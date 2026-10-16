@@ -272,6 +272,7 @@ mod tests {
                 background: "light".into(),
                 guifont: String::new(),
                 colors_name: "rose-pine".into(),
+                cmdheight: None,
             },
         })
     }
@@ -344,6 +345,7 @@ mod tests {
                 background: "dark".into(),
                 guifont: String::new(),
                 colors_name: "lunaperche".into(),
+                cmdheight: None,
             },
         });
         let css = gtk_css(&t);
@@ -509,6 +511,7 @@ mod tests {
                 background: "dark".into(),
                 guifont: String::new(),
                 colors_name: "lunaperche".into(),
+                cmdheight: None,
             },
         })
     }
@@ -543,6 +546,7 @@ mod tests {
                 background: "light".into(),
                 guifont: String::new(),
                 colors_name: "rose-pine".into(),
+                cmdheight: None,
             },
         })
     }

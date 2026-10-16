@@ -126,6 +126,10 @@ type Props = {
    *  key that opens the box. Since 2026-10-15 it replaces the "i or Ctrl+j to type" sentence that followed
    *  the placeholder (`Ctrl+j` is in the `?` sheet). */
   browseKey?: string;
+  /** What the empty box says while the panel does not hold the keys (the start screen: how to reach it).
+   *  Only then: with the keys here the caret is the sign, and grey text behind an input method's preedit
+   *  reads as a second line of input. */
+  idleHint?: string;
 };
 
 /** C2: the BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
@@ -164,6 +168,7 @@ export function Composer({
   slashCommands = null,
   onLineKey,
   browseKey = "i",
+  idleHint,
 }: Props) {
   const [text, setText] = useState("");
   const [walk, setWalk] = useState<HistoryWalk>({ index: null, stash: "" });
@@ -540,10 +545,11 @@ export function Composer({
                     ? "editing in nvim — :wq to return"
                     : running
                       ? runningPlaceholder(enterSteers)
-                      : // Nothing in an ordinary empty box: the caret and the box's INPUT frame already say
-                        // where the keys are, and grey text behind an input method's preedit reads as a
-                        // second line of input.
-                        undefined
+                      : // Nothing in an ordinary empty box while it holds the keys: the caret and the box's
+                        // INPUT frame already say where the keys are, and grey text behind an input
+                        // method's preedit reads as a second line of input. Without the keys there is no
+                        // caret and no preedit, and the host may say how to get here.
+                        idleHint
             }
           />
         </>

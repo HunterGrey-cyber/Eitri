@@ -156,7 +156,7 @@ type Props = {
   agent?: string | null;
 };
 
-/** The empty tab's dashboard: a centred `Eitri`, the
+/** The empty tab's dashboard: a centred question, the
  *  where-line and one row per `dashItems(hello)`, each with its key -- and nothing else. What a mode
  *  does, what a message carries from the editor and the window's keys are all in the `?` sheet, which
  *  the last row opens; only a companion window with no editor attached says one more line, because
@@ -183,7 +183,7 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, editorLink = nu
 export function DashboardHead({ hello, narrow, agent = null }: { hello: Hello; narrow: boolean; agent?: string | null }) {
   return (
     <>
-      <div className="dash-title">Eitri</div>
+      <div className="dash-title">What shall we work on?</div>
       <div className="dash-where">{whereLine(hello, narrow, agent)}</div>
     </>
   );

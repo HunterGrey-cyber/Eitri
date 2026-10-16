@@ -217,6 +217,11 @@ pub struct ThemeTokens {
     /// `css_vars()` emits `--nv-editor-row` only for `Some`, so a reload before the editor's first
     /// frame uses the `24px` fallback in `index.css`.
     pub editor_row_px: Option<f32>,
+    /// nvim's `'cmdheight'`, the rows the editor keeps under its statusline, so the panel's status band
+    /// can sit on the statusline's row instead of the command line's. Sent as `--nv-editor-cmd-rows`
+    /// only beside an editor whose row height is known ([`Self::editor_row_px`]): a window with no
+    /// editor under the band (a companion window) has no row to line up with.
+    pub editor_cmd_rows: Option<u32>,
 }
 
 /// The `font-size` `index.css` was written against, and what `--nv-font-size` is unless a host says
@@ -437,6 +442,7 @@ impl ThemeTokens {
             font_size_px: DEFAULT_PANEL_FONT_SIZE_PX,
             color_scheme: if light { "light" } else { "dark" },
             editor_row_px: None,
+            editor_cmd_rows: payload.options.cmdheight,
         }
     }
 
@@ -494,6 +500,9 @@ impl ThemeTokens {
         vars.push(("--nv-color-scheme".to_string(), self.color_scheme.to_string()));
         if let Some(px) = self.editor_row_px {
             vars.push(("--nv-editor-row".to_string(), format!("{px}px")));
+            if let Some(rows) = self.editor_cmd_rows {
+                vars.push(("--nv-editor-cmd-rows".to_string(), rows.to_string()));
+            }
         }
         vars
     }
@@ -581,6 +590,7 @@ mod tests {
                 background: background.into(),
                 guifont: String::new(),
                 colors_name: "t".into(),
+                cmdheight: None,
             },
         }
     }
@@ -653,6 +663,27 @@ mod tests {
         assert!(t
             .css_vars()
             .contains(&("--nv-editor-row".to_string(), "22px".to_string())));
+    }
+
+    /// The command line's rows under the editor's statusline lift the panel's band by as many rows, and
+    /// only where there is an editor row to line up with.
+    #[test]
+    fn the_command_line_height_is_a_css_var_only_beside_a_measured_editor() {
+        let mut p = payload("dark", &[]);
+        p.options.cmdheight = Some(1);
+        let mut t = ThemeTokens::derive(&p);
+        assert!(
+            t.css_vars().iter().all(|(n, _)| n != "--nv-editor-cmd-rows"),
+            "no editor row yet: nothing to line up with"
+        );
+        t.editor_row_px = Some(22.0);
+        assert!(t
+            .css_vars()
+            .contains(&("--nv-editor-cmd-rows".to_string(), "1".to_string())));
+        // A snippet older than the field: unknown, so no lift at all rather than a guessed one.
+        let mut old = ThemeTokens::derive(&payload("dark", &[]));
+        old.editor_row_px = Some(22.0);
+        assert!(old.css_vars().iter().all(|(n, _)| n != "--nv-editor-cmd-rows"));
     }
 
     #[test]

@@ -1,432 +1,1765 @@
+/* The panel borrows its ink and type from the editor. Space and shape carry the conversation. */
 :root {
   color-scheme: var(--nv-color-scheme);
+  --fs-xs: calc(var(--nv-font-size, 14px) * 9.5 / 14);
+  --fs-sm: calc(var(--nv-font-size, 14px) * 10.5 / 14);
+  --fs-md: calc(var(--nv-font-size, 14px) * 11 / 14);
+  --fs-base: var(--nv-font-size, 14px);
+  --fs-code: calc(var(--nv-font-size, 14px) * 12 / 14);
+  --fs-prose: calc(var(--nv-font-size, 14px) * 12 / 14);
+  --fs-heading: calc(var(--nv-font-size, 14px) * 12.6 / 14);
+  --fs-title: calc(var(--nv-font-size, 14px) * 18 / 14);
+  --row-sign-w: 20px;
+  --row-gap: 8px;
+  --row-gutter: calc(var(--row-sign-w) + var(--row-gap));
+  --prose-measure: 1fr;
+  --page-pad: clamp(18px, 3.5vw, 48px);
+  --sign-w: calc(var(--fs-code) * 1.2);
+  --rule-soft: color-mix(in srgb, var(--nv-fg) 13%, var(--nv-bg));
+  --rule-frame: color-mix(in srgb, var(--nv-fg) 24%, var(--nv-bg));
+  --radius-block: 10px;
+  --band-fill: color-mix(in srgb, var(--nv-cursorline) 24%, var(--nv-bg));
+  --band-fill-inactive: color-mix(in srgb, var(--nv-cursorline) 12%, var(--nv-bg));
 }
-
 * {
   box-sizing: border-box;
 }
-
-html,
-body,
-#root {
+html, body, #root {
+  height: 100%;
   margin: 0;
   padding: 0;
-  height: 100%;
   background: var(--nv-bg);
   color: var(--nv-fg);
   font-family: var(--nv-font-prose);
-  font-size: var(--fs-base);
+  font-size: var(--fs-prose);
 }
-
+body {
+  overflow: hidden;
+}
+button, input, textarea {
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-prose);
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  border: 1px solid var(--rule-frame);
+  border-radius: 6px;
+}
+button {
+  cursor: pointer;
+  padding: 7px 12px;
+}
+button:disabled {
+  cursor: default;
+  border-style: dashed;
+}
+button:hover {
+  border-color: var(--nv-fg);
+}
+button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button"]:focus-visible {
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 3px;
+}
+a {
+  color: var(--nv-fg);
+  text-underline-offset: 3px;
+}
+pre, code, kbd {
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+}
+pre {
+  margin: 0;
+}
 .agent-ui-root {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
-  /* The containing block for `.hint-layer`, whose labels are placed from rects measured against
-     this root (`components/HintLayer.tsx`). Nothing else here is positioned. */
-  position: relative;
+  min-width: 0;
+  outline: 0;
 }
-
-/* What `main.tsx`'s `PanelErrorBoundary` draws in place of an empty `#root` when the
-   panel itself throws while rendering -- plain text on the page's own colours, so it reads even when nothing
-   else drew. */
-.panel-crashed {
-  padding: 12px;
-  color: var(--nv-fg);
+.agent-ui-conversation {
+  display: flex;
+  flex-direction: column;
+  grid-template-rows: none;
+  min-height: 0;
 }
-
-/* winbar, the scrolling message list, the status line, the composer -- panel-as-document task 6
-   split what used to be one `.session-header` row into a winbar (identity/model, above) and a
-   status line (mode/status/position/Stop, directly above the composer).
-
-   A flex column (inherited from `.agent-ui-root`), not the grid it used to be. The grid was
-   `grid-template-rows: auto 1fr auto auto`, which hands the `1fr` to whatever child happens to be
-   SECOND -- the message list normally, but the fatal-error banner whenever it is shown, because
-   `App.tsx` renders it between the winbar and the list. The list then sat in an `auto` track at its
-   full content height and never scrolled, so `j`/`k`'s stepping through a long reply did nothing in
-   exactly the state where someone reads back over a dead session (found in review). The list now
-   takes the free space by its own class, whatever else is on screen, and nothing else shrinks. */
 .agent-ui-conversation > * {
   flex: 0 0 auto;
 }
-
-/* The list's own region, and the `?` overlay's containing block. A wrapper rather than the whole
-   conversation, so the overlay covers only the conversation list;
-   the winbar and status line remain visible, with no JS measurement of the winbar's wrapping height. */
 .agent-ui-scroller {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1 1 0%;
   min-height: 0;
-  position: relative;
-}
-
-.agent-ui-scroller > .message-list {
-  flex: 1 1 0%;
-  min-height: 0;
-}
-
-/* The which-key box:
-   drawn `WHICH_KEY_DELAY_MS` (200ms) after a leader/table sequence, or one of `resolveKey`'s own
-   reserved `g`/`z`/`[`/`]` prefixes, is still pending with a continuation to show. Positioned
-   against `.agent-ui-scroller`, the same wrapper `.keymap-overlay`/`.detail-popover`/`.chooser` are
-   -- `bottom: 0` is the footer's own top rule, so this box sits directly above it. `mock:
-   leader.html` A. `.wk-group`'s label is `--nv-fg`, not `--nv-chrome-accent`: `chrome_accent` is
-   guarded at UI_CONTRAST (3.0, WCAG 1.4.11's non-text threshold), never at the 4.5:1 text needs
-   (the same reason `indexCss.test.ts`'s real guard test still refuses it inside the winbar) -- so
-   it has no contrast guarantee for THIS use, and the group's own `+` prefix is left to carry the
-   "this opens more keys" signal instead of a colour nothing promises.
-   Its text is `--nv-surface-fg`/`--nv-surface-muted`, never the body's `--nv-fg`/`--nv-muted`:
-   those are guarded against `bg`, and the box is painted `--nv-surface` (sw-theme-2). */
-.which-key-box {
-  color: var(--nv-surface-fg);
-  position: absolute;
-  right: 10px;
-  bottom: 0;
-  z-index: 3;
-  min-width: 210px;
-  background: var(--nv-surface);
-  border: 1px solid var(--nv-fg);
-  border-radius: 4px;
-  padding: 10px 12px 6px;
-  font-size: var(--fs-md);
-}
-.which-key-box .wk-title {
-  position: absolute;
-  top: -0.7em;
-  left: 10px;
-  background: var(--nv-surface);
-  padding: 0 5px;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  color: var(--nv-surface-fg);
-}
-.which-key-box .wk-entry {
-  display: grid;
-  grid-template-columns: 2ch 1.4ch 1fr;
-  gap: 0 6px;
-  line-height: 1.6;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.which-key-box .wk-key {
-  /* Deliberately unguarded, the same exemption `--nv-syn-*` gets inside an `hljs-*` rule
-     (`indexCss.test.ts`'s own doc comment: syntax tokens are the editor's own colours, not a
-     contrast guarantee) -- narrowed here to exactly this one selector so it cannot widen to any
-     other keycap in the box. */
-  font-family: var(--nv-font-mono);
-  color: var(--nv-syn-keyword);
-  font-weight: 600;
-}
-.which-key-box .wk-sep {
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-xs);
-  color: var(--nv-surface-muted);
-}
-.which-key-box .wk-group {
-  color: var(--nv-surface-fg);
-}
-.which-key-box .wk-disabled {
-  color: var(--nv-surface-muted);
-}
-.which-key-box .wk-foot {
-  margin-top: 6px;
-  padding-top: 4px;
-  border-top: 1px solid var(--nv-border);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-xs);
-  color: var(--nv-surface-muted);
-  display: flex;
-  gap: 10px;
-}
-@media (max-width: 400px) {
-  .which-key-box {
-    min-width: 190px;
-  }
-}
-
-/* The empty tab: Claude Code's fresh prompt, replacing the old
-   `.mode-selector` start screen. The mode-selector's own boxed Auto/Bypass buttons are gone with
-   it -- there is no second `:not(.row-choice)` rule to keep in step, since this screen never draws
-   a boxed button at all any more. */
-/* The start screen's body: everything between the tab bar and the status band. A flex column like the root
-   it sits in, so `.empty-tab`'s `margin: auto` centres it exactly as it did as the root's own child, and
-   `position: relative` makes it the containing block of the trust question, which must not cover the band
-   (the band shows that question's own prompt and flashes). `min-height` is left at its automatic value:
-   content taller than the screen overflows as before and never shrinks into the band. */
-.empty-stage {
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 auto;
-  position: relative;
-}
-
-.empty-tab {
-  margin: auto;
-  padding: 24px;
-  width: 100%;
-  text-align: center;
-  outline: none;
-  /* Defect 3 (phase 2's sandbox pass): `width: 100%` plus 24px padding each side, in the default
-     content-box, overflowed a narrow column (beside a Lua panel, ~348px). `border-box` folds the
-     padding into the 100%, and `min-width: 0` lets a flex/grid ancestor actually shrink it instead
-     of holding it to its content's own min-content width. */
-  box-sizing: border-box;
   min-width: 0;
-  /* the containing block for this screen's own
-     `.which-key-box` (`EmptyTab.tsx`'s own doc comment on that render -- there is no
-     `.agent-ui-scroller` on this screen, for it to dock against the way the live
-     conversation's copy does). */
-  position: relative;
 }
-.empty-tab-resume .session-title,
-.empty-tab-resume .detail {
+.empty-stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-height: 0;
+}
+.panel-crashed, .fatal-error {
+  padding: 16px var(--page-pad);
+  font-size: var(--fs-prose);
   overflow-wrap: anywhere;
 }
-/* On the starting and failed screens the box stands under what they say, the same margin each side rather
-   than the conversation's foot's step in to the body's edge (there is no sign column here for it to line
-   up with). On the dashboard it is the New session row (`.dash-input`, below). */
-.empty-box .composer {
-  margin: 20px 0 0;
+.fatal-error {
+  border-bottom: 1px solid var(--nv-error);
 }
-
-/* tmux's window list: one row, shown only with two or more tabs or while
-   a rename is open (`showTabBar`, `tabs.ts`). Above `errorBanner` in the conversation layout and
-   above `EmptyTab` in the empty layout -- `App.tsx`. Scrolls sideways on overflow (`nav.ts`'s
-   `SCROLL_CONTAINERS`), the same idiom the old `.session-choice` list used vertically. */
+/* Tabs read as a quiet document header; the bottom band retains the editor's mode vocabulary. */
 .tab-bar {
   display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  padding: 8px 12px 0;
   overflow-x: auto;
-  white-space: nowrap;
   border-bottom: 1px solid var(--nv-border);
-  padding: 0 12px;
-  /* No scrollbar: WebKitGTK's sat over the lower half of an overflowing bar and took the clicks
-     meant for the tabs (GUI pass, 2026-09-25). It still scrolls -- see `TabBar`'s scrollIntoView. */
   scrollbar-width: none;
+}
+.tab {
+  border: 0;
+  border-radius: 7px 7px 0 0;
+  padding: 8px 12px 11px;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.tab-active {
+  color: var(--nv-fg);
+  box-shadow: inset 0 -2px var(--nv-chrome-accent);
+}
+.tab-ended {
+  text-decoration: line-through;
+}
+.tab-working::after {
+  content: " •";
+  margin-left: 0.5ch;
 }
 .tab-bar::-webkit-scrollbar {
   display: none;
 }
-/* A text button, not a boxed one -- the fill below is what marks the active tab, not a border. */
-.tab {
-  background: none;
-  border: 0;
-  font: inherit;
-  color: var(--nv-fg);
-  padding: 4px 10px;
-  cursor: pointer;
-  flex: none;
+.tab-rename {
+  min-width: 3ch;
+  max-width: 28ch;
+  padding: 3px 6px;
 }
-/* The cursorline fill, same as a conversation row's own cursor: the
-   FOCUS signal stays the row cursor elsewhere in the panel, this only marks which tab is showing. */
-.tab-active {
+/* A full-width page with distinct conversational and operational rhythms. */
+.message-list {
+  position: relative;
+  isolation: isolate;
+  flex: 1 1 0%;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  padding: 28px var(--page-pad) 24px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-frame) var(--nv-bg);
+}
+.row {
+  border-left: 0;
+  display: grid;
+  grid-template-columns: var(--row-sign-w) minmax(0, var(--prose-measure));
+  gap: 0 var(--row-gap);
+  align-items: start;
+  padding: 5px 0;
+}
+.row-sign {
+  user-select: none;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+  color: var(--nv-muted);
+  text-align: center;
+}
+.row-body {
+  min-width: 0;
+  font-size: var(--fs-prose);
+  line-height: 1.7;
+}
+.row-current {
   background: var(--nv-cursorline);
 }
-.tab-ended {
-  color: var(--nv-muted);
+.row-current .row-sign {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
 }
-/* A background tab with a turn running: a plain, static mark. Deliberately NOT
-   animated -- the activity line's star (`.activity-glyph`) is the one animated element in this stylesheet
-   (`indexCss.test.ts`), and a second, per-tab motion would either duplicate that guarantee or
-   escape it. The active tab's own turn is shown by `ActivityLine` instead. */
-/* Defect 4 (phase 2's sandbox pass): a label cut with `…` (the tab's own name-truncation) followed
-   by this marker read `……`, two ellipses run together with no visual break. Separated, and not an
-   ellipsis itself, so it can never repeat that collision. */
-.tab-working::after {
-  content: " ✻";
-}
-.tab-rename {
-  font: inherit;
-  width: 16ch;
-}
-/* The `/` prompt: vim's own command line, now a line of its own above the band rather
-   than sharing the footer's third slot -- the y/n `confirm_close`
-   prompt this used to share a class with is the band's own `.band-prompt` now. */
-.search-bar {
-  font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
-}
-.search-bar input {
-  font: inherit;
+.message-list > .row {
+  position: relative;
+  display: block;
+  padding: 0;
   background: none;
-  border: 0;
-  color: var(--nv-fg);
-  width: 24ch;
 }
-
-/* The activity line, directly above the composer (only while a turn runs): Claude Code's running line,
-   `✻ Working… 12s · 2 queued · ctrl+c interrupt`, one mono line at the small size, muted but for the
-   phase word. Plain body surface, not nvim's `StatusLine` colours, so it agrees with the band below.
-   It opens the foot: this line, the turn's changes, the queued lines and the composer share the
-   conversation's side margins (`--page-pad`) and fill the panel, and the star sits in the sign column so
-   the words after it start where the conversation's text does. The foot reads as one block above the
-   status band, and no rule separates it from the conversation -- the composer is the boundary. No `z-index` anywhere here: the `?` overlay and the detail popover are positioned
-   against `.agent-ui-scroller`, the list's own region, so neither can reach this line and nothing here
-   has to out-paint them. */
-.activity-line {
-  display: flex;
-  align-items: center;
-  gap: var(--sign-gap);
-  box-sizing: border-box;
-  margin-inline: var(--page-pad);
-  padding: 4px 0 0;
-  min-height: 26px;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
+.message-list > .row + .row {
+  margin-top: 12px;
+}
+.message-list .row-sign {
+  display: none;
+}
+.message-list > .row-tool, .message-list > .row-tool-run, .message-list > .row-thinking {
+  padding-left: 24px;
+}
+.message-list > .row-tool::before, .message-list > .row-tool-run::before, .message-list > .row-thinking::before {
+  content: attr(data-sign) / "";
+  position: absolute;
+  left: 0;
+  top: 1px;
   color: var(--nv-muted);
-  /* Never two lines: see the in-flight indicator's own comment further down. */
-  white-space: nowrap;
+  font-size: var(--fs-md);
 }
-/* The star at the head of the line, in the accent the old bar meter was filled with. While the agent
-   works it breathes (`turn-breath`, with the in-flight motion further down); a card waiting, or a phase
-   that is the user's to end, holds it still (`data-moving` is absent then). An inline block, so a
-   transform applies to it. */
-.activity-glyph {
-  display: inline-block;
-  flex: none;
-  width: var(--sign-w);
+.row-tool[data-sign="◐"]::before {
   color: var(--nv-chrome-accent);
 }
-/* The interrupt-key reminder, or a card that waits, in the activity line's own
-   slot. `.activity-card` is deliberately readable text (`--nv-fg`), not muted like the reminder it
-   replaces -- a card holding the queue is worth noticing, the reminder is not. */
-.activity-card,
-.activity-keys {
+.row-tool[data-sign="✗"]::before {
+  color: var(--nv-error);
+}
+.message-list > .row-prompt {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 32px;
+  margin-bottom: 26px;
+}
+.message-list > .row-prompt:first-child {
+  margin-top: 0;
+}
+.message-list > .row-prompt + .row-prompt {
+  margin-top: -12px;
+}
+.row-prompt .row-body {
+  max-width: 88%;
+  padding: 12px 18px;
+  border-radius: 18px 18px 5px 18px;
+  background: var(--nv-tint);
+  color: var(--nv-tint-fg);
+  white-space: pre-wrap;
+}
+.row-prompt .prompt-delivered {
+  display: block;
+  margin-top: 5px;
+  color: var(--nv-tint-muted);
+  font-size: var(--fs-xs);
+}
+.message-list > .row-assistant {
+  margin-top: 24px;
+  margin-bottom: 24px;
+}
+.row-assistant p {
+  margin: 0 0 14px;
+}
+.row-assistant p:last-child {
+  margin-bottom: 0;
+}
+.row-assistant h1, .row-assistant h2, .row-assistant h3, .row-assistant h4 {
+  font-size: var(--fs-heading);
+  font-weight: 650;
+  line-height: 1.45;
+  margin: 22px 0 10px;
+}
+.row-assistant ul, .row-assistant ol {
+  padding-left: 24px;
+  margin: 12px 0;
+}
+.row-assistant li + li {
+  margin-top: 6px;
+}
+.row-assistant blockquote {
+  margin: 16px 0;
+  padding: 0 18px;
+  border-left: 2px solid var(--rule-frame);
   color: var(--nv-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
-.activity-card {
-  color: var(--nv-fg);
+.row-assistant hr {
+  border: 0;
+  border-top: 1px solid var(--rule-soft);
+  margin: 24px 0;
 }
-/* A path `gf`/a click can open -- the tool registry's own spans and a diff's own path line
-   share this class (`.path-link`); an inline code span in an assistant reply is a click target too,
-   without a class of its own, since not every inline `code` is a path. `.path-pick` is its own
-   letter-per-path list, above the band, while a `gf` with several paths waits for one. */
-.path-link {
-  text-decoration: underline;
-  text-decoration-color: var(--nv-muted);
-  cursor: pointer;
+.row-assistant img {
+  max-width: 100%;
+  height: auto;
 }
-/* An inline code span is never broken inside a token (`--json` split between its hyphens).
-   A browser may break after a hyphen-minus and only `white-space: nowrap` stops that, which would let a long
-   span run out of the row; an atomic inline does both. As an `inline-block` its shrink-to-fit width is its
-   content's own, so nothing inside wraps and the whole span moves to the next line when it does not fit this
-   one; only a span longer than the whole row is capped at `max-width: 100%` and broken, anywhere. Fenced code
-   is `pre code`, which this leaves alone. It sits on your own tint (`--tint-you`), rounded, a step smaller
-   than the prose around it, in the tint's guarded ink. */
 .row-assistant code:not(pre code) {
-  cursor: pointer;
   display: inline-block;
   max-width: 100%;
   overflow-wrap: anywhere;
-  padding: 0 0.3em;
-  border-radius: 4px;
-  background: var(--tint-you);
+  white-space: normal;
+  vertical-align: baseline;
+  background: var(--nv-tint);
   color: var(--nv-tint-fg);
+  padding: 0 3px;
+  border-radius: 4px;
   font-size: var(--fs-md);
 }
-/* A table's cells keep their words whole and the table scrolls in its own box (see
-   `.table-scroll` above), so a span in a cell is neither broken nor capped at the cell's width -- the rule
-   above would otherwise beat the cell's inherited `overflow-wrap: normal` on the span's own box. */
 .row-assistant .table-scroll code:not(pre code) {
-  max-width: none;
   overflow-wrap: normal;
+  max-width: none;
 }
-/* An inline-block does not take its ancestors' text decoration into its own box
-   (CSS Text Decoration 3: not propagated to atomic inline-level descendants), so the span in a link lost
-   its underline and the span in `~~ ~~` its strike-through. Each is drawn on the span's own box, as a value
-   and not `inherit`: a `<strong>` between the link and the span has a computed `none`. */
 .row-assistant a code:not(pre code) {
   text-decoration: underline;
 }
-.row-assistant del code:not(pre code),
-.row-assistant s code:not(pre code) {
+.row-assistant del code:not(pre code), .row-assistant s code:not(pre code) {
   text-decoration: line-through;
 }
-.row-assistant a del code:not(pre code),
-.row-assistant del a code:not(pre code),
-.row-assistant a s code:not(pre code),
-.row-assistant s a code:not(pre code) {
+.row-assistant a del code:not(pre code), .row-assistant del a code:not(pre code), .row-assistant a s code:not(pre code), .row-assistant s a code:not(pre code) {
   text-decoration: underline line-through;
 }
-.path-pick {
-  font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
+.code-block {
+  background: var(--nv-surface);
+  color: var(--nv-surface-fg);
+  border: 1px solid var(--rule-soft);
+  border-radius: 8px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  white-space: pre;
+  font-size: var(--fs-code);
+  line-height: 1.65;
+  margin: 14px 0;
+  max-width: 100%;
 }
-/* `gx` with several links: the same list as `.path-pick`, but every address is shown
-   in full -- a long one wraps rather than being cut, because the tail of a disguised link is the part a
-   reader needs to see. */
-.link-pick {
+.row-assistant .code-block {
+  max-width: 100%;
+}
+.code-block code {
+  font-size: var(--fs-code);
+}
+.code-escape, .permission-card-escape {
+  outline: 1px solid var(--nv-warn);
+  outline-offset: 1px;
+}
+.code-escape {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 18px 0;
+}
+.table-scroll table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--fs-prose);
+}
+.table-scroll td, .table-scroll th {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rule-soft);
+  overflow-wrap: normal;
+}
+.table-scroll th {
+  font-weight: 600;
+}
+/* Process lines are compact enough to scan; opened evidence gets its own reading space. */
+.tool-card {
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-md);
+  color: var(--nv-muted);
+  line-height: 1.6;
+}
+.tool-card-bash {
+  white-space: pre-wrap;
   font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
+  font-size: var(--fs-sm);
+}
+.tool-card-generic pre, .tool-result-body {
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-/* The queued lines: muted italic, one line each, directly above the composer in the foot --
-   provisional text, the way Codex and Claude Code show a message that has not reached the agent yet. */
-.queue-lines {
-  box-sizing: border-box;
-  margin-inline: var(--page-pad);
-  padding: 2px 0 0;
-  font-size: var(--fs-sm);
-  color: var(--nv-muted);
+.tool-card-generic {
+  max-width: 100%;
 }
-/* Each line's mark stands in the sign column and its words start at the body's edge, as the activity
-   line's star and words do above it. */
-.queue-line {
+.tool-card-generic pre {
+  padding: 10px 0;
+}
+.tool-result, .tool-result-preview {
   display: grid;
   grid-template-columns: var(--sign-w) minmax(0, 1fr);
-  column-gap: var(--sign-gap);
-  line-height: 1.7;
-  font-style: italic;
+  gap: 0 6px;
+  margin-top: 6px;
+  color: var(--nv-muted);
+  font-size: var(--fs-md);
+  line-height: 1.65;
 }
-.queue-glyph {
-  font-style: normal;
+.tool-result::before,
+.tool-result-preview::before {
+  content: "⎿" / "";
+  color: var(--nv-muted);
+  grid-column: 1;
 }
-.queue-text {
-  white-space: nowrap;
+.tool-result-body {
+  grid-column: 2;
+  min-width: 0;
+  max-height: 360px;
+  overflow-y: auto;
+  font-size: var(--fs-code);
+}
+.tool-result-preview-line, .tool-result-preview-more {
+  grid-column: 2;
+  min-width: 0;
+}
+.tool-result-preview-line {
+  white-space: pre;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.queue-note,
-.queue-error {
-  padding-left: var(--body-edge);
+.tool-result-preview-more {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
 }
-/* A message sent into the running turn and not yet read: dimmer than a held one, since it needs nothing
-   from the user. */
-.queue-line-steered {
-  opacity: 0.75;
+.tool-result-pending, .tool-result-unavailable, .tool-rule-note, .tool-waiting, .tool-denied {
+  margin-top: 5px;
+  color: var(--nv-muted);
+  font-size: var(--fs-md);
 }
-/* Why the held lines are held: said once, quieter than the lines themselves. */
-.queue-note {
-  font-style: italic;
-  opacity: 0.8;
+.tool-result-error {
+  border: 1px solid color-mix(in srgb, var(--nv-error) 50%, var(--nv-bg));
+  background: var(--nv-error-tint);
+  color: var(--nv-error-tint-fg);
+  grid-template-columns: minmax(0, 1fr);
+  width: max-content;
+  min-width: min(100%, 36rem);
+  max-width: 100%;
+  padding: 12px 14px;
+  border-radius: 10px;
+}
+.tool-result-error::before {
+  display: none;
+}
+.tool-result-error .tool-result-body, .tool-result-error .tool-result-preview-line {
+  grid-column: 1;
+}
+.tool-result-preview.tool-result-error {
+  color: var(--nv-error-tint-fg);
+}
+.tool-result-error .tool-result-preview-more {
+  grid-column: 1;
+  color: var(--nv-error-tint-muted);
+}
+.tool-result-preview-wrapped .tool-result-preview-line {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+}
+.tool-provider-input {
+  white-space: pre-wrap;
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+.fold-marker {
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+  padding-left: 5px;
+}
+.thinking-head {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+}
+.thinking-count {
+  font-size: var(--fs-xs);
+}
+.thinking-text, .thinking-preview {
+  white-space: pre-wrap;
+  unicode-bidi: isolate;
+  color: var(--nv-muted);
+  font-size: var(--fs-md);
+  line-height: 1.65;
+  padding: 10px 0;
+}
+.thinking-preview {
+  max-height: 5em;
+  overflow: hidden;
+}
+.turn-time {
+  margin: 18px 0 24px;
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+}
+.row-ending {
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+  border-top: 1px solid var(--rule-soft);
+  padding-top: 10px;
+}
+.row-problem-remedy {
+  white-space: pre-wrap;
+}
+.row-hint {
+  font-size: var(--fs-sm);
+  margin-top: 8px;
+}
+.agent-ui-conversation > .row-error {
+  background: var(--nv-error-tint);
+  color: var(--nv-error-tint-fg);
+  border: 1px solid var(--nv-error);
+  border-radius: 10px;
+  margin: 8px var(--page-pad);
+  padding: 14px;
+}
+.agent-ui-conversation > .row-error .row-body, .agent-ui-conversation > .row-error .row-sign {
+  color: var(--nv-error-tint-fg);
+}
+.agent-ui-conversation > .row-error pre {
+  white-space: pre-wrap;
+}
+.agent-ui-conversation > .row-ended {
+  margin: 8px var(--page-pad);
+  color: var(--nv-muted);
+}
+/* The cursor is measured by the navigation layer, so it has no layout footprint. The two shadows
+   carry the fill a little above and below the row, so the row's first and last lines do not sit on
+   the band's edge; the bar on its left is what the eye finds while scrolling. */
+.cursor-band {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--band-fill);
+  box-shadow: 0 -8px 0 var(--band-fill), 0 8px 0 var(--band-fill);
+  border-radius: 8px;
+}
+.cursor-band::before {
+  content: "";
+  position: absolute;
+  top: -8px;
+  bottom: -8px;
+  left: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--nv-chrome-accent);
+}
+.message-list[data-focused="false"] .cursor-band, .agent-ui-root[data-panel-mode="input"] .cursor-band {
+  background: var(--band-fill-inactive);
+  box-shadow: 0 -8px 0 var(--band-fill-inactive), 0 8px 0 var(--band-fill-inactive);
+}
+.message-list[data-focused="false"] .cursor-band::before, .agent-ui-root[data-panel-mode="input"] .cursor-band::before {
+  background: var(--rule-frame);
+}
+/* A permission card is its own frame; the band behind it would draw a second one. */
+.message-list:has(.row-current .permission-card) .cursor-band {
+  display: none;
+}
+.row-current .permission-card {
+  box-shadow: 0 0 0 1px var(--nv-warn);
+}
+.message-list[data-visual] .cursor-band {
+  display: none;
+}
+.message-list[data-visual] .row-current {
+  background: none;
+}
+.message-list[data-visual] ::selection {
+  background: var(--nv-cursorline);
+}
+.message-list[data-visual="caret"] ::selection {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+}
+.row-yanked {
+  outline: 1px solid var(--nv-fg);
+  outline-offset: 4px;
+}
+.message-list pre.code-block:focus {
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 2px;
+}
+.message-list[data-focused="false"] pre.code-block:focus {
+  outline-width: 1px;
+}
+/* File changes are reviewable documents within the transcript. */
+.permission-card-edit {
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--rule-frame);
+  border-radius: 10px;
+  overflow: hidden;
+  margin: 8px 0;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+}
+.permission-card-edit-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rule-soft);
+  font-size: var(--fs-code);
+}
+.permission-card-edit-tool {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.permission-card-edit-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--nv-font-mono);
+}
+.permission-card-edit-counts {
+  margin-left: auto;
+  white-space: nowrap;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+.edit-count-added .edit-sign {
+  color: var(--nv-ok);
+}
+.edit-count-removed .edit-sign {
+  color: var(--nv-error);
+}
+.permission-card-edit-note {
+  font-size: var(--fs-sm);
+  padding: 9px 14px;
+}
+.permission-card-diff {
+  overflow-x: auto;
+  padding: 8px 0 14px;
+  font-size: var(--fs-code);
+  line-height: 1.65;
+}
+.diff-line {
+  display: flex;
+  min-width: min-content;
+}
+.diff-gutter {
+  width: 3ch;
+  text-align: center;
+  flex-shrink: 0;
+}
+.diff-text {
+  min-width: 0;
+}
+.diff-added {
+  background: var(--nv-bg);
+}
+.diff-removed {
+  background: var(--nv-bg);
+}
+.diff-added .diff-gutter {
+  color: var(--nv-ok);
+}
+.diff-removed .diff-gutter {
+  color: var(--nv-error);
+}
+/* Approval has a clear title, readable evidence, then the decision. */
+.permission-card {
+  background: var(--nv-warn-tint);
+  color: var(--nv-warn-tint-fg);
+  border: 1px solid var(--nv-warn);
+  border-radius: 14px;
+  padding: 20px;
+  margin: 20px 0;
+}
+.permission-card-tool {
+  font-size: var(--fs-heading);
+  font-weight: 650;
+  margin-bottom: 16px;
+}
+.permission-card-command, .permission-card-input {
+  font-size: var(--fs-code);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  margin: 12px 0;
+}
+.permission-card-command {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+}
+.permission-card-description, .permission-card-provider, .permission-card-stale {
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--nv-warn-tint-muted);
+  margin: 10px 0;
+}
+.permission-card-provider-label {
+  display: block;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+.permission-card-provider-reason {
+  white-space: pre-wrap;
+}
+.permission-card-edit-path, .permission-card-diff {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+.permission-card .permission-card-edit {
+  background: none;
+  color: var(--nv-warn-tint-fg);
+  border-color: var(--nv-warn);
+}
+.permission-card .permission-card-edit-head {
+  border-color: var(--nv-warn);
+}
+.permission-card .permission-card-diff {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.permission-card .diff-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  background: none;
+}
+.permission-card .diff-added .diff-gutter {
+  color: var(--nv-ok);
+}
+.permission-card .diff-removed .diff-gutter {
+  color: var(--nv-error);
+}
+.permission-card input {
+  box-sizing: border-box;
+  font: inherit;
+  width: 100%;
+  min-width: 0;
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-prose);
+  padding: 10px 12px;
+  text-overflow: ellipsis;
+  margin: 12px 0 4px;
+}
+.permission-card-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.permission-card-buttons button {
+  font: inherit;
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-prose);
+  padding: 8px 15px;
+}
+.permission-card-buttons button:first-child {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+  border-color: var(--nv-fg);
+}
+.permission-card-buttons button:first-child:focus {
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 3px;
+}
+.permission-card-buttons [data-key]::after {
+  content: attr(data-key) / "";
+  display: none;
+  font-size: var(--fs-xs);
+  padding-left: 12px;
+}
+[data-panel-mode="browse"] .message-list[data-focused="true"] .row-current .permission-card-buttons [data-key]:not(:disabled)::after {
+  display: inline;
+}
+.permission-card-warning {
+  margin: 8px 0;
+  font-size: var(--fs-sm);
+}
+.path-link {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 4px;
+}
+/* A writing card separates composition from the transcript without covering either: one line
+   until there is more to say. */
+.composer {
+  position: relative;
+  margin: 10px var(--page-pad) 14px;
+  padding: 10px 14px;
+  background: var(--nv-bg);
+  border: 1px solid var(--rule-frame);
+  border-radius: 14px;
+  box-shadow: 0 3px 0 color-mix(in srgb, var(--nv-fg) 4%, var(--nv-bg));
+}
+.composer:focus-within {
+  border-color: var(--nv-status-insert-bg);
+  outline: 1px solid var(--nv-status-insert-bg);
+  outline-offset: 0;
+}
+.composer textarea {
+  display: block;
+  width: 100%;
+  max-height: 30vh;
+  padding: 0;
+  margin: 0;
+  resize: none;
+  border: 0;
+  background: none;
+  outline: none;
+  line-height: 1.6;
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-prose);
+  overflow-y: auto;
+}
+.composer textarea:focus-visible {
+  outline: none;
+}
+.composer textarea::placeholder {
+  color: var(--nv-muted);
+  opacity: 1;
+}
+.composer-browse-hint {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  outline: none;
+  color: var(--nv-muted);
+  font-size: var(--fs-prose);
+  white-space: pre-wrap;
+  cursor: text;
+}
+.composer-draft {
+  min-width: 0;
+  color: var(--nv-fg);
+}
+.composer-key {
+  color: var(--nv-muted);
+  margin-left: auto;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  border: 1px solid var(--rule-soft);
+  border-radius: 5px;
+  padding: 0 7px;
+}
+.composer-queued {
+  margin-left: auto;
+  white-space: nowrap;
+  font-size: var(--fs-xs);
+}
+.composer-queued + .composer-key {
+  margin-left: 0;
+}
+.composer-closing, .composer-slash-flash {
+  margin: 0 0 10px;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+.activity-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-inline: var(--page-pad);
+  padding: 8px 0 0;
+  font-family: var(--nv-font-prose);
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+  white-space: nowrap;
+  z-index: auto;
+}
+.activity-glyph {
+  display: inline-block;
+  flex: 0 0 auto;
+  color: var(--nv-chrome-accent);
+  font-size: var(--fs-prose);
+  transform-origin: center;
+}
+.activity-glyph[data-moving] {
+  animation: turn-breath calc(var(--meter-step, 300ms) * 4) steps(2, jump-end) infinite;
+}
+@keyframes turn-breath {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(0.6);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .activity-glyph[data-moving] {
+    animation: none;
+    transform: scale(1);
+  }
+}
+.turn-activity {
+  overflow: hidden;
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  gap: 8px;
+}
+.turn-state {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-elapsed {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.activity-line .stop {
+  flex-shrink: 0;
+  margin-left: auto;
+  background: none;
+  border: 0;
+  padding: 3px 0;
+  color: var(--nv-muted);
+  font: inherit;
+  white-space: nowrap;
+}
+.activity-keys {
+  white-space: nowrap;
+}
+.activity-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.queue-lines {
+  margin: 6px var(--page-pad) 0;
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+}
+.queue-line {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+}
+.queue-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-note, .queue-error {
+  padding: 4px 0 4px 22px;
+  line-height: 1.5;
 }
 .queue-error {
   color: var(--nv-fg);
 }
-/* The latest turn's changes (`TurnChanges.tsx`): one quiet mono line in the foot -- how many
-   files, `+N −M` with the signs coloured as an edit card's are, and, once the turn is over, the key that
-   opens them for review at the line's right end. */
 .turn-changes {
   display: flex;
-  gap: 8px;
+  gap: 10px;
   align-items: baseline;
-  box-sizing: border-box;
-  margin-inline: var(--page-pad);
-  padding: 4px 0 0 calc(var(--sign-w) + var(--sign-gap));
-  font-family: var(--nv-font-mono);
+  margin: 8px var(--page-pad) 0;
+  padding: 9px 0 0;
+  border-top: 1px solid var(--rule-soft);
   font-size: var(--fs-sm);
   color: var(--nv-muted);
 }
 .turn-changes-key {
   margin-left: auto;
 }
+.history-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 26px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule-soft);
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+}
+.history-notice button {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  padding: 0;
+  border: 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  color: var(--nv-muted);
+}
+.command-notice {
+  margin: 10px var(--page-pad);
+  padding: 12px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 8px;
+  white-space: pre-wrap;
+}
+/* An empty conversation begins with a single invitation. */
+.empty-tab {
+  min-width: 0;
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+  outline: none;
+  /* The foot matches the conversation's: its box is `14px` above the band. */
+  padding: 18px var(--page-pad) 14px;
+  display: flex;
+  flex-direction: column;
+}
+/* The box sits at the foot, where the conversation's box will be, so sending a first message moves nothing;
+   the question and the rows stand in the space above it, a little above its middle (the two spacers' 1 : 1.4).
+   The rows come before the box on screen, so `j`/`k` walk them top to bottom and then the box
+   (`EmptyTab`'s `screenOrder`). */
+.dashboard {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.dashboard::before, .dashboard::after {
+  content: "";
+  flex: 1 1 0;
+}
+.dashboard::after {
+  flex-grow: 1.4;
+  order: 2;
+}
+.dashboard > .dash-items, .dashboard > .dash-context {
+  order: 1;
+}
+.dashboard > .queue-lines, .dashboard > .dash-input {
+  order: 3;
+}
+.dash-title {
+  text-align: center;
+  font-weight: 450;
+  font-size: var(--fs-title);
+  letter-spacing: -0.035em;
+  line-height: 1.3;
+}
+.dash-where {
+  margin: 14px 0 0;
+  color: var(--nv-muted);
+  font-size: var(--fs-sm);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.dash-input .composer {
+  margin: 0;
+}
+.dash-input[aria-current="true"] .composer {
+  border-color: var(--nv-fg);
+}
+/* Without the keys the box is not where typing lands: a faint frame, and its placeholder names the key that
+   brings them here. The brightest line on the screen belongs to wherever the keys are. */
+.agent-ui-root[data-pane-focused="false"] .dash-input .composer {
+  border-color: var(--rule-soft);
+  outline: none;
+  box-shadow: none;
+}
+/* With them, and the caret in it, the box takes INPUT's colour, as it does on the chat page; the cursor's
+   `--nv-fg` frame above is BROWSE's. */
+.agent-ui-root[data-pane-focused="true"] .dash-input .composer:focus-within {
+  border-color: var(--nv-status-insert-bg);
+}
+.dash-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 24px;
+  /* A column under the question, not the panel's width: on a wide panel the keys stay beside their words. */
+  width: min(100%, 420px);
+  align-self: center;
+}
+.dash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  min-width: 0;
+}
+.dash-item:hover, .dash-item[aria-current="true"] {
+  background: var(--nv-cursorline);
+}
+.dash-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dash-resume-title {
+  display: none;
+}
+.dash-icon, .dash-key {
+  color: var(--nv-muted);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-xs);
+}
+.dash-key {
+  margin-left: auto;
+}
+.dash-context {
+  text-align: center;
+  margin: 22px 0 0;
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.empty-box-stack {
+  /* The same foot as the dashboard's box, so the starting screen after a send does not move it either. */
+  margin: auto 0 0;
+}
+.empty-box .composer {
+  margin-inline: 0;
+}
+.connecting {
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.row-choice {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 6px;
+}
+.row-choice.selected {
+  background: var(--nv-cursorline);
+}
+.empty-tab-resumes {
+  margin-top: 20px;
+}
+.resume .detail {
+  display: block;
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+/* Overlays share the same document edge, small header, and visible keyboard destination. */
+.keymap-overlay, .chooser, .review-overlay, .slash-picker, .trust-prompt {
+  position: absolute;
+  inset: 12px var(--page-pad);
+  z-index: 5;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  border: 1px solid var(--rule-frame);
+  border-radius: 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 22px;
+  font-size: var(--fs-prose);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--nv-fg) 10%, var(--nv-bg));
+}
+.keymap-overlay h2, .trust-prompt h2 {
+  margin: 0 0 18px;
+  font-size: var(--fs-heading);
+  font-weight: 650;
+}
+.keymap-overlay h3, .trust-prompt h3 {
+  font-size: var(--fs-prose);
+  margin: 22px 0 10px;
+}
+.keymap-overlay section + section {
+  border-top: 1px solid var(--rule-soft);
+  margin-top: 24px;
+  padding-top: 18px;
+}
+.keymap-overlay table {
+  table-layout: fixed;
+  width: 100%;
+  border-collapse: collapse;
+}
+.keymap-overlay td {
+  vertical-align: top;
+  padding: 8px 5px;
+  border-bottom: 1px solid var(--rule-soft);
+  font-size: var(--fs-sm);
+}
+.keymap-overlay td:first-child {
+  width: 42%;
+  white-space: normal;
+}
+.keymap-overlay td:last-child {
+  color: var(--nv-muted);
+}
+.keycap {
+  display: inline;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  white-space: normal;
+}
+.keymap-overlay p {
+  font-size: var(--fs-sm);
+  line-height: 1.65;
+}
+.which-key-box {
+  position: absolute;
+  right: var(--page-pad);
+  bottom: 12px;
+  z-index: 8;
+  min-width: 230px;
+  max-width: calc(100% - 36px);
+  padding: 16px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 12px;
+  background: var(--nv-surface);
+  color: var(--nv-surface-fg);
+  font-size: var(--fs-md);
+}
+.which-key-box .wk-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  padding-bottom: 10px;
+}
+.wk-entry {
+  display: flex;
+  gap: 14px;
+  padding: 6px 0;
+}
+.wk-key {
+  min-width: 3ch;
+  font-family: var(--nv-font-mono);
+}
+.which-key-box .wk-foot, .which-key-box .wk-disabled {
+  color: var(--nv-surface-muted);
+  font-size: var(--fs-xs);
+}
+.wk-foot {
+  margin-top: 12px;
+}
+.which-key {
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+}
+.detail-popover {
+  position: absolute;
+  z-index: 6;
+  right: var(--page-pad);
+  bottom: 12px;
+  max-width: calc(100% - 36px);
+  max-height: 80%;
+  overflow: auto;
+  background: var(--nv-bg);
+  border: 1px solid var(--rule-frame);
+  border-radius: 12px;
+  padding: 18px;
+  font-size: var(--fs-sm);
+}
+.detail-popover table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.detail-popover td {
+  padding: 8px;
+  border-bottom: 1px solid var(--rule-soft);
+  overflow-wrap: anywhere;
+}
+.detail-popover tr.current {
+  background: var(--nv-cursorline);
+}
+.chooser-header, .slash-picker-header, .review-header {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--rule-soft);
+  margin-bottom: 16px;
+}
+.chooser-title, .slash-picker-title, .review-title {
+  font-size: var(--fs-heading);
+  font-weight: 650;
+}
+.chooser-project, .chooser-muted, .chooser-counts, .slash-picker-scope {
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.chooser-filter, .chooser-rename, .tab-rename {
+  font-size: var(--fs-prose);
+  padding: 8px;
+}
+.chooser-filter {
+  width: 100%;
+  margin: 8px 0;
+}
+.chooser-list, .slash-picker-list {
+  margin: 12px 0;
+  list-style: none;
+  padding: 0;
+}
+.chooser-group {
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+  padding: 18px 0 8px;
+}
+.chooser-row {
+  display: flex;
+  gap: 10px;
+  padding: 12px 8px;
+  border-bottom: 1px solid var(--rule-soft);
+  border-radius: 6px;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.chooser-row.current, .slash-picker-row.current {
+  background: var(--nv-cursorline);
+}
+.chooser-sign {
+  flex: 0 0 20px;
+  text-align: center;
+}
+.chooser-row.current .chooser-sign {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+  border-radius: 3px;
+}
+.chooser-lead {
+  flex: 1 1 0%;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chooser-line1 {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  display: flex;
+  gap: 12px;
+  flex: 1 1 0%;
+  min-width: 0;
+}
+.chooser-line2 {
+  font-size: var(--fs-xs);
+  margin-top: 5px;
+  width: 100%;
+  padding-left: 30px;
+}
+.chooser-right {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  text-align: right;
+}
+.chooser-unread {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--nv-chrome-accent);
+}
+.chooser-mode-line, .chooser-keys, .slash-picker-hint, .review-keys {
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+  line-height: 1.7;
+  margin-top: 16px;
+}
+.chooser-empty {
+  padding: 24px 0;
+  color: var(--nv-muted);
+}
+.chooser mark {
+  color: var(--nv-fg);
+  background: none;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.slash-picker-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.slash-picker-name {
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+.slash-picker-current-marker {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
+.search-bar, .history-search {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  border: 1px solid var(--rule-frame);
+  border-radius: 8px;
+  font-size: var(--fs-sm);
+}
+.search-bar input, .history-search input {
+  min-width: 0;
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 4px;
+  outline: none;
+}
+.history-search {
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.history-search-match {
+  width: 100%;
+  white-space: pre-wrap;
+}
+.slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 7;
+  max-height: 50vh;
+  overflow-y: auto;
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  border: 1px solid var(--rule-frame);
+  border-radius: 12px;
+  padding: 8px;
+  font-size: var(--fs-sm);
+}
+.slash-menu-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 9px 10px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.slash-menu-row[aria-selected="true"], .slash-menu-row.current {
+  background: var(--nv-cursorline);
+}
+.slash-menu-name {
+  max-width: 50%;
+  min-width: 0;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  font-family: var(--nv-font-mono);
+  unicode-bidi: isolate;
+}
+.slash-menu-hint, .slash-menu-desc {
+  unicode-bidi: isolate;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--nv-muted);
+}
+.slash-menu-desc {
+  flex: 1;
+  min-width: 0;
+}
+.slash-menu-footer {
+  padding: 8px 10px 2px;
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
+.review-file {
+  margin: 10px 0;
+  border: 1px solid var(--rule-soft);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.review-file > .row {
+  padding: 10px;
+}
+.review-path {
+  font-family: var(--nv-font-mono);
+  overflow-wrap: anywhere;
+}
+.review-counts, .review-file-flag {
+  margin-left: 10px;
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+}
+.review-hunk-header {
+  padding: 8px 12px;
+  border-top: 1px solid var(--rule-soft);
+}
+.review-hunk-lines {
+  overflow: auto;
+  max-height: 45vh;
+  padding: 6px 0 14px;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+  line-height: 1.65;
+}
+.review-lineno {
+  width: 4ch;
+  flex: 0 0 auto;
+  text-align: right;
+  color: var(--nv-muted);
+}
+.review-hunk-lines .diff-text {
+  white-space: pre;
+}
+.review-note, .review-flag {
+  padding: 8px 0;
+  font-size: var(--fs-sm);
+  color: var(--nv-muted);
+}
+.review-comment-text, .review-preview-text {
+  white-space: pre-wrap;
+}
+.review-comment-lines {
+  margin-right: 8px;
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
+.review-draft, .review-status, .review-prompt, .review-recovery {
+  padding: 12px;
+  margin-top: 12px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 8px;
+}
+.review-question {
+  margin-bottom: 10px;
+}
+.review-preview {
+  margin: 10px 0;
+  font-size: var(--fs-sm);
+}
+.trust-prompt {
+  z-index: 10;
+}
+.trust-root {
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+.trust-key {
+  color: var(--nv-muted);
+  margin-right: 8px;
+}
+.trust-items, .trust-paths {
+  padding-left: 20px;
+  font-size: var(--fs-sm);
+}
+.trust-item {
+  padding: 6px 0;
+  overflow-wrap: anywhere;
+}
+.trust-item-text {
+  white-space: pre-wrap;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+.trust-note, .trust-outside {
+  border-left: 2px solid var(--nv-warn);
+  padding: 6px 12px;
+  font-size: var(--fs-sm);
+  line-height: 1.65;
+}
+.trust-footer {
+  border-top: 1px solid var(--rule-soft);
+  padding-top: 16px;
+  font-size: var(--fs-sm);
+}
+.handoff {
+  margin: 4px var(--page-pad) 12px;
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+}
+.handoff button {
+  padding: 3px 0;
+  border: 0;
+  font-size: var(--fs-xs);
+  color: var(--nv-muted);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.handoff-confirm, .handoff-card {
+  padding: 16px;
+  border: 1px solid var(--rule-frame);
+  border-radius: 10px;
+  font-size: var(--fs-sm);
+}
+.handoff-confirm .warning, .handoff-card .warning {
+  border-left: 2px solid var(--nv-warn);
+  padding-left: 12px;
+}
+.handoff-confirm .detail, .handoff-card .detail {
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+}
+.handoff-command {
+  background: var(--nv-surface);
+  color: var(--nv-surface-fg);
+  padding: 14px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+  user-select: text;
+}
+.path-pick, .link-pick {
+  font-family: var(--nv-font-mono);
+  overflow-wrap: anywhere;
+}
+.hint-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 30;
+}
+.hint-label {
+  position: absolute;
+  background: var(--nv-hint-bg);
+  color: var(--nv-hint-fg);
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-xs);
+  padding: 1px 4px;
+  border-radius: 3px;
+  line-height: 1.3;
+}
+.agent-ui-root button:focus {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 2px;
+}
+.agent-ui-root button:focus * {
+  background: var(--nv-fg);
+  color: var(--nv-bg);
+}
+/* Syntax keeps the editor's language palette. */
+.hljs-keyword, .hljs-selector-tag {
+  color: var(--nv-syn-keyword);
+}
+.hljs-string, .hljs-regexp {
+  color: var(--nv-syn-string);
+}
+.hljs-comment, .hljs-quote {
+  color: var(--nv-syn-comment);
+}
+.hljs-number, .hljs-literal {
+  color: var(--nv-syn-number);
+}
+.hljs-title, .hljs-title.function_ {
+  color: var(--nv-syn-function);
+}
+.hljs-type, .hljs-built_in {
+  color: var(--nv-syn-type);
+}
+.hljs-variable, .hljs-attr, .hljs-attribute {
+  color: var(--nv-syn-variable);
+}
+.hljs-operator {
+  color: var(--nv-syn-operator);
+}
+.hljs-punctuation {
+  color: var(--nv-syn-punctuation);
+}
+.hljs-meta, .hljs-symbol, .hljs-bullet {
+  color: var(--nv-syn-constant);
+}
+.hljs-section {
+  color: var(--nv-syn-function);
+}
+.hljs-addition {
+  color: var(--nv-syn-string);
+}
+.hljs-deletion {
+  color: var(--nv-syn-keyword);
+}
+@media (max-width: 560px) {
+  .message-list {
+    padding-top: 20px;
+  }
+  .row-prompt .row-body {
+    max-width: 94%;
+    padding: 10px 14px;
+  }
+  .permission-card {
+    padding: 14px;
+  }
+  .permission-card-buttons {
+    gap: 6px;
+  }
+  .activity-line {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .activity-line .stop {
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .activity-keys {
+    display: none;
+  }
+  .keymap-overlay, .chooser, .review-overlay, .slash-picker, .trust-prompt {
+    inset: 8px;
+    padding: 16px;
+  }
+}
+.message-list pre.code-block[data-hint-landed] {
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 2px;
+  outline-style: solid;
+  outline-color: var(--nv-fg);
+  outline-width: 2px;
+}
+.message-list[data-focused="false"] pre.code-block[data-hint-landed] {
+  outline-width: 1.5px;
+  outline-width: 1.5px;
+}
+/* Evidence is shown in storage order, including suspicious direction controls. */
+.code-block,
+.code-block code {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+.hljs-function, .hljs-params {
+  color: var(--nv-syn-variable);
+}
+.hljs-title.class_ {
+  color: var(--nv-syn-type);
+}
+input::placeholder {
+  color: var(--nv-muted);
+  opacity: 1;
+}
+.session-title {
+  overflow-wrap: anywhere;
+}
+.chooser-sign-unread {
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 6px var(--nv-bg);
+  background: var(--nv-chrome-accent);
+}
+.chooser-sign-waiting {
+  border-bottom: 2px solid var(--nv-warn);
+}
+.chooser-sign-failed {
+  border-bottom: 2px solid var(--nv-error);
+}
+.permission-card-escape {
+  outline: 1px solid var(--nv-warn);
+}
+.handoff-confirm-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.handoff-blocked {
+  font-size: var(--fs-xs);
+}
+.review-comment-text {
+  padding-left: var(--row-gutter);
+}
+.permission-card input {
+  line-height: 1.4;
+}
+.message-list > .row-prompt:not(:first-child) {
+  margin-top: 32px;
+}
+.message-list > .row-prompt + .row-prompt:not(:first-child) {
+  margin-top: 8px;
+}
+.message-list > .row-prompt.row-prompt-delivered:not(:first-child) {
+  margin-top: 12px;
+}
+.message-list > .row + .row-assistant {
+  margin-top: 24px;
+}
+.permission-card .diff-text {
+  min-width: 0;
+}
+.hint-typed {
+  text-decoration: underline;
+}
+.hint-label.hint-off {
+  visibility: hidden;
+}
+
+.permission-card-diff:empty {
+  padding: 0;
+}
+
 /* The bottom band: replaces `StatusRow`, `Footer`, `NewPill`
    and `ContextLine` with one vim-statusline row (lualine's own layout -- a mode section, facts,
    then the right side; tmux's `status-right` for the right-hand facts). One line, the editor's row high,
-   mono at the editor's text size (`--fs-code`).
+   mono at the editor's text size (`--fs-base`).
 
    **Plain fills preserve the theme tokens' contrast guarantees.**
    A blended fill on the whole band and mode
@@ -453,7 +1786,12 @@ body,
    clipping to it -- a bigger min-height alone would not have fixed this.
    No top rule: the composer card above it is the foot's boundary, and a hairline under the card read
    as a second edge. With no border, the line box is the whole row, so the text sits on the same
-   centre line as the editor's statusline text. */
+   centre line as the editor's statusline text.
+   The band continues the editor's statusline across the divider: the same fill and text pair
+   (`--nv-chrome`, nvim's `StatusLine`), and the same row -- lifted by the rows nvim keeps under its
+   statusline for the command line (`'cmdheight'`, `--nv-editor-cmd-rows`), which are blank here as
+   the editor's are between messages. With no editor beside the band the variable is absent and the
+   band keeps the bottom row. */
 .status-band {
   display: flex;
   align-items: center;
@@ -463,9 +1801,11 @@ body,
   line-height: var(--nv-editor-row, 24px);
   /* No left margin: the mode section starts at the band's edge, as the statusline's does at the editor's. */
   padding: 0 var(--page-pad) 0 0;
+  margin-bottom: calc(var(--nv-editor-cmd-rows, 0) * var(--nv-editor-row, 24px));
   font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-  color: var(--nv-fg);
+  font-size: var(--fs-base);
+  background: var(--nv-chrome);
+  color: var(--nv-chrome-fg);
 }
 /* Not content, just this render's ruler (`StatusBand.tsx`'s own doc comment): one character, at
    the band's own font, kept out of the flow and never painted. */
@@ -475,7 +1815,7 @@ body,
   white-space: pre;
   pointer-events: none;
 }
-.band-open {
+.status-band .band-open {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -483,7 +1823,7 @@ body,
   border: 0;
   padding: 0;
   font: inherit;
-  color: var(--nv-fg);
+  color: var(--nv-chrome-fg);
   cursor: pointer;
   overflow: hidden;
   white-space: nowrap;
@@ -544,8 +1884,9 @@ body,
    Font glyph the panel's font may not carry, and a triangle the row's height is what that glyph is.
    The colours are copied as nvim has them, unguarded, for the reason the syntax colours are
    (`tokens.rs`, `status_normal`): it is the editor's own pair; with no lualine they are the guarded
-   cursorline block the band drew before. Without the keys the block stays, empty and in the cursorline,
-   as an inactive statusline carries no mode. */
+   cursorline block the band drew before. Without the keys the block keeps its place but draws nothing --
+   no fill, no arrow, no word -- as an inactive statusline carries no mode; an empty filled block read as
+   a rendering fault. */
 .status-band .band-open {
   align-self: stretch;
 }
@@ -582,10 +1923,13 @@ body,
   background: inherit;
   clip-path: polygon(0 0, 100% 50%, 0 100%);
 }
-.band-mode[data-focused="false"] {
-  background: var(--nv-cursorline);
-  color: var(--nv-muted);
+.status-band .band-mode[data-focused="false"] {
+  background: none;
+  color: var(--nv-chrome-muted);
   font-weight: 400;
+}
+.band-mode[data-focused="false"]::after {
+  display: none;
 }
 /* U+23F5 is not in FiraCode Nerd Font (`fc-list ':charset=23f5'`, 2026-09-26): this needs a
    font that actually carries the glyph -- Noto Sans Symbols 2 first, Symbola and Segoe UI Symbol as
@@ -622,256 +1966,12 @@ body,
   cursor: help; /* the full diagnostic line is in its title attribute */
 }
 
-/* The page reads as a document that fills the panel: the side margin is `--page-pad` (the chat page's
-   measures below) and the rows inside run from one edge to the other, on a thin scrollbar in the
-   hairline colour. */
-.message-list {
-  overflow-y: auto;
-  padding: 16px var(--page-pad);
-  scrollbar-width: thin;
-  scrollbar-color: var(--rule-soft) transparent;
-  /* Nothing in the conversation may scroll it sideways.
-     `overflow-y: auto` makes this box scroll on BOTH axes, so any line that cannot
-     wrap -- a path, a URL, a long argument with no space in it -- used to push the whole document,
-     sign column and all, sideways: 517px at a 420px panel for a 116-character `Bash` command, and a
-     WebKitGTK probe found the same for every tool card (a `Read` path, a `WebFetch` URL, a `Grep`
-     pattern, a skill, an unrecognized MCP tool's name), a URL in a reply's prose, and a markdown
-     table. The prompt had fixed this for itself alone (`.row-prompt .row-body`); inheriting it from
-     here covers every text in the list, present and future. `anywhere` rather than `break-word`
-     because it also lets a line break for min-content sizing, which is what lets a table give up
-     width instead of overflowing. It changes only lines that would otherwise have overflowed, and a
-     `<pre>` left at `white-space: pre` -- a code block, a diff, a JSON dump, each with its own
-     `overflow-x: auto` -- is untouched by it: those scroll inside their own box. `indexCss.test.ts`
-     holds every `<pre>` the panel renders to one of those two. */
-  overflow-wrap: anywhere;
-  /* The cursor's band (`.cursor-band`) is placed in the list's own content space and painted under the
-     rows: the list is its containing block and the stacking context it sits at the bottom of. */
-  position: relative;
-  isolation: isolate;
-}
-/* `.row-assistant pre` used to style every fenced code block here, back when `renderMarkdown` (then
-   inlined in `MessageList.tsx`) used marked's plain default renderer and emitted a bare `<pre>`.
-   Removed rather than kept alongside `.code-block` below: a descendant
-   selector with an element (`.row-assistant pre`, specificity 0,1,1) beats a single class
-   (`.code-block`, 0,1,0), so keeping both would have silently won the `background` back to
-   `--nv-bg` regardless of source order. `renderMarkdown` puts `class="code-block"` on every `<pre>`
-   it emits and nothing else in an assistant row renders a bare `<pre>`, so this rule is fully
-   superseded, not narrowed. */
-
-/* --- the sign-column grid's horizontal geometry, as tokens ------------------------------------
-   `--row-gutter` is the sign column plus the gap beside it, derived from the two rather than written as
-   their sum, so the review overlay's indented lines (`.review-note`, `.review-hunk`, ...) cannot drift
-   from the grid they line up with. `--prose-measure` is that grid's body track: `1fr` uses the width
-   there is. The conversation's own rows are on a grid of their own, a sign cell and a body (the chat
-   rows below).
-
-   **No container query anywhere in this file, and no container-query unit.** A size query container on
-   a conversation row (`container-type: inline-size`, read through `100cqw`) made WebKitGTK 2.52.6 reset
-   `.message-list`'s `scrollTop` to a stale value every time the status line's elapsed counter ticked
-   while a reply streamed, so the panel stopped following the reply about a second in; a container on
-   `.row-body`, on `.message-list` or on the assistant rows only broke the same way.
-   `shell/tests/panel_stream_scroll.rs` pins it against the real engine and `indexCss.test.ts` keeps a
-   display-free tripwire. Widths that depend on the panel are written against the viewport instead
-   (`@media`, `vw`, and percentages), which is the panel's own width. No custom property carries a
-   container-query unit either: with no container a `cqw` silently resolves against the viewport, a
-   wrong width with nothing to say so. */
-:root {
-  --row-sign-w: 22px;
-  --row-gap: 8px;
-  --row-gutter: calc(var(--row-sign-w) + var(--row-gap));
-  --prose-measure: 1fr;
+/* The pill, the `⏵⏵` glyph split into its own `.mode-glyph` span above -- moved into
+   the band, no longer its own block with a `margin-top`. */
+.status-band .mode-pill {
+  color: var(--nv-chrome-fg);
 }
 
-/* --- one text size, and every other one a ratio of it (2026-09-21) --------------------------
-   Font size was fixed: thirty-one `font-size` literals sat in this
-   file at six values, so "make the panel bigger" meant editing thirty-one numbers and hoping the
-   proportions survived. `--nv-font-size` is emitted by Rust with every other `--nv-*`
-   (`core/src/theme/tokens.rs`, `DEFAULT_PANEL_FONT_SIZE_PX`) and set from `init.lua`'s
-   `eitri.config.set("agent.font_size", "16")`. Unset, it is 14px and nothing here moves.
-
-   The ratios are written as the fraction they came from -- `* 12.5 / 14`, not `* 0.893` -- so each
-   one still says what it was when the base was 14, and none of them drifts by rounding. Six steps
-   is what the file already used; rationalising that into a smaller scale is a separate visual
-   decision nobody has looked at.
-
-   **Every reference carries the `14px` fallback on purpose.** An undefined `var()` makes the whole
-   `calc()` invalid at computed-value time, so without it a panel whose `--nv-*` injection had not
-   arrived would lose EVERY font size at once and fall back to the browser's 16px -- not a colour
-   degrading to something, a layout collapsing. jsdom found this immediately: `.activity-line`'s
-   `4ch` measured 32px instead of 24px. The literal is a second copy of Rust's
-   `DEFAULT_PANEL_FONT_SIZE_PX`, and `indexCss.test.ts` holds the two equal.
-
-   Since 2026-10-15 the base is the editor's own text size unless `agent.font_size` says otherwise
-   (`shell` reads `guifont` the way Neovide does and converts it out of WebKit's page zoom), and a
-   reply's prose and every mono line of content -- a tool line, a code block, a diff, the status band --
-   are drawn at the base itself, so by default the panel's text is the editor's size beside it. The
-   smaller steps (thoughts, notes, counts) stay the ratios they were. */
-:root {
-  --fs-xs: calc(var(--nv-font-size, 14px) * 11 / 14);
-  --fs-sm: calc(var(--nv-font-size, 14px) * 12 / 14);
-  --fs-code: var(--nv-font-size, 14px);
-  --fs-md: calc(var(--nv-font-size, 14px) * 13 / 14);
-  --fs-base: var(--nv-font-size, 14px);
-  --fs-prose: var(--nv-font-size, 14px);
-  /* A seventh step, added rather than reusing one of the six above:
-     The dashboard name is "22px mono", well past the prose size, and the guard
-     below ("every font-size spends a token, never a literal length") means it has to be one of
-     these rather than a bare `22px` on `.dash-title`. Same ratio-of-the-base shape as the rest. */
-  --fs-title: calc(var(--nv-font-size, 14px) * 22 / 14);
-  /* An eighth: a heading inside a reply, one twentieth larger than the reply's own prose, so it is told
-     apart by weight first and size second, as a document's run-in headings are. */
-  --fs-heading: calc(var(--nv-font-size, 14px) * 14.7 / 14);
-}
-
-/* --- the chat page's measures and tints ----------------------------------------------------------
-   The conversation and the foot under it (the activity line, the turn's changes, the queued lines, the
-   composer, the session's end) fill the panel at every width, less `--page-pad` at each side (12px in a
-   narrow panel, growing with it to 40px when the panel has the whole screen). There is no column width:
-   the panel is as wide as you made it, and the text uses it. Every user of the margin reads `--page-pad`
-   where it is used, so the narrow block below (or a test) can change it. The status band runs the whole
-   width too, as the editor's status line does. All of it is written against the viewport, not a container
-   query (see the sign-column grid's geometry block): the viewport is the panel.
-
-   Every conversation row is a sign cell and a body. `--sign-w` is two characters of the mono face at the
-   sign's size, written from `--fs-code` rather than `2ch`, so it is the same width in a row, in the
-   foot's lines and in the turn-time line whatever font each of them is set in; `--sign-gap` is the gap
-   after it. Everything that reads as text -- prose, a tool line, your message, a thought, an ending, the
-   time line, the activity line -- starts where the body does, `--body-edge` from the margin; only a sign
-   (a glyph, never selectable) stands in the cell before it.
-
-   `--tint-you` is the one surface that is yours: the messages you sent and the box you write the next
-   one in. It is `--nv-tint`, a small step from `--nv-bg` toward `--nv-fg` (the way Codex tints a user
-   row from the live background, so it follows every theme), mixed in Rust so that Rust can guard the
-   text drawn on it: `--nv-tint-fg` and `--nv-tint-muted`, never the body's `--nv-fg`/`--nv-muted`,
-   which are guarded against `--nv-bg` only and lose some of their margin on any tint. The permission
-   card's and a session-end row's tints are the same kind of fill with their own pairs
-   (`--nv-warn-tint*`, `--nv-error-tint*`). `--rule-soft` is the hairline of the tables, the scrollbar and a
-   code block's edge, a little stronger than the tint; `--rule-frame` is the frame round an edit, your
-   messages and the composer, a step stronger again so it holds on the tint. Both are line colours, never a
-   fill under text. */
-:root {
-  --page-pad: clamp(12px, 2.5vw, 40px);
-  --sign-w: calc(var(--fs-code) * 1.2);
-  --sign-gap: 6px;
-  --body-edge: calc(var(--sign-w) + var(--sign-gap));
-  --tint-you: var(--nv-tint);
-  --rule-soft: color-mix(in srgb, var(--nv-fg) 13%, var(--nv-bg));
-  --rule-frame: color-mix(in srgb, var(--nv-fg) 20%, var(--nv-bg));
-  --radius-block: 4px;
-}
-
-
-
-/* --- the sign-column grid ----------------------------------------------------------------------
-   One grid for the rows outside the conversation -- the turn review's rows, the start screen's handoff
-   row -- so their signs line up down the page however a body is built; their cursor is the current
-   row's sign cell (below). The conversation's own rows leave this grid for a sign cell of their own that
-   is drawn as generated content (the chat rows below). */
-.row {
-  display: grid;
-  grid-template-columns: var(--row-sign-w) minmax(0, var(--prose-measure));
-  gap: 0 var(--row-gap);
-  align-items: start;
-  padding: 2px 0;
-  /* Every row on this grid reserves the same 2px, so the sign column sits on one x position down the
-     page whatever a row's own state; the review overlay's indented lines count it
-     (`calc(var(--row-gutter) + 2px)`). */
-  border-left: 2px solid transparent;
-}
-/* The current row of a list drawn on the sign-column grid (the review overlay): `--nv-cursorline` is a
-   BACKGROUND (nvim's own `Visual` highlight token), not text, so `indexCss.test.ts`'s text-colour guard
-   does not apply to it. */
-.row-current {
-  background: var(--nv-cursorline);
-}
-/* In the conversation the cursor is vim's cursorline, not the row's own fill: one flat band behind the
-   rows that glides from the row the cursor left to the row it reached, as Neovide's cursor glides
-   (`cursorBand.ts` measures the row's box). It runs the width of the column, a little past the text into
-   the margin each side (`MessageList.tsx`, `bandBox`) -- the list's whole width in a narrow panel -- and is
-   three pixels taller than the row at each end. It is drawn lighter than the
-   editor's cursorline -- a mix of `--nv-cursorline` into `--nv-bg`, so a whole reply under it still reads
-   as a page -- with square corners and no mark of its own: where the keys are is said by the band's place
-   and by the status band's mode block. Text on it is `--nv-fg`/`--nv-muted`, and Rust guards each of
-   those against both fills the mix is made of, so any mix of the two reads too. The band takes no pointer
-   events and sits under every row's content (`z-index: -1` in the list's stacking context), so it covers
-   no text, selection or button. VISUAL hides it (the selection is the cursor there). Without the keys it
-   is the same band at a weaker mix, so coming back to the panel shows where `j`/`k` continue from. A
-   control focused inside the current row, or a code block the global f HINT landed on, is drawn as its
-   own solid or outlined mark over the band. The measured height is the row's; the three pixels each end
-   are the band's own `top` offset and bottom padding. */
-.message-list > .row-current {
-  background: none;
-}
-.cursor-band {
-  --band-fill: color-mix(in srgb, var(--nv-cursorline) 45%, var(--nv-bg));
-  position: absolute;
-  top: -3px;
-  left: 0;
-  z-index: -1;
-  pointer-events: none;
-  box-sizing: content-box;
-  padding-bottom: 6px;
-  background: var(--band-fill);
-}
-.cursor-band[data-row="none"],
-.message-list[data-visual] > .cursor-band {
-  display: none;
-}
-.message-list[data-focused="false"] > .cursor-band {
-  --band-fill: color-mix(in srgb, var(--nv-cursorline) 20%, var(--nv-bg));
-}
-/* The row `y`/`Y` just copied, flashed for 400ms (`App.tsx`'s `copied`, codecompanion's yank flash) so
-   a keypress with no visible result of its own still tells the reader something happened: an inset
-   outline in `--nv-ok`, a non-text colour, which stays visible over the cursor band under the same
-   row. */
-.row-yanked {
-  outline: 2px solid var(--nv-ok);
-  outline-offset: -2px;
-}
-.row-sign {
-  font-family: var(--nv-font-mono);
-  color: var(--nv-muted);
-  text-align: center;
-  line-height: 1.65;
-  user-select: none;
-}
-/* On the sign-column grid the cursor is the current row's sign cell, drawn the way the editor's cursor
-   sits on a character: a solid block with the glyph knocked out. The editor's is Neovide's own block,
-   and the top bar's focused item is the same shape again, so the whole window says "the keys go here"
-   one way: solid. The conversation draws its cursor as the band above instead, and its rows draw their
-   signs as generated content (the chat rows below), never as this cell.
-
-   The solid block is `--nv-bg` text on an `--nv-fg` fill: the body's own guarded text pair, reversed,
-   so the same contrast. `indexCss.test.ts` admits `--nv-bg` as text ONLY in a rule that is entirely
-   `.row-current .row-sign` and fills it with `--nv-fg`. */
-.row-current .row-sign {
-  background: var(--nv-fg);
-  color: var(--nv-bg);
-  border-radius: 2px;
-}
-/* In visual mode, the DOM
-   selection while VISUAL/V-LINE is on reads in nvim's own Visual colour (the same `--nv-cursorline`
-   token the cursor row already fills with, `.row-current` above) -- text keeps its own colour, only
-   the background changes. `.row-current`'s own fill is turned off for as long as VISUAL is on, so
-   the highlight would not vanish where the two coincide (a bare `v`/`V` always starts on the cursor
-   row). No new Rust token for v1 -- an exact reverse `Visual` (`invert_selection`) would need
-   `visual_bg`/`visual_fg` in `ThemeTokens`/`css_vars`, guarded like `cursorline`. */
-.message-list[data-visual] ::selection {
-  background: var(--nv-cursorline);
-}
-/* The caret is a one-character reverse-video selection -- the theme's own
-   text/background contrast pair, reversed, so it is visible on every theme rather than nvim's
-   Visual colour it would otherwise share with a genuine VISUAL/V-LINE selection. Placed AFTER the
-   general `[data-visual]` rule above so source order wins the tie between two selectors of equal
-   specificity (`.message-list[data-visual]` vs. `.message-list[data-visual="caret"]`, both
-   (0,2,0)): the caret's own colours must win on a caret, the cursorline colour everywhere else. */
-.message-list[data-visual="caret"] ::selection {
-  background: var(--nv-fg);
-  color: var(--nv-bg);
-}
-.message-list[data-visual] .row-current {
-  background: none;
-}
 /* `VISUAL_CHROME` (visual.ts), everywhere but `.row-sign` (already `user-select: none` above,
    just before `.message-list[data-visual]`): a selection built by VISUAL must never rest in, or
    copy from, any of these. `[aria-hidden="true"]` already covers the diff gutter (`EditDiff.tsx`'s
@@ -906,2125 +2006,4 @@ textarea,
 [data-visual-copying] [data-nav-action],
 [data-visual-copying] .fold-marker {
   display: none;
-}
-.row-body {
-  font-family: var(--nv-font-prose);
-  font-size: var(--fs-prose);
-  line-height: 1.7;
-  min-width: 0;
-}
-
-/* --- the conversation's rows ---------------------------------------------------------------------
-   The page reads like a terminal session in Neovim's own idiom: one left edge and a sign column. Every
-   row is a grid of a sign cell and a body (`--sign-w`, `--sign-gap`), and the sign is the row's own
-   `data-sign` drawn as generated content, so it is never part of a selection or of what `y` and VISUAL
-   copy, and the empty alternative text keeps a screen reader from reading it out beside the row's words;
-   `.row-sign`, the cell the other lists draw, stays hidden and chrome to VISUAL. Rows align on their first
-   line's baseline, so a sign sits level with the text it belongs to whatever size the row's text is. An
-   assistant reply has no sign: its cell is empty and its text starts at the same edge as everything else.
-   There is never a coloured rail down a row's side. Quiet things stay quiet -- prose is prose, a tool call
-   is one muted line -- and a frame goes only round what a reader reviews or answers: an edit, a failure's
-   output, the permission card, a code block, and your own messages and the box you write them in. Every
-   frame is 1px at `--radius-block`, with no shadow. Spacing says what belongs together: a turn opens with air above your message,
-   tool lines and thoughts sit close, and the reply after them takes its air back.
-
-   A sign is not text, so its colour is held to the non-text threshold: `--nv-error` is guarded at 3:1
-   against `--nv-bg`, and the running mark takes the accent the activity line's star is drawn in
-   (`indexCss.test.ts` admits exactly these two, on exactly these glyphs); every other sign is muted. */
-.message-list > .row {
-  display: grid;
-  grid-template-columns: var(--sign-w) minmax(0, 1fr);
-  column-gap: var(--sign-gap);
-  align-items: baseline;
-  padding: 0;
-  border-left: 0;
-}
-.message-list > .row::before {
-  content: attr(data-sign);
-  content: attr(data-sign) / "";
-  grid-column: 1;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-  color: var(--nv-muted);
-}
-.message-list > .row > .row-body {
-  grid-column: 2;
-}
-.message-list .row-sign {
-  display: none;
-}
-.row-tool[data-sign="◐"]::before {
-  color: var(--nv-chrome-accent);
-}
-.row-tool[data-sign="✗"]::before {
-  color: var(--nv-error);
-}
-/* A card that is waiting is marked with the flag the status band counts it by, not the `!` the row
-   carries as data. */
-.message-list > .row-permission::before {
-  content: "⚑";
-  content: "⚑" / "";
-}
-.message-list > .row + .row {
-  margin-top: 10px;
-}
-/* "Worked for 1m 23s" under a finished turn's last row (`turnTimes.ts`): muted, small, at the body's
-   edge, a little below the row. Chrome, not a row: it carries no `data-nav-stop`, so the cursor never
-   lands on it, and its text sits in an `aria-hidden` span, which VISUAL's copy leaves out like the other
-   chrome. Sitting between two rows, it gives the row after it the gap two rows have. */
-.turn-time {
-  margin: 6px 0 0;
-  padding-left: var(--body-edge);
-  color: var(--nv-muted);
-  font-size: var(--fs-sm);
-}
-.message-list > .turn-time + .row {
-  margin-top: 10px;
-}
-
-/* Your own message: a bubble at the body's edge, its `›` in the sign cell outside it -- a soft fill
-   (`--tint-you`) with round corners and no frame, the way a chat draws what you said, so your words tell
-   apart from the agent's at a glance without reading as a card or a button. It is as wide as its text
-   needs, up to the right margin, so a one-line request is a short bubble and not a slab across a wide
-   panel. The text is the tint's own `--nv-tint-fg`, with its own line breaks kept. A long token with no
-   space in it (a pasted JWT) breaks inside the bubble rather than scrolling the whole conversation
-   sideways. */
-.row-prompt .row-body {
-  justify-self: start;
-  max-width: 100%;
-  box-sizing: border-box;
-  padding: 7px 14px;
-  border-radius: 12px;
-  background: var(--tint-you);
-  color: var(--nv-tint-fg);
-  font-size: var(--fs-base);
-  line-height: 1.6;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-/* A turn opens with air above your message. Two messages sent back to back (queued while a turn ran, or
-   sent in a quick burst) are one turn's input and sit together: that rule names `:not(:first-child)`
-   again only to outrank the opening margin at every width (the wide block raises it). The row after
-   your message gets a little more room than two of the agent's rows do. */
-.message-list > .row-prompt:not(:first-child) {
-  margin-top: 26px;
-}
-.message-list > .row-prompt + .row-prompt:not(:first-child) {
-  margin-top: 6px;
-}
-.message-list > .row-prompt + .row:not(.row-prompt) {
-  margin-top: 14px;
-}
-/* A message you put into a running turn, drawn where the agent read it (`row-prompt-delivered`): it is
-   part of that turn, not the start of a new one, so it takes the gap any two rows have rather than the
-   air a turn opens with. One class more than the opening rule, so it wins at every width without
-   repeating the wide block. */
-.message-list > .row-prompt.row-prompt-delivered:not(:first-child) {
-  margin-top: 10px;
-}
-
-/* A tool call is one quiet line: mono, muted, its status in the sign cell in front of it -- ✓ done,
-   ✗ failed, ◐ still running. Success is the expected case and stays muted; only a failure, or something
-   still running, takes a colour on its glyph (the note at the head of this section). Tool lines and
-   thoughts sit close; the reply after them takes its air back. */
-.row-tool .row-body {
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-}
-.row-tool .row-body,
-.row-tool-run .row-body {
-  line-height: 22px;
-}
-.message-list > .row-tool + .row-tool,
-.message-list > .row-tool + .row-tool-run,
-.message-list > .row-tool-run + .row-tool,
-.message-list > .row-tool-run + .row-tool-run {
-  margin-top: 4px;
-}
-.message-list > .row-tool + .row-assistant,
-.message-list > .row-tool-run + .row-assistant {
-  margin-top: 14px;
-}
-
-/* The agent's thinking: `∴ Thought · 4 lines ▸`, muted italic, a step smaller than a reply, and plain
-   text -- the provider's own words, drawn as they came (`MessageList`'s `ThinkingBody`), so `pre-wrap`
-   keeps its line breaks and `anywhere` lets a long token break instead of widening the row. An opened
-   thought is indented no further than the line that heads it. It sits among the tool lines with their
-   spacing. */
-.row-thinking .row-body {
-  color: var(--nv-muted);
-  font-size: var(--fs-sm);
-  line-height: 22px;
-}
-.thinking-head {
-  font-style: italic;
-}
-/* The provider's text, which may be written right to left or carry stray direction marks: isolated, so
-   its direction cannot reorder the row around it. */
-.thinking-text,
-.thinking-preview {
-  margin-top: 2px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  line-height: 1.55;
-  unicode-bidi: isolate;
-}
-/* While a thought is written, `preview` shows its newest lines in a box of fixed height: lines arriving
-   push the oldest out at the top instead of moving every row below. Flex with its content at the end is
-   what keeps the newest line at the bottom edge and lets an overflow leave at the top. */
-.thinking-preview {
-  height: calc(4 * 1.55em);
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-}
-.message-list > .row-thinking + .row-tool,
-.message-list > .row-thinking + .row-tool-run,
-.message-list > .row-thinking + .row-thinking,
-.message-list > .row-tool + .row-thinking,
-.message-list > .row-tool-run + .row-thinking {
-  margin-top: 4px;
-}
-.message-list > .row-thinking + .row-assistant {
-  margin-top: 14px;
-}
-
-/* A reply's prose: the first and last block sit flush with the row, paragraphs and lists keep a modest
-   rhythm, and a heading is told apart by weight first and size second. An inline code span sits on your
-   own tint, a step smaller than the prose around it. */
-.row-assistant .row-body > div > :first-child {
-  margin-top: 0;
-}
-.row-assistant .row-body > div > :last-child {
-  margin-bottom: 0;
-}
-.row-assistant p {
-  margin: 0 0 0.7em;
-}
-.row-assistant :is(h1, h2, h3, h4) {
-  font-size: var(--fs-heading);
-  font-weight: 600;
-  line-height: 1.4;
-  margin: 1.1em 0 0.45em;
-}
-.row-assistant :is(ul, ol) {
-  margin: 0 0 0.7em;
-  padding-left: 1.3em;
-}
-.row-assistant li + li {
-  margin-top: 0.2em;
-}
-
-/* A turn that did not complete -- failed, hit a limit, was interrupted, or was cut off by the session
-   ending -- says so where it stopped: a quiet marker, small, muted and italic. It is information, and
-   the words carry it, so no signal colour is drawn on the text. The provider's own message can hold line
-   breaks and a long unbroken token (a URL, a request id): `pre-line` keeps the breaks and wraps at
-   spaces, `anywhere` lets a long token break instead of widening the column. */
-.row-ending .row-body {
-  color: var(--nv-muted);
-  font-size: var(--fs-sm);
-  font-style: italic;
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-}
-
-/* The session's end, said under the conversation in the foot (`App.tsx` draws it between the list and the
-   activity line): a lost session as a flat block on `--nv-error-tint`, its text in that tint's guarded
-   pair, an ordinary end as a muted line. Neither draws its sign cell. */
-.agent-ui-conversation > .row {
-  display: block;
-  box-sizing: border-box;
-  margin: 8px var(--page-pad) 0;
-  padding: 0;
-  border-left: 0;
-}
-.agent-ui-conversation > .row > .row-sign {
-  display: none;
-}
-.agent-ui-conversation > .row-error {
-  padding: 8px 12px;
-  border-radius: var(--radius-block);
-  background: var(--nv-error-tint);
-  color: var(--nv-error-tint-fg);
-}
-.agent-ui-conversation > .row-error pre {
-  color: var(--nv-error-tint-fg);
-}
-.agent-ui-conversation > .row-error .row-problem-remedy,
-.agent-ui-conversation > .row-error .row-hint {
-  color: var(--nv-error-tint-muted);
-}
-/* `state.status.reason` on the lost-session row, wrapped: the reason is often a long transport-error
-   string, and it is shown in full. */
-.row-error pre {
-  margin: 8px 0 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
-  user-select: text;
-}
-/* `Row`'s `problem` prop draws a headline (inheriting `.row-body`'s text colour, so it declares none)
-   and a remedy line ABOVE whatever the row already rendered (`.row-error pre`'s raw text included,
-   unchanged and below). The remedy reads as secondary, the same `--nv-muted` `.row-hint` uses for
-   "press r". */
-.row-problem {
-  margin-bottom: 6px;
-}
-.row-problem-remedy {
-  color: var(--nv-muted);
-  margin-top: 2px;
-  /* A remedy can carry its own line breaks ("Looked for it at:" and the paths, one a line, for a
-     missing sidecar), which must not run together into one line; a path longer than the row breaks
-     anywhere rather than running out of a narrow panel. */
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-}
-/* An ordinary ending (the host closed it, the provider exited cleanly) is deliberately not drawn like a
-   lost session: it is information, not alarm, and styling it like a loss would train the eye to ignore
-   the one that matters. */
-.row-ended .row-body {
-  color: var(--nv-muted);
-}
-.row-hint {
-  color: var(--nv-muted);
-  font-size: var(--fs-code);
-  margin-top: 4px;
-}
-/* An unrecognized tool's raw JSON dump: an ordinary block `<pre>` with no width of its own, so it fills
-   the card. `overflow-x: auto` is what keeps ONE unusually long line (a long string value, say) from
-   bleeding past the card rather than scrolling inside it, the role `.code-block`'s own `overflow-x`
-   plays for a fenced code block. */
-.tool-card-generic pre {
-  overflow-x: auto;
-}
-/* "allowed by rule `Bash(git log *)`" under a call a saved rule answered -- a fact
-   about how it was allowed, never an action waiting on you, so it recedes like the fold marker. */
-.tool-rule-note {
-  color: var(--nv-muted);
-  font-size: var(--fs-code);
-}
-
-/* The input the CLI's own prompt showed, after the gate had judged another: laid out ltr and
-   overridden like a card's command so a bidi control cannot reorder it, and wrapped, not cut. */
-.tool-changed-input-note code {
-  direction: ltr;
-  unicode-bidi: bidi-override;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-/* A tool call's own line: one quiet mono line in the body's muted ink, no box -- a tool call is the
-   agent at work, not something waiting on you. Its status is the row's glyph column (the chat rows
-   above). The line sits on `--nv-bg`, so its text is the body's pair. */
-.tool-card {
-  margin: 0;
-  color: var(--nv-muted);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-}
-.tool-card-skill {
-  font-style: italic;
-}
-/* A call a card is waiting on keeps full-strength text: it is not receding, it is the reason a card is
-   on screen at all. */
-.tool-card-gated {
-  color: var(--nv-fg);
-}
-/* The fold marker recedes behind the line it closes. */
-.fold-marker {
-  opacity: 0.7;
-}
-/* A table scrolls in its own box and its cells never break mid-word, so the list never scrolls sideways
-   (`.message-list`); it has no frame and no corners: a bold head over one hairline, and a hairline
-   between rows. The head has no fill, so every cell is the body's own ink on `--nv-bg`. */
-.table-scroll {
-  overflow-x: auto;
-  max-width: 100%;
-  margin: 0.2em 0 0.9em;
-}
-.table-scroll table {
-  border-collapse: collapse;
-  font-size: var(--fs-base);
-}
-.table-scroll th,
-.table-scroll td {
-  padding: 5px 12px;
-  text-align: left;
-  vertical-align: top;
-  overflow-wrap: normal;
-  word-break: normal;
-}
-.table-scroll th:first-child,
-.table-scroll td:first-child {
-  padding-left: 0;
-}
-.table-scroll th {
-  font-weight: 600;
-  border-bottom: 1px solid var(--rule-soft);
-}
-.table-scroll tr + tr td,
-.table-scroll thead + tbody tr:first-child td {
-  border-top: 1px solid var(--rule-soft);
-}
-.table-scroll thead + tbody tr:first-child td {
-  border-top: 0;
-}
-/* A `Bash` call's command is a `<pre>` (`toolRegistry.tsx`), and a `<pre>` keeps the UA's
-   `white-space: pre` -- no wrapping at all, not even at its spaces -- so a long command would scroll
-   the whole conversation sideways (see `.message-list`). It wraps like the tool's own output below it
-   (`.tool-result-body`); newlines in a multi-line command still show. */
-.tool-card-bash {
-  white-space: pre-wrap;
-}
-/* A tool call's outcome, drawn for every tool, under its line and indented to the body's edge. Each
-   output block opens with a muted `⎿` in a cell of its own, Claude Code's connector from a call to what
-   it printed (generated content: it is never selected or copied, and the empty alternative text keeps a
-   screen reader from reading it). The block has no fill, no frame and no rail, so its text is the
-   body's pair on `--nv-bg`: muted for an output that went well, `--nv-fg` for a failure's, which is
-   what sets it apart -- the row's `✗` carries the red. The three states still tell apart by more than
-   colour: the row's status glyph, the words, and the output itself. */
-.tool-result,
-.tool-result-preview {
-  display: grid;
-  grid-template-columns: var(--sign-w) minmax(0, 1fr);
-  column-gap: var(--sign-gap);
-  align-items: baseline;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  color: var(--nv-muted);
-}
-.tool-result::before,
-.tool-result-preview::before {
-  content: "⎿";
-  content: "⎿" / "";
-  grid-column: 1;
-  grid-row: 1;
-  color: var(--nv-muted);
-}
-.tool-result > *,
-.tool-result-preview > * {
-  grid-column: 2;
-}
-.tool-result-pending {
-  color: var(--nv-muted);
-  font-style: italic;
-}
-/* A `null` result the panel knows can never arrive -- not a rerun of `.tool-result-pending`'s "still
-   running" claim, so it gets its own class even though today it reads identically. */
-.tool-result-abandoned {
-  color: var(--nv-muted);
-  font-style: italic;
-}
-/* A finished, successful call keeps its output folded away -- success is the expected case, and its
-   row's glyph and line already say what ran (`Enter`, or `Ctrl+o` for every row, still opens it). A
-   failure shows its first line under the `⎿`, in the body's full-strength ink: signal colours
-   (`--nv-warn`, `--nv-error`, `--nv-ok`, `--nv-mode-*`) are never text colours here. Rust guards the
-   first three at 3:1, enough for a glyph, a border or a tint (WCAG 1.4.11) and not for 12px text
-   (1.4.3, 4.5:1); the mode colours are not guarded at all. */
-.tool-result-body {
-  margin: 0;
-  padding: 0;
-  color: var(--nv-muted);
-  line-height: 1.5;
-  /* Bounded here as well as in `truncateResult`: the truncation budget is a character count, and a
-     few thousand characters of one-column output is still taller than the panel. */
-  max-height: 260px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.row-tool[data-sign="✓"] .tool-call[data-folded="true"] .tool-result-preview {
-  display: none;
-}
-/* A failure's output is the one tool output with a frame: it is what should stop a reader skimming the
-   tool lines. A block at the body's edge on the error tint, outlined in the error colour mixed halfway
-   into the page (the `✗` beside the call carries the full colour), its text in that tint's guarded pair
-   (`--nv-error-tint-fg`/`-muted`). The frame stands in for the `⎿`, which it drops. */
-.tool-result.tool-result-error,
-.tool-result-preview.tool-result-error {
-  /* One zero-minimum track, as the connector's two are: a long line still cannot widen the row. The
-     block's own width follows an edit's frame (at least 36rem, at most the row). */
-  grid-template-columns: minmax(0, 1fr);
-  width: max-content;
-  min-width: min(100%, 36rem);
-  max-width: 100%;
-  box-sizing: border-box;
-  margin-top: 4px;
-  padding: 5px 10px;
-  border: 1px solid color-mix(in srgb, var(--nv-error) 50%, var(--nv-bg));
-  border-radius: var(--radius-block);
-  background: var(--nv-error-tint);
-}
-.tool-result-error::before {
-  content: none;
-}
-.tool-result-error > * {
-  grid-column: 1;
-}
-.tool-result-error,
-.tool-result-error .tool-result-body {
-  color: var(--nv-error-tint-fg);
-}
-/* The folded preview (`toolRegistry.tsx`'s `ToolResultPreview`): its first lines and how many more
-   there are, so a row says how much output a command made and whether it failed without being opened.
-   It stays inside the row's text track and never scrolls: each line is cut at the track's edge with an
-   ellipsis instead of wrapping, so three lines are three lines of height whatever the output holds. The
-   track is `minmax(0, 1fr)` so a long line cannot widen the row past the list (a grid track with a zero
-   minimum contributes nothing to its container's minimum width, which a plain block of
-   `white-space: pre` lines does). */
-.tool-result-preview {
-  line-height: 1.5;
-}
-.tool-result-preview-line {
-  white-space: pre;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* A refused call's reason is the CLI's own words: it wraps, in the failure's full-strength ink, and the row
-   is as tall as the text needs (the list measures its rows, as it does for any wrapped line). */
-.tool-result-preview-wrapped .tool-result-preview-line {
-  white-space: pre-wrap;
-  overflow: visible;
-  text-overflow: clip;
-  overflow-wrap: anywhere;
-}
-/* How many more lines there are: always muted, a failure's in its tint's muted ink. */
-.tool-result-preview-more {
-  color: var(--nv-muted);
-  font-size: var(--fs-xs);
-}
-.tool-result-error .tool-result-preview-more,
-.tool-result-error .tool-result-truncated {
-  color: var(--nv-error-tint-muted);
-  font-size: var(--fs-xs);
-}
-.tool-result-truncated {
-  color: var(--nv-muted);
-  font-size: var(--fs-xs);
-  margin-top: 2px;
-}
-/* The tool call a pending permission is blocking, marked where the call itself is rather than only
-   on the card further down. */
-.tool-awaiting-permission {
-  color: var(--nv-fg);
-  font-size: var(--fs-xs);
-  margin-top: 2px;
-}
-
-/* A permission card: the one block on the page that asks for you while it waits -- a tinted block at the
-   body's edge, outlined in the warn colour (a non-text mark, guarded at 3:1) and with no second box round
-   it, its tool named in bold, the request inside,
-   the primary answer filled. The fill is `--nv-warn-tint`, `--nv-bg` with a little `--nv-warn` in it,
-   mixed in Rust, and the text on it is that tint's guarded pair (`--nv-warn-tint-fg`/
-   `--nv-warn-tint-muted`), never the body's: the body's pair is guarded against `--nv-bg` alone. */
-.permission-card {
-  margin: 4px 0 6px;
-  padding: 12px 14px;
-  border: 1px solid var(--nv-warn);
-  border-radius: var(--radius-block);
-  background: var(--nv-warn-tint);
-  color: var(--nv-warn-tint-fg);
-}
-.permission-card-tool {
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-/* The raw-JSON `<pre>` a permission card renders for every tool with no dedicated view (`ToolInput` in
-   `PermissionCard.tsx` falls back here whenever `editPreview` returns null). Its own `--nv-bg` fill
-   inside the tinted card, so the body's pair again. */
-.permission-card-input {
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  padding: 6px;
-  border-radius: var(--radius-block);
-  overflow-x: auto;
-  /* Wrapped, never scrolled: a line wider than the card must not hide its tail from the person
-     approving it. */
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-/* The `Bash` card's own command line -- Claude Code's `Command:`, real newlines and all, wrapped
-   rather than scrolled sideways (unlike the JSON `<pre>` above, which stays a single unbroken block
-   the reader may want to copy byte-for-byte). */
-.permission-card-command {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-}
-/* The command, the JSON input and an edit's file name and diff are what a person approves, so they
-   are laid out in the order of their characters: direction controls are already drawn as escapes
-   (`revealHidden.ts`), and this also turns off the implicit reordering right-to-left letters cause
-   around them, as a terminal without bidi shows the same line. */
-.permission-card-command,
-.permission-card-input,
-.code-block,
-.permission-card-edit-path,
-.permission-card-diff {
-  direction: ltr;
-  unicode-bidi: bidi-override;
-}
-/* One escaped character (`⟨U+202E⟩`), and the line saying why there are any. The signal colour is an
-   outline, never text (see the note above `.tool-result-body`). */
-.permission-card-escape,
-.code-escape {
-  outline: 1px solid var(--nv-warn);
-}
-.permission-card-warning {
-  font-weight: 600;
-}
-.permission-card-warning::before {
-  content: "⚠ ";
-  content: "⚠ " / "";
-}
-.permission-card-description {
-  color: var(--nv-warn-tint-muted);
-}
-/* The CLI's own prompt -- a small label naming whose question it is, then the CLI's sentence. */
-.permission-card-provider {
-  margin: 4px 0 6px;
-  font-size: var(--fs-sm);
-  color: var(--nv-warn-tint-fg);
-  overflow-wrap: anywhere;
-}
-.permission-card-provider-label {
-  font-size: var(--fs-xs);
-  color: var(--nv-warn-tint-muted);
-  border: 1px solid var(--nv-border);
-  border-radius: 3px;
-  padding: 0 4px;
-  margin-right: 6px;
-  white-space: nowrap;
-}
-/* Approve, Deny and the third button take the panel's face and scale like every other control in it (the
-   composer, the rename box, the reason box above them) rather than WebKit's 13.33px form-control font,
-   which did not grow with the panel's text size. Rounded, framed with the hairline, on `--nv-bg`; the
-   first -- the primary answer -- filled with the body's pair reversed, the same guaranteed contrast as
-   the cursor block (`indexCss.test.ts` admits `--nv-bg` as its text only in a rule that paints that
-   fill). Focused, a button is the solid cursor (the rule at the end of this file); the primary one,
-   already solid, takes a ring outside it instead, so the keys' place still shows on it. */
-.permission-card-buttons button {
-  margin-right: 8px;
-  padding: 4px 14px;
-  border: 1px solid var(--rule-soft);
-  border-radius: 8px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font: inherit;
-  font-size: var(--fs-base);
-  cursor: pointer;
-}
-.permission-card-buttons button:first-child {
-  background: var(--nv-fg);
-  border-color: var(--nv-fg);
-  color: var(--nv-bg);
-}
-/* The reason box fills the card, not the browser's intrinsic twenty-odd characters (its placeholder read
-   "Reason (shown to the ag"); where even the card is too narrow, the placeholder ends in an ellipsis
-   rather than a hard clip. Its face and size are the combined rule further down's (`font: inherit` and
-   `--fs-base`). */
-.permission-card input {
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
-  margin: 10px 0;
-  padding: 6px 10px;
-  border: 1px solid var(--rule-soft);
-  border-radius: 8px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  text-overflow: ellipsis;
-}
-
-/* The composer is one box at the foot, centred: the same margin each side (2026-10-15; it used to step in
-   to the body's edge on the left only, and read as off-centre). It is the page, not a tint -- a hairline
-   frame on `--nv-bg`, rounded a little more than the conversation's blocks so it reads as the place you
-   type -- with the prompt `›` before the text. While it has the keys the frame becomes a ring in the INSERT
-   block's colour (the status band's, lualine's insert section), laid over the hairline, so the place the
-   keys are is never only a caret. Everything written in it is the body's pair (`--nv-fg`, `--nv-muted`),
-   the placeholder included. It is the last block of the foot (the activity line's comment). */
-.composer {
-  /* The `/` command menu sits just above the box, against this edge. */
-  position: relative;
-  display: flex;
-  /* Wrap so the closing notice below can take a whole row of its own rather than being squeezed in
-     beside the textarea. With no notice present nothing wraps: the textarea is the only flexible
-     item and it shrinks before anything is pushed down. */
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  box-sizing: border-box;
-  min-height: 44px;
-  margin: 6px var(--page-pad) 10px;
-  padding: 9px 12px 9px 9px;
-  border: 1px solid var(--rule-frame);
-  border-radius: 8px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-}
-/* The prompt: `›`, the sign your sent messages carry in the conversation, in a cell of its own before the
-   text, level with the first line however many the box grows to. Generated content: never typed, copied or
-   read out. */
-.composer::before {
-  content: "›";
-  content: "›" / "";
-  flex: none;
-  align-self: flex-start;
-  width: 1.4em;
-  text-align: center;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-base);
-  line-height: 1.5;
-  color: var(--nv-muted);
-  pointer-events: none;
-}
-.composer:focus-within {
-  outline: 1.5px solid color-mix(in srgb, var(--nv-status-insert-bg) 70%, var(--nv-bg));
-  outline-offset: -1px;
-}
-
-/* The `/` command menu (`SlashMenu.tsx`): a card of the composer's family just above the box, as wide as
-   it, drawn over the end of the conversation with a soft shadow. Rows are the editor's own colours: the
-   selected one in the cursorline fill, rounded, the description muted. */
-.slash-menu {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 3;
-  box-sizing: border-box;
-  padding: 6px;
-  background: var(--nv-bg);
-  border: 1px solid var(--rule-soft);
-  border-radius: var(--radius-block);
-  box-shadow: 0 6px 20px color-mix(in srgb, var(--nv-fg) 12%, transparent);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  /* The composer draws at most `SLASH_MENU_ROWS` one-line rows; the cap only keeps a short panel from
-     being covered by them, and the menu scrolls if it hits it. */
-  max-height: 50vh;
-  overflow-y: auto;
-}
-.slash-menu-row {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 4px 10px;
-  border-radius: 8px;
-  cursor: pointer;
-}
-.slash-menu-row.current {
-  background: var(--nv-cursorline);
-}
-/* A name and its hint are one line at most half the row, cut with an ellipsis at the end (the hint goes first), so
-   a long hint from an agent never wraps or squeezes the description out. The three isolate their direction:
-   a right-to-left run in one cannot reorder the text beside it. */
-.slash-menu-name {
-  flex: 0 1 auto;
-  min-width: 14ch;
-  max-width: 50%;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  unicode-bidi: isolate;
-}
-.slash-menu-hint,
-.slash-menu-desc {
-  color: var(--nv-muted);
-  unicode-bidi: isolate;
-}
-.slash-menu-desc {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-/* Why the box stopped taking input while a terminal handoff closes the conversation. A control that
-   goes inert with no explanation reads as broken, and the specific thing a user needs told here is
-   that whatever they had typed is still theirs. */
-.composer-closing {
-  flex: 0 0 100%;
-  margin: 0;
-  font-size: var(--fs-sm);
-  color: var(--nv-fg);
-}
-/* A held-back slash command's own local flash (`Composer.tsx`'s `slashFlash`),
-   same shape as `.composer-closing` just above -- transient rather than persistent. */
-.composer-slash-flash {
-  flex: 0 0 100%;
-  margin: 0;
-  font-size: var(--fs-sm);
-  color: var(--nv-fg);
-}
-/* The textarea draws no box of its own inside the composer card: no border, no fill, no focus ring. */
-.composer textarea {
-  flex: 1;
-  resize: none;
-  min-height: 1.5em;
-  line-height: 1.5;
-  background: none;
-  color: var(--nv-fg);
-  border: 0;
-  padding: 0;
-  /* WebKit's own focus ring would draw a second box inside the card; the caret, the card's INPUT frame
-     and the band's INPUT block say where the keys are. */
-  outline: none;
-}
-/* The placeholder in the tint's guarded muted ink. Without this rule WebKit draws it in its UA sheet's
-   `darkGray` (about 1.9:1 on a light tint), whatever the card's colour; `opacity: 1` undoes the UA's
-   own dimming where an engine applies one. */
-.composer textarea::placeholder {
-  color: var(--nv-muted);
-  opacity: 1;
-}
-/* BROWSE's stand-in for the textarea (`Composer.tsx`): same slot in the box, but nothing here accepts
-   a keystroke. Bare, like the textarea; the band's mode block carries the mode. The label is
-   `--nv-muted`, the placeholder's colour. */
-.composer-browse-hint {
-  flex: 1;
-  min-height: 1.5em;
-  display: flex;
-  align-items: center;
-  color: var(--nv-muted);
-  font-size: var(--fs-base);
-  line-height: 1.5;
-  cursor: text;
-  outline: none;
-}
-/* The unsent draft, previewed in BROWSE like the greyed-out text it stands in for. */
-.composer-draft {
-  white-space: pre-wrap;
-}
-/* The key that opens the box (`Composer`'s `browseKey`): at its right end, mono and muted, as the start
-   screen's menu draws its keys. */
-.composer-key {
-  margin-left: auto;
-  padding-left: 8px;
-  font-family: var(--nv-font-mono);
-  color: var(--nv-muted);
-}
-/* With messages queued the count comes first at the right end and the key after it. */
-.composer-queued + .composer-key {
-  margin-left: 0;
-}
-.composer-queued {
-  margin-left: auto;
-  padding-left: 8px;
-  font-size: var(--fs-sm);
-}
-
-/* C3: the composer uses the panel's own face and scale (WebKitGTK's UA sheet gives form controls
-   `font: -webkit-small-control` otherwise), and grows to its content up to 40% of the panel --
-   `Composer`'s layout effect sets the height; this is the backstop. */
-.composer textarea,
-.permission-card input,
-.tab-rename,
-.history-search input {
-  font: inherit;
-  font-size: var(--fs-base);
-  line-height: 1.4;
-}
-.composer textarea {
-  max-height: 40vh;
-  overflow-y: auto;
-}
-.history-search {
-  flex: 0 0 100%;
-  display: flex;
-  gap: 0;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  color: var(--nv-muted);
-}
-.history-search input {
-  background: none;
-  border: 0;
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  width: 16ch;
-}
-.history-search-match {
-  color: var(--nv-fg);
-}
-
-/* --- the chat page at the panel's two extremes ------------------------------------------------------
-   A narrow panel (beside a side panel, or a small window) gives the margins and a little of the sign
-   column back to the text. A panel with the whole window gets more air above the conversation and between
-   turns. Both are written against the
-   viewport, which is the panel itself -- never a container query (see the sign-column grid's geometry
-   block). */
-@media (max-width: 420px) {
-  :root {
-    --page-pad: 10px;
-    --sign-gap: 4px;
-  }
-  .message-list {
-    padding-top: 12px;
-    padding-bottom: 12px;
-  }
-}
-@media (min-width: 1100px) {
-  .message-list {
-    padding-top: 32px;
-  }
-  .message-list > .row-prompt:not(:first-child) {
-    margin-top: 34px;
-  }
-  .composer {
-    margin-bottom: 18px;
-  }
-}
-
-/* --- Phase 3: backend-aware start screen, identities, and in-panel errors ------------------- */
-/* --- The empty tab replaces the mode-selector start screen -------- */
-
-/* Moved from `.mode-selector button strong`/`.mode-selector .detail` -- the old resumable-session
-   picker is gone, and the empty tab's own resume rows (`.empty-tab-resume`, below) are the one
-   place this project still stacks a choice row's title above its detail line. */
-.empty-tab-resume strong {
-  display: block;
-}
-.empty-tab-resume .detail {
-  display: block;
-  opacity: 0.75;
-  font-size: var(--fs-sm);
-  margin-top: 2px;
-}
-.empty-tab .connecting {
-  opacity: 0.85;
-}
-
-/* --- The empty tab's dashboard ------------------------- */
-/* LazyVim's start screen (snacks.nvim), `mock: empty.html` C: a centred `Eitri`, the where-line,
-   one row per `dashItems` with its key, and nothing more (`Dashboard.tsx`). Replaces the eight resume rows
-   (`.empty-tab-resume` above is now dead JSX-wise -- kept only because `indexCss.test.ts`'s
-   "keeps the empty tab inside its column" test still renders a synthetic `.empty-tab-resume
-   .session-title` fragment against it; deleting the rule would fail that out-of-scope test rather
-   than this task's own). */
-.dashboard {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 32px 12px 8px;
-  text-align: center;
-}
-.dash-title {
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-title);
-  font-weight: 600;
-}
-.dash-where {
-  color: var(--nv-muted);
-  font-size: var(--fs-sm);
-  margin-bottom: 8px;
-}
-.dash-items {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  width: 100%;
-  max-width: var(--dash-w);
-}
-.dashboard {
-  /* The menu's width, which the box above its rows shares, so the two read as one list. */
-  --dash-w: 440px;
-}
-/* The box you type in, as the dashboard's first row (`EmptyTab`): as wide as the rows, left-aligned text in
-   the centred screen, a little air above it after the where-line and below it before the rows. Its edges are
-   the rows' edges and its padding theirs, so its key (`.composer-key`) stands in the rows' key column. With
-   the cursor on it in BROWSE its hairline takes the body's ink at half strength -- the box's own form of the
-   rows' cursorline fill, which its tint would hide; in INSERT its ring says the same. */
-.dash-input {
-  width: 100%;
-  max-width: var(--dash-w);
-  margin: 10px 0 6px;
-  text-align: left;
-}
-.dash-input .composer {
-  margin: 0;
-  min-height: 0;
-  /* The prompt in the rows' icon cell and the text where their labels start: a row's own padding less
-     this box's border, then the same 1.4em cell and 8px gap a row has. */
-  padding: 6px 9px;
-}
-.dash-input[aria-current="true"] .composer {
-  border-color: color-mix(in srgb, var(--nv-fg) 45%, var(--nv-bg));
-}
-/* Deliberately NOT `<button>` (`Dashboard.tsx`'s own doc comment): `role="button"`/`tabIndex={-1}`
-   on a `div`, so a `Space` keydown here is never native button activation -- it has to reach the
-   leader system instead. `cursor: pointer` is presentational only; nothing here is really focused,
-   `[aria-current]` (below) is the only cursor this screen draws. */
-.dash-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 10px;
-  border-radius: 3px;
-  cursor: pointer;
-  text-align: left;
-}
-/* The conversation cursor's own fill (`.row-current`'s doc comment): `--nv-cursorline` is a
-   BACKGROUND, not text, so the text-colour guard does not apply to this rule at all. */
-.dash-item[aria-current="true"] {
-  background: var(--nv-cursorline);
-}
-.dash-icon {
-  display: inline-block;
-  width: 1.4em;
-  text-align: center;
-  font-family: var(--nv-font-mono);
-}
-.dash-label {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.dash-resume-title {
-  color: var(--nv-muted);
-}
-/* The key column: the letter alone, in the mono face and the muted ink, at the row's right end -- the way
-   snacks.nvim's dashboard lists its keys. No box round it: the row is already the thing you choose. */
-.dash-key {
-  font-family: var(--nv-font-mono);
-  color: var(--nv-muted);
-}
-/* The one line under the items, and only in a companion window with no editor attached: something to fix,
-   so it is said where it can be seen. */
-.dash-context {
-  color: var(--nv-muted);
-  font-size: var(--fs-sm);
-  margin-top: 10px;
-  max-width: 360px;
-}
-/* The pill, the `⏵⏵` glyph split into its own `.mode-glyph` span above -- moved into
-   the band, no longer its own block with a `margin-top`. */
-.mode-pill {
-  color: var(--nv-fg);
-}
-
-/* In-flight motion. Per-turn state, so it lives on the activity
-   line rather than on a row or anywhere else. */
-.turn-activity {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-/* The one animated element in the whole stylesheet, and the only rule in the file with an `animation:`
-   declaration (`indexCss.test.ts` asserts both halves of that, and that there is exactly one
-   `@keyframes`): the activity line's star breathes while the agent works -- full size, a little smaller,
-   smallest, a little smaller -- the way Claude Code's spinner glyph moves in place of a progress bar.
-
-   `transform` only -- never colour or alpha: the star's accent clears its 3:1 guarantee only at full
-   strength, so a fade would spend most of its period below it, a defect no static check could catch once
-   it existed. The keyframes body is asserted to contain only `transform:` declarations for
-   the same reason. And in steps, never eased: four visible states per cycle, one repaint per
-   `--meter-step` (300ms unless the typing cadence slows it, `typingCadence.ts`; the name is the bar
-   meter's, which this star replaced), so the panel never repaints faster than that while the user types
-   in the editor beside it. `steps(2, jump-end)` on each half of the cycle gives exactly the four states
-   1, 0.8, 0.6, 0.8. Not while a card waits or the phase is the user's to end (`data-moving` is absent
-   then): a moving star would claim the agent is working when it is not. */
-.activity-glyph[data-moving] {
-  animation: turn-breath calc(var(--meter-step, 300ms) * 4) steps(2, jump-end) infinite;
-}
-@keyframes turn-breath {
-  0%,
-  100% {
-    transform: scale(1);
-  }
-  50% {
-    transform: scale(0.6);
-  }
-}
-/* Nothing is lost: the word already carries all five phases and does not move. What reduced motion
-   costs is the LIVENESS channel, and the elapsed clock (`.turn-elapsed`) replaces it -- a number that
-   increments once a second is a content update, not motion. The star rests at its full size,
-   the cycle's first state. */
-@media (prefers-reduced-motion: reduce) {
-  .activity-glyph[data-moving] {
-    animation: none;
-    transform: scale(1);
-  }
-}
-/* The phase word is the line's one full-strength text, said like Claude Code's (`Running Bash…`): a
-   capital first letter and an ellipsis while the agent works, none while the phase is the user's. The
-   clock and everything after it are muted; the queue count joins the clock with the line's separator. */
-.activity-line .turn-activity .turn-state {
-  color: var(--nv-fg);
-}
-.activity-line .turn-activity .turn-elapsed {
-  color: var(--nv-muted);
-}
-.activity-line .turn-state::first-letter {
-  text-transform: uppercase;
-}
-.activity-line .turn-activity:not([data-phase="blocked"]) .turn-state::after {
-  content: "…";
-}
-.activity-line .turn-activity + .activity-keys::before {
-  content: "· ";
-}
-/* --- what the activity line sacrifices first as it narrows -----------------------------------------
-   `.activity-line` is a nowrap flex row that could not shrink and never clipped, and the in-flight
-   indicator roughly DOUBLES its minimum content width: the star plus `running NotebookEdit`
-   (20ch in the longest phase word) plus `123s+` plus its gaps, on a bar that needed
-   about 250px before it. So under pressure the phase word wrapped to a second line -- breaking the
-   `min-height: 28px` -- and past that the Stop button was pushed
-   off the right edge. `App.tsx`'s own comment beside that button says it is the ONLY Stop control
-   for mouse users, so that was the interrupt affordance leaving the screen, which must never
-   happen.
-
-   **The priority order: the phase word truncates with an ellipsis** (`running NotebookEdit` ->
-   `running Note…`), and nothing else. **Never:** the star, the elapsed clock, and the Stop button.
-   Those are `flex: none`, so a narrow panel spends the word and never spends the control that
-   stops a turn. What `flex: none` buys the clock is that the DISTRIBUTION never spends it -- not
-   that it can never be clipped. Once the phase word is gone there is nothing left inside
-   `.turn-activity` to give, so a deeper squeeze takes the box below its own fixed content;
-   `overflow: hidden` on it is what makes that clip (the clock) rather than overflowing onto Stop. The panel width at which any of this begins is a screen question,
-   and needs visual measurement.
-
-   Two mechanics worth knowing before editing this: shrinking is distributed by `flex-shrink x
-   base-size`, so `.turn-activity`'s factor below is what makes IT (rather than Stop) the thing
-   that gives; and `min-width: 0` on the phase word is required, since a flex item's automatic
-   minimum is otherwise its min-content size (the whole word), which `text-overflow` never engages
-   without. `white-space: nowrap` on the bar is what stops the word wrapping inside its own box
-   instead of truncating. */
-.activity-line .turn-activity {
-  flex-shrink: 1;
-  min-width: 0;
-  overflow: hidden;
-}
-.activity-line .turn-activity .turn-elapsed,
-.activity-line .stop {
-  flex: none;
-}
-/* `ctrl+c interrupt` is words in the line, not WebKit's button
-   face. Still a real button for the mouse and `hjkl`; focused, the
-   solid-cursor rule at the end of this file wins (it is more specific). */
-.activity-line .stop {
-  background: none;
-  border: 0;
-  padding: 0 2px;
-  font: inherit;
-  color: var(--nv-muted);
-  cursor: pointer;
-}
-.activity-line .stop::before {
-  content: "· ";
-}
-/* The queue count already ends in its own separator, so the Stop control after it needs none. */
-.activity-line .activity-keys + .stop::before {
-  content: none;
-}
-/* The only shrinkable child of `.turn-activity`. The plain default, stated rather than inherited so
-   that the day a second shrinkable child appears here, this is a number someone has to choose
-   rather than one nobody noticed. */
-.activity-line .turn-activity .turn-state {
-  flex-shrink: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* The which-key STRIP is gone
-   -- the band leaves it no room, and its
-   `.keycap`s were the only reason `.which-key`/`.which-key-help`/the focus-dimming rule existed.
-   The which-key BOX (`.which-key-box`, above) is a different feature and is unaffected. */
-/* No `font-family` of its own: `font-family` inherits by default, and every place a `.keycap` sits
-   (the keymap overlay's tables) already names `--nv-font-mono` on itself
-   -- `font-family: inherit;` here was tried and is redundant with that, and `indexCss.test.ts`'s
-   font guard reads it as a THIRD, unaccounted-for font declaration and refuses it. */
-.keycap {
-  background: var(--nv-cursorline);
-  color: var(--nv-fg);
-  border-radius: 3px;
-  padding: 0 4px;
-}
-
-/* The `?` keymap overlay: opened by `?` in
-   BROWSE, closed by `?`/Escape/q or a click on its own backdrop (`App.tsx`, `KeymapOverlay.tsx`).
-   `position: absolute; inset: 0;` against `.agent-ui-scroller`, the message list's own region --
-   which leaves the activity line and the band outside the
-   overlay's box entirely rather than under it (formerly the winbar and
-   the status line, same rule; `StatusRow`/`Footer` were replaced with the
-   band, still outside this box for the same reason). The first version covered the whole
-   conversation and lifted those bars back by z-index; that put this scroll box's top under the
-   winbar, where its first heading was both unreadable and unreachable (`scrollTop` is already 0
-   there). No JS measurement of a bar's wrapping height is
-   needed either way. A HINT starting while this is open closes it first (`App.tsx`'s `hint_collect`
-   handler), so the two are never both on screen. Body text is the plain surface's own
-   `--nv-fg`/`--nv-muted` pair (this is not chrome) -- `indexCss.test.ts`'s guard admits both with no
-   exemption. */
-.keymap-overlay {
-  position: absolute;
-  inset: 0;
-  overflow-y: auto;
-  padding: 16px 20px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-}
-.keymap-overlay h2 {
-  margin: 16px 0 6px;
-  font-size: var(--fs-md);
-}
-.keymap-overlay section:first-child h2 {
-  margin-top: 0;
-}
-.keymap-overlay table {
-  border-collapse: collapse;
-  width: 100%;
-}
-.keymap-overlay td {
-  padding: 2px 8px 2px 0;
-  vertical-align: top;
-}
-/* The keys may wrap at their own spaces (`Ctrl+0 / Ctrl+Keypad0 / ...` is wider than a 520px panel);
-   `nowrap` here scrolled the overlay sideways and, beside a Lua side panel, pushed every
-   description off the right edge (the keymap GUI pass, 2026-09-25). A wrapped keycap keeps its fill
-   and padding on each line. */
-.keymap-overlay td:first-child .keycap {
-  -webkit-box-decoration-break: clone;
-  box-decoration-break: clone;
-}
-/* The description column only -- the keys column keeps the inherited `--nv-fg`, same as the
-   keycap's own label text everywhere else on this page. */
-.keymap-overlay td:last-child {
-  color: var(--nv-muted);
-}
-
-/* This session's details, opened by `prefix i` or `Enter` on the status
-   row: shaped exactly like `.keymap-overlay` above (same overlay, same surface, same backdrop
-   rule), a two-column table instead of four sections. `App.tsx` owns `j`/`k`/`y`/`Esc`/`q` while
-   it is open, the way it owns the `?` overlay's -- this component draws only. */
-.detail-popover {
-  position: absolute;
-  inset: 0;
-  overflow-y: auto;
-  padding: 16px 20px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-}
-.detail-popover table {
-  border-collapse: collapse;
-  width: 100%;
-}
-.detail-popover td {
-  padding: 2px 8px 2px 0;
-  vertical-align: top;
-}
-.detail-popover td:first-child {
-  color: var(--nv-muted);
-}
-/* The row `j`/`k` sit on -- the same solid-block cursor idiom the conversation's own rows use
-   (`.row-current .row-sign`), on the whole row rather than a sign cell of its own: this table has
-   none. */
-.detail-popover tr.current {
-  background: var(--nv-cursorline);
-}
-
-/* The turn review overlay (`c` in BROWSE; `components/ReviewOverlay.tsx`): shaped like `.keymap-overlay`
-   and `.detail-popover` above -- the same overlay over `.agent-ui-scroller`, the same surface -- so the winbar
-   and the status band stay visible. Its rows are the document's own `Row` (the sign column and the cursor
-   block come with it) and its patches the `.diff-*` rules further down, so nothing here sets a colour but
-   `--nv-fg` and `--nv-muted`: a new colour declaration on a signal token is a design error, and
-   `indexCss.test.ts`'s guard is what says so. */
-.review-overlay {
-  position: absolute;
-  inset: 0;
-  overflow-y: auto;
-  padding: 16px 20px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-}
-.review-header {
-  margin-bottom: 8px;
-}
-.review-title {
-  font-size: var(--fs-md);
-}
-/* What the record says is partial or wrong about the turn, one line each, under the title. */
-.review-flag,
-.review-note,
-.review-draft,
-.review-status,
-.review-question {
-  color: var(--nv-muted);
-  padding: 2px 0;
-}
-/* A comment of the draft, under the hunk it is on: its lines, then its text in the user's own words. */
-.review-comment-lines {
-  margin-right: 12px;
-  color: var(--nv-muted);
-  white-space: nowrap;
-}
-.review-comment-text {
-  word-break: break-word;
-}
-/* The message `s` would send, as the shell composed it: its own line breaks kept, nothing cut. */
-.review-preview-text {
-  white-space: pre-wrap;
-  word-break: break-word;
-  padding: 2px 0 2px calc(var(--row-gutter) + 2px);
-}
-.review-note {
-  padding-left: calc(var(--row-gutter) + 2px);
-}
-.review-path {
-  word-break: break-all;
-}
-.review-counts,
-.review-file-flag {
-  margin-left: 12px;
-  color: var(--nv-muted);
-  white-space: nowrap;
-}
-.review-hunk {
-  margin-left: var(--row-gutter);
-}
-.review-hunk-header {
-  color: var(--nv-muted);
-}
-/* One open hunk's lines. Past the height of a tool result's own box it scrolls inside itself, and `j`/`k`
-   scroll it before they move the cursor (`App.tsx`). */
-.review-hunk-lines {
-  margin-left: var(--row-gutter);
-  max-height: 260px;
-  overflow: auto;
-  padding-bottom: 4px;
-}
-.review-lineno {
-  width: 4ch;
-  flex: none;
-  text-align: right;
-  color: var(--nv-muted);
-}
-.review-keys {
-  margin-top: 12px;
-  color: var(--nv-muted);
-}
-
-/* `prefix w`: shaped exactly like
-   `.keymap-overlay` and `.detail-popover` above -- same overlay, same surface, same positioning --
-   over `.agent-ui-scroller` in the conversation layout and over `.agent-ui-root` (also
-   `position: relative`) in the empty layout, since that screen has no scroller of its own. Body
-   text is the plain surface's own `--nv-fg`/`--nv-muted` pair; `indexCss.test.ts`'s guard admits
-   both with no new exemption. */
-.chooser {
-  position: absolute;
-  inset: 0;
-  overflow-y: hidden;
-  display: flex;
-  flex-direction: column;
-  padding: 16px 20px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-}
-.chooser-filter {
-  flex: 0 0 auto;
-  margin-bottom: 8px;
-  padding: 4px 6px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  border: 1px solid var(--nv-border);
-  font: inherit;
-}
-.chooser-list {
-  flex: 1 1 0%;
-  min-height: 0;
-  overflow-y: auto;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.chooser-row {
-  padding: 2px 4px;
-}
-/* The row `j`/`k` sit on, the same idiom as `.detail-popover tr.current`. */
-.chooser-row.current {
-  background: var(--nv-cursorline);
-}
-/* A record another window's lease holds: shown, never chosen. */
-.chooser-row.unchoosable {
-  color: var(--nv-muted);
-}
-.chooser-empty {
-  color: var(--nv-muted);
-  padding: 2px 4px;
-}
-/* The picker's header, `Sessions` then the project name
-   then the right-aligned open/earlier counts (`3 open · 5 earlier`, or `2 of 8` while filtered). */
-.chooser-header {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.chooser-title {
-  font-weight: bold;
-}
-.chooser-project {
-  color: var(--nv-muted);
-}
-.chooser-counts {
-  margin-left: auto;
-  color: var(--nv-muted);
-}
-/* `j`/`k` skip these -- they carry no `.chooser-row` class, so they are never a `rows[]` entry
-   (`chooserRows` builds the list of choosable/navigable rows; a group label is drawn beside it,
-   never inside it). */
-.chooser-group {
-  color: var(--nv-muted);
-  padding: 6px 4px 2px;
-  font-size: var(--fs-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.chooser-row {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 0 6px;
-}
-.chooser-sign {
-  flex: 0 0 auto;
-  width: 1.2em;
-  text-align: center;
-}
-/* A dot, not coloured text (a signal token is a fill, a border or
-   a glyph, never text colour) -- `--nv-ok` for a running tab, `--nv-chrome-accent` for one with an
-   unread reply. */
-.chooser-sign-running,
-.chooser-sign-unread {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-}
-.chooser-sign-running {
-  background: var(--nv-ok);
-}
-/* The current row's sign cell is the panel's cursor: the solid block, `›` in it, the
-   body's own pair reversed, as `.row-current .row-sign` draws it. */
-.chooser-row.current .chooser-sign {
-  background: var(--nv-fg);
-  color: var(--nv-bg);
-}
-.chooser-sign-unread {
-  background: var(--nv-chrome-accent);
-}
-/* `flex-basis: 0`, not `auto` (r2-gui GUI pass, 2026-09-26): with `auto` a long record title made
-   this line wider than the row, so `flex-wrap` dropped it under the sign column and the title
-   wrapped there. It stays beside the sign now and `.chooser-lead` cuts it. */
-.chooser-line1 {
-  flex: 1 1 0%;
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-}
-.chooser-lead {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.chooser-line2 {
-  flex: 1 1 100%;
-  padding-left: calc(1.2em + 6px);
-}
-.chooser-muted {
-  color: var(--nv-muted);
-}
-.chooser-right {
-  flex: 0 0 auto;
-  white-space: nowrap;
-}
-.chooser-rename {
-  flex: 1 1 auto;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  border: 1px solid var(--nv-border);
-  font: inherit;
-}
-/* The mode line and the keys line, above and below each other -- neither is part of
-   `.chooser-list`'s own scroll region, the same way `.chooser-filter` sits outside it. */
-.chooser-mode-line {
-  flex: 0 0 auto;
-  margin-top: 8px;
-  color: var(--nv-muted);
-}
-.chooser-keys {
-  flex: 0 0 auto;
-  color: var(--nv-muted);
-}
-/* A filter match. No `color:` declared at all --
-   `<mark>`'s own text stays whatever colour its row already painted it (`--nv-fg`/`--nv-muted`),
-   so the guard never has to admit a fourth exemption for it. */
-.chooser mark {
-  background: color-mix(in srgb, var(--nv-hint-bg) 35%, transparent);
-}
-
-/* The /model /effort picker (`SlashPicker.tsx`). Positioned and
-   drawn the same way `.chooser` is -- a full overlay over the conversation, same font/colours --
-   since it is a smaller instance of the same idea (a `j`/`k`/Enter/Esc list over the conversation). */
-.slash-picker {
-  position: absolute;
-  inset: 0;
-  overflow-y: hidden;
-  display: flex;
-  flex-direction: column;
-  padding: 16px 20px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-}
-.slash-picker-header {
-  flex: 0 0 auto;
-  margin-bottom: 8px;
-}
-.slash-picker-title {
-  font-weight: bold;
-}
-.slash-picker-list {
-  flex: 1 1 0%;
-  min-height: 0;
-  overflow-y: auto;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.slash-picker-row {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 2px 4px;
-}
-.slash-picker-row.current {
-  background: var(--nv-cursorline);
-}
-.slash-picker-sign {
-  flex: 0 0 auto;
-  width: 1.2em;
-  text-align: center;
-}
-.slash-picker-current-marker {
-  color: var(--nv-muted);
-}
-.slash-picker-hint {
-  flex: 0 0 auto;
-  margin-top: 8px;
-  color: var(--nv-muted);
-}
-.slash-picker-scope {
-  color: var(--nv-muted);
-}
-
-/* Replaces window.alert: copyable, non-blocking, and able to show the sidecar's own multi-line
-   startup diagnostics, which is usually where the real cause is. */
-.fatal-error {
-  margin: 12px;
-  padding: 12px;
-  border: 1px solid var(--nv-error);
-  border-left-width: 3px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-error) 8%, transparent);
-  color: var(--nv-fg);
-  font-size: var(--fs-sm);
-}
-.fatal-error pre {
-  margin: 8px 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--nv-font-mono);
-  color: var(--nv-fg);
-  user-select: text;
-}
-
-/* A session that was LOST, and one that ended normally, used to be two separately boxed banners
-   here (`.session-lost` in the fatal-error palette, `.session-over` muted). Panel-as-document
-   task 3 put both on the plain row grid instead (`App.tsx`'s `sessionEndedBanner`); they are
-   `row-error`/`row-ended` respectively now, styled above under "the sign-column grid", including
-   the wrapping their `<pre>`/text needs -- that is not left to `.row-body`'s own defaults. */
-
-/* `.resume` marks every previous-conversation row in the picker, visually distinct from the "New
-   session" row beside them, since starting fresh and continuing have very different consequences and
-   the wrong click is not obviously wrong afterwards. (This comment described a single
-   "continue-previous-session" control; that control became a list of rows when the picker landed.) */
-/* Every control on this screen is painted explicitly, none of them inheriting the UA's native button
-   appearance. That was a real defect, not tidiness: setting ANY border property on a button drops
-   WebKit's native styling, and the fallback is a light `ButtonFace` background. Only `.resume` set a
-   border, so the start screen's one blue-labelled control -- the one whose misclick costs the most,
-   since it continues a conversation instead of starting one -- rendered pale-on-pale while every
-   other button stayed correctly dark. */
-/* The boxed Auto/Bypass buttons (`.mode-selector button:not(.row-choice)`) are gone with the
-   mode-selector start screen -- every button on this screen is a choice row now, so the hover fill
-   moves onto `.row-choice` itself, unscoped: the same `--nv-cursorline` value
-   `.row-choice.selected` uses below, so hovering a row (selected or not) is still a correct,
-   harmless fill rather than a conflict. */
-.row-choice:hover {
-  background: var(--nv-cursorline);
-}
-/* `.resume` used to be told apart from "New session" by this border-color alone (`--nv-mode-browse`,
-   set only here). Both now sit on the `.row-choice` grid below, whose `border` is `none` for
-   every choice row -- so a `border-color` here would have nothing left to color. The "↺" sign
-   (JSX, `data-sign`) and, once picked, `.row-choice.selected`'s fill now carry that distinction. */
-
-/* `display`, `grid-template-columns` and `gap` come from `.row`, which every choice also carries.
-   Repeating them here would be two places to change the grid. */
-/* `color: var(--nv-fg)` instead of `inherit`: `indexCss.test.ts`'s guard holds every
-   unexempted `color:` declaration to `--nv-fg`/`--nv-muted` exactly, and `inherit` fails that match
-   even though it resolves to the identical value here (the body sets `color: var(--nv-fg)`, and
-   nothing between it and this button sets its own `color`). Same rendered colour, a declaration the
-   guard can actually check. */
-.row-choice {
-  width: 100%;
-  text-align: left;
-  background: none;
-  border: none;
-  color: var(--nv-fg);
-  font: inherit;
-  padding: 4px 0;
-  cursor: pointer;
-}
-.row-choice.selected { background: var(--nv-cursorline); }
-
-/* A permission request that outlived its session. Muted rather than alarming: the loud banner above
-   already says the session was lost -- this only explains why these buttons no longer do anything. */
-.permission-card-stale {
-  margin-top: 8px;
-  font-size: var(--fs-xs);
-  color: var(--nv-warn-tint-muted);
-}
-
-/* The empty tab's resume rows, under the fresh prompt -- moved here from
-   `.mode-selector .session-choice`, the old resumable-session picker's own list. */
-/* A column, not a row: capped at `EMPTY_TAB_RESUME_ROWS` (8), well below the old picker's up-to-17,
-   so the `max-height`/`overflow-y` below is inherited caution rather than a case this screen is
-   known to hit -- kept anyway, since the tab chooser still lists every record uncapped.
-
-   The surrounding chrome (the composer, the mode pill) is uncapped, `.empty-tab` is centred with
-   `margin: auto` inside a `height: 100vh` flex column, and centred overflow in that arrangement
-   splits above and below with the block-start half unreachable by scrolling. Never observed --
-   nobody has looked at this screen with a full 8 rows at any pane height. */
-.empty-tab-resume {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 12px;
-  max-height: 40vh;
-  overflow-y: auto;
-}
-.empty-tab-resume button {
-  margin: 0;
-}
-/* `.row-choice.selected`'s fill (above) marks a selected row; the empty tab's resume rows have no
-   such state -- clicking one resumes it at once, there is nothing to arm first. */
-
-/* "Continue in a terminal", under the composer. Quiet by default: it is a way out of this panel,
-   not one of the things it is for. */
-.handoff {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 0 12px 10px;
-  font-size: var(--fs-xs);
-}
-.handoff-open {
-  background: none;
-  border: 1px solid var(--nv-border);
-  border-radius: 4px;
-  color: var(--nv-muted);
-  font-size: var(--fs-xs);
-  padding: 4px 8px;
-  cursor: pointer;
-}
-.handoff-open:disabled {
-  cursor: default;
-  opacity: 0.5;
-}
-/* The reason the control is unavailable, as VISIBLE text beside it rather than only as a `title`.
-   A disabled button with no explanation reads as broken, and a tooltip is unreadable without a
-   pointer hovering it. */
-.handoff-blocked {
-  color: var(--nv-muted);
-  flex: 1 1 200px;
-}
-
-/* The confirmation, in place of the button. Bordered because the thing it is about to do -- close
-   the conversation -- is not undoable on a backend with no resume. */
-.handoff-confirm {
-  margin: 0 12px 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--nv-warn);
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
-  font-size: var(--fs-sm);
-}
-.handoff-confirm p {
-  margin: 0 0 8px;
-}
-.handoff-confirm .warning {
-  border-left: 3px solid var(--nv-warn);
-  padding-left: 8px;
-}
-.handoff-confirm-buttons {
-  display: flex;
-  gap: 8px;
-}
-
-/* The command, on the start screen, after the session really has been closed. It carries a warning
-   about concurrency that must not be dismissible: the whole point of this path is that nothing is
-   holding the session, and a warning that can be clicked away is one that will be. */
-.handoff-card {
-  margin: 12px;
-  padding: 12px;
-  border: 1px solid var(--nv-mode-browse);
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-mode-browse) 8%, transparent);
-  font-size: var(--fs-sm);
-  text-align: left;
-}
-/* `.handoff-card` now lives on `.row-body` (`TerminalHandoff.tsx`'s `HandoffCommandCard`), and its
-   own `margin: 12px` is the same specificity as `.row-body` and later in the file, so it was
-   winning outright rather than adding to it -- the handoff row sat 12px off the grid every other
-   row lines up on. Keep the box, drop only the outer margin the grid already provides; `12px`
-   below the card (rather than nothing) is what `margin: 12px` gave it on every side before. */
-.row-handoff .handoff-card {
-  margin: 0 0 12px;
-}
-.handoff-card p {
-  margin: 8px 0 0;
-}
-.handoff-card .warning {
-  border-left: 3px solid var(--nv-warn);
-  padding-left: 8px;
-}
-.handoff-card .detail {
-  color: var(--nv-muted);
-}
-/* Selectable and wrapping: this is a line to copy character for character, and a long project path
-   must not push it out of the pane. */
-.handoff-command {
-  margin: 8px 0 0;
-  padding: 8px;
-  border-radius: 4px;
-  background: var(--nv-surface);
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-family: var(--nv-font-mono);
-  color: var(--nv-surface-fg);
-  user-select: text;
-}
-
-/* A command the host refused, in the words the host used. Distinct from `.fatal-error`, and it has
-   to stay distinct: that one means the whole session is gone, this one means one command did not
-   happen and everything else is fine. Dismissible for the same reason -- there is nothing here a
-   user needs protecting from clicking away, unlike the lost-session row (`App.tsx`'s
-   `sessionEndedBanner`, `row-error`, no dismiss control) that says the transcript may be
-   incomplete. */
-/* The restored-history notice: one line at the top of the list saying where the
-   conversation above the live turn came from, with a Copy path button for the file itself.
-
-   Its shape is `.command-notice`'s below -- flex, a `flex: 1` span, a button -- and its COLOUR
-   deliberately is not. That rule borders in `--nv-warn`, which is the palette's "this was refused"
-   colour; restoring history is not a warning, and painting it like one would teach the reader to
-   read a normal, successful resume as a problem. `--nv-muted` is the neutral token
-   the panel already guards for text against `--nv-bg` at 4.5:1, so this needs no new entry in
-   `indexCss.test.ts`'s exemption list -- and needing one would have been the sign that the choice
-   was wrong. */
-/* Where a resumed session's history came from: one quiet line above the first row, `↺` in the sign column
-   and the words at the body's edge, its way to the file a word after them rather than a form button -- muted, underlined by dots, the page's own face. Focused by the cursor it is the solid cursor
-   block like any control (the focus rule at the end of this file). A hairline under it parts what was
-   restored from what follows only by place, not by a box. */
-.history-notice {
-  display: grid;
-  grid-template-columns: var(--sign-w) minmax(0, auto) auto;
-  justify-content: start;
-  column-gap: var(--sign-gap);
-  align-items: baseline;
-  margin: 0 0 14px;
-  padding: 0 0 10px;
-  border-bottom: 1px solid var(--rule-soft);
-  color: var(--nv-muted);
-  font-size: var(--fs-sm);
-}
-.history-notice::before {
-  content: "↺";
-  content: "↺" / "";
-  font-family: var(--nv-font-mono);
-  text-align: center;
-}
-.history-notice > span {
-  min-width: 0;
-}
-.history-notice > button {
-  margin: 0 0 0 10px;
-  white-space: nowrap;
-  padding: 0;
-  border: 0;
-  background: none;
-  font: inherit;
-  color: var(--nv-muted);
-  text-decoration: underline dotted;
-  text-underline-offset: 3px;
-  cursor: pointer;
-}
-
-.command-notice {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin: 12px;
-  padding: 10px;
-  border: 1px solid var(--nv-warn);
-  border-left-width: 3px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--nv-warn) 8%, transparent);
-  color: var(--nv-fg);
-  font-size: var(--fs-sm);
-}
-.command-notice span {
-  flex: 1;
-  user-select: text;
-}
-
-/* --- an edit: a framed block, the diff inside it ---------------------------------------------------------
-   An edit is the unit a reader reviews, so in the transcript it is framed: the head -- the tool's name, the
-   file, and the counts at the right edge -- in a hairline box at the body's edge, its status glyph in the
-   sign cell outside, and the diff on demand inside the same box under a hairline. Folded, it is the head
-   alone. It has no fill, so the cursor's band shows through it and its text stays the body's pair. The
-   same view sits inside a permission card without the frame, where the diff is what is being approved and
-   the card's tint is the surface under it.
-
-   Signal colours live on the counts' `+`/`−` glyphs and on the diff lines' tint, never on text:
-   `--nv-ok`/`--nv-error` are guarded at 3:1 for non-text marks, not the 4.5:1 text needs, so the numbers
-   themselves stay in the head's muted ink and only the sign before each is coloured
-   (`indexCss.test.ts` admits exactly that). */
-.permission-card-edit-head {
-  display: flex;
-  gap: 0.7em;
-  align-items: baseline;
-  flex-wrap: wrap;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-  line-height: 22px;
-  color: var(--nv-muted);
-}
-.permission-card-edit-tool {
-  flex: none;
-}
-.permission-card-edit-path { font-family: var(--nv-font-mono); font-size: var(--fs-code); color: var(--nv-muted); word-break: break-all; }
-.permission-card-edit-counts { font-family: var(--nv-font-mono); font-size: var(--fs-code); color: var(--nv-muted); white-space: nowrap; }
-.edit-count-added .edit-sign { color: var(--nv-ok); }
-.edit-count-removed .edit-sign { color: var(--nv-error); }
-.permission-card-edit-note {
-  font-size: var(--fs-sm); color: var(--nv-muted);
-}
-/* In a transcript row: the frame, the head's padding and the counts pushed to the right edge, and the
-   notes and the diff each under a hairline inside it. */
-.tool-call > .permission-card-edit {
-  /* As wide as its head or its diff needs, as a code block is: at least 36rem (or the row, if that is
-     narrower), at most the row -- a full-width frame round one short line read as a slab on a wide panel. */
-  width: max-content;
-  min-width: min(100%, 36rem);
-  max-width: 100%;
-  box-sizing: border-box;
-  border: 1px solid var(--rule-frame);
-  border-radius: var(--radius-block);
-  overflow: hidden;
-}
-.tool-call > .permission-card-edit > .permission-card-edit-head {
-  padding: 3px 10px;
-}
-.tool-call > .permission-card-edit .permission-card-edit-counts {
-  margin-left: auto;
-}
-.tool-call > .permission-card-edit > .permission-card-edit-note,
-.tool-call > .permission-card-edit > .permission-card-diff {
-  border-top: 1px solid var(--rule-soft);
-}
-.tool-call > .permission-card-edit > .permission-card-edit-note {
-  padding: 4px 10px;
-}
-/* The diff's top padding parts it from the line above; the bottom padding is room for the horizontal
-   scrollbar, which is WebKitGTK's overlay one and takes none of its own -- with less, it was drawn over a
-   one-line diff's `+` line. `scrollbar-gutter` reserves the block-axis scrollbar's room only, so the strip
-   is plain padding. */
-.permission-card-diff { margin: 0; padding: 4px 0 12px; font-family: var(--nv-font-mono); font-size: var(--fs-code); overflow-x: auto; }
-.tool-call[data-folded="true"] .permission-card-diff { display: none; }
-.diff-line { display: flex; gap: 6px; padding: 0 10px; white-space: pre; color: var(--nv-fg); }
-.diff-gutter { width: 1ch; flex: none; color: var(--nv-muted); }
-.diff-added { background: color-mix(in srgb, var(--nv-ok) 12%, transparent); }
-.diff-removed { background: color-mix(in srgb, var(--nv-error) 12%, transparent); }
-.diff-added .diff-gutter { color: var(--nv-ok); }
-.diff-removed .diff-gutter { color: var(--nv-error); }
-/* In a permission card the lines have no tint of their own: the card's pair is guarded against its own
-   fill and not against a second one laid over it, so the gutter's glyph is the only colour there. */
-.permission-card .diff-added,
-.permission-card .diff-removed { background: none; }
-/* Inside a permission card the diff wraps: a line wider than the card must not hide its tail from the
-   person approving it. */
-.permission-card .diff-line { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--nv-warn-tint-fg); }
-/* The head, the diff and its note have no fill of their own: in a tool row they sit on `--nv-bg` (the
-   body's pair, above), inside a permission card on its warn tint, so they take that tint's pair there. */
-.permission-card .permission-card-edit-head,
-.permission-card .permission-card-edit-path,
-.permission-card .permission-card-edit-counts,
-.permission-card .diff-gutter,
-.permission-card .permission-card-edit-note { color: var(--nv-warn-tint-muted); }
-.permission-card .permission-card-edit-path { color: var(--nv-warn-tint-fg); }
-.permission-card .diff-added .diff-gutter { color: var(--nv-ok); }
-.permission-card .diff-removed .diff-gutter { color: var(--nv-error); }
-.permission-card .permission-card-edit { margin-top: 2px; }
-/* A flex item's minimum width is its content's, so without this a long line would still widen the
-   row past the card instead of wrapping. */
-.permission-card .diff-text { min-width: 0; }
-
-/* --- syntax highlighting (panel-as-document, task 4) -------------------------------------------
-   highlight.js emits plain `hljs-*` classes; these are the only place they get colour, and it comes
-   from the same nvim highlight groups the editor draws with -- so a Rust keyword is the same colour
-   in the panel and in the buffer three inches to its left. */
-/* A fenced code block is a surface block in a hairline frame, as wide as the row. Its long lines scroll
-   inside it. */
-.code-block {
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-code);
-  line-height: 1.55;
-  /* --nv-surface, not --nv-bg: the --nv-syn-* colours below are derived against Normal's
-     background, so painting them on --nv-surface is a small (~4%) departure from an exact editor
-     match. A visually distinct code block is worth that. Its plain text follows the fill: the
-     surface-guarded `--nv-surface-fg`, not the body's `--nv-fg`. */
-  background: var(--nv-surface);
-  color: var(--nv-surface-fg);
-  border: 1px solid var(--rule-soft);
-  border-radius: var(--radius-block);
-  padding: 10px 12px;
-  overflow-x: auto;
-}
-/* In a reply a fenced block is as wide as its lines need, so five short lines are not a slab across a wide
-   panel: at least 36rem (or the row, if that is narrower), at most the row. A longer line scrolls inside the
-   block (`overflow-x: auto` above), never the list. Written against the row's own `%` and rem, never a
-   measured width or a container. */
-.row-assistant .code-block {
-  width: max-content;
-  min-width: min(100%, 36rem);
-  max-width: 100%;
-}
-/* These rules are the deliberate, narrow exception to the "text is only --nv-fg/--nv-muted" guard
-   below: they are the whole feature this task adds, and `indexCss.test.ts` allows exactly this --
-   `--nv-syn-*` as `color:`, and only inside a selector that is ENTIRELY `hljs-*` classes. See that
-   test for why a signal colour (`--nv-warn`/`--nv-error`/`--nv-ok`/`--nv-mode-*`) as text is still
-   refused. */
-.hljs-keyword, .hljs-built_in { color: var(--nv-syn-keyword); }
-.hljs-title, .hljs-title.function_ { color: var(--nv-syn-function); }
-/* Go's grammar wraps a WHOLE function signature (`func name(params)`) in one outer `hljs-function`
-   span around its own already-coloured `hljs-keyword`/`hljs-title`/`hljs-params` children -- found
-   by `highlightCoverage.test.ts` failing on it: the outer span's only direct, un-wrapped text is a
-   single space, so this rule is close to a no-op today, but the class is real and the coverage test
-   checks presence, not visible effect. */
-.hljs-function { color: var(--nv-syn-function); }
-.hljs-string { color: var(--nv-syn-string); }
-.hljs-type { color: var(--nv-syn-type); }
-/* TOML/INI's `[section]` header (highlight.js's `ini` grammar, which is what `toml` is registered
-   from) -- a named structural grouping, closest among the twelve tokens to a type/namespace
-   declaration. Also found by `highlightCoverage.test.ts`. */
-.hljs-section { color: var(--nv-syn-type); }
-.hljs-title.class_ { color: var(--nv-syn-type); }
-.hljs-comment { color: var(--nv-syn-comment); }
-.hljs-number { color: var(--nv-syn-number); }
-.hljs-literal { color: var(--nv-syn-constant); }
-.hljs-variable, .hljs-params { color: var(--nv-syn-variable); }
-.hljs-operator { color: var(--nv-syn-operator); }
-.hljs-punctuation { color: var(--nv-syn-punctuation); }
-.hljs-attr, .hljs-property { color: var(--nv-syn-property); }
-/* Added on review: both classes are live (Rust attributes/shebangs; YAML list markers) and were
-   unstyled by the rules above, so they fell through to plain --nv-fg. Nearest Treesitter analogues,
-   since neither `SYNTAX` group in `core/src/theme/tokens.rs` names a "meta" or "bullet" token. */
-.hljs-meta { color: var(--nv-syn-constant); }
-.hljs-bullet { color: var(--nv-syn-punctuation); }
-/* Dead with the language set this task registers -- no xml/html grammar is registered, so nothing
-   ever emits these two classes today. Left in rather than removed: it costs nothing, and the
-   registered set may grow to include a markup language. */
-.hljs-tag, .hljs-name { color: var(--nv-syn-tag); }
-
-/* `diff` is one of the twelve registered languages, and highlighting what changed is its whole
-   reason to exist -- `.hljs-addition`/`.hljs-deletion` were the one pairing left completely
-   unstyled by the rules above, so a ```diff block rendered monochrome. Deliberately NOT `color:`:
-   spec guards --nv-ok/--nv-error at 3:1 for "borders, rules, tints and dots", never for text
-   (4.5:1) -- the same reasoning `.diff-added`/`.diff-removed` above already rely on for their
-   border, so `indexCss.test.ts`'s text-colour guard need not (and does not) exempt these two.
-   `display: block`, because highlight.js's diff grammar wraps the WHOLE line in the span
-   (`begin: '^\+.*$'`/`'^-.*$'`), and an inline element's background does not fill the row the way
-   a line-level diff tint is expected to. */
-.hljs-addition { display: block; background: color-mix(in srgb, var(--nv-ok) 15%, transparent); }
-.hljs-deletion { display: block; background: color-mix(in srgb, var(--nv-error) 15%, transparent); }
-
-/* The selected control is drawn as a cursor, the same solid block as everywhere else in the window
-   (2026-09-19): `h`/`l`/`j`/`k` reach every button (`./nav`), and "the keys go here" is said one
-   way -- solid -- whether it is the editor's block, a row's sign cell, the top bar's item or a
-   button. The selected control IS the focused one, so a click and `Tab` show the same thing.
-   `* ` recolours the button's own children (a mode button's description, a choice row's cells),
-   which would otherwise keep their muted colours on the fg fill and vanish.
-
-   `--nv-bg` text on an `--nv-fg` fill is the body's own guarded pair reversed, so the same
-   contrast; `indexCss.test.ts` admits `--nv-bg` as text only in a rule that is entirely these two
-   selectors and paints that fill. LAST in the file on purpose: `.row-choice:hover` sits earlier and
-   would otherwise win back the fill on a focused, hovered row, which the cascade test checks. */
-.agent-ui-root button:focus,
-.agent-ui-root button:focus * {
-  background: var(--nv-fg);
-  color: var(--nv-bg);
-  outline: none;
-}
-/* A permission card's primary answer is already drawn solid (the body's pair reversed), so focus
-   cannot be shown by filling it: it takes a ring just outside its edge instead. */
-.agent-ui-root .permission-card-buttons button:first-child:focus {
-  outline: 2px solid var(--nv-fg);
-  outline-offset: 2px;
-}
-/* A code block the global f HINT landed on is "the item" until the next key (`y` copies it, `v`
-   starts inside it). It is drawn as the block's own outline in the body's ink, thinner while the panel
-   does not have the keys (the solid/hollow rule); the cursor band stays under the row `j`/`k` continue
-   from. An attribute (`App.tsx`'s `markLandedCode`), not focus on the `pre`: a focused non-control would
-   enter `./nav`'s "the selected control is the focused one" logic. */
-.message-list pre.code-block[data-hint-landed] {
-  outline-style: solid;
-  outline-width: 2px;
-  outline-color: var(--nv-fg);
-  outline-offset: -2px;
-}
-.message-list[data-focused="false"] pre.code-block[data-hint-landed] {
-  outline-width: 1.5px;
-}
-
-/* The global f HINT's labels. The IncSearch pair, so a
-   label reads as a transient jump target and never as the solid cursor. `hint-fg` is guarded for
-   text against `hint-bg` only (`tokens.rs`), which is why the fill sits in the same rule and
-   `indexCss.test.ts` admits the text colour nowhere else. A row's label covers its sign cell,
-   displacing the glyph for as long as HINT lasts; a control's sits at its top-left
-   corner and a code block's at its top-right. The dimming below is deliberate: an already-typed
-   prefix and a label that can no longer match are meant to recede. */
-.hint-layer {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 10;
-}
-.hint-label {
-  position: absolute;
-  background: var(--nv-hint-bg);
-  color: var(--nv-hint-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  line-height: 1;
-  padding: 3px 4px;
-  border-radius: 3px;
-  display: grid;
-  place-items: center;
-}
-.hint-typed {
-  opacity: 0.45;
-}
-.hint-off {
-  opacity: 0.3;
-}
-
-/* The question before a project's own Claude configuration is loaded (`components/TrustPrompt.tsx`): shaped
-   like `.keymap-overlay` (same overlay, same surface, same backdrop rule), drawn over the conversation or the
-   start screen while `App.tsx` owns every key. Everything in it is text from a repository, so the blocks lay
-   out ltr with `bidi-override` the way a permission card's command does; the hidden characters it finds are
-   outlined by `.permission-card-escape`. Text colours are the plain surface's own pair. */
-.trust-prompt {
-  position: absolute;
-  inset: 0;
-  overflow-y: auto;
-  padding: 16px 20px;
-  background: var(--nv-bg);
-  color: var(--nv-fg);
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-sm);
-  z-index: 5;
-}
-.trust-prompt h2 {
-  margin: 0 0 8px;
-  font-size: var(--fs-md);
-}
-.trust-prompt h3 {
-  margin: 14px 0 4px;
-  font-size: var(--fs-sm);
-}
-.trust-prompt h4 {
-  margin: 6px 0 2px;
-  font-size: var(--fs-sm);
-  color: var(--nv-muted);
-}
-.trust-prompt ul {
-  margin: 0;
-  padding-left: 18px;
-}
-.trust-root,
-.trust-item-text,
-.trust-paths li,
-.trust-file h3,
-.trust-note {
-  direction: ltr;
-  unicode-bidi: bidi-override;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-.trust-root {
-  margin: 2px 0;
-}
-.trust-key {
-  color: var(--nv-muted);
-}
-.trust-outside {
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
-  color: var(--nv-muted);
-}
-.trust-note {
-  margin: 14px 0 0;
-  border-left: 2px solid var(--nv-warn);
-  padding-left: 6px;
-}
-.trust-footer {
-  margin: 14px 0 0;
-  color: var(--nv-muted);
-}
-
-/* The key that answers a card, drawn on its button only while that key would do it: the card is
-   under the cursor, the list has the keys, and the panel is in BROWSE. Drawn from the attribute so
-   the button's own name stays "Approve"/"Deny" for a screen reader and for copying. */
-.agent-ui-conversation[data-panel-mode="browse"]
-  .message-list[data-focused="true"]
-  .row-current
-  .permission-card-buttons
-  button[data-key]:not(:disabled)::after {
-  content: attr(data-key);
-  margin-left: 8px;
-  padding: 0 4px;
-  border: 1px solid currentColor;
-  border-radius: 3px;
-  font-family: var(--nv-font-mono);
-  font-size: var(--fs-xs);
-  opacity: 0.7;
 }

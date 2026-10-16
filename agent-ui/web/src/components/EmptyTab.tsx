@@ -35,6 +35,12 @@ const DASH_NARROW_PX = 360;
  *  effect below, which a bare boolean or a repeated string would coalesce away. */
 export type NavKeyRequest = { seq: number; direction: NavKeyDirection };
 
+/** The dashboard's cursor indices in the order the screen draws them, top to bottom: the box (index 0, the
+ *  New session item) sits at the foot under the other rows, so `j` walks the rows and then reaches it. */
+export function screenOrder(count: number): number[] {
+  return [...Array.from({ length: count }, (_, i) => i).slice(1), 0];
+}
+
 export type EmptyTabProps = {
   hello: Hello | null;
   tab: TabInfo;
@@ -658,7 +664,11 @@ export function EmptyTab(props: EmptyTabProps) {
     if (event.key === "j" || event.key === "k" || event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       const delta = event.key === "j" || event.key === "ArrowDown" ? 1 : -1;
-      setDashCursor((c) => Math.max(0, Math.min(items.length - 1, c + delta)));
+      setDashCursor((c) => {
+        const order = screenOrder(items.length);
+        const at = order.indexOf(c);
+        return order[Math.max(0, Math.min(order.length - 1, at + delta))];
+      });
       return;
     }
     if (event.key === "Enter") {
@@ -787,6 +797,8 @@ export function EmptyTab(props: EmptyTabProps) {
             onOpenKeymap={props.onOpenKeymap}
             // A tab that has not started has no reported list yet: Claude's built-ins, nothing for another agent.
             slashCommands={completionSource(props.tab.agent, null)}
+            // The window's own key for the module to the right, which is where the panel sits.
+            idleHint={props.paneFocused ? undefined : "Ctrl+l to start typing"}
           />
         </div>
         {inDashboard && hello !== null && (

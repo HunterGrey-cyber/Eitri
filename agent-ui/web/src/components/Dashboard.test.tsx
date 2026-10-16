@@ -122,9 +122,11 @@ describe("MODE_CONSEQUENCE", () => {
 describe("Dashboard", () => {
   /** The where-line does not name the backend: the name is the same in every release build, so
    *  it carries nothing. The backend stays reachable in `prefix i`. */
-  it("draws the centred name and the where-line with no backend, account omitted when null", () => {
+  it("draws the centred question and the where-line with no backend, account omitted when null", () => {
     const { getByText, container } = renderDash();
-    getByText("Eitri");
+    // 2026-10-16: no brand line above the question; the question and the where-line are the whole head.
+    getByText("What shall we work on?");
+    expect(container.querySelector(".dash-brand")).toBeNull();
     getByText("~/Documents/eitri · work");
     const noAccount = { ...HELLO, account: null };
     const { getByText: getByTextNoAccount } = renderDash({ hello: noAccount });

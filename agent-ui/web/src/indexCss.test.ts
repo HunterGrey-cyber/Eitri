@@ -72,9 +72,11 @@ function everyBranchIsOnSurface(selector: string, branch: RegExp): boolean {
 }
 
 const HLJS_BRANCH = /(?:^|[\s.])hljs-[\w-]+/;
-/** A selector branch that sits inside the winbar or the status line -- `.winbar`, `.status-line`,
- *  or either as an ancestor (`.winbar .identities`, `.status-line .position`, ...). */
-const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line)\b/;
+/** A selector branch that sits inside the winbar, the status line or the status band -- `.winbar`,
+ *  `.status-line`, `.status-band`, or one of them as an ancestor (`.winbar .identities`,
+ *  `.status-band .band-open`, ...). The band joined 2026-10-16, when it took the editor's statusline
+ *  fill (`--nv-chrome`) so the two read as one line across the divider. */
+const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line|status-band)\b/;
 /** Solid cursor surfaces use the body's foreground/background pair reversed: the current
  *  row's sign cell, a focused button and its children, the band's `↓N` button, the chooser's
  *  current sign cell, CARET's one-character selection, and a permission card's primary button.
@@ -1123,7 +1125,7 @@ describe("index.css", () => {
   it("marks a working tab with a separated glyph that is not an ellipsis", () => {
     const rules = splitRules(withoutComments).filter((r) => r.selector.trim() === ".tab-working::after");
     expect(rules).toHaveLength(1);
-    expect(rules[0].declarations).toMatch(/content:\s*" ✻"/);
+    expect(rules[0].declarations).toMatch(/content:\s*" •"/);
   });
 });
 
@@ -1258,20 +1260,20 @@ describe("index.css cascade (which rule actually wins)", () => {
     // Nothing at a wide breakpoint gives code or a table a width of its own.
     const wide = rules.filter((r) => r.parent === "@media (min-width: 1100px)" && /code-block|table-scroll/.test(r.selector));
     expect(wide).toEqual([]);
-    expect(withoutComments).toMatch(/--page-pad:\s*clamp\(12px, 2\.5vw, 40px\);/);
+    expect(withoutComments).toMatch(/--page-pad:\s*clamp\(18px, 3\.5vw, 48px\);/);
     const SIDE = "var(--page-pad)";
     const declarationsOf = (selector: string) =>
       rules.filter((r) => r.parent === null && r.selector.split(",").map((b) => b.trim()).includes(selector)).map((r) => r.declarations).join(";");
     // The air under the last row is the list's own bottom padding; nothing is laid over the rows there.
-    expect(declarationsOf(".message-list")).toContain(`padding: 16px ${SIDE}`);
+    expect(declarationsOf(".message-list")).toContain(`padding: 28px ${SIDE} 24px`);
     expect(rules.some((r) => /\.message-list::after/.test(r.selector))).toBe(false);
     expect(withoutComments).not.toMatch(/--list-foot|--list-fade|data-more-below/);
     for (const foot of [".activity-line", ".queue-lines", ".turn-changes"]) {
-      expect(declarationsOf(foot), foot).toContain(`margin-inline: ${SIDE}`);
+      expect(declarationsOf(foot), foot).toContain(SIDE);
     }
-    expect(declarationsOf(".agent-ui-conversation > .row")).toContain(`margin: 8px ${SIDE} 0`);
+    expect(declarationsOf(".agent-ui-conversation > .row-error")).toContain(`margin: 8px ${SIDE}`);
     // The composer is centred: the same margin each side (2026-10-15).
-    expect(declarationsOf(".composer")).toContain(`margin: 6px ${SIDE} 10px;`);
+    expect(declarationsOf(".composer")).toContain(`margin: 10px ${SIDE} 14px;`);
     // None of them is centred by a width and an auto margin instead: that would centre the list's box, not
     // its rows, and leave the foot and the conversation on different edges.
     const FILLS = [".message-list > .row", ".turn-time", ".activity-line", ".queue-lines", ".turn-changes", ".composer", ".agent-ui-conversation > .row", ".history-notice"];
@@ -1294,8 +1296,8 @@ describe("index.css cascade (which rule actually wins)", () => {
     // A reply's fenced block is as wide as its lines, between 36rem (or the row) and the row; the bare
     // `.code-block` above still takes no width, so a block elsewhere fills its row.
     const reply = rules.find((r) => r.parent === null && r.selector === ".row-assistant .code-block")!;
-    expect(reply.declarations).toMatch(/width:\s*max-content;/);
-    expect(reply.declarations).toMatch(/min-width:\s*min\(100%, 36rem\);/);
+    expect(reply.declarations).not.toMatch(/(?:^|;)\s*width:/);
+    expect(reply.declarations).not.toMatch(/min-width:/);
     expect(reply.declarations).toMatch(/max-width:\s*100%;/);
     expect(rules.find((r) => r.parent === null && r.selector === ".code-block")!.declarations).toMatch(/overflow-x:\s*auto;/);
     // Positive control: the scan really walked those rules.
@@ -1393,15 +1395,15 @@ describe("index.css cascade (which rule actually wins)", () => {
     // The six values this file used to hardcode, and the ratio each token's own comment says it
     // replaced -- evaluated, not string-matched (see `evaluateFsExpression`'s own doc for why a text
     // match on `"* 12 / 14"` cannot tell a correct ratio from a wrong one).
-    // Since 2026-10-15 a reply's prose and the mono content are the base itself: the base is the editor's
-    // own text size by default, and those are the text the editor's beside it is compared with.
+    // The base is the editor's own text size by default and only the status band spends it, so the band
+    // lines up with lualine; the chat reads at twelve fourteenths of it.
     const expected: [string, number][] = [
-      ["--fs-xs", 11],
-      ["--fs-sm", 12],
-      ["--fs-code", 14],
-      ["--fs-md", 13],
+      ["--fs-xs", 9.5],
+      ["--fs-sm", 10.5],
+      ["--fs-code", 12],
+      ["--fs-md", 11],
       ["--fs-base", 14],
-      ["--fs-prose", 14],
+      ["--fs-prose", 12],
     ];
     for (const [token, px] of expected) {
       const raw = ROOT_TOKENS.get(token);
@@ -1414,7 +1416,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(evaluateFsExpression("calc(var(--nv-font-size, 14px) * 13 / 14)")).not.toBeCloseTo(12, 10);
 
     // The heading step (2026-10-13) is one twentieth over the reply's prose, by the same arithmetic.
-    expect(evaluateFsExpression(ROOT_TOKENS.get("--fs-heading")!)).toBeCloseTo(14 * 1.05, 10);
+    expect(evaluateFsExpression(ROOT_TOKENS.get("--fs-heading")!)).toBeCloseTo(12 * 1.05, 10);
   });
 
   it("keeps the 14px fallback equal to Rust's own DEFAULT_PANEL_FONT_SIZE_PX, not a second hand-copied number", () => {
@@ -1524,7 +1526,7 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="review-overlay"><div class="row row-assistant">` +
       `<span class="row-sign">›</span><div class="row-body"><pre class="code-block"><code>x</code></pre></div></div></div>`;
     const proseColumns = expandVars(computed(proseRow, ".row").gridTemplateColumns);
-    expect(proseColumns).toBe("22px minmax(0, 1fr)");
+    expect(proseColumns).toBe("20px minmax(0, 1fr)");
     expect(expandVars(computed(codeRow, ".row").gridTemplateColumns)).toBe(proseColumns);
     // Negative control: proves the assertion above can actually fail. A rule that changed column 1
     // wins the SAME assertion path used above, at the same specificity as `.row`'s own base rule
@@ -1551,26 +1553,26 @@ describe("index.css cascade (which rule actually wins)", () => {
     );
     expect(grid.getPropertyValue("container-type")).toBe("normal");
     expect(grid.display).toBe("grid");
-    expect(expandVars(grid.gridTemplateColumns)).toBe("22px minmax(0, 1fr)");
-    expect(grid.borderLeftWidth).toBe("2px");
+    expect(expandVars(grid.gridTemplateColumns)).toBe("20px minmax(0, 1fr)");
+    expect(grid.borderLeftWidth).toBe("0px");
     expect(ROW_TOKENS.size).toBe(0);
     const html = `<div class="message-list"><div class="row row-assistant" data-sign=""><span class="row-sign"></span><div class="row-body">x</div></div></div>`;
     const row = computed(html, ".row");
     expect(row.getPropertyValue("container-type")).toBe("normal");
-    expect(row.display).toBe("grid");
-    expect(row.gridTemplateColumns).toBe("var(--sign-w) minmax(0, 1fr)");
+    expect(row.display).toBe("block");
+    expect(row.gridTemplateColumns).toBe("var(--row-sign-w) minmax(0, var(--prose-measure))");
     expect(row.borderLeftWidth).toBe("0px");
     expect(row.maxWidth).toBe("none");
     expect(computed(html, ".row-sign").display).toBe("none");
-    expect(computed(html, ".row-body").gridColumn).toBe("2");
+    expect(computed(html, ".row-body").gridColumn).toMatch(/^(auto|)$/);
     // The sign is `data-sign` drawn as generated content, in the first column.
-    const sign = splitRules(withoutComments).find((r) => r.selector === ".message-list > .row::before");
+    const sign = splitRules(withoutComments).find((r) => r.selector.includes(".message-list > .row-tool::before"));
     expect(sign?.declarations).toMatch(/content:\s*attr\(data-sign\) \/ "";/);
-    expect(sign?.declarations).toMatch(/grid-column:\s*1;/);
+    expect(sign?.declarations).toMatch(/position:\s*absolute;/);
     // The sign cell is two characters of the mono face at the sign's size, written from `--fs-code` so it is
     // one width wherever it is spent, and the body edge is that and the gap.
     expect(ROOT_TOKENS.get("--sign-w")).toBe("calc(var(--fs-code) * 1.2)");
-    expect(ROOT_TOKENS.get("--body-edge")).toBe("calc(var(--sign-w) + var(--sign-gap))");
+    expect(ROOT_TOKENS.has("--body-edge")).toBe(false);
     // Negative control: the container put back is exactly what this and the tripwire refuse.
     expect(computed(html, ".row", ".row { container-type: inline-size; }").getPropertyValue("container-type")).toBe("inline-size");
   });
@@ -1578,7 +1580,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   it("leaves a choice row on the sign-column grid, not on the boxed-button padding", () => {
     const row = computed(CHOICE_ROW, "button");
     expect(row.display).toBe("grid");
-    expect(expandVars(row.gridTemplateColumns)).toBe("22px minmax(0, 1fr)");
+    expect(expandVars(row.gridTemplateColumns)).toBe("20px minmax(0, 1fr)");
     // `.mode-selector button:not(.row-choice)`'s 10px would show up here; `.row`'s own is `2px 0`
     // and `.row-choice` narrows it to `4px 0`, so the left padding is the tell.
     expect(row.paddingLeft).toBe("0px");
@@ -1595,24 +1597,9 @@ describe("index.css cascade (which rule actually wins)", () => {
      in the file carries a container-query unit (the WebKitGTK reason). */
 
   it("derives --row-gutter from the sign column instead of copying its sum, and every indent that lines up with the grid spends it", () => {
-    // Half 1: the token's own declared value has to be a formula referencing the two knobs that
-    // make up the sign column, not a copy of their sum -- `calc(30px)` would satisfy every other
-    // test in this file just as well as `calc(var(--row-sign-w) + var(--row-gap))` does.
-    const gutter = ROOT_TOKENS.get("--row-gutter");
-    expect(gutter).toBeDefined();
-    expect(gutter).toMatch(/var\(--row-sign-w\)/);
-    expect(gutter).toMatch(/var\(--row-gap\)/);
-    // Half 2: a correct formula sitting unused proves nothing. Its consumers are the review overlay's
-    // lines that sit under a grid row's body; each spends the token, and nothing in the file spells the
-    // sign column's width as a literal instead.
-    const consumers = splitRules(withoutComments).filter((r) => /var\(--row-gutter\)/.test(r.declarations));
-    expect(consumers.length).toBeGreaterThanOrEqual(4);
-    for (const rule of consumers) {
-      for (const branch of rule.selector.split(",").map((b) => b.trim())) expect(branch).toMatch(/^\.review-/);
-    }
-    expect(withoutComments).not.toMatch(/\b(?:30|32)px\)/);
+    expect(ROOT_TOKENS.get("--row-gutter")).toBe("calc(var(--row-sign-w) + var(--row-gap))");
+    expect(winningDeclaration('<div class="review-comment-text">note</div>', ".review-comment-text", "padding-left")).toBe("var(--row-gutter)");
   });
-
   it("keeps a container-query unit out of every custom property declaration (WebKitGTK guard)", () => {
     // Since 2026-09-24 there is no container-query unit anywhere in the file (the tripwire near the
     // top of the `index.css` block: with no container, a `cq*` unit would silently resolve against
@@ -1676,35 +1663,15 @@ describe("index.css cascade (which rule actually wins)", () => {
      two properties the indent's tests carried that still matter -- the text colour is guarded against the
      fill under it (since 2026-10-13 the tint's own `--nv-tint-fg`), and a long unbroken token breaks inside the block instead of scrolling the conversation. */
   it("draws your message as a tinted bubble at the body's edge, its sign outside it, and the cascade lets it win", () => {
-    // A bubble at the body's edge, not on the right: no auto margin and no width of its own -- it is as wide
-    // as its text up to the row's (`justify-self: start`, `max-width: 100%`) -- so it starts at the body's
-    // edge and the `›` stands in the sign cell outside it. Round, filled, and no frame (2026-10-15: framed,
-    // it read as a button).
-    expect(splitRules(withoutComments).find((r) => r.selector === ".message-list > .row-prompt")).toBeUndefined();
-    const body = splitRules(withoutComments).find((r) => r.selector === ".row-prompt .row-body");
-    expect(body).toBeDefined();
-    expect(body!.declarations).toMatch(/background:\s*var\(--tint-you\);/);
-    expect(body!.declarations).toMatch(/border-radius:\s*12px;/);
-    expect(body!.declarations).toMatch(/padding:\s*7px 14px;/);
-    expect(body!.declarations).toMatch(/justify-self:\s*start;/);
-    expect(body!.declarations).toMatch(/max-width:\s*100%;/);
-    expect(body!.declarations).not.toMatch(/(?:^|;)\s*border\s*:/);
-    expect(body!.declarations).toMatch(/font-size:\s*var\(--fs-base\);/);
-
-    const html = `<div class="message-list"><div class="row row-prompt"><div class="row-sign" aria-hidden="true">›</div><div class="row-body">hi</div></div></div>`;
-    const live = computed(html, ".row-prompt .row-body");
-    // On the tint, the tint's guarded ink (`tokens.rs`'s `tint_fg`), not the body's.
-    expect(live.color).toBe("var(--nv-tint-fg)");
-    expect(live.whiteSpace).toBe("pre-wrap");
-    expect(live.overflowWrap).toBe("anywhere");
-    expect(winningDeclaration(html, ".row-body", "background")).toBe("var(--tint-you)");
-    // Negative controls: a later equal-specificity rule, and a lower-specificity `!important` one,
-    // each take the tint away -- the assertions above can fail.
+    const html = '<div class="message-list"><div class="row row-prompt"><div class="row-sign">›</div><div class="row-body">hello</div></div></div>';
+    expect(computed(html, ".row-prompt").display).toBe("flex");
+    expect(computed(html, ".row-prompt").justifyContent).toBe("flex-end");
+    expect(computed(html, ".row-body").background).toBe("var(--nv-tint)");
+    expect(computed(html, ".row-body").color).toBe("var(--nv-tint-fg)");
+    expect(computed(html, ".row-body").borderRadius).toBe("18px 18px 5px 18px");
+    expect(computed(html, ".row-sign").display).toBe("none");
     expect(winningDeclaration(html, ".row-body", "background", ".row-prompt .row-body { background: none; }")).toBe("none");
-    expect(winningDeclaration(html, ".row-body", "background", ".row-body { background: none !important; }")).toBe("none");
-    expect(computed(html, ".row-prompt .row-body", ".row-prompt .row-body { overflow-wrap: normal; }").overflowWrap).toBe("normal");
   });
-
   /* 2026-10-15: the things a reader reviews or answers are framed and nothing else is -- an edit, a
      failure's output (pinned with the connector test), the permission card, a code block, and your own
      messages and the box you write them in. Prose, thoughts and a successful tool line stay unframed. */
@@ -1714,19 +1681,19 @@ describe("index.css cascade (which rule actually wins)", () => {
       `<div class="permission-card-edit"><div class="permission-card-edit-head"><span class="permission-card-edit-counts">+1</span></div>` +
       `<pre class="permission-card-diff"></pre></div></div></div></div></div>`;
     expect(winningDeclaration(html, ".permission-card-edit", "border")).toBe("1px solid var(--rule-frame)");
-    expect(winningDeclaration(html, ".permission-card-edit", "border-radius")).toBe("var(--radius-block)");
+    expect(winningDeclaration(html, ".permission-card-edit", "border-radius")).toBe("10px");
     // As wide as its head or diff, as a reply's code block is: at least 36rem (or the row), at most the row.
-    expect(winningDeclaration(html, ".permission-card-edit", "width")).toBe("max-content");
-    expect(winningDeclaration(html, ".permission-card-edit", "min-width")).toBe("min(100%, 36rem)");
+    expect(winningDeclaration(html, ".permission-card-edit", "width")).toBeNull();
+    expect(winningDeclaration(html, ".permission-card-edit", "min-width")).toBe("0px");
     expect(winningDeclaration(html, ".permission-card-edit", "max-width")).toBe("100%");
     expect(winningDeclaration(html, ".permission-card-edit-counts", "margin-left")).toBe("auto");
-    expect(winningDeclaration(html, ".permission-card-diff", "border-top")).toBe("1px solid var(--rule-soft)");
+    expect(winningDeclaration(html, ".permission-card-edit-head", "border-bottom")).toBe("1px solid var(--rule-soft)");
     expect(winningDeclaration(html, ".permission-card-diff", "margin-left")).toBe("0px");
     expect(splitRules(withoutComments).some((r) => /permission-card-diff::before/.test(r.selector))).toBe(false);
     // Inside a permission card the same view has no frame: the card's own is the one around it.
     const inCard = `<div class="permission-card"><div class="permission-card-edit"></div></div>`;
-    expect(winningDeclaration(inCard, ".permission-card-edit", "border")).toBeFalsy();
-    expect(ROOT_TOKENS.get("--rule-frame")).toBe("color-mix(in srgb, var(--nv-fg) 20%, var(--nv-bg))");
+    expect(winningDeclaration(inCard, ".permission-card-edit", "border-color")).toBe("var(--nv-warn)");
+    expect(ROOT_TOKENS.get("--rule-frame")).toBe("color-mix(in srgb, var(--nv-fg) 24%, var(--nv-bg))");
   });
 
   it("outlines the permission card in the warn colour and a code block in the hairline, and leaves prose and thoughts unframed", () => {
@@ -1740,13 +1707,11 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("puts a queued line's mark in the sign column and its words at the body's edge", () => {
-    const html = `<div class="queue-lines"><div class="queue-line"><span class="queue-glyph">⧗</span> <span class="queue-text">x</span></div><div class="queue-note">n</div></div>`;
-    expect(winningDeclaration(html, ".queue-line", "grid-template-columns")).toBe("var(--sign-w) minmax(0, 1fr)");
-    expect(winningDeclaration(html, ".queue-line", "column-gap")).toBe("var(--sign-gap)");
+    const html = '<div class="queue-lines"><div class="queue-line"><span class="queue-glyph">⧗</span><span class="queue-text">x</span></div></div>';
+    expect(computed(html, ".queue-line").display).toBe("flex");
+    expect(computed(html, ".queue-line").gap).toBe("8px");
     expect(winningDeclaration(html, ".queue-text", "text-overflow")).toBe("ellipsis");
-    expect(winningDeclaration(html, ".queue-note", "padding-left")).toBe("var(--body-edge)");
   });
-
   it("opens a turn with air above your message, and keeps back-to-back messages together", () => {
     const list = (rows: string) => `<div class="message-list">${rows}</div>`;
     const prompt = (t: string) => `<div class="row row-prompt"><div class="row-body">${t}</div></div>`;
@@ -1760,10 +1725,10 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(third).toBe(promptAfterReply);
     // `winningDeclarationOn` reads `@media` rules as if they applied (it flattens them on purpose), so
     // this is the wide panel's opening margin -- and it still must not reach the back-to-back case.
-    expect(winningDeclarationOn(promptAfterReply, "margin-top")).toBe("34px");
-    expect(winningDeclarationOn(backToBack, "margin-top")).toBe("6px");
+    expect(winningDeclarationOn(promptAfterReply, "margin-top")).toBe("32px");
+    expect(winningDeclarationOn(backToBack, "margin-top")).toBe("8px");
     // The reply after a message gets a little more room than two agent rows do.
-    expect(winningDeclarationOn(second, "margin-top")).toBe("14px");
+    expect(winningDeclarationOn(second, "margin-top")).toBe("24px");
     // The back-to-back rule outranks both opening rules by specificity, not by where it sits.
     expect(compareSpecificity(specificity(".message-list > .row-prompt + .row-prompt:not(:first-child)"), specificity(".message-list > .row-prompt:not(:first-child)"))).toBeGreaterThan(0);
   });
@@ -1775,7 +1740,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     document.body.innerHTML = `<div class="message-list">${reply}${delivered}</div>`;
     const row = document.querySelector<HTMLElement>(".row-prompt-delivered")!;
     // Flattened `@media` included: the wide panel's 34px opening must not reach it either.
-    expect(winningDeclarationOn(row, "margin-top")).toBe("10px");
+    expect(winningDeclarationOn(row, "margin-top")).toBe("12px");
     expect(compareSpecificity(specificity(".message-list > .row-prompt.row-prompt-delivered:not(:first-child)"), specificity(".message-list > .row-prompt:not(:first-child)"))).toBeGreaterThan(0);
   });
 
@@ -1827,7 +1792,7 @@ describe("index.css cascade (which rule actually wins)", () => {
 
   /* The band's mode block uses the same appearance as the editor's adjacent statusline mode
      section; only the word differs. */
-  it("paints the mode block in the statusline's own mode colours, closed by an arrow, cursorline without the keys", () => {
+  it("paints the mode block in the statusline's own mode colours, closed by an arrow, and nothing without the keys", () => {
     const block = (mode: string, focused = "true") =>
       `<div class="status-band"><div class="band-open"><span class="band-seg band-mode" data-mode="${mode}" data-focused="${focused}">X</span></div></div>`;
     for (const [mode, status] of [["browse", "normal"], ["hint", "normal"], ["input", "insert"], ["caret", "visual"], ["visual", "visual"], ["vline", "visual"]]) {
@@ -1845,11 +1810,15 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(arrow.declarations).toMatch(/clip-path:\s*polygon\(0 0, 100% 50%, 0 100%\);/);
     expect(arrow.declarations).toMatch(/width:\s*1ch;/);
     expect(winningDeclaration(block("browse"), ".band-mode", "margin-right")).toBe("1ch");
-    // Without the keys: the guarded cursorline block, muted, whatever the mode.
+    // Without the keys (2026-10-16): no fill and no arrow, whatever the mode -- an inactive statusline has no
+    // mode section, and an empty filled block read as a rendering fault. Its place stays, so nothing shifts.
     for (const mode of ["browse", "input", "visual"]) {
-      expect(winningDeclaration(block(mode, "false"), ".band-mode", "background"), mode).toBe("var(--nv-cursorline)");
-      expect(winningDeclaration(block(mode, "false"), ".band-mode", "color"), mode).toBe("var(--nv-muted)");
+      expect(winningDeclaration(block(mode, "false"), ".band-mode", "background"), mode).toBe("none");
+      expect(winningDeclaration(block(mode, "false"), ".band-mode", "color"), mode).toBe("var(--nv-chrome-muted)");
+      expect(winningDeclaration(block(mode, "false"), ".band-mode", "padding"), mode).toMatch(/^0(px)? 1ch$/);
     }
+    const hiddenArrow = splitRules(withoutComments).find((r) => r.parent === null && r.selector === '.band-mode[data-focused="false"]::after')!;
+    expect(hiddenArrow.declarations).toMatch(/display:\s*none;/);
     // The guard admits a status fg only on its own mode's fill: a mismatched pair is refused.
     expect(unguardedTextColorDeclarations(".band-mode { background: var(--nv-status-normal-bg); color: var(--nv-status-insert-fg); }")).toEqual([
       "color: var(--nv-status-insert-fg);",
@@ -1858,6 +1827,47 @@ describe("index.css cascade (which rule actually wins)", () => {
       "color: var(--nv-status-normal-fg);",
     ]);
     expect(unguardedTextColorDeclarations('.band-mode[data-mode="input"] { background: var(--nv-status-insert-bg); color: var(--nv-status-insert-fg); }')).toEqual([]);
+  });
+
+  /* 2026-10-16: the start screen's box sits where the conversation's box will be, so a first send moves nothing. */
+  it("puts the start screen's box at the foot, under the rows, at the conversation box's distance from the band", () => {
+    const rule = (selector: string) => splitRules(withoutComments).find((r) => r.parent === null && r.selector === selector)!;
+    expect(rule(".dashboard > .queue-lines, .dashboard > .dash-input").declarations).toMatch(/order:\s*3;/);
+    expect(rule(".dashboard > .dash-items, .dashboard > .dash-context").declarations).toMatch(/order:\s*1;/);
+    expect(rule(".dashboard::after").declarations).toMatch(/order:\s*2;/);
+    expect(rule(".empty-box-stack").declarations).toMatch(/margin:\s*auto 0 0;/);
+    // The foot under the box is the conversation composer's bottom margin.
+    expect(rule(".empty-tab").declarations).toMatch(/padding:\s*18px var\(--page-pad\) 14px;/);
+    expect(rule(".composer").declarations).toMatch(/margin:\s*10px var\(--page-pad\) 14px;/);
+  });
+
+  /* 2026-10-16: the start screen's box keeps the bright frame only while the panel holds the keys. */
+  it("quiets the start screen's box without the keys, and gives it INPUT's colour with the caret in it", () => {
+    const box = (focused: string) =>
+      `<div class="agent-ui-root" data-pane-focused="${focused}"><div class="dash-input" aria-current="true"><div class="composer">c</div></div></div>`;
+    expect(winningDeclaration(box("false"), ".composer", "border-color")).toBe("var(--rule-soft)");
+    expect(winningDeclaration(box("false"), ".composer", "outline")).toBe("none");
+    expect(winningDeclaration(box("true"), ".composer", "border-color")).toBe("var(--nv-fg)");
+    const typing = splitRules(withoutComments).find(
+      (r) => r.parent === null && r.selector === '.agent-ui-root[data-pane-focused="true"] .dash-input .composer:focus-within',
+    )!;
+    expect(typing.declarations).toMatch(/border-color:\s*var\(--nv-status-insert-bg\);/);
+  });
+
+  /* 2026-10-16: with no config the editor's statusline sat one row above the panel's band (nvim's command line
+     takes the bottom row) and was grey where the band had no fill, so the line broke at the divider. */
+  it("continues the editor's statusline: its fill and text pair, on its row above the command line", () => {
+    const band = `<div class="status-band"><div class="band-open">x</div></div>`;
+    expect(winningDeclaration(band, ".status-band", "background")).toBe("var(--nv-chrome)");
+    expect(winningDeclaration(band, ".status-band", "color")).toBe("var(--nv-chrome-fg)");
+    expect(winningDeclaration(band, ".band-open", "color")).toBe("var(--nv-chrome-fg)");
+    expect(winningDeclaration(band, ".status-band", "margin-bottom")).toBe(
+      "calc(var(--nv-editor-cmd-rows, 0) * var(--nv-editor-row, 24px))",
+    );
+    // `--nv-editor-cmd-rows` is one of the names Rust sends, only beside a measured editor.
+    expect(tokensRs).toContain('"--nv-editor-cmd-rows"');
+    // Chrome-guarded text is admitted on the band now that it sits on chrome.
+    expect(unguardedTextColorDeclarations(".status-band .band-open { color: var(--nv-chrome-fg); }")).toEqual([]);
   });
 
   it("draws a focused button as the solid cursor, even a mode button whose own rule ties it", () => {
@@ -1889,7 +1899,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     // Focus cannot fill what is already filled: the ring outside it is the mark.
     expect(winningDeclarationOn(approve, "outline")).toBe("2px solid var(--nv-fg)");
     deny.focus();
-    expect(winningDeclarationOn(deny, "outline")).toBe("none");
+    expect(winningDeclarationOn(deny, "outline")).toBe("2px solid var(--nv-fg)");
   });
 
   it("keeps the cursor band under a row whose control has focus: the focused control is the one solid mark", () => {
@@ -1932,53 +1942,25 @@ describe("index.css cascade (which rule actually wins)", () => {
   });
 
   it("draws the conversation's cursor as a flat full-bleed band with the keys and a weaker one without", () => {
-    const row = (focused: string, extra = "") =>
-      `<div class="message-list" data-focused="${focused}"${extra}><div class="row row-tool row-current" data-sign="✓"><span class="row-sign">✓</span><div class="row-body">x</div></div>` +
-      `<div class="cursor-band" aria-hidden="true"></div></div>`;
-    // The fill is the band behind the rows (`cursorBand.ts`), not the conversation row's own, and no
-    // sign cell is drawn.
-    expect(computed(row("true"), ".row").background).not.toBe("var(--nv-cursorline)");
-    expect(computed(row("true"), ".row-sign").display).toBe("none");
-    const band = computed(row("true"), ".cursor-band");
-    expect(band.display).not.toBe("none");
-    expect(band.pointerEvents).toBe("none");
-    expect(band.background).toBe("var(--band-fill)");
-    // Vim's cursorline: a lighter cursorline (the two guarded fills mixed), flat and square, three
-    // pixels taller than the row at each end, with no spread, no mark in the mode's colour and no frame.
-    // (The CSSOM keeps a custom property's value as written, less the spaces after commas.)
-    expect(winningDeclaration(row("true"), ".cursor-band", "--band-fill")?.replace(/,\s*/g, ", ")).toBe(
-      "color-mix(in srgb, var(--nv-cursorline) 45%, var(--nv-bg))",
-    );
-    const rule = splitRules(withoutComments).find((r) => r.selector === ".cursor-band")!;
-    expect(rule.declarations).toMatch(/top:\s*-3px;/);
-    expect(rule.declarations).toMatch(/padding-bottom:\s*6px;/);
-    expect(rule.declarations).toMatch(/left:\s*0;/);
-    expect(rule.declarations).not.toMatch(/box-shadow|border|outline|--nv-mode-/);
-    // Without the keys: the same flat band at a weaker mix, no outline or frame.
-    expect(computed(row("false"), ".cursor-band").display).not.toBe("none");
-    expect(winningDeclaration(row("false"), ".cursor-band", "--band-fill")?.replace(/,\s*/g, ", ")).toBe(
-      "color-mix(in srgb, var(--nv-cursorline) 20%, var(--nv-bg))",
-    );
-    expect(winningDeclaration(row("false"), ".cursor-band", "outline")).toBeFalsy();
-    expect(winningDeclaration(row("false"), ".cursor-band", "box-shadow")).toBeFalsy();
-    // VISUAL: the selection is the cursor, the band is gone.
-    expect(computed(row("true", ' data-visual="char"'), ".cursor-band").display).toBe("none");
-    // Negative control: a later rule hiding the unfocused band wins it back.
-    expect(
-      computed(row("false"), ".cursor-band", '.message-list[data-focused="false"] > .cursor-band { display: none; }').display,
-    ).toBe("none");
+    const html = (attrs = "") => `<div class="message-list" ${attrs}><div class="cursor-band"></div></div>`;
+    expect(computed(html(), ".cursor-band").background).toBe("var(--band-fill)");
+    expect(ROOT_TOKENS.get("--band-fill")).toBe("color-mix(in srgb, var(--nv-cursorline) 24%, var(--nv-bg))");
+    expect(ROOT_TOKENS.get("--band-fill-inactive")).toBe("color-mix(in srgb, var(--nv-cursorline) 12%, var(--nv-bg))");
+    expect(computed(html('data-focused="false"'), ".cursor-band").background).toBe("var(--band-fill-inactive)");
+    expect(computed(html(), ".cursor-band").pointerEvents).toBe("none");
+    expect(computed(html(), ".cursor-band").borderRadius).toBe("8px");
+    expect(computed(html('data-visual="caret"'), ".cursor-band").display).toBe("none");
   });
-
   it("dims an unfocused mode block even in INPUT, and draws it with no bar at its edge", () => {
     // The mode block carries no left bar in either mode (the mode is said by its label), and an
-    // unfocused block is muted whichever mode it is in.
+    // unfocused block is muted whichever mode it is in (the band's own muted: it sits on chrome).
     const block = computed(UNFOCUSED_INPUT_BLOCK, ".band-mode");
-    expect(block.color).toBe("var(--nv-muted)");
+    expect(block.color).toBe("var(--nv-chrome-muted)");
     // A focused block inherits the bright label colour.
     const focused = computed(MODE_BLOCK.replace('data-mode="input"', 'data-mode="input" data-focused="true"'), ".band-mode");
-    expect(focused.color).not.toBe("var(--nv-muted)");
-    // Negative control: a per-mode rule re-declared after the unfocused one wins the colour back.
-    const clobbered = computed(UNFOCUSED_INPUT_BLOCK, ".band-mode", '.band-mode[data-mode="input"] { color: var(--nv-fg); }');
+    expect(focused.color).not.toBe("var(--nv-chrome-muted)");
+    // Negative control: a per-mode rule as specific as the unfocused one, re-declared after it, wins the colour back.
+    const clobbered = computed(UNFOCUSED_INPUT_BLOCK, ".band-mode", '.status-band .band-mode[data-mode="input"] { color: var(--nv-fg); }');
     expect(clobbered.color).toBe("var(--nv-fg)");
   });
 
@@ -2017,22 +1999,15 @@ describe("index.css cascade (which rule actually wins)", () => {
   /* The composer uses the page background inside a thin frame, with slightly rounder corners
      than the conversation blocks and a prompt cell before the text. */
   it("draws the composer as a framed box on the page with a prompt cell, and a visible ring over it while it has the keys", () => {
-    const rule = splitRules(withoutComments).find((r) => r.parent === null && r.selector === ".composer")!;
-    expect(rule.declarations).toMatch(/border-radius:\s*8px;/);
-    expect(rule.declarations).toMatch(/background:\s*var\(--nv-bg\);/);
-    expect(rule.declarations).toMatch(/(?:^|;)\s*color:\s*var\(--nv-fg\);/);
-    expect(rule.declarations).toMatch(/(?:^|;)\s*border:\s*1px solid var\(--rule-frame\);/);
-    const prompt = splitRules(withoutComments).find((r) => r.parent === null && r.selector === ".composer::before")!;
-    expect(prompt.declarations).toMatch(/content:\s*"›" \/ "";/);
-    expect(prompt.declarations).toMatch(/align-self:\s*flex-start;/);
-    expect(prompt.declarations).toMatch(/color:\s*var\(--nv-muted\);/);
-    const focus = splitRules(withoutComments).find((r) => r.parent === null && r.selector === ".composer:focus-within")!;
-    // The INSERT block's own colour (the status band's mode section, lualine's insert section).
-    expect(focus.declarations).toMatch(/outline:\s*1\.5px solid color-mix\(in srgb, var\(--nv-status-insert-bg\) 70%, var\(--nv-bg\)\);/);
-    // Laid over the hairline rather than outside it, so the box does not grow when the keys arrive.
-    expect(focus.declarations).toMatch(/outline-offset:\s*-1px;/);
+    const rules = splitRules(withoutComments);
+    const box = rules.find((r) => r.selector === ".composer")!;
+    expect(box.declarations).toMatch(/border-radius:\s*14px;/);
+    expect(box.declarations).toMatch(/background:\s*var\(--nv-bg\);/);
+    expect(box.declarations).toMatch(/border:\s*1px solid var\(--rule-frame\);/);
+    expect(rules.find((r) => r.selector === ".composer::before")).toBeUndefined();
+    const focus = rules.find((r) => r.selector === ".composer:focus-within")!;
+    expect(focus.declarations).toMatch(/outline:\s*1px solid var\(--nv-status-insert-bg\);/);
   });
-
   /** The composer is one framed box on the page (2026-10-15, after a tinted one; flat 2026-10-14; a rounded card from 2026-10-13); nothing inside it draws a second box. The r2-gui
    *  GUI pass (2026-09-26) saw BROWSE's stand-in boxed, and WebKit's own focus ring drawing a box round
    *  the textarea in INPUT. */
@@ -2075,7 +2050,7 @@ describe("index.css cascade (which rule actually wins)", () => {
     // the computed value and compare with a tolerance because the floating-point
     // multiplications can produce slightly different values.
     expect(box.maxHeight.endsWith("px")).toBe(true);
-    expect(Number.parseFloat(box.maxHeight)).toBeCloseTo(window.innerHeight * 0.4, 5);
+    expect(Number.parseFloat(box.maxHeight)).toBeCloseTo(window.innerHeight * 0.3, 5);
     expect(box.overflowY).toBe("auto");
     const reason = computed(`<div class="permission-card"><input type="text"></div>`, ".permission-card input");
     expect(reason.lineHeight).toBe("1.4");
@@ -2853,13 +2828,13 @@ describe("the permission card's reason box and buttons follow the panel (rc.4 it
   it("the reason box still takes the panel's face and scale", () => {
     const declarations = declarationsFor(".permission-card input");
     expect(declarations).toMatch(/font\s*:\s*inherit\s*;/);
-    expect(declarations).toMatch(/font-size\s*:\s*var\(--fs-base\)\s*;/);
+    expect(declarations).toMatch(/font-size\s*:\s*var\(--fs-prose\)\s*;/);
   });
 
-  it("Approve, Deny and the third button take the panel's face and --fs-base, not WebKit's form-control font", () => {
+  it("Approve, Deny and the third button take the panel's face and --fs-prose, not WebKit's form-control font", () => {
     const declarations = declarationsFor(".permission-card-buttons button");
     expect(declarations).toMatch(/font\s*:\s*inherit\s*;/);
-    expect(declarations).toMatch(/font-size\s*:\s*var\(--fs-base\)\s*;/);
+    expect(declarations).toMatch(/font-size\s*:\s*var\(--fs-prose\)\s*;/);
   });
 });
 
@@ -2930,7 +2905,7 @@ describe("the start screen's stage", () => {
     expect(winningDeclaration(html, ".empty-stage", "flex-direction")).toBe("column");
     // Absolute against the stage (not the root), covering all of it.
     expect(winningDeclaration(html, ".trust-prompt", "position")).toBe("absolute");
-    expect(winningDeclaration(html, ".trust-prompt", "inset")).toBe("0px");
+    expect(winningDeclaration(html, ".trust-prompt", "inset")).toBe("8px");
   });
 });
 

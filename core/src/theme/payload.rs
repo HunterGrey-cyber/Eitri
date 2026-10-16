@@ -26,6 +26,10 @@ pub struct NvimOptions {
     pub guifont: String,
     /// `g:colors_name`, or empty. Only ever logged.
     pub colors_name: String,
+    /// nvim's `'cmdheight'`: the rows under the statusline. Absent from a snippet older than this
+    /// field, which reads as unknown rather than as any one number.
+    #[serde(default)]
+    pub cmdheight: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -46,6 +50,7 @@ impl NvimThemePayload {
                 background: "dark".to_string(),
                 guifont: String::new(),
                 colors_name: String::new(),
+                cmdheight: None,
             },
         }
     }
@@ -90,6 +95,16 @@ mod tests {
                 reverse: true
             }
         );
+    }
+
+    #[test]
+    fn reads_cmdheight_and_tolerates_a_snippet_without_it() {
+        assert_eq!(parse_payload(DAWN).expect("valid").options.cmdheight, None);
+        let with = DAWN.replace(
+            r#""colors_name":"rose-pine""#,
+            r#""colors_name":"rose-pine","cmdheight":0"#,
+        );
+        assert_eq!(parse_payload(&with).expect("valid").options.cmdheight, Some(0));
     }
 
     #[test]

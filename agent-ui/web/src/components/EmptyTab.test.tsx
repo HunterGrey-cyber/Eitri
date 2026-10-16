@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { RenderResult } from "@testing-library/react";
-import { EmptyTab } from "./EmptyTab";
+import { EmptyTab, screenOrder } from "./EmptyTab";
 import type { EmptyTabProps } from "./EmptyTab";
 import type { Hello, ResumableSession, TabInfo } from "../types";
 import { TABLE } from "../testFixtures";
@@ -91,6 +91,14 @@ describe("EmptyTab: the box is the dashboard's New session row", () => {
     expect(after.value).toBe("half a thought");
     // Off the dashboard it is the plain box again: no key at its end.
     expect(rendered.container.querySelector(".empty-box .composer")).not.toBeNull();
+  });
+
+  /* 2026-10-16: without the keys the empty box was the brightest thing in the window and said nothing. */
+  it("names the key that brings the keys here while the panel lacks them, and nothing once it has them", () => {
+    const away = renderEmpty({ paneFocused: false });
+    expect(away.container.querySelector("textarea")!.getAttribute("placeholder")).toBe("Ctrl+l to start typing");
+    away.rerender(<EmptyTab {...away.props} paneFocused />);
+    expect(away.container.querySelector("textarea")!.hasAttribute("placeholder")).toBe(false);
   });
 });
 
@@ -231,30 +239,41 @@ describe("EmptyTab (F3)", () => {
       expect(items[0].getAttribute("aria-current")).toBe("true");
     });
 
-    it("j/k move the cursor, clamped at both ends", () => {
+    it("walks the rows top to bottom and then the box (screenOrder)", () => {
+      expect(screenOrder(4)).toEqual([1, 2, 3, 0]);
+      expect(screenOrder(1)).toEqual([0]);
+    });
+
+    it("j/k move the cursor in the screen's order, clamped at both ends", () => {
       const rendered = renderEmpty();
       const { props } = rendered;
       const root = toBrowse(rendered, props);
       const current = () => root.querySelector<HTMLElement>('[aria-current="true"]');
+      // In document order: the box first, then the rows (HELLO has records: new/resume/sessions/keys). On
+      // screen the box is at the foot, under the rows (2026-10-16), and j/k follow the screen.
       const items = () => Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
       expect(items().indexOf(current()!)).toBe(0);
+      // Clamped, not wrapped: j on the box, the bottom, stays put.
       fireEvent.keyDown(root, { key: "j" });
-      expect(items().indexOf(current()!)).toBe(1);
-      fireEvent.keyDown(root, { key: "k" });
       expect(items().indexOf(current()!)).toBe(0);
-      // Clamped, not wrapped: holding k at the top stays put.
       fireEvent.keyDown(root, { key: "k" });
-      expect(items().indexOf(current()!)).toBe(0);
-      // HELLO above has records, so the table is new/resume/sessions/keys -- 4 items, last index 3.
-      for (let i = 0; i < 10; i++) fireEvent.keyDown(root, { key: "j" });
       expect(items().indexOf(current()!)).toBe(3);
+      fireEvent.keyDown(root, { key: "k" });
+      expect(items().indexOf(current()!)).toBe(2);
+      fireEvent.keyDown(root, { key: "j" });
+      expect(items().indexOf(current()!)).toBe(3);
+      fireEvent.keyDown(root, { key: "j" });
+      expect(items().indexOf(current()!)).toBe(0);
+      // Holding k reaches the top row and stays there.
+      for (let i = 0; i < 10; i++) fireEvent.keyDown(root, { key: "k" });
+      expect(items().indexOf(current()!)).toBe(1);
     });
 
     it("Enter runs the item under the cursor", () => {
       const rendered = renderEmpty();
       const { props } = rendered;
       const root = toBrowse(rendered, props);
-      fireEvent.keyDown(root, { key: "j" }); // -> resume
+      for (let i = 0; i < 3; i++) fireEvent.keyDown(root, { key: "k" }); // box -> keys -> sessions -> resume
       fireEvent.keyDown(root, { key: "Enter" });
       expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
     });
@@ -390,7 +409,7 @@ describe("EmptyTab (F3)", () => {
         const rendered = renderEmpty({ hello: OFFERED, onRestoreLast });
         const root = toBrowse(rendered, rendered.props);
         keyGap();
-        fireEvent.keyDown(root, { key: "j" }); // new -> restore
+        for (let i = 0; i < 10; i++) fireEvent.keyDown(root, { key: "k" }); // up to the top row: restore
         keyGap();
         fireEvent.keyDown(root, { key: "Enter" });
         expect(onRestoreLast).toHaveBeenCalledTimes(1);
@@ -467,7 +486,7 @@ describe("EmptyTab (F3)", () => {
       const root = toBrowse(rendered, props);
       const keys = Array.from(root.querySelectorAll<HTMLElement>(".dash-key, .composer-key")).map((el) => el.textContent);
       expect(keys).not.toContain("⇧Tab");
-      for (let i = 0; i < 3; i++) fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "k" }); // the box -> the last row above it
       fireEvent.keyDown(root, { key: "Enter" });
       expect(onOpenKeymap).toHaveBeenCalledTimes(1);
       expect(props.onCycleMode).not.toHaveBeenCalled();
@@ -1144,16 +1163,16 @@ describe("EmptyTab (F3)", () => {
       const rendered = renderEmpty();
       const root = toBrowse(rendered, rendered.props);
       const current = () => rendered.container.querySelector('.dash-item[aria-current="true"]')!.textContent;
-      fireEvent.keyDown(root, { key: "j" });
-      expect(current()).toContain("Resume last");
-      fireEvent.keyDown(root, { key: "ArrowDown" });
-      expect(current()).toContain("All sessions");
+      fireEvent.keyDown(root, { key: "k" });
+      expect(current()).toContain("Keys");
       fireEvent.keyDown(root, { key: "ArrowUp" });
-      expect(current()).toContain("Resume last");
+      expect(current()).toContain("All sessions");
+      fireEvent.keyDown(root, { key: "ArrowDown" });
+      expect(current()).toContain("Keys");
       const l = new KeyboardEvent("keydown", { key: "l", bubbles: true, cancelable: true });
       root.dispatchEvent(l);
       expect(l.defaultPrevented).toBe(true);
-      expect(current()).toContain("Resume last");
+      expect(current()).toContain("Keys");
     });
   });
 });
@@ -1173,10 +1192,10 @@ describe("the dashboard's bare m is removed", () => {
     const root = toBrowse(rendered, props);
     const current = () => root.querySelector<HTMLElement>('[aria-current="true"]');
     const items = () => Array.from(root.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
-    // Start away from the top so `k` (cursor up) has something to do, and is not itself clamped
-    // into looking like a no-op the way it would be at index 0.
-    fireEvent.keyDown(root, { key: "j" });
-    fireEvent.keyDown(root, { key: "j" });
+    // Start away from the top row so `k` (cursor up) has something to do, and is not itself clamped
+    // into looking like a no-op. From the box at the foot: keys, then sessions.
+    fireEvent.keyDown(root, { key: "k" });
+    fireEvent.keyDown(root, { key: "k" });
     expect(items().indexOf(current()!)).toBe(2);
     for (const key of ["m", "a", "k", "e"]) fireEvent.keyDown(root, { key });
     // m, a and e are unbound letters and do nothing; only k -- the cursor-up key -- moved anything.
@@ -1460,7 +1479,7 @@ describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
     }
   });
 
-  it("y on a dashboard with no handoff: j within the window moves nothing, and does after it", () => {
+  it("y on a dashboard with no handoff: k within the window moves nothing, and does after it", () => {
     vi.useFakeTimers();
     try {
       const { container, root } = inBrowse();
@@ -1468,10 +1487,10 @@ describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
       const before = cursor();
       fireEvent.keyDown(root, { key: "y" });
       at(60);
-      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "k" });
       expect(cursor()).toBe(before);
       at(TYPING_GUARD_MS + 50);
-      fireEvent.keyDown(root, { key: "j" });
+      fireEvent.keyDown(root, { key: "k" });
       expect(cursor()).not.toBe(before);
     } finally {
       vi.useRealTimers();

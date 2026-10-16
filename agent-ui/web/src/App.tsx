@@ -4036,6 +4036,8 @@ export default function App() {
         className="agent-ui-root"
         ref={startScreenRef}
         tabIndex={-1}
+        // Whether the panel holds the keys, for the stylesheet: the start screen's box is quiet without them.
+        data-pane-focused={paneFocused ? "true" : "false"}
         // `.empty-tab` is centred, so a click above or below it lands here; taking focus would put the
         // keys on an element that handles none (the phase-3 GUI pass, 2026-09-25). Its own background
         // only -- a press on anything inside is the browser's.
@@ -5805,6 +5807,7 @@ export default function App() {
       ref={containerRef}
       // Lets the stylesheet show key hints only where those keys would act (BROWSE, not INPUT).
       data-panel-mode={mode}
+      data-pane-focused={paneFocused ? "true" : "false"}
       // Real, focusable, so BROWSE's keydown handler has a DOM node to bubble from -- see the
       // effect above `onKeyDown` that keeps focus here whenever `mode` is "browse".
       tabIndex={0}

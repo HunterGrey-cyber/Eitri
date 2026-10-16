@@ -49,6 +49,9 @@ local function snapshot()
       background = vim.o.background,
       guifont = vim.o.guifont,
       colors_name = vim.g.colors_name or "",
+      -- How many rows the command line takes under the editor's statusline: the panel's own status
+      -- band sits that many rows above the window's bottom so the two lines are one row.
+      cmdheight = vim.o.cmdheight,
     },
   })
 end
@@ -96,7 +99,7 @@ end
 
 local augroup = vim.api.nvim_create_augroup("EitriThemeFeed", { clear = true })
 vim.api.nvim_create_autocmd({ "VimEnter", "ColorScheme" }, { group = augroup, callback = send_now })
-vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont" }, callback = send_now })
+vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "background", "guifont", "cmdheight" }, callback = send_now })
 
 -- nvim has no "a highlight group changed" event at all, so a bare
 -- `nvim_set_hl` call -- or an autocmd registered AFTER this file's own, which therefore fires
