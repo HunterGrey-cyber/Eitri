@@ -29,6 +29,16 @@
 //! still bring the delivery, and it is passed on with the typed text under the same id, so the host
 //! can take back the message it held again instead of sending it a second time.
 //!
+//! **The wait counts only while the stream is up.** A broken watch stream is re-opened from the last
+//! sequence seen, and the sidecar replays what was missed, the follow-up's `TurnStarted` and the
+//! delivery included. Giving up while it is down would release the turn's end on a guess: the host
+//! would see no turn running and send the message as a turn of its own, and if the follow-up had
+//! already finished by then, the sidecar would take that turn and the replayed delivery would come too
+//! late to stop it, so the words would run twice. So the stream breaking stops the wait
+//! ([`SteerGate::stream_lost`]), and its re-opening starts a whole new one
+//! ([`SteerGate::stream_back`]), which the replay that follows has to beat. A stream that cannot be
+//! re-opened ends the session, and that ends the hold.
+//!
 //! Pure state, no I/O and no clock: the caller (`EventQueue` in `mod.rs`) owns the lock, the timer and
 //! the sending, so every rule here is tested without a sidecar or a runtime. `R` is the request the
 //! caller sends; it is only kept and handed back.
@@ -38,11 +48,11 @@ use crate::AgentDomainEvent;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// How long a turn's end waits for the follow-up turn the sidecar opens for a message still to run.
-/// The sidecar sends the follow-up's `TurnStarted` right after the `TurnCompleted`, in the same
-/// write, so this only bounds a broken peer; it is longer than the whole watch-stream reconnect
-/// backoff (under a second), so a stream that breaks between the two and reconnects promptly still
-/// delivers the `TurnStarted` in time.
+/// How long a turn's end waits for the follow-up turn the sidecar opens for a message still to run,
+/// counted only while the watch stream is up: a break stops it, and the re-opened stream gets the
+/// whole wait again for its replay. The sidecar sends the follow-up's `TurnStarted` right after the
+/// `TurnCompleted`, in the same write, so this only bounds a peer that stopped talking on a live
+/// stream.
 pub(crate) const FOLLOW_UP_WAIT: Duration = Duration::from_secs(5);
 
 /// The most messages that may be open at once; a further one is held by the host for the turn's end.
@@ -102,6 +112,8 @@ pub(crate) struct SteerGate<R> {
     /// out or the stream ended, with their typed text, newest last, at most [`MAX_OPEN_STEERS`]: a
     /// delivery that still comes for one is passed on.
     given_up: VecDeque<(String, String)>,
+    /// The watch stream broke and has not been re-opened: no hold may give up meanwhile.
+    stream_down: bool,
 }
 
 impl<R> Default for SteerGate<R> {
@@ -112,6 +124,7 @@ impl<R> Default for SteerGate<R> {
             holding: None,
             generations: 0,
             given_up: VecDeque::new(),
+            stream_down: false,
         }
     }
 }
@@ -252,7 +265,7 @@ impl<R> SteerGate<R> {
     /// The wait armed for `generation` ran out. If that hold is still in force, every open message is
     /// dropped and the held events go, in that order.
     pub(crate) fn expire(&mut self, generation: u64) -> Vec<AgentDomainEvent> {
-        if self.holding != Some(generation) {
+        if self.holding != Some(generation) || self.stream_down {
             return Vec::new();
         }
         eprintln!(
@@ -261,6 +274,27 @@ impl<R> SteerGate<R> {
             FOLLOW_UP_WAIT
         );
         self.give_up_then_release(UNREPORTED)
+    }
+
+    /// The watch stream broke. The wait armed for a hold in force no longer counts: what it waits for
+    /// may be in the replay, and that comes only once the stream is open again.
+    pub(crate) fn stream_lost(&mut self) {
+        self.stream_down = true;
+        if self.holding.is_some() {
+            self.generations += 1;
+            self.holding = Some(self.generations);
+        }
+    }
+
+    /// The watch stream is open again and its replay follows. `Some(generation)` when a hold is in
+    /// force: the caller arms a whole new wait for it.
+    pub(crate) fn stream_back(&mut self) -> Option<u64> {
+        self.stream_down = false;
+        if self.holding.is_some() {
+            self.generations += 1;
+            self.holding = Some(self.generations);
+        }
+        self.holding
     }
 
     /// Events held back, for the queue depth a caller reports.
@@ -490,6 +524,43 @@ mod tests {
         );
         // Once.
         assert!(gate.pass(delivered("m1", "t2")).ready.is_empty());
+    }
+
+    /// The stream broke between the turn's end and the follow-up's start, and re-opening it took longer
+    /// than the wait. Giving up meanwhile would have released the end with the message reported
+    /// dropped, and the host would have sent it as a turn of its own while the replay still carried its
+    /// delivery. The wait stops while the stream is down and starts again when it is back, and the
+    /// replay releases the end with the follow-up.
+    #[test]
+    fn the_wait_does_not_run_out_while_the_stream_is_down() {
+        let mut gate = one_sent();
+        let armed = gate.pass(completed("t1")).hold_started.unwrap();
+        gate.stream_lost();
+        assert!(gate.expire(armed).is_empty(), "the stream is down: nothing is given up");
+        assert_eq!(gate.held_len(), 1);
+        let rearmed = gate.stream_back().expect("the hold is still in force");
+        assert_ne!(rearmed, armed);
+        assert!(gate.expire(armed).is_empty(), "the wait armed before the break is void");
+        // The replay brings the follow-up and the delivery.
+        assert_eq!(gate.pass(started("t2")).ready, [completed("t1"), started("t2")]);
+        assert_eq!(
+            gate.pass(delivered("m1", "t2")).ready,
+            [delivered_as("m1", "t2", "typed one")]
+        );
+        assert!(gate.expire(rearmed).is_empty(), "nothing is held any more");
+    }
+
+    /// Once the stream is back, a follow-up that still does not come is given up on as before.
+    #[test]
+    fn the_wait_armed_when_the_stream_is_back_still_runs_out() {
+        let mut gate = one_sent();
+        gate.pass(completed("t1"));
+        gate.stream_lost();
+        let rearmed = gate.stream_back().expect("the hold is still in force");
+        assert_eq!(gate.expire(rearmed), [drop_of("m1", UNREPORTED), completed("t1")]);
+        // A break with no hold in force arms nothing.
+        gate.stream_lost();
+        assert_eq!(gate.stream_back(), None);
     }
 
     #[test]

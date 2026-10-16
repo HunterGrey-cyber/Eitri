@@ -441,7 +441,12 @@ impl ClaudeSidecarProvider {
                     client.watch_session_events(request).await
                 };
                 let mut stream = match opened {
-                    Ok(response) => response.into_inner(),
+                    Ok(response) => {
+                        // Whatever a held turn end waits for comes in the replay that follows, so its
+                        // wait starts over from here.
+                        events.stream_back();
+                        response.into_inner()
+                    }
                     Err(status) => {
                         let detail = match watch::classify_open_failure(&map_status(status)) {
                             watch::OpenFailure::Fatal(detail) => {
@@ -516,6 +521,9 @@ impl ClaudeSidecarProvider {
                 if closed_by_session {
                     return;
                 }
+                // Until the stream is open again, a held turn end must not give up on its follow-up:
+                // the replay may carry it.
+                events.stream_lost();
                 if delivered_since_open {
                     consecutive_failures = 0;
                 }
@@ -1100,13 +1108,33 @@ impl EventQueue {
             passed.hold_started
         };
         if let Some(generation) = hold_started {
-            let queue = Arc::clone(self);
-            let wait = self.follow_up_wait;
-            tokio::spawn(async move {
-                tokio::time::sleep(wait).await;
-                queue.expire_hold(generation);
-            });
+            self.arm_hold(generation);
         }
+    }
+
+    /// The watch stream broke. A hold in force stops counting its wait: what it waits for may be in the
+    /// replay, which comes only once the stream is open again.
+    fn stream_lost(&self) {
+        self.lock().gate.stream_lost();
+    }
+
+    /// The watch stream is open again. A hold still in force gets a whole new wait, which the replay
+    /// that follows has to beat. Runs on the provider's runtime, like `push`.
+    fn stream_back(self: &Arc<Self>) {
+        let generation = self.lock().gate.stream_back();
+        if let Some(generation) = generation {
+            self.arm_hold(generation);
+        }
+    }
+
+    /// A timer task on the provider's runtime, which sleeps rather than blocks.
+    fn arm_hold(self: &Arc<Self>, generation: u64) {
+        let queue = Arc::clone(self);
+        let wait = self.follow_up_wait;
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            queue.expire_hold(generation);
+        });
     }
 
     fn expire_hold(&self, generation: u64) {
@@ -1962,6 +1990,90 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
         assert_ne!(queue.signal.seen(), seen);
+        assert_eq!(
+            queue.take(),
+            [
+                AgentDomainEvent::UserMessageDropped {
+                    client_message_id: "m1".into(),
+                    reason: steer::UNREPORTED.into(),
+                },
+                turn_completed("t1"),
+            ]
+        );
+    }
+
+    /// The watch stream broke after a turn's end was held, and re-opening it took longer than the wait.
+    /// Had the wait run out meanwhile, the host would have seen the message dropped and no turn
+    /// running, and sent the message as a turn of its own; with the follow-up already over on the
+    /// sidecar that turn is taken, and the replayed delivery finds nothing left to take back, so the
+    /// words run twice. Nothing is released while the stream is down, and the replay after the
+    /// re-opening releases the end with the follow-up and the delivery.
+    #[test]
+    fn the_queue_does_not_give_up_on_a_follow_up_while_the_stream_reconnects() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
+        queue
+            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("m1");
+        let started = AgentDomainEvent::TurnStarted { turn_id: "t2".into() };
+        runtime.block_on(async {
+            queue.push(turn_completed("t1"));
+            queue.stream_lost();
+            // A reconnect slower than the wait.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        assert!(
+            queue.take().is_empty(),
+            "nothing given up while the stream is down, so the host has nothing to send again"
+        );
+        runtime.block_on(async {
+            queue.stream_back();
+            queue.push(started.clone());
+            queue.push(AgentDomainEvent::UserMessageDelivered {
+                client_message_id: "m1".into(),
+                turn_id: "t2".into(),
+                text: String::new(),
+            });
+            // The wait armed on re-opening finds nothing held.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        assert_eq!(
+            queue.take(),
+            [
+                turn_completed("t1"),
+                started,
+                AgentDomainEvent::UserMessageDelivered {
+                    client_message_id: "m1".into(),
+                    turn_id: "t2".into(),
+                    text: "typed".into(),
+                },
+            ]
+        );
+    }
+
+    /// Re-opened, a stream whose replay brings no follow-up is given up on after a whole new wait.
+    #[test]
+    fn the_queue_gives_up_after_a_new_wait_once_the_stream_is_back() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let queue = Arc::new(EventQueue::with_follow_up_wait(Duration::from_millis(20)));
+        queue
+            .open_steer("m1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("m1");
+        runtime.block_on(async {
+            queue.push(turn_completed("t1"));
+            queue.stream_lost();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            queue.stream_back();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
         assert_eq!(
             queue.take(),
             [

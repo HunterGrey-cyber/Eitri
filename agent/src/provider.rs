@@ -351,9 +351,11 @@ pub trait AgentProvider {
     ///
     /// **Giving up is not knowing.** A provider that stops waiting -- a follow-up that does not come in
     /// time, a session or stream that ends -- reports the message dropped although the agent may have
-    /// it. If the agent is later seen to read it, `UserMessageDelivered` still comes under the same id:
+    /// it; one whose event stream is being re-opened with a replay does not give up meanwhile, since the
+    /// outcome may be in that replay. If the agent is later seen to read it, `UserMessageDelivered` still comes under the same id:
     /// the one case of two outcomes for one message, and the later one wins. The host takes such a
-    /// message back from its queue rather than send it again (`Queued::dropped_as` in the tab set). A
+    /// message back from its queue rather than send it again (`Queued::dropped_as` in the tab set), and
+    /// never puts a message dropped once into a turn again, so a late delivery has one copy to settle. A
     /// session that has ended reports nothing more, so a message dropped with it may have reached the
     /// agent unseen.
     ///

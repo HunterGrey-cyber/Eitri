@@ -124,7 +124,7 @@ pub struct Queued {
     /// The ids it was sent into a turn under and reported dropped from, oldest first. A provider that
     /// gave up waiting on a message reports it dropped, and may still see the agent read it later: a
     /// delivery under one of these ids means the message reached the agent, so it leaves the queue
-    /// instead of being sent again.
+    /// instead of being sent again. Such a message is not put into a turn again; it waits for the turn's end.
     pub dropped_as: Vec<String>,
 }
 
@@ -682,20 +682,32 @@ fn settle_against(
     let mut changed = false;
     let mut dropped = None;
     queue.retain_mut(|item| {
-        // Reported dropped once, and read by the agent after all.
+        // Reported dropped under an earlier id, and read by the agent after all.
         let read_late = item
             .dropped_as
             .iter()
             .any(|id| matches!(projection.steer_outcome(id), Some(agent::SteerOutcome::Delivered)));
-        if read_late {
-            changed = true;
-            return false;
-        }
         let QueuedState::Steered { client_id, .. } = &item.state else {
+            if read_late {
+                changed = true;
+                return false;
+            }
             return true;
         };
         match projection.steer_outcome(client_id) {
             Some(agent::SteerOutcome::Delivered) => {
+                changed = true;
+                false
+            }
+            // The agent already read an earlier copy, so this one's drop leaves nothing to send again.
+            Some(agent::SteerOutcome::Dropped { .. }) if read_late => {
+                changed = true;
+                false
+            }
+            // Read under an earlier id while the newest is still open: it stays in the queue, shown as
+            // sent, until that id's outcome comes. Once no turn runs nothing more will come for it, and
+            // the copy the agent read is enough.
+            None if read_late && projection.active_turn_id.is_none() => {
                 changed = true;
                 false
             }
@@ -2819,7 +2831,8 @@ impl TabSet {
     /// later message never reaches the agent before an earlier one (the provider keeps that order for the
     /// refusals it learns of later), and the held ones wait for the turn's end with the reason under them.
     /// A message that may not be steered (a confirmed review, or a slash command on an agent that reads
-    /// commands: `reads_slash_commands`) stops them too, for the same order. A card
+    /// commands: `reads_slash_commands`) stops them too, for the same order, and so does a message the
+    /// provider reported dropped once (`Queued::dropped_as`): the agent may still read that copy. A card
     /// waiting does not stop it: the agent reads the message once that call is answered, sooner than the
     /// turn's end, and the card keeps its own keys. Whether the queue changed.
     pub fn steer_held(&mut self, id: TabId, now_ms: u64, shown_turn: Option<&str>) -> bool {
@@ -2836,6 +2849,16 @@ impl TabSet {
         let reads_commands = reads_slash_commands(&tab.agent, &backend.projection());
         let mut refusal = None;
         for item in tab.queue.iter_mut().filter(|q| q.is_held()) {
+            // A provider that stopped waiting on a message reports it dropped although the agent may
+            // still read it, and sent again under a new id it could run twice. It waits for the turn's
+            // end instead, where a late delivery under its old id takes it out of the queue.
+            if !item.dropped_as.is_empty() {
+                refusal = Some(
+                    "it went into the turn once already, so it waits for the turn's end, and what follows it waits too"
+                        .to_string(),
+                );
+                break;
+            }
             if !item.steerable {
                 refusal = Some("a review waits for the turn's end, and what follows it waits too".to_string());
                 break;
@@ -12381,6 +12404,131 @@ mod steer_tests {
         // the delivery is the row where the agent read it.
         assert_eq!(prompts(&set, tab), ["and the tests", "and the tests"]);
         shut_down(&mut set);
+    }
+
+    /// The provider gave up on a message and reported it dropped, and the agent's follow-up turn started
+    /// before the host could flush, so the message is held again while a turn runs. Enter does not put it
+    /// into that turn under a new id, since the agent may still read the first copy and would then read
+    /// it twice: it waits for the turn's end with what was typed after it, and the late delivery under its
+    /// old id takes it out of the queue.
+    #[test]
+    fn a_message_reported_dropped_is_not_put_into_the_turn_again() {
+        const WAITS: &str = "held until the turn ends: it went into the turn once already, so it waits for the \
+             turn's end, and what follows it waits too";
+        let (dir, mut set, tab, provider) = running_codex("steer-given-up-enter", true);
+        enter(&mut set, tab, "and the tests");
+        let id = provider.steers()[0].client_message_id.clone();
+        provider.inner.queue_all(vec![
+            AgentDomainEvent::UserMessageDropped {
+                client_message_id: id.clone(),
+                reason: "Claude did not say whether it read it".into(),
+            },
+            turn_completed("turn-1", agent::TurnOutcome::Completed),
+            AgentDomainEvent::TurnStarted {
+                turn_id: "turn-2".into(),
+            },
+        ]);
+        until("the follow-up turn is folded", || {
+            set.pump(&dir, true);
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .active_turn_id
+                .as_deref()
+                == Some("turn-2")
+        });
+        assert_eq!(queue(&set, tab), [("and the tests".to_string(), false)], "held again");
+        assert!(set.flush_queue(tab).is_none(), "the follow-up runs");
+
+        set.queue_message(tab, "and the docs", "ctx\n\nand the docs".into(), 3, true)
+            .unwrap();
+        set.steer_held(tab, 4, Some("turn-2"));
+        assert_eq!(provider.steers().len(), 1, "nothing more went into a turn");
+        assert_eq!(
+            queue(&set, tab),
+            [
+                ("and the tests".to_string(), false),
+                ("and the docs".to_string(), false)
+            ]
+        );
+        assert_eq!(note(&set, tab).as_deref(), Some(WAITS));
+
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id,
+            turn_id: "turn-2".into(),
+            text: "and the tests".into(),
+        });
+        until("the late delivery takes the message out of the queue", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().queue.len() == 1
+        });
+        assert_eq!(queue(&set, tab), [("and the docs".to_string(), false)]);
+        provider
+            .inner
+            .queue(turn_completed("turn-2", agent::TurnOutcome::Completed));
+        let out = pump_until_running(&mut set, &dir, tab, false);
+        assert_eq!(out.turn_ended, [tab]);
+        let flush = set.flush_queue(tab).expect("what was typed after it goes out");
+        assert!(flush.outcome.is_ok());
+        assert_eq!(
+            provider.inner.turns(),
+            ["ctx\n\nand the docs"],
+            "the agent read the first message once, and it was never sent again"
+        );
+        assert_eq!(provider.steers().len(), 1);
+        shut_down(&mut set);
+    }
+
+    /// A message read under an id it was reported dropped from, while a newer copy is still with the
+    /// agent, stays in the queue until the newer copy's outcome comes, or until no turn runs; then it
+    /// leaves without being sent again, whatever became of the newer copy.
+    #[test]
+    fn a_late_delivery_of_an_old_copy_waits_for_the_newer_copy() {
+        let steered = Queued {
+            state: QueuedState::Steered {
+                client_id: "new".into(),
+                sent_at_ms: 2,
+            },
+            dropped_as: vec!["old".into()],
+            ..Queued::held("x", "x".into(), 1)
+        };
+        let delivered = |id: &str| AgentDomainEvent::UserMessageDelivered {
+            client_message_id: id.into(),
+            turn_id: "turn-2".into(),
+            text: "x".into(),
+        };
+        let mut projection = agent::AgentSessionProjection::default();
+        projection.apply(&AgentDomainEvent::TurnStarted {
+            turn_id: "turn-2".into(),
+        });
+        projection.apply(&delivered("old"));
+        let mut queue = vec![steered.clone()];
+        let mut note = None;
+        assert!(!settle_against(&mut queue, &mut note, &projection));
+        assert_eq!(queue, [steered.clone()], "the newer copy is still open");
+
+        let mut dropped = projection.clone();
+        dropped.apply(&AgentDomainEvent::UserMessageDropped {
+            client_message_id: "new".into(),
+            reason: "Claude discarded it".into(),
+        });
+        assert!(settle_against(&mut queue, &mut note, &dropped));
+        assert!(queue.is_empty(), "the copy the agent read is enough");
+        assert_eq!(note, None, "not held again");
+
+        let mut ended = projection.clone();
+        ended.apply(&turn_completed("turn-2", agent::TurnOutcome::Completed));
+        let mut queue = vec![steered.clone()];
+        assert!(settle_against(&mut queue, &mut note, &ended));
+        assert!(queue.is_empty(), "no turn runs, and the agent read it");
+
+        let mut read_twice = projection;
+        read_twice.apply(&delivered("new"));
+        let mut queue = vec![steered];
+        assert!(settle_against(&mut queue, &mut note, &read_twice));
+        assert!(queue.is_empty());
     }
 
     /// A slash command typed while the turn runs waits for the turn's end on an agent that reads commands
