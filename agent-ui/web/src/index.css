@@ -1965,6 +1965,13 @@ input::placeholder {
   font: inherit;
   cursor: pointer;
 }
+/* The button is already the solid cursor, so the fill that marks every other focused button changes
+   nothing here; a ring does, as on the permission card's filled answer. The `.agent-ui-root` prefix
+   outranks the global `button:focus` rule, which turns the outline off. */
+.agent-ui-root .band-unread:focus {
+  outline: 2px solid var(--nv-fg);
+  outline-offset: 2px;
+}
 .band-warn {
   cursor: help; /* the full diagnostic line is in its title attribute */
 }

@@ -2074,24 +2074,66 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(now.color).toBe("var(--nv-bg)");
   });
 
+  /* A focused button is drawn as the solid cursor, the fill being its one focus sign. A button already
+     drawn with that fill therefore shows nothing on focus unless its own :focus rule adds a ring. */
+  it("gives every button already drawn with the solid cursor fill a focus rule that changes something", () => {
+    const unmarkedFocus = (css: string): string[] => {
+      const rules = splitRules(css);
+      const ringed = (branch: string): boolean =>
+        rules.some(
+          (r) =>
+            r.selector
+              .split(",")
+              .map((b) => b.trim())
+              .some((b) => b === `${branch}:focus` || b === `.agent-ui-root ${branch}:focus`) &&
+            /(?:^|;)\s*(?:outline|box-shadow)\s*:\s*(?!none\b|0\b)\S/.test(r.declarations),
+        );
+      const missing: string[] = [];
+      for (const rule of rules) {
+        if (!/(?:^|;)\s*background(?:-color)?:\s*var\(--nv-fg\)\s*(?:;|$)/.test(rule.declarations)) continue;
+        for (const branch of rule.selector.split(",").map((b) => b.trim())) {
+          // The focus rules themselves, CARET's selection and the sign cells are not buttons.
+          if (/:focus|::selection|-sign$/.test(branch)) continue;
+          if (!ringed(branch)) missing.push(branch);
+        }
+      }
+      return missing;
+    };
+    expect(unmarkedFocus(withoutComments)).toEqual([]);
+    // The check sees what it claims to: a filled button with no ring, or only an outline switched off, is caught.
+    expect(unmarkedFocus(".agent-ui-root .go { background: var(--nv-fg); }")).toEqual([".agent-ui-root .go"]);
+    expect(
+      unmarkedFocus(".go { background: var(--nv-fg); } .agent-ui-root .go:focus { outline: none; }"),
+    ).toEqual([".go"]);
+    expect(
+      unmarkedFocus(".go { background: var(--nv-fg); } .agent-ui-root .go:focus { outline: 2px solid var(--nv-fg); }"),
+    ).toEqual([]);
+    // The band's jump button is among those the scan reaches.
+    expect(withoutComments).toMatch(/\.band-unread\s*\{[^}]*background:\s*var\(--nv-fg\)/);
+  });
+
   /* A lualine mode block's fill is the editor's own colour and unguarded; with no lualine it is the cursorline
      stand-in, 1.15:1 on bg. Drawn as the composer's ring it can be fainter than the unfocused frame, so rings,
      borders and outlines take `--nv-focus-ring` (guarded at 3:1 in Rust) and the mode fills stay fills. */
   it("never draws a status-block colour as a border, outline or shadow", () => {
     const stroke = /^(?:border(?:-(?:top|right|bottom|left|inline|block)(?:-[a-z]+)?)?(?:-color)?|outline(?:-color)?|box-shadow|text-decoration(?:-color)?|caret-color|accent-color)$/i;
-    const offenders: string[] = [];
-    for (const rule of splitRules(withoutComments)) {
-      for (const raw of rule.declarations.split(";")) {
-        const m = raw.trim().match(/^([a-z-]+)\s*:\s*(.*)$/is);
-        if (m !== null && stroke.test(m[1]) && /var\(--nv-status-(?:normal|insert|visual)-bg\)/.test(m[2])) {
-          offenders.push(`${rule.selector} { ${raw.trim()} }`);
+    const statusStrokes = (css: string): string[] => {
+      const found: string[] = [];
+      for (const rule of splitRules(css)) {
+        for (const raw of rule.declarations.split(";")) {
+          const m = raw.trim().match(/^([a-z-]+)\s*:\s*(.*)$/is);
+          if (m !== null && stroke.test(m[1]) && /var\(--nv-status-(?:normal|insert|visual)-bg\)/.test(m[2])) {
+            found.push(`${rule.selector} { ${raw.trim()} }`);
+          }
         }
       }
-    }
-    expect(offenders).toEqual([]);
-    // The guard sees what it claims to: a ring written in a mode fill is caught.
-    const bad = splitRules(".composer:focus-within { outline: 1px solid var(--nv-status-insert-bg); }");
-    expect(/var\(--nv-status-insert-bg\)/.test(bad[0].declarations)).toBe(true);
+      return found;
+    };
+    expect(statusStrokes(withoutComments)).toEqual([]);
+    // The guard sees what it claims to: a ring or a border written in a mode fill is caught, a fill is not.
+    expect(statusStrokes(".composer:focus-within { outline: 1px solid var(--nv-status-insert-bg); }")).toHaveLength(1);
+    expect(statusStrokes(".composer { border-color: var(--nv-status-visual-bg); }")).toHaveLength(1);
+    expect(statusStrokes(".mode-block { background: var(--nv-status-normal-bg); }")).toEqual([]);
     // The two focus rules draw the guarded ring.
     const ring = splitRules(withoutComments).filter((r) => r.selector.endsWith(".composer:focus-within"));
     expect(ring.map((r) => r.selector).sort()).toEqual([

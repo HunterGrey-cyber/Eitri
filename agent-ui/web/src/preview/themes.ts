@@ -82,6 +82,23 @@ function ensureContrast(color: Rgb, against: Rgb, toward: Rgb, min: number): Rgb
   }
   return toward;
 }
+// `ensure_contrast_against_both`: a colour that must hold `min` against two backgrounds at once. It tries the
+// walk toward `toward`, then toward whichever pole serves both backgrounds better, then the other pole, and
+// when nothing reaches `min` it keeps the step whose worse contrast is highest.
+function ensureContrastAgainstBoth(color: Rgb, a: Rgb, b: Rgb, toward: Rgb, min: number): Rgb {
+  const worse = (c: Rgb): number => Math.min(contrast(c, a), contrast(c, b));
+  const [black, white]: [Rgb, Rgb] = [[0, 0, 0], [255, 255, 255]];
+  const poles = worse(black) >= worse(white) ? [black, white] : [white, black];
+  let best = color;
+  for (const target of [toward, ...poles]) {
+    for (let step = 0; step <= 20; step += 1) {
+      const candidate = mix(color, target, step * 0.05);
+      if (worse(candidate) >= min) return candidate;
+      if (worse(candidate) > worse(best)) best = candidate;
+    }
+  }
+  return best;
+}
 function ensureContrastWithPole(color: Rgb, against: Rgb, toward: Rgb, min: number): Rgb {
   const guarded = ensureContrast(color, against, toward, min);
   if (contrast(guarded, against) >= min) return guarded;
@@ -107,8 +124,17 @@ function cursorBandFill(bg: Rgb, cursorline: Rgb, start: number, min: number): R
   return cursorline;
 }
 
+/** `warn`/`error` as the panel is sent them (`band_signal`): held to 3:1 against `bg`, then against `bg` and
+ *  `chrome` together, because the status band draws them as glyphs on `chrome`. */
+function bandSignal(p: Palette, raw: string): string {
+  const [bg, chrome, fg] = [hexToRgb(p.bg), hexToRgb(p.chrome), hexToRgb(p.fg)];
+  return rgbToHex(ensureContrastAgainstBoth(ensureContrast(hexToRgb(raw), bg, fg, 3), bg, chrome, fg, 3));
+}
+
 export function themeVars(name: string): Record<string, string> {
-  const p = palettes[name] ?? palettes["tokyonight-night"];
+  const base = palettes[name] ?? palettes["tokyonight-night"];
+  // Everything below reads the guarded pair, the tint inputs included, as `ThemeTokens::derive` does.
+  const p: Palette = { ...base, warn: bandSignal(base, base.warn), error: bandSignal(base, base.error) };
   const vars: Record<string, string> = {
     bg: p.bg, fg: p.fg, surface: p.surface, "surface-fg": p.surfaceFg, "surface-muted": p.muted,
     chrome: p.chrome, "chrome-fg": p.chromeFg, "chrome-muted": p.muted, "chrome-accent": p.accent,
