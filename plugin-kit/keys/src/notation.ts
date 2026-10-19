@@ -6,6 +6,12 @@ const NAMED: Record<string, string> = {
   Up: "ArrowUp", Down: "ArrowDown", Space: " ", Tab: "Tab", Home: "Home", End: "End", Del: "Delete", lt: "<",
 };
 
+const NAMES = new Map(Object.entries(NAMED).map(([name, key]) => [name.toLowerCase(), key]));
+NAMES.set("enter", "Enter");
+NAMES.set("return", "Enter");
+NAMES.set("bslash", "\\");
+NAMES.set("bar", "|");
+
 function shifted(key: string): boolean {
   return /^[A-Z~!@#$%^&*()_+{}|:"<>?]$/.test(key);
 }
@@ -19,13 +25,13 @@ export function parseNotation(text: string): KeySeq | null {
     if (text.startsWith("<") && text.includes(">")) {
       const end = text.indexOf(">");
       let token = text.slice(1, end);
-      while (token.startsWith("C-") || token.startsWith("S-")) {
-        if (token.startsWith("C-")) { if (ctrl) return null; ctrl = true; }
+      while (/^[cs]-/i.test(token)) {
+        if (/^c-/i.test(token)) { if (ctrl) return null; ctrl = true; }
         else { if (shift) return null; shift = true; }
         token = token.slice(2);
       }
-      const named = Object.prototype.hasOwnProperty.call(NAMED, token);
-      key = named ? NAMED[token] : token;
+      const named = NAMES.get(token.toLowerCase());
+      key = named ?? token;
       if (!named && !/^[\x21-\x7e]$/.test(token)) return null;
       if (ctrl && /^[A-Z]$/.test(key)) { shift = true; key = key.toLowerCase(); }
       if (shift && !ctrl && /^[a-z]$/.test(key)) key = key.toUpperCase();
@@ -48,6 +54,11 @@ export function strokeOf(ev: KeyboardEvent): KeyStroke {
 
 export function notationOf(stroke: KeyStroke): string {
   const named = Object.entries(NAMED).find(([, key]) => key === stroke.key)?.[0];
-  if (stroke.ctrl) return `<C-${stroke.shift ? "S-" : ""}${named ?? stroke.key}>`;
-  return named ? `<${named}>` : stroke.key;
+  const modifiers = `${stroke.ctrl ? "C-" : ""}${stroke.shift && (stroke.ctrl || !shifted(stroke.key)) ? "S-" : ""}`;
+  return named || modifiers ? `<${modifiers}${named ?? stroke.key}>` : stroke.key;
+}
+
+/** One spelling for aliases and modifier names, so declarations and bindings compare the same keys. */
+export function canonicalOf(notation: string): string | null {
+  return parseNotation(notation)?.map(notationOf).join("") ?? null;
 }

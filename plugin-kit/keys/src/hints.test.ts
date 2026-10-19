@@ -101,6 +101,30 @@ describe("hint targets", () => {
     expect(collectTargets(document, [])).toEqual([]);
   });
 
+  it("excludes targets inside an inert subtree, and the page's own targets there", () => {
+    document.body.innerHTML = '<section inert><button></button><a href="#x">x</a></section><button></button>';
+    document.querySelectorAll("button, a").forEach((el) => box(el));
+    const [inside, link, outside] = [...document.querySelectorAll("button, a")];
+    expect(collectTargets(document, [{ el: inside }, { el: link }]).map(({ el }) => el)).toEqual([outside]);
+  });
+
+  it.each([true, false])("limits targets to a modal dialog when modal=%s", (modal) => {
+    const outside = button();
+    const dialog = document.createElement("dialog");
+    dialog.open = true;
+    document.body.append(dialog);
+    box(dialog);
+    const inside = button();
+    dialog.append(inside);
+    const extra = document.createElement("span");
+    document.body.append(extra);
+    box(extra);
+    const matches = dialog.matches.bind(dialog);
+    vi.spyOn(dialog, "matches").mockImplementation((selector) => selector === ":modal" ? modal : matches(selector));
+    expect(collectTargets(document, [{ el: extra }]).map(({ el }) => el))
+      .toEqual(modal ? [inside] : [outside, inside, extra]);
+  });
+
   it("includes a visible target that overrides an ancestor's visibility", () => {
     const parent = document.createElement("div");
     parent.style.visibility = "hidden";
@@ -287,32 +311,57 @@ describe("installed hint mode", () => {
     expect(labels()[1].classList.contains("eitri-hint-danger")).toBe(false);
   });
 
-  it.each(["window scroll", "document scroll", "nested scroll", "resize"])(
-    "cancels hints on %s without activating a stale label", async (change) => {
+  it.each(["window scroll", "document scroll", "nested scroll", "unrelated scroll", "resize"])(
+    "keeps hints on %s and moves each label with its target", async (change) => {
       const container = document.createElement("div");
       container.style.overflow = "auto";
-      document.body.append(container);
+      const other = document.createElement("div");
+      document.body.append(container, other);
       const el = button();
       container.append(el);
-      box(container, 0, 0, 100, 100);
+      box(container, 0, 0, 200, 200);
       let clicks = 0;
       el.addEventListener("click", () => clicks++);
       await start();
       key("f");
       expect(labels()).toHaveLength(1);
+      box(el, 50, 60);
       if (change === "window scroll") window.dispatchEvent(new Event("scroll"));
       if (change === "document scroll") document.dispatchEvent(new Event("scroll"));
       if (change === "nested scroll") container.dispatchEvent(new Event("scroll"));
+      if (change === "unrelated scroll") other.dispatchEvent(new Event("scroll"));
       if (change === "resize") window.dispatchEvent(new Event("resize"));
-      expect(labels()).toHaveLength(0);
-      expect(document.getElementById("eitri-keys-hud")!.dataset.mode).toBe("normal");
-      key("s");
-      expect(clicks).toBe(0);
-      key("f");
+      expect(labels()).toHaveLength(1);
+      expect([labels()[0].style.left, labels()[0].style.top]).toEqual(["50px", "60px"]);
+      expect(document.getElementById("eitri-keys-hud")!.dataset.mode).toBe("hint");
       key("s");
       expect(clicks).toBe(1);
     },
   );
+
+  it("hides the label of a target scrolled out of view, and ends hint mode when none is left", async () => {
+    const first = button(10, 10);
+    const second = button(10, 40);
+    let clicks = 0;
+    first.addEventListener("click", () => clicks++);
+    second.addEventListener("click", () => clicks++);
+    await start();
+    key("f");
+    box(first, 10, -100);
+    window.dispatchEvent(new Event("scroll"));
+    const gone = labels().filter((label) => label.hidden);
+    expect(gone).toHaveLength(1);
+    expect(labels().filter((label) => !label.hidden)).toHaveLength(1);
+    key(gone[0].textContent!);
+    expect(clicks).toBe(0);
+    expect(labels()).toHaveLength(0);
+    key("f");
+    expect(labels()).toHaveLength(1);
+    box(second, 10, -100);
+    window.dispatchEvent(new Event("scroll"));
+    expect(labels()).toHaveLength(0);
+    expect(document.getElementById("eitri-keys-hud")!.dataset.mode).toBe("normal");
+  });
 
   it("uses the viewport centre by default and setCurrent as the origin", async () => {
     const corner = button(10, 10);

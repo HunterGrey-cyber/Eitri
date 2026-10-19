@@ -14,4 +14,6 @@ await build({
   bundle: true,
   format: "iife",
   target: "es2020",
+  // Vimium's notice (a `/*!` comment) has to travel with every copy of the bundle, including a vendored one.
+  legalComments: "eof",
 });

@@ -341,7 +341,7 @@ fn check_text(what: &str, action: &str, text: &str, max: usize) -> Result<(), St
     Ok(())
 }
 
-/// Checks a page's declaration: the limits, unique actions, and no key Eitri keeps.
+/// Checks a page's declaration: the limits, unique actions, no key held by two actions, and no key Eitri keeps.
 pub fn validate(rows: Vec<KeyRowArg>, prefix_key: &Chord) -> Result<Vec<KeyRow>, String> {
     if rows.len() > MAX_ROWS {
         return Err(format!("{} rows; a page may declare at most {MAX_ROWS}", rows.len()));
@@ -366,6 +366,13 @@ pub fn validate(rows: Vec<KeyRowArg>, prefix_key: &Chord) -> Result<Vec<KeyRow>,
         }
         for key in &row.keys {
             check_key(key, prefix_key).map_err(|why| format!("{:?}: {why}", row.action))?;
+            // The page's kit would run only one of the two, and the `?` sheets would still list both.
+            if let Some(other) = out.iter().find(|r| r.keys.iter().any(|k| same_key(k, key))) {
+                return Err(format!(
+                    "{key:?} is held by both {:?} and {:?}; a key names one action",
+                    other.action, row.action
+                ));
+            }
         }
         check_text("context", &row.action, &row.context, MAX_CONTEXT_CHARS)?;
         check_text("desc", &row.action, &row.desc, MAX_DESC_CHARS)?;
@@ -769,9 +776,11 @@ mod tests {
     #[test]
     fn a_declaration_over_the_limits_is_refused() {
         let prefix = stock_prefix();
-        let many: Vec<KeyRowArg> = (0..201).map(|i| arg(&format!("a{i}"), &["j"])).collect();
+        // Each row its own key (`aa`, `ab`, ...), since one key on two actions is refused.
+        let own_key = |i: u8| format!("{}{}", (b'a' + i / 26) as char, (b'a' + i % 26) as char);
+        let many: Vec<KeyRowArg> = (0..201).map(|i| arg(&format!("a{i}"), &[&own_key(i)])).collect();
         assert!(validate(many, &prefix).unwrap_err().contains("200"));
-        let fine: Vec<KeyRowArg> = (0..200).map(|i| arg(&format!("a{i}"), &["j"])).collect();
+        let fine: Vec<KeyRowArg> = (0..200).map(|i| arg(&format!("a{i}"), &[&own_key(i)])).collect();
         assert!(validate(fine, &prefix).is_ok());
         let eleven = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"];
         assert!(validate(vec![arg("x", &eleven)], &prefix).unwrap_err().contains("10"));
@@ -805,6 +814,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("\"item.next\""), "{err}");
+    }
+
+    #[test]
+    fn a_key_held_by_two_actions_is_refused_naming_both() {
+        for (first, second) in [("f", "f"), ("<C-n>", "<c-n>"), ("G", "<S-g>")] {
+            let err = validate(
+                vec![arg("hint.start", &["x", first]), arg("item.find", &[second])],
+                &stock_prefix(),
+            )
+            .expect_err(second);
+            assert!(err.contains(&format!("{second:?}")), "{err}");
+            assert!(err.contains("\"hint.start\"") && err.contains("\"item.find\""), "{err}");
+        }
+        // A key that only starts a longer one is not the same key: the kit waits `timeoutlen` between them.
+        assert!(validate(
+            vec![arg("item.next", &["g"]), arg("scroll.top", &["gg"])],
+            &stock_prefix()
+        )
+        .is_ok());
     }
 
     #[test]

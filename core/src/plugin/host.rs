@@ -1252,6 +1252,36 @@ mod tests {
     }
 
     #[test]
+    fn hello_reply_keys_and_keyboard_values_match_the_shared_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!("fixtures/rep-hello.json")).unwrap();
+        let r = rig(vec![]);
+        r.send(fixture["re"].as_u64().unwrap(), "host.hello", json!({}));
+        let sent = r.page.take();
+        let reply = sent.iter().find(|m| m["re"] == fixture["re"]).expect("a reply");
+        assert_eq!(
+            reply.as_object().unwrap().keys().collect::<Vec<_>>(),
+            fixture.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reply["result"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            fixture["result"].as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        for key in ["keys_kit", "timeoutlen"] {
+            assert_eq!(reply["result"][key], fixture["result"][key], "{key}");
+        }
+    }
+
+    #[test]
+    fn keys_declare_reply_matches_the_shared_fixture() {
+        let request: Value = serde_json::from_str(include_str!("fixtures/req-keys-declare.json")).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!("fixtures/rep-keys-declare.json")).unwrap();
+        let r = rig(vec![]);
+        r.hello();
+        r.host.page_message(&request.to_string(), Instant::now());
+        assert_eq!(r.page.take(), vec![fixture]);
+    }
+
+    #[test]
     fn the_focus_waits_for_hello_and_is_sent_once_after_its_reply() {
         let r = rig(vec![]);
         r.host.set_has_keys(true);

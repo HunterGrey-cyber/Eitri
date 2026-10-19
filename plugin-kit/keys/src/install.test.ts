@@ -162,7 +162,7 @@ describe("installation", () => {
   });
 
   it.each([
-    "Shift", "Control", "Alt", "AltGraph", "Meta", "Super", "Hyper", "CapsLock", "NumLock", "ScrollLock", "Fn", "OS",
+    "Shift", "Control", "Alt", "AltGraph", "Meta", "CapsLock", "NumLock", "ScrollLock", "Fn",
   ])("preserves ]q across a %s press and release", async (modifier) => {
     const run = await start();
     key("]");
@@ -172,6 +172,17 @@ describe("installation", () => {
     const ev = key("q");
     expect(run).toHaveBeenCalledWith("item.next", ev);
     expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it.each(["Super", "Hyper", "OS"])("cancels pending keys and their fallback on %s", async (modifier) => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    const run = await start();
+    key("g");
+    expect(key(modifier).defaultPrevented).toBe(false);
+    window.dispatchEvent(new KeyboardEvent("keyup", { key: modifier }));
+    vi.advanceTimersByTime(1001);
+    expect(run).not.toHaveBeenCalled();
+    expect(document.querySelector("#eitri-keys-hud")!.textContent).not.toContain("g");
   });
 
   it("does not extend a pending prefix's deadline for a modifier press", async () => {
@@ -231,6 +242,184 @@ describe("installation", () => {
     expect(key("Escape", init, input).defaultPrevented).toBe(false);
     expect(document.activeElement).toBe(input);
   });
+
+  it("fires a key that starts a longer one after timeoutlen, and still completes the longer one", async () => {
+    effective.find((row) => row.action === "item.next")!.keys.push("g");
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    const run = await start();
+    expect(key("g").defaultPrevented).toBe(true);
+    key("g");
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+    expect(run).not.toHaveBeenCalled();
+    const ev = key("g");
+    vi.advanceTimersByTime(999);
+    expect(run).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2);
+    expect(run).toHaveBeenCalledWith("item.next", ev);
+    expect(document.querySelector("#eitri-keys-hud")!.textContent).not.toContain("g");
+  });
+
+  it.each(["timer", "mismatch"])("keeps g's fallback and event after gx on %s", async (ending) => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    effective.push({ action: "item.long", keys: ["gxy"], context: "page", desc: "long" });
+    effective.push({ action: "item.other", keys: ["q"], context: "page", desc: "other" });
+    const run = await start();
+    const first = key("g");
+    key("x");
+    if (ending === "timer") vi.advanceTimersByTime(1001);
+    else {
+      const last = key("q");
+      expect(run).toHaveBeenNthCalledWith(2, "item.other", last);
+    }
+    expect(run).toHaveBeenNthCalledWith(1, "item.next", first);
+    expect(run).toHaveBeenCalledTimes(ending === "timer" ? 1 : 2);
+  });
+
+  it.each(["timer", "mismatch", "late key"])("replays buffered keys after the fallback on %s", async (ending) => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    effective.push({ action: "item.long", keys: ["gxyz"], context: "page", desc: "long" });
+    for (const part of ["x", "y", "q"]) {
+      effective.push({ action: `item.${part}`, keys: [part], context: "page", desc: part });
+    }
+    const run = await start();
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const first = key("g");
+    const x = key("x");
+    const y = key("y");
+    const expected = [["item.next", first], ["item.x", x], ["item.y", y]];
+    if (ending === "timer") vi.advanceTimersByTime(1001);
+    else {
+      if (ending === "late key") clock.mockReturnValue(1001);
+      expected.push(["item.q", key("q")]);
+    }
+    expect(run.mock.calls).toEqual(expected);
+    expected.forEach(([, event], i) => expect(run.mock.calls[i][1]).toBe(event));
+  });
+
+  it("lets a buffered key and the ending key complete a fresh sequence", async () => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    effective.push({ action: "item.long", keys: ["gxy"], context: "page", desc: "long" });
+    effective.push({ action: "item.other", keys: ["xq"], context: "page", desc: "other" });
+    const run = await start();
+    const first = key("g");
+    key("x");
+    const last = key("q");
+    expect(run.mock.calls).toEqual([["item.next", first], ["item.other", last]]);
+    expect(run.mock.calls[0][1]).toBe(first);
+    expect(run.mock.calls[1][1]).toBe(last);
+  });
+
+  it.each(["timer", "mismatch"])("uses the event completing a multi-key fallback on %s", async (ending) => {
+    effective.find((row) => row.action === "item.pick")!.keys = ["<Space>1"];
+    effective.push({ action: "item.long", keys: ["<Space>1x"], context: "page", desc: "long" });
+    const run = await start();
+    key(" ");
+    const completed = key("1");
+    if (ending === "timer") vi.advanceTimersByTime(1001);
+    else expect(key("Tab").defaultPrevented).toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0]).toBe("item.pick");
+    expect(run.mock.calls[0][1]).toBe(completed);
+  });
+
+  it.each(["timer", "mismatch"])("updates the fallback event when a longer binding completes on %s", async (ending) => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    effective.find((row) => row.action === "scroll.top")!.keys = ["<Home>"];
+    effective.find((row) => row.action === "item.pick")!.keys = ["gg"];
+    effective.push({ action: "item.long", keys: ["ggx"], context: "page", desc: "long" });
+    const run = await start();
+    key("g");
+    const completed = key("g");
+    if (ending === "timer") vi.advanceTimersByTime(1001);
+    else key("q");
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0]).toBe("item.pick");
+    expect(run.mock.calls[0][1]).toBe(completed);
+  });
+
+  it.each(["timer", "mismatch"])("uses Esc's event when it cancels and restarts a wait on %s", async (ending) => {
+    effective.find((row) => row.action === "mode.escape")!.keys = [];
+    effective.push({ action: "item.escape", keys: ["<Esc>"], context: "page", desc: "escape" });
+    effective.push({ action: "item.long", keys: ["<Esc>x"], context: "page", desc: "long" });
+    const run = await start();
+    key("g");
+    const escape = key("Escape");
+    if (ending === "timer") vi.advanceTimersByTime(1001);
+    else key("q");
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0]).toBe("item.escape");
+    expect(run.mock.calls[0][1]).toBe(escape);
+  });
+
+  it("fires g before replaying j as scroll.down", async () => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    const order: string[] = [];
+    const run = await start(vi.fn(() => { order.push("item.next"); return true; }));
+    vi.mocked(window.scrollBy).mockImplementation(() => { order.push("scroll.down"); });
+    const first = key("g");
+    expect(key("j").defaultPrevented).toBe(true);
+    expect(order).toEqual(["item.next", "scroll.down"]);
+    expect(run).toHaveBeenCalledWith("item.next", first);
+  });
+
+  it("passes the 1 event to item.pick and replays q with its own event", async () => {
+    effective.push({ action: "item.long", keys: ["1x"], context: "page", desc: "long" });
+    effective.push({ action: "item.other", keys: ["q"], context: "page", desc: "other" });
+    const run = await start();
+    const first = key("1");
+    const last = key("q");
+    expect(run.mock.calls).toEqual([["item.pick", first], ["item.other", last]]);
+  });
+
+  it("does not prevent Tab when it ends g's wait", async () => {
+    effective.find((row) => row.action === "item.next")!.keys = ["g"];
+    const run = await start();
+    const first = key("g");
+    expect(key("Tab").defaultPrevented).toBe(false);
+    expect(run).toHaveBeenCalledWith("item.next", first);
+  });
+
+  it("runs a declared sequence that ends in Esc", async () => {
+    effective.push({ action: "item.custom", keys: ["g<Esc>"], context: "阅读", desc: "自定" });
+    const run = await start();
+    key("g");
+    const ev = key("Escape");
+    expect(run).toHaveBeenCalledWith("item.custom", ev);
+  });
+
+  it("gives a page row the generic key it also names", async () => {
+    const find: Row = { action: "item.find", keys: ["f"], context: "页面", desc: "查找" };
+    call.mockImplementation(async (_verb: string, args: { rows: Row[] }) => ({ rows: args.rows }));
+    const run = vi.fn(() => true);
+    cleanup = await install({ rows: [find], run });
+    const declared: Row[] = call.mock.calls[0][1].rows;
+    expect(declared.map((row) => row.action)).not.toContain("hint.start");
+    expect(declared.filter((row) => row.keys.includes("f"))).toEqual([find]);
+    const ev = key("f");
+    expect(run).toHaveBeenCalledWith("item.find", ev);
+    expect(document.querySelector("#eitri-keys-hints")).toBeNull();
+  });
+
+  it("keeps a generic row in place when a page redeclares its action", async () => {
+    const hint: Row = { action: "hint.start", keys: ["F"], context: "页面", desc: "提示" };
+    const find: Row = { action: "item.find", keys: ["f"], context: "页面", desc: "查找" };
+    cleanup = await install({ rows: [find, hint], run: vi.fn(() => true) });
+    const declared: Row[] = call.mock.calls[0][1].rows;
+    expect(declared.map((row) => row.action)).toEqual([...GENERIC_ROWS.map((row) => row.action), "item.find"]);
+    expect(declared.find((row) => row.action === "hint.start")).toEqual(hint);
+  });
+
+  it.each(["checkbox", "radio", "button", "range", "color", "file"])("keeps the page's keys on a focused %s input",
+    async (type) => {
+      await start();
+      const input = document.createElement("input");
+      input.type = type;
+      document.body.append(input);
+      input.focus();
+      expect(document.querySelector<HTMLElement>("#eitri-keys-hud")!.dataset.mode).toBe("normal");
+      expect(key("j", {}, input).defaultPrevented).toBe(true);
+      expect(window.scrollBy).toHaveBeenCalledTimes(1);
+    });
 
   it.each([true, false])("run returning %s controls default prevention", async (handled) => {
     const run = await start(vi.fn(() => handled));

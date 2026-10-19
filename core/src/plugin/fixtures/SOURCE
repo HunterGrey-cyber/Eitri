@@ -1,1 +1,2 @@
-662745c14f299cb5b2fcb13ff6640e319b79b1fc  engine/web/src/eitri/fixtures (the page side's copy; change both in one session)
+bfe837cbc286e3d999ffea200207f0a3316d1c5d  engine/web/src/eitri/fixtures (the page side's copy; change both in one session)
+rep-hello.json and rep-keys-declare.json were updated host-side and await synchronization with the page-side copy.

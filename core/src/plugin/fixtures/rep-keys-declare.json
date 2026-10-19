@@ -1,0 +1,44 @@
+{
+  "v": 1,
+  "re": 27,
+  "ok": true,
+  "result": {
+    "rows": [
+      {
+        "action": "scroll.down",
+        "keys": [
+          "j"
+        ],
+        "sources": [
+          "default"
+        ],
+        "context": "页面",
+        "desc": "向下滚动"
+      },
+      {
+        "action": "item.next",
+        "keys": [
+          "]q",
+          "<C-n>"
+        ],
+        "sources": [
+          "default",
+          "default"
+        ],
+        "context": "题目",
+        "desc": "下一题"
+      },
+      {
+        "action": "hint.open",
+        "keys": [
+          "f"
+        ],
+        "sources": [
+          "default"
+        ],
+        "context": "页面",
+        "desc": "给能点的地方标上字母"
+      }
+    ]
+  }
+}

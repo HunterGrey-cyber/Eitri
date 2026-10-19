@@ -3,9 +3,9 @@ import { blockedEvent, shouldSkip, textField } from "./events";
 import { installHeldSuperTracking, reset as resetSuper, superHeld } from "./held-super";
 import { activate, startHints } from "./hints";
 import { setDimmed, showMessage, showMode } from "./hud";
-import { strokeOf } from "./notation";
+import { canonicalOf, strokeOf } from "./notation";
 import { createResolver } from "./resolver";
-import { GENERIC_ROWS } from "./rows";
+import { GENERIC_ROWS, type Row } from "./rows";
 import { runScroll } from "./scroll";
 import { closeSheet, openSheet, sheetIsOpen } from "./sheet";
 import type { InstallOptions } from "./index";
@@ -28,12 +28,26 @@ export function setCurrent(el: Element | null): void {
   current?.classList.toggle("eitri-keys-dimmed", !pageHasKeys);
 }
 
+/** The generic rows, then the page's. A page row replaces the generic row of its action in place, and a key a page
+ * row holds is taken from the other generic rows (a row left without keys is dropped), so no key names two actions. */
+export function mergeRows(page: Row[]): Row[] {
+  const spelled = (key: string) => canonicalOf(key) ?? key;
+  const taken = new Set(page.flatMap((row) => row.keys.map(spelled)));
+  const own = new Set(page.map((row) => row.action));
+  const declared = new Map(GENERIC_ROWS.map((row) => [row.action, row]));
+  for (const row of page) declared.set(row.action, row);
+  return [...declared.values()].flatMap((row) => {
+    if (own.has(row.action)) return [row];
+    const keys = row.keys.filter((key) => !taken.has(spelled(key)));
+    if (!keys.length) return [];
+    return [keys.length === row.keys.length ? row : { ...row, keys }];
+  });
+}
+
 export async function install(opts: InstallOptions): Promise<() => void> {
   removeInstallation?.();
   const ticket = ++generation;
   const bridge = pluginBridge();
-  const declared = new Map(GENERIC_ROWS.map((row) => [row.action, row]));
-  for (const row of opts.rows) declared.set(row.action, row);
   const updates: Array<() => void> = [];
   let ready = false;
   let hints: ReturnType<typeof startHints> | undefined;
@@ -58,7 +72,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   }));
   let rows: ReturnType<typeof effectiveRows>;
   try {
-    rows = effectiveRows(await bridge.call("keys.declare", { rows: [...declared.values()] }));
+    rows = effectiveRows(await bridge.call("keys.declare", { rows: mergeRows(opts.rows) }));
   } catch (error) {
     focus();
     config();
@@ -73,6 +87,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   let timeoutlen = opts.initial?.timeoutlen ?? 1000;
   pageHasKeys = opts.initial?.hasKeys ?? true;
   let pending = "";
+  let pendingEvents: KeyboardEvent[] = [];
   let timer: number | undefined;
   const resolver = createResolver(rows, () => timeoutlen, () => performance.now());
   const renderMode = () => showMode(textField(document.activeElement) ? "insert" : hints?.active ? "hint" : "normal",
@@ -81,6 +96,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     window.clearTimeout(timer);
     timer = undefined;
     pending = "";
+    pendingEvents = [];
     resolver.reset();
     renderMode();
   };
@@ -93,20 +109,32 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   document.addEventListener("focusout", syncFocus);
   const onBlur = () => { hints?.cancel(); clearPrefix(); };
   window.addEventListener("blur", onBlur);
+  // Labels follow their targets rather than ending hint mode: a smooth scroll still running, or a list that scrolls
+  // itself as output arrives, would otherwise end it the moment it starts. A browser sends these at most once a frame.
   const onViewportChange = () => {
     if (!hints?.active) return;
-    hints.cancel();
-    clearPrefix();
+    hints.reposition();
+    renderMode();
   };
   // Nested scrollers move targets too, and their scroll events do not bubble.
   window.addEventListener("scroll", onViewportChange, true);
   window.addEventListener("resize", onViewportChange);
 
-  const onKey = (ev: KeyboardEvent) => {
+  const runFallback = (action: string, consumed: number) => {
+    const completed = pendingEvents[consumed - 1];
+    const remaining = pendingEvents.slice(consumed);
+    clearPrefix();
+    if (perform(action, completed)) completed.preventDefault();
+    for (const event of remaining) onKey(event, true);
+  };
+
+  const onKey = (ev: KeyboardEvent, replay = false) => {
     if (!pageHasKeys) return;
-    if (MODIFIER_KEYS.has(ev.key)) return;
     const held = superHeld();
-    if (shouldSkip(ev, held)) {
+    if (held) { clearPrefix(); return; }
+    if (MODIFIER_KEYS.has(ev.key)) return;
+    // Buffered events already passed the guard; this listener prevented them while they were pending.
+    if (!replay && shouldSkip(ev, held)) {
       // Only the resolver may authorize a Ctrl chord; the shell's navigation and IME chords stay reserved.
       if (blockedEvent(ev, held) || !ev.ctrlKey || ev.altKey || ev.metaKey || ev.shiftKey ||
         /^[hjkl]$/i.test(ev.key)) return;
@@ -132,22 +160,39 @@ export async function install(opts: InstallOptions): Promise<() => void> {
       if (ev.key === "Escape") { closeSheet(); clearPrefix(); ev.preventDefault(); }
       return;
     }
-    if (ev.key === "Escape") clearPrefix();
     const result = resolver.feed(strokeOf(ev));
     window.clearTimeout(timer);
     timer = undefined;
     pending = "";
+    if (result.kind === "fallback") {
+      runFallback(result.action, result.consumed);
+      onKey(ev, replay);
+      return;
+    }
     if (result.kind === "pending") {
+      pendingEvents.push(ev);
+      // Esc may have cancelled the old sequence and begun a new one with only the current event.
+      pendingEvents = pendingEvents.slice(-result.length);
       pending = result.prefix;
-      timer = window.setTimeout(clearPrefix, timeoutlen + 1);
+      timer = window.setTimeout(() => {
+        const result = resolver.expire();
+        if (result.kind === "fallback" && !superHeld()) runFallback(result.action, result.consumed);
+        else clearPrefix();
+      }, timeoutlen + 1);
       renderMode();
       ev.preventDefault();
       return;
     }
+    pendingEvents = [];
     renderMode();
     if (result.kind !== "action") return;
+    if (perform(result.action, ev)) ev.preventDefault();
+  };
+
+  /** Runs `action` for the key event `ev` that completed it; true when the key was handled. */
+  const perform = (action: string, ev: KeyboardEvent): boolean => {
     let handled: boolean;
-    switch (result.action) {
+    switch (action) {
       case "sheet.open": openSheet(rows); handled = true; break;
       case "mode.escape": handled = true; break;
       case "hint.start": {
@@ -161,10 +206,9 @@ export async function install(opts: InstallOptions): Promise<() => void> {
         break;
       }
       default:
-        handled = GENERIC_ROWS.some((row) => row.action === result.action) ?
-          runScroll(result.action) : opts.run(result.action, ev);
+        handled = GENERIC_ROWS.some((row) => row.action === action) ? runScroll(action) : opts.run(action, ev);
     }
-    if (handled) ev.preventDefault();
+    return handled;
   };
   window.addEventListener("keydown", onKey);
   showMessage("");

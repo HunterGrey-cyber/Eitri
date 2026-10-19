@@ -6,6 +6,8 @@
     "host": "eitri",
     "version": "0.1.0",
     "protocol": 1,
+    "keys_kit": 1,
+    "timeoutlen": 1000,
     "capabilities": [
       "tasks",
       "editor.open",

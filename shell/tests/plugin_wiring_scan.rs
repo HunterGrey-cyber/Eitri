@@ -2,7 +2,8 @@
 //! read (so a plugin is placed, keyed and killed as one), given the window's one editor handle and its layout,
 //! stopped by a kill of its module, and shut down when the window closes; told when its module holds the keys
 //! and what the editor's `timeoutlen` is; its keys read for `prefix ?` before the chat takes them; and its host
-//! given the Super filter and the edge rule for `Ctrl+h/j/k/l`.
+//! given the Super filter and the edge rule for `Ctrl+h/j/k/l`. Also, from `plugin_page.rs`: the kit's reserved
+//! path is answered before the plugin's site is looked up.
 
 use eitri_core::source_scan as scan;
 
@@ -84,4 +85,20 @@ fn every_web_module_host_gets_the_super_filter_and_lua_pages_swallow_at_edges() 
     assert!(code.contains(
         "install_module_nav(id.clone(),host,move_focus.clone(),intercept,swallow_at_edge);panel_super::install(host);}"
     ));
+}
+
+#[test]
+fn the_kit_path_is_answered_before_any_site_file_is_looked_up() {
+    let source = scan::read_required("shell/src/plugin_page.rs");
+    let code = scan::code_only(&source.text);
+    let serve = scan::functions(&code, "serve");
+    assert_eq!(serve.len(), 1, "one scheme handler");
+    let serve: String = serve[0].split_whitespace().collect();
+    let kit = serve
+        .find("ifpage_policy::kit_request(id,&uri){")
+        .expect("the kit path is checked in serve");
+    let answered = serve[kit..].find("return;").expect("and answered there") + kit;
+    let site = serve.find("page_policy::site_file(").expect("the site lookup");
+    // A plugin's own `.eitri/keys.js` would replace the host's kit if the site were looked up first.
+    assert!(kit < answered && answered < site);
 }

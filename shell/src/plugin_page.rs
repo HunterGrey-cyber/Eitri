@@ -279,10 +279,11 @@ pub(crate) fn open_outside(url: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::KIT_JS;
-
     #[test]
     fn the_embedded_kit_is_the_built_bundle() {
+        // Named inside the test, not imported at module level: the `harness = false` target that includes this
+        // file compiles the module without its tests, and an outer import would be unused there.
+        use super::KIT_JS;
         assert!(!KIT_JS.is_empty());
         assert!(
             KIT_JS.starts_with("\"use strict\";\n(() => {"),
@@ -292,5 +293,9 @@ mod tests {
             KIT_JS.contains("eitriKeys"),
             "the bundle installs the page-facing global"
         );
+        // The bundle is also copied on its own (a plugin vendors it for use outside Eitri), so the notice of the
+        // code it adapts must be inside it, not only in the release's licence collection.
+        assert!(KIT_JS.contains("Copyright (c) 2010 Phil Crosby, Ilya Sukhar."));
+        assert!(KIT_JS.contains("The above copyright notice and this permission notice shall be included in"));
     }
 }
