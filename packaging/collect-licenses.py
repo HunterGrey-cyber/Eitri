@@ -1273,6 +1273,28 @@ def vite_runtime(shipped, counts, repo=REPO):
              "files": [("LICENSE.md (Vite core licence section)", text[:cut])]}]
 
 
+# A line esbuild writes above each source module it bundles, so its presence in `shell` shows the kit's
+# hint code (the part adapted from Vimium) is in the binary.
+KIT_MARKER = b"// src/hints.ts"
+
+
+def kit_entries(shipped, counts):
+    """The plugin keyboard kit adapts Vimium's hint-label scheme. It is not an npm dependency, so no tree
+    lists it and the licence text has to be added by hand: Vimium's MIT notice, from
+    license-texts/vimium-LICENSE, printed whenever the shipped `shell` carries the kit bundle."""
+    with open(shipped["shell"], "rb") as f:
+        if KIT_MARKER not in f.read():
+            return []
+    text = read_text(os.path.join(TEXTS, "vimium-LICENSE"))
+    if "MIT License" not in text or "Phil Crosby" not in text:
+        raise Fail("license-texts/vimium-LICENSE is no longer Vimium's MIT notice; re-check it")
+    counts["MIT"] = counts.get("MIT", 0) + 1
+    return [{"title": "Vimium (hint-label scheme adapted into the plugin keyboard kit)", "name": "vimium",
+             "version": "", "license": "MIT", "status": None, "copyleft": False,
+             "note": "adapted source, not an npm dependency, so not in the npm tree above; it is in the built kit bundle",
+             "files": [("vimium-LICENSE", text)]}]
+
+
 def artwork_entries(repo=REPO):
     """The one entry for Eitri's own artwork (ARTWORK_DIR under `repo`), or a Fail: the directory must
     hold exactly ARTWORK_FILES, its LICENSE must be the notice (ARTWORK_NOTICE) word for word,
@@ -1414,6 +1436,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
     native = native_components(by_nv, shipped, binaries_dir, skia_license_dir)
     web = [resolve(p, by_nv, counts_web) for p in npm_packages(os.path.join(repo, "agent-ui", "web"))]
     web += vite_runtime(shipped, counts_web, repo)
+    web += kit_entries(shipped, counts_web)
 
     sc, sc_pkgs, excluded, archive_entries = None, [], [], []
     if not no_sidecar:

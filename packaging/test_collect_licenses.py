@@ -1080,5 +1080,50 @@ class MainArgParsing(unittest.TestCase):
             self.assertIn(f"EITRI_BUILD_FORK_COMMIT={head}", f.read())
 
 
+class KitLicence(unittest.TestCase):
+    """The plugin keyboard kit adapts Vimium, which is no npm dependency: its MIT notice is added by hand."""
+
+    def _shell(self, content):
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, "shell")
+        with open(path, "wb") as f:
+            f.write(content)
+        return {"shell": path}
+
+    def test_vimium_is_listed_with_its_mit_notice_when_the_binary_carries_the_kit(self):
+        counts = {}
+        entries = cl.kit_entries(self._shell(b"\x00" + cl.KIT_MARKER + b"\n"), counts)
+        self.assertEqual([e["name"] for e in entries], ["vimium"])
+        entry = entries[0]
+        self.assertEqual((entry["license"], entry["copyleft"]), ("MIT", False))
+        self.assertEqual([name for name, _ in entry["files"]], ["vimium-LICENSE"])
+        self.assertEqual(counts, {"MIT": 1})
+        lines = []
+        cl.render_entries(entries, {}, lines)
+        rendered = "\n".join(lines)
+        self.assertIn("Vimium", rendered)
+        self.assertIn("Phil Crosby", rendered)
+
+    def test_a_binary_without_the_kit_lists_nothing(self):
+        counts = {}
+        self.assertEqual(cl.kit_entries(self._shell(b"no bundle here"), counts), [])
+        self.assertEqual(counts, {})
+
+    def test_the_vendored_text_is_the_notice_the_kit_source_carries(self):
+        with open(os.path.join(cl.REPO, "plugin-kit", "keys", "LICENSE-vimium"), encoding="utf-8") as f:
+            source = f.read()
+        self.assertEqual(cl.read_text(os.path.join(cl.TEXTS, "vimium-LICENSE")), cl.read_text(
+            os.path.join(cl.REPO, "plugin-kit", "keys", "LICENSE-vimium")))
+        self.assertIn("Permission is hereby granted", source)
+
+    def test_the_kit_bundle_really_carries_the_marker(self):
+        bundle = os.path.join(cl.REPO, "plugin-kit", "keys", "dist", "keys.js")
+        if not os.path.isfile(bundle):
+            self.skipTest("the kit has not been built in this checkout")
+        with open(bundle, "rb") as f:
+            self.assertIn(cl.KIT_MARKER, f.read())
+
+
 if __name__ == "__main__":
     unittest.main()

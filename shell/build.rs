@@ -1,6 +1,7 @@
 //! Builds `agent-ui/web` (a standalone npm/Vite project, see agent-ui/web/package.json) into a
 //! single-file `dist/index.html` before `shell` compiles, since `shell/src/agent_panel.rs`
-//! embeds that file's contents at compile time via `include_str!`. Node.js/npm is a hard
+//! embeds that file's contents at compile time via `include_str!`. Builds `plugin-kit/keys` the same
+//! way into `dist/keys.js`, which `shell/src/plugin_page.rs` embeds. Node.js/npm is a hard
 //! build-time prerequisite for `shell`.
 //!
 //! Also bakes `shell --version`'s three build identities into the
@@ -43,7 +44,22 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=EITRI_WEB_CLEAN_BUILD");
     let clean_build = std::env::var("EITRI_WEB_CLEAN_BUILD").as_deref() == Ok("1");
-    ensure_web_bundle_built(&web_dir, None, clean_build);
+    ensure_web_bundle_built(&web_dir, "dist/index.html", None, clean_build);
+
+    // The keyboard kit plugin pages load at `/.eitri/keys.js`: a second bundle under the same rule,
+    // embedded by `shell/src/plugin_page.rs`.
+    let kit_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-kit/keys");
+    if !kit_dir.is_dir() {
+        panic!(
+            "plugin-kit/keys is not at {} -- the checkout is incomplete, or this build script was \
+             compiled for another one (`cargo clean -p shell` rebuilds it against this one)",
+            kit_dir.display()
+        );
+    }
+    for path in web_build_watch_paths(&kit_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    ensure_web_bundle_built(&kit_dir, "dist/keys.js", None, clean_build);
 }
 
 /// Bakes `EITRI_BUILD_COMMIT`, `EITRI_FORK_REV` and `EITRI_VERDANDI_REV` into the binary via

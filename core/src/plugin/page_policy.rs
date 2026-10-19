@@ -219,6 +219,15 @@ fn request_path<'a>(id: &str, uri: &'a str) -> Option<&'a str> {
     Some(rest.split(['?', '#']).next().unwrap_or(""))
 }
 
+/// Where every plugin's origin serves the keyboard kit, a path no site file is read for.
+pub const KIT_PATH: &str = ".eitri/keys.js";
+
+/// Whether `uri` asks this plugin's origin for the keyboard kit: its decoded path is [`KIT_PATH`] exactly, the
+/// query and fragment ignored.
+pub fn kit_request(id: &str, uri: &str) -> bool {
+    request_path(id, uri).is_some_and(|p| decoded(p).is_some_and(|d| d == KIT_PATH))
+}
+
 pub fn is_entry(id: &str, entry: &str, uri: &str) -> bool {
     request_path(id, uri).is_some_and(|p| p.is_empty() || decoded(p).is_some_and(|d| d == entry))
 }
@@ -382,6 +391,21 @@ mod tests {
         );
         assert!(!is_entry("demo", "index.html", "eitri-plugin://demo/app.js"));
         assert!(!NOT_BUILT_HTML.contains("<script"));
+    }
+
+    #[test]
+    fn the_keyboard_kit_is_asked_for_by_one_path_and_nothing_else() {
+        assert!(kit_request("snotra", "eitri-plugin://snotra/.eitri/keys.js"));
+        assert!(kit_request("snotra", "eitri-plugin://snotra/.eitri/keys.js?v=1"));
+        assert!(kit_request("snotra", "eitri-plugin://snotra/.eitri/keys.js#x"));
+        assert!(kit_request("snotra", "eitri-plugin://snotra/%2Eeitri/keys%2Ejs"));
+        assert!(!kit_request("snotra", "eitri-plugin://snotra/.eitri/other.js"));
+        assert!(!kit_request("snotra", "eitri-plugin://snotra/x/.eitri/keys.js"));
+        assert!(!kit_request("snotra", "eitri-plugin://snotra/.eitri/keys.js/"));
+        assert!(!kit_request("snotra", "eitri-plugin://snotra/.eitri/keys.json"));
+        assert!(!kit_request("snotra", "eitri-plugin://snotra/"));
+        assert!(!kit_request("snotra", "eitri-plugin://other/.eitri/keys.js"));
+        assert!(!kit_request("snotra", "https://snotra/.eitri/keys.js"));
     }
 
     #[test]

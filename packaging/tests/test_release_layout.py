@@ -590,8 +590,8 @@ class TreeEqualityTests(unittest.TestCase):
     def test_the_eitri_source_assets_known_additions_are_allowed(self):
         """The Eitri source asset equals `git archive HEAD` except exactly
         vendor/, skia/, neovide/, proto/, .cargo/config.toml, agent-ui/web/dist/index.html,
-        agent-ui/web/dist/.inputs-sha256, THIRD-PARTY-LICENSES and
-        SOURCE."""
+        agent-ui/web/dist/.inputs-sha256, the plugin keyboard kit's
+        plugin-kit/keys/dist/keys.js and its .inputs-sha256, THIRD-PARTY-LICENSES and SOURCE."""
         repo, head = _init_git_repo({"core/lib.rs": b"fn f() {}\n"})
         extracted = _scratch_dir()
         self.addCleanup(shutil.rmtree, extracted, ignore_errors=True)
@@ -604,6 +604,8 @@ class TreeEqualityTests(unittest.TestCase):
             ".cargo/config.toml": b"[source.crates-io]\n",
             "agent-ui/web/dist/index.html": b"<html></html>\n",
             "agent-ui/web/dist/.inputs-sha256": b"a" * 64 + b"\n",
+            "plugin-kit/keys/dist/keys.js": b"(() => {})();\n",
+            "plugin-kit/keys/dist/.inputs-sha256": b"a" * 64 + b"\n",
             "THIRD-PARTY-LICENSES": b"...\n",
             "SOURCE": b"...\n",
         }
@@ -1191,6 +1193,17 @@ class WebBundleFingerprintTests(unittest.TestCase):
         _plant(root, {"src/a.ts": b"x\n"})
         self.assertEqual(rc.web_bundle_fingerprint(root), self.PINNED_SHA256)
 
+    # The same fixture plus a bundling script `y\n`; `shell/tests/web_bundle_freshness.rs` pins this value too.
+    PINNED_WITH_BUILD_SCRIPT = "cca1e95e0df5fd4af8f591f7d787e118812bba746ccf62fb9b087ca7c77a6abe"
+
+    def test_the_bundling_script_joins_the_fingerprint(self):
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        _plant(root, {"src/a.ts": b"x\n", "build.mjs": b"y\n"})
+        self.assertEqual(rc.web_bundle_fingerprint(root), self.PINNED_WITH_BUILD_SCRIPT)
+        _plant(root, {"build.mjs": b"z\n"})
+        self.assertNotEqual(rc.web_bundle_fingerprint(root), self.PINNED_WITH_BUILD_SCRIPT)
+
 
 class EitriSourceTreeTests(unittest.TestCase):
     SKIA = "skia-binaries-k.tar.gz"
@@ -1200,6 +1213,7 @@ class EitriSourceTreeTests(unittest.TestCase):
         self.verdandi, self.vhead = _init_git_repo({"proto/v1/runtime.proto": b'syntax = "proto3";\n',
                                                     "package.json": b"{}\n"})
         self.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
+                                      "plugin-kit/keys/src/a.ts": b"k\n", "plugin-kit/keys/build.mjs": b"b\n",
                                       "packaging/install.sh": b"# names claude-agent-sdk\n"})
         fork, _ = _init_git_repo({"Cargo.toml": b"[package]\n"})
         shutil.copytree(fork, os.path.join(self.src, "neovide"))
@@ -1222,6 +1236,10 @@ class EitriSourceTreeTests(unittest.TestCase):
         # Compute it from the fixture's web sources so the source-tree check can verify the bundle's inputs.
         self.web_dir = os.path.join(self.root, "agent-ui/web")
         _plant(self.root, {"agent-ui/web/dist/.inputs-sha256": rc.web_bundle_fingerprint(self.web_dir).encode()})
+        # The plugin keyboard kit is shipped the same way: its bundle and the fingerprint of its sources.
+        self.kit_dir = os.path.join(self.root, "plugin-kit/keys")
+        _plant(self.root, {"plugin-kit/keys/dist/keys.js": b"(() => {})();\n"})
+        _plant(self.root, {"plugin-kit/keys/dist/.inputs-sha256": rc.web_bundle_fingerprint(self.kit_dir).encode()})
 
     def check(self):
         sha = hashlib.sha256(self.SKIA_BYTES).hexdigest()
@@ -1251,6 +1269,24 @@ class EitriSourceTreeTests(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("does not match a fresh fingerprint", problems[0])
 
+
+    def test_the_kit_bundle_and_its_fingerprint_are_required_and_checked(self):
+        # The offline rebuild of the asset must reach no npm for the kit either: the bundle has to be there,
+        # and the fingerprint has to be one a fresh walk of the shipped kit sources gives back.
+        os.remove(os.path.join(self.root, "plugin-kit/keys/dist/.inputs-sha256"))
+        self.assertTrue(any("no plugin-kit/keys/dist/.inputs-sha256" in p for p in self.check()))
+        _plant(self.root, {"plugin-kit/keys/dist/.inputs-sha256": b"0" * 64})
+        problems = self.check()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("plugin-kit/keys/dist/.inputs-sha256 does not match a fresh fingerprint", problems[0])
+        os.remove(os.path.join(self.root, "plugin-kit/keys/dist/keys.js"))
+        self.assertTrue(any("no plugin-kit/keys/dist/keys.js" in p for p in self.check()))
+
+    def test_a_changed_kit_build_script_makes_the_shipped_fingerprint_stale(self):
+        _plant(self.root, {"plugin-kit/keys/build.mjs": b"changed\n"})
+        problems = self.check()
+        self.assertTrue(any("source asset vs git archive HEAD" in p for p in problems), problems)
+        self.assertTrue(any("plugin-kit/keys/dist/.inputs-sha256 does not match" in p for p in problems), problems)
 
     def test_an_unexpected_file_a_changed_proto_or_another_skia_fails(self):
         _plant(self.root, {"stray.txt": b"x", "proto/v1/runtime.proto": b"changed\n", "skia/" + self.SKIA: b"other"})
@@ -1308,6 +1344,7 @@ class ReleaseAssetsTests(unittest.TestCase):
             "proto/v1/runtime.proto": b'syntax = "proto3";\n',
         })
         cls.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
+                                     "plugin-kit/keys/src/a.ts": b"k\n",
                                      "packaging/install.sh": cls.INSTALL, "LICENSE": b"MIT\n",
                                      "packaging/apparmor/eitri": cls.APPARMOR,
                                      # The tracked desktop entry and icons the release ships unmodified
@@ -1337,12 +1374,15 @@ class ReleaseAssetsTests(unittest.TestCase):
         # `git archive HEAD` of cls.src also reads agent-ui/web/src/a.ts from -- the two agree
         # because that tree is clean (nothing planted here changes agent-ui/web).
         fingerprint = rc.web_bundle_fingerprint(os.path.join(self.src, "agent-ui/web"))
+        kit_fingerprint = rc.web_bundle_fingerprint(os.path.join(self.src, "plugin-kit/keys"))
         source.update({top + rel: data for rel, data in {
             "vendor/nvim-rs/src/lib.rs": b"pub fn f() {}\n",
             ".cargo/config.toml": b'[source.vendored-sources]\ndirectory = "vendor"\n',
             "skia/" + self.SKIA: self.SKIA_BYTES,
             "agent-ui/web/dist/index.html": b"<html></html>\n",
             "agent-ui/web/dist/.inputs-sha256": fingerprint.encode(),
+            "plugin-kit/keys/dist/keys.js": b"(() => {})();\n",
+            "plugin-kit/keys/dist/.inputs-sha256": kit_fingerprint.encode(),
             **self.NOTICES,
         }.items()})
         return {

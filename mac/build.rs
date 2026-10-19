@@ -31,5 +31,5 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=EITRI_WEB_CLEAN_BUILD");
     let clean_build = std::env::var("EITRI_WEB_CLEAN_BUILD").as_deref() == Ok("1");
-    ensure_web_bundle_built(&web_dir, None, clean_build);
+    ensure_web_bundle_built(&web_dir, "dist/index.html", None, clean_build);
 }

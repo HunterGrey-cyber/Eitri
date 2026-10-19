@@ -56,14 +56,15 @@ fn decide_web_build(
 
 /// Every file the fingerprint (and `cargo:rerun-if-changed`) covers, relative to nothing --
 /// absolute paths under `web_dir` -- in a stable order: `src/` walked depth-first with each
-/// directory's entries sorted, then `package.json`, `package-lock.json` and `index.html` if
-/// present, then every top-level `vite.config.*`/`tsconfig*.json`, sorted. A name that does not
+/// directory's entries sorted, then `package.json`, `package-lock.json`, `index.html` and `build.mjs`
+/// (a project that bundles with its own script, as the keyboard kit does, is rebuilt when that script
+/// changes) if present, then every top-level `vite.config.*`/`tsconfig*.json`, sorted. A name that does not
 /// exist is simply absent from this list, not an error -- a minimal test fixture need not carry
 /// every one of these, though the real `agent-ui/web` always does.
 fn web_build_inputs(web_dir: &Path) -> Vec<PathBuf> {
     let mut inputs = Vec::new();
     walk_sorted(&web_dir.join("src"), &mut inputs);
-    for name in ["package.json", "package-lock.json", "index.html"] {
+    for name in ["package.json", "package-lock.json", "index.html", "build.mjs"] {
         let path = web_dir.join(name);
         if path.is_file() {
             inputs.push(path);
@@ -173,8 +174,13 @@ fn hex(bytes: &[u8]) -> String {
 /// than searched for on `PATH` -- the real caller always passes `None`; the test file passes
 /// `Some` to point at a logging stub instead of a real npm, with no `PATH`/process-env mutation
 /// (and so no cross-test race) needed to do it.
-fn ensure_web_bundle_built(web_dir: &Path, npm_override_dir: Option<&Path>, clean_build: bool) {
-    let dist_index = web_dir.join("dist/index.html");
+///
+/// `output` is the file, relative to `web_dir`, that a build must leave behind and whose presence
+/// (with a matching fingerprint) means the bundle is current: `dist/index.html` for the agent panel,
+/// `dist/keys.js` for the plugin keyboard kit. One function serves both so the offline rule -- no npm
+/// when nothing changed, `node_modules` or not -- cannot drift between them.
+fn ensure_web_bundle_built(web_dir: &Path, output: &str, npm_override_dir: Option<&Path>, clean_build: bool) {
+    let dist_index = web_dir.join(output);
     let node_modules_present = web_dir.join("node_modules").is_dir();
 
     let lockfile_path = web_dir.join("package-lock.json");
@@ -209,7 +215,10 @@ fn ensure_web_bundle_built(web_dir: &Path, npm_override_dir: Option<&Path>, clea
     if plan.npm_build {
         run(web_dir, "npm", &["run", "build"], npm_override_dir);
         if !dist_index.is_file() {
-            panic!("agent-ui/web build did not produce dist/index.html -- check the npm build output above");
+            panic!(
+                "the build in {} did not produce {output} -- check the npm build output above",
+                web_dir.display()
+            );
         }
         // Save `current_fingerprint`, computed before the build. The build writes only to `dist/`,
         // which the fingerprint excludes. Recomputing afterwards could mark a concurrent input edit

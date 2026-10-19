@@ -930,6 +930,10 @@ ctr_phase_f() {
 	cargo fetch --locked
 	step "npm ci (agent-ui/web)"
 	(cd agent-ui/web && npm ci --no-audit --no-fund)
+	# The plugin keyboard kit is a second bundle shell/build.rs builds; its packages come in here, with the
+	# network, because the build below runs offline.
+	step "npm ci (plugin-kit/keys)"
+	(cd plugin-kit/keys && npm ci --no-audit --no-fund)
 
 	step "the Skia archive, checked against its pin"
 	ctr_fetch_pinned "$RS_SKIA_URL_UPSTREAM" "/build/skia/$RS_SKIA_ARCHIVE" "$RS_SKIA_SHA256"
@@ -1036,9 +1040,9 @@ ctr_phase_b() {
 	cargo tree --locked --offline -e features -p shell -p agent -p supervisor -i agent > "$logs/feature-tree.txt"
 	if grep -n 'legacy-backend' "$logs/feature-tree.txt" >&2; then ctr_die "the resolved graph enables legacy-backend"; fi
 
-	# shell/build.rs writes agent-ui/web/dist/index.html into a fresh source copy while
-	# /build/target is retained. Unchanged inputs can make cargo skip the build script
-	# on a retry, leaving the bundle absent and causing include_str! to fail.
+	# shell/build.rs writes agent-ui/web/dist/index.html and plugin-kit/keys/dist/keys.js
+	# into a fresh source copy while /build/target is retained. Unchanged inputs can make
+	# cargo skip the build script on a retry, leaving bundles absent and include_str! failing.
 	# Cleaning shell makes its build script run against the fresh copy every time.
 	step "cargo clean --release -p shell (its build script writes the web bundle into this fresh copy)"
 	cargo clean --release --locked --offline -p shell
@@ -1108,7 +1112,7 @@ ctr_phase_b() {
 	find "$tb/$tt" -exec touch -h -d "@$sde" {} +
 	ctr_tar "$tt" "$tb" "$out/$tt.tar.gz"
 
-	step "the Eitri source asset: git archive, neovide, vendor/, proto/, the web bundle, Skia"
+	step "the Eitri source asset: git archive, neovide, vendor/, proto/, the web bundles, Skia"
 	local sa="eitri-$RS_VERSION-source" sd=/build/check/source-tree
 	rm -rf "$sd"; mkdir -p "$sd/$sa/neovide"
 	git archive --format=tar HEAD | tar -x -C "$sd/$sa"
@@ -1123,6 +1127,10 @@ ctr_phase_b() {
 	# Ship it with its bundle so the source asset can rebuild offline without a separate
 	# mtime check to keep in sync with build.rs.
 	install -D -m 0644 agent-ui/web/dist/.inputs-sha256 "$sd/$sa/agent-ui/web/dist/.inputs-sha256"
+	# The plugin keyboard kit is the same case: its bundle and the fingerprint it was built from travel
+	# together, so the offline rebuild of the asset skips npm for it too.
+	install -D -m 0644 plugin-kit/keys/dist/keys.js "$sd/$sa/plugin-kit/keys/dist/keys.js"
+	install -D -m 0644 plugin-kit/keys/dist/.inputs-sha256 "$sd/$sa/plugin-kit/keys/dist/.inputs-sha256"
 	install -D -m 0644 "/build/skia/$RS_SKIA_ARCHIVE" "$sd/$sa/skia/$RS_SKIA_ARCHIVE"
 	install -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$st/dist/SOURCE" "$sd/$sa/"
 	find "$sd/$sa" -exec touch -h -d "@$sde" {} +

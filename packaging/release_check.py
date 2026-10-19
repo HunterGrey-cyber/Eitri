@@ -388,7 +388,7 @@ def web_bundle_fingerprint(web_dir: str) -> str:
     """The same fingerprint `shell/build_web.rs`'s `compute_fingerprint` writes to
     `dist/.inputs-sha256`: a sha256 over every file under `src/`
     (depth-first, each directory's own entries sorted first) followed by `package.json`,
-    `package-lock.json` and `index.html` if present, then every top-level `vite.config.*`/
+    `package-lock.json`, `index.html` and `build.mjs` if present, then every top-level `vite.config.*`/
     `tsconfig*.json` sorted -- each entry as its path relative to `web_dir` (forward slashes, as
     Rust's own `Path::join`/`strip_prefix` produce on this platform) plus a NUL, its content plus a
     NUL. Must stay byte-for-byte the same algorithm as the Rust side or this check would only prove
@@ -417,7 +417,7 @@ def web_bundle_fingerprint(web_dir: str) -> str:
 
     for rel, path in walk_sorted(os.path.join(web_dir, "src"), "src"):
         add(rel, path)
-    for name in ("package.json", "package-lock.json", "index.html"):
+    for name in ("package.json", "package-lock.json", "index.html", "build.mjs"):
         path = os.path.join(web_dir, name)
         if os.path.isfile(path):
             add(name, path)
@@ -461,6 +461,9 @@ KNOWN_EITRI_SOURCE_ADDITIONS = (
     # -- shipped alongside it so the source asset's offline rebuild can
     # skip npm by content match rather than an mtime rule.
     "agent-ui/web/dist/.inputs-sha256",
+    # The plugin keyboard kit's bundle and fingerprint, shipped for the same reason.
+    "plugin-kit/keys/dist/keys.js",
+    "plugin-kit/keys/dist/.inputs-sha256",
     "THIRD-PARTY-LICENSES",
     "SOURCE",
 )
@@ -925,6 +928,33 @@ def check_same_bytes(named_paths: dict[str, str]) -> list[str]:
     return problems
 
 
+# The npm projects shell/build.rs builds into a file the binary embeds, each with the bundle it leaves
+# behind: the source asset ships both beside a fingerprint so its offline rebuild reaches no npm.
+WEB_BUNDLES = (("agent-ui/web", "dist/index.html"), ("plugin-kit/keys", "dist/keys.js"))
+
+
+def _check_web_bundle(root: str, web_rel: str, output: str) -> list[str]:
+    """The source asset's bundle `web_rel/output` and its `dist/.inputs-sha256`: both present, and the
+    fingerprint equal to a fresh one over the shipped sources."""
+    problems = []
+    web_dir = os.path.join(root, *web_rel.split("/"))
+    bundle = os.path.join(web_dir, *output.split("/"))
+    fingerprint_file = os.path.join(web_dir, "dist", ".inputs-sha256")
+    if not os.path.isfile(bundle):
+        problems.append(f"source asset has no {web_rel}/{output}")
+    if not os.path.isfile(fingerprint_file):
+        problems.append(f"source asset has no {web_rel}/dist/.inputs-sha256")
+    elif os.path.isfile(bundle):
+        shipped = open(fingerprint_file, encoding="utf-8").read().strip()
+        recomputed = web_bundle_fingerprint(web_dir)
+        if shipped != recomputed:
+            problems.append(
+                f"source asset {web_rel}/dist/.inputs-sha256 does not match a fresh fingerprint of "
+                f"its own web sources ({shipped[:12]} shipped vs {recomputed[:12]} recomputed) -- "
+                "an offline rebuild from this asset would reach npm")
+    return problems
+
+
 def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdandi_rev: str,
                               skia_archive: str, skia_sha256: str) -> list[str]:
     """The extracted Eitri source asset's top directory (M2): `git archive HEAD` of src_repo byte
@@ -964,21 +994,8 @@ def check_eitri_source_tree(root: str, src_repo: str, verdandi_repo: str, verdan
     config = os.path.join(root, ".cargo", "config.toml")
     if not os.path.isfile(config) or 'directory = "vendor"' not in open(config, encoding="utf-8").read():
         problems.append('source asset .cargo/config.toml does not name directory = "vendor"')
-    bundle = os.path.join(root, "agent-ui", "web", "dist", "index.html")
-    fingerprint_file = os.path.join(root, "agent-ui", "web", "dist", ".inputs-sha256")
-    web_dir = os.path.join(root, "agent-ui", "web")
-    if not os.path.isfile(bundle):
-        problems.append("source asset has no agent-ui/web/dist/index.html")
-    if not os.path.isfile(fingerprint_file):
-        problems.append("source asset has no agent-ui/web/dist/.inputs-sha256")
-    elif os.path.isfile(bundle):
-        shipped = open(fingerprint_file, encoding="utf-8").read().strip()
-        recomputed = web_bundle_fingerprint(web_dir)
-        if shipped != recomputed:
-            problems.append(
-                "source asset agent-ui/web/dist/.inputs-sha256 does not match a fresh fingerprint of "
-                f"its own web sources ({shipped[:12]} shipped vs {recomputed[:12]} recomputed) -- "
-                "an offline rebuild from this asset would reach npm")
+    for web_rel, output in WEB_BUNDLES:
+        problems.extend(_check_web_bundle(root, web_rel, output))
     files = iter_files(root)
     for name, hits in (("the SEA fuse sentinel", find_sentinel_hits(files)),
                        ("a node_modules/ path", find_node_modules_dirs(files)),

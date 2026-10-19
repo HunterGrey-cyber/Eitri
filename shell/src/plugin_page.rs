@@ -24,6 +24,10 @@ use webkit6::{
 /// The name the page posts to: `window.webkit.messageHandlers.eitriPlugin`.
 pub(crate) const HANDLER: &str = "eitriPlugin";
 
+/// The keyboard kit `build.rs` bundles from `plugin-kit/keys`, answered at `page_policy::KIT_PATH` in every
+/// plugin's origin so a page loads it with an ordinary same-origin script tag under the CSP floor.
+const KIT_JS: &str = include_str!("../../plugin-kit/keys/dist/keys.js");
+
 pub(crate) struct PageSpec {
     pub(crate) id: String,
     /// Canonical when the site is built; a missing site shows the static "not built" page.
@@ -48,6 +52,14 @@ pub(crate) struct PageHooks {
 /// the main context, and the file itself is read without blocking this thread.
 fn serve(request: &URISchemeRequest, site_root: &Path, id: &str, entry: &str) {
     let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+    // The kit is part of the host, not of the plugin's site: it is answered from memory, ahead of the site
+    // lookup, so a site file of the same name can neither replace it nor be asked for through it.
+    if page_policy::kit_request(id, &uri) {
+        let bytes = glib::Bytes::from_static(KIT_JS.as_bytes());
+        let stream = gio::MemoryInputStream::from_bytes(&bytes);
+        request.finish(&stream, bytes.len() as i64, Some("text/javascript"));
+        return;
+    }
     let request = request.clone();
     let (site_root, id, entry) = (site_root.to_path_buf(), id.to_owned(), entry.to_owned());
     glib::spawn_future_local(async move {
@@ -263,4 +275,22 @@ pub(crate) fn open_outside(url: &str) {
             eprintln!("[plugin] opening {shown}: {e}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KIT_JS;
+
+    #[test]
+    fn the_embedded_kit_is_the_built_bundle() {
+        assert!(!KIT_JS.is_empty());
+        assert!(
+            KIT_JS.starts_with("\"use strict\";\n(() => {"),
+            "the bundle build.mjs emits is one IIFE, not a module"
+        );
+        assert!(
+            KIT_JS.contains("eitriKeys"),
+            "the bundle installs the page-facing global"
+        );
+    }
 }

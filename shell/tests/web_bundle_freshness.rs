@@ -93,7 +93,7 @@ fn npm_stub_dir() -> &'static Path {
 printf '%s\n' "$*" >> ../npm.log
 case "$1" in
   ci) mkdir -p node_modules ;;
-  run) [ "$2" = build ] && { mkdir -p dist && printf '<html></html>\n' > dist/index.html; } ;;
+  run) [ "$2" = build ] && { mkdir -p dist && printf '<html></html>\n' > dist/index.html && printf '(() => {})();\n' > dist/keys.js; } ;;
 esac
 "#;
         let staged = dir.join(format!("npm.{}.tmp", std::process::id()));
@@ -143,7 +143,7 @@ impl Fixture {
     /// never `installed`'s own initial `ci` + `run build`.
     fn run_and_log(&self, clean_build: bool) -> Vec<String> {
         let _ = fs::remove_file(&self.log_path);
-        ensure_web_bundle_built(&self.web_dir, Some(npm_stub_dir()), clean_build);
+        ensure_web_bundle_built(&self.web_dir, "dist/index.html", Some(npm_stub_dir()), clean_build);
         fs::read_to_string(&self.log_path)
             .unwrap_or_default()
             .lines()
@@ -258,6 +258,41 @@ fn the_clean_build_switch_forces_ci_and_the_build_even_with_nothing_changed() {
     );
 }
 
+/// The keyboard kit is bundled by its own `build.mjs`, so editing that script alone must rebuild the bundle,
+/// and its output is `dist/keys.js` where the agent panel's is `dist/index.html`.
+#[test]
+fn a_bundling_script_is_a_build_input_and_the_output_file_is_the_callers_choice() {
+    let fixture = Fixture::new("bundling-script");
+    fs::write(fixture.web_dir.join("build.mjs"), "export {};\n").unwrap();
+    let run = |clean: bool| {
+        let _ = fs::remove_file(&fixture.log_path);
+        ensure_web_bundle_built(&fixture.web_dir, "dist/keys.js", Some(npm_stub_dir()), clean);
+        fs::read_to_string(&fixture.log_path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run(false), vec!["ci".to_string(), "run build".to_string()]);
+    assert!(fixture.web_dir.join("dist/keys.js").is_file());
+    assert_eq!(run(false), Vec::<String>::new());
+    let before = compute_fingerprint(&fixture.web_dir).unwrap();
+    append(&fixture.web_dir.join("build.mjs"), "// changed\n");
+    assert_ne!(compute_fingerprint(&fixture.web_dir).unwrap(), before);
+    assert_eq!(run(false), vec!["run build".to_string()]);
+    assert!(web_build_watch_paths(&fixture.web_dir).contains(&fixture.web_dir.join("build.mjs")));
+    // The bundle current and `node_modules` gone is the source asset's state: no npm at all.
+    fs::remove_dir_all(fixture.web_dir.join("node_modules")).unwrap();
+    assert_eq!(run(false), Vec::<String>::new());
+}
+
+#[test]
+#[should_panic(expected = "did not produce dist/never-built.js")]
+fn a_build_that_leaves_the_named_output_missing_panics() {
+    let fixture = Fixture::new("output-missing");
+    ensure_web_bundle_built(&fixture.web_dir, "dist/never-built.js", Some(npm_stub_dir()), false);
+}
+
 /// `build.rs`'s own `cargo:rerun-if-changed` list, over this fixture: the `src` directory itself
 /// (covering every file under it in one watch, additions and removals included, so no file under
 /// `src/` is separately listed) plus every top-level input the fingerprint also covers -- and
@@ -299,5 +334,19 @@ fn fingerprint_matches_the_pinned_value_the_python_side_also_asserts() {
     assert_eq!(
         compute_fingerprint(&scratch).unwrap(),
         "ae53f67ca66e61114b0f5453e451fa06c6ed8d9f8d44bee54b35d51b23fe3408"
+    );
+}
+
+/// The same fixture with a bundling script beside it: the value `packaging/tests/test_release_layout.py` pins
+/// for `web_bundle_fingerprint`, so the kit's `build.mjs` counts the same on both sides.
+#[test]
+fn a_bundling_script_changes_the_fingerprint_to_the_pinned_value_the_python_side_also_asserts() {
+    let scratch = ScratchDir::new("pinned-fingerprint-build-script");
+    fs::create_dir_all(scratch.join("src")).unwrap();
+    fs::write(scratch.join("src/a.ts"), "x\n").unwrap();
+    fs::write(scratch.join("build.mjs"), "y\n").unwrap();
+    assert_eq!(
+        compute_fingerprint(&scratch).unwrap(),
+        "cca1e95e0df5fd4af8f591f7d787e118812bba746ccf62fb9b087ca7c77a6abe"
     );
 }
