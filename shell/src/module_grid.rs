@@ -22,7 +22,8 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
 use eitri_core::layout::{
-    arrange, Axis, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Rect, Reopen, Size, ZoomChange,
+    arrange, Axis, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Preset, Rect, Reopen, Size,
+    ZoomChange,
 };
 
 use throttle::{WebThrottle, QUIET};
@@ -65,6 +66,15 @@ fn frame_size(width: i32, height: i32) -> Size {
     }
 }
 
+/// Where the probe puts a host, whatever the layout says: a rectangle in the grid's coordinates (it may
+/// overlap another host or reach past the grid's edge), or off the screen.
+#[cfg(feature = "probe")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbePlace {
+    Hidden,
+    At(Rect),
+}
+
 /// A module's host and its focus target. Generic over the widget only so [`focus_target_of`] is
 /// tested on these same records without a display; the grid holds `gtk4::Widget`s.
 struct Host<W = gtk4::Widget> {
@@ -99,6 +109,9 @@ mod imp {
         pub(super) changed: RefCell<Vec<Rc<dyn Fn()>>>,
         /// Called after a pinned split got its length ([`ModuleGrid::connect_settled`]).
         pub(super) settled: RefCell<Vec<Rc<dyn Fn()>>>,
+        /// Hosts the probe places by hand instead of by the layout ([`ModuleGrid::probe_place`]).
+        #[cfg(feature = "probe")]
+        pub(super) probe_places: RefCell<std::collections::BTreeMap<ModuleId, ProbePlace>>,
     }
 
     #[glib::object_subclass]
@@ -369,6 +382,7 @@ impl ModuleGrid {
                 .hosts
                 .borrow()
                 .iter()
+                .filter(|h| !self.probe_places_host(&h.id))
                 .map(|h| (h.widget.clone(), layout.is_visible(&h.id)))
                 .collect()
         };
@@ -447,10 +461,96 @@ impl ModuleGrid {
         swapped
     }
 
-    /// `Ctrl+a |` / `Ctrl+a _` (`eitri_core::layout::even`).
+    /// `eitri_core::layout::even` on its own: an even split that is not a preset, so `layout.next`
+    /// does not count it. The keys' `even-*` go through [`ModuleGrid::preset`] instead, which does.
+    #[allow(dead_code)]
     pub(crate) fn even_modules(&self, axis: Axis) {
         eitri_core::layout::even(&mut self.layout().borrow_mut(), axis);
         self.apply();
+    }
+
+    // The verbs below share one shape: the layout is borrowed only while core changes it, and
+    // released before `apply`, whose hooks read it; `apply` runs only when something changed, so a
+    // refused or empty verb neither moves a widget nor counts as a change for the state file.
+
+    /// `move.far-*` (`eitri_core::layout::move_far`): `Ok(false)` when `target` already spans that edge.
+    pub(crate) fn move_far(&self, target: &ModuleId, dir: Direction) -> Result<bool, LayoutError> {
+        let size = self.size();
+        let moved = {
+            let layout = self.layout();
+            let mut layout = layout.borrow_mut();
+            self.with_frame(size, |frame| {
+                eitri_core::layout::move_far(&mut layout, target, dir, frame)
+            })
+        }?;
+        if moved {
+            self.apply();
+        }
+        Ok(moved)
+    }
+
+    /// `layout.toggle-split` (`eitri_core::layout::toggle_split`).
+    pub(crate) fn toggle_split(&self, target: &ModuleId) -> bool {
+        let changed = eitri_core::layout::toggle_split(&mut self.layout().borrow_mut(), target);
+        if changed {
+            self.apply();
+        }
+        changed
+    }
+
+    /// `layout.rotate-*` (`eitri_core::layout::rotate`).
+    pub(crate) fn rotate(&self, down: bool) -> bool {
+        let changed = eitri_core::layout::rotate(&mut self.layout().borrow_mut(), down);
+        if changed {
+            self.apply();
+        }
+        changed
+    }
+
+    /// `layout.flip-*` (`eitri_core::layout::flip`).
+    pub(crate) fn flip(&self, axis: Axis) -> bool {
+        let changed = eitri_core::layout::flip(&mut self.layout().borrow_mut(), axis);
+        if changed {
+            self.apply();
+        }
+        changed
+    }
+
+    /// The five tmux presets (`eitri_core::layout::preset`), remembered for `layout.next`.
+    pub(crate) fn preset(&self, preset: Preset) -> Result<(), LayoutError> {
+        eitri_core::layout::preset(&mut self.layout().borrow_mut(), preset)?;
+        self.apply();
+        Ok(())
+    }
+
+    /// `layout.next`/`layout.previous` (`eitri_core::layout::cycle_preset`): the preset applied.
+    pub(crate) fn cycle_preset(&self, forward: bool) -> Result<Preset, LayoutError> {
+        let preset = eitri_core::layout::cycle_preset(&mut self.layout().borrow_mut(), forward)?;
+        self.apply();
+        Ok(preset)
+    }
+
+    /// `layout.spread` (`eitri_core::layout::spread`).
+    pub(crate) fn spread(&self, target: &ModuleId) -> bool {
+        let changed = eitri_core::layout::spread(&mut self.layout().borrow_mut(), target);
+        if changed {
+            self.apply();
+        }
+        changed
+    }
+
+    /// `swap.marked` (`eitri_core::layout::swap_marked`): the marked module it swapped with.
+    pub(crate) fn swap_marked(&self, target: &ModuleId) -> Result<ModuleId, LayoutError> {
+        let marked = eitri_core::layout::swap_marked(&mut self.layout().borrow_mut(), target)?;
+        self.apply();
+        Ok(marked)
+    }
+
+    /// `layout.undo` (`Layout::undo`): pressed again, it redoes.
+    pub(crate) fn undo(&self) -> Result<(), LayoutError> {
+        self.layout().borrow_mut().undo()?;
+        self.apply();
+        Ok(())
     }
 
     /// The divider thickness: the separators' own CSS size (`.content-area > separator`, 1px).
@@ -642,6 +742,9 @@ impl ModuleGrid {
         let mut held = false;
         let mut restart_quiet = false;
         for host in imp.hosts.borrow().iter() {
+            if self.probe_places_host(&host.id) {
+                continue;
+            }
             let Some(target) = arrangement.rect_of(&host.id) else {
                 continue;
             };
@@ -669,6 +772,7 @@ impl ModuleGrid {
                 .size_allocate(&gtk4::Allocation::new(rect.x, rect.y, rect.w, rect.h), -1);
         }
         *imp.clips.borrow_mut() = clips;
+        self.allocate_probe_hosts();
         self.place_handles(&arrangement.dividers);
         // Only a new target restarts the quiet period (`WebAllocation::restart_quiet`). The second
         // clause is belt and braces -- the first hold of any target already restarts -- so that a
@@ -677,6 +781,73 @@ impl ModuleGrid {
             self.settle_after_quiet();
         }
     }
+
+    /// Whether the probe places `id` by hand. Always false without the `probe` feature.
+    #[cfg(feature = "probe")]
+    fn probe_places_host(&self, id: &ModuleId) -> bool {
+        self.imp().probe_places.borrow().contains_key(id)
+    }
+
+    #[cfg(not(feature = "probe"))]
+    fn probe_places_host(&self, _id: &ModuleId) -> bool {
+        false
+    }
+
+    /// Puts `id`'s host where the probe says, after the tiled ones, and `None` gives it back to the
+    /// layout. A host placed here is not in the layout's tree at all or is tiled and overridden; either
+    /// way the layout's arrangement does not allocate it.
+    #[cfg(feature = "probe")]
+    pub(crate) fn probe_place(&self, id: &ModuleId, place: Option<ProbePlace>) {
+        let widget = self
+            .imp()
+            .hosts
+            .borrow()
+            .iter()
+            .find(|h| h.id == *id)
+            .map(|h| h.widget.clone());
+        let Some(widget) = widget else { return };
+        match place {
+            Some(place) => {
+                self.imp().probe_places.borrow_mut().insert(id.clone(), place);
+                widget.set_child_visible(matches!(place, ProbePlace::At(_)));
+                self.queue_allocate();
+            }
+            None => {
+                self.imp().probe_places.borrow_mut().remove(id);
+                self.apply();
+            }
+        }
+    }
+
+    #[cfg(feature = "probe")]
+    fn allocate_probe_hosts(&self) {
+        let places: Vec<(ModuleId, ProbePlace)> = self
+            .imp()
+            .probe_places
+            .borrow()
+            .iter()
+            .map(|(id, place)| (id.clone(), *place))
+            .collect();
+        for (id, place) in places {
+            let ProbePlace::At(rect) = place else { continue };
+            let Some(widget) = self
+                .imp()
+                .hosts
+                .borrow()
+                .iter()
+                .find(|h| h.id == id)
+                .map(|h| h.widget.clone())
+            else {
+                continue;
+            };
+            let _ = widget.measure(gtk4::Orientation::Horizontal, -1);
+            let _ = widget.measure(gtk4::Orientation::Vertical, rect.w);
+            widget.size_allocate(&gtk4::Allocation::new(rect.x, rect.y, rect.w, rect.h), -1);
+        }
+    }
+
+    #[cfg(not(feature = "probe"))]
+    fn allocate_probe_hosts(&self) {}
 
     fn place_handles(&self, dividers: &[Divider]) {
         for (i, handle) in self.imp().handles.borrow().iter().enumerate() {

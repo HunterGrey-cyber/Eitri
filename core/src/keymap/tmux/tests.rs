@@ -89,7 +89,7 @@ fn set_g_prefix_sets_the_prefix() {
 
 #[test]
 fn unbind_removes_a_key_and_an_unbound_one_is_no_error() {
-    let got = import("unbind C-b\nunbind-key -T prefix %\nunbind q\n");
+    let got = import("unbind C-b\nunbind-key -T prefix %\nunbind g\n");
     assert_eq!(got.bound("C-b"), None);
     assert_eq!(got.bound("%"), None);
     assert!(got.import.skipped.is_empty(), "{:?}", got.import.skipped);
@@ -102,11 +102,11 @@ fn unbind_all_removes_tmux_actions_and_keeps_eitris_own() {
     assert_eq!(got.bound("m"), None, "imported before -a");
     for gone in [
         "C-b", "%", "\"", "Up", "C-Up", ";", "o", "{", "M-1", "x", "c", "n", "p", "l", "&", "w", ",", ":", "C-l", "[",
-        "PPage",
+        "PPage", "M-3", "M-4", "M-5", "Space", "E", "C-o", "M-o", "M", "q",
     ] {
         assert_eq!(got.bound(gone), None, "{gone}");
     }
-    for kept in ["f", "e", "a", "t", "?", "r", "F11", "1", "i"] {
+    for kept in ["f", "e", "a", "t", "?", "r", "F11", "1", "i", "H", "J", "K", "M-e"] {
         assert!(got.bound(kept).is_some(), "{kept}: Eitri's own action stays");
     }
     assert_eq!(got.bound("z"), Some((Action::Tab(TabAction::Close), false)));
@@ -376,7 +376,16 @@ const SKIPS: &[(&str, &str)] = &[
     ("bind k select-pane", "no Eitri equivalent: select-pane"),
     ("bind k select-pane -t :.-", "-t :.- not imported"),
     ("bind k swap-pane -t 2", "-t 2 not imported"),
-    ("bind k select-layout tiled", "no Eitri equivalent: select-layout tiled"),
+    (
+        "bind k select-layout main-vertical-mirrored",
+        "no Eitri equivalent: select-layout main-vertical-mirrored",
+    ),
+    ("bind k select-layout -n", "flag -n not imported"),
+    ("bind k select-pane -m -L", "-m or -M with another flag"),
+    ("bind k rotate-window -Z", "flag -Z not imported"),
+    ("bind k display-panes -d 500", "flag -d not imported"),
+    ("bind k display-panes 'kill-pane'", "argument kill-pane not imported"),
+    ("bind k next-layout -t x", "flag -t not imported"),
     ("bind k resize-pane -L 900", "1 to 500"),
     ("bind k new-window htop", "argument htop not imported"),
     (
@@ -711,7 +720,7 @@ fn init_lua_overwrites_and_deletes_imported_keys_without_error() {
     assert_eq!(map.lookup(&k("m")).unwrap().action, Action::Zoom);
     assert_eq!(map.lookup(&k("m")).unwrap().source, Source::User);
     // A key nobody bound is still init.lua's mistake, and a default still needs its del.
-    assert!(got.map.clone().then_user(&[del("q")], &[]).is_err());
+    assert!(got.map.clone().then_user(&[del("g")], &[]).is_err());
     assert!(got
         .map
         .clone()
@@ -775,7 +784,7 @@ fn the_setting_is_on_by_default_off_imports_nothing_and_a_bad_value_names_the_ke
     assert!(import.unwrap().changes_anything());
     assert!(Keymap::for_startup(&[], &[], Some("1"), || env.clone(), &LuaClaims::default()).is_err());
     // init.lua's own mistakes still fail startup, import or not.
-    assert!(Keymap::for_startup(&[del("q")], &[], None, || env.clone(), &LuaClaims::default()).is_err());
+    assert!(Keymap::for_startup(&[del("g")], &[], None, || env.clone(), &LuaClaims::default()).is_err());
 }
 
 // --- The fingerprint behind the one-time notice. ------------------------------------------------------
@@ -877,8 +886,8 @@ fn the_number_of_steps_and_skips_is_bounded() {
 #[test]
 fn a_binding_that_reads_a_variable_a_percent_if_may_have_set_is_skipped() {
     let got =
-        import("ACTION=new-window\n%if #{==:#{host},x}\nACTION=kill-pane\n%endif\nbind m $ACTION\nbind n kill-pane\n");
-    assert_eq!(got.bound("m"), None, "neither guessed as new-window nor as kill-pane");
+        import("ACTION=new-window\n%if #{==:#{host},x}\nACTION=kill-pane\n%endif\nbind g $ACTION\nbind n kill-pane\n");
+    assert_eq!(got.bound("g"), None, "neither guessed as new-window nor as kill-pane");
     let reason = got
         .import
         .skipped
@@ -1029,9 +1038,9 @@ fn a_config_tilde_follows_home_and_an_uncertain_home_skips_the_line() {
 #[test]
 fn uncertainty_passes_through_an_assignment() {
     let got = import(
-        "ACTION=kill-pane\n%if 1\nACTION=new-window\n%endif\nCOPY=$ACTION\nAGAIN=$COPY\nbind m $AGAIN\nbind n kill-pane\n",
+        "ACTION=kill-pane\n%if 1\nACTION=new-window\n%endif\nCOPY=$ACTION\nAGAIN=$COPY\nbind g $AGAIN\nbind n kill-pane\n",
     );
-    assert_eq!(got.bound("m"), None);
+    assert_eq!(got.bound("g"), None);
     let reason = got
         .import
         .skipped
@@ -1042,8 +1051,8 @@ fn uncertainty_passes_through_an_assignment() {
         .clone();
     assert!(reason.contains("$AGAIN"), "{reason}");
     // In one statement too: the assignment's dependency is the command's.
-    let got = import("%if 1\nA=x\n%endif\nB=$A bind m kill-pane\n");
-    assert_eq!(got.bound("m"), None);
+    let got = import("%if 1\nA=x\n%endif\nB=$A bind g kill-pane\n");
+    assert_eq!(got.bound("g"), None);
 }
 
 #[test]
@@ -1056,9 +1065,9 @@ fn a_block_refused_for_its_depth_is_skipped_whole_however_deep() {
     for _ in 0..crate::keymap::tmux::lex::MAX_NESTING {
         conf.push_str("}\n");
     }
-    conf.push_str("bind m kill-pane\n}\nbind n kill-pane\n");
+    conf.push_str("bind g kill-pane\n}\nbind n kill-pane\n");
     let got = import(&conf);
-    assert_eq!(got.bound("m"), None, "{:?}", got.import.skipped);
+    assert_eq!(got.bound("g"), None, "{:?}", got.import.skipped);
     assert_eq!(got.bound("n"), Some((Action::ModuleKill, false)));
 }
 
@@ -1094,4 +1103,31 @@ fn the_strip_and_the_overlay_follow_a_tmux_binding_over_a_module_key() {
     let rows = got.map.help(&crate::layout::ModuleKeys::built_in());
     let a = rows.iter().find(|r| r.keys == "Ctrl+b a").unwrap();
     assert!(a.what.contains("(tmux)") && a.what.contains("Send"), "{a:?}");
+}
+
+#[test]
+fn the_layout_commands_tmux_binds_come_across() {
+    let got = import(
+        "bind A select-layout main-horizontal\nbind B select-layout main-vertical\nbind C selectl tiled\n\
+         bind D select-layout -E\nbind F next-layout\nbind G prevl\nbind I rotate-window\n\
+         bind N rotate-window -D\nbind O select-pane -m\nbind P selectp -M\nbind Q display-panes\n\
+         bind R swap-pane\n",
+    );
+    assert!(got.import.skipped.is_empty(), "{:?}", got.import.skipped);
+    for (key, action) in [
+        ("A", Action::MainHorizontal),
+        ("B", Action::MainVertical),
+        ("C", Action::Tiled),
+        ("D", Action::Spread),
+        ("F", Action::CycleLayout { forward: true }),
+        ("G", Action::CycleLayout { forward: false }),
+        ("I", Action::Rotate { down: false }),
+        ("N", Action::Rotate { down: true }),
+        ("O", Action::MarkToggle),
+        ("P", Action::MarkClear),
+        ("Q", Action::SelectNumber),
+        ("R", Action::SwapMarked),
+    ] {
+        assert_eq!(got.bound(key), Some((action, false)), "{key}");
+    }
 }

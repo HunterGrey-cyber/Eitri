@@ -40,6 +40,38 @@ groundwork for a macOS app and is not meant to change anything on Linux.
   for an application that hosts Neovide's own window. Both are groundwork for a macOS app, which is not usable
   yet. On Linux nothing is meant to change.
 
+## Window layout: new keys and verbs (added after 0.2.2)
+
+The layout gains verbs that tmux, vim and i3 users expect, with the same keys after the prefix:
+
+| key after the prefix | action | from |
+|---|---|---|
+| `H` `J` `K` | `move.far-left`, `move.far-down`, `move.far-up` | vim `Ctrl+w H/J/K` |
+| `M-e` | `container.toggle-split` | i3 `layout toggle split` |
+| `C-o` / `M-o` | `rotate.up` / `rotate.down` | tmux `rotate-window` |
+| `M-3` `M-4` `M-5` | `layout.main-horizontal`, `layout.main-vertical`, `layout.tiled` | tmux `select-layout` |
+| `Space` | `layout.next` | tmux `next-layout` |
+| `E` | `layout.spread` | tmux `select-layout -E` |
+| `m` / `M` | `mark.toggle` / `mark.clear` | tmux `select-pane -m` / `-M` |
+| `q` | `select.number` | tmux `display-panes` |
+
+Without a key, by name only: `move.far-right`, `layout.flip-horizontal`, `layout.flip-vertical`, `layout.previous`,
+`swap.marked` and `layout.undo` (one step, kept in memory). In Lua, `eitri.layout.run(name, options)` runs any layout
+action by its `eitri.keymap` name, `eitri.layout.mark(id)` marks a module and `eitri.layout.get()` reads the layout.
+The layout file's format is unchanged.
+
+**What this can break:**
+- **A `set` over any of these keys stops startup,** as every `set` over a default does: the message names the key and
+  says to `del` it first. If your `init.lua` sets `H`, `J`, `K`, `M-e`, `C-o`, `M-o`, `M-3`, `M-4`, `M-5`, `Space`,
+  `E`, `m`, `M` or `q`, put `k.del("prefix", "<key>")` before that `set`. With the tmux import on and your tmux
+  configuration binding the key, no `del` is needed, because your `set` replaces the imported binding. A `del` of a key
+  that is not bound also stops startup, so a `del` line works only on this version or later, or with the import on and
+  the key bound in your tmux configuration. `docs/keymap/tmux-ctrl-a.lua` carries the `del` lines for its `m`, `q`,
+  `H`, `J` and `K`.
+- **A Lua panel keyed `H`, `J` or `K`** now fails at startup with `Bound`; these three were free to panels before.
+  Pick another key from the documented free list.
+- `L` is deliberately not bound.
+
 ## Upgrading from 0.2.1
 
 - **Nothing to rebuild.** The agent backend is pinned to the same revision as in 0.2.1, so `install.sh` keeps

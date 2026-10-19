@@ -192,6 +192,8 @@ pub(crate) struct HintCoordinator {
     /// end. Detached on that key's release, on the next fresh key, on a new HINT, or when the
     /// window stops being active.
     draining: RefCell<Option<gtk4::EventControllerKey>>,
+    /// `select.number`'s digits ([`HintCoordinator::show_numbers`]): labels only, with no session.
+    numbers: RefCell<Vec<gtk4::Label>>,
 }
 
 pub(crate) struct HintWidgets {
@@ -233,6 +235,7 @@ impl HintCoordinator {
             next_session: Cell::new(0),
             active: RefCell::new(None),
             draining: RefCell::new(None),
+            numbers: RefCell::new(Vec::new()),
         });
         // Alt-tab away cancels. Connected once, for the window's lifetime; a no-op
         // when no HINT is up.
@@ -443,6 +446,59 @@ impl HintCoordinator {
             HintInbound::Request if self.is_active() => {}
             HintInbound::Request => self.toggle(),
             HintInbound::Targets { session_id, count } => self.on_targets(session_id, count),
+        }
+    }
+
+    /// `select.number`: each digit drawn large in the centre of its module, in the HINT labels'
+    /// style. Draw-only: no session starts and no controller is added, so the digit typed next goes
+    /// to the prefix, which is waiting for it, and nothing here can hold the keys if the wait ends
+    /// some way nobody expected -- the worst a missed [`HintCoordinator::hide_numbers`] leaves is a
+    /// stale digit on screen. A module that is not mapped gets no digit drawn; its number can still
+    /// be typed. Replaces any digits already up. The number of digits drawn.
+    ///
+    /// `hosts` is every module's host, not HINT's own [`HintWidgets::modules`]: HINT leaves out a
+    /// chat that shows a notice instead of a page (it has no labels to collect), but that notice is
+    /// still a module on screen whose digit can be typed, so it gets its digit drawn too.
+    pub(crate) fn show_numbers(&self, plan: &[(char, ModuleId)], hosts: &[(ModuleId, gtk4::Widget)]) -> usize {
+        self.hide_numbers();
+        let mut labels = Vec::new();
+        for (digit, id) in plan {
+            let Some((_, host)) = hosts.iter().find(|(m, _)| m == id) else {
+                continue;
+            };
+            if !visible(host) {
+                continue;
+            }
+            let Some(origin) = host.compute_point(&self.overlay, &graphene::Point::new(0.0, 0.0)) else {
+                continue;
+            };
+            let label = gtk4::Label::new(Some(&digit.to_string()));
+            label.add_css_class("hint-label");
+            label.add_css_class("hint-number");
+            label.set_can_target(false);
+            label.set_can_focus(false);
+            label.set_halign(gtk4::Align::Start);
+            label.set_valign(gtk4::Align::Start);
+            // Measured once it is in the overlay, so its CSS (the large size) is what is measured.
+            self.overlay.add_overlay(&label);
+            let (_, w, ..) = label.measure(gtk4::Orientation::Horizontal, -1);
+            let (_, h, ..) = label.measure(gtk4::Orientation::Vertical, -1);
+            let x = origin.x().round() as i32 + (host.width() - w) / 2;
+            let y = origin.y().round() as i32 + (host.height() - h) / 2;
+            label.set_margin_start(x.max(0));
+            label.set_margin_top(y.max(0));
+            labels.push(label);
+        }
+        let drawn = labels.len();
+        *self.numbers.borrow_mut() = labels;
+        drawn
+    }
+
+    /// Takes `select.number`'s digits down; nothing if none are up.
+    pub(crate) fn hide_numbers(&self) {
+        let labels = std::mem::take(&mut *self.numbers.borrow_mut());
+        for label in labels {
+            self.overlay.remove_overlay(&label);
         }
     }
 

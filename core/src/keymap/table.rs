@@ -261,6 +261,22 @@ fn default_bindings() -> Vec<Binding> {
     bind("}", Action::Swap(SwapTarget::Next), false);
     bind("M-1", Action::Even(Axis::Row), false);
     bind("M-2", Action::Even(Axis::Column), false);
+    // tmux's select-layout, next-layout, rotate-window, select-pane -m/-M and display-panes keys; vim's <C-w>H/J/K and i3's $mod+e after the prefix.
+    bind("M-3", Action::MainHorizontal, false);
+    bind("M-4", Action::MainVertical, false);
+    bind("M-5", Action::Tiled, false);
+    bind("Space", Action::CycleLayout { forward: true }, false);
+    bind("E", Action::Spread, false);
+    bind("C-o", Action::Rotate { down: false }, false);
+    bind("M-o", Action::Rotate { down: true }, false);
+    bind("M-e", Action::ToggleSplit, false);
+    bind("H", Action::MoveFar(Direction::Left), false);
+    bind("J", Action::MoveFar(Direction::Down), false);
+    bind("K", Action::MoveFar(Direction::Up), false);
+    bind("m", Action::MarkToggle, false);
+    bind("M", Action::MarkClear, false);
+    bind("q", Action::SelectNumber, false);
+
     bind("x", Action::ModuleKill, false);
     bind("c", Action::Tab(TabAction::New), false);
     bind("n", Action::Tab(TabAction::Next), false);
@@ -365,6 +381,16 @@ fn is_tmux_action(action: &Action) -> bool {
             | Action::SelectNext
             | Action::Swap(_)
             | Action::Even(_)
+            | Action::MainHorizontal
+            | Action::MainVertical
+            | Action::Tiled
+            | Action::CycleLayout { .. }
+            | Action::Spread
+            | Action::Rotate { .. }
+            | Action::MarkToggle
+            | Action::MarkClear
+            | Action::SelectNumber
+            | Action::SwapMarked
             | Action::ModuleKill
             | Action::PanelCommandLine
             | Action::CopyMode { .. }
@@ -821,6 +847,20 @@ mod tests {
         ("}", "swap.next", false),
         ("M-1", "layout.even-horizontal", false),
         ("M-2", "layout.even-vertical", false),
+        ("M-3", "layout.main-horizontal", false),
+        ("M-4", "layout.main-vertical", false),
+        ("M-5", "layout.tiled", false),
+        ("Space", "layout.next", false),
+        ("E", "layout.spread", false),
+        ("C-o", "rotate.up", false),
+        ("M-o", "rotate.down", false),
+        ("M-e", "container.toggle-split", false),
+        ("H", "move.far-left", false),
+        ("J", "move.far-down", false),
+        ("K", "move.far-up", false),
+        ("m", "mark.toggle", false),
+        ("M", "mark.clear", false),
+        ("q", "select.number", false),
         ("x", "module.kill", false),
         ("c", "tab.new", false),
         ("n", "tab.next", false),
@@ -910,7 +950,10 @@ mod tests {
     fn every_default_is_a_stock_tmux_key_or_marked_eitri_only() {
         // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
         // bindings), so they need no entry here even though Eitri's action differs from tmux's.
-        const EITRI_ONLY: [&str; 11] = ["C-l", "C-h", "C-j", "C-k", "F11", "e", "a", "C-=", "C-+", "C--", "C-0"];
+        // `H J K` are vim's `<C-w>H/J/K`, `M-e` i3's `$mod+e` pressed after the prefix.
+        const EITRI_ONLY: [&str; 15] = [
+            "C-l", "C-h", "C-j", "C-k", "F11", "e", "a", "C-=", "C-+", "C--", "C-0", "M-e", "H", "J", "K",
+        ];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();
             if EITRI_ONLY.contains(&name.as_str()) {
@@ -937,7 +980,7 @@ mod tests {
 
     #[test]
     fn a_second_set_on_the_same_key_names_the_first_user_binding() {
-        let err = Keymap::apply_user(&[set("m", "zoom"), set("m", "module.hide")], &[])
+        let err = Keymap::apply_user(&[set("g", "zoom"), set("g", "module.hide")], &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("already bound to zoom (set earlier in init.lua)"), "{err}");
@@ -959,9 +1002,9 @@ mod tests {
 
     #[test]
     fn del_of_an_unbound_key_fails_naming_it() {
-        let err = Keymap::apply_user(&[del("q")], &[]).unwrap_err().to_string();
+        let err = Keymap::apply_user(&[del("g")], &[]).unwrap_err().to_string();
         assert!(
-            err.contains("eitri.keymap.del(\"prefix\", \"q\")") && err.contains("not bound"),
+            err.contains("eitri.keymap.del(\"prefix\", \"g\")") && err.contains("not bound"),
             "{err}"
         );
     }
@@ -1299,5 +1342,69 @@ mod tests {
         let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zq", "tab.new")], &[]).unwrap();
         assert_eq!(ok.panel_user().sets.len(), 2);
         assert_eq!(ok.panel_user().dels.len(), 1);
+    }
+
+    #[test]
+    fn the_tiling_defaults_are_stock_tmux_keys_or_vims_and_i3s() {
+        let map = Keymap::defaults();
+        for (key, action, stock) in [
+            ("M-3", "layout.main-horizontal", "select-layout"),
+            ("M-4", "layout.main-vertical", "select-layout"),
+            ("M-5", "layout.tiled", "select-layout"),
+            ("Space", "layout.next", "next-layout"),
+            ("E", "layout.spread", "select-layout"),
+            ("C-o", "rotate.up", "rotate-window"),
+            ("M-o", "rotate.down", "rotate-window"),
+            ("m", "mark.toggle", "select-pane"),
+            ("M", "mark.clear", "select-pane"),
+            ("q", "select.number", "display-panes"),
+        ] {
+            let binding = map.lookup(&k(key)).unwrap_or_else(|| panic!("{key} is unbound"));
+            assert_eq!(binding.action.name(), action, "{key}");
+            assert!(!binding.repeatable, "{key}: stock tmux binds it without -r");
+            assert_eq!(crate::keymap::stock::stock_command(&k(key)), Some(stock), "{key}");
+        }
+        for (key, action) in [
+            ("H", "move.far-left"),
+            ("J", "move.far-down"),
+            ("K", "move.far-up"),
+            ("M-e", "container.toggle-split"),
+        ] {
+            assert_eq!(map.lookup(&k(key)).unwrap().action.name(), action, "{key}");
+            assert_eq!(
+                crate::keymap::stock::stock_command(&k(key)),
+                None,
+                "{key}: never a stock tmux key"
+            );
+        }
+        for name in [
+            "swap.marked",
+            "layout.flip-horizontal",
+            "layout.flip-vertical",
+            "layout.previous",
+            "move.far-right",
+            "layout.undo",
+        ] {
+            assert!(
+                map.bindings().iter().all(|b| b.action.name() != name),
+                "{name} has no default key"
+            );
+        }
+        assert!(
+            map.lookup(&k("L")).is_none(),
+            "L stays unbound until it can keep tmux's meaning"
+        );
+    }
+
+    #[test]
+    fn a_lua_panel_keyed_h_j_or_k_is_refused_naming_the_default() {
+        for (key, action) in [("H", "move.far-left"), ("J", "move.far-down"), ("K", "move.far-up")] {
+            let err =
+                ModuleKeys::build(&[(ModuleId::lua("notes"), Some(key.to_string()))], &Keymap::defaults()).unwrap_err();
+            assert!(
+                matches!(&err, crate::layout::KeyError::Bound { action: a, .. } if a == action),
+                "{key}: {err:?}"
+            );
+        }
     }
 }

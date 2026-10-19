@@ -196,6 +196,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         scratch_dir,
         start.backend_kind,
         start.panel_notice.as_deref(),
+        None,
     );
     config.apply_to_panel(&agent);
     // The panel reads the context when its tick runs, and its tick runs only when woken.
@@ -383,6 +384,11 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             module_keys,
             move |command, keycode| {
                 let action = match command {
+                    crate::prefix::PrefixCommand::Number(digit) => {
+                        println!("[companion] prefix: number {digit} refused");
+                        toast.show(companion_prefix::REFUSED_TEXT);
+                        return;
+                    }
                     crate::prefix::PrefixCommand::Run(action) => action,
                     // A module key after a split key: there is nothing to place.
                     crate::prefix::PrefixCommand::Place { module, axis } => {

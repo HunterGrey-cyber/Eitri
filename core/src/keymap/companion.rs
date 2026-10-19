@@ -63,7 +63,21 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::Module(_)
         | Action::ModuleHide
         | Action::ModuleKill
-        | Action::WindowImmersive => CompanionVerb::Refuse,
+        | Action::WindowImmersive
+        | Action::MoveFar(_)
+        | Action::ToggleSplit
+        | Action::Rotate { .. }
+        | Action::Flip(_)
+        | Action::MainHorizontal
+        | Action::MainVertical
+        | Action::Tiled
+        | Action::CycleLayout { .. }
+        | Action::Spread
+        | Action::LayoutUndo
+        | Action::MarkToggle
+        | Action::MarkClear
+        | Action::SwapMarked
+        | Action::SelectNumber => CompanionVerb::Refuse,
     }
 }
 
@@ -72,7 +86,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
 /// it says why nothing will happen.
 pub fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
     match waiting {
-        Waiting::No => Vec::new(),
+        Waiting::No | Waiting::Number => Vec::new(),
         Waiting::Module(_) => vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
         Waiting::Command => {
             let verbs = [
@@ -115,6 +129,8 @@ mod tests {
     fn classify_maps_every_action_family() {
         let key = KeySpec::char('x', false, false);
         let cases: Vec<(Action, CompanionVerb)> = vec![
+            (Action::SelectNumber, CompanionVerb::Refuse),
+            (Action::MoveFar(Direction::Left), CompanionVerb::Refuse),
             (Action::Zoom, CompanionVerb::Refuse),
             (
                 Action::Resize {
@@ -191,6 +207,7 @@ mod tests {
             "{texts:?}"
         );
         assert_eq!(strip_pieces(Waiting::No, &keymap), vec![]);
+        assert_eq!(strip_pieces(Waiting::Number, &keymap), vec![]);
         assert_eq!(
             strip_pieces(Waiting::Module(Axis::Row), &keymap),
             vec![StripPiece::Heading(REFUSED_TEXT.to_string())]

@@ -115,6 +115,7 @@ pub fn kill(
         Reopen::InPlace => {}
         Reopen::Never => layout.retire(id, was_shown),
     }
+    layout.clear_last_preset();
     Ok(next)
 }
 

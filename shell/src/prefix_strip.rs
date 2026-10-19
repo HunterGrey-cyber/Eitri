@@ -40,6 +40,7 @@ pub(crate) fn strip_pieces(
     });
     let (heading, runs): (Option<String>, Vec<StripPiece>) = match waiting {
         Waiting::No => return Vec::new(),
+        Waiting::Number => return Vec::new(),
         Waiting::Command => (
             None,
             modules
@@ -63,6 +64,22 @@ pub(crate) fn strip_pieces(
             pieces.push(StripPiece::Dot);
         }
         pieces.push(run);
+    }
+    pieces
+}
+
+/// The strip while `select.number` waits for a digit: each number and the module it reaches,
+/// `1 editor · 2 agent`, in the order the digits were drawn. Empty with no modules to number.
+pub(crate) fn number_pieces(plan: &[(char, ModuleId)], title: &dyn Fn(&ModuleId) -> String) -> Vec<StripPiece> {
+    let mut pieces = Vec::new();
+    for (i, (digit, id)) in plan.iter().enumerate() {
+        if i > 0 {
+            pieces.push(StripPiece::Dot);
+        }
+        pieces.push(StripPiece::Run {
+            text: format!("{digit} {}", title(id)),
+            dimmed: false,
+        });
     }
     pieces
 }
@@ -187,6 +204,13 @@ mod tests {
         let right = strip_pieces(Waiting::Module(Axis::Row), &entries(), "agent", &title, &verbs());
         assert_eq!(right[0], StripPiece::Heading("right of agent:".to_string()));
         assert!(strip_pieces(Waiting::No, &entries(), "agent", &title, &verbs()).is_empty());
+    }
+
+    #[test]
+    fn waiting_for_a_digit_it_lists_each_number_and_its_module() {
+        let plan = [('1', ModuleId::editor()), ('2', ModuleId::agent())];
+        assert_eq!(reads(&number_pieces(&plan, &title)), "1 editor \u{b7} 2 agent");
+        assert!(number_pieces(&[], &title).is_empty());
     }
 
     /// A `·` separates every two runs, including module keys and verbs, so runs with spaces of their

@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use eitri_core::layout::ModuleId;
 use gtk4::{prelude::*, ApplicationWindow};
 
 /// The top bar's project label shows the directory's own last path component, never the whole
@@ -37,6 +38,22 @@ pub(crate) struct TopBar {
     /// Where the tray goes, left of `↻` (`tray`). Its chips precede the other top-bar items;
     /// `main.rs` joins the two lists.
     pub(crate) tray: gtk4::Box,
+    /// `marked: <title>`, left of the tray, shown only while a module is marked ([`mark_text`]).
+    pub(crate) mark: gtk4::Label,
+}
+
+/// What the top bar says about the mark `swap.marked` swaps with: nothing without one. The mark
+/// is shown only as this text -- a frame or outline on the marked module would take layout space
+/// from it, or be one more kind of chrome around a pane where focus is shown by cursors alone.
+pub(crate) fn mark_text(mark: Option<&ModuleId>, title: &dyn Fn(&ModuleId) -> String) -> Option<String> {
+    mark.map(|id| format!("marked: {}", title(id)))
+}
+
+/// Shows `text` on the mark label, or hides it. Plain text, never markup: a Lua panel's title is
+/// the user's own string.
+pub(crate) fn show_mark(label: &gtk4::Label, text: Option<&str>) {
+    label.set_text(text.unwrap_or(""));
+    label.set_visible(text.is_some());
 }
 
 /// `h`/`l` on the top bar: the visible item `step` away from `current`, stopping at either end, or
@@ -93,10 +110,17 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     let tray = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     tray.set_valign(gtk4::Align::Center);
     tray.set_margin_end(6);
+    let mark = gtk4::Label::new(None);
+    mark.add_css_class("topbar-mark");
+    mark.set_valign(gtk4::Align::Center);
+    // A long title gives way rather than widening the bar, as the project name does.
+    mark.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    mark.set_visible(false);
 
     bar.append(&app_name);
     bar.append(&strip);
     bar.append(&project_name);
+    bar.append(&mark);
     bar.append(&tray);
     bar.append(&reload_agent);
     bar.append(&controls);
@@ -110,6 +134,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
         app_name,
         strip,
         tray,
+        mark,
     }
 }
 
@@ -162,7 +187,19 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
 #[cfg(test)]
 mod tests {
     use super::project_display_name;
+    use eitri_core::layout::ModuleId;
     use std::path::Path;
+
+    #[test]
+    fn the_mark_reads_as_text_naming_its_module_and_is_absent_without_one() {
+        use super::mark_text;
+        let title = |id: &ModuleId| id.as_str().to_string();
+        assert_eq!(mark_text(None, &title), None);
+        assert_eq!(
+            mark_text(Some(&ModuleId::agent()), &title),
+            Some("marked: agent".to_string())
+        );
+    }
 
     #[test]
     fn a_normal_path_shows_its_last_component() {

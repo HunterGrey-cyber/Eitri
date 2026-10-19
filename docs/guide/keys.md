@@ -41,12 +41,56 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> %` or `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there |
 | `<prefix> {` / `<prefix> }` | swap this module with the previous / the next one on screen |
 | `<prefix> Alt+1` / `Alt+2` | every module in one row / in one column, at equal sizes |
+| `<prefix> Alt+3` / `Alt+4` / `Alt+5` | the first module big on top with the others in a row below / big on the left with the others in a column beside it / all modules in a grid (tmux's `main-horizontal`, `main-vertical` and `tiled`) |
+| `<prefix> Space` | the next arrangement of the cycle: one row, one column, `Alt+3`, `Alt+4`, `Alt+5`, then one row again; it starts after the last one you chose, or at one row once the modules have been rearranged some other way, or one closed, since; a divider moved, a zoom, a mark, or a module shown or hidden keeps its place in the cycle |
+| `<prefix> E` | spread the modules around this one evenly, along the direction they are split (tmux's `select-layout -E`) |
+| `<prefix> H` / `J` / `K` | move this module to the far left / bottom / top edge of the window, full height or width (vim's `Ctrl+w H`, `J`, `K`); nothing happens when it is already there |
+| `<prefix> Alt+e` | turn the split this module is in from side by side to stacked, or back (i3's `layout toggle split`) |
+| `<prefix> Ctrl+o` / `Alt+o` | rotate every module on screen one place up / down through the same spaces (tmux's `rotate-window`) |
+| `<prefix> m` / `M` | mark this module, or clear the mark when it is the marked one / clear the mark; one module is marked at a time, and the top bar shows `marked: <title>` while there is a mark |
+| `<prefix> q` | draw a number on every module on screen; press that number (`1` to `9`, then `0`) to give that module the keys. `Esc` or any other key ends it, and so does one second without a key |
 | `<prefix> Ctrl+Up`, `Ctrl+Down`, `Ctrl+Left`, `Ctrl+Right` | move the nearest divider one cell that way (repeats) |
 | `<prefix> Alt+Up`, `Alt+Down`, `Alt+Left`, `Alt+Right` | the same, five cells (repeats) |
 | `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri |
 | `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
 | `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only (repeats: keep Ctrl down and press `=` or `-` again) |
+
+Each of these arrangements ends a zoom when it changes something and leaves it on when there was nothing to do. The
+keys stay with the module that had them, and a hidden module stays hidden. With fewer than two modules on screen they
+change nothing and the refusal flashes; `Alt+3`, `Alt+4`, `Alt+5` and `Space` also refuse more than 20 modules on
+screen.
+
+**Actions with no key.** These are reached by name: from a Lua command with `eitri.layout.run` (see
+[Configuration](configuration.md#layout-from-lua)) and, once bound, in the list under `<prefix> ?`. To give one a key, add a line
+to your `init.lua`; the keys here are examples that no default uses:
+
+```lua
+local k = eitri.keymap
+k.set("prefix", "S", "swap.marked")              -- swap this module with the marked one (the mark stays)
+k.set("prefix", "U", "layout.undo")              -- undo the last change of the arrangement; again, redo
+k.set("prefix", "M-r", "move.far-right")         -- move this module to the far right edge
+k.set("prefix", "Q", "layout.previous")          -- the previous arrangement of the cycle
+k.set("prefix", "M-f", "layout.flip-horizontal") -- mirror left and right
+k.set("prefix", "M-g", "layout.flip-vertical")   -- mirror top and bottom; either one twice is the identity
+for key, dir in pairs({ ["M-h"] = "left", ["M-j"] = "down", ["M-k"] = "up", ["M-l"] = "right" }) do
+  k.set("prefix", key, "swap." .. dir)           -- swap with the module on that side
+end
+```
+
+`layout.undo` keeps one step in memory and never saves it: it swaps the arrangement with the one before the last
+change (a divider moved since then is undone with it), so pressing it again redoes. Showing or hiding a module is not
+a change it sees. Closing the terminal or a Lua panel with `<prefix> x` puts its place back where it opens next, and
+that becomes the last change: `layout.undo` right after it only moves the closed module's place back, so nothing on
+screen changes, and the change before the close can no longer be undone.
+
+**Setting a key that already has an action.** The keys in this section are defaults, and `eitri.keymap.set` on a key
+that has an action stops Eitri at startup with a message that names the call and says to run
+`eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4` or `M-5` (the
+spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
+tmux configuration binds the key, the key already counts as yours and your `set` replaces it with no `del`. A `del`
+of a key that nothing is bound to also stops startup, so a `del` line works only from this version on, or when the
+import and your tmux configuration bind that key.
 
 **The window and the panel.**
 

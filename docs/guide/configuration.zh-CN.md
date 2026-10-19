@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=a3c8961ab7ab1afdbec0b797ec3e294f0a84c9aa045951c97c73c33a8e1225f4 -->
+<!-- translated-from: configuration.md sha256=995ef80379008dcc59c1cc889658d0d862cc6bf8c9103a65e08ed3620a463b0f -->
 
 # 配置
 
@@ -69,6 +69,28 @@ k.del("prefix", "%")                          -- remove a default binding
 默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们用绝对路径 `source-file` 进来的文件；相对路径会被跳过，因为 Eitri 不知道 tmux 会拿哪个目录去解析它），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
 
 一个完整的例子是 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua)，它把前缀移到 `Ctrl+a`，并重新绑定了分割、调整大小和放大。把你想要的部分从里面粘贴到你的 `init.lua` 里。
+
+<a id="layout-from-lua"></a>
+## 用 Lua 调整布局
+
+[按键](keys.zh-CN.md)里每个改变布局的键同时也是一个有名字的动作，Lua 用同样的名字调用同样的动作。这些调用用在命令（`eitri.command.register`）或事件处理函数里：它们把你要求的事排进队列，处理函数返回后 Eitri 按顺序执行。在 `init.lua` 还在加载、窗口还不存在时调用，会停下并给出说明这一点的信息；塑造第一个窗口用的是 `eitri.layout.default`。
+
+```lua
+eitri.command.register({
+  id = "tidy",
+  title = "Rearrange the window",
+  keybinding = "<Control><Alt>r",
+  action = function()
+    eitri.layout.run("layout.main-vertical")      -- any layout action, by its eitri.keymap name
+    eitri.layout.run("rotate.down")
+    eitri.layout.run("resize.left", { cells = 5 }) -- options go in a table, as in eitri.keymap.set
+  end,
+})
+```
+
+- **`eitri.layout.run(name, options?)`** 对拿着按键的那个模块执行一个布局动作：[按键](keys.zh-CN.md)里“模块”表中的那些（排布、交换、移到边缘、标记、放大、调整大小、隐藏、关闭），以及没有按键的那些（`swap.marked`、`layout.undo`、`layout.previous`、两种翻转、`move.far-right`）。要对别的模块操作，先调用 `eitri.layout.focus(id)`。关闭模块仍然会问那个 `y/n`。不是布局动作的（比如标签页动作）会被拒绝并点名，另外还有三样也会被拒绝：`split.right` 和 `split.below`（它们要等一个模块键；用 `eitri.layout.split(id, "right")` 或 `"below"` 来做这件事）、`select.number`（它要等一个数字；用 `eitri.layout.focus(id)` 让某个模块拿到按键）以及 `repeatable` 选项，它属于按键绑定。
+- **`eitri.layout.mark(id)`** 标记那个模块，不移动按键，就像 `<prefix> m` 标记拿着按键的那个模块。
+- **`eitri.layout.get()`** 返回一张描述当前布局的新表，形状和 `eitri.layout.default` 接受的一样：`{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`，其中一个分割的第一个子项带着这个分割的比例。它另外加上 `focus`（拿着按键的模块）、`hidden`（一个列表）、`zoomed` 和 `marked`（某个模块，或者什么都没有）。固定高度的底部行不会写进这张表；默认的形状会自己恢复底部行的高度。在布局正被修改的过程中调用它会停下并给出信息，而不是读到改了一半的东西。
 
 <a id="how-a-launch-starts"></a>
 ## 一次启动怎样开始

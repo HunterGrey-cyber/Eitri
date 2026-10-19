@@ -52,6 +52,9 @@ rmpv = "1"
 # README reader's -- contains it. Ask for it with
 # `cargo run -p shell --features shell/legacy-backend`; `agent` holds every `cfg`.
 legacy-backend = ["eitri-core/legacy-backend", "eitri-panel/legacy-backend"]
+# The grid probe (`src/grid_probe/`): a mode of the product binary that runs scripted operations on the
+# real module grid inside the sandbox and logs what the hosts do. Never in a release or a default build.
+probe = []
 
 [dev-dependencies]
 # `tests/web_bundle_freshness.rs` `include!`s `build_web.rs` (the way `build_info_lockfile_parsing.rs`

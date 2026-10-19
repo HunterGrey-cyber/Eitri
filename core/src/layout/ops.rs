@@ -75,19 +75,21 @@ pub fn even(layout: &mut Layout, axis: Axis) {
         .partition(|id| layout.is_shown(id));
     let n = shown.len();
     let items: Vec<ModuleId> = shown.into_iter().chain(hidden).collect();
-    let last = items
-        .last()
-        .expect("the module with the keys is shown, so it is never a kept row")
-        .clone();
-    let mut node = Node::Leaf(last);
-    for (i, id) in items.iter().enumerate().rev().skip(1) {
-        let ratio = if i + 1 < n { 1.0 / (n - i) as f32 } else { 0.5 };
-        node = Node::split(axis, ratio.clamp(MIN_RATIO, MAX_RATIO), Node::Leaf(id.clone()), node);
-    }
+    let mut node = even_chain(axis, items.into_iter().map(Node::Leaf).collect(), n);
     for row in kept.into_iter().rev() {
         node = row.around(node);
     }
     layout.replace_root(node);
+}
+
+pub(super) fn even_chain(axis: Axis, items: Vec<Node>, shown: usize) -> Node {
+    let mut items: Vec<_> = items.into_iter().enumerate().collect();
+    let mut node = items.pop().expect("a chain needs a member").1;
+    for (i, item) in items.into_iter().rev() {
+        let ratio = if i + 1 < shown { 1.0 / (shown - i) as f32 } else { 0.5 };
+        node = Node::split(axis, ratio.clamp(MIN_RATIO, MAX_RATIO), item, node);
+    }
+    node
 }
 
 /// `swap.prev` / `swap.next`: `focused` changes places
@@ -113,16 +115,16 @@ pub fn swap_adjacent(layout: &mut Layout, focused: &ModuleId, forward: bool) -> 
 }
 
 /// A pinned split whose kept side is a hidden module: the row [`even`] leaves where it is.
-struct KeptRow {
+pub(super) struct KeptRow {
     axis: Axis,
     ratio: f32,
     pin: Pin,
-    id: ModuleId,
+    pub(super) id: ModuleId,
 }
 
 impl KeptRow {
     /// The row again, with `rest` where the rest of the tree was.
-    fn around(self, rest: Node) -> Node {
+    pub(super) fn around(self, rest: Node) -> Node {
         let row = Node::Leaf(self.id);
         let (first, second) = match self.pin.side {
             Branch::First => (row, rest),
@@ -142,7 +144,7 @@ impl KeptRow {
 /// hidden -- outermost first. [`even`] puts each back around the chain it builds, so the row is below
 /// everything the chain holds, as `Ctrl+a t` opens it; a Lua `side` panel that sat beside the row is
 /// now in the chain above it. A row on screen is not one: its module is evened with the rest.
-fn hidden_bottom_rows(layout: &Layout) -> Vec<KeptRow> {
+pub(super) fn hidden_bottom_rows(layout: &Layout) -> Vec<KeptRow> {
     fn walk(node: &Node, layout: &Layout, rows: &mut Vec<KeptRow>) {
         let Node::Split {
             axis,

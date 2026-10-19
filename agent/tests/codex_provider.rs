@@ -364,8 +364,11 @@ fn missing_binary_is_a_tab_notice() {
 
 /// A scratch directory holding `codex`, a script that leaves `ran` beside itself when anything runs it.
 /// Returns the directory, the program and the marker.
+///
+/// A child writes the script, never this process: a write fd held here would be copied into any child
+/// another test thread forks in the meantime, and until that child `exec`s, running the script fails
+/// with `ETXTBSY`. The start then fails before the script runs, so a test expecting the marker sees none.
 fn marker_program(name: &str) -> (PathBuf, PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -374,8 +377,15 @@ fn marker_program(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let marker = dir.join("ran");
     let program = dir.join("codex");
-    std::fs::write(&program, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display())).unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+        .arg("sh")
+        .arg(format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()))
+        .arg(&program)
+        .status()
+        .unwrap();
+    assert!(status.success(), "writing the test program failed: {status}");
     (dir, program, marker)
 }
 

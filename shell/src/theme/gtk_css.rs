@@ -62,6 +62,14 @@ window {{
     font-size: 12px;
 }}
 
+/* `marked: <title>` while a module is marked for `swap.marked`: text only, quiet like the project
+   name, never a frame on the module itself. */
+.topbar-mark {{
+    color: {chrome_muted};
+    font-size: 12px;
+    margin-right: 8px;
+}}
+
 .win-btn {{
     background-color: transparent;
     background-image: none;
@@ -217,6 +225,14 @@ window {{
 .hint-label.hint-off {{
     opacity: 0.3;
 }}
+
+/* `select.number`'s digits: the HINT label's pair, large enough to read from across the window,
+   one in the middle of each module. */
+.hint-label.hint-number {{
+    font-size: 32px;
+    padding: 4px 14px;
+    border-radius: 6px;
+}}
 "#
     )
 }
@@ -359,6 +375,7 @@ mod tests {
             (".prefix-strip .strip-dot", t.chrome_muted, 4.5),
             (".topbar-app-name", t.chrome_fg, 4.5),
             (".topbar-project-name", t.chrome_muted, 4.5),
+            (".topbar-mark", t.chrome_muted, 4.5),
             (".win-btn", t.chrome_muted, 4.5),
         ] {
             let body = rule(&css, selector);

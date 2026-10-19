@@ -31,7 +31,7 @@ fn text(lua: &Lua, value: &Value) -> Option<String> {
     }
 }
 
-fn opts(lua: &Lua, value: &Value) -> Result<Vec<(String, OptValue)>, String> {
+pub(crate) fn opts(lua: &Lua, value: &Value) -> Result<Vec<(String, OptValue)>, String> {
     let table = match value {
         Value::Nil => return Ok(Vec::new()),
         Value::Table(table) => table,
@@ -291,6 +291,13 @@ mod tests {
             action("L"),
             Some((Action::Swap(SwapTarget::Toward(Direction::Right)), false))
         );
+        for (key, dir) in [("H", Direction::Left), ("J", Direction::Down), ("K", Direction::Up)] {
+            assert_eq!(
+                action(key),
+                Some((Action::Swap(SwapTarget::Toward(dir)), false)),
+                "{key}: the tmux swap, not the far-edge default"
+            );
+        }
         assert_eq!(action("q"), Some((Action::Tab(TabAction::Close), false)));
         assert_eq!(
             action("x"),

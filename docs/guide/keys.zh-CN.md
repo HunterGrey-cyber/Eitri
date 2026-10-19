@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=5521a41222e998b6c45a889a0185c9a514f7c54cf9fecad57cb5d43cf15e2f8a -->
+<!-- translated-from: keys.md sha256=e856c2990f6c1702986fcf1649c833a05a5cd635b86f9d767dbfd9ca980464b5 -->
 
 # 按键
 
@@ -36,12 +36,41 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> %` 或 `<prefix> "`，然后 `e`、`a` 或 `t` | 在这个模块的右边 / 下面打开那个模块，或者把它移到那里 |
 | `<prefix> {` / `<prefix> }` | 把这个模块和屏幕上的上一个 / 下一个模块交换 |
 | `<prefix> Alt+1` / `Alt+2` | 所有模块排成一行 / 一列，大小相等 |
+| `<prefix> Alt+3` / `Alt+4` / `Alt+5` | 第一个模块在上面占大头、其余排成一行在下面 / 第一个模块在左边占大头、其余排成一列在旁边 / 所有模块排成网格（tmux 的 `main-horizontal`、`main-vertical` 和 `tiled`） |
+| `<prefix> Space` | 切到循环里的下一种排布：一行、一列、`Alt+3`、`Alt+4`、`Alt+5`，然后回到一行；从你上一次选的那种之后开始；如果此后模块被别的方式重新排布过，或者有模块被关闭，则从一行开始；移动分隔线、放大、标记，以及显示或隐藏模块，都不会改变它在循环里的位置 |
+| `<prefix> E` | 把这个模块周围的模块沿它们被分割的方向均匀摊开（tmux 的 `select-layout -E`） |
+| `<prefix> H` / `J` / `K` | 把这个模块移到窗口的最左边 / 最下边 / 最上边，占满整个高度或宽度（vim 的 `Ctrl+w H`、`J`、`K`）；它已经在那里时什么都不发生 |
+| `<prefix> Alt+e` | 把这个模块所在的分割从左右并排改成上下叠放，或者改回来（i3 的 `layout toggle split`） |
+| `<prefix> Ctrl+o` / `Alt+o` | 把屏幕上的每个模块在原有的空间里向前 / 向后轮转一位（tmux 的 `rotate-window`） |
+| `<prefix> m` / `M` | 标记这个模块，如果它就是被标记的那个则取消标记 / 清除标记；同一时刻只标记一个模块，有标记时顶栏会显示 `marked: <标题>` |
+| `<prefix> q` | 在屏幕上的每个模块上画一个数字；按下那个数字（`1` 到 `9`，然后是 `0`）就让那个模块拿到按键。`Esc` 或任何别的键会结束它，一秒钟没有按键也会结束 |
 | `<prefix> Ctrl+Up`、`Ctrl+Down`、`Ctrl+Left`、`Ctrl+Right` | 把最近的分隔线朝那个方向移一格（repeats） |
 | `<prefix> Alt+Up`、`Alt+Down`、`Alt+Left`、`Alt+Right` | 同上，五格（repeats） |
 | `<prefix> x` | 关闭这个模块并结束它里面运行的东西，会先问一个 `y/n`；关掉屏幕上的最后一个模块就关闭 Eitri |
 | `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式）；只在终端拿着按键时有效，在别处只会闪一下拒绝提示 |
 | `<prefix> F11` | 沉浸模式：不带顶栏的全屏 |
 | `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 只放大 / 缩小 / 还原拿着按键的那个窗格的文字（repeats：按住 Ctrl 再按 `=` 或 `-` 继续调） |
+
+上面这些排布在真的改变了东西时会结束放大，什么都没做时则保持放大。按键仍留在原来拿着它的模块上，被隐藏的模块仍然隐藏。屏幕上少于两个模块时它们什么都不改，只闪一下拒绝提示；`Alt+3`、`Alt+4`、`Alt+5` 和 `Space` 在屏幕上超过 20 个模块时也会拒绝。
+
+**没有按键的动作。** 这些按名字使用：在 Lua 命令里用 `eitri.layout.run`（见[配置](configuration.zh-CN.md#layout-from-lua)），绑上键之后才会出现在 `<prefix> ?` 的列表里。要给其中某个绑上键，在你的 `init.lua` 里加一行；这里的键只是示例，没有任何默认键用到它们：
+
+```lua
+local k = eitri.keymap
+k.set("prefix", "S", "swap.marked")              -- swap this module with the marked one (the mark stays)
+k.set("prefix", "U", "layout.undo")              -- undo the last change of the arrangement; again, redo
+k.set("prefix", "M-r", "move.far-right")         -- move this module to the far right edge
+k.set("prefix", "Q", "layout.previous")          -- the previous arrangement of the cycle
+k.set("prefix", "M-f", "layout.flip-horizontal") -- mirror left and right
+k.set("prefix", "M-g", "layout.flip-vertical")   -- mirror top and bottom; either one twice is the identity
+for key, dir in pairs({ ["M-h"] = "left", ["M-j"] = "down", ["M-k"] = "up", ["M-l"] = "right" }) do
+  k.set("prefix", key, "swap." .. dir)           -- swap with the module on that side
+end
+```
+
+`layout.undo` 在内存里保留一步，从不保存：它把当前排布和上一次改动之前的排布对调（之后移动过的分隔线会一起被撤销），所以再按一次就是重做。显示或隐藏模块不算它看得到的改动。用 `<prefix> x` 关闭终端或 Lua 面板会把它的位置放回下次打开的地方，这本身就成了上一次改动：紧接着执行 `layout.undo` 只会把被关闭模块的位置挪回去，屏幕上什么都不变，而关闭之前的那次改动再也撤销不了。
+
+**给已经有动作的键再 `set`。** 本节的这些键是默认键，对一个已有动作的键调用 `eitri.keymap.set` 会让 Eitri 在启动时停下，信息里点名那次调用，并说要先执行 `eitri.keymap.del("prefix", "<key>")`。如果你的 `init.lua` 设置了 `m`、`M`、`q`、`E`、`H`、`J`、`K`、`Space`、`C-o`、`M-o`、`M-e`、`M-3`、`M-4` 或 `M-5`（`eitri.keymap` 接受的写法），就在那个 `set` 之前放一行 `k.del("prefix", "<key>")`。tmux 导入开着、并且你的 tmux 配置绑定了这个键时，这个键已经算是你的，你的 `set` 直接替换它，不需要 `del`。对一个没有绑定任何东西的键执行 `del` 同样会让启动停下，所以 `del` 这一行只有在这个版本及之后才能用，或者导入开着、并且你的 tmux 配置绑定了那个键。
 
 **窗口和面板。**
 

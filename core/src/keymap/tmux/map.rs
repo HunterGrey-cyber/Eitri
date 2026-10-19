@@ -134,6 +134,9 @@ fn template(name: &str) -> Option<&'static str> {
         "resize-pane" => "DLMRTt:Ux:y:Z",
         "swap-pane" => "dDs:t:UZ",
         "select-layout" => "Enopt:",
+        "next-layout" | "previous-layout" => "t:",
+        "rotate-window" => "Dt:UZ",
+        "display-panes" => "bd:Nt:",
         "kill-pane" | "kill-window" | "next-window" | "previous-window" => "at:",
         "last-window" => "t:",
         "new-window" => "abc:de:F:kn:PSt:",
@@ -535,8 +538,18 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
             Ok(Action::Split(if parsed.has('h') { Axis::Row } else { Axis::Column }))
         }
         "select-pane" => {
-            parsed.only("LDURlt")?;
+            parsed.only("LDURltmM")?;
             parsed.at_most(0)?;
+            if parsed.has('m') || parsed.has('M') {
+                if parsed.flags.len() != 1 {
+                    return Err("-m or -M with another flag, which Eitri cannot follow".to_string());
+                }
+                return Ok(if parsed.has('m') {
+                    Action::MarkToggle
+                } else {
+                    Action::MarkClear
+                });
+            }
             if let Some(target) = parsed.value('t') {
                 if target != ":.+" {
                     return Err(format!("-t {target} not imported"));
@@ -604,18 +617,42 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
             } else if parsed.has('U') {
                 Ok(Action::Swap(SwapTarget::Prev))
             } else {
-                Err(no_equivalent("swap-pane with no direction"))
+                Ok(Action::SwapMarked)
             }
         }
         "select-layout" => {
-            parsed.only("")?;
+            parsed.only("E")?;
+            if parsed.has('E') {
+                parsed.at_most(0)?;
+                return Ok(Action::Spread);
+            }
             parsed.at_most(1)?;
             match parsed.rest.first().and_then(Arg::word) {
                 Some("even-horizontal") => Ok(Action::Even(Axis::Row)),
                 Some("even-vertical") => Ok(Action::Even(Axis::Column)),
+                Some("main-horizontal") => Ok(Action::MainHorizontal),
+                Some("main-vertical") => Ok(Action::MainVertical),
+                Some("tiled") => Ok(Action::Tiled),
                 Some(other) => Err(no_equivalent(&format!("select-layout {other}"))),
                 None => Err(no_equivalent("select-layout")),
             }
+        }
+        "next-layout" | "previous-layout" => {
+            parsed.only("")?;
+            parsed.at_most(0)?;
+            Ok(Action::CycleLayout {
+                forward: name == "next-layout",
+            })
+        }
+        "rotate-window" => {
+            parsed.only("DU")?;
+            parsed.at_most(0)?;
+            Ok(Action::Rotate { down: parsed.has('D') })
+        }
+        "display-panes" => {
+            parsed.only("")?;
+            parsed.at_most(0)?;
+            Ok(Action::SelectNumber)
         }
         "kill-pane" => {
             parsed.only("")?;

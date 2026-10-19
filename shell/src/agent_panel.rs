@@ -143,6 +143,7 @@ pub(crate) fn build_agent_panel(
     scratch: Option<eitri_core::scratch::ScratchDir>,
     backend_kind: BackendKind,
     unavailable: Option<&str>,
+    related: Option<&WebView>,
 ) -> (gtk4::Widget, AgentPanelHandle) {
     let init = PanelInit {
         project_dir,
@@ -163,11 +164,16 @@ pub(crate) fn build_agent_panel(
         NetworkProxyMode::Custom,
         Some(&NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI), &[])),
     );
-    let webview = WebView::builder()
+    let builder = WebView::builder()
         .user_content_manager(&content_manager)
         .network_session(&network_session)
-        .default_content_security_policy(panel_content_security_policy())
-        .build();
+        .default_content_security_policy(panel_content_security_policy());
+    // `related-view` is construct-only: it can be given here and nowhere later. The page then shares
+    // the related page's web process.
+    let webview = match related {
+        Some(related) => builder.related_view(related).build(),
+        None => builder.build(),
+    };
     webview.set_hexpand(true);
     webview.set_vexpand(true);
     let page = Rc::new(PanelPage::new(Rc::new(WebKitPage(webview.clone()))));

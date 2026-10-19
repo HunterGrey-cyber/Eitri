@@ -16,7 +16,9 @@ use gtk4::prelude::*;
 use eitri_core::keymap::{KeyName, KeySpec, Keymap};
 use eitri_core::layout::ModuleKeys;
 
-pub(crate) use eitri_core::keymap::prefix::{literal_for, Outcome, Prefix, PrefixCommand, Press, Waiting};
+pub(crate) use eitri_core::keymap::prefix::{
+    literal_for, Outcome, Prefix, PrefixCommand, Press, Waiting, DISPLAY_PANES_TIME,
+};
 
 /// A bare modifier is not "the next key".
 const MODIFIER_KEYS: [Key; 16] = [
@@ -100,7 +102,9 @@ pub(crate) fn classify(key: Key, state: ModifierType) -> Press {
 
 /// Installs the prefix on `window`. `on_command` runs a command and is told the keycode of the key
 /// that ran it (HINT needs it: that key is still down); `on_waiting` hears every change of
-/// `waiting()`. Cancelled by the window losing activation and by any click.
+/// `waiting()` made here, including one `on_command` made through the returned prefix. A change
+/// made later, from outside (a timer ending the digit wait), is the caller's to announce.
+/// Cancelled by the window losing activation and by any click.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
     keymap: Rc<Keymap>,
@@ -135,6 +139,13 @@ pub(crate) fn install(
                 Outcome::Run(cmd) => {
                     println!("[prefix] {cmd:?}");
                     on_command(cmd, keycode);
+                    // A command may start a wait of its own (`select.number`'s digit wait, which
+                    // the host enters once its digits are drawn): announced like any other change.
+                    let after = prefix.borrow().waiting();
+                    if after != now {
+                        println!("[prefix] armed={} waiting={after:?}", after != Waiting::No);
+                        on_waiting(after);
+                    }
                     glib::Propagation::Stop
                 }
             }

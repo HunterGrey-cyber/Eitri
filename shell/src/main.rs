@@ -10,6 +10,8 @@ mod editor_feeds;
 mod editor_quit;
 mod editor_rpc;
 mod editor_start_failure;
+#[cfg(feature = "probe")]
+mod grid_probe;
 mod hint;
 mod kill_pane;
 mod layout;
@@ -54,7 +56,8 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened};
 use eitri_core::keymap::{Action, SwapTarget, TabAction};
 use eitri_core::layout::{
-    Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
+    Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Preset,
+    Reopen,
 };
 use eitri_core::plugin::theme::PageTheme;
 use eitri_core::tabs::TabVerb;
@@ -334,6 +337,7 @@ fn build_ui(
         scratch_dir,
         backend_kind,
         panel_notice,
+        None,
     );
     // The panel reads the context when its tick runs, and its tick runs only when woken.
     crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
@@ -1585,22 +1589,93 @@ fn build_ui(
         move |tab_action| run_tab_action(tab_action)
     });
 
-    // The prefix. Installed after every other window-level controller that exists
-    // at startup, so it sees keys first; HINT's, added when a HINT starts, still comes before it.
-    // Below `move_focus` because `select.*` uses it.
+    // The mark `swap.marked` swaps with, as text in the top bar. Refreshed after every mark verb and
+    // every change of the grid: a module retired or killed takes its mark with it.
+    let refresh_mark: Rc<dyn Fn()> = {
+        let module_layout = module_layout.clone();
+        let label = top_bar.mark.clone();
+        let title = module_title.clone();
+        Rc::new(move || {
+            let Ok(layout) = module_layout.try_borrow() else {
+                eprintln!("[modules] BUG: the layout was borrowed while the mark was redrawn");
+                return;
+            };
+            let text = chrome::mark_text(layout.mark(), &*title);
+            drop(layout);
+            chrome::show_mark(&label, text.as_deref());
+        })
+    };
     {
+        let refresh_mark = refresh_mark.clone();
+        grid.connect_changed(move || refresh_mark());
+    }
+
+    // `select.number`: the numbers as drawn, which the digit typed next is looked up in -- not the
+    // layout as it is by then -- and the prefix, which exists only once `prefix::install` returns
+    // below but is what the runner starts the digit wait on.
+    let number_plan: Rc<RefCell<Vec<(char, ModuleId)>>> = Rc::default();
+    let prefix_cell: Rc<std::cell::OnceCell<Rc<RefCell<prefix::Prefix>>>> = Rc::default();
+
+    // Every change of what the prefix waits for: the app name's block, the strip, and the digits,
+    // which come down whenever the digit wait ends however it ended. Shared, because the digit wait's
+    // timer ends that wait from outside the prefix's own controller.
+    let on_waiting: Rc<dyn Fn(prefix::Waiting)> = {
+        let app_name = top_bar.app_name.clone();
+        let strip_keys = module_keys.clone();
+        let strip_verbs = keymap.strip_verbs();
+        let strip_keymap = keymap.clone();
+        let strip_layout = module_layout.clone();
+        let strip_title = module_title.clone();
+        let prefix_strip = prefix_strip.clone();
+        let hint_coordinator = hint_coordinator.clone();
+        let number_plan = number_plan.clone();
+        Rc::new(move |waiting| {
+            if waiting != prefix::Waiting::Number {
+                hint_coordinator.hide_numbers();
+            }
+            if waiting == prefix::Waiting::No {
+                app_name.remove_css_class("prefix-armed");
+            } else {
+                app_name.add_css_class("prefix-armed");
+            }
+            let pieces = if waiting == prefix::Waiting::Number {
+                prefix_strip::number_pieces(&number_plan.borrow(), &*strip_title)
+            } else {
+                let layout = strip_layout.borrow();
+                // Armed, the keys that reach each module as the effective table binds them (a
+                // `del`ed `e` is not advertised); after a split key, the fixed module keys
+                //.
+                let entries = match waiting {
+                    prefix::Waiting::Command => eitri_core::layout::strip_direct(&strip_keys, &strip_keymap, &layout),
+                    _ => eitri_core::layout::strip(&strip_keys, &layout),
+                };
+                prefix_strip::strip_pieces(
+                    waiting,
+                    &entries,
+                    &strip_title(layout.focus()),
+                    &*strip_title,
+                    &strip_verbs,
+                )
+            };
+            prefix_strip.show(&pieces);
+        })
+    };
+
+    // One runner for every key action, from the prefix and from `eitri.layout.run`, so a key and a
+    // Lua call cannot drift apart. `keycode` is the key that ran it, which only `hint` reads (that
+    // key is still down); Lua passes 0 and cannot run `hint`, which is not a layout action.
+    // Below `move_focus` because `select.*` uses it.
+    let run_action: Rc<dyn Fn(Action, u32)> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let editor = pane.clone();
         let agent = agent_panel_handle.clone();
         let window_for_focus = window.clone();
-        let app_name = top_bar.app_name.clone();
         let refused_name = top_bar.app_name.clone();
         let text_size_controller = text_size_controller.clone();
         let terminal = terminal.clone();
         let focus_module = focus_module.clone();
         let open_module = open_module.clone();
-        let place_and_arrive = place_and_arrive.clone();
         let show_on_screen = show_on_screen.clone();
         let move_focus = move_focus.clone();
         let land_by_key = land_by_key.clone();
@@ -1608,272 +1683,400 @@ fn build_ui(
         let hint_coordinator = hint_coordinator.clone();
         let window_modes = window_modes.clone();
         let keymap_for_send = keymap.clone();
-        let strip_keys = module_keys.clone();
-        let strip_verbs = keymap.strip_verbs();
-        let strip_keymap = keymap.clone();
-        let strip_layout = module_layout.clone();
-        let strip_title = module_title.clone();
-        let prefix_strip = prefix_strip.clone();
         let run_tab_action = run_tab_action.clone();
         let kill_now = kill_now.clone();
         let kill_prompt = kill_prompt.clone();
         let kill_title = module_title.clone();
         let kill_refused = top_bar.app_name.clone();
         let toast = toast.clone();
+        let refresh_mark = refresh_mark.clone();
+        let number_plan = number_plan.clone();
+        let prefix_cell = prefix_cell.clone();
+        let on_waiting = on_waiting.clone();
         let keymap_plugins = plugin_panels.clone();
         let keys_return = keys_return.clone();
-        prefix::install(
+        Rc::new(move |action: Action, keycode: u32| {
+            // The module that last held the keys: what zoom, resize, hide and swap act on.
+            let target = || module_layout.borrow().focus().clone();
+            // The module that holds the keys right now (`pane_focus`'s own definition).
+            let focused = || pane_focus::focused_module(&window_for_focus, &grid.hosts());
+            match action {
+                Action::MoveFar(dir) => {
+                    let target = target();
+                    match grid.move_far(&target, dir) {
+                        Ok(true) => {}
+                        // Already against that edge: nothing to do, as a swap with nothing that way.
+                        Ok(false) => println!("[modules] {target}: already at the far {dir:?} edge"),
+                        Err(err) => refuse(&refused_name, &toast, &err),
+                    }
+                }
+                Action::ToggleSplit => {
+                    if !grid.toggle_split(&target()) {
+                        println!("[modules] toggle-split: no split around the module on screen");
+                        flash(&refused_name);
+                    }
+                }
+                Action::Rotate { down } => {
+                    if !grid.rotate(down) {
+                        println!("[modules] rotate: fewer than two modules on screen");
+                        flash(&refused_name);
+                    }
+                }
+                Action::Flip(axis) => {
+                    if !grid.flip(axis) {
+                        println!("[modules] flip: no split that way on screen");
+                        flash(&refused_name);
+                    }
+                }
+                Action::Spread => {
+                    if !grid.spread(&target()) {
+                        println!("[modules] spread: no split around the module on screen");
+                        flash(&refused_name);
+                    }
+                }
+                // `even-*` are presets too, so `layout.next` goes on from them.
+                Action::Even(axis) => {
+                    let preset = match axis {
+                        Axis::Row => Preset::EvenHorizontal,
+                        Axis::Column => Preset::EvenVertical,
+                    };
+                    if let Err(err) = grid.preset(preset) {
+                        refuse(&refused_name, &toast, &err);
+                    }
+                }
+                Action::MainHorizontal | Action::MainVertical | Action::Tiled => {
+                    let preset = match action {
+                        Action::MainHorizontal => Preset::MainHorizontal,
+                        Action::MainVertical => Preset::MainVertical,
+                        _ => Preset::Tiled,
+                    };
+                    if let Err(err) = grid.preset(preset) {
+                        refuse(&refused_name, &toast, &err);
+                    }
+                }
+                Action::CycleLayout { forward } => match grid.cycle_preset(forward) {
+                    Ok(preset) => println!("[modules] layout -> {preset:?}"),
+                    Err(err) => refuse(&refused_name, &toast, &err),
+                },
+                Action::LayoutUndo => {
+                    if let Err(err) = grid.undo() {
+                        refuse(&refused_name, &toast, &err);
+                    }
+                }
+                Action::MarkToggle => {
+                    let id = target();
+                    let toggled = module_layout.borrow_mut().toggle_mark(&id);
+                    match toggled {
+                        Ok(marked) => println!("[modules] {id}: marked={marked}"),
+                        Err(err) => refuse(&refused_name, &toast, &err),
+                    }
+                    refresh_mark();
+                }
+                Action::MarkClear => {
+                    let cleared = module_layout.borrow_mut().clear_mark();
+                    if !cleared {
+                        println!("[modules] no module is marked");
+                    }
+                    refresh_mark();
+                }
+                Action::SwapMarked => {
+                    let target = target();
+                    match grid.swap_marked(&target) {
+                        Ok(marked) => println!("[modules] {target}: swapped with the marked {marked}"),
+                        Err(err) => refuse(&refused_name, &toast, &err),
+                    }
+                }
+                // tmux's `display-panes`: the digits go up first, then the prefix waits for one,
+                // so a window that cannot draw them never swallows the next key.
+                Action::SelectNumber => {
+                    let plan = eitri_core::layout::number_plan(&module_layout.borrow());
+                    if plan.is_empty() {
+                        println!("[prefix] select.number: no module on screen to number");
+                        flash(&refused_name);
+                        return;
+                    }
+                    let Some(prefix) = prefix_cell.get() else {
+                        return;
+                    };
+                    let drawn = hint_coordinator.show_numbers(&plan, &grid.hosts_in_tree_order());
+                    println!("[prefix] select.number: {} numbered, {drawn} drawn", plan.len());
+                    *number_plan.borrow_mut() = plan;
+                    prefix.borrow_mut().await_number(std::time::Instant::now());
+                    let prefix = Rc::downgrade(prefix);
+                    let on_waiting = on_waiting.clone();
+                    glib::timeout_add_local_once(prefix::DISPLAY_PANES_TIME, move || {
+                        let Some(prefix) = prefix.upgrade() else { return };
+                        // `false` when the wait already ended (a digit, a key, a click) or a later
+                        // `select.number` started its own, with its own timer.
+                        let ended = prefix.borrow_mut().expire(std::time::Instant::now());
+                        if ended {
+                            println!("[prefix] armed=false waiting=No (no digit in time)");
+                            on_waiting(prefix::Waiting::No);
+                        }
+                    });
+                }
+                Action::Zoom => grid.toggle_zoom(&target()),
+                Action::Resize { dir, cells } => {
+                    let cell = editor.cell_size().unwrap_or(layout::FALLBACK_CELL);
+                    grid.resize(&target(), dir, layout::resize_px(dir, cell, cells));
+                }
+                Action::Select(dir) => {
+                    move_focus(&target(), dir);
+                }
+                // tmux's `last-pane` and `select-pane -t :.+`, landing the
+                // way `Ctrl+h/j/k/l` do (`land_by_key`). No `RefCell` borrow is held across that
+                // call: `on_owner` runs inside it and writes both the layout and the history.
+                Action::SelectLast => {
+                    let previous = focus_history.borrow().previous().cloned();
+                    match previous.filter(|id| module_layout.borrow().can_focus(id).is_ok()) {
+                        Some(id) => {
+                            let grabbed = land_by_key(&id);
+                            println!("[prefix] select.last -> {id} (grab_focus={grabbed})");
+                        }
+                        None => {
+                            println!("[prefix] no last module");
+                            flash(&refused_name);
+                        }
+                    }
+                }
+                Action::SelectNext => {
+                    let next = {
+                        let layout = module_layout.borrow();
+                        eitri_core::layout::next_on_screen(&layout, layout.focus())
+                    };
+                    match next {
+                        Some(id) => {
+                            let grabbed = land_by_key(&id);
+                            println!("[prefix] select.next -> {id} (grab_focus={grabbed})");
+                        }
+                        None => {
+                            println!("[prefix] no other module on screen");
+                            flash(&refused_name);
+                        }
+                    }
+                }
+                Action::SendPrefix | Action::SendKeys(_) => {
+                    let Some(key) = prefix::literal_for(&action, &keymap_for_send) else {
+                        return;
+                    };
+                    match terminal::literal_target(focused().as_ref().map(ModuleId::kind)) {
+                        terminal::LiteralTarget::Editor => editor.send_keys(&key.to_vim()),
+                        terminal::LiteralTarget::Panel => agent.literal_key(&key),
+                        terminal::LiteralTarget::Terminal => match terminal::keys::literal(&key) {
+                            Some(inputs) => inputs.into_iter().for_each(|input| terminal.send(input)),
+                            None => println!("[prefix] {key}: the terminal takes C-<letter> or one character"),
+                        },
+                        terminal::LiteralTarget::Neither => {}
+                    }
+                }
+                // `Ctrl+a t`'s rule since the terminal's phase 1 (`terminal::toggle_action`), in the
+                // order `ToggleAction::steps` gives and the terminal's own tests pin.
+                Action::Module(id) if id.kind() == ModuleKind::Terminal => {
+                    let has_keys = focused().as_ref() == Some(&id);
+                    let shown = module_layout.borrow().is_shown(&id);
+                    for step in terminal::toggle_action(shown, has_keys).steps() {
+                        match step {
+                            terminal::ToggleStep::Unzoom => {
+                                grid.unzoom();
+                            }
+                            terminal::ToggleStep::Show => {
+                                if let Err(err) = grid.show_module(&id) {
+                                    eprintln!("[terminal] not shown: {err}");
+                                }
+                            }
+                            terminal::ToggleStep::Start => terminal.start(),
+                            terminal::ToggleStep::FocusTerminal => {
+                                focus_module(&id);
+                            }
+                            terminal::ToggleStep::Hide => {
+                                if let Err(err) = grid.hide_module(&id, &*focus_module) {
+                                    refuse(&refused_name, &toast, &err);
+                                }
+                            }
+                        }
+                    }
+                }
+                Action::Module(id) => {
+                    // `v` before the canvas exists, or a module this window has not got.
+                    if !grid.hosts().iter().any(|(m, _)| *m == id) {
+                        println!("[prefix] {id}: not in this window yet");
+                        flash(&refused_name);
+                        return;
+                    }
+                    let has_keys = focused().as_ref() == Some(&id);
+                    let action = eitri_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
+                    open_module(&id, action);
+                }
+                Action::ModuleHide => open_module(&target(), KeyAction::Hide),
+                Action::ModuleKill => {
+                    let id = target();
+                    let scope = match eitri_core::layout::can_kill(&module_layout.borrow(), &id) {
+                        Ok(scope) => scope,
+                        Err(err) => {
+                            refuse(&refused_name, &toast, &err);
+                            return;
+                        }
+                    };
+                    let (running, queued) = (agent.running_count(), agent.queued_count());
+                    let text = kill_pane::prompt(&id, &kill_title(&id), scope, running, queued);
+                    // What `y` also answers for the window close, if this kill closes it.
+                    let confirmed = eitri_core::tabs::window_close_prompt(running, queued);
+                    let Some(prompt) = kill_prompt.get() else {
+                        return;
+                    };
+                    println!("[modules] {id}: {text}");
+                    let kill_now = kill_now.clone();
+                    let kill_refused = kill_refused.clone();
+                    prompt.ask(&text, move || {
+                        if let Err(err) = kill_now(&id, confirmed) {
+                            println!("[modules] {id}: not killed: {err}");
+                            flash(&kill_refused);
+                        }
+                    });
+                }
+                Action::Swap(SwapTarget::Toward(dir)) => {
+                    let target = target();
+                    if grid.swap_modules(&target, dir).is_none() {
+                        println!("[modules] {target}: nothing to swap with {dir:?}");
+                    }
+                }
+                Action::Swap(which) => {
+                    let target = target();
+                    if grid.swap_adjacent(&target, which == SwapTarget::Next).is_none() {
+                        println!("[modules] {target}: nothing to swap with");
+                    }
+                }
+                Action::Text(change) => match text_size::route_focused_module(focused().as_ref()) {
+                    text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(change.into()),
+                    text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(change.into()),
+                    text_size::TextSizeTarget::Neither => {}
+                },
+                Action::Hint => hint_coordinator.toggle_from_prefix(keycode),
+                Action::PanelReload => agent.reload_document_by_hand(),
+                Action::PanelKeymap => {
+                    // Read before the chat takes the keys: afterwards the chat is what holds them.
+                    let from = focused();
+                    let plugin = from
+                        .clone()
+                        .and_then(|module| keymap_plugins.declared_rows(&module))
+                        .map(|(title, rows)| eitri_core::plugin::keys::plugin_help(&title, rows));
+                    let chat = ModuleId::agent();
+                    // What showing the chat is about to change, so closing the sheet can undo it.
+                    let (ended_zoom, showed_sheet) = {
+                        let layout = module_layout.borrow();
+                        let ended_zoom = if layout.zoom_hides(&chat) {
+                            layout.zoomed().cloned()
+                        } else {
+                            None
+                        };
+                        (ended_zoom, !layout.is_shown(&chat))
+                    };
+                    if let Err(err) = show_on_screen(&chat) {
+                        refuse(&refused_name, &toast, &err);
+                        return;
+                    }
+                    let opening = keys_return.borrow_mut().opened(
+                        Opened {
+                            from,
+                            ended_zoom,
+                            showed_sheet,
+                        },
+                        &chat,
+                    );
+                    focus_module(&chat);
+                    agent.open_keymap(plugin, opening);
+                }
+                // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
+                // letters typed after the chord go into the entry instead of acting as panel keys.
+                Action::PanelCommandLine => {
+                    let chat = ModuleId::agent();
+                    if let Err(err) = show_on_screen(&chat) {
+                        refuse(&refused_name, &toast, &err);
+                        return;
+                    }
+                    // A close of the `?` sheet may still be on its way from the page: the command line is
+                    // the newer request, and that close must not move the keys out from under it.
+                    keys_return.borrow_mut().superseded();
+                    focus_module(&chat);
+                    agent.open_command_line();
+                }
+                Action::WindowImmersive => window_modes.toggle_immersive(),
+                // `run_tab_action` is shared with the panel's `tab_verb` messages.
+                // It computes `keys_in` the same way `focused()` does here.
+                Action::Tab(tab_action) => run_tab_action(tab_action),
+                // The prefix never hands a split key back: it waits for a module key instead.
+                Action::Split(_) => {}
+                // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
+                // mode, only while it holds the keys -- elsewhere the same refusal shape as
+                // every other misdirected prefix action (`Action::Module`, above).
+                Action::CopyMode { up } => {
+                    if terminal::copy_mode_entry(focused().as_ref().map(ModuleId::kind)) {
+                        terminal.enter_copy_mode(up);
+                    } else {
+                        println!("[prefix] prefix [ scrolls the terminal");
+                        flash(&refused_name);
+                    }
+                }
+            }
+        })
+    };
+
+    // The prefix. Installed after every other window-level controller that exists
+    // at startup, so it sees keys first; HINT's, added when a HINT starts, still comes before it.
+    {
+        let refused_name = top_bar.app_name.clone();
+        let place_and_arrive = place_and_arrive.clone();
+        let land_by_key = land_by_key.clone();
+        let focus_module = focus_module.clone();
+        let module_layout = module_layout.clone();
+        let agent = agent_panel_handle.clone();
+        let toast = toast.clone();
+        let number_plan = number_plan.clone();
+        let run_action = run_action.clone();
+        let on_waiting = on_waiting.clone();
+        let prefix = prefix::install(
             &window,
             keymap.clone(),
             module_keys.clone(),
-            move |command, keycode| {
-                let action = match command {
-                    prefix::PrefixCommand::Place { module, axis } => {
-                        if let Err(err) = place_and_arrive(&module, axis) {
-                            refuse(&refused_name, &toast, &err);
-                        }
-                        return;
+            move |command, keycode| match command {
+                prefix::PrefixCommand::Place { module, axis } => {
+                    if let Err(err) = place_and_arrive(&module, axis) {
+                        refuse(&refused_name, &toast, &err);
                     }
-                    prefix::PrefixCommand::Run(action) => action,
-                };
-                // The module that last held the keys: what zoom, resize, hide and swap act on.
-                let target = || module_layout.borrow().focus().clone();
-                // The module that holds the keys right now (`pane_focus`'s own definition).
-                let focused = || pane_focus::focused_module(&window_for_focus, &grid.hosts());
-                match action {
-                    Action::Zoom => grid.toggle_zoom(&target()),
-                    Action::Resize { dir, cells } => {
-                        let cell = editor.cell_size().unwrap_or(layout::FALLBACK_CELL);
-                        grid.resize(&target(), dir, layout::resize_px(dir, cell, cells));
-                    }
-                    Action::Select(dir) => {
-                        move_focus(&target(), dir);
-                    }
-                    // tmux's `last-pane` and `select-pane -t :.+`, landing the
-                    // way `Ctrl+h/j/k/l` do (`land_by_key`). No `RefCell` borrow is held across that
-                    // call: `on_owner` runs inside it and writes both the layout and the history.
-                    Action::SelectLast => {
-                        let previous = focus_history.borrow().previous().cloned();
-                        match previous.filter(|id| module_layout.borrow().can_focus(id).is_ok()) {
-                            Some(id) => {
-                                let grabbed = land_by_key(&id);
-                                println!("[prefix] select.last -> {id} (grab_focus={grabbed})");
-                            }
-                            None => {
-                                println!("[prefix] no last module");
-                                flash(&refused_name);
-                            }
-                        }
-                    }
-                    Action::SelectNext => {
-                        let next = {
-                            let layout = module_layout.borrow();
-                            eitri_core::layout::next_on_screen(&layout, layout.focus())
-                        };
-                        match next {
-                            Some(id) => {
-                                let grabbed = land_by_key(&id);
-                                println!("[prefix] select.next -> {id} (grab_focus={grabbed})");
-                            }
-                            None => {
-                                println!("[prefix] no other module on screen");
-                                flash(&refused_name);
-                            }
-                        }
-                    }
-                    Action::SendPrefix | Action::SendKeys(_) => {
-                        let Some(key) = prefix::literal_for(&action, &keymap_for_send) else {
-                            return;
-                        };
-                        match terminal::literal_target(focused().as_ref().map(ModuleId::kind)) {
-                            terminal::LiteralTarget::Editor => editor.send_keys(&key.to_vim()),
-                            terminal::LiteralTarget::Panel => agent.literal_key(&key),
-                            terminal::LiteralTarget::Terminal => match terminal::keys::literal(&key) {
-                                Some(inputs) => inputs.into_iter().for_each(|input| terminal.send(input)),
-                                None => println!("[prefix] {key}: the terminal takes C-<letter> or one character"),
-                            },
-                            terminal::LiteralTarget::Neither => {}
-                        }
-                    }
-                    // `Ctrl+a t`'s rule since the terminal's phase 1 (`terminal::toggle_action`), in the
-                    // order `ToggleAction::steps` gives and the terminal's own tests pin.
-                    Action::Module(id) if id.kind() == ModuleKind::Terminal => {
-                        let has_keys = focused().as_ref() == Some(&id);
-                        let shown = module_layout.borrow().is_shown(&id);
-                        for step in terminal::toggle_action(shown, has_keys).steps() {
-                            match step {
-                                terminal::ToggleStep::Unzoom => {
-                                    grid.unzoom();
+                }
+                // The digits are already down (the wait's end hid them); the number is looked up in
+                // what they showed. A digit with no module there does nothing, as in tmux.
+                prefix::PrefixCommand::Number(digit) => {
+                    let to = number_plan
+                        .borrow()
+                        .iter()
+                        .find(|(d, _)| *d == digit)
+                        .map(|(_, id)| id.clone());
+                    match to {
+                        // Zoomed, `1` is the zoomed module: it gets the keys and the zoom stays, as
+                        // tmux keeps a zoom when the pane picked is the one zoomed. Anywhere else
+                        // the keys land as `Ctrl+h/j/k/l` land them.
+                        Some(id) => {
+                            let zoomed_here = module_layout.borrow().zoomed() == Some(&id);
+                            let grabbed = if zoomed_here {
+                                let grabbed = focus_module(&id);
+                                if grabbed && id.kind() == ModuleKind::Agent {
+                                    agent.arrive();
                                 }
-                                terminal::ToggleStep::Show => {
-                                    if let Err(err) = grid.show_module(&id) {
-                                        eprintln!("[terminal] not shown: {err}");
-                                    }
-                                }
-                                terminal::ToggleStep::Start => terminal.start(),
-                                terminal::ToggleStep::FocusTerminal => {
-                                    focus_module(&id);
-                                }
-                                terminal::ToggleStep::Hide => {
-                                    if let Err(err) = grid.hide_module(&id, &*focus_module) {
-                                        refuse(&refused_name, &toast, &err);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Action::Module(id) => {
-                        // `v` before the canvas exists, or a module this window has not got.
-                        if !grid.hosts().iter().any(|(m, _)| *m == id) {
-                            println!("[prefix] {id}: not in this window yet");
-                            flash(&refused_name);
-                            return;
-                        }
-                        let has_keys = focused().as_ref() == Some(&id);
-                        let action = eitri_core::layout::key_action(&module_layout.borrow(), &id, has_keys);
-                        open_module(&id, action);
-                    }
-                    Action::ModuleHide => open_module(&target(), KeyAction::Hide),
-                    Action::ModuleKill => {
-                        let id = target();
-                        let scope = match eitri_core::layout::can_kill(&module_layout.borrow(), &id) {
-                            Ok(scope) => scope,
-                            Err(err) => {
-                                refuse(&refused_name, &toast, &err);
-                                return;
-                            }
-                        };
-                        let (running, queued) = (agent.running_count(), agent.queued_count());
-                        let text = kill_pane::prompt(&id, &kill_title(&id), scope, running, queued);
-                        // What `y` also answers for the window close, if this kill closes it.
-                        let confirmed = eitri_core::tabs::window_close_prompt(running, queued);
-                        let Some(prompt) = kill_prompt.get() else {
-                            return;
-                        };
-                        println!("[modules] {id}: {text}");
-                        let kill_now = kill_now.clone();
-                        let kill_refused = kill_refused.clone();
-                        prompt.ask(&text, move || {
-                            if let Err(err) = kill_now(&id, confirmed) {
-                                println!("[modules] {id}: not killed: {err}");
-                                flash(&kill_refused);
-                            }
-                        });
-                    }
-                    Action::Swap(SwapTarget::Toward(dir)) => {
-                        let target = target();
-                        if grid.swap_modules(&target, dir).is_none() {
-                            println!("[modules] {target}: nothing to swap with {dir:?}");
-                        }
-                    }
-                    Action::Swap(which) => {
-                        let target = target();
-                        if grid.swap_adjacent(&target, which == SwapTarget::Next).is_none() {
-                            println!("[modules] {target}: nothing to swap with");
-                        }
-                    }
-                    Action::Even(axis) => grid.even_modules(axis),
-                    Action::Text(change) => match text_size::route_focused_module(focused().as_ref()) {
-                        text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(change.into()),
-                        text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(change.into()),
-                        text_size::TextSizeTarget::Neither => {}
-                    },
-                    Action::Hint => hint_coordinator.toggle_from_prefix(keycode),
-                    Action::PanelReload => agent.reload_document_by_hand(),
-                    Action::PanelKeymap => {
-                        // Read before the chat takes the keys: afterwards the chat is what holds them.
-                        let from = focused();
-                        let plugin = from
-                            .clone()
-                            .and_then(|module| keymap_plugins.declared_rows(&module))
-                            .map(|(title, rows)| eitri_core::plugin::keys::plugin_help(&title, rows));
-                        let chat = ModuleId::agent();
-                        // What showing the chat is about to change, so closing the sheet can undo it.
-                        let (ended_zoom, showed_sheet) = {
-                            let layout = module_layout.borrow();
-                            let ended_zoom = if layout.zoom_hides(&chat) {
-                                layout.zoomed().cloned()
+                                grabbed
                             } else {
-                                None
+                                land_by_key(&id)
                             };
-                            (ended_zoom, !layout.is_shown(&chat))
-                        };
-                        if let Err(err) = show_on_screen(&chat) {
-                            refuse(&refused_name, &toast, &err);
-                            return;
+                            println!("[prefix] number {digit} -> {id} (grab_focus={grabbed})");
                         }
-                        let opening = keys_return.borrow_mut().opened(
-                            Opened {
-                                from,
-                                ended_zoom,
-                                showed_sheet,
-                            },
-                            &chat,
-                        );
-                        focus_module(&chat);
-                        agent.open_keymap(plugin, opening);
-                    }
-                    // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
-                    // letters typed after the chord go into the entry instead of acting as panel keys.
-                    Action::PanelCommandLine => {
-                        let chat = ModuleId::agent();
-                        if let Err(err) = show_on_screen(&chat) {
-                            refuse(&refused_name, &toast, &err);
-                            return;
-                        }
-                        // A close of the `?` sheet may still be on its way from the page: the command line is
-                        // the newer request, and that close must not move the keys out from under it.
-                        keys_return.borrow_mut().superseded();
-                        focus_module(&chat);
-                        agent.open_command_line();
-                    }
-                    Action::WindowImmersive => window_modes.toggle_immersive(),
-                    // `run_tab_action` is shared with the panel's `tab_verb` messages.
-                    // It computes `keys_in` the same way `focused()` does here.
-                    Action::Tab(tab_action) => run_tab_action(tab_action),
-                    // The prefix never hands a split key back: it waits for a module key instead.
-                    Action::Split(_) => {}
-                    // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
-                    // mode, only while it holds the keys -- elsewhere the same refusal shape as
-                    // every other misdirected prefix action (`Action::Module`, above).
-                    Action::CopyMode { up } => {
-                        if terminal::copy_mode_entry(focused().as_ref().map(ModuleId::kind)) {
-                            terminal.enter_copy_mode(up);
-                        } else {
-                            println!("[prefix] prefix [ scrolls the terminal");
-                            flash(&refused_name);
-                        }
+                        None => println!("[prefix] number {digit}: no module has it"),
                     }
                 }
+                prefix::PrefixCommand::Run(action) => run_action(action, keycode),
             },
-            move |waiting| {
-                if waiting == prefix::Waiting::No {
-                    app_name.remove_css_class("prefix-armed");
-                } else {
-                    app_name.add_css_class("prefix-armed");
-                }
-                let pieces = {
-                    let layout = strip_layout.borrow();
-                    // Armed, the keys that reach each module as the effective table binds them (a
-                    // `del`ed `e` is not advertised); after a split key, the fixed module keys
-                    //.
-                    let entries = match waiting {
-                        prefix::Waiting::Command => {
-                            eitri_core::layout::strip_direct(&strip_keys, &strip_keymap, &layout)
-                        }
-                        _ => eitri_core::layout::strip(&strip_keys, &layout),
-                    };
-                    prefix_strip::strip_pieces(
-                        waiting,
-                        &entries,
-                        &strip_title(layout.focus()),
-                        &*strip_title,
-                        &strip_verbs,
-                    )
-                };
-                prefix_strip.show(&pieces);
-            },
+            move |waiting| on_waiting(waiting),
         );
+        let _ = prefix_cell.set(prefix);
     }
 
     // Install after `prefix::install`: GTK runs a widget's most recently added controller first,
@@ -2098,16 +2301,20 @@ fn build_ui(
         });
     }
 
-    // Lua layout requests (`show`, `hide`, `focus`, `split`) are queued while a command or event
-    // handler runs and applied here after it returns. This avoids changing the layout during a Lua
-    // call. Each refusal is logged like a handler error.
+    // Lua `layout.show/hide/focus/split/run/mark` requests are queued while the
+    // command or event handler runs and applied after it returns, so layout changes
+    // do not happen under a Lua call. Each refusal is logged like a handler error.
+    // `run` uses the prefix's runner, which flashes and logs its own refusals.
     let apply_layout_requests: Rc<dyn Fn()> = {
         let lua_engine = lua_engine.clone();
         let grid = grid.clone();
+        let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
         let focus_and_arrive = focus_and_arrive.clone();
         let show_on_screen = show_on_screen.clone();
         let place_and_arrive = place_and_arrive.clone();
+        let run_action = run_action.clone();
+        let refresh_mark = refresh_mark.clone();
         Rc::new(move || {
             let requests = lua_engine.layout.borrow_mut().take_requests();
             for request in requests {
@@ -2119,6 +2326,16 @@ fn build_ui(
                     LayoutRequest::Hide(id) => grid.hide_module(id, &*focus_module),
                     LayoutRequest::Focus(id) => focus_and_arrive(id),
                     LayoutRequest::Split(id, axis) => place_and_arrive(id, *axis),
+                    LayoutRequest::Run(action) => {
+                        run_action(action.clone(), 0);
+                        Ok(())
+                    }
+                    LayoutRequest::Mark(id) => {
+                        // Released before the redraw, which reads the layout.
+                        let marked = module_layout.borrow_mut().set_mark(id);
+                        refresh_mark();
+                        marked
+                    }
                 };
                 if let Err(err) = result {
                     eprintln!("[lua] layout: {request:?} refused: {err}");
@@ -2157,6 +2374,17 @@ fn build_ui(
     // or `↻`) is the first focusable widget, so it never has.
     let first = module_layout.borrow().focus().clone();
     window.present();
+    #[cfg(feature = "probe")]
+    grid_probe::start_if_requested(grid_probe::Context {
+        app: app.clone(),
+        window: window.clone(),
+        grid: grid.clone(),
+        pane: pane.clone(),
+        terminal: terminal.clone(),
+        agent: agent_widget.clone(),
+        project_root: project_root.to_path_buf(),
+        backend_kind,
+    });
     // Call `grab_focus()` after `present()`, since a widget must be shown to take focus.
     // Then call `arrive` as module keys do, so restored chat focus uses the same
     // arrival behavior as other keyboard routes. At launch the panel may still be
@@ -2167,7 +2395,20 @@ fn build_ui(
 
     // The one real v1 event: fires once the window is actually up, so any Lua handler reacting
     // to it sees a fully-built shell (panels registered, commands bound, window shown).
-    // `eitri.layout.show` and the rest work from here on, `shell:ready` handlers included.
+    // `eitri.layout.show` and the rest work from here on, `shell:ready` handlers included; `get`
+    // reads the live layout, and `run('module.<id>')` may name each registered panel.
+    {
+        let panel_ids: Vec<String> = lua_engine
+            .panels
+            .borrow()
+            .entries()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let mut store = lua_engine.layout.borrow_mut();
+        store.attach(module_layout.clone());
+        store.set_lua_panels(panel_ids);
+    }
     lua_engine.layout.borrow_mut().accept_requests();
     lua_engine.emit("shell:ready");
     apply_layout_requests();

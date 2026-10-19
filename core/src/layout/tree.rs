@@ -17,11 +17,14 @@
 //! a Lua `bottom` panel) or below the editor's leaf ([`Placement::BelowEditor`], the default terminal)
 //! are pinned, including rows that are not full width. On first show, the ratio gives either module
 //! a third of the available height; [`super::geometry::settle_pins`] then freezes that length.
+//!
+//! The mark, last preset and undo slot are runtime state; no state file reads or writes them.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use super::module::{ModuleDecl, ModuleId, Placement};
+use super::verbs::Preset;
 
 /// A split never gives either side less than this share.
 pub const MIN_RATIO: f32 = 0.05;
@@ -256,6 +259,16 @@ impl Node {
         }
     }
 
+    pub(super) fn map_leaves(&mut self, f: &dyn Fn(&ModuleId) -> ModuleId) {
+        match self {
+            Node::Leaf(id) => *id = f(id),
+            Node::Split { first, second, .. } => {
+                first.map_leaves(f);
+                second.map_leaves(f);
+            }
+        }
+    }
+
     /// Replaces the leaf `id` with `with(leaf)`. `false` if there is no such leaf.
     pub(super) fn replace_leaf(&mut self, id: &ModuleId, with: impl FnOnce(Node) -> Node) -> bool {
         match self {
@@ -296,11 +309,23 @@ pub enum LayoutError {
     SameModule(ModuleId),
     /// Killed for the rest of this window (`super::kill`, `Reopen::Never`).
     Gone(ModuleId),
+    NoMark,
+    MarkedIsTarget(ModuleId),
+    MarkHidden(ModuleId),
+    TooMany {
+        limit: usize,
+    },
+    NothingToUndo,
 }
 
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LayoutError::NoMark => write!(f, "no module is marked"),
+            LayoutError::MarkedIsTarget(id) => write!(f, "'{id}' is the marked module itself"),
+            LayoutError::MarkHidden(id) => write!(f, "the marked module '{id}' is hidden"),
+            LayoutError::TooMany { limit } => write!(f, "more than {limit} modules on screen"),
+            LayoutError::NothingToUndo => write!(f, "nothing to undo"),
             LayoutError::Duplicate(id) => write!(f, "module '{id}' appears more than once"),
             LayoutError::NotInTree(id) => write!(f, "module '{id}' is not in the layout"),
             LayoutError::Hidden(id) => write!(f, "module '{id}' is hidden and cannot hold the keys"),
@@ -329,6 +354,9 @@ pub enum ZoomChange {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     root: Node,
+    mark: Option<ModuleId>,
+    last_preset: Option<Preset>,
+    undo: Option<Node>,
     hidden: BTreeSet<ModuleId>,
     zoomed: Option<ModuleId>,
     /// The module that last held the keys (`pane_focus`'s "last pane"). What `Ctrl+a m` zooms,
@@ -373,6 +401,9 @@ impl Layout {
         mru.extend(leaves.into_iter().filter(|id| *id != focus));
         Ok(Layout {
             root,
+            mark: None,
+            last_preset: None,
+            undo: None,
             hidden: BTreeSet::new(),
             zoomed: None,
             focus,
@@ -458,6 +489,65 @@ impl Layout {
 
     pub fn focus(&self) -> &ModuleId {
         &self.focus
+    }
+
+    pub fn mark(&self) -> Option<&ModuleId> {
+        self.mark.as_ref()
+    }
+
+    pub fn set_mark(&mut self, id: &ModuleId) -> Result<(), LayoutError> {
+        if !self.contains(id) {
+            return Err(LayoutError::NotInTree(id.clone()));
+        }
+        if self.is_gone(id) {
+            return Err(LayoutError::Gone(id.clone()));
+        }
+        self.mark = Some(id.clone());
+        Ok(())
+    }
+
+    pub fn clear_mark(&mut self) -> bool {
+        self.mark.take().is_some()
+    }
+
+    pub fn toggle_mark(&mut self, id: &ModuleId) -> Result<bool, LayoutError> {
+        if self.mark.as_ref() == Some(id) {
+            self.clear_mark();
+            Ok(false)
+        } else {
+            self.set_mark(id)?;
+            Ok(true)
+        }
+    }
+
+    pub fn last_preset(&self) -> Option<Preset> {
+        self.last_preset
+    }
+
+    pub(super) fn set_last_preset(&mut self, preset: Preset) {
+        self.last_preset = Some(preset);
+    }
+
+    pub(super) fn clear_last_preset(&mut self) {
+        self.last_preset = None;
+    }
+
+    pub fn undo(&mut self) -> Result<(), LayoutError> {
+        let Some(mut old) = self.undo.take() else {
+            return Err(LayoutError::NothingToUndo);
+        };
+        let mut before = old.leaves();
+        let mut now = self.leaves();
+        before.sort();
+        now.sort();
+        if before != now {
+            return Err(LayoutError::NothingToUndo);
+        }
+        self.unzoom();
+        std::mem::swap(&mut old, &mut self.root);
+        self.undo = Some(old);
+        self.last_preset = None;
+        Ok(())
     }
 
     pub fn mru(&self) -> &[ModuleId] {
@@ -594,7 +684,11 @@ impl Layout {
                 self.mru.push(id);
             }
         }
-        self.root = root;
+        let old = std::mem::replace(&mut self.root, root);
+        if old != self.root {
+            self.undo = Some(old);
+        }
+        self.last_preset = None;
     }
 
     /// Marks the hidden module `id` gone, for `super::kill`, which has just hidden it; `was_shown`
@@ -602,6 +696,9 @@ impl Layout {
     pub(super) fn retire(&mut self, id: &ModuleId, was_shown: bool) {
         debug_assert!(self.hidden.contains(id), "only a hidden module can be gone");
         self.gone.insert(id.clone());
+        if self.mark.as_ref() == Some(id) {
+            self.mark = None;
+        }
         if was_shown {
             self.retired_shown.insert(id.clone());
         }

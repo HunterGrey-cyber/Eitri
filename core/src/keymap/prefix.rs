@@ -23,6 +23,9 @@ use crate::layout::{Axis, ModuleId, ModuleKeys, ModuleKind};
 /// tmux's default `repeat-time`.
 pub const REPEAT_TIME: Duration = Duration::from_millis(500);
 
+/// tmux's default time for the pane numbers to remain on screen.
+pub const DISPLAY_PANES_TIME: Duration = Duration::from_millis(1000);
+
 /// One key press as the prefix reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Press {
@@ -38,6 +41,7 @@ pub enum Press {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixCommand {
     Run(Action),
+    Number(char),
     /// After a split key and a module key: open `module` next to the module with the keys, or move it.
     Place {
         module: ModuleId,
@@ -72,6 +76,9 @@ enum State {
     AwaitModule {
         axis: Axis,
     },
+    AwaitNumber {
+        until: Instant,
+    },
     /// After a repeatable binding: another repeatable key before `until` runs without the prefix.
     Repeat {
         until: Instant,
@@ -85,6 +92,7 @@ pub enum Waiting {
     No,
     Command,
     Module(Axis),
+    Number,
 }
 
 pub struct Prefix {
@@ -113,9 +121,29 @@ impl Prefix {
     pub fn waiting(&self) -> Waiting {
         match self.state {
             State::Armed => Waiting::Command,
+            State::AwaitNumber { .. } => Waiting::Number,
             State::AwaitModule { axis } => Waiting::Module(axis),
             State::Idle | State::Repeat { .. } => Waiting::No,
         }
+    }
+
+    /// Start waiting after the host draws the digits. A window that refuses the action never
+    /// calls this, so it never eats a digit.
+    pub fn await_number(&mut self, now: Instant) {
+        self.state = State::AwaitNumber {
+            until: now + DISPLAY_PANES_TIME,
+        };
+    }
+
+    /// End a number wait once its display time is past; report whether one ended.
+    pub fn expire(&mut self, now: Instant) -> bool {
+        if let State::AwaitNumber { until } = self.state {
+            if now > until {
+                self.state = State::Idle;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn cancel(&mut self) {
@@ -139,7 +167,7 @@ impl Prefix {
     }
 
     pub fn press(&mut self, press: Press, keycode: u32, now: Instant) -> Outcome {
-        if let State::Repeat { until } = self.state {
+        if let State::Repeat { until } | State::AwaitNumber { until } = self.state {
             if now > until {
                 self.state = State::Idle;
             }
@@ -158,6 +186,19 @@ impl Prefix {
             return Outcome::Swallow;
         }
         match self.state {
+            State::AwaitNumber { .. } => {
+                if press == Press::Modifier {
+                    return Outcome::Swallow;
+                }
+                self.held = Some(keycode);
+                self.state = State::Idle;
+                if let Press::Key(key) = press {
+                    if let Some(c) = key.as_char().filter(char::is_ascii_digit) {
+                        return Outcome::Run(PrefixCommand::Number(c));
+                    }
+                }
+                Outcome::Swallow
+            }
             State::Idle => {
                 if is_prefix {
                     self.state = State::Armed;
@@ -322,7 +363,7 @@ mod tests {
     #[test]
     fn an_unbound_key_or_esc_after_the_prefix_is_swallowed_and_ends_it() {
         let t = Instant::now();
-        for press in [key("q"), key("s"), key("S-Up"), Press::Other, Press::Escape] {
+        for press in [key("g"), key("y"), key("S-Up"), Press::Other, Press::Escape] {
             let mut p = armed(defaults(), t);
             assert_eq!(p.press(press, K1, t), Outcome::Swallow, "{press:?}");
             assert!(!p.is_armed());
@@ -405,9 +446,9 @@ mod tests {
             })
         );
         let mut p = armed(defaults(), t);
-        assert_eq!(p.press(key("q"), K1, t), Outcome::Swallow);
+        assert_eq!(p.press(key("g"), K1, t), Outcome::Swallow);
         assert_eq!(
-            p.press(key("q"), K1, t),
+            p.press(key("g"), K1, t),
             Outcome::Swallow,
             "an unbound key's repeat reaches nobody"
         );
@@ -574,6 +615,10 @@ mod tests {
                     ("repeatable".into(), crate::keymap::OptValue::Bool(true)),
                 ],
             },
+            KeymapOp::Del {
+                table: "prefix".into(),
+                key: "H".into(),
+            },
             KeymapOp::Set {
                 table: "prefix".into(),
                 key: "H".into(),
@@ -611,5 +656,49 @@ mod tests {
         );
         let mut p = armed(with(keymap, &[]), t);
         assert_eq!(p.press(key("="), K1, t), run(Action::Text(TextChange::Larger)));
+    }
+
+    #[test]
+    fn display_panes_waits_for_a_digit_until_its_time_is_up() {
+        let t = Instant::now();
+        for (digit, want) in [("3", '3'), ("0", '0')] {
+            let mut p = armed(defaults(), t);
+            assert_eq!(p.press(key("q"), K1, t), run(Action::SelectNumber));
+            assert_eq!(p.waiting(), Waiting::No, "the host starts the wait, not the key");
+            p.await_number(t);
+            assert_eq!(p.waiting(), Waiting::Number);
+            assert!(p.is_armed());
+            assert_eq!(p.press(key("q"), K1, t), Outcome::Swallow, "the held q's own repeat");
+            assert_eq!(p.waiting(), Waiting::Number);
+            assert_eq!(p.press(Press::Modifier, SHIFT_L, t), Outcome::Swallow);
+            assert_eq!(p.waiting(), Waiting::Number, "a bare modifier is not the next key");
+            p.release(K1);
+            assert_eq!(
+                p.press(key(digit), K2, t + Duration::from_millis(900)),
+                Outcome::Run(PrefixCommand::Number(want))
+            );
+            assert_eq!(p.waiting(), Waiting::No);
+        }
+        for press in [Press::Escape, key("x"), key("M-1"), Press::Other, key("C-b")] {
+            let mut p = defaults();
+            p.await_number(t);
+            assert_eq!(p.press(press, K2, t), Outcome::Swallow, "{press:?}");
+            assert_eq!(p.waiting(), Waiting::No, "{press:?}");
+        }
+        let mut p = defaults();
+        p.await_number(t);
+        assert_eq!(
+            p.press(key("3"), K2, t + Duration::from_millis(1001)),
+            Outcome::Pass,
+            "past its time the key goes where it was going"
+        );
+        assert_eq!(p.waiting(), Waiting::No);
+        let mut p = defaults();
+        p.await_number(t);
+        assert!(!p.expire(t + Duration::from_millis(999)));
+        assert_eq!(p.waiting(), Waiting::Number);
+        assert!(p.expire(t + Duration::from_millis(1001)));
+        assert_eq!(p.waiting(), Waiting::No);
+        assert!(!p.expire(t + Duration::from_millis(2000)), "nothing left to end");
     }
 }

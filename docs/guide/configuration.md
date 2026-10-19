@@ -90,6 +90,43 @@ skip the tmux step.
 A complete example, which moves the prefix to `Ctrl+a` and rebinds splits, resizing and zoom, is
 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua). Paste what you want from it into your `init.lua`.
 
+## Layout from Lua
+
+Every key in [Keys](keys.md) that changes the layout is also an action with a name, and Lua reaches the
+same actions by the same names. These calls are for a command (`eitri.command.register`) or an event handler: they
+queue what you ask for, and Eitri carries it out when the handler returns, in order. Called while `init.lua` is
+still loading, before the window exists, they stop with a message that says so; `eitri.layout.default` is what
+shapes the first window.
+
+```lua
+eitri.command.register({
+  id = "tidy",
+  title = "Rearrange the window",
+  keybinding = "<Control><Alt>r",
+  action = function()
+    eitri.layout.run("layout.main-vertical")      -- any layout action, by its eitri.keymap name
+    eitri.layout.run("rotate.down")
+    eitri.layout.run("resize.left", { cells = 5 }) -- options go in a table, as in eitri.keymap.set
+  end,
+})
+```
+
+- **`eitri.layout.run(name, options?)`** runs one layout action on the module that has the keys: the ones in the
+  Modules table of [Keys](keys.md) (arrangements, swaps, moves to an edge, marks, zoom, resize, hide, close)
+  and the ones with no key (`swap.marked`, `layout.undo`, `layout.previous`, the flips, `move.far-right`). To act on
+  another module, call `eitri.layout.focus(id)` first. Closing a module still asks its `y/n` question. An action that
+  is not a layout action (a tab action, say) is refused naming it, and so are three more: `split.right` and
+  `split.below` (they wait for a module key; `eitri.layout.split(id, "right")` or `"below"` does the work), `select.number`
+  (it waits for a digit; `eitri.layout.focus(id)` gives a module the keys) and the `repeatable` option, which belongs
+  to a key binding.
+- **`eitri.layout.mark(id)`** marks that module without moving the keys, as `<prefix> m` marks the one that has them.
+- **`eitri.layout.get()`** returns a new table describing the layout as it is now, in the shape
+  `eitri.layout.default` takes: `{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`, where
+  a split's first child carries the split's ratio. It adds `focus` (the module with the keys), `hidden` (a list),
+  `zoomed` and `marked` (a module, or nothing). Pinned bottom rows are not written into the table; the default shape
+  restores a bottom row's height by itself. Called from inside a layout change it stops with a message instead of
+  reading half a change.
+
 ## How a launch starts
 
 Two settings decide what a new window does with the tabs and the mode of its last session.

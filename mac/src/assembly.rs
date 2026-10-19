@@ -201,6 +201,11 @@ impl Shared {
 
     fn run_prefix(&self, command: PrefixCommand, pane: Pane) {
         let action = match command {
+            PrefixCommand::Number(digit) => {
+                crate::log_line!("[mac] prefix: number {digit} refused");
+                self.actions.toast(NOT_IN_THIS_WINDOW);
+                return;
+            }
             PrefixCommand::Run(action) => action,
             // A module key after a split key: there is nothing to place.
             PrefixCommand::Place { module, axis } => {

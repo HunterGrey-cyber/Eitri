@@ -365,11 +365,11 @@ mod tests {
     fn a_stock_tmux_key_eitri_does_not_bind_stays_reserved() {
         // `[` and `PPage` are bound to `copy-mode` and `copy-mode -u`, so Lua panels taking them fail
         // `Bound`, not `StockTmux`. `;` and `o` are bound to `last-pane` and `select-pane -t :.+` too.
-        // `q` (`display-panes`, replaced by HINT) remains an unbound stock key.
+        // `q` is bound to `select.number`; `D` (`choose-client`) remains an unbound stock key.
         // See `every_character_the_effective_table_binds_refuses_a_lua_panel`.
         for (key, command) in [
             ('s', "choose-tree"),
-            ('q', "display-panes"),
+            ('D', "choose-client"),
             (']', "paste-buffer"),
             ('C', "customize-mode"),
         ] {
@@ -403,7 +403,13 @@ mod tests {
     /// including `V` for the reserved canvas key `v`.
     #[test]
     fn the_capital_of_a_built_in_key_is_refused_naming_the_key() {
-        for key in ['E', 'A', 'T', 'V'] {
+        // `E` is also a built-in capital, but it is bound itself now (`layout.spread`), and a bound key is refused as
+        // bound before the capital rule is read.
+        assert!(matches!(
+            build_one("E", &Keymap::defaults()),
+            Err(KeyError::Bound { action, .. }) if action == "layout.spread"
+        ));
+        for key in ['A', 'T', 'V'] {
             let err = build_one(&key.to_string(), &Keymap::defaults()).unwrap_err();
             assert_eq!(
                 err,

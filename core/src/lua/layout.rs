@@ -1,30 +1,33 @@
-//! The Lua interface for default layouts and runtime layout requests.
+//! `eitri.layout.*`: the Lua half of the layout.
 //!
-//! `layout.default{ ... }` in `init.lua` supplies the first window's tree when no saved layout is
-//! usable. A malformed table is a startup failure naming the call: [`LayoutStore::default_tree`]
-//! holds the error for `shell`, which exits after `init.lua` runs. Logging Lua errors alone would
-//! allow startup with an invalid default.
+//! `eitri.layout.default{ ... }` in `init.lua` supplies the first window's tree when no saved
+//! layout is usable. A malformed table is a startup failure: [`LayoutStore::default_tree`]
+//! holds the error for `shell` to report after `init.lua` runs, since Lua errors are only logged.
+//! `agent.font_size` uses the same error handling.
 //!
-//! `layout.show(id)`, `.hide(id)`, `.focus(id)` and `.split(id, 'right'|'below')` queue a
-//! [`LayoutRequest`] for `shell` to execute when the command or event handler returns.
-//! Before the window exists, they refuse and name `default` as the way to shape the first window.
+//! `eitri.layout.show(id)`, `.hide(id)`, `.focus(id)`, `.split(id, 'right'|'below')`,
+//! `.run(name, opts?)` and `.mark(id)` queue a [`LayoutRequest`] from a command or event handler.
+//! `shell` applies it after the handler returns. Before a window exists, these calls refuse
+//! and name `default` as the way to shape the first window. `eitri.layout.get()` returns a
+//! fresh table of the live layout once the window exists. For layout actions, `run` takes the
+//! same names and options as `eitri.keymap.set`, so keys and Lua calls reach the same verbs.
 //!
-//! For example: `{ 'row', {'editor', 0.6}, {'column', {'agent'}, {'canvas', 0.5}} }`.
-//! A node starts with `'row'` or `'column'` for a split with at least two children, or a module id.
-//! A module's optional second item is its share; a split uses `share = x`. Children without shares
-//! divide the remainder equally. Shares are inside `(0, 1)` and must leave room for other children,
-//! or sum to 1 if all are given. Unknown fields are refused so typos cannot silently do nothing.
-//! For example, a module cannot use `share = 0.6`, and a split cannot use `shares = 0.7`.
-//! The tree must contain `editor` and `agent`. Unavailable modules are removed by
-//! `layout::reconcile_default`, with a log line.
+//! A tree looks like `{ 'row', {'editor', 0.6}, {'column', {'agent'}, {'canvas', 0.5}} }`.
+//! A node starts with `'row'` or `'column'` followed by at least two children, or with a module
+//! id and an optional second item giving its share. Splits take their share as `share = x`.
+//! Shares are inside `(0, 1)`. Unspecified children divide the remainder equally; explicit
+//! shares must leave them room, or sum to 1 if all are given. Other fields are refused so a
+//! typo cannot silently do nothing. A module's share is its second item, not `share = x`.
+//! The tree must contain `editor` and `agent`. Modules unavailable in this window are removed
+//! by `layout::reconcile_default`, with a log line.
 //!
-//! A terminal or Lua `bottom` panel that forms a full-width bottom row is pinned to keep its height.
-//! Both `{ 'column', {'row', ...}, {'terminal'} }` and
-//! `{ 'column', {'editor'}, {'agent'}, {'terminal'} }` are recognised, and pinning is logged.
-//! A module in the middle of a column or beside another module in a row divides by its share.
+//! A terminal or Lua `bottom` panel that forms a full-width bottom row keeps its pinned
+//! height, with a log line. This applies both to `{ 'column', {'row', ...}, {'terminal'} }`
+//! and to `{ 'column', {'editor'}, {'agent'}, {'terminal'} }`. A panel in the middle of a
+//! column or beside another module in a row divides space by its share.
 //!
-//! `show` ends a zoom that would keep its module off screen, as `Ctrl+a e` and `Ctrl+a a` do.
-//! Focusing the zoomed module itself leaves the zoom on.
+//! `show` ends a zoom if needed to expose its module, as `Ctrl+a e`/`a` do. Focusing the
+//! zoomed module itself keeps the zoom.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -32,10 +35,11 @@ use std::rc::Rc;
 
 use mlua::{Lua, Table, Value};
 
+use crate::keymap::Action;
 use crate::layout::tree::{MAX_RATIO, MIN_RATIO};
-use crate::layout::{Axis, ModuleId, Node};
+use crate::layout::{Axis, Layout, ModuleId, Node};
 
-/// One `eitri.layout.show/hide/focus/split` call, for `shell` to carry out.
+/// One queued `eitri.layout` call, for `shell` to carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutRequest {
     Show(ModuleId),
@@ -43,6 +47,10 @@ pub enum LayoutRequest {
     Focus(ModuleId),
     /// `Axis::Row` is `'right'`, `Axis::Column` is `'below'`, of the module with the keys.
     Split(ModuleId, Axis),
+    /// A key action by its `eitri.keymap` name, run on the module with the keys;
+    /// `shell` runs it exactly as the prefix does.
+    Run(Action),
+    Mark(ModuleId),
 }
 
 /// What `eitri.layout.*` recorded.
@@ -51,15 +59,27 @@ pub struct LayoutStore {
     default: Option<Result<Node, String>>,
     requests: Vec<LayoutRequest>,
     accepting: bool,
+    lua_panels: Vec<String>,
+    layout: Option<Rc<RefCell<Layout>>>,
 }
 
 impl LayoutStore {
+    /// The window's live layout, so `get` reads its current state.
+    pub fn attach(&mut self, layout: Rc<RefCell<Layout>>) {
+        self.layout = Some(layout);
+    }
+
+    /// The registered panel ids that `module.<id>` may name.
+    pub fn set_lua_panels(&mut self, ids: Vec<String>) {
+        self.lua_panels = ids;
+    }
+
     /// `eitri.layout.default`'s tree, or why it is not one. `None` if `init.lua` never called it.
     pub fn default_tree(&self) -> Option<&Result<Node, String>> {
         self.default.as_ref()
     }
 
-    /// The window exists: from now on `show`/`hide`/`focus`/`split` queue, and `default` refuses.
+    /// The window exists: runtime calls are accepted, and `default` refuses.
     pub fn accept_requests(&mut self) {
         self.accepting = true;
     }
@@ -109,7 +129,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
         )?;
     }
 
-    let split_store = store;
+    let split_store = store.clone();
     table.set(
         "split",
         lua.create_function(move |_, (id, direction): (String, String)| {
@@ -127,8 +147,118 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
         })?,
     )?;
 
+    let run_store = store.clone();
+    table.set(
+        "run",
+        lua.create_function(move |lua, (name, options): (Value, Value)| {
+            let Value::String(name) = name else {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "eitri.layout.run: the action name must be a string, not a {}",
+                    name.type_name()
+                )));
+            };
+            let name = name.to_str().map_err(|e| {
+                mlua::Error::RuntimeError(format!("eitri.layout.run: {e}"))
+            })?.to_string();
+            let opts = crate::lua::keymap::opts(lua, &options)
+                .map_err(|why| mlua::Error::RuntimeError(format!("eitri.layout.run({name:?}): {why}")))?;
+            if opts.iter().any(|(key, _)| key == "repeatable") {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "eitri.layout.run({name:?}): repeatable is a key binding's option"
+                )));
+            }
+            let action = crate::keymap::action::parse(&name, &opts, &run_store.borrow().lua_panels)
+                .map_err(|error| mlua::Error::RuntimeError(format!("eitri.layout.run: {error}")))?.action;
+            if matches!(action, Action::Split(_)) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "eitri.layout.run: {name} waits for a module key; eitri.layout.split(id, 'right'|'below') places one"
+                )));
+            }
+            if matches!(action, Action::SelectNumber) {
+                return Err(mlua::Error::RuntimeError(
+                    "eitri.layout.run: select.number waits for a digit; eitri.layout.focus(id) gives a module the keys".to_string()
+                ));
+            }
+            if !action.is_layout() {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "eitri.layout.run: {name} is not a layout action"
+                )));
+            }
+            queue(&run_store, "run", LayoutRequest::Run(action))
+        })?,
+    )?;
+
+    let mark_store = store.clone();
+    table.set(
+        "mark",
+        lua.create_function(move |_, id: String| {
+            let id = module_arg("mark", &id)?;
+            queue(&mark_store, "mark", LayoutRequest::Mark(id))
+        })?,
+    )?;
+
+    table.set(
+        "get",
+        lua.create_function(move |lua, ()| {
+            let store = store.borrow();
+            let live = store.layout.as_ref().filter(|_| store.accepting).ok_or_else(|| {
+                mlua::Error::RuntimeError(
+                    "eitri.layout.get: only once the window exists (in a command or an event handler)".to_string(),
+                )
+            })?;
+            let layout = live.try_borrow().map_err(|_| {
+                mlua::Error::RuntimeError(
+                    "eitri.layout.get: the layout is being changed; call it from a command or an event handler"
+                        .to_string(),
+                )
+            })?;
+            let table = node_table(lua, layout.root(), None)?;
+            table.set("focus", layout.focus().as_str())?;
+            table.set(
+                "hidden",
+                lua.create_sequence_from(layout.hidden().iter().map(ModuleId::as_str))?,
+            )?;
+            table.set("zoomed", layout.zoomed().map(ModuleId::as_str))?;
+            table.set("marked", layout.mark().map(ModuleId::as_str))?;
+            Ok(table)
+        })?,
+    )?;
+
     eitri.set("layout", table)?;
     Ok(())
+}
+
+fn node_table(lua: &Lua, node: &Node, share: Option<f32>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    match node {
+        Node::Leaf(id) => {
+            table.raw_set(1, id.as_str())?;
+            if let Some(share) = share {
+                table.raw_set(2, f64::from(share))?;
+            }
+        }
+        Node::Split {
+            axis,
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            table.raw_set(
+                1,
+                match axis {
+                    Axis::Row => "row",
+                    Axis::Column => "column",
+                },
+            )?;
+            table.raw_set(2, node_table(lua, first, Some(*ratio))?)?;
+            table.raw_set(3, node_table(lua, second, None)?)?;
+            if let Some(share) = share {
+                table.raw_set("share", f64::from(share))?;
+            }
+        }
+    }
+    Ok(table)
 }
 
 fn module_arg(call: &str, id: &str) -> mlua::Result<ModuleId> {
@@ -286,6 +416,8 @@ fn chain(axis: Axis, children: Vec<(Node, Option<f32>)>, head: &str) -> Result<N
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::Action;
+    use crate::layout::{Direction, Layout};
 
     fn engine() -> (Lua, Rc<RefCell<LayoutStore>>) {
         let lua = Lua::new();
@@ -294,6 +426,182 @@ mod tests {
         install(&lua, &eitri, store.clone()).unwrap();
         lua.globals().set("eitri", eitri).unwrap();
         (lua, store)
+    }
+
+    fn attached(layout: Layout) -> (Lua, Rc<RefCell<LayoutStore>>, Rc<RefCell<Layout>>) {
+        let (lua, store) = engine();
+        let live = Rc::new(RefCell::new(layout));
+        store.borrow_mut().attach(live.clone());
+        store.borrow_mut().set_lua_panels(vec!["notes".to_string()]);
+        store.borrow_mut().accept_requests();
+        (lua, store, live)
+    }
+
+    #[test]
+    fn run_queues_a_layout_action_by_its_key_name_with_its_options() {
+        let (lua, store, _) = attached(Layout::initial(&[]).unwrap());
+        lua.load(
+            "eitri.layout.run('move.far-left'); eitri.layout.run('resize.left', { cells = 5 }); \
+             eitri.layout.run('layout.tiled'); eitri.layout.run('module.notes'); eitri.layout.run('module.kill')",
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(
+            store.borrow_mut().take_requests(),
+            [
+                LayoutRequest::Run(Action::MoveFar(Direction::Left)),
+                LayoutRequest::Run(Action::Resize {
+                    dir: Direction::Left,
+                    cells: 5
+                }),
+                LayoutRequest::Run(Action::Tiled),
+                LayoutRequest::Run(Action::Module(ModuleId::lua("notes"))),
+                LayoutRequest::Run(Action::ModuleKill),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_refuses_what_is_not_a_layout_action_or_waits_for_a_key() {
+        let (lua, store, _) = attached(Layout::initial(&[]).unwrap());
+        for (source, why) in [
+            ("eitri.layout.run('tab.new')", "tab.new is not a layout action"),
+            ("eitri.layout.run('hint')", "hint is not a layout action"),
+            ("eitri.layout.run('zoomm')", "\"zoomm\" is not an action"),
+            ("eitri.layout.run('resize.left', { cells = 0 })", "1 to 500"),
+            (
+                "eitri.layout.run('zoom', { repeatable = true })",
+                "repeatable is a key binding's option",
+            ),
+            ("eitri.layout.run('split.right')", "eitri.layout.split"),
+            ("eitri.layout.run('select.number')", "eitri.layout.focus"),
+            ("eitri.layout.run('module.nope')", "module.nope"),
+            ("eitri.layout.run(3)", "must be a string"),
+            ("eitri.layout.run('zoom', 'fast')", "options must be a table"),
+        ] {
+            let err = lua.load(source).exec().unwrap_err().to_string();
+            assert!(err.contains("eitri.layout.run") && err.contains(why), "{source}: {err}");
+        }
+        assert!(store.borrow_mut().take_requests().is_empty());
+    }
+
+    #[test]
+    fn run_mark_and_get_wait_for_the_window() {
+        let (lua, store) = engine();
+        for source in [
+            "eitri.layout.run('zoom')",
+            "eitri.layout.mark('agent')",
+            "eitri.layout.get()",
+        ] {
+            let err = lua.load(source).exec().unwrap_err().to_string();
+            assert!(err.contains("only once the window exists"), "{source}: {err}");
+        }
+        assert!(store.borrow_mut().take_requests().is_empty());
+    }
+
+    #[test]
+    fn mark_queues_its_module() {
+        let (lua, store, _) = attached(Layout::initial(&[]).unwrap());
+        lua.load("eitri.layout.mark('agent')").exec().unwrap();
+        assert_eq!(
+            store.borrow_mut().take_requests(),
+            [LayoutRequest::Mark(ModuleId::agent())]
+        );
+        let err = lua.load("eitri.layout.mark('chat')").exec().unwrap_err().to_string();
+        assert!(
+            err.contains("eitri.layout.mark") && err.contains("unknown module 'chat'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn get_reads_the_live_layout_in_the_default_grammar() {
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.6,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(ModuleId::terminal()),
+                ),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        let frame = crate::layout::Frame::new(crate::layout::Size { w: 1280, h: 721 }, 1);
+        crate::layout::hide(&mut layout, &ModuleId::terminal(), &frame).unwrap();
+        layout.set_mark(&ModuleId::agent()).unwrap();
+        layout.toggle_zoom(&ModuleId::agent());
+        let (lua, _, _) = attached(layout);
+        let got: String = lua
+            .load(
+                r#"
+            local t = eitri.layout.get()
+            return string.format("%s %s %.1f | %s %s %.1f %s | %s | focus=%s zoomed=%s marked=%s",
+                t[1], t[2][1], t[2][2], t[3][1], t[3][2][1], t[3][2][2], t[3][3][1],
+                table.concat(t.hidden, ","), t.focus, t.zoomed, t.marked)
+            "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            got,
+            "row editor 0.6 | column agent 0.5 terminal | terminal | focus=editor zoomed=agent marked=agent"
+        );
+    }
+
+    #[test]
+    fn get_fed_back_to_the_default_grammar_gives_the_same_rectangles() {
+        use crate::layout::{arrange, Frame, Size};
+        let layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                crate::layout::tree::DEFAULT_EDITOR_SHARE,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.6,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(ModuleId::terminal()),
+                ),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        let (lua, _, live) = attached(layout);
+        let table: Value = lua
+            .load(
+                "local t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.zoomed = nil; t.marked = nil; return t",
+            )
+            .eval()
+            .unwrap();
+        let back = Layout::new(parse_default(&table).unwrap(), ModuleId::editor()).unwrap();
+        for size in [
+            Size { w: 1280, h: 721 },
+            Size { w: 1920, h: 1040 },
+            Size { w: 800, h: 600 },
+        ] {
+            let frame = Frame::new(size, 1);
+            assert_eq!(
+                arrange(&back, &frame).modules,
+                arrange(&live.borrow(), &frame).modules,
+                "{size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_while_the_layout_is_being_changed_is_refused_not_a_panic() {
+        let (lua, _, live) = attached(Layout::initial(&[]).unwrap());
+        let _held = live.borrow_mut();
+        let err = lua.load("eitri.layout.get()").exec().unwrap_err().to_string();
+        assert!(
+            err.contains("eitri.layout.get") && err.contains("being changed"),
+            "{err}"
+        );
     }
 
     fn default_of(source: &str) -> Result<Node, String> {

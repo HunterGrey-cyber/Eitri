@@ -42,6 +42,39 @@ pub enum TextChange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// vim `<C-w>H/J/K/L`: move the module to the window's far edge.
+    MoveFar(Direction),
+    /// i3 `layout toggle split`: switch the containing split's axis.
+    ToggleSplit,
+    /// tmux `rotate-window` / `-D`: rotate the modules on screen.
+    Rotate {
+        down: bool,
+    },
+    /// Mirror the layout along an axis; tmux and vim have no equivalent command.
+    Flip(Axis),
+    /// tmux `select-layout main-horizontal`.
+    MainHorizontal,
+    /// tmux `select-layout main-vertical`.
+    MainVertical,
+    /// tmux `select-layout tiled`.
+    Tiled,
+    /// tmux `next-layout` / `previous-layout`.
+    CycleLayout {
+        forward: bool,
+    },
+    /// tmux `select-layout -E`.
+    Spread,
+    /// Undo the last layout change; tmux and vim have no layout undo command.
+    LayoutUndo,
+    /// tmux `select-pane -m`: toggle the mark on this module.
+    MarkToggle,
+    /// tmux `select-pane -M`: clear the mark.
+    MarkClear,
+    /// tmux `swap-pane` with no flags: swap with the marked module.
+    SwapMarked,
+    /// tmux `display-panes`: number the modules for a digit to select.
+    SelectNumber,
+
     /// Hand the pane with the keys the prefix chord itself.
     SendPrefix,
     /// Hand the pane with the keys this key.
@@ -214,6 +247,23 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "split.right" => (Action::Split(Axis::Row), &[]),
         "split.below" => (Action::Split(Axis::Column), &[]),
         "zoom" => (Action::Zoom, &[]),
+        "container.toggle-split" => (Action::ToggleSplit, &[]),
+        "rotate.up" => (Action::Rotate { down: false }, &[]),
+        "rotate.down" => (Action::Rotate { down: true }, &[]),
+        "layout.flip-horizontal" => (Action::Flip(Axis::Row), &[]),
+        "layout.flip-vertical" => (Action::Flip(Axis::Column), &[]),
+        "layout.main-horizontal" => (Action::MainHorizontal, &[]),
+        "layout.main-vertical" => (Action::MainVertical, &[]),
+        "layout.tiled" => (Action::Tiled, &[]),
+        "layout.next" => (Action::CycleLayout { forward: true }, &[]),
+        "layout.previous" => (Action::CycleLayout { forward: false }, &[]),
+        "layout.spread" => (Action::Spread, &[]),
+        "layout.undo" => (Action::LayoutUndo, &[]),
+        "mark.toggle" => (Action::MarkToggle, &[]),
+        "mark.clear" => (Action::MarkClear, &[]),
+        "swap.marked" => (Action::SwapMarked, &[]),
+        "select.number" => (Action::SelectNumber, &[]),
+
         // Explicit, since the `select.` fallback below reads only a direction.
         "select.last" => (Action::SelectLast, &[]),
         "select.next" => (Action::SelectNext, &[]),
@@ -255,7 +305,9 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
             &["up"],
         ),
         _ => {
-            if let Some(dir) = name.strip_prefix("resize.") {
+            if let Some(dir) = name.strip_prefix("move.far-") {
+                (Action::MoveFar(direction(dir).ok_or_else(unknown)?), &[])
+            } else if let Some(dir) = name.strip_prefix("resize.") {
                 let dir = direction(dir).ok_or_else(unknown)?;
                 let cells = o.cells.unwrap_or(1);
                 let cells = u16::try_from(cells)
@@ -305,6 +357,47 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
 }
 
 impl Action {
+    /// What `eitri.layout.run` accepts; every new action must decide here whether it is layout.
+    pub fn is_layout(&self) -> bool {
+        match self {
+            Action::Split(_)
+            | Action::Zoom
+            | Action::Resize { .. }
+            | Action::Select(_)
+            | Action::SelectLast
+            | Action::SelectNext
+            | Action::Swap(_)
+            | Action::Even(_)
+            | Action::ModuleHide
+            | Action::ModuleKill
+            | Action::Module(_)
+            | Action::MoveFar(_)
+            | Action::ToggleSplit
+            | Action::Rotate { .. }
+            | Action::Flip(_)
+            | Action::MainHorizontal
+            | Action::MainVertical
+            | Action::Tiled
+            | Action::CycleLayout { .. }
+            | Action::Spread
+            | Action::LayoutUndo
+            | Action::MarkToggle
+            | Action::MarkClear
+            | Action::SwapMarked
+            | Action::SelectNumber => true,
+            Action::SendPrefix
+            | Action::SendKeys(_)
+            | Action::Tab(_)
+            | Action::Hint
+            | Action::PanelReload
+            | Action::PanelKeymap
+            | Action::PanelCommandLine
+            | Action::WindowImmersive
+            | Action::Text(_)
+            | Action::CopyMode { .. } => false,
+        }
+    }
+
     /// The Lua name `eitri.keymap.set` takes, without options.
     pub fn name(&self) -> String {
         match self {
@@ -313,6 +406,24 @@ impl Action {
             Action::Split(Axis::Row) => "split.right".into(),
             Action::Split(Axis::Column) => "split.below".into(),
             Action::Zoom => "zoom".into(),
+            Action::MoveFar(dir) => format!("move.far-{}", direction_name(*dir)),
+            Action::ToggleSplit => "container.toggle-split".into(),
+            Action::Rotate { down: false } => "rotate.up".into(),
+            Action::Rotate { down: true } => "rotate.down".into(),
+            Action::Flip(Axis::Row) => "layout.flip-horizontal".into(),
+            Action::Flip(Axis::Column) => "layout.flip-vertical".into(),
+            Action::MainHorizontal => "layout.main-horizontal".into(),
+            Action::MainVertical => "layout.main-vertical".into(),
+            Action::Tiled => "layout.tiled".into(),
+            Action::CycleLayout { forward: true } => "layout.next".into(),
+            Action::CycleLayout { forward: false } => "layout.previous".into(),
+            Action::Spread => "layout.spread".into(),
+            Action::LayoutUndo => "layout.undo".into(),
+            Action::MarkToggle => "mark.toggle".into(),
+            Action::MarkClear => "mark.clear".into(),
+            Action::SwapMarked => "swap.marked".into(),
+            Action::SelectNumber => "select.number".into(),
+
             Action::Resize { dir, .. } => format!("resize.{}", direction_name(*dir)),
             Action::Select(dir) => format!("select.{}", direction_name(*dir)),
             Action::SelectLast => "select.last".into(),
@@ -374,6 +485,29 @@ impl Action {
                 format!("Then a module key ({module_keys}): open it below this one, or move it there")
             }
             Action::Zoom => "Zoom this module, or restore".into(),
+            Action::MoveFar(Direction::Left) => "Move this module to the window's far left".into(),
+            Action::MoveFar(Direction::Down) => "Move this module to the window's bottom".into(),
+            Action::MoveFar(Direction::Up) => "Move this module to the window's top".into(),
+            Action::MoveFar(Direction::Right) => "Move this module to the window's far right".into(),
+            Action::ToggleSplit => "Turn this module's split between side by side and stacked".into(),
+            Action::Rotate { down: false } => {
+                "Rotate the modules on screen one place back (the first goes last)".into()
+            }
+            Action::Rotate { down: true } => "Rotate the modules on screen one place on (the last comes first)".into(),
+            Action::Flip(Axis::Row) => "Mirror the layout left to right".into(),
+            Action::Flip(Axis::Column) => "Mirror the layout top to bottom".into(),
+            Action::MainHorizontal => "The first module on top, the rest in a row below".into(),
+            Action::MainVertical => "The first module on the left, the rest in a column beside it".into(),
+            Action::Tiled => "Every module in a grid of equal cells".into(),
+            Action::CycleLayout { forward: true } => "The next of the five layouts (even, main, tiled)".into(),
+            Action::CycleLayout { forward: false } => "The previous of the five layouts".into(),
+            Action::Spread => "Even out the sizes in this module's row or column".into(),
+            Action::LayoutUndo => "Undo the last layout change (one step; again: redo)".into(),
+            Action::MarkToggle => "Mark this module, or clear the mark if it is this one".into(),
+            Action::MarkClear => "Clear the mark".into(),
+            Action::SwapMarked => "Swap this module with the marked one".into(),
+            Action::SelectNumber => "Number the modules on screen; a digit moves the keys there".into(),
+
             Action::Resize { cells: 1, .. } => "Move the nearest divider 1 cell that way".into(),
             Action::Resize { cells, .. } => format!("Move the nearest divider {cells} cells that way"),
             Action::Select(_) => "Move the keys to the module that way".into(),
@@ -573,5 +707,89 @@ mod tests {
             Action::CopyMode { up: true }.describe("Ctrl+b", "e / a / t"),
             "Scroll the terminal back (copy mode)"
         );
+    }
+
+    #[test]
+    fn the_layout_verbs_parse_by_name_and_round_trip() {
+        let cases: Vec<(&str, Action)> = vec![
+            ("move.far-left", Action::MoveFar(Direction::Left)),
+            ("move.far-down", Action::MoveFar(Direction::Down)),
+            ("move.far-up", Action::MoveFar(Direction::Up)),
+            ("move.far-right", Action::MoveFar(Direction::Right)),
+            ("container.toggle-split", Action::ToggleSplit),
+            ("rotate.up", Action::Rotate { down: false }),
+            ("rotate.down", Action::Rotate { down: true }),
+            ("layout.flip-horizontal", Action::Flip(Axis::Row)),
+            ("layout.flip-vertical", Action::Flip(Axis::Column)),
+            ("layout.main-horizontal", Action::MainHorizontal),
+            ("layout.main-vertical", Action::MainVertical),
+            ("layout.tiled", Action::Tiled),
+            ("layout.next", Action::CycleLayout { forward: true }),
+            ("layout.previous", Action::CycleLayout { forward: false }),
+            ("layout.spread", Action::Spread),
+            ("layout.undo", Action::LayoutUndo),
+            ("mark.toggle", Action::MarkToggle),
+            ("mark.clear", Action::MarkClear),
+            ("swap.marked", Action::SwapMarked),
+            ("select.number", Action::SelectNumber),
+        ];
+        for (name, action) in cases {
+            assert_eq!(parse(name, &[], &[]).unwrap().action, action, "{name}");
+            assert_eq!(action.name(), name);
+            assert!(action.options().is_empty(), "{name}");
+            assert!(action.is_layout(), "{name}");
+            assert!(!action.describe("Ctrl+b", "e / a / t").is_empty(), "{name}");
+            let err = parse(name, &[("cells".into(), OptValue::Int(2))], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("is not an option of {name}")), "{err}");
+        }
+        for bad in [
+            "move.far-sideways",
+            "move.far",
+            "swap.markedd",
+            "select.numbers",
+            "rotate.left",
+        ] {
+            assert!(parse(bad, &[], &[]).unwrap_err().to_string().contains(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn is_layout_holds_the_layout_actions_and_nothing_else() {
+        let layout = [
+            Action::Split(Axis::Row),
+            Action::Zoom,
+            Action::Resize {
+                dir: Direction::Left,
+                cells: 1,
+            },
+            Action::Select(Direction::Up),
+            Action::SelectLast,
+            Action::SelectNext,
+            Action::Swap(SwapTarget::Prev),
+            Action::Even(Axis::Row),
+            Action::ModuleHide,
+            Action::ModuleKill,
+            Action::Module(ModuleId::terminal()),
+        ];
+        let other = [
+            Action::SendPrefix,
+            Action::SendKeys(KeySpec::parse("C-l").unwrap()),
+            Action::Tab(TabAction::New),
+            Action::Hint,
+            Action::PanelReload,
+            Action::PanelKeymap,
+            Action::PanelCommandLine,
+            Action::WindowImmersive,
+            Action::Text(TextChange::Reset),
+            Action::CopyMode { up: false },
+        ];
+        for action in layout {
+            assert!(action.is_layout(), "{action:?}");
+        }
+        for action in other {
+            assert!(!action.is_layout(), "{action:?}");
+        }
     }
 }
