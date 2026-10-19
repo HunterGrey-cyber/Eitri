@@ -41,7 +41,7 @@ const ALL_MODES: PermissionModeChoice[] = ["manual", "auto", "bypass"];
 
 /** A plugin page's section when the page has not declared its keys. A page that declared and kept no key
  *  gets an empty section instead: it did register, so this sentence would be untrue of it. */
-const PLUGIN_UNDECLARED = "此插件未登记按键";
+const PLUGIN_UNDECLARED = "This plugin has not declared its keys";
 
 /** The Typing section's Shift+Tab row, worded for the modes the tab cycles through. */
 function cycleRow(row: KeyHelp, modes: PermissionModeChoice[]): KeyHelp {

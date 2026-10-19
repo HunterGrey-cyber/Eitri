@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { activate, assignLabels, collectTargets } from "./hints";
+import { activate, assignLabels, collectTargets, placeLabel } from "./hints";
 import { install, setCurrent } from "./install";
 import { GENERIC_ROWS } from "./rows";
+import { STYLE_TEXT } from "./style";
 
 let cleanup: (() => void) | undefined;
 let events: Map<string, (data: unknown) => void>;
@@ -32,6 +33,33 @@ function key(value: string, init: KeyboardEventInit = {}) {
 
 function labels() {
   return [...document.querySelectorAll<HTMLElement>(".eitri-hint")];
+}
+
+/** Gives every hint label, and the HUD, a size; jsdom lays nothing out. */
+function sizes(label = { width: 20, height: 16 }, hudHeight = 0) {
+  const original = Element.prototype.getBoundingClientRect;
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    const rect = (left: number, top: number, width: number, height: number) =>
+      ({ x: left, y: top, left, top, right: left + width, bottom: top + height, width, height, toJSON: () => ({}) }) as DOMRect;
+    if (this.classList.contains("eitri-hint")) return rect(0, 0, label.width, label.height);
+    if (this.id === "eitri-keys-hud") return rect(0, window.innerHeight - hudHeight, window.innerWidth, hudHeight);
+    return original.call(this);
+  });
+}
+
+function labelAt(top: number) {
+  return labels().find((label) => label.style.top === `${top}px`)!;
+}
+
+function intersects(a: { left: number; top: number; right: number; bottom: number },
+  b: { left: number; top: number; right: number; bottom: number }) {
+  return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+function labelRect(label: HTMLElement, size = { width: 20, height: 16 }) {
+  const left = parseFloat(label.style.left);
+  const top = parseFloat(label.style.top);
+  return { left, top, right: left + size.width, bottom: top + size.height };
 }
 
 async function start(targets?: () => { el: Element; rank?: number }[]) {
@@ -309,6 +337,9 @@ describe("installed hint mode", () => {
     expect(labels()).toHaveLength(2);
     expect(labels()[0].classList.contains("eitri-hint-danger")).toBe(true);
     expect(labels()[1].classList.contains("eitri-hint-danger")).toBe(false);
+    expect(labels()[0].style.background).toBe("");
+    expect(labels()[0].style.color).toBe("");
+    expect(STYLE_TEXT).toContain(".eitri-hint.eitri-hint-danger{border:2px solid var(--nv-error, #9c2525)}");
   });
 
   it.each(["window scroll", "document scroll", "nested scroll", "unrelated scroll", "resize"])(
@@ -332,7 +363,7 @@ describe("installed hint mode", () => {
       if (change === "unrelated scroll") other.dispatchEvent(new Event("scroll"));
       if (change === "resize") window.dispatchEvent(new Event("resize"));
       expect(labels()).toHaveLength(1);
-      expect([labels()[0].style.left, labels()[0].style.top]).toEqual(["50px", "60px"]);
+      expect([labels()[0].style.left, labels()[0].style.top]).toEqual(["48px", "60px"]);
       expect(document.getElementById("eitri-keys-hud")!.dataset.mode).toBe("hint");
       key("s");
       expect(clicks).toBe(1);
@@ -430,4 +461,176 @@ describe("installed hint mode", () => {
       expect(clicks).toBe(1);
     },
   );
+});
+
+describe("label placement", () => {
+  const view = { width: 400, height: 300 };
+  const size = { width: 20, height: 16 };
+
+  it("puts the label left of its target, centred on its first line", () => {
+    expect(placeLabel({ left: 100, top: 50, right: 200, bottom: 70 }, size, view, []))
+      .toEqual({ left: 78, top: 52, side: "left" });
+    expect(placeLabel({ left: 100, top: 50, right: 200, bottom: 150 }, size, view, []))
+      .toEqual({ left: 78, top: 58, side: "left" });
+    expect(placeLabel({ left: 100, top: 50, right: 200, bottom: 60 }, size, view, []))
+      .toEqual({ left: 78, top: 50, side: "left" });
+  });
+
+  it("goes above, then below, then right when the earlier sides do not fit", () => {
+    expect(placeLabel({ left: 10, top: 50, right: 110, bottom: 70 }, size, view, []))
+      .toEqual({ left: 10, top: 32, side: "above" });
+    expect(placeLabel({ left: 10, top: 5, right: 110, bottom: 25 }, size, view, []))
+      .toEqual({ left: 10, top: 27, side: "below" });
+    const avoid = [{ left: 0, top: 70, right: 400, bottom: 99 }, { left: 0, top: 121, right: 400, bottom: 150 }];
+    expect(placeLabel({ left: 10, top: 100, right: 110, bottom: 120 }, size, view, avoid))
+      .toEqual({ left: 112, top: 102, side: "right" });
+  });
+
+  it("takes a side that touches the viewport's edge but not one that crosses it", () => {
+    expect(placeLabel({ left: 22, top: 50, right: 100, bottom: 66 }, size, view, []).side).toBe("left");
+    expect(placeLabel({ left: 21, top: 50, right: 100, bottom: 66 }, size, view, []).side).toBe("above");
+  });
+
+  it("falls back to the target's top-right corner when nothing outside fits", () => {
+    expect(placeLabel({ left: 0, top: 0, right: 400, bottom: 300 }, size, view, []))
+      .toEqual({ left: 380, top: 0, side: "inside" });
+    expect(placeLabel({ left: 0, top: 0, right: 10, bottom: 300 }, size, { width: 10, height: 300 }, []))
+      .toEqual({ left: 0, top: 0, side: "inside" });
+  });
+
+  it("keeps the inside fallback within a view shortened by the HUD", () => {
+    const short = { width: 1024, height: 748 };
+    const above = { left: 100, top: 720, right: 200, bottom: 740 };
+    expect(placeLabel({ left: 100, top: 740, right: 200, bottom: 760 }, size, short, [above]))
+      .toEqual({ left: 180, top: 732, side: "inside" });
+    expect(placeLabel({ left: 0, top: 0, right: 1100, bottom: 748 }, size, short, []))
+      .toEqual({ left: 1004, top: 0, side: "inside" });
+  });
+
+  it("never lets a label placed outside touch its own target, another target or a placed label", () => {
+    const targets = Array.from({ length: 48 }, (_, i) => {
+      const left = 4 + (i % 6) * 64;
+      const top = 4 + Math.floor(i / 6) * 36;
+      return { left, top, right: left + 40 + (i % 3) * 6, bottom: top + 14 + (i % 4) * 4 };
+    });
+    const placed: { left: number; top: number; right: number; bottom: number }[] = [];
+    targets.forEach((target, i) => {
+      const others = targets.filter((_, j) => j !== i);
+      const at = placeLabel(target, size, view, [...others, ...placed]);
+      const box = { left: at.left, top: at.top, right: at.left + size.width, bottom: at.top + size.height };
+      if (at.side !== "inside") {
+        expect(intersects(box, target)).toBe(false);
+        for (const other of [...others, ...placed]) expect(intersects(box, other)).toBe(false);
+      }
+      placed.push(box);
+    });
+  });
+});
+
+describe("hint labels outside their targets", () => {
+  it("places each label beside its target and colours nothing inline", async () => {
+    sizes();
+    const column = Array.from({ length: 6 }, (_, i) => button(100, 10 + 40 * i));
+    await start();
+    key("f");
+    expect(labels()).toHaveLength(6);
+    for (let i = 0; i < column.length; i++) {
+      const label = labelAt(12 + 40 * i);
+      expect(label.style.left).toBe("78px");
+      expect(label.style.background).toBe("");
+      expect(label.style.color).toBe("");
+      expect(label.style.position).toBe("");
+    }
+  });
+
+  it("covers no choice's first character in a list whose gaps are smaller than a label", async () => {
+    sizes();
+    const choices = Array.from({ length: 4 }, (_, i) => {
+      const el = document.createElement("div");
+      el.setAttribute("role", "option");
+      document.body.append(el);
+      return box(el, 0, 100 + 28 * i, 300, 24);
+    });
+    await start();
+    key("f");
+    expect(labels()).toHaveLength(4);
+    const firstChars = choices.map((el) => {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, right: r.left + 16, bottom: r.top + 16 };
+    });
+    for (const label of labels()) {
+      for (const first of firstChars) expect(intersects(labelRect(label), first)).toBe(false);
+    }
+  });
+
+  it("keeps labels out of the HUD's row", async () => {
+    sizes({ width: 20, height: 16 }, 20);
+    const upper = document.createElement("div");
+    upper.setAttribute("role", "option");
+    const lower = document.createElement("div");
+    lower.setAttribute("role", "option");
+    document.body.append(upper, lower);
+    box(upper, 0, 692, 300, 24);
+    box(lower, 0, 720, 300, 24);
+    await start();
+    key("f");
+    const bottom = window.innerHeight - 20;
+    for (const label of labels()) expect(labelRect(label).bottom).toBeLessThanOrEqual(bottom);
+    expect(labels().some((label) => label.style.left === "302px" && label.style.top === "724px")).toBe(true);
+  });
+
+  it("keeps a kept target's label across two sessions while the others stay prefix-free", async () => {
+    sizes();
+    const column = Array.from({ length: 20 }, (_, i) => button(100, 10 + 30 * i));
+    const kept = column[17];
+    kept.dataset.eitriHintKeep = "";
+    let clicks = 0;
+    kept.addEventListener("click", () => clicks++);
+    await start();
+    key("f");
+    const first = labelAt(12 + 30 * 17).textContent!;
+    for (const character of first) key(character);
+    expect(clicks).toBe(1);
+    setCurrent(column[0]);
+    expect(assignLabels(collectTargets(document, []), { x: 115, y: 20 }).get(kept)).not.toBe(first);
+    key("f");
+    expect(labelAt(12 + 30 * 17).textContent).toBe(first);
+    const texts = labels().map((label) => label.textContent!);
+    expect(new Set(texts).size).toBe(texts.length);
+    for (const a of texts) for (const b of texts) if (a !== b) expect(b.startsWith(a)).toBe(false);
+  });
+
+  it("forgets the kept label after another target is activated", async () => {
+    sizes();
+    const column = Array.from({ length: 20 }, (_, i) => button(100, 10 + 30 * i));
+    const kept = column[17];
+    kept.dataset.eitriHintKeep = "";
+    await start();
+    key("f");
+    for (const character of labelAt(12 + 30 * 17).textContent!) key(character);
+    key("f");
+    for (const character of labelAt(12).textContent!) key(character);
+    setCurrent(column[0]);
+    const expected = assignLabels(collectTargets(document, []), { x: 115, y: 20 }).get(kept);
+    key("f");
+    expect(labelAt(12 + 30 * 17).textContent).toBe(expected);
+  });
+
+  it("forgets the kept label when its target is not among the next session's targets", async () => {
+    sizes();
+    const column = Array.from({ length: 20 }, (_, i) => button(100, 10 + 30 * i));
+    const kept = column[17];
+    kept.dataset.eitriHintKeep = "";
+    await start();
+    key("f");
+    for (const character of labelAt(12 + 30 * 17).textContent!) key(character);
+    kept.remove();
+    key("f");
+    key("Escape");
+    document.body.append(kept);
+    setCurrent(column[0]);
+    const expected = assignLabels(collectTargets(document, []), { x: 115, y: 20 }).get(kept);
+    key("f");
+    expect(labelAt(12 + 30 * 17).textContent).toBe(expected);
+  });
 });

@@ -23,8 +23,41 @@
  * THE SOFTWARE.
  */
 import type { HintTarget } from "./index";
+import { ensureStyle } from "./style";
 
 export type { HintTarget } from "./index";
+
+export type Rect = { left: number; top: number; right: number; bottom: number };
+
+function intersects(a: Rect, b: Rect): boolean {
+  return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+export function placeLabel(
+  target: Rect, size: { width: number; height: number }, view: { width: number; height: number },
+  avoid: readonly Rect[], gap = 2,
+): { left: number; top: number; side: "left" | "above" | "below" | "right" | "inside" } {
+  const { width, height } = size;
+  // On a tall target the label sits on its first line, as a list marker does.
+  const line = target.top + Math.max(0, Math.min(target.bottom - target.top, 2 * height) - height) / 2;
+  const sides = [
+    ["left", target.left - gap - width, line],
+    ["above", Math.max(0, target.left), target.top - gap - height],
+    ["below", Math.max(0, target.left), target.bottom + gap],
+    ["right", target.right + gap, line],
+  ] as const;
+  for (const [side, left, top] of sides) {
+    const box = { left, top, right: left + width, bottom: top + height };
+    const fits = box.left >= 0 && box.top >= 0 && box.right <= view.width && box.bottom <= view.height;
+    if (fits && !avoid.some((other) => intersects(box, other))) return { left, top, side };
+  }
+  // A target reaching under the HUD or past the edge still gets a whole label inside the view.
+  const left = Math.max(0, Math.min(Math.max(target.left, target.right - width), view.width - width));
+  const top = Math.max(0, Math.min(target.top, view.height - height));
+  return { left, top, side: "inside" };
+}
+
+let kept: { el: Element; label: string } | null = null;
 
 const TARGETS = 'a[href], button, summary, input, select, textarea, [role="button"], [role="tab"], ' +
   '[role="option"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-eitri-target]';
@@ -88,6 +121,7 @@ export function collectTargets(root: Document, extra: HintTarget[]): HintTarget[
 
 export function assignLabels(
   targets: HintTarget[], origin: { x: number; y: number }, alphabet = "sadfjklewcmpgh",
+  keep?: { el: Element; label: string } | null,
 ): Map<Element, string> {
   if (!targets.length) return new Map();
   const characters = [...new Set(alphabet)];
@@ -100,14 +134,27 @@ export function assignLabels(
   ordered.sort((a, b) => ((a.rank ?? Infinity) - (b.rank ?? Infinity)) || a.distance - b.distance);
 
   // Expanding a leaf replaces it with its children, so none of the remaining labels is a prefix.
+  const retained = keep && targets.some(({ el }) => el === keep.el) ? keep : null;
+  const eligible = (label: string) => !retained ||
+    (!label.startsWith(retained.label) && !retained.label.startsWith(label));
   const labels = [""];
   let offset = 0;
-  while (labels.length - offset < ordered.length || labels.length === 1) {
+  let available = eligible("") ? 1 : 0;
+  const needed = ordered.length - (retained ? 1 : 0);
+  while (available < needed || labels.length === 1) {
     const prefix = labels[offset++];
-    for (const character of characters) labels.push(prefix + character);
+    // The reserved label owns its entire subtree; only its ancestors need expanding.
+    if (retained && prefix.startsWith(retained.label)) continue;
+    if (eligible(prefix)) available--;
+    for (const character of characters) {
+      const label = prefix + character;
+      labels.push(label);
+      if (eligible(label)) available++;
+    }
   }
-  const selected = labels.slice(offset, offset + ordered.length).sort((a, b) => a.length - b.length);
-  return new Map(ordered.map(({ el }, index) => [el, selected[index]]));
+  const selected = labels.slice(offset).filter(eligible).slice(0, needed).sort((a, b) => a.length - b.length);
+  let index = 0;
+  return new Map(ordered.map(({ el }) => [el, retained?.el === el ? retained.label : selected[index++]]));
 }
 
 export function activate(el: Element): void {
@@ -117,25 +164,20 @@ export function activate(el: Element): void {
 }
 
 export function startHints(root: Document, extra: HintTarget[], origin: { x: number; y: number }) {
-  const labels = assignLabels(collectTargets(root, extra), origin);
+  const targets = collectTargets(root, extra);
+  if (kept && !targets.some(({ el }) => el === kept!.el)) kept = null;
+  const labels = assignLabels(targets, origin, undefined, kept);
+  ensureStyle(root);
   const overlay = root.createElement("div");
   overlay.id = "eitri-keys-hints";
   overlay.setAttribute("aria-hidden", "true");
   overlay.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483646";
   const markers = new Map<Element, HTMLElement>();
   for (const [el, label] of labels) {
-    const rect = visibleRect(el, root)!;
     const marker = root.createElement("span");
     marker.className = "eitri-hint";
     marker.textContent = label;
-    marker.style.cssText = `position:fixed;left:${rect.left}px;top:${rect.top}px;padding:1px 3px;` +
-      "background:#ffe082;color:#171717;border:1px solid #171717;border-radius:2px;" +
-      "font:bold 13px monospace;line-height:16px;text-transform:none";
-    if (el.hasAttribute("data-eitri-danger")) {
-      marker.classList.add("eitri-hint-danger");
-      marker.style.background = "#9c2525";
-      marker.style.color = "#fff";
-    }
+    if (el.hasAttribute("data-eitri-danger")) marker.classList.add("eitri-hint-danger");
     overlay.append(marker);
     markers.set(el, marker);
   }
@@ -144,6 +186,30 @@ export function startHints(root: Document, extra: HintTarget[], origin: { x: num
   // Targets that have left the viewport since the labels were drawn: their labels are hidden and cannot be typed.
   const gone = new Set<Element>();
   if (active) root.body.append(overlay);
+  const sizes = new Map([...markers].map(([el, marker]) => {
+    const { width, height } = marker.getBoundingClientRect();
+    return [el, { width, height }] as const;
+  }));
+  const place = () => {
+    // Every position is read before any label moves, so the page is laid out once.
+    const rects = [...labels.keys()].map((el) => [el, visibleRect(el, root)] as const);
+    const hud = root.getElementById("eitri-keys-hud");
+    const hudHeight = hud && !hud.hidden ? hud.getBoundingClientRect().height : 0;
+    const view = { width: root.defaultView!.innerWidth, height: root.defaultView!.innerHeight - hudHeight };
+    const placed: Rect[] = [];
+    gone.clear();
+    for (const [el, rect] of rects) {
+      if (!rect) { gone.add(el); continue; }
+      const avoid = rects.flatMap(([other, bounds]) => other !== el && bounds ? [bounds] : []);
+      const size = sizes.get(el)!;
+      const { left, top } = placeLabel(rect, size, view, [...avoid, ...placed]);
+      const marker = markers.get(el)!;
+      marker.style.left = `${left}px`;
+      marker.style.top = `${top}px`;
+      placed.push({ left, top, right: left + size.width, bottom: top + size.height });
+    }
+  };
+  if (active) place();
   const cancel = () => { active = false; overlay.remove(); };
   const show = () => {
     let matched = false;
@@ -161,15 +227,7 @@ export function startHints(root: Document, extra: HintTarget[], origin: { x: num
     /** Moves each label to where its target is now; called when the page scrolls or the viewport changes. */
     reposition() {
       if (!active) return;
-      // Every position is read before any label moves, so the page is laid out once.
-      const rects = [...labels.keys()].map((el) => [el, visibleRect(el, root)] as const);
-      gone.clear();
-      for (const [el, rect] of rects) {
-        if (!rect) { gone.add(el); continue; }
-        const marker = markers.get(el)!;
-        marker.style.left = `${rect.left}px`;
-        marker.style.top = `${rect.top}px`;
-      }
+      place();
       show();
     },
     feed(key: string): Element | null {
@@ -177,7 +235,11 @@ export function startHints(root: Document, extra: HintTarget[], origin: { x: num
       if (key === "Escape") { cancel(); return null; }
       prefix += key.length === 1 ? key.toLowerCase() : key;
       for (const [el, label] of labels) {
-        if (label === prefix && !gone.has(el)) { cancel(); return el; }
+        if (label === prefix && !gone.has(el)) {
+          kept = el.hasAttribute("data-eitri-hint-keep") ? { el, label } : null;
+          cancel();
+          return el;
+        }
       }
       show();
       return null;

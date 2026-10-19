@@ -2,6 +2,8 @@
   "v": 1,
   "event": "keys_config",
   "data": {
-    "timeoutlen": 300
+    "timeoutlen": 300,
+    "prefix": "Ctrl+b",
+    "module_key": null
   }
 }

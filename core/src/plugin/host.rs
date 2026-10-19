@@ -23,6 +23,7 @@ use super::protocol::{
 use super::roots::{self, PathRefusal};
 use super::state::{PluginStore, StoreError, StoreErrorKind, StoreOp, StoreWorker};
 use super::tasks::{ExitKind, Launch, RunInfo, RunsWaiter, StartError, Stream, TaskEvent, TaskRunner};
+use super::theme::PageTheme;
 use crate::editor_rpc::EditorRpc;
 use crate::keymap::{Chord, KeySpec};
 use crate::nvim_rpc::Pending;
@@ -46,6 +47,9 @@ const CHECK_TIMEOUT: &str = "the filesystem did not answer within 5 s";
 /// The page. `send` is asynchronous and never calls back into the host before it returns.
 pub trait PagePort {
     fn send(&self, message: &str);
+    /// The view's background and its user style sheet: what the next document starts with, and the
+    /// background a reload shows before it paints.
+    fn set_theme(&self, theme: &PageTheme);
 }
 
 /// The window's layout: give the keys to the editor (showing it first if hidden) or to the plugin's module.
@@ -200,6 +204,12 @@ struct PluginHostState {
     timeoutlen: u32,
     /// The window's prefix key: a page may not bind it.
     prefix_key: Chord,
+    /// The same prefix as a person reads it, which the page is told for its own key help.
+    prefix_label: String,
+    /// The key that shows this plugin's module after the prefix, if the registration gave one.
+    module_key: Option<String>,
+    /// The window's appearance as this page last received it.
+    theme: PageTheme,
     /// The current document's declared key table, with the user's overrides applied.
     declared: Option<Vec<EffectiveRow>>,
 }
@@ -301,6 +311,7 @@ impl PluginHost {
         store: Option<PluginStore>,
         overrides: Vec<PluginKeyOp>,
     ) -> PluginHost {
+        let stock_prefix = KeySpec::parse(crate::keymap::stock::STOCK_PREFIX).expect("the stock prefix parses");
         let state = PluginHostState {
             hello: false,
             closed: false,
@@ -319,9 +330,10 @@ impl PluginHost {
             check_gate: None,
             has_keys: false,
             timeoutlen: DEFAULT_TIMEOUTLEN,
-            prefix_key: Chord::of(
-                &KeySpec::parse(crate::keymap::stock::STOCK_PREFIX).expect("the stock prefix parses"),
-            ),
+            prefix_key: Chord::of(&stock_prefix),
+            prefix_label: stock_prefix.human(),
+            module_key: None,
+            theme: PageTheme::fallback(),
             declared: None,
         };
         PluginHost {
@@ -347,9 +359,81 @@ impl PluginHost {
     }
 
     /// The window's prefix key, which a page's declaration may not hold. Until this is called it is the
-    /// stock prefix.
+    /// stock prefix. A page that has said hello is told its new spelling.
     pub fn set_prefix_key(&self, prefix: &KeySpec) {
-        self.state.borrow_mut().prefix_key = Chord::of(prefix);
+        let label = prefix.human();
+        let hello = {
+            let mut st = self.state.borrow_mut();
+            st.prefix_key = Chord::of(prefix);
+            if st.prefix_label == label {
+                return;
+            }
+            st.prefix_label = label;
+            st.hello
+        };
+        if hello {
+            self.send_keys_config();
+        }
+    }
+
+    /// The key that shows this plugin's module after the prefix, as the registration wrote it (a single
+    /// character, which is its own spelling), or `None`. A page that has said hello is told when it changes.
+    pub fn set_module_key(&self, key: Option<&str>) {
+        let hello = {
+            let mut st = self.state.borrow_mut();
+            if st.module_key.as_deref() == key {
+                return;
+            }
+            st.module_key = key.map(str::to_owned);
+            st.hello
+        };
+        if hello {
+            self.send_keys_config();
+        }
+    }
+
+    /// The window's theme for this page. Same set as before: nothing. Otherwise it is recorded, the page
+    /// port takes it (background and user sheet), and the current document gets a `theme` event, whether
+    /// or not it has said hello.
+    pub fn set_theme(&self, theme: &PageTheme) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st.theme == *theme {
+                return;
+            }
+            st.theme = theme.clone();
+        }
+        // The port first: a reload that starts before the event already gets the new sheet.
+        self.page.set_theme(theme);
+        self.send_theme();
+    }
+
+    pub fn theme(&self) -> PageTheme {
+        self.state.borrow().theme.clone()
+    }
+
+    /// A document was committed in the view (a load, a reload, a back/forward-cache restore): it gets the
+    /// current `theme` event. No other state changes.
+    pub fn page_committed(&self) {
+        self.send_theme();
+    }
+
+    fn send_theme(&self) {
+        let data = self.state.borrow().theme.to_json();
+        self.page.send(&protocol::event_text("theme", &data));
+    }
+
+    /// The page's keyboard settings, all three each time, so a page never merges a partial update.
+    fn send_keys_config(&self) {
+        let config = {
+            let st = self.state.borrow();
+            KeysConfig {
+                timeoutlen: st.timeoutlen,
+                prefix: st.prefix_label.clone(),
+                module_key: st.module_key.clone(),
+            }
+        };
+        self.page.send(&protocol::event_text("keys_config", &config));
     }
 
     /// Whether the page's module holds the keys; the page is told once it has said hello.
@@ -375,8 +459,7 @@ impl PluginHost {
             st.hello
         };
         if hello {
-            self.page
-                .send(&protocol::event_text("keys_config", &KeysConfig { timeoutlen: ms }));
+            self.send_keys_config();
         }
     }
 
@@ -563,7 +646,15 @@ impl PluginHost {
         // is delivered once (in the tail) and not again as output.
         let runs = self.state.borrow_mut().tasks.attach();
         self.state.borrow_mut().hello = true;
-        let timeoutlen = self.state.borrow().timeoutlen;
+        let (timeoutlen, prefix, module_key, theme) = {
+            let st = self.state.borrow();
+            (
+                st.timeoutlen,
+                st.prefix_label.clone(),
+                st.module_key.clone(),
+                st.theme.to_json(),
+            )
+        };
         let manifest = &self.plugin.manifest;
         let capabilities: Vec<&str> = manifest.capabilities.iter().map(|c| c.as_str()).collect();
         let roots: BTreeMap<&String, String> = self
@@ -587,6 +678,9 @@ impl PluginHost {
                 "runs": runs,
                 "keys_kit": 1,
                 "timeoutlen": timeoutlen,
+                "prefix": prefix,
+                "module_key": module_key,
+                "theme": theme,
             }),
         )
     }
@@ -1211,6 +1305,10 @@ mod tests {
                 .borrow_mut()
                 .push(serde_json::from_str(message).expect("the host sends JSON"));
         }
+        // Logged with the messages so a test sees which came first.
+        fn set_theme(&self, theme: &PageTheme) {
+            self.0.borrow_mut().push(json!({ "page.set_theme": theme.to_json() }));
+        }
     }
 
     impl Page {
@@ -1327,8 +1425,19 @@ mod tests {
             reply["result"].as_object().unwrap().keys().collect::<Vec<_>>(),
             fixture["result"].as_object().unwrap().keys().collect::<Vec<_>>()
         );
-        for key in ["keys_kit", "timeoutlen"] {
+        for key in ["keys_kit", "timeoutlen", "prefix", "module_key"] {
             assert_eq!(reply["result"][key], fixture["result"][key], "{key}");
+        }
+        let fixture_vars = fixture["result"]["theme"]["vars"]
+            .as_object()
+            .expect("the fixture's theme.vars");
+        let fallback = PageTheme::fallback();
+        let mut want: Vec<&str> = fallback.vars().iter().map(|(n, _)| n.as_str()).collect();
+        want.sort();
+        assert_eq!(fixture_vars.keys().map(String::as_str).collect::<Vec<_>>(), want);
+        for (name, value) in fixture_vars {
+            let value = value.as_str().expect("a string value");
+            assert!(crate::plugin::theme::page_var_ok(name, value), "{name}: {value}");
         }
     }
 
@@ -1418,13 +1527,14 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_timeoutlen_is_sent_once_and_a_repeat_is_not() {
+    fn set_timeoutlen_sends_all_three_fields() {
         let r = rig(vec![]);
         r.hello();
         r.host.set_timeoutlen(300);
         assert_eq!(
             r.page.take(),
-            vec![json!({"v": 1, "event": "keys_config", "data": {"timeoutlen": 300}})]
+            vec![json!({"v": 1, "event": "keys_config",
+                        "data": {"timeoutlen": 300, "prefix": "Ctrl+b", "module_key": null}})]
         );
         r.host.set_timeoutlen(300);
         assert!(r.page.take().is_empty());
@@ -1528,7 +1638,148 @@ mod tests {
         let r = rig(vec![]);
         r.hello();
         r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        r.page.take();
         assert_eq!(r.declare(json!([row("x", &["<C-a>"])]))["ok"], false);
         assert_eq!(r.declare(json!([row("x", &["<C-b>"])]))["ok"], true);
+    }
+
+    /// A theme other than the fallback, so setting it is a change.
+    fn light_theme() -> PageTheme {
+        let mut payload = crate::theme::payload::NvimThemePayload::empty();
+        payload.options.background = "light".into();
+        PageTheme::from_tokens(&crate::theme::ThemeTokens::derive(&payload))
+    }
+
+    fn theme_event(theme: &PageTheme) -> Value {
+        json!({"v": 1, "event": "theme", "data": theme.to_json()})
+    }
+
+    fn port_entry(theme: &PageTheme) -> Value {
+        json!({ "page.set_theme": theme.to_json() })
+    }
+
+    #[test]
+    fn hello_carries_the_theme_prefix_and_module_key() {
+        let r = rig(vec![]);
+        let sent = r.hello();
+        let result = &sent[0]["result"];
+        assert_eq!(result["theme"], r.host.theme().to_json());
+        assert_eq!(result["prefix"], "Ctrl+b");
+        assert_eq!(result["module_key"], Value::Null);
+
+        let r = rig(vec![]);
+        r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        r.host.set_module_key(Some("y"));
+        assert!(r.page.take().is_empty(), "nothing before hello");
+        let sent = r.hello();
+        assert_eq!(sent[0]["result"]["prefix"], "Ctrl+a");
+        assert_eq!(sent[0]["result"]["module_key"], "y");
+        assert!(sent.iter().all(|m| m["event"] != "keys_config"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_theme_before_hello_reaches_the_port_then_the_page() {
+        let r = rig(vec![]);
+        let theme = light_theme();
+        r.host.set_theme(&theme);
+        assert_eq!(r.page.take(), vec![port_entry(&theme), theme_event(&theme)]);
+        assert_eq!(r.host.theme(), theme);
+        let sent = r.hello();
+        assert_eq!(sent[0]["result"]["theme"], theme.to_json());
+    }
+
+    #[test]
+    fn a_changed_theme_after_hello_sends_one_event_after_the_port() {
+        let r = rig(vec![]);
+        r.hello();
+        let theme = light_theme();
+        r.host.set_theme(&theme);
+        assert_eq!(r.page.take(), vec![port_entry(&theme), theme_event(&theme)]);
+    }
+
+    #[test]
+    fn the_same_theme_again_sends_nothing() {
+        let r = rig(vec![]);
+        r.host.set_theme(&PageTheme::fallback());
+        assert!(r.page.take().is_empty(), "the host starts from the fallback");
+        r.hello();
+        let theme = light_theme();
+        r.host.set_theme(&theme);
+        r.page.take();
+        r.host.set_theme(&theme);
+        assert!(r.page.take().is_empty());
+    }
+
+    #[test]
+    fn after_a_new_load_a_change_still_sends_the_event_and_the_next_hello_has_the_newest() {
+        let r = rig(vec![]);
+        r.hello();
+        r.host.page_loading();
+        let theme = light_theme();
+        r.host.set_theme(&theme);
+        assert_eq!(r.page.take(), vec![port_entry(&theme), theme_event(&theme)]);
+        let sent = r.hello();
+        assert_eq!(sent[0]["result"]["theme"], theme.to_json());
+    }
+
+    #[test]
+    fn a_commit_sends_the_current_theme_and_nothing_else() {
+        let r = rig(vec![]);
+        r.host.set_has_keys(true);
+        r.host.page_committed();
+        assert_eq!(r.page.take(), vec![theme_event(&PageTheme::fallback())]);
+        r.hello();
+        let theme = light_theme();
+        r.host.set_theme(&theme);
+        r.page.take();
+        r.host.page_committed();
+        assert_eq!(r.page.take(), vec![theme_event(&theme)]);
+        r.host.page_loading();
+        r.host.page_committed();
+        r.host.set_has_keys(false);
+        r.host.set_timeoutlen(300);
+        r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        r.host.set_module_key(Some("y"));
+        assert_eq!(
+            r.page.take(),
+            vec![theme_event(&theme)],
+            "focus and keys_config wait for the new document's hello"
+        );
+    }
+
+    #[test]
+    fn a_new_prefix_after_hello_sends_one_complete_keys_config() {
+        let r = rig(vec![]);
+        r.hello();
+        r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "event": "keys_config",
+                        "data": {"timeoutlen": 1000, "prefix": "Ctrl+a", "module_key": null}})]
+        );
+        r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        assert!(r.page.take().is_empty(), "the same prefix again");
+        r.host.set_module_key(Some("y"));
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "event": "keys_config",
+                        "data": {"timeoutlen": 1000, "prefix": "Ctrl+a", "module_key": "y"}})]
+        );
+        r.host.set_module_key(Some("y"));
+        assert!(r.page.take().is_empty(), "the same module key again");
+        r.host.set_module_key(None);
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "event": "keys_config",
+                        "data": {"timeoutlen": 1000, "prefix": "Ctrl+a", "module_key": null}})]
+        );
+
+        let r = rig(vec![]);
+        r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        r.host.set_module_key(Some("y"));
+        assert!(r.page.take().is_empty(), "nothing before hello");
+        let sent = r.hello();
+        assert_eq!(sent[0]["result"]["prefix"], "Ctrl+a");
+        assert_eq!(sent[0]["result"]["module_key"], "y");
     }
 }

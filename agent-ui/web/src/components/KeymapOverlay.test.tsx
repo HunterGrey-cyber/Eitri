@@ -500,24 +500,36 @@ describe("KeymapOverlay: a plugin page's section", () => {
     expect(section.querySelectorAll("td")[1].textContent).toBe("<img src=x onerror=alert(1)>");
   });
 
+  it("renders a folded generic row's context as text", () => {
+    const what = '<img src=x onerror="alert(1)">';
+    const { container } = withPlugin({
+      title: "Plugin",
+      declared: true,
+      rows: [{ keys: "j / <C-e> k f", what }],
+    });
+    const section = sectionTitled(container, "Plugin");
+    expect(section.querySelector("img")).toBeNull();
+    expect(section.querySelectorAll("td")[1].textContent).toBe(what);
+  });
+
   it("says so when the page has declared no keys", () => {
     const { container } = withPlugin({ title: "Snotra", declared: false, rows: [] });
     const section = sectionTitled(container, "Snotra");
     expect(section.querySelectorAll("tr")).toHaveLength(0);
-    expect(section.textContent).toContain("此插件未登记按键");
+    expect(section.textContent).toContain("This plugin has not declared its keys");
   });
 
   it("draws an empty section, without the undeclared note, for a page that declared and kept no key", () => {
     const { container } = withPlugin({ title: "Snotra", declared: true, rows: [] });
     const section = sectionTitled(container, "Snotra");
     expect(section.querySelectorAll("tr")).toHaveLength(0);
-    expect(section.textContent).not.toContain("此插件未登记按键");
+    expect(section.textContent).not.toContain("This plugin has not declared its keys");
   });
 
   it("is not drawn without a plugin", () => {
     const { container } = withPlugin(undefined);
     const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
     expect(titles[0]).toBe("This panel");
-    expect(container.textContent).not.toContain("此插件未登记按键");
+    expect(container.textContent).not.toContain("This plugin has not declared its keys");
   });
 });

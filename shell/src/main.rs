@@ -51,10 +51,12 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
+use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened};
 use eitri_core::keymap::{Action, SwapTarget, TabAction};
 use eitri_core::layout::{
     Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Reopen,
 };
+use eitri_core::plugin::theme::PageTheme;
 use eitri_core::tabs::TabVerb;
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
@@ -349,8 +351,9 @@ fn build_ui(
     let keymap = config.keymap.clone();
 
     // Each `eitri.plugin.load` becomes a Lua panel whose content is the plugin's page. Registered before the
-    // Lua panels are read below, so a plugin is placed, keyed, killed and revived like any Lua panel.
-    let plugin_panels = match plugin_panels::PluginPanels::install(&lua_engine, &keymap) {
+    // Lua panels are read below, so a plugin is placed, keyed, killed and revived like any Lua panel. The
+    // theme feed has not started yet, so the pages start from the fallback, as the agent panel does.
+    let plugin_panels = match plugin_panels::PluginPanels::install(&lua_engine, &keymap, &PageTheme::fallback()) {
         Ok(panels) => Rc::new(panels),
         Err(message) => {
             eprintln!("eitri: {message}");
@@ -717,6 +720,7 @@ fn build_ui(
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
         let terminal = terminal.clone();
+        let plugin_panels = plugin_panels.clone();
         let editor_font = editor_font.clone();
         let text_size_slot = text_size_slot.clone();
         let follows_editor = config.panel_font_follows_editor;
@@ -739,6 +743,9 @@ fn build_ui(
             agent_panel_handle.set_theme(&panel_tokens(Some(&payload)));
             pane_for_theme.set_clear_color(editor_clear(&tokens));
             terminal.set_colors(terminal::colors_from(&tokens));
+            // The derived tokens, not the panel's sized ones: a page's set carries no size, so a size-only
+            // change leaves it equal and sends the pages nothing.
+            plugin_panels.set_theme(&tokens);
         });
     }
 
@@ -879,6 +886,9 @@ fn build_ui(
     // nobody visited (`eitri_core::layout::FocusHistory`). The tracker below and the prefix each
     // hold a clone.
     let focus_history = Rc::new(RefCell::new(eitri_core::layout::FocusHistory::default()));
+    // Where `prefix ?` found the keys, so closing its sheet by its own keys can give them back
+    // (`eitri_core::keymap::keys_return`). The pane-focus tracker below forgets it when the keys move on.
+    let keys_return = Rc::new(RefCell::new(KeysReturn::default()));
 
     // Which module has the keys. One tracker drives the editor's cursor (solid, or not drawn,
     // via Neovide itself) and the agent panel's cursor and mode block, so they cannot disagree. See
@@ -891,6 +901,7 @@ fn build_ui(
         let terminal = terminal.clone();
         let module_layout = module_layout.clone();
         let focus_history = focus_history.clone();
+        let keys_return = keys_return.clone();
         let plugin_panels = plugin_panels.clone();
         pane_focus::install(
             &window,
@@ -903,7 +914,10 @@ fn build_ui(
                     // history hears only what the layout accepted, so it never names a module the
                     // keys could not have been on.
                     match layout.set_focus(id) {
-                        Ok(()) => focus_history.borrow_mut().note(id),
+                        Ok(()) => {
+                            focus_history.borrow_mut().note(id);
+                            keys_return.borrow_mut().focus_moved(id, &ModuleId::agent());
+                        }
                         Err(err) => eprintln!("[pane_focus] {err}; the layout keeps {}", layout.focus()),
                     }
                 }
@@ -1449,6 +1463,47 @@ fn build_ui(
         }
     });
 
+    // The `?` sheet that `prefix ?` opened was closed. When its own keys (or a click outside it) closed it
+    // and the keys are still in the chat, they go back to the module that held them, with the zoom and the
+    // hidden chat that opening it changed put back. Every borrow is released before anything moves, since
+    // moving the keys re-enters the layout and this hook's own state through `pane_focus`.
+    agent_panel_handle.on_keymap_closed({
+        let grid = grid.clone();
+        let window = window.clone();
+        let module_layout = module_layout.clone();
+        let focus_module = focus_module.clone();
+        let keys_return = keys_return.clone();
+        move |opening, return_keys| {
+            let chat = ModuleId::agent();
+            let focused = pane_focus::focused_module(&window, &grid.hosts());
+            let ret = {
+                let layout = module_layout.borrow();
+                let shown = |id: &ModuleId| layout.is_shown(id);
+                let at = AtClose {
+                    focused: focused.as_ref(),
+                    zoomed: layout.zoomed(),
+                    sheet_shown: layout.is_shown(&chat),
+                    shown: &shown,
+                };
+                keys_return.borrow_mut().closed(opening, return_keys, at, &chat)
+            };
+            let Some(ret) = ret else { return };
+            if ret.hide_sheet {
+                if let Err(err) = grid.hide_module(&chat, &*focus_module) {
+                    eprintln!("[keys_return] could not hide {chat} again: {err}");
+                }
+            }
+            if let Some(zoom) = &ret.zoom {
+                grid.toggle_zoom(zoom);
+            }
+            // A module hidden before the close got no `Return` at all; this refusal is only a backstop
+            // for one the hide or zoom just above took away.
+            if !focus_module(&ret.focus) {
+                println!("[keys_return] {} could not take the keys back", ret.focus);
+            }
+        }
+    });
+
     // The prefix's `Action::Tab` chords and the panel's `tab_verb` messages use the
     // same code, so behavior is shared across both routes. `keymap.ts` resolves the
     // panel's `<leader>` bindings.
@@ -1566,6 +1621,7 @@ fn build_ui(
         let kill_refused = top_bar.app_name.clone();
         let toast = toast.clone();
         let keymap_plugins = plugin_panels.clone();
+        let keys_return = keys_return.clone();
         prefix::install(
             &window,
             keymap.clone(),
@@ -1726,16 +1782,36 @@ fn build_ui(
                     Action::PanelReload => agent.reload_document_by_hand(),
                     Action::PanelKeymap => {
                         // Read before the chat takes the keys: afterwards the chat is what holds them.
-                        let plugin = focused()
+                        let from = focused();
+                        let plugin = from
+                            .clone()
                             .and_then(|module| keymap_plugins.declared_rows(&module))
                             .map(|(title, rows)| eitri_core::plugin::keys::plugin_help(&title, rows));
                         let chat = ModuleId::agent();
+                        // What showing the chat is about to change, so closing the sheet can undo it.
+                        let (ended_zoom, showed_sheet) = {
+                            let layout = module_layout.borrow();
+                            let ended_zoom = if layout.zoom_hides(&chat) {
+                                layout.zoomed().cloned()
+                            } else {
+                                None
+                            };
+                            (ended_zoom, !layout.is_shown(&chat))
+                        };
                         if let Err(err) = show_on_screen(&chat) {
                             refuse(&refused_name, &toast, &err);
                             return;
                         }
+                        let opening = keys_return.borrow_mut().opened(
+                            Opened {
+                                from,
+                                ended_zoom,
+                                showed_sheet,
+                            },
+                            &chat,
+                        );
                         focus_module(&chat);
-                        agent.open_keymap(plugin);
+                        agent.open_keymap(plugin, opening);
                     }
                     // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
                     // letters typed after the chord go into the entry instead of acting as panel keys.
@@ -1745,6 +1821,9 @@ fn build_ui(
                             refuse(&refused_name, &toast, &err);
                             return;
                         }
+                        // A close of the `?` sheet may still be on its way from the page: the command line is
+                        // the newer request, and that close must not move the keys out from under it.
+                        keys_return.borrow_mut().superseded();
                         focus_module(&chat);
                         agent.open_command_line();
                     }

@@ -10,7 +10,7 @@ declare global {
 }
 
 export function pluginBridge(): PluginBridge {
-  if (!window.eitriPlugin) throw new Error("未连接 Eitri");
+  if (!window.eitriPlugin) throw new Error("not connected to Eitri");
   return window.eitriPlugin;
 }
 
@@ -20,16 +20,16 @@ function record(value: unknown): value is Record<string, unknown> {
 
 export function effectiveRows(reply: unknown): Row[] {
   const rows: unknown = record(reply) ? reply.rows : reply;
-  if (!Array.isArray(rows)) throw new Error("按键表格式无效");
+  if (!Array.isArray(rows)) throw new Error("the key table is malformed");
   return rows.map((row: unknown) => {
     if (!record(row) || typeof row.action !== "string" || typeof row.context !== "string" ||
-      typeof row.desc !== "string" || !Array.isArray(row.keys)) throw new Error("按键表格式无效");
+      typeof row.desc !== "string" || !Array.isArray(row.keys)) throw new Error("the key table is malformed");
     const keys = row.keys.map((entry: unknown) => {
       if (typeof entry === "string") return entry;
       if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && typeof entry[1] === "string") {
         return entry[0];
       }
-      throw new Error("按键表格式无效");
+      throw new Error("the key table is malformed");
     });
     return { action: row.action, keys, context: row.context, desc: row.desc };
   });

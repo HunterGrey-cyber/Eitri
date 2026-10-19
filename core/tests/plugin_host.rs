@@ -14,18 +14,22 @@ use eitri_core::plugin::load::load_plugin;
 use eitri_core::plugin::protocol::FocusTarget;
 use eitri_core::plugin::state::PluginStore;
 use eitri_core::plugin::test_support::{demo_plugin, Scratch};
+use eitri_core::plugin::theme::PageTheme;
 use serde_json::{json, Value};
 
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
-struct Page(RefCell<Vec<Value>>);
+struct Page(RefCell<Vec<Value>>, RefCell<Vec<PageTheme>>);
 
 impl PagePort for Page {
     fn send(&self, message: &str) {
         self.0
             .borrow_mut()
             .push(serde_json::from_str(message).expect("the host sends JSON"));
+    }
+    fn set_theme(&self, theme: &PageTheme) {
+        self.1.borrow_mut().push(theme.clone());
     }
 }
 

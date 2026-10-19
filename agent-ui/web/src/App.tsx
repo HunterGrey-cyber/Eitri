@@ -1151,6 +1151,8 @@ export default function App() {
         setLineFocusRequest((n) => n + 1);
         break;
       case "panel.keymap":
+        keymapOpening.current = null;
+        keymapClosedByKey.current = false;
         setKeymapOpen(true);
         break;
       case "panel.handoff": {
@@ -1214,6 +1216,25 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  /** The number `prefix ?` gave the opening that is showing (`open_keymap`'s `opening`), or `null` when the
+   *  panel's own `?` opened it: only the former reports its close to Rust, which may give the keys back. */
+  const keymapOpening = useRef<number | null>(null);
+  /** Whether the showing opening is being closed by the overlay's own keys or a click outside it. Every
+   *  other close leaves it false, so a forced close (`:`, a review, a new session) gives nothing back. */
+  const keymapClosedByKey = useRef(false);
+  function closeKeymapByKey() {
+    keymapClosedByKey.current = true;
+    setKeymapOpen(false);
+  }
+  useEffect(() => {
+    if (keymapOpen) return;
+    const opening = keymapOpening.current;
+    if (opening !== null) {
+      postToRust({ type: "keymap_closed", request_id: nextRequestId(), opening, return_keys: keymapClosedByKey.current });
+    }
+    keymapOpening.current = null;
+    keymapClosedByKey.current = false;
+  }, [keymapOpen]);
   const keymapPendingG = useRef(false);
   useEffect(() => { keymapPendingG.current = false; }, [keymapOpen]);
 
@@ -1226,7 +1247,7 @@ export default function App() {
     if (event.altKey || event.metaKey || event.nativeEvent.isComposing) return;
     if (event.ctrlKey && event.shiftKey) return;
     if (!event.ctrlKey && (event.key === "?" || event.key === "Escape" || event.key === "q")) {
-      setKeymapOpen(false);
+      closeKeymapByKey();
     } else if (!event.ctrlKey && event.key === "g") {
       if (pendingG) scrollKeymapOverlay(keymapOverlayRef.current, "gg", false);
       else keymapPendingG.current = true;
@@ -2668,6 +2689,8 @@ export default function App() {
         exitRegion();
         setMode("browse");
         setKeymapPlugin(pluginKeysHelp(payload.plugin));
+        keymapOpening.current = typeof payload.opening === "number" ? payload.opening : null;
+        keymapClosedByKey.current = false;
         setKeymapOpen(true);
         setReview(null); // the review overlay is over the same area, and ends where `?` does
       } else if (payload.kind === "open_command_line") {
@@ -4263,7 +4286,7 @@ export default function App() {
           <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
             <KeymapOverlay
               ref={keymapOverlayRef}
-              onClose={() => setKeymapOpen(false)}
+              onClose={closeKeymapByKey}
               windowKeys={keymapHelp.window}
               prefixKeys={keymapHelp.prefixKeys}
               prefixLabel={keymapHelp.prefix}
@@ -5962,7 +5985,7 @@ export default function App() {
           <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
             <KeymapOverlay
               ref={keymapOverlayRef}
-              onClose={() => setKeymapOpen(false)}
+              onClose={closeKeymapByKey}
               windowKeys={keymapHelp.window}
               prefixKeys={keymapHelp.prefixKeys}
               prefixLabel={keymapHelp.prefix}

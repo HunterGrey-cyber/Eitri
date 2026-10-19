@@ -48,9 +48,16 @@ async function start(run = vi.fn(() => true), initial?: { timeoutlen: number; ha
 }
 
 describe("installation", () => {
+  it("passes the page's labels to the in-page sheet", async () => {
+    cleanup = await install({ rows: pageRows, run: vi.fn(() => true), labels: { sheetTitle: "按键" } });
+    key("?", { shiftKey: true });
+    expect(document.querySelector("#eitri-keys-sheet h2")!.textContent).toBe("按键");
+    key("Escape");
+  });
+
   it("publishes the versioned API", () => {
-    expect(window.eitriKeys).toMatchObject({ version: 1, install, setCurrent });
-    expect(typeof window.eitriKeys.message).toBe("function");
+    expect(window.eitriKeys).toMatchObject({ version: 2, install, setCurrent });
+    for (const name of ["message", "status", "keys"] as const) expect(typeof window.eitriKeys[name]).toBe("function");
   });
 
   it("declares merged rows without owning host.hello", async () => {
@@ -492,5 +499,73 @@ describe("installation", () => {
     key("j");
     expect(window.scrollBy).not.toHaveBeenCalled();
     expect(events.size).toBe(0);
+  });
+});
+
+
+describe("status() and keys()", () => {
+  it("clears the status on a new installation and on removal", async () => {
+    await start();
+    window.eitriKeys.status("item 1/8");
+    expect(document.querySelector(".eitri-keys-status")!.textContent).toBe("item 1/8");
+    await start();
+    expect(document.querySelector(".eitri-keys-status")!.textContent).toBe("");
+    window.eitriKeys.status("item 2/8");
+    cleanup!();
+    cleanup = undefined;
+    expect(document.getElementById("eitri-keys-hud")).toBeNull();
+    window.eitriKeys.message("x");
+    expect(document.querySelector(".eitri-keys-status")!.textContent).toBe("");
+  });
+
+  it("is empty before the installation resolves, then gives the reply's keys", async () => {
+    let answer!: (value: unknown) => void;
+    call.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    const pending = install({ rows: pageRows, run: vi.fn(() => true) });
+    expect(window.eitriKeys.keys("item.next")).toEqual([]);
+    effective.find((row) => row.action === "item.next")!.keys = ["<C-n>"];
+    answer({ rows: effective });
+    cleanup = await pending;
+    expect(window.eitriKeys.keys("item.next")).toEqual(["<C-n>"]);
+    expect(window.eitriKeys.keys("hint.start")).toEqual(["f"]);
+    expect(window.eitriKeys.keys("item.unknown")).toEqual([]);
+  });
+
+  it("reads the host's key/source pairs", async () => {
+    call.mockResolvedValueOnce({ rows: effective.map((row) => ({
+      ...row, keys: row.action === "item.next" ? [["]x", "init.lua"], ["]q", "default"]] : row.keys.map((k) => [k, "default"]),
+    })) });
+    await start();
+    expect(window.eitriKeys.keys("item.next")).toEqual(["]x", "]q"]);
+  });
+
+  it("gives an empty list for an action whose keys the host removed", async () => {
+    effective.find((row) => row.action === "scroll.down")!.keys = [];
+    await start();
+    expect(window.eitriKeys.keys("scroll.down")).toEqual([]);
+  });
+
+  it("returns a copy each call", async () => {
+    await start();
+    const first = window.eitriKeys.keys("item.next");
+    first.push("x");
+    expect(window.eitriKeys.keys("item.next")).toEqual(["]q"]);
+  });
+
+  it("is empty after the installation is removed", async () => {
+    await start();
+    cleanup!();
+    cleanup = undefined;
+    expect(window.eitriKeys.keys("item.next")).toEqual([]);
+  });
+
+  it("keeps keys() on the newest installation when an older one resolves late", async () => {
+    let answerOld!: (value: unknown) => void;
+    call.mockImplementationOnce(() => new Promise((resolve) => { answerOld = resolve; }));
+    const old = install({ rows: pageRows, run: vi.fn(() => true) });
+    cleanup = await install({ rows: pageRows, run: vi.fn(() => true) });
+    answerOld({ rows: effective.map((row) => row.action === "item.next" ? { ...row, keys: ["<C-x>"] } : row) });
+    await old;
+    expect(window.eitriKeys.keys("item.next")).toEqual(["]q"]);
   });
 });

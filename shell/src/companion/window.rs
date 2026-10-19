@@ -396,7 +396,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                     CompanionVerb::Reload => agent.reload_document_by_hand(),
                     CompanionVerb::Keymap => {
                         focus_module(&ModuleId::agent());
-                        agent.open_keymap(None);
+                        agent.open_keymap(None, 0);
                     }
                     CompanionVerb::CommandLine => {
                         focus_module(&ModuleId::agent());

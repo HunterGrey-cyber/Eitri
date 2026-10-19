@@ -1,18 +1,35 @@
-import type { Row } from "./index";
+import type { Row, GenericAction, KitLabels } from "./index";
 export type { Row, Mode } from "./index";
 
-export const GENERIC_ROWS: Row[] = [
-  { action: "scroll.down", keys: ["j"], context: "页面", desc: "向下滚动" },
-  { action: "scroll.up", keys: ["k"], context: "页面", desc: "向上滚动" },
-  { action: "scroll.half_down", keys: ["d"], context: "页面", desc: "向下半页" },
-  { action: "scroll.half_up", keys: ["u"], context: "页面", desc: "向上半页" },
-  { action: "scroll.top", keys: ["gg"], context: "页面", desc: "页面顶部" },
-  { action: "scroll.bottom", keys: ["G"], context: "页面", desc: "页面底部" },
-  { action: "history.back", keys: ["H"], context: "页面", desc: "后退" },
-  { action: "history.forward", keys: ["L"], context: "页面", desc: "前进" },
-  { action: "link.prev", keys: ["[["], context: "页面", desc: "上一页" },
-  { action: "link.next", keys: ["]]"], context: "页面", desc: "下一页" },
-  { action: "hint.start", keys: ["f"], context: "页面", desc: "提示模式" },
-  { action: "sheet.open", keys: ["?"], context: "页面", desc: "按键帮助" },
-  { action: "mode.escape", keys: ["<Esc>"], context: "页面", desc: "退出模式" },
+export const DEFAULT_PAGE_LABEL = "page";
+
+const DEFAULT_ROWS: (Row & { action: GenericAction })[] = [
+  { action: "scroll.down", keys: ["j"], context: DEFAULT_PAGE_LABEL, desc: "scroll down" },
+  { action: "scroll.up", keys: ["k"], context: DEFAULT_PAGE_LABEL, desc: "scroll up" },
+  { action: "scroll.half_down", keys: ["d"], context: DEFAULT_PAGE_LABEL, desc: "half a page down" },
+  { action: "scroll.half_up", keys: ["u"], context: DEFAULT_PAGE_LABEL, desc: "half a page up" },
+  { action: "scroll.top", keys: ["gg"], context: DEFAULT_PAGE_LABEL, desc: "top of the page" },
+  { action: "scroll.bottom", keys: ["G"], context: DEFAULT_PAGE_LABEL, desc: "bottom of the page" },
+  { action: "history.back", keys: ["H"], context: DEFAULT_PAGE_LABEL, desc: "back" },
+  { action: "history.forward", keys: ["L"], context: DEFAULT_PAGE_LABEL, desc: "forward" },
+  { action: "link.prev", keys: ["[["], context: DEFAULT_PAGE_LABEL, desc: "previous page" },
+  { action: "link.next", keys: ["]]"], context: DEFAULT_PAGE_LABEL, desc: "next page" },
+  { action: "hint.start", keys: ["f"], context: DEFAULT_PAGE_LABEL, desc: "hint mode" },
+  { action: "sheet.open", keys: ["?"], context: DEFAULT_PAGE_LABEL, desc: "this sheet" },
+  { action: "mode.escape", keys: ["<Esc>"], context: DEFAULT_PAGE_LABEL, desc: "leave a mode" },
 ];
+
+export function genericRows(labels?: KitLabels): Row[] {
+  return DEFAULT_ROWS.map((row) => ({
+    ...row,
+    keys: [...row.keys],
+    context: labels?.page ?? DEFAULT_PAGE_LABEL,
+    desc: labels?.generic?.[row.action] ?? row.desc,
+  }));
+}
+
+export const GENERIC_ROWS: Row[] = genericRows();
+
+export function isGenericAction(action: string): action is GenericAction {
+  return DEFAULT_ROWS.some((row) => row.action === action);
+}

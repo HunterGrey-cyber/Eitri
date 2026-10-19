@@ -1,5 +1,6 @@
 // The host bridge of a plugin page. It runs at document start, before any of the page's own scripts,
 // and is the page's only way to the host: window.eitriPlugin.call(verb, args) and .on(event, fn).
+// It also keeps the host's theme on the document root as --nv-* custom properties.
 (function () {
   "use strict";
   var handlers = window.webkit && window.webkit.messageHandlers;
@@ -20,6 +21,53 @@
     return e;
   }
 
+  // The theme the host hands every page: the configured colours and font lists, set as custom properties on the
+  // root so a page reads them with var(). Each value is checked again here with the host's own rule.
+  var THEME_NAME = /^--nv-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+  var THEME_COLOUR = /^#[0-9a-f]{6}$/u;
+  var THEME_FONTS = /^(?:"[^"\x5C;{}<>()[\]/*\u{0}-\u{1F}\u{7F}-\u{9F}]{1,100}"|[A-Za-z][A-Za-z0-9-]{0,39})(?:, ?(?:"[^"\x5C;{}<>()[\]/*\u{0}-\u{1F}\u{7F}-\u{9F}]{1,100}"|[A-Za-z][A-Za-z0-9-]{0,39})){0,15}$/u;
+  var themeNames = new Set();
+
+  function themeValueOk(name, value) {
+    if (typeof name !== "string" || typeof value !== "string") return false;
+    if (Array.from(name).length > 64 || !THEME_NAME.test(name)) return false;
+    if (name === "--nv-color-scheme") return value === "light" || value === "dark";
+    if (name.indexOf("--nv-font-") === 0) return Array.from(value).length <= 1024 && THEME_FONTS.test(value);
+    return THEME_COLOUR.test(value);
+  }
+
+  function applyTheme(theme) {
+    try {
+      var root = document.documentElement;
+      if (!root || !theme || typeof theme !== "object" || !theme.vars || typeof theme.vars !== "object" ||
+        Array.isArray(theme.vars)) {
+        return;
+      }
+      var vars = theme.vars;
+      var now = new Set();
+      var skipped = 0;
+      Object.keys(vars).forEach(function (name) {
+        if (!themeValueOk(name, vars[name])) {
+          skipped++;
+          return;
+        }
+        root.style.setProperty(name, vars[name]);
+        now.add(name);
+      });
+      themeNames.forEach(function (name) {
+        if (!now.has(name)) {
+          root.style.removeProperty(name);
+        }
+      });
+      themeNames = now;
+      if (skipped) {
+        console.warn("eitri: skipped " + skipped + " theme value(s) that failed the check");
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
   function dispatch(text) {
     var msg;
     try {
@@ -37,6 +85,9 @@
       }
       pending.delete(msg.re);
       if (msg.ok === true) {
+        if (waiting.verb === "host.hello" && msg.result && typeof msg.result === "object") {
+          applyTheme(msg.result.theme);
+        }
         waiting.resolve(msg.result);
       } else {
         var err = msg.error || {};
@@ -50,6 +101,9 @@
       return;
     }
     if (typeof msg.event === "string") {
+      if (msg.event === "theme") {
+        applyTheme(msg.data);
+      }
       var set = listeners.get(msg.event);
       if (!set) {
         return;
@@ -79,7 +133,7 @@
         reject(hostError("too_large", "a message may be at most 256 KiB"));
         return;
       }
-      pending.set(id, { resolve: resolve, reject: reject });
+      pending.set(id, { resolve: resolve, reject: reject, verb: verb });
       handler.postMessage(text);
     });
   }

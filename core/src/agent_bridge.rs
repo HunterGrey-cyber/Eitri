@@ -416,6 +416,15 @@ pub enum InboundMessage {
         request_id: String,
         direction: PaneNavDirection,
     },
+    /// The `?` overlay that `prefix ?` opened was closed. `opening` is the number `open_keymap` carried, so a close
+    /// that arrives after a newer `prefix ?` can be told apart; `return_keys` is true only for the overlay's own
+    /// keys or a click outside it. Both are required: a message without either is malformed, never "close, no
+    /// return".
+    KeymapClosed {
+        request_id: String,
+        opening: u64,
+        return_keys: bool,
+    },
     /// `gx` opens this web link in the system browser. The page sends a WHATWG-normalized
     /// address from `agent-ui/web/src/nav.ts#webUrl`; `shell` rechecks it in
     /// `agent_panel.rs#web_url` before `gtk4::UriLauncher`. No `serde(default)`: a missing
@@ -560,6 +569,7 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { .. }
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
+            | InboundMessage::KeymapClosed { .. }
             | InboundMessage::ReviewRecover { .. }
             | InboundMessage::TrustCommand { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
@@ -671,6 +681,7 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { request_id, .. }
             | InboundMessage::NavFallthrough { request_id, .. }
             | InboundMessage::PaneNav { request_id, .. }
+            | InboundMessage::KeymapClosed { request_id, .. }
             | InboundMessage::TrustAnswer { request_id, .. }
             | InboundMessage::TrustCancel { request_id, .. }
             | InboundMessage::TrustCommand { request_id, .. }
@@ -917,12 +928,13 @@ pub fn serialize_literal_key_for_js(key: &str) -> String {
     json!({ "kind": "literal_key", "key": key }).to_string()
 }
 
-/// `{"kind":"open_keymap"}`: `prefix ?` -- open the `?` overlay, in BROWSE. With a plugin page's section
-/// (`{"kind":"open_keymap","plugin":{"title":..,"rows":[{"keys","what"}]}}`) when that page held the keys.
-pub fn serialize_open_keymap_for_js(plugin: Option<&crate::plugin::keys::PluginKeysHelp>) -> String {
+/// `{"kind":"open_keymap","opening":N}`: `prefix ?` -- open the `?` overlay, in BROWSE. `opening` numbers this
+/// opening, and the page quotes it back in `keymap_closed`. With a plugin page's section
+/// (`{"kind":"open_keymap","opening":N,"plugin":{"title":..,"rows":[{"keys","what"}]}}`) when that page held the keys.
+pub fn serialize_open_keymap_for_js(plugin: Option<&crate::plugin::keys::PluginKeysHelp>, opening: u64) -> String {
     match plugin {
-        Some(plugin) => json!({ "kind": "open_keymap", "plugin": plugin }).to_string(),
-        None => json!({ "kind": "open_keymap" }).to_string(),
+        Some(plugin) => json!({ "kind": "open_keymap", "opening": opening, "plugin": plugin }).to_string(),
+        None => json!({ "kind": "open_keymap", "opening": opening }).to_string(),
     }
 }
 
@@ -2496,8 +2508,65 @@ mod tests {
     fn serializes_literal_key_and_open_keymap() {
         let value: serde_json::Value = serde_json::from_str(&serialize_literal_key_for_js("C-a")).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "literal_key", "key": "C-a" }));
-        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(None)).unwrap();
-        assert_eq!(value, serde_json::json!({ "kind": "open_keymap" }));
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(None, 0)).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "open_keymap", "opening": 0 }));
+    }
+
+    #[test]
+    fn open_keymap_carries_the_opening() {
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(None, 7)).unwrap();
+        assert_eq!(value, serde_json::json!({ "kind": "open_keymap", "opening": 7 }));
+        let help = crate::plugin::keys::PluginKeysHelp {
+            title: "Snotra".into(),
+            declared: false,
+            rows: Vec::new(),
+        };
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&help), 8)).unwrap();
+        assert_eq!(value["opening"], serde_json::json!(8));
+        assert_eq!(value["kind"], serde_json::json!("open_keymap"));
+    }
+
+    /// `agent-ui/web/src/bridge.test.ts` pins `JSON.stringify` of the same message to these strings.
+    #[test]
+    fn keymap_closed_parses_with_both_return_keys_values() {
+        for (json, want) in [
+            (
+                r#"{"type":"keymap_closed","request_id":"req-1","opening":7,"return_keys":true}"#,
+                true,
+            ),
+            (
+                r#"{"type":"keymap_closed","request_id":"req-2","opening":7,"return_keys":false}"#,
+                false,
+            ),
+        ] {
+            let msg = parse_inbound_message(json).unwrap();
+            assert_eq!(msg.tab_ref(), TabRef::WindowLevel);
+            match msg {
+                InboundMessage::KeymapClosed {
+                    request_id,
+                    opening,
+                    return_keys,
+                } => {
+                    assert!(request_id.starts_with("req-"), "{json}");
+                    assert_eq!(opening, 7, "{json}");
+                    assert_eq!(return_keys, want, "{json}");
+                }
+                other => panic!("{json}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn keymap_closed_without_opening_or_return_keys_is_malformed() {
+        for json in [
+            r#"{"type":"keymap_closed","request_id":"r","return_keys":true}"#,
+            r#"{"type":"keymap_closed","request_id":"r","opening":7}"#,
+            r#"{"type":"keymap_closed","opening":7,"return_keys":true}"#,
+            r#"{"type":"keymap_closed","request_id":"r","opening":-1,"return_keys":true}"#,
+            r#"{"type":"keymap_closed","request_id":"r","opening":7,"return_keys":null}"#,
+        ] {
+            assert!(parse_inbound_message(json).is_none(), "{json}");
+        }
     }
 
     #[test]
@@ -2510,11 +2579,12 @@ mod tests {
                 what: "<img src=x onerror=alert(1)>".into(),
             }],
         };
-        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&help))).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&help), 3)).unwrap();
         assert_eq!(
             value,
             serde_json::json!({
                 "kind": "open_keymap",
+                "opening": 3,
                 "plugin": {
                     "title": "Snotra",
                     "declared": true,
@@ -2527,7 +2597,7 @@ mod tests {
             declared: false,
             rows: Vec::new(),
         };
-        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&empty))).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&empty), 3)).unwrap();
         assert_eq!(value["plugin"]["rows"], serde_json::json!([]));
         assert_eq!(value["plugin"]["declared"], serde_json::json!(false));
     }

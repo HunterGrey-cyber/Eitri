@@ -6,6 +6,7 @@
 pub mod action;
 pub mod companion;
 pub mod key;
+pub mod keys_return;
 pub mod panel;
 pub mod prefix;
 pub mod root;

@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod roots;
 pub mod state;
 pub mod tasks;
+pub mod theme;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

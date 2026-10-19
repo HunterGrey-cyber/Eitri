@@ -119,6 +119,12 @@ export type OutboundMessage =
    *  `command_result`, an error only if no hook is installed. `InboundMessage::PaneNav`,
    *  `core/src/agent_bridge.rs`. */
   | { type: "pane_nav"; request_id: string; direction: PaneDirection }
+  /** The `?` overlay that `prefix ?` opened was closed. `opening` is the number its `open_keymap` carried, so a
+   *  close that arrives after a newer `prefix ?` is told apart; `return_keys` is true only for the overlay's own
+   *  keys (`?`, `Esc`, `q`) or a click outside it, never for a close another route forced. Window-level; the
+   *  window gives the keys back to the module that held them, and always answers with a `command_result`.
+   *  `InboundMessage::KeymapClosed`, `core/src/agent_bridge.rs`. */
+  | { type: "keymap_closed"; request_id: string; opening: number; return_keys: boolean }
   /** `gx` on a web link: open this address in the system browser. `url` is
    *  the WHATWG-normalized `href` (`nav.ts#webUrl`) -- what the pick showed -- never the spelling the reply
    *  wrote. Window-level, like `open_path`; Rust re-checks it (`agent_panel.rs#web_url`, http(s) and a plain
@@ -267,7 +273,7 @@ type InboundHandler = (
     | { kind: "literal_key"; key: string }
     /** `prefix ?`: open the `?` overlay in BROWSE, with a plugin page's section first when that page held the
      *  keys. See `serialize_open_keymap_for_js` in `core/src/agent_bridge.rs`. */
-    | { kind: "open_keymap"; plugin?: PluginKeysHelp }
+    | { kind: "open_keymap"; opening?: number; plugin?: PluginKeysHelp }
     /** `prefix :` opens the `:` command line without executing a command. Serialized by
      *  `serialize_open_command_line_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "open_command_line" }

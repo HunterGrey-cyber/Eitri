@@ -1,10 +1,13 @@
 import type { Mode } from "./rows";
+import { ensureStyle } from "./style";
 
 let mode: Mode = "normal";
 let pending = "";
 let message = "";
+let status = "";
 let dimmed = false;
-const MODES: Record<Mode, string> = { normal: "普通", hint: "提示", insert: "输入" };
+const MODES: Record<Mode, string> = { normal: "NORMAL", hint: "HINT", insert: "INSERT" };
+let modeWords = { ...MODES };
 
 function render(): void {
   let hud = document.getElementById("eitri-keys-hud");
@@ -12,21 +15,23 @@ function render(): void {
     hud = document.createElement("div");
     hud.id = "eitri-keys-hud";
     hud.setAttribute("role", "status");
-    hud.style.cssText = "position:fixed;bottom:0;left:0;right:0;z-index:2147483647;padding:4px 12px;" +
-      "background:#20252b;color:#f4f4f4;font:13px monospace;pointer-events:none;white-space:pre-wrap";
+    for (const name of ["mode", "pending", "message", "status"]) {
+      const span = document.createElement("span");
+      span.className = `eitri-keys-${name}`;
+      hud.append(span);
+    }
     document.body.append(hud);
   }
-  if (!document.getElementById("eitri-keys-style")) {
-    const style = document.createElement("style");
-    style.id = "eitri-keys-style";
-    style.textContent = ".eitri-keys-current{outline:2px solid #cfa85d;outline-offset:3px}" +
-      ".eitri-keys-current.eitri-keys-dimmed{outline-color:#8888}";
-    document.head.append(style);
-  }
+  ensureStyle();
   hud.dataset.mode = mode;
   hud.dataset.dimmed = String(dimmed);
   hud.hidden = dimmed;
-  hud.textContent = [MODES[mode], pending, message].filter(Boolean).join("  ");
+  const modeSpan = hud.querySelector<HTMLElement>(".eitri-keys-mode")!;
+  modeSpan.dataset.mode = mode;
+  modeSpan.textContent = modeWords[mode];
+  hud.querySelector(".eitri-keys-pending")!.textContent = pending;
+  hud.querySelector(".eitri-keys-message")!.textContent = message;
+  hud.querySelector(".eitri-keys-status")!.textContent = status;
 }
 
 export function showMode(next: Mode, prefix: string): void {
@@ -42,5 +47,19 @@ export function showMessage(text: string): void {
 
 export function setDimmed(value: boolean): void {
   dimmed = value;
+  render();
+}
+
+export function showStatus(text: string): void {
+  status = text;
+  render();
+}
+
+export function forgetStatus(): void {
+  status = "";
+}
+
+export function setModeWords(words?: Partial<Record<Mode, string>>): void {
+  modeWords = { ...MODES, ...words };
   render();
 }

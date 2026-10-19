@@ -68,14 +68,30 @@ pub struct PluginKeysHelp {
     pub rows: Vec<root::HelpRow>,
 }
 
+fn generic_actions() -> &'static [String] {
+    static ACTIONS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ACTIONS.get_or_init(|| {
+        #[derive(serde::Deserialize)]
+        struct GenericActions {
+            actions: Vec<String>,
+        }
+        serde_json::from_str::<GenericActions>(include_str!("kit_generic_actions.json"))
+            .expect("the bundled generic action list is valid")
+            .actions
+    })
+}
+
 /// Builds the sheet's section from a page's effective table (`None`: not declared yet).
 pub fn plugin_help(title: &str, rows: Option<Vec<EffectiveRow>>) -> PluginKeysHelp {
     let declared = rows.is_some();
-    let rows = rows
+    let (generic, page): (Vec<_>, Vec<_>) = rows
         .unwrap_or_default()
         .into_iter()
         // An action the user's overrides left with no key cannot be pressed, so the sheet has nothing to say.
         .filter(|row| !row.keys.is_empty())
+        .partition(|row| generic_actions().contains(&row.action));
+    let mut rows: Vec<_> = page
+        .into_iter()
         .map(|row| root::HelpRow {
             keys: row
                 .keys
@@ -90,6 +106,26 @@ pub fn plugin_help(title: &str, rows: Option<Vec<EffectiveRow>>) -> PluginKeysHe
             },
         })
         .collect();
+    if let Some(first) = generic.first() {
+        rows.push(root::HelpRow {
+            keys: generic
+                .iter()
+                .map(|row| {
+                    row.keys
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            what: if !first.context.is_empty() && generic.iter().all(|row| row.context == first.context) {
+                first.context.clone()
+            } else {
+                "page".into()
+            },
+        });
+    }
     PluginKeysHelp {
         title: title.to_string(),
         declared,
@@ -958,10 +994,126 @@ mod tests {
                 },
                 root::HelpRow {
                     keys: "?".into(),
-                    what: "按键帮助".into(),
+                    what: "page".into(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn page_rows_come_first_and_the_generic_rows_fold_into_one_last_row() {
+        let help = plugin_help(
+            "Plugin",
+            Some(vec![
+                effective_row(
+                    "scroll.down",
+                    &[("j", KeySource::Default), ("<C-e>", KeySource::InitLua)],
+                    "page",
+                    "down",
+                ),
+                effective_row("scroll.up", &[("k", KeySource::Default)], "page", "up"),
+                effective_row("hint.start", &[("f", KeySource::Default)], "page", "hint"),
+                effective_row("item.next", &[("]q", KeySource::Default)], "item", "next"),
+                effective_row("item.prev", &[("[q", KeySource::Default)], "", "previous"),
+            ]),
+        );
+        assert_eq!(
+            help.rows,
+            vec![
+                root::HelpRow {
+                    keys: "]q".into(),
+                    what: "item · next".into()
+                },
+                root::HelpRow {
+                    keys: "[q".into(),
+                    what: "previous".into()
+                },
+                root::HelpRow {
+                    keys: "j / <C-e> k f".into(),
+                    what: "page".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fold_is_labelled_with_the_shared_context_else_page() {
+        for (down, up, expected) in [
+            ("页面", "页面", "页面"),
+            ("页面", "navigation", "page"),
+            ("", "", "page"),
+            ("页面", "", "page"),
+            ("", "页面", "page"),
+        ] {
+            let help = plugin_help(
+                "Plugin",
+                Some(vec![
+                    effective_row("scroll.down", &[("j", KeySource::Default)], down, "down"),
+                    effective_row("scroll.up", &[("k", KeySource::Default)], up, "up"),
+                ]),
+            );
+            assert_eq!(
+                help.rows,
+                vec![root::HelpRow {
+                    keys: "j k".into(),
+                    what: expected.into()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_row_with_a_generic_action_is_folded() {
+        let help = plugin_help(
+            "Plugin",
+            Some(vec![effective_row(
+                "scroll.down",
+                &[("x", KeySource::Default)],
+                "custom",
+                "page-defined action",
+            )]),
+        );
+        assert_eq!(
+            help.rows,
+            vec![root::HelpRow {
+                keys: "x".into(),
+                what: "custom".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn rows_the_overrides_emptied_are_dropped_before_folding() {
+        let help = plugin_help(
+            "Plugin",
+            Some(vec![
+                effective_row("scroll.down", &[], "different context", "removed"),
+                effective_row("scroll.up", &[("k", KeySource::Default)], "页面", "up"),
+            ]),
+        );
+        assert_eq!(
+            help.rows,
+            vec![root::HelpRow {
+                keys: "k".into(),
+                what: "页面".into()
+            }]
+        );
+        let empty = plugin_help(
+            "Plugin",
+            Some(vec![
+                effective_row("scroll.down", &[], "page", "removed"),
+                effective_row("scroll.up", &[], "page", "removed"),
+            ]),
+        );
+        assert!(empty.declared);
+        assert!(empty.rows.is_empty());
+    }
+
+    #[test]
+    fn the_generic_action_list_parses_and_holds_13_unique_actions() {
+        let actions = generic_actions();
+        assert_eq!(actions.len(), 13);
+        assert_eq!(actions.iter().collect::<std::collections::HashSet<_>>().len(), 13);
     }
 
     #[test]

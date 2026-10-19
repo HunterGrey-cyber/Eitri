@@ -383,3 +383,20 @@ describe("OutboundMessage: open_url serialises exactly", () => {
     expect(JSON.stringify(message)).toBe('{"type":"open_url","request_id":"req-1","url":"https://example.com/a"}');
   });
 });
+
+/* `keymap_closed`'s exact wire string, field order included -- the core test
+   `keymap_closed_parses_with_both_return_keys_values` parses this same string. */
+describe("OutboundMessage: keymap_closed serialises exactly", () => {
+  it.each<[OutboundMessage, string]>([
+    [
+      { type: "keymap_closed", request_id: "req-1", opening: 7, return_keys: true },
+      '{"type":"keymap_closed","request_id":"req-1","opening":7,"return_keys":true}',
+    ],
+    [
+      { type: "keymap_closed", request_id: "req-2", opening: 7, return_keys: false },
+      '{"type":"keymap_closed","request_id":"req-2","opening":7,"return_keys":false}',
+    ],
+  ])("%o -> %s", (message, wire) => {
+    expect(JSON.stringify(message)).toBe(wire);
+  });
+});

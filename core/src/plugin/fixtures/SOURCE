@@ -1,2 +1,3 @@
 bfe837cbc286e3d999ffea200207f0a3316d1c5d  engine/web/src/eitri/fixtures (the page side's copy; change both in one session)
 rep-hello.json and rep-keys-declare.json were updated host-side and await synchronization with the page-side copy.
+ev-theme.json, and the theme, prefix and module_key members of rep-hello.json and ev-keys-config.json (keys_config carries prefix and module_key; hello carries all three), started on the host side and await their page-side mirror.

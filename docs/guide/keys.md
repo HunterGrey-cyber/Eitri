@@ -54,7 +54,7 @@ The keys marked "repeats" can be pressed again within half a second without the 
 |---|---|
 | `<prefix> f` | HINT: jump anywhere in the window (see [HINT](#hint)) |
 | `<prefix> r` | reload the agent panel; the session keeps running |
-| `<prefix> ?` | the full list of keys, in the panel |
+| `<prefix> ?` | the full list of keys, in the panel; closing it with `?`, `Esc`, `q` or a click outside gives the keys back to the module that had them, and puts back a zoom or a hidden chat that opening it changed |
 | `<prefix> :` | the panel's `:` command line (see [The command line](#the-command-line)) |
 | `<prefix> Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l` | send that chord itself to whatever has the keys; the bare chords below are Eitri's |
 

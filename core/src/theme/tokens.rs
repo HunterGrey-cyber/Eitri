@@ -42,6 +42,14 @@ pub const PROSE_FONT_STACK: &str =
     "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif";
 /// Neovide's embedded default face, which is what the editor draws with when `guifont` is empty.
 const MONO_FONT_FALLBACK: &str = "\"FiraCode Nerd Font\", monospace";
+/// Maximum Unicode scalar values in one font family.
+pub const FONT_FAMILY_MAX_CHARS: usize = 100;
+/// Maximum families in the complete font list, including the fallback.
+pub const FONT_LIST_MAX_FAMILIES: usize = 16;
+/// Maximum Unicode scalar values in the complete font list, including the fallback.
+pub const FONT_LIST_MAX_CHARS: usize = 1024;
+/// Maximum user families before the fallback's two families.
+pub const FONT_USER_MAX_FAMILIES: usize = 14;
 
 /// `(token suffix, Treesitter group, legacy group)`. The Treesitter group wins when both are set.
 const SYNTAX: [(&str, &str, &str); 12] = [
@@ -495,7 +503,8 @@ impl ThemeTokens {
         }
     }
 
-    pub fn css_vars(&self) -> Vec<(String, String)> {
+    /// Colours, font stacks and colour scheme a page beside the editor takes to look like it.
+    pub fn appearance_vars(&self) -> Vec<(String, String)> {
         let colours = [
             ("bg", self.bg),
             ("fg", self.fg),
@@ -547,9 +556,14 @@ impl ThemeTokens {
         );
         vars.push(("--nv-font-prose".to_string(), PROSE_FONT_STACK.to_string()));
         vars.push(("--nv-font-mono".to_string(), self.font_mono.clone()));
-        // `{}` on an `f32` prints `14`, not `14.0`, so the common case reads as it was typed.
-        vars.push(("--nv-font-size".to_string(), format!("{}px", self.font_size_px)));
         vars.push(("--nv-color-scheme".to_string(), self.color_scheme.to_string()));
+        vars
+    }
+
+    /// Sizes measured from this window, which a page with its own zoom must not take.
+    pub fn metric_vars(&self) -> Vec<(String, String)> {
+        // `{}` on an `f32` prints `14`, not `14.0`, so the common case reads as it was typed.
+        let mut vars = vec![("--nv-font-size".to_string(), format!("{}px", self.font_size_px))];
         if let Some(px) = self.editor_row_px {
             vars.push(("--nv-editor-row".to_string(), format!("{px}px")));
             if let Some(rows) = self.editor_cmd_rows {
@@ -558,28 +572,54 @@ impl ThemeTokens {
         }
         vars
     }
+
+    pub fn css_vars(&self) -> Vec<(String, String)> {
+        let mut vars = self.appearance_vars();
+        vars.extend(self.metric_vars());
+        vars
+    }
 }
 
 /// `guifont` as a CSS `font-family` list, parsed the way Neovide does (`font_options.rs`): options
 /// start at the first `:`, families are comma-separated, and `_` or `\ ` stand for a space.
 ///
-/// Characters that could end a CSS value or a quoted family (`" \ ; { } < >`) are dropped. The
-/// value reaches the WebView through `setProperty`, which already refuses to parse across a
-/// declaration, so this is defence in depth -- `guifont` is set by whatever runs inside nvim.
+/// Characters that could end a CSS value or quoted family, or open a CSS group or comment
+/// (`" \ ; { } < > ( ) [ ] / *`, C0, DEL and C1), are dropped. Family and list limits keep the
+/// list inside the page font rule by construction. The value reaches the WebView through
+/// `setProperty`, so this is defence in depth against whatever sets `guifont` inside nvim.
 pub(crate) fn mono_font_stack(guifont: &str) -> String {
     let families = guifont.split(':').next().unwrap_or("");
-    let mut stack: Vec<String> = families
-        .split(',')
-        .map(|f| f.replace("\\ ", " ").replace('_', " "))
-        .map(|f| {
-            f.chars()
-                .filter(|c| !matches!(c, '"' | '\\' | ';' | '{' | '}' | '<' | '>'))
-                .collect::<String>()
-        })
-        .map(|f| f.trim().to_string())
-        .filter(|f| !f.is_empty())
-        .map(|f| format!("\"{f}\""))
-        .collect();
+    let mut stack = Vec::new();
+    let mut user_chars = 0;
+    let fallback_chars = MONO_FONT_FALLBACK.chars().count();
+    for family in families.split(',') {
+        let family = family.replace("\\ ", " ").replace('_', " ");
+        let family: String = family
+            .chars()
+            .filter(|&c| {
+                !matches!(
+                    c,
+                    '"' | '\\' | ';' | '{' | '}' | '<' | '>' | '(' | ')' | '[' | ']' | '/' | '*'
+                ) && c >= ' '
+                    && !('\u{7f}'..='\u{9f}').contains(&c)
+            })
+            .collect();
+        let family: String = family.trim().chars().take(FONT_FAMILY_MAX_CHARS).collect();
+        let family = family.trim();
+        if family.is_empty() {
+            continue;
+        }
+        if stack.len() >= FONT_USER_MAX_FAMILIES {
+            break;
+        }
+        let quoted = format!("\"{family}\"");
+        let next_chars = user_chars + if stack.is_empty() { 0 } else { 2 } + quoted.chars().count();
+        if next_chars + 2 + fallback_chars > FONT_LIST_MAX_CHARS {
+            break;
+        }
+        user_chars = next_chars;
+        stack.push(quoted);
+    }
     stack.push(MONO_FONT_FALLBACK.to_string());
     stack.join(", ")
 }
@@ -1528,5 +1568,198 @@ mod tests {
             "chrome_muted must fall back to a pole too, got {}",
             t.chrome_muted.contrast(t.chrome)
         );
+    }
+
+    const FALLBACK_TAIL: &str = "\"FiraCode Nerd Font\", monospace";
+
+    #[test]
+    fn css_vars_are_the_appearance_vars_then_the_metric_vars() {
+        let mut t = ThemeTokens::fallback();
+        t.editor_row_px = Some(22.0);
+        t.editor_cmd_rows = Some(2);
+        let appearance = t.appearance_vars();
+        let metric = t.metric_vars();
+        let mut joined = appearance.clone();
+        joined.extend(metric.clone());
+        assert_eq!(t.css_vars(), joined);
+        let names: std::collections::HashSet<&str> = appearance.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(metric.iter().all(|(n, _)| !names.contains(n.as_str())));
+    }
+
+    #[test]
+    fn the_metric_vars_are_the_sizes_measured_from_the_window() {
+        let mut t = ThemeTokens::fallback();
+        t.editor_row_px = Some(22.0);
+        t.editor_cmd_rows = Some(2);
+        let names: Vec<String> = t.metric_vars().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["--nv-font-size", "--nv-editor-row", "--nv-editor-cmd-rows"]);
+        assert_eq!(
+            ThemeTokens::fallback()
+                .metric_vars()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            ["--nv-font-size"]
+        );
+    }
+
+    #[test]
+    fn the_appearance_vars_number_53_and_carry_no_size() {
+        let vars = ThemeTokens::fallback().appearance_vars();
+        assert_eq!(vars.len(), 53);
+        let names: std::collections::HashSet<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names.len(), 53, "no duplicate names");
+        for name in [
+            "--nv-bg",
+            "--nv-focus-ring",
+            "--nv-syn-tag",
+            "--nv-font-prose",
+            "--nv-font-mono",
+            "--nv-color-scheme",
+        ] {
+            assert!(names.contains(name), "{name}");
+        }
+        for name in ["--nv-font-size", "--nv-editor-row", "--nv-editor-cmd-rows"] {
+            assert!(!names.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn guifont_loses_every_character_that_could_open_a_css_group_or_comment() {
+        assert_eq!(
+            mono_font_stack("a(b)c[d]e/f*g\u{7}h\u{7f}i\u{85}j\u{9f}k:h12"),
+            "\"abcdefghijk\", \"FiraCode Nerd Font\", monospace"
+        );
+    }
+
+    #[test]
+    fn each_guifont_family_is_cut_to_100_characters() {
+        let long = "x".repeat(150);
+        assert_eq!(
+            mono_font_stack(&long),
+            format!("\"{}\", {FALLBACK_TAIL}", "x".repeat(100))
+        );
+        let wide = "\u{1D538}".repeat(101);
+        assert_eq!(
+            mono_font_stack(&wide),
+            format!("\"{}\", {FALLBACK_TAIL}", "\u{1D538}".repeat(100))
+        );
+    }
+
+    #[test]
+    fn at_most_14_guifont_families_are_kept() {
+        let many: Vec<String> = (0..20).map(|i| format!("f{i}")).collect();
+        let kept: Vec<String> = (0..14).map(|i| format!("\"f{i}\"")).collect();
+        assert_eq!(
+            mono_font_stack(&many.join(",")),
+            format!("{}, {FALLBACK_TAIL}", kept.join(", "))
+        );
+    }
+
+    #[test]
+    fn the_font_list_stops_growing_before_1024_characters() {
+        // Nine families of 100 fit (967 characters with the fallback); the tenth would pass 1024, and the
+        // short one after it is not tried.
+        let mut families: Vec<String> = (0..10u8)
+            .map(|i| format!("{}{}", char::from(b'a' + i), "x".repeat(99)))
+            .collect();
+        families.push("z".into());
+        let stack = mono_font_stack(&families.join(","));
+        assert!(stack.ends_with(FALLBACK_TAIL));
+        assert_eq!(stack.chars().count(), 967);
+        assert_eq!(stack.matches('"').count(), 2 * 9 + 2);
+        assert!(!stack.contains("\"z\""));
+    }
+
+    /// Long and hostile guifont values, from a fixed seed: every output is a list a page's font rule accepts.
+    #[test]
+    fn every_guifont_gives_a_font_list_inside_the_page_rule() {
+        const POOL: &[char] = &[
+            'a',
+            'Z',
+            '0',
+            ' ',
+            '_',
+            '-',
+            '.',
+            '@',
+            '\'',
+            '\u{e9}',
+            '\u{4e2d}',
+            '\u{1D538}',
+            '\u{2028}',
+            '\u{a0}',
+            '\u{5c}',
+            '"',
+            ';',
+            '{',
+            '}',
+            '<',
+            '>',
+            '(',
+            ')',
+            '[',
+            ']',
+            '/',
+            '*',
+            '\u{0}',
+            '\n',
+            '\t',
+            '\u{1f}',
+            '\u{7f}',
+            '\u{80}',
+            '\u{85}',
+            '\u{9f}',
+        ];
+        let refused = |c: char| {
+            matches!(
+                c,
+                '"' | '\u{5c}' | ';' | '{' | '}' | '<' | '>' | '(' | ')' | '[' | ']' | '/' | '*'
+            ) || c < ' '
+                || ('\u{7f}'..='\u{9f}').contains(&c)
+        };
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, bound: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % bound as u64) as usize
+            }
+        }
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..2000 {
+            let mut families = Vec::new();
+            for _ in 0..1 + rng.below(40) {
+                let mut family = String::new();
+                for _ in 0..1 + rng.below(150) {
+                    family.push(POOL[rng.below(POOL.len())]);
+                }
+                families.push(family);
+            }
+            let guifont = families.join(",");
+            let stack = mono_font_stack(&guifont);
+            assert!(stack.chars().count() <= FONT_LIST_MAX_CHARS, "{guifont:?}");
+            let user = stack
+                .strip_suffix(FALLBACK_TAIL)
+                .unwrap_or_else(|| panic!("no fallback: {guifont:?}"));
+            if user.is_empty() {
+                continue;
+            }
+            let user = user.strip_suffix(", ").unwrap_or_else(|| panic!("{stack:?}"));
+            let kept: Vec<&str> = user.split(", ").collect();
+            assert!(kept.len() <= FONT_USER_MAX_FAMILIES, "{guifont:?}");
+            for family in kept {
+                let inner = family
+                    .strip_prefix('"')
+                    .and_then(|f| f.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("unquoted {family:?}"));
+                assert!(
+                    (1..=FONT_FAMILY_MAX_CHARS).contains(&inner.chars().count()),
+                    "{family:?}"
+                );
+                assert!(!inner.chars().any(refused), "{family:?}");
+            }
+        }
     }
 }

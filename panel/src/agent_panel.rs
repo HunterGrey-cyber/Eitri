@@ -677,6 +677,10 @@ struct AgentPanelState {
     /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
     /// and `InboundMessage::PaneNav` can be refused.
     nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
+    /// Where a `keymap_closed` message goes (the opening it closes, and whether the overlay's own keys
+    /// closed it): `None` in a window that never gives the keys back (the companion window, `eitri-mac`),
+    /// where the message is accepted and does nothing.
+    keymap_closed_hook: Option<Rc<dyn Fn(u64, bool)>>,
     /// How many times this WebView's own web process has crashed recently, and whether
     /// automatic recovery has given up on it -- see `AgentPanelHandle::page_gone`.
     /// Re-armed by a manual recovery, never by the automatic path itself --
@@ -1714,10 +1718,15 @@ impl AgentPanelHandle {
     }
 
     /// `prefix ?`: open the `?` overlay, with the section of the plugin page that held the keys, if one did.
-    pub fn open_keymap(&self, plugin: Option<eitri_core::plugin::keys::PluginKeysHelp>) {
+    /// `opening` numbers this opening; the page quotes it back when the overlay closes, so a close that
+    /// arrives after a newer opening can be told apart.
+    pub fn open_keymap(&self, plugin: Option<eitri_core::plugin::keys::PluginKeysHelp>, opening: u64) {
         self.wake();
         self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js(plugin.as_ref()));
+        self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js(
+            plugin.as_ref(),
+            opening,
+        ));
     }
 
     /// `prefix :`: open the panel's `:` command line, which runs nothing.
@@ -1887,6 +1896,13 @@ impl AgentPanelHandle {
     pub fn on_nav_fallthrough(&self, hook: impl Fn(Direction) + 'static) {
         self.wake();
         self.state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(hook));
+    }
+
+    /// Where a `keymap_closed` message goes: the opening it closes, and whether the overlay's own keys (or a
+    /// click outside it) closed it. `main.rs` installs this once; without it the message does nothing.
+    pub fn on_keymap_closed(&self, hook: impl Fn(u64, bool) + 'static) {
+        self.wake();
+        self.state.borrow_mut().keymap_closed_hook = Some(Rc::new(hook));
     }
 }
 
@@ -2336,6 +2352,7 @@ fn panel_state(
         tab_verb_hook: None,
         nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
+        keymap_closed_hook: None,
         crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     }
 }
@@ -2402,6 +2419,7 @@ fn bare_state(
         tab_verb_hook: None,
         nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
+        keymap_closed_hook: None,
         crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
         tab_memory: TabWriter::new(None, PathBuf::new()),
         titles,
@@ -6245,6 +6263,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
         },
+        // The `?` overlay `prefix ?` opened was closed. With no hook (the companion window, `eitri-mac`) there is
+        // nothing to give back, and the message is accepted all the same.
+        InboundMessage::KeymapClosed {
+            opening, return_keys, ..
+        } => {
+            run_keymap_closed(state, opening, return_keys);
+            ok(page);
+        }
         // `gx` -- a web link out to the system browser. The page's own check
         // (`nav.ts#webUrl`) is not trusted with what reaches the launcher: `web_url` decides again, and a
         // refusal means a page/Rust mismatch or a page that should not be sending this, so it is logged
@@ -6497,6 +6523,15 @@ fn run_pane_nav(state: &Rc<RefCell<AgentPanelState>>, direction: PaneNavDirectio
         PaneNavDirection::Right => Direction::Right,
     });
     Ok(())
+}
+
+/// `keymap_closed`: the hook `main.rs` installs via `on_keymap_closed`, cloned out of the state first because
+/// what it does (moving the keys) re-enters the panel through `pane_focus`. With no hook it does nothing.
+fn run_keymap_closed(state: &Rc<RefCell<AgentPanelState>>, opening: u64, return_keys: bool) {
+    let hook = state.borrow().keymap_closed_hook.clone();
+    if let Some(hook) = hook {
+        hook(opening, return_keys);
+    }
 }
 
 /// The file `gf` opens for a path the page sent: relative paths are under the project root. A path
@@ -8277,7 +8312,7 @@ mod tests {
         handle.enter_input();
         handle.nav_key(NavKeyDirection::Down);
         handle.literal_key(&eitri_core::keymap::KeySpec::parse("C-b").unwrap());
-        handle.open_keymap(None);
+        handle.open_keymap(None, 0);
         handle.open_command_line();
         handle.set_keymap_help("{}".to_string());
         assert!(state.borrow().pane_focused);
@@ -8505,6 +8540,74 @@ mod tests {
                 "{wire:?}: the hook is called once per message"
             );
         }
+    }
+
+    /// `keymap_closed` reaches the installed hook with the opening and the `return_keys` the page sent, once
+    /// per message, and holds no borrow of the state while the hook runs (the hook moves the keys, which
+    /// re-enters the panel).
+    #[test]
+    fn a_keymap_closed_reaches_the_hook_with_its_opening_and_return_keys() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        let seen: Rc<RefCell<Vec<(u64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let reentrant = Rc::downgrade(&state);
+        {
+            let seen = seen.clone();
+            state.borrow_mut().keymap_closed_hook = Some(Rc::new(move |opening, return_keys| {
+                let state = reentrant.upgrade().expect("the state outlives the call");
+                state.borrow_mut().pane_focused = true;
+                seen.borrow_mut().push((opening, return_keys));
+            }));
+        }
+        run_keymap_closed(&state, 7, true);
+        run_keymap_closed(&state, 8, false);
+        assert_eq!(*seen.borrow(), vec![(7, true), (8, false)]);
+        assert!(state.borrow().pane_focused);
+    }
+
+    /// The companion window and `eitri-mac` install no hook: the message is accepted and nothing happens.
+    #[test]
+    fn a_keymap_closed_without_a_hook_does_nothing() {
+        let state = state_for_hooks(TabSet::new(
+            BackendKind::Sidecar,
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
+        ));
+        assert!(state.borrow().keymap_closed_hook.is_none());
+        run_keymap_closed(&state, 3, true);
+        assert!(!state.borrow().pane_focused);
+    }
+
+    /// A raw `keymap_closed` through the inbound dispatch is answered with an ok `command_result` for its
+    /// request (never an error toast) with or without a hook, and the hook gets the opening and
+    /// `return_keys` the message carried.
+    #[test]
+    fn a_raw_keymap_closed_is_answered_ok_with_or_without_a_hook() {
+        let (handle, page, _host) = handle_with_recording_page();
+        let seen: Rc<RefCell<Vec<(u64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let result = |request: &str| -> Option<(bool, String)> {
+            page.sent.borrow().iter().find_map(|envelope| {
+                let v: serde_json::Value = serde_json::from_str(envelope).unwrap();
+                (v["kind"] == "command_result" && v["requestId"] == request)
+                    .then(|| (v["ok"] == true, v["error"].as_str().unwrap_or("").to_string()))
+            })
+        };
+
+        handle.page_message(r#"{"type":"keymap_closed","request_id":"k1","opening":4,"return_keys":true}"#);
+        assert_eq!(result("k1"), Some((true, String::new())), "no hook: accepted, no error");
+
+        {
+            let seen = seen.clone();
+            handle.on_keymap_closed(move |opening, return_keys| seen.borrow_mut().push((opening, return_keys)));
+        }
+        handle.page_message(r#"{"type":"keymap_closed","request_id":"k2","opening":5,"return_keys":false}"#);
+        assert_eq!(result("k2"), Some((true, String::new())), "a hook: accepted, no error");
+        assert_eq!(
+            *seen.borrow(),
+            vec![(5, false)],
+            "only the message sent with a hook reaches it"
+        );
     }
 
     /// The hook `main.rs` installs goes back through the panel's state (`move_focus` reads and writes

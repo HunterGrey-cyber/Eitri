@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=0fccd4e80c3960de22e480f0ca520755858e4e1e6a8e1f7adce31439f1f29ba8 -->
+<!-- translated-from: keys.md sha256=5521a41222e998b6c45a889a0185c9a514f7c54cf9fecad57cb5d43cf15e2f8a -->
 
 # 按键
 
@@ -49,7 +49,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 |---|---|
 | `<prefix> f` | HINT：跳到窗口里的任何地方（见 [HINT](#hint)） |
 | `<prefix> r` | 重新加载 agent 面板；会话继续运行 |
-| `<prefix> ?` | 完整的按键列表，显示在面板里 |
+| `<prefix> ?` | 完整的按键列表，显示在面板里；用 `?`、`Esc`、`q` 或点击面板外关闭它，会把按键还给原来拿着它们的模块，并恢复因打开它而改变的缩放或被隐藏的聊天面板 |
 | `<prefix> :` | 面板的 `:` 命令行（见[命令行](#the-command-line)） |
 | `<prefix> Ctrl+h`、`Ctrl+j`、`Ctrl+k`、`Ctrl+l` | 把那个组合键本身发给当前拿着按键的东西；下面不带前缀的那几个组合键是 Eitri 的 |
 

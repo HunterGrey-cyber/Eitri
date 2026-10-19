@@ -7787,7 +7787,7 @@ describe("App: the ? keymap overlay", () => {
   it("says the page declared no keys when shell sends an empty plugin section", () => {
     const { container } = started();
     act(() => dispatch({ kind: "open_keymap", plugin: { title: "Snotra", declared: false, rows: [] } }));
-    expect(overlay(container)!.textContent).toContain("此插件未登记按键");
+    expect(overlay(container)!.textContent).toContain("This plugin has not declared its keys");
   });
 
   it("does not call a page undeclared when shell says it declared and kept no key", () => {
@@ -7795,7 +7795,7 @@ describe("App: the ? keymap overlay", () => {
     act(() => dispatch({ kind: "open_keymap", plugin: { title: "Snotra", declared: true, rows: [] } }));
     const titles = Array.from(overlay(container)!.querySelectorAll("h2")).map((h) => h.textContent);
     expect(titles[0]).toBe("Snotra");
-    expect(overlay(container)!.textContent).not.toContain("此插件未登记按键");
+    expect(overlay(container)!.textContent).not.toContain("This plugin has not declared its keys");
   });
 
   it("opens on shell's open_keymap, in BROWSE, even from INPUT", () => {

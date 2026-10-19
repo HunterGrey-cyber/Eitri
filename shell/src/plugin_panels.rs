@@ -16,6 +16,8 @@ use eitri_core::plugin::page_policy;
 use eitri_core::plugin::protocol::FocusTarget;
 use eitri_core::plugin::state::PluginStore;
 use eitri_core::plugin::tasks::{RunsWaiter, GRACE};
+use eitri_core::plugin::theme::PageTheme;
+use eitri_core::theme::ThemeTokens;
 use eitri_panel::panel_wake::PanelWake;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -115,8 +117,9 @@ pub(crate) struct PluginPanels {
 
 impl PluginPanels {
     /// Registers every loaded plugin as a Lua panel entry, each host checking its page's keys against the
-    /// window's prefix and applying the user's `plugin:<id>` overrides. `Err` is a startup failure's text.
-    pub(crate) fn install(engine: &LuaEngine, keymap: &Keymap) -> Result<PluginPanels, String> {
+    /// window's prefix and applying the user's `plugin:<id>` overrides, and each page starting in `theme`.
+    /// `Err` is a startup failure's text.
+    pub(crate) fn install(engine: &LuaEngine, keymap: &Keymap, theme: &PageTheme) -> Result<PluginPanels, String> {
         let loaded: Vec<_> = engine
             .plugins
             .borrow()
@@ -164,6 +167,14 @@ impl PluginPanels {
                                 }
                             })
                         },
+                        on_committed: {
+                            let cell = cell.clone();
+                            Rc::new(move || {
+                                if let Some(pump) = cell.get() {
+                                    pump.host.page_committed();
+                                }
+                            })
+                        },
                         open_outside: Rc::new(plugin_page::open_outside),
                     };
                     let spec = PageSpec {
@@ -173,12 +184,15 @@ impl PluginPanels {
                         origins: plugin.manifest.origins.clone(),
                         downloads: downloads_dir(),
                     };
-                    let webview = plugin_page::build(&spec, hooks);
+                    let webview = plugin_page::build(&spec, hooks, theme);
                     let page = Rc::new(WebKitPluginPage(webview.downgrade()));
                     let store = store_root.clone().map(|root| PluginStore::new(root, &id));
                     let overrides = keymap.plugin_user(&id).to_vec();
                     let host = Rc::new(PluginHost::new(plugin.clone(), page, wake.waker(), store, overrides));
                     host.set_prefix_key(keymap.prefix());
+                    // The view already wears `theme`; the host records it so it sends nothing for the same set.
+                    host.set_theme(theme);
+                    host.set_module_key(key.as_deref());
                     let pump = Pump::start(host, wake);
                     let _ = cell.set(pump.clone());
                     let guard = install_crash_recovery(
@@ -235,6 +249,15 @@ impl PluginPanels {
     pub(crate) fn set_has_keys(&self, module: &ModuleId, has_keys: bool) {
         if let Some((_, pump)) = self.hosts().find(|(m, _)| *m == module) {
             pump.host.set_has_keys(has_keys);
+        }
+    }
+
+    /// Every page follows the window's colorscheme. A change that leaves the page's set as it was (a size
+    /// alone, say) sends nothing.
+    pub(crate) fn set_theme(&self, tokens: &ThemeTokens) {
+        let theme = PageTheme::from_tokens(tokens);
+        for (_, pump) in self.hosts() {
+            pump.host.set_theme(&theme);
         }
     }
 
@@ -303,5 +326,78 @@ mod tests {
         layout.focus(FocusTarget::Editor).unwrap();
         layout.focus(FocusTarget::Page).unwrap();
         assert_eq!(*asked.borrow(), [ModuleId::editor(), ModuleId::lua("demo")]);
+    }
+
+    /// What a host did to its page: `set_theme` for the port, or the name of an event it sent.
+    #[derive(Default)]
+    struct Recorded(RefCell<Vec<String>>);
+
+    impl eitri_core::plugin::host::PagePort for Recorded {
+        fn send(&self, message: &str) {
+            let value: serde_json::Value = serde_json::from_str(message).expect("the host sends JSON");
+            let event = value["event"].as_str().unwrap_or("(not an event)").to_owned();
+            self.0.borrow_mut().push(event);
+        }
+
+        fn set_theme(&self, _theme: &PageTheme) {
+            self.0.borrow_mut().push("set_theme".to_owned());
+        }
+    }
+
+    #[test]
+    fn set_theme_reaches_every_host() {
+        use eitri_core::plugin::load::load_plugin;
+        use eitri_core::plugin::test_support::{demo_plugin, Scratch};
+        use eitri_core::theme::payload::{HlAttrs, NvimOptions, NvimThemePayload, PAYLOAD_VERSION};
+
+        let scratch = Scratch::new("panels-theme");
+        let mut panels = Vec::new();
+        let mut pages = Vec::new();
+        for name in ["one", "two"] {
+            let (dir, settings) = demo_plugin(&scratch.0.join(name));
+            let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
+            let page = Rc::new(Recorded::default());
+            let host = Rc::new(PluginHost::new(
+                plugin,
+                page.clone(),
+                std::sync::Arc::new(|| {}),
+                None,
+                Vec::new(),
+            ));
+            // Built directly, not through `Pump::start`: no wake is watched, so nothing runs on a main loop.
+            let pump = Rc::new_cyclic(|me| Pump {
+                host,
+                wake: PanelWake::new().unwrap(),
+                timer: RefCell::new(None),
+                me: me.clone(),
+            });
+            panels.push((ModuleId::lua(name), Some(pump)));
+            pages.push(page);
+        }
+        let plugin_panels = PluginPanels { panels };
+        // A light set: the hosts start from the dark fallback, which would send nothing.
+        let light = NvimThemePayload {
+            v: PAYLOAD_VERSION,
+            groups: [(
+                "Normal".to_owned(),
+                HlAttrs {
+                    fg: Some(0x575279),
+                    bg: Some(0xfaf4ed),
+                    reverse: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            options: NvimOptions {
+                background: "light".to_owned(),
+                guifont: String::new(),
+                colors_name: "dawn".to_owned(),
+                cmdheight: None,
+            },
+        };
+        plugin_panels.set_theme(&ThemeTokens::derive(&light));
+        for page in &pages {
+            assert_eq!(*page.0.borrow(), ["set_theme", "theme"]);
+        }
     }
 }

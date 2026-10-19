@@ -19,10 +19,46 @@ fn main_rs() -> String {
 fn plugins_are_installed_before_the_lua_panels_are_read() {
     let code = main_rs();
     let install = code
-        .find("plugin_panels::PluginPanels::install(&lua_engine,&keymap)")
+        .find("plugin_panels::PluginPanels::install(&lua_engine,&keymap,&PageTheme::fallback())")
         .expect("installed");
     let panels = code.find("letlua_panels:").expect("the Lua panels are read");
     assert!(install < panels);
+}
+
+#[test]
+fn the_theme_listener_feeds_every_plugin_page() {
+    let code = main_rs();
+    let at = code.find("feed_pump.listen_theme(feed,").expect("the theme listener");
+    let body = scan::braced(&code, at + code[at..].find('{').unwrap());
+    let terminal = body
+        .find("terminal.set_colors(")
+        .expect("the terminal follows the theme");
+    // The freshly derived tokens: the page set carries no size, so a size-only change sends the page nothing.
+    let pages = body
+        .find("plugin_panels.set_theme(&tokens);")
+        .expect("every plugin page follows the theme");
+    assert!(terminal < pages);
+}
+
+#[test]
+fn a_committed_document_gets_the_theme_and_a_host_its_module_key() {
+    let source = scan::read_required("shell/src/plugin_panels.rs");
+    let code = scan::code_only(&source.text);
+    let code: String = scan::without(&code, &scan::modules(&code, "tests"))
+        .split_whitespace()
+        .collect();
+    let at = code.find("on_committed:").expect("the commit hook");
+    let hook = scan::braced(&code, at + code[at..].find('{').unwrap());
+    assert!(hook.contains("pump.host.page_committed()"), "{hook}");
+    let new = code.find("PluginHost::new(").expect("the host is made");
+    assert!(
+        code[new..].contains("host.set_theme(theme);"),
+        "the host starts with the window's theme"
+    );
+    assert!(
+        code[new..].contains("host.set_module_key(key.as_deref());"),
+        "the host knows its module key"
+    );
 }
 
 #[test]
@@ -72,9 +108,59 @@ fn prefix_question_mark_reads_the_plugin_before_the_chat_takes_the_keys() {
         .find("focus_module(&chat);")
         .expect("the chat takes the keys");
     let open = code[arm..]
-        .find("agent.open_keymap(plugin);")
+        .find("agent.open_keymap(plugin,opening);")
         .expect("opened with the section");
     assert!(read < focus && focus < open);
+}
+
+#[test]
+fn prefix_question_mark_keeps_what_it_opened_from() {
+    let code = main_rs();
+    let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
+    let body = &code[arm..];
+    let show = body.find("show_on_screen(&chat)").expect("the chat is put on screen");
+    let kept = body
+        .find("keys_return.borrow_mut().opened(")
+        .expect("what it opened from is kept");
+    let focus = body.find("focus_module(&chat);").expect("the chat takes the keys");
+    assert!(
+        show < kept && kept < focus,
+        "kept only after the chat is on screen, before it takes the keys"
+    );
+
+    // Reported only for a move the layout accepted: inside the `Ok(())` arm of `layout.set_focus`.
+    let install = code.find("pane_focus::install(").expect("the focus tracker");
+    let accept = "layout.set_focus(id){Ok(())=>";
+    let accepted = code[install..].find(accept).expect("the layout's accepted-move arm") + install;
+    let arm = scan::braced(&code, accepted + accept.len());
+    assert!(
+        arm.contains("keys_return.borrow_mut().focus_moved("),
+        "a focus move is reported from the arm that the layout accepted"
+    );
+    assert_eq!(
+        code.matches("keys_return.borrow_mut().focus_moved(").count(),
+        1,
+        "and nowhere else, so a refused move is not reported"
+    );
+
+    // The close hook's own body asks what to give back.
+    let hook = code
+        .find("agent_panel_handle.on_keymap_closed({")
+        .expect("the close hook is installed");
+    let hook_body = scan::braced(&code, hook + "agent_panel_handle.on_keymap_closed(".len());
+    assert!(
+        hook_body.contains("keys_return.borrow_mut().closed("),
+        "the hook asks KeysReturn what to give back"
+    );
+
+    // A command line opened after the sheet forgets it, before the chat takes the keys.
+    let line = code.find("Action::PanelCommandLine=>{").expect("the prefix : arm");
+    let line_body = scan::braced(&code, line + "Action::PanelCommandLine=>".len());
+    let forget = line_body
+        .find("keys_return.borrow_mut().superseded();")
+        .expect("the newer request forgets the sheet's pending return");
+    let take = line_body.find("focus_module(&chat);").expect("the chat takes the keys");
+    assert!(forget < take);
 }
 
 #[test]

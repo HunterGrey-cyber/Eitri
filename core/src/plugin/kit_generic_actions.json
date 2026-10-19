@@ -1,0 +1,17 @@
+{
+  "actions": [
+    "scroll.down",
+    "scroll.up",
+    "scroll.half_down",
+    "scroll.half_up",
+    "scroll.top",
+    "scroll.bottom",
+    "history.back",
+    "history.forward",
+    "link.prev",
+    "link.next",
+    "hint.start",
+    "sheet.open",
+    "mode.escape"
+  ]
+}

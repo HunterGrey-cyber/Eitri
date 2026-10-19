@@ -1,13 +1,7 @@
 {
-  "v": 1,
-  "re": 16,
   "ok": true,
+  "re": 16,
   "result": {
-    "host": "eitri",
-    "version": "0.1.0",
-    "protocol": 1,
-    "keys_kit": 1,
-    "timeoutlen": 1000,
     "capabilities": [
       "tasks",
       "editor.open",
@@ -16,23 +10,88 @@
       "state",
       "net"
     ],
+    "host": "eitri",
+    "keys_kit": 1,
+    "module_key": null,
+    "prefix": "Ctrl+b",
+    "protocol": 1,
     "roots": {
-      "work": "/w/work",
-      "plugin": "/w/plugin"
+      "plugin": "/w/plugin",
+      "work": "/w/work"
     },
     "runs": [
       {
         "run": 3,
+        "tail": [
+          "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+          "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+        ],
         "task": "watch",
         "vars": {
           "course": "rust",
           "exercise": "ch04-02-fix-total-len"
-        },
-        "tail": [
-          "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
-          "{\"type\":\"check_started\",\"course\":\"rust\",\"exercise\":\"ch04-02-fix-total-len\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
-        ]
+        }
       }
-    ]
-  }
+    ],
+    "theme": {
+      "vars": {
+        "--nv-bg": "#14161b",
+        "--nv-border": "#33353a",
+        "--nv-chrome": "#1c1e23",
+        "--nv-chrome-accent": "#e0e2ea",
+        "--nv-chrome-fg": "#e0e2ea",
+        "--nv-chrome-muted": "#83858c",
+        "--nv-color-scheme": "dark",
+        "--nv-cursor-band": "#1c1e23",
+        "--nv-cursor-band-inactive": "#181a1f",
+        "--nv-cursorline": "#26282d",
+        "--nv-error": "#d4383a",
+        "--nv-error-tint": "#25191e",
+        "--nv-error-tint-fg": "#e0e2ea",
+        "--nv-error-tint-muted": "#8e9098",
+        "--nv-fg": "#e0e2ea",
+        "--nv-focus-ring": "#e0e2ea",
+        "--nv-font-mono": "\"FiraCode Nerd Font\", monospace",
+        "--nv-font-prose": "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif",
+        "--nv-hint-bg": "#e0e2ea",
+        "--nv-hint-fg": "#14161b",
+        "--nv-mode-browse": "#e0e2ea",
+        "--nv-mode-input": "#e0e2ea",
+        "--nv-muted": "#8e9098",
+        "--nv-ok": "#3a8a3a",
+        "--nv-search": "#e0e2ea",
+        "--nv-status-insert-bg": "#26282d",
+        "--nv-status-insert-fg": "#e0e2ea",
+        "--nv-status-normal-bg": "#26282d",
+        "--nv-status-normal-fg": "#e0e2ea",
+        "--nv-status-visual-bg": "#26282d",
+        "--nv-status-visual-fg": "#e0e2ea",
+        "--nv-surface": "#1c1e23",
+        "--nv-surface-fg": "#e0e2ea",
+        "--nv-surface-muted": "#83858c",
+        "--nv-syn-comment": "#e0e2ea",
+        "--nv-syn-constant": "#e0e2ea",
+        "--nv-syn-function": "#e0e2ea",
+        "--nv-syn-keyword": "#e0e2ea",
+        "--nv-syn-number": "#e0e2ea",
+        "--nv-syn-operator": "#e0e2ea",
+        "--nv-syn-property": "#e0e2ea",
+        "--nv-syn-punctuation": "#e0e2ea",
+        "--nv-syn-string": "#e0e2ea",
+        "--nv-syn-tag": "#e0e2ea",
+        "--nv-syn-type": "#e0e2ea",
+        "--nv-syn-variable": "#e0e2ea",
+        "--nv-tint": "#222429",
+        "--nv-tint-fg": "#e0e2ea",
+        "--nv-tint-muted": "#8e9098",
+        "--nv-warn": "#d19a00",
+        "--nv-warn-tint": "#1f1e19",
+        "--nv-warn-tint-fg": "#e0e2ea",
+        "--nv-warn-tint-muted": "#8e9098"
+      }
+    },
+    "timeoutlen": 1000,
+    "version": "0.1.0"
+  },
+  "v": 1
 }

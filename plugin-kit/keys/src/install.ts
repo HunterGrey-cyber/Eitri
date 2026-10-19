@@ -2,13 +2,13 @@ import { effectiveRows, hasKeys, pluginBridge, timeoutOf } from "./bridge";
 import { blockedEvent, shouldSkip, textField } from "./events";
 import { installHeldSuperTracking, reset as resetSuper, superHeld } from "./held-super";
 import { activate, startHints } from "./hints";
-import { setDimmed, showMessage, showMode } from "./hud";
+import { forgetStatus, setDimmed, setModeWords, showMessage, showMode, showStatus } from "./hud";
 import { canonicalOf, strokeOf } from "./notation";
 import { createResolver } from "./resolver";
-import { GENERIC_ROWS, type Row } from "./rows";
+import { genericRows, isGenericAction, type Row } from "./rows";
 import { runScroll } from "./scroll";
 import { closeSheet, openSheet, sheetIsOpen } from "./sheet";
-import type { InstallOptions } from "./index";
+import type { InstallOptions, KitLabels } from "./index";
 
 export type { HintTarget, InstallOptions } from "./index";
 
@@ -16,6 +16,11 @@ let current: Element | null = null;
 let pageHasKeys = true;
 let removeInstallation: (() => void) | undefined;
 let generation = 0;
+let installedRows: Row[] | null = null;
+
+export function keysOf(action: string): string[] {
+  return [...(installedRows?.find((row) => row.action === action)?.keys ?? [])];
+}
 
 const MODIFIER_KEYS = new Set([
   "Shift", "Control", "Alt", "AltGraph", "Meta", "Super", "Hyper", "CapsLock", "NumLock", "ScrollLock", "Fn", "OS",
@@ -30,11 +35,11 @@ export function setCurrent(el: Element | null): void {
 
 /** The generic rows, then the page's. A page row replaces the generic row of its action in place, and a key a page
  * row holds is taken from the other generic rows (a row left without keys is dropped), so no key names two actions. */
-export function mergeRows(page: Row[]): Row[] {
+export function mergeRows(page: Row[], labels?: KitLabels): Row[] {
   const spelled = (key: string) => canonicalOf(key) ?? key;
   const taken = new Set(page.flatMap((row) => row.keys.map(spelled)));
   const own = new Set(page.map((row) => row.action));
-  const declared = new Map(GENERIC_ROWS.map((row) => [row.action, row]));
+  const declared = new Map(genericRows(labels).map((row) => [row.action, row]));
   for (const row of page) declared.set(row.action, row);
   return [...declared.values()].flatMap((row) => {
     if (own.has(row.action)) return [row];
@@ -46,6 +51,7 @@ export function mergeRows(page: Row[]): Row[] {
 
 export async function install(opts: InstallOptions): Promise<() => void> {
   removeInstallation?.();
+  installedRows = null;
   const ticket = ++generation;
   const bridge = pluginBridge();
   const updates: Array<() => void> = [];
@@ -72,7 +78,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   }));
   let rows: ReturnType<typeof effectiveRows>;
   try {
-    rows = effectiveRows(await bridge.call("keys.declare", { rows: mergeRows(opts.rows) }));
+    rows = effectiveRows(await bridge.call("keys.declare", { rows: mergeRows(opts.rows, opts.labels) }));
   } catch (error) {
     focus();
     config();
@@ -83,6 +89,8 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     config();
     return () => {};
   }
+
+  installedRows = rows;
 
   let timeoutlen = opts.initial?.timeoutlen ?? 1000;
   pageHasKeys = opts.initial?.hasKeys ?? true;
@@ -193,7 +201,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   const perform = (action: string, ev: KeyboardEvent): boolean => {
     let handled: boolean;
     switch (action) {
-      case "sheet.open": openSheet(rows); handled = true; break;
+      case "sheet.open": openSheet(rows, opts.labels); handled = true; break;
       case "mode.escape": handled = true; break;
       case "hint.start": {
         clearPrefix();
@@ -206,11 +214,13 @@ export async function install(opts: InstallOptions): Promise<() => void> {
         break;
       }
       default:
-        handled = GENERIC_ROWS.some((row) => row.action === action) ? runScroll(action) : opts.run(action, ev);
+        handled = isGenericAction(action) ? runScroll(action) : opts.run(action, ev);
     }
     return handled;
   };
   window.addEventListener("keydown", onKey);
+  setModeWords(opts.labels?.modes);
+  showStatus("");
   showMessage("");
   setDimmed(!pageHasKeys);
   current?.classList.toggle("eitri-keys-dimmed", !pageHasKeys);
@@ -233,6 +243,9 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     config();
     closeSheet();
     setCurrent(null);
+    installedRows = null;
+    forgetStatus();
+    setModeWords(undefined);
     document.getElementById("eitri-keys-hud")?.remove();
     if (removeInstallation === remove) removeInstallation = undefined;
   };

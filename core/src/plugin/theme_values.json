@@ -1,0 +1,444 @@
+{
+  "accepted": [
+    {
+      "id": "colour",
+      "name": "--nv-bg",
+      "value": "#14161b"
+    },
+    {
+      "id": "syntax-colour",
+      "name": "--nv-syn-keyword",
+      "value": "#a0b1c2"
+    },
+    {
+      "id": "shortest-name",
+      "name": "--nv-a",
+      "value": "#000000"
+    },
+    {
+      "id": "name-64",
+      "name": "--nv-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "value": "#000000"
+    },
+    {
+      "id": "scheme-light",
+      "name": "--nv-color-scheme",
+      "value": "light"
+    },
+    {
+      "id": "scheme-dark",
+      "name": "--nv-color-scheme",
+      "value": "dark"
+    },
+    {
+      "id": "prose-stack",
+      "name": "--nv-font-prose",
+      "value": "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif"
+    },
+    {
+      "id": "mono-fallback",
+      "name": "--nv-font-mono",
+      "value": "\"FiraCode Nerd Font\", monospace"
+    },
+    {
+      "id": "no-space-after-comma",
+      "name": "--nv-font-mono",
+      "value": "\"Maple Mono NF CN\",\"FiraCode Nerd Font\",monospace"
+    },
+    {
+      "id": "at-sign-quoted",
+      "name": "--nv-font-mono",
+      "value": "\"@font\""
+    },
+    {
+      "id": "comma-quoted",
+      "name": "--nv-font-mono",
+      "value": "\"a,b\""
+    },
+    {
+      "id": "nbsp-quoted",
+      "name": "--nv-font-mono",
+      "value": "\"a b\""
+    },
+    {
+      "id": "bare-40",
+      "name": "--nv-font-mono",
+      "value": "Abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "id": "families-16",
+      "name": "--nv-font-mono",
+      "value": "a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a"
+    },
+    {
+      "id": "family-100",
+      "name": "--nv-font-mono",
+      "value": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+    },
+    {
+      "id": "family-100-non-bmp",
+      "name": "--nv-font-mono",
+      "value": "\"𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸\""
+    },
+    {
+      "id": "list-1024",
+      "name": "--nv-font-mono",
+      "value": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+    },
+    {
+      "id": "other-font-name",
+      "name": "--nv-font-other",
+      "value": "serif"
+    }
+  ],
+  "refused": [
+    {
+      "id": "name-upper",
+      "name": "--nv-BG",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-empty-tail",
+      "name": "--nv-",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-trailing-dash",
+      "name": "--nv-bg-",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-double-dash",
+      "name": "--nv--bg",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-other-prefix",
+      "name": "--other",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-no-dashes",
+      "name": "nv-bg",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-semicolon",
+      "name": "--nv-bg;",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-space",
+      "name": "--nv-b g",
+      "value": "#14161b",
+      "why": "name"
+    },
+    {
+      "id": "name-65",
+      "name": "--nv-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "value": "#000000",
+      "why": "name over 64"
+    },
+    {
+      "id": "name-non-ascii",
+      "name": "--nv-é",
+      "value": "#000000",
+      "why": "name"
+    },
+    {
+      "id": "colour-upper",
+      "name": "--nv-bg",
+      "value": "#14161B",
+      "why": "colour"
+    },
+    {
+      "id": "colour-short",
+      "name": "--nv-bg",
+      "value": "#14161",
+      "why": "colour"
+    },
+    {
+      "id": "colour-long",
+      "name": "--nv-bg",
+      "value": "#14161bb",
+      "why": "colour"
+    },
+    {
+      "id": "colour-word",
+      "name": "--nv-bg",
+      "value": "red",
+      "why": "colour"
+    },
+    {
+      "id": "colour-breakout",
+      "name": "--nv-bg",
+      "value": "#14161b;color:red",
+      "why": "colour"
+    },
+    {
+      "id": "colour-empty",
+      "name": "--nv-bg",
+      "value": "",
+      "why": "colour"
+    },
+    {
+      "id": "colour-leading-space",
+      "name": "--nv-bg",
+      "value": " #14161b",
+      "why": "colour"
+    },
+    {
+      "id": "scheme-capital",
+      "name": "--nv-color-scheme",
+      "value": "Light",
+      "why": "scheme"
+    },
+    {
+      "id": "scheme-space",
+      "name": "--nv-color-scheme",
+      "value": "light ",
+      "why": "scheme"
+    },
+    {
+      "id": "scheme-auto",
+      "name": "--nv-color-scheme",
+      "value": "auto",
+      "why": "scheme"
+    },
+    {
+      "id": "scheme-colour",
+      "name": "--nv-color-scheme",
+      "value": "#14161b",
+      "why": "scheme"
+    },
+    {
+      "id": "font-empty",
+      "name": "--nv-font-mono",
+      "value": "",
+      "why": "font"
+    },
+    {
+      "id": "font-empty-quoted",
+      "name": "--nv-font-mono",
+      "value": "\"\"",
+      "why": "font"
+    },
+    {
+      "id": "font-unclosed",
+      "name": "--nv-font-mono",
+      "value": "\"a",
+      "why": "font"
+    },
+    {
+      "id": "font-stray-quote",
+      "name": "--nv-font-mono",
+      "value": "a\"",
+      "why": "font"
+    },
+    {
+      "id": "quoted-semicolon",
+      "name": "--nv-font-mono",
+      "value": "\"a;b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-open-brace",
+      "name": "--nv-font-mono",
+      "value": "\"a{b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-close-brace",
+      "name": "--nv-font-mono",
+      "value": "\"a}b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-lt",
+      "name": "--nv-font-mono",
+      "value": "\"a<b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-gt",
+      "name": "--nv-font-mono",
+      "value": "\"a>b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-open-paren",
+      "name": "--nv-font-mono",
+      "value": "\"a(b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-close-paren",
+      "name": "--nv-font-mono",
+      "value": "\"a)b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-open-bracket",
+      "name": "--nv-font-mono",
+      "value": "\"a[b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-close-bracket",
+      "name": "--nv-font-mono",
+      "value": "\"a]b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-slash",
+      "name": "--nv-font-mono",
+      "value": "\"a/b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-star",
+      "name": "--nv-font-mono",
+      "value": "\"a*b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-backslash",
+      "name": "--nv-font-mono",
+      "value": "\"a\\b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-nul",
+      "name": "--nv-font-mono",
+      "value": "\"a\u0000b\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-newline",
+      "name": "--nv-font-mono",
+      "value": "\"a\nb\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-unit-separator",
+      "name": "--nv-font-mono",
+      "value": "\"a\u001fb\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-del",
+      "name": "--nv-font-mono",
+      "value": "\"ab\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-c1-nel",
+      "name": "--nv-font-mono",
+      "value": "\"ab\"",
+      "why": "refused character"
+    },
+    {
+      "id": "quoted-c1-last",
+      "name": "--nv-font-mono",
+      "value": "\"ab\"",
+      "why": "refused character"
+    },
+    {
+      "id": "family-101",
+      "name": "--nv-font-mono",
+      "value": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "why": "family over 100"
+    },
+    {
+      "id": "family-101-non-bmp",
+      "name": "--nv-font-mono",
+      "value": "\"𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸𝔸\"",
+      "why": "family over 100"
+    },
+    {
+      "id": "families-17",
+      "name": "--nv-font-mono",
+      "value": "a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a",
+      "why": "over 16 families"
+    },
+    {
+      "id": "list-1025",
+      "name": "--nv-font-mono",
+      "value": "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+      "why": "list over 1024"
+    },
+    {
+      "id": "bare-digit-first",
+      "name": "--nv-font-mono",
+      "value": "1abc",
+      "why": "bare"
+    },
+    {
+      "id": "bare-space",
+      "name": "--nv-font-mono",
+      "value": "Fira Code",
+      "why": "bare"
+    },
+    {
+      "id": "bare-41",
+      "name": "--nv-font-mono",
+      "value": "Abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "why": "bare over 40"
+    },
+    {
+      "id": "bare-dash-first",
+      "name": "--nv-font-mono",
+      "value": "-abc",
+      "why": "bare"
+    },
+    {
+      "id": "bare-underscore",
+      "name": "--nv-font-mono",
+      "value": "a_b",
+      "why": "bare"
+    },
+    {
+      "id": "two-spaces",
+      "name": "--nv-font-mono",
+      "value": "a,  b",
+      "why": "separator"
+    },
+    {
+      "id": "space-before-comma",
+      "name": "--nv-font-mono",
+      "value": "a ,b",
+      "why": "separator"
+    },
+    {
+      "id": "leading-space",
+      "name": "--nv-font-mono",
+      "value": " a",
+      "why": "separator"
+    },
+    {
+      "id": "trailing-comma",
+      "name": "--nv-font-mono",
+      "value": "a,",
+      "why": "separator"
+    },
+    {
+      "id": "leading-comma",
+      "name": "--nv-font-mono",
+      "value": ",a",
+      "why": "separator"
+    },
+    {
+      "id": "declaration-breakout",
+      "name": "--nv-font-mono",
+      "value": "inherit; color: red",
+      "why": "separator"
+    }
+  ]
+}

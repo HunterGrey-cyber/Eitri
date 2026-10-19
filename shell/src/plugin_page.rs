@@ -2,7 +2,7 @@
 //! policy floor the page cannot loosen, an ephemeral network session whose proxy lets through only the
 //! origins the manifest declares, a navigation lock, and the bridge script. What a page may do is decided in
 //! `eitri_core::plugin`; this file builds the view and carries text both ways. Its `PagePort` is the only
-//! place a script is run in the page.
+//! place a script is run in the page, and `apply_theme` the only place the window's theme reaches the view.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -11,6 +11,7 @@ use eitri_core::plugin::host::PagePort;
 use eitri_core::plugin::manifest::Origin;
 use eitri_core::plugin::page_policy::{self, Navigation, SiteRefusal};
 use eitri_core::plugin::protocol::BRIDGE_JS;
+use eitri_core::plugin::theme::PageTheme;
 use gtk4::gio;
 use gtk4::gio::prelude::*;
 use gtk4::glib;
@@ -18,7 +19,7 @@ use gtk4::prelude::*;
 use webkit6::prelude::*;
 use webkit6::{
     NetworkProxyMode, NetworkProxySettings, NetworkSession, URISchemeRequest, UserContentInjectedFrames,
-    UserContentManager, UserScript, UserScriptInjectionTime, WebContext, WebView,
+    UserContentManager, UserScript, UserScriptInjectionTime, UserStyleLevel, UserStyleSheet, WebContext, WebView,
 };
 
 /// The name the page posts to: `window.webkit.messageHandlers.eitriPlugin`.
@@ -43,6 +44,9 @@ pub(crate) struct PageHooks {
     pub(crate) on_message: Rc<dyn Fn(&str)>,
     /// A new document started loading: the host must hear `host.hello` again before it sends events.
     pub(crate) on_loading: Rc<dyn Fn()>,
+    /// A document was committed (a load, a reload, a back/forward-cache restore): the host sends it the
+    /// current theme, which a restored document would otherwise never hear.
+    pub(crate) on_committed: Rc<dyn Fn()>,
     /// A clicked `http`, `https` or `mailto` link.
     pub(crate) open_outside: Rc<dyn Fn(&str)>,
 }
@@ -109,8 +113,32 @@ fn answer(
     }
 }
 
-/// Builds the view and starts loading the plugin's entry.
-pub(crate) fn build(spec: &PageSpec, hooks: PageHooks) -> WebView {
+/// The window's theme on the view: its background, which shows before the web process paints and while a
+/// reload is under way (WebKit's default is opaque white), and a user style sheet holding the theme's
+/// variables on the root, which every document starts with. The sheet is replaced whole, so a variable the
+/// new theme lacks does not linger from the old one.
+fn apply_theme(webview: &WebView, theme: &PageTheme) {
+    let [r, g, b] = theme.background();
+    webview.set_background_color(&gtk4::gdk::RGBA::new(
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        1.0,
+    ));
+    if let Some(content) = webview.user_content_manager() {
+        content.remove_all_style_sheets();
+        content.add_style_sheet(&UserStyleSheet::new(
+            &theme.user_style_sheet(),
+            UserContentInjectedFrames::TopFrame,
+            UserStyleLevel::User,
+            &[],
+            &[],
+        ));
+    }
+}
+
+/// Builds the view and starts loading the plugin's entry, already wearing `theme`.
+pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> WebView {
     let context = WebContext::new();
     if let Some(security) = context.security_manager() {
         security.register_uri_scheme_as_secure(page_policy::SCHEME);
@@ -234,13 +262,16 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks) -> WebView {
 
     {
         let on_loading = hooks.on_loading.clone();
-        webview.connect_load_changed(move |_, event| {
-            if event == webkit6::LoadEvent::Started {
-                on_loading();
-            }
+        let on_committed = hooks.on_committed.clone();
+        webview.connect_load_changed(move |_, event| match event {
+            webkit6::LoadEvent::Started => on_loading(),
+            webkit6::LoadEvent::Committed => on_committed(),
+            _ => {}
         });
     }
 
+    // Before the first load, so the first document's first frame is already themed.
+    apply_theme(&webview, theme);
     webview.load_uri(&page_policy::entry_uri(&spec.id, &spec.entry));
     webview
 }
@@ -260,6 +291,11 @@ impl PagePort for WebKitPluginPage {
                 eprintln!("[plugin] a message to the page was lost: {e}");
             }
         });
+    }
+
+    fn set_theme(&self, theme: &PageTheme) {
+        let Some(webview) = self.0.upgrade() else { return };
+        apply_theme(&webview, theme);
     }
 }
 

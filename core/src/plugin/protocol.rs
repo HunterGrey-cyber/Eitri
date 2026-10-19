@@ -388,11 +388,25 @@ pub struct FocusEvent {
     pub has_keys: bool,
 }
 
-/// `keys_config`: how long, in milliseconds, a key sequence waits for its next key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `keys_config`: the page's keyboard settings, complete each time any of them changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysConfig {
+    /// How long, in milliseconds, a key sequence waits for its next key.
     pub timeoutlen: u32,
+    /// The window's prefix key as a person reads it (`Ctrl+b`), for the page's own key help.
+    pub prefix: String,
+    /// The key that shows this plugin's module after the prefix, or `null` when it has none. Required on
+    /// the wire: a page must never mistake an older message without it for "no key".
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub module_key: Option<String>,
+}
+
+/// `theme`: the complete set of appearance variables for the page's root, each a checked `--nv-*` value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeEvent {
+    pub vars: BTreeMap<String, String>,
 }
 
 pub fn event_text<T: Serialize>(event: &str, data: &T) -> String {
@@ -485,6 +499,7 @@ mod tests {
                 "keys_config" => {
                     serde_json::to_value(serde_json::from_value::<KeysConfig>(event.data.clone()).unwrap())
                 }
+                "theme" => serde_json::to_value(serde_json::from_value::<ThemeEvent>(event.data.clone()).unwrap()),
                 other => panic!("{name}: unknown event {other}"),
             }
             .unwrap();
@@ -494,6 +509,58 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    fn fixture(name: &str) -> Value {
+        let text = fixtures()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .1;
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn the_theme_fixture_names_are_the_appearance_names() {
+        let event = fixture("ev-theme.json");
+        assert_eq!(event["event"], "theme");
+        let theme: ThemeEvent = serde_json::from_value(event["data"].clone()).unwrap();
+        let mut want: Vec<String> = crate::theme::ThemeTokens::fallback()
+            .appearance_vars()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        want.sort();
+        assert_eq!(theme.vars.keys().cloned().collect::<Vec<_>>(), want);
+        for (name, value) in &theme.vars {
+            assert!(crate::plugin::theme::page_var_ok(name, value), "{name}: {value}");
+        }
+    }
+
+    #[test]
+    fn keys_config_carries_three_fields_and_needs_module_key() {
+        let event = fixture("ev-keys-config.json");
+        let config: KeysConfig = serde_json::from_value(event["data"].clone()).unwrap();
+        assert_eq!(
+            config,
+            KeysConfig {
+                timeoutlen: 300,
+                prefix: "Ctrl+b".into(),
+                module_key: None,
+            }
+        );
+        let mut without = event["data"].clone();
+        without.as_object_mut().unwrap().remove("module_key");
+        assert!(serde_json::from_value::<KeysConfig>(without).is_err());
+        let with_key: KeysConfig =
+            serde_json::from_value(serde_json::json!({"timeoutlen": 1, "prefix": "Ctrl+a", "module_key": "y"}))
+                .unwrap();
+        assert_eq!(with_key.module_key.as_deref(), Some("y"));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["module_key"],
+            Value::Null,
+            "written as null, never left out"
+        );
     }
 
     #[test]
