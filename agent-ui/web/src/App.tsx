@@ -19,8 +19,8 @@ import {
   STEP_LINES,
 } from "./jkScroll";
 import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
-import { EMPTY_PANEL_TABLE, isPlainAnswerKey, panelEntryKey, resolveKey } from "./keymap";
-import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix } from "./keymap";
+import { EMPTY_PANEL_TABLE, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
+import type { KeyLike, KeymapHelp, PanelBinding, PanelMode, PendingPrefix, PluginKeysHelp } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
@@ -1204,6 +1204,13 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  /** The plugin page's section `prefix ?` sent with `open_keymap`, drawn first while the overlay is open. It
+   *  belongs to that one opening: once the overlay closes it is dropped, so the panel's own `?` later shows no
+   *  page's keys. */
+  const [keymapPlugin, setKeymapPlugin] = useState<PluginKeysHelp | null>(null);
+  useEffect(() => {
+    if (!keymapOpen) setKeymapPlugin(null);
+  }, [keymapOpen]);
   /** The turn review overlay (`c` in BROWSE), or `null` when it is closed. Like `?` it is drawn over the
    *  conversation and owns every key while it is open; unlike `?` it is read-only state the shell fills in
    *  (`./review` is the whole of its logic). Closed wherever `?` is forced shut, and by a switch of tab. */
@@ -2630,6 +2637,7 @@ export default function App() {
         // reaches this panel as an envelope and must exit VISUAL here.
         exitRegion();
         setMode("browse");
+        setKeymapPlugin(pluginKeysHelp(payload.plugin));
         setKeymapOpen(true);
         setReview(null); // the review overlay is over the same area, and ends where `?` does
       } else if (payload.kind === "open_command_line") {
@@ -4235,6 +4243,7 @@ export default function App() {
               panel={panelTable}
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
+              plugin={keymapPlugin ?? undefined}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
               agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
               modes={hello === null ? undefined : tabPermissionModes(hello.permissionModes, activeTab?.agent)}
@@ -5938,6 +5947,7 @@ export default function App() {
               panel={panelTable}
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
+              plugin={keymapPlugin ?? undefined}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
               agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
               modes={hello === null ? undefined : tabPermissionModes(hello.permissionModes, activeTab?.agent)}

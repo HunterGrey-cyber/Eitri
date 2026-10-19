@@ -318,11 +318,16 @@ fn relative_path_ok(path: &str) -> bool {
         && path.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
+/// A plugin id: `[a-z0-9-]`, at most 40, not starting or ending with `-`.
+pub fn id_ok(id: &str) -> bool {
+    CharClass::LowerDigitDash.admits(id) && id.len() <= MAX_ID_LEN
+}
+
 pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     let raw: RawManifest = toml::from_str(text).map_err(|e| format!("eitri-plugin.toml: {e}"))?;
     let fail = |key: &str, why: String| Err(format!("eitri-plugin.toml: {key}: {why}"));
 
-    if !CharClass::LowerDigitDash.admits(&raw.id) || raw.id.len() > MAX_ID_LEN {
+    if !id_ok(&raw.id) {
         return fail(
             "id",
             format!(

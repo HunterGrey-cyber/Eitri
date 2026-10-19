@@ -119,6 +119,23 @@ pub struct LogRead {
     pub from: Option<String>,
 }
 
+/// One row of a page's key table: an action of its own, the keys that run it, and the text the `?` sheet
+/// shows for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRowArg {
+    pub action: String,
+    pub keys: Vec<String>,
+    pub context: String,
+    pub desc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeysDeclareArgs {
+    pub rows: Vec<KeyRowArg>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verb", content = "args")]
 pub enum Verb {
@@ -144,13 +161,16 @@ pub enum Verb {
     LogAppend(LogAppend),
     #[serde(rename = "log.read")]
     LogRead(LogRead),
+    #[serde(rename = "keys.declare")]
+    KeysDeclare(KeysDeclareArgs),
 }
 
 impl Verb {
-    /// The capability a verb needs; `host.hello` needs none.
+    /// The capability a verb needs. `host.hello` needs none, and neither does `keys.declare`: it grants no
+    /// power, only records text the window shows.
     pub fn capability(&self) -> Option<Capability> {
         match self {
-            Verb::HostHello(_) => None,
+            Verb::HostHello(_) | Verb::KeysDeclare(_) => None,
             Verb::TaskStart(_) | Verb::TaskCancel(_) => Some(Capability::Tasks),
             Verb::EditorOpen(_) => Some(Capability::EditorOpen),
             Verb::EditorAssist(_) | Verb::EditorAssistClear(_) => Some(Capability::EditorAssist),
@@ -172,6 +192,7 @@ impl Verb {
             Verb::StateWrite(_) => "state.write",
             Verb::LogAppend(_) => "log.append",
             Verb::LogRead(_) => "log.read",
+            Verb::KeysDeclare(_) => "keys.declare",
         }
     }
 }
@@ -360,6 +381,20 @@ pub struct TaskExit {
     pub dropped_bytes: u64,
 }
 
+/// `focus`: whether the page's module holds the keys of a window that is itself active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FocusEvent {
+    pub has_keys: bool,
+}
+
+/// `keys_config`: how long, in milliseconds, a key sequence waits for its next key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeysConfig {
+    pub timeoutlen: u32,
+}
+
 pub fn event_text<T: Serialize>(event: &str, data: &T) -> String {
     let data = serde_json::to_value(data).unwrap_or(Value::Null);
     serde_json::to_string(&HostEvent {
@@ -389,7 +424,7 @@ mod tests {
             })
             .collect();
         all.sort();
-        assert!(all.len() >= 23, "the shared fixtures are missing");
+        assert!(all.len() >= 27, "the shared fixtures are missing");
         all
     }
 
@@ -446,6 +481,10 @@ mod tests {
                     serde_json::to_value(serde_json::from_value::<TaskOutput>(event.data.clone()).unwrap())
                 }
                 "task.exit" => serde_json::to_value(serde_json::from_value::<TaskExit>(event.data.clone()).unwrap()),
+                "focus" => serde_json::to_value(serde_json::from_value::<FocusEvent>(event.data.clone()).unwrap()),
+                "keys_config" => {
+                    serde_json::to_value(serde_json::from_value::<KeysConfig>(event.data.clone()).unwrap())
+                }
                 other => panic!("{name}: unknown event {other}"),
             }
             .unwrap();
@@ -519,12 +558,53 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_declare_fixture_parses_to_its_verb() {
+        let text = fixtures()
+            .into_iter()
+            .find(|(n, _)| n == "req-keys-declare.json")
+            .expect("req-keys-declare.json")
+            .1;
+        let Inbound::Request(Request {
+            verb: Verb::KeysDeclare(args),
+            ..
+        }) = parse_request(&text)
+        else {
+            panic!("not keys.declare")
+        };
+        assert!(!args.rows.is_empty());
+        assert!(args.rows.iter().all(|r| !r.keys.is_empty()));
+    }
+
+    #[test]
+    fn a_keys_declare_row_with_an_unknown_or_missing_key_is_a_bad_request() {
+        for raw in [
+            r#"{"v":1,"id":9,"verb":"keys.declare","args":{"rows":[{"action":"a","keys":["j"],"context":"c","desc":"d","when":"x"}]}}"#,
+            r#"{"v":1,"id":9,"verb":"keys.declare","args":{"rows":[{"action":"a","keys":["j"],"context":"c"}]}}"#,
+            r#"{"v":1,"id":9,"verb":"keys.declare","args":{"rows":[],"extra":1}}"#,
+            r#"{"v":1,"id":9,"verb":"keys.declare","args":{"rows":[{"action":"a","keys":"j","context":"c","desc":"d"}]}}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_request(raw),
+                    Inbound::Refused {
+                        re: Some(9),
+                        code: ErrorCode::BadRequest,
+                        ..
+                    }
+                ),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
     fn each_verb_names_its_capability() {
         let cap = |raw: &str| match parse_request(raw) {
             Inbound::Request(r) => r.verb.capability(),
             Inbound::Refused { message, .. } => panic!("{message}"),
         };
         assert_eq!(cap(r#"{"v":1,"id":1,"verb":"host.hello","args":{}}"#), None);
+        assert_eq!(cap(r#"{"v":1,"id":1,"verb":"keys.declare","args":{"rows":[]}}"#), None);
         assert_eq!(
             cap(r#"{"v":1,"id":1,"verb":"task.cancel","args":{"run":2}}"#),
             Some(Capability::Tasks)

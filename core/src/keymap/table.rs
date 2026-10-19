@@ -3,6 +3,7 @@
 //! to a root chord, or a Lua command's `keybinding` equal to the prefix or a root chord.
 //! Lua panel keys are checked in `crate::layout::keys`, where those keys are built.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use super::action::{self, Action, ActionError, OptValue, SwapTarget, TabAction, TextChange};
@@ -10,6 +11,8 @@ use super::key::{Chord, KeyName, KeyParseError, KeySpec};
 use super::panel::PanelUserTable;
 use super::root::{self, HelpRow};
 use crate::layout::{Axis, Direction, ModuleId, ModuleKeys, ModuleKind};
+use crate::plugin::keys::{self as plugin_keys, PluginKeyOp};
+use crate::plugin::manifest::id_ok;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -45,6 +48,9 @@ pub struct Keymap {
     prefix: KeySpec,
     bindings: Vec<Binding>,
     panel_user: PanelUserTable,
+    /// `init.lua`'s `plugin:<id>` tables, by plugin id: merged with what each page declares by the
+    /// plugin's host, since only the page knows its actions.
+    plugin_user: BTreeMap<String, Vec<PluginKeyOp>>,
     /// The keys the tmux import unbound and left unbound: `init.lua`'s `del` of one is not an
     /// error, since the user's own snippet may delete what their tmux config already deleted.
     removed_by_import: Vec<KeySpec>,
@@ -127,6 +133,12 @@ pub enum KeymapError {
         call: String,
         why: String,
     },
+    /// A `plugin:<id>` table op refused: a key that is not a key, one Eitri keeps, an action name no
+    /// page could declare, or options (the table takes none). `why` names the key or action.
+    PluginKey {
+        call: String,
+        why: String,
+    },
 }
 
 impl fmt::Display for KeymapError {
@@ -134,7 +146,10 @@ impl fmt::Display for KeymapError {
         match self {
             KeymapError::Recorded(message) => f.write_str(message),
             KeymapError::UnknownTable { call, table } => {
-                write!(f, "{call}: {table:?} is not a table (v1 has \"prefix\" and \"panel\")")
+                write!(
+                    f,
+                    "{call}: {table:?} is not a table (there are \"prefix\", \"panel\" and \"plugin:<id>\")"
+                )
             }
             KeymapError::BadKey { call, error } => write!(f, "{call}: {error}"),
             KeymapError::Action { call, error } => write!(f, "{call}: {error}"),
@@ -176,6 +191,7 @@ impl fmt::Display for KeymapError {
                 "eitri.command.register{{ id = {command:?}, keybinding = {keybinding:?} }}: {keybinding} is {hits}"
             ),
             KeymapError::Panel { call, why } => write!(f, "{call}: {why}"),
+            KeymapError::PluginKey { call, why } => write!(f, "{call}: {why}"),
         }
     }
 }
@@ -198,6 +214,15 @@ fn prefix_table(op: &KeymapOp, table: &str) -> Result<(), KeymapError> {
             table: table.to_string(),
         })
     }
+}
+
+/// The plugin a `plugin:<id>` table names, when `table` is one and the id is one a manifest could have.
+fn plugin_table(table: &str) -> Option<&str> {
+    table.strip_prefix("plugin:").filter(|id| id_ok(id))
+}
+
+fn plugin_key(op: &KeymapOp, why: String) -> KeymapError {
+    KeymapError::PluginKey { call: op.call(), why }
 }
 
 fn default_bindings() -> Vec<Binding> {
@@ -484,6 +509,7 @@ impl Keymap {
             prefix: KeySpec::parse(super::stock::STOCK_PREFIX).expect("C-b parses"),
             bindings: default_bindings(),
             panel_user: PanelUserTable::default(),
+            plugin_user: BTreeMap::new(),
             removed_by_import: Vec::new(),
         }
     }
@@ -500,6 +526,9 @@ impl Keymap {
     pub fn then_user(self, ops: &[KeymapOp], lua_panels: &[String]) -> Result<Keymap, KeymapError> {
         let mut map = self;
         let mut prefix_call = None;
+        // A plugin key is checked against the prefix only once every call has run, since a later
+        // `prefix` call moves it.
+        let mut plugin_sets: Vec<(&KeymapOp, &str)> = Vec::new();
         for op in ops {
             match op {
                 KeymapOp::Invalid(message) => return Err(KeymapError::Recorded(message.clone())),
@@ -517,7 +546,26 @@ impl Keymap {
                     action,
                     opts,
                 } => {
-                    if table == "panel" {
+                    if let Some(id) = plugin_table(table) {
+                        if !opts.is_empty() {
+                            return Err(plugin_key(op, "a plugin table's set takes no options".into()));
+                        }
+                        if !plugin_keys::action_ok(action) {
+                            return Err(plugin_key(
+                                op,
+                                format!("{action:?} is not an action a page could declare ([a-z0-9_.-], at most 40)"),
+                            ));
+                        }
+                        plugin_keys::parse(key).map_err(|why| plugin_key(op, why))?;
+                        plugin_sets.push((op, key));
+                        map.plugin_user
+                            .entry(id.to_string())
+                            .or_default()
+                            .push(PluginKeyOp::Set {
+                                key: key.clone(),
+                                action: action.clone(),
+                            });
+                    } else if table == "panel" {
                         map.panel_user
                             .set(key, action)
                             .map_err(|why| KeymapError::Panel { call: op.call(), why })?;
@@ -548,7 +596,13 @@ impl Keymap {
                     }
                 }
                 KeymapOp::Del { table, key } => {
-                    if table == "panel" {
+                    if let Some(id) = plugin_table(table) {
+                        plugin_keys::parse(key).map_err(|why| plugin_key(op, why))?;
+                        map.plugin_user
+                            .entry(id.to_string())
+                            .or_default()
+                            .push(PluginKeyOp::Del { key: key.clone() });
+                    } else if table == "panel" {
                         map.panel_user
                             .del(key)
                             .map_err(|why| KeymapError::Panel { call: op.call(), why })?;
@@ -578,6 +632,9 @@ impl Keymap {
                 root: named,
             });
         }
+        for (op, key) in plugin_sets {
+            plugin_keys::check_key(key, &chord).map_err(|why| plugin_key(op, why))?;
+        }
         Ok(map)
     }
 
@@ -597,6 +654,11 @@ impl Keymap {
     /// own mappings and the panel's defaults.
     pub fn panel_user(&self) -> &PanelUserTable {
         &self.panel_user
+    }
+
+    /// `init.lua`'s recorded `plugin:<id>` table ops, in order; empty for a plugin it never named.
+    pub fn plugin_user(&self, id: &str) -> &[PluginKeyOp] {
+        self.plugin_user.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Every key bound to `action`, in table order.
@@ -1103,6 +1165,114 @@ mod tests {
             [k("a")]
         );
         assert!(Keymap::defaults().keys_for(&Action::Zoom).contains(&k("z")));
+    }
+
+    fn plugin_set(table: &str, key: &str, action: &str) -> KeymapOp {
+        KeymapOp::Set {
+            table: table.into(),
+            key: key.into(),
+            action: action.into(),
+            opts: vec![],
+        }
+    }
+
+    #[test]
+    fn a_plugin_table_records_its_ops_in_order_per_plugin() {
+        let ops = [
+            plugin_set("plugin:snotra", "<C-n>", "item.next"),
+            KeymapOp::Del {
+                table: "plugin:snotra".into(),
+                key: "]q".into(),
+            },
+            plugin_set("plugin:other-1", "x", "a.b"),
+        ];
+        let map = Keymap::apply_user(&ops, &[]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            map.plugin_user("snotra"),
+            [
+                PluginKeyOp::Set {
+                    key: "<C-n>".into(),
+                    action: "item.next".into()
+                },
+                PluginKeyOp::Del { key: "]q".into() }
+            ]
+        );
+        assert_eq!(map.plugin_user("other-1").len(), 1);
+        assert!(map.plugin_user("nobody").is_empty());
+        // The plugin tables touch neither the prefix table nor the panel's.
+        assert_eq!(map.bindings(), Keymap::defaults().bindings());
+    }
+
+    #[test]
+    fn a_plugin_table_refuses_a_key_eitri_keeps() {
+        for key in ["<C-h>", "<F11>", "<C-=>", "<C-b>", "<C-S-a>", "<D-j>"] {
+            let err = Keymap::apply_user(&[plugin_set("plugin:snotra", key, "x")], &[]).unwrap_err();
+            let KeymapError::PluginKey { call, why } = &err else {
+                panic!("{key}: {err:?}")
+            };
+            assert!(call.contains("plugin:snotra"), "{call}");
+            assert!(why.contains(&format!("{key:?}")), "{key}: {why}");
+        }
+        // The prefix checked is the one init.lua leaves, whichever order it was set in.
+        let moved = [
+            plugin_set("plugin:snotra", "<C-a>", "x"),
+            KeymapOp::Prefix { key: "C-a".into() },
+        ];
+        assert!(matches!(
+            Keymap::apply_user(&moved, &[]),
+            Err(KeymapError::PluginKey { .. })
+        ));
+        let freed = [
+            KeymapOp::Prefix { key: "C-a".into() },
+            plugin_set("plugin:snotra", "<C-b>", "x"),
+        ];
+        assert!(Keymap::apply_user(&freed, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_plugin_table_refuses_bad_keys_actions_and_options() {
+        let err = |op: KeymapOp| match Keymap::apply_user(&[op], &[]) {
+            Err(KeymapError::PluginKey { why, .. }) => why,
+            other => panic!("{other:?}"),
+        };
+        assert!(err(plugin_set("plugin:snotra", "<Foo>", "x")).contains("\"<Foo>\""));
+        assert!(err(plugin_set("plugin:snotra", "j", "Item.Next")).contains("\"Item.Next\""));
+        assert!(err(KeymapOp::Set {
+            table: "plugin:snotra".into(),
+            key: "j".into(),
+            action: "x".into(),
+            opts: vec![("cells".into(), OptValue::Int(1))],
+        })
+        .contains("option"));
+        assert!(err(KeymapOp::Del {
+            table: "plugin:snotra".into(),
+            key: "<Foo>".into(),
+        })
+        .contains("\"<Foo>\""));
+        // A key the page's kit cannot bind would leave the action with a key that never fires.
+        for key in ["<M-n>", "<A-x>", "<F2>", "<PageDown>", "<Insert>"] {
+            assert!(
+                err(plugin_set("plugin:snotra", key, "item.next")).contains(&format!("{key:?}")),
+                "{key}"
+            );
+            assert!(
+                err(KeymapOp::Del {
+                    table: "plugin:snotra".into(),
+                    key: key.into(),
+                })
+                .contains(&format!("{key:?}")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plugin_table_must_name_a_plugin_id() {
+        for table in ["plugin:Bad_Id", "plugin:", "plugin:-x", "plugin", "plugins:snotra"] {
+            let err = Keymap::apply_user(&[plugin_set(table, "j", "x")], &[]).unwrap_err();
+            assert!(matches!(err, KeymapError::UnknownTable { .. }), "{table}: {err:?}");
+            assert!(err.to_string().contains("plugin:<id>"), "{err}");
+        }
     }
 
     #[test]

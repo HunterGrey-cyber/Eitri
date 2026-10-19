@@ -85,7 +85,7 @@ impl Rig {
         let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
         let page = Rc::new(Page::default());
         let store = PluginStore::new(s.0.join("state"), "demo");
-        let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), Some(store));
+        let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), Some(store), Vec::new());
         let editor = Rc::new(Editor::default());
         let layout = Rc::new(Layout::default());
         host.set_editor(editor.clone());
@@ -123,6 +123,17 @@ impl Rig {
             }
             assert!(Instant::now() < deadline, "never: {what}");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Pumps at `now` until the editor has been asked `n` times: a page-supplied path is checked on a worker
+    /// before the editor is asked.
+    fn asked(&self, n: usize, now: Instant) {
+        let deadline = Instant::now() + HANG_GUARD;
+        while self.editor.calls.borrow().len() < n {
+            assert!(Instant::now() < deadline, "the editor was never asked {n} time(s)");
+            self.host.pump(now);
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -252,6 +263,8 @@ fn editor_open_checks_roots_then_opens_and_moves_the_keys_to_the_editor() {
         json!({"path": file.display().to_string(), "line": 1, "col": 4}),
     );
     assert!(rig.page.replies_to(id).is_empty(), "the answer comes later");
+    rig.asked(1, Instant::now());
+    assert!(rig.page.replies_to(id).is_empty(), "the answer comes later");
     assert!(std::ptr::eq(rig.editor.calls.borrow()[0].0, PLUGIN_OPEN_LUA));
     let answer = rig.editor.answers.borrow_mut().remove(0);
     answer.send(Ok(rmpv::Value::Map(vec![
@@ -271,6 +284,7 @@ fn an_editor_that_never_answers_times_out_once() {
     let text =
         json!({"v": 1, "id": 7, "verb": "editor.open", "args": {"path": file.display().to_string()}}).to_string();
     rig.host.page_message(&text, start);
+    rig.asked(1, start);
     let next = rig.host.pump(start + Duration::from_secs(1));
     assert!(next.is_some(), "a pending answer asks for a timer");
     assert!(rig.page.replies_to(7).is_empty());
@@ -292,6 +306,7 @@ fn assist_is_reported_and_stopping_the_plugin_clears_it() {
         "editor.assist",
         json!({"root": root.display().to_string(), "diagnostics": "off", "inlay_hints": "on"}),
     );
+    rig.asked(1, Instant::now());
     {
         let calls = rig.editor.calls.borrow();
         assert!(std::ptr::eq(calls[0].0, PLUGIN_ASSIST_LUA));
@@ -322,6 +337,7 @@ fn a_clear_never_overtakes_an_apply_that_is_still_out() {
         "editor.assist",
         json!({"root": root.display().to_string(), "diagnostics": "off", "inlay_hints": "on"}),
     );
+    rig.asked(1, Instant::now());
     // The plugin is closed before the editor has answered the apply: the clear waits behind it.
     let waiting = rig.host.stop(Instant::now());
     assert!(waiting.is_some(), "a held clear needs the pump to run again");
@@ -377,6 +393,7 @@ fn assist_calls_go_out_one_at_a_time_in_the_order_they_came() {
         assert_eq!(calls.len(), n, "{what}");
         calls[n - 1].1[0].clone()
     };
+    rig.asked(1, Instant::now());
     assert_eq!(sent(1, "only the first is out"), rmpv::Value::from("apply"));
     rig.editor.answers.borrow_mut().remove(0).send(Ok(applied(false, true)));
     rig.pump_until("the first answer", |p| !p.replies_to(first).is_empty());
@@ -386,6 +403,7 @@ fn assist_calls_go_out_one_at_a_time_in_the_order_they_came() {
         ("left_alone".into(), 0.into()),
     ])));
     rig.pump_until("the clear's answer", |p| !p.replies_to(clear).is_empty());
+    rig.asked(3, Instant::now());
     assert_eq!(sent(3, "the second apply is last"), rmpv::Value::from("apply"));
     rig.editor.answers.borrow_mut().remove(0).send(Ok(applied(true, false)));
     rig.pump_until("the second answer", |p| !p.replies_to(second).is_empty());
@@ -492,6 +510,7 @@ fn an_answer_still_out_when_the_page_reloads_never_reaches_the_new_page() {
     // The old document asks the editor and the store, and reloads before either answer is taken.
     let file = rig.work.join("ex/src/lib.rs");
     raw(3, "editor.open", json!({"path": file.display().to_string()}));
+    rig.asked(1, Instant::now());
     raw(4, "state.read", json!({"key": "nope"}));
     rig.host.page_loading();
     let mark = rig.page.0.borrow().len();
@@ -539,4 +558,145 @@ fn a_page_that_outlives_the_shutdown_cannot_start_a_run() {
     rig.host.pump(Instant::now() + Duration::from_secs(1));
     assert!(rig.page.replies_to(late).is_empty());
     assert!(rig.host.runs().is_empty());
+}
+
+#[test]
+fn a_path_check_that_never_returns_holds_nothing_and_gives_up_at_its_deadline() {
+    let rig = Rig::new("host-stalled-check", |m| m);
+    // Every check waits for one message: a filesystem that does not answer until told to.
+    let gate = rig.host.gate_path_checks();
+    let file = rig.work.join("ex/src/lib.rs").display().to_string();
+    let start = Instant::now();
+    let raw = |id: u64, verb: &str, args: Value, at: Instant| {
+        rig.host
+            .page_message(&json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string(), at);
+    };
+    // The calls return although their checks cannot finish.
+    raw(1, "editor.open", json!({"path": file}), start);
+    raw(2, "task.start", json!({"task": "prepare", "vars": vars()}), start);
+    let next = rig.host.pump(start + Duration::from_secs(1));
+    assert!(next.is_some_and(|at| at <= start + Duration::from_secs(5)), "{next:?}");
+    assert!(rig.page.0.borrow().is_empty());
+
+    rig.host.pump(start + Duration::from_secs(6));
+    for id in [1, 2] {
+        let replies = rig.page.replies_to(id);
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0]["error"]["code"], "io");
+    }
+
+    // The filesystem comes back. The given-up checks finish first (the worker keeps their order), and neither
+    // opens nor starts anything; a new open goes through.
+    drop(gate);
+    raw(3, "editor.open", json!({"path": file}), start + Duration::from_secs(7));
+    rig.asked(1, start + Duration::from_secs(7));
+    assert_eq!(rig.editor.calls.borrow().len(), 1);
+    assert!(rig.host.runs().is_empty(), "the given-up start started nothing");
+    assert_eq!(rig.page.replies_to(1).len(), 1);
+    assert_eq!(rig.page.replies_to(2).len(), 1);
+}
+
+#[test]
+fn a_clear_sent_while_the_apply_root_is_checked_waits_behind_it() {
+    let rig = Rig::new("host-check-order", |m| m);
+    let gate = rig.host.gate_path_checks();
+    let root = rig.work.join("ex").display().to_string();
+    let apply = rig.send(
+        "editor.assist",
+        json!({"root": root, "diagnostics": "off", "inlay_hints": "on"}),
+    );
+    let clear = rig.send("editor.assist_clear", json!({}));
+    rig.host.pump(Instant::now());
+    assert!(
+        rig.editor.calls.borrow().is_empty(),
+        "the clear does not go ahead of the apply"
+    );
+    gate.send(()).unwrap();
+    rig.asked(1, Instant::now());
+    assert_eq!(rig.editor.calls.borrow()[0].1[0], rmpv::Value::from("apply"));
+    rig.editor.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Map(vec![
+        ("diagnostics".into(), false.into()),
+        ("inlay_hints".into(), true.into()),
+        ("buffers".into(), 1.into()),
+        ("partial".into(), false.into()),
+    ])));
+    rig.asked(2, Instant::now());
+    assert_eq!(rig.editor.calls.borrow()[1].1[0], rmpv::Value::from("clear"));
+    assert_eq!(rig.reply(apply)["ok"], true);
+    assert!(
+        rig.page.replies_to(clear).is_empty(),
+        "the clear has not been answered yet"
+    );
+}
+
+#[test]
+fn an_apply_that_timed_out_still_holds_the_calls_behind_it_until_it_is_answered() {
+    let rig = Rig::new("host-late-apply", |m| m);
+    let root = rig.work.join("ex").display().to_string();
+    let file = rig.work.join("ex/src/lib.rs").display().to_string();
+    let start = Instant::now();
+    let raw = |id: u64, verb: &str, args: Value| {
+        rig.host.page_message(
+            &json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string(),
+            start,
+        );
+    };
+    let assists = || {
+        rig.editor
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(code, _)| std::ptr::eq(*code, PLUGIN_ASSIST_LUA))
+            .map(|(_, args)| args[0].clone())
+            .collect::<Vec<_>>()
+    };
+    raw(
+        1,
+        "editor.assist",
+        json!({"root": root, "diagnostics": "off", "inlay_hints": "on"}),
+    );
+    rig.asked(1, start);
+    raw(2, "editor.assist_clear", json!({}));
+    raw(
+        3,
+        "editor.assist",
+        json!({"root": root, "diagnostics": "on", "inlay_hints": "off"}),
+    );
+    // Checks finish in order: once this open reaches the editor, the second apply's root has been checked.
+    raw(4, "editor.open", json!({"path": file}));
+    rig.asked(2, start);
+    let answers: Vec<Answer> = rig.editor.answers.borrow_mut().drain(..).collect();
+    let mut answers = answers.into_iter();
+    let apply_answer = answers.next().unwrap();
+
+    // Past every deadline: the page is told, but the apply may still reach nvim, so nothing behind it is sent.
+    let next = rig.host.pump(start + Duration::from_secs(6));
+    for id in [1, 2, 3] {
+        assert_eq!(rig.page.replies_to(id)[0]["error"]["code"], "editor_timeout", "{id}");
+    }
+    assert_eq!(assists(), [rmpv::Value::from("apply")]);
+    assert!(next.is_some(), "the late apply is still looked at");
+    rig.host.pump(start + Duration::from_secs(7));
+    assert_eq!(assists().len(), 1);
+
+    // nvim runs the apply at last; only then does the clear go out, and the second apply waits for the clear
+    // although its own deadline has long passed.
+    apply_answer.send(Ok(rmpv::Value::Nil));
+    rig.host.pump(start + Duration::from_secs(8));
+    assert_eq!(assists(), [rmpv::Value::from("apply"), rmpv::Value::from("clear")]);
+    rig.host.pump(start + Duration::from_secs(9));
+    assert_eq!(assists().len(), 2, "the second apply waits for the clear");
+    rig.editor.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Nil));
+    rig.host.pump(start + Duration::from_secs(10));
+    assert_eq!(
+        assists(),
+        [
+            rmpv::Value::from("apply"),
+            rmpv::Value::from("clear"),
+            rmpv::Value::from("apply")
+        ]
+    );
+    for id in [1, 2, 3] {
+        assert_eq!(rig.page.replies_to(id).len(), 1, "told once: {id}");
+    }
 }

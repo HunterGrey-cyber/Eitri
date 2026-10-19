@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { KeymapOverlay } from "./KeymapOverlay";
 import { BROWSE_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
-import type { KeyHelp, PanelTable } from "../keymap";
+import type { KeyHelp, PanelTable, PluginKeysHelp } from "../keymap";
 import { binding, TABLE } from "../testFixtures";
 import { listedSlashCommands } from "../slashCommands";
 import { MODE_CONSEQUENCE } from "./Dashboard";
@@ -440,5 +440,65 @@ describe("KeymapOverlay: a companion window", () => {
     const { container } = overlay();
     expect(container.textContent).not.toContain(NOTE);
     expect(sectionTitled(container, "After Ctrl+b").querySelector("p")).toBeNull();
+  });
+});
+
+describe("KeymapOverlay: a plugin page's section", () => {
+  function withPlugin(plugin: PluginKeysHelp | undefined) {
+    return render(
+      <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} plugin={plugin} />,
+    );
+  }
+
+  it("comes first, under the plugin's title, with its rows", () => {
+    const { container } = withPlugin({
+      title: "Snotra",
+      declared: true,
+      rows: [
+        { keys: "]q / <C-n>", what: "题目 · 下一题" },
+        { keys: "?", what: "按键帮助" },
+      ],
+    });
+    const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles[0]).toBe("Snotra");
+    expect(titles[1]).toBe("This panel");
+    const section = sectionTitled(container, "Snotra");
+    expect(section.querySelectorAll("tr")).toHaveLength(2);
+    expect(section.querySelector("kbd")!.textContent).toBe("]q / <C-n>");
+    expect(section.textContent).toContain("题目 · 下一题");
+  });
+
+  it("renders a row's text as text, never as markup", () => {
+    const { container } = withPlugin({
+      title: "<b>Snotra</b>",
+      declared: true,
+      rows: [{ keys: "<img src=x>", what: "<img src=x onerror=alert(1)>" }],
+    });
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("b")).toBeNull();
+    const section = sectionTitled(container, "<b>Snotra</b>");
+    expect(section.querySelector("kbd")!.textContent).toBe("<img src=x>");
+    expect(section.querySelectorAll("td")[1].textContent).toBe("<img src=x onerror=alert(1)>");
+  });
+
+  it("says so when the page has declared no keys", () => {
+    const { container } = withPlugin({ title: "Snotra", declared: false, rows: [] });
+    const section = sectionTitled(container, "Snotra");
+    expect(section.querySelectorAll("tr")).toHaveLength(0);
+    expect(section.textContent).toContain("此插件未登记按键");
+  });
+
+  it("draws an empty section, without the undeclared note, for a page that declared and kept no key", () => {
+    const { container } = withPlugin({ title: "Snotra", declared: true, rows: [] });
+    const section = sectionTitled(container, "Snotra");
+    expect(section.querySelectorAll("tr")).toHaveLength(0);
+    expect(section.textContent).not.toContain("此插件未登记按键");
+  });
+
+  it("is not drawn without a plugin", () => {
+    const { container } = withPlugin(undefined);
+    const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles[0]).toBe("This panel");
+    expect(container.textContent).not.toContain("此插件未登记按键");
   });
 });

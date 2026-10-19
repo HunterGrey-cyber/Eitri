@@ -350,7 +350,7 @@ fn build_ui(
 
     // Each `eitri.plugin.load` becomes a Lua panel whose content is the plugin's page. Registered before the
     // Lua panels are read below, so a plugin is placed, keyed, killed and revived like any Lua panel.
-    let plugin_panels = match plugin_panels::PluginPanels::install(&lua_engine) {
+    let plugin_panels = match plugin_panels::PluginPanels::install(&lua_engine, &keymap) {
         Ok(panels) => Rc::new(panels),
         Err(message) => {
             eprintln!("eitri: {message}");
@@ -441,7 +441,12 @@ fn build_ui(
     keys_help.send();
     if let Some(feed) = nvim_keys_feed.as_mut() {
         let keys_help = keys_help.clone();
-        feed_pump.listen_keys(feed, move |report| keys_help.nvim_report(report));
+        let plugin_panels = plugin_panels.clone();
+        feed_pump.listen_keys(feed, move |report| {
+            // A page's multi-key sequences wait as long as the editor's do.
+            plugin_panels.set_timeoutlen(report.timeoutlen);
+            keys_help.nvim_report(report);
+        });
     }
     // The layout this window opens with: this project's state file if
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
@@ -886,6 +891,7 @@ fn build_ui(
         let terminal = terminal.clone();
         let module_layout = module_layout.clone();
         let focus_history = focus_history.clone();
+        let plugin_panels = plugin_panels.clone();
         pane_focus::install(
             &window,
             grid.live_hosts(),
@@ -915,6 +921,8 @@ fn build_ui(
                     }
                     ModuleKind::Agent => agent_panel_handle.set_pane_focused(has_keys),
                     ModuleKind::Terminal => terminal.set_focused(has_keys),
+                    // A plugin page hears this as its `focus` event; a Lua panel that is no plugin has no host.
+                    ModuleKind::LuaWebview => plugin_panels.set_has_keys(id, has_keys),
                     _ => {}
                 }
             },
@@ -1557,6 +1565,7 @@ fn build_ui(
         let kill_title = module_title.clone();
         let kill_refused = top_bar.app_name.clone();
         let toast = toast.clone();
+        let keymap_plugins = plugin_panels.clone();
         prefix::install(
             &window,
             keymap.clone(),
@@ -1716,13 +1725,17 @@ fn build_ui(
                     Action::Hint => hint_coordinator.toggle_from_prefix(keycode),
                     Action::PanelReload => agent.reload_document_by_hand(),
                     Action::PanelKeymap => {
+                        // Read before the chat takes the keys: afterwards the chat is what holds them.
+                        let plugin = focused()
+                            .and_then(|module| keymap_plugins.declared_rows(&module))
+                            .map(|(title, rows)| eitri_core::plugin::keys::plugin_help(&title, rows));
                         let chat = ModuleId::agent();
                         if let Err(err) = show_on_screen(&chat) {
                             refuse(&refused_name, &toast, &err);
                             return;
                         }
                         focus_module(&chat);
-                        agent.open_keymap();
+                        agent.open_keymap(plugin);
                     }
                     // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
                     // letters typed after the chord go into the entry instead of acting as panel keys.
@@ -1845,7 +1858,10 @@ fn build_ui(
     // the page did not handle starts at the window again (`pane_switch::LetThrough`).
     // Only the agent host gets an intercept: `Ctrl+j`/`Ctrl+k` claimed for the
     // composer, decided from the panel's own `panel_keys` mirror. A Lua panel has no such mode and
-    // passes `None`, so every chord there still goes straight to `move_focus` as before.
+    // passes `None`, so every chord there still goes straight to `move_focus`.
+    // A Lua panel's page (a plugin's among them) never gets `Ctrl+h/j/k/l`, even with no module that way:
+    // what such a page does with a key must not depend on where its module sits. The agent panel still
+    // gets the chord at an edge, as its own keys expect.
     for (id, host) in grid
         .hosts()
         .iter()
@@ -1856,12 +1872,12 @@ fn build_ui(
         } else {
             None
         };
-        install_module_nav(id.clone(), host, move_focus.clone(), intercept);
-        // No key with Super or Hyper held reaches the panel's page: WebKitGTK does not tell the
-        // page, so `a`/`d`/`D` and the bypass `y` could not refuse it there (`panel_super.rs`).
-        if id.kind() == ModuleKind::Agent {
-            panel_super::install(host);
-        }
+        let swallow_at_edge = id.kind() == ModuleKind::LuaWebview;
+        install_module_nav(id.clone(), host, move_focus.clone(), intercept, swallow_at_edge);
+        // No key with Super or Hyper held reaches a web module's page: WebKitGTK does not tell the
+        // page, so the agent panel's `a`/`d`/`D` and the bypass `y`, or a plugin page's own keys,
+        // could not refuse it there (`panel_super.rs`).
+        panel_super::install(host);
     }
 
     // --- Ctrl+h/j/k/l in the terminal: Eitri's, always.
@@ -2336,18 +2352,22 @@ fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
 }
 
 /// Installs Ctrl+h/j/k/l navigation on a web module host, both at startup and for modules added
-/// later. Neovim's navigator cannot handle keys focused here. Capture phase runs before the
-/// `WebView` can consume the chord; bubble phase would be too late. A successful focus move
-/// consumes the chord.
+/// later. The navigator inside Neovim never sees these keys, because Neovim is not the focused
+/// widget here. Capture phase runs before the `WebView` can consume the chord; bubble phase would
+/// be too late. A successful focus move consumes the chord.
 ///
 /// `intercept` runs after the `LetThrough` second-delivery check and before `move_focus`. A
 /// claimed chord reaches neither `move_focus` nor the page. Only the agent host passes an
 /// interceptor; Lua panels pass `None`.
+///
+/// With `swallow_at_edge`, a chord with no module in that direction stops here rather than
+/// reaching the page, so WebKit has no event to return to GTK.
 fn install_module_nav(
     id: ModuleId,
     host: &gtk4::Widget,
     move_focus: Rc<dyn Fn(&ModuleId, Direction) -> bool>,
     intercept: Option<Rc<dyn Fn(Direction) -> bool>>,
+    swallow_at_edge: bool,
 ) {
     // A chord this controller lets through to the page comes back through it once more if the page
     // does not handle it: WebKit puts the same event back on the queue for GTK's own bindings
@@ -2369,13 +2389,15 @@ fn install_module_nav(
         if intercept.as_ref().is_some_and(|intercept| intercept(direction)) {
             return glib::Propagation::Stop;
         }
-        if move_focus(&id, direction) {
-            return glib::Propagation::Stop;
+        match pane_switch::nav_outcome(move_focus(&id, direction), swallow_at_edge) {
+            pane_switch::NavOutcome::Stop => glib::Propagation::Stop,
+            pane_switch::NavOutcome::LetThrough => {
+                if let Some(event) = event {
+                    let_through.borrow_mut().let_through(event);
+                }
+                glib::Propagation::Proceed
+            }
         }
-        if let Some(event) = event {
-            let_through.borrow_mut().let_through(event);
-        }
-        glib::Propagation::Proceed
     });
     host.add_controller(controller);
 }

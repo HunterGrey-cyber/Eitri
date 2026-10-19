@@ -1,5 +1,5 @@
 import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
-import type { KeymapHelp, PaneDirection } from "./keymap";
+import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
 
@@ -265,8 +265,9 @@ type InboundHandler = (
      *  key itself, so the panel acts on the ones it knows (`C-a`: select all) and ignores the rest.
      *  `key` is tmux's spelling. See `serialize_literal_key_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "literal_key"; key: string }
-    /** `prefix ?`: open the `?` overlay in BROWSE. */
-    | { kind: "open_keymap" }
+    /** `prefix ?`: open the `?` overlay in BROWSE, with a plugin page's section first when that page held the
+     *  keys. See `serialize_open_keymap_for_js` in `core/src/agent_bridge.rs`. */
+    | { kind: "open_keymap"; plugin?: PluginKeysHelp }
     /** `prefix :` opens the `:` command line without executing a command. Serialized by
      *  `serialize_open_command_line_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "open_command_line" }

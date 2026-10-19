@@ -225,7 +225,7 @@ impl Shared {
             CompanionVerb::Reload => self.panel.reload_document_by_hand(),
             CompanionVerb::Keymap => {
                 if self.give_panel_keys() {
-                    self.panel.open_keymap();
+                    self.panel.open_keymap(None);
                 }
             }
             CompanionVerb::CommandLine => {

@@ -1,0 +1,34 @@
+{
+  "v": 1,
+  "id": 27,
+  "verb": "keys.declare",
+  "args": {
+    "rows": [
+      {
+        "action": "scroll.down",
+        "keys": [
+          "j"
+        ],
+        "context": "页面",
+        "desc": "向下滚动"
+      },
+      {
+        "action": "item.next",
+        "keys": [
+          "]q",
+          "<C-n>"
+        ],
+        "context": "题目",
+        "desc": "下一题"
+      },
+      {
+        "action": "hint.open",
+        "keys": [
+          "f"
+        ],
+        "context": "页面",
+        "desc": "给能点的地方标上字母"
+      }
+    ]
+  }
+}

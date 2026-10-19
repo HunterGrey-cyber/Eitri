@@ -917,9 +917,13 @@ pub fn serialize_literal_key_for_js(key: &str) -> String {
     json!({ "kind": "literal_key", "key": key }).to_string()
 }
 
-/// `{"kind":"open_keymap"}`: `prefix ?` -- open the `?` overlay, in BROWSE.
-pub fn serialize_open_keymap_for_js() -> String {
-    json!({ "kind": "open_keymap" }).to_string()
+/// `{"kind":"open_keymap"}`: `prefix ?` -- open the `?` overlay, in BROWSE. With a plugin page's section
+/// (`{"kind":"open_keymap","plugin":{"title":..,"rows":[{"keys","what"}]}}`) when that page held the keys.
+pub fn serialize_open_keymap_for_js(plugin: Option<&crate::plugin::keys::PluginKeysHelp>) -> String {
+    match plugin {
+        Some(plugin) => json!({ "kind": "open_keymap", "plugin": plugin }).to_string(),
+        None => json!({ "kind": "open_keymap" }).to_string(),
+    }
 }
 
 /// `{"kind":"open_command_line"}`: `prefix :` opens the panel's `:` line in BROWSE. It runs
@@ -2492,8 +2496,40 @@ mod tests {
     fn serializes_literal_key_and_open_keymap() {
         let value: serde_json::Value = serde_json::from_str(&serialize_literal_key_for_js("C-a")).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "literal_key", "key": "C-a" }));
-        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(None)).unwrap();
         assert_eq!(value, serde_json::json!({ "kind": "open_keymap" }));
+    }
+
+    #[test]
+    fn open_keymap_carries_the_plugin_pages_section() {
+        let help = crate::plugin::keys::PluginKeysHelp {
+            title: "Snotra".into(),
+            declared: true,
+            rows: vec![crate::keymap::root::HelpRow {
+                keys: "]q / <C-n>".into(),
+                what: "<img src=x onerror=alert(1)>".into(),
+            }],
+        };
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&help))).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "kind": "open_keymap",
+                "plugin": {
+                    "title": "Snotra",
+                    "declared": true,
+                    "rows": [{ "keys": "]q / <C-n>", "what": "<img src=x onerror=alert(1)>" }],
+                },
+            })
+        );
+        let empty = crate::plugin::keys::PluginKeysHelp {
+            title: "Snotra".into(),
+            declared: false,
+            rows: Vec::new(),
+        };
+        let value: serde_json::Value = serde_json::from_str(&serialize_open_keymap_for_js(Some(&empty))).unwrap();
+        assert_eq!(value["plugin"]["rows"], serde_json::json!([]));
+        assert_eq!(value["plugin"]["declared"], serde_json::json!(false));
     }
 
     #[test]

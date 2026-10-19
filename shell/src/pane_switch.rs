@@ -62,6 +62,26 @@ pub(crate) fn nav_direction(key: Key, state: ModifierType) -> Option<Direction> 
     }
 }
 
+/// What a web module's `Ctrl+h/j/k/l` controller does with a chord once it knows whether focus moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NavOutcome {
+    /// The chord ends here: it moved focus, or it is withheld from a page that may not act on it.
+    Stop,
+    /// The chord goes on to the page, which may use it.
+    LetThrough,
+}
+
+/// A chord that moved stops. One with nowhere to go reaches the page unless the module swallows it at its
+/// edges: a plugin page must never act on `Ctrl+h/j/k/l`, so whether the chord reached it cannot depend on
+/// where the module sits.
+pub(crate) fn nav_outcome(moved: bool, swallow_at_edge: bool) -> NavOutcome {
+    if moved || swallow_at_edge {
+        NavOutcome::Stop
+    } else {
+        NavOutcome::LetThrough
+    }
+}
+
 /// How many let-through key events [`LetThrough`] remembers. A page that handles a key never sends
 /// it back, so its entry stays until this many later ones push it out.
 const LET_THROUGH_REMEMBERED: usize = 16;
@@ -159,6 +179,14 @@ fn locate_shim_binary() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chord_with_nowhere_to_go_is_swallowed_only_where_the_module_says_so() {
+        assert_eq!(nav_outcome(true, false), NavOutcome::Stop);
+        assert_eq!(nav_outcome(true, true), NavOutcome::Stop);
+        assert_eq!(nav_outcome(false, true), NavOutcome::Stop);
+        assert_eq!(nav_outcome(false, false), NavOutcome::LetThrough);
+    }
 
     #[test]
     fn only_control_with_hjkl_and_nothing_else_held_moves() {

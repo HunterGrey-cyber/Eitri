@@ -8,8 +8,10 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use eitri_core::editor_rpc::EditorRpc;
+use eitri_core::keymap::Keymap;
 use eitri_core::layout::ModuleId;
 use eitri_core::plugin::host::{LayoutPort, PluginHost};
+use eitri_core::plugin::keys::EffectiveRow;
 use eitri_core::plugin::page_policy;
 use eitri_core::plugin::protocol::FocusTarget;
 use eitri_core::plugin::state::PluginStore;
@@ -112,8 +114,9 @@ pub(crate) struct PluginPanels {
 }
 
 impl PluginPanels {
-    /// Registers every loaded plugin as a Lua panel entry. `Err` is a startup failure's text.
-    pub(crate) fn install(engine: &LuaEngine) -> Result<PluginPanels, String> {
+    /// Registers every loaded plugin as a Lua panel entry, each host checking its page's keys against the
+    /// window's prefix and applying the user's `plugin:<id>` overrides. `Err` is a startup failure's text.
+    pub(crate) fn install(engine: &LuaEngine, keymap: &Keymap) -> Result<PluginPanels, String> {
         let loaded: Vec<_> = engine
             .plugins
             .borrow()
@@ -173,10 +176,17 @@ impl PluginPanels {
                     let webview = plugin_page::build(&spec, hooks);
                     let page = Rc::new(WebKitPluginPage(webview.downgrade()));
                     let store = store_root.clone().map(|root| PluginStore::new(root, &id));
-                    let host = Rc::new(PluginHost::new(plugin.clone(), page, wake.waker(), store));
+                    let overrides = keymap.plugin_user(&id).to_vec();
+                    let host = Rc::new(PluginHost::new(plugin.clone(), page, wake.waker(), store, overrides));
+                    host.set_prefix_key(keymap.prefix());
                     let pump = Pump::start(host, wake);
                     let _ = cell.set(pump.clone());
-                    let guard = install_crash_recovery(&webview, id.clone(), url.clone());
+                    let guard = install_crash_recovery(
+                        &webview,
+                        id.clone(),
+                        url.clone(),
+                        Some(page_policy::host_page_base(&id)),
+                    );
                     (webview.upcast::<gtk4::Widget>(), guard, Some(pump))
                 }
                 None => (
@@ -219,6 +229,27 @@ impl PluginPanels {
                 show_and_focus: show_and_focus.clone(),
             }));
         }
+    }
+
+    /// Whether a plugin's module holds the keys, from the window's focus tracking. Any other module: nothing.
+    pub(crate) fn set_has_keys(&self, module: &ModuleId, has_keys: bool) {
+        if let Some((_, pump)) = self.hosts().find(|(m, _)| *m == module) {
+            pump.host.set_has_keys(has_keys);
+        }
+    }
+
+    /// The editor's `timeoutlen`, which every page's multi-key sequences wait for.
+    pub(crate) fn set_timeoutlen(&self, ms: u32) {
+        for (_, pump) in self.hosts() {
+            pump.host.set_timeoutlen(ms);
+        }
+    }
+
+    /// The plugin's title and the key table its current page declared (`None` inside: not declared yet), or
+    /// `None` when `module` is not a plugin page with a running host.
+    pub(crate) fn declared_rows(&self, module: &ModuleId) -> Option<(String, Option<Vec<EffectiveRow>>)> {
+        let (_, pump) = self.hosts().find(|(m, _)| *m == module)?;
+        Some((pump.host.plugin().manifest.title.clone(), pump.host.declared_rows()))
     }
 
     /// `prefix x` on a plugin's module: its runs stop and its assist is put back.

@@ -7764,6 +7764,40 @@ describe("App: the ? keymap overlay", () => {
     expect(overlay(container)!.textContent).toContain("Zoom (tmux)");
   });
 
+  it("shows the plugin page's section shell sent with open_keymap, and drops it once the overlay closes", () => {
+    const { container } = started();
+    act(() =>
+      dispatch({
+        kind: "open_keymap",
+        plugin: { title: "Snotra", declared: true, rows: [{ keys: "]q", what: "<img src=x onerror=alert(1)>" }] },
+      }),
+    );
+    const titles = Array.from(overlay(container)!.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles[0]).toBe("Snotra");
+    expect(overlay(container)!.textContent).toContain("<img src=x onerror=alert(1)>");
+    expect(overlay(container)!.querySelector("img")).toBeNull();
+    fireEvent.keyDown(container.querySelector(".agent-ui-root")!, { key: "q" });
+    expect(overlay(container)).toBeNull();
+    // Opened again without a plugin (the panel's own `?`, or `prefix ?` from another module): no stale section.
+    act(() => dispatch({ kind: "open_keymap" }));
+    const again = Array.from(overlay(container)!.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(again[0]).toBe("This panel");
+  });
+
+  it("says the page declared no keys when shell sends an empty plugin section", () => {
+    const { container } = started();
+    act(() => dispatch({ kind: "open_keymap", plugin: { title: "Snotra", declared: false, rows: [] } }));
+    expect(overlay(container)!.textContent).toContain("此插件未登记按键");
+  });
+
+  it("does not call a page undeclared when shell says it declared and kept no key", () => {
+    const { container } = started();
+    act(() => dispatch({ kind: "open_keymap", plugin: { title: "Snotra", declared: true, rows: [] } }));
+    const titles = Array.from(overlay(container)!.querySelectorAll("h2")).map((h) => h.textContent);
+    expect(titles[0]).toBe("Snotra");
+    expect(overlay(container)!.textContent).not.toContain("此插件未登记按键");
+  });
+
   it("opens on shell's open_keymap, in BROWSE, even from INPUT", () => {
     const { container } = started();
     enterInputMode(container);

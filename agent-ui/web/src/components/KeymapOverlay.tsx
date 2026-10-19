@@ -1,6 +1,6 @@
 import { forwardRef } from "react";
 import { browseKeys, CARET_KEYS, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
-import type { KeyHelp, PanelBinding, PanelTable } from "../keymap";
+import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
 import type { PermissionModeChoice } from "../types";
@@ -32,9 +32,16 @@ type Props = {
   /** The modes the active tab offers, in cycle order (`tabPermissionModes`): the sheet names only these, so
    *  a tab whose agent has no manual mode is not told about one. Absent reads as all three. */
   modes?: PermissionModeChoice[];
+  /** The plugin page that held the keys when `prefix ?` opened this sheet: its section comes first. Its title
+   *  and rows are the page's own text, drawn as text nodes only. */
+  plugin?: PluginKeysHelp;
 };
 
 const ALL_MODES: PermissionModeChoice[] = ["manual", "auto", "bypass"];
+
+/** A plugin page's section when the page has not declared its keys. A page that declared and kept no key
+ *  gets an empty section instead: it did register, so this sentence would be untrue of it. */
+const PLUGIN_UNDECLARED = "此插件未登记按键";
 
 /** The Typing section's Shift+Tab row, worded for the modes the tab cycles through. */
 function cycleRow(row: KeyHelp, modes: PermissionModeChoice[]): KeyHelp {
@@ -55,8 +62,9 @@ function Section({ title, rows, note }: { title: string; rows: KeyHelp[]; note?:
       <h2>{title}</h2>
       <table>
         <tbody>
-          {rows.map((row) => (
-            <tr key={row.keys}>
+          {/* Indexed: a plugin page may list the same keys on two rows (one per context). */}
+          {rows.map((row, index) => (
+            <tr key={`${index}:${row.keys}`}>
               <td>
                 <kbd className="keycap">{row.keys}</kbd>
               </td>
@@ -222,7 +230,7 @@ function SlashCommands() {
  * fires it.
  */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin },
   ref,
 ) {
   return (
@@ -241,6 +249,12 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           `../ctrlBracket` document listener, so describe it in the note rather than as a
           `BROWSE_KEYS` row. The note also explains each permission mode; the status band names
           the active mode. */}
+      {/* The page the keys were in when the sheet was asked for comes first: those are the keys the reader
+          was just using. Its title and rows are the page's own text, so they go through `Section`, which
+          draws text nodes only. */}
+      {plugin !== undefined && (
+        <Section title={plugin.title} rows={plugin.rows} note={plugin.declared ? undefined : PLUGIN_UNDECLARED} />
+      )}
       <Section
         title="This panel"
         rows={[...browseKeys(prefixLabel), { keys: "Ctrl+j", what: "Type (the box below)" }]}

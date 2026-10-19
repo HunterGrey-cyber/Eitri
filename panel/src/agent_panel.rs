@@ -1713,11 +1713,11 @@ impl AgentPanelHandle {
         self.dispatch(eitri_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()));
     }
 
-    /// `prefix ?`: open the `?` overlay.
-    pub fn open_keymap(&self) {
+    /// `prefix ?`: open the `?` overlay, with the section of the plugin page that held the keys, if one did.
+    pub fn open_keymap(&self, plugin: Option<eitri_core::plugin::keys::PluginKeysHelp>) {
         self.wake();
         self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js());
+        self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js(plugin.as_ref()));
     }
 
     /// `prefix :`: open the panel's `:` command line, which runs nothing.
@@ -8277,7 +8277,7 @@ mod tests {
         handle.enter_input();
         handle.nav_key(NavKeyDirection::Down);
         handle.literal_key(&eitri_core::keymap::KeySpec::parse("C-b").unwrap());
-        handle.open_keymap();
+        handle.open_keymap(None);
         handle.open_command_line();
         handle.set_keymap_help("{}".to_string());
         assert!(state.borrow().pane_focused);

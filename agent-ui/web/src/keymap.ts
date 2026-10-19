@@ -750,6 +750,26 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
 /** One line of the `?` keymap: the key as a person types it, and what it does. */
 export type KeyHelp = { keys: string; what: string };
 
+/** The `?` sheet's section for the plugin page that held the keys when `prefix ?` was pressed: the plugin's
+ *  title, whether the page has declared its keys, and its effective keys (`eitri_core::plugin::keys::plugin_help`).
+ *  Title and rows come from the page, so they are drawn as text only. A declared page may still have no rows: it
+ *  declared an empty table, or the user's overrides removed every key. */
+export type PluginKeysHelp = { title: string; declared: boolean; rows: KeyHelp[] };
+
+/** `open_keymap`'s `plugin` field when it has the shape the sheet draws, else `null`: a malformed section is
+ *  left out rather than breaking the whole sheet. A missing `declared` reads as not declared, so the sheet never
+ *  claims a table the host did not say it has. */
+export function pluginKeysHelp(value: unknown): PluginKeysHelp | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { title, declared, rows } = value as { title?: unknown; declared?: unknown; rows?: unknown };
+  if (typeof title !== "string" || !Array.isArray(rows)) return null;
+  if (declared !== undefined && typeof declared !== "boolean") return null;
+  const ok = rows.every(
+    (row) => typeof row === "object" && row !== null && typeof row.keys === "string" && typeof row.what === "string",
+  );
+  return ok ? { title, declared: declared === true, rows: rows.map((row) => ({ keys: row.keys, what: row.what })) } : null;
+}
+
 /** The row `shell`'s "Anywhere in the window" section prints for moving between modules (`eitri_core::keymap::root::
  *  help_rows`; a Rust test pins the words): its keys read `<left> / <right>`. The panel sits in the module to the
  *  right of the editor, so the second key is the one that brings the keyboard into it. */

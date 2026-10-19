@@ -97,7 +97,7 @@ pub(crate) fn install(
             webview.load_uri(&resolved_url);
             webview.set_hexpand(true);
             webview.set_vexpand(true);
-            let crash_guard = install_crash_recovery(&webview, parsed.id.clone(), resolved_url.clone());
+            let crash_guard = install_crash_recovery(&webview, parsed.id.clone(), resolved_url.clone(), None);
             (webview.upcast(), crash_guard)
         } else {
             eprintln!(
@@ -137,10 +137,14 @@ pub(crate) fn install(
 /// The signal closure uses the callback's `WebView` argument rather than capturing an owned
 /// clone. Capturing a clone would create a strong reference cycle through the view's
 /// signal-handler storage, preventing a replaced panel from being freed.
+///
+/// `give_up_base` is the address used for the give-up notice. `None` uses `about:blank`; a view
+/// with restricted navigation passes an allowed address instead.
 pub(crate) fn install_crash_recovery(
     webview: &webkit6::WebView,
     id: String,
     url: String,
+    give_up_base: Option<String>,
 ) -> Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>> {
     let guard = Rc::new(RefCell::new(
         crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
@@ -163,7 +167,7 @@ pub(crate) fn install_crash_recovery(
                 let html = crate::webview_crash_guard::crash_message_html(
                     "Close and reopen this panel (prefix x, then its key) to try again.",
                 );
-                webview.load_html(&html, None);
+                webview.load_html(&html, give_up_base.as_deref());
             }
             CrashResponse::AlreadyGivenUp => {}
         }

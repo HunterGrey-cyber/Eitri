@@ -118,7 +118,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     let theme_css = crate::theme::gtk_css::ThemeCss::install(&fallback);
 
     let config_dir = crate::config_dir();
-    let lua = Rc::new(LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"));
+    let lua = Rc::new(LuaEngine::without_plugins(config_dir.clone()).expect("LuaEngine construction must not fail"));
     lua.load_init_file(&config_dir.join("init.lua"));
     // A companion window has no place for a Lua panel or command, and nothing runs `shell:ready`.
     let (panels, commands) = (lua.panels.borrow().entries().len(), lua.commands.borrow().len());
@@ -396,7 +396,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                     CompanionVerb::Reload => agent.reload_document_by_hand(),
                     CompanionVerb::Keymap => {
                         focus_module(&ModuleId::agent());
-                        agent.open_keymap();
+                        agent.open_keymap(None);
                     }
                     CompanionVerb::CommandLine => {
                         focus_module(&ModuleId::agent());
@@ -449,6 +449,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         &agent_host,
         move_focus.clone(),
         Some(agent.nav_intercept()),
+        false,
     );
     // No key with Super or Hyper held reaches the panel's page (`panel_super.rs`).
     crate::panel_super::install(&agent_host);

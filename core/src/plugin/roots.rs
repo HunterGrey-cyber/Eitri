@@ -55,13 +55,20 @@ pub fn has_control(text: &str) -> bool {
     text.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}')
 }
 
-fn canonical_inside(roots: &Roots, raw: &str) -> Result<(PathBuf, std::fs::Metadata), PathRefusal> {
+/// The checks that need no disk: a caller that must not wait on the filesystem can refuse these at once and
+/// leave the rest to a worker.
+pub fn lexical(raw: &str) -> Result<(), PathRefusal> {
     if has_control(raw) {
         return Err(PathRefusal::ControlCharacter);
     }
     if !Path::new(raw).is_absolute() {
         return Err(PathRefusal::NotAbsolute);
     }
+    Ok(())
+}
+
+fn canonical_inside(roots: &Roots, raw: &str) -> Result<(PathBuf, std::fs::Metadata), PathRefusal> {
+    lexical(raw)?;
     let canonical = std::fs::canonicalize(raw).map_err(|_| PathRefusal::Missing)?;
     // A link inside a root can lead to a file whose own name holds a control character.
     if has_control(&canonical.to_string_lossy()) {

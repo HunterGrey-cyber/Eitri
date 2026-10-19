@@ -402,9 +402,16 @@ pub const MAX_COMMAND_HINT_CHARS: usize = 60;
 /// control, a format character (bidi overrides and isolates, zero-width characters, the byte-order mark,
 /// the soft hyphen, tag characters), any space, or a character that renders blank. The same set as the
 /// page's `revealHidden.ts`, which both `cleanCommands` there and this module's name check follow, so a
-/// name one side drops the other drops too. Rust's standard library has no format-character test, hence
-/// the table (Unicode general category `Cf`).
+/// name one side drops the other drops too.
 fn is_hidden_char(c: char) -> bool {
+    c.is_control() || c.is_whitespace() || is_invisible_char(c)
+}
+
+/// The part of [`is_hidden_char`] that is neither a control nor a space: a format character or one that
+/// renders blank. Public so another check of text a user reads (one that allows ordinary spaces) uses the
+/// same table rather than a copy that drifts. Rust's standard library has no format-character test, hence
+/// the table (Unicode general category `Cf`).
+pub fn is_invisible_char(c: char) -> bool {
     const FORMAT: &[(u32, u32)] = &[
         (0xAD, 0xAD),
         (0x600, 0x605),
@@ -443,7 +450,7 @@ fn is_hidden_char(c: char) -> bool {
     ];
     let code = c as u32;
     let within = |table: &[(u32, u32)]| table.iter().any(|&(from, to)| (from..=to).contains(&code));
-    c.is_control() || c.is_whitespace() || within(FORMAT) || within(BLANK)
+    within(FORMAT) || within(BLANK)
 }
 
 /// Cuts `text` to `max` characters with `…`, with control characters (newlines included) turned into

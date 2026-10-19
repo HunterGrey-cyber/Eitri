@@ -42,6 +42,12 @@ pub fn origin(id: &str) -> String {
     format!("{SCHEME}://{id}")
 }
 
+/// The address a page the host writes itself (the crash notice) is loaded at: inside the plugin's origin, so
+/// the navigation lock lets it in, where `about:blank` would be refused.
+pub fn host_page_base(id: &str) -> String {
+    format!("{}/", origin(id))
+}
+
 /// The entry's address, each byte outside the unreserved set percent-encoded so a name holding `#`, `?` or
 /// `%` reaches `site_file` as the file it names and not as a fragment, a query or an escape.
 pub fn entry_uri(id: &str, entry: &str) -> String {
@@ -310,6 +316,7 @@ mod tests {
         ] {
             assert_eq!(navigation("demo", refused), Navigation::Refuse, "{refused}");
         }
+        assert_eq!(navigation("demo", &host_page_base("demo")), Navigation::Stay);
     }
 
     #[test]

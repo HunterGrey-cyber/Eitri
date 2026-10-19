@@ -8,25 +8,40 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use super::editor::{self, decode_apply, decode_clear};
-use super::load::{LoadedPlugin, TaskRefusal};
+use super::keys::{self, EffectiveRow, PluginKeyOp};
+use super::load::{LoadedPlugin, ResolvedTask, TaskRefusal};
 use super::protocol::{
-    self, ErrorCode, ExitStatus, FocusTarget, Inbound, OnOff, Reply, StreamName, TaskExit, TaskOutput, Verb,
+    self, ErrorCode, ExitStatus, FocusEvent, FocusTarget, Inbound, KeyRowArg, KeysConfig, OnOff, Reply, StreamName,
+    TaskExit, TaskOutput, Verb,
 };
 use super::roots::{self, PathRefusal};
 use super::state::{PluginStore, StoreError, StoreErrorKind, StoreOp, StoreWorker};
 use super::tasks::{ExitKind, Launch, RunInfo, RunsWaiter, StartError, Stream, TaskEvent, TaskRunner};
 use crate::editor_rpc::EditorRpc;
+use crate::keymap::{Chord, KeySpec};
 use crate::nvim_rpc::Pending;
 
 /// How long an editor call may take before the page is told the editor is busy.
 pub const EDITOR_DEADLINE: Duration = Duration::from_secs(5);
 /// How often a pending editor answer is looked at, by a one-shot timer, while one is outstanding.
 pub const EDITOR_POLL: Duration = Duration::from_millis(20);
+/// How often an assist call the page has already been told about is looked at: it stays tracked until the
+/// editor answers, so the calls behind it never overtake it, but nobody is waiting on it any more.
+pub const EDITOR_LATE_POLL: Duration = Duration::from_millis(250);
+/// How long a page-supplied path (or a task's program and working directory) may take to check before the
+/// page is told the filesystem did not answer.
+pub const CHECK_DEADLINE: Duration = Duration::from_secs(5);
+/// How long a key sequence waits for its next key until the editor reports its own `timeoutlen`: vim's
+/// default.
+pub const DEFAULT_TIMEOUTLEN: u32 = 1000;
+
+const CHECK_TIMEOUT: &str = "the filesystem did not answer within 5 s";
 
 /// The page. `send` is asynchronous and never calls back into the host before it returns.
 pub trait PagePort {
@@ -70,12 +85,89 @@ struct ParkedAssist {
 }
 
 enum AssistOp {
+    /// An apply whose root is still being checked: it holds its place in line, and nothing behind it is sent
+    /// until it is either an `Apply` or gone.
+    Checking {
+        ticket: u64,
+        raw: String,
+        diagnostics: bool,
+        inlay_hints: bool,
+    },
     Apply {
         root: PathBuf,
         diagnostics: bool,
         inlay_hints: bool,
     },
     Clear,
+}
+
+/// What the path checker is asked. `canonicalize` and `metadata` can stall on a slow or hung filesystem, so
+/// they never run on the thread that calls the host.
+enum CheckJob {
+    File(String),
+    Dir(String),
+    Task {
+        task: String,
+        vars: BTreeMap<String, String>,
+    },
+}
+
+enum Checked {
+    Path(Result<PathBuf, PathRefusal>),
+    Task(Result<ResolvedTask, TaskRefusal>),
+}
+
+/// One worker thread per plugin, started at the first check. Checks run in order; one stalled on the
+/// filesystem holds the ones behind it, which then run out their deadlines rather than piling up threads.
+struct PathChecker {
+    tx: mpsc::Sender<(u64, CheckJob)>,
+    rx: mpsc::Receiver<(u64, Checked)>,
+}
+
+impl PathChecker {
+    fn spawn(plugin: LoadedPlugin, wake: agent::UiWake, gate: Option<mpsc::Receiver<()>>) -> std::io::Result<Self> {
+        let (tx, jobs) = mpsc::channel::<(u64, CheckJob)>();
+        let (done, rx) = mpsc::channel();
+        std::thread::Builder::new().name("plugin-paths".into()).spawn(move || {
+            for (ticket, job) in jobs {
+                if let Some(gate) = &gate {
+                    // A closed gate lets everything through.
+                    let _ = gate.recv();
+                }
+                let checked = match job {
+                    CheckJob::File(raw) => Checked::Path(roots::file_inside(&plugin.roots, &raw)),
+                    CheckJob::Dir(raw) => Checked::Path(roots::dir_inside(&plugin.roots, &raw)),
+                    CheckJob::Task { task, vars } => Checked::Task(plugin.resolve_task(&task, &vars)),
+                };
+                if done.send((ticket, checked)).is_err() {
+                    return;
+                }
+                wake();
+            }
+        })?;
+        Ok(PathChecker { tx, rx })
+    }
+}
+
+/// An `editor.open` or `task.start` waiting for its check.
+struct Checking {
+    ticket: u64,
+    re: u64,
+    document: u64,
+    deadline: Instant,
+    then: Then,
+}
+
+enum Then {
+    Open {
+        raw: String,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+    Task {
+        task: String,
+        vars: BTreeMap<String, String>,
+    },
 }
 
 struct PluginHostState {
@@ -98,6 +190,18 @@ struct PluginHostState {
     /// An assist was sent and not cleared since.
     assisted: bool,
     parked: VecDeque<ParkedAssist>,
+    checker: Option<PathChecker>,
+    checking: Vec<Checking>,
+    /// Handed to the checker when it starts: each check then waits for one message (tests only).
+    check_gate: Option<mpsc::Receiver<()>>,
+    /// Whether the page's module holds the keys of an active window, as the window last said.
+    has_keys: bool,
+    /// The editor's `timeoutlen`, in milliseconds, as last reported.
+    timeoutlen: u32,
+    /// The window's prefix key: a page may not bind it.
+    prefix_key: Chord,
+    /// The current document's declared key table, with the user's overrides applied.
+    declared: Option<Vec<EffectiveRow>>,
 }
 
 pub struct PluginHost {
@@ -105,6 +209,8 @@ pub struct PluginHost {
     page: Rc<dyn PagePort>,
     wake: agent::UiWake,
     store: Option<PluginStore>,
+    /// `init.lua`'s `plugin:<id>` table, applied to every declaration the page makes.
+    overrides: Vec<PluginKeyOp>,
     state: RefCell<PluginHostState>,
 }
 
@@ -193,6 +299,7 @@ impl PluginHost {
         page: Rc<dyn PagePort>,
         wake: agent::UiWake,
         store: Option<PluginStore>,
+        overrides: Vec<PluginKeyOp>,
     ) -> PluginHost {
         let state = PluginHostState {
             hello: false,
@@ -207,12 +314,22 @@ impl PluginHost {
             calls: Vec::new(),
             assisted: false,
             parked: VecDeque::new(),
+            checker: None,
+            checking: Vec::new(),
+            check_gate: None,
+            has_keys: false,
+            timeoutlen: DEFAULT_TIMEOUTLEN,
+            prefix_key: Chord::of(
+                &KeySpec::parse(crate::keymap::stock::STOCK_PREFIX).expect("the stock prefix parses"),
+            ),
+            declared: None,
         };
         PluginHost {
             plugin,
             page,
             wake,
             store,
+            overrides,
             state: RefCell::new(state),
         }
     }
@@ -229,6 +346,94 @@ impl PluginHost {
         self.state.borrow_mut().layout = Some(layout);
     }
 
+    /// The window's prefix key, which a page's declaration may not hold. Until this is called it is the
+    /// stock prefix.
+    pub fn set_prefix_key(&self, prefix: &KeySpec) {
+        self.state.borrow_mut().prefix_key = Chord::of(prefix);
+    }
+
+    /// Whether the page's module holds the keys; the page is told once it has said hello.
+    pub fn set_has_keys(&self, has_keys: bool) {
+        let hello = {
+            let mut st = self.state.borrow_mut();
+            st.has_keys = has_keys;
+            st.hello
+        };
+        if hello {
+            self.send_focus();
+        }
+    }
+
+    /// The editor's `timeoutlen`; a page that has said hello is told when it changes.
+    pub fn set_timeoutlen(&self, ms: u32) {
+        let hello = {
+            let mut st = self.state.borrow_mut();
+            if st.timeoutlen == ms {
+                return;
+            }
+            st.timeoutlen = ms;
+            st.hello
+        };
+        if hello {
+            self.page
+                .send(&protocol::event_text("keys_config", &KeysConfig { timeoutlen: ms }));
+        }
+    }
+
+    /// The current document's key table with the user's overrides applied, or `None` before it declared
+    /// one.
+    pub fn declared_rows(&self) -> Option<Vec<EffectiveRow>> {
+        self.state.borrow().declared.clone()
+    }
+
+    fn send_focus(&self) {
+        let has_keys = self.state.borrow().has_keys;
+        self.page.send(&protocol::event_text("focus", &FocusEvent { has_keys }));
+    }
+
+    /// Holds every path check until the returned sender sends one message for it, so a test can stand in for
+    /// a filesystem that does not answer. Dropping the sender lets every check through. Must be called before
+    /// the first check.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn gate_path_checks(&self) -> mpsc::Sender<()> {
+        let (tx, rx) = mpsc::channel();
+        self.state.borrow_mut().check_gate = Some(rx);
+        tx
+    }
+
+    /// Hands a check to the worker; the ticket names its answer.
+    fn submit_check(&self, job: CheckJob) -> Result<u64, String> {
+        let mut st = self.state.borrow_mut();
+        if st.checker.is_none() {
+            let gate = st.check_gate.take();
+            let spawned = PathChecker::spawn((*self.plugin).clone(), self.wake.clone(), gate);
+            st.checker = Some(spawned.map_err(|e| format!("the path checker's thread could not start: {e}"))?);
+        }
+        let ticket = st.next_ticket;
+        st.next_ticket += 1;
+        if let Some(checker) = st.checker.as_ref() {
+            let _ = checker.tx.send((ticket, job));
+        }
+        Ok(ticket)
+    }
+
+    fn check_then(&self, re: u64, job: CheckJob, then: Then, now: Instant) -> Option<Reply> {
+        let ticket = match self.submit_check(job) {
+            Ok(ticket) => ticket,
+            Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
+        };
+        let mut st = self.state.borrow_mut();
+        let document = st.document;
+        st.checking.push(Checking {
+            ticket,
+            re,
+            document,
+            deadline: now + CHECK_DEADLINE,
+            then,
+        });
+        None
+    }
+
     /// A new document started loading (a reload, a crash's recovery, a navigation): it must say hello again,
     /// and nothing still out for the old one is answered.
     pub fn page_loading(&self) {
@@ -239,6 +444,8 @@ impl PluginHost {
         let mut st = self.state.borrow_mut();
         st.hello = false;
         st.document += 1;
+        // A new document has its own keys, and declares them once it has loaded.
+        st.declared = None;
     }
 
     pub fn runs(&self) -> Vec<RunInfo> {
@@ -290,8 +497,26 @@ impl PluginHost {
 
     fn handle(&self, re: u64, verb: Verb, now: Instant) -> Option<Reply> {
         match verb {
-            Verb::HostHello(_) => Some(self.hello(re)),
-            Verb::TaskStart(args) => Some(self.task_start(re, &args.task, &args.vars)),
+            Verb::HostHello(_) => {
+                // The page learns where the keys are only after the reply, so it has its configuration
+                // before the first event.
+                self.reply(self.hello(re));
+                self.send_focus();
+                None
+            }
+            Verb::KeysDeclare(args) => Some(self.keys_declare(re, args.rows)),
+            Verb::TaskStart(args) => self.check_then(
+                re,
+                CheckJob::Task {
+                    task: args.task.clone(),
+                    vars: args.vars.clone(),
+                },
+                Then::Task {
+                    task: args.task,
+                    vars: args.vars,
+                },
+                now,
+            ),
             Verb::TaskCancel(args) => {
                 let known = self.state.borrow_mut().tasks.cancel(args.run);
                 Some(if known {
@@ -334,6 +559,7 @@ impl PluginHost {
         // is delivered once (in the tail) and not again as output.
         let runs = self.state.borrow_mut().tasks.attach();
         self.state.borrow_mut().hello = true;
+        let timeoutlen = self.state.borrow().timeoutlen;
         let manifest = &self.plugin.manifest;
         let capabilities: Vec<&str> = manifest.capabilities.iter().map(|c| c.as_str()).collect();
         let roots: BTreeMap<&String, String> = self
@@ -355,12 +581,55 @@ impl PluginHost {
                 "capabilities": capabilities,
                 "roots": roots,
                 "runs": runs,
+                "keys_kit": 1,
+                "timeoutlen": timeoutlen,
             }),
         )
     }
 
-    fn task_start(&self, re: u64, task: &str, vars: &BTreeMap<String, String>) -> Reply {
-        let resolved = self.plugin.resolve_task(task, vars);
+    fn keys_declare(&self, re: u64, rows: Vec<KeyRowArg>) -> Reply {
+        // A document that has not said hello may be the previous one, still running script after a new
+        // load started: its table would stand for a page that never declared one.
+        let (hello, prefix_key) = {
+            let st = self.state.borrow();
+            (st.hello, st.prefix_key.clone())
+        };
+        if !hello {
+            return Reply::err(re, ErrorCode::BadRequest, "keys.declare comes after host.hello");
+        }
+        let rows = match keys::validate(rows, &prefix_key) {
+            Ok(rows) => rows,
+            Err(why) => return Reply::err(re, ErrorCode::BadRequest, &why),
+        };
+        let (effective, log) = keys::effective(&rows, &self.overrides);
+        for line in log {
+            eprintln!("[plugin {}] {line}", self.id());
+        }
+        let result: Vec<Value> = effective
+            .iter()
+            .map(|row| {
+                let keys: Vec<&str> = row.keys.iter().map(|(k, _)| k.as_str()).collect();
+                let sources: Vec<&str> = row.keys.iter().map(|(_, s)| s.as_str()).collect();
+                json!({
+                    "action": row.action,
+                    "keys": keys,
+                    "sources": sources,
+                    "context": row.context,
+                    "desc": row.desc,
+                })
+            })
+            .collect();
+        self.state.borrow_mut().declared = Some(effective);
+        Reply::ok(re, json!({ "rows": result }))
+    }
+
+    fn task_start(
+        &self,
+        re: u64,
+        task: &str,
+        vars: &BTreeMap<String, String>,
+        resolved: Result<ResolvedTask, TaskRefusal>,
+    ) -> Reply {
         let started = {
             let mut st = self.state.borrow_mut();
             match resolved {
@@ -413,27 +682,9 @@ impl PluginHost {
     }
 
     fn editor_open(&self, re: u64, raw: &str, line: Option<u32>, col: Option<u32>, now: Instant) -> Option<Reply> {
-        let path = match roots::file_inside(&self.plugin.roots, raw) {
-            Ok(path) => path,
-            Err(refusal) => return Some(path_refusal(re, refusal, raw)),
-        };
-        let Some(editor) = self.editor() else {
-            return Some(Reply::err(
-                re,
-                ErrorCode::EditorUnavailable,
-                "this window has no editor running",
-            ));
-        };
-        let pending = editor::open(&*editor, &path, line, col);
-        self.push_call(Some(re), Call::Open, pending, now + EDITOR_DEADLINE);
-        None
-    }
-
-    fn editor_assist(&self, re: u64, raw: &str, diagnostics: OnOff, inlay_hints: OnOff, now: Instant) -> Option<Reply> {
-        let root = match roots::dir_inside(&self.plugin.roots, raw) {
-            Ok(root) => root,
-            Err(refusal) => return Some(path_refusal(re, refusal, raw)),
-        };
+        if let Err(refusal) = roots::lexical(raw) {
+            return Some(path_refusal(re, refusal, raw));
+        }
         if self.editor().is_none() {
             return Some(Reply::err(
                 re,
@@ -441,17 +692,60 @@ impl PluginHost {
                 "this window has no editor running",
             ));
         }
+        let then = Then::Open {
+            raw: raw.to_owned(),
+            line,
+            col,
+        };
+        self.check_then(re, CheckJob::File(raw.to_owned()), then, now)
+    }
+
+    /// The file passed its check: the editor is asked, within what is left of the request's deadline.
+    fn open_checked(&self, re: u64, path: &std::path::Path, line: Option<u32>, col: Option<u32>, deadline: Instant) {
+        let Some(editor) = self.editor() else {
+            self.reply(Reply::err(
+                re,
+                ErrorCode::EditorUnavailable,
+                "this window has no editor running",
+            ));
+            return;
+        };
+        let pending = editor::open(&*editor, path, line, col);
+        self.push_call(Some(re), Call::Open, pending, deadline);
+    }
+
+    fn editor_assist(&self, re: u64, raw: &str, diagnostics: OnOff, inlay_hints: OnOff, now: Instant) -> Option<Reply> {
+        if let Err(refusal) = roots::lexical(raw) {
+            return Some(path_refusal(re, refusal, raw));
+        }
+        if self.editor().is_none() {
+            return Some(Reply::err(
+                re,
+                ErrorCode::EditorUnavailable,
+                "this window has no editor running",
+            ));
+        }
+        let ticket = match self.submit_check(CheckJob::Dir(raw.to_owned())) {
+            Ok(ticket) => ticket,
+            Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
+        };
         // Marked now, not on the answer: a stop before the answer still clears it.
-        self.state.borrow_mut().assisted = true;
-        self.assist_call(
-            Some(re),
-            AssistOp::Apply {
-                root,
+        let mut st = self.state.borrow_mut();
+        st.assisted = true;
+        // Parked even when nothing is outstanding, so a clear sent while the root is being checked waits
+        // behind it.
+        let document = st.document;
+        st.parked.push_back(ParkedAssist {
+            re: Some(re),
+            op: AssistOp::Checking {
+                ticket,
+                raw: raw.to_owned(),
                 diagnostics: diagnostics == OnOff::On,
                 inlay_hints: inlay_hints == OnOff::On,
             },
-            now,
-        );
+            deadline: now + EDITOR_DEADLINE,
+            document,
+        });
         None
     }
 
@@ -491,6 +785,7 @@ impl PluginHost {
             return re.map(|re| Reply::err(re, ErrorCode::EditorUnavailable, "this window has no editor running"));
         };
         let (call, pending) = match &op {
+            AssistOp::Checking { .. } => return None,
             AssistOp::Apply {
                 root,
                 diagnostics,
@@ -597,11 +892,13 @@ impl PluginHost {
             }
         }
 
+        let mut replies = Vec::new();
+        self.take_checks(now, &mut replies);
+
         let calls = std::mem::take(&mut self.state.borrow_mut().calls);
         let layout = self.state.borrow().layout.clone();
         let current = self.state.borrow().document;
         let mut keep = Vec::new();
-        let mut replies = Vec::new();
         for mut call in calls {
             if call.document != current {
                 // Asked by a document that has been replaced: no answer, and the keys stay where they are.
@@ -634,26 +931,45 @@ impl PluginHost {
                     }
                 }
                 None if now >= call.deadline => {
-                    if let Some(re) = call.re {
+                    if let Some(re) = call.re.take() {
                         replies.push(Reply::err(
                             re,
                             ErrorCode::EditorTimeout,
                             "the editor did not answer within 5 s; it may be waiting for a key (press Esc and try again)",
                         ));
                     }
+                    // The request is still on its way to nvim and may run later. An assist call is kept until
+                    // it is answered, so the clear behind it can never reach nvim first and be undone by it.
+                    if call.call != Call::Open {
+                        keep.push(call);
+                    }
                 }
-                None => {
-                    let at = now + EDITOR_POLL;
-                    next = Some(next.map_or(at, |n| n.min(at)));
-                    keep.push(call);
-                }
+                None => keep.push(call),
             }
         }
         self.state.borrow_mut().calls.extend(keep);
         self.send_parked(now, &mut replies);
-        if !self.state.borrow().calls.is_empty() {
-            let at = now + EDITOR_POLL;
-            next = Some(next.map_or(at, |n| n.min(at)));
+        {
+            let st = self.state.borrow();
+            for call in &st.calls {
+                let at = now
+                    + if now >= call.deadline {
+                        EDITOR_LATE_POLL
+                    } else {
+                        EDITOR_POLL
+                    };
+                next = Some(next.map_or(at, |n| n.min(at)));
+            }
+            // A check's answer raises the wake; the timer is only for its deadline.
+            let deadlines = st.checking.iter().map(|c| c.deadline).chain(
+                st.parked
+                    .iter()
+                    .filter(|p| matches!(p.op, AssistOp::Checking { .. }))
+                    .map(|p| p.deadline),
+            );
+            for at in deadlines {
+                next = Some(next.map_or(at, |n| n.min(at)));
+            }
         }
 
         let results = self
@@ -676,6 +992,108 @@ impl PluginHost {
             self.reply(reply);
         }
         next
+    }
+
+    /// Acts on the checks that have finished, and gives up on the ones past their deadline.
+    fn take_checks(&self, now: Instant, replies: &mut Vec<Reply>) {
+        let results: Vec<(u64, Checked)> = {
+            let st = self.state.borrow();
+            st.checker
+                .as_ref()
+                .map(|c| c.rx.try_iter().collect())
+                .unwrap_or_default()
+        };
+        let (current, closed) = {
+            let st = self.state.borrow();
+            (st.document, st.closed)
+        };
+        for (ticket, checked) in results {
+            let waiting = {
+                let mut st = self.state.borrow_mut();
+                let at = st.checking.iter().position(|c| c.ticket == ticket);
+                at.map(|i| st.checking.remove(i))
+            };
+            if let Some(c) = waiting {
+                // The document that asked is gone (a reload, a stop) or the window is closing: nothing is
+                // opened or started on its behalf.
+                if c.document != current || closed {
+                    continue;
+                }
+                match (c.then, checked) {
+                    (Then::Open { raw, .. }, Checked::Path(Err(refusal))) => {
+                        replies.push(path_refusal(c.re, refusal, &raw))
+                    }
+                    (Then::Open { line, col, .. }, Checked::Path(Ok(path))) => {
+                        self.open_checked(c.re, &path, line, col, c.deadline)
+                    }
+                    (Then::Task { task, vars }, Checked::Task(resolved)) => {
+                        replies.push(self.task_start(c.re, &task, &vars, resolved))
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let Checked::Path(result) = checked else { continue };
+            let mut st = self.state.borrow_mut();
+            let at = st
+                .parked
+                .iter()
+                .position(|p| matches!(p.op, AssistOp::Checking { ticket: t, .. } if t == ticket));
+            let Some(i) = at else { continue };
+            match result {
+                Ok(root) => {
+                    let parked = &mut st.parked[i];
+                    if let AssistOp::Checking {
+                        diagnostics,
+                        inlay_hints,
+                        ..
+                    } = parked.op
+                    {
+                        parked.op = AssistOp::Apply {
+                            root,
+                            diagnostics,
+                            inlay_hints,
+                        };
+                    }
+                }
+                Err(refusal) => {
+                    let Some(parked) = st.parked.remove(i) else { continue };
+                    if let (Some(re), AssistOp::Checking { raw, .. }) = (parked.re, &parked.op) {
+                        if parked.document == current {
+                            replies.push(path_refusal(re, refusal, raw));
+                        }
+                    }
+                }
+            }
+        }
+
+        // A check past its deadline is given up: whatever it finds later is dropped, and nothing is opened,
+        // started or applied for it.
+        let mut st = self.state.borrow_mut();
+        let mut expired = Vec::new();
+        st.checking.retain(|c| {
+            if now < c.deadline {
+                return true;
+            }
+            if c.document == current && !closed {
+                expired.push(c.re);
+            }
+            false
+        });
+        st.parked.retain(|p| {
+            if !matches!(p.op, AssistOp::Checking { .. }) || now < p.deadline {
+                return true;
+            }
+            if let Some(re) = p.re.filter(|_| p.document == current) {
+                expired.push(re);
+            }
+            false
+        });
+        replies.extend(
+            expired
+                .into_iter()
+                .map(|re| Reply::err(re, ErrorCode::Io, CHECK_TIMEOUT)),
+        );
     }
 
     /// Sends the assist call at the head of the line once none is outstanding, and tells the page whose call
@@ -705,6 +1123,9 @@ impl PluginHost {
                 if st.calls.iter().any(|c| matches!(c.call, Call::Assist | Call::Clear)) {
                     return;
                 }
+                if matches!(st.parked.front().map(|p| &p.op), Some(AssistOp::Checking { .. })) {
+                    return;
+                }
                 st.parked.pop_front()
             };
             let Some(parked) = next else { return };
@@ -732,7 +1153,7 @@ impl PluginHost {
         }
         let waiting = {
             let st = self.state.borrow();
-            !st.calls.is_empty() || !st.parked.is_empty()
+            !st.calls.is_empty() || !st.parked.is_empty() || !st.checking.is_empty()
         };
         waiting.then(|| now + EDITOR_POLL)
     }
@@ -744,5 +1165,279 @@ impl PluginHost {
         self.state.borrow_mut().closed = true;
         self.stop(now);
         self.state.borrow().tasks.waiter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::load::load_plugin;
+    use crate::plugin::test_support::{demo_plugin, Scratch};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Page(RefCell<Vec<Value>>);
+
+    impl PagePort for Page {
+        fn send(&self, message: &str) {
+            self.0
+                .borrow_mut()
+                .push(serde_json::from_str(message).expect("the host sends JSON"));
+        }
+    }
+
+    impl Page {
+        fn take(&self) -> Vec<Value> {
+            std::mem::take(&mut *self.0.borrow_mut())
+        }
+    }
+
+    struct Rig {
+        _s: Scratch,
+        host: PluginHost,
+        page: Rc<Page>,
+    }
+
+    /// A plugin whose manifest declares no capability at all, so every verb these tests send is one a
+    /// page may send without asking for anything.
+    fn rig(overrides: Vec<PluginKeyOp>) -> Rig {
+        let s = Scratch::new("host-keys");
+        let (dir, _) = demo_plugin(&s.0);
+        std::fs::write(
+            dir.join("eitri-plugin.toml"),
+            "id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\n\
+             site = \"build/site\"\nentry = \"index.html\"\ncapabilities = []\n",
+        )
+        .unwrap();
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &BTreeMap::new(), None).unwrap());
+        let page = Rc::new(Page::default());
+        let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), None, overrides);
+        Rig { _s: s, host, page }
+    }
+
+    impl Rig {
+        fn send(&self, id: u64, verb: &str, args: Value) {
+            let text = json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string();
+            self.host.page_message(&text, Instant::now());
+        }
+
+        fn hello(&self) -> Vec<Value> {
+            self.send(1, "host.hello", json!({}));
+            self.page.take()
+        }
+
+        fn declare(&self, rows: Value) -> Value {
+            self.send(7, "keys.declare", json!({ "rows": rows }));
+            let mut sent = self.page.take();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            sent.remove(0)
+        }
+    }
+
+    fn row(action: &str, keys: &[&str]) -> Value {
+        json!({"action": action, "keys": keys, "context": "题目", "desc": "下一题"})
+    }
+
+    fn focus_events(sent: &[Value]) -> Vec<Value> {
+        sent.iter().filter(|m| m["event"] == "focus").cloned().collect()
+    }
+
+    #[test]
+    fn hello_says_the_kit_version_and_the_default_timeoutlen() {
+        let r = rig(vec![]);
+        let sent = r.hello();
+        let reply = sent.iter().find(|m| m["re"] == 1).expect("a reply");
+        assert_eq!(reply["result"]["keys_kit"], 1);
+        assert_eq!(reply["result"]["timeoutlen"], 1000);
+    }
+
+    #[test]
+    fn the_focus_waits_for_hello_and_is_sent_once_after_its_reply() {
+        let r = rig(vec![]);
+        r.host.set_has_keys(true);
+        assert!(r.page.take().is_empty(), "nothing before hello");
+        let sent = r.hello();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0]["re"], 1, "the reply comes first");
+        assert_eq!(sent[1], json!({"v": 1, "event": "focus", "data": {"has_keys": true}}));
+        r.host.set_has_keys(false);
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "event": "focus", "data": {"has_keys": false}})]
+        );
+    }
+
+    #[test]
+    fn a_page_that_starts_without_the_keys_is_told_so() {
+        let r = rig(vec![]);
+        let sent = r.hello();
+        assert_eq!(
+            focus_events(&sent),
+            vec![json!({"v": 1, "event": "focus", "data": {"has_keys": false}})]
+        );
+    }
+
+    #[test]
+    fn a_new_document_forgets_the_declaration_and_is_told_the_focus_again_after_its_hello() {
+        let r = rig(vec![]);
+        r.host.set_has_keys(true);
+        r.hello();
+        assert_eq!(r.declare(json!([row("item.next", &["]q"])]))["ok"], true);
+        assert!(r.host.declared_rows().is_some());
+        r.host.page_loading();
+        assert!(r.host.declared_rows().is_none(), "a reloaded page declares again");
+        r.host.set_has_keys(true);
+        assert!(r.page.take().is_empty(), "the new document has not said hello");
+        let sent = r.hello();
+        assert_eq!(focus_events(&sent).len(), 1, "{sent:?}");
+        assert_eq!(focus_events(&sent)[0]["data"]["has_keys"], true);
+    }
+
+    #[test]
+    fn a_stop_forgets_the_declaration() {
+        let r = rig(vec![]);
+        r.hello();
+        assert_eq!(r.declare(json!([row("item.next", &["]q"])]))["ok"], true);
+        r.host.stop(Instant::now());
+        assert!(r.host.declared_rows().is_none());
+    }
+
+    #[test]
+    fn a_declaration_before_hello_is_refused_and_records_nothing() {
+        let r = rig(vec![]);
+        let reply = r.declare(json!([row("item.next", &["]q"])]));
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(reply["error"]["code"], "bad_request");
+        assert!(r.host.declared_rows().is_none());
+    }
+
+    #[test]
+    fn the_old_document_declaring_while_the_new_one_loads_leaves_no_table() {
+        let r = rig(vec![]);
+        r.hello();
+        assert_eq!(r.declare(json!([row("item.next", &["]q"])]))["ok"], true);
+        r.host.page_loading();
+        // The old document still runs script until the new one commits.
+        assert_eq!(r.declare(json!([row("old.row", &["x"])]))["ok"], false);
+        r.hello();
+        assert!(
+            r.host.declared_rows().is_none(),
+            "a new document that never declares has no table"
+        );
+    }
+
+    #[test]
+    fn a_changed_timeoutlen_is_sent_once_and_a_repeat_is_not() {
+        let r = rig(vec![]);
+        r.hello();
+        r.host.set_timeoutlen(300);
+        assert_eq!(
+            r.page.take(),
+            vec![json!({"v": 1, "event": "keys_config", "data": {"timeoutlen": 300}})]
+        );
+        r.host.set_timeoutlen(300);
+        assert!(r.page.take().is_empty());
+    }
+
+    #[test]
+    fn a_timeoutlen_reported_before_hello_is_in_the_hello() {
+        let r = rig(vec![]);
+        r.host.set_timeoutlen(300);
+        assert!(r.page.take().is_empty());
+        let sent = r.hello();
+        assert_eq!(sent[0]["result"]["timeoutlen"], 300);
+        assert!(sent.iter().all(|m| m["event"] != "keys_config"));
+    }
+
+    #[test]
+    fn a_declaration_is_answered_with_the_effective_table() {
+        let set = PluginKeyOp::Set {
+            key: "<C-n>".into(),
+            action: "item.next".into(),
+        };
+        let r = rig(vec![set, PluginKeyOp::Del { key: "j".into() }]);
+        r.hello();
+        let reply = r.declare(json!([row("item.next", &["]q"]), row("scroll.down", &["j", "<C-n>"])]));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(
+            reply["result"],
+            json!({"rows": [
+                {"action": "item.next", "keys": ["]q", "<C-n>"], "sources": ["default", "init.lua"],
+                 "context": "题目", "desc": "下一题"},
+                {"action": "scroll.down", "keys": [], "sources": [], "context": "题目", "desc": "下一题"},
+            ]})
+        );
+        let rows = r.host.declared_rows().unwrap();
+        assert_eq!(rows[0].keys[1], ("<C-n>".to_string(), keys::KeySource::InitLua));
+        // A later declaration replaces the earlier one.
+        r.declare(json!([row("only.this", &["x"])]));
+        let rows = r.host.declared_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "only.this");
+    }
+
+    #[test]
+    fn an_override_reaches_the_page_in_the_spelling_its_kit_binds() {
+        let set = PluginKeyOp::Set {
+            key: "<c-n>".into(),
+            action: "item.next".into(),
+        };
+        let r = rig(vec![set]);
+        r.hello();
+        let reply = r.declare(json!([row("item.next", &["]q"]), row("scroll.down", &["j", "<C-n>"])]));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["result"]["rows"][0]["keys"], json!(["]q", "<C-n>"]));
+        assert_eq!(reply["result"]["rows"][1]["keys"], json!(["j"]));
+    }
+
+    #[test]
+    fn a_declaration_over_a_limit_or_with_a_kept_key_is_a_bad_request() {
+        let r = rig(vec![]);
+        r.hello();
+        let many: Vec<Value> = (0..201).map(|i| row(&format!("a{i}"), &["j"])).collect();
+        let mut long_desc = row("x", &["j"]);
+        long_desc["desc"] = json!("d".repeat(81));
+        let cases = vec![
+            ("201 rows", json!(many)),
+            (
+                "11 keys",
+                json!([row("x", &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"])]),
+            ),
+            ("a 41-character action", json!([row(&"a".repeat(41), &["j"])])),
+            ("an 81-character desc", json!([long_desc])),
+            ("a repeated action", json!([row("x", &["j"]), row("x", &["k"])])),
+            ("<C-h>", json!([row("x", &["<C-h>"])])),
+            ("<F11>", json!([row("x", &["<F11>"])])),
+            ("<C-=>", json!([row("x", &["<C-=>"])])),
+            ("<C-b>", json!([row("x", &["<C-b>"])])),
+            ("<C-S-a>", json!([row("x", &["<C-S-a>"])])),
+            ("<C-?>", json!([row("x", &["<C-?>"])])),
+            (
+                "an unknown row key",
+                json!([{"action": "x", "keys": ["j"], "context": "c", "desc": "d", "x": 1}]),
+            ),
+        ];
+        for (what, rows) in cases {
+            let reply = r.declare(rows);
+            assert_eq!(reply["ok"], false, "{what}");
+            assert_eq!(reply["error"]["code"], "bad_request", "{what}");
+            if what.starts_with('<') {
+                let message = reply["error"]["message"].as_str().unwrap();
+                assert!(message.contains(&format!("{what:?}")), "{what}: {message}");
+            }
+        }
+        assert!(
+            r.host.declared_rows().is_none(),
+            "a refused declaration records nothing"
+        );
+    }
+
+    #[test]
+    fn the_prefix_the_window_uses_is_the_one_refused() {
+        let r = rig(vec![]);
+        r.hello();
+        r.host.set_prefix_key(&KeySpec::parse("C-a").unwrap());
+        assert_eq!(r.declare(json!([row("x", &["<C-a>"])]))["ok"], false);
+        assert_eq!(r.declare(json!([row("x", &["<C-b>"])]))["ok"], true);
     }
 }

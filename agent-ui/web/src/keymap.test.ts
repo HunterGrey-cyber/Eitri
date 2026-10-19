@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { noteKey } from "./heldSuper";
-import { BROWSE_KEYS, CARET_KEYS, FIXED_PAIRS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, panelEntryKey, resolveKey } from "./keymap";
+import { BROWSE_KEYS, CARET_KEYS, FIXED_PAIRS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 
 const key = (
@@ -1259,5 +1259,17 @@ describe("resolveKey's a/d/Shift+D agree with isPlainAnswerKey on every modifier
     const ev = key("D", { ...mod, shiftKey: true });
     const expected = isPlainAnswerKey(ev) ? { kind: "deny-reason" } : null;
     expect(resolveKey("browse", ev, ctx)).toEqual(expected);
+  });
+});
+
+describe("pluginKeysHelp: open_keymap's plugin section", () => {
+  it("keeps whether the page declared", () => {
+    expect(pluginKeysHelp({ title: "Snotra", declared: true, rows: [] })).toEqual({ title: "Snotra", declared: true, rows: [] });
+    expect(pluginKeysHelp({ title: "Snotra", declared: false, rows: [] })).toEqual({ title: "Snotra", declared: false, rows: [] });
+  });
+
+  it("reads a missing declared as not declared, and refuses one that is not a boolean", () => {
+    expect(pluginKeysHelp({ title: "Snotra", rows: [] })).toEqual({ title: "Snotra", declared: false, rows: [] });
+    expect(pluginKeysHelp({ title: "Snotra", declared: "yes", rows: [] })).toBeNull();
   });
 });

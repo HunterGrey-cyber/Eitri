@@ -113,7 +113,13 @@ fn run() -> Result<Vec<String>, String> {
     window.set_child(Some(&webview));
     window.present();
     let page: Rc<dyn PagePort> = Rc::new(plugin_page::WebKitPluginPage(webview.downgrade()));
-    let host = Rc::new(PluginHost::new(plugin, page, Arc::new(|| {}), Some(store.clone())));
+    let host = Rc::new(PluginHost::new(
+        plugin,
+        page,
+        Arc::new(|| {}),
+        Some(store.clone()),
+        Vec::new(),
+    ));
     *host_cell.borrow_mut() = Some(host.clone());
 
     let session = webview.network_session().ok_or("the view has no network session")?;

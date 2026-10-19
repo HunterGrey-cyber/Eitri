@@ -1,5 +1,6 @@
 //! Records Lua keymap prefix, set and delete calls without applying or validating them here.
-//! After `init.lua`, `shell` passes them to `Keymap::apply_user`, so invalid keys, unknown
+//! Tables are `"prefix"`, `"panel"` and `"plugin:<id>"`; plugin page keys use vim notation.
+//! After `init.lua`, `shell` passes the calls to `Keymap::apply_user`, so invalid keys, unknown
 //! actions and collisions fail startup with the call named. Raising only a Lua error here
 //! would let the window open with a different keymap than requested.
 //! Wrong argument types are also retained as [`KeymapOp::Invalid`].
@@ -119,7 +120,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<KeymapStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keymap::{Action, KeySpec, Keymap, SwapTarget, TabAction};
+    use crate::keymap::{Action, KeySpec, Keymap, KeymapError, SwapTarget, TabAction};
     use crate::layout::{Axis, Direction};
 
     fn run(source: &str) -> Vec<KeymapOp> {
@@ -221,6 +222,27 @@ mod tests {
         );
         let map = Keymap::apply_user(&ops, &[]).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(map.panel_user().sets.len(), 1);
+    }
+
+    /// A plugin page's table is named `plugin:<id>`; it is recorded like the others, and a key Eitri keeps
+    /// fails startup rather than reaching the page.
+    #[test]
+    fn a_plugin_table_set_is_recorded_and_a_kept_key_fails_startup() {
+        let ops = run(r#"
+            eitri.keymap.set("plugin:snotra", "<C-n>", "item.next")
+            eitri.keymap.del("plugin:snotra", "]q")
+        "#);
+        let map = Keymap::apply_user(&ops, &[]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(map.plugin_user("snotra").len(), 2);
+
+        let ops = run(r#"eitri.keymap.set("plugin:snotra", "<C-h>", "x")"#);
+        let err = Keymap::apply_user(&ops, &[]).unwrap_err();
+        assert!(matches!(err, KeymapError::PluginKey { .. }), "{err:?}");
+        assert!(err.to_string().contains("\"<C-h>\""), "{err}");
+
+        let ops = run(r#"eitri.keymap.set("plugin:Bad_Id", "j", "x")"#);
+        let err = Keymap::apply_user(&ops, &[]).unwrap_err();
+        assert!(matches!(err, KeymapError::UnknownTable { .. }), "{err:?}");
     }
 
     /// The snippet runs through Lua and produces the expected prefix and action bindings.
