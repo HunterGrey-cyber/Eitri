@@ -322,13 +322,23 @@ function rowScrollStep(row: HTMLElement): number {
   return STEP_LINES * computedLineHeight(rowTextElement(row));
 }
 
-/** `j`/`k` while the `?` keymap overlay is open: scrolls the overlay itself, by the
- *  same three-line step a tall row uses (`rowScrollStep`) rather than a fresh pixel constant --
- *  the plan asks for exactly this reuse. `el.scrollTop` clamps itself at both ends, the same as
- *  every other raw `scrollTop` write in this file, so there is nothing else here to bound. */
-function scrollKeymapOverlay(el: HTMLDivElement | null, direction: 1 | -1) {
+/** The sheet owns its scroll box: line motions share the conversation's text-sized step, while page
+ *  motions use the visible sheet height so they still fit after resizing the window. */
+function scrollKeymapOverlay(el: HTMLDivElement | null, key: string, ctrl: boolean) {
   if (el === null) return;
-  el.scrollTop += direction * rowScrollStep(el);
+  if (ctrl) {
+    if (key === "d") el.scrollTop += el.clientHeight / 2;
+    else if (key === "u") el.scrollTop -= el.clientHeight / 2;
+    else if (key === "f") el.scrollTop += el.clientHeight;
+    else if (key === "b") el.scrollTop -= el.clientHeight;
+  } else {
+    if (key === "j" || key === "ArrowDown") el.scrollTop += rowScrollStep(el);
+    else if (key === "k" || key === "ArrowUp") el.scrollTop -= rowScrollStep(el);
+    else if (key === "PageDown" || key === " ") el.scrollTop += el.clientHeight;
+    else if (key === "PageUp") el.scrollTop -= el.clientHeight;
+    else if (key === "gg") el.scrollTop = 0;
+    else if (key === "G") el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+  }
 }
 
 /** Brings `row` on screen in `list` after the cursor has landed on it, by computing the `scrollTop`
@@ -1204,6 +1214,26 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  const keymapPendingG = useRef(false);
+  useEffect(() => { keymapPendingG.current = false; }, [keymapOpen]);
+
+  function onKeymapKey(event: KeyboardEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isModifierKey(event.key)) return;
+    const pendingG = keymapPendingG.current;
+    keymapPendingG.current = false;
+    if (event.altKey || event.metaKey || event.nativeEvent.isComposing) return;
+    if (event.ctrlKey && event.shiftKey) return;
+    if (!event.ctrlKey && (event.key === "?" || event.key === "Escape" || event.key === "q")) {
+      setKeymapOpen(false);
+    } else if (!event.ctrlKey && event.key === "g") {
+      if (pendingG) scrollKeymapOverlay(keymapOverlayRef.current, "gg", false);
+      else keymapPendingG.current = true;
+    } else {
+      scrollKeymapOverlay(keymapOverlayRef.current, event.key, event.ctrlKey);
+    }
+  }
   /** The plugin page's section `prefix ?` sent with `open_keymap`, drawn first while the overlay is open. It
    *  belongs to that one opening: once the overlay closes it is dropped, so the panel's own `?` later shows no
    *  page's keys. */
@@ -4066,10 +4096,7 @@ export default function App() {
         onKeyDownCapture={(event) => {
           if (answerConfirm(event)) return;
           if (!keymapOpen) return;
-          event.preventDefault();
-          event.stopPropagation();
-          if (event.key === "?" || event.key === "Escape" || event.key === "q") setKeymapOpen(false);
-          else if (event.key === "j" || event.key === "k") scrollKeymapOverlay(keymapOverlayRef.current, event.key === "j" ? 1 : -1);
+          onKeymapKey(event);
         }}
       >
         {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
@@ -4962,12 +4989,7 @@ export default function App() {
     // unconditionally: `a`/`d` must not reach a permission card hidden underneath, and neither
     // must anything else this table would otherwise claim.
     if (keymapOpen) {
-      event.preventDefault();
-      if (event.key === "?" || event.key === "Escape" || event.key === "q") {
-        setKeymapOpen(false);
-      } else if (event.key === "j" || event.key === "k") {
-        scrollKeymapOverlay(keymapOverlayRef.current, event.key === "j" ? 1 : -1);
-      }
+      onKeymapKey(event);
       return;
     }
     // The review overlay owns every key while it is open, the same way and for the same reason: `a`/`d` must

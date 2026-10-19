@@ -26,6 +26,25 @@ function sectionTitled(container: HTMLElement, title: string) {
 }
 
 describe("KeymapOverlay", () => {
+  it.each(["Ctrl+b", "Ctrl+a"])("names the sheet's scroll and close keys under %s", (prefix) => {
+    const { container } = render(
+      <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel={prefix} panel={EMPTY_PANEL_TABLE} />,
+    );
+    const help = Array.from(container.querySelectorAll("p")).find((p) => /scroll/i.test(p.textContent ?? ""));
+    expect(help).toBeDefined();
+    for (const key of ["j/k", "↓/↑", "Ctrl+d/u", "Ctrl+f", "PageDown/PageUp", "Space", "gg/G", "?", "Esc", "q"]) {
+      expect(help!.textContent).toContain(key);
+    }
+    if (prefix === "Ctrl+b") {
+      expect(help!.textContent).toContain("Ctrl+b is the prefix");
+      expect(help!.textContent).not.toContain("Ctrl+f/b");
+    } else {
+      expect(help!.textContent).toContain("Ctrl+f/b");
+      expect(help!.textContent).not.toContain("Ctrl+b is the prefix");
+    }
+    expect(help!.textContent).toMatch(/close/i);
+  });
+
   it("renders the six groups, the leader between BROWSE and Typing, Slash commands between Typing and Anywhere, the last headed by the configured prefix", () => {
     const { container } = overlay();
     const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);

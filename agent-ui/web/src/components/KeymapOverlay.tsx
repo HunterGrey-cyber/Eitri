@@ -217,18 +217,10 @@ function SlashCommands() {
   );
 }
 
-/**
- * The full `?` keymap: the two key-table groups come from the one source of truth
- * `BROWSE_KEYS`/`INPUT_KEYS` in `./keymap`, so this list can neither promise a key the panel does
- * not have nor omit one it does. "Anywhere in the window" and "After <prefix>" come from `shell`'s
- * own `keymap` envelope, generated from `eitri_core::keymap`: nothing on this page can read what
- * GTK binds. It draws only; `App.tsx` decides when it is open, swallows every key while it is (so
- * `a`/`d` cannot reach a card hidden underneath) and scrolls it on `j`/`k` through the forwarded
- * ref. The one thing this component decides for itself is a click on its own backdrop, which also
- * closes it: `event.target === event.currentTarget` is exactly a click that landed on this element
- * and not on anything it contains, so a click inside a table (reading a row, selecting text) never
- * fires it.
- */
+/** The key tables share the panel's bindings; the window and prefix rows come from the shell, since
+ *  this page cannot read GTK's bindings. App owns the keyboard and scrolls this box through the ref,
+ *  so reading the sheet never acts on a card underneath. Only a click on the backdrop closes it here:
+ *  a click inside a table must still allow reading a row or selecting its text. */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
   { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin },
   ref,
@@ -243,6 +235,11 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         if (event.target === event.currentTarget) onClose();
       }}
     >
+      <p>
+        Scroll this sheet: j/k or ↓/↑; Ctrl+d/u half a page; {prefixLabel === "Ctrl+b" ? "Ctrl+f" : "Ctrl+f/b"},
+        {" "}PageDown/PageUp or Space a page{prefixLabel === "Ctrl+b" ? " (Ctrl+b is the prefix)" : ""};
+        gg/G top/bottom. ? / Esc / q close.
+      </p>
       {/* Rust's `install_module_nav` claims `Ctrl+j` before `resolveKey`, so add it here rather
           than to `BROWSE_KEYS`, which tests tie to `resolveKey` in both directions. The Typing
           section likewise adds GTK-handled keys separately. `Ctrl+[` is handled by the

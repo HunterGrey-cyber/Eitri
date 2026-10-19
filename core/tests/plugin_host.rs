@@ -496,7 +496,7 @@ fn an_idle_host_asks_for_no_timer() {
 #[test]
 fn an_answer_still_out_when_the_page_reloads_never_reaches_the_new_page() {
     let rig = Rig::new("host-reload-answers", |m| m);
-    // Explicit ids: a reloaded page's bridge numbers its calls from 1 again.
+    // Explicit, equal ids: the host must not rely on the bridge's ids differing across documents.
     let raw = |id: u64, verb: &str, args: Value| {
         rig.host.page_message(
             &json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string(),

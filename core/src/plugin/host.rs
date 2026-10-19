@@ -176,8 +176,8 @@ struct PluginHostState {
     /// The window is closing: the page may still be alive for a moment, but nothing it sends is acted on, so
     /// no run can start after the shutdown's list of runs to wait for was taken.
     closed: bool,
-    /// Counts documents: raised by every reload and by a stop. A new document numbers its calls from 1 again,
-    /// so an answer still out for an older one must never be sent under that id.
+    /// Counts documents: raised by every reload and by a stop, so an answer still out for an older one
+    /// is never sent into the document that replaced it.
     document: u64,
     editor: Option<Rc<dyn EditorRpc>>,
     layout: Option<Rc<dyn LayoutPort>>,
@@ -458,6 +458,10 @@ impl PluginHost {
 
     fn reply(&self, reply: Reply) {
         self.page.send(&reply.to_text());
+    }
+
+    fn log_dropped_reply(&self, re: u64, reason: &str) {
+        eprintln!("[plugin {}] dropped reply {re}: {reason}", self.id());
     }
 
     pub fn page_message(&self, raw: &str, now: Instant) {
@@ -901,13 +905,15 @@ impl PluginHost {
         let mut keep = Vec::new();
         for mut call in calls {
             if call.document != current {
+                if let Some(re) = call.re.take() {
+                    self.log_dropped_reply(re, "the requesting document was replaced");
+                }
                 // Asked by a document that has been replaced: no answer, and the keys stay where they are.
                 if call.call == Call::Open {
                     continue;
                 }
                 // An assist call stays tracked until the editor has answered it, silently: the calls behind
                 // it are sent only then.
-                call.re = None;
             }
             let answer = call.pending.try_take();
             match answer {
@@ -985,6 +991,8 @@ impl PluginHost {
             if let Some((document, re)) = waiting {
                 if document == current {
                     replies.push(store_reply(re, result));
+                } else {
+                    self.log_dropped_reply(re, "the requesting document was replaced");
                 }
             }
         }
@@ -1007,6 +1015,11 @@ impl PluginHost {
             let st = self.state.borrow();
             (st.document, st.closed)
         };
+        let drop_reason = if closed {
+            "the window is closing"
+        } else {
+            "the requesting document was replaced"
+        };
         for (ticket, checked) in results {
             let waiting = {
                 let mut st = self.state.borrow_mut();
@@ -1017,6 +1030,7 @@ impl PluginHost {
                 // The document that asked is gone (a reload, a stop) or the window is closing: nothing is
                 // opened or started on its behalf.
                 if c.document != current || closed {
+                    self.log_dropped_reply(c.re, drop_reason);
                     continue;
                 }
                 match (c.then, checked) {
@@ -1061,6 +1075,8 @@ impl PluginHost {
                     if let (Some(re), AssistOp::Checking { raw, .. }) = (parked.re, &parked.op) {
                         if parked.document == current {
                             replies.push(path_refusal(re, refusal, raw));
+                        } else {
+                            self.log_dropped_reply(re, drop_reason);
                         }
                     }
                 }
@@ -1077,6 +1093,8 @@ impl PluginHost {
             }
             if c.document == current && !closed {
                 expired.push(c.re);
+            } else {
+                self.log_dropped_reply(c.re, drop_reason);
             }
             false
         });
@@ -1084,8 +1102,12 @@ impl PluginHost {
             if !matches!(p.op, AssistOp::Checking { .. }) || now < p.deadline {
                 return true;
             }
-            if let Some(re) = p.re.filter(|_| p.document == current) {
-                expired.push(re);
+            if let Some(re) = p.re {
+                if p.document == current {
+                    expired.push(re);
+                } else {
+                    self.log_dropped_reply(re, drop_reason);
+                }
             }
             false
         });
@@ -1113,6 +1135,8 @@ impl PluginHost {
                             ErrorCode::EditorTimeout,
                             "the editor did not answer within 5 s; it may be waiting for a key (press Esc and try again)",
                         ));
+                    } else {
+                        self.log_dropped_reply(re, "the requesting document was replaced");
                     }
                 }
             }
@@ -1130,6 +1154,9 @@ impl PluginHost {
             };
             let Some(parked) = next else { return };
             let re = parked.re.filter(|_| parked.document == current);
+            if let Some(re) = parked.re.filter(|_| parked.document != current) {
+                self.log_dropped_reply(re, "the requesting document was replaced");
+            }
             if let Some(reply) = self.send_assist(re, parked.op, parked.deadline) {
                 replies.push(reply);
             }
@@ -1240,6 +1267,40 @@ mod tests {
 
     fn focus_events(sent: &[Value]) -> Vec<Value> {
         sent.iter().filter(|m| m["event"] == "focus").cloned().collect()
+    }
+
+    #[test]
+    fn a_state_read_pending_across_new_document_sends_no_reply() {
+        let s = Scratch::new("host-stale-read");
+        let (dir, settings) = demo_plugin(&s.0);
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
+        let store = PluginStore::new(s.0.join("state"), "demo");
+        store.write("position", &json!("old page")).unwrap();
+        let page = Rc::new(Page::default());
+        let (done, ready) = mpsc::channel();
+        let wake = Arc::new(move || {
+            let _ = done.send(());
+        });
+        let host = PluginHost::new(plugin, page.clone(), wake, Some(store), Vec::new());
+        host.page_message(
+            &json!({"v": 1, "id": 42, "verb": "state.read", "args": {"key": "position"}}).to_string(),
+            Instant::now(),
+        );
+        assert!(page.take().is_empty(), "the read waits for the store worker");
+        host.new_document();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        host.pump(Instant::now());
+        assert!(
+            page.take().is_empty(),
+            "the old read must not answer into the new document"
+        );
+        assert!(host.state.borrow().store_waiting.is_empty(), "the answer was consumed");
+        host.page_message(
+            &json!({"v": 1, "id": 42, "verb": "host.hello", "args": {}}).to_string(),
+            Instant::now(),
+        );
+        let sent = page.take();
+        assert_eq!(sent[0]["result"]["host"], "eitri");
     }
 
     #[test]

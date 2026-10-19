@@ -10,7 +10,9 @@
   var LIMIT = 256 * 1024;
   var pending = new Map();
   var listeners = new Map();
-  var next = 1;
+  // A reply may run in a different document after navigation, including a cached page's restore.
+  // Give each document a random id base so such a reply is unlikely to match a call waiting here.
+  var next = 1 + Math.floor(Math.random() * 0x100000) * 0x100000000;
 
   function hostError(code, message) {
     var e = new Error(message);
