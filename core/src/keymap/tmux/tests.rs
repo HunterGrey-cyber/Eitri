@@ -1217,3 +1217,19 @@ fn switch_client_and_choose_tree_s() {
         "flagless choose-tree is the tab chooser"
     );
 }
+
+#[test]
+fn break_pane_breaks_a_tab_out_and_its_flags_are_not_imported() {
+    let got = import("bind ! break-pane\nbind B breakp\n");
+    assert!(got.import.skipped.is_empty(), "{:?}", got.import.skipped);
+    assert_eq!(got.bound("!"), Some((Action::TabBreak, false)));
+    assert_eq!(got.bound("B"), Some((Action::TabBreak, false)));
+    for (line, why) in [
+        ("bind B break-pane -d\n", "flag -d not imported"),
+        ("bind B break-pane -t :2\n", "flag -t not imported"),
+        ("bind B break-pane -n x\n", "flag -n not imported"),
+    ] {
+        let got = import(line);
+        assert!(got.only_reason().contains(why), "{line}: {}", got.only_reason());
+    }
+}

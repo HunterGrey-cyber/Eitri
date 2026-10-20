@@ -157,7 +157,7 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
     let plan = match set
-        .cycle_mode(tab)
+        .cycle_mode(tab, eitri_core::tab_set::ViewId::BASE)
         .expect("an empty tab can always start a bypass entry")
     {
         ModeCycle::Confirm(plan) => plan,
@@ -165,7 +165,7 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     };
     assert_eq!(plan.approve.len(), 0, "an empty tab has no cards to approve yet");
     match set
-        .confirm_bypass(plan.scope, plan.nonce)
+        .confirm_bypass(plan.scope, plan.nonce, eitri_core::tab_set::ViewId::BASE)
         .expect("the just-built plan is still current")
     {
         ConfirmOutcome::Entered { approved, .. } => assert_eq!(approved, 0),
@@ -1608,11 +1608,11 @@ fn protected_paths_under_default_with_hook_allow() {
     }
 
     // Leaving bypass moves this session to Manual immediately; the next press moves it to Auto.
-    match set.cycle_mode(tab).unwrap() {
+    match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Manual) => {}
         other => panic!("leaving bypass moves at once, to manual, got {other:?}"),
     }
-    match set.cycle_mode(tab).unwrap() {
+    match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Auto) => {}
         other => panic!("manual -> auto moves at once, got {other:?}"),
     }
@@ -1654,7 +1654,9 @@ fn protected_paths_under_default_with_hook_allow() {
                             reason: Some("v1-mode probe: only the Write of the target is approved".into()),
                         }
                     };
-                    set.answer_card(tab, &id, decision).map_err(|e| e.message).unwrap();
+                    set.answer_card(tab, eitri_core::tab_set::ViewId::BASE, &id, decision)
+                        .map_err(|e| e.message)
+                        .unwrap();
                 }
             }
         },
@@ -2182,7 +2184,7 @@ fn bypass_approves_the_ask_rule_card(label: &str, ask_rule: &str) {
         "nothing is written while the card waits in the Auto tab"
     );
 
-    let plan = match set.cycle_mode(tab).unwrap() {
+    let plan = match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Confirm(plan) => plan,
         other => panic!("entering bypass always asks first, got {other:?}"),
     };
@@ -2192,7 +2194,10 @@ fn bypass_approves_the_ask_rule_card(label: &str, ask_rule: &str) {
         plan.approve
     );
     assert_eq!(plan.lines.len(), 1, "no card stays waiting: {:?}", plan.lines);
-    match set.confirm_bypass(plan.scope, plan.nonce).unwrap() {
+    match set
+        .confirm_bypass(plan.scope, plan.nonce, eitri_core::tab_set::ViewId::BASE)
+        .unwrap()
+    {
         ConfirmOutcome::Entered { approved, .. } => {
             assert_eq!(approved, plan.approve.len(), "every listed card was approved");
         }
@@ -2365,7 +2370,7 @@ fn bypass_approves_the_waiting_card(
         .clone()
         .unwrap_or_else(|| panic!("the card names no tool call, so its result cannot be followed"));
 
-    let plan = match set.cycle_mode(tab).unwrap() {
+    let plan = match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Confirm(plan) => plan,
         other => panic!("expected Confirm with the waiting card listed, got {other:?}"),
     };
@@ -2376,7 +2381,10 @@ fn bypass_approves_the_waiting_card(
         plan.approve
     );
 
-    match set.confirm_bypass(plan.scope, plan.nonce).unwrap() {
+    match set
+        .confirm_bypass(plan.scope, plan.nonce, eitri_core::tab_set::ViewId::BASE)
+        .unwrap()
+    {
         ConfirmOutcome::Entered { approved, .. } => {
             assert_eq!(approved, plan.approve.len(), "every listed card was approved")
         }
@@ -2403,11 +2411,11 @@ fn bypass_approves_the_waiting_card(
         "the card the confirm listed was really approved"
     );
 
-    match set.cycle_mode(tab).unwrap() {
+    match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Manual) => {}
         other => panic!("leaving bypass moves at once, to manual, got {other:?}"),
     }
-    match set.cycle_mode(tab).unwrap() {
+    match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Auto) => {}
         other => panic!("manual -> auto moves at once, got {other:?}"),
     }
@@ -2550,7 +2558,7 @@ fn user_hook_ask_in_an_auto_tab(kind: BackendKind, label: &str) {
                     gate_cards.push(id.clone());
                     approved_gate_calls.extend(call);
                 }
-                set.answer_card(tab, &id, PermissionDecision::Allow)
+                set.answer_card(tab, eitri_core::tab_set::ViewId::BASE, &id, PermissionDecision::Allow)
                     .map_err(|e| e.message)
                     .unwrap();
             }

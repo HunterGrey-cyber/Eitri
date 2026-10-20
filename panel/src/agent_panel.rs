@@ -17,8 +17,12 @@
 //! panel's idea of "a turn is running" ahead of the server's, which is the exact shadow state the
 //! runtime design forbids.
 //!
-//! **The WebView draws only the active tab.** A background tab's events feed its attention and mark
-//! it stale (`TabSet::pump`); a switch always sends the new active tab's full snapshot.
+//! **Each page draws only the tab it shows.** The panel keeps one page per chat view: the base view's
+//! page draws its active tab, an extra view's page its one bound tab, and every payload about a tab
+//! goes to the page that shows it (`AgentPanelState::page_of`). A background base-view tab's events
+//! feed its attention and mark it stale (`TabSet::pump_views`); a switch always sends the new active
+//! tab's full snapshot. A message from a page is handled as that page's: its view comes from the
+//! handler the page was built with, never from what the page says.
 
 use crate::panel_document::{PanelDocument, PANEL_BASE_URI};
 use crate::panel_page::{PanelHost, PanelPage};
@@ -40,8 +44,10 @@ use eitri_core::tab_set::{
     AgentId, AwaitingTrust, BypassPolicy, DeferredStart, FirstTurn, PendingHandoff, PendingStart, RestoreConnect,
     RestoreGo, RestorePrompt, RestoreStep, ResumeRoute, StartCollected, Tab, TabBackend,
 };
+pub use eitri_core::tab_set::{TabPlace, ViewId};
 use eitri_core::tabs::TabId;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -589,11 +595,36 @@ struct AgentPanelState {
     /// The `?` overlay's rows (`serialize_keymap_for_js`), sent with the theme on every `ready` so
     /// a reloaded document is told the keymap it needs, not the one baked into a hand list.
     keymap_help: Option<String>,
-    /// Whether this panel's pane holds the window's keyboard focus, as `crate::pane_focus` last
-    /// reported it. It is held here so that a freshly loaded document (first load or a
-    /// `prefix r` reload) is told on `ready`. A document is otherwise told only when focus
-    /// changes, and a reload does not change focus.
-    pane_focused: bool,
+    /// One record per chat page that is attached and live, by the view it shows, and always one for
+    /// the base view. A page that goes idle loses its record, so nothing here is ever sent to it again
+    /// until it is attached anew.
+    pages: BTreeMap<ViewId, PageState>,
+    /// Told once per extra view left holding no tab (`AgentPanelHandle::on_view_empty`).
+    view_empty_hook: Option<Rc<dyn Fn(ViewId)>>,
+    /// Told when a pick asks the window to show a view and give it the keys
+    /// (`AgentPanelHandle::on_show_view`).
+    show_view_hook: Option<Rc<dyn Fn(ViewId)>>,
+    /// Extra views whose tab left since the hook was last told, in the order they emptied.
+    emptied_views: Vec<ViewId>,
+    /// Whether the views left empty by a settled restore have been judged (once per window).
+    empty_views_judged: bool,
+    /// The page the last chooser was opened in: its newer titles go there.
+    chooser_view: ViewId,
+    /// The review requests the flow has not finished answering, each with the page that sent it: what
+    /// the flow answers later goes there. Two pages may not have the same request id out at once.
+    review_requests: Vec<(String, ViewId)>,
+    /// The `:trust` and `:untrust` commands the gate is still working on, by the id the gate knows
+    /// each by. Two pages number their requests alike, so the gate is given ids unique in the window.
+    trust_commands: BTreeMap<String, TrustCommand>,
+    /// The number in the next command's gate id.
+    next_trust_command: u64,
+    /// The page each starting tab's start was asked from, with that command's request id: its
+    /// `command_result` is owed there even if the tab has moved to another view since.
+    start_pages: BTreeMap<TabId, (String, ViewId)>,
+    /// `agent.typing_cadence_hz` as last set, for a page attached after it was.
+    typing_cadence: Option<u32>,
+    /// Whether the editor holds the keys, for a page attached after it was last said.
+    editor_has_keys: bool,
     /// How the page shows the agent's thinking (`init.lua`'s `agent.thinking`), sent on every `ready`
     /// so a reloaded document draws thinking the way the first one did.
     thinking_display: eitri_core::agent_prefs::ThinkingDisplay,
@@ -602,21 +633,21 @@ struct AgentPanelState {
     /// rather than a plain closure field because the hook must be cloned out of the borrow before
     /// being called -- see `handle_inbound_message`'s HintRequest/HintTargets arms for why.
     hint_hook: Option<Rc<dyn Fn(HintInbound)>>,
-    /// The window's check on every card answer from the page (`AgentPanelHandle::set_answer_gate`):
-    /// `Err(why)` refuses the answer and leaves the card waiting. Cloned out of the borrow before it
-    /// is called, as `hint_hook` is, so a gate that reads the panel cannot find the state held.
+    /// The window's check on every answer from a page (`AgentPanelHandle::set_answer_gate`), asked
+    /// with that page's view: `Err(why)` refuses the answer and leaves the card or question waiting.
+    /// Cloned out of the borrow before it is called, as `hint_hook` is, so a gate that reads the panel
+    /// cannot find the state held.
     answer_gate: Option<AnswerGate>,
     /// The window's word on whether a float covers the chat now (`AgentPanelHandle::set_coverage`). A
     /// covered chat is off screen for attention: what finishes under a float is not seen. Cloned out
     /// of the borrow before it is called, as `answer_gate` is.
     coverage: Option<Coverage>,
-    /// Told whenever the window's attention (every tab's, summed: `TabSet::attention`) changes,
-    /// with the value before and after: the tray's `agent ⚑N`, the toast, `on_permission`.
+    /// Told whenever the window's attention (every tab's, summed: `TabSet::attention`) or one tab's
+    /// own changes, with the window's value before and after and the views handed a card: each chat
+    /// chip's `⚑N`, the toast, `on_permission`.
     attention_hook: Option<AttentionHook>,
-    /// The last `tabs` envelope sent, so the tick sends one only when it changed.
-    last_tabs_payload: Option<String>,
-    /// The open provider sessions `hello` was last computed against.
-    last_open_ids: Vec<String>,
+    /// Every tab's attention as the hook was last told it (`report_attention`).
+    reported_tabs: Vec<eitri_core::tabs::TabAttention>,
     /// The per-window scratch directory, `None` if it could not be made.
     scratch: Option<eitri_core::scratch::ScratchDir>,
     /// Edits out in nvim, polled by the tick until their marker appears.
@@ -652,8 +683,9 @@ struct AgentPanelState {
     /// What the window gives the flow's editor overlay: who owns the module in its nvim, and what to
     /// do once a file opened there.
     review_editor: crate::review_editor::ReviewEditor,
-    /// An edit came back (or was discarded): the keys return to the chat, in INPUT.
-    editor_done_hook: Option<Rc<dyn Fn()>>,
+    /// An edit came back (or was discarded): the keys return to the chat, in INPUT, in the view of the
+    /// edit's tab.
+    editor_done_hook: Option<Rc<dyn Fn(ViewId)>>,
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
     /// backstop covers them too. See [`Retiring`].
     retiring: Retiring,
@@ -666,34 +698,21 @@ struct AgentPanelState {
     rules_dir: Option<PathBuf>,
     /// The project's prompts, oldest first, as last read or written.
     history: Vec<String>,
-    /// Set by `ready`, cleared by `reload_document`.
-    document_ready: bool,
-    /// The last `editor_context` envelope sent.
-    last_context_payload: Option<String>,
     /// The last `editor_link` envelope (companion mode), kept so a fresh document is told on
     /// `ready`. `None` in a window with no companion, which never sends one.
     editor_link: Option<String>,
-    /// Where a `tab_verb` message's mapped `TabAction` goes. `None`
-    /// until `main.rs`'s `AgentPanelHandle::on_tab_verb` installs one.
-    tab_verb_hook: Option<Rc<dyn Fn(TabAction)>>,
-    /// The page's last-reported `panel_keys` mode, mirrored here. Starts, and is reset to,
-    /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
-    /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
-    nav_mode: Cell<PanelKeys>,
+    /// Where a `tab_verb` message's mapped `TabAction` goes, with the view of the page that sent it.
+    /// `None` until `main.rs`'s `AgentPanelHandle::on_tab_verb` installs one.
+    tab_verb_hook: Option<Rc<dyn Fn(ViewId, TabAction)>>,
     /// Where a `nav_fallthrough` message's direction goes, and a `pane_nav`'s (`Ctrl+w h/j/k/l` --
-    /// the same move, from a key the page read itself): `None` until `main.rs`'s
-    /// `AgentPanelHandle::on_nav_fallthrough` installs one, which is why `InboundMessage::NavFallthrough`
-    /// and `InboundMessage::PaneNav` can be refused.
-    nav_fallthrough_hook: Option<Rc<dyn Fn(Direction)>>,
+    /// the same move, from a key the page read itself), with the view of the page that sent it:
+    /// `None` until `main.rs`'s `AgentPanelHandle::on_nav_fallthrough` installs one, which is why
+    /// `InboundMessage::NavFallthrough` and `InboundMessage::PaneNav` can be refused.
+    nav_fallthrough_hook: Option<Rc<dyn Fn(ViewId, Direction)>>,
     /// Where a `keymap_closed` message goes (the opening it closes, and whether the overlay's own keys
     /// closed it): `None` in a window that never gives the keys back (the companion window, `eitri-mac`),
     /// where the message is accepted and does nothing.
     keymap_closed_hook: Option<Rc<dyn Fn(u64, bool)>>,
-    /// How many times this WebView's own web process has crashed recently, and whether
-    /// automatic recovery has given up on it -- see `AgentPanelHandle::page_gone`.
-    /// Re-armed by a manual recovery, never by the automatic path itself --
-    /// `AgentPanelHandle::reload_document_by_hand`'s own doc says why.
-    crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
     /// Keeps `$XDG_STATE_HOME/eitri/tabs/<project>.json` in step with the tabs, once per tick.
     tab_memory: TabWriter,
     /// The CLI's own session titles, read on a worker; a title that changed raises the wake and `hello`
@@ -732,12 +751,6 @@ struct AgentPanelState {
     start_notes: StartNotes,
     /// A restore whose resumes have not all returned yet.
     restore_run: Option<RestoreRun>,
-    /// Whether the hello last sent could carry the restore offer, so the tick sends a new one only
-    /// when that changes.
-    last_restore_offered: bool,
-    /// The agent of the active tab the hello last sent was computed for: its sessions are the ones
-    /// the greeting offers, so the tick sends a new one when the active tab runs another agent.
-    last_hello_agent: AgentId,
     /// Where a restore's one-line result goes: `main.rs`'s window toast.
     toast_hook: Option<ToastHook>,
     /// Whether a session about to start may load the project's own Claude configuration, and the
@@ -745,6 +758,159 @@ struct AgentPanelState {
     trust: TrustGate,
     /// What starts a session's backend: the real connect workers, or a test's stand-in.
     spawner: Spawner,
+}
+
+/// What the panel keeps for one live chat page. Everything here is about the document in that page:
+/// a reload or a crash of one page leaves every other page's record as it was.
+struct PageState {
+    /// Set by `ready`, cleared by `reload_document`: until then nothing that can wait is sent.
+    document_ready: bool,
+    /// The page's last-reported `panel_keys` mode, mirrored here. Starts, and is reset to,
+    /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
+    /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
+    nav_mode: Cell<PanelKeys>,
+    /// Whether this page's pane holds the window's keyboard focus, as `crate::pane_focus` last
+    /// reported it. It is held here so that a freshly loaded document (first load or a
+    /// `prefix r` reload) is told on `ready`. A document is otherwise told only when focus
+    /// changes, and a reload does not change focus.
+    pane_focused: bool,
+    /// The last `tabs` envelope sent to this page, so the tick sends one only when it changed.
+    last_tabs_payload: Option<String>,
+    /// The open provider sessions this page's `hello` was last computed against.
+    last_open_ids: Vec<String>,
+    /// Whether this page's last hello could carry the restore offer (only the base page's can), so
+    /// the tick sends a new one only when that changes.
+    last_restore_offered: bool,
+    /// The agent of the tab this page's last hello was computed for: its sessions are the ones the
+    /// greeting offers, so the tick sends a new one when that tab runs another agent.
+    last_hello_agent: AgentId,
+    /// The last `editor_context` envelope sent to this page.
+    last_context_payload: Option<String>,
+    /// How many times this page's own web process has crashed recently, and whether
+    /// automatic recovery has given up on it -- see `AgentPanelHandle::page_gone`.
+    /// Re-armed by a manual recovery, never by the automatic path itself --
+    /// `AgentPanelHandle::reload_document_by_hand`'s own doc says why.
+    crash_guard: crate::webview_crash_guard::WebViewCrashGuard,
+}
+
+impl Default for PageState {
+    fn default() -> Self {
+        PageState {
+            document_ready: false,
+            nav_mode: Cell::new(PanelKeys::Other),
+            pane_focused: false,
+            last_tabs_payload: None,
+            last_open_ids: Vec::new(),
+            last_restore_offered: false,
+            last_hello_agent: AgentId::Claude,
+            last_context_payload: None,
+            crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+        }
+    }
+}
+
+impl AgentPanelState {
+    /// The record of `view`'s page, while it is live.
+    fn page(&self, view: ViewId) -> Option<&PageState> {
+        self.pages.get(&view)
+    }
+
+    /// The record of `view`'s page, made if there is none.
+    fn page_mut(&mut self, view: ViewId) -> &mut PageState {
+        self.pages.entry(view).or_default()
+    }
+
+    /// Whether `view`'s page is live and its document said `ready`.
+    fn ready(&self, view: ViewId) -> bool {
+        self.page(view).is_some_and(|page| page.document_ready)
+    }
+
+    /// The tab `view`'s page shows: the base view's active tab, or an extra view's bound tab (none
+    /// before one is opened in it).
+    fn tab_of_page(&self, view: ViewId) -> Option<TabId> {
+        if view.is_base() {
+            Some(self.tabs.active())
+        } else {
+            self.tabs.tab_in(view)
+        }
+    }
+
+    /// The view whose page shows `tab` now: the base view for its active tab, an extra view for its
+    /// bound tab while that view's page is live. `None` for a background tab, and for a bound tab
+    /// whose page is idle or not attached yet. The base page is always counted as there: with no page
+    /// at all, what is sent to it goes nowhere.
+    fn shown_in(&self, tab: TabId) -> Option<ViewId> {
+        if !self.tabs.is_shown(tab) {
+            return None;
+        }
+        let view = self.tabs.view_of(tab);
+        (view.is_base() || self.pages.contains_key(&view)).then_some(view)
+    }
+
+    /// Where a payload about `tab` that must wait for a ready document goes: [`Self::shown_in`] once
+    /// that page's document is ready, else `None` (the payload waits for that page's `ready` or the
+    /// tab's next switch, as a background tab's does).
+    fn page_of(&self, tab: TabId) -> Option<ViewId> {
+        self.shown_in(tab).filter(|view| self.ready(*view))
+    }
+}
+
+/// One chat page the panel can reach, and whether it is routed to. An idle page still takes the
+/// theme and the font, and nothing else.
+#[derive(Clone)]
+struct PageSlot {
+    page: Rc<PanelPage>,
+    live: bool,
+}
+
+/// Every chat page the window built, by the view it shows; shared by every clone of the handle. A
+/// page is never moved to another view: a view's page is replaced only by attaching one for it.
+#[derive(Clone, Default)]
+struct Pages(Rc<RefCell<BTreeMap<ViewId, PageSlot>>>);
+
+impl Pages {
+    /// `view`'s page while it is live (routed to).
+    fn live(&self, view: ViewId) -> Option<Rc<PanelPage>> {
+        self.0
+            .borrow()
+            .get(&view)
+            .filter(|slot| slot.live)
+            .map(|slot| slot.page.clone())
+    }
+
+    /// `view`'s page, live or idle.
+    fn any(&self, view: ViewId) -> Option<Rc<PanelPage>> {
+        self.0.borrow().get(&view).map(|slot| slot.page.clone())
+    }
+
+    /// Every live page with its view, base first.
+    fn live_views(&self) -> Vec<(ViewId, Rc<PanelPage>)> {
+        self.0
+            .borrow()
+            .iter()
+            .filter(|(_, slot)| slot.live)
+            .map(|(view, slot)| (*view, slot.page.clone()))
+            .collect()
+    }
+
+    /// Every page, live and idle.
+    fn every(&self) -> Vec<Rc<PanelPage>> {
+        self.0.borrow().values().map(|slot| slot.page.clone()).collect()
+    }
+
+    /// Sends `payload` to `view`'s page if it is live. The map is not borrowed while the page runs.
+    fn send(&self, view: ViewId, payload: &str) {
+        if let Some(page) = self.live(view) {
+            page.send(payload);
+        }
+    }
+
+    /// Each payload, in order, to `view`'s page if it is live.
+    fn send_all(&self, view: ViewId, payloads: Vec<String>) {
+        if let Some(page) = self.live(view) {
+            dispatch_all(&page, payloads);
+        }
+    }
 }
 
 /// How [`start_deferred`] begins a session.
@@ -790,8 +956,9 @@ enum SpawnCall {
 /// [`AgentPanelState::toast_hook`]: shows one line in the window's toast.
 type ToastHook = Rc<dyn Fn(&str)>;
 
-/// [`AgentPanelState::attention_hook`]: called with the attention before a change and after it.
-type AttentionHook = Rc<dyn Fn(eitri_core::attention::Attention, eitri_core::attention::Attention)>;
+/// [`AgentPanelState::attention_hook`]: called with the window's attention before a change and after
+/// it, and the views handed a card since the last call (`tabs::views_handed_a_card`).
+type AttentionHook = Rc<dyn Fn(eitri_core::attention::Attention, eitri_core::attention::Attention, &[ViewId])>;
 
 /// `AgentPanelHandle::on_editor_request`: the request to hand nvim; `Err` says why it could not.
 type EditorRequestHook = Rc<dyn Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String>>;
@@ -805,18 +972,19 @@ type EditorRequestHook = Rc<dyn Fn(&eitri_core::scratch::ScratchRequest) -> Resu
 #[derive(Clone)]
 pub struct AgentPanelHandle {
     state: Rc<RefCell<AgentPanelState>>,
-    /// Held so the panel's document can be re-injected without going back through the widget tree.
-    /// The page and the pacer in front of it are one value, shared with the pump and the page's own
-    /// message handler.
-    ///
-    /// `None` when WebKit's sandbox cannot start in this process (`webkit_sandbox::Decision::
+    /// Every chat page, by the view it shows, held so a document can be re-injected without going
+    /// back through the widget tree. Each page and the pacer in front of it are one value, shared
+    /// with the pump and the page's own message handler. Pages are attached after the handle is
+    /// built ([`AgentPanelHandle::attach_page`]).
+    pages: Pages,
+    /// `false` when WebKit's sandbox cannot start in this process (`webkit_sandbox::Decision::
     /// Unavailable`): no `WebView` is built, the
     /// panel's place is a GTK notice, and nothing ever starts a session -- sessions start from the
     /// page's own messages, and there is no page. Every method below still runs against the inert
     /// state `main.rs`'s focus, HINT, prefix and tab-verb paths call into; what would reach a page
     /// does nothing, and the tab verbs refuse (`closing`), so `main.rs` flashes rather than opening
     /// tabs nobody can see.
-    page: Option<Rc<PanelPage>>,
+    with_pages: bool,
     /// The wake's raise, held outside the state so raising it never needs the state's cell.
     raise: Option<agent::UiWake>,
 }
@@ -842,18 +1010,29 @@ pub struct PanelInit {
 }
 
 impl AgentPanelHandle {
-    /// A handle over `state` and `page`, holding the state's wake.
+    /// A handle over `state`, holding the state's wake, with `page` attached as the base view's when
+    /// there is one; with none, the handle has no pages at all.
+    #[cfg(any(test, feature = "test-support"))]
     fn over(state: Rc<RefCell<AgentPanelState>>, page: Option<Rc<PanelPage>>) -> Self {
         let raise = state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::waker);
-        AgentPanelHandle { state, page, raise }
+        let handle = AgentPanelHandle {
+            state,
+            pages: Pages::default(),
+            with_pages: page.is_some(),
+            raise,
+        };
+        if let Some(page) = page {
+            handle.attach_page(ViewId::BASE, page);
+        }
+        handle
     }
 
-    /// With a page: connects to (or starts) the supervisor and builds the state, touching nothing on the
-    /// page. Without one (WebKit's sandbox cannot start): the state alone, no pump and no supervisor
-    /// client, and every page verb does nothing.
-    pub fn new(init: PanelInit, page: Option<Rc<PanelPage>>, host: Rc<dyn PanelHost>) -> Self {
+    /// With pages (`with_pages`): connects to (or starts) the supervisor and builds the state; the pages
+    /// are attached afterwards ([`attach_page`](Self::attach_page)). Without (WebKit's sandbox cannot
+    /// start): the state alone, no pump and no supervisor client, and every page verb does nothing.
+    pub fn new(init: PanelInit, with_pages: bool, host: Rc<dyn PanelHost>) -> Self {
         let backend_kind = init.backend_kind;
-        let (supervisor, supervisor_pending) = if page.is_some() {
+        let (supervisor, supervisor_pending) = if with_pages {
             let project_dir = &init.project_dir;
             let instance_id = uuid::Uuid::new_v4().to_string();
             let project_name = project_dir
@@ -878,14 +1057,77 @@ impl AgentPanelHandle {
             (None, None)
         };
         let state = Rc::new(RefCell::new(panel_state(init, supervisor, supervisor_pending, host)));
-        AgentPanelHandle::over(state, page)
+        let raise = state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::waker);
+        AgentPanelHandle {
+            state,
+            pages: Pages::default(),
+            with_pages,
+            raise,
+        }
     }
 
-    /// Paints the page's background and loads the themed document; called once the host listens for the
-    /// page's messages.
-    pub fn load_first_document(&self) {
+    /// `page` becomes `view`'s live page, starting with a fresh record (no document ready yet): a new
+    /// page, or the idle page that showed `view` before, attached again. Whatever page `view` had is
+    /// replaced; a page is never moved to another view. The page is given the typing cadence and the
+    /// editor's keys as they stand; its document is loaded by [`load_document`](Self::load_document).
+    pub fn attach_page(&self, view: ViewId, page: Rc<PanelPage>) {
         self.wake();
-        let Some(page) = &self.page else { return };
+        if !self.with_pages {
+            return;
+        }
+        let (cadence, editor_has_keys) = {
+            let mut state = self.state.borrow_mut();
+            // Whether the view's pane has the keys is the pane's, not the document's: it carries over.
+            let pane_focused = state.page(view).is_some_and(|record| record.pane_focused);
+            state.pages.insert(
+                view,
+                PageState {
+                    pane_focused,
+                    ..PageState::default()
+                },
+            );
+            (state.typing_cadence, state.editor_has_keys)
+        };
+        {
+            let mut pacer = page.pacer().borrow_mut();
+            pacer.set_cadence(cadence);
+            pacer.set_editor_has_keys(editor_has_keys);
+        }
+        self.pages.0.borrow_mut().insert(view, PageSlot { page, live: true });
+    }
+
+    /// `view`'s page leaves routing: its record is dropped, what its pacer held is let go, the prompts
+    /// it showed go, and its document is loaded again, so it shows the empty chat and nothing of the
+    /// tab it showed. It still takes the theme and the font. The base view's page never goes idle.
+    pub fn idle_page(&self, view: ViewId) {
+        self.wake();
+        if view.is_base() {
+            eprintln!("[agent_panel] the base view's page cannot go idle");
+            return;
+        }
+        let Some(page) = self.pages.any(view) else { return };
+        if let Some(slot) = self.pages.0.borrow_mut().get_mut(&view) {
+            slot.live = false;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.pages.remove(&view);
+            if !state.shutting_down {
+                state.tabs.drop_bypass_prompt_in(view);
+            }
+        }
+        let discarded = page.pacer().borrow_mut().discard_pending();
+        trace_discarded_first_texts(&self.state, discarded);
+        // Called by path: a `.load_document(` call in this file is read as a document load that must
+        // name the secure base, and this one only reaches `load_document`'s own load, which does.
+        AgentPanelHandle::load_document(self, view);
+    }
+
+    /// Paints `view`'s page's background and loads the themed document into it, live or idle; called
+    /// once the host listens for the page's messages, and again when an idle page is reused.
+    pub fn load_document(&self, view: ViewId) {
+        self.wake();
+        let Some(page) = self.pages.any(view) else { return };
         let (tokens, document) = {
             let state = self.state.borrow();
             (state.theme.clone(), state.document)
@@ -894,29 +1136,39 @@ impl AgentPanelHandle {
         page.load_document(&document.themed(&tokens.css_vars()), PANEL_BASE_URI);
     }
 
-    /// A message the page posted (the `eitriAgent` handler).
-    pub fn page_message(&self, raw: &str) {
+    /// A message `view`'s page posted (the `eitriAgent` handler that page was built with). A page that
+    /// is not live -- idle, or never attached -- has nothing to say: its message is dropped.
+    pub fn page_message(&self, view: ViewId, raw: &str) {
         self.wake();
-        if let Some(page) = &self.page {
-            handle_inbound_message(raw, &self.state, page);
+        match self.pages.live(view) {
+            Some(page) => handle_inbound_message(raw, &self.state, &self.pages, view, &page),
+            None => eprintln!(
+                "[agent_panel] view {}: a message from a page that is not live was dropped",
+                view.number()
+            ),
         }
     }
 
-    /// The page came on screen, or a float stopped covering it: whatever finished in the active tab
-    /// while the chat was away has been seen (the tray's `agent •`). Nothing is seen while the page is
-    /// unmapped or a float covers it (`set_coverage`).
-    pub fn page_shown(&self) {
+    /// `view`'s page came on screen, or a float stopped covering it: whatever finished in the tab it
+    /// shows while the page was away has been seen (the tray's `agent •`). Nothing is seen while the
+    /// page is unmapped or a float covers it (`set_coverage`).
+    pub fn page_shown(&self, view: ViewId) {
         self.wake();
-        let Some(page) = self.page.as_deref() else { return };
+        let Some(page) = self.pages.live(view) else { return };
         if self.state.borrow().shutting_down {
             return;
         }
         // Mapped under a float is not seen: the window calls this again once the float is off it.
-        if !on_screen(&self.state, page) {
+        if !on_screen(&self.state, view, &page) {
             return;
         }
         let before = self.state.borrow().tabs.attention();
-        self.state.borrow_mut().tabs.mark_seen();
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(tab) = state.tab_of_page(view) {
+                state.tabs.mark_seen(tab);
+            }
+        }
         report_attention(&self.state, before);
     }
 
@@ -928,9 +1180,9 @@ impl AgentPanelHandle {
     /// relative link resolves to the panel's own address, which goes nowhere. A refusal is logged (the
     /// address through `{:?}`, which escapes anything a terminal would act on) and flashed, so the
     /// click is not silently lost.
-    pub fn link_clicked(&self, uri: Option<&str>) {
+    pub fn link_clicked(&self, view: ViewId, uri: Option<&str>) {
         self.wake();
-        let Some(page) = self.page.as_deref() else { return };
+        let Some(page) = self.pages.live(view) else { return };
         match uri.and_then(clicked_link_url) {
             Some(url) => {
                 // Cloned out of the borrow first: the host runs arbitrary code.
@@ -958,7 +1210,9 @@ impl AgentPanelHandle {
     /// [`take_wake`](Self::take_wake). `None`: there is no wake, and the host runs the tick every
     /// [`TICK`](Self::TICK) as [`run_tick`](Self::run_tick) says.
     pub fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
-        self.page.as_ref()?;
+        if !self.with_pages {
+            return None;
+        }
         self.state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::fd)
     }
 
@@ -991,21 +1245,21 @@ impl AgentPanelHandle {
         if !self.tick() {
             return NextTick::Stop;
         }
-        let Some(page) = self.page.as_deref() else {
-            return NextTick::Stop;
-        };
         let state = self.state.borrow();
         let mut next = (polled_before || needs_polling(&state)).then_some(now + Self::TICK);
-        let paced = page
-            .pacer()
-            .borrow()
-            .next_deadline(std::time::Instant::now(), state.document_ready)
-            // Never at the moment this tick started: a deadline that would not move cannot spin the loop.
-            .map(|at| at.max(now + std::time::Duration::from_millis(1)));
-        next = match (next, paced) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        // Every live page's typing cadence, each against its own document.
+        for (view, page) in self.pages.live_views() {
+            let paced = page
+                .pacer()
+                .borrow()
+                .next_deadline(std::time::Instant::now(), state.ready(view))
+                // Never at the moment this tick started: a deadline that would not move cannot spin the loop.
+                .map(|at| at.max(now + std::time::Duration::from_millis(1)));
+            next = match (next, paced) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
         next.map_or(NextTick::OnWake, NextTick::At)
     }
 
@@ -1013,17 +1267,22 @@ impl AgentPanelHandle {
     ///
     /// 1. collect every backend that finished constructing on a worker thread (and every handoff whose
     ///    close finished), and answer the command that has been waiting on it;
-    /// 2. drain every tab's backend (`TabSet::pump`): `take_ui_delivery` is where the permission policy
-    ///    answers what needs no human, so a tab that was not pumped would stall. The active tab's batch
-    ///    goes to the panel as one `events{tab,fromRevision,throughRevision,events[]}` envelope; a
-    ///    background tab's feeds its attention and marks it stale;
+    /// 2. drain every tab's backend (`TabSet::pump_views`): `take_ui_delivery` is where the permission
+    ///    policy answers what needs no human, so a tab that was not pumped would stall. Each shown tab's
+    ///    batch -- the base view's active tab's, and each bound tab's -- goes to the page that shows it
+    ///    as one `events{tab,fromRevision,throughRevision,events[]}` envelope; a background tab's feeds
+    ///    its attention and marks it stale;
     /// 3. report the window's aggregated status to `eitri-supervisor`.
     ///
-    /// Then the `tabs` envelope and `hello` go out if what they describe changed.
+    /// Then each page's `tabs` envelope and `hello` go out if what they describe changed, and the
+    /// extra views left holding no tab are told to the window.
     pub fn tick(&self) -> bool {
         let state = &self.state;
+        let pages = &self.pages;
         // No page, no session ever starts and nothing could be shown: nothing to drive.
-        let Some(page) = self.page.as_deref() else { return false };
+        if !self.with_pages {
+            return false;
+        }
         // The window has been closed and its tabs taken; everything below would be a no-op
         // against a destroyed window for as long as the close watch holds the application. Stop
         // instead of ticking 30 times a second at nothing. See `AgentPanelState::shutting_down`.
@@ -1034,26 +1293,31 @@ impl AgentPanelHandle {
         {
             state.borrow_mut().ticks_run += 1;
         }
-        // The chat's own host is unmapped while it is hidden or zoomed away; mapped under a float, it
-        // is off screen too.
-        let panel_mapped = on_screen(state, page);
+        // Each chat view's host is unmapped while it is hidden or zoomed away; mapped under a float,
+        // it is off screen too. Asked before the state is borrowed: the window's probe may read it.
+        let live = pages.live_views();
+        let mapped: Vec<ViewId> = live
+            .iter()
+            .filter(|(view, page)| on_screen(state, *view, page))
+            .map(|(view, _)| *view)
+            .collect();
         // Read before anything below changes it: a session installed this tick resets its count.
         let attention_before = state.borrow().tabs.attention();
         let notes = state.borrow().start_notes.drain();
-        dispatch_all(page, notes);
-        collect_pending_starts(state, page);
-        collect_pending_handoffs(state, page);
-        report_sessions_that_never_opened(state, page);
+        pages.send_all(ViewId::BASE, notes);
+        collect_pending_starts(state, pages);
+        collect_pending_handoffs(state, pages);
+        report_sessions_that_never_opened(state, pages);
         let retired = state.borrow_mut().retiring.poll();
         for tab in retired {
             state.borrow_mut().tabs.retire_done(tab);
         }
 
-        // The payload is built under the borrow and dispatched OUTSIDE it. Calling into WebKit while
+        // The payloads are built under the borrow and dispatched OUTSIDE it. Calling into WebKit while
         // holding a `RefMut` on the panel's own state is a latent re-entrancy hazard: the script
         // message handler takes the same `RefCell`, and anything that let it run during the
         // dispatch would panic on an already-borrowed cell rather than fail gracefully.
-        let (payload, class, first_text, turn_ended, offers_changed, queue_changed, tripped, review_hints) = {
+        let (streams, turn_ended, offers_changed, queue_changed, tripped, review_hints) = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             // A supervisor this window had to start itself finishes connecting here rather than
@@ -1073,9 +1337,10 @@ impl AgentPanelHandle {
                 }
             }
             // The project root travels in because the permission policy judges `Read`/`Grep`/`Glob`
-            // paths against it -- see `AgentBackend::answer_what_needs_no_human`.
+            // paths against it -- see `AgentBackend::answer_what_needs_no_human`. A view counts as
+            // mapped only while its page is live and on screen.
             let project_dir = state_ref.project_dir.clone();
-            let out = state_ref.tabs.pump(&project_dir, panel_mapped);
+            let out = state_ref.tabs.pump_views(&project_dir, &|view| mapped.contains(&view));
             let statuses: Vec<supervisor::AgentStatus> = state_ref
                 .tabs
                 .tabs()
@@ -1092,26 +1357,28 @@ impl AgentPanelHandle {
             if let Some(supervisor) = state_ref.supervisor.as_mut() {
                 supervisor.send_status(status);
             }
-            // Whose first text the payload carries, kept with it: the cadence may release it after
-            // the active tab, or that tab's turn, has changed (`panel_pacer::FirstText`).
-            let first_text = if out.first_text {
+            // Whose first text each payload carries, kept with it: the cadence may release it after
+            // the tab, or that tab's turn, has changed (`panel_pacer::FirstText`).
+            let mut streams: Vec<(ViewId, Stream)> = Vec::new();
+            if let Some(payload) = out.active_payload {
                 let active = state_ref.tabs.active();
-                state_ref
-                    .tabs
-                    .active_tab()
-                    .turn_trace
-                    .as_ref()
-                    .map(|trace| crate::panel_pacer::FirstText {
-                        tab: active,
-                        turn: trace.submitted_at(),
-                    })
-            } else {
-                None
-            };
+                let first_text = if out.first_text {
+                    first_text_of(&state_ref.tabs, active)
+                } else {
+                    None
+                };
+                streams.push((ViewId::BASE, (payload, first_text, out.active_class)));
+            }
+            for shown in out.view_payloads {
+                let first_text = if shown.first_text {
+                    first_text_of(&state_ref.tabs, shown.tab)
+                } else {
+                    None
+                };
+                streams.push((shown.view, (shown.payload, first_text, shown.class)));
+            }
             (
-                out.active_payload,
-                out.active_class,
-                first_text,
+                streams,
                 out.turn_ended,
                 out.offers_changed,
                 out.queue_changed,
@@ -1121,103 +1388,117 @@ impl AgentPanelHandle {
         };
         // The CLI-mode tripwire failed these tabs: each session is shut down off
         // this thread, as a closed tab's is, and the shutdown denies what is still pending in it.
-        // The active one also says why, as a session that never opened does.
+        // A tab on screen in some page also says why there, as a session that never opened does.
         for tripped in tripped {
-            let active = state.borrow().tabs.active() == tripped.tab;
+            let shown = state.borrow().shown_in(tripped.tab);
             // The pump counted it as retiring for its tab.
             state.borrow_mut().retiring.backend(tripped.backend, Some(tripped.tab));
-            if active {
-                page.send(&serialize_error_for_js(tripped.tab, &tripped.reason));
+            if let Some(view) = shown {
+                pages.send(view, &serialize_error_for_js(tripped.tab, &tripped.reason));
             }
         }
-        // The stream goes through the typing cadence (`crate::panel_pacer`): held for the next
-        // slot while the user types in the editor, if it is plain streamed content; at once
+        // Each stream goes through its own page's typing cadence (`crate::panel_pacer`): held for the
+        // next slot while the user types in the editor, if it is plain streamed content; at once
         // otherwise, and always at once into a page that has not said `ready` (its snapshot
         // follows), as before. Whatever a slot or the end of the typing window releases goes out
-        // in this same tick.
-        let page_ready = state.borrow().document_ready;
-        {
-            let sink = page.sink();
-            let mut pacer = page.pacer().borrow_mut();
-            let now = std::time::Instant::now();
-            if let Some(payload) = payload {
-                let class = if page_ready {
-                    class
-                } else {
-                    eitri_core::panel_cadence::EnvelopeClass::Immediate
-                };
-                pacer.send_stream(&sink, payload, first_text, class, now);
+        // in this same tick. A payload for a view with no live page has nowhere to go: that page's
+        // `ready` sends the tab's whole state.
+        for (view, page) in &live {
+            let page_ready = state.borrow().ready(*view);
+            {
+                let sink = page.sink();
+                let mut pacer = page.pacer().borrow_mut();
+                let now = std::time::Instant::now();
+                for (_, (payload, first_text, class)) in streams.iter().filter(|(to, _)| to == view) {
+                    let class = if page_ready {
+                        *class
+                    } else {
+                        eitri_core::panel_cadence::EnvelopeClass::Immediate
+                    };
+                    pacer.send_stream(&sink, payload.clone(), *first_text, class, now);
+                }
+                pacer.poll(&sink, now, page_ready);
             }
-            pacer.poll(&sink, now, page_ready);
-        }
-        let sent = page.pacer().borrow_mut().take_sent();
-        // Stamped at the dispatch call that really sent it -- where the WebView's own clock starts,
-        // which under the cadence may be a later tick or a flush between ticks -- for the tab and
-        // turn it was pumped for.
-        stamp_first_text_dispatches(state, sent.first_text);
-        if sent.any {
-            let mut state_ref = state.borrow_mut();
-            if let Some(trace) = state_ref.tabs.active_tab_mut().turn_trace.as_mut() {
-                if trace.is_complete() {
-                    trace.emit();
+            let sent = page.pacer().borrow_mut().take_sent();
+            // Stamped at the dispatch call that really sent it -- where the WebView's own clock starts,
+            // which under the cadence may be a later tick or a flush between ticks -- for the tab and
+            // turn it was pumped for.
+            stamp_first_text_dispatches(state, sent.first_text);
+            if sent.any {
+                let mut state_ref = state.borrow_mut();
+                let shows = state_ref.tab_of_page(*view);
+                if let Some(trace) = shows
+                    .and_then(|tab| state_ref.tabs.get_mut(tab))
+                    .and_then(|t| t.turn_trace.as_mut())
+                {
+                    if trace.is_complete() {
+                        trace.emit();
+                    }
                 }
             }
         }
         // A message put into a turn was read (its row went out above) or is held again.
         for tab in queue_changed {
-            send_queue(state, page, tab);
+            send_queue(state, pages, tab);
         }
         // A turn ended in these tabs; their queued messages go out now.
         for tab in turn_ended {
             let flush = state.borrow_mut().tabs.flush_queue(tab);
             if let Some(flush) = flush {
-                apply_flush(state, page, tab, flush);
+                apply_flush(state, pages, tab, flush);
             }
         }
-        // A turn's end snapshot landed: the status band's hint. A page that has not said `ready` (still
-        // loading, or reloading) has nothing to show it, so it waits here for the page; the review
-        // itself is asked for by `c`, never by this.
+        // A turn's end snapshot landed: the status band's hint, in the page of the hint's tab's view. A
+        // page that has not said `ready` (still loading, or reloading) has nothing to show it, so it
+        // waits here for the page; the review itself is asked for by `c`, never by this.
         let hints = {
             let mut state_ref = state.borrow_mut();
             let state_ref = &mut *state_ref;
             forget_hints_of_running_or_closed_tabs(state_ref);
             let review_hints = hints_to_keep(state_ref.review_hint, review_hints);
             keep_newest_hint_per_tab(&mut state_ref.review_hints, review_hints);
-            if state_ref.document_ready {
-                std::mem::take(&mut state_ref.review_hints)
-            } else {
-                Vec::new()
-            }
+            take_hints_for_ready_pages(state_ref)
         };
         if !hints.is_empty() {
-            keep_shown_hints(&mut state.borrow_mut().shown_hints, &hints);
+            let sent: Vec<_> = hints.iter().map(|(_, hint)| hint.clone()).collect();
+            keep_shown_hints(&mut state.borrow_mut().shown_hints, &sent);
         }
-        for hint in &hints {
-            page.send(&eitri_core::agent_bridge::serialize_review_hint_for_js(hint));
+        for (view, hint) in &hints {
+            pages.send(*view, &eitri_core::agent_bridge::serialize_review_hint_for_js(hint));
         }
-        // The active tab's offers changed (a card arrived or went): the panel's third buttons follow.
-        if offers_changed.contains(&state.borrow().tabs.active()) && state.borrow().document_ready {
+        // A shown tab's offers changed (a card arrived or went): its page's third buttons follow.
+        for tab in offers_changed {
             let payload = {
                 let state_ref = state.borrow();
-                let tab = state_ref.tabs.active_tab();
-                eitri_core::agent_bridge::serialize_rule_offers_for_js(tab.id, &tab.rule_offers)
+                state_ref.page_of(tab).and_then(|view| {
+                    state_ref.tabs.get(tab).map(|t| {
+                        (
+                            view,
+                            eitri_core::agent_bridge::serialize_rule_offers_for_js(t.id, &t.rule_offers),
+                        )
+                    })
+                })
             };
-            page.send(&payload);
+            if let Some((view, payload)) = payload {
+                pages.send(view, &payload);
+            }
         }
-        send_context_if_changed(state, page);
-        poll_scratch_edits(state, page);
-        poll_review_jobs(state, page);
-        poll_review_flow(state, page);
+        send_context_if_changed(state, pages);
+        poll_scratch_edits(state, pages);
+        poll_review_jobs(state, pages);
+        poll_review_flow(state, pages);
         // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
-        poll_trust(state, page);
+        poll_trust(state, pages);
         apply_title_reads(state);
-        send_chooser_titles_if_changed(state, page);
-        send_tabs_if_changed(state, page);
+        send_chooser_titles_if_changed(state, pages);
+        send_tabs_if_changed(state, pages);
         remember_tabs(state);
-        send_hello_if_open_sessions_changed(state, page);
+        send_hello_if_open_sessions_changed(state, pages);
         // After the payload, not before it: a reaction that sends the panel an envelope -- one
         // that lands on a card, say -- must find the card it names already there.
         report_attention(state, attention_before);
+        judge_empty_views(state);
+        tell_emptied_views(state);
         true
     }
 
@@ -1326,6 +1607,14 @@ impl AgentPanelHandle {
         ShutdownWatch { entries }
     }
 
+    /// Records whether `view`'s page's document said `ready` (nothing for a page with no record).
+    fn set_document_ready(&self, view: ViewId, ready: bool) {
+        let mut state = self.state.borrow_mut();
+        if let Some(record) = state.pages.get_mut(&view) {
+            record.document_ready = ready;
+        }
+    }
+
     /// Reloads the panel's frontend from scratch, deliberately WITHOUT touching the session.
     ///
     /// The frontend is a pure view layer over `AgentSessionProjection`, which lives here in Rust --
@@ -1347,19 +1636,25 @@ impl AgentPanelHandle {
     /// a replay, and `serialize_snapshot_for_js` already carries tool-call results. A pump that
     /// ever stopped being the sole consumer, or a snapshot that stopped being complete, would turn
     /// this into a quiet data-loss path with no test failing.
-    pub(crate) fn reload_document(&self) {
-        let Some(page) = &self.page else {
-            eprintln!("[agent_panel] no panel document to reload: WebKit's sandbox cannot start here");
+    pub(crate) fn reload_document(&self, view: ViewId) {
+        let Some(page) = self.pages.live(view) else {
+            eprintln!(
+                "[agent_panel] no panel document to reload in view {}: no live page shows it",
+                view.number()
+            );
             return;
         };
-        eprintln!("[agent_panel] reloading the panel document; the session is left untouched");
+        eprintln!(
+            "[agent_panel] reloading the panel document; the session is left untouched (view {})",
+            view.number()
+        );
         // The page that said `ready` is going; the tick holds its envelopes until the new one does.
-        self.state.borrow_mut().document_ready = false;
+        self.set_document_ready(view, false);
         // What the typing cadence still holds is in the projection, hence in the new page's snapshot.
         let discarded = page.pacer().borrow_mut().discard_pending();
         trace_discarded_first_texts(&self.state, discarded);
         // And so is the mode it reported: until the new page's `ready`, nothing is BROWSE or INPUT.
-        forget_the_pages_nav_mode(&self.state.borrow());
+        forget_the_pages_nav_mode(&self.state.borrow(), view);
         let (vars, document) = {
             let state = self.state.borrow();
             (state.theme.css_vars(), state.document)
@@ -1379,10 +1674,15 @@ impl AgentPanelHandle {
     /// the guard too, every automatic reload would erase its own crash history and `GiveUp` could
     /// never be reached, defeating the loop guard entirely. Only a genuinely manual recovery may
     /// re-arm it; the automatic path must keep counting toward the very loop it exists to detect.
-    pub fn reload_document_by_hand(&self) {
+    pub fn reload_document_by_hand(&self, view: ViewId) {
         self.wake();
-        self.state.borrow_mut().crash_guard.reset();
-        self.reload_document();
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(record) = state.pages.get_mut(&view) {
+                record.crash_guard.reset();
+            }
+        }
+        self.reload_document(view);
     }
 
     /// The page's content process ended: a real WebKit crash, or the host
@@ -1395,25 +1695,36 @@ impl AgentPanelHandle {
     /// even finish loading does not turn into a reload/crash loop. The host leaves out an end it asked
     /// for itself (WebKit's `TerminatedByApi`): that is no crash and must not count toward the guard's
     /// budget. Nothing on this panel's view ends its process today, but the Lua-panel's call site does.
-    pub fn page_gone(&self, reason: &str) {
+    pub fn page_gone(&self, view: ViewId, reason: &str) {
         self.wake();
         // The page that reported BROWSE or INPUT is dead, and the give-up document never sends
         // `ready`: left as it was, `main.rs` would keep claiming `Ctrl+j`/`Ctrl+k` for a page that
         // cannot answer.
-        forget_the_pages_nav_mode(&self.state.borrow());
-        let response = self.state.borrow_mut().crash_guard.on_crash();
+        forget_the_pages_nav_mode(&self.state.borrow(), view);
+        // An idle page's crash is reloaded by its next attach; nothing is routed to it meanwhile.
+        let response = {
+            let mut state = self.state.borrow_mut();
+            state.pages.get_mut(&view).map(|record| record.crash_guard.on_crash())
+        };
+        let Some(response) = response else { return };
         match response {
             crate::webview_crash_guard::CrashResponse::Reload => {
-                eprintln!("[agent_panel] the WebView's web process terminated ({reason}); reloading it");
-                self.reload_document();
+                eprintln!(
+                    "[agent_panel] the WebView's web process terminated ({reason}); reloading it (view {})",
+                    view.number()
+                );
+                self.reload_document(view);
             }
             crate::webview_crash_guard::CrashResponse::GiveUp => {
-                eprintln!("[agent_panel] the WebView's web process kept terminating; giving up on automatic reload");
-                self.state.borrow_mut().document_ready = false;
+                eprintln!(
+                    "[agent_panel] the WebView's web process kept terminating; giving up on automatic reload (view {})",
+                    view.number()
+                );
+                self.set_document_ready(view, false);
                 let html = crate::webview_crash_guard::crash_message_html(
                     "Reload it by hand with \u{21bb} in the top bar, or prefix r.",
                 );
-                if let Some(page) = &self.page {
+                if let Some(page) = self.pages.live(view) {
                     let discarded = page.pacer().borrow_mut().discard_pending();
                     trace_discarded_first_texts(&self.state, discarded);
                     page.load_document(&html, PANEL_BASE_URI);
@@ -1465,9 +1776,11 @@ impl AgentPanelHandle {
         self.wake();
         let payload = eitri_core::agent_bridge::serialize_theme_for_js(tokens);
         self.state.borrow_mut().theme = tokens.clone();
-        let Some(page) = &self.page else { return };
-        page.set_background([tokens.bg.r, tokens.bg.g, tokens.bg.b]);
-        page.send_direct(&payload);
+        // Every page, idle ones too: a reused page must not show the old colours for a frame.
+        for page in self.pages.every() {
+            page.set_background([tokens.bg.r, tokens.bg.g, tokens.bg.b]);
+            page.send_direct(&payload);
+        }
     }
 
     /// Updates only the recorded theme's `font_size_px` and re-sends it -- the zoom-together
@@ -1508,12 +1821,32 @@ impl AgentPanelHandle {
     /// Dispatches one already-serialized envelope to the live document, guarded so it is safe to
     /// call before the page has loaded (in which case `ready`'s own batch re-sends whatever state
     /// mattered, and this call is simply a no-op).
-    fn dispatch(&self, payload: String) {
-        // No page at all (`page`'s own doc): nothing is listening, as before a page loads.
-        let Some(page) = &self.page else { return };
-        // Behind whatever the typing cadence is holding, as `PanelPage::send` is.
+    fn dispatch(&self, view: ViewId, payload: String) {
+        // No live page for the view: nothing is listening, as before a page loads.
+        let Some(page) = self.pages.live(view) else { return };
+        Self::dispatch_to(&page, &payload);
+    }
+
+    /// [`dispatch`](Self::dispatch) to every page, idle ones included: what a page reused later must
+    /// already know when it shows its empty chat (the keymap, how thinking is shown, the editor link).
+    fn dispatch_every(&self, payload: String) {
+        for page in self.pages.every() {
+            Self::dispatch_to(&page, &payload);
+        }
+    }
+
+    /// [`dispatch`](Self::dispatch) to every live page.
+    fn dispatch_live(&self, payload: String) {
+        for (_, page) in self.pages.live_views() {
+            Self::dispatch_to(&page, &payload);
+        }
+    }
+
+    /// The one send past the pacer for a dispatch: behind whatever the typing cadence is holding, as
+    /// `PanelPage::send` is.
+    fn dispatch_to(page: &PanelPage, payload: &str) {
         page.flush();
-        page.send_direct(&payload);
+        page.send_direct(payload);
     }
 
     /// The user pressed a key in the editor and it reached nvim (`NeovideEditorPane::
@@ -1523,10 +1856,11 @@ impl AgentPanelHandle {
     /// Wakes the tick only when the key began a typing window: a key inside one moves only the window's
     /// end, which the tick already waits for, and a wake per keystroke would cost a tick per keystroke.
     pub fn note_editor_key(&self) {
-        let began = self
-            .page
-            .as_ref()
-            .is_some_and(|page| page.pacer().borrow_mut().note_editor_key(std::time::Instant::now()));
+        let now = std::time::Instant::now();
+        let mut began = false;
+        for page in self.pages.every() {
+            began |= page.pacer().borrow_mut().note_editor_key(now);
+        }
         if began {
             self.wake();
         }
@@ -1536,15 +1870,18 @@ impl AgentPanelHandle {
     /// at once: the next tick releases what is held.
     pub fn set_editor_has_keys(&self, has_keys: bool) {
         self.wake();
-        if let Some(page) = &self.page {
+        self.state.borrow_mut().editor_has_keys = has_keys;
+        for page in self.pages.every() {
             page.pacer().borrow_mut().set_editor_has_keys(has_keys);
         }
     }
 
-    /// `agent.typing_cadence_hz` as `init.lua` left it (`None`: `"off"`), applied once after it ran.
+    /// `agent.typing_cadence_hz` as `init.lua` left it (`None`: `"off"`), applied once after it ran, to
+    /// every page and to each page attached later.
     pub fn set_typing_cadence(&self, cadence_hz: Option<u32>) {
         self.wake();
-        if let Some(page) = &self.page {
+        self.state.borrow_mut().typing_cadence = cadence_hz;
+        for page in self.pages.every() {
             page.pacer().borrow_mut().set_cadence(cadence_hz);
         }
     }
@@ -1611,7 +1948,7 @@ impl AgentPanelHandle {
             state.apply_review(review);
             review_settings_payload(&state)
         };
-        self.dispatch(payload);
+        self.dispatch_live(payload);
     }
 
     /// Where a restore's one-line result goes. `main.rs` installs this once.
@@ -1620,20 +1957,26 @@ impl AgentPanelHandle {
         self.state.borrow_mut().toast_hook = Some(Rc::new(hook));
     }
 
-    /// Records whether this panel's pane has keyboard focus and tells the live document, which
+    /// Records whether `view`'s pane has keyboard focus and tells its live document, which
     /// dims its mode block when it does not. Safe before the page has loaded for the same reason
     /// `set_theme` is: the dispatch is guarded, and `ready` re-sends the recorded value.
-    pub fn set_pane_focused(&self, focused: bool) {
+    pub fn set_pane_focused(&self, view: ViewId, focused: bool) {
         self.wake();
-        self.state.borrow_mut().pane_focused = focused;
-        if !focused {
-            // A pending bypass prompt is about the tab the user was just looking
-            // at. Losing the keys entirely (focus moved to another module, e.g. the editor or the
-            // terminal) must drop it, the same way switching tabs already does (`TabSet::select`),
-            // so a `y` that slips through afterwards lands on nothing.
-            self.state.borrow_mut().tabs.drop_bypass_prompt();
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(record) = state.pages.get_mut(&view) {
+                record.pane_focused = focused;
+            }
+            if !focused && !state.shutting_down {
+                // A pending bypass prompt is about the tab the user was just looking at in this
+                // page. Losing the keys (focus moved to another module, e.g. the editor, the
+                // terminal or another chat view) must drop it, the same way switching tabs already
+                // does (`TabSet::select`), so a `y` that slips through afterwards lands on nothing.
+                // Another page's prompts are still on screen there, and stay.
+                state.tabs.drop_bypass_prompt_in(view);
+            }
         }
-        self.dispatch(eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));
+        self.dispatch(view, eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));
     }
 
     /// `agent.thinking` as `init.lua` left it, applied once after it ran. Recorded for every later
@@ -1642,17 +1985,17 @@ impl AgentPanelHandle {
     pub fn set_thinking_display(&self, display: eitri_core::agent_prefs::ThinkingDisplay) {
         self.wake();
         self.state.borrow_mut().thinking_display = display;
-        self.dispatch(eitri_core::agent_bridge::serialize_display_for_js(display));
+        self.dispatch_every(eitri_core::agent_bridge::serialize_display_for_js(display));
     }
 
     /// Asks the panel to open its composer with the caret in it. Sent only from the new-tab path
     /// now; see `serialize_enter_input_for_js`. Safe before
     /// the page loads (the dispatch is guarded), in which case there is no composer yet and nothing
     /// happens.
-    pub fn enter_input(&self) {
+    pub fn enter_input(&self, view: ViewId) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_enter_input_for_js());
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(view, eitri_core::agent_bridge::serialize_enter_input_for_js());
     }
 
     /// Where every other keyboard arrival lands: BROWSE -- on the last row with following resumed if
@@ -1660,10 +2003,10 @@ impl AgentPanelHandle {
     /// tray chip/`prefix a`'s miss have moved GTK focus into the panel (this reverses the 2026-09-19
     /// behaviour of `Ctrl+l` going straight into the composer). Mirrors `enter_input` exactly
     /// except for the envelope it dispatches; safe before the page loads for the same reason.
-    pub fn arrive(&self) {
+    pub fn arrive(&self, view: ViewId) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_arrive_for_js());
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(view, eitri_core::agent_bridge::serialize_arrive_for_js());
     }
 
     /// Every keyboard route GTK claims before the WebView sees a key is a route away
@@ -1672,34 +2015,41 @@ impl AgentPanelHandle {
     /// next ordinary key -- the `y` that copies a code block HINT landed on, a name starting with
     /// `y` -- entered bypass and approved the waiting cards. The same now holds for `arrive`,
     /// `enter_input`, `nav_key`, `literal_key`, `prefix ?`, `prefix i`, `prefix &`, `<leader>bo` and
-    /// a card landing, besides `pane_focus false` and the tab switches that already dropped it.
-    fn drop_bypass_prompt(&self) {
-        self.state.borrow_mut().tabs.drop_bypass_prompt();
+    /// a card landing, besides `pane_focus false` and the tab switches that already dropped it. Only
+    /// the prompts of the page the route is in (`view`): another page's are still on its screen.
+    fn drop_bypass_prompt_in(&self, view: ViewId) {
+        let mut state = self.state.borrow_mut();
+        if !state.shutting_down {
+            state.tabs.drop_bypass_prompt_in(view);
+        }
     }
 
-    /// The page's last-reported effective mode, for `main.rs`'s
+    /// `view`'s page's last-reported effective mode, for `main.rs`'s
     /// `Ctrl+j`/`Ctrl+k` intercept to decide against (`claims`). `Other` before the page has ever
     /// posted one, and again after every `ready` -- see `PanelKeys::Other`'s own doc.
-    pub fn panel_keys(&self) -> PanelKeys {
-        self.state.borrow().nav_mode.get()
+    pub fn panel_keys(&self, view: ViewId) -> PanelKeys {
+        self.state
+            .borrow()
+            .page(view)
+            .map_or(PanelKeys::Other, |record| record.nav_mode.get())
     }
 
     /// Tells the page that `Ctrl+j` was claimed in BROWSE, or
     /// `Ctrl+k` claimed in INPUT. Safe before the page loads for the same reason `arrive` is --
     /// there is no live mirror yet, so `main.rs`'s intercept never calls this before one exists.
-    pub fn nav_key(&self, direction: NavKeyDirection) {
+    pub fn nav_key(&self, view: ViewId, direction: NavKeyDirection) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(serialize_nav_key_for_js(direction));
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(view, serialize_nav_key_for_js(direction));
     }
 
     /// The agent host's `Ctrl+j`/`Ctrl+k` intercept for a module-navigation controller: a chord the
     /// panel's own `panel_keys` mirror claims goes to the panel as a nav key and the closure answers
     /// `true`; every other direction answers `false`, so the host moves focus as it would without one.
-    pub fn nav_intercept(&self) -> Rc<dyn Fn(Direction) -> bool> {
+    pub fn nav_intercept(&self, view: ViewId) -> Rc<dyn Fn(Direction) -> bool> {
         let agent = self.clone();
         Rc::new(move |direction: Direction| {
-            if !claims(agent.panel_keys(), direction) {
+            if !claims(agent.panel_keys(view), direction) {
                 return false;
             }
             let direction = match direction {
@@ -1709,7 +2059,7 @@ impl AgentPanelHandle {
                     unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
                 }
             };
-            agent.nav_key(direction);
+            agent.nav_key(view, direction);
             true
         })
     }
@@ -1719,73 +2069,91 @@ impl AgentPanelHandle {
     pub fn set_keymap_help(&self, payload: String) {
         self.wake();
         self.state.borrow_mut().keymap_help = Some(payload.clone());
-        self.dispatch(payload);
+        self.dispatch_every(payload);
     }
 
-    /// `send-prefix`/`send-keys` with the panel holding the keys.
-    pub fn literal_key(&self, key: &eitri_core::keymap::KeySpec) {
+    /// `send-prefix`/`send-keys` with `view`'s page holding the keys.
+    pub fn literal_key(&self, view: ViewId, key: &eitri_core::keymap::KeySpec) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()));
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(
+            view,
+            eitri_core::agent_bridge::serialize_literal_key_for_js(&key.to_string()),
+        );
     }
 
-    /// `prefix ?`: open the `?` overlay, with the section of the plugin page that held the keys, if one did.
-    /// `opening` numbers this opening; the page quotes it back when the overlay closes, so a close that
-    /// arrives after a newer opening can be told apart.
-    pub fn open_keymap(&self, plugin: Option<eitri_core::plugin::keys::PluginKeysHelp>, opening: u64) {
+    /// `prefix ?`: open the `?` overlay in `view`'s page, with the section of the plugin page that held the
+    /// keys, if one did. `opening` numbers this opening; the page quotes it back when the overlay closes,
+    /// so a close that arrives after a newer opening can be told apart.
+    pub fn open_keymap(&self, view: ViewId, plugin: Option<eitri_core::plugin::keys::PluginKeysHelp>, opening: u64) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_open_keymap_for_js(
-            plugin.as_ref(),
-            opening,
-        ));
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(
+            view,
+            eitri_core::agent_bridge::serialize_open_keymap_for_js(plugin.as_ref(), opening),
+        );
     }
 
-    /// `prefix :`: open the panel's `:` command line, which runs nothing.
-    pub fn open_command_line(&self) {
+    /// `prefix :`: open `view`'s page's `:` command line, which runs nothing.
+    pub fn open_command_line(&self, view: ViewId) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_open_command_line_for_js());
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(view, eitri_core::agent_bridge::serialize_open_command_line_for_js());
     }
 
-    /// Global `f` HINT. Each
-    /// is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope; `shell::hint`
-    /// drives the session, this handle only relays it to the WebView.
+    /// Global `f` HINT, in the base page only: an extra view is labelled as a module, its rows are
+    /// not. Each is a one-line dispatch of the matching `serialize_hint_*_for_js` envelope;
+    /// `shell::hint` drives the session, this handle only relays it to the WebView.
     pub fn hint_collect(&self, session_id: u64) {
         self.wake();
-        self.drop_bypass_prompt();
-        self.dispatch(eitri_core::agent_bridge::serialize_hint_collect_for_js(session_id));
+        self.drop_bypass_prompt_in(ViewId::BASE);
+        self.dispatch(
+            ViewId::BASE,
+            eitri_core::agent_bridge::serialize_hint_collect_for_js(session_id),
+        );
     }
     pub fn hint_show(&self, session_id: u64, labels: &[String]) {
         self.wake();
-        self.dispatch(eitri_core::agent_bridge::serialize_hint_show_for_js(session_id, labels));
+        self.dispatch(
+            ViewId::BASE,
+            eitri_core::agent_bridge::serialize_hint_show_for_js(session_id, labels),
+        );
     }
     pub fn hint_prefix(&self, session_id: u64, typed: &str) {
         self.wake();
-        self.dispatch(eitri_core::agent_bridge::serialize_hint_prefix_for_js(
-            session_id, typed,
-        ));
+        self.dispatch(
+            ViewId::BASE,
+            eitri_core::agent_bridge::serialize_hint_prefix_for_js(session_id, typed),
+        );
     }
     pub fn hint_land(&self, session_id: u64, index: usize) {
         self.wake();
-        self.dispatch(eitri_core::agent_bridge::serialize_hint_land_for_js(session_id, index));
+        self.dispatch(
+            ViewId::BASE,
+            eitri_core::agent_bridge::serialize_hint_land_for_js(session_id, index),
+        );
     }
     pub fn hint_end(&self, session_id: u64) {
         self.wake();
-        self.dispatch(eitri_core::agent_bridge::serialize_hint_end_for_js(session_id));
+        self.dispatch(
+            ViewId::BASE,
+            eitri_core::agent_bridge::serialize_hint_end_for_js(session_id),
+        );
     }
 
-    /// A check every card answer from the page passes before it is taken; `Err(why)` refuses the answer, which
-    /// leaves the card waiting, and `why` is what the page shows. The window sets it once.
-    pub fn set_answer_gate(&self, gate: Rc<dyn Fn() -> Result<(), String>>) {
+    /// Every card answer, bypass `y` and trust answer from a page passes this, with the page's view, after
+    /// the page check and before anything is answered; `Err(why)` refuses it and leaves the card or question
+    /// waiting, and `why` is what the page shows. The window sets it once.
+    pub fn set_answer_gate(&self, gate: Rc<dyn Fn(ViewId) -> Result<(), String>>) {
         self.wake();
         self.state.borrow_mut().answer_gate = Some(gate);
     }
 
-    /// Whether a float covers the chat now, asked whenever the panel decides if the chat is on screen
-    /// for attention (a turn finishing, a tab switch, the page coming on screen). The window sets it
-    /// once, and calls [`AgentPanelHandle::page_shown`] when a float stops covering the chat.
-    pub fn set_coverage(&self, covered: Rc<dyn Fn() -> bool>) {
+    /// Whether a float covers a chat view's module now, asked with the view whenever the panel decides
+    /// if that view's page is on screen for attention (a turn finishing, a tab switch, the page coming
+    /// on screen). The window sets it once, and calls [`AgentPanelHandle::page_shown`] when a float
+    /// stops covering a view.
+    pub fn set_coverage(&self, covered: Rc<dyn Fn(ViewId) -> bool>) {
         self.wake();
         self.state.borrow_mut().coverage = Some(covered);
     }
@@ -1833,11 +2201,7 @@ impl AgentPanelHandle {
     pub fn review_editor_lost(&self) {
         self.wake();
         let outs = self.state.borrow_mut().review_flow.editor_lost();
-        for out in outs {
-            if let eitri_core::turn_review::Out::Envelope(payload) = out {
-                self.dispatch(payload);
-            }
-        }
+        dispatch_review_outs(&self.state, &self.pages, outs);
     }
 
     /// Where the panel stands with the editor beside it (companion mode), kept so a document that
@@ -1852,56 +2216,60 @@ impl AgentPanelHandle {
             }
             state.editor_link = Some(payload.clone());
         }
-        self.dispatch(payload);
+        self.dispatch_every(payload);
     }
 
     /// The editor went away or was swapped: every draft edit still out in it ends (a body saved in
-    /// nvim becomes the draft). The active tab is told now, the others when they are switched to.
-    /// Says so once if any edit was cut, and returns how many. It does not return the keys to the
-    /// chat: the editor left, so nothing should take the focus.
+    /// nvim becomes the draft). Each tab on screen is told now, in its own page; the others when they
+    /// are switched to. Says so once if any edit was cut, and returns how many. It does not return
+    /// the keys to the chat: the editor left, so nothing should take the focus.
     pub fn editor_detached(&self) -> usize {
         self.wake();
-        let (ended, active) = {
+        let ended = {
             let mut state = self.state.borrow_mut();
             let ended = end_pending_edits(&mut state);
-            (ended, state.tabs.active())
+            ended
+                .into_iter()
+                .map(|(tab, draft)| (tab, draft, state.shown_in(tab)))
+                .collect::<Vec<_>>()
         };
-        for (tab, draft) in &ended {
-            if *tab != active {
-                continue;
-            }
+        for (tab, draft, shown) in &ended {
+            let Some(view) = shown else { continue };
             if let Some(text) = draft {
-                self.dispatch(eitri_core::agent_bridge::serialize_draft_for_js(*tab, text));
+                self.dispatch(*view, eitri_core::agent_bridge::serialize_draft_for_js(*tab, text));
             }
-            self.dispatch(eitri_core::agent_bridge::serialize_scratch_for_js(*tab, false));
+            self.dispatch(*view, eitri_core::agent_bridge::serialize_scratch_for_js(*tab, false));
         }
         if !ended.is_empty() {
-            self.dispatch(eitri_core::agent_bridge::serialize_notice_for_js(
-                "draft editing stopped: the editor went away",
-            ));
+            self.dispatch(
+                ViewId::BASE,
+                eitri_core::agent_bridge::serialize_notice_for_js("draft editing stopped: the editor went away"),
+            );
         }
         ended.len()
     }
 
-    /// One line in the panel's band, in the notice's own style. Used by the companion window for what
-    /// it cannot say any other way (a desktop it cannot move focus on).
+    /// One line in the base page's band, in the notice's own style. Used by the companion window for
+    /// what it cannot say any other way (a desktop it cannot move focus on).
     pub fn show_notice(&self, text: &str) {
         self.wake();
-        self.dispatch(eitri_core::agent_bridge::serialize_notice_for_js(text));
+        self.dispatch(ViewId::BASE, eitri_core::agent_bridge::serialize_notice_for_js(text));
     }
 
-    /// Called when a draft edited in nvim came back (or was discarded): the keys return to the
-    /// chat. `main.rs` installs this once.
-    pub fn on_editor_done(&self, hook: impl Fn() + 'static) {
+    /// Called when a draft edited in nvim came back (or was discarded), with the view of the edit's
+    /// tab: the keys return to that chat view. `main.rs` installs this once.
+    pub fn on_editor_done(&self, hook: impl Fn(ViewId) + 'static) {
         self.wake();
         self.state.borrow_mut().editor_done_hook = Some(Rc::new(hook));
     }
 
-    /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes --
-    /// the one place that knows both, so `main.rs` keeps no copy of its own to drift. `main.rs` installs this once.
+    /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes, or
+    /// one tab's own attention does ([`AgentPanelHandle::attention_of`] for its view) -- the one place
+    /// that knows both, so `main.rs` keeps no copy of its own to drift -- with the views handed a card
+    /// since the last call, the view holding the newest of them last. `main.rs` installs this once.
     pub fn on_attention(
         &self,
-        hook: impl Fn(eitri_core::attention::Attention, eitri_core::attention::Attention) + 'static,
+        hook: impl Fn(eitri_core::attention::Attention, eitri_core::attention::Attention, &[ViewId]) + 'static,
     ) {
         self.wake();
         self.state.borrow_mut().attention_hook = Some(Rc::new(hook));
@@ -1910,8 +2278,8 @@ impl AgentPanelHandle {
     /// Where a `tab_verb` message's mapped `TabAction` goes: the same code the prefix's own
     /// `Action::Tab` arm runs (`main.rs`'s `run_tab_action`). `None`
     /// until `main.rs` installs one, which is why `InboundMessage::TabVerb` can be refused.
-    /// `main.rs` installs this once.
-    pub fn on_tab_verb(&self, hook: impl Fn(TabAction) + 'static) {
+    /// The hook is told the view of the page the verb came from. `main.rs` installs this once.
+    pub fn on_tab_verb(&self, hook: impl Fn(ViewId, TabAction) + 'static) {
         self.wake();
         self.state.borrow_mut().tab_verb_hook = Some(Rc::new(hook));
     }
@@ -1919,8 +2287,9 @@ impl AgentPanelHandle {
     /// Where a `nav_fallthrough` message's direction goes: `main.rs` wires this to
     /// `move_focus(&ModuleId::agent(), dir)`, i.e. exactly what the chord would have done had the
     /// panel never intercepted it. A `pane_nav` (`Ctrl+w h/j/k/l`) goes through the
-    /// same hook, for it is the same move. `main.rs` installs this once.
-    pub fn on_nav_fallthrough(&self, hook: impl Fn(Direction) + 'static) {
+    /// same hook, for it is the same move. The hook is told the view of the page the move came from, the
+    /// module it moves from. `main.rs` installs this once.
+    pub fn on_nav_fallthrough(&self, hook: impl Fn(ViewId, Direction) + 'static) {
         self.wake();
         self.state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(hook));
     }
@@ -1935,27 +2304,20 @@ impl AgentPanelHandle {
 
 /// The session-tab verbs `main.rs` binds. Each borrows, changes
 /// the set, drops the borrow, then dispatches. Every one of them does nothing once the window is
-/// closing (`AgentPanelState::shutting_down`: the set is empty then).
+/// closing (`AgentPanelState::shutting_down`: the set is empty then). A verb about "the tab on
+/// screen" names the view whose page has the keys and acts on that page's tab.
 // The keymap and the window close will call these; until they do, some have no caller.
 #[allow(dead_code)]
 impl AgentPanelHandle {
-    /// The window is closing (`AgentPanelState::shutting_down`), or there is no page at all
-    /// (`page`'s own doc): every verb below then does nothing, and says so to its caller the way
+    /// The window is closing (`AgentPanelState::shutting_down`), or there are no pages at all
+    /// (`with_pages`'s own doc): every verb below then does nothing, and says so to its caller the way
     /// it does for a closing window.
     fn closing(&self) -> bool {
-        self.live_page().is_none()
+        !self.with_pages || self.state.borrow().shutting_down
     }
 
-    /// The page, while there is one and the window is not closing.
-    fn live_page(&self) -> Option<&PanelPage> {
-        if self.state.borrow().shutting_down {
-            return None;
-        }
-        self.page.as_deref()
-    }
-
-    /// `prefix c`: opens a tab running the window's default agent (`agent.default`), selects it, and
-    /// sends `tabs` -- nothing else: an empty tab has no state yet.
+    /// `prefix c`: opens a tab running the window's default agent (`agent.default`) in the base view,
+    /// selects it, and sends `tabs` -- nothing else: an empty tab has no state yet.
     pub fn new_tab(&self) {
         self.wake();
         let agent = self.state.borrow().default_agent.clone();
@@ -1965,142 +2327,204 @@ impl AgentPanelHandle {
     /// [`new_tab`](Self::new_tab) for a named agent (`:tabnew <agent>`).
     pub fn new_tab_for(&self, agent: AgentId) {
         self.wake();
-        let Some(page) = self.live_page() else {
+        if self.closing() {
             return;
-        };
+        }
         self.state.borrow_mut().tabs.open(agent);
-        send_tabs(&self.state, page);
+        send_tabs(&self.state, &self.pages);
     }
 
-    /// `prefix <digit>`. `false` when no tab has that number (the caller flashes).
-    pub fn select_number(&self, n: u16) -> bool {
+    /// `prefix <digit>`: a base-view tab is selected there; a tab bound to an extra view asks the window
+    /// to show that view (`on_show_view`). Where the tab is, or `None` when no tab has that number (the
+    /// caller flashes).
+    pub fn select_number(&self, n: u16) -> Option<TabPlace> {
         self.wake();
-        self.switch_with(|tabs| tabs.select_number(n))
+        if self.closing() {
+            return None;
+        }
+        let place = self.state.borrow_mut().tabs.select_number(n)?;
+        match place {
+            TabPlace::Base(_) => send_switch(&self.state, &self.pages),
+            TabPlace::View(view, _) => show_view(&self.state, view),
+        }
+        Some(place)
     }
 
-    /// `prefix n` (+1) / `p` (-1), wrapping.
+    /// `prefix n` (+1) / `p` (-1), wrapping, over the base view's tabs.
     pub fn step(&self, delta: i32) -> bool {
         self.wake();
         self.switch_with(|tabs| tabs.step(delta))
     }
 
-    /// `prefix l`: the previously active tab.
+    /// `prefix l`: the base view's previously active tab.
     pub fn select_last(&self) -> bool {
         self.wake();
         self.switch_with(eitri_core::tab_set::TabSet::select_last)
     }
 
     fn switch_with(&self, select: impl FnOnce(&mut eitri_core::tab_set::TabSet) -> Option<TabId>) -> bool {
-        let Some(page) = self.live_page() else {
+        if self.closing() {
             return false;
-        };
+        }
         let selected = select(&mut self.state.borrow_mut().tabs);
         if selected.is_none() {
             return false;
         }
-        send_switch(&self.state, page);
+        send_switch(&self.state, &self.pages);
         true
     }
 
-    /// `prefix ,`: the inline rename field on the active tab's label.
-    pub fn begin_rename(&self) {
+    /// `prefix ,`: the inline rename field on the label of the tab `view`'s page shows.
+    pub fn begin_rename(&self, view: ViewId) {
         self.wake();
         if self.closing() {
             return;
         }
-        self.drop_bypass_prompt();
+        self.drop_bypass_prompt_in(view);
         let payload = {
             let state = self.state.borrow();
-            let tab = state.tabs.active_tab();
+            let Some(tab) = state.tab_of_page(view).and_then(|tab| state.tabs.get(tab)) else {
+                return;
+            };
             eitri_core::agent_bridge::serialize_begin_rename_for_js(tab.id, tab.name.as_deref())
         };
-        self.dispatch(payload);
+        self.dispatch(view, payload);
     }
 
-    /// `prefix &`: the footer's y/n prompt for the active tab.
-    pub fn confirm_close(&self) {
+    /// `prefix &`: the footer's y/n prompt for the tab `view`'s page shows.
+    pub fn confirm_close(&self, view: ViewId) {
         self.wake();
         if self.closing() {
             return;
         }
         // The panel's close prompt replaces a bypass prompt on screen; Rust's copy goes with it.
-        self.drop_bypass_prompt();
+        self.drop_bypass_prompt_in(view);
         let payload = {
             let state = self.state.borrow();
-            let active = state.tabs.active();
-            let facts = state.tabs.close_facts(active).expect("the active tab exists");
-            eitri_core::agent_bridge::serialize_confirm_close_for_js(active, &eitri_core::tabs::close_prompt(&facts))
+            let Some((tab, facts)) = state
+                .tab_of_page(view)
+                .and_then(|tab| state.tabs.close_facts(tab).map(|facts| (tab, facts)))
+            else {
+                return;
+            };
+            eitri_core::agent_bridge::serialize_confirm_close_for_js(tab, &eitri_core::tabs::close_prompt(&facts))
         };
-        self.dispatch(payload);
+        self.dispatch(view, payload);
     }
 
-    /// `<leader>bo`: the footer's y/n prompt over every tab but the active one.
-    /// Nothing to dispatch, and no flash, when the active tab is the only one open -- `<leader>bo`
-    /// with one tab is simply nothing to do, the same as `prefix n`/`p` with one tab (unlike a verb naming a tab that
-    /// does not exist, which flashes).
+    /// `<leader>bo` in the base view: the footer's y/n prompt over every base-view tab but the active
+    /// one. Nothing to dispatch, and no flash, when the active tab is the only one -- `<leader>bo`
+    /// with one tab is simply nothing to do, the same as `prefix n`/`p` with one tab (unlike a verb
+    /// naming a tab that does not exist, which flashes).
     pub fn confirm_close_others(&self) {
         self.wake();
         if self.closing() {
             return;
         }
-        self.drop_bypass_prompt();
+        self.drop_bypass_prompt_in(ViewId::BASE);
         let Some((tabs, prompt)) = self.state.borrow().tabs.close_others_plan() else {
             return;
         };
         let payload = eitri_core::agent_bridge::serialize_confirm_close_others_for_js(&tabs, &[prompt]);
-        self.dispatch(payload);
+        self.dispatch(ViewId::BASE, payload);
     }
 
-    /// `prefix w`.
-    pub fn open_chooser(&self) {
+    /// `prefix w` in `view`'s page: every open tab, and the records of that page's tab's agent.
+    pub fn open_chooser(&self, view: ViewId) {
         self.wake();
         if self.closing() {
             return;
         }
         // Opening the chooser is one of the routes that cancels an outstanding bypass
-        // prompt -- it was about the tab the user is leaving to see this list. A fresh one raised
-        // from inside the chooser (its own Shift+Tab) makes its own plan afterwards, unaffected.
-        self.state.borrow_mut().tabs.drop_bypass_prompt();
-        let (payload, listed) = chooser_payload(&self.state.borrow());
-        self.state.borrow_mut().chooser_listed = listed;
-        self.dispatch(payload);
+        // prompt in this page -- it was about the tab the user is leaving to see this list. A fresh
+        // one raised from inside the chooser (its own Shift+Tab) makes its own plan afterwards.
+        self.drop_bypass_prompt_in(view);
+        let (payload, listed) = chooser_payload(&self.state.borrow(), view);
+        {
+            let mut state = self.state.borrow_mut();
+            state.chooser_listed = listed;
+            state.chooser_view = view;
+        }
+        self.dispatch(view, payload);
     }
 
-    /// `prefix i`: the active tab's detail popover.
-    pub fn open_detail(&self) {
+    /// `prefix i`: the detail popover of the tab `view`'s page shows.
+    pub fn open_detail(&self, view: ViewId) {
         self.wake();
         if self.closing() {
             return;
         }
-        self.drop_bypass_prompt();
+        self.drop_bypass_prompt_in(view);
         let payload = {
             let state = self.state.borrow();
-            detail_payload(&state, state.tabs.active())
+            let Some(tab) = state.tab_of_page(view) else { return };
+            detail_payload(&state, tab)
         };
-        self.dispatch(payload);
+        self.dispatch(view, payload);
     }
 
-    /// The tray chip, `prefix a`: switches to the tab holding the oldest pending card and puts the
-    /// panel's cursor on it. `false` when no tab holds a card.
-    pub fn focus_oldest_card(&self) -> bool {
+    /// The tray chip, `prefix a`: the oldest pending card among `view`'s tabs, with `view`'s page's
+    /// cursor put on it. The base view switches to the tab holding it; an extra view shows its one
+    /// tab already. `false` when none of `view`'s tabs holds a card.
+    pub fn focus_oldest_card(&self, view: ViewId) -> bool {
         self.wake();
-        let Some(page) = self.live_page() else {
+        if self.closing() {
             return false;
-        };
+        }
         let target = {
             let mut state = self.state.borrow_mut();
-            let Some(target) = state.tabs.oldest_card_tab() else {
+            let Some(target) = oldest_card_in(&state.tabs, view) else {
                 return false;
             };
-            state.tabs.select(target);
+            if view.is_base() {
+                state.tabs.select(target);
+            }
             // A landing on a card is a route away even when it names the tab already on
             // screen, which `select` alone does not treat as a move.
-            state.tabs.drop_bypass_prompt();
+            state.tabs.drop_bypass_prompt_in(view);
             target
         };
-        send_switch(&self.state, page);
-        self.dispatch(eitri_core::agent_bridge::serialize_focus_permission_for_js(target));
+        if view.is_base() {
+            send_switch(&self.state, &self.pages);
+        }
+        self.dispatch(
+            view,
+            eitri_core::agent_bridge::serialize_focus_permission_for_js(target),
+        );
         true
+    }
+
+    /// The view whose tab holds the window's oldest pending card.
+    pub fn oldest_card_view(&self) -> Option<ViewId> {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return None;
+        }
+        state.tabs.oldest_card_place().map(|place| match place {
+            TabPlace::Base(_) => ViewId::BASE,
+            TabPlace::View(view, _) => view,
+        })
+    }
+
+    /// The view whose tab holds the window's newest pending card (where attention points).
+    pub fn newest_card_view(&self) -> Option<ViewId> {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return None;
+        }
+        state.tabs.newest_card_tab().map(|tab| state.tabs.view_of(tab))
+    }
+
+    /// What `view`'s tabs owe the user: the base view's summed, or an extra view's one tab's.
+    pub fn attention_of(&self, view: ViewId) -> eitri_core::attention::Attention {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return Default::default();
+        }
+        state.tabs.attention_of(view)
     }
 
     /// What the chat owes the user now, summed over every tab: its pending permission
@@ -2123,34 +2547,181 @@ impl AgentPanelHandle {
         state.tabs.get(id).map(|t| (t.number, t.label_name()))
     }
 
-    /// `prefix x` on the chat (2026-09-26): every session tab is closed exactly as `y` to `prefix &`
-    /// closes one (`close_tab`: a running turn interrupted, queued words kept as history, the backend
-    /// shut down and dropped on a worker the window-close backstop still covers, the record never
-    /// deleted, so each session stays resumable). The set is left with one fresh empty tab, as closing
-    /// its last tab always leaves it. How many tabs were closed.
+    /// [`AgentPanelHandle::newest_card_label`] among `view`'s tabs only.
+    pub fn newest_card_label_in(&self, view: ViewId) -> Option<(u16, String)> {
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return None;
+        }
+        let id = state.tabs.newest_card_tab_in(view)?;
+        state.tabs.get(id).map(|t| (t.number, t.label_name()))
+    }
+
+    /// `prefix x` on a chat view (2026-09-26): every tab of `view` is closed exactly as `y` to
+    /// `prefix &` closes one (`close_tab`: a running turn interrupted, queued words kept as history,
+    /// the backend shut down and dropped on a worker the window-close backstop still covers, the
+    /// record never deleted, so each session stays resumable). The base view is left with one fresh
+    /// empty tab, as closing its last tab always leaves it, and every extra view's tab keeps running;
+    /// an extra view loses its one tab. How many tabs were closed.
     ///
-    /// Refused, closing nothing, while a tab is being handed off to a terminal: `close_tab` refuses
-    /// that tab, and a kill that closed the others and left it would not be a kill.
-    pub fn close_every_tab(&self) -> Result<usize, &'static str> {
+    /// Refused, closing nothing, while one of them is being handed off to a terminal: `close_tab`
+    /// refuses that tab, and a kill that closed the others and left it would not be a kill.
+    pub fn close_view_tabs(&self, view: ViewId) -> Result<usize, &'static str> {
         self.wake();
-        let Some(page) = self.live_page() else {
+        if self.closing() {
             return Ok(0);
-        };
+        }
         let ids: Vec<TabId> = {
             let state = self.state.borrow();
-            if state.tabs.tabs().iter().any(|t| t.pending_handoff.is_some()) {
+            let ids: Vec<TabId> = if view.is_base() {
+                state.tabs.base_tabs()
+            } else {
+                state.tabs.tab_in(view).into_iter().collect()
+            };
+            if ids
+                .iter()
+                .any(|id| state.tabs.get(*id).is_some_and(|t| t.pending_handoff.is_some()))
+            {
                 return Err("a tab is still being handed off to a terminal; kill the chat once that finishes");
             }
-            state.tabs.tabs().iter().map(|t| t.id).collect()
+            ids
         };
         for id in &ids {
-            close_tab(&self.state, page, *id)?;
+            close_tab(&self.state, &self.pages, *id)?;
         }
         eprintln!(
-            "[agent_panel] killed: {} session tab(s) closed, records kept",
-            ids.len()
+            "[agent_panel] killed: {} session tab(s) closed, records kept (view {})",
+            ids.len(),
+            view.number()
         );
+        tell_emptied_views(&self.state);
         Ok(ids.len())
+    }
+
+    /// `prefix !` (tmux's `break-pane`) with the keys in the base view: its active tab moves to the
+    /// empty extra view `view`, and the base page shows the tab it falls back to. The moved tab.
+    pub fn break_out(&self, view: ViewId) -> Result<TabId, String> {
+        self.wake();
+        if self.closing() {
+            return Err("the window is closing".to_string());
+        }
+        let moved = self
+            .state
+            .borrow_mut()
+            .tabs
+            .break_out(view)
+            .map_err(|e| e.to_string())?;
+        send_switch(&self.state, &self.pages);
+        send_view(&self.state, &self.pages, view);
+        send_moved_hint(&self.state, &self.pages, moved, view);
+        Ok(moved)
+    }
+
+    /// The tab `view` shows comes back into the base view as its active tab; `view` is left empty,
+    /// which the window is told (`on_view_empty`). The tab that came back.
+    pub fn join_back(&self, view: ViewId) -> Result<TabId, String> {
+        self.wake();
+        if self.closing() {
+            return Err("the window is closing".to_string());
+        }
+        let tab = self
+            .state
+            .borrow_mut()
+            .tabs
+            .join_back(view)
+            .ok_or_else(|| format!("agent {} shows no tab", view.number()))?;
+        send_switch(&self.state, &self.pages);
+        send_moved_hint(&self.state, &self.pages, tab, ViewId::BASE);
+        self.state.borrow_mut().emptied_views.push(view);
+        tell_emptied_views(&self.state);
+        Ok(tab)
+    }
+
+    /// A new chat view's tab: a new empty tab of the window's default agent, bound to the empty extra
+    /// view `view`; the base view's active tab is unchanged. The new tab.
+    pub fn open_in(&self, view: ViewId) -> Result<TabId, String> {
+        self.wake();
+        if self.closing() {
+            return Err("the window is closing".to_string());
+        }
+        let agent = self.state.borrow().default_agent.clone();
+        let tab = self
+            .state
+            .borrow_mut()
+            .tabs
+            .open_in(agent, view)
+            .map_err(|e| e.to_string())?;
+        send_view(&self.state, &self.pages, view);
+        Ok(tab)
+    }
+
+    /// The extra views that hold a tab, ascending.
+    pub fn views(&self) -> Vec<ViewId> {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return Vec::new();
+        }
+        state.tabs.views()
+    }
+
+    /// The label of the tab the extra view `view` shows, as its strip names it (`<n> <name>`): what
+    /// `prefix x` on that view says it closes. `None` when `view` holds no tab, and for the base view,
+    /// whose kill closes every base-view tab.
+    pub fn view_tab_label(&self, view: ViewId) -> Option<String> {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return None;
+        }
+        let tab = state.tabs.tab_in(view).and_then(|tab| state.tabs.get(tab))?;
+        Some(eitri_core::tabs::label(tab.number, &tab.label_name()))
+    }
+
+    /// What closing the extra view `view`'s tab would end, as the window-close prompt counts it: whether
+    /// its turn is running or its session still connecting (0 or 1), and its queued messages. `(0, 0)`
+    /// when `view` holds no tab, and for the base view.
+    pub fn view_running_queued(&self, view: ViewId) -> (usize, usize) {
+        self.wake();
+        let state = self.state.borrow();
+        if state.shutting_down {
+            return (0, 0);
+        }
+        let Some(tab) = state.tabs.tab_in(view).and_then(|tab| state.tabs.get(tab)) else {
+            return (0, 0);
+        };
+        let running = matches!(tab.backend, TabBackend::Starting(_)) || tab.turn_running();
+        (usize::from(running), tab.queue.len())
+    }
+
+    /// The extra chat views the window's layout holds, in any workspace, told before any restore so a
+    /// restored tab saved in one of them comes back into it.
+    pub fn set_layout_views(&self, views: Vec<ViewId>) {
+        self.wake();
+        self.state.borrow_mut().tabs.set_layout_views(views);
+    }
+
+    /// Whether the last window's tabs are settled: none on offer, no restore question open and no
+    /// restore run in flight. Until then an extra view holding no tab may still be given one.
+    pub fn restore_settled(&self) -> bool {
+        self.wake();
+        restore_settled(&self.state.borrow())
+    }
+
+    /// Told once per extra view left holding no tab: its tab closed, joined back or a failed restore
+    /// discarded it, and, once the restore has settled, each attached extra view that never got one.
+    /// The window removes the view. `main.rs` installs this once.
+    pub fn on_view_empty(&self, hook: impl Fn(ViewId) + 'static) {
+        self.wake();
+        self.state.borrow_mut().view_empty_hook = Some(Rc::new(hook));
+    }
+
+    /// Told when a pick asks the window to show a view and give it the keys: a chooser pick, a number
+    /// key or a resume naming a tab bound to an extra view, or a resume from an extra page that opened
+    /// in a new base-view tab. `main.rs` installs this once.
+    pub fn on_show_view(&self, hook: impl Fn(ViewId) + 'static) {
+        self.wake();
+        self.state.borrow_mut().show_view_hook = Some(Rc::new(hook));
     }
 
     /// Tabs whose turn is running or whose session is still connecting.
@@ -2172,20 +2743,98 @@ impl AgentPanelHandle {
     }
 }
 
-/// Tells the attention hook, if the value changed. The hook is cloned out of the borrow first: it
-/// reaches the layout and the top bar, and must never find this panel's state borrowed.
+/// The oldest pending card among `view`'s tabs.
+fn oldest_card_in(tabs: &eitri_core::tab_set::TabSet, view: ViewId) -> Option<TabId> {
+    let stamps: Vec<(TabId, Option<u64>)> = tabs
+        .tabs()
+        .iter()
+        .filter(|t| t.view_id() == view)
+        .map(|t| (t.id, t.attention.oldest_pending_stamp()))
+        .collect();
+    eitri_core::tabs::oldest_card(&stamps)
+}
+
+/// Asks the window to show `view` and give it the keys. The hook is cloned out of the borrow first:
+/// it moves the layout's focus, which reaches back into the panel.
+fn show_view(state: &Rc<RefCell<AgentPanelState>>, view: ViewId) {
+    let hook = state.borrow().show_view_hook.clone();
+    if let Some(hook) = hook {
+        hook(view);
+    }
+}
+
+/// Whether the last window's tabs are settled ([`AgentPanelHandle::restore_settled`]). `agent.restore
+/// = "auto"` keeps its source until the base page's first `ready` uses it up.
+fn restore_settled(state: &AgentPanelState) -> bool {
+    let on_offer = restore_is_on_offer(state)
+        || (state.restore_policy == RestorePolicy::Auto
+            && state.restore_source.is_some()
+            && !state.ready(ViewId::BASE));
+    !on_offer && !state.tabs.restore_question_open() && !restore_waits_for_trust(state) && state.restore_run.is_none()
+}
+
+/// Once the restore has settled, every attached extra view still holding no tab is owed to the
+/// window as empty, once per window.
+fn judge_empty_views(state: &Rc<RefCell<AgentPanelState>>) {
+    let mut state = state.borrow_mut();
+    if state.empty_views_judged || state.shutting_down || !restore_settled(&state) {
+        return;
+    }
+    state.empty_views_judged = true;
+    let empty: Vec<ViewId> = state
+        .pages
+        .keys()
+        .copied()
+        .filter(|view| !view.is_base() && state.tabs.tab_in(*view).is_none())
+        .collect();
+    for view in empty {
+        if !state.emptied_views.contains(&view) {
+            state.emptied_views.push(view);
+        }
+    }
+}
+
+/// Tells the window of each extra view left empty since it was last told, once each, with the state
+/// released: the window removes the view and idles its page, which comes back into the panel.
+fn tell_emptied_views(state: &Rc<RefCell<AgentPanelState>>) {
+    let (views, hook) = {
+        let mut state = state.borrow_mut();
+        let mut views = std::mem::take(&mut state.emptied_views);
+        views.dedup();
+        // A view given a tab again since (a restore, a new tab) is not empty any more.
+        views.retain(|view| state.tabs.tab_in(*view).is_none());
+        (views, state.view_empty_hook.clone())
+    };
+    for view in views {
+        eprintln!("[agent_panel] view {}: no tab left", view.number());
+        if let Some(hook) = &hook {
+            hook(view);
+        }
+    }
+}
+
+/// Tells the attention hook, if the window's value changed or any tab's own did (or a tab moved to
+/// another view): each chat view's chip shows only its own tabs, so a view that turns unread while
+/// another already is must still be redrawn, and two views handed a card in one pump must both be
+/// named. The hook is cloned out of the borrow first: it reaches the layout and the top bar, and must
+/// never find this panel's state borrowed.
 fn report_attention(state: &Rc<RefCell<AgentPanelState>>, before: eitri_core::attention::Attention) {
-    let (after, hook) = {
-        let state = state.borrow();
+    let (after, hook, handed) = {
+        let mut state = state.borrow_mut();
         if state.shutting_down {
             return;
         }
-        (state.tabs.attention(), state.attention_hook.clone())
-    };
-    if after != before {
-        if let Some(hook) = hook {
-            hook(before, after);
+        let after = state.tabs.attention();
+        let now = state.tabs.tab_attentions();
+        if after == before && now == state.reported_tabs {
+            return;
         }
+        let handed = eitri_core::tabs::views_handed_a_card(&state.reported_tabs, &now);
+        state.reported_tabs = now;
+        (after, state.attention_hook.clone(), handed)
+    };
+    if let Some(hook) = hook {
+        hook(before, after, &handed);
     }
 }
 
@@ -2332,8 +2981,6 @@ fn panel_state(
         acp_agents: Vec::new(),
         start_notes: StartNotes::default(),
         restore_run: None,
-        last_restore_offered: false,
-        last_hello_agent: AgentId::Claude,
         toast_hook: None,
         editor_context,
         backend_kind,
@@ -2349,14 +2996,25 @@ fn panel_state(
         ticks_run: 0,
         theme: eitri_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
-        pane_focused: false,
+        // The base view's record is there from the start: its page is the window's, attached or not.
+        pages: BTreeMap::from([(ViewId::BASE, PageState::default())]),
+        view_empty_hook: None,
+        show_view_hook: None,
+        emptied_views: Vec::new(),
+        empty_views_judged: false,
+        chooser_view: ViewId::BASE,
+        review_requests: Vec::new(),
+        trust_commands: BTreeMap::new(),
+        next_trust_command: 0,
+        start_pages: BTreeMap::new(),
+        typing_cadence: Some(eitri_core::panel_cadence::DEFAULT_CADENCE_HZ),
+        editor_has_keys: false,
         thinking_display: eitri_core::agent_prefs::ThinkingDisplay::Collapsed,
         hint_hook: None,
         answer_gate: None,
         coverage: None,
         attention_hook: None,
-        last_tabs_payload: None,
-        last_open_ids: Vec::new(),
+        reported_tabs: Vec::new(),
         scratch,
         pending_edits: Vec::new(),
         review_jobs: Vec::new(),
@@ -2375,14 +3033,10 @@ fn panel_state(
         history_dir,
         rules_dir,
         history,
-        document_ready: false,
-        last_context_payload: None,
         editor_link: None,
         tab_verb_hook: None,
-        nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
         keymap_closed_hook: None,
-        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     }
 }
 
@@ -2414,14 +3068,25 @@ fn bare_state(
         ticks_run: 0,
         theme: eitri_core::theme::ThemeTokens::fallback(),
         keymap_help: None,
-        pane_focused: false,
+        // The base view's record is there from the start: its page is the window's, attached or not.
+        pages: BTreeMap::from([(ViewId::BASE, PageState::default())]),
+        view_empty_hook: None,
+        show_view_hook: None,
+        emptied_views: Vec::new(),
+        empty_views_judged: false,
+        chooser_view: ViewId::BASE,
+        review_requests: Vec::new(),
+        trust_commands: BTreeMap::new(),
+        next_trust_command: 0,
+        start_pages: BTreeMap::new(),
+        typing_cadence: Some(eitri_core::panel_cadence::DEFAULT_CADENCE_HZ),
+        editor_has_keys: false,
         thinking_display: eitri_core::agent_prefs::ThinkingDisplay::Collapsed,
         hint_hook: None,
         answer_gate: None,
         coverage: None,
         attention_hook: None,
-        last_tabs_payload: None,
-        last_open_ids: Vec::new(),
+        reported_tabs: Vec::new(),
         scratch: None,
         pending_edits: Vec::new(),
         review_jobs: Vec::new(),
@@ -2444,14 +3109,10 @@ fn bare_state(
         history_dir: None,
         rules_dir: None,
         history: Vec::new(),
-        document_ready: false,
-        last_context_payload: None,
         editor_link: None,
         tab_verb_hook: None,
-        nav_mode: Cell::new(PanelKeys::Other),
         nav_fallthrough_hook: None,
         keymap_closed_hook: None,
-        crash_guard: crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
         tab_memory: TabWriter::new(None, PathBuf::new()),
         titles,
         hello_titles_stale: false,
@@ -2467,8 +3128,6 @@ fn bare_state(
         acp_agents: Vec::new(),
         start_notes: StartNotes::default(),
         restore_run: None,
-        last_restore_offered: false,
-        last_hello_agent: AgentId::Claude,
         toast_hook: None,
         // No worker and no disk: every start goes on untrusted, as for a root with nothing to
         // trust. A test about the question puts a real gate in its place.
@@ -2525,34 +3184,60 @@ fn dispatch_all(page: &PanelPage, payloads: Vec<String>) {
     }
 }
 
-/// The `tabs` envelope, recorded as the last one sent.
-fn tabs_payload_recorded(state: &mut AgentPanelState) -> String {
-    let payload = state.tabs.tabs_payload();
-    state.last_tabs_payload = Some(payload.clone());
+/// The `tabs` envelope for `view`'s page (`TabSet::tabs_payload_for`: the base page lists the base
+/// view's tabs, an extra page its one tab), recorded as the last one sent to that page.
+fn tabs_payload_recorded(state: &mut AgentPanelState, view: ViewId) -> String {
+    let payload = state.tabs.tabs_payload_for(view);
+    if let Some(record) = state.pages.get_mut(&view) {
+        record.last_tabs_payload = Some(payload.clone());
+    }
     payload
 }
 
-/// Sends `tabs` now: the set changed in a way the panel must see at once.
-fn send_tabs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
-    let payload = tabs_payload_recorded(&mut state.borrow_mut());
-    page.send(&payload);
-    send_mode_note(state, page);
+/// Sends `tabs` now: the set changed in a way the pages must see at once. The base page is always
+/// sent its strip; an extra page only when its own changed and it is ready.
+fn send_tabs(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    let payload = tabs_payload_recorded(&mut state.borrow_mut(), ViewId::BASE);
+    pages.send(ViewId::BASE, &payload);
+    send_extra_tabs_if_changed(state, pages);
+    send_mode_note(state, pages);
+}
+
+/// Each live extra page's `tabs`, when its own changed since the last one it was sent.
+fn send_extra_tabs_if_changed(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    for (view, _) in pages.live_views() {
+        if view.is_base() {
+            continue;
+        }
+        let payload = {
+            let mut state_ref = state.borrow_mut();
+            let now = state_ref.tabs.tabs_payload_for(view);
+            let ready = state_ref.ready(view);
+            state_ref
+                .pages
+                .get_mut(&view)
+                .and_then(|record| changed_envelope(&mut record.last_tabs_payload, now, ready))
+        };
+        if let Some(payload) = payload {
+            pages.send(view, &payload);
+        }
+    }
 }
 
 /// What the tab set noted about a tab that could not take the window's mode (an agent with no
-/// manual mode started in auto), said once in the page's transient slot, after the `tabs` that
-/// shows the tab. Kept until a page is ready to show it.
-fn send_mode_note(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// manual mode started in auto), said once in the base page's transient slot, after the `tabs` that
+/// shows the tab. Kept until the base page is ready to show it.
+fn send_mode_note(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let note = {
         let mut state_ref = state.borrow_mut();
-        if !state_ref.document_ready {
+        if !state_ref.ready(ViewId::BASE) {
             return;
         }
         state_ref.tabs.take_mode_note()
     };
     if let Some(note) = note {
         eprintln!("[permission] {note}");
-        page.send(&eitri_core::agent_bridge::serialize_notice_for_js(&note));
+        pages.send(ViewId::BASE, &eitri_core::agent_bridge::serialize_notice_for_js(&note));
     }
 }
 
@@ -2575,6 +3260,8 @@ const MAX_REVIEW_JOBS: usize = 4;
 /// One review being worked out on a worker thread.
 struct PendingReview {
     request_id: String,
+    /// The page that asked: the answer goes there.
+    view: ViewId,
     /// The finished envelope, or why there is none.
     rx: mpsc::Receiver<Result<String, String>>,
     /// The tab and turn whose status-band hint the page drops when this review's envelope arrives:
@@ -2587,6 +3274,7 @@ struct PendingReview {
 /// Refused while [`MAX_REVIEW_JOBS`] are already out.
 fn start_review_job(
     state: &Rc<RefCell<AgentPanelState>>,
+    view: ViewId,
     request_id: &str,
     clears_hint: Option<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
     work: impl FnOnce() -> Result<String, String> + Send + 'static,
@@ -2601,6 +3289,7 @@ fn start_review_job(
     });
     state.borrow_mut().review_jobs.push(PendingReview {
         request_id: request_id.to_string(),
+        view,
         rx,
         clears_hint,
     });
@@ -2610,25 +3299,39 @@ fn start_review_job(
 /// What the finished jobs of `jobs` owe the panel, in order: an envelope for a review that was
 /// worked out, a failing `command_result` for one that could not be (or whose worker died). The
 /// finished ones leave `jobs`. The second list is the hints those envelopes clear on the page.
+#[cfg(test)]
 fn finished_reviews(
     jobs: &mut Vec<PendingReview>,
 ) -> (Vec<String>, Vec<(u64, eitri_core::agent_bridge::ReviewTurnWire)>) {
+    let (payloads, cleared) = finished_reviews_by_page(jobs);
+    (payloads.into_iter().map(|(_, payload)| payload).collect(), cleared)
+}
+
+/// What [`finished_reviews_by_page`] found: each payload with the page it goes to, and the hints the
+/// reviews among them clear.
+type ReviewsDone = (
+    Vec<(ViewId, String)>,
+    Vec<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
+);
+
+/// [`finished_reviews`], each payload with the view of the page that asked for it.
+fn finished_reviews_by_page(jobs: &mut Vec<PendingReview>) -> ReviewsDone {
     let mut payloads = Vec::new();
     let mut cleared = Vec::new();
     jobs.retain(|job| match job.rx.try_recv() {
         Ok(Ok(envelope)) => {
-            payloads.push(envelope);
+            payloads.push((job.view, envelope));
             cleared.extend(job.clears_hint);
             false
         }
         Ok(Err(why)) => {
-            payloads.push(serialize_command_result_for_js(&job.request_id, Err(&why)));
+            payloads.push((job.view, serialize_command_result_for_js(&job.request_id, Err(&why))));
             false
         }
         Err(mpsc::TryRecvError::Disconnected) => {
-            payloads.push(serialize_command_result_for_js(
-                &job.request_id,
-                Err("the review stopped before it finished"),
+            payloads.push((
+                job.view,
+                serialize_command_result_for_js(&job.request_id, Err("the review stopped before it finished")),
             ));
             false
         }
@@ -2704,42 +3407,97 @@ fn forget_hints_of_running_or_closed_tabs(state: &mut AgentPanelState) {
     });
 }
 
-/// What a new document is owed of the hints the last one showed.
-fn hints_for_new_document(state: &mut AgentPanelState) -> Vec<eitri_core::turn_review::ReviewHint> {
-    forget_hints_of_running_or_closed_tabs(state);
-    state.shown_hints.clone()
+/// The status-band hint `tab` showed in the page it left, to the ready page of `view` it moved to:
+/// that page was never sent it, and the tick does not send a shown hint again. A page not ready yet is
+/// sent it with the rest on its `ready` ([`hints_for_new_document`]).
+fn send_moved_hint(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId, view: ViewId) {
+    let hint = {
+        let mut state_ref = state.borrow_mut();
+        if !state_ref.ready(view) {
+            return;
+        }
+        forget_hints_of_running_or_closed_tabs(&mut state_ref);
+        state_ref
+            .shown_hints
+            .iter()
+            .find(|hint| hint.tab == tab.0)
+            .map(eitri_core::agent_bridge::serialize_review_hint_for_js)
+    };
+    if let Some(hint) = hint {
+        pages.send(view, &hint);
+    }
 }
 
-/// The tick's half of a review: whatever a worker finished goes to the panel.
-fn poll_review_jobs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// What a new document in `view`'s page is owed of the hints the last one showed: only those of the
+/// tabs in that view.
+fn hints_for_new_document(state: &mut AgentPanelState, view: ViewId) -> Vec<eitri_core::turn_review::ReviewHint> {
+    forget_hints_of_running_or_closed_tabs(state);
+    state
+        .shown_hints
+        .iter()
+        .filter(|hint| state.tabs.view_of(TabId(hint.tab)) == view)
+        .cloned()
+        .collect()
+}
+
+/// The waiting hints whose tab's view has a ready page, each with that view; the others keep waiting.
+fn take_hints_for_ready_pages(state: &mut AgentPanelState) -> Vec<(ViewId, eitri_core::turn_review::ReviewHint)> {
+    let waiting = std::mem::take(&mut state.review_hints);
+    let mut ready = Vec::new();
+    for hint in waiting {
+        let view = state.tabs.view_of(TabId(hint.tab));
+        if state.ready(view) {
+            ready.push((view, hint));
+        } else {
+            state.review_hints.push(hint);
+        }
+    }
+    ready
+}
+
+/// The tick's half of a review: whatever a worker finished goes to the page that asked.
+fn poll_review_jobs(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let payloads = {
         let mut state_ref = state.borrow_mut();
         if state_ref.review_jobs.is_empty() {
             return;
         }
-        let (payloads, cleared) = finished_reviews(&mut state_ref.review_jobs);
+        let (payloads, cleared) = finished_reviews_by_page(&mut state_ref.review_jobs);
         for (tab, turn) in cleared {
             forget_hint_for_review(&mut state_ref.shown_hints, tab, turn);
         }
         payloads
     };
-    dispatch_all(page, payloads);
+    for (view, payload) in payloads {
+        pages.send(view, &payload);
+    }
 }
 
-/// What the review flow owes the panel: an envelope goes out as it is, and a confirmed review that
-/// was sent is applied as any flush of a tab's queue is. Called with no borrow of the state held,
-/// because applying a flush takes it.
-fn dispatch_review_outs(
-    state: &Rc<RefCell<AgentPanelState>>,
-    page: &PanelPage,
-    outs: Vec<eitri_core::turn_review::Out>,
-) {
+/// What the review flow owes the panel: an answer goes to the page that sent its request, a tab's
+/// draft to the page of the tab's view, the window's interrupted reverts to the base page, and a
+/// confirmed review that was sent is applied as any flush of a tab's queue is. Called with no borrow
+/// of the state held, because applying a flush takes it. The requests the flow no longer owes an
+/// answer are forgotten afterwards.
+fn dispatch_review_outs(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, outs: Vec<eitri_core::turn_review::Out>) {
     use eitri_core::turn_review::Out;
     for out in outs {
         match out {
-            Out::Envelope(payload) => page.send(&payload),
-            Out::Flushed(tab, flush) => apply_flush(state, page, tab, flush),
-            Out::QueueChanged(tab) => send_queue(state, page, tab),
+            Out::Envelope(payload) => pages.send(ViewId::BASE, &payload),
+            Out::Answer { request_id, payload } => {
+                let asked_from = state
+                    .borrow()
+                    .review_requests
+                    .iter()
+                    .find(|(id, _)| *id == request_id)
+                    .map(|(_, view)| *view);
+                match asked_from {
+                    Some(view) => pages.send(view, &payload),
+                    None => eprintln!("[agent_panel] review answer for {request_id}: no page asked for it"),
+                }
+            }
+            Out::Draft(tab, payload) => send_to_tabs_page(state, pages, tab, &payload),
+            Out::Flushed(tab, flush) => apply_flush(state, pages, tab, flush),
+            Out::QueueChanged(tab) => send_queue(state, pages, tab),
             Out::EditorOpened => {
                 let hook = state.borrow().review_editor.opened_hook();
                 if let Some(hook) = hook {
@@ -2748,13 +3506,38 @@ fn dispatch_review_outs(
             }
         }
     }
+    let mut state_ref = state.borrow_mut();
+    let state_ref = &mut *state_ref;
+    let flow = &state_ref.review_flow;
+    state_ref.review_requests.retain(|(id, _)| flow.owes_answer(id));
 }
 
-/// One review message for the flow, with the window's editor handle if it has one.
-fn run_review_flow(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, message: InboundMessage) {
+/// What a page is told when its review request has the id of another page's that is still out: the
+/// answers could not be told apart. Its next request has another id.
+const REVIEW_ID_IN_USE: &str = "another view's review request is still being worked out; try again in a moment";
+
+/// One review message for the flow from `view`'s page, with the window's editor handle if it has one.
+/// What the flow answers, now or on a later tick, goes to that page.
+fn run_review_flow(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, view: ViewId, message: InboundMessage) {
+    let request_id = message.request_id().to_string();
+    let in_use = state
+        .borrow()
+        .review_requests
+        .iter()
+        .any(|(id, asked_from)| *id == request_id && *asked_from != view);
+    if in_use {
+        pages.send(
+            view,
+            &serialize_command_result_for_js(&request_id, Err(REVIEW_ID_IN_USE)),
+        );
+        return;
+    }
     let outs = {
         let mut state_ref = state.borrow_mut();
         let state_ref = &mut *state_ref;
+        if !state_ref.review_requests.iter().any(|(id, _)| *id == request_id) {
+            state_ref.review_requests.push((request_id, view));
+        }
         state_ref.review_editor.sync(&mut state_ref.review_flow);
         state_ref.review_flow.handle(
             message,
@@ -2763,12 +3546,12 @@ fn run_review_flow(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, messa
             std::time::Instant::now(),
         )
     };
-    dispatch_review_outs(state, page, outs);
+    dispatch_review_outs(state, pages, outs);
 }
 
 /// The tick's half of the review flow: editor answers, workers that finished and tickets whose tab
-/// went away.
-fn poll_review_flow(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// went away, each answer for the page that sent its request.
+fn poll_review_flow(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let outs = {
         let mut state_ref = state.borrow_mut();
         let state_ref = &mut *state_ref;
@@ -2782,12 +3565,12 @@ fn poll_review_flow(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
             std::time::Instant::now(),
         )
     };
-    dispatch_review_outs(state, page, outs);
+    dispatch_review_outs(state, pages, outs);
 }
 
 /// The return half of a scratch edit: every edit whose marker appeared goes back to the tab it came from,
-/// and the keys return to the chat.
-fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// told to the page that shows it, and the keys return to the chat view of the last such tab.
+fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let finished: Vec<(eitri_core::scratch::PendingEdit, eitri_core::scratch::EditDone)> = {
         let mut state_ref = state.borrow_mut();
         if state_ref.pending_edits.is_empty() {
@@ -2806,26 +3589,32 @@ fn poll_scratch_edits(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     if finished.is_empty() {
         return;
     }
+    let mut keys_to = ViewId::BASE;
     for (edit, result) in finished {
         let returned = state.borrow_mut().tabs.finish_scratch_edit(edit.id, &result);
         edit.cleanup();
         let Some((tab, draft)) = returned else { continue };
-        let active = state.borrow().tabs.active() == tab;
-        if active {
+        let (shown, view) = {
+            let state_ref = state.borrow();
+            (state_ref.shown_in(tab), state_ref.tabs.view_of(tab))
+        };
+        keys_to = view;
+        if let Some(shown) = shown {
             if let Some(text) = &draft {
-                page.send(&eitri_core::agent_bridge::serialize_draft_for_js(tab, text));
+                pages.send(shown, &eitri_core::agent_bridge::serialize_draft_for_js(tab, text));
             }
-            page.send(&eitri_core::agent_bridge::serialize_scratch_for_js(tab, false));
+            pages.send(shown, &eitri_core::agent_bridge::serialize_scratch_for_js(tab, false));
         }
         if let eitri_core::scratch::EditDone::Failed(why) = &result {
-            page.send(&eitri_core::agent_bridge::serialize_notice_for_js(&format!(
-                "the nvim scratch buffer failed: {why}"
-            )));
+            pages.send(
+                view,
+                &eitri_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
+            );
         }
     }
     let hook = state.borrow().editor_done_hook.clone();
     if let Some(hook) = hook {
-        hook();
+        hook(keys_to);
     }
 }
 
@@ -2845,10 +3634,11 @@ fn apply_title_reads(state: &Rc<RefCell<AgentPanelState>>) {
     state_ref.tabs.retitle_from(|session| titles.known_title(&cwd, session));
 }
 
-/// The titles of the records the last chooser listed that the cache knows better since it was sent. The page
-/// applies them only to a chooser still open, so sending them after it closed reopens nothing.
-fn send_chooser_titles_if_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
-    let payload = {
+/// The titles of the records the last chooser listed that the cache knows better since it was sent, to the
+/// page it was opened in. The page applies them only to a chooser still open, so sending them after it
+/// closed reopens nothing.
+fn send_chooser_titles_if_changed(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    let (view, payload) = {
         let mut state_ref = state.borrow_mut();
         let state_ref = &mut *state_ref;
         if !std::mem::take(&mut state_ref.chooser_titles_stale) {
@@ -2868,47 +3658,71 @@ fn send_chooser_titles_if_changed(state: &Rc<RefCell<AgentPanelState>>, page: &P
         if changed.is_empty() {
             return;
         }
-        eitri_core::agent_bridge::serialize_chooser_titles_for_js(&changed)
+        (
+            state_ref.chooser_view,
+            eitri_core::agent_bridge::serialize_chooser_titles_for_js(&changed),
+        )
     };
-    page.send(&payload);
+    pages.send(view, &payload);
 }
 
-/// The tick's `tabs` envelope: sent only when it differs from the last one sent (a marker, a
-/// label, a state -- whatever `TabSet::tabs_payload` says).
+/// The tick's `tabs` envelopes, one per live page: each sent only when it differs from the last one
+/// that page was sent (a marker, a label, a state -- whatever `TabSet::tabs_payload_for` says).
 ///
-/// Held back while no document has said `ready`, and then not recorded as sent, so it
-/// goes out once one has.
-fn send_tabs_if_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
-    let payload = {
-        let mut state_ref = state.borrow_mut();
-        let state_ref = &mut *state_ref;
-        let now = state_ref.tabs.tabs_payload();
-        changed_envelope(&mut state_ref.last_tabs_payload, now, state_ref.document_ready)
-    };
-    if let Some(payload) = payload {
-        page.send(&payload);
-        send_mode_note(state, page);
+/// Held back while a page's document has not said `ready`, and then not recorded as sent, so it
+/// goes out once it has.
+fn send_tabs_if_changed(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    let mut base_sent = false;
+    for (view, page) in pages.live_views() {
+        let payload = {
+            let mut state_ref = state.borrow_mut();
+            let now = state_ref.tabs.tabs_payload_for(view);
+            let ready = state_ref.ready(view);
+            state_ref
+                .pages
+                .get_mut(&view)
+                .and_then(|record| changed_envelope(&mut record.last_tabs_payload, now, ready))
+        };
+        if let Some(payload) = payload {
+            page.send(&payload);
+            base_sent |= view.is_base();
+        }
+    }
+    if base_sent {
+        send_mode_note(state, pages);
     }
 }
 
-/// V1: the editor context's summary, when it changed.
-fn send_context_if_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
-    let payload = {
-        let mut state_ref = state.borrow_mut();
-        let state_ref = &mut *state_ref;
+/// V1: the editor context's summary, to each live page whose last one differs.
+fn send_context_if_changed(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    let views = pages.live_views();
+    if views.is_empty() {
+        return;
+    }
+    let now = {
+        let state_ref = state.borrow();
         let summary =
             eitri_core::agent_bridge::context_summary((state_ref.editor_context)().as_ref(), &state_ref.project_dir);
-        let now = eitri_core::agent_bridge::serialize_editor_context_for_js(summary.as_ref());
-        changed_envelope(&mut state_ref.last_context_payload, now, state_ref.document_ready)
+        eitri_core::agent_bridge::serialize_editor_context_for_js(summary.as_ref())
     };
-    if let Some(payload) = payload {
-        page.send(&payload);
+    for (view, page) in views {
+        let payload = {
+            let mut state_ref = state.borrow_mut();
+            let ready = state_ref.ready(view);
+            state_ref
+                .pages
+                .get_mut(&view)
+                .and_then(|record| changed_envelope(&mut record.last_context_payload, now.clone(), ready))
+        };
+        if let Some(payload) = payload {
+            page.send(&payload);
+        }
     }
 }
 
-/// Appends `texts` to the project's history and tells the panel. Best-effort: a failed
-/// write is logged and the panel keeps the list it had.
-fn remember_prompts(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, texts: &[String]) {
+/// Appends `texts` to the project's history and tells every ready page (the history is the
+/// window's). Best-effort: a failed write is logged and the pages keep the list they had.
+fn remember_prompts(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, texts: &[String]) {
     let (dir, root) = {
         let s = state.borrow();
         (s.history_dir.clone(), s.project_dir.clone())
@@ -2916,118 +3730,196 @@ fn remember_prompts(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, text
     let Some(dir) = dir else { return };
     match eitri_core::prompt_history::append(&dir, &root, texts) {
         Ok(entries) => {
-            let ready = {
+            let payload = {
                 let mut s = state.borrow_mut();
                 s.history = entries;
-                s.document_ready
+                eitri_core::agent_bridge::serialize_history_for_js(&s.history)
             };
-            if ready {
-                let payload = eitri_core::agent_bridge::serialize_history_for_js(&state.borrow().history);
-                page.send(&payload);
+            for (view, page) in pages.live_views() {
+                if state.borrow().ready(view) {
+                    page.send(&payload);
+                }
             }
         }
         Err(e) => eprintln!("[history] could not append: {e}"),
     }
 }
 
-/// The active tab's queue, after anything changed it.
-fn send_queue(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId) {
-    let payload = {
+/// The queue of a tab on screen, after anything changed it, to the ready page that shows it.
+fn send_queue(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId) {
+    let (view, payload) = {
         let s = state.borrow();
-        if s.tabs.active() != tab || !s.document_ready {
-            return;
-        }
-        let t = s.tabs.get(tab).expect("the active tab exists");
-        eitri_core::agent_bridge::serialize_queue_for_js(
-            tab,
-            &t.queue,
-            t.queue_error.as_deref(),
-            t.queue_note.as_deref(),
-            t.steers(),
+        let Some(view) = s.page_of(tab) else { return };
+        let t = s.tabs.get(tab).expect("a shown tab exists");
+        (
+            view,
+            eitri_core::agent_bridge::serialize_queue_for_js(
+                tab,
+                &t.queue,
+                t.queue_error.as_deref(),
+                t.queue_note.as_deref(),
+                t.steers(),
+            ),
         )
     };
-    page.send(&payload);
+    pages.send(view, &payload);
 }
 
 /// A flush's outcome: the same benign/fatal split a command gets, with no request to
 /// answer. A refusal leaves the queue and its `error` line; the queue envelope says so.
-fn apply_flush(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId, flush: eitri_core::tab_set::Flush) {
+fn apply_flush(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId, flush: eitri_core::tab_set::Flush) {
     if flush.outcome.is_ok() {
         title_from_first_prompt(state, tab, &flush.typed);
     }
-    apply_outcome(state, page, tab, None, flush.outcome);
-    send_queue(state, page, tab);
+    apply_outcome(state, pages, tab, None, flush.outcome);
+    send_queue(state, pages, tab);
 }
 
-/// `tabs`, then the active tab's own state (always, not only when stale), and the trust
-/// question again when the tab on screen waits for one: routing away took the old one off. A
-/// `:trust` question goes with any move, answered as not trusted.
+/// Whether a move or a reload in `view`'s page ends the `:trust` prompt: it was typed in that page,
+/// or its tab has left the view of the page it was typed in, which can no longer answer it (or no
+/// command is recorded, which leaves the gate's own record to decide).
+fn command_prompt_is_in(state: &AgentPanelState, view: ViewId) -> bool {
+    let Some(command) = state.trust.command_prompt().and_then(|id| state.trust_commands.get(id)) else {
+        return true;
+    };
+    command.typed_in == view
+        || state
+            .tabs
+            .get(command.tab)
+            .is_none_or(|t| t.view_id() != command.typed_in)
+}
+
+/// The base page's `tabs`, then the active tab's own state (always, not only when stale), and the
+/// trust question again when the tab on screen waits for one: routing away took the old one off. A
+/// `:trust` question typed in the base page goes with any move there, answered as not trusted, and so
+/// does one whose tab has left the view it was typed in.
 fn switch_payloads(state: &mut AgentPanelState) -> Vec<String> {
-    state.trust.drop_command_prompt();
-    let mut payloads = vec![tabs_payload_recorded(state)];
+    if command_prompt_is_in(state, ViewId::BASE) {
+        state.trust.drop_command_prompt();
+    }
+    let mut payloads = vec![tabs_payload_recorded(state, ViewId::BASE)];
     payloads.extend(state.tabs.active_state_payloads());
     let active = state.tabs.active();
     if state.trust.current_route(&waiting_profile(state, active)) == Some(Route::Ask) {
-        payloads.extend(reroute_or_ask(state, active).payloads);
+        payloads.extend(reroute_or_ask(state, active).payloads_for(state, ViewId::BASE));
     }
     payloads
 }
 
-/// After the active tab changed: `mark_seen` if the panel is on screen, then `tabs` and the new
-/// active tab's state.
-fn send_switch(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// What `view`'s page is owed when the tab it shows arrived or changed state: for the base view,
+/// [`switch_payloads`]; for an extra view, its `tabs`, its tab's own state and its tab's trust question
+/// asked again. An extra view with no tab gets only its (empty) `tabs`.
+fn view_payloads(state: &mut AgentPanelState, view: ViewId) -> Vec<String> {
+    if view.is_base() {
+        return switch_payloads(state);
+    }
+    let mut payloads = vec![tabs_payload_recorded(state, view)];
+    let Some(tab) = state.tabs.tab_in(view) else {
+        return payloads;
+    };
+    payloads.extend(state.tabs.state_payloads(tab));
+    if state.trust.current_route(&waiting_profile(state, tab)) == Some(Route::Ask) {
+        payloads.extend(reroute_or_ask(state, tab).payloads_for(state, view));
+    }
+    payloads
+}
+
+/// After the base view's active tab changed: `mark_seen` if the base page is on screen, then its
+/// `tabs` and the new active tab's state.
+fn send_switch(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    send_view(state, pages, ViewId::BASE);
+}
+
+/// [`send_switch`] for any view's page: `mark_seen` of the tab it shows if the page is on screen, then
+/// [`view_payloads`]. An extra page is sent nothing until its document is ready: its `ready` sends
+/// all of it.
+fn send_view(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, view: ViewId) {
+    let page = pages.live(view);
+    if !view.is_base() && !state.borrow().ready(view) {
+        return;
+    }
     let before = state.borrow().tabs.attention();
-    let shown = on_screen(state, page);
+    let shown = page.as_ref().is_some_and(|page| on_screen(state, view, page));
     let payloads = {
         let mut state_ref = state.borrow_mut();
         if shown {
-            state_ref.tabs.mark_seen();
+            if let Some(tab) = state_ref.tab_of_page(view) {
+                state_ref.tabs.mark_seen(tab);
+            }
         }
-        switch_payloads(&mut state_ref)
+        view_payloads(&mut state_ref, view)
     };
-    dispatch_all(page, payloads);
+    if let Some(page) = page {
+        dispatch_all(&page, payloads);
+    }
     report_attention(state, before);
 }
 
-/// `hello` is window-level and re-sent, recomputed, whenever the set of open provider
-/// sessions changes -- a session adopted, a resume installed, a tab closed or reset.
-fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
-    let payload = {
-        let mut state_ref = state.borrow_mut();
-        // `ready` sends `hello` itself, and records what it was computed against.
-        if !state_ref.document_ready {
-            return;
-        }
-        let open = state_ref.tabs.open_session_ids();
-        // The saved tabs are on offer only while nothing here has started: when that stops being
-        // true the dashboard's line has to go, though no session id changed with it.
-        let offered = restore_is_on_offer(&state_ref);
-        // The greeting lists the active tab's agent's sessions, so a switch to a tab running another
-        // agent changes it too, though no session id changed with it.
-        let agent = state_ref.tabs.active_tab().agent().clone();
-        // A title the worker found since: the rows it names are out of date.
-        let titles_changed = std::mem::take(&mut state_ref.hello_titles_stale);
-        if open == state_ref.last_open_ids
-            && offered == state_ref.last_restore_offered
-            && agent == state_ref.last_hello_agent
-            && !titles_changed
-        {
-            return;
-        }
-        let mut greeting = BackendGreeting::for_agent_titled(
-            state_ref.backend_kind,
-            &agent,
-            state_ref.project_dir.clone(),
-            eitri_core::agent_backend::Titles::Cached(&state_ref.titles),
-        );
-        greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
-        let offer = restore_offer(&state_ref);
-        state_ref.last_open_ids = open;
-        state_ref.last_restore_offered = offered;
-        state_ref.last_hello_agent = agent;
-        serialize_hello_with_restore_for_js(&greeting, offer.as_ref())
-    };
-    page.send(&payload);
+/// The payloads a page shows for tab `tab` once it changed state: the whole view's when the tab is on
+/// screen in some page ([`view_payloads`]), else only the `tabs` of its view, to that view's page.
+fn shown_payloads(state: &mut AgentPanelState, tab: TabId) -> (ViewId, Vec<String>) {
+    let view = state.tabs.view_of(tab);
+    if state.tabs.is_shown(tab) && (view.is_base() || state.ready(view)) {
+        (view, view_payloads(state, view))
+    } else {
+        (view, vec![tabs_payload_recorded(state, view)])
+    }
+}
+
+/// `hello` is per page and re-sent, recomputed, whenever what it describes changes -- a session
+/// adopted, a resume installed, a tab closed or reset, the page's tab now running another agent.
+fn send_hello_if_open_sessions_changed(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    // A title the worker found since: the rows it names are out of date, in every page.
+    let titles_changed = std::mem::take(&mut state.borrow_mut().hello_titles_stale);
+    for (view, page) in pages.live_views() {
+        let payload = {
+            let mut state_ref = state.borrow_mut();
+            let state_ref = &mut *state_ref;
+            // `ready` sends `hello` itself, and records what it was computed against.
+            if !state_ref.ready(view) {
+                continue;
+            }
+            let open = state_ref.tabs.open_session_ids();
+            // The saved tabs are on offer only in the base page, and only while nothing here has
+            // started: when that stops being true the dashboard's line has to go, though no session id
+            // changed with it.
+            let offered = view.is_base() && restore_is_on_offer(state_ref);
+            // The greeting lists the page's tab's agent's sessions, so a switch to a tab running another
+            // agent changes it too, though no session id changed with it.
+            let agent = hello_agent(state_ref, view);
+            let record = state_ref.pages.get(&view).expect("a ready page has its record");
+            if open == record.last_open_ids
+                && offered == record.last_restore_offered
+                && agent == record.last_hello_agent
+                && !titles_changed
+            {
+                continue;
+            }
+            let mut greeting = BackendGreeting::for_agent_titled(
+                state_ref.backend_kind,
+                &agent,
+                state_ref.project_dir.clone(),
+                eitri_core::agent_backend::Titles::Cached(&state_ref.titles),
+            );
+            greeting.resumable.retain(|r| !open.contains(&r.provider_session_id));
+            let offer = if view.is_base() { restore_offer(state_ref) } else { None };
+            let record = state_ref.pages.get_mut(&view).expect("a ready page has its record");
+            record.last_open_ids = open;
+            record.last_restore_offered = offered;
+            record.last_hello_agent = agent;
+            serialize_hello_with_restore_for_js(&greeting, offer.as_ref())
+        };
+        page.send(&payload);
+    }
+}
+
+/// The agent whose records `view`'s page offers: the agent of the tab it shows, or the window's
+/// default for an extra page that shows none yet.
+fn hello_agent(state: &AgentPanelState, view: ViewId) -> AgentId {
+    state
+        .tab_of_page(view)
+        .and_then(|tab| state.tabs.get(tab))
+        .map_or_else(|| state.default_agent.clone(), |t| t.agent().clone())
 }
 
 /// Whether the launch dashboard may offer to bring the last window's tabs back at all: the policy is
@@ -3285,41 +4177,52 @@ fn finish_restore(state: &Rc<RefCell<AgentPanelState>>) {
     }
 }
 
-/// What a [`RestoreResult`] owes the page; `Err` is a refusal for the caller to report.
-fn deliver_restore(
-    state: &Rc<RefCell<AgentPanelState>>,
-    page: &PanelPage,
-    result: RestoreResult,
-) -> Result<(), String> {
+/// What a [`RestoreResult`] owes the base page, the only one that offers or asks about a restore;
+/// `Err` is a refusal for the caller to report.
+fn deliver_restore(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, result: RestoreResult) -> Result<(), String> {
     match result {
         RestoreResult::Refused(why) => Err(why),
         RestoreResult::Question(prompt) => {
-            page.send(&serialize_confirm_restore_for_js(&prompt));
+            pages.send(ViewId::BASE, &serialize_confirm_restore_for_js(&prompt));
             Ok(())
         }
         RestoreResult::Started { notice } => {
-            send_switch(state, page);
+            send_switch(state, pages);
+            // A restored tab that came back into its extra view is shown there.
+            send_extra_views(state, pages);
             if let Some(notice) = notice {
-                page.send(&eitri_core::agent_bridge::serialize_notice_for_js(&notice));
+                pages.send(
+                    ViewId::BASE,
+                    &eitri_core::agent_bridge::serialize_notice_for_js(&notice),
+                );
             }
             finish_restore(state);
             Ok(())
         }
         // The tab shows as starting while the question is asked; the tick's trust events go on.
         RestoreResult::Deferred => {
-            send_tabs(state, page);
+            send_tabs(state, pages);
             Ok(())
         }
     }
 }
 
-/// `agent.restore = "auto"`: on the first page that says `ready`, bring the last window's tabs back
+/// [`send_view`] for every live extra page.
+fn send_extra_views(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
+    for (view, _) in pages.live_views() {
+        if !view.is_base() {
+            send_view(state, pages, view);
+        }
+    }
+}
+
+/// `agent.restore = "auto"`: on the base page's first `ready`, bring the last window's tabs back
 /// with no key pressed. Used up on its first go, so a reload of the page does not do it again.
-fn restore_at_launch(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+fn restore_at_launch(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let Some(result) = launch_restore(&mut state.borrow_mut()) else {
         return;
     };
-    if let Err(why) = deliver_restore(state, page, result) {
+    if let Err(why) = deliver_restore(state, pages, result) {
         eprintln!("[restore] not restored: {why}");
     }
 }
@@ -3333,20 +4236,32 @@ fn launch_restore(state: &mut AgentPanelState) -> Option<RestoreResult> {
     Some(ask_for_restore(state, from, RestoreAsk::Launch))
 }
 
-/// What a trust step owes the page and the window: payloads to dispatch in order, a toast, and
-/// what a restore it started has to say.
+/// Which page a [`TrustOut`] payload goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dest {
+    /// This view's page: an answer to a request it sent, or what that page shows.
+    Page(ViewId),
+    /// The page of this tab's view, decided when it is delivered: what is said about the tab.
+    Tab(TabId),
+}
+
+/// What a trust step owes the pages and the window: payloads to dispatch in order, each with the
+/// page it goes to, a toast, and what a restore it started has to say.
 #[derive(Default)]
 struct TrustOut {
+    /// The payloads in order. `dests` holds the page of each, at the same index.
     payloads: Vec<String>,
+    dests: Vec<Dest>,
     toast: Option<String>,
-    /// A restore was started: its one-line result for the band (`None` when it has nothing to say),
-    /// sent after the payloads, and then whether it is already over is checked.
+    /// A restore was started: its one-line result for the base page's band (`None` when it has
+    /// nothing to say), sent after the payloads, and then whether it is already over is checked.
     restored: Option<Option<String>>,
 }
 
 impl TrustOut {
     fn extend(&mut self, other: TrustOut) {
         self.payloads.extend(other.payloads);
+        self.dests.extend(other.dests);
         if other.toast.is_some() {
             self.toast = other.toast;
         }
@@ -3355,14 +4270,43 @@ impl TrustOut {
         }
     }
 
-    fn push(&mut self, payload: String) {
+    fn push(&mut self, dest: Dest, payload: String) {
         self.payloads.push(payload);
+        self.dests.push(dest);
+    }
+
+    fn push_all(&mut self, dest: Dest, payloads: Vec<String>) {
+        for payload in payloads {
+            self.push(dest, payload);
+        }
+    }
+
+    /// The payloads bound for `view`'s page, in order; the others, and the toast, are dropped. For a
+    /// caller that already sends to that page alone.
+    fn payloads_for(self, state: &AgentPanelState, view: ViewId) -> Vec<String> {
+        self.payloads
+            .into_iter()
+            .zip(self.dests)
+            .filter(|(_, dest)| dest_view(state, *dest) == view)
+            .map(|(payload, _)| payload)
+            .collect()
     }
 }
 
-/// Dispatches a [`TrustOut`] once the state is no longer borrowed.
-fn deliver_trust(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, out: TrustOut) {
-    dispatch_all(page, out.payloads);
+/// The view whose page a [`Dest`] names now.
+fn dest_view(state: &AgentPanelState, dest: Dest) -> ViewId {
+    match dest {
+        Dest::Page(view) => view,
+        Dest::Tab(tab) => state.tabs.view_of(tab),
+    }
+}
+
+/// Dispatches a [`TrustOut`] once the state is no longer borrowed, each payload to its page.
+fn deliver_trust(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, out: TrustOut) {
+    for (payload, dest) in out.payloads.into_iter().zip(out.dests) {
+        let view = dest_view(&state.borrow(), dest);
+        pages.send(view, &payload);
+    }
     if let Some(toast) = out.toast {
         let hook = state.borrow().toast_hook.clone();
         if let Some(hook) = hook {
@@ -3370,8 +4314,13 @@ fn deliver_trust(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, out: Tr
         }
     }
     if let Some(notice) = out.restored {
+        // A restored tab that came back into its extra view is shown there.
+        send_extra_views(state, pages);
         if let Some(notice) = notice {
-            page.send(&eitri_core::agent_bridge::serialize_notice_for_js(&notice));
+            pages.send(
+                ViewId::BASE,
+                &eitri_core::agent_bridge::serialize_notice_for_js(&notice),
+            );
         }
         finish_restore(state);
     }
@@ -3516,7 +4465,8 @@ fn start_deferred(state: &mut AgentPanelState, tab: TabId, start: DeferredStart,
             });
             // The `command_result` is owed once the connect finishes and the first turn is sent
             // (`collect_pending_starts`).
-            out.push(tabs_payload_recorded(state));
+            let view = state.tabs.view_of(tab);
+            out.push(Dest::Page(view), tabs_payload_recorded(state, view));
         }
         DeferredStart::Resume {
             request_id,
@@ -3541,11 +4491,8 @@ fn start_deferred(state: &mut AgentPanelState, tab: TabId, start: DeferredStart,
                 resumed_name,
             });
             // The command_result is owed once the connect finishes.
-            if state.tabs.active() == tab {
-                out.payloads.extend(switch_payloads(state));
-            } else {
-                out.push(tabs_payload_recorded(state));
-            }
+            let (view, payloads) = shown_payloads(state, tab);
+            out.push_all(Dest::Page(view), payloads);
         }
         DeferredStart::Restore { go } => {
             let result = match &state.spawner {
@@ -3566,7 +4513,7 @@ fn start_deferred(state: &mut AgentPanelState, tab: TabId, start: DeferredStart,
                     start_restore(state, tab, go, &mut spawn, project)
                 }
             };
-            out.payloads.extend(switch_payloads(state));
+            out.push_all(Dest::Page(ViewId::BASE), switch_payloads(state));
             out.restored = Some(match result {
                 RestoreResult::Started { notice } => notice,
                 _ => None,
@@ -3677,10 +4624,12 @@ fn start_external_tab(
         resumed_name,
     });
     let mut out = TrustOut::default();
-    if resuming && state.tabs.active() == tab {
-        out.payloads.extend(switch_payloads(state));
+    if resuming {
+        let (view, payloads) = shown_payloads(state, tab);
+        out.push_all(Dest::Page(view), payloads);
     } else {
-        out.push(tabs_payload_recorded(state));
+        let view = state.tabs.view_of(tab);
+        out.push(Dest::Page(view), tabs_payload_recorded(state, view));
     }
     out
 }
@@ -3691,26 +4640,45 @@ fn start_external_tab(
 fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: DeferredStart, why: &str) -> TrustOut {
     state.resume_after.remove(&tab);
     let mut out = TrustOut::default();
-    out.push(tabs_payload_recorded(state));
-    out.push(eitri_core::agent_bridge::serialize_notice_for_js(why));
+    let view = state.tabs.view_of(tab);
+    out.push(Dest::Page(view), tabs_payload_recorded(state, view));
+    out.push(Dest::Tab(tab), eitri_core::agent_bridge::serialize_notice_for_js(why));
     match start {
         DeferredStart::FirstSend {
             request_id: sent,
             first_turn,
         } => return_first_message(state, tab, &sent, &first_turn, why, &mut out),
         DeferredStart::Resume { request_id: asked, .. } => {
-            out.push(serialize_command_result_for_js(&asked, Err(why)));
+            let asked_from = start_answer_dest(state, tab, &asked);
+            out.push(asked_from, serialize_command_result_for_js(&asked, Err(why)));
             out.toast = Some(why.to_string());
         }
         DeferredStart::Restore { go } => {
-            if !state.tabs.keep_put_off_restore(tab, go, why) {
-                state.restore_source = None;
-            }
-            out.payloads.extend(switch_payloads(state));
+            put_off_restore(state, tab, go, why, &mut out);
             out.toast = Some(why.to_string());
         }
     }
     out
+}
+
+/// A restore whose start will not happen keeps its sessions as failed tabs
+/// ([`TabSet::keep_put_off_restore`]). The base page is shown its tabs again, and a view a kept tab
+/// came back into is shown that tab.
+fn put_off_restore(state: &mut AgentPanelState, from: TabId, go: RestoreGo, why: &str, out: &mut TrustOut) {
+    let held_before = state.tabs.views();
+    if !state.tabs.keep_put_off_restore(from, go, why) {
+        state.restore_source = None;
+    }
+    out.push_all(Dest::Page(ViewId::BASE), switch_payloads(state));
+    for view in state.tabs.views() {
+        if held_before.contains(&view) {
+            continue;
+        }
+        if let Some(tab) = state.tabs.tab_in(view) {
+            let (view, payloads) = shown_payloads(state, tab);
+            out.push_all(Dest::Page(view), payloads);
+        }
+    }
 }
 
 /// A first message whose start will not happen goes back to the composer, `why` being the refusal.
@@ -3732,10 +4700,33 @@ fn return_first_message(
         format!("{}\n{typed_since}", first_turn.typed)
     };
     state.tabs.set_draft(tab, &draft);
-    out.push(serialize_command_result_for_js(sent, Err(why)));
-    out.push(eitri_core::agent_bridge::serialize_refused_draft_for_js(
-        tab, &draft, sent,
-    ));
+    // The refusal to the page that sent the message, which reports it with its text if it no longer
+    // shows the tab; the draft to the page that shows the tab now, whose box takes the message back.
+    let sent_from = start_answer_dest(state, tab, sent);
+    out.push(sent_from, serialize_command_result_for_js(sent, Err(why)));
+    out.push(
+        Dest::Tab(tab),
+        eitri_core::agent_bridge::serialize_refused_draft_for_js(tab, &draft, sent),
+    );
+}
+
+/// Records that the start of `tab`, owed a `command_result` under `request_id`, was asked from `view`'s
+/// page: that page holds the request, wherever the tab is when the start ends.
+fn note_start_page(state: &mut AgentPanelState, tab: TabId, request_id: &str, view: ViewId) {
+    state.start_pages.insert(tab, (request_id.to_string(), view));
+}
+
+/// Where the `command_result` owed under `request_id` for `tab`'s start goes: the page it was asked
+/// from, or the page of the tab's view when none is recorded. The record is spent.
+fn start_answer_dest(state: &mut AgentPanelState, tab: TabId, request_id: &str) -> Dest {
+    match state.start_pages.remove(&tab) {
+        Some((asked, view)) if asked == request_id => Dest::Page(view),
+        Some(other) => {
+            state.start_pages.insert(tab, other);
+            Dest::Tab(tab)
+        }
+        None => Dest::Tab(tab),
+    }
 }
 
 /// A tab waiting for the trust question, given what the gate knows now: started if the answer is
@@ -3766,8 +4757,8 @@ fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> TrustOut {
             if asking.is_some_and(|nonce| state.trust.is_shown(tab, nonce)) {
                 return out;
             }
-            if state.tabs.active() != tab || !state.document_ready {
-                // Asked when it is next on screen.
+            if state.page_of(tab).is_none() {
+                // Asked when it is next on screen, in the page that shows it then.
                 state.trust.hide(tab);
                 return out;
             }
@@ -3775,7 +4766,7 @@ fn reroute_or_ask(state: &mut AgentPanelState, tab: TabId) -> TrustOut {
                 return out;
             };
             match state.trust.ask(tab, nonce, &profile) {
-                Some(Asked::Prompt(message)) => out.push(message),
+                Some(Asked::Prompt(message)) => out.push(Dest::Tab(tab), message),
                 // Nothing in a prompt may be cut, so one too large to show refuses its start.
                 Some(asked @ (Asked::TooLarge { .. } | Asked::Unavailable)) => {
                     if let Some(start) = state.tabs.take_deferred(tab) {
@@ -3819,44 +4810,60 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
                 if let Some(start) = state.tabs.take_recorded(tab) {
                     out.extend(start_deferred(state, tab, start, ProjectTrust::Trusted));
                     if let Some(notice) = notice {
-                        out.push(serialize_notice_for_js(&notice));
+                        out.push(Dest::Tab(tab), serialize_notice_for_js(&notice));
                     }
                 }
             }
             GateEvent::RecordRefused { tab, notice } => {
-                out.push(serialize_notice_for_js(&notice));
+                out.push(Dest::Tab(tab), serialize_notice_for_js(&notice));
                 // The `y` is spent; the tab waits for a new answer, asked by the sweep below.
                 if state.tabs.ask_trust(tab).is_ok() {
                     state.trust.hide(tab);
                 }
             }
-            GateEvent::CommandAsk { request_id, tab } => {
-                let shown = (state.tabs.active() == tab && state.document_ready)
-                    .then(|| state.trust.ask_command(tab, &request_id))
+            GateEvent::CommandAsk {
+                request_id: command,
+                tab,
+            } => {
+                let shown = state
+                    .page_of(tab)
+                    .is_some()
+                    .then(|| state.trust.ask_command(tab, &command))
                     .flatten();
                 match shown {
-                    Some(Asked::Prompt(message)) => out.push(message),
+                    Some(Asked::Prompt(message)) => out.push(Dest::Tab(tab), message),
+                    // Too large to show, or not ready: the command is over.
                     Some(asked @ (Asked::TooLarge { .. } | Asked::Unavailable)) => {
                         let why = match asked {
                             Asked::TooLarge { agent, bytes } => crate::trust_gate::too_large(&agent, bytes),
                             _ => crate::trust_gate::UNAVAILABLE_COMMAND.to_string(),
                         };
-                        out.push(serialize_notice_for_js(&why));
-                        out.push(serialize_command_result_for_js(&request_id, Err(&why)));
+                        if let Some((typed_in, request_id)) = end_trust_command(state, &command) {
+                            out.push(typed_in, serialize_notice_for_js(&why));
+                            out.push(typed_in, serialize_command_result_for_js(&request_id, Err(&why)));
+                        }
                     }
                     // The tab is not on screen any more: `:trust` is answered on the next poll.
                     None => state.trust.drop_command_prompt(),
                 }
             }
-            GateEvent::CommandDone { request_id, ok, notice } => {
+            GateEvent::CommandDone {
+                request_id: command,
+                ok,
+                notice,
+            } => {
+                let Some((typed_in, request_id)) = end_trust_command(state, &command) else {
+                    eprintln!("[agent_panel] {command} ended, but no page's :trust is recorded for it");
+                    continue;
+                };
                 if let Some(notice) = &notice {
-                    out.push(serialize_notice_for_js(notice));
+                    out.push(typed_in, serialize_notice_for_js(notice));
                 }
                 let error = notice.as_deref().unwrap_or(crate::trust_gate::NOT_TRUSTED);
-                out.push(serialize_command_result_for_js(
-                    &request_id,
-                    if ok { Ok(()) } else { Err(error) },
-                ));
+                out.push(
+                    typed_in,
+                    serialize_command_result_for_js(&request_id, if ok { Ok(()) } else { Err(error) }),
+                );
             }
         }
     }
@@ -3864,17 +4871,40 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
     out
 }
 
-/// `:trust` / `:untrust` from the `:` line, about the active tab's agent. `agent` is the agent the page
-/// believed that tab runs; a command typed for another agent's tab (the page was behind a switch) is
-/// refused rather than applied to whichever agent is on screen now.
+/// One `:trust` or `:untrust` the gate is working on.
+struct TrustCommand {
+    /// The id the page that typed it knows it by.
+    request_id: String,
+    /// The tab whose `:` line it was typed in.
+    tab: TabId,
+    /// The page it was typed in: its result goes there.
+    typed_in: ViewId,
+}
+
+/// The command the gate knows as `command` is over: its record goes, and its result is owed to the
+/// page it was typed in, under that page's own request id. `None` for a command no record names.
+fn end_trust_command(state: &mut AgentPanelState, command: &str) -> Option<(Dest, String)> {
+    state
+        .trust_commands
+        .remove(command)
+        .map(|c| (Dest::Page(c.typed_in), c.request_id))
+}
+
+/// `:trust` / `:untrust` from the `:` line of `view`'s page, about the agent of the tab that page
+/// shows. `agent` is the agent the page believed that tab runs; a command typed for another agent's
+/// tab (the page was behind a switch) is refused rather than applied to whichever agent is on screen
+/// now. An extra page that shows no tab has no agent to trust.
 fn trust_command(
     state: &mut AgentPanelState,
+    view: ViewId,
     request_id: &str,
     action: eitri_core::agent_bridge::TrustAction,
     agent: &str,
 ) -> Result<(), String> {
-    let active = state.tabs.active_tab();
-    let (tab, running) = (active.id, active.agent().clone());
+    let Some(shown) = state.tab_of_page(view).and_then(|tab| state.tabs.get(tab)) else {
+        return Err(NO_TAB_HERE.to_string());
+    };
+    let (tab, running) = (shown.id, shown.agent().clone());
     if running.record_name() != agent {
         let command = match action {
             eitri_core::agent_bridge::TrustAction::Trust => ":trust",
@@ -3886,24 +4916,33 @@ fn trust_command(
             running.label()
         ));
     }
-    state.trust.command(
-        request_id.to_string(),
-        action,
-        tab,
-        &trust_profile(&state.acp_agents, &running),
+    let command = format!("trust-command-{}", state.next_trust_command);
+    state.next_trust_command += 1;
+    state.trust_commands.insert(
+        command.clone(),
+        TrustCommand {
+            request_id: request_id.to_string(),
+            tab,
+            typed_in: view,
+        },
     );
+    state
+        .trust
+        .command(command, action, tab, &trust_profile(&state.acp_agents, &running));
     Ok(())
 }
 
 /// Drains the gate from the tick.
-fn poll_trust(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+fn poll_trust(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let out = trust_events(&mut state.borrow_mut());
-    deliver_trust(state, page, out);
+    deliver_trust(state, pages, out);
 }
 
 /// `y` or `n` to a trust question, a tab's or `:trust`'s. Only checks and queues: a `y` starts its
 /// session when the worker says the disk is unchanged since the prompt (and the record written, when
 /// one is kept), never here.
+// One parameter per field of the answer, and the view of the page that sent it.
+#[allow(clippy::too_many_arguments)]
 fn answer_trust(
     state: &mut AgentPanelState,
     request_id: &str,
@@ -3912,57 +4951,59 @@ fn answer_trust(
     fingerprint: &str,
     findings_digest: &str,
     trust: bool,
+    view: ViewId,
 ) -> TrustOut {
     use eitri_core::agent_bridge::serialize_notice_for_js;
     let mut out = TrustOut::default();
+    let here = Dest::Page(view);
     let now = now_unix();
-    if state.tabs.check_trust_answer(tab, nonce).is_ok() {
+    if state.tabs.check_trust_answer(tab, nonce, view).is_ok() {
         match state.trust.answer(tab, nonce, fingerprint, findings_digest, trust, now) {
             AnswerOutcome::Start(project, notice) => {
-                let Ok(start) = state.tabs.take_answered(tab, nonce) else {
-                    out.push(serialize_command_result_for_js(
-                        request_id,
-                        Err(crate::trust_gate::NOT_CURRENT),
-                    ));
+                let Ok(start) = state.tabs.take_answered(tab, nonce, view) else {
+                    out.push(
+                        here,
+                        serialize_command_result_for_js(request_id, Err(crate::trust_gate::NOT_CURRENT)),
+                    );
                     return out;
                 };
                 out.extend(start_deferred(state, tab, start, project));
                 if let Some(notice) = notice {
-                    out.push(serialize_notice_for_js(&notice));
+                    out.push(here, serialize_notice_for_js(&notice));
                 }
-                out.push(serialize_command_result_for_js(request_id, Ok(())));
+                out.push(here, serialize_command_result_for_js(request_id, Ok(())));
                 // The window's answer may cover the other tabs waiting for it.
                 out.extend(sweep_awaiting(state));
             }
             AnswerOutcome::Recording => {
-                let marked = state.tabs.mark_recording(tab, nonce);
-                out.push(serialize_command_result_for_js(
-                    request_id,
-                    marked.as_ref().map(|_| ()).map_err(String::as_str),
-                ));
+                let marked = state.tabs.mark_recording(tab, nonce, view);
+                out.push(
+                    here,
+                    serialize_command_result_for_js(request_id, marked.as_ref().map(|_| ()).map_err(String::as_str)),
+                );
             }
             AnswerOutcome::Refused(why) => {
-                out.push(serialize_notice_for_js(&why));
-                out.push(serialize_command_result_for_js(request_id, Err(&why)));
+                out.push(here, serialize_notice_for_js(&why));
+                out.push(here, serialize_command_result_for_js(request_id, Err(&why)));
                 // Asked again with what is on disk now, or started if there is nothing left to ask.
                 out.extend(reroute_or_ask(state, tab));
             }
             AnswerOutcome::NotStarted(why) => {
-                let Ok(start) = state.tabs.take_answered(tab, nonce) else {
-                    out.push(serialize_command_result_for_js(
-                        request_id,
-                        Err(crate::trust_gate::NOT_CURRENT),
-                    ));
+                let Ok(start) = state.tabs.take_answered(tab, nonce, view) else {
+                    out.push(
+                        here,
+                        serialize_command_result_for_js(request_id, Err(crate::trust_gate::NOT_CURRENT)),
+                    );
                     return out;
                 };
                 out.extend(put_off_start(state, tab, start, &why));
                 // The answer itself was taken; it is the start that is refused.
-                out.push(serialize_command_result_for_js(request_id, Ok(())));
+                out.push(here, serialize_command_result_for_js(request_id, Ok(())));
             }
         }
         return out;
     }
-    if state.tabs.active() == tab && state.trust.is_command_prompt(tab, nonce) {
+    if state.tab_of_page(view) == Some(tab) && state.trust.is_command_prompt(tab, nonce) {
         match state
             .trust
             .answer_command(tab, nonce, fingerprint, findings_digest, trust, now)
@@ -3973,71 +5014,148 @@ fn answer_trust(
                 notice,
             }) => {
                 if let Some(notice) = &notice {
-                    out.push(serialize_notice_for_js(notice));
+                    out.push(here, serialize_notice_for_js(notice));
                 }
                 let error = notice.as_deref().unwrap_or(crate::trust_gate::NOT_TRUSTED);
-                out.push(serialize_command_result_for_js(
-                    &command,
-                    if ok { Ok(()) } else { Err(error) },
-                ));
-                out.push(serialize_command_result_for_js(request_id, Ok(())));
+                if let Some((typed_in, command)) = end_trust_command(state, &command) {
+                    out.push(
+                        typed_in,
+                        serialize_command_result_for_js(&command, if ok { Ok(()) } else { Err(error) }),
+                    );
+                }
+                out.push(here, serialize_command_result_for_js(request_id, Ok(())));
             }
-            Some(CommandAnswer::Recording) => out.push(serialize_command_result_for_js(request_id, Ok(()))),
-            None => out.push(serialize_command_result_for_js(
-                request_id,
-                Err(crate::trust_gate::NOT_CURRENT),
-            )),
+            Some(CommandAnswer::Recording) => out.push(here, serialize_command_result_for_js(request_id, Ok(()))),
+            None => out.push(
+                here,
+                serialize_command_result_for_js(request_id, Err(crate::trust_gate::NOT_CURRENT)),
+            ),
         }
         return out;
     }
-    out.push(serialize_command_result_for_js(
-        request_id,
-        Err(crate::trust_gate::NOT_CURRENT),
-    ));
+    out.push(
+        here,
+        serialize_command_result_for_js(request_id, Err(crate::trust_gate::NOT_CURRENT)),
+    );
+    out
+}
+
+/// Which trust question an answer is to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustAsked {
+    /// The tab's own question, which holds its start.
+    Tab,
+    /// The prompt a `:trust` typed in the page asked.
+    Command,
+}
+
+/// Which trust question an answer from `view`'s page is to, if that page may answer it: the tab's own
+/// question it shows, or the `:trust` prompt typed in it. `None` is an answer [`answer_trust`] refuses
+/// as no longer current. Changes nothing.
+fn trust_question_answered(state: &AgentPanelState, tab: TabId, nonce: u64, view: ViewId) -> Option<TrustAsked> {
+    if state.tabs.check_trust_answer(tab, nonce, view).is_ok() {
+        Some(TrustAsked::Tab)
+    } else if state.tab_of_page(view) == Some(tab) && state.trust.is_command_prompt(tab, nonce) {
+        Some(TrustAsked::Command)
+    } else {
+        None
+    }
+}
+
+/// The refusal for a `:trust` prompt's answer the window's gate turned down: the command is over, and
+/// the user typed it, so typing it again is its way back.
+fn trust_command_refused(why: &str) -> String {
+    format!("{why} — :trust was not answered; type :trust again once it is uncovered")
+}
+
+/// A trust answer the window's gate refused (`why`, said to the page). A tab's own question stays
+/// open: the page closed it when the key was pressed, so it is asked again in that page under a fresh
+/// nonce, and the tab keeps waiting for an answer from an uncovered page. A `:trust` prompt ends the
+/// command unrecorded (`not trusted`, on the next poll).
+// One parameter per fact of the refused answer, and the view of the page that sent it.
+#[allow(clippy::too_many_arguments)]
+fn refuse_trust_answer(
+    state: &mut AgentPanelState,
+    request_id: &str,
+    tab: TabId,
+    nonce: u64,
+    asked: TrustAsked,
+    why: &str,
+    view: ViewId,
+) -> TrustOut {
+    use eitri_core::agent_bridge::serialize_notice_for_js;
+    let mut out = TrustOut::default();
+    let here = Dest::Page(view);
+    match asked {
+        TrustAsked::Tab => {
+            out.push(here, serialize_notice_for_js(why));
+            out.push(here, serialize_command_result_for_js(request_id, Err(why)));
+            if state.tabs.check_trust_answer(tab, nonce, view).is_ok() {
+                state.trust.hide(tab);
+                out.extend(reroute_or_ask(state, tab));
+            }
+        }
+        TrustAsked::Command => {
+            let text = trust_command_refused(why);
+            if state.trust.is_command_prompt(tab, nonce) {
+                state.trust.drop_command_prompt();
+            }
+            out.push(here, serialize_notice_for_js(&text));
+            out.push(here, serialize_command_result_for_js(request_id, Err(&text)));
+        }
+    }
     out
 }
 
 /// `Escape` on a trust question: the start is put off. A first message goes back to the composer; a
 /// resume is dropped and the toast says so; a restore keeps its sessions (as failed tabs holding their
 /// resume ids, or still on offer in an otherwise empty window). Nothing was leased, so nothing is released.
-fn cancel_trust_question(state: &mut AgentPanelState, request_id: &str, tab: TabId, nonce: u64) -> TrustOut {
+fn cancel_trust_question(
+    state: &mut AgentPanelState,
+    request_id: &str,
+    tab: TabId,
+    nonce: u64,
+    view: ViewId,
+) -> TrustOut {
     use crate::trust_gate::{NOT_CURRENT, NOT_STARTED, NOT_TRUSTED, PUT_OFF};
     let mut out = TrustOut::default();
-    if state.tabs.check_trust_answer(tab, nonce).is_err() {
-        if state.tabs.active() == tab {
+    let here = Dest::Page(view);
+    if state.tabs.check_trust_answer(tab, nonce, view).is_err() {
+        if state.tab_of_page(view) == Some(tab) {
             if let Some(command) = state.trust.cancel_command(tab, nonce) {
-                out.push(serialize_command_result_for_js(&command, Err(NOT_TRUSTED)));
-                out.push(serialize_command_result_for_js(request_id, Ok(())));
+                if let Some((typed_in, command)) = end_trust_command(state, &command) {
+                    out.push(typed_in, serialize_command_result_for_js(&command, Err(NOT_TRUSTED)));
+                }
+                out.push(here, serialize_command_result_for_js(request_id, Ok(())));
                 return out;
             }
         }
-        out.push(serialize_command_result_for_js(request_id, Err(NOT_CURRENT)));
+        out.push(here, serialize_command_result_for_js(request_id, Err(NOT_CURRENT)));
         return out;
     }
-    let Ok(start) = state.tabs.cancel_trust(tab, nonce) else {
-        out.push(serialize_command_result_for_js(request_id, Err(NOT_CURRENT)));
+    let Ok(start) = state.tabs.cancel_trust(tab, nonce, view) else {
+        out.push(here, serialize_command_result_for_js(request_id, Err(NOT_CURRENT)));
         return out;
     };
     state.trust.hide(tab);
-    out.push(tabs_payload_recorded(state));
+    let tabs_view = state.tabs.view_of(tab);
+    out.push(Dest::Page(tabs_view), tabs_payload_recorded(state, tabs_view));
     match start {
         DeferredStart::FirstSend {
             request_id: sent,
             first_turn,
         } => return_first_message(state, tab, &sent, &first_turn, NOT_STARTED, &mut out),
         DeferredStart::Resume { request_id: asked, .. } => {
-            out.push(serialize_command_result_for_js(&asked, Err(PUT_OFF)));
+            let asked_from = start_answer_dest(state, tab, &asked);
+            out.push(asked_from, serialize_command_result_for_js(&asked, Err(PUT_OFF)));
             out.toast = Some(PUT_OFF.to_string());
         }
         DeferredStart::Restore { go } => {
-            if !state.tabs.keep_put_off_restore(tab, go, PUT_OFF) {
-                state.restore_source = None;
-            }
-            out.payloads.extend(switch_payloads(state));
+            put_off_restore(state, tab, go, PUT_OFF, &mut out);
             out.toast = Some(PUT_OFF.to_string());
         }
     }
-    out.push(serialize_command_result_for_js(request_id, Ok(())));
+    out.push(here, serialize_command_result_for_js(request_id, Ok(())));
     out
 }
 
@@ -4054,11 +5172,13 @@ fn remember_tabs(state: &Rc<RefCell<AgentPanelState>>) {
     state_ref.tab_memory.observe(snapshot);
 }
 
-/// The chooser's envelope (`prefix w`): the open tabs in number order, then every record open
-/// in no tab, each marked if another window holds its lease. Also each record listed with the title shown.
-fn chooser_payload(state: &AgentPanelState) -> (String, Vec<(String, Option<String>)>) {
-    // The records offered are the active tab's agent's, as the resume that follows starts in it.
-    let agent = state.tabs.active_tab().agent().clone();
+/// The chooser's envelope (`prefix w` in `view`'s page): every open tab in number order, a tab bound
+/// to an extra view naming it, then every record open in no tab, each marked if another window holds
+/// its lease. Also each record listed with the title shown.
+fn chooser_payload(state: &AgentPanelState, view: ViewId) -> (String, Vec<(String, Option<String>)>) {
+    // The records offered are the agent's of the tab the opening page shows, as the resume that
+    // follows starts in it.
+    let agent = hello_agent(state, view);
     let greeting = BackendGreeting::for_agent_titled(
         state.backend_kind,
         &agent,
@@ -4074,7 +5194,7 @@ fn chooser_payload(state: &AgentPanelState) -> (String, Vec<(String, Option<Stri
             let facts = t.facts();
             ChooserTab {
                 tab: t.id,
-                label: eitri_core::tabs::label(t.number, &t.label_name()),
+                label: ChooserTab::label(t.number, &t.label_name(), t.view_id()),
                 marker: eitri_core::tabs::marker(facts),
                 pending: facts.pending,
                 resumable: t.resumable(state.backend_kind),
@@ -4724,8 +5844,8 @@ fn never_opened_message(reason: &str) -> String {
 /// `AgentConversation::resume` catches the common case synchronously, within its own short window.
 /// This is the backstop for everything slower than that window and for fresh sessions, which have
 /// no equivalent check: either way the tab becomes `Failed` with the provider's own reason, where `r` starts it over. It is never turned into a fresh session automatically. The
-/// `error{tab}` envelope goes out only if that tab is active; the tab keeps the reason for when it
-/// is shown, and no other tab is touched.
+/// `error{tab}` envelope goes out only if that tab is on screen, to the page that shows it; the tab
+/// keeps the reason for when it is shown, and no other tab is touched.
 ///
 /// **`reason` used to be a fixed, generic string on the legacy backend** ("provider process
 /// exited unexpectedly") for every non-zero exit, regardless of cause -- and that generic text
@@ -4737,7 +5857,7 @@ fn never_opened_message(reason: &str) -> String {
 /// `SessionUnavailable.reason` itself (see `agent/src/session.rs`), so `reason` below is already
 /// the specific one when the provider produced any stderr at all before dying. See
 /// `never_opened_message` for the one exception to the guess it otherwise wraps `reason` in.
-fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let failed: Vec<(TabId, String)> = {
         let state_ref = state.borrow();
         state_ref
@@ -4756,11 +5876,11 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
         let message = never_opened_message(&reason);
         eprintln!("[agent_panel] tab {}: {message}", tab.0);
         // Asked before the state is borrowed: the window's coverage probe may read the panel.
-        let shown = on_screen(state, page);
-        let (dead, active) = {
+        let shown_in = state.borrow().shown_in(tab);
+        let shown = shown_in.is_some_and(|view| pages.live(view).is_some_and(|page| on_screen(state, view, &page)));
+        let dead = {
             let mut state_ref = state.borrow_mut();
-            let active = state_ref.tabs.active() == tab;
-            let on_screen = active && shown;
+            let on_screen = shown;
             let Some(t) = state_ref.tabs.get_mut(tab) else { continue };
             t.reported_start_failure = true;
             t.failed_after_start = false;
@@ -4768,21 +5888,20 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
             t.failed_resume = t.live().and_then(AgentBackend::provider_session_id);
             // Its cards go with it (the tick reports the change).
             t.attention.session_ended(on_screen);
-            let dead = std::mem::replace(
+            std::mem::replace(
                 &mut t.backend,
                 TabBackend::Failed {
                     reason: message.clone(),
                 },
-            );
-            (dead, active)
+            )
         };
         if let TabBackend::Live(backend) = dead {
             let mut state_ref = state.borrow_mut();
             state_ref.tabs.note_retiring(tab);
             state_ref.retiring.backend(backend, Some(tab));
         }
-        if active {
-            page.send(&serialize_error_for_js(tab, &message));
+        if let Some(view) = shown_in {
+            pages.send(view, &serialize_error_for_js(tab, &message));
         }
     }
 }
@@ -4790,7 +5909,10 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
 /// Every connect that finished since the last tick (`TabSet::collect_starts`), answered. `try_recv`
 /// only, inside the set: this runs on the GTK main loop 30 times a second and must never block it --
 /// which is the entire reason construction was moved off this thread in the first place.
-fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+///
+/// What the page showing a tab is owed goes to that page; a command's answer to the page it was sent
+/// from (`start_answer_dest`), which need not show the tab any more.
+fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let collected = state.borrow_mut().tabs.collect_starts();
     for result in collected {
         let part_of_a_restore = account_for_restore(&mut state.borrow_mut(), &result);
@@ -4803,21 +5925,30 @@ fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage
                 // A tab a restore started: nobody asked for this connect by name, so there is no
                 // `command_result` owed -- the restore reports once, when its last resume is back.
                 let restored = part_of_a_restore != RestoreStart::NotPartOfOne;
-                // The panel has been showing this tab as starting; give it the real projection at
+                // The page has been showing this tab as starting; give it the real projection at
                 // once rather than making it wait for the first event.
-                let payloads = {
+                let shown = {
                     let mut state_ref = state.borrow_mut();
-                    if state_ref.tabs.active() == tab {
-                        switch_payloads(&mut state_ref)
-                    } else {
-                        Vec::new()
+                    match state_ref.shown_in(tab) {
+                        Some(view) if view.is_base() || state_ref.ready(view) => {
+                            Some((view, view_payloads(&mut state_ref, view)))
+                        }
+                        _ => None,
                     }
                 };
-                dispatch_all(page, payloads);
+                if let Some((view, payloads)) = shown {
+                    pages.send_all(view, payloads);
+                }
                 if !restored {
                     match first_turn {
-                        Some(turn) => send_first_turn(state, page, tab, &request_id, turn),
-                        None => page.send(&serialize_command_result_for_js(&request_id, Ok(()))),
+                        Some(turn) => send_first_turn(state, pages, tab, &request_id, turn),
+                        None => send_start_answer(
+                            state,
+                            pages,
+                            tab,
+                            &request_id,
+                            &serialize_command_result_for_js(&request_id, Ok(())),
+                        ),
                     }
                 }
             }
@@ -4830,19 +5961,54 @@ fn collect_pending_starts(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage
                 // away by `account_for_restore`, rather than left on screen as a dead tab each.
                 if let RestoreStart::Failed { was_active } = part_of_a_restore {
                     if was_active {
-                        send_switch(state, page);
+                        send_switch(state, pages);
                     }
                     continue;
                 }
-                page.send(&serialize_command_result_for_js(&request_id, Err(&error.message)));
+                send_start_answer(
+                    state,
+                    pages,
+                    tab,
+                    &request_id,
+                    &serialize_command_result_for_js(&request_id, Err(&error.message)),
+                );
                 // Only if that tab is on screen; it keeps the reason for later.
-                if state.borrow().tabs.active() == tab {
-                    page.send(&serialize_error_for_js(tab, &error.message));
+                let shown = state.borrow().shown_in(tab);
+                if let Some(view) = shown {
+                    pages.send(view, &serialize_error_for_js(tab, &error.message));
                 }
             }
         }
     }
+    {
+        // A start that ended another way (its tab closed, or was reset into a new one) owes nothing.
+        let mut state_ref = state.borrow_mut();
+        let state_ref = &mut *state_ref;
+        let tabs = &state_ref.tabs;
+        state_ref.start_pages.retain(|tab, _| {
+            tabs.get(*tab)
+                .is_some_and(|t| matches!(t.backend, TabBackend::Starting(_) | TabBackend::AwaitingTrust(_)))
+        });
+    }
     finish_restore(state);
+}
+
+/// Sends `payload`, the answer owed under `request_id` when `tab`'s start ended, to the page that asked
+/// for the start.
+fn send_start_answer(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId, request_id: &str, payload: &str) {
+    let view = {
+        let mut state_ref = state.borrow_mut();
+        let asked_from = start_answer_dest(&mut state_ref, tab, request_id);
+        dest_view(&state_ref, asked_from)
+    };
+    pages.send(view, payload);
+}
+
+/// Sends `payload` to the page of `tab`'s view, if it is live: a command's answer, or a notice about
+/// the tab, wherever it is in that view.
+fn send_to_tabs_page(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId, payload: &str) {
+    let view = state.borrow().tabs.view_of(tab);
+    pages.send(view, payload);
 }
 
 /// How one collected connect relates to the restore in progress, if there is one.
@@ -4861,7 +6027,12 @@ enum RestoreStart {
 /// Counts a collected connect into the restore that started it. A refused one is also taken off the
 /// screen: an empty tab again if the restore began in it, gone if the restore made it.
 fn account_for_restore(state: &mut AgentPanelState, collected: &StartCollected) -> RestoreStart {
-    let AgentPanelState { restore_run, tabs, .. } = state;
+    let AgentPanelState {
+        restore_run,
+        tabs,
+        emptied_views,
+        ..
+    } = state;
     let Some(run) = restore_run.as_mut() else {
         return RestoreStart::NotPartOfOne;
     };
@@ -4874,7 +6045,12 @@ fn account_for_restore(state: &mut AgentPanelState, collected: &StartCollected) 
             let back_to = run.back_to(*tab);
             run.note_failed(*tab, &error.message);
             let was_active = tabs.active() == *tab;
+            let view = tabs.view_of(*tab);
             tabs.discard_failed_restore(*tab, back_to);
+            // A restored tab that came back into an extra view and is discarded leaves that view.
+            if !view.is_base() && tabs.tab_in(view).is_none() {
+                emptied_views.push(view);
+            }
             // The tab on screen did not come back: the first that did (or is coming) takes its place,
             // rather than leaving an empty dashboard over tabs that restored.
             if was_active {
@@ -4890,13 +6066,7 @@ fn account_for_restore(state: &mut AgentPanelState, collected: &StartCollected) 
 
 /// The first turn of a session started by it, sent once its backend is installed. Its
 /// `command_result` is the one the `send_message` that started the session was owed.
-fn send_first_turn(
-    state: &Rc<RefCell<AgentPanelState>>,
-    page: &PanelPage,
-    tab: TabId,
-    request_id: &str,
-    turn: FirstTurn,
-) {
+fn send_first_turn(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId, request_id: &str, turn: FirstTurn) {
     let outcome = {
         let mut state_ref = state.borrow_mut();
         let mut mode = eitri_core::agent_bridge::SessionModeChoice::Auto;
@@ -4909,7 +6079,13 @@ fn send_first_turn(
     if outcome.is_ok() {
         title_from_first_prompt(state, tab, &turn.typed);
     }
-    apply_command_outcome(state, page, tab, request_id, outcome);
+    // The `send_message` is answered in the page it came from.
+    let view = {
+        let mut state_ref = state.borrow_mut();
+        let sent_from = start_answer_dest(&mut state_ref, tab, request_id);
+        dest_view(&state_ref, sent_from)
+    };
+    apply_outcome(state, pages, tab, Some((view, request_id)), outcome);
 }
 
 /// A tab with no title takes its first prompt's (`agent::persistence::title_from_prompt`, the rule
@@ -4927,10 +6103,10 @@ fn title_from_first_prompt(state: &Rc<RefCell<AgentPanelState>>, tab: TabId, typ
 ///
 /// The command is dispatched here and nowhere else, which is what makes the handoff ordering real: by
 /// the time the frontend can show a user the line to run, the session's own `shutdown()` has
-/// already returned on the worker thread. The handoff card goes out only if its tab is active
-/// (the tab keeps it in `last_handoff` for when it is shown); the `command_result` is
-/// owed either way, and the tick's `tabs` envelope reports the state change.
-fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// already returned on the worker thread. The handoff card goes out only if its tab is on screen, to
+/// the page that shows it (the tab keeps it in `last_handoff` for when it is shown); the
+/// `command_result` is owed either way, and the tick's `tabs` envelope reports the state change.
+fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages) {
     let handing_off: Vec<TabId> = state
         .borrow()
         .tabs
@@ -4942,7 +6118,7 @@ fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPa
     for tab in handing_off {
         let finished = {
             let mut state_ref = state.borrow_mut();
-            let active = state_ref.tabs.active() == tab;
+            let shown = state_ref.shown_in(tab);
             let Some(t) = state_ref.tabs.get_mut(tab) else { continue };
             let Some(pending) = t.pending_handoff.as_ref() else {
                 continue;
@@ -4960,23 +6136,33 @@ fn collect_pending_handoffs(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPa
                 // else anywhere remembers this session id.
                 t.last_handoff = Some(pending.command.clone());
             }
-            (pending, outcome, active)
+            (pending, outcome, shown)
         };
-        let (pending, outcome, active) = finished;
+        let (pending, outcome, shown) = finished;
         if outcome == HandoffCloseOutcome::CloseFailed {
             eprintln!("[agent_panel] tab {}: {HANDOFF_CLOSE_FAILED_MESSAGE}", tab.0);
         }
-        if active {
-            dispatch_all(
-                page,
-                handoff_payloads(tab, &outcome, &pending.request_id, &pending.command),
-            );
-        } else {
-            let result = match outcome {
-                HandoffCloseOutcome::CloseFailed => Err(HANDOFF_CLOSE_FAILED_MESSAGE),
-                _ => Ok(()),
-            };
-            page.send(&serialize_command_result_for_js(&pending.request_id, result));
+        match shown {
+            Some(view) if view == pending.page => pages.send_all(
+                view,
+                handoff_payloads(tab, &outcome, Some(&pending.request_id), &pending.command),
+            ),
+            // The tab moved, or is in the background: the page showing it gets the card or the error,
+            // and the page that asked gets the answer, which ends its wait for the close wherever the
+            // tab is now. Without it that page would keep the tab's composer disabled as closing.
+            _ => {
+                if let Some(view) = shown {
+                    pages.send_all(view, handoff_payloads(tab, &outcome, None, &pending.command));
+                }
+                let result = match outcome {
+                    HandoffCloseOutcome::CloseFailed => Err(HANDOFF_CLOSE_FAILED_MESSAGE),
+                    _ => Ok(()),
+                };
+                pages.send(
+                    pending.page,
+                    &serialize_command_result_for_js(&pending.request_id, result),
+                );
+            }
         }
     }
 }
@@ -5006,7 +6192,8 @@ fn classify_close_signal(closed_rx: &mpsc::Receiver<()>) -> HandoffCloseOutcome 
 }
 
 /// The envelopes owed for a handoff whose close reached `outcome`, in dispatch order, when its tab
-/// is on screen.
+/// is on screen; the `command_result` only when `request_id` is given (the page showing the tab is
+/// the one that asked).
 ///
 /// The property worth stating: only `Closed` ever produces a `handoff` envelope. A close that is
 /// still running, or one that died partway, must not be followed by a card whose first line claims
@@ -5014,22 +6201,27 @@ fn classify_close_signal(closed_rx: &mpsc::Receiver<()>) -> HandoffCloseOutcome 
 fn handoff_payloads(
     tab: TabId,
     outcome: &HandoffCloseOutcome,
-    request_id: &str,
+    request_id: Option<&str>,
     command: &agent::handoff::ClaudeResumeCommand,
 ) -> Vec<String> {
     match outcome {
         HandoffCloseOutcome::StillClosing => Vec::new(),
-        HandoffCloseOutcome::Closed => vec![
-            eitri_core::agent_bridge::serialize_handoff_for_js(tab, command),
-            serialize_command_result_for_js(request_id, Ok(())),
-        ],
+        HandoffCloseOutcome::Closed => {
+            let mut payloads = vec![eitri_core::agent_bridge::serialize_handoff_for_js(tab, command)];
+            payloads.extend(request_id.map(|id| serialize_command_result_for_js(id, Ok(()))));
+            payloads
+        }
         // The session is gone regardless -- it was handed to the worker before this. Saying so is
         // the only honest option: an `error` envelope returns the tab to its empty screen, where a
         // failed handoff reads as a dead session rather than as a conversation that is still there.
-        HandoffCloseOutcome::CloseFailed => vec![
-            serialize_command_result_for_js(request_id, Err(HANDOFF_CLOSE_FAILED_MESSAGE)),
-            serialize_error_for_js(tab, HANDOFF_CLOSE_FAILED_MESSAGE),
-        ],
+        HandoffCloseOutcome::CloseFailed => {
+            let mut payloads: Vec<String> = request_id
+                .map(|id| serialize_command_result_for_js(id, Err(HANDOFF_CLOSE_FAILED_MESSAGE)))
+                .into_iter()
+                .collect();
+            payloads.push(serialize_error_for_js(tab, HANDOFF_CLOSE_FAILED_MESSAGE));
+            payloads
+        }
     }
 }
 
@@ -5118,8 +6310,10 @@ fn end_pending_edits(state: &mut AgentPanelState) -> Vec<(TabId, Option<String>)
 /// rest of `Ready`'s payload-building so it has its own doc and its own test
 /// (`ready_resets_the_nav_mode_mirror_to_other`), the same reason `ready_payloads` and
 /// `changed_envelope` are pulled out of that arm.
-fn reset_nav_mode_for_ready(state: &AgentPanelState) {
-    state.nav_mode.set(PanelKeys::Other);
+fn reset_nav_mode_for_ready(state: &AgentPanelState, view: ViewId) {
+    if let Some(record) = state.page(view) {
+        record.nav_mode.set(PanelKeys::Other);
+    }
 }
 
 /// The other half of the same rule: when the page that reported a mode goes -- its web process
@@ -5127,8 +6321,10 @@ fn reset_nav_mode_for_ready(state: &AgentPanelState) {
 /// replaced (`reload_document`) -- the mirror is `Other` until a new page says otherwise. The
 /// give-up document (`webview_crash_guard::crash_message_html`) never sends `ready`, so the reset
 /// on `ready` alone left `Ctrl+j` claimed for a page that could not take it.
-fn forget_the_pages_nav_mode(state: &AgentPanelState) {
-    state.nav_mode.set(PanelKeys::Other);
+fn forget_the_pages_nav_mode(state: &AgentPanelState, view: ViewId) {
+    if let Some(record) = state.page(view) {
+        record.nav_mode.set(PanelKeys::Other);
+    }
 }
 
 /// A window-level envelope for the tick: `Some` when the page can take it and it changed since the
@@ -5141,30 +6337,48 @@ fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool
     Some(now)
 }
 
-/// The window's check on a card answer (`AgentPanelHandle::set_answer_gate`).
-type AnswerGate = Rc<dyn Fn() -> Result<(), String>>;
+/// The window's check on an answer from a page (`AgentPanelHandle::set_answer_gate`), asked with that
+/// page's view.
+type AnswerGate = Rc<dyn Fn(ViewId) -> Result<(), String>>;
 
-/// A card answer from the page, through the window's gate first: a refusal returns the gate's words
+/// An answer from `view`'s page, through the window's gate first: a refusal returns the gate's words
 /// and never runs `answer`, so the card stays waiting. The gate is asked at the moment of the answer
 /// and with the panel's state released, so what it reads is the window as it is now.
-fn through_answer_gate<T>(gate: Option<&AnswerGate>, answer: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn through_answer_gate<T>(
+    gate: Option<&AnswerGate>,
+    view: ViewId,
+    answer: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     if let Some(gate) = gate {
-        gate()?;
+        gate(view)?;
     }
     answer()
 }
 
-/// The window's word on whether a float covers the chat (`AgentPanelHandle::set_coverage`).
-type Coverage = Rc<dyn Fn() -> bool>;
+/// Whether `view`'s page may answer about `tab`: refused, naming the tab, when the tab is in another
+/// view. Asked before the window's gate, so an answer from a page that does not show the tab never
+/// reaches the window, whatever covers it.
+fn page_may_answer(tabs: &eitri_core::tab_set::TabSet, tab: TabId, view: ViewId) -> Result<(), String> {
+    if tabs.may_answer(tab, view) {
+        return Ok(());
+    }
+    Err(match tabs.get(tab) {
+        Some(t) => format!("tab {} is not shown in this page", t.number),
+        None => format!("no tab {}", tab.0),
+    })
+}
 
-/// Whether the chat is on screen for attention: its page mapped and no float over it. The window's
+/// The window's word on whether a float covers a chat view's module (`AgentPanelHandle::set_coverage`).
+type Coverage = Rc<dyn Fn(ViewId) -> bool>;
+
+/// Whether `view`'s page is on screen for attention: mapped and no float over its view. The window's
 /// probe is asked with the panel's state released, so it may read the panel.
-fn on_screen(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) -> bool {
+fn on_screen(state: &Rc<RefCell<AgentPanelState>>, view: ViewId, page: &PanelPage) -> bool {
     if !page.is_visible() {
         return false;
     }
     let coverage = state.borrow().coverage.clone();
-    !coverage.is_some_and(|covered| covered())
+    !coverage.is_some_and(|covered| covered(view))
 }
 
 /// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
@@ -5205,6 +6419,7 @@ fn answer_permission_response(
     rules_dir: Option<&Path>,
     project_dir: &Path,
     tab: TabId,
+    page: ViewId,
     answer: PermissionAnswer,
 ) -> Result<Result<Vec<agent::AgentDomainEvent>, BackendError>, String> {
     let remembered = {
@@ -5240,7 +6455,7 @@ fn answer_permission_response(
         }
     }
     let decision = answer.decision.into_decision(answer.reason);
-    Ok(tabs.answer_card(tab, &answer.permission_id, decision))
+    Ok(tabs.answer_card(tab, page, &answer.permission_id, decision))
 }
 
 /// The `remember` choice: the rule Rust offered for `permission_id`, only with an allow, and
@@ -5310,13 +6525,18 @@ fn events_owed(
 /// rather than delivered through the pump: legacy's synthesized events, a refused send's folded
 /// prompt, and the `PermissionResolved`s entering bypass produced on
 /// legacy (`ConfirmOutcome::Entered::resolved`), which no pump ever carries. `None` for an empty
-/// batch, or for a tab that is not the active one: the WebView draws only that tab, and a background
-/// tab catches up with a snapshot when it is switched to. The revisions are the projection's, as the
-/// events were folded into it one each, just now, on this thread.
-fn returned_events_payload(state: &AgentPanelState, tab: TabId, events: &[agent::AgentDomainEvent]) -> Option<String> {
-    if events.is_empty() || state.tabs.active() != tab {
+/// batch, or for a tab no page shows: each page draws only its own tab, and a background tab catches
+/// up with a snapshot when it is switched to. With the view whose page shows the tab. The revisions
+/// are the projection's, as the events were folded into it one each, just now, on this thread.
+fn returned_events_payload(
+    state: &AgentPanelState,
+    tab: TabId,
+    events: &[agent::AgentDomainEvent],
+) -> Option<(ViewId, String)> {
+    if events.is_empty() {
         return None;
     }
+    let view = state.shown_in(tab)?;
     let through_revision = state
         .tabs
         .get(tab)
@@ -5324,7 +6544,10 @@ fn returned_events_payload(state: &AgentPanelState, tab: TabId, events: &[agent:
         .map(|b| b.projection().last_revision)
         .unwrap_or(0);
     let from_revision = through_revision.saturating_sub(events.len() as u64);
-    Some(serialize_events_for_js(tab, from_revision, through_revision, events))
+    Some((
+        view,
+        serialize_events_for_js(tab, from_revision, through_revision, events),
+    ))
 }
 
 /// Applies one command's outcome to its tab and the frontend, uniformly.
@@ -5332,41 +6555,42 @@ fn returned_events_payload(state: &AgentPanelState, tab: TabId, events: &[agent:
 /// The benign/fatal split is the whole point: a benign failure (a turn sent while one was running,
 /// a permission answered twice) reports itself and leaves the session alone, while a fatal one
 /// retires the tab's backend and marks the tab `Failed`. Events and the `error`
-/// envelope go out only if `tab` is the active one -- the WebView draws only that tab, and a
-/// background tab catches up with a snapshot when it is switched to. The `command_result` is owed
-/// either way.
+/// envelope go out only if `tab` is on screen, to the page that shows it -- each page draws only its
+/// own tab, and a background tab catches up with a snapshot when it is switched to. The
+/// `command_result` is owed either way, to `view`'s page, which sent the command.
 fn apply_command_outcome(
     state: &Rc<RefCell<AgentPanelState>>,
-    page: &PanelPage,
+    pages: &Pages,
+    view: ViewId,
     tab: TabId,
     request_id: &str,
     outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
 ) {
-    apply_outcome(state, page, tab, Some(request_id), outcome);
+    apply_outcome(state, pages, tab, Some((view, request_id)), outcome);
 }
 
 /// [`apply_command_outcome`] for an outcome no request is waiting on (a queue flush):
-/// `request_id` is `None` and no `command_result` goes out.
+/// `request` is `None` and no `command_result` goes out.
 fn apply_outcome(
     state: &Rc<RefCell<AgentPanelState>>,
-    page: &PanelPage,
+    pages: &Pages,
     tab: TabId,
-    request_id: Option<&str>,
+    request: Option<(ViewId, &str)>,
     outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
 ) {
     let events = events_owed(&outcome);
-    let active = state.borrow().tabs.active() == tab;
+    let shown_in = state.borrow().shown_in(tab);
     // Only the legacy backend ever gets here with a non-empty batch: it synthesizes events its own
     // wire protocol cannot provide. The sidecar backend returns an empty vec and its state arrives
     // through the pump, from the server.
     let payload = returned_events_payload(&state.borrow(), tab, events);
-    if let Some(payload) = payload {
-        page.send(&payload);
+    if let Some((view, payload)) = payload {
+        pages.send(view, &payload);
     }
     match outcome {
         Ok(_) => {
-            if let Some(id) = request_id {
-                page.send(&serialize_command_result_for_js(id, Ok(())));
+            if let Some((view, id)) = request {
+                pages.send(view, &serialize_command_result_for_js(id, Ok(())));
             }
         }
         Err(error) if error.benign => {
@@ -5374,8 +6598,8 @@ fn apply_outcome(
                 "[agent_panel] tab {}: command rejected (session stays alive): {}",
                 tab.0, error.message
             );
-            if let Some(id) = request_id {
-                page.send(&serialize_command_result_for_js(id, Err(&error.message)));
+            if let Some((view, id)) = request {
+                pages.send(view, &serialize_command_result_for_js(id, Err(&error.message)));
             }
         }
         Err(error) => {
@@ -5387,7 +6611,7 @@ fn apply_outcome(
             // escalating to SIGKILL, then RuntimeThread joins its Tokio thread) would block the
             // whole shell -- editor pane included -- on the GTK main loop.
             let attention_before = state.borrow().tabs.attention();
-            let shown = active && on_screen(state, page);
+            let shown = shown_in.is_some_and(|view| pages.live(view).is_some_and(|page| on_screen(state, view, &page)));
             let dead = {
                 let mut state_ref = state.borrow_mut();
                 state_ref.tabs.get_mut(tab).map(|t| {
@@ -5408,15 +6632,33 @@ fn apply_outcome(
                 state_ref.tabs.note_retiring(tab);
                 state_ref.retiring.backend(backend, Some(tab));
             }
-            if let Some(id) = request_id {
-                page.send(&serialize_command_result_for_js(id, Err(&error.message)));
+            if let Some((view, id)) = request {
+                pages.send(view, &serialize_command_result_for_js(id, Err(&error.message)));
             }
-            if active {
-                page.send(&serialize_error_for_js(tab, &error.message));
+            if let Some(view) = shown_in {
+                pages.send(view, &serialize_error_for_js(tab, &error.message));
             }
             report_attention(state, attention_before);
         }
     }
+}
+
+/// One stream payload for a page's pacer: the envelope, whose first text it carries, and its class.
+type Stream = (
+    String,
+    Option<crate::panel_pacer::FirstText>,
+    eitri_core::panel_cadence::EnvelopeClass,
+);
+
+/// The first text `tab`'s turn trace waits for, as the pacer stamps it: that tab and turn, never
+/// whichever tab is on screen when the stamp lands.
+fn first_text_of(tabs: &eitri_core::tab_set::TabSet, tab: TabId) -> Option<crate::panel_pacer::FirstText> {
+    tabs.get(tab)
+        .and_then(|t| t.turn_trace.as_ref())
+        .map(|trace| crate::panel_pacer::FirstText {
+            tab,
+            turn: trace.submitted_at(),
+        })
 }
 
 /// Applies the pacer's first-text stamps (`panel_pacer::Sent::first_text`): each to the tab and turn
@@ -5459,7 +6701,24 @@ fn trace_discarded_first_texts(state: &Rc<RefCell<AgentPanelState>>, discarded: 
     }
 }
 
-fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
+/// What an extra page that shows no tab answers a command about a tab.
+const NO_TAB_HERE: &str = "protocol: this page shows no tab";
+
+/// What an extra page is told when it asks about the last window's tabs: only the base page offers them.
+const RESTORE_IS_THE_BASE_PAGES: &str = "protocol: the last session's tabs are restored from the base view";
+
+/// What an extra page is told when it asks to close the other tabs: it shows one.
+const ONE_TAB_HERE: &str = "this view shows one tab: there are no others to close";
+
+/// One message from `view`'s page (`page`). Every answer goes back to that page; what changes for a
+/// tab goes to the page that shows it.
+fn handle_inbound_message(
+    raw: &str,
+    state: &Rc<RefCell<AgentPanelState>>,
+    pages: &Pages,
+    view: ViewId,
+    page: &PanelPage,
+) {
     let Some(message) = parse_inbound_message(raw) else {
         // Already logged inside parse_inbound_message -- an unparseable/unrecognized message
         // from the WebView must never crash the shell process. No requestId is known for it, so
@@ -5476,6 +6735,12 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
     // Bound before the `match`: a scrutinee's temporaries live to the end of the whole match.
     let resolved = state.borrow().tabs.resolve(message.tab_ref());
     let target = match resolved {
+        // An extra page that shows no tab yet has no tab to command.
+        Ok(Some(_)) if !view.is_base() && state.borrow().tabs.tab_in(view).is_none() => {
+            eprintln!("[agent_panel] refused {request_id}: {NO_TAB_HERE}");
+            page.send(&serialize_command_result_for_js(&request_id, Err(NO_TAB_HERE)));
+            return;
+        }
         Ok(target) => target,
         Err(protocol) => {
             eprintln!("[agent_panel] refused {request_id}: {protocol}");
@@ -5499,7 +6764,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             // Everything a fresh document is owed is decided by one pure function, so the reload
             // path is testable without a WebView -- see `ready_payloads`. A `ready` never opens the
             // chooser,  on the first one or on a reload -- the empty tab's dashboard is
-            // what a fresh document sees.
+            // what a fresh document sees. Only this page's tab is in it: another page's tab and its
+            // cards are that page's.
             let payloads = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
@@ -5508,8 +6774,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 // the torn-down document last reported, so the mirror must not carry the old
                 // value across -- see `reset_nav_mode_for_ready`'s own doc for the failure this
                 // closes.
-                reset_nav_mode_for_ready(state_ref);
-                let agent = state_ref.tabs.active_tab().agent().clone();
+                reset_nav_mode_for_ready(state_ref, view);
+                let agent = hello_agent(state_ref, view);
                 let greeting = BackendGreeting::for_agent_titled(
                     state_ref.backend_kind,
                     &agent,
@@ -5523,7 +6789,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     &state_ref.project_dir,
                 );
                 let context_payload = eitri_core::agent_bridge::serialize_editor_context_for_js(context.as_ref());
-                state_ref.last_context_payload = Some(context_payload.clone());
+                state_ref.page_mut(view).last_context_payload = Some(context_payload.clone());
                 let mut window = window_payloads(
                     eitri_core::agent_bridge::serialize_history_for_js(&state_ref.history),
                     context_payload,
@@ -5536,15 +6802,24 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 );
                 // Whether the page may speak of a turn's changes, before the tabs it would speak of.
                 window.insert(1, review_settings_payload(state_ref));
-                let tabs = tabs_payload_recorded(state_ref);
-                let active = state_ref.tabs.active_state_payloads();
+                let tabs = tabs_payload_recorded(state_ref, view);
+                // The base page's active tab, as always; an extra page's one tab, or nothing for an
+                // extra page that shows none yet.
+                let active = if view.is_base() {
+                    state_ref.tabs.active_state_payloads()
+                } else {
+                    match state_ref.tabs.tab_in(view) {
+                        Some(tab) => state_ref.tabs.state_payloads(tab),
+                        None => Vec::new(),
+                    }
+                };
                 // What the last window left open, if the dashboard may offer it: a reloaded page
-                // is told again, like everything else in the greeting.
+                // is told again, like everything else in the greeting. Only the base page offers it.
                 let mut offered_greeting = greeting;
                 offered_greeting
                     .resumable
                     .retain(|r| !open.contains(&r.provider_session_id));
-                let offer = restore_offer(state_ref);
+                let offer = if view.is_base() { restore_offer(state_ref) } else { None };
                 let mut payloads = ready_payloads(
                     offered_greeting,
                     &open,
@@ -5555,61 +6830,79 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     state_ref.keymap_help.as_deref(),
                     offer.as_ref(),
                 );
-                // The status-band hints the replaced document was showing.
-                for hint in hints_for_new_document(state_ref) {
+                // The status-band hints the replaced document was showing, of this view's tabs.
+                for hint in hints_for_new_document(state_ref, view) {
                     payloads.push(eitri_core::agent_bridge::serialize_review_hint_for_js(&hint));
                 }
                 // Last, so nothing the document draws from the payloads above can reset it.
-                payloads.push(eitri_core::agent_bridge::serialize_pane_focus_for_js(
-                    state_ref.pane_focused,
-                ));
-                state_ref.last_open_ids = open;
-                state_ref.last_restore_offered = restore_is_on_offer(state_ref);
-                state_ref.last_hello_agent = agent;
+                let focused = state_ref.page(view).is_some_and(|record| record.pane_focused);
+                payloads.push(eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));
+                let offered = view.is_base() && restore_is_on_offer(state_ref);
+                let record = state_ref.page_mut(view);
+                record.last_open_ids = open;
+                record.last_restore_offered = offered;
+                record.last_hello_agent = agent;
                 // From here on the tick may send into this document.
-                state_ref.document_ready = true;
+                record.document_ready = true;
                 payloads
             };
+            eprintln!("[agent_panel] view {}: ready", view.number());
             dispatch_all(page, payloads);
             // A mode note set before any page was ready (the configured agent clamping the empty
             // tab) is held back by `send_mode_note`; this is the first moment it can be said, after
             // the `tabs` that shows the tab. Taking it clears it, so a later `tabs` does not repeat it.
-            send_mode_note(state, page);
+            send_mode_note(state, pages);
             ok(page);
-            // The interrupted reverts, offered once the page can show them (and again after a reload).
-            let owed = {
-                let mut state_ref = state.borrow_mut();
-                let state_ref = &mut *state_ref;
-                state_ref.review_flow.document_ready(&state_ref.tabs)
-            };
-            dispatch_review_outs(state, page, owed);
-            // A fresh document has no trust question on screen: the tab waiting for one is asked
-            // again, and a fresh check gives `prefix i` its row.
+            // The interrupted reverts, offered once the base page can show them (and again after a
+            // reload). They are the window's, so only the base page offers them.
+            if view.is_base() {
+                let owed = {
+                    let mut state_ref = state.borrow_mut();
+                    let state_ref = &mut *state_ref;
+                    state_ref.review_flow.document_ready(&state_ref.tabs)
+                };
+                dispatch_review_outs(state, pages, owed);
+            }
+            // A fresh document has no trust question on screen: the tab it shows, if that tab waits
+            // for one, is asked again, and a fresh check gives `prefix i` its row. A `:trust` prompt
+            // ends only when it was this page's.
             let asked = {
                 let mut state_ref = state.borrow_mut();
                 let state_ref = &mut *state_ref;
-                state_ref.trust.drop_command_prompt();
-                let active = state_ref.tabs.active();
-                state_ref.trust.hide(active);
-                let profile = waiting_profile(state_ref, active);
-                state_ref.trust.begin_check(&profile);
-                reroute_or_ask(state_ref, active)
+                if command_prompt_is_in(state_ref, view) {
+                    state_ref.trust.drop_command_prompt();
+                }
+                match state_ref.tab_of_page(view) {
+                    Some(tab) => {
+                        state_ref.trust.hide(tab);
+                        let profile = waiting_profile(state_ref, tab);
+                        state_ref.trust.begin_check(&profile);
+                        reroute_or_ask(state_ref, tab)
+                    }
+                    None => TrustOut::default(),
+                }
             };
-            deliver_trust(state, page, asked);
-            // `agent.restore = "auto"`: only once the page can take what it starts.
-            restore_at_launch(state, page);
+            deliver_trust(state, pages, asked);
+            // `agent.restore = "auto"`: only once the base page can take what it starts.
+            if view.is_base() {
+                restore_at_launch(state, pages);
+            }
+        }
+        // The last window's tabs are offered, and asked about, in the base page only.
+        InboundMessage::RestoreLast { .. } | InboundMessage::RestoreAnswer { .. } if !view.is_base() => {
+            refuse(page, RESTORE_IS_THE_BASE_PAGES);
         }
         InboundMessage::RestoreLast { .. } => {
             let tab = tab_of(target);
             let result = ask_for_restore(&mut state.borrow_mut(), tab, RestoreAsk::Dashboard);
-            match deliver_restore(state, page, result) {
+            match deliver_restore(state, pages, result) {
                 Ok(()) => ok(page),
                 Err(why) => refuse(page, &why),
             }
         }
         InboundMessage::RestoreAnswer { nonce, keep_bypass, .. } => {
             let result = answer_restore_question(&mut state.borrow_mut(), nonce, keep_bypass);
-            match deliver_restore(state, page, result) {
+            match deliver_restore(state, pages, result) {
                 Ok(()) => ok(page),
                 Err(why) => refuse(page, &why),
             }
@@ -5617,7 +6910,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         InboundMessage::SendMessage { text, .. } => {
             let tab = tab_of(target);
             // A sent prompt is history whether or not the backend takes it, as in Claude Code.
-            remember_prompts(state, page, std::slice::from_ref(&text));
+            remember_prompts(state, pages, std::slice::from_ref(&text));
             // ...and no longer the tab's draft (a refusal puts it back in the box panel-side).
             state.borrow_mut().tabs.note_sent(tab);
             enum Plan {
@@ -5670,7 +6963,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     if outcome.is_ok() {
                         title_from_first_prompt(state, tab, &text);
                     }
-                    apply_command_outcome(state, page, tab, &request_id, outcome);
+                    apply_command_outcome(state, pages, view, tab, &request_id, outcome);
                 }
                 // The `command_result` is owed once the connect finishes and the first turn is
                 // sent (`collect_pending_starts`), or when the question is put off.
@@ -5684,7 +6977,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                     // signal handler and aborts the window.
                     let started = gate_start(&mut state.borrow_mut(), tab, start);
                     match started {
-                        Ok(()) => send_tabs(state, page),
+                        Ok(()) => {
+                            note_start_page(&mut state.borrow_mut(), tab, &request_id, view);
+                            send_tabs(state, pages)
+                        }
                         Err(why) => refuse(page, &why),
                     }
                 }
@@ -5719,8 +7015,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 .tabs
                 .route_resume(tab, &agent, &provider_session_id, held);
             match route {
-                ResumeRoute::SwitchTo(_) => {
-                    send_switch(state, page);
+                // Already open: a bound tab is never selected, its view is shown instead; a base-view
+                // tab is the base view's now, and the base view is shown if the pick was elsewhere.
+                ResumeRoute::SwitchTo(open) => {
+                    let open_in = state.borrow().tabs.view_of(open);
+                    if open_in.is_base() {
+                        send_switch(state, pages);
+                    }
+                    if open_in != view {
+                        show_view(state, open_in);
+                    }
                     ok(page);
                 }
                 ResumeRoute::Refuse(why) => refuse(page, &why),
@@ -5732,10 +7036,19 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                         provider_session_id,
                         true,
                     );
+                    // An extra page's empty tab takes the resume itself; any other opens in a new
+                    // base-view tab, and the base view takes the keys.
+                    let started_in = state.borrow().tabs.view_of(target_tab);
                     match deferred {
                         // The command_result is owed once the connect finishes, or when the question
                         // is put off.
-                        Ok(()) => send_switch(state, page),
+                        Ok(()) => {
+                            note_start_page(&mut state.borrow_mut(), target_tab, &request_id, view);
+                            send_view(state, pages, started_in);
+                            if started_in != view {
+                                show_view(state, started_in);
+                            }
+                        }
                         Err(why) => refuse(page, &why),
                     }
                 }
@@ -5744,14 +7057,14 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
             let outcome = backend_for(&mut state.borrow_mut().tabs, tab).and_then(AgentBackend::interrupt);
-            apply_command_outcome(state, page, tab, &request_id, outcome);
+            apply_command_outcome(state, pages, view, tab, &request_id, outcome);
         }
         InboundMessage::StopBackground { running, .. } => {
             // The tab the question was asked in, never the one on screen now. A refusal is benign and
             // leaves the session alone; a taken stop ends the session through the pump, as a lost one.
             let tab = tab_of(target);
             let outcome = state.borrow_mut().tabs.stop_background(tab, running);
-            apply_command_outcome(state, page, tab, &request_id, outcome);
+            apply_command_outcome(state, pages, view, tab, &request_id, outcome);
         }
         message @ InboundMessage::PermissionResponse { .. } => {
             let tab = tab_of(target);
@@ -5761,19 +7074,24 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 (s.rules_dir.clone(), s.project_dir.clone(), s.answer_gate.clone())
             };
             // `Ctrl+y`, BROWSE's answer keys and a card's own buttons all arrive here, so one gate
-            // covers every way a card is answered.
-            let answered = through_answer_gate(gate.as_ref(), || {
-                answer_permission_response(
-                    &mut state.borrow_mut().tabs,
-                    rules_dir.as_deref(),
-                    &project_dir,
-                    tab,
-                    answer,
-                )
+            // covers every way a card is answered. Another page's card is refused before the window
+            // is asked; `answer_card` checks the page again, so a later change here cannot skip it.
+            let shown_here = page_may_answer(&state.borrow().tabs, tab, view);
+            let answered = shown_here.and_then(|()| {
+                through_answer_gate(gate.as_ref(), view, || {
+                    answer_permission_response(
+                        &mut state.borrow_mut().tabs,
+                        rules_dir.as_deref(),
+                        &project_dir,
+                        tab,
+                        view,
+                        answer,
+                    )
+                })
             });
             match answered {
                 Err(why) => refuse(page, &why),
-                Ok(outcome) => apply_command_outcome(state, page, tab, &request_id, outcome),
+                Ok(outcome) => apply_command_outcome(state, pages, view, tab, &request_id, outcome),
             }
         }
         InboundMessage::HintRequest { .. } => {
@@ -5881,8 +7199,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 // prompt was open for it -- a live tab's `Switch to bypass?` whose `y` would then also
                 // have moved the window default. Reached by clicks that never pass
                 // through the panel's y/n, so it is dropped here; `confirm_bypass`'s own re-check of
-                // which question was asked is the other half.
-                state_ref.tabs.drop_bypass_prompt();
+                // which question was asked is the other half. Only this page's: the click was here.
+                state_ref.tabs.drop_bypass_prompt_in(view);
                 let t = state_ref.tabs.get_mut(tab).expect("resolved above");
                 match std::mem::replace(&mut t.backend, TabBackend::NotStarted) {
                     TabBackend::Live(backend) => Some(backend),
@@ -5922,27 +7240,43 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                         command,
                         closed_rx,
                         dropped_rx,
+                        page: view,
                     });
                 }
             }
             // No command_result yet -- `collect_pending_handoffs` owes it once the close finishes.
-            send_tabs(state, page);
+            send_tabs(state, pages);
         }
+        // A pick in the chooser, which lists every tab: a base-view tab is selected there, and the
+        // base view shown if the pick was in another page; a tab bound to an extra view is never
+        // selected, its view is shown instead.
         InboundMessage::SelectTab { .. } => {
             let tab = tab_of(target);
-            state.borrow_mut().tabs.select(tab);
-            send_switch(state, page);
+            let place = state.borrow_mut().tabs.select_place(tab);
+            match place {
+                Some(TabPlace::View(shown_in, _)) => {
+                    if shown_in != view {
+                        show_view(state, shown_in);
+                    }
+                }
+                _ => {
+                    send_switch(state, pages);
+                    if !view.is_base() {
+                        show_view(state, ViewId::BASE);
+                    }
+                }
+            }
             ok(page);
         }
         InboundMessage::RenameTab { name, .. } => {
             let tab = tab_of(target);
             state.borrow_mut().tabs.rename(tab, &name);
-            send_tabs(state, page);
+            send_tabs(state, pages);
             ok(page);
         }
         InboundMessage::CloseTab { .. } => {
             let tab = tab_of(target);
-            match close_tab(state, page, tab) {
+            match close_tab(state, pages, tab) {
                 Ok(()) => ok(page),
                 Err(why) => refuse(page, why),
             }
@@ -5978,11 +7312,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                         }
                         state_ref.trust.forget_tab(tab);
                     }
+                    // The put-off start's command is answered in the page it was sent from.
+                    let owed = owed.map(|owed| {
+                        let asked_from = start_answer_dest(&mut state.borrow_mut(), tab, &owed);
+                        let asked_from = match asked_from {
+                            Dest::Page(asked_from) => asked_from,
+                            Dest::Tab(_) => view,
+                        };
+                        (owed, asked_from)
+                    });
                     // No lease check first: the tab's own old backend holds it until its teardown, which the
                     // start waits for. The command is answered when the connect finishes. The tab is selected
                     // only if it was on screen: a reset never moves the window to another tab.
                     let resumed = continued.map(|provider_session_id| {
-                        let on_screen = state.borrow().tabs.active() == tab;
+                        let on_screen = state.borrow().shown_in(tab).is_some();
                         resume_in(
                             &mut state.borrow_mut(),
                             tab,
@@ -5991,28 +7334,25 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                             on_screen,
                         )
                     });
-                    if let Some(Err(_)) = &resumed {
-                        state.borrow_mut().resume_after.remove(&tab);
+                    match &resumed {
+                        Some(Ok(())) => note_start_page(&mut state.borrow_mut(), tab, &request_id, view),
+                        Some(Err(_)) => {
+                            state.borrow_mut().resume_after.remove(&tab);
+                        }
+                        None => {}
                     }
                     // Before the draft the reset carries: the page puts a refused message back in
                     // its box itself, and the draft that follows then only confirms it.
-                    if let Some(owed) = owed {
-                        page.send(&serialize_command_result_for_js(
-                            &owed,
-                            Err(crate::trust_gate::NOT_STARTED),
-                        ));
+                    if let Some((owed, asked_from)) = owed {
+                        pages.send(
+                            asked_from,
+                            &serialize_command_result_for_js(&owed, Err(crate::trust_gate::NOT_STARTED)),
+                        );
                     }
-                    let payloads = {
-                        let mut state_ref = state.borrow_mut();
-                        if state_ref.tabs.active() == tab {
-                            // `tabs` and the (empty) tab's own state.
-                            switch_payloads(&mut state_ref)
-                        } else {
-                            vec![tabs_payload_recorded(&mut state_ref)]
-                        }
-                    };
-                    dispatch_all(page, payloads);
-                    send_hello_if_open_sessions_changed(state, page);
+                    // `tabs` and the (empty) tab's own state, in the page that shows it.
+                    let (shown_in, payloads) = shown_payloads(&mut state.borrow_mut(), tab);
+                    pages.send_all(shown_in, payloads);
+                    send_hello_if_open_sessions_changed(state, pages);
                     report_attention(state, before);
                     match resumed {
                         None => ok(page),
@@ -6034,10 +7374,10 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             // Bound as its own statement, not the match scrutinee: edition 2021 keeps a match
             // scrutinee's temporaries alive for the whole match, and the `Changed` arm below calls
             // `send_tabs`, which needs `state.borrow_mut()`.
-            let outcome = cycle_tab_mode(state, tab);
+            let outcome = cycle_tab_mode(state, tab, view);
             match outcome {
                 Ok(eitri_core::tab_set::ModeCycle::Changed(_)) => {
-                    send_tabs(state, page);
+                    send_tabs(state, pages);
                     ok(page);
                 }
                 Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => {
@@ -6049,8 +7389,8 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         }
         InboundMessage::OpenDetail { .. } => {
             let tab = tab_of(target);
-            // A route away from a bypass prompt (the panel cancels its own on `tab_detail`).
-            state.borrow_mut().tabs.drop_bypass_prompt();
+            // A route away from this page's bypass prompt (the panel cancels its own on `tab_detail`).
+            state.borrow_mut().tabs.drop_bypass_prompt_in(view);
             let payload = detail_payload(&state.borrow(), tab);
             page.send(&payload);
             ok(page);
@@ -6066,16 +7406,16 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             };
             match queued {
                 Ok(_) => {
-                    remember_prompts(state, page, std::slice::from_ref(&text));
+                    remember_prompts(state, pages, std::slice::from_ref(&text));
                     // The turn may have ended between the panel's Enter and this handler.
                     let flush = state.borrow_mut().tabs.flush_queue(tab);
                     match flush {
-                        Some(flush) => apply_flush(state, page, tab, flush),
+                        Some(flush) => apply_flush(state, pages, tab, flush),
                         None => {
                             // Into the running turn when its agent can take it; held otherwise. Never
                             // waits on the agent: the outcome arrives through the pump.
                             state.borrow_mut().tabs.steer_held(tab, now_ms(), turn_id.as_deref());
-                            send_queue(state, page, tab);
+                            send_queue(state, pages, tab);
                         }
                     }
                     ok(page);
@@ -6087,7 +7427,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             let tab = tab_of(target);
             let texts = state.borrow_mut().tabs.take_back_queue(tab);
             page.send(&eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &texts));
-            send_queue(state, page, tab);
+            send_queue(state, pages, tab);
             ok(page);
         }
         InboundMessage::SendNow { text, .. } => {
@@ -6099,17 +7439,17 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 state_ref.tabs.send_now(tab, &text, wire, now_ms())
             };
             if !text.trim().is_empty() {
-                remember_prompts(state, page, std::slice::from_ref(&text));
+                remember_prompts(state, pages, std::slice::from_ref(&text));
             }
             match result {
                 Err(why) => refuse(page, &why),
                 Ok(eitri_core::tab_set::SendNow::Interrupting(outcome)) => {
-                    send_queue(state, page, tab);
-                    apply_command_outcome(state, page, tab, &request_id, outcome);
+                    send_queue(state, pages, tab);
+                    apply_command_outcome(state, pages, view, tab, &request_id, outcome);
                 }
                 Ok(eitri_core::tab_set::SendNow::Flushed(flush)) => {
                     if let Some(flush) = flush {
-                        apply_flush(state, page, tab, flush);
+                        apply_flush(state, pages, tab, flush);
                     }
                     ok(page);
                 }
@@ -6120,7 +7460,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             state.borrow_mut().tabs.set_draft(tab_of(target), &text);
         }
         InboundMessage::HistoryPush { text, .. } => {
-            remember_prompts(state, page, std::slice::from_ref(&text));
+            remember_prompts(state, pages, std::slice::from_ref(&text));
             ok(page);
         }
         InboundMessage::OpenPath { path, line, .. } => {
@@ -6150,7 +7490,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             let started = job.and_then(|job| {
                 let draft = draft?;
                 let id = request_id.clone();
-                start_review_job(state, &request_id, Some((tab.0, turn)), move || {
+                start_review_job(state, view, &request_id, Some((tab.0, turn)), move || {
                     job.run()
                         .map(|overview| eitri_core::agent_bridge::serialize_review_for_js(&id, tab, &overview, &draft))
                         .map_err(|why| why.to_string())
@@ -6169,13 +7509,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         | InboundMessage::ReviewCommentRemove { .. }
         | InboundMessage::ReviewSend { .. }
         | InboundMessage::ReviewRecover { .. }
-        | InboundMessage::OpenInEditor { .. } => run_review_flow(state, page, message),
+        | InboundMessage::OpenInEditor { .. } => run_review_flow(state, pages, view, message),
         InboundMessage::ReviewDiffRequest { turn, scope, path, .. } => {
             let tab = tab_of(target);
             let job = state.borrow().tabs.review_diff_job(tab, turn, scope.into(), &path);
             let started = job.and_then(|job| {
                 let id = request_id.clone();
-                start_review_job(state, &request_id, None, move || {
+                start_review_job(state, view, &request_id, None, move || {
                     job.run()
                         .map(|diff| eitri_core::agent_bridge::serialize_review_diff_for_js(&id, tab, &diff))
                         .map_err(|why| why.to_string())
@@ -6243,17 +7583,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             page.send(&eitri_core::agent_bridge::serialize_scratch_for_js(tab, true));
             ok(page);
         }
-        // `<leader>bd`: quiet unless `close_needs_confirm`; `prefix &` never comes through here.
+        // `<leader>bd`: quiet unless `close_needs_confirm`, about the tab this page shows; `prefix &`
+        // never comes through here.
         InboundMessage::TabVerb {
             verb: TabVerbWire::Close,
             ..
-        } if !{
+        } if {
             let state_ref = state.borrow();
-            state_ref.tabs.close_needs_confirm(state_ref.tabs.active())
+            state_ref
+                .tab_of_page(view)
+                .is_some_and(|tab| !state_ref.tabs.close_needs_confirm(tab))
         } =>
         {
-            let active = state.borrow().tabs.active();
-            match close_tab(state, page, active) {
+            let shown = state.borrow().tab_of_page(view).expect("checked in the guard");
+            match close_tab(state, pages, shown) {
                 Ok(()) => ok(page),
                 Err(why) => refuse(page, why),
             }
@@ -6264,15 +7607,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             verb: TabVerbWire::New,
             agent: Some(word),
             ..
-        } => match open_tab_named(state, &word) {
+        } => match open_tab_named(state, view, &word) {
             Ok(()) => {
-                send_tabs(state, page);
-                page.send(&eitri_core::agent_bridge::serialize_enter_input_for_js());
+                send_tabs(state, pages);
+                // The new tab is the base view's: typed in an extra page, the base view is shown and
+                // takes the keys first.
+                if !view.is_base() {
+                    show_view(state, ViewId::BASE);
+                }
+                pages.send(ViewId::BASE, &eitri_core::agent_bridge::serialize_enter_input_for_js());
                 ok(page);
             }
             Err(why) => refuse(page, &why),
         },
-        InboundMessage::TabVerb { verb, .. } => match run_tab_verb(state, verb) {
+        InboundMessage::TabVerb { verb, .. } => match run_tab_verb(state, view, verb) {
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
         },
@@ -6280,9 +7628,9 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             // `Shift+Tab` on the chooser's `New session` row or a record: the window's
             // remembered default, exactly as `CycleMode` remembers a tab's own mode above. `Confirm`
             // dispatches the same y/n prompt, answered by a later `confirm_bypass` message.
-            match cycle_default_mode(state) {
+            match cycle_default_mode(state, view) {
                 eitri_core::tab_set::ModeCycle::Changed(_) => {
-                    send_tabs(state, page);
+                    send_tabs(state, pages);
                     ok(page);
                 }
                 eitri_core::tab_set::ModeCycle::Confirm(plan) => {
@@ -6291,10 +7639,13 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 }
             }
         }
+        // An extra view shows one tab: there are no others to close from its page.
+        InboundMessage::CloseOthers { .. } if !view.is_base() => refuse(page, ONE_TAB_HERE),
         InboundMessage::CloseOthers { .. } => {
             // `y` to `confirm_close_others`: recomputed fresh rather than
             // trusting the set the prompt was shown with, then `close_tab` -- the same close path
-            // `prefix &`'s own `y` runs -- once per tab.
+            // `prefix &`'s own `y` runs -- once per tab. Only the base view's tabs: another view's
+            // tab is not one of the strip's others.
             let ids = state
                 .borrow()
                 .tabs
@@ -6302,7 +7653,7 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
                 .map_or_else(Vec::new, |(ids, _)| ids);
             let mut first_err = None;
             for id in ids {
-                if let Err(why) = close_tab(state, page, id) {
+                if let Err(why) = close_tab(state, pages, id) {
                     first_err.get_or_insert(why);
                 }
             }
@@ -6315,15 +7666,20 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         // `AgentPanelHandle::panel_keys`. Never refused -- an unrecognised `mode` is a parse
         // failure in `parse_inbound_message`, not something that reaches here.
         InboundMessage::PanelKeys { mode, .. } => {
-            state.borrow().nav_mode.set(mode);
+            {
+                let state_ref = state.borrow();
+                if let Some(record) = state_ref.page(view) {
+                    record.nav_mode.set(mode);
+                }
+            }
             ok(page);
         }
-        InboundMessage::NavFallthrough { direction, .. } => match run_nav_fallthrough(state, direction) {
+        InboundMessage::NavFallthrough { direction, .. } => match run_nav_fallthrough(state, view, direction) {
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
         },
         // `Ctrl+w h/j/k/l` in the panel's BROWSE -- the move `Ctrl+h/j/k/l` make.
-        InboundMessage::PaneNav { direction, .. } => match run_pane_nav(state, direction) {
+        InboundMessage::PaneNav { direction, .. } => match run_pane_nav(state, view, direction) {
             Ok(()) => ok(page),
             Err(why) => refuse(page, why),
         },
@@ -6362,26 +7718,40 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
             ..
         } => {
             let tab = tab_of(target);
-            let out = answer_trust(
-                &mut state.borrow_mut(),
-                &request_id,
-                tab,
-                nonce,
-                &fingerprint,
-                &findings_digest,
-                trust,
-            );
-            deliver_trust(state, page, out);
+            // Only an answer this page may give meets the window's gate, asked with the state
+            // released; an `n` too, since a covered page's question may not be the one the user read.
+            let asked = trust_question_answered(&state.borrow(), tab, nonce, view);
+            let gate = state.borrow().answer_gate.clone();
+            let refused = match (asked, gate) {
+                (Some(_), Some(gate)) => gate(view).err(),
+                _ => None,
+            };
+            let out = match (asked, refused) {
+                (Some(asked), Some(why)) => {
+                    refuse_trust_answer(&mut state.borrow_mut(), &request_id, tab, nonce, asked, &why, view)
+                }
+                _ => answer_trust(
+                    &mut state.borrow_mut(),
+                    &request_id,
+                    tab,
+                    nonce,
+                    &fingerprint,
+                    &findings_digest,
+                    trust,
+                    view,
+                ),
+            };
+            deliver_trust(state, pages, out);
         }
         InboundMessage::TrustCancel { nonce, .. } => {
             let tab = tab_of(target);
-            let out = cancel_trust_question(&mut state.borrow_mut(), &request_id, tab, nonce);
-            deliver_trust(state, page, out);
+            let out = cancel_trust_question(&mut state.borrow_mut(), &request_id, tab, nonce, view);
+            deliver_trust(state, pages, out);
         }
         // `:trust` / `:untrust`: queued for the gate's worker; the notice and this command's
         // `command_result` come from the tick when it is done.
         InboundMessage::TrustCommand { action, agent, .. } => {
-            let refused = trust_command(&mut state.borrow_mut(), &request_id, action, &agent);
+            let refused = trust_command(&mut state.borrow_mut(), view, &request_id, action, &agent);
             if let Err(why) = refused {
                 refuse(page, &why);
             }
@@ -6395,39 +7765,45 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         // A tab's `y` approves every card still waiting in it, and the prompt itself may be what a
         // float hides, so it meets the window's card-answer gate first, with the state released, as a
         // card answer does: refused from a covered chat, nothing changes, and Shift+Tab asks again
-        // (the page has closed the prompt already).
+        // (the page has closed the prompt already). A tab's prompt is answered only from the page
+        // that shows the tab, checked before the window is asked.
         InboundMessage::ConfirmBypass { tab, scope, nonce, .. } => {
             let gate = state.borrow().answer_gate.clone();
-            match scope
-                .scope(tab)
-                .and_then(|scope| through_answer_gate(gate.as_ref(), || Ok(scope)))
-            {
+            let checked = scope.scope(tab).and_then(|scope| match scope {
+                eitri_core::tab_set::BypassScope::Tab(tab) => {
+                    page_may_answer(&state.borrow().tabs, tab, view).map(|()| scope)
+                }
+                eitri_core::tab_set::BypassScope::Default => Ok(scope),
+            });
+            match checked.and_then(|scope| through_answer_gate(gate.as_ref(), view, || Ok(scope))) {
                 Err(why) => refuse(page, &why),
                 Ok(scope) => {
                     let before = state.borrow().tabs.attention();
-                    match apply_confirm_bypass(state, scope, nonce) {
+                    match apply_confirm_bypass(state, scope, nonce, view) {
                         Ok(eitri_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
                             // On legacy the approved cards' resolutions exist
                             // only here (its CLI reports nothing for a hook reply), so without this the
                             // cards stayed drawn and counted as waiting until the next snapshot. A tab
-                            // scope is always the active tab (`confirm_bypass` refuses any other); the
-                            // window-default scope approves nothing, so `resolved` is empty there.
-                            let payload = {
-                                let state_ref = state.borrow();
-                                let active = state_ref.tabs.active();
-                                returned_events_payload(&state_ref, active, &resolved)
+                            // scope is always a tab this page shows (`confirm_bypass` refuses any
+                            // other); the window-default scope approves nothing, so `resolved` is
+                            // empty there.
+                            let payload = match scope {
+                                eitri_core::tab_set::BypassScope::Tab(tab) => {
+                                    returned_events_payload(&state.borrow(), tab, &resolved)
+                                }
+                                eitri_core::tab_set::BypassScope::Default => None,
                             };
-                            if let Some(payload) = payload {
-                                page.send(&payload);
+                            if let Some((shown_in, payload)) = payload {
+                                pages.send(shown_in, &payload);
                             }
-                            send_tabs(state, page);
+                            send_tabs(state, pages);
                             // The cards `confirm_bypass` just approved leave the tray at once, rather
                             // than waiting for a later poll to notice `attention()` dropped.
                             report_attention(state, before);
                             ok(page);
                         }
                         Ok(eitri_core::tab_set::ConfirmOutcome::AlreadyBypass) => {
-                            send_tabs(state, page);
+                            send_tabs(state, pages);
                             ok(page);
                         }
                         Ok(eitri_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
@@ -6474,13 +7850,17 @@ fn default_mode_said(configured: SessionModeChoice, remembered: Option<SessionMo
 /// auto in its place when it leaves bypass, which nobody chose, and remembered it would beat
 /// `init.lua`'s default on every later launch. A failure to write is logged, not refused: the mode
 /// itself did change.
-fn cycle_tab_mode(state: &Rc<RefCell<AgentPanelState>>, tab: TabId) -> Result<eitri_core::tab_set::ModeCycle, String> {
+fn cycle_tab_mode(
+    state: &Rc<RefCell<AgentPanelState>>,
+    tab: TabId,
+    page: ViewId,
+) -> Result<eitri_core::tab_set::ModeCycle, String> {
     let remembered_if_moved = state
         .borrow()
         .tabs
         .get(tab)
         .is_some_and(|t| matches!(t.backend, TabBackend::NotStarted) && !t.agent().mode_fixed_at_start());
-    let outcome = state.borrow_mut().tabs.cycle_mode(tab);
+    let outcome = state.borrow_mut().tabs.cycle_mode(tab, page);
     if let Ok(eitri_core::tab_set::ModeCycle::Changed(mode)) = &outcome {
         if remembered_if_moved {
             let (prefs_dir, project_dir) = {
@@ -6503,8 +7883,8 @@ fn cycle_tab_mode(state: &Rc<RefCell<AgentPanelState>>, tab: TabId) -> Result<ei
 /// forbidden too). A failure to write is logged, not refused, since the mode itself did change.
 /// Never touches the WebView, so it is tested directly; the arm above owns `send_tabs` and
 /// dispatching the prompt.
-fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>) -> eitri_core::tab_set::ModeCycle {
-    let outcome = state.borrow_mut().tabs.cycle_default_mode();
+fn cycle_default_mode(state: &Rc<RefCell<AgentPanelState>>, page: ViewId) -> eitri_core::tab_set::ModeCycle {
+    let outcome = state.borrow_mut().tabs.cycle_default_mode(page);
     if let eitri_core::tab_set::ModeCycle::Changed(mode) = outcome {
         let (prefs_dir, project_dir) = {
             let state_ref = state.borrow();
@@ -6528,31 +7908,32 @@ fn apply_confirm_bypass(
     state: &Rc<RefCell<AgentPanelState>>,
     scope: eitri_core::tab_set::BypassScope,
     nonce: u64,
+    page: ViewId,
 ) -> Result<eitri_core::tab_set::ConfirmOutcome, String> {
-    state.borrow_mut().tabs.confirm_bypass(scope, nonce)
+    state.borrow_mut().tabs.confirm_bypass(scope, nonce, page)
 }
 
 /// `tab_verb`: the hook `main.rs` installs via `on_tab_verb` (`run_tab_action`), mapped from the wire shape and called -- or a refusal naming why there is none yet (a
 /// legacy backend at startup, before `main.rs` has wired it). Never touches the WebView, so it is
 /// tested directly.
-fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, verb: TabVerbWire) -> Result<(), &'static str> {
+fn run_tab_verb(state: &Rc<RefCell<AgentPanelState>>, view: ViewId, verb: TabVerbWire) -> Result<(), &'static str> {
     // Cloned out in its own statement: a `state.borrow()` in the `match` scrutinee would live to
     // the end of the `match` (edition 2021), and the hook -- `main.rs`'s `run_tab_action` -- goes
     // back through this same state with `borrow_mut` (`switch_with`, `new_tab`), which panics.
     let hook = state.borrow().tab_verb_hook.clone();
     match hook {
         Some(hook) => {
-            hook(tab_action_for(verb));
+            hook(view, tab_action_for(verb));
             Ok(())
         }
         None => Err("tab verbs are not wired"),
     }
 }
 
-/// `tab_verb new` with an agent word (`:tabnew <agent>`): opens and selects a tab that runs the agent
-/// the word names, or refuses naming the words that are accepted. Touches no page, so it is tested
-/// directly.
-fn open_tab_named(state: &Rc<RefCell<AgentPanelState>>, word: &str) -> Result<(), String> {
+/// `tab_verb new` with an agent word (`:tabnew <agent>`, typed in `view`'s page): opens and selects a
+/// base-view tab that runs the agent the word names, or refuses naming the words that are accepted.
+/// Touches no page, so it is tested directly.
+fn open_tab_named(state: &Rc<RefCell<AgentPanelState>>, view: ViewId, word: &str) -> Result<(), String> {
     let mut state = state.borrow_mut();
     let registered: Vec<&str> = state.acp_agents.iter().map(|a| a.name.as_str()).collect();
     let Some(agent) = eitri_core::agent_prefs::agent_named(word, &registered) else {
@@ -6563,7 +7944,7 @@ fn open_tab_named(state: &Rc<RefCell<AgentPanelState>>, word: &str) -> Result<()
             accepted.join(", ")
         ));
     };
-    state.tabs.drop_bypass_prompt();
+    state.tabs.drop_bypass_prompt_in(view);
     state.tabs.open(agent);
     Ok(())
 }
@@ -6571,7 +7952,11 @@ fn open_tab_named(state: &Rc<RefCell<AgentPanelState>>, word: &str) -> Result<()
 /// `nav_fallthrough`: the hook `main.rs` installs via `on_nav_fallthrough`, called
 /// with the direction the page could not apply -- or a refusal naming why there is none yet. Never
 /// touches the WebView, so it is tested directly, the same shape as `run_tab_verb`.
-fn run_nav_fallthrough(state: &Rc<RefCell<AgentPanelState>>, direction: NavKeyDirection) -> Result<(), &'static str> {
+fn run_nav_fallthrough(
+    state: &Rc<RefCell<AgentPanelState>>,
+    view: ViewId,
+    direction: NavKeyDirection,
+) -> Result<(), &'static str> {
     let hook = state.borrow().nav_fallthrough_hook.clone();
     match hook {
         Some(hook) => {
@@ -6579,7 +7964,7 @@ fn run_nav_fallthrough(state: &Rc<RefCell<AgentPanelState>>, direction: NavKeyDi
                 NavKeyDirection::Down => Direction::Down,
                 NavKeyDirection::Up => Direction::Up,
             };
-            hook(direction);
+            hook(view, direction);
             Ok(())
         }
         None => Err("nav fallthrough is not wired"),
@@ -6588,15 +7973,22 @@ fn run_nav_fallthrough(state: &Rc<RefCell<AgentPanelState>>, direction: NavKeyDi
 
 /// `pane_nav`: the same hook `nav_fallthrough` uses -- `main.rs` installs it as
 /// `move_focus(&ModuleId::agent(), direction)`, exactly what `Ctrl+h/j/k/l` do from the panel.
-fn run_pane_nav(state: &Rc<RefCell<AgentPanelState>>, direction: PaneNavDirection) -> Result<(), &'static str> {
+fn run_pane_nav(
+    state: &Rc<RefCell<AgentPanelState>>,
+    view: ViewId,
+    direction: PaneNavDirection,
+) -> Result<(), &'static str> {
     let hook = state.borrow().nav_fallthrough_hook.clone();
     let hook = hook.ok_or("pane nav is not wired")?;
-    hook(match direction {
-        PaneNavDirection::Left => Direction::Left,
-        PaneNavDirection::Down => Direction::Down,
-        PaneNavDirection::Up => Direction::Up,
-        PaneNavDirection::Right => Direction::Right,
-    });
+    hook(
+        view,
+        match direction {
+            PaneNavDirection::Left => Direction::Left,
+            PaneNavDirection::Down => Direction::Down,
+            PaneNavDirection::Up => Direction::Up,
+            PaneNavDirection::Right => Direction::Right,
+        },
+    );
     Ok(())
 }
 
@@ -6740,11 +8132,15 @@ fn tab_action_for(verb: TabVerbWire) -> TabAction {
 /// A tab closed while it is still connecting has its `send_message`/`resume` answered with an
 /// error here, so the panel's in-flight record is closed and a first message comes back with its
 /// text; its connect is kept in `Retiring` and shut down when it finishes.
-fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId) -> Result<(), &'static str> {
+///
+/// A tab bound to an extra view leaves that view empty: its page is sent its empty strip, and the
+/// window is told by the next tick (`on_view_empty`), never from inside a page's own message.
+fn close_tab(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId) -> Result<(), &'static str> {
     let before = state.borrow().tabs.attention();
     let Some(facts) = state.borrow().tabs.close_facts(tab) else {
         return Ok(());
     };
+    let view = state.borrow().tabs.view_of(tab);
     if state
         .borrow()
         .tabs
@@ -6755,6 +8151,8 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId)
     }
     // A wait for the tab's old backend goes with the tab; nothing will start in it.
     state.borrow_mut().resume_after.remove(&tab);
+    // Taken before the removal: a start asked from a page the tab has since left is answered there.
+    let start_page = state.borrow_mut().start_pages.remove(&tab);
     let mut owed = Vec::new();
     for step in eitri_core::tabs::close_steps(&facts) {
         match step {
@@ -6771,7 +8169,7 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId)
             // The queued words outlive the tab as history.
             eitri_core::tabs::CloseStep::QueueToHistory => {
                 let texts = state.borrow().tabs.queue_texts(tab);
-                remember_prompts(state, page, &texts);
+                remember_prompts(state, pages, &texts);
             }
             // Folded into `Remove`: `Retiring::tab` shuts the removed tab's backend down.
             eitri_core::tabs::CloseStep::Shutdown => {}
@@ -6786,16 +8184,32 @@ fn close_tab(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage, tab: TabId)
             }
         }
     }
-    let payloads = switch_payloads(&mut state.borrow_mut());
-    dispatch_all(page, payloads);
+    if view.is_base() {
+        let payloads = switch_payloads(&mut state.borrow_mut());
+        pages.send_all(ViewId::BASE, payloads);
+    } else {
+        let payload = tabs_payload_recorded(&mut state.borrow_mut(), view);
+        pages.send(view, &payload);
+        state.borrow_mut().emptied_views.push(view);
+    }
     // After the switch, not before: the panel restores a refused send into the composer only while
     // its tab is the active one, and the switch that follows would then replace it with the next
     // tab's draft. Answered once the closed tab is no longer active, the refusal is reported with
     // the message's full text instead, and the switch cannot clear that notice.
+    // The page that sent a request holds it, and it may not be the page that showed the tab: a first
+    // message sent in the base view, its tab broken out while it waited, is still the base page's to
+    // report (with its text) and to take back.
     for request_id in owed {
-        page.send(&serialize_command_result_for_js(&request_id, Err(TAB_CLOSED_MESSAGE)));
+        let asked_from = match &start_page {
+            Some((asked, page)) if *asked == request_id => *page,
+            _ => view,
+        };
+        pages.send(
+            asked_from,
+            &serialize_command_result_for_js(&request_id, Err(TAB_CLOSED_MESSAGE)),
+        );
     }
-    send_hello_if_open_sessions_changed(state, page);
+    send_hello_if_open_sessions_changed(state, pages);
     report_attention(state, before);
     Ok(())
 }
@@ -7029,7 +8443,14 @@ mod tests {
         .unwrap();
         let tab = set.resolve(message.tab_ref()).unwrap().unwrap();
         // The production route itself (`InboundMessage::PermissionResponse`'s whole body).
-        let outcome = answer_permission_response(&mut set, None, &dir, tab, PermissionAnswer::of(message).unwrap());
+        let outcome = answer_permission_response(
+            &mut set,
+            None,
+            &dir,
+            tab,
+            ViewId::BASE,
+            PermissionAnswer::of(message).unwrap(),
+        );
         assert!(
             matches!(outcome, Ok(Ok(_))),
             "{:?}",
@@ -7079,7 +8500,8 @@ mod tests {
         handle.set_answer_gate(Rc::new({
             let covered = covered.clone();
             let asked = asked.clone();
-            move || {
+            move |view: ViewId| {
+                assert_eq!(view, ViewId::BASE, "asked with the view of the page that answered");
                 asked.set(asked.get() + 1);
                 if covered.get() {
                     Err(COVERED.to_string())
@@ -7089,7 +8511,7 @@ mod tests {
             }
         }));
         let answer = |request: &str, permission: &str| {
-            handle.page_message(&format!(
+            handle.page_message(ViewId::BASE, &format!(
                 r#"{{"type":"permission_response","request_id":"{request}","tab":{},"permission_id":"{permission}","decision":"allow"}}"#,
                 tab.0
             ));
@@ -7105,10 +8527,13 @@ mod tests {
 
         // A tab's bypass `y` approves every card waiting in it, so from a covered chat it meets the
         // same gate before anything about the prompt is checked, and both cards stay.
-        handle.page_message(&format!(
-            r#"{{"type":"confirm_bypass","request_id":"b1","tab":{},"scope":"tab","nonce":1}}"#,
-            tab.0
-        ));
+        handle.page_message(
+            ViewId::BASE,
+            &format!(
+                r#"{{"type":"confirm_bypass","request_id":"b1","tab":{},"scope":"tab","nonce":1}}"#,
+                tab.0
+            ),
+        );
         assert_eq!(result_for(&page.sent.borrow(), "b1"), Some(Err(COVERED.to_string())));
         for id in ["perm-1", "perm-2"] {
             assert!(
@@ -7165,26 +8590,34 @@ mod tests {
         let covered = Rc::new(Cell::new(true));
         handle.set_coverage(Rc::new({
             let covered = covered.clone();
-            move || covered.get()
+            move |_view| covered.get()
         }));
-        handle.page_shown();
+        handle.page_shown(ViewId::BASE);
         assert!(unread(), "mapped under a float is not seen");
-        assert!(!on_screen(&state, handle.page.as_deref().unwrap()));
+        assert!(!on_screen(
+            &state,
+            ViewId::BASE,
+            &handle.pages.live(ViewId::BASE).unwrap()
+        ));
 
         covered.set(false);
-        handle.page_shown();
+        handle.page_shown(ViewId::BASE);
         assert!(!unread(), "seen once the float is off it");
-        assert!(on_screen(&state, handle.page.as_deref().unwrap()));
+        assert!(on_screen(
+            &state,
+            ViewId::BASE,
+            &handle.pages.live(ViewId::BASE).unwrap()
+        ));
 
         page.visible.set(false);
         assert!(
-            !on_screen(&state, handle.page.as_deref().unwrap()),
+            !on_screen(&state, ViewId::BASE, &handle.pages.live(ViewId::BASE).unwrap()),
             "an unmapped page is never on screen"
         );
         state.borrow_mut().coverage = None;
         page.visible.set(true);
         assert!(
-            on_screen(&state, handle.page.as_deref().unwrap()),
+            on_screen(&state, ViewId::BASE, &handle.pages.live(ViewId::BASE).unwrap()),
             "no probe: mapped is on screen"
         );
     }
@@ -7225,7 +8658,14 @@ mod tests {
         ))
         .unwrap();
         let tab = set.resolve(message.tab_ref()).unwrap().unwrap();
-        let outcome = answer_permission_response(&mut set, None, &dir, tab, PermissionAnswer::of(message).unwrap());
+        let outcome = answer_permission_response(
+            &mut set,
+            None,
+            &dir,
+            tab,
+            ViewId::BASE,
+            PermissionAnswer::of(message).unwrap(),
+        );
         assert!(matches!(outcome, Ok(Ok(_))));
 
         provider.queue(agent::AgentDomainEvent::PermissionResolved {
@@ -7383,7 +8823,7 @@ mod tests {
             state.clone(),
             Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
         );
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         let notices = || {
             page.sent
                 .borrow()
@@ -7442,7 +8882,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(notices().is_empty(), "nothing is said to a page that is not ready");
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         let said = notices();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("gem tabs have no manual mode"), "{said:?}");
@@ -7550,7 +8990,7 @@ mod tests {
     fn ready_gets_its_envelopes_in_their_fixed_order() {
         let (handle, page) = handle_with_strict_page();
         page.inner.visible.set(true);
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         let kinds: Vec<String> = page.inner.sent.borrow().iter().map(|e| kind_of(e)).collect();
         let at = |k: &str| {
             kinds
@@ -7574,7 +9014,7 @@ mod tests {
         use eitri_core::agent_prefs::ThinkingDisplay;
         let (handle, page) = handle_with_strict_page();
         page.inner.visible.set(true);
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         let displays = |page: &std::cell::RefCell<Vec<String>>| -> Vec<String> {
             page.borrow()
                 .iter()
@@ -7590,7 +9030,7 @@ mod tests {
         assert_eq!(displays(&page.inner.sent), vec!["collapsed"]);
         handle.set_thinking_display(ThinkingDisplay::Hidden);
         assert_eq!(displays(&page.inner.sent), vec!["collapsed", "hidden"]);
-        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
         assert_eq!(displays(&page.inner.sent), vec!["collapsed", "hidden", "hidden"]);
     }
 
@@ -7601,7 +9041,7 @@ mod tests {
     fn the_review_settings_are_told_at_once_and_again_on_every_ready() {
         let (handle, page) = handle_with_strict_page();
         page.inner.visible.set(true);
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         let settings = |page: &std::cell::RefCell<Vec<String>>| -> Vec<(bool, bool)> {
             page.borrow()
                 .iter()
@@ -7621,7 +9061,7 @@ mod tests {
             hint: true,
         });
         assert_eq!(settings(&page.inner.sent), vec![(false, false), (true, true)]);
-        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
         assert_eq!(
             settings(&page.inner.sent),
             vec![(false, false), (true, true), (true, true)]
@@ -7636,14 +9076,14 @@ mod tests {
     #[test]
     fn the_tick_runs_until_the_close_and_never_after() {
         let (handle, page) = handle_with_strict_page();
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         assert!(handle.tick());
         assert!(handle.tick());
         let watch = handle.shutdown();
         assert!(watch.is_empty(), "no tab ever started a backend");
         assert!(!handle.tick());
         let before = page.inner.sent.borrow().len();
-        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
         assert_eq!(
             page.inner.sent.borrow().len(),
             before,
@@ -7660,7 +9100,6 @@ mod tests {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("panel-retiring-presence");
         let (handle, page, _host) = handle_with_recording_page();
-        let panel_page = handle.page.clone().unwrap();
         let provider = std::sync::Arc::new(ExternalRecordingProvider::codex());
         let release = provider.hold_close();
         let (codex, survivor, guard) = {
@@ -7692,7 +9131,7 @@ mod tests {
         }
         assert_eq!(guard.check(), Ok(()), "nothing runs yet");
 
-        close_tab(&handle.state, &panel_page, codex).unwrap();
+        close_tab(&handle.state, &handle.pages, codex).unwrap();
         assert!(handle.state.borrow().tabs.get(codex).is_none());
         assert!(handle.state.borrow().tabs.get(survivor).is_some());
         page.visible.set(true);
@@ -7784,9 +9223,10 @@ mod tests {
         };
         let stop = |request: &str, tab: Option<TabId>| {
             let tab = tab.map_or(String::new(), |t| format!(r#","tab":{}"#, t.0));
-            handle.page_message(&format!(
-                r#"{{"type":"stop_background","request_id":"{request}"{tab},"running":1}}"#
-            ));
+            handle.page_message(
+                ViewId::BASE,
+                &format!(r#"{{"type":"stop_background","request_id":"{request}"{tab},"running":1}}"#),
+            );
         };
 
         stop("s0", Some(TabId(9_999)));
@@ -7833,10 +9273,10 @@ mod tests {
         assert_eq!(wire(codex)["resumesOnR"], true);
         assert_eq!(wire(on_screen)["resumesOnR"], false);
         let release = provider.hold_close();
-        handle.page_message(&format!(
-            r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#,
-            codex.0
-        ));
+        handle.page_message(
+            ViewId::BASE,
+            &format!(r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#, codex.0),
+        );
         {
             let state_ref = handle.state.borrow();
             let tab = state_ref.tabs.get(codex).unwrap();
@@ -7918,10 +9358,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(handle.state.borrow().tabs.resumes_on_r(codex), None);
-        handle.page_message(&format!(
-            r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#,
-            codex.0
-        ));
+        handle.page_message(
+            ViewId::BASE,
+            &format!(r#"{{"type":"reset_tab","request_id":"r1","tab":{}}}"#, codex.0),
+        );
         assert!(matches!(
             handle.state.borrow().tabs.get(codex).unwrap().backend,
             TabBackend::NotStarted
@@ -7946,7 +9386,7 @@ mod tests {
         };
         handle.state.borrow_mut().editor_context = Rc::new(move || Some(context.clone()));
         handle.state.borrow_mut().project_dir = PathBuf::from("/p");
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         for _ in 0..10 {
             handle.tick();
         }
@@ -7971,7 +9411,7 @@ mod tests {
     fn settled_panel() -> (AgentPanelHandle, Rc<RecordingPage>) {
         let (handle, page, _host) = handle_with_recording_page();
         page.visible.set(true);
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         let now = std::time::Instant::now();
         handle.take_wake(now);
         assert_eq!(
@@ -8009,7 +9449,7 @@ mod tests {
             page.sent.borrow()[sent..].iter().any(|p| kind_of(p) == "tabs"),
             "the new tab reached the page"
         );
-        handle.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
         assert!(handle.take_wake(now).is_some(), "a page message wakes it");
     }
 
@@ -8142,6 +9582,7 @@ mod tests {
         let (_review_tx, review_rx) = mpsc::channel();
         handle.state.borrow_mut().review_jobs.push(PendingReview {
             request_id: "r".into(),
+            view: ViewId::BASE,
             rx: review_rx,
             clears_hint: None,
         });
@@ -8277,6 +9718,7 @@ mod tests {
             "nav_intercept",
             "attention",
             "newest_card_label",
+            "newest_card_label_in",
             "running_count",
             "queued_count",
         ];
@@ -8331,9 +9773,9 @@ mod tests {
     #[test]
     fn a_clicked_web_link_goes_to_the_host_and_anything_else_is_refused_on_the_page() {
         let (handle, page, host) = handle_with_recording_page();
-        handle.link_clicked(Some("https://example.com/a"));
-        handle.link_clicked(Some("tel:123"));
-        handle.link_clicked(None);
+        handle.link_clicked(ViewId::BASE, Some("https://example.com/a"));
+        handle.link_clicked(ViewId::BASE, Some("tel:123"));
+        handle.link_clicked(ViewId::BASE, None);
         assert_eq!(*host.opened.borrow(), vec!["https://example.com/a".to_owned()]);
         let kinds: Vec<String> = page.sent.borrow().iter().map(|e| kind_of(e)).collect();
         assert_eq!(kinds, vec!["notice", "notice"]);
@@ -8342,7 +9784,7 @@ mod tests {
     #[test]
     fn the_first_document_is_the_themed_bundle_at_the_panel_base() {
         let (handle, page, _host) = handle_with_recording_page();
-        handle.load_first_document();
+        handle.load_document(ViewId::BASE);
         let documents = page.documents.borrow();
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].1, PANEL_BASE_URI);
@@ -8353,10 +9795,10 @@ mod tests {
     #[test]
     fn a_crash_reloads_the_bundle_and_repeated_crashes_give_up() {
         let (handle, page, _host) = handle_with_recording_page();
-        handle.page_gone("Crashed");
+        handle.page_gone(ViewId::BASE, "Crashed");
         assert_eq!(page.documents.borrow().len(), 1, "one reload");
         for _ in 0..10 {
-            handle.page_gone("Crashed");
+            handle.page_gone(ViewId::BASE, "Crashed");
         }
         let last = page.documents.borrow().last().cloned().unwrap();
         assert_eq!(last.1, PANEL_BASE_URI);
@@ -8369,8 +9811,14 @@ mod tests {
     #[test]
     fn open_url_goes_to_the_host_only_for_a_web_address() {
         let (handle, page, host) = handle_with_recording_page();
-        handle.page_message(r#"{"type":"open_url","request_id":"a","url":"https://example.com/"}"#);
-        handle.page_message(r#"{"type":"open_url","request_id":"b","url":"file:///etc/passwd"}"#);
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"open_url","request_id":"a","url":"https://example.com/"}"#,
+        );
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"open_url","request_id":"b","url":"file:///etc/passwd"}"#,
+        );
         assert_eq!(*host.opened.borrow(), vec!["https://example.com/".to_owned()]);
         assert_eq!(
             page.sent
@@ -8394,6 +9842,86 @@ mod tests {
     /// A spawner whose every start fails at once (its sender is gone), so no test starts a process.
     fn spawn_nothing() -> Spawner {
         Spawner::Fake(Rc::new(RefCell::new(|_call: SpawnCall| mpsc::channel().1)))
+    }
+
+    /// Each chat view's chip shows its own tabs, so the hook hears a tab's own change even when the
+    /// window's sum stays where it was, and both views handed a card in one pump are named.
+    #[test]
+    fn the_attention_hook_hears_each_views_change_and_names_every_view_handed_a_card() {
+        use agent::AgentDomainEvent;
+        use eitri_core::attention::Attention;
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let base = tabs.active();
+        let moved = tabs.open(eitri_core::tab_set::AgentId::Claude);
+        let two = ViewId::new(2).unwrap();
+        assert_eq!(tabs.break_out(two), Ok(moved));
+        let state = state_for_hooks(tabs);
+        // Each call: whether the window's value changed, and the views handed a card.
+        type Heard = Rc<RefCell<Vec<(bool, Vec<ViewId>)>>>;
+        let heard: Heard = Rc::default();
+        {
+            let heard = heard.clone();
+            state.borrow_mut().attention_hook = Some(Rc::new(
+                move |before: Attention, after: Attention, handed: &[ViewId]| {
+                    heard.borrow_mut().push((before != after, handed.to_vec()));
+                },
+            ));
+        }
+        let finished = AgentDomainEvent::TurnCompleted {
+            turn_id: "t".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let card = |id: &str| AgentDomainEvent::PermissionRequested {
+            permission_id: id.into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({}),
+            provider_prompt: None,
+        };
+        let observe = |tab: TabId, event: &AgentDomainEvent| {
+            let before = state.borrow().tabs.attention();
+            state
+                .borrow_mut()
+                .tabs
+                .get_mut(tab)
+                .unwrap()
+                .attention
+                .observe(std::slice::from_ref(event), false);
+            report_attention(&state, before);
+        };
+
+        observe(base, &finished);
+        assert_eq!(heard.borrow_mut().pop(), Some((true, vec![])));
+        // The window was already unread: only agent 2's chip changes.
+        observe(moved, &finished);
+        assert_eq!(heard.borrow_mut().pop(), Some((false, vec![])));
+        // Nothing changed: not told.
+        observe(moved, &finished);
+        assert_eq!(heard.borrow_mut().pop(), None);
+
+        // agent 2 is handed a card first, the base view the newest, before one report.
+        let before = state.borrow().tabs.attention();
+        {
+            let mut state = state.borrow_mut();
+            state
+                .tabs
+                .get_mut(moved)
+                .unwrap()
+                .attention
+                .observe(&[card("p1")], false);
+            state
+                .tabs
+                .get_mut(base)
+                .unwrap()
+                .attention
+                .observe(&[card("p2")], false);
+        }
+        report_attention(&state, before);
+        assert_eq!(heard.borrow_mut().pop(), Some((true, vec![two, ViewId::BASE])));
     }
 
     /// `review.enabled` and `review.hint` reach the panel's state: enabled installs a review and the hint
@@ -8527,17 +10055,17 @@ mod tests {
         let tabs_before: Vec<TabId> = state.borrow().tabs.tabs().iter().map(|t| t.id).collect();
 
         // Focus and arrival (`pane_focus`, `move_focus`, `arrive`), the prefix's panel keys.
-        handle.set_pane_focused(true);
-        handle.arrive();
-        handle.enter_input();
-        handle.nav_key(NavKeyDirection::Down);
-        handle.literal_key(&eitri_core::keymap::KeySpec::parse("C-b").unwrap());
-        handle.open_keymap(None, 0);
-        handle.open_command_line();
+        handle.set_pane_focused(ViewId::BASE, true);
+        handle.arrive(ViewId::BASE);
+        handle.enter_input(ViewId::BASE);
+        handle.nav_key(ViewId::BASE, NavKeyDirection::Down);
+        handle.literal_key(ViewId::BASE, &eitri_core::keymap::KeySpec::parse("C-b").unwrap());
+        handle.open_keymap(ViewId::BASE, None, 0);
+        handle.open_command_line(ViewId::BASE);
         handle.set_keymap_help("{}".to_string());
-        assert!(state.borrow().pane_focused);
-        assert_eq!(handle.panel_keys(), PanelKeys::Other);
-        handle.set_pane_focused(false);
+        assert!(state.borrow().page(ViewId::BASE).unwrap().pane_focused);
+        assert_eq!(handle.panel_keys(ViewId::BASE), PanelKeys::Other);
+        handle.set_pane_focused(ViewId::BASE, false);
 
         // HINT (`hint::HintCoordinator`): every envelope is a no-op.
         handle.hint_collect(1);
@@ -8554,28 +10082,31 @@ mod tests {
         handle.set_panel_font_size_px(19.0);
         handle.set_editor_row_px(21.0);
         assert_eq!(state.borrow().theme.font_size_px, 19.0);
-        handle.reload_document();
-        handle.reload_document_by_hand();
-        handle.page_gone("Crashed");
-        handle.load_first_document();
-        handle.page_shown();
-        handle.link_clicked(Some("https://example.com/"));
+        handle.reload_document(ViewId::BASE);
+        handle.reload_document_by_hand(ViewId::BASE);
+        handle.page_gone(ViewId::BASE, "Crashed");
+        handle.load_document(ViewId::BASE);
+        handle.page_shown(ViewId::BASE);
+        handle.link_clicked(ViewId::BASE, Some("https://example.com/"));
         // A page message is the one way a command reaches the host, and there is no page to post one.
-        handle.page_message(r#"{"type":"open_url","request_id":"a","url":"https://example.com/"}"#);
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"open_url","request_id":"a","url":"https://example.com/"}"#,
+        );
         assert!(host.opened.borrow().is_empty());
 
         // The tab verbs refuse: nothing a user could not see is opened, closed or switched to.
         handle.new_tab();
         assert!(!handle.step(1));
         assert!(!handle.select_last());
-        assert!(!handle.select_number(1));
-        handle.begin_rename();
-        handle.confirm_close();
+        assert!(handle.select_number(1).is_none());
+        handle.begin_rename(ViewId::BASE);
+        handle.confirm_close(ViewId::BASE);
         handle.confirm_close_others();
-        handle.open_chooser();
-        handle.open_detail();
-        assert!(!handle.focus_oldest_card());
-        assert_eq!(handle.close_every_tab(), Ok(0));
+        handle.open_chooser(ViewId::BASE);
+        handle.open_detail(ViewId::BASE);
+        assert!(!handle.focus_oldest_card(ViewId::BASE));
+        assert_eq!(handle.close_view_tabs(ViewId::BASE), Ok(0));
         let tabs_after: Vec<TabId> = state.borrow().tabs.tabs().iter().map(|t| t.id).collect();
         assert_eq!(tabs_after, tabs_before);
 
@@ -8597,12 +10128,15 @@ mod tests {
             BackendKind::Sidecar,
             eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
-        assert_eq!(run_tab_verb(&state, TabVerbWire::Close), Err("tab verbs are not wired"));
+        assert_eq!(
+            run_tab_verb(&state, ViewId::BASE, TabVerbWire::Close),
+            Err("tab verbs are not wired")
+        );
 
         let seen: Rc<RefCell<Vec<TabAction>>> = Rc::new(RefCell::new(Vec::new()));
         {
             let seen = seen.clone();
-            state.borrow_mut().tab_verb_hook = Some(Rc::new(move |action| seen.borrow_mut().push(action)));
+            state.borrow_mut().tab_verb_hook = Some(Rc::new(move |_view, action| seen.borrow_mut().push(action)));
         }
         for (verb, action) in [
             (TabVerbWire::Next, TabAction::Next),
@@ -8614,7 +10148,7 @@ mod tests {
             (TabVerbWire::Choose, TabAction::Choose),
             (TabVerbWire::Info, TabAction::Info),
         ] {
-            assert_eq!(run_tab_verb(&state, verb), Ok(()));
+            assert_eq!(run_tab_verb(&state, ViewId::BASE, verb), Ok(()));
             assert_eq!(seen.borrow_mut().pop(), Some(action), "{verb:?} -> {action:?}");
         }
     }
@@ -8632,13 +10166,13 @@ mod tests {
         {
             let weak = Rc::downgrade(&state);
             let ran = ran.clone();
-            state.borrow_mut().tab_verb_hook = Some(Rc::new(move |_action| {
+            state.borrow_mut().tab_verb_hook = Some(Rc::new(move |_view, _action| {
                 let state = weak.upgrade().expect("state alive");
                 let _guard = state.borrow_mut();
                 *ran.borrow_mut() += 1;
             }));
         }
-        assert_eq!(run_tab_verb(&state, TabVerbWire::Next), Ok(()));
+        assert_eq!(run_tab_verb(&state, ViewId::BASE, TabVerbWire::Next), Ok(()));
         assert_eq!(*ran.borrow(), 1);
     }
 
@@ -8650,10 +10184,13 @@ mod tests {
             BackendKind::Sidecar,
             eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
-        assert_eq!(state.borrow().nav_mode.get(), PanelKeys::Other);
+        assert_eq!(
+            state.borrow().page(ViewId::BASE).unwrap().nav_mode.get(),
+            PanelKeys::Other
+        );
         for mode in [PanelKeys::Browse, PanelKeys::Input, PanelKeys::Other] {
-            state.borrow().nav_mode.set(mode);
-            assert_eq!(state.borrow().nav_mode.get(), mode);
+            state.borrow().page(ViewId::BASE).unwrap().nav_mode.set(mode);
+            assert_eq!(state.borrow().page(ViewId::BASE).unwrap().nav_mode.get(), mode);
         }
     }
 
@@ -8668,10 +10205,10 @@ mod tests {
             eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         for stale in [PanelKeys::Input, PanelKeys::Browse] {
-            state.borrow().nav_mode.set(stale);
-            reset_nav_mode_for_ready(&state.borrow());
+            state.borrow().page(ViewId::BASE).unwrap().nav_mode.set(stale);
+            reset_nav_mode_for_ready(&state.borrow(), ViewId::BASE);
             assert_eq!(
-                state.borrow().nav_mode.get(),
+                state.borrow().page(ViewId::BASE).unwrap().nav_mode.get(),
                 PanelKeys::Other,
                 "stale {stale:?} must clear"
             );
@@ -8688,9 +10225,13 @@ mod tests {
             eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         for stale in [PanelKeys::Input, PanelKeys::Browse] {
-            state.borrow().nav_mode.set(stale);
-            forget_the_pages_nav_mode(&state.borrow());
-            assert_eq!(state.borrow().nav_mode.get(), PanelKeys::Other, "stale {stale:?}");
+            state.borrow().page(ViewId::BASE).unwrap().nav_mode.set(stale);
+            forget_the_pages_nav_mode(&state.borrow(), ViewId::BASE);
+            assert_eq!(
+                state.borrow().page(ViewId::BASE).unwrap().nav_mode.get(),
+                PanelKeys::Other,
+                "stale {stale:?}"
+            );
         }
     }
 
@@ -8704,20 +10245,21 @@ mod tests {
             eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         assert_eq!(
-            run_nav_fallthrough(&state, NavKeyDirection::Down),
+            run_nav_fallthrough(&state, ViewId::BASE, NavKeyDirection::Down),
             Err("nav fallthrough is not wired")
         );
 
         let seen: Rc<RefCell<Vec<Direction>>> = Rc::new(RefCell::new(Vec::new()));
         {
             let seen = seen.clone();
-            state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |direction| seen.borrow_mut().push(direction)));
+            state.borrow_mut().nav_fallthrough_hook =
+                Some(Rc::new(move |_view, direction| seen.borrow_mut().push(direction)));
         }
         for (wire, direction) in [
             (NavKeyDirection::Down, Direction::Down),
             (NavKeyDirection::Up, Direction::Up),
         ] {
-            assert_eq!(run_nav_fallthrough(&state, wire), Ok(()));
+            assert_eq!(run_nav_fallthrough(&state, ViewId::BASE, wire), Ok(()));
             assert_eq!(seen.borrow_mut().pop(), Some(direction), "{wire:?} -> {direction:?}");
         }
     }
@@ -8739,13 +10281,18 @@ mod tests {
             PaneNavDirection::Up,
             PaneNavDirection::Right,
         ] {
-            assert_eq!(run_pane_nav(&state, wire), Err("pane nav is not wired"), "{wire:?}");
+            assert_eq!(
+                run_pane_nav(&state, ViewId::BASE, wire),
+                Err("pane nav is not wired"),
+                "{wire:?}"
+            );
         }
 
         let seen: Rc<RefCell<Vec<Direction>>> = Rc::new(RefCell::new(Vec::new()));
         {
             let seen = seen.clone();
-            state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |direction| seen.borrow_mut().push(direction)));
+            state.borrow_mut().nav_fallthrough_hook =
+                Some(Rc::new(move |_view, direction| seen.borrow_mut().push(direction)));
         }
         for (wire, direction) in [
             (PaneNavDirection::Left, Direction::Left),
@@ -8753,7 +10300,7 @@ mod tests {
             (PaneNavDirection::Up, Direction::Up),
             (PaneNavDirection::Right, Direction::Right),
         ] {
-            assert_eq!(run_pane_nav(&state, wire), Ok(()));
+            assert_eq!(run_pane_nav(&state, ViewId::BASE, wire), Ok(()));
             assert_eq!(seen.borrow_mut().pop(), Some(direction), "{wire:?} -> {direction:?}");
             assert!(
                 seen.borrow().is_empty(),
@@ -8777,14 +10324,14 @@ mod tests {
             let seen = seen.clone();
             state.borrow_mut().keymap_closed_hook = Some(Rc::new(move |opening, return_keys| {
                 let state = reentrant.upgrade().expect("the state outlives the call");
-                state.borrow_mut().pane_focused = true;
+                state.borrow_mut().page_mut(ViewId::BASE).pane_focused = true;
                 seen.borrow_mut().push((opening, return_keys));
             }));
         }
         run_keymap_closed(&state, 7, true);
         run_keymap_closed(&state, 8, false);
         assert_eq!(*seen.borrow(), vec![(7, true), (8, false)]);
-        assert!(state.borrow().pane_focused);
+        assert!(state.borrow().page(ViewId::BASE).is_some_and(|page| page.pane_focused));
     }
 
     /// The companion window and `eitri-mac` install no hook: the message is accepted and nothing happens.
@@ -8796,7 +10343,7 @@ mod tests {
         ));
         assert!(state.borrow().keymap_closed_hook.is_none());
         run_keymap_closed(&state, 3, true);
-        assert!(!state.borrow().pane_focused);
+        assert!(!state.borrow().page(ViewId::BASE).is_some_and(|page| page.pane_focused));
     }
 
     /// A raw `keymap_closed` through the inbound dispatch is answered with an ok `command_result` for its
@@ -8814,14 +10361,20 @@ mod tests {
             })
         };
 
-        handle.page_message(r#"{"type":"keymap_closed","request_id":"k1","opening":4,"return_keys":true}"#);
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"keymap_closed","request_id":"k1","opening":4,"return_keys":true}"#,
+        );
         assert_eq!(result("k1"), Some((true, String::new())), "no hook: accepted, no error");
 
         {
             let seen = seen.clone();
             handle.on_keymap_closed(move |opening, return_keys| seen.borrow_mut().push((opening, return_keys)));
         }
-        handle.page_message(r#"{"type":"keymap_closed","request_id":"k2","opening":5,"return_keys":false}"#);
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"keymap_closed","request_id":"k2","opening":5,"return_keys":false}"#,
+        );
         assert_eq!(result("k2"), Some((true, String::new())), "a hook: accepted, no error");
         assert_eq!(
             *seen.borrow(),
@@ -8841,12 +10394,12 @@ mod tests {
             eitri_core::agent_bridge::SessionModeChoice::Auto,
         ));
         let reentrant = Rc::downgrade(&state);
-        state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |_| {
+        state.borrow_mut().nav_fallthrough_hook = Some(Rc::new(move |_, _| {
             let state = reentrant.upgrade().expect("the state outlives the call");
-            state.borrow_mut().pane_focused = true;
+            state.borrow_mut().page_mut(ViewId::BASE).pane_focused = true;
         }));
-        assert_eq!(run_pane_nav(&state, PaneNavDirection::Right), Ok(()));
-        assert!(state.borrow().pane_focused);
+        assert_eq!(run_pane_nav(&state, ViewId::BASE, PaneNavDirection::Right), Ok(()));
+        assert!(state.borrow().page(ViewId::BASE).unwrap().pane_focused);
     }
 
     /// The addresses `gx` may hand `UriLauncher`. The page sends a normalized
@@ -9004,7 +10557,7 @@ mod tests {
         state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
         state.borrow_mut().project_dir = project_dir.clone();
 
-        let plan = match cycle_default_mode(&state) {
+        let plan = match cycle_default_mode(&state, ViewId::BASE) {
             eitri_core::tab_set::ModeCycle::Confirm(plan) => plan,
             other => panic!("auto -> bypass must ask first: {other:?}"),
         };
@@ -9022,7 +10575,7 @@ mod tests {
         // Confirming is `apply_confirm_bypass`'s job, which is `TabSet::confirm_bypass`
         // and nothing else -- it moves the in-memory default and still writes nothing.
         assert_eq!(
-            apply_confirm_bypass(&state, plan.scope, plan.nonce),
+            apply_confirm_bypass(&state, plan.scope, plan.nonce, ViewId::BASE),
             Ok(eitri_core::tab_set::ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -9040,7 +10593,7 @@ mod tests {
 
         // Leaving bypass moves at once, to manual, and IS remembered -- manual is allowed.
         assert_eq!(
-            cycle_default_mode(&state),
+            cycle_default_mode(&state, ViewId::BASE),
             eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Manual)
         );
         assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Manual);
@@ -9050,7 +10603,7 @@ mod tests {
         );
         // Manual -> auto moves at once and is remembered too.
         assert_eq!(
-            cycle_default_mode(&state),
+            cycle_default_mode(&state, ViewId::BASE),
             eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
         );
         assert_eq!(
@@ -9087,14 +10640,14 @@ mod tests {
         state.borrow_mut().project_dir = project_dir.clone();
         assert_eq!(set_mode(&state, acp), SessionModeChoice::Auto);
 
-        let plan = match cycle_tab_mode(&state, acp) {
+        let plan = match cycle_tab_mode(&state, acp, ViewId::BASE) {
             Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("auto -> bypass asks: {other:?}"),
         };
-        apply_confirm_bypass(&state, plan.scope, plan.nonce).unwrap();
+        apply_confirm_bypass(&state, plan.scope, plan.nonce, ViewId::BASE).unwrap();
         assert_eq!(set_mode(&state, acp), SessionModeChoice::Bypass);
         assert_eq!(
-            cycle_tab_mode(&state, acp),
+            cycle_tab_mode(&state, acp, ViewId::BASE),
             Ok(eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto))
         );
         assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Manual);
@@ -9107,7 +10660,7 @@ mod tests {
         // The same move on an empty Claude tab is remembered, as before.
         state.borrow_mut().tabs.select(claude);
         assert_eq!(
-            cycle_tab_mode(&state, claude),
+            cycle_tab_mode(&state, claude, ViewId::BASE),
             Ok(eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto))
         );
         assert_eq!(
@@ -9138,13 +10691,13 @@ mod tests {
         state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
         state.borrow_mut().project_dir = project_dir.clone();
 
-        let cycled = state.borrow_mut().tabs.cycle_mode(tab);
+        let cycled = state.borrow_mut().tabs.cycle_mode(tab, ViewId::BASE);
         let plan = match cycled {
             Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("an empty auto tab must ask first: {other:?}"),
         };
         assert_eq!(
-            apply_confirm_bypass(&state, plan.scope, plan.nonce),
+            apply_confirm_bypass(&state, plan.scope, plan.nonce, ViewId::BASE),
             Ok(eitri_core::tab_set::ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -9177,7 +10730,7 @@ mod tests {
             outcome: agent::PermissionOutcome::Allowed,
         }];
 
-        let payload = returned_events_payload(&state.borrow(), active, &resolved)
+        let (_, payload) = returned_events_payload(&state.borrow(), active, &resolved)
             .expect("the tab on screen is owed the resolution");
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["kind"], "events");
@@ -9203,7 +10756,7 @@ mod tests {
         let tab = set.active();
         let state = state_for_hooks(set);
 
-        let cycled = state.borrow_mut().tabs.cycle_mode(tab);
+        let cycled = state.borrow_mut().tabs.cycle_mode(tab, ViewId::BASE);
         let plan = match cycled {
             Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("an empty auto tab must ask first: {other:?}"),
@@ -9213,7 +10766,7 @@ mod tests {
         state.borrow_mut().tabs.drop_bypass_prompt();
 
         assert_eq!(
-            apply_confirm_bypass(&state, plan.scope, plan.nonce),
+            apply_confirm_bypass(&state, plan.scope, plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string())
         );
         assert_eq!(set_mode(&state, tab), SessionModeChoice::Auto, "nothing changed");
@@ -9400,8 +10953,14 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(hints_for_new_document(&mut state.borrow_mut()), vec![live.clone()]);
-        assert_eq!(hints_for_new_document(&mut state.borrow_mut()), vec![live]);
+        assert_eq!(
+            hints_for_new_document(&mut state.borrow_mut(), ViewId::BASE),
+            vec![live.clone()]
+        );
+        assert_eq!(
+            hints_for_new_document(&mut state.borrow_mut(), ViewId::BASE),
+            vec![live]
+        );
     }
 
     /// A review's answer is the worker's envelope as it is; a job that failed or whose worker died
@@ -9420,21 +10979,25 @@ mod tests {
         let mut jobs = vec![
             PendingReview {
                 request_id: "a".into(),
+                view: ViewId::BASE,
                 rx: done_rx,
                 clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
             PendingReview {
                 request_id: "b".into(),
+                view: ViewId::BASE,
                 rx: failed_rx,
                 clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
             PendingReview {
                 request_id: "c".into(),
+                view: ViewId::BASE,
                 rx: died_rx,
                 clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
             PendingReview {
                 request_id: "d".into(),
+                view: ViewId::BASE,
                 rx: running_rx,
                 clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
             },
@@ -9601,8 +11164,14 @@ mod tests {
         assert!(set.get(tab).unwrap().card_is_waiting("perm-1"));
 
         // The first response: a deny, never remembered, through the production route.
-        let outcome =
-            answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "deny", false));
+        let outcome = answer_permission_response(
+            &mut set,
+            Some(&rules_dir),
+            &dir,
+            tab,
+            ViewId::BASE,
+            response("perm-1", "deny", false),
+        );
         assert!(matches!(outcome, Ok(Ok(_))));
         assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), false)]);
         assert!(
@@ -9636,8 +11205,14 @@ mod tests {
 
         // A replayed "Always allow" for perm-1 (a tab switch or a reload re-drew the card): refused,
         // and no rule reaches the file.
-        let replay =
-            answer_permission_response(&mut set, Some(&rules_dir), &dir, tab, response("perm-1", "allow", true));
+        let replay = answer_permission_response(
+            &mut set,
+            Some(&rules_dir),
+            &dir,
+            tab,
+            ViewId::BASE,
+            response("perm-1", "allow", true),
+        );
         assert_eq!(replay.map(|_| ()), Err("this request was already answered".to_string()));
         assert_eq!(
             eitri_core::permission_store::load(&rules_dir, &dir),
@@ -10162,7 +11737,13 @@ mod tests {
     fn the_command_is_not_released_until_the_close_worker_has_reported() {
         let (closed_tx, closed_rx) = mpsc::channel();
         assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::StillClosing);
-        assert!(handoff_payloads(TabId(1), &HandoffCloseOutcome::StillClosing, "req-1", &a_command()).is_empty());
+        assert!(handoff_payloads(
+            TabId(1),
+            &HandoffCloseOutcome::StillClosing,
+            Some("req-1"),
+            &a_command()
+        )
+        .is_empty());
 
         closed_tx.send(()).unwrap();
         assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::Closed);
@@ -10170,7 +11751,7 @@ mod tests {
             kinds(&handoff_payloads(
                 TabId(1),
                 &HandoffCloseOutcome::Closed,
-                "req-1",
+                Some("req-1"),
                 &a_command()
             )),
             vec!["handoff", "command_result"]
@@ -10186,7 +11767,7 @@ mod tests {
         drop(closed_tx);
         assert_eq!(classify_close_signal(&closed_rx), HandoffCloseOutcome::CloseFailed);
 
-        let payloads = handoff_payloads(TabId(1), &HandoffCloseOutcome::CloseFailed, "req-2", &a_command());
+        let payloads = handoff_payloads(TabId(1), &HandoffCloseOutcome::CloseFailed, Some("req-2"), &a_command());
         assert_eq!(kinds(&payloads), vec!["command_result", "error"]);
         assert!(
             !payloads.iter().any(|p| p.contains("1857dcd5-973b-46a2")),
@@ -10243,6 +11824,7 @@ mod tests {
                         provider_session_id: id.to_string(),
                         name: name.map(str::to_string),
                         mode: *mode,
+                        view: None,
                     })
                     .collect(),
                 active: 0,
@@ -10441,20 +12023,19 @@ mod tests {
             (ids, hello["restore"]["labels"].clone())
         };
         let hellos = || page.sent.borrow().iter().filter(|e| kind_of(e) == "hello").count();
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         assert_eq!(
             last_hello(),
             (vec!["s-a".to_string()], serde_json::json!(["title of s-a"]))
         );
 
-        let panel_page = handle.page.clone().unwrap();
         let before = hellos();
-        send_hello_if_open_sessions_changed(&state, &panel_page);
+        send_hello_if_open_sessions_changed(&state, &handle.pages);
         assert_eq!(hellos(), before, "nothing changed, nothing is sent");
 
         let claude_tab = state.borrow().tabs.active();
         state.borrow_mut().tabs.open(AgentId::Codex);
-        send_hello_if_open_sessions_changed(&state, &panel_page);
+        send_hello_if_open_sessions_changed(&state, &handle.pages);
         assert_eq!(hellos(), before + 1);
         assert_eq!(
             last_hello(),
@@ -10463,7 +12044,7 @@ mod tests {
         );
 
         state.borrow_mut().tabs.select(claude_tab);
-        send_hello_if_open_sessions_changed(&state, &panel_page);
+        send_hello_if_open_sessions_changed(&state, &handle.pages);
         assert_eq!(hellos(), before + 2);
         assert_eq!(
             last_hello(),
@@ -11082,7 +12663,7 @@ mod tests {
                 })
                 .collect()
         };
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         assert_eq!(
             titles(&page),
             vec!["title of s-titled".to_string()],
@@ -11118,7 +12699,7 @@ mod tests {
             state.clone(),
             Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
         );
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         // The greeting's read finds no transcript yet; the title is written after.
         assert!(state.borrow().titles.wait_read(std::time::Duration::from_secs(5)));
         let tick_pending = |handle: &AgentPanelHandle| {
@@ -11133,7 +12714,7 @@ mod tests {
             "{\"type\":\"ai-title\",\"aiTitle\":\"the CLI's late title\"}\n",
         )
         .unwrap();
-        handle.open_chooser();
+        handle.open_chooser(ViewId::BASE);
         let chooser = page
             .sent
             .borrow()
@@ -11200,7 +12781,7 @@ mod tests {
         );
         // The greeting asks the worker to read the session's transcript, which may land before the session
         // has opened, as at a restore.
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         assert!(state.borrow().titles.wait_read(std::time::Duration::from_secs(5)));
         provider.open_session("s-tabbed", &dir);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -11367,7 +12948,7 @@ mod tests {
             let mut s = state.borrow_mut();
             s.project_dir = root.clone();
             s.canonical_project_dir = root.to_string_lossy().into_owned();
-            s.document_ready = true;
+            s.page_mut(ViewId::BASE).document_ready = true;
             s.trust = trust_gate_for(Some(state_home.as_os_str()), Some(home.as_os_str()), &root);
             let counted = spawned.clone();
             let counted_external = external.clone();
@@ -11486,6 +13067,7 @@ mod tests {
             &p.fingerprint,
             &p.digest,
             trust,
+            ViewId::BASE,
         )
     }
 
@@ -11630,18 +13212,30 @@ mod tests {
         let tab = codex_tab(&state);
         let codex_record = PathBuf::from(format!("{}.codex", fx.record_file().display()));
 
-        let refused = trust_command(&mut state.borrow_mut(), "c0", TrustAction::Trust, "claude");
+        let refused = trust_command(
+            &mut state.borrow_mut(),
+            ViewId::BASE,
+            "c0",
+            TrustAction::Trust,
+            "claude",
+        );
         assert_eq!(
             refused,
             Err("that :trust was for a Claude tab; this tab runs Codex".to_string())
         );
-        let refused = trust_command(&mut state.borrow_mut(), "c0", TrustAction::Untrust, "claude");
+        let refused = trust_command(
+            &mut state.borrow_mut(),
+            ViewId::BASE,
+            "c0",
+            TrustAction::Untrust,
+            "claude",
+        );
         assert_eq!(
             refused,
             Err("that :untrust was for a Claude tab; this tab runs Codex".to_string())
         );
 
-        trust_command(&mut state.borrow_mut(), "c1", TrustAction::Trust, "codex").unwrap();
+        trust_command(&mut state.borrow_mut(), ViewId::BASE, "c1", TrustAction::Trust, "codex").unwrap();
         let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());
         let payloads = all_payloads(&seen);
         assert_eq!(
@@ -11660,7 +13254,14 @@ mod tests {
         assert!(state.borrow().trust.row(&Profile::Codex).starts_with("trusted since "));
         assert_eq!(state.borrow().trust.row(&Profile::Claude), "not checked yet");
 
-        trust_command(&mut state.borrow_mut(), "c2", TrustAction::Untrust, "codex").unwrap();
+        trust_command(
+            &mut state.borrow_mut(),
+            ViewId::BASE,
+            "c2",
+            TrustAction::Untrust,
+            "codex",
+        )
+        .unwrap();
         let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "c2").is_some());
         assert_eq!(result_for(&all_payloads(&seen), "c2"), Some(Ok(())));
         assert!(!codex_record.exists());
@@ -11723,6 +13324,7 @@ mod tests {
         // `:untrust`, then an `n` in a second Codex tab: every directory untrusted, skills off.
         trust_command(
             &mut state.borrow_mut(),
+            ViewId::BASE,
             "u1",
             eitri_core::agent_bridge::TrustAction::Untrust,
             "codex",
@@ -11912,7 +13514,14 @@ mod tests {
 
         // `:trust` has nothing to trust: told, with nothing shown.
         use eitri_core::agent_bridge::TrustAction;
-        trust_command(&mut state.borrow_mut(), "c1", TrustAction::Trust, "claude").unwrap();
+        trust_command(
+            &mut state.borrow_mut(),
+            ViewId::BASE,
+            "c1",
+            TrustAction::Trust,
+            "claude",
+        )
+        .unwrap();
         let seen = tick_until(&state, |seen| result_for(&all_payloads(seen), "c1").is_some());
         let payloads = all_payloads(&seen);
         assert!(prompts(&payloads).is_empty());
@@ -11985,14 +13594,14 @@ mod tests {
     #[test]
     fn registered_agent_offered_by_tabnew() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
-        let refused = open_tab_named(&state, "gem").unwrap_err();
+        let refused = open_tab_named(&state, ViewId::BASE, "gem").unwrap_err();
         assert_eq!(refused, "unknown agent gem — :tabnew accepts claude, codex");
         state.borrow_mut().acp_agents = vec![gem_registration()];
-        open_tab_named(&state, "gem").unwrap();
+        open_tab_named(&state, ViewId::BASE, "gem").unwrap();
         assert_eq!(state.borrow().tabs.active_tab().agent(), &AgentId::Acp("gem".into()));
-        let refused = open_tab_named(&state, "other").unwrap_err();
+        let refused = open_tab_named(&state, ViewId::BASE, "other").unwrap_err();
         assert_eq!(refused, "unknown agent other — :tabnew accepts claude, codex, gem");
-        assert!(open_tab_named(&state, "acp:gem").is_err());
+        assert!(open_tab_named(&state, ViewId::BASE, "acp:gem").is_err());
     }
 
     /// A registered agent in a root with none of its files is still asked about, with the question
@@ -12299,7 +13908,7 @@ mod tests {
         {
             let mut s = state.borrow_mut();
             s.restore_policy = RestorePolicy::Auto;
-            s.document_ready = true;
+            s.page_mut(ViewId::BASE).document_ready = true;
         }
         let mut resumes = FakeResumes::default();
         let result = launch_restore(&mut state.borrow_mut());
@@ -12347,7 +13956,7 @@ mod tests {
         {
             let mut s = state.borrow_mut();
             s.restore_policy = RestorePolicy::Auto;
-            s.document_ready = true;
+            s.page_mut(ViewId::BASE).document_ready = true;
         }
         let mut resumes = FakeResumes::default();
         assert!(matches!(
@@ -12361,7 +13970,7 @@ mod tests {
         remember_tabs_written(&state);
         assert_eq!(saved_file_sessions(&files, &dir), both, "kept while the question waits");
 
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce, ViewId::BASE);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert_eq!(out.toast.as_deref(), Some(crate::trust_gate::PUT_OFF));
         assert!(resumes.asked.is_empty(), "nothing was resumed");
@@ -12386,6 +13995,60 @@ mod tests {
         assert_eq!(failed, [Some("s-1".to_string()), Some("s-2".to_string())]);
     }
 
+    /// A put-off restore's tab saved in an extra view is kept there, as a failed tab, and that view's
+    /// page is shown it; the saved file still names the view.
+    #[test]
+    fn a_restore_put_off_keeps_a_tab_in_its_saved_view_and_shows_it_there() {
+        let (state, dir) = restore_panel(
+            "trust-restore-escape-view",
+            &[("s-1", None, Auto), ("s-2", None, Auto)],
+            &["s-1", "s-2"],
+        );
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
+        {
+            let mut s = state.borrow_mut();
+            s.restore_source.as_mut().unwrap().tabs[0].view = Some(2);
+            s.restore_policy = RestorePolicy::Auto;
+            s.page_mut(ViewId::BASE).document_ready = true;
+            s.page_mut(view(2)).document_ready = true;
+            s.tabs.set_layout_views(vec![view(2)]);
+        }
+        let mut resumes = FakeResumes::default();
+        assert!(matches!(
+            launch_restore(&mut state.borrow_mut()),
+            Some(RestoreResult::Deferred)
+        ));
+        let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce, ViewId::BASE);
+        assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
+        assert!(resumes.asked.is_empty(), "nothing was resumed");
+
+        let s = state.borrow();
+        let kept = s.tabs.tab_in(view(2)).expect("the tab saved in agent#2 is kept there");
+        assert_eq!(s.tabs.get(kept).unwrap().failed_resume.as_deref(), Some("s-1"));
+        assert!(s.tabs.view_of(s.tabs.active()).is_base());
+        let to_view: Vec<serde_json::Value> = out
+            .payloads
+            .iter()
+            .zip(&out.dests)
+            .filter(|(_, dest)| dest_view(&s, **dest) == view(2))
+            .map(|(payload, _)| json_of(payload))
+            .collect();
+        assert!(
+            to_view.iter().any(|v| v["kind"] == "tabs" && v["active"] == kept.0),
+            "its page is shown the kept tab: {to_view:?}"
+        );
+        let saved = s.tabs.saved_snapshot(&s.conversation_id).unwrap();
+        let mut views: Vec<(String, Option<u8>)> = saved
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.clone(), t.view))
+            .collect();
+        views.sort();
+        assert_eq!(views, [("s-1".to_string(), Some(2)), ("s-2".to_string(), None)]);
+    }
+
     /// A restore asked for from the launch dashboard leaves the saved tabs on offer: put off with
     /// `Escape`, its tab is empty again, the offer stands (the same key asks again) and the file is not
     /// touched, as before restores kept their sessions as failed tabs.
@@ -12400,7 +14063,7 @@ mod tests {
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-escape-files");
         state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
-        state.borrow_mut().document_ready = true;
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
         let result = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
@@ -12414,7 +14077,7 @@ mod tests {
             std::fs::read_dir(&files).unwrap().next().is_none(),
             "the file is not written while it waits with nothing else to save"
         );
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce, ViewId::BASE);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         remember_tabs_written(&state);
         assert!(std::fs::read_dir(&files).unwrap().next().is_none(), "nor after");
@@ -12514,7 +14177,7 @@ mod tests {
             state.clone(),
             Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
         );
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
         let from = state.borrow().tabs.active();
         assert!(matches!(
@@ -12602,7 +14265,7 @@ mod tests {
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-other-files");
         state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
-        state.borrow_mut().document_ready = true;
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
         assert!(matches!(
@@ -12636,7 +14299,7 @@ mod tests {
         );
 
         let prompt = with_resumes(&state, &mut resumes, || next_prompt(&state));
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, prompt.nonce, ViewId::BASE);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert!(resumes.asked.is_empty(), "nothing was resumed");
         remember_tabs_written(&state);
@@ -12666,7 +14329,7 @@ mod tests {
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-starting-files");
         state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
-        state.borrow_mut().document_ready = true;
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
         assert!(matches!(
@@ -12680,7 +14343,7 @@ mod tests {
         let (provider, backend) = live_backend(&dir);
         state.borrow_mut().tabs.get_mut(other).unwrap().backend = TabBackend::Live(backend);
         let nonce = state.borrow_mut().tabs.ask_trust(from).unwrap();
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", prompt.tab, nonce, ViewId::BASE);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert!(state.borrow().restore_source.is_none(), "no longer on offer");
         remember_tabs_written(&state);
@@ -12716,7 +14379,7 @@ mod tests {
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
         let files = agent::state_dirs::test_workspace_dir("trust-restore-dashboard-same-tick-files");
         state.borrow_mut().tab_memory = TabWriter::new(Some(files.clone()), dir.clone());
-        state.borrow_mut().document_ready = true;
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
         let from = state.borrow().tabs.active();
         let mut resumes = FakeResumes::default();
         assert!(matches!(
@@ -12727,7 +14390,7 @@ mod tests {
         let (other, _provider) = start_session_in_new_tab(&state, &dir, "s-new");
         // Asked again with no tick between (a tick would write the file first).
         let nonce = state.borrow_mut().tabs.ask_trust(from).unwrap();
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", from, nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", from, nonce, ViewId::BASE);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert!(state.borrow().restore_source.is_none(), "no longer on offer");
         remember_tabs_written(&state);
@@ -12756,7 +14419,7 @@ mod tests {
         {
             let mut s = state.borrow_mut();
             s.restore_policy = RestorePolicy::Auto;
-            s.document_ready = true;
+            s.page_mut(ViewId::BASE).document_ready = true;
         }
         let mut resumes = FakeResumes::default();
         assert!(matches!(
@@ -12791,7 +14454,7 @@ mod tests {
         {
             let mut s = state.borrow_mut();
             s.restore_policy = RestorePolicy::Auto;
-            s.document_ready = true;
+            s.page_mut(ViewId::BASE).document_ready = true;
         }
         let mut resumes = FakeResumes::default();
         assert!(matches!(
@@ -12919,7 +14582,7 @@ mod tests {
         let external = Rc::new(RefCell::new(Vec::new()));
         {
             let mut s = state.borrow_mut();
-            s.document_ready = true;
+            s.page_mut(ViewId::BASE).document_ready = true;
             let saved = s.restore_source.as_mut().unwrap();
             saved.external_tabs = vec![eitri_core::saved_tabs::SavedExternalTab {
                 agent,
@@ -12927,6 +14590,7 @@ mod tests {
                 provider_session_id: session.to_string(),
                 name: None,
                 mode: Auto,
+                view: None,
             }];
             saved.active_external = Some(0);
             let (resumed, external) = (resumed.clone(), external.clone());
@@ -13135,7 +14799,7 @@ mod tests {
         let (state, dir) = restore_panel("trust-restore-bypass", &[("s-1", None, Bypass)], &["s-1"]);
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(PROJECT_SETTINGS), session_start_hook("touch /tmp/never")).unwrap();
-        state.borrow_mut().document_ready = true;
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
         let from = state.borrow().tabs.active();
         let RestoreResult::Question(question) = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard)
         else {
@@ -13196,7 +14860,7 @@ mod tests {
         gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
         let prompt = next_prompt(&state);
         state.borrow_mut().tabs.set_draft(tab, "and more");
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", tab, prompt.nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", tab, prompt.nonce, ViewId::BASE);
         let drafts: Vec<_> = out
             .payloads
             .iter()
@@ -13221,7 +14885,7 @@ mod tests {
         let tab = state.borrow().tabs.active();
         gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
         let prompt = next_prompt(&state);
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", tab, prompt.nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c1", tab, prompt.nonce, ViewId::BASE);
         assert_eq!(result_for(&out.payloads, "c1"), Some(Ok(())));
         assert_eq!(
             result_for(&out.payloads, "r1"),
@@ -13262,7 +14926,7 @@ mod tests {
         )
         .unwrap();
         let prompt = next_prompt(&state);
-        let out = cancel_trust_question(&mut state.borrow_mut(), "c2", tab, prompt.nonce);
+        let out = cancel_trust_question(&mut state.borrow_mut(), "c2", tab, prompt.nonce, ViewId::BASE);
         assert_eq!(out.toast.as_deref(), Some(crate::trust_gate::PUT_OFF));
         assert_eq!(
             result_for(&out.payloads, "r2"),
@@ -13639,14 +15303,14 @@ mod tests {
     #[test]
     fn tabnew_opens_the_named_agent_and_refuses_other_words() {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
-        assert_eq!(open_tab_named(&state, "codex"), Ok(()));
+        assert_eq!(open_tab_named(&state, ViewId::BASE, "codex"), Ok(()));
         let active = state.borrow().tabs.active();
         assert_eq!(state.borrow().tabs.get(active).unwrap().agent(), &AgentId::Codex);
-        assert_eq!(open_tab_named(&state, "claude"), Ok(()));
+        assert_eq!(open_tab_named(&state, ViewId::BASE, "claude"), Ok(()));
         let active = state.borrow().tabs.active();
         assert_eq!(state.borrow().tabs.get(active).unwrap().agent(), &AgentId::Claude);
         let before = state.borrow().tabs.tabs().len();
-        let refused = open_tab_named(&state, "gemini").unwrap_err();
+        let refused = open_tab_named(&state, ViewId::BASE, "gemini").unwrap_err();
         assert!(
             refused.contains("gemini") && refused.contains("claude, codex"),
             "{refused}"
@@ -13717,5 +15381,1413 @@ mod tests {
         );
         assert_eq!(gate.root(), root.as_path());
         let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    // ---- Chat views: one page per view, each told only of the tab it shows. ----
+
+    const READY: &str = r#"{"type":"ready","request_id":"r-ready"}"#;
+
+    fn view(n: u8) -> ViewId {
+        ViewId::new(n).unwrap()
+    }
+
+    /// A recording page attached to `handle` as `view`'s, its document not loaded.
+    fn attach_recording_page(handle: &AgentPanelHandle, view: ViewId) -> Rc<RecordingPage> {
+        let page = Rc::new(RecordingPage::default());
+        handle.attach_page(view, Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>)));
+        page
+    }
+
+    /// [`handle_with_recording_page`] with a second recording page attached as view 2, both past `ready`.
+    fn handle_with_two_pages() -> (AgentPanelHandle, Rc<RecordingPage>, Rc<RecordingPage>) {
+        let (handle, base, _host) = handle_with_recording_page();
+        let second = attach_recording_page(&handle, view(2));
+        handle.page_message(ViewId::BASE, READY);
+        handle.page_message(view(2), READY);
+        (handle, base, second)
+    }
+
+    /// Every tab the envelopes `page` was sent name, for those that name one.
+    fn tabs_named(page: &RecordingPage) -> Vec<u64> {
+        page.sent
+            .borrow()
+            .iter()
+            .filter_map(|e| json_of(e)["tab"].as_u64())
+            .collect()
+    }
+
+    /// The ids and the active tab of the last `tabs` envelope `page` was sent.
+    fn last_strip(page: &RecordingPage) -> (Vec<u64>, u64) {
+        let sent = page.sent.borrow();
+        let strip = sent
+            .iter()
+            .rev()
+            .map(|e| json_of(e))
+            .find(|v| v["kind"] == "tabs")
+            .expect("a tabs envelope");
+        let ids = strip["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_u64().unwrap())
+            .collect();
+        (ids, strip["active"].as_u64().unwrap())
+    }
+
+    /// Whether `page` was sent an envelope of `kind` about `tab`.
+    fn sent_about(page: &RecordingPage, kind: &str, tab: TabId) -> bool {
+        page.sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .any(|v| v["kind"] == kind && v["tab"] == tab.0)
+    }
+
+    /// A new tab fed by a provider of its own, opened (so selected) in the base view.
+    fn live_tab(handle: &AgentPanelHandle, dir: &Path) -> (TabId, std::sync::Arc<RecordingProvider>) {
+        let (provider, backend) = live_backend(dir);
+        let mut state = handle.state.borrow_mut();
+        let tab = state.tabs.open(AgentId::Claude);
+        state.tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        (tab, provider)
+    }
+
+    /// Ticks until `done` says so, at most five seconds.
+    fn tick_handle_until(handle: &AgentPanelHandle, what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn stream(provider: &RecordingProvider, turn: &str, text: &str) {
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: turn.into() });
+        provider.queue(agent::AgentDomainEvent::ContentDelta {
+            turn_id: turn.into(),
+            kind: agent::ContentKind::Text,
+            text: text.into(),
+        });
+    }
+
+    /// A `Write` that needs a human, so the pump leaves it a card.
+    fn write_card(permission_id: &str) -> agent::AgentDomainEvent {
+        agent::AgentDomainEvent::PermissionRequested {
+            permission_id: permission_id.into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: serde_json::json!({ "file_path": ".git/main.rs", "content": "" }),
+            provider_prompt: None,
+        }
+    }
+
+    fn clear(pages: &[&Rc<RecordingPage>]) {
+        for page in pages {
+            page.sent.borrow_mut().clear();
+        }
+    }
+
+    #[test]
+    fn break_out_and_join_route_every_payload_to_the_right_page() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-break-join");
+        let (handle, base, second) = handle_with_two_pages();
+        let first = handle.state.borrow().tabs.active();
+        let (moved, provider) = live_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(moved));
+        assert_eq!(handle.state.borrow().tabs.active(), first, "the base view falls back");
+        let (ids, active) = last_strip(&base);
+        assert!(!ids.contains(&moved.0), "the base strip no longer lists it: {ids:?}");
+        assert_eq!(active, first.0);
+        assert_eq!(last_strip(&second), (vec![moved.0], moved.0));
+
+        clear(&[&base, &second]);
+        stream(&provider, "t1", "to the extra view");
+        tick_handle_until(&handle, "the moved tab's events in page 2", || {
+            sent_about(&second, "events", moved)
+        });
+        assert!(
+            !tabs_named(&base).contains(&moved.0),
+            "the base page is told nothing of it: {:?}",
+            base.sent.borrow()
+        );
+
+        assert_eq!(handle.join_back(view(2)), Ok(moved));
+        let (ids, active) = last_strip(&base);
+        assert!(ids.contains(&moved.0), "{ids:?}");
+        assert_eq!(active, moved.0, "it comes back as the base view's active tab");
+        clear(&[&base, &second]);
+        provider.queue(agent::AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: "back in the base view".into(),
+        });
+        tick_handle_until(&handle, "the joined tab's events in the base page", || {
+            sent_about(&base, "events", moved)
+        });
+        assert!(
+            !tabs_named(&second).contains(&moved.0),
+            "page 2 shows it no longer: {:?}",
+            second.sent.borrow()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_receiving_page_gets_the_tabs_snapshot_with_its_pending_card() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-break-card");
+        let (handle, _base, second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.queue(write_card("perm-1"));
+        tick_handle_until(&handle, "the card", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .attention
+                .attention()
+                .pending
+                == 1
+        });
+        clear(&[&second]);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        let sent = second.sent.borrow().clone();
+        let strip = sent.iter().position(|e| kind_of(e) == "tabs").expect("its strip");
+        let snapshot = sent
+            .iter()
+            .position(|e| kind_of(e) == "snapshot" && json_of(e)["tab"] == tab.0)
+            .expect("its tab's snapshot");
+        assert!(strip < snapshot, "the strip before the tab it shows");
+        assert_eq!(last_strip(&second), (vec![tab.0], tab.0));
+        assert!(
+            sent[snapshot].contains("perm-1"),
+            "with its pending card: {}",
+            sent[snapshot]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_page_has_its_own_document_ready() {
+        let (handle, _base, _host) = handle_with_recording_page();
+        let second = attach_recording_page(&handle, view(2));
+        handle.page_message(ViewId::BASE, READY);
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let moved = handle.break_out(view(2)).unwrap();
+        handle.tick();
+        assert!(
+            second.sent.borrow().is_empty(),
+            "nothing goes to a page before its ready: {:?}",
+            second.sent.borrow()
+        );
+        handle.page_message(ViewId::BASE, READY);
+        handle.state.borrow_mut().tabs.rename(moved, "renamed");
+        handle.tick();
+        assert!(
+            second.sent.borrow().is_empty(),
+            "the base page's ready releases nothing of page 2's: {:?}",
+            second.sent.borrow()
+        );
+        handle.page_message(view(2), READY);
+        assert_eq!(last_strip(&second), (vec![moved.0], moved.0));
+        assert!(second.sent.borrow().iter().any(|e| kind_of(e) == "hello"));
+        clear(&[&second]);
+        handle.state.borrow_mut().tabs.rename(moved, "again");
+        handle.tick();
+        assert!(
+            second.sent.borrow().iter().any(|e| kind_of(e) == "tabs"),
+            "from its own ready on, its strip follows"
+        );
+    }
+
+    #[test]
+    fn page_shown_from_an_extra_view_marks_its_own_tab_seen_not_active() {
+        let (handle, base, second) = handle_with_two_pages();
+        let active = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let bound = handle.break_out(view(2)).unwrap();
+        assert_eq!(handle.state.borrow().tabs.active(), active);
+        base.visible.set(true);
+        second.visible.set(true);
+        for tab in [active, bound] {
+            handle
+                .state
+                .borrow_mut()
+                .tabs
+                .get_mut(tab)
+                .unwrap()
+                .attention
+                .session_ended(false);
+        }
+        let unread = |tab: TabId| {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .attention
+                .attention()
+                .unread
+        };
+        assert!(unread(active) && unread(bound));
+        handle.page_shown(view(2));
+        assert!(!unread(bound), "the page's own tab is seen");
+        assert!(unread(active), "the base view's active tab is not");
+    }
+
+    #[test]
+    fn prefix_x_on_the_base_view_leaves_an_extra_views_session_running_and_opens_a_fresh_base_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-kill-base");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (bound, _bound_provider) = live_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(bound));
+        let (closed, _closed_provider) = live_tab(&handle, &dir);
+        let before = handle.state.borrow().tabs.base_tabs();
+        assert_eq!(before.len(), 2);
+        assert_eq!(handle.close_view_tabs(ViewId::BASE), Ok(2));
+        let state = handle.state.borrow();
+        assert!(state.tabs.get(closed).is_none());
+        let now = state.tabs.base_tabs();
+        assert_eq!(now.len(), 1, "the base view is left one tab");
+        assert!(!before.contains(&now[0]), "a fresh one");
+        assert_eq!(state.tabs.active(), now[0]);
+        let kept = state.tabs.get(bound).expect("the extra view's tab is kept");
+        assert!(matches!(kept.backend, TabBackend::Live(_)), "its session runs on");
+        assert_eq!(state.tabs.view_of(bound), view(2));
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_idle_page_is_told_nothing_and_reloads_empty() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-idle");
+        let (handle, _base, second) = handle_with_two_pages();
+        let (_bound, provider) = live_tab(&handle, &dir);
+        handle.break_out(view(2)).unwrap();
+        provider.queue(write_card("perm-1"));
+        tick_handle_until(&handle, "its card in page 2", || {
+            second.sent.borrow().iter().any(|e| e.contains("perm-1"))
+        });
+        let documents = second.documents.borrow().len();
+        handle.idle_page(view(2));
+        assert_eq!(
+            second.documents.borrow().len(),
+            documents + 1,
+            "its document is loaded again, empty"
+        );
+        assert!(handle.state.borrow().page(view(2)).is_none(), "its record is gone");
+        clear(&[&second]);
+        provider.queue(write_card("perm-2"));
+        for _ in 0..20 {
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        handle.set_pane_focused(view(2), true);
+        handle.arrive(view(2));
+        handle.page_message(view(2), READY);
+        assert!(
+            second.sent.borrow().is_empty(),
+            "an idle page is sent nothing, and its own message is dropped: {:?}",
+            second.sent.borrow()
+        );
+        assert!(handle.state.borrow().page(view(2)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restore_that_asks_keeps_an_extra_view_until_its_tab_arrives() {
+        let (state, dir) = restore_panel("views-restore", &[("s-1", None, Bypass)], &["s-1"]);
+        state.borrow_mut().restore_source.as_mut().unwrap().tabs[0].view = Some(2);
+        let base = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(base.clone() as Rc<dyn PageSurface>))),
+        );
+        let _second = attach_recording_page(&handle, view(2));
+        let _third = attach_recording_page(&handle, view(3));
+        handle.set_layout_views(vec![view(2), view(3)]);
+        let emptied = Rc::new(RefCell::new(Vec::<ViewId>::new()));
+        handle.on_view_empty({
+            let emptied = emptied.clone();
+            move |view| emptied.borrow_mut().push(view)
+        });
+        handle.page_message(ViewId::BASE, READY);
+        handle.tick();
+        assert!(!handle.restore_settled(), "on offer");
+        assert!(emptied.borrow().is_empty());
+
+        // The saved bypass tab is asked about first.
+        let from = state.borrow().tabs.active();
+        let asked = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard);
+        let RestoreResult::Question(prompt) = asked else {
+            panic!("a saved bypass tab is asked about");
+        };
+        handle.tick();
+        assert!(!handle.restore_settled(), "the restore's question is open");
+        assert!(emptied.borrow().is_empty());
+
+        // Answered, it waits for the trust check, then resumes into its view.
+        let answered = answer_restore_question(&mut state.borrow_mut(), prompt.nonce, false);
+        assert!(matches!(answered, RestoreResult::Deferred));
+        assert!(!handle.restore_settled(), "waiting for the trust question");
+        let mut resumes = FakeResumes::default();
+        with_resumes(&state, &mut resumes, || {
+            tick_handle_until(&handle, "the restore to start", || state.borrow().restore_run.is_some());
+            assert!(emptied.borrow().is_empty());
+        });
+        assert_eq!(resumes.asked, vec!["s-1".to_string()]);
+        let restored = state
+            .borrow()
+            .tabs
+            .tab_in(view(2))
+            .expect("the saved tab comes back into its view");
+        handle.tick();
+        assert!(!handle.restore_settled(), "its resume is still out");
+        assert!(emptied.borrow().is_empty());
+
+        let (_provider, backend) = live_backend(&dir);
+        resumes.senders[0].send(Ok(backend)).unwrap();
+        tick_handle_until(&handle, "the restore to settle", || handle.restore_settled());
+        handle.tick();
+        assert_eq!(state.borrow().tabs.tab_in(view(2)), Some(restored));
+        assert_eq!(
+            *emptied.borrow(),
+            vec![view(3)],
+            "only the view the restore left empty goes, once"
+        );
+        handle.tick();
+        assert_eq!(emptied.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_theme_reaches_every_page_idle_ones_included() {
+        let (handle, base, second) = handle_with_two_pages();
+        let third = attach_recording_page(&handle, view(3));
+        handle.idle_page(view(3));
+        for page in [&base, &second, &third] {
+            page.sent.borrow_mut().clear();
+            page.backgrounds.borrow_mut().clear();
+        }
+        let mut tokens = eitri_core::theme::ThemeTokens::fallback();
+        tokens.font_size_px = 23.0;
+        handle.set_theme(&tokens);
+        handle.set_panel_font_size_px(25.0);
+        for page in [&base, &second, &third] {
+            assert_eq!(page.backgrounds.borrow().len(), 2);
+            let themes = page.sent.borrow().iter().filter(|e| kind_of(e) == "theme").count();
+            assert_eq!(themes, 2, "{:?}", page.sent.borrow());
+        }
+    }
+
+    #[test]
+    fn a_reload_of_an_extra_page_gets_its_own_tabs_snapshot_and_no_base_card() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-reload");
+        let (handle, base, second) = handle_with_two_pages();
+        let (bound, _bound_provider) = live_tab(&handle, &dir);
+        handle.break_out(view(2)).unwrap();
+        let (base_tab, base_provider) = live_tab(&handle, &dir);
+        base_provider.queue(write_card("perm-base"));
+        tick_handle_until(&handle, "the base tab's card", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(base_tab)
+                .unwrap()
+                .attention
+                .attention()
+                .pending
+                == 1
+        });
+        clear(&[&base, &second]);
+        handle.page_message(view(2), READY);
+        let sent = second.sent.borrow().clone();
+        assert_eq!(last_strip(&second), (vec![bound.0], bound.0));
+        assert!(sent_about(&second, "snapshot", bound), "{sent:?}");
+        let hello = sent
+            .iter()
+            .map(|e| json_of(e))
+            .find(|v| v["kind"] == "hello")
+            .expect("a hello");
+        assert!(hello["restore"].is_null(), "no restore offer outside the base page");
+        for envelope in &sent {
+            assert!(!envelope.contains("perm-base"), "{envelope}");
+            assert_ne!(json_of(envelope)["tab"].as_u64(), Some(base_tab.0), "{envelope}");
+        }
+        assert!(
+            base.sent.borrow().is_empty(),
+            "the base page is told nothing of it: {:?}",
+            base.sent.borrow()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_shown_tabs_streaming_in_one_tick_reach_their_own_pages() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-two-streams");
+        let (handle, base, second) = handle_with_two_pages();
+        let (bound, bound_provider) = live_tab(&handle, &dir);
+        handle.break_out(view(2)).unwrap();
+        let (shown, shown_provider) = live_tab(&handle, &dir);
+        clear(&[&base, &second]);
+        stream(&bound_provider, "tb", "the bound tab's text");
+        stream(&shown_provider, "ts", "the base tab's text");
+        tick_handle_until(&handle, "both pages' events", || {
+            sent_about(&second, "events", bound) && sent_about(&base, "events", shown)
+        });
+        assert!(
+            tabs_named(&base).iter().all(|tab| *tab == shown.0),
+            "{:?}",
+            base.sent.borrow()
+        );
+        assert!(
+            tabs_named(&second).iter().all(|tab| *tab == bound.0),
+            "{:?}",
+            second.sent.borrow()
+        );
+        assert!(base.sent.borrow().iter().all(|e| !e.contains("the bound tab's text")));
+        assert!(second.sent.borrow().iter().all(|e| !e.contains("the base tab's text")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_and_overlays_in_the_base_page_leave_an_extra_views_prompts() {
+        let (handle, _base, _second) = handle_with_two_pages();
+        let state = handle.state.clone();
+        state.borrow_mut().tabs.open(AgentId::Claude);
+        let bound = handle.break_out(view(2)).unwrap();
+        // The mode key in page 2 asks first (a fresh press there takes page 2's own questions off,
+        // so its tab's trust question is asked after it).
+        let default_prompt = || match cycle_default_mode(&state, view(2)) {
+            eitri_core::tab_set::ModeCycle::Confirm(plan) => plan,
+            other => panic!("auto -> bypass asks first: {other:?}"),
+        };
+        let plan = default_prompt();
+        assert_eq!(plan.page, view(2));
+        let nonce = {
+            let mut s = state.borrow_mut();
+            s.tabs.defer_start(bound, first_send("r1", "hello")).unwrap();
+            s.tabs.ask_trust(bound).unwrap()
+        };
+        handle.arrive(ViewId::BASE);
+        handle.open_keymap(ViewId::BASE, None, 0);
+        handle.hint_collect(1);
+        handle.set_pane_focused(ViewId::BASE, false);
+        assert_eq!(state.borrow().tabs.check_trust_answer(bound, nonce, view(2)), Ok(()));
+        assert!(matches!(
+            state.borrow_mut().tabs.confirm_bypass(plan.scope, plan.nonce, view(2)),
+            Ok(eitri_core::tab_set::ConfirmOutcome::Entered { .. })
+        ));
+
+        // Page 2 losing the keys drops both of its own.
+        state
+            .borrow_mut()
+            .tabs
+            .apply_configured_default(SessionModeChoice::Auto);
+        let plan = default_prompt();
+        let nonce = state.borrow_mut().tabs.ask_trust(bound).unwrap();
+        assert_eq!(state.borrow().tabs.check_trust_answer(bound, nonce, view(2)), Ok(()));
+        handle.set_pane_focused(view(2), false);
+        assert!(state.borrow().tabs.check_trust_answer(bound, nonce, view(2)).is_err());
+        assert!(state
+            .borrow_mut()
+            .tabs
+            .confirm_bypass(plan.scope, plan.nonce, view(2))
+            .is_err());
+    }
+
+    #[test]
+    fn the_chooser_lists_every_tab_and_names_a_bound_tabs_view() {
+        let (handle, base, second) = handle_with_two_pages();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let bound = handle.break_out(view(2)).unwrap();
+        let other = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let every: Vec<u64> = handle.state.borrow().tabs.tabs().iter().map(|t| t.id.0).collect();
+        for (shown_in, page) in [(ViewId::BASE, &base), (view(2), &second)] {
+            clear(&[page]);
+            handle.open_chooser(shown_in);
+            let sent = page.sent.borrow();
+            let chooser = sent
+                .iter()
+                .map(|e| json_of(e))
+                .find(|v| v["kind"] == "chooser")
+                .expect("the chooser, in the page it was opened in");
+            let rows = chooser["open"].as_array().unwrap();
+            let listed: Vec<u64> = rows.iter().map(|r| r["tab"].as_u64().unwrap()).collect();
+            assert_eq!(listed, every, "every tab, from any page");
+            for row in rows {
+                let label = row["label"].as_str().unwrap();
+                assert_eq!(label.ends_with(" · agent 2"), row["tab"] == bound.0, "{label}");
+            }
+        }
+        assert!(handle.state.borrow().tabs.get(other).is_some());
+    }
+
+    #[test]
+    fn a_chooser_pick_of_a_bound_tab_asks_the_window_to_show_its_view() {
+        let (handle, base, _second) = handle_with_two_pages();
+        let first = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let bound = handle.break_out(view(2)).unwrap();
+        let shown = Rc::new(RefCell::new(Vec::<ViewId>::new()));
+        handle.on_show_view({
+            let shown = shown.clone();
+            move |view| shown.borrow_mut().push(view)
+        });
+        clear(&[&base]);
+        handle.page_message(
+            ViewId::BASE,
+            &format!(r#"{{"type":"select_tab","request_id":"p1","tab":{}}}"#, bound.0),
+        );
+        assert_eq!(*shown.borrow(), vec![view(2)]);
+        assert_eq!(
+            handle.state.borrow().tabs.active(),
+            first,
+            "a bound tab is never selected"
+        );
+        assert_eq!(result_for(&base.sent.borrow(), "p1"), Some(Ok(())));
+        let number = handle.state.borrow().tabs.get(bound).unwrap().number;
+        assert_eq!(handle.select_number(number), Some(TabPlace::View(view(2), bound)));
+        assert_eq!(*shown.borrow(), vec![view(2), view(2)]);
+    }
+
+    // ---- Answers per page: each from the page that shows its tab, through the window's gate. ----
+
+    /// A gate that records the view of every answer it is asked about and refuses those of `refused`
+    /// views while `covered` is set.
+    fn recording_gate(
+        handle: &AgentPanelHandle,
+        refused: &'static [u8],
+        covered: Rc<Cell<bool>>,
+    ) -> Rc<RefCell<Vec<ViewId>>> {
+        const COVERED: &str = "agent 2 is under terminal 2: C-b M-- from terminal 2 stows it";
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        handle.set_answer_gate(Rc::new({
+            let asked = asked.clone();
+            move |view: ViewId| {
+                asked.borrow_mut().push(view);
+                if covered.get() && refused.contains(&view.number()) {
+                    Err(COVERED.to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        asked
+    }
+
+    fn permission_response(handle: &AgentPanelHandle, from: ViewId, request: &str, tab: TabId, permission: &str) {
+        handle.page_message(
+            from,
+            &format!(
+                r#"{{"type":"permission_response","request_id":"{request}","tab":{},"permission_id":"{permission}","decision":"allow"}}"#,
+                tab.0
+            ),
+        );
+    }
+
+    fn waiting(handle: &AgentPanelHandle, tab: TabId, permission: &str) -> bool {
+        handle.state.borrow().tabs.get(tab).unwrap().card_is_waiting(permission)
+    }
+
+    fn pending_cards(handle: &AgentPanelHandle, tab: TabId) -> usize {
+        handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .attention
+            .attention()
+            .pending
+    }
+
+    fn shut_down_every_tab(handle: &AgentPanelHandle) {
+        for mut t in handle.state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut t.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn a_permission_answer_is_taken_only_from_the_page_that_shows_its_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-answer-per-page");
+        let (handle, base, second) = handle_with_two_pages();
+        let (bound, bound_provider) = live_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(bound));
+        // A base-view tab left in the background: still the base page's to answer.
+        let (background, background_provider) = live_tab(&handle, &dir);
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        assert_ne!(handle.state.borrow().tabs.active(), background);
+        bound_provider.queue(write_card("perm-2"));
+        background_provider.queue(write_card("perm-b"));
+        tick_handle_until(&handle, "both cards", || {
+            pending_cards(&handle, bound) == 1 && pending_cards(&handle, background) == 1
+        });
+        let asked = recording_gate(&handle, &[], Rc::new(Cell::new(false)));
+        let number = handle.state.borrow().tabs.get(bound).unwrap().number;
+
+        permission_response(&handle, ViewId::BASE, "r1", bound, "perm-2");
+        assert_eq!(
+            result_for(&base.sent.borrow(), "r1"),
+            Some(Err(format!("tab {number} is not shown in this page")))
+        );
+        assert!(waiting(&handle, bound, "perm-2"), "still waiting");
+        assert!(bound_provider.resolutions().is_empty());
+        assert!(asked.borrow().is_empty(), "refused before the window is asked");
+
+        permission_response(&handle, view(2), "r2", bound, "perm-2");
+        assert_eq!(result_for(&second.sent.borrow(), "r2"), Some(Ok(())));
+        assert_eq!(bound_provider.resolutions(), vec![("perm-2".to_string(), true)]);
+
+        // Page 2 cannot answer the base view's card, whichever tab the base view shows.
+        permission_response(&handle, view(2), "r3", background, "perm-b");
+        assert!(matches!(result_for(&second.sent.borrow(), "r3"), Some(Err(_))));
+        assert!(waiting(&handle, background, "perm-b"));
+        permission_response(&handle, ViewId::BASE, "r4", background, "perm-b");
+        assert_eq!(result_for(&base.sent.borrow(), "r4"), Some(Ok(())));
+        assert_eq!(background_provider.resolutions(), vec![("perm-b".to_string(), true)]);
+        assert_eq!(
+            *asked.borrow(),
+            vec![view(2), ViewId::BASE],
+            "asked with each answering page's view"
+        );
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_permission_answer_from_the_page_a_tab_left_is_refused_and_the_new_page_answers_it() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-answer-left-page");
+        let (handle, base, second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.queue(write_card("perm-1"));
+        tick_handle_until(&handle, "the card", || pending_cards(&handle, tab) == 1);
+        // The base page drew the card; the tab moves to view 2 before its answer arrives.
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        permission_response(&handle, ViewId::BASE, "r1", tab, "perm-1");
+        assert!(
+            matches!(result_for(&base.sent.borrow(), "r1"), Some(Err(why)) if why.contains("not shown in this page"))
+        );
+        assert!(
+            waiting(&handle, tab, "perm-1"),
+            "the card waits for the page that shows it"
+        );
+        assert!(provider.resolutions().is_empty());
+
+        permission_response(&handle, view(2), "r2", tab, "perm-1");
+        assert_eq!(result_for(&second.sent.borrow(), "r2"), Some(Ok(())));
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), true)]);
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_card_answer_from_a_covered_view_is_refused_and_the_card_stays() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("views-answer-covered");
+        let (handle, _base, second) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        provider.queue(write_card("perm-1"));
+        tick_handle_until(&handle, "the card", || pending_cards(&handle, tab) == 1);
+        let covered = Rc::new(Cell::new(true));
+        let asked = recording_gate(&handle, &[2], covered.clone());
+
+        permission_response(&handle, view(2), "r1", tab, "perm-1");
+        assert!(matches!(result_for(&second.sent.borrow(), "r1"), Some(Err(why)) if why.contains("under terminal 2")));
+        assert!(
+            waiting(&handle, tab, "perm-1"),
+            "a refused answer leaves the card waiting"
+        );
+        assert!(provider.resolutions().is_empty(), "nothing reached the agent");
+        assert_eq!(*asked.borrow(), vec![view(2)]);
+
+        covered.set(false);
+        permission_response(&handle, view(2), "r2", tab, "perm-1");
+        assert_eq!(result_for(&second.sent.borrow(), "r2"), Some(Ok(())));
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), true)]);
+        shut_down_every_tab(&handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The last `confirm_bypass` prompt `page` was sent: its scope's tab and its nonce.
+    fn last_bypass_prompt(page: &RecordingPage) -> Option<(Option<u64>, u64)> {
+        page.sent
+            .borrow()
+            .iter()
+            .rev()
+            .map(|e| json_of(e))
+            .find(|v| v["kind"] == "confirm_bypass")
+            .map(|v| (v["tab"].as_u64(), v["nonce"].as_u64().unwrap()))
+    }
+
+    fn confirm_bypass_from(handle: &AgentPanelHandle, from: ViewId, request: &str, tab: TabId, nonce: u64) {
+        handle.page_message(
+            from,
+            &format!(
+                r#"{{"type":"confirm_bypass","request_id":"{request}","tab":{},"scope":"tab","nonce":{nonce}}}"#,
+                tab.0
+            ),
+        );
+    }
+
+    fn cycle_mode_from(handle: &AgentPanelHandle, from: ViewId, request: &str, tab: TabId) {
+        handle.page_message(
+            from,
+            &format!(r#"{{"type":"cycle_mode","request_id":"{request}","tab":{}}}"#, tab.0),
+        );
+    }
+
+    /// What `prefix x` on an extra view names: the label of the one tab it shows, as its strip does, and
+    /// nothing for a view with no tab or for the base view, whose kill closes every base-view tab.
+    #[test]
+    fn an_extra_views_kill_names_its_one_tab() {
+        let (handle, _base, _second) = handle_with_two_pages();
+        assert_eq!(handle.view_tab_label(view(2)), None, "no tab yet");
+        assert_eq!(handle.view_running_queued(view(2)), (0, 0));
+        let tab = handle.open_in(view(2)).unwrap();
+        let number = handle.state.borrow().tabs.get(tab).unwrap().number;
+        assert_eq!(handle.view_tab_label(view(2)), Some(format!("{number} new")));
+        assert_eq!(handle.view_running_queued(view(2)), (0, 0), "an empty tab runs nothing");
+        assert_eq!(handle.view_tab_label(ViewId::BASE), None);
+        assert_eq!(handle.view_tab_label(view(3)), None);
+    }
+
+    fn mode_of(handle: &AgentPanelHandle, tab: TabId) -> SessionModeChoice {
+        handle.state.borrow().tabs.get(tab).unwrap().mode()
+    }
+
+    #[test]
+    fn cycle_mode_into_bypass_from_an_extra_view_shows_the_prompt_there_and_takes_its_confirmation() {
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        assert_eq!(mode_of(&handle, tab), SessionModeChoice::Auto);
+        let asked = recording_gate(&handle, &[], Rc::new(Cell::new(false)));
+        clear(&[&base, &second]);
+        cycle_mode_from(&handle, view(2), "m1", tab);
+        assert_eq!(result_for(&second.sent.borrow(), "m1"), Some(Ok(())));
+        let (prompt_tab, nonce) = last_bypass_prompt(&second).expect("the prompt, in page 2");
+        assert_eq!(prompt_tab, Some(tab.0));
+        assert_eq!(last_bypass_prompt(&base), None, "the base page is shown nothing");
+
+        // The base page's `y` with the same tab and nonce is not page 2's answer, and leaves its prompt.
+        confirm_bypass_from(&handle, ViewId::BASE, "y1", tab, nonce);
+        assert!(
+            matches!(result_for(&base.sent.borrow(), "y1"), Some(Err(why)) if why.contains("not shown in this page"))
+        );
+        assert_eq!(mode_of(&handle, tab), SessionModeChoice::Auto);
+        assert!(asked.borrow().is_empty(), "refused before the window is asked");
+
+        confirm_bypass_from(&handle, view(2), "y2", tab, nonce);
+        assert_eq!(result_for(&second.sent.borrow(), "y2"), Some(Ok(())));
+        assert_eq!(mode_of(&handle, tab), SessionModeChoice::Bypass);
+        assert_eq!(*asked.borrow(), vec![view(2)]);
+
+        // A press in the base page about page 2's tab is refused, so no prompt is built there.
+        clear(&[&base]);
+        cycle_mode_from(&handle, ViewId::BASE, "m2", tab);
+        assert!(matches!(result_for(&base.sent.borrow(), "m2"), Some(Err(_))));
+        assert_eq!(last_bypass_prompt(&base), None);
+    }
+
+    #[test]
+    fn a_bypass_prompt_is_dropped_when_its_page_loses_the_keys() {
+        let (handle, base, second) = handle_with_two_pages();
+        let first = handle.state.borrow().tabs.active();
+        let tab = handle.open_in(view(2)).unwrap();
+        cycle_mode_from(&handle, view(2), "m1", tab);
+        let (_, nonce) = last_bypass_prompt(&second).expect("page 2's prompt");
+        handle.set_pane_focused(view(2), false);
+        confirm_bypass_from(&handle, view(2), "y1", tab, nonce);
+        assert!(
+            matches!(result_for(&second.sent.borrow(), "y1"), Some(Err(_))),
+            "dropped with the keys"
+        );
+        assert_eq!(mode_of(&handle, tab), SessionModeChoice::Auto);
+
+        // A prompt built in the base page stays when page 2 loses the keys.
+        cycle_mode_from(&handle, ViewId::BASE, "m2", first);
+        let (prompt_tab, nonce) = last_bypass_prompt(&base).expect("the base page's prompt");
+        assert_eq!(prompt_tab, Some(first.0));
+        handle.set_pane_focused(view(2), false);
+        confirm_bypass_from(&handle, ViewId::BASE, "y2", first, nonce);
+        assert_eq!(result_for(&base.sent.borrow(), "y2"), Some(Ok(())));
+        assert_eq!(mode_of(&handle, first), SessionModeChoice::Bypass);
+    }
+
+    /// An untrusted project ([`trust_panel`] with a project hook) behind a handle with two recording
+    /// pages past `ready` and a new empty tab bound to view 2. The gate's worker waits on `hold`
+    /// before each job; it starts open.
+    struct TrustViews {
+        handle: AgentPanelHandle,
+        base: Rc<RecordingPage>,
+        second: Rc<RecordingPage>,
+        tab: TabId,
+        fx: TrustFx,
+        hold: crate::trust_gate::WorkerHold,
+    }
+
+    fn trust_views(label: &str) -> TrustViews {
+        let (state, fx) = trust_panel(label);
+        fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
+        let hold = crate::trust_gate::WorkerHold::default();
+        {
+            let mut s = state.borrow_mut();
+            let home = fx.root.parent().unwrap().to_path_buf();
+            let store = eitri_core::project_trust::TrustStore::new(Some(fx.state.as_os_str()), Some(home.as_os_str()));
+            s.trust = TrustGate::new_held(store, fx.root.clone(), Some(home), hold.clone());
+        }
+        let base = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle::over(
+            state,
+            Some(Rc::new(PanelPage::new(base.clone() as Rc<dyn PageSurface>))),
+        );
+        let second = attach_recording_page(&handle, view(2));
+        handle.page_message(ViewId::BASE, READY);
+        handle.page_message(view(2), READY);
+        let tab = handle.open_in(view(2)).unwrap();
+        TrustViews {
+            handle,
+            base,
+            second,
+            tab,
+            fx,
+            hold,
+        }
+    }
+
+    /// The gate's tick, delivering to the pages, until `done` says so (at most five seconds).
+    fn poll_trust_until(handle: &AgentPanelHandle, what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            poll_trust(&handle.state, &handle.pages);
+            if done() {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The gate's tick until it owes nothing.
+    fn poll_trust_until_idle(handle: &AgentPanelHandle) {
+        poll_trust_until(handle, "the gate to go idle", || !handle.state.borrow().trust.is_busy());
+    }
+
+    fn trust_answer_from(handle: &AgentPanelHandle, from: ViewId, request: &str, p: &Prompt, trust: bool) {
+        handle.page_message(
+            from,
+            &format!(
+                r#"{{"type":"trust_answer","request_id":"{request}","tab":{},"nonce":{},"fingerprint":"{}","findings_digest":"{}","trust":{trust}}}"#,
+                p.tab.0, p.nonce, p.fingerprint, p.digest
+            ),
+        );
+    }
+
+    fn awaiting_trust(handle: &AgentPanelHandle, tab: TabId) -> bool {
+        matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend,
+            TabBackend::AwaitingTrust(AwaitingTrust { recording: false, .. })
+        )
+    }
+
+    #[test]
+    fn an_extra_views_trust_question_survives_a_base_view_switch_and_its_y_starts_the_turn() {
+        let TrustViews {
+            handle,
+            base,
+            second,
+            tab,
+            fx,
+            hold: _hold,
+        } = trust_views("views-trust-switch");
+        let first = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let asked = recording_gate(&handle, &[], Rc::new(Cell::new(false)));
+        clear(&[&base, &second]);
+        handle.page_message(
+            view(2),
+            &format!(
+                r#"{{"type":"send_message","request_id":"s1","tab":{},"text":"hello"}}"#,
+                tab.0
+            ),
+        );
+        poll_trust_until(&handle, "the question in page 2", || {
+            !prompts(&second.sent.borrow()).is_empty()
+        });
+        let prompt = prompts(&second.sent.borrow()).pop().unwrap();
+        assert_eq!(prompt.tab, tab);
+        assert!(
+            prompts(&base.sent.borrow()).is_empty(),
+            "asked only in the page that shows it"
+        );
+
+        trust_answer_from(&handle, ViewId::BASE, "a1", &prompt, true);
+        assert!(matches!(result_for(&base.sent.borrow(), "a1"), Some(Err(_))));
+        assert!(awaiting_trust(&handle, tab));
+        assert!(
+            asked.borrow().is_empty(),
+            "another page's answer never reaches the window"
+        );
+
+        // A switch in the base view drops the base view's questions only.
+        handle.page_message(
+            ViewId::BASE,
+            &format!(r#"{{"type":"select_tab","request_id":"p1","tab":{}}}"#, first.0),
+        );
+        assert_eq!(handle.state.borrow().tabs.active(), first);
+        assert!(handle
+            .state
+            .borrow()
+            .tabs
+            .check_trust_answer(tab, prompt.nonce, view(2))
+            .is_ok());
+
+        trust_answer_from(&handle, view(2), "a2", &prompt, true);
+        assert_eq!(result_for(&second.sent.borrow(), "a2"), Some(Ok(())));
+        assert_eq!(*asked.borrow(), vec![view(2)]);
+        poll_trust_until(&handle, "the start", || !fx.spawned.borrow().is_empty());
+        assert_eq!(*fx.spawned.borrow(), [(None, ProjectTrust::Trusted)]);
+        let state = handle.state.borrow();
+        match &state.tabs.get(tab).unwrap().backend {
+            TabBackend::Starting(pending) => {
+                assert_eq!(pending.request_id, "s1");
+                assert_eq!(pending.first_turn.as_ref().unwrap().typed, "hello");
+            }
+            _ => panic!("page 2's tab connects once the record is written"),
+        };
+    }
+
+    #[test]
+    fn a_trust_answer_from_a_covered_page_is_refused_and_asked_again() {
+        let TrustViews {
+            handle,
+            second,
+            tab,
+            fx,
+            ..
+        } = trust_views("views-trust-covered");
+        let covered = Rc::new(Cell::new(true));
+        let asked = recording_gate(&handle, &[2], covered.clone());
+        handle.page_message(
+            view(2),
+            &format!(
+                r#"{{"type":"send_message","request_id":"s1","tab":{},"text":"hello"}}"#,
+                tab.0
+            ),
+        );
+        poll_trust_until(&handle, "the question", || !prompts(&second.sent.borrow()).is_empty());
+        let first = prompts(&second.sent.borrow()).pop().unwrap();
+        let mut shown = first.clone();
+
+        // Both a `y` and an `n` are refused from a covered page.
+        for (request, trust) in [("a1", true), ("n1", false)] {
+            clear(&[&second]);
+            trust_answer_from(&handle, view(2), request, &shown, trust);
+            let sent = second.sent.borrow().clone();
+            assert!(
+                matches!(result_for(&sent, request), Some(Err(why)) if why.contains("under terminal 2")),
+                "{sent:?}"
+            );
+            assert!(
+                notices(&sent).iter().any(|n| n.contains("under terminal 2")),
+                "the page is told why"
+            );
+            poll_trust_until(&handle, "the question again", || {
+                !prompts(&second.sent.borrow()).is_empty()
+            });
+            let again = prompts(&second.sent.borrow()).pop().unwrap();
+            assert_eq!(again.tab, tab);
+            assert_ne!(again.nonce, shown.nonce, "asked again under a fresh nonce");
+            assert!(awaiting_trust(&handle, tab), "the tab still waits for its answer");
+            assert!(fx.spawned.borrow().is_empty(), "nothing started");
+            shown = again;
+        }
+        assert_eq!(*asked.borrow(), vec![view(2), view(2)]);
+
+        covered.set(false);
+        trust_answer_from(&handle, view(2), "a2", &first, true);
+        assert!(
+            matches!(result_for(&second.sent.borrow(), "a2"), Some(Err(_))),
+            "the question first shown is no longer current"
+        );
+        trust_answer_from(&handle, view(2), "a3", &shown, true);
+        assert_eq!(result_for(&second.sent.borrow(), "a3"), Some(Ok(())));
+        poll_trust_until(&handle, "the start", || !fx.spawned.borrow().is_empty());
+        assert!(fx.record_file().is_file());
+    }
+
+    #[test]
+    fn a_trust_command_answer_from_a_covered_page_ends_the_command_unrecorded() {
+        let TrustViews {
+            handle,
+            second,
+            fx,
+            hold,
+            ..
+        } = trust_views("views-trust-command-covered");
+        let covered = Rc::new(Cell::new(true));
+        recording_gate(&handle, &[2], covered.clone());
+        let trust_command_from = |request: &str| {
+            handle.page_message(
+                view(2),
+                &format!(r#"{{"type":"trust_command","request_id":"{request}","action":"trust","agent":"claude"}}"#),
+            );
+        };
+        trust_command_from("c1");
+        poll_trust_until(&handle, "the :trust prompt", || {
+            !prompts(&second.sent.borrow()).is_empty()
+        });
+        let prompt = prompts(&second.sent.borrow()).pop().unwrap();
+        poll_trust_until_idle(&handle);
+        // From here a job the answer queued would stay queued, and the gate would say it is busy.
+        hold.close();
+        clear(&[&second]);
+        trust_answer_from(&handle, view(2), "a1", &prompt, true);
+        let sent = second.sent.borrow().clone();
+        assert!(
+            notices(&sent)
+                .iter()
+                .any(|n| n.contains("under terminal 2") && n.contains(":trust")),
+            "{sent:?}"
+        );
+        assert!(matches!(result_for(&sent, "a1"), Some(Err(why)) if why.contains(":trust")));
+        poll_trust_until(&handle, "the command's result", || {
+            result_for(&second.sent.borrow(), "c1").is_some()
+        });
+        assert!(matches!(result_for(&second.sent.borrow(), "c1"), Some(Err(_))));
+        assert!(
+            !handle.state.borrow().trust.is_busy(),
+            "no Record or Confirm job was queued"
+        );
+        assert!(!fx.record_file().exists(), "nothing recorded");
+        hold.open();
+
+        covered.set(false);
+        clear(&[&second]);
+        trust_command_from("c2");
+        poll_trust_until(&handle, "the :trust prompt again", || {
+            !prompts(&second.sent.borrow()).is_empty()
+        });
+        assert_ne!(prompts(&second.sent.borrow()).pop().unwrap().nonce, prompt.nonce);
+    }
+
+    fn trust_command_from(handle: &AgentPanelHandle, from: ViewId, request: &str, action: &str) {
+        handle.page_message(
+            from,
+            &format!(r#"{{"type":"trust_command","request_id":"{request}","action":"{action}","agent":"claude"}}"#),
+        );
+    }
+
+    /// A `:trust` typed in the base page whose tab breaks out ends: the base page no longer shows that
+    /// tab and cannot answer its prompt. One typed in page 2 whose tab joins back ends the same way.
+    #[test]
+    fn a_trust_command_ends_when_its_tab_leaves_the_page_it_was_typed_in() {
+        let TrustViews {
+            handle,
+            base,
+            second,
+            tab,
+            fx: _fx,
+            hold: _hold,
+        } = trust_views("views-trust-command-moves");
+        let first = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        handle.state.borrow_mut().tabs.select(first);
+        let third = attach_recording_page(&handle, view(3));
+        handle.page_message(view(3), READY);
+
+        trust_command_from(&handle, ViewId::BASE, "c1", "trust");
+        poll_trust_until(&handle, "the :trust prompt in the base page", || {
+            !prompts(&base.sent.borrow()).is_empty()
+        });
+        assert_eq!(handle.break_out(view(3)), Ok(first));
+        poll_trust_until(&handle, "the command's end", || {
+            result_for(&base.sent.borrow(), "c1").is_some()
+        });
+        assert!(matches!(result_for(&base.sent.borrow(), "c1"), Some(Err(_))));
+        assert_eq!(result_for(&third.sent.borrow(), "c1"), None);
+
+        clear(&[&base, &second, &third]);
+        trust_command_from(&handle, view(2), "c2", "trust");
+        poll_trust_until(&handle, "the :trust prompt in page 2", || {
+            !prompts(&second.sent.borrow()).is_empty()
+        });
+        assert_eq!(handle.join_back(view(2)), Ok(tab));
+        poll_trust_until(&handle, "the second command's end", || {
+            result_for(&second.sent.borrow(), "c2").is_some()
+        });
+        assert!(matches!(result_for(&second.sent.borrow(), "c2"), Some(Err(_))));
+        assert_eq!(result_for(&base.sent.borrow(), "c2"), None);
+    }
+
+    /// Two pages number their requests alike: a `:untrust` from page 2 and a `:trust` from the base
+    /// page, both `c1` and both out at once, are each answered in the page that typed it.
+    #[test]
+    fn trust_commands_out_at_once_from_two_pages_are_each_answered_in_their_own_page() {
+        let TrustViews {
+            handle,
+            base,
+            second,
+            fx: _fx,
+            hold,
+            ..
+        } = trust_views("views-trust-two-commands");
+        poll_trust_until_idle(&handle);
+        hold.close();
+        trust_command_from(&handle, view(2), "c1", "untrust");
+        trust_command_from(&handle, ViewId::BASE, "c1", "trust");
+        hold.open();
+        poll_trust_until(&handle, "the :untrust's result and the :trust prompt", || {
+            result_for(&second.sent.borrow(), "c1").is_some() && !prompts(&base.sent.borrow()).is_empty()
+        });
+        assert!(result_for(&second.sent.borrow(), "c1").is_some());
+        assert_eq!(
+            result_for(&base.sent.borrow(), "c1"),
+            None,
+            "the base page's :trust waits for its answer"
+        );
+
+        let prompt = prompts(&base.sent.borrow()).pop().unwrap();
+        clear(&[&base, &second]);
+        trust_answer_from(&handle, ViewId::BASE, "n1", &prompt, false);
+        poll_trust_until(&handle, "the :trust's result", || {
+            result_for(&base.sent.borrow(), "c1").is_some()
+        });
+        assert!(matches!(result_for(&base.sent.borrow(), "c1"), Some(Err(_))));
+        assert_eq!(
+            result_for(&second.sent.borrow(), "c1"),
+            None,
+            "page 2's c1 was answered once"
+        );
+        assert!(
+            handle.state.borrow().trust_commands.is_empty(),
+            "no record is left behind"
+        );
+    }
+
+    /// A first message sent in the base page, its tab broken out to view 3 while it waits and then
+    /// starting there: the start's failure is answered in the base page, which holds the request and
+    /// the text, and page 3 (which shows the tab now) is told the tab's error.
+    #[test]
+    fn a_start_is_answered_in_the_page_it_was_asked_from_after_its_tab_moved() {
+        let TrustViews {
+            handle,
+            base,
+            fx: _fx,
+            hold: _hold,
+            ..
+        } = trust_views("views-start-moves");
+        let first = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        handle.state.borrow_mut().tabs.select(first);
+        let third = attach_recording_page(&handle, view(3));
+        handle.page_message(view(3), READY);
+        handle.page_message(
+            ViewId::BASE,
+            &format!(
+                r#"{{"type":"send_message","request_id":"s1","tab":{},"text":"hello"}}"#,
+                first.0
+            ),
+        );
+        poll_trust_until(&handle, "the question in the base page", || {
+            !prompts(&base.sent.borrow()).is_empty()
+        });
+        assert_eq!(handle.break_out(view(3)), Ok(first));
+        poll_trust_until(&handle, "the question in page 3", || {
+            !prompts(&third.sent.borrow()).is_empty()
+        });
+        let prompt = prompts(&third.sent.borrow()).pop().unwrap();
+        assert_eq!(prompt.tab, first);
+        clear(&[&base, &third]);
+        trust_answer_from(&handle, view(3), "a1", &prompt, true);
+        assert_eq!(result_for(&third.sent.borrow(), "a1"), Some(Ok(())));
+        // The fake connect's channel is closed: the start fails on the tick that collects it.
+        tick_handle_until(&handle, "the start's answer", || {
+            result_for(&base.sent.borrow(), "s1").is_some()
+        });
+        assert!(matches!(result_for(&base.sent.borrow(), "s1"), Some(Err(_))));
+        assert_eq!(result_for(&third.sent.borrow(), "s1"), None);
+        assert!(sent_about(&third, "error", first), "{:?}", third.sent.borrow());
+        assert!(handle.state.borrow().start_pages.is_empty());
+    }
+
+    /// A first message sent in the base page, its tab broken out to view 3 while it waits for the trust
+    /// answer, then closed there: the cancellation goes to the base page, which holds the request and
+    /// reports it with the message's text, not to page 3, which never sent it.
+    #[test]
+    fn a_closed_tabs_start_is_refused_in_the_page_it_was_asked_from_after_its_tab_moved() {
+        let TrustViews {
+            handle,
+            base,
+            fx: _fx,
+            hold: _hold,
+            ..
+        } = trust_views("views-start-closed");
+        let first = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        handle.state.borrow_mut().tabs.select(first);
+        let third = attach_recording_page(&handle, view(3));
+        handle.page_message(view(3), READY);
+        handle.page_message(
+            ViewId::BASE,
+            &format!(
+                r#"{{"type":"send_message","request_id":"s1","tab":{},"text":"hello"}}"#,
+                first.0
+            ),
+        );
+        poll_trust_until(&handle, "the question in the base page", || {
+            !prompts(&base.sent.borrow()).is_empty()
+        });
+        assert_eq!(handle.break_out(view(3)), Ok(first));
+        clear(&[&base, &third]);
+        assert_eq!(handle.close_view_tabs(view(3)), Ok(1));
+        assert_eq!(
+            result_for(&base.sent.borrow(), "s1"),
+            Some(Err(TAB_CLOSED_MESSAGE.to_string()))
+        );
+        assert_eq!(result_for(&third.sent.borrow(), "s1"), None);
+        assert!(handle.state.borrow().start_pages.is_empty());
+    }
+
+    /// A terminal handoff asked from the base page, its tab broken out to view 2 before the close
+    /// finished: page 2, which shows the tab, is sent the card (or the failed close's error), and the
+    /// base page, which holds the request and shows the tab as closing until it is answered, gets the
+    /// answer.
+    #[test]
+    fn a_handoff_is_answered_in_the_page_it_was_asked_from_after_its_tab_moved() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        for failed in [false, true] {
+            let (handle, base, second) = handle_with_two_pages();
+            let moved = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let (_dropped_tx, dropped_rx) = mpsc::channel();
+            handle.state.borrow_mut().tabs.get_mut(moved).unwrap().pending_handoff = Some(PendingHandoff {
+                request_id: "h1".into(),
+                command: a_command(),
+                closed_rx,
+                dropped_rx,
+                page: ViewId::BASE,
+            });
+            assert_eq!(handle.break_out(view(2)), Ok(moved));
+            clear(&[&base, &second]);
+            if failed {
+                drop(closed_tx);
+            } else {
+                closed_tx.send(()).unwrap();
+            }
+            tick_handle_until(&handle, "the handoff's answer", || {
+                result_for(&base.sent.borrow(), "h1").is_some()
+            });
+            let answer = result_for(&base.sent.borrow(), "h1").unwrap();
+            assert_eq!(answer.is_ok(), !failed, "{answer:?}");
+            assert_eq!(result_for(&second.sent.borrow(), "h1"), None);
+            let card = if failed { "error" } else { "handoff" };
+            assert!(sent_about(&second, card, moved), "{:?}", second.sent.borrow());
+            assert!(!sent_about(&base, card, moved), "{:?}", base.sent.borrow());
+            assert!(handle.state.borrow().tabs.get(moved).unwrap().pending_handoff.is_none());
+        }
+    }
+
+    /// The review flow's answers go to the page whose request they answer, a tab's draft to the page
+    /// that shows the tab, and the window's interrupted reverts to the base page; a request the flow
+    /// no longer owes is forgotten.
+    #[test]
+    fn review_flow_answers_go_to_the_page_that_asked() {
+        use eitri_core::turn_review::Out;
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        handle.state.borrow_mut().review_requests = vec![("req-1".into(), view(2)), ("req-2".into(), ViewId::BASE)];
+        clear(&[&base, &second]);
+        let answer = |id: &str| Out::Answer {
+            request_id: id.to_string(),
+            payload: serialize_command_result_for_js(id, Ok(())),
+        };
+        dispatch_review_outs(
+            &handle.state,
+            &handle.pages,
+            vec![
+                answer("req-1"),
+                answer("req-2"),
+                Out::Draft(tab, format!(r#"{{"kind":"review_draft","tab":{}}}"#, tab.0)),
+                Out::Envelope(r#"{"kind":"review_recovery","entries":[]}"#.to_string()),
+            ],
+        );
+        assert_eq!(result_for(&second.sent.borrow(), "req-1"), Some(Ok(())));
+        assert_eq!(result_for(&second.sent.borrow(), "req-2"), None);
+        assert_eq!(result_for(&base.sent.borrow(), "req-2"), Some(Ok(())));
+        assert_eq!(result_for(&base.sent.borrow(), "req-1"), None);
+        assert!(sent_about(&second, "review_draft", tab));
+        assert!(!sent_about(&base, "review_draft", tab));
+        let kinds = |page: &RecordingPage| -> Vec<String> {
+            page.sent
+                .borrow()
+                .iter()
+                .map(|e| json_of(e)["kind"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        assert!(kinds(&base).contains(&"review_recovery".to_string()));
+        assert!(!kinds(&second).contains(&"review_recovery".to_string()));
+        assert!(
+            handle.state.borrow().review_requests.is_empty(),
+            "the flow owes neither any more"
+        );
+    }
+
+    /// A review request whose id another page's request still out has is refused, not mixed up with it.
+    #[test]
+    fn a_review_request_with_another_pages_id_out_is_refused() {
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        handle.state.borrow_mut().review_requests = vec![("req-7".into(), ViewId::BASE)];
+        clear(&[&base, &second]);
+        handle.page_message(
+            view(2),
+            &format!(r#"{{"type":"review_undo","request_id":"req-7","tab":{}}}"#, tab.0),
+        );
+        assert_eq!(
+            result_for(&second.sent.borrow(), "req-7"),
+            Some(Err(REVIEW_ID_IN_USE.to_string()))
+        );
+        assert_eq!(result_for(&base.sent.borrow(), "req-7"), None);
+        assert_eq!(
+            handle.state.borrow().review_requests,
+            vec![("req-7".to_string(), ViewId::BASE)],
+            "the base page's request keeps its record"
+        );
+    }
+
+    /// A tab whose turn left a review hint in page 2 brings it to the base page when it joins back, and
+    /// takes it to page 2 when it breaks out again: the page it arrives in was never sent it.
+    #[test]
+    fn a_moved_tab_brings_its_review_hint_to_its_new_page() {
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        let hint = eitri_core::turn_review::ReviewHint {
+            tab: tab.0,
+            turn: 1,
+            files: 2,
+        };
+        handle.state.borrow_mut().shown_hints.push(hint.clone());
+        clear(&[&base, &second]);
+        assert_eq!(handle.join_back(view(2)), Ok(tab));
+        assert!(sent_about(&base, "review_hint", tab), "{:?}", base.sent.borrow());
+        clear(&[&base, &second]);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        assert!(sent_about(&second, "review_hint", tab), "{:?}", second.sent.borrow());
+        assert!(!sent_about(&base, "review_hint", tab));
     }
 }

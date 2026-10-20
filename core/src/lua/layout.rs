@@ -5,6 +5,8 @@
 //!   startup failure naming the call: [`LayoutStore::default_tree`] holds the error for `shell`, which
 //!   exits naming it once `init.lua` has run -- the discipline `agent.font_size` follows, since
 //!   `init.lua`'s own errors are only logged.
+//! - `eitri.layout.rule(target, opts)`, in `init.lua`: where automatically opened modules go.
+//! - `eitri.layout.open(kind, opts?)`: queues a new terminal or chat view once the window exists.
 //! - `eitri.layout.show(id)`, `.hide(id)`, `.focus(id)`, `.split(id, 'right'|'below')`,
 //!   `.run(name, opts?)`, `.mark(id)` and `.float(id, rect?)`, for use
 //!   inside `eitri.command.register` commands and event handlers: each queues a
@@ -45,12 +47,18 @@ use std::rc::Rc;
 use mlua::{Lua, Table, Value};
 
 use crate::keymap::Action;
+use crate::layout::rules::{OpenRule, OpenRules, RuleSize, RuleTarget};
 use crate::layout::tree::MIN_RATIO;
-use crate::layout::{Axis, Child, Con, ConLayout, Float, FloatRect, Layout, ModuleId, Node, Workspaces, MAX_FLOAT_PX};
+use crate::layout::{
+    Axis, Child, Con, ConLayout, Float, FloatRect, Layout, ModuleId, ModuleKind, Node, Workspaces, MAX_FLOAT_PX,
+};
 
 /// One queued `eitri.layout` call, for `shell` to carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutRequest {
+    /// `eitri.layout.open(kind, opts?)`: a new instance of `kind`; with `opts`, placed as they say,
+    /// else as the rules say.
+    Open(ModuleKind, Option<OpenRule>),
     Switch(String),
     Show(ModuleId),
     Hide(ModuleId),
@@ -76,6 +84,8 @@ pub struct LuaTree {
 pub struct LayoutStore {
     default: Option<Result<LuaTree, String>>,
     defined: Vec<(String, Result<LuaTree, String>)>,
+    rules: OpenRules,
+    rule_error: Option<String>,
     workspaces: Option<Rc<RefCell<Workspaces>>>,
     requests: Vec<LayoutRequest>,
     accepting: bool,
@@ -84,6 +94,14 @@ pub struct LayoutStore {
 }
 
 impl LayoutStore {
+    /// `init.lua`'s open rules, or the first refusal among its `eitri.layout.rule` calls, which stops startup.
+    pub fn rules(&self) -> Result<&OpenRules, String> {
+        match &self.rule_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(&self.rules),
+        }
+    }
+
     /// Definitions in init.lua order, including errors that must stop startup.
     pub fn defined_workspaces(&self) -> &[(String, Result<LuaTree, String>)] {
         &self.defined
@@ -180,6 +198,70 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 store.defined.push((name, parsed.clone()));
             }
             parsed.map(|_| ()).map_err(mlua::Error::RuntimeError)
+        })?,
+    )?;
+
+    let rule_store = store.clone();
+    table.set(
+        "rule",
+        lua.create_function(move |_, (target, opts): (Value, Value)| {
+            if rule_store.borrow().accepting {
+                return Err(mlua::Error::RuntimeError(
+                    "eitri.layout.rule: only in init.lua, before the window exists".to_string(),
+                ));
+            }
+            let Value::String(target) = target else {
+                let message = format!(
+                    "eitri.layout.rule: the target must be a string, not a {}",
+                    target.type_name()
+                );
+                rule_store.borrow_mut().rule_error.get_or_insert(message.clone());
+                return Err(mlua::Error::RuntimeError(message));
+            };
+            let target = target.to_str()?.to_string();
+            let call = format!("eitri.layout.rule('{}')", crate::layout::workspace::printable(&target));
+            let parsed = RuleTarget::parse(&target)
+                .map_err(|e| format!("{call}: {e}"))
+                .and_then(|t| {
+                    let editor = t == RuleTarget::Module(ModuleId::editor());
+                    parse_rule(&call, &opts, editor).map(|rule| (t, rule))
+                });
+            let mut store = rule_store.borrow_mut();
+            let added = parsed.and_then(|(t, rule)| store.rules.add(t, rule).map_err(|e| format!("{call}: {e}")));
+            if let Err(message) = added {
+                store.rule_error.get_or_insert(message.clone());
+                return Err(mlua::Error::RuntimeError(message));
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let open_store = store.clone();
+    table.set(
+        "open",
+        lua.create_function(move |_, (kind, opts): (Value, Value)| {
+            let refuse = |what: String| {
+                mlua::Error::RuntimeError(format!(
+                    "eitri.layout.open: kind must be \"terminal\" or \"agent\", not {what}"
+                ))
+            };
+            let kind = match &kind {
+                Value::String(s) => s.to_str()?.to_string(),
+                other => return Err(refuse(format!("a {}", other.type_name()))),
+            };
+            let module_kind = match kind.as_str() {
+                "terminal" => ModuleKind::Terminal,
+                "agent" => ModuleKind::Agent,
+                other => return Err(refuse(format!("{other:?}"))),
+            };
+            let rule = match &opts {
+                Value::Nil => None,
+                opts => Some(
+                    parse_rule(&format!("eitri.layout.open('{kind}')"), opts, false)
+                        .map_err(mlua::Error::RuntimeError)?,
+                ),
+            };
+            queue(&open_store, "open", LayoutRequest::Open(module_kind, rule))
         })?,
     )?;
 
@@ -431,6 +513,121 @@ fn queue(store: &RefCell<LayoutStore>, call: &str, request: LayoutRequest) -> ml
     }
     store.requests.push(request);
     Ok(())
+}
+
+/// An open rule's options, as `eitri.layout.rule` and `eitri.layout.open` take them; `call` starts every refusal.
+fn parse_rule(call: &str, opts: &Value, editor: bool) -> Result<OpenRule, String> {
+    let Value::Table(table) = opts else {
+        return Err(format!(
+            "{call}: the options must be a table, not a {}",
+            opts.type_name()
+        ));
+    };
+    let mut rule = OpenRule::default();
+    let mut size = None;
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, value) = pair.map_err(|e| format!("{call}: {e}"))?;
+        let key = match &key {
+            Value::String(s) => s.to_str().map_err(|e| format!("{call}: {e}"))?.to_string(),
+            _ => {
+                return Err(format!(
+                    "{call}: option names are strings (at, float, size, scratchpad, focus)"
+                ))
+            }
+        };
+        match key.as_str() {
+            "at" => {
+                let Value::String(s) = &value else {
+                    return Err(format!("{call}: at must be a string, not a {}", value.type_name()));
+                };
+                let s = s.to_str().map_err(|e| format!("{call}: {e}"))?.to_string();
+                rule.at = Some(crate::layout::rules::parse_at(&s).ok_or_else(|| {
+                    format!(
+                        "{call}: at '{s}' is not one of side, bottom, main, below-editor, right, below, left, \
+                         above, tab"
+                    )
+                })?);
+            }
+            "float" | "scratchpad" | "focus" => {
+                let Value::Boolean(on) = value else {
+                    return Err(format!("{call}: {key} must be a boolean, not a {}", value.type_name()));
+                };
+                match key.as_str() {
+                    "float" => rule.float = on,
+                    "scratchpad" => rule.scratchpad = on,
+                    _ => rule.focus = on,
+                }
+            }
+            "size" => size = Some(value),
+            other => {
+                return Err(format!(
+                    "{call}: unknown option '{other}' (at, float, size, scratchpad, focus)"
+                ))
+            }
+        }
+    }
+    if rule.scratchpad {
+        rule.float = true;
+    }
+    if rule.float && rule.at.is_some() {
+        return Err(format!("{call}: a floating module has no 'at'; drop one of them"));
+    }
+    if rule.float && editor {
+        return Err(format!("{call}: the editor never floats"));
+    }
+    if let Some(value) = size {
+        rule.size = Some(parse_rule_size(call, &value, rule.float)?);
+    }
+    Ok(rule)
+}
+
+fn parse_rule_size(call: &str, value: &Value, floating: bool) -> Result<RuleSize, String> {
+    let number = |v: &Value| match v {
+        Value::Integer(i) => Some(*i as f64),
+        Value::Number(n) => Some(*n),
+        _ => None,
+    };
+    let fraction = |n: f64| n > 0.0 && n <= 1.0;
+    match (value, floating) {
+        (Value::Table(t), true) => {
+            let (mut w, mut h) = (None, None);
+            for pair in t.clone().pairs::<Value, Value>() {
+                let (k, v) = pair.map_err(|e| format!("{call}: {e}"))?;
+                let slot = match &k {
+                    Value::Integer(1) => &mut w,
+                    Value::Integer(2) => &mut h,
+                    Value::String(s) if s.to_str().is_ok_and(|s| s == "w") => &mut w,
+                    Value::String(s) if s.to_str().is_ok_and(|s| s == "h") => &mut h,
+                    _ => {
+                        return Err(format!(
+                            "{call}: a floating size is {{ w, h }}, two fractions of the grid"
+                        ))
+                    }
+                };
+                *slot = number(&v);
+            }
+            match (w, h) {
+                (Some(w), Some(h)) if fraction(w) && fraction(h) => Ok(RuleSize::Float {
+                    w: w as f32,
+                    h: h as f32,
+                }),
+                _ => Err(format!(
+                    "{call}: a floating size needs w and h, each a fraction of the grid above 0 and at most 1"
+                )),
+            }
+        }
+        (Value::Table(_), false) => Err(format!(
+            "{call}: a tiled size is one share between 0 and 1, not a table"
+        )),
+        (_, true) => Err(format!(
+            "{call}: a floating size is {{ w, h }}, two fractions of the grid"
+        )),
+        (_, false) => match number(value) {
+            Some(s) if s > 0.0 && s < 1.0 => Ok(RuleSize::Share(s as f32)),
+            Some(s) => Err(format!("{call}: size must be between 0 and 1, not {s}")),
+            None => Err(format!("{call}: size must be a number, not a {}", value.type_name())),
+        },
+    }
 }
 
 /// `eitri.layout.default`'s argument as a tree (the module doc's grammar).
@@ -884,6 +1081,214 @@ mod tests {
         store.borrow_mut().set_lua_panels(vec!["notes".to_string()]);
         store.borrow_mut().accept_requests();
         (lua, store, live)
+    }
+
+    #[test]
+    fn rule_records_an_open_rule_in_init_lua_only() {
+        use crate::layout::rules::{At, OpenPoint, OpenRule, RuleSize, RuleSource};
+        use crate::layout::{Direction, Placement};
+        let (lua, store) = engine();
+        lua.load(
+            "eitri.layout.rule('terminal', { at = 'below-editor' })\n\
+             eitri.layout.rule('terminal#2', { float = true, size = { 0.6, 0.5 }, scratchpad = true })\n\
+             eitri.layout.rule('agent', { at = 'right' })\n\
+             eitri.layout.rule('lua:notes', { at = 'tab', focus = false })\n\
+             eitri.layout.rule('agent#3', { size = 0.3 })\n\
+             eitri.layout.rule('terminal#3', { float = true, size = { w = 0.5, h = 0.4 } })",
+        )
+        .exec()
+        .unwrap();
+        let store = store.borrow();
+        let rules = store.rules().unwrap();
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let (rule, source) = rules.resolve(&t2, OpenPoint::NewInstance, None);
+        assert_eq!(source, RuleSource::Module);
+        assert_eq!(
+            rule,
+            OpenRule {
+                at: None,
+                float: true,
+                size: Some(RuleSize::Float { w: 0.6, h: 0.5 }),
+                scratchpad: true,
+                focus: true
+            }
+        );
+        let (rule, _) = rules.resolve(&ModuleId::parse("terminal#3").unwrap(), OpenPoint::NewInstance, None);
+        assert_eq!(rule.size, Some(RuleSize::Float { w: 0.5, h: 0.4 }));
+        let (rule, _) = rules.resolve(&ModuleId::lua("notes"), OpenPoint::Launch, None);
+        assert_eq!((rule.at, rule.focus), (Some(At::Tab), false));
+        let (rule, _) = rules.resolve(&ModuleId::parse("agent#2").unwrap(), OpenPoint::Break, None);
+        assert_eq!(rule.at, Some(At::Beside(Direction::Right)));
+        let (rule, _) = rules.resolve(&ModuleId::parse("agent#3").unwrap(), OpenPoint::Break, None);
+        assert_eq!((rule.at, rule.size), (None, Some(RuleSize::Share(0.3))));
+        let (rule, _) = rules.resolve(&ModuleId::terminal(), OpenPoint::Launch, None);
+        assert_eq!(rule.at, Some(At::Placement(Placement::BelowEditor)));
+    }
+
+    #[test]
+    fn a_malformed_rule_is_a_startup_failure_naming_the_call() {
+        for (source, why) in [
+            (
+                "eitri.layout.rule('terminal', { at = 'top' })",
+                "at 'top' is not one of side, bottom, main, below-editor, right, below, left, above, tab",
+            ),
+            (
+                "eitri.layout.rule('terminal', { at = 3 })",
+                "at must be a string, not a integer",
+            ),
+            (
+                "eitri.layout.rule('terminal', { float = 'yes' })",
+                "float must be a boolean, not a string",
+            ),
+            (
+                "eitri.layout.rule('terminal', { focus = 1 })",
+                "focus must be a boolean, not a integer",
+            ),
+            (
+                "eitri.layout.rule('terminal', { width = 3 })",
+                "unknown option 'width' (at, float, size, scratchpad, focus)",
+            ),
+            (
+                "eitri.layout.rule('terminal', { float = true, at = 'right' })",
+                "a floating module has no 'at'; drop one of them",
+            ),
+            (
+                "eitri.layout.rule('terminal', { scratchpad = true, at = 'right' })",
+                "a floating module has no 'at'; drop one of them",
+            ),
+            (
+                "eitri.layout.rule('terminal', { size = 1 })",
+                "size must be between 0 and 1, not 1",
+            ),
+            (
+                "eitri.layout.rule('terminal', { size = 0 })",
+                "size must be between 0 and 1, not 0",
+            ),
+            (
+                "eitri.layout.rule('terminal', { size = 'big' })",
+                "size must be a number, not a string",
+            ),
+            (
+                "eitri.layout.rule('terminal', { size = { 0.5, 0.5 } })",
+                "a tiled size is one share between 0 and 1, not a table",
+            ),
+            (
+                "eitri.layout.rule('terminal', { float = true, size = 0.5 })",
+                "a floating size is { w, h }, two fractions of the grid",
+            ),
+            (
+                "eitri.layout.rule('terminal', { float = true, size = { 0.5 } })",
+                "a floating size needs w and h, each a fraction of the grid above 0 and at most 1",
+            ),
+            (
+                "eitri.layout.rule('terminal', { float = true, size = { 0.5, 1.5 } })",
+                "a floating size needs w and h, each a fraction of the grid above 0 and at most 1",
+            ),
+            (
+                "eitri.layout.rule('terminal', { float = true, size = { w = 0.5, d = 0.5 } })",
+                "a floating size is { w, h }, two fractions of the grid",
+            ),
+            (
+                "eitri.layout.rule('editor', { float = true })",
+                "the editor never floats",
+            ),
+            (
+                "eitri.layout.rule('editor', { scratchpad = true })",
+                "the editor never floats",
+            ),
+            (
+                "eitri.layout.rule('terminal#1', { at = 'right' })",
+                "instance 1 is 'terminal'",
+            ),
+            (
+                "eitri.layout.rule('terminal', 'right')",
+                "the options must be a table, not a string",
+            ),
+            ("eitri.layout.rule(3, {})", "the target must be a string, not a integer"),
+        ] {
+            let (lua, store) = engine();
+            let err = lua.load(source).exec().unwrap_err().to_string();
+            assert!(
+                err.contains("eitri.layout.rule") && err.contains(why),
+                "{source}: {err}"
+            );
+            let kept = store.borrow().rules().unwrap_err();
+            assert!(
+                kept.contains(why),
+                "{source}: the store keeps the error for the shell to stop on: {kept}"
+            );
+        }
+        let (lua, store) = engine();
+        lua.load("eitri.layout.rule('agent', {})").exec().unwrap();
+        let err = lua
+            .load("eitri.layout.rule('agent', { at = 'left' })")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("eitri.layout.rule('agent'): a rule for it is already set"),
+            "{err}"
+        );
+        assert!(store.borrow().rules().is_err());
+        let (lua, store) = engine();
+        store.borrow_mut().accept_requests();
+        let err = lua
+            .load("eitri.layout.rule('agent', {})")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("eitri.layout.rule: only in init.lua, before the window exists"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn open_queues_a_kind_and_its_options_once_the_window_exists() {
+        use crate::layout::rules::{At, OpenRule};
+        use crate::layout::{Direction, ModuleKind};
+        let (lua, store) = engine();
+        let err = lua
+            .load("eitri.layout.open('terminal')")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only once the window exists"), "{err}");
+        store.borrow_mut().accept_requests();
+        lua.load("eitri.layout.open('terminal'); eitri.layout.open('agent', { at = 'below', focus = false })")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            store.borrow_mut().take_requests(),
+            [
+                LayoutRequest::Open(ModuleKind::Terminal, None),
+                LayoutRequest::Open(
+                    ModuleKind::Agent,
+                    Some(OpenRule {
+                        at: Some(At::Beside(Direction::Down)),
+                        focus: false,
+                        ..OpenRule::default()
+                    })
+                ),
+            ]
+        );
+        for (source, why) in [
+            (
+                "eitri.layout.open('editor')",
+                "kind must be \"terminal\" or \"agent\", not \"editor\"",
+            ),
+            (
+                "eitri.layout.open(2)",
+                "kind must be \"terminal\" or \"agent\", not a integer",
+            ),
+            (
+                "eitri.layout.open('terminal', { at = 'nowhere' })",
+                "eitri.layout.open('terminal'): at 'nowhere' is not one of",
+            ),
+        ] {
+            let err = lua.load(source).exec().unwrap_err().to_string();
+            assert!(err.contains(why), "{source}: {err}");
+        }
     }
 
     #[test]

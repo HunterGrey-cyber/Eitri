@@ -2159,6 +2159,20 @@ pub struct ChooserTab {
     pub resumable: bool,
 }
 
+impl ChooserTab {
+    /// A chooser row's label: the tab's own label (`tabs::label`), and for a tab shown in an extra
+    /// chat view, which one, after it. The chooser lists every tab from any page, so a row says where
+    /// a pick of it will land. Set as text by the page, never as markup.
+    pub fn label(number: u16, name_part: &str, view: crate::tabs::ViewId) -> String {
+        let label = crate::tabs::label(number, name_part);
+        if view.is_base() {
+            label
+        } else {
+            format!("{label} · agent {}", view.number())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChooserRecord {
     pub provider_session_id: String,
@@ -2356,6 +2370,16 @@ pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chooser_row_names_the_extra_view_that_shows_its_tab() {
+        use crate::tabs::ViewId;
+        assert_eq!(ChooserTab::label(3, "docs", ViewId::BASE), "3 docs");
+        assert_eq!(
+            ChooserTab::label(3, "docs", ViewId::new(2).unwrap()),
+            "3 docs · agent 2"
+        );
+    }
     use crate::tabs::{Marker, TabId};
     use agent::PermissionOutcome;
 
@@ -5585,6 +5609,7 @@ mod tests {
             // Use the strings `TabSet` sends so this assertion cannot drift from the actual prompt text.
             lines: vec![crate::tabs::bypass_prompt(crate::tabs::PromptScope::LiveTab, 2)],
             prompt: crate::tabs::PromptScope::LiveTab,
+            page: crate::tabs::ViewId::BASE,
         };
         assert_eq!(
             serde_json::from_str::<Value>(&serialize_confirm_bypass_for_js(&tab_plan)).unwrap(),
@@ -5604,6 +5629,7 @@ mod tests {
             approve: Vec::new(),
             lines: vec![crate::tabs::bypass_prompt(crate::tabs::PromptScope::Default, 0)],
             prompt: crate::tabs::PromptScope::Default,
+            page: crate::tabs::ViewId::BASE,
         };
         assert_eq!(
             serde_json::from_str::<Value>(&serialize_confirm_bypass_for_js(&default_plan)).unwrap(),

@@ -29,19 +29,26 @@ pub(crate) fn toast_top(bar_shown: bool, bar_height: i32) -> i32 {
     TOAST_MARGIN + if bar_shown { bar_height.max(0) } else { 0 }
 }
 
-/// What the toast says when a card arrives for a chat that is not on screen. `tab` is the tab
-/// holding the newest pending card, `(number, label name)`; `None` when no tab is known
+/// What the toast says when a card arrives for a chat view that is not on screen. `chat` is the
+/// view's chip title (`agent`, `agent 2`) and `attention` the view's own, so the toast reads as that
+/// view's chip does. `tab` is the view's tab holding its newest pending card, `(number, label name)`
+///; `None` when no tab is known
 /// (session tabs not yet wired up, or every tracked card already gone by the time this reads it),
 /// and then the toast falls back to a bare count. `way_back` is the key that brings the chat back,
 /// as the effective keymap binds it (`Ctrl+b a` by default); `None` when the user unbound it, and
 /// then the toast promises no key.
-pub(crate) fn permission_toast_text(attention: Attention, tab: Option<(u16, &str)>, way_back: Option<&str>) -> String {
+pub(crate) fn permission_toast_text(
+    chat: &str,
+    attention: Attention,
+    tab: Option<(u16, &str)>,
+    way_back: Option<&str>,
+) -> String {
     let what = match tab {
         Some((number, name)) => format!("tab {number} \"{name}\""),
         None if attention.pending == 1 => "1 permission card waiting".to_string(),
         None => format!("{} permission cards waiting", attention.pending),
     };
-    let mut text = format!("agent \u{2691}{} \u{2014} {what}", attention.pending);
+    let mut text = format!("{chat} \u{2691}{} \u{2014} {what}", attention.pending);
     if let Some(way_back) = way_back {
         text.push_str(&format!(" \u{00b7} {way_back}"));
     }
@@ -117,7 +124,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            permission_toast_text(one, Some((2, "docs")), Some("Ctrl+b a")),
+            permission_toast_text("agent", one, Some((2, "docs")), Some("Ctrl+b a")),
             "agent \u{2691}1 \u{2014} tab 2 \"docs\" \u{00b7} Ctrl+b a"
         );
         let three = Attention {
@@ -126,13 +133,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            permission_toast_text(three, Some((1, "new")), Some("Ctrl+a a")),
+            permission_toast_text("agent", three, Some((1, "new")), Some("Ctrl+a a")),
             "agent \u{2691}3 \u{2014} tab 1 \"new\" \u{00b7} Ctrl+a a"
         );
         assert_eq!(
-            permission_toast_text(one, None, None),
+            permission_toast_text("agent", one, None, None),
             "agent \u{2691}1 \u{2014} 1 permission card waiting",
             "no tab known and no key bound: the count, and no promise"
+        );
+        assert_eq!(
+            permission_toast_text("agent 2", one, Some((3, "x")), Some("the agent 2 chip")),
+            "agent 2 \u{2691}1 \u{2014} tab 3 \"x\" \u{00b7} the agent 2 chip",
+            "an extra view's toast reads as its chip does"
         );
     }
 

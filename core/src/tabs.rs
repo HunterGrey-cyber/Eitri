@@ -5,11 +5,38 @@
 
 use crate::attention::{AgentPlace, Attention};
 use crate::keymap::TabAction;
-use crate::layout::ModuleKind;
+use crate::layout::module::MAX_INSTANCE;
+use crate::layout::{ModuleId, ModuleKind};
 
 /// A tab's identity for its whole life, and the bridge's: monotonic, never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TabId(pub u64);
+
+/// Which chat view shows a tab: 1 is the base view `agent`, 2 to 9 the extra view `agent#N`. The number is the
+/// view's module's instance number, so a page's view and its module never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ViewId(u8);
+
+impl ViewId {
+    pub const BASE: ViewId = ViewId(1);
+    pub fn new(n: u8) -> Option<ViewId> {
+        (1..=MAX_INSTANCE).contains(&n).then_some(ViewId(n))
+    }
+    pub fn number(self) -> u8 {
+        self.0
+    }
+    pub fn is_base(self) -> bool {
+        self.0 == 1
+    }
+    /// The chat view's module: `agent` for the base view, `agent#N` for an extra one.
+    pub fn module(self) -> ModuleId {
+        ModuleId::instance(ModuleKind::Agent, self.0).expect("a view number is an agent instance number")
+    }
+    /// The view a chat module shows; `None` for any other module.
+    pub fn of_module(id: &ModuleId) -> Option<ViewId> {
+        (id.kind() == ModuleKind::Agent).then(|| ViewId(id.number()))
+    }
+}
 
 /// A rename longer than this is cut.
 pub const NAME_MAX_CHARS: usize = 40;
@@ -310,6 +337,41 @@ pub fn newest_card(tabs: &[(TabId, Option<u64>)]) -> Option<TabId> {
         .map(|(_, id)| id)
 }
 
+/// One tab's attention as the window reported it: the view showing the tab, and when the tab's newest
+/// pending card arrived. Kept per tab, not per view, so a tab that moves between views carries its
+/// count with it instead of looking like a new card in the view it moved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabAttention {
+    pub tab: TabId,
+    pub view: ViewId,
+    pub attention: Attention,
+    pub newest_card: Option<u64>,
+}
+
+/// The views handed a card between two reports: each view showing a tab whose own `arrived` rose and
+/// that still has a card waiting (a tab missing from `before` counts from nothing), once, the view
+/// holding the newest such card last. The window's sum cannot say this: two views handed a card in
+/// one pump raise it once, and only one of them holds the newest card.
+pub fn views_handed_a_card(before: &[TabAttention], now: &[TabAttention]) -> Vec<ViewId> {
+    let mut handed: Vec<(u64, ViewId)> = Vec::new();
+    for tab in now {
+        let was = before
+            .iter()
+            .find(|b| b.tab == tab.tab)
+            .map_or(0, |b| b.attention.arrived);
+        let Some(stamp) = tab.newest_card else { continue };
+        if tab.attention.arrived <= was || tab.attention.pending == 0 {
+            continue;
+        }
+        match handed.iter_mut().find(|(_, view)| *view == tab.view) {
+            Some(entry) => entry.0 = entry.0.max(stamp),
+            None => handed.push((stamp, tab.view)),
+        }
+    }
+    handed.sort();
+    handed.into_iter().map(|(_, view)| view).collect()
+}
+
 /// What a tab verb after the prefix does to the keys: the same table for every host, pure, so it is a test
 /// rather than a reading of a window's code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +431,48 @@ pub fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: usize, in
     TabVerbPlan { verb, takes_the_keys }
 }
 
+/// What a tab key does with the keys in an extra chat view: it acts on that
+/// view's tab, on the base view's tabs, or on the tab with that number wherever it is.
+/// `page` is the view whose page the verb opens in or acts on; for `Select` it is where
+/// a base-view tab is selected -- a tab bound to an extra view has its own view take
+/// the keys instead, which the window reads from where the tab is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewPlan {
+    pub verb: TabVerb,
+    pub page: ViewId,
+    pub takes_the_keys: bool,
+}
+
+/// `None` with the keys in the base view: [`plan`] decides there, as it always has.
+pub fn view_plan(action: TabAction, keys_view: ViewId) -> Option<ViewPlan> {
+    if keys_view.is_base() {
+        return None;
+    }
+    let own = |verb| ViewPlan {
+        verb,
+        page: keys_view,
+        takes_the_keys: false,
+    };
+    let base = |verb, takes_the_keys| ViewPlan {
+        verb,
+        page: ViewId::BASE,
+        takes_the_keys,
+    };
+    Some(match action {
+        TabAction::Rename => own(TabVerb::Rename),
+        TabAction::Close => own(TabVerb::Close),
+        TabAction::Info => own(TabVerb::Info),
+        TabAction::Choose => own(TabVerb::Choose),
+        // An extra view holds one tab: there is no other tab of its own to close.
+        TabAction::CloseOthers => own(TabVerb::Flash),
+        TabAction::New => base(TabVerb::New, true),
+        TabAction::Next => base(TabVerb::Step(1), false),
+        TabAction::Prev => base(TabVerb::Step(-1), false),
+        TabAction::Last => base(TabVerb::Last, false),
+        TabAction::Select(n) => base(TabVerb::Select(u16::from(n)), true),
+    })
+}
+
 /// A conversation record's `created_at`/`updated_at` as a person reads it: local time, `2026-10-09 05:12`.
 /// The records keep milliseconds since the epoch as a string; a stamp that is not one (an older record, a
 /// value this build does not know) is shown as it is, never guessed at.
@@ -418,6 +522,95 @@ mod tests {
     use super::*;
     use crate::attention::{AgentPlace, Attention};
     use crate::layout::ModuleKind;
+
+    #[test]
+    fn a_view_is_its_chat_modules_instance_number() {
+        assert_eq!(ViewId::BASE.number(), 1);
+        assert!(ViewId::BASE.is_base());
+        assert_eq!(ViewId::BASE.module(), crate::layout::ModuleId::agent());
+        let three = ViewId::new(3).unwrap();
+        assert!(!three.is_base());
+        assert_eq!(three.module().as_str(), "agent#3");
+        assert_eq!(ViewId::of_module(&three.module()), Some(three));
+        assert_eq!(ViewId::of_module(&crate::layout::ModuleId::agent()), Some(ViewId::BASE));
+        assert_eq!(ViewId::of_module(&crate::layout::ModuleId::terminal()), None);
+        assert_eq!(
+            ViewId::of_module(&crate::layout::ModuleId::parse("terminal#3").unwrap()),
+            None
+        );
+        assert_eq!(ViewId::new(0), None);
+        assert_eq!(ViewId::new(10), None);
+        assert_eq!(ViewId::new(9).map(ViewId::number), Some(9));
+        assert!(ViewId::BASE < three, "views order by number");
+    }
+
+    #[test]
+    fn the_tab_keys_in_an_extra_view() {
+        let two = ViewId::new(2).unwrap();
+        assert_eq!(
+            view_plan(TabAction::New, ViewId::BASE),
+            None,
+            "the base view keeps tabs::plan"
+        );
+        let plan = |action| view_plan(action, two).unwrap();
+        for (action, verb) in [
+            (TabAction::Rename, TabVerb::Rename),
+            (TabAction::Close, TabVerb::Close),
+            (TabAction::Info, TabVerb::Info),
+            (TabAction::Choose, TabVerb::Choose),
+            (TabAction::CloseOthers, TabVerb::Flash),
+        ] {
+            assert_eq!(
+                plan(action),
+                ViewPlan {
+                    verb,
+                    page: two,
+                    takes_the_keys: false
+                },
+                "{action:?}"
+            );
+        }
+        assert_eq!(
+            plan(TabAction::New),
+            ViewPlan {
+                verb: TabVerb::New,
+                page: ViewId::BASE,
+                takes_the_keys: true
+            }
+        );
+        assert_eq!(
+            plan(TabAction::Next),
+            ViewPlan {
+                verb: TabVerb::Step(1),
+                page: ViewId::BASE,
+                takes_the_keys: false
+            }
+        );
+        assert_eq!(
+            plan(TabAction::Prev),
+            ViewPlan {
+                verb: TabVerb::Step(-1),
+                page: ViewId::BASE,
+                takes_the_keys: false
+            }
+        );
+        assert_eq!(
+            plan(TabAction::Last),
+            ViewPlan {
+                verb: TabVerb::Last,
+                page: ViewId::BASE,
+                takes_the_keys: false
+            }
+        );
+        assert_eq!(
+            plan(TabAction::Select(4)),
+            ViewPlan {
+                verb: TabVerb::Select(4),
+                page: ViewId::BASE,
+                takes_the_keys: true
+            }
+        );
+    }
 
     #[test]
     fn a_new_tab_takes_the_lowest_free_number_from_one() {
@@ -773,6 +966,40 @@ mod tests {
         assert_eq!(oldest_card(&tabs), Some(TabId(3)));
         assert_eq!(newest_card(&tabs), Some(TabId(1)));
         assert_eq!(oldest_card(&[(TabId(1), None)]), None);
+    }
+
+    #[test]
+    fn every_view_handed_a_card_is_named_the_newest_cards_view_last() {
+        let view = |n| ViewId::new(n).unwrap();
+        let at = |tab, v, pending, arrived, newest| TabAttention {
+            tab: TabId(tab),
+            view: view(v),
+            attention: Attention {
+                pending,
+                unread: false,
+                arrived,
+            },
+            newest_card: newest,
+        };
+        // Tab 1 in agent#2 gets a card first, tab 3 in the base view the newest, in the same pump.
+        let before = [at(1, 2, 0, 0, None), at(2, 1, 0, 1, None), at(3, 1, 0, 0, None)];
+        let now = [at(1, 2, 1, 1, Some(5)), at(2, 1, 0, 1, None), at(3, 1, 1, 1, Some(6))];
+        assert_eq!(views_handed_a_card(&before, &now), vec![view(2), ViewId::BASE]);
+        // Nothing new: cards already counted, a tab moved to another view with its card, a card that
+        // arrived and was answered between the two reports.
+        let answered = [at(1, 2, 0, 1, None), at(2, 1, 0, 1, None), at(3, 1, 1, 1, Some(6))];
+        assert_eq!(views_handed_a_card(&now, &answered), Vec::<ViewId>::new());
+        let moved = [at(1, 3, 1, 1, Some(5))];
+        assert_eq!(views_handed_a_card(&now, &moved), Vec::<ViewId>::new());
+        let gone = [at(1, 2, 0, 2, None)];
+        assert_eq!(views_handed_a_card(&answered, &gone), Vec::<ViewId>::new());
+        // A tab first seen with a card waiting, and two tabs of the base view: the base view once.
+        let fresh = [
+            at(4, 4, 1, 1, Some(2)),
+            at(2, 1, 1, 2, Some(7)),
+            at(3, 1, 2, 2, Some(8)),
+        ];
+        assert_eq!(views_handed_a_card(&now, &fresh), vec![view(4), ViewId::BASE]);
     }
 
     #[test]

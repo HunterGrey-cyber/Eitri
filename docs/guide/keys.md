@@ -39,6 +39,7 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> o` | move the keys to the next module on screen |
 | `<prefix> z` | zoom this module, or restore it |
 | `<prefix> %` or `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there; with the keys in a terminal, `t` opens a new terminal there (see [Containers and terminals](#containers-and-terminals)) |
+| `<prefix> !` | with the keys in the agent panel: break the active tab out into a chat view of its own, to the right of the panel; with the keys in such a view, join its tab back (see [Chat views](#chat-views)) |
 | `<prefix> {` / `<prefix> }` | swap this module with the previous / the next one on screen |
 | `<prefix> Alt+1` / `Alt+2` | every module in one row / in one column, at equal sizes |
 | `<prefix> Alt+3` / `Alt+4` / `Alt+5` | the first module big on top with the others in a row below / big on the left with the others in a column beside it / all modules in a grid (tmux's `main-horizontal`, `main-vertical` and `tiled`) |
@@ -87,7 +88,7 @@ screen changes, and the change before the close can no longer be undone.
 **Setting a key that already has an action.** The keys in this section are defaults, and `eitri.keymap.set` on a key
 that has an action stops Eitri at startup with a message that names the call and says to run
 `eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4`, `M-5`, `M-H`,
-`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d`, `M-Enter`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s` or `$` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
+`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d`, `M-Enter`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$` or `!` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
 tmux configuration binds the key, the key already counts as yours and your `set` replaces it with no `del`. A `del`
 of a key that nothing is bound to also stops startup, so a `del` line works only from this version on, or when the
 import and your tmux configuration bind that key.
@@ -158,9 +159,53 @@ on its own reaches the terminal that has the keys, or else the one you used last
 it, after the usual `y/n`; the `terminal` itself is only closed and reopens below the editor. A numbered terminal
 whose shell ends (`exit`) is removed with no question. `<prefix> n` / `<prefix> p` with the keys in a terminal go to
 the next / the previous tab when it is in a tabbed or stacked container, otherwise to the next / the previous
-terminal on screen, and do nothing with only one. Terminals have no text-size keys. There are no extra chats yet:
-`Alt+Enter` opens terminals only, and a split key then `a` with the keys in the chat flashes `chat views: not in
-this build`.
+terminal on screen, and do nothing with only one. Terminals have no text-size keys. `Alt+Enter` opens terminals only; a new chat view
+comes from a split key then `a` with the keys in a chat view, or from `<prefix> !` (see [Chat views](#chat-views)).
+
+### Chat views
+
+A **chat view** is another page of the agent panel, shown as a module of its own and holding one session tab. The
+agent panel you start with is the **base view** (`agent`); the others are `agent#2` to `agent#9`, up to nine in all
+(a tenth is refused with `at most 9 chat views`). Every view is a module like the terminals are: it sits in the
+layout, can be moved, zoomed, floated or hidden, is in every workspace, and has its own chip (`agent 2`, or
+`agent 2 ⚑1` while a card waits in it). Their tabs belong to the window, so they keep running when their view is
+hidden, and every view spends the window's one [account](configuration.md#accounts).
+
+- **`<prefix> !` breaks a tab out.** With the keys in the base view, the tab you are on moves into a new view to the
+  right of the base view, and the view takes the keys. With only one tab in the base view it refuses (the toast reads
+  `can't break with only one tab`): the base view always keeps a tab. With the keys in an extra view, `!` does the
+  opposite: the view is shown no more, its tab returns to the base view as the tab you are on, and the keys go there.
+  With the keys in the editor or a terminal it only flashes. A `set` of `!` in your `init.lua` needs
+  `k.del("prefix", "!")` before it, as for any default key (above).
+- **A new view with an empty tab.** `eitri.layout.run("instance.new", { kind = "agent" })`, `eitri.layout.open("agent")`
+  and a split key then `a` with the keys in a chat view each make a new view holding a new, empty tab of the default
+  agent (its first message goes through the usual [trust question](permissions.md#trusting-a-project) in that view).
+  Where it opens is up to your [open rules](configuration.md#where-a-new-module-opens); by default it is to the right
+  of the module that has the keys.
+- **`<prefix> a`** shows the chat you want: with the keys in a chat view it hides that view, as it hides the base view
+  today; from anywhere else it goes to the view holding the oldest waiting card, else to the chat view you used last,
+  else to the base view. A view has no key of its own by default; `eitri.keymap.set("prefix", "F4", "module.agent#2")`
+  gives one the same behaviour for that view.
+- **Closing.** `<prefix> x` in a view asks `kill-pane agent 2? closes tab 3 <name> (y/n)` and, on `y`, closes that
+  tab and removes the view. A view that is left with no tab (you closed its tab, or joined it back) goes away by
+  itself.
+
+**Tab keys in an extra view.** A view holds one tab, so the tab keys read differently there:
+
+| keys | what they do with the keys in an extra view |
+|---|---|
+| `,` rename, `i` details, `&` close, `Shift+Tab` mode | act on this view's tab; `&` also removes the now-empty view |
+| `r`, `?`, `:` | reload this page only, show its keys, open its command line (a `:` command acts on this view's tab) |
+| `c` | a new tab in the base view, which takes the keys |
+| `n`, `p`, `l` | step through the base view's tabs, as from the editor, without moving the keys |
+| `1` ... `9` | the tab with that number wherever it is: a tab in an extra view gives that view the keys (shown first if hidden), a base-view tab is selected in the base view, which takes them |
+| `w` | the chooser, in this page, listing every open tab (a tab in an extra view reads ` · agent 2` after its name); a choice acts as its digit |
+| `<leader>b o` | flashes: there is no other tab here to close |
+| `!` | join the tab back (above) |
+
+The base view's tab strip lists only its own tabs, so a tab shown in another view leaves a gap in its numbers, as a
+closed tab does. A view with one tab draws no strip. A restored session comes back in the view it was in when the
+layout still has that view, otherwise in the base view (see [Agents](agents.md#chat-views)).
 
 ### Floats, the scratchpad and workspaces
 
@@ -207,7 +252,8 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- a drop-
 
 The first press makes `terminal#2` as `<prefix> Alt+Enter` would, but straight into the scratchpad, shown and with
 the keys; the next one puts it away; a third calls it back. For a module that exists and is not a scratch float,
-the press sends it there and shows it. A chat (`agent#N`) is refused for now (`chat views: not in this build`).
+the press sends it there and shows it. For a chat view that does not exist, `module = "agent#3"` makes it the same way: a float holding a new empty tab,
+put into the scratchpad and shown; a number that is taken, or a tenth view, is refused.
 
 **Workspaces.** `<prefix> s` (or a click on the workspace's name in the top bar, which shows only while there are
 two or more) draws the chooser in the prefix's hint line and waits for one key:
@@ -229,9 +275,9 @@ free number, and `workspace.switch` takes a `name` (`eitri.keymap.set("prefix", 
 "study" })`), making the workspace first when none has that name. Neither has a key; bind them as above.
 
 **The `del` each new default needs.** `Alt+Shift+Space`, `Alt+-`, `Alt+_`, `(`, `)`, `L`, `s` and `$` are
-defaults now, so an `init.lua` that already sets any of them stops at startup until it puts
-`k.del("prefix", "<key>")` before that `set` (the spelling is the one `eitri.keymap` takes: `M-S-Space`, `M--`,
-`M-_`, `(`, `)`, `L`, `s`, `$`). The rule is the one under "Setting a key that already has an action" above,
+defaults now, and so is `!` (`tab.break`, tmux's `break-pane`), so an `init.lua` that already sets any of them stops at
+startup until it puts `k.del("prefix", "<key>")` before that `set` (the spelling is the one `eitri.keymap` takes:
+`M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`; for `!` that is `k.del("prefix", "!")`). The rule is the one under "Setting a key that already has an action" above,
 tmux import included.
 
 ## Moving between panes

@@ -60,7 +60,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use eitri_core::layout::persist::{self, Loaded, V2State};
-use eitri_core::layout::{reconcile_default_floating, Con, FloatRect, Layout, ModuleDecl, ModuleId, Node, Workspaces};
+use eitri_core::layout::rules::{OpenPoint, NOMINAL_GRID};
+use eitri_core::layout::{
+    apply_launch_rule, first_launch_decls, reconcile_default_floating, Con, FloatRect, Layout, ModuleDecl, ModuleId,
+    ModuleKind, Node, OpenRules, Placement, Workspaces,
+};
 use eitri_core::lua::layout::LuaTree;
 use gtk4::glib;
 
@@ -83,23 +87,55 @@ use gtk4::glib;
 /// that one keypress and one relaunch away. `show_editor` is the key that shows it, as the effective
 /// keymap binds it (`Ctrl+b e` by default), so the note names it; `None` when nothing binds one, and
 /// the note then names no key rather than a wrong one.
+///
+/// `lua` is the window's module declarations (the Lua panels', and where the open rules put modules
+/// when nothing holds the keys). A first launch -- the Lua default included -- then applies `rules`'
+/// floats, scratchpads and sizes to what it placed itself: the base terminal and each Lua panel, all
+/// of them with no Lua default, else those the default's tree does not name, sized against
+/// [`NOMINAL_GRID`] since the window has no size yet. A saved layout is never changed by a rule: it is
+/// how the project was left, as it wins over `eitri.layout.default`.
 pub(crate) fn choose_startup_layout(
     default: Option<&LuaTree>,
     loaded: Option<Loaded>,
     lua: &[ModuleDecl],
+    rules: &OpenRules,
     show_editor: Option<&str>,
 ) -> Result<(Workspaces, Layout, Vec<String>, Option<String>), String> {
     let mut notes = Vec::new();
     let first_launch = |notes: &mut Vec<String>| -> Result<Layout, String> {
-        match default {
+        let (mut layout, named) = match default {
             Some(tree) => {
                 let r = reconcile_default_floating(tree.tiled.clone(), tree.floats.clone(), lua)
                     .map_err(|e| format!("eitri.layout.default: {e}"))?;
                 notes.extend(r.notes.into_iter().map(|n| format!("eitri.layout.default: {n}")));
-                Ok(r.layout)
+                let named: Vec<ModuleId> = tree
+                    .tiled
+                    .leaves()
+                    .into_iter()
+                    .chain(tree.floats.iter().map(|float| float.id.clone()))
+                    .collect();
+                (r.layout, named)
             }
-            None => crate::terminal::initial_layout(lua).map_err(|e| e.to_string()),
+            None => (
+                crate::terminal::initial_layout(lua).map_err(|e| e.to_string())?,
+                Vec::new(),
+            ),
+        };
+        let mut placed: Vec<(ModuleId, Option<Placement>)> = vec![(ModuleId::terminal(), None)];
+        placed.extend(
+            first_launch_decls(lua)
+                .into_iter()
+                .filter(|d| d.id.kind() == ModuleKind::LuaWebview)
+                .map(|d| (d.id, Some(d.placement))),
+        );
+        for (id, position) in placed.into_iter().filter(|(id, _)| !named.contains(id)) {
+            let (rule, _) = rules.resolve(&id, OpenPoint::Launch, position);
+            match apply_launch_rule(&mut layout, &id, &rule, NOMINAL_GRID) {
+                Ok(applied) => notes.extend(applied),
+                Err(err) => notes.push(format!("open rule for '{id}' not applied at the first launch: {err}")),
+            }
         }
+        Ok(layout)
     };
     let (workspaces, layout, keep_copy) = match loaded {
         Some(Loaded::Restored(opened)) | Some(Loaded::Migrated(opened)) => {
@@ -163,7 +199,7 @@ pub(crate) fn add_defined_workspaces(
             .create(name, reconciled.layout)
             .map_err(|err| format!("eitri.layout.workspace('{name}'): {err}"))?;
     }
-    notes.extend(workspaces.fit_all(live));
+    notes.extend(workspaces.fit_all_with(live, lua));
     Ok(notes)
 }
 
@@ -513,7 +549,8 @@ mod tests {
 
     #[test]
     fn defined_workspaces_open_after_main_on_a_first_launch() {
-        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let (mut workspaces, mut layout, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
         let notes = add_defined_workspaces(
             &mut workspaces,
             &mut layout,
@@ -547,7 +584,8 @@ mod tests {
             notes: vec![],
             keep_copy: None,
         });
-        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(loaded), &[], None).unwrap();
+        let (mut workspaces, mut layout, _, _) =
+            choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None).unwrap();
         let notes = add_defined_workspaces(
             &mut workspaces,
             &mut layout,
@@ -584,7 +622,8 @@ mod tests {
             },
             scratch: true,
         });
-        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let (mut workspaces, mut layout, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
         add_defined_workspaces(&mut workspaces, &mut layout, &[("review".to_string(), review)], &[]).unwrap();
         assert!(workspaces.stored("review").unwrap().is_floating(&t2));
         assert!(layout.contains(&t2) && layout.hidden().contains(&t2) && !layout.is_floating(&t2));
@@ -592,7 +631,8 @@ mod tests {
 
     #[test]
     fn a_template_without_the_chat_is_an_error_naming_the_call() {
-        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let (mut workspaces, mut layout, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
         let err = add_defined_workspaces(
             &mut workspaces,
             &mut layout,
@@ -637,6 +677,7 @@ mod tests {
             }),
             Some(restored(left.clone())),
             &[],
+            &OpenRules::default(),
             None,
         )
         .unwrap();
@@ -670,6 +711,7 @@ mod tests {
                 }),
                 loaded,
                 &[],
+                &OpenRules::default(),
                 None,
             )
             .unwrap();
@@ -686,7 +728,8 @@ mod tests {
             id: ModuleId::lua("side"),
             placement: Placement::RightOfRoot,
         }];
-        let (_, layout, notes, _) = choose_startup_layout(None, Some(Loaded::Missing), &side, None).unwrap();
+        let (_, layout, notes, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &side, &OpenRules::default(), None).unwrap();
         assert_eq!(layout, crate::terminal::initial_layout(&side).unwrap());
         assert!(notes.is_empty());
     }
@@ -704,8 +747,14 @@ mod tests {
             &eitri_core::layout::Frame::new(eitri_core::layout::Size { w: 1280, h: 721 }, 1),
         )
         .unwrap();
-        let (_, layout, notes, _) =
-            choose_startup_layout(None, Some(restored(left.clone())), &[], Some("Ctrl+b e")).unwrap();
+        let (_, layout, notes, _) = choose_startup_layout(
+            None,
+            Some(restored(left.clone())),
+            &[],
+            &OpenRules::default(),
+            Some("Ctrl+b e"),
+        )
+        .unwrap();
         assert!(!layout.is_shown(&ModuleId::editor()));
         assert_eq!(
             notes.last().map(String::as_str),
@@ -715,7 +764,8 @@ mod tests {
             )
         );
         // With nothing bound to show the editor, the note names no key rather than a wrong one.
-        let (_, _, notes, _) = choose_startup_layout(None, Some(restored(left)), &[], None).unwrap();
+        let (_, _, notes, _) =
+            choose_startup_layout(None, Some(restored(left)), &[], &OpenRules::default(), None).unwrap();
         assert_eq!(
             notes.last().map(String::as_str),
             Some(
@@ -723,7 +773,8 @@ mod tests {
                  it is shown"
             )
         );
-        let (_, _, notes, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let (_, _, notes, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
         assert!(notes.iter().all(|n| !n.contains("editor is hidden")), "{notes:?}");
     }
 
@@ -986,6 +1037,7 @@ mod tests {
             }),
             Some(Loaded::Missing),
             &[],
+            &OpenRules::default(),
             None,
         )
         .unwrap();
@@ -1040,6 +1092,7 @@ mod tests {
             }),
             Some(Loaded::Missing),
             &[],
+            &OpenRules::default(),
             None,
         )
         .unwrap();
@@ -1505,6 +1558,7 @@ mod tests {
             }),
             None,
             &[],
+            &OpenRules::default(),
             None,
         )
         .unwrap();
@@ -1529,7 +1583,8 @@ mod tests {
     impl Window {
         fn open(dir: &Path) -> Window {
             let loaded = persist::load(dir, root(), &[]);
-            let (workspaces, layout, _, keep_copy) = choose_startup_layout(None, Some(loaded), &[], None).unwrap();
+            let (workspaces, layout, _, keep_copy) =
+                choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None).unwrap();
             Window::with(dir, workspaces, layout, keep_copy)
         }
 
@@ -1612,8 +1667,14 @@ mod tests {
                 "second": {"type": "leaf", "module": "agent"}},
             "hidden": [], "focus": "editor"}"#;
         std::fs::write(&v1, text).unwrap();
-        let (workspaces, layout, notes, keep_copy) =
-            choose_startup_layout(None, Some(persist::load(&dir, root(), &[])), &[], None).unwrap();
+        let (workspaces, layout, notes, keep_copy) = choose_startup_layout(
+            None,
+            Some(persist::load(&dir, root(), &[])),
+            &[],
+            &OpenRules::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(workspaces, Workspaces::single());
         assert!(layout.is_shown(&ModuleId::terminal()));
         assert_eq!(
@@ -1850,7 +1911,8 @@ mod tests {
                 scratch: false,
             }],
         };
-        let (_, layout, notes, copy) = choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], None).unwrap();
+        let (_, layout, notes, copy) =
+            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
         assert!(layout.is_floating(&ModuleId::terminal()));
         assert!(!layout.leaves().contains(&ModuleId::terminal()));
         assert!(notes.is_empty(), "{notes:?}");
@@ -1878,7 +1940,8 @@ mod tests {
                 scratch: false,
             }],
         };
-        let (_, layout, notes, copy) = choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], None).unwrap();
+        let (_, layout, notes, copy) =
+            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
         assert!(layout.is_floating(&ModuleId::agent()));
         assert!(!layout.leaves().contains(&ModuleId::agent()));
         assert!(notes.is_empty(), "{notes:?}");
@@ -1988,5 +2051,179 @@ mod tests {
         assert!(back.is_stowed(&ModuleId::terminal()));
         assert!(back.hidden().contains(&ModuleId::terminal()));
         assert!(back.float_of(&ModuleId::terminal()).unwrap().scratch);
+    }
+
+    fn rules_of(entries: &[(&str, eitri_core::layout::OpenRule)]) -> OpenRules {
+        let mut rules = OpenRules::default();
+        for (target, rule) in entries {
+            rules
+                .add(
+                    eitri_core::layout::rules::RuleTarget::parse(target).unwrap(),
+                    rule.clone(),
+                )
+                .unwrap();
+        }
+        rules
+    }
+
+    fn at(name: &str) -> Option<eitri_core::layout::rules::At> {
+        Some(eitri_core::layout::rules::parse_at(name).unwrap())
+    }
+
+    #[test]
+    fn a_first_launch_stows_the_terminal_a_scratchpad_rule_names() {
+        use eitri_core::layout::OpenRule;
+        let rules = rules_of(&[(
+            "terminal",
+            OpenRule {
+                scratchpad: true,
+                ..OpenRule::default()
+            },
+        )]);
+        let (decls, _) = rules.launch_decls(&[]);
+        let (_, layout, notes, _) = choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        let terminal = ModuleId::terminal();
+        assert!(layout.is_floating(&terminal), "{layout:?}");
+        assert!(layout.float_of(&terminal).unwrap().scratch);
+        assert!(!layout.leaves().contains(&terminal));
+        assert!(!layout.is_shown(&terminal));
+        assert_eq!(layout.focus(), &ModuleId::editor());
+        assert_eq!(layout.visible_leaves(), [ModuleId::editor(), ModuleId::agent()]);
+        assert!(
+            notes.contains(&"open rule for 'terminal': a first launch floats it, stowed in the scratchpad".to_string()),
+            "{notes:?}"
+        );
+    }
+
+    /// A chat view's or a numbered instance's declaration only says where that module goes when
+    /// something else places it: a first launch places neither, and its tree is today's.
+    #[test]
+    fn a_first_launch_with_rules_for_chat_views_and_instances_places_only_its_own() {
+        use eitri_core::layout::OpenRule;
+        let rules = rules_of(&[
+            (
+                "agent",
+                OpenRule {
+                    at: at("below"),
+                    ..OpenRule::default()
+                },
+            ),
+            (
+                "terminal#3",
+                OpenRule {
+                    at: at("side"),
+                    ..OpenRule::default()
+                },
+            ),
+        ]);
+        let (decls, _) = rules.launch_decls(&[]);
+        assert!(decls.iter().any(|d| d.id == ModuleId::agent()));
+        assert!(decls.iter().any(|d| d.id == ModuleId::parse("terminal#3").unwrap()));
+        let (_, layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        let today = crate::terminal::initial_layout(&[]).unwrap();
+        assert_eq!(layout.leaves(), today.leaves());
+        assert_eq!(layout, today);
+    }
+
+    #[test]
+    fn a_first_launch_puts_the_terminal_where_its_rule_says() {
+        use eitri_core::layout::OpenRule;
+        let rules = rules_of(&[(
+            "terminal",
+            OpenRule {
+                at: at("bottom"),
+                ..OpenRule::default()
+            },
+        )]);
+        let (decls, _) = rules.launch_decls(&[]);
+        let (_, layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        assert_eq!(
+            layout.leaves(),
+            [ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()],
+            "below everything, not below the editor"
+        );
+        assert!(!layout.is_shown(&ModuleId::terminal()));
+    }
+
+    #[test]
+    fn a_saved_layout_is_not_moved_by_a_rule() {
+        use eitri_core::layout::OpenRule;
+        let mut left = crate::terminal::initial_layout(&[]).unwrap();
+        left.show(&ModuleId::terminal()).unwrap();
+        let rules = rules_of(&[(
+            "terminal",
+            OpenRule {
+                at: at("bottom"),
+                float: true,
+                ..OpenRule::default()
+            },
+        )]);
+        let (decls, _) = rules.launch_decls(&[]);
+        let (_, layout, notes, _) =
+            choose_startup_layout(None, Some(restored(left.clone())), &decls, &rules, None).unwrap();
+        assert_eq!(layout, left);
+        assert!(notes.iter().all(|n| !n.starts_with("open rule")), "{notes:?}");
+    }
+
+    /// A Lua default's tree is the user's own arrangement: what it names stays as it says, and only what
+    /// the first launch adds to it -- here a Lua panel and the terminal it leaves out -- follows a rule.
+    #[test]
+    fn a_lua_default_places_what_it_names_and_the_rules_place_the_rest() {
+        use eitri_core::layout::OpenRule;
+        let named = ModuleId::lua("named");
+        let other = ModuleId::lua("other");
+        let floats = OpenRule {
+            float: true,
+            ..OpenRule::default()
+        };
+        let rules = rules_of(&[
+            ("lua:named", floats.clone()),
+            ("lua:other", floats.clone()),
+            ("terminal", floats),
+        ]);
+        let panels = [
+            ModuleDecl {
+                id: named.clone(),
+                placement: Placement::RightOfRoot,
+            },
+            ModuleDecl {
+                id: other.clone(),
+                placement: Placement::RightOfRoot,
+            },
+        ];
+        let (decls, _) = rules.launch_decls(&panels);
+        let tree = LuaTree {
+            tiled: Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(named.clone()),
+                ),
+            ),
+            floats: Vec::new(),
+        };
+        let (_, layout, notes, _) =
+            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        assert!(layout.leaves().contains(&named) && !layout.is_floating(&named));
+        assert!(layout.is_floating(&other) && !layout.leaves().contains(&other));
+        assert!(layout.is_floating(&ModuleId::terminal()));
+        assert!(
+            !layout.is_shown(&ModuleId::terminal()),
+            "a first launch's terminal stays hidden"
+        );
+        for floated in [&other, &ModuleId::terminal()] {
+            let note = format!("open rule for '{floated}': a first launch floats it");
+            assert!(notes.contains(&note), "{note} in {notes:?}");
+        }
+        assert!(
+            notes
+                .iter()
+                .all(|n| !n.starts_with(&format!("open rule for '{named}'"))),
+            "{notes:?}"
+        );
     }
 }

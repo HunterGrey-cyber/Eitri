@@ -3,6 +3,7 @@
 //! in a WebView and bridges it to a lazily started `agent::AgentSession`.
 
 mod agent_panel;
+mod chat_views;
 mod chrome;
 mod close_prompt;
 mod companion;
@@ -54,18 +55,23 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
+use agent_panel::ViewId;
+use chat_views::ChatViews;
 use eitri_core::attention::AgentPlace;
 use eitri_core::keymap::action::{FloatRule, SelectionRule, SplitCwd};
-use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened};
+use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened as KeysOpened};
 use eitri_core::keymap::prefix::WorkspacePick;
 use eitri_core::keymap::{Action, SwapTarget, TabAction};
+use eitri_core::layout::rules::{OpenPoint, RuleSize};
 use eitri_core::layout::workspace::MAIN;
 use eitri_core::layout::{
-    Axis, ConLayout, Direction, FloatRect, KeyAction, KillScope, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKeys,
-    ModuleKind, Nav, Preset, Reopen, ScratchShow, Selection, WorkspaceError, Workspaces, DEFAULT_FLOAT_SHARE,
+    declared_placement, Axis, ConLayout, Direction, KeyAction, KillScope, Layout, LayoutError, ModuleDecl, ModuleId,
+    ModuleKeys, ModuleKind, Nav, OpenRule, OpenRules, Opened, Placement, Preset, Reopen, ScratchShow, Selection,
+    WorkspaceError, Workspaces,
 };
 use eitri_core::plugin::theme::PageTheme;
 use eitri_core::tabs::TabVerb;
+use eitri_panel::panel_page::PanelPage;
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
@@ -439,7 +445,9 @@ fn build_ui(
             })
             .collect(),
     );
-    let decls: Vec<ModuleDecl> = lua_panels
+    // The Lua panels as `init.lua` registered them, each at its own `position`. Where the window
+    // places modules by itself (`decls`, below) is these with the open rules applied.
+    let panel_decls: Vec<ModuleDecl> = lua_panels
         .iter()
         .map(|(id, slot, _)| ModuleDecl {
             id: id.clone(),
@@ -496,6 +504,24 @@ fn build_ui(
         }
         None => None,
     };
+    let rules = match lua_engine.layout.borrow().rules().cloned() {
+        Ok(rules) => Rc::new(rules),
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            std::process::exit(1);
+        }
+    };
+    // Where the window places a module when no module holds the keys -- a first launch, a reconcile of
+    // the file or a template, a module a workspace lacks, a module back after a kill: the Lua panels at
+    // their rule's place, else their `position`, and each built-in or instance a rule names. Every one
+    // of those reads these, so the rules reach them all.
+    let decls: Vec<ModuleDecl> = {
+        let (decls, notes) = rules.launch_decls(&panel_decls);
+        for note in notes {
+            println!("[layout] {note}");
+        }
+        decls
+    };
     let state_dir = eitri_core::layout::persist::state_dir(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
@@ -513,7 +539,8 @@ fn build_ui(
     // `workspaces` holds the window's other workspaces beside it, and what a later build keeps in the
     // file.
     let (workspaces, module_layout, keep_copy) =
-        match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls, show_editor.as_deref()) {
+        match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls, &rules, show_editor.as_deref())
+        {
             Ok((workspaces, layout, notes, keep_copy)) => {
                 for note in notes {
                     println!("[layout] {note}");
@@ -610,6 +637,40 @@ fn build_ui(
         let (pane, _) = terminals.borrow_mut().take_or_make(&id, || make_terminal_pane());
         grid.add(id, pane.widget(), pane.widget(), HostKind::Direct);
     }
+    // Every extra chat view's page, keyed by its module id: a view that leaves the layout keeps its page
+    // here, idle, for the next view of that number only (`chat_views`'s module doc). The base view's page
+    // is the `related` one of each: the pages share its web process (and so its memory).
+    let chat_views: Rc<RefCell<ChatViews<(webkit6::WebView, Rc<PanelPage>)>>> = Rc::new(RefCell::new(ChatViews::new()));
+    let base_webview: Option<webkit6::WebView> = agent_widget.downcast_ref::<webkit6::WebView>().cloned();
+    // Every chat view the layout the window opens with holds, in any workspace, gets its page and host
+    // now, as the numbered terminals do, so the hosts exist before the first `apply`. The panel is told
+    // which views there are before the base page's `ready` can start a restore, so a restored tab saved
+    // in one of them comes back into it. Where WebKit cannot start, each view's place is the notice the
+    // base view shows.
+    let startup_chat_views: Vec<ModuleId> = {
+        let layout = module_layout.borrow();
+        let workspaces = workspaces.borrow();
+        let layouts: Vec<&eitri_core::layout::Layout> =
+            workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
+        extra_chat_views(&layouts)
+    };
+    for id in &startup_chat_views {
+        let view = ViewId::of_module(id).expect("a chat module");
+        match &base_webview {
+            Some(base) => {
+                let ((webview, _), _) = chat_views.borrow_mut().take_or_make(id, || {
+                    agent_panel::build_chat_page(&agent_panel_handle, view, Some(base))
+                });
+                grid.add(id.clone(), &WebHost::new(&webview), &webview, web_host);
+            }
+            None => {
+                let notice = webkit_sandbox::notice_widget(panel_notice.unwrap_or(CHAT_VIEWS_NEED_WEBKIT));
+                grid.add(id.clone(), &WebHost::new(&notice), &notice, web_host);
+            }
+        }
+        println!("[chat] {id}: its page and host made at startup");
+    }
+    agent_panel_handle.set_layout_views(startup_chat_views.iter().filter_map(ViewId::of_module).collect());
     for (id, slot, widget) in &lua_panels {
         // On the `WebView`: its host measures its one child, so the grid sees the same floor.
         if *slot == PanelSlot::Bottom {
@@ -750,7 +811,14 @@ fn build_ui(
     // action. Everything about it -- why it is an app action, what it costs, what is still
     // unverified -- is in `agent_panel::install_reload_action`'s doc comment. One call rather than
     // an inline block on purpose: `build_ui` is being edited by two other tracks of the same plan.
-    agent_panel::install_reload_action(app, &agent_panel_handle);
+    agent_panel::install_reload_action(app, &agent_panel_handle, {
+        let module_layout = module_layout.clone();
+        Rc::new(move || {
+            module_layout
+                .try_borrow()
+                .map_or(ViewId::BASE, |layout| keys_chat_view(&layout))
+        })
+    });
     // The panel starts on the same fallback the chrome does, then both follow nvim together.
     // So does the editor's own clear colour: `neovide-editor` snaps the grid's sub-cell remainder
     // to the TOP edge so the bottom sits flush against the window's edge, which puts a thin band
@@ -959,12 +1027,12 @@ fn build_ui(
         .chain(tray.items())
         .chain(top_bar.items.iter().cloned())
         .collect();
-    // A strip entry reads as its module's chip would, so a chat on a tab not drawn shows its cards'
-    // mark there (`agent ⚑1`): the tray has no chip for a module its strip already names.
+    // A strip entry reads as its module's chip would, so a chat view on a tab not drawn shows its own
+    // tab's cards' mark there (`agent 2 ⚑1`): the tray has no chip for a module its strip already names.
     {
         let title = module_title.clone();
         let agent = agent_panel_handle.clone();
-        grid.set_strip_label(move |id| tray::strip_label(id, &title(id), agent.attention()));
+        grid.set_strip_label(move |id| tray::strip_label(id, &title(id), view_attention(&agent, id)));
     }
     // The selected container, as text in the top bar beside the mark. Refreshed on every change of
     // the grid, after every action and Lua request, on the prefix's own `Esc`, and when the keys move
@@ -1105,6 +1173,7 @@ fn build_ui(
                         match layout.set_focus(id) {
                             Ok(()) => {
                                 focus_history.borrow_mut().note(id);
+                                // A return is kept only for a sheet in the base view.
                                 keys_return.borrow_mut().focus_moved(id, &ModuleId::agent());
                                 // A float given the keys is on top of the z-order now; its host goes to
                                 // the top of the grid once this focus change is over, not inside it, and
@@ -1140,7 +1209,10 @@ fn build_ui(
                         // The typing window only counts while the editor holds the keys.
                         agent_panel_handle.set_editor_has_keys(has_keys);
                     }
-                    ModuleKind::Agent => agent_panel_handle.set_pane_focused(has_keys),
+                    // Each chat view's page is told for itself, so exactly one is told it has the keys.
+                    ModuleKind::Agent => {
+                        agent_panel_handle.set_pane_focused(ViewId::of_module(id).expect("a chat module"), has_keys)
+                    }
                     // One solid cursor among the terminals: the one taking the keys draws it, and
                     // every other live terminal is told it has not got them.
                     ModuleKind::Terminal => {
@@ -1202,78 +1274,101 @@ fn build_ui(
     let arrive: Rc<dyn Fn(&ModuleId)> = {
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |id| {
-            if id.kind() == ModuleKind::Agent {
-                // The oldest card across every tab: its tab is switched to first (session tabs).
-                if !agent_panel_handle.focus_oldest_card() {
-                    agent_panel_handle.arrive();
+            // Into a chat view: the oldest card among that view's tabs (the base view switches to the
+            // tab holding it first), else the view's own arrival.
+            if let Some(view) = ViewId::of_module(id) {
+                if !agent_panel_handle.focus_oldest_card(view) {
+                    agent_panel_handle.arrive(view);
                 }
             }
         })
     };
 
-    // A card that arrives while the chat is not on screen: a toast -- the
+    // A card that arrives while its chat view is not on screen: a toast -- the
     // only sign in Immersive mode -- or, with `modules.chat.on_permission = reveal` and nothing
-    // zoomed, the chat back where it was, the keys staying where they are.
-    // The key that brings the chat back, as the keymap binds it: the toast's last words.
-    let way_back: Option<String> = keymap
-        .keys_for(&Action::Module(ModuleId::agent()))
-        .first()
-        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()));
+    // zoomed, that view back where it was, the keys staying where they are. Every view handed a card
+    // reacts by its own place, so a card for a hidden view is not lost to one that arrived in a view on
+    // screen in the same pump; the toast names the last of them to want one, the newest card's view.
+    // The way back to each view, as the keymap binds it: the toast's last words.
+    let way_backs: Vec<(ViewId, String, Option<String>)> = (1..=eitri_core::layout::module::MAX_INSTANCE)
+        .filter_map(ViewId::new)
+        .map(|view| {
+            let title = module_title(&view.module());
+            let way_back = view_way_back(&keymap, view, &title);
+            (view, title, way_back)
+        })
+        .collect();
     {
         let module_layout = module_layout.clone();
         let grid = grid.clone();
         let toast = toast.clone();
         let tray = tray.clone();
         let give_keys = give_keys.clone();
-        let way_back = way_back.clone();
         let on_permission = config.on_permission;
-        // Cloned so the closure can call back into the handle for the tab that holds the newest
+        // Cloned so the closure can call back into the handle for each view's attention and newest
         // card: the hook fires from the pump (`report_attention`) after its own state borrow is
         // already dropped, so this is safe and never re-enters a held `RefCell`.
         let agent_panel_handle_for_toast = agent_panel_handle.clone();
-        agent_panel_handle.on_attention(move |before, after| {
-            // A chat under a float counts as away: its cards may be hidden there.
-            let (place, covered) = {
+        agent_panel_handle.on_attention(move |_before, after, handed| {
+            let agent = &agent_panel_handle_for_toast;
+            {
                 let layout = module_layout.borrow();
-                let covered = covered_chat(&chat_covering(&grid, &layout));
-                (eitri_core::layout::agent_place_covered(&layout, &covered), covered)
-            };
-            let reaction = eitri_core::attention::react(on_permission, before, after, place);
-            println!("[attention] agent {after:?} ({place:?}) -> {reaction:?}");
-            tray.refresh(&module_layout.borrow(), after, &covered);
+                tray.refresh(&layout, &|id| view_attention(agent, id), &covered_views(&grid, &layout));
+            }
             // A chat on a tab not drawn has no chip: its strip entry carries the mark, and a card
             // arriving or clearing changes no layout, so the entries are relabelled here.
             grid.refresh_strips();
-            let mut toast_instead = false;
-            if reaction.reveal && place == AgentPlace::Covered {
-                // Only scratch floats without the keys are put away; a float still over the chat
-                // after that gets the toast the badge policy shows.
-                if reveal_covered_chat(&grid, &module_layout, &*give_keys) {
-                    println!("[attention] a float still covers the chat; a toast instead");
-                    toast_instead = true;
-                }
-            } else if reaction.reveal {
-                // Its tab stays behind when the keys are on a sibling tab of the same container
-                // (drawing the chat's would hide them): the toast the badge policy shows is all there
-                // is then, as under a zoom.
-                match reveal_chat_in_grid(&grid, &module_layout) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        println!("[attention] the chat's tab stays behind the keys' tab; a toast instead");
+            let mut toast_for = None;
+            for &view in handed {
+                let chat = view.module();
+                // A view under a float counts as away: its cards may be hidden there. Asked again for
+                // each view, as revealing the one before may have moved the layout.
+                let place = {
+                    let layout = module_layout.borrow();
+                    eitri_core::layout::view_place(&layout, &chat, &covered_views(&grid, &layout))
+                };
+                // The panel already judged that a card arrived in this view, so the view's attention is
+                // weighed against none: `react` then asks only whether a card waits and where it is.
+                let mine = agent.attention_of(view);
+                let reaction = eitri_core::attention::react(on_permission, Default::default(), mine, place);
+                println!("[attention] {chat} {mine:?} (window {after:?}, {place:?}) -> {reaction:?}");
+                let mut toast_instead = false;
+                if reaction.reveal && place == AgentPlace::Covered {
+                    // Only scratch floats without the keys are put away; a float still over the view
+                    // after that gets the toast the badge policy shows.
+                    if reveal_covered_chat(&grid, &module_layout, view, &*give_keys) {
+                        println!("[attention] a float still covers {chat}; a toast instead");
                         toast_instead = true;
                     }
-                    Err(err) => eprintln!("[attention] could not reveal the chat: {err}"),
+                } else if reaction.reveal {
+                    // Its tab stays behind when the keys are on a sibling tab of the same container
+                    // (drawing the view's would hide them): the toast the badge policy shows is all
+                    // there is then, as under a zoom.
+                    match reveal_chat_in_grid(&grid, &module_layout, &chat) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            println!("[attention] {chat}'s tab stays behind the keys' tab; a toast instead");
+                            toast_instead = true;
+                        }
+                        Err(err) => eprintln!("[attention] could not reveal {chat}: {err}"),
+                    }
+                }
+                if reaction.toast || toast_instead {
+                    toast_for = Some((view, mine));
                 }
             }
-            if reaction.toast || toast_instead {
-                toast.show(&toast::permission_toast_text(
-                    after,
-                    agent_panel_handle_for_toast
-                        .newest_card_label()
-                        .as_ref()
-                        .map(|(n, name)| (*n, name.as_str())),
-                    way_back.as_deref(),
-                ));
+            if let Some((view, mine)) = toast_for {
+                if let Some((_, title, way_back)) = way_backs.iter().find(|(v, _, _)| *v == view) {
+                    toast.show(&toast::permission_toast_text(
+                        title,
+                        mine,
+                        agent
+                            .newest_card_label_in(view)
+                            .as_ref()
+                            .map(|(n, name)| (*n, name.as_str())),
+                        way_back.as_deref(),
+                    ));
+                }
             }
         });
     }
@@ -1333,10 +1428,10 @@ fn build_ui(
             }
         });
     }
-    // A card answer from the chat while a float covers it is refused and the card stays waiting:
-    // the answer would be for a card the user may not see. Asked at the moment of each answer, from
-    // the arrangement then; the refusal names the topmost float over the chat and the key that clears
-    // it.
+    // A card answer from a chat view while a float covers that view is refused and the card stays
+    // waiting: the answer would be for a card the user may not see. Asked at the moment of each answer,
+    // for the view whose page sent it, from the arrangement then; the refusal names that view, the
+    // topmost float over it and the key that clears it. A float over another view does not count.
     {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
@@ -1345,8 +1440,8 @@ fn build_ui(
         let toast = toast.clone();
         let stow_key = key_text(&keymap, &Action::ScratchpadShow { module: None });
         let sink_key = key_text(&keymap, &Action::FloatToggle);
-        agent_panel_handle.set_answer_gate(Rc::new(move || {
-            let chat = ModuleId::agent();
+        agent_panel_handle.set_answer_gate(Rc::new(move |view: ViewId| {
+            let chat = view.module();
             let Ok(layout) = module_layout.try_borrow() else {
                 // Nothing holds the layout across a page message; were something to, the answer is
                 // not taken unchecked.
@@ -1354,7 +1449,7 @@ fn build_ui(
                 refuse_text(&refused_name, &toast, &text);
                 return Err(text);
             };
-            let covering = chat_covering(&grid, &layout);
+            let covering = view_covering(&grid, &layout, view);
             let Some(top) = covering.last() else {
                 return Ok(());
             };
@@ -1366,39 +1461,39 @@ fn build_ui(
             Err(text)
         }));
     }
-    // For attention a chat under a float is off screen: a turn that finishes there is unread. Asked by
-    // the panel each time it decides; a layout being written right then counts as covered, so the
-    // completion keeps its mark rather than being taken for seen.
+    // For attention a chat view under a float is off screen: a turn that finishes there is unread.
+    // Asked by the panel each time it decides, for the view it judges; a layout being written right
+    // then counts as covered, so the completion keeps its mark rather than being taken for seen.
     {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
-        agent_panel_handle.set_coverage(Rc::new(move || match module_layout.try_borrow() {
-            Ok(layout) => !chat_covering(&grid, &layout).is_empty(),
+        agent_panel_handle.set_coverage(Rc::new(move |view: ViewId| match module_layout.try_borrow() {
+            Ok(layout) => !view_covering(&grid, &layout, view).is_empty(),
             Err(_) => true,
         }));
     }
-    // `prefix ?` and `prefix :` open something in the chat and give it the keys: under a float the
-    // sheet or the line would be out of sight while every key went to it. Scratch floats over the chat
+    // `prefix ?` and `prefix :` open something in a chat view and give it the keys: under a float the
+    // sheet or the line would be out of sight while every key went to it. Scratch floats over the view
     // that do not hold the keys are put away first, as for a card that reveals; a float still over it
-    // refuses the key with the text a card answer gets. `None` when the chat can take the keys in view.
-    let chat_covered_refusal: Rc<dyn Fn() -> Option<String>> = {
+    // refuses the key with the text a card answer gets. `None` when the view can take the keys in view.
+    let chat_covered_refusal: Rc<dyn Fn(ViewId) -> Option<String>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let title = module_title.clone();
         let give_keys = give_keys.clone();
         let stow_key = key_text(&keymap, &Action::ScratchpadShow { module: None });
         let sink_key = key_text(&keymap, &Action::FloatToggle);
-        Rc::new(move || {
-            let chat = ModuleId::agent();
+        Rc::new(move |view: ViewId| {
+            let chat = view.module();
             if module_layout.borrow().is_floating(&chat) {
                 // Taking the keys raises a floating chat over every other float.
                 return None;
             }
-            if !reveal_covered_chat(&grid, &module_layout, &*give_keys) {
+            if !reveal_covered_chat(&grid, &module_layout, view, &*give_keys) {
                 return None;
             }
             let layout = module_layout.borrow();
-            let top = chat_covering(&grid, &layout).last().cloned()?;
+            let top = view_covering(&grid, &layout, view).last().cloned()?;
             let scratch = layout.float_of(&top).is_some_and(|float| float.scratch);
             drop(layout);
             let key = if scratch { &stow_key } else { &sink_key };
@@ -1486,8 +1581,16 @@ fn build_ui(
     }
     {
         let focus_and_arrive = focus_and_arrive.clone();
-        agent_panel_handle.on_editor_done(move || {
-            if let Err(err) = focus_and_arrive(&ModuleId::agent()) {
+        // Back to the view the edit's tab is in; to the base view when that view has gone meanwhile.
+        agent_panel_handle.on_editor_done(move |view| {
+            let returned = focus_and_arrive(&view.module()).or_else(|err| {
+                if view.is_base() {
+                    Err(err)
+                } else {
+                    focus_and_arrive(&ModuleId::agent())
+                }
+            });
+            if let Err(err) = returned {
                 eprintln!("[scratch] could not return the keys to the chat: {err}");
             }
         });
@@ -1499,10 +1602,14 @@ fn build_ui(
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let terminals = terminals.clone();
+        let chat_views = chat_views.clone();
         let give_keys = give_keys.clone();
         let arrive = arrive.clone();
         Rc::new(move |id, axis| {
-            let live = terminals.borrow().get(id).is_some();
+            let live = match id.kind() {
+                ModuleKind::Agent => chat_views.borrow().get(id).is_some(),
+                _ => terminals.borrow().get(id).is_some(),
+            };
             placeable_by_id(id, live)?;
             let target = module_layout.borrow().focus().clone();
             grid.place_module(id, &target, axis)?;
@@ -1616,8 +1723,119 @@ fn build_ui(
             Ok(())
         })
     };
+    // The chat views whose removal is their caller's own, while it closes or moves their tab: the kill
+    // of a view, and a new view taking its tab back after a refusal. The panel's word that such a view
+    // holds no tab is then not a request to remove it.
+    let chat_busy: Rc<RefCell<std::collections::BTreeSet<ViewId>>> = Rc::default();
+    // An extra chat view leaves the window: out of the layout (its keys handed on as a kill hands them,
+    // before its host unmaps), out of every other workspace, and its page idle under its id for the next
+    // view of that number. Its host stays in the grid, child-invisible. `true` when there was anything
+    // to remove.
+    let drop_chat_view: Rc<dyn Fn(&ModuleId) -> Result<bool, LayoutError>> = {
+        let grid = grid.downgrade();
+        let module_layout = module_layout.clone();
+        let focus_module = focus_module.clone();
+        let workspaces = workspaces.clone();
+        let chat_views = chat_views.clone();
+        let agent = agent_panel_handle.clone();
+        Rc::new(move |id| {
+            let (Some(grid), Some(view)) = (grid.upgrade(), ViewId::of_module(id)) else {
+                return Ok(false);
+            };
+            if view.is_base() {
+                return Ok(false);
+            }
+            let in_layout = module_layout.borrow().contains(id);
+            if in_layout {
+                grid.kill_module(id, Reopen::Remove, &*focus_module)?;
+            }
+            let elsewhere = {
+                let layout = module_layout.borrow();
+                let workspaces = workspaces.borrow();
+                workspaces.each(&layout).iter().any(|(_, layout)| layout.contains(id))
+            };
+            workspaces.borrow_mut().remove_everywhere(id);
+            let idled = chat_views.borrow_mut().retire(id);
+            if idled {
+                agent.idle_page(view);
+            }
+            // A restore still to come must not bring a tab back into a view that has left: its page is
+            // idle, so the tab would show nowhere. The panel is told the views that remain.
+            let remaining: Vec<ViewId> = {
+                let layout = module_layout.borrow();
+                let workspaces = workspaces.borrow();
+                let layouts: Vec<&eitri_core::layout::Layout> =
+                    workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
+                extra_chat_views(&layouts)
+                    .iter()
+                    .filter_map(ViewId::of_module)
+                    .collect()
+            };
+            agent.set_layout_views(remaining);
+            Ok(in_layout || elsewhere || idled)
+        })
+    };
+    // An extra view left with no tab -- its tab closed, joined back, or a failed restore discarded, and,
+    // once the restore has settled, a view the layout held that no tab came back into -- leaves every
+    // workspace. Removed on the loop's next turn, not inside the panel's own call: the panel may be in
+    // the middle of its tick. A view given a tab again by then stays.
+    {
+        let chat_busy = chat_busy.clone();
+        let drop_chat_view = drop_chat_view.clone();
+        let give_keys = give_keys.clone();
+        let show_on_screen = show_on_screen.clone();
+        let module_layout = module_layout.clone();
+        let window = window.clone();
+        let grid = grid.downgrade();
+        let agent = agent_panel_handle.clone();
+        agent_panel_handle.on_view_empty(move |view| {
+            if view.is_base() || chat_busy.borrow().contains(&view) {
+                return;
+            }
+            let drop_chat_view = drop_chat_view.clone();
+            let give_keys = give_keys.clone();
+            let show_on_screen = show_on_screen.clone();
+            let module_layout = module_layout.clone();
+            let window = window.clone();
+            let grid = grid.clone();
+            let agent = agent.clone();
+            glib::idle_add_local_once(move || {
+                if agent.views().contains(&view) {
+                    return;
+                }
+                let Some(grid) = grid.upgrade() else { return };
+                let id = view.module();
+                // The view the only module on screen: its removal hides it first, as a kill does, and
+                // the layout refuses to hide its last module, so the base view is shown beside it first
+                // (the editor where the base view cannot be shown). Without this the empty view would
+                // stay for good, since nothing asks again.
+                let alone = eitri_core::layout::can_kill(&module_layout.borrow(), &id) == Ok(KillScope::Window);
+                if alone {
+                    let shown = show_on_screen(&ModuleId::agent()).or_else(|err| {
+                        println!("[chat] {id}: the base view could not be shown ({err}); trying the editor");
+                        show_on_screen(&ModuleId::editor())
+                    });
+                    if let Err(err) = shown {
+                        println!("[chat] {id} holds no tab but is the only module on screen: {err}");
+                        return;
+                    }
+                }
+                // The keys in the view that goes: they go to the base view first, where a chat is.
+                if pane_focus::focused_module(&window, &grid.hosts()).as_ref() == Some(&id) {
+                    give_keys(&ModuleId::agent());
+                }
+                match drop_chat_view(&id) {
+                    Ok(true) => println!("[chat] {id} holds no tab; removed"),
+                    Ok(false) => {}
+                    Err(err) => println!("[chat] {id} holds no tab and could not be removed: {err}"),
+                }
+            });
+        });
+    }
     let kill_now: Rc<dyn Fn(&ModuleId, Option<String>) -> Result<(), String>> = {
         let grid = grid.clone();
+        let chat_busy = chat_busy.clone();
+        let drop_chat_view = drop_chat_view.clone();
         let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
         let kill_terminal = kill_terminal.clone();
@@ -1654,8 +1872,20 @@ fn build_ui(
                     }
                     killed.borrow_mut().insert(id.clone());
                 }
+                // An extra view: its one tab closed, then the view leaves the layout and every workspace,
+                // and its page goes idle under its id.
+                ModuleKind::Agent if id.number() >= 2 => {
+                    let view = ViewId::of_module(id).expect("a chat module");
+                    chat_busy.borrow_mut().insert(view);
+                    let closed = agent.close_view_tabs(view);
+                    chat_busy.borrow_mut().remove(&view);
+                    let closed = closed?;
+                    drop_chat_view(id).map_err(|e| e.to_string())?;
+                    println!("[modules] {id}: killed, {closed} session tab(s) closed; the view left the layout");
+                }
+                // The base view: only its own tabs close. A tab shown in another view is that view's.
                 ModuleKind::Agent => {
-                    let closed = agent.close_every_tab()?;
+                    let closed = agent.close_view_tabs(ViewId::BASE)?;
                     grid.kill_module(id, reopen, &*focus_module)
                         .map_err(|e| e.to_string())?;
                     println!("[modules] {id}: killed, {closed} session tab(s) closed");
@@ -1696,7 +1926,7 @@ fn build_ui(
                 killed.borrow_mut().remove(&id);
                 println!("[modules] {id}: shown again after a kill, starting it fresh");
                 match id.kind() {
-                    ModuleKind::Agent => agent.open_chooser(),
+                    ModuleKind::Agent => agent.open_chooser(ViewId::of_module(&id).expect("a chat module")),
                     ModuleKind::LuaWebview => {
                         if let Some((_, widget, url, crash_guard)) = lua_pages.iter().find(|(m, _, _, _)| *m == id) {
                             if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
@@ -1724,36 +1954,47 @@ fn build_ui(
             open_module(id, action);
         });
     }
-    // Every layout change redraws the tray, a float moving onto or off the chat included. A float
-    // leaving the chat brings it on screen as a map would: what finished under the float is seen then.
+    // Every layout change redraws the tray, a float moving onto or off a chat view included. A float
+    // leaving a view brings it on screen as a map would: what finished under the float is seen then.
     {
         let tray = tray.clone();
         let module_layout = module_layout.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         let changed_grid = grid.downgrade();
-        let was_covered = Rc::new(std::cell::Cell::new(false));
+        let was_covered: Rc<RefCell<Vec<ModuleId>>> = Rc::default();
         grid.connect_changed(move || {
             let Some(grid) = changed_grid.upgrade() else { return };
-            let uncovered = {
+            let uncovered: Vec<ViewId> = {
                 let Ok(layout) = module_layout.try_borrow() else { return };
-                let covered = covered_chat(&chat_covering(&grid, &layout));
-                tray.refresh(&layout, agent_panel_handle.attention(), &covered);
-                was_covered.replace(!covered.is_empty()) && covered.is_empty()
+                let covered = covered_views(&grid, &layout);
+                tray.refresh(&layout, &|id| view_attention(&agent_panel_handle, id), &covered);
+                let was = was_covered.replace(covered.clone());
+                was.iter()
+                    .filter(|id| !covered.contains(id))
+                    .filter_map(ViewId::of_module)
+                    .collect()
             };
             // Once this change is over, never inside it: the panel's attention hook reads the layout
-            // and the grid again. The panel checks then that the page is mapped and clear, so a chat
+            // and the grid again. The panel checks then that the page is mapped and clear, so a view
             // that left the screen with its float sees nothing.
-            if uncovered {
+            if !uncovered.is_empty() {
                 let panel = agent_panel_handle.clone();
-                glib::idle_add_local_once(move || panel.page_shown());
+                glib::idle_add_local_once(move || {
+                    for view in uncovered {
+                        panel.page_shown(view);
+                    }
+                });
             }
         });
     }
-    tray.refresh(
-        &module_layout.borrow(),
-        agent_panel_handle.attention(),
-        &covered_chat(&chat_covering(&grid, &module_layout.borrow())),
-    );
+    {
+        let layout = module_layout.borrow();
+        tray.refresh(
+            &layout,
+            &|id| view_attention(&agent_panel_handle, id),
+            &covered_views(&grid, &layout),
+        );
+    }
 
     // --- A module takes the keys by keyboard: `Ctrl+h/j/k/l` (`move_focus`, below) and `prefix ;`/
     // `prefix o` (the prefix's `Action::SelectLast`/`SelectNext`) land the same way. A zoom ends
@@ -1768,8 +2009,8 @@ fn build_ui(
         Rc::new(move |to| {
             grid.unzoom();
             let grabbed = give_keys(to);
-            if grabbed && to.kind() == ModuleKind::Agent {
-                agent_panel_handle.arrive();
+            if let Some(view) = ViewId::of_module(to).filter(|_| grabbed) {
+                agent_panel_handle.arrive(view);
             }
             grabbed
         })
@@ -1808,8 +2049,8 @@ fn build_ui(
     // asks Rust to do exactly what the chord would have done.
     agent_panel_handle.on_nav_fallthrough({
         let move_focus = move_focus.clone();
-        move |direction| {
-            move_focus(&ModuleId::agent(), direction);
+        move |view: ViewId, direction| {
+            move_focus(&view.module(), direction);
         }
     });
 
@@ -1825,6 +2066,8 @@ fn build_ui(
         let give_keys = give_keys.clone();
         let keys_return = keys_return.clone();
         move |opening, return_keys| {
+            // Only an opening in the base view keeps a return: a chat view holding the keys opens the
+            // sheet in its own page, where the keys already are.
             let chat = ModuleId::agent();
             let focused = pane_focus::focused_module(&window, &grid.hosts());
             let ret = {
@@ -1995,54 +2238,67 @@ fn build_ui(
             }
         })
     };
-    // A new terminal instance (`instance.new`, `M-Enter`, or a split key from a terminal): the lowest
-    // number no workspace holds and no data kept for a later build names, a pane from the registry --
-    // the idle one of that number if it was killed before, whose host the grid already holds, else a
-    // new pane with its own host -- placed beside `beside` along `axis`, added hidden to every other
-    // workspace, and given the keys. Its shell starts in `dir` through the change hook, when the
-    // placement shows it. `beside` is checked here, not where the request was made: a split that read
-    // its shell's directory off the GTK thread finds out only now whether its target is still there.
-    let new_terminal: Rc<dyn Fn(&ModuleId, Axis, PathBuf) -> Result<ModuleId, String>> = {
+    // A new terminal instance: the lowest number no workspace holds and no data kept for a later build
+    // names, a pane from the registry -- the idle one of that number if it was killed before, whose host
+    // the grid already holds, else a new pane with its own host -- placed as `how` says, added hidden
+    // to every other workspace at its declared place, and given the keys unless its open rule keeps
+    // them where they are. A split key from a terminal says where (`OpenHow::Beside`, never a rule);
+    // `instance.new`, `M-Enter` and `eitri.layout.open` go where the open rules say. Its shell starts
+    // in `dir` through the change hook, when the placement shows it. A split's `beside` is checked
+    // here, not where the request was made: a split that read its shell's directory off the GTK thread
+    // finds out only now whether its target is still there.
+    let new_terminal: Rc<dyn Fn(OpenHow, PathBuf) -> Result<ModuleId, String>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let workspaces = workspaces.clone();
         let terminals = terminals.clone();
         let host_terminal = host_terminal.clone();
         let give_keys = give_keys.clone();
-        Rc::new(move |beside, axis, dir| {
+        let rules = rules.clone();
+        let decls = decls.clone();
+        Rc::new(move |how, dir| {
             let id = {
                 let layout = module_layout.borrow();
-                if !layout.contains(beside) {
-                    return Err(format!("{beside} has left the layout; no terminal was opened"));
+                if let OpenHow::Beside(beside, _) = &how {
+                    if !layout.contains(beside) {
+                        return Err(format!("{beside} has left the layout; no terminal was opened"));
+                    }
                 }
                 let workspaces = workspaces.borrow();
                 let layouts: Vec<&eitri_core::layout::Layout> =
                     workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
-                new_terminal_id(&layouts, &workspaces.reserved())
+                new_instance_id(ModuleKind::Terminal, &layouts, &workspaces.reserved())
             }
             .ok_or_else(|| "at most 9 terminals".to_string())?;
             host_terminal(&id, dir);
-            if let Err(err) = grid.place_module(&id, beside, axis) {
-                terminals.borrow_mut().retire(&id);
-                return Err(err.to_string());
-            }
-            workspaces.borrow_mut().add_everywhere(&id);
-            give_keys(&id);
-            println!("[terminal] {id}: opened beside {beside} ({axis:?})");
+            let opened = match open_instance(&grid, &rules, &id, &how, &*give_keys) {
+                Ok(opened) => opened,
+                Err(err) => {
+                    terminals.borrow_mut().retire(&id);
+                    return Err(err.to_string());
+                }
+            };
+            workspaces
+                .borrow_mut()
+                .add_everywhere_at(&id, declared_placement(&decls, &id, Placement::BelowEditor));
+            println!("[terminal] {id}: opened {}", how.describe(&opened));
             Ok(id)
         })
     };
     // `scratchpad.show { module = "terminal#N" }` for an instance that does not exist yet: made as
-    // `new_terminal` makes one, but added as a float rather than placed in the tree, centred at the
-    // default share of the grid, and hidden in every other workspace. Not given the keys here: the
-    // caller asks the scratchpad to show it, which does that. Refused for a number another workspace
-    // holds or data kept for a later build names, since two modules must never share a name.
+    // `new_terminal` makes one, but added as a float rather than placed in the tree, centred at its
+    // open rule's float size, else the default share of the grid, and hidden in every other workspace
+    // at its declared place. Not given the keys here: the caller asks the scratchpad to show it, which
+    // does that. Refused for a number another workspace holds or data kept for a later build names,
+    // since two modules must never share a name.
     let new_scratch_terminal: Rc<dyn Fn(&ModuleId, PathBuf) -> Result<(), String>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let workspaces = workspaces.clone();
         let terminals = terminals.clone();
         let host_terminal = host_terminal.clone();
+        let rules = rules.clone();
+        let decls = decls.clone();
         Rc::new(move |id, dir| {
             {
                 let layout = module_layout.borrow();
@@ -2055,7 +2311,8 @@ fn build_ui(
                 }
             }
             host_terminal(id, dir);
-            let rect = grid.with_current_frame(|frame| FloatRect::centred(frame.size, DEFAULT_FLOAT_SHARE));
+            let size = rule_for(&rules, id, OpenPoint::NewInstance, None).size;
+            let rect = grid.with_current_frame(|frame| eitri_core::layout::rules::float_rect(size, frame.size));
             // Added as a plain float: the scratchpad's show that follows makes it a scratch float and
             // shows it, where a float already in the scratchpad and on screen would be stowed instead.
             let added = module_layout.borrow_mut().add_float(id, rect, false);
@@ -2063,15 +2320,212 @@ fn build_ui(
                 terminals.borrow_mut().retire(id);
                 return Err(err.to_string());
             }
-            workspaces.borrow_mut().add_everywhere(id);
+            workspaces
+                .borrow_mut()
+                .add_everywhere_at(id, declared_placement(&decls, id, Placement::BelowEditor));
             println!("[terminal] {id}: opened as a float for the scratchpad");
             Ok(())
         })
     };
 
+    // An extra chat view's page and host: its page from the pool -- the live one, else the idle one
+    // recorded under this id, attached again with a fresh document, else a new page built for this view
+    // by the one constructor, with the base view's page as its related one -- and, the first time, its
+    // host, off screen until a placement shows it, with the keys' routes every web module has.
+    let host_chat_view: Rc<dyn Fn(&ModuleId) -> Result<(), String>> = {
+        let grid = grid.clone();
+        let chat_views = chat_views.clone();
+        let agent = agent_panel_handle.clone();
+        let base_webview = base_webview.clone();
+        let move_focus = move_focus.clone();
+        let text_size_controller = text_size_controller.clone();
+        Rc::new(move |id| {
+            let Some(base) = base_webview.as_ref() else {
+                return Err(CHAT_VIEWS_NEED_WEBKIT.to_string());
+            };
+            let view = ViewId::of_module(id)
+                .filter(|view| !view.is_base())
+                .ok_or_else(|| format!("{id} is not an extra chat view"))?;
+            let was_live = chat_views.borrow().get(id).is_some();
+            let ((webview, page), reused) = chat_views
+                .borrow_mut()
+                .take_or_make(id, || agent_panel::build_chat_page(&agent, view, Some(base)));
+            if reused == chat_views::Reused::Yes && !was_live {
+                // The same page, still answering for this view only: it starts again from an empty
+                // record and a fresh document.
+                agent.attach_page(view, page);
+                agent.load_document(view);
+            }
+            if !grid.has_host(id) {
+                if reused == chat_views::Reused::Yes {
+                    eprintln!("[chat] BUG: {id} reused a page the grid has no host for; giving it one");
+                }
+                let host = WebHost::new(&webview);
+                grid.add(id.clone(), &host, &webview, web_host);
+                // Off screen until a placement shows it (`ModuleGrid::apply` maps it then).
+                host.set_child_visible(false);
+                let host: gtk4::Widget = host.upcast();
+                install_module_nav(
+                    id.clone(),
+                    &host,
+                    move_focus.clone(),
+                    Some(agent.nav_intercept(view)),
+                    false,
+                );
+                panel_super::install(&host);
+                wheel_zoom::install(id.clone(), &host, text_size_controller.clone());
+            }
+            Ok(())
+        })
+    };
+    // A page that never got its view placed waits idle under its id.
+    let retire_chat_page: Rc<dyn Fn(&ModuleId)> = {
+        let chat_views = chat_views.clone();
+        let agent = agent_panel_handle.clone();
+        Rc::new(move |id| {
+            if chat_views.borrow_mut().retire(id) {
+                if let Some(view) = ViewId::of_module(id) {
+                    agent.idle_page(view);
+                }
+            }
+        })
+    };
+    // A new chat view: the lowest `agent#N` no workspace holds and no kept data reserves, its page and
+    // host (`host_chat_view`), its tab -- a new empty tab of the window's default agent, or the base
+    // view's active tab brought out of it -- placed as `how` says, added hidden to every other
+    // workspace at its declared place, and given the keys unless its open rule keeps them where they
+    // are. A split key then the chat's key with the keys in a chat view says where
+    // (`OpenHow::Beside`); `instance.new { kind = "agent" }`, `eitri.layout.open("agent")` and
+    // `tab.break` go where the open rules say. A refused placement takes the tab back (the empty tab
+    // closed, a brought tab joined back) and leaves the page idle.
+    let new_chat_view: Rc<dyn Fn(OpenHow, NewViewTab) -> Result<ModuleId, String>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let workspaces = workspaces.clone();
+        let agent = agent_panel_handle.clone();
+        let host_chat_view = host_chat_view.clone();
+        let retire_chat_page = retire_chat_page.clone();
+        let chat_busy = chat_busy.clone();
+        let give_keys = give_keys.clone();
+        let rules = rules.clone();
+        let decls = decls.clone();
+        Rc::new(move |how, tab| {
+            let id = {
+                let layout = module_layout.borrow();
+                if let OpenHow::Beside(beside, _) = &how {
+                    if !layout.contains(beside) {
+                        return Err(format!("{beside} has left the layout; no chat view was opened"));
+                    }
+                }
+                let workspaces = workspaces.borrow();
+                let layouts: Vec<&eitri_core::layout::Layout> =
+                    workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
+                new_instance_id(ModuleKind::Agent, &layouts, &workspaces.reserved())
+            }
+            .ok_or_else(|| "at most 9 chat views".to_string())?;
+            host_chat_view(&id)?;
+            let view = ViewId::of_module(&id).expect("a chat module");
+            chat_busy.borrow_mut().insert(view);
+            let placed = (|| {
+                match tab {
+                    NewViewTab::Empty => agent.open_in(view).map(drop)?,
+                    NewViewTab::Break => agent.break_out(view).map(drop)?,
+                }
+                open_instance(&grid, &rules, &id, &how, &*give_keys).map_err(|err| {
+                    let back = match tab {
+                        NewViewTab::Empty => agent.close_view_tabs(view).map(drop).map_err(String::from),
+                        NewViewTab::Break => agent.join_back(view).map(drop),
+                    };
+                    if let Err(back) = back {
+                        eprintln!("[chat] {id}: its tab could not be taken back: {back}");
+                    }
+                    err.to_string()
+                })
+            })();
+            chat_busy.borrow_mut().remove(&view);
+            let opened = match placed {
+                Ok(opened) => opened,
+                Err(err) => {
+                    retire_chat_page(&id);
+                    return Err(err);
+                }
+            };
+            workspaces
+                .borrow_mut()
+                .add_everywhere_at(&id, declared_placement(&decls, &id, Placement::BelowEditor));
+            if opened.takes_keys {
+                agent.arrive(view);
+            }
+            println!("[chat] {id}: opened {}", how.describe(&opened));
+            Ok(id)
+        })
+    };
+    // `scratchpad.show { module = "agent#N" }` for a view that does not exist yet: made as
+    // `new_chat_view` makes one, with a new empty tab, but added as a float rather than placed in the
+    // tree, centred at its open rule's float size, else the default share of the grid, and hidden in
+    // every other workspace at its declared place. Not given the keys here: the caller asks the
+    // scratchpad to show it, which does that. Refused for a number another workspace holds or data kept
+    // for a later build names, since two modules must never share a name.
+    let new_scratch_chat_view: Rc<dyn Fn(&ModuleId) -> Result<(), String>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let workspaces = workspaces.clone();
+        let agent = agent_panel_handle.clone();
+        let host_chat_view = host_chat_view.clone();
+        let retire_chat_page = retire_chat_page.clone();
+        let chat_busy = chat_busy.clone();
+        let rules = rules.clone();
+        let decls = decls.clone();
+        Rc::new(move |id| {
+            {
+                let layout = module_layout.borrow();
+                let workspaces = workspaces.borrow();
+                if workspaces.reserved().contains(id) {
+                    return Err(format!("{id}: a later build's saved layout holds that number"));
+                }
+                if workspaces.each(&layout).iter().any(|(_, layout)| layout.contains(id)) {
+                    return Err(format!("{id}: another workspace holds it"));
+                }
+            }
+            host_chat_view(id)?;
+            let view = ViewId::of_module(id).expect("a chat module");
+            chat_busy.borrow_mut().insert(view);
+            let added = (|| {
+                agent.open_in(view)?;
+                let size = rule_for(&rules, id, OpenPoint::NewInstance, None).size;
+                let rect = grid.with_current_frame(|frame| eitri_core::layout::rules::float_rect(size, frame.size));
+                // Added as a plain float: the scratchpad's show that follows makes it a scratch float
+                // and shows it.
+                let added = module_layout.borrow_mut().add_float(id, rect, false);
+                added.map_err(|err| {
+                    if let Err(back) = agent.close_view_tabs(view) {
+                        eprintln!("[chat] {id}: its tab could not be closed: {back}");
+                    }
+                    err.to_string()
+                })
+            })();
+            chat_busy.borrow_mut().remove(&view);
+            if let Err(err) = added {
+                retire_chat_page(id);
+                return Err(err);
+            }
+            workspaces
+                .borrow_mut()
+                .add_everywhere_at(id, declared_placement(&decls, id, Placement::BelowEditor));
+            println!("[chat] {id}: opened as a float for the scratchpad");
+            Ok(())
+        })
+    };
+
+    // The view a page's own `tab_verb` names, for the one action it runs: that page's view is the keys'
+    // view then, whatever holds the keys by the time the message is read. Set and taken around that one
+    // action only.
+    let tab_verb_view: Rc<std::cell::Cell<Option<ViewId>>> = Rc::default();
     // The prefix's `Action::Tab` chords and the panel's `tab_verb` messages use the
     // same code, so behavior is shared across both routes. `keymap.ts` resolves the
     // panel's `<leader>` bindings.
+    // In an extra chat view, `tabs::view_plan` chooses that view's own tab or the base
+    // view's tabs. Elsewhere, `tabs::plan` chooses the action.
     let run_tab_action: Rc<dyn Fn(TabAction)> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
@@ -2081,9 +2535,111 @@ fn build_ui(
         let show_on_screen = show_on_screen.clone();
         let refused_name = top_bar.app_name.clone();
         let toast = toast.clone();
+        let tab_verb_view = tab_verb_view.clone();
         Rc::new(move |tab_action: TabAction| {
             let chat = ModuleId::agent();
-            let keys = pane_focus::focused_module(&window, &grid.hosts());
+            let keys = match tab_verb_view.take() {
+                Some(view) => Some(view.module()),
+                None => pane_focus::focused_module(&window, &grid.hosts()),
+            };
+            let keys_view = keys.as_ref().and_then(ViewId::of_module);
+            // The base view shown and given the keys, for a verb that needs them there.
+            let base_takes_the_keys = || match show_on_screen(&chat) {
+                Ok(()) => {
+                    give_keys(&chat);
+                    true
+                }
+                Err(err) => {
+                    refuse(&refused_name, &toast, &err);
+                    false
+                }
+            };
+            // A new tab in the base view, typed into at once: an empty tab has nothing to browse.
+            let new_base_tab = || {
+                agent.new_tab();
+                agent.enter_input(ViewId::BASE);
+            };
+            // A base-view tab chosen from elsewhere shows a hidden base view where it was, keys unmoved,
+            // and puts away the scratch floats over a covered one; under a zoom only the tray chip
+            // changes.
+            let reveal_base = || {
+                let place = {
+                    let layout = module_layout.borrow();
+                    eitri_core::layout::view_place(&layout, &chat, &covered_views(&grid, &layout))
+                };
+                if !eitri_core::tabs::reveal_on_switch(place) {
+                    return;
+                }
+                if place == AgentPlace::Covered {
+                    if reveal_covered_chat(&grid, &module_layout, ViewId::BASE, &*give_keys) {
+                        println!("[tabs] a float still covers the chat");
+                    }
+                } else {
+                    match reveal_chat_in_grid(&grid, &module_layout, &chat) {
+                        Ok(true) => {}
+                        Ok(false) => println!("[tabs] the chat's tab stays behind the keys' tab"),
+                        Err(err) => eprintln!("[tabs] could not reveal the chat: {err}"),
+                    }
+                }
+            };
+            if let Some(plan) = keys_view.and_then(|view| eitri_core::tabs::view_plan(tab_action, view)) {
+                let switched = match plan.verb {
+                    TabVerb::Rename => {
+                        agent.begin_rename(plan.page);
+                        true
+                    }
+                    TabVerb::Close => {
+                        // A `y` closes the view's one tab; the view, empty then, goes with it.
+                        agent.confirm_close(plan.page);
+                        true
+                    }
+                    TabVerb::Info => {
+                        agent.open_detail(plan.page);
+                        true
+                    }
+                    TabVerb::Choose => {
+                        agent.open_chooser(plan.page);
+                        true
+                    }
+                    TabVerb::New => {
+                        if !base_takes_the_keys() {
+                            return;
+                        }
+                        new_base_tab();
+                        true
+                    }
+                    TabVerb::Step(_) | TabVerb::Last => {
+                        let switched = match plan.verb {
+                            TabVerb::Step(delta) => agent.step(delta),
+                            _ => agent.select_last(),
+                        };
+                        if switched {
+                            reveal_base();
+                        }
+                        switched
+                    }
+                    // A tab bound to a view: that view is shown and given the keys (`on_show_view`). A
+                    // base-view tab: the base view is.
+                    TabVerb::Select(n) => match agent.select_number(n) {
+                        Some(eitri_core::tab_set::TabPlace::Base(_)) => {
+                            // A refusal to show the base view has said so already.
+                            base_takes_the_keys();
+                            true
+                        }
+                        Some(eitri_core::tab_set::TabPlace::View(..)) => true,
+                        None => false,
+                    },
+                    TabVerb::Flash
+                    | TabVerb::CloseOthers
+                    | TabVerb::Sibling(_)
+                    | TabVerb::Terminal(_)
+                    | TabVerb::Nothing => false,
+                };
+                if !switched {
+                    flash(&refused_name);
+                }
+                return;
+            }
             let keys_in = keys.as_ref().map(ModuleId::kind);
             // `n`/`p` in a terminal: its sibling tabs when it sits in a tabbed or stacked container with
             // another tab to go to, else the terminals on screen, else nothing.
@@ -2107,28 +2663,29 @@ fn build_ui(
                 }
                 None => flash(&refused_name),
             };
-            if plan.takes_the_keys {
-                if let Err(err) = show_on_screen(&chat) {
-                    refuse(&refused_name, &toast, &err);
-                    return;
-                }
-                give_keys(&chat);
+            if plan.takes_the_keys && !base_takes_the_keys() {
+                return;
             }
             let switched = match plan.verb {
                 TabVerb::New => {
-                    agent.new_tab();
-                    agent.enter_input();
+                    new_base_tab();
                     true
                 }
                 TabVerb::Step(delta) => agent.step(delta),
                 TabVerb::Last => agent.select_last(),
-                TabVerb::Select(n) => agent.select_number(n),
+                TabVerb::Select(n) => match agent.select_number(n) {
+                    // A tab bound to a view: that view is shown and given the keys (`on_show_view`),
+                    // and the base view is left as it is.
+                    Some(eitri_core::tab_set::TabPlace::View(..)) => return,
+                    Some(eitri_core::tab_set::TabPlace::Base(_)) => true,
+                    None => false,
+                },
                 TabVerb::Rename => {
-                    agent.begin_rename();
+                    agent.begin_rename(ViewId::BASE);
                     true
                 }
                 TabVerb::Close => {
-                    agent.confirm_close();
+                    agent.confirm_close(ViewId::BASE);
                     true
                 }
                 TabVerb::CloseOthers => {
@@ -2136,11 +2693,11 @@ fn build_ui(
                     true
                 }
                 TabVerb::Choose => {
-                    agent.open_chooser();
+                    agent.open_chooser(ViewId::BASE);
                     true
                 }
                 TabVerb::Info => {
-                    agent.open_detail();
+                    agent.open_detail(ViewId::BASE);
                     true
                 }
                 TabVerb::Flash => false,
@@ -2165,27 +2722,31 @@ fn build_ui(
                 flash(&refused_name);
                 return;
             }
-            // A switch from elsewhere shows a hidden chat where it was, keys unmoved, and puts away the
-            // scratch floats over a covered one; under a zoom only the tray chip changes.
-            let place = {
-                let layout = module_layout.borrow();
-                eitri_core::layout::agent_place_covered(&layout, &covered_chat(&chat_covering(&grid, &layout)))
-            };
-            if !plan.takes_the_keys && eitri_core::tabs::reveal_on_switch(place) {
-                if place == AgentPlace::Covered {
-                    if reveal_covered_chat(&grid, &module_layout, &*give_keys) {
-                        println!("[tabs] a float still covers the chat");
-                    }
-                } else {
-                    match reveal_chat_in_grid(&grid, &module_layout) {
-                        Ok(true) => {}
-                        Ok(false) => println!("[tabs] the chat's tab stays behind the keys' tab"),
-                        Err(err) => eprintln!("[tabs] could not reveal the chat: {err}"),
-                    }
-                }
+            if !plan.takes_the_keys {
+                reveal_base();
             }
         })
     };
+    // A pick that names a tab bound to an extra view -- a number key, a chooser pick, a resume -- or a
+    // resume from an extra page that opened a new base-view tab: that view is shown where it was hidden
+    // from, given the keys, and arrived in.
+    {
+        let show_on_screen = show_on_screen.clone();
+        let give_keys = give_keys.clone();
+        let refused_name = top_bar.app_name.clone();
+        let toast = toast.clone();
+        let agent = agent_panel_handle.clone();
+        agent_panel_handle.on_show_view(move |view| {
+            let id = view.module();
+            if let Err(err) = show_on_screen(&id) {
+                refuse(&refused_name, &toast, &err);
+                return;
+            }
+            if give_keys(&id) {
+                agent.arrive(view);
+            }
+        });
+    }
     // The mark `swap.marked` swaps with, as text in the top bar. Refreshed after every mark verb and
     // every change of the grid: a module retired or killed takes its mark with it.
     let refresh_mark: Rc<dyn Fn()> = {
@@ -2414,6 +2975,8 @@ fn build_ui(
         let terminals = terminals.clone();
         let new_terminal = new_terminal.clone();
         let new_scratch_terminal = new_scratch_terminal.clone();
+        let new_chat_view = new_chat_view.clone();
+        let new_scratch_chat_view = new_scratch_chat_view.clone();
         let scratch_empty_text = scratch_empty_text.clone();
         let project_dir = project_root.to_path_buf();
         let focus_module = focus_module.clone();
@@ -2443,6 +3006,8 @@ fn build_ui(
         let switch_workspace = switch_workspace.clone();
         let switch_or_make = switch_or_make.clone();
         let start_rename = start_rename.clone();
+        let rules = rules.clone();
+        let panel_decls = panel_decls.clone();
         Rc::new(move |action: Action, keycode: u32| {
             // The module that last held the keys: what zoom, resize, hide and swap act on.
             let target = || module_layout.borrow().focus().clone();
@@ -2611,7 +3176,11 @@ fn build_ui(
                     };
                     match terminal::literal_target(focused().as_ref().map(ModuleId::kind)) {
                         terminal::LiteralTarget::Editor => editor.send_keys(&key.to_vim()),
-                        terminal::LiteralTarget::Panel => agent.literal_key(&key),
+                        terminal::LiteralTarget::Panel => {
+                            // To the page of the chat view that holds the keys.
+                            let view = focused().as_ref().and_then(ViewId::of_module).unwrap_or(ViewId::BASE);
+                            agent.literal_key(view, &key)
+                        }
                         terminal::LiteralTarget::Terminal => match terminal::keys::literal(&key) {
                             // To the terminal that holds the keys, whichever instance it is.
                             Some(inputs) => {
@@ -2664,6 +3233,13 @@ fn build_ui(
                     }
                 }
                 Action::Module(id) => {
+                    // The chat's key reaches the chat view with the keys, else the one holding the oldest
+                    // waiting card, else the most recent one; a numbered view's key addresses that view.
+                    let id = if id == ModuleId::agent() {
+                        chat_target(&module_layout.borrow(), agent.oldest_card_view())
+                    } else {
+                        id
+                    };
                     // `v` before the canvas exists, or a module this window has not got.
                     if !grid.has_host(&id) {
                         println!("[prefix] {id}: not in this window yet");
@@ -2685,7 +3261,15 @@ fn build_ui(
                         }
                     };
                     let (running, queued) = (agent.running_count(), agent.queued_count());
-                    let text = kill_pane::prompt(&id, &kill_title(&id), scope, running, queued);
+                    // An extra chat view's y/n names the one tab it closes, with that tab's own counts.
+                    let text = match ViewId::of_module(&id).filter(|view| !view.is_base()) {
+                        Some(view) if scope == KillScope::Module => {
+                            let (running, queued) = agent.view_running_queued(view);
+                            let tab = agent.view_tab_label(view);
+                            kill_pane::prompt_closing_tab(&id, &kill_title(&id), scope, tab.as_deref(), running, queued)
+                        }
+                        _ => kill_pane::prompt(&id, &kill_title(&id), scope, running, queued),
+                    };
                     // What `y` also answers for the window close, if this kill closes it.
                     let confirmed = eitri_core::tabs::window_close_prompt(running, queued);
                     let Some(prompt) = kill_prompt.get() else {
@@ -2719,7 +3303,10 @@ fn build_ui(
                     text_size::TextSizeTarget::Neither => {}
                 },
                 Action::Hint => hint_coordinator.toggle_from_prefix(keycode),
-                Action::PanelReload => agent.reload_document_by_hand(),
+                // `r`, `?` and `:` act in the page of the chat view with the keys; from anywhere else, in
+                // the base view's, which comes up with the keys for the two that read them.
+                Action::PanelReload => agent
+                    .reload_document_by_hand(focused().as_ref().and_then(ViewId::of_module).unwrap_or(ViewId::BASE)),
                 Action::PanelKeymap => {
                     // Read before the chat takes the keys: afterwards the chat is what holds them.
                     let from = focused();
@@ -2727,7 +3314,10 @@ fn build_ui(
                         .clone()
                         .and_then(|module| keymap_plugins.declared_rows(&module))
                         .map(|(title, rows)| eitri_core::plugin::keys::plugin_help(&title, rows));
-                    let chat = ModuleId::agent();
+                    // A chat view that holds the keys opens the sheet in its own page; from anywhere else it
+                    // opens in the base view's, which takes the keys.
+                    let view = from.as_ref().and_then(ViewId::of_module).unwrap_or(ViewId::BASE);
+                    let chat = view.module();
                     // What showing the chat is about to change, so closing the sheet can undo it. The zoom
                     // is kept whole, a container's as well as a module's.
                     let (zoom_before, showed_sheet) = {
@@ -2738,7 +3328,7 @@ fn build_ui(
                         refuse(&refused_name, &toast, &err);
                         return;
                     }
-                    if let Some(text) = chat_covered_refusal() {
+                    if let Some(text) = chat_covered_refusal(view) {
                         // Nothing opens, so what showing the chat changed is put back.
                         if showed_sheet {
                             if let Err(err) = grid.hide_module(&chat, &*focus_module) {
@@ -2764,7 +3354,7 @@ fn build_ui(
                         }
                     };
                     let opening = keys_return.borrow_mut().opened(
-                        Opened {
+                        KeysOpened {
                             from,
                             ended_zoom,
                             showed_sheet,
@@ -2772,17 +3362,20 @@ fn build_ui(
                         &chat,
                     );
                     give_keys(&chat);
-                    agent.open_keymap(plugin, opening);
+                    agent.open_keymap(view, plugin, opening);
                 }
                 // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
                 // letters typed after the chord go into the entry instead of acting as panel keys.
                 Action::PanelCommandLine => {
-                    let chat = ModuleId::agent();
+                    // A chat view that holds the keys opens the line in its own page; from anywhere else it
+                    // opens in the base view's, which takes the keys.
+                    let view = focused().as_ref().and_then(ViewId::of_module).unwrap_or(ViewId::BASE);
+                    let chat = view.module();
                     if let Err(err) = show_on_screen(&chat) {
                         refuse(&refused_name, &toast, &err);
                         return;
                     }
-                    if let Some(text) = chat_covered_refusal() {
+                    if let Some(text) = chat_covered_refusal(view) {
                         refuse_text(&refused_name, &toast, &text);
                         return;
                     }
@@ -2790,7 +3383,7 @@ fn build_ui(
                     // the newer request, and that close must not move the keys out from under it.
                     keys_return.borrow_mut().superseded();
                     give_keys(&chat);
-                    agent.open_command_line();
+                    agent.open_command_line(view);
                 }
                 Action::WindowImmersive => window_modes.toggle_immersive(),
                 // `run_tab_action` is shared with the panel's `tab_verb` messages.
@@ -2845,22 +3438,50 @@ fn build_ui(
                         flash(&refused_name);
                     }
                 }
-                // A new terminal right of the module with the keys, its shell in the project root.
+                // A new terminal where the open rules say -- by default right of the module with the
+                // keys -- its shell in the project root.
                 Action::InstanceNew {
                     kind: ModuleKind::Terminal,
                 } => {
-                    if let Err(text) = new_terminal(&target(), Axis::Row, project_dir.clone()) {
+                    if let Err(text) = new_terminal(OpenHow::new_instance(target(), None), project_dir.clone()) {
                         refuse_text(&refused_name, &toast, &text);
                     }
                 }
+                // A new chat view where the open rules say -- by default right of the module with the
+                // keys -- holding a new empty tab.
                 Action::InstanceNew {
                     kind: ModuleKind::Agent,
-                } => refuse_text(&refused_name, &toast, CHAT_VIEWS_REFUSED),
+                } => {
+                    if let Err(text) = new_chat_view(OpenHow::new_instance(target(), None), NewViewTab::Empty) {
+                        refuse_text(&refused_name, &toast, &text);
+                    }
+                }
                 // i3's `floating toggle`: a tile floats; a float sinks beside the most recent tile in
-                // view. The keys stay with the module, which moves between the grid's bands.
+                // view. The keys stay with the module, which moves between the grid's bands. A tile that
+                // has never floated takes its open rule's float size, if the rule gives one; one that has
+                // floats where it last did.
                 Action::FloatToggle => {
                     let target = target();
-                    match grid.float_toggle(&target) {
+                    let never_floated = {
+                        let layout = module_layout.borrow();
+                        !layout.is_floating(&target) && !layout.float_memory().contains_key(&target)
+                    };
+                    let first_size = if never_floated {
+                        rule_float_size(&rules, &panel_decls, &target)
+                    } else {
+                        None
+                    };
+                    let floated = match first_size {
+                        Some(size) => {
+                            let rect = grid.with_current_frame(|frame| {
+                                eitri_core::layout::rules::float_rect(Some(size), frame.size)
+                            });
+                            grid.float_at(&target, Some(rect))
+                                .map(|_| eitri_core::layout::FloatChange::Floated)
+                        }
+                        None => grid.float_toggle(&target),
+                    };
+                    match floated {
                         Ok(change) => println!("[modules] {target}: {change:?}"),
                         Err(err) => refuse(&refused_name, &toast, &err),
                     }
@@ -2888,23 +3509,17 @@ fn build_ui(
                         refuse(&refused_name, &toast, &err);
                     }
                 }
-                // i3's `scratchpad show`. A named terminal instance that does not exist yet is made
-                // straight into the scratchpad and shown; a chat view cannot be made in this build.
+                // i3's `scratchpad show`. A named terminal instance or chat view that does not exist yet
+                // is made straight into the scratchpad and shown.
                 Action::ScratchpadShow { module } => {
                     let shown = match grid.scratchpad_show(module.as_ref(), &*give_keys) {
                         Ok(ScratchShow::Missing(id)) => {
-                            match id.kind() {
-                                ModuleKind::Terminal => {}
-                                ModuleKind::Agent => {
-                                    refuse_text(&refused_name, &toast, CHAT_VIEWS_REFUSED);
-                                    return;
-                                }
-                                _ => {
-                                    refuse_text(&refused_name, &toast, &format!("{id}: not in this window"));
-                                    return;
-                                }
-                            }
-                            if let Err(text) = new_scratch_terminal(&id, project_dir.clone()) {
+                            let made = match id.kind() {
+                                ModuleKind::Terminal => new_scratch_terminal(&id, project_dir.clone()),
+                                ModuleKind::Agent => new_scratch_chat_view(&id),
+                                _ => Err(format!("{id}: not in this window")),
+                            };
+                            if let Err(text) = made {
                                 refuse_text(&refused_name, &toast, &text);
                                 return;
                             }
@@ -2978,6 +3593,49 @@ fn build_ui(
                     println!("[prefix] {}: not in this build yet", action.name());
                     flash(&refused_name);
                 }
+                // tmux's `break-pane`, on the chat view with the keys: from the base view its active tab
+                // goes out into a new view right of it; from an extra view that view's tab comes back
+                // into the base view, and the view, empty then, goes (`on_view_empty`).
+                Action::TabBreak => match break_plan(focused().as_ref().and_then(ViewId::of_module)) {
+                    // Where the open rules say for a broken-out tab: by default right of the base view,
+                    // where the key was pressed.
+                    BreakPlan::Break => {
+                        let how = OpenHow::Rule {
+                            point: OpenPoint::Break,
+                            keys: ModuleId::agent(),
+                            explicit: None,
+                        };
+                        if let Err(text) = new_chat_view(how, NewViewTab::Break) {
+                            refuse_text(&refused_name, &toast, &text);
+                        }
+                    }
+                    BreakPlan::Join(view) => {
+                        // Asked before anything moves: a view with no tab has nothing to join, and the
+                        // keys would otherwise be left in the base view for a refusal.
+                        if !agent.views().contains(&view) {
+                            refuse_text(&refused_name, &toast, &format!("agent {} shows no tab", view.number()));
+                            return;
+                        }
+                        // The keys leave the view before it goes, into the base view the tab comes back to.
+                        let chat = ModuleId::agent();
+                        if let Err(err) = show_on_screen(&chat) {
+                            refuse(&refused_name, &toast, &err);
+                            return;
+                        }
+                        give_keys(&chat);
+                        match agent.join_back(view) {
+                            Ok(_) => {
+                                agent.arrive(ViewId::BASE);
+                                println!("[chat] {}: its tab joined the base view", view.module());
+                            }
+                            Err(text) => refuse_text(&refused_name, &toast, &text),
+                        }
+                    }
+                    BreakPlan::Refuse => {
+                        println!("[prefix] {}: the keys are in no chat view", action.name());
+                        flash(&refused_name);
+                    }
+                },
                 // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
                 // mode, only while it holds the keys -- elsewhere the same refusal shape as
                 // every other misdirected prefix action (`Action::Module`, above).
@@ -3044,7 +3702,13 @@ fn build_ui(
     // container selection's rules included: a tab verb ends a selection whichever route sent it.
     agent_panel_handle.on_tab_verb({
         let run_action = run_action.clone();
-        move |tab_action| run_action(Action::Tab(tab_action), 0)
+        let tab_verb_view = tab_verb_view.clone();
+        move |view, tab_action| {
+            tab_verb_view.set(Some(view));
+            run_action(Action::Tab(tab_action), 0);
+            // A gate that refused the action never reached `run_tab_action`, which takes it.
+            tab_verb_view.set(None);
+        }
     });
 
     // The prefix. Installed after every other window-level controller that exists
@@ -3066,6 +3730,7 @@ fn build_ui(
         let pick_workspaces = workspaces.clone();
         let switch_workspace = switch_workspace.clone();
         let workspaces_changed = workspaces_changed.clone();
+        let split_new_chat_view = new_chat_view.clone();
         let split_new_terminal = split_new_terminal(
             new_terminal.clone(),
             terminals.clone(),
@@ -3080,7 +3745,7 @@ fn build_ui(
             move |command, keycode| match command {
                 // A split key's second half: `split.*` ends a container selection, as its rule says.
                 // From a terminal, the terminal's key makes a new one (`split_choice`); a chat's key from
-                // the chat would make a chat view, which this build has not got.
+                // a chat view makes a new chat view, holding a new empty tab.
                 prefix::PrefixCommand::Place { module, axis, cwd } => {
                     let (choice, target) = {
                         let layout = module_layout.borrow();
@@ -3098,8 +3763,14 @@ fn build_ui(
                         eitri_core::layout::SplitChoice::NewInstance(ModuleKind::Terminal) => {
                             split_new_terminal(target, axis, cwd);
                         }
-                        eitri_core::layout::SplitChoice::NewInstance(_) => {
-                            refuse_text(&refused_name, &toast, CHAT_VIEWS_REFUSED);
+                        eitri_core::layout::SplitChoice::NewInstance(ModuleKind::Agent) => {
+                            if let Err(text) = split_new_chat_view(OpenHow::Beside(target, axis), NewViewTab::Empty) {
+                                refuse_text(&refused_name, &toast, &text);
+                            }
+                        }
+                        eitri_core::layout::SplitChoice::NewInstance(kind) => {
+                            println!("[modules] split: no new instance of {kind:?} can be made");
+                            flash(&refused_name);
                         }
                     }
                     clear_selection(&module_layout);
@@ -3121,8 +3792,8 @@ fn build_ui(
                             let zoomed_here = module_layout.borrow().zoomed() == Some(&id);
                             let grabbed = if zoomed_here {
                                 let grabbed = give_keys(&id);
-                                if grabbed && id.kind() == ModuleKind::Agent {
-                                    agent.arrive();
+                                if let Some(view) = ViewId::of_module(&id).filter(|_| grabbed) {
+                                    agent.arrive(view);
                                 }
                                 grabbed
                             } else {
@@ -3243,11 +3914,9 @@ fn build_ui(
         .iter()
         .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
     {
-        let intercept: Option<Rc<dyn Fn(Direction) -> bool>> = if id.kind() == ModuleKind::Agent {
-            Some(agent_panel_handle.nav_intercept())
-        } else {
-            None
-        };
+        // Each chat view's intercept reads its own page's mode.
+        let intercept: Option<Rc<dyn Fn(Direction) -> bool>> =
+            ViewId::of_module(id).map(|view| agent_panel_handle.nav_intercept(view));
         let swallow_at_edge = id.kind() == ModuleKind::LuaWebview;
         install_module_nav(id.clone(), host, move_focus.clone(), intercept, swallow_at_edge);
         // No key with Super or Hyper held reaches a web module's page: WebKitGTK does not tell the
@@ -3462,6 +4131,9 @@ fn build_ui(
         let refresh_selection = refresh_selection.clone();
         let one_module_text = one_module_text.clone();
         let switch_or_make = switch_or_make.clone();
+        let new_terminal = new_terminal.clone();
+        let new_chat_view = new_chat_view.clone();
+        let project_dir = project_root.to_path_buf();
         Rc::new(move || {
             let requests = lua_engine.layout.borrow_mut().take_requests();
             for request in requests {
@@ -3477,6 +4149,21 @@ fn build_ui(
                 }
                 // The same three helpers `Ctrl+a` uses, so the two cannot drift apart.
                 let result = match &request {
+                    // A new terminal, or a new chat view holding a new empty tab, as `instance.new` makes
+                    // one: where the call's options say when it gave them, else where the open rules do.
+                    // Its refusal is the maker's text, logged here as a workspace switch's is.
+                    LayoutRequest::Open(kind, explicit) => {
+                        let how = OpenHow::new_instance(module_layout.borrow().focus().clone(), explicit.clone());
+                        let made = match kind {
+                            ModuleKind::Terminal => new_terminal(how, project_dir.clone()).map(drop),
+                            ModuleKind::Agent => new_chat_view(how, NewViewTab::Empty).map(drop),
+                            other => Err(format!("no new instance of {other:?} can be made")),
+                        };
+                        if let Err(text) = made {
+                            eprintln!("[lua] layout: {request:?} refused: {text}");
+                        }
+                        Ok(())
+                    }
                     // Its refusal is a workspace's, not a layout's: said here, as the others are below.
                     LayoutRequest::Switch(name) => {
                         if let Err(text) = switch_or_make(name) {
@@ -3554,7 +4241,17 @@ fn build_ui(
             .expect("the base terminal keeps its pane in the registry"),
         agent: agent_widget.clone(),
         project_root: project_root.to_path_buf(),
-        backend_kind,
+        panel: agent_panel_handle.clone(),
+        new_chat_view: new_chat_view.clone(),
+        kill_chat_view: {
+            let kill_now = kill_now.clone();
+            Rc::new(move |id: &ModuleId| {
+                if let Err(err) = kill_now(id, None) {
+                    println!("[modules] {id}: not killed: {err}");
+                }
+            })
+        },
+        chat_views: chat_views.clone(),
     });
     // Call `grab_focus()` after `present()`, since a widget must be shown to take focus.
     // Then call `arrive` as module keys do, so restored chat focus uses the same
@@ -3871,23 +4568,27 @@ fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
     }
 }
 
-/// Brings the chat back for a reveal that leaves the keys where they are: shown where it was hidden
-/// from and, when it sits in a tabbed or stacked container, its tab drawn. A hidden chat's container
-/// may have gone on drawing a sibling, so showing it alone can leave it on a tab nobody sees; both
-/// steps are taken whichever place it started from. `Ok((changed, drawn))`: `drawn` is `false` when its
-/// tab stays behind the keys' own (drawing it would hide them), so the caller can say so instead.
-fn reveal_chat(layout: &mut eitri_core::layout::Layout) -> Result<(bool, bool), LayoutError> {
-    let chat = ModuleId::agent();
-    let shown = layout.show(&chat)?;
-    let tabbed_away = layout.is_tabbed_away(&chat);
-    let brought = tabbed_away && layout.bring_forward(&chat);
+/// Brings the chat view `chat` back for a reveal that leaves the keys where they are: shown where it was
+/// hidden from and, when it sits in a tabbed or stacked container, its tab drawn. A hidden view's
+/// container may have gone on drawing a sibling, so showing it alone can leave it on a tab nobody sees;
+/// both steps are taken whichever place it started from. `Ok((changed, drawn))`: `drawn` is `false`
+/// when its tab stays behind the keys' own (drawing it would hide them), so the caller can say so
+/// instead.
+fn reveal_chat(layout: &mut eitri_core::layout::Layout, chat: &ModuleId) -> Result<(bool, bool), LayoutError> {
+    let shown = layout.show(chat)?;
+    let tabbed_away = layout.is_tabbed_away(chat);
+    let brought = tabbed_away && layout.bring_forward(chat);
     Ok((shown || brought, !tabbed_away || brought))
 }
 
 /// [`reveal_chat`] on the window's layout, redrawing the grid when it changed anything. `Ok(true)`
-/// when the chat is on its container's drawn tab now.
-fn reveal_chat_in_grid(grid: &ModuleGrid, layout: &RefCell<eitri_core::layout::Layout>) -> Result<bool, LayoutError> {
-    let (changed, drawn) = reveal_chat(&mut layout.borrow_mut())?;
+/// when the view is on its container's drawn tab now.
+fn reveal_chat_in_grid(
+    grid: &ModuleGrid,
+    layout: &RefCell<eitri_core::layout::Layout>,
+    chat: &ModuleId,
+) -> Result<bool, LayoutError> {
+    let (changed, drawn) = reveal_chat(&mut layout.borrow_mut(), chat)?;
     if changed {
         grid.apply();
     }
@@ -3919,6 +4620,7 @@ fn selection_gate(action: &Action, selection: Selection) -> SelectionGate {
 fn lua_request_action(request: &eitri_core::lua::layout::LayoutRequest) -> Option<Action> {
     use eitri_core::lua::layout::LayoutRequest;
     match request {
+        LayoutRequest::Open(kind, _) => Some(Action::InstanceNew { kind: *kind }),
         LayoutRequest::Hide(_) => Some(Action::ModuleHide),
         LayoutRequest::Mark(_) => Some(Action::MarkToggle),
         LayoutRequest::Show(id) | LayoutRequest::Focus(id) => Some(Action::Module(id.clone())),
@@ -3988,37 +4690,63 @@ fn covered_reveal(covering: &[(ModuleId, bool)], keys: &ModuleId) -> (Vec<Module
     (stow.into_iter().map(|(id, _)| id.clone()).collect(), !stay.is_empty())
 }
 
-/// The floats over the chat now, bottom first (`ModuleGrid::covered_now`). With no float in the layout
-/// there is nothing to arrange for: every divider drag asks this.
-fn chat_covering(grid: &ModuleGrid, layout: &eitri_core::layout::Layout) -> Vec<ModuleId> {
+/// The floats over the chat view `view` now, bottom first (`ModuleGrid::covered_now`): each view is
+/// judged by what lies over its own module, so a float over one view leaves every other view clear.
+/// With no float in the layout there is nothing to arrange for: every divider drag asks this.
+fn view_covering(grid: &ModuleGrid, layout: &eitri_core::layout::Layout, view: ViewId) -> Vec<ModuleId> {
+    covering_of_view(layout, view, &|id| grid.covered_now(id))
+}
+
+/// [`view_covering`] over any way of naming the floats over a module, so it can be judged without a
+/// window. A view the layout does not hold has nothing over it.
+fn covering_of_view(
+    layout: &eitri_core::layout::Layout,
+    view: ViewId,
+    covered_now: &dyn Fn(&ModuleId) -> Vec<ModuleId>,
+) -> Vec<ModuleId> {
+    let chat = view.module();
+    if layout.floats().is_empty() || !layout.contains(&chat) {
+        return Vec::new();
+    }
+    covered_now(&chat)
+}
+
+/// The chat views covered now, as `view_place` and the tray take them: every chat module in the layout
+/// with a float over it. The floats themselves are not what is covered; passed as they are, the views
+/// would count as on screen and the floats would get the chips.
+fn covered_views(grid: &ModuleGrid, layout: &eitri_core::layout::Layout) -> Vec<ModuleId> {
+    covered_views_of(layout, &|id| grid.covered_now(id))
+}
+
+/// [`covered_views`] over any way of naming the floats over a module.
+fn covered_views_of(
+    layout: &eitri_core::layout::Layout,
+    covered_now: &dyn Fn(&ModuleId) -> Vec<ModuleId>,
+) -> Vec<ModuleId> {
     if layout.floats().is_empty() {
         return Vec::new();
     }
-    grid.covered_now(&ModuleId::agent())
+    layout
+        .modules()
+        .into_iter()
+        .filter_map(|id| ViewId::of_module(&id))
+        .filter(|view| !covering_of_view(layout, *view, covered_now).is_empty())
+        .map(ViewId::module)
+        .collect()
 }
 
-/// The modules covered, as `agent_place_covered` and the tray take them: the chat alone while any
-/// float is over it. `covering` names the floats, not what they cover; passed as it is, the chat
-/// would count as on screen and the float would get the chip.
-fn covered_chat(covering: &[ModuleId]) -> Vec<ModuleId> {
-    if covering.is_empty() {
-        Vec::new()
-    } else {
-        vec![ModuleId::agent()]
-    }
-}
-
-/// A reveal of a chat on screen under floats: stows the scratch floats over it that do not hold the
-/// keys ([`covered_reveal`]), the keys staying where they are. `true` when a float still covers it, for
-/// the caller to fall back to the toast.
+/// A reveal of the chat view `view` on screen under floats: stows the scratch floats over it that do not
+/// hold the keys ([`covered_reveal`]), the keys staying where they are. `true` when a float still covers
+/// it, for the caller to fall back to the toast.
 fn reveal_covered_chat(
     grid: &ModuleGrid,
     layout: &RefCell<eitri_core::layout::Layout>,
+    view: ViewId,
     focus: &dyn Fn(&ModuleId) -> bool,
 ) -> bool {
     let (stow, mut still) = {
         let layout = layout.borrow();
-        let covering: Vec<(ModuleId, bool)> = chat_covering(grid, &layout)
+        let covering: Vec<(ModuleId, bool)> = view_covering(grid, &layout, view)
             .into_iter()
             .map(|id| {
                 let scratch = layout.float_of(&id).is_some_and(|float| float.scratch);
@@ -4027,9 +4755,10 @@ fn reveal_covered_chat(
             .collect();
         covered_reveal(&covering, layout.focus())
     };
+    let chat = view.module();
     for id in stow {
         match grid.scratchpad_show(Some(&id), focus) {
-            Ok(ScratchShow::Stowed(_)) => println!("[attention] {id}: stowed off the chat"),
+            Ok(ScratchShow::Stowed(_)) => println!("[attention] {id}: stowed off {chat}"),
             Ok(other) => {
                 eprintln!("[attention] {id}: asked to stow, the scratchpad answered {other:?}");
                 still = true;
@@ -4041,6 +4770,53 @@ fn reveal_covered_chat(
         }
     }
     still
+}
+
+/// What `prefix !` does with the keys in `keys_view` (`None`: the keys are in no chat view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakPlan {
+    /// The base view's active tab goes out into a new chat view of its own.
+    Break,
+    /// That extra view's tab comes back into the base view, and the view goes.
+    Join(ViewId),
+    /// Like tmux's `break-pane`, it acts on the pane with the keys: anywhere but a chat view there is
+    /// no tab to break.
+    Refuse,
+}
+
+fn break_plan(keys_view: Option<ViewId>) -> BreakPlan {
+    match keys_view {
+        Some(view) if view.is_base() => BreakPlan::Break,
+        Some(view) => BreakPlan::Join(view),
+        None => BreakPlan::Refuse,
+    }
+}
+
+/// `prefix a`'s instance: the chat view with the keys, so the key still hides the one you are in; else the
+/// view holding the oldest waiting card, when the layout holds it; else the most recently used chat view, then
+/// the base view.
+fn chat_target(layout: &Layout, oldest: Option<ViewId>) -> ModuleId {
+    if layout.focus().kind() == ModuleKind::Agent {
+        return layout.focus().clone();
+    }
+    if let Some(v) = oldest.filter(|v| layout.contains(&v.module())) {
+        return v.module();
+    }
+    eitri_core::layout::module_target(layout, &ModuleId::agent())
+}
+
+/// How a card's toast names the way back to chat view `view`: the key bound to its module (`C-b a` for
+/// the base view), else its chip, which is reachable from the top bar whenever the view is off screen.
+fn view_way_back(keymap: &eitri_core::keymap::Keymap, view: ViewId, title: &str) -> Option<String> {
+    let key = keymap
+        .keys_for(&Action::Module(view.module()))
+        .first()
+        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()));
+    match key {
+        Some(key) => Some(key),
+        None if view.is_base() => None,
+        None => Some(format!("the {title} chip")),
+    }
 }
 
 /// Puts the selection back on the module with the keys; `true` if a container was selected. A
@@ -4057,7 +4833,7 @@ fn clear_selection(layout: &RefCell<eitri_core::layout::Layout>) -> bool {
 /// ended, or a directory that cannot be read, gives the project root and one log line
 /// (`terminal::start_dir`). Otherwise the new shell starts in the project root.
 fn split_new_terminal(
-    new_terminal: Rc<dyn Fn(&ModuleId, Axis, PathBuf) -> Result<ModuleId, String>>,
+    new_terminal: Rc<dyn Fn(OpenHow, PathBuf) -> Result<ModuleId, String>>,
     terminals: Rc<RefCell<Terminals<terminal::TerminalPane>>>,
     root: PathBuf,
     app_name: gtk4::Label,
@@ -4082,7 +4858,7 @@ fn split_new_terminal(
             let app_name = app_name.clone();
             let toast = toast.clone();
             move |dir: PathBuf| {
-                if let Err(text) = new_terminal(&target, axis, dir) {
+                if let Err(text) = new_terminal(OpenHow::Beside(target.clone(), axis), dir) {
                     refuse_text(&app_name, &toast, &text);
                 }
             }
@@ -4121,12 +4897,19 @@ fn split_new_terminal(
 }
 
 /// Whether `id` may be placed by its name (`Ctrl+a \`/`"` + a key, `eitri.layout.split`), given
-/// whether the registry holds a live pane for it. A numbered terminal that was killed keeps its host
-/// in the grid, for the next terminal of that number, but its pane is idle: placed again by name it
-/// would be a terminal with no shell, which the start hook (live panes only) never starts. Only a
-/// new instance brings a numbered terminal back. Every other module is the grid's to judge.
+/// whether its pool holds a live pane or page for it. A numbered terminal that was killed keeps its
+/// host in the grid, for the next terminal of that number, but its pane is idle: placed again by name
+/// it would be a terminal with no shell, which the start hook (live panes only) never starts. A
+/// removed chat view is the same: its host stays, but its page is idle and holds no tab, so placed by
+/// name it would take the keys and show nothing, and every message it sent would be dropped. Only a
+/// new instance brings either back. The base chat and every other module are the grid's to judge.
 fn placeable_by_id(id: &ModuleId, live: bool) -> Result<(), LayoutError> {
-    if id.kind() == ModuleKind::Terminal && !live {
+    let pooled = match id.kind() {
+        ModuleKind::Terminal => true,
+        ModuleKind::Agent => id.number() >= 2,
+        _ => false,
+    };
+    if pooled && !live {
         return Err(LayoutError::NotInTree(id.clone()));
     }
     Ok(())
@@ -4172,8 +4955,22 @@ fn wait_needs_the_top_bar(waiting: prefix::Waiting) -> bool {
     matches!(waiting, prefix::Waiting::Workspace { .. })
 }
 
-/// What a request for a second chat view says: the id parses, but this build cannot make one.
-const CHAT_VIEWS_REFUSED: &str = "chat views: not in this build";
+/// The chat view the keys are in, from the layout's focus (the module that last held them); the base
+/// view's when that is no chat view.
+fn keys_chat_view(layout: &Layout) -> ViewId {
+    ViewId::of_module(layout.focus()).unwrap_or(ViewId::BASE)
+}
+
+/// What the chat view a module shows owes the user, for its chip and its strip entry; nothing for any
+/// other module.
+fn view_attention(agent: &agent_panel::AgentPanelHandle, id: &ModuleId) -> eitri_core::attention::Attention {
+    ViewId::of_module(id)
+        .map(|view| agent.attention_of(view))
+        .unwrap_or_default()
+}
+
+/// What a request for a new chat view says where no `WebView` can be built in this process.
+const CHAT_VIEWS_NEED_WEBKIT: &str = "chat views need WebKit, which cannot start here";
 
 /// What `workspace.last` says when no workspace was left, or the one left has been deleted since.
 const NO_LAST_WORKSPACE: &str = "no workspace to go back to";
@@ -4213,10 +5010,10 @@ fn resolve_pick(order: &[String], current: &str, pick: WorkspacePick) -> Pick {
 }
 
 /// The layout a workspace made by name at runtime starts from: `init.lua`'s definition of that name,
-/// reconciled as the window's startup reconciles it and brought to the window's modules (`fit_to`:
-/// an instance the window lacks is left out, a module the definition does not place is hidden below
-/// the editor), else a copy of `live`, the current arrangement. The notes say what was left out or
-/// added.
+/// reconciled as the window's startup reconciles it and brought to the window's modules (`fit_to_with`:
+/// an instance the window lacks is left out, a module the definition does not place is hidden at its
+/// declared place in `lua`, else below the editor), else a copy of `live`, the current arrangement. The
+/// notes say what was left out or added.
 fn new_workspace_layout(
     template: Option<Result<eitri_core::lua::layout::LuaTree, String>>,
     live: &Layout,
@@ -4230,20 +5027,141 @@ fn new_workspace_layout(
         .map_err(|err| format!("eitri.layout.workspace: {err}"))?;
     let mut layout = reconciled.layout;
     let mut notes = reconciled.notes;
-    notes.extend(eitri_core::layout::fit_to(&mut layout, &live.modules()));
+    notes.extend(eitri_core::layout::fit_to_with(&mut layout, &live.modules(), lua));
     Ok((layout, notes))
 }
 
-/// The id a new terminal takes: the lowest number from 2 to 9 that no workspace's layout holds and
-/// that no data kept for a later build names (that build may still place a terminal of that number,
-/// and two modules must never share a name). `None` when every number is taken.
-fn new_terminal_id(layouts: &[&eitri_core::layout::Layout], reserved: &[ModuleId]) -> Option<ModuleId> {
+/// The id a new instance of `kind` (a terminal, a chat view) takes: the lowest number from 2 to 9 that
+/// no workspace's layout holds and that no data kept for a later build names (that build may still
+/// place an instance of that number, and two modules must never share a name). `None` when every
+/// number is taken.
+fn new_instance_id(
+    kind: ModuleKind,
+    layouts: &[&eitri_core::layout::Layout],
+    reserved: &[ModuleId],
+) -> Option<ModuleId> {
     let taken: Vec<ModuleId> = layouts
         .iter()
         .flat_map(|layout| layout.modules())
         .chain(reserved.iter().cloned())
         .collect();
-    ModuleId::lowest_free(ModuleKind::Terminal, &taken)
+    ModuleId::lowest_free(kind, &taken)
+}
+
+/// Every extra chat view (`agent#2`..`agent#9`) any of `layouts` holds, ascending and once each.
+fn extra_chat_views(layouts: &[&eitri_core::layout::Layout]) -> Vec<ModuleId> {
+    let mut ids: Vec<ModuleId> = layouts
+        .iter()
+        .flat_map(|layout| layout.modules())
+        .filter(|id| id.kind() == ModuleKind::Agent && id.number() >= 2)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// What a new chat view shows first: a new empty tab, or the base view's active tab brought out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewViewTab {
+    Empty,
+    Break,
+}
+
+/// How a new terminal or chat view is put on screen.
+#[derive(Debug, Clone, PartialEq)]
+enum OpenHow {
+    /// A split key: beside this module along this axis. The user said where, so no open rule is read.
+    Beside(ModuleId, Axis),
+    /// Where the open rules say for `point`, `keys` being the module with the keys; `explicit` is a
+    /// call's own options (`eitri.layout.open(kind, opts)`), which decide in place of the rules.
+    Rule {
+        point: OpenPoint,
+        keys: ModuleId,
+        explicit: Option<OpenRule>,
+    },
+}
+
+impl OpenHow {
+    /// `instance.new`'s and `eitri.layout.open`'s way: a new instance, the rules deciding unless the
+    /// call gave its own.
+    fn new_instance(keys: ModuleId, explicit: Option<OpenRule>) -> OpenHow {
+        OpenHow::Rule {
+            point: OpenPoint::NewInstance,
+            keys,
+            explicit,
+        }
+    }
+
+    /// What the log says about where it went.
+    fn describe(&self, opened: &Opened) -> String {
+        let place = match self {
+            OpenHow::Beside(beside, axis) => format!("beside {beside} ({axis:?})"),
+            OpenHow::Rule { point, keys, explicit } => format!(
+                "where {} says ({point:?}, the keys in {keys})",
+                if explicit.is_some() {
+                    "the call"
+                } else {
+                    "its open rule"
+                }
+            ),
+        };
+        if opened.stowed {
+            format!("{place}, stowed in the scratchpad")
+        } else if opened.takes_keys {
+            place
+        } else {
+            format!("{place}, the keys left where they were")
+        }
+    }
+}
+
+/// The float size `id`'s open rule gives (at a new instance's point, a Lua panel's `position` counted),
+/// if it gives one: what `float.toggle` floats a tile that never floated at.
+fn rule_float_size(rules: &OpenRules, panel_decls: &[ModuleDecl], id: &ModuleId) -> Option<RuleSize> {
+    let position = panel_decls.iter().find(|d| d.id == *id).map(|d| d.placement);
+    match rules.resolve(id, OpenPoint::NewInstance, position).0.size {
+        Some(size @ RuleSize::Float { .. }) => Some(size),
+        _ => None,
+    }
+}
+
+/// The rule a runtime open follows: `explicit` (an `eitri.layout.open` with options) wins, else the rules'.
+fn rule_for(rules: &OpenRules, id: &ModuleId, point: OpenPoint, explicit: Option<&OpenRule>) -> OpenRule {
+    match explicit {
+        Some(rule) => rule.clone(),
+        None => rules.resolve(id, point, None).0,
+    }
+}
+
+/// Puts the new instance `id`, whose host the grid holds, on screen as `how` says, and gives it the keys
+/// through `focus` when it takes them: always after a split key, as its open rule says otherwise
+/// (`ModuleGrid::open_module`). The rule's notes are logged.
+fn open_instance(
+    grid: &ModuleGrid,
+    rules: &OpenRules,
+    id: &ModuleId,
+    how: &OpenHow,
+    focus: &dyn Fn(&ModuleId) -> bool,
+) -> Result<Opened, LayoutError> {
+    match how {
+        OpenHow::Beside(beside, axis) => {
+            grid.place_module(id, beside, *axis)?;
+            focus(id);
+            Ok(Opened {
+                takes_keys: true,
+                stowed: false,
+                notes: Vec::new(),
+            })
+        }
+        OpenHow::Rule { point, keys, explicit } => {
+            let rule = rule_for(rules, id, *point, explicit.as_ref());
+            let opened = grid.open_module(id, &rule, Some(keys), focus)?;
+            for note in &opened.notes {
+                println!("[layout] {note}");
+            }
+            Ok(opened)
+        }
+    }
 }
 
 /// Logs a refused layout operation and flashes the top bar's app name for `REFUSAL_FLASH`. A
@@ -4406,6 +5324,12 @@ mod tests {
         assert_eq!(placeable_by_id(&id("terminal"), true), Ok(()));
         assert_eq!(placeable_by_id(&id("agent"), false), Ok(()));
         assert_eq!(placeable_by_id(&id("editor"), false), Ok(()));
+        assert_eq!(
+            placeable_by_id(&id("agent#2"), false),
+            Err(LayoutError::NotInTree(id("agent#2"))),
+            "a removed chat view's page is idle"
+        );
+        assert_eq!(placeable_by_id(&id("agent#2"), true), Ok(()));
     }
 
     /// A split from a terminal goes ahead after its directory is read only if the same shell is
@@ -4453,15 +5377,18 @@ mod tests {
             Layout::initial(&decls).unwrap()
         };
         let layout = below(&["terminal", "terminal#2"]);
-        assert_eq!(new_terminal_id(&[&layout], &[]), Some(id("terminal#3")));
         assert_eq!(
-            new_terminal_id(&[&layout], &[id("terminal#3")]),
+            new_instance_id(ModuleKind::Terminal, &[&layout], &[]),
+            Some(id("terminal#3"))
+        );
+        assert_eq!(
+            new_instance_id(ModuleKind::Terminal, &[&layout], &[id("terminal#3")]),
             Some(id("terminal#4")),
             "a reserved number is passed over"
         );
         let other = below(&["terminal", "terminal#4"]);
         assert_eq!(
-            new_terminal_id(&[&layout, &other], &[id("terminal#3")]),
+            new_instance_id(ModuleKind::Terminal, &[&layout, &other], &[id("terminal#3")]),
             Some(id("terminal#5")),
             "a number another workspace holds is taken too"
         );
@@ -4469,7 +5396,108 @@ mod tests {
         let full: Vec<&str> = std::iter::once("terminal")
             .chain(full.iter().map(String::as_str))
             .collect();
-        assert_eq!(new_terminal_id(&[&below(&full)], &[]), None, "at most 9 terminals");
+        assert_eq!(
+            new_instance_id(ModuleKind::Terminal, &[&below(&full)], &[]),
+            None,
+            "at most 9 terminals"
+        );
+    }
+
+    /// A call's own options decide where its one module opens; without them a rule for the module wins
+    /// over its kind's, and with neither the point's built-in default: right of the keys for a new
+    /// instance, below the editor for a terminal back after a kill.
+    #[test]
+    fn an_explicit_open_beats_the_rules_and_the_rules_beat_the_built_in() {
+        use eitri_core::layout::rules::{parse_at, At, RuleTarget};
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let t3 = ModuleId::parse("terminal#3").unwrap();
+        let at = |name: &str| OpenRule {
+            at: parse_at(name),
+            ..OpenRule::default()
+        };
+        let none = OpenRules::default();
+        assert_eq!(
+            rule_for(&none, &t2, OpenPoint::NewInstance, None).at,
+            Some(At::Beside(Direction::Right))
+        );
+        assert_eq!(
+            rule_for(&none, &ModuleId::parse("agent#2").unwrap(), OpenPoint::Break, None).at,
+            Some(At::Beside(Direction::Right))
+        );
+        assert_eq!(
+            rule_for(&none, &ModuleId::terminal(), OpenPoint::Reopen, None).at,
+            Some(At::Placement(Placement::BelowEditor))
+        );
+        let mut rules = OpenRules::default();
+        rules.add(RuleTarget::parse("terminal").unwrap(), at("below")).unwrap();
+        rules.add(RuleTarget::parse("terminal#3").unwrap(), at("tab")).unwrap();
+        assert_eq!(
+            rule_for(&rules, &t2, OpenPoint::NewInstance, None),
+            at("below"),
+            "the kind's rule"
+        );
+        assert_eq!(
+            rule_for(&rules, &t3, OpenPoint::NewInstance, None),
+            at("tab"),
+            "the module's own"
+        );
+        let explicit = OpenRule {
+            focus: false,
+            ..at("left")
+        };
+        assert_eq!(rule_for(&rules, &t3, OpenPoint::NewInstance, Some(&explicit)), explicit);
+        assert_eq!(rule_for(&none, &t2, OpenPoint::NewInstance, Some(&explicit)), explicit);
+    }
+
+    /// A new chat view takes the lowest `agent#N` from 2 that no workspace holds and no kept data
+    /// reserves, as a new terminal does, and is refused once all nine are taken.
+    #[test]
+    fn a_new_chat_view_takes_the_lowest_free_number_not_reserved() {
+        use eitri_core::layout::{Layout, ModuleDecl, Placement};
+        let id = |text: &str| ModuleId::parse(text).unwrap();
+        let below = |ids: &[&str]| -> Layout {
+            let decls: Vec<ModuleDecl> = ids
+                .iter()
+                .map(|text| ModuleDecl {
+                    id: id(text),
+                    placement: Placement::BelowEditor,
+                })
+                .collect();
+            Layout::initial(&decls).unwrap()
+        };
+        let current = below(&["terminal"]);
+        let other = below(&["terminal", "agent#2"]);
+        assert_eq!(
+            new_instance_id(ModuleKind::Agent, &[&current, &other], &[id("agent#3")]),
+            Some(id("agent#4")),
+            "agent#2 is held in another workspace and agent#3 is reserved"
+        );
+        assert_eq!(
+            new_instance_id(ModuleKind::Agent, &[&current], &[]),
+            Some(id("agent#2")),
+            "the base view is not a number a new view can take"
+        );
+        assert_eq!(
+            new_instance_id(ModuleKind::Agent, &[&current, &other], &[id("terminal#3")]),
+            Some(id("agent#3")),
+            "a terminal's number reserves no chat view"
+        );
+        let full: Vec<String> = (2..=9).map(|n| format!("agent#{n}")).collect();
+        let full: Vec<&str> = std::iter::once("terminal")
+            .chain(full.iter().map(String::as_str))
+            .collect();
+        assert_eq!(
+            new_instance_id(ModuleKind::Agent, &[&below(&full)], &[]),
+            None,
+            "at most 9 chat views"
+        );
+        let both = below(&["terminal", "agent#3", "agent#2"]);
+        assert_eq!(
+            extra_chat_views(&[&both, &other, &current]),
+            vec![id("agent#2"), id("agent#3")],
+            "the extra views every layout holds, once each and never the base view"
+        );
+        assert!(extra_chat_views(&[&current]).is_empty());
     }
 
     /// `eitri.layout.hide` and `mark` act on one module, so a selected container refuses them as it
@@ -4618,7 +5646,7 @@ mod tests {
     #[test]
     fn a_float_over_the_chat_covers_the_chat_not_itself() {
         use eitri_core::layout::{
-            agent_place_covered, arrange, covering, tray_covered, Axis, FloatRect, Frame, Layout, Node, Size,
+            arrange, covering, tray_covered, view_place, Axis, FloatRect, Frame, Layout, Node, Size,
         };
         let size = Size { w: 1280, h: 721 };
         let t2 = ModuleId::parse("terminal#2").unwrap();
@@ -4629,17 +5657,158 @@ mod tests {
         )
         .unwrap();
         layout.add_float(&t2, FloatRect::centred(size, 0.9), false).unwrap();
-        let floats = covering(&arrange(&layout, &Frame::new(size, 1)), &chat);
+        let frame = Frame::new(size, 1);
+        let floats = covering_of_view(&layout, ViewId::BASE, &|id| covering(&arrange(&layout, &frame), id));
         assert_eq!(floats, vec![t2.clone()], "the float is over the chat");
-        let covered = covered_chat(&floats);
-        assert_eq!(agent_place_covered(&layout, &covered), AgentPlace::Covered);
+        let covered = covered_views_of(&layout, &|id| covering(&arrange(&layout, &frame), id));
+        assert_eq!(covered, vec![chat.clone()]);
+        assert_eq!(view_place(&layout, &chat, &covered), AgentPlace::Covered);
         let chips = tray_covered(&layout, &covered);
         assert!(chips.contains(&chat), "{chips:?}");
         assert!(!chips.contains(&t2), "{chips:?}");
+        let clear = Layout::new(
+            Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::editor()), Node::Leaf(chat.clone())),
+            ModuleId::editor(),
+        )
+        .unwrap();
         assert_eq!(
-            covered_chat(&[]),
+            covered_views_of(&clear, &|id| covering(&arrange(&clear, &frame), id)),
             Vec::<ModuleId>::new(),
             "nothing over it: nothing covered"
+        );
+    }
+
+    /// Each chat view is judged by the floats over its own module: a float over `agent#2` covers view 2
+    /// and leaves the base view, beside it, clear -- so an answer from the base page is taken while one
+    /// from view 2's page is refused.
+    #[test]
+    fn a_covered_view_is_judged_by_its_own_floats() {
+        use eitri_core::layout::{arrange, covering, view_place, Axis, FloatRect, Frame, Layout, Node, Rect, Size};
+        let size = Size { w: 1280, h: 721 };
+        let frame = Frame::new(size, 1);
+        let two = ModuleId::parse("agent#2").unwrap();
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = Layout::new(
+            Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::agent()), Node::Leaf(two.clone())),
+            ModuleId::agent(),
+        )
+        .unwrap();
+        let rect_of_two = arrange(&layout, &frame).rect_of(&two).expect("view 2 is tiled");
+        // A small float well inside view 2, clear of the base view on its left.
+        let over_two = Rect {
+            x: rect_of_two.x + rect_of_two.w / 4,
+            y: rect_of_two.y + rect_of_two.h / 4,
+            w: rect_of_two.w / 2,
+            h: rect_of_two.h / 2,
+        };
+        layout
+            .add_float(&t2, FloatRect::of_rect(over_two, size), false)
+            .unwrap();
+        let now = |id: &ModuleId| covering(&arrange(&layout, &frame), id);
+        let view2 = ViewId::of_module(&two).unwrap();
+        assert_eq!(
+            covering_of_view(&layout, view2, &now),
+            vec![t2.clone()],
+            "covered for view 2"
+        );
+        assert_eq!(
+            covering_of_view(&layout, ViewId::BASE, &now),
+            Vec::<ModuleId>::new(),
+            "the base view is clear"
+        );
+        let covered = covered_views_of(&layout, &now);
+        assert_eq!(covered, vec![two.clone()], "only view 2 is covered");
+        assert_eq!(view_place(&layout, &two, &covered), AgentPlace::Covered);
+        assert_eq!(view_place(&layout, &ModuleId::agent(), &covered), AgentPlace::OnScreen);
+        let three = ViewId::new(3).unwrap();
+        assert_eq!(
+            covering_of_view(&layout, three, &now),
+            Vec::<ModuleId>::new(),
+            "a view not in the layout"
+        );
+    }
+
+    /// The covered refusal names the view the answer came from, not the base chat.
+    #[test]
+    fn the_covered_refusal_names_the_view_and_the_float() {
+        let title = tray::module_title(&ModuleId::parse("agent#2").unwrap(), &[]);
+        assert_eq!(
+            covered_text(&title, "terminal 2", "C-b M--", true),
+            "agent 2 is under terminal 2: C-b M-- from terminal 2 stows it"
+        );
+    }
+
+    /// `prefix !` breaks from the base view, joins back from an extra one, and does nothing with the keys
+    /// in no chat view, as tmux's `break-pane` acts on the pane with the keys.
+    #[test]
+    fn break_plan_breaks_from_the_base_view_joins_from_an_extra_one_and_refuses_elsewhere() {
+        let two = ViewId::new(2).unwrap();
+        assert_eq!(break_plan(Some(ViewId::BASE)), BreakPlan::Break);
+        assert_eq!(break_plan(Some(two)), BreakPlan::Join(two));
+        assert_eq!(break_plan(ViewId::of_module(&ModuleId::editor())), BreakPlan::Refuse);
+        assert_eq!(break_plan(ViewId::of_module(&ModuleId::terminal())), BreakPlan::Refuse);
+        assert_eq!(break_plan(None), BreakPlan::Refuse);
+    }
+
+    /// `prefix a`'s instance: the chat view with the keys first, then the view with the oldest card when
+    /// the layout holds it, then the most recently used chat view.
+    #[test]
+    fn prefix_a_picks_the_view_with_the_keys_before_the_oldest_card() {
+        use eitri_core::layout::{Axis, Layout, Node};
+        let id = |text: &str| ModuleId::parse(text).unwrap();
+        let (two, three) = (id("agent#2"), id("agent#3"));
+        let oldest = ViewId::of_module(&two);
+        let tree = || {
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::split(Axis::Column, 0.5, Node::Leaf(two.clone()), Node::Leaf(three.clone())),
+                ),
+            )
+        };
+        let mut layout = Layout::new(tree(), three.clone()).unwrap();
+        assert_eq!(
+            chat_target(&layout, oldest),
+            three,
+            "keys in agent#3: the key hides that one"
+        );
+        layout.set_focus(&ModuleId::agent()).unwrap();
+        assert_eq!(chat_target(&layout, oldest), ModuleId::agent(), "keys in the base view");
+        layout.set_focus(&ModuleId::editor()).unwrap();
+        assert_eq!(
+            chat_target(&layout, oldest),
+            two,
+            "keys in the editor: the oldest card's view"
+        );
+        let mut without = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(three.clone()),
+                ),
+            ),
+            three.clone(),
+        )
+        .unwrap();
+        without.set_focus(&ModuleId::editor()).unwrap();
+        assert_eq!(
+            chat_target(&without, oldest),
+            eitri_core::layout::module_target(&without, &ModuleId::agent()),
+            "the card's view not in the layout: the most recently used chat view"
+        );
+        assert_eq!(
+            chat_target(&without, None),
+            eitri_core::layout::module_target(&without, &ModuleId::agent())
         );
     }
 
@@ -4692,7 +5861,7 @@ mod tests {
             .expect("the chat held the keys");
         layout.set_focus(&next).unwrap();
         assert_eq!(next, ModuleId::editor());
-        assert_eq!(reveal_chat(&mut layout).unwrap(), (true, false));
+        assert_eq!(reveal_chat(&mut layout, &chat).unwrap(), (true, false));
         assert!(layout.is_tabbed_away(&chat), "shown, on the tab not drawn");
         assert_eq!(layout.focus(), &ModuleId::editor());
 
@@ -4711,11 +5880,15 @@ mod tests {
         .unwrap();
         hide(&mut layout, &chat, &frame).unwrap();
         assert!(!layout.is_shown(&chat));
-        assert_eq!(reveal_chat(&mut layout).unwrap(), (true, true));
+        assert_eq!(reveal_chat(&mut layout, &chat).unwrap(), (true, true));
         assert!(layout.is_visible(&chat));
         assert_eq!(layout.focus(), &ModuleId::editor());
 
-        assert_eq!(reveal_chat(&mut layout).unwrap(), (false, true), "already on screen");
+        assert_eq!(
+            reveal_chat(&mut layout, &chat).unwrap(),
+            (false, true),
+            "already on screen"
+        );
     }
 
     /// Checks that `build_application` sets `NON_UNIQUE`, which disables gio's
@@ -4848,10 +6021,10 @@ mod tests {
     fn keyboard_arrival_is_browse_and_only_a_new_tab_types() {
         // Split literals, so this test's own text is not counted.
         let src = include_str!("main.rs");
-        let calls = src.matches(concat!(".enter", "_input()")).count();
+        let calls = src.matches(concat!(".enter", "_input(")).count();
         assert_eq!(calls, 1, "only the new-tab path may land in INPUT");
         assert!(
-            src.matches(concat!(".arr", "ive()")).count() >= 2,
+            src.matches(concat!(".arr", "ive(")).count() >= 2,
             "move_focus and arrive both use it"
         );
     }

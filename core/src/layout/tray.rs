@@ -47,16 +47,20 @@ pub fn agent_place(layout: &Layout) -> AgentPlace {
 
 /// A visible chat in `covered` may have cards hidden by a float.
 pub fn agent_place_covered(layout: &Layout, covered: &[ModuleId]) -> AgentPlace {
-    let agent = ModuleId::agent();
-    if layout.is_visible(&agent) {
-        if covered.contains(&agent) {
+    view_place(layout, &ModuleId::agent(), covered)
+}
+
+/// Where the chat view `id` is, `covered` naming the modules a float covers now.
+pub fn view_place(layout: &Layout, id: &ModuleId, covered: &[ModuleId]) -> AgentPlace {
+    if layout.is_visible(id) {
+        if covered.contains(id) {
             AgentPlace::Covered
         } else {
             AgentPlace::OnScreen
         }
-    } else if !layout.is_zoomed() && layout.is_tabbed_away(&agent) {
+    } else if !layout.is_zoomed() && layout.is_tabbed_away(id) {
         AgentPlace::TabbedAway
-    } else if layout.is_shown(&agent) {
+    } else if layout.is_shown(id) {
         AgentPlace::ZoomedAway
     } else if layout.is_zoomed() {
         AgentPlace::HiddenUnderZoom
@@ -88,6 +92,51 @@ mod tests {
             ModuleId::editor(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_chat_views_place_is_its_own() {
+        use super::super::{Child, Con, ConLayout, Node};
+        let a2 = ModuleId::parse("agent#2").unwrap();
+        let mut layout = Layout::new(
+            Node::Con(Con::new(
+                ConLayout::SplitH,
+                vec![
+                    Child::new(Node::Leaf(ModuleId::editor()), 0.4),
+                    Child::new(
+                        Node::Con(Con::new(
+                            ConLayout::Tabbed,
+                            vec![
+                                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                                Child::new(Node::Leaf(a2.clone()), 0.5),
+                            ],
+                        )),
+                        0.6,
+                    ),
+                ],
+            )),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        assert_eq!(view_place(&layout, &ModuleId::agent(), &[]), AgentPlace::OnScreen);
+        assert_eq!(view_place(&layout, &a2, &[]), AgentPlace::TabbedAway);
+        assert_eq!(
+            agent_place_covered(&layout, &[]),
+            AgentPlace::OnScreen,
+            "the base view's place is unchanged"
+        );
+        assert_eq!(
+            view_place(&layout, &ModuleId::agent(), &[ModuleId::agent()]),
+            AgentPlace::Covered
+        );
+        assert_eq!(
+            view_place(&layout, &a2, &[a2.clone()]),
+            AgentPlace::TabbedAway,
+            "a tab not drawn is not covered"
+        );
+        hide(&mut layout, &a2, &frame()).unwrap();
+        assert_eq!(view_place(&layout, &a2, &[]), AgentPlace::Hidden);
+        assert_eq!(view_place(&layout, &ModuleId::agent(), &[]), AgentPlace::OnScreen);
     }
 
     #[test]

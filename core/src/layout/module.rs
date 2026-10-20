@@ -207,6 +207,23 @@ pub struct ModuleDecl {
     pub id: ModuleId,
     pub placement: Placement,
 }
+
+/// Where `id` goes when the window places it itself: its own declaration, else, for a numbered instance, its kind's
+/// base declaration (`terminal` for `terminal#3`), else `fallback`.
+pub fn declared_placement(decls: &[ModuleDecl], id: &ModuleId, fallback: Placement) -> Placement {
+    decls
+        .iter()
+        .find(|d| d.id == *id)
+        .or_else(|| {
+            if id.number() >= 2 {
+                decls.iter().find(|d| d.id == id.base())
+            } else {
+                None
+            }
+        })
+        .map_or(fallback, |d| d.placement)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +383,45 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_declaration_says_where_a_module_or_its_instances_go() {
+        let t = ModuleId::terminal();
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let t3 = ModuleId::parse("terminal#3").unwrap();
+        let a2 = ModuleId::parse("agent#2").unwrap();
+        let decls = [
+            ModuleDecl {
+                id: t.clone(),
+                placement: Placement::BelowRoot,
+            },
+            ModuleDecl {
+                id: t3.clone(),
+                placement: Placement::RightOfRoot,
+            },
+        ];
+        assert_eq!(
+            declared_placement(&decls, &t, Placement::BelowEditor),
+            Placement::BelowRoot
+        );
+        assert_eq!(
+            declared_placement(&decls, &t3, Placement::BelowEditor),
+            Placement::RightOfRoot
+        );
+        assert_eq!(
+            declared_placement(&decls, &t2, Placement::BelowEditor),
+            Placement::BelowRoot,
+            "its kind's"
+        );
+        assert_eq!(
+            declared_placement(&decls, &a2, Placement::BelowEditor),
+            Placement::BelowEditor,
+            "none: the fallback"
+        );
+        assert_eq!(
+            declared_placement(&[], &t, Placement::BelowEditor),
+            Placement::BelowEditor
+        );
     }
 }

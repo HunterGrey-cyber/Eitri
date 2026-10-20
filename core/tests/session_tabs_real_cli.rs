@@ -152,9 +152,14 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
     );
     let permission_id = card["permissionId"].as_str().unwrap().to_string();
     // The panel's own route for a card's answer, by tab and permission id.
-    set.answer_card(background, &permission_id, agent::PermissionDecision::Allow)
-        .map_err(|e| e.message)
-        .unwrap();
+    set.answer_card(
+        background,
+        eitri_core::tab_set::ViewId::BASE,
+        &permission_id,
+        agent::PermissionDecision::Allow,
+    )
+    .map_err(|e| e.message)
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(180);
     while !dir.join("tabs-proof.txt").exists() || set.get(background).unwrap().turn_running() {
         set.pump(&dir, true);

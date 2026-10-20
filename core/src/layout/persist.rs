@@ -689,10 +689,13 @@ fn read_workspace(
             own.push(format!("normalised a container in workspace '{name}'"));
         }
     }
-    if tree
-        .leaves()
-        .iter()
-        .any(|id| id.kind() == super::module::ModuleKind::Agent && id.number() >= 2)
+    // The builds before floats are also the builds before chat views: their reconcile leaves a
+    // tiled `agent#N` out, so they keep a copy of the file for a build that reads it.
+    if reader == Reader::BeforeFloats
+        && tree
+            .leaves()
+            .iter()
+            .any(|id| id.kind() == super::module::ModuleKind::Agent && id.number() >= 2)
     {
         *copy = true;
     }
@@ -858,8 +861,16 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
     };
 
     // Tiled leaves and floats create instances, in every workspace; names in kept data reserve their
-    // numbers instead.
-    fn terminals(node: &Value, found: &mut BTreeSet<ModuleId>) {
+    // numbers instead. The builds before floats had no chat views, so for them only a terminal is an
+    // instance and an `agent#N` stays a module the window does not have.
+    let makes_instance = |id: &ModuleId| {
+        id.number() >= 2
+            && match reader {
+                Reader::ThisBuild => id.kind().has_instances(),
+                Reader::BeforeFloats => id.kind() == super::module::ModuleKind::Terminal,
+            }
+    };
+    fn instances_in(node: &Value, makes_instance: &dyn Fn(&ModuleId) -> bool, found: &mut BTreeSet<ModuleId>) {
         match node.get("type").and_then(Value::as_str) {
             Some("leaf") => {
                 if let Some(id) = node
@@ -867,7 +878,7 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
                     .and_then(Value::as_str)
                     .and_then(|s| ModuleId::parse(s).ok())
                 {
-                    if id.kind() == super::module::ModuleKind::Terminal && id.number() >= 2 {
+                    if makes_instance(&id) {
                         found.insert(id);
                     }
                 }
@@ -876,7 +887,7 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
                 if let Some(children) = node.get("children").and_then(Value::as_array) {
                     for child in children {
                         if let Some(node) = child.get("node") {
-                            terminals(node, found);
+                            instances_in(node, makes_instance, found);
                         }
                     }
                 }
@@ -887,7 +898,7 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
     let mut instances = BTreeSet::new();
     for item in &items {
         if let Some(tiled) = item.get("tiled") {
-            terminals(tiled, &mut instances);
+            instances_in(tiled, &makes_instance, &mut instances);
         }
         if reader == Reader::ThisBuild {
             if let Some(Value::Array(floats)) = item.get("floating") {
@@ -900,7 +911,7 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
                     else {
                         continue;
                     };
-                    if id.kind() == super::module::ModuleKind::Terminal && id.number() >= 2 {
+                    if makes_instance(&id) {
                         instances.insert(id);
                     }
                 }
@@ -2588,12 +2599,80 @@ mod tests {
         let agent = ModuleId::parse("agent#2").unwrap();
         main.replace_root(super::super::tree::place_new(main.root_node(), &agent, Placement::BelowEditor).0);
         let restored = decode_v2(&encode_v2(&Workspaces::single(), &main, &root()), &root(), &[]).unwrap();
-        assert!(!restored.current.contains(&agent));
-        assert!(restored
-            .notes
-            .iter()
-            .any(|n| n.contains("left out 'agent#2': this window has no such module")));
-        assert!(restored.keep_copy.is_some());
+        assert!(
+            restored.current.contains(&agent),
+            "a chat view in the file is one of the window's"
+        );
+        assert!(
+            restored.notes.iter().all(|n| !n.contains("agent#2")),
+            "{:?}",
+            restored.notes
+        );
+        assert_eq!(restored.keep_copy, None);
+    }
+
+    /// Two workspaces: `agent#2` tiled in `main`, `agent#3` a float in `study`, written by this build.
+    fn a_file_with_two_chat_views() -> (String, Float) {
+        let mut main = plain();
+        main.replace_root(super::super::tree::place_new(main.root_node(), &id("agent#2"), Placement::BelowEditor).0);
+        let floating = float("agent#3", rect(0.5, 0.5, 600, 400), false);
+        let study = plain_with(vec![floating.clone()], &[]);
+        let workspaces = with(&["main", "study"], "main", &[main.clone(), study]);
+        (encode_v2(&workspaces, &main, &root()), floating)
+    }
+
+    #[test]
+    fn a_file_names_its_chat_views_tiled_or_floating_and_every_workspace_gets_them() {
+        let (text, floating) = a_file_with_two_chat_views();
+        let back = decode_v2(&text, &root(), &[]).unwrap();
+        let (two, three) = (id("agent#2"), id("agent#3"));
+        assert!(back.current.leaves().contains(&two) && !back.current.hidden().contains(&two));
+        assert!(
+            back.current.leaves().contains(&three) && back.current.hidden().contains(&three),
+            "placed hidden where the file did not place it"
+        );
+        let study = back.workspaces.stored("study").unwrap();
+        assert!(study.leaves().contains(&two) && study.hidden().contains(&two));
+        assert_eq!(study.floats(), [floating], "the float comes back as it was left");
+        assert_eq!(
+            back.notes,
+            [
+                "workspace 'main': placed 'agent#3' below the editor, hidden: another workspace has it",
+                "workspace 'study': placed 'agent#2' below the editor, hidden: another workspace has it",
+            ]
+        );
+        assert_eq!(back.keep_copy, None);
+
+        let again = encode_v2(&back.workspaces, &back.current, &root());
+        let twice = decode_v2(&again, &root(), &[]).unwrap();
+        assert!(twice.notes.is_empty(), "{:?}", twice.notes);
+        assert_eq!(twice.keep_copy, None);
+        assert_eq!(
+            encode_v2(&twice.workspaces, &twice.current, &root()),
+            again,
+            "both are written back"
+        );
+        assert!(twice.current.contains(&two) && twice.current.contains(&three));
+    }
+
+    #[test]
+    fn the_build_before_floats_still_leaves_a_chat_view_out_and_keeps_a_copy() {
+        let (text, _) = a_file_with_two_chat_views();
+        let old = decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap();
+        assert!(!old.current.contains(&id("agent#2")));
+        assert!(
+            old.notes
+                .iter()
+                .any(|n| n == "workspace 'main': left out 'agent#2': this window has no such module"),
+            "{:?}",
+            old.notes
+        );
+        assert!(
+            old.notes.iter().all(|n| !n.contains("placed 'agent#")),
+            "that build makes no chat view: {:?}",
+            old.notes
+        );
+        assert_eq!(old.keep_copy.as_deref(), Some(text.as_str()));
     }
 
     fn id(text: &str) -> ModuleId {
@@ -2756,11 +2835,6 @@ mod tests {
                 "floating",
                 json!([at("lua:gone")]),
                 "workspace 'main': left out floating 'lua:gone': this window has no such module",
-            ),
-            (
-                "floating",
-                json!([at("agent#2")]),
-                "workspace 'main': left out floating 'agent#2': this window has no such module",
             ),
             (
                 "floating",

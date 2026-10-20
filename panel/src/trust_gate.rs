@@ -1255,6 +1255,16 @@ impl TrustGate {
         }
     }
 
+    /// The request of the `:trust` whose prompt is on screen, or whose question is about to be asked.
+    /// There is at most one: a newer command's check ends the older one's prompt.
+    pub(crate) fn command_prompt(&self) -> Option<&str> {
+        self.command_shown.as_ref().map(|c| c.request_id.as_str()).or_else(|| {
+            self.command_pending
+                .as_ref()
+                .map(|(request_id, _, _)| request_id.as_str())
+        })
+    }
+
     /// Whether `nonce` names `:trust`'s prompt on screen in `tab`.
     pub(crate) fn is_command_prompt(&self, tab: TabId, nonce: u64) -> bool {
         self.command_shown

@@ -25,7 +25,7 @@ use std::time::Duration;
 use block2::RcBlock;
 use eitri_core::keymap::prefix::PrefixCommand;
 use eitri_core::keymap::Action;
-use eitri_panel::agent_panel::AgentPanelHandle;
+use eitri_panel::agent_panel::{AgentPanelHandle, ViewId};
 use eitri_panel::panel_page::PanelHost;
 use objc2::msg_send;
 use objc2::rc::Retained;
@@ -79,16 +79,16 @@ struct RecordingEvents(AgentPanelHandle);
 
 impl PageEvents for RecordingEvents {
     fn page_message(&self, raw: &str) {
-        self.0.page_message(raw);
+        self.0.page_message(ViewId::BASE, raw);
     }
     fn link_clicked(&self, url: Option<&str>) {
-        self.0.link_clicked(url);
+        self.0.link_clicked(ViewId::BASE, url);
     }
     fn page_gone(&self, reason: &str) {
-        self.0.page_gone(reason);
+        self.0.page_gone(ViewId::BASE, reason);
     }
     fn page_shown(&self) {
-        self.0.page_shown();
+        self.0.page_shown(ViewId::BASE);
     }
     fn navigation_decided(&self, kind: NavKind, url: Option<&str>, decision: &NavDecision) {
         let decision = match decision {

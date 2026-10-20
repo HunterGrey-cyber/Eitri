@@ -4,6 +4,9 @@
 //! ```json
 //! {"run": ["cal", "p1", "p2"], "counts": {"p1_moves": 1000, "p2_cycles": 500}}
 //! ```
+//!
+//! The `p6` probe uses `p6_cycles` for pooled terminals and the page, and `p6_view_cycles` for
+//! creating and ending the window's chat views. The latter defaults to `p6_cycles` when absent.
 
 use std::collections::BTreeMap;
 

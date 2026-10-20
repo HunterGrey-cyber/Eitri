@@ -173,8 +173,11 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     )
     .unwrap_or_else(|why| panic!("assemble: {why}"));
     let panel = assembly.panel.clone();
-    panel.load_first_document();
-    panel.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+    panel.load_document(eitri_panel::agent_panel::ViewId::BASE);
+    panel.page_message(
+        eitri_panel::agent_panel::ViewId::BASE,
+        r#"{"type":"ready","request_id":"r1"}"#,
+    );
 
     let pump = PanelPump::new(panel.clone());
     let mut looped = Loop {
@@ -221,7 +224,10 @@ fn every_duty_of_the_panels_tick_is_driven_by_the_macs_pump() {
     let mut once = Some(());
     looped.run(Duration::from_millis(300), || {
         if once.take().is_some() {
-            panel.page_message(r#"{"type":"ready","request_id":"r2"}"#);
+            panel.page_message(
+                eitri_panel::agent_panel::ViewId::BASE,
+                r#"{"type":"ready","request_id":"r2"}"#,
+            );
         }
     });
     assert!(panel.ticks_run() > before, "a page message woke the tick");

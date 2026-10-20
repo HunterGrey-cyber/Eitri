@@ -19,7 +19,7 @@ use eitri_core::layout::{ModuleKeys, ModuleKind};
 use eitri_core::lua::kernel::{refuse_panels, Kernel};
 use eitri_core::tabs::{plan, TabVerb};
 use eitri_core::theme::ThemeTokens;
-use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound, PanelInit};
+use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound, PanelInit, ViewId};
 use eitri_panel::keys_help::{HelpScope, KeysHelp};
 use eitri_panel::panel_document::PanelDocument;
 use eitri_panel::panel_page::{PanelHost, PanelPage};
@@ -164,18 +164,18 @@ impl Shared {
         let switched = match plan.verb {
             TabVerb::New => {
                 panel.new_tab();
-                panel.enter_input();
+                panel.enter_input(ViewId::BASE);
                 true
             }
             TabVerb::Step(delta) => panel.step(delta),
             TabVerb::Last => panel.select_last(),
-            TabVerb::Select(n) => panel.select_number(n),
+            TabVerb::Select(n) => panel.select_number(n).is_some(),
             TabVerb::Rename => {
-                panel.begin_rename();
+                panel.begin_rename(ViewId::BASE);
                 true
             }
             TabVerb::Close => {
-                panel.confirm_close();
+                panel.confirm_close(ViewId::BASE);
                 true
             }
             TabVerb::CloseOthers => {
@@ -183,11 +183,11 @@ impl Shared {
                 true
             }
             TabVerb::Choose => {
-                panel.open_chooser();
+                panel.open_chooser(ViewId::BASE);
                 true
             }
             TabVerb::Info => {
-                panel.open_detail();
+                panel.open_detail(ViewId::BASE);
                 true
             }
             TabVerb::Flash => false,
@@ -232,15 +232,15 @@ impl Shared {
         }
         match companion_prefix::classify(&action) {
             CompanionVerb::Tab(tab) => self.run_tab(tab, pane),
-            CompanionVerb::Reload => self.panel.reload_document_by_hand(),
+            CompanionVerb::Reload => self.panel.reload_document_by_hand(ViewId::BASE),
             CompanionVerb::Keymap => {
                 if self.give_panel_keys() {
-                    self.panel.open_keymap(None, 0);
+                    self.panel.open_keymap(ViewId::BASE, None, 0);
                 }
             }
             CompanionVerb::CommandLine => {
                 if self.give_panel_keys() {
-                    self.panel.open_command_line();
+                    self.panel.open_command_line(ViewId::BASE);
                 }
             }
             CompanionVerb::Text(change) => {
@@ -251,7 +251,7 @@ impl Shared {
             CompanionVerb::Literal => {
                 if let Some(key) = literal_for(&action, &self.keymap) {
                     match pane {
-                        Pane::Panel => self.panel.literal_key(&key),
+                        Pane::Panel => self.panel.literal_key(ViewId::BASE, &key),
                         Pane::Editor => {
                             if let Err(why) = self.editor.send_keys(&key.to_vim()) {
                                 crate::log_line!("[mac] prefix: the key did not reach the editor: {why}");
@@ -354,7 +354,10 @@ pub fn assemble(
         backend_kind,
         document,
     };
-    let panel = AgentPanelHandle::new(init, page, host);
+    let panel = AgentPanelHandle::new(init, page.is_some(), host);
+    if let Some(page) = page {
+        panel.attach_page(ViewId::BASE, page);
+    }
     config.apply_to_panel(&panel);
     let mut tokens = ThemeTokens::fallback();
     tokens.font_size_px = config.panel_font_size;
@@ -381,7 +384,7 @@ pub fn assemble(
         keys_report: RefCell::new(KeysReport::default()),
     });
     install_hooks(&shared);
-    let keys = Keys::new(config.keymap.clone(), module_keys, panel.nav_intercept());
+    let keys = Keys::new(config.keymap.clone(), module_keys, panel.nav_intercept(ViewId::BASE));
     Ok(Assembly {
         panel,
         keys: RefCell::new(keys),
@@ -399,7 +402,7 @@ fn install_hooks(shared: &Rc<Shared>) {
     }
     {
         let shared = shared.clone();
-        panel.on_tab_verb(move |action| shared.run_tab(action, Pane::Panel));
+        panel.on_tab_verb(move |_view, action| shared.run_tab(action, Pane::Panel));
     }
     {
         let shared = shared.clone();
@@ -412,7 +415,7 @@ fn install_hooks(shared: &Rc<Shared>) {
     {
         // The page's stale-mirror recovery and its `pane_nav` ask for the move the chord would have made.
         let shared = shared.clone();
-        panel.on_nav_fallthrough(move |direction| {
+        panel.on_nav_fallthrough(move |_view, direction| {
             if let Some(pane) = neighbour(Pane::Panel, direction) {
                 shared.actions.focus(pane);
             }
@@ -439,10 +442,10 @@ fn install_hooks(shared: &Rc<Shared>) {
     {
         // An edit that came back: the keys return to the panel, on the oldest card if one waits.
         let shared = shared.clone();
-        panel.on_editor_done(move || {
+        panel.on_editor_done(move |_view| {
             // The arrival is where the keys land in the panel; without them it has nowhere to land.
-            if shared.give_panel_keys() && !shared.panel.focus_oldest_card() {
-                shared.panel.arrive();
+            if shared.give_panel_keys() && !shared.panel.focus_oldest_card(ViewId::BASE) {
+                shared.panel.arrive(ViewId::BASE);
             }
         });
     }
@@ -468,7 +471,7 @@ impl Assembly {
         let changes = self.shared.keys_report.borrow_mut().update(pane, window_key);
         for change in changes {
             match change {
-                KeysChange::PanelFocused(focused) => self.panel.set_pane_focused(focused),
+                KeysChange::PanelFocused(focused) => self.panel.set_pane_focused(ViewId::BASE, focused),
                 KeysChange::EditorHasKeys(has) => self.panel.set_editor_has_keys(has),
             }
         }

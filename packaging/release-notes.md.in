@@ -91,9 +91,9 @@ starts in the directory of the terminal you split (`k.set("prefix", "|", "split.
 tmux import on, `split-window -c "#{pane_current_path}"` becomes that, and any other `-c` value is not imported (the
 binding still works and starts in the project root). In Lua, the layout grammar accepts `'tabbed'` and `'stacked'`
 with `active = n` and the instance ids `terminal#2` to `terminal#9`, and
-`eitri.layout.run("instance.new", { kind = "terminal" })` opens a terminal. Chat views (`agent#2` and up) are not in
-this build: `instance.new { kind = "agent" }` flashes `chat views: not in this build`, and a Lua panel whose id is
-`terminal#2` to `terminal#9` or `agent#2` to `agent#9` is refused at registration.
+`eitri.layout.run("instance.new", { kind = "terminal" })` opens a terminal. Chat views (`agent#2` and up) come in the
+chat views section below; a Lua panel whose id is `terminal#2` to `terminal#9` or `agent#2` to `agent#9` is refused at
+registration.
 
 **What this can break:**
 - **A `set` over any of these keys stops startup.** If your `init.lua` sets `M-H`, `M-J`, `M-K`, `M-L`, `M-w`,
@@ -152,6 +152,35 @@ this build: `instance.new { kind = "agent" }` flashes `chat views: not in this b
   never a module.
 - **A workspace defined by `eitri.layout.workspace` comes back** from its definition at the next launch if you delete
   or rename it in the window; remove its call from `init.lua` to remove it for good.
+
+## Window layout: chat views and open rules (added after 0.2.2)
+
+- **Chat views.** The agent panel can be shown in more than one place: `agent#2` to `agent#9` are further pages of
+  the same panel, each holding one session tab, each a module you can move, float, zoom or hide. `<prefix> !` (tmux's
+  `break-pane`) breaks the tab you are on out into a view of its own, and from that view joins it back. A new view
+  with an empty tab comes from `eitri.layout.run("instance.new", { kind = "agent" })` or from a split key then `a`
+  with the keys in a chat view. A card is answered only from the page that shows its tab, and a view a float covers
+  refuses answers like the covered chat does, so the trust question from a covered page is refused and asked again
+  in the same page. Every view spends the window's one account.
+- **Open rules.** `eitri.layout.rule(target, opts)`, in `init.lua`, says where the window puts a module it opens by
+  itself (`at`, `float`, `size`, `scratchpad`, `focus`), for a kind (`"terminal"`, `"agent"`) or one module;
+  `eitri.layout.open(kind, opts?)` opens a new terminal or chat view from Lua, with a rule's options for that one
+  opening. A split key, a move or a drag never reads a rule, and a saved layout is never changed by one.
+
+| key after the prefix | action | from |
+|---|---|---|
+| `!` | `tab.break` | tmux `break-pane` |
+
+**What this can break:**
+- **`!` is a new default key, so a `set` over it stops startup.** If your `init.lua` sets `!` in the prefix table,
+  put `k.del("prefix", "!")` before that `set`. With the tmux import on and your tmux configuration binding `!`, no
+  `del` is needed. A `del` of a key that is not bound also stops startup, so on a version without this default the
+  `del` line stops the launch: add it when you upgrade, not before. A flagless `break-pane` in your tmux
+  configuration is imported as `tab.break` on the key you bound it to; one with flags is not.
+- **The layout file gains `agent#N` entries,** in a workspace's tree or `floating` list, and the saved tabs file gains
+  a `view` number on a tab shown in a view. The version before chat views leaves an `agent#N` out of the layout with a
+  note and copies the file to `<hash>.v2.json.partial` first, so no view is lost; it ignores `view`, so those tabs come
+  back in its single chat.
 
 ## Upgrading from 0.2.1
 

@@ -27,9 +27,13 @@ use gtk4::prelude::*;
 use gtk4::{glib, graphene};
 use neovide_editor::NeovideEditorPane;
 
-use eitri_core::agent_backend::BackendKind;
 use eitri_core::layout::{ModuleId, Rect};
 
+use eitri_panel::panel_page::PanelPage;
+use webkit6::WebView;
+
+use crate::agent_panel::AgentPanelHandle;
+use crate::chat_views::ChatViews;
 use crate::module_grid::{ModuleGrid, ProbePlace};
 use crate::terminal::TerminalPane;
 
@@ -45,7 +49,16 @@ pub(crate) struct Context {
     /// The base chat page's widget: a `WebView`, or the notice standing in for one.
     pub(crate) agent: gtk4::Widget,
     pub(crate) project_root: PathBuf,
-    pub(crate) backend_kind: BackendKind,
+    /// The window's own panel: every page the probe builds is attached to it, through the one
+    /// constructor the window's chat views use, so what it measures is the window's routing.
+    pub(crate) panel: AgentPanelHandle,
+    /// The window's own chat-view maker, as `instance.new { kind = "agent" }` runs it.
+    pub(crate) new_chat_view: Rc<dyn Fn(crate::OpenHow, crate::NewViewTab) -> Result<ModuleId, String>>,
+    /// The confirmed half of the window's kill of a chat module: what `prefix x` then `y` runs, with no
+    /// key pressed.
+    pub(crate) kill_chat_view: Rc<dyn Fn(&ModuleId)>,
+    /// The window's pool of extra chat pages, read only.
+    pub(crate) chat_views: Rc<RefCell<ChatViews<(WebView, Rc<PanelPage>)>>>,
 }
 
 /// Runs the script named by `EITRI_GRID_PROBE`, if the variable is set. Called once, after the window is
@@ -67,7 +80,25 @@ pub(crate) fn start_if_requested(ctx: Context) {
         }
     };
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let probe = Rc::new(Probe::new(ctx, script, dir));
+    let pooled: Vec<String> = ctx.chat_views.borrow().live().map(|(id, _)| id.to_string()).collect();
+    say(format!("chat-views live={}", pooled.join(",")));
+    // Startup views have no restored tab, and the panel releases empty views on its first
+    // tick. Give each an empty tab before the loop runs so the lifecycle probe kills a view
+    // that the window actually holds.
+    let startup: Vec<(ModuleId, usize)> = ctx
+        .chat_views
+        .borrow()
+        .live()
+        .map(|(id, (view, _))| (id.clone(), page_pointer(view)))
+        .collect();
+    for (id, _) in &startup {
+        if let Some(view) = crate::agent_panel::ViewId::of_module(id) {
+            if let Err(err) = ctx.panel.open_in(view) {
+                say(format!("warn {id} could not be given a tab: {err}"));
+            }
+        }
+    }
+    let probe = Rc::new(Probe::new(ctx, script, dir, startup));
     glib::spawn_future_local(async move { probe.run().await });
 }
 
@@ -86,6 +117,16 @@ pub(crate) struct Probe {
     counters: RefCell<Vec<Counter>>,
     /// The pages and terminals the probe made, kept alive for the run.
     made: RefCell<hosts::Made>,
+    /// The extra chat views the window opened with and the pointer of each one's `WebView`, as they were
+    /// when the probe started.
+    startup_views: Vec<(ModuleId, usize)>,
+}
+
+/// The identity of a page's `WebView` for the log: two reads of one view give one number, and two
+/// views never share one while both are alive.
+fn page_pointer(view: &WebView) -> usize {
+    use gtk4::glib::object::ObjectType;
+    view.as_ptr() as usize
 }
 
 /// One line of the log.
@@ -94,7 +135,7 @@ fn say(line: impl AsRef<str>) {
 }
 
 impl Probe {
-    fn new(ctx: Context, script: script::Script, dir: PathBuf) -> Probe {
+    fn new(ctx: Context, script: script::Script, dir: PathBuf, startup_views: Vec<(ModuleId, usize)>) -> Probe {
         Probe {
             ctx,
             script,
@@ -102,6 +143,7 @@ impl Probe {
             seq: Cell::new(0),
             counters: RefCell::new(Vec::new()),
             made: RefCell::new(hosts::Made::default()),
+            startup_views,
         }
     }
 

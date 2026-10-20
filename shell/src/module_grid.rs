@@ -29,8 +29,8 @@ use gtk4::subclass::prelude::*;
 
 use eitri_core::layout::{
     arrange, covering, Arrangement, Axis, ConLayout, Direction, Divider, FloatChange, FloatRect, Frame, Layout,
-    LayoutError, ModuleDecl, ModuleId, Nav, Preset, Rect, Reopen, ScratchShow, Size, Strip, WorkspaceError, Workspaces,
-    Zoom, ZoomChange, DEFAULT_STRIP_PX,
+    LayoutError, ModuleDecl, ModuleId, Nav, OpenRule, Opened, Preset, Rect, Reopen, ScratchShow, Size, Strip,
+    WorkspaceError, Workspaces, Zoom, ZoomChange, DEFAULT_STRIP_PX,
 };
 
 use floatbars::{chrome_owners, chrome_plan, grip_rect, ChromeHooks, FloatChrome};
@@ -819,6 +819,36 @@ impl ModuleGrid {
         eitri_core::layout::place(&mut self.layout().borrow_mut(), module, target, axis)?;
         self.apply();
         Ok(())
+    }
+
+    /// Opens `id`, which the layout does not hold yet and whose host the grid does, where `rule` says
+    /// (`eitri_core::layout::open_by_rule`) at the grid's size now, `keys` being the module with the
+    /// keys. When a tile takes them, its host is mapped and `focus` gives them before `apply` unmaps
+    /// what the open hid -- a module in the editor's place hides the editor, and unmapping that first
+    /// would leave GTK's focus chain to choose where the keys go ([`leave_then_unmap`]'s order). A float
+    /// that takes them is given them after `apply` has mapped and restacked it, as a scratchpad show
+    /// is, so they never land under another float. A stowed or unfocused open only applies.
+    pub(crate) fn open_module(
+        &self,
+        id: &ModuleId,
+        rule: &OpenRule,
+        keys: Option<&ModuleId>,
+        focus: &dyn Fn(&ModuleId) -> bool,
+    ) -> Result<Opened, LayoutError> {
+        let hosted: Vec<ModuleId> = self.hosts().into_iter().map(|(id, _)| id).collect();
+        placeable(&hosted, id)?;
+        let size = self.size();
+        let opened = eitri_core::layout::open_by_rule(&mut self.layout().borrow_mut(), id, rule, keys, size)?;
+        let floats = self.layout().borrow().is_floating(id);
+        if opened.takes_keys && !floats {
+            self.map_arriving(id);
+            focus(id);
+        }
+        self.apply();
+        if opened.takes_keys && floats {
+            focus(id);
+        }
+        Ok(opened)
     }
 
     /// `Ctrl+a H/J/K/L` (`eitri_core::layout::swap`). The neighbour, if they swapped.

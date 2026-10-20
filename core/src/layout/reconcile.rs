@@ -34,7 +34,7 @@ use std::fmt;
 
 use super::con::{ConLayout, Node, Pin};
 use super::float::{Float, FloatRect};
-use super::module::{ModuleDecl, ModuleId, Placement};
+use super::module::{declared_placement, ModuleDecl, ModuleId, ModuleKind, Placement};
 use super::tree::{place_new, Layout, LayoutError};
 
 /// Every window has an editor, an agent and a terminal.
@@ -101,7 +101,8 @@ pub fn reconcile_floating(
     reconcile_with(root, floats, memory, hidden, focus, lua, instances, false)
 }
 
-/// Reconciles a Lua default, keeping terminal instances named in its tree or floats.
+/// Reconciles a Lua default or a template, keeping the instances -- terminals and chat views -- named
+/// in its tree or floats.
 pub fn reconcile_default_floating(
     root: Node,
     floats: Vec<Float>,
@@ -111,7 +112,7 @@ pub fn reconcile_default_floating(
         .leaves()
         .into_iter()
         .chain(floats.iter().map(|float| float.id.clone()))
-        .filter(|id| id.kind() == super::module::ModuleKind::Terminal && id.number() >= 2)
+        .filter(|id| id.kind().has_instances() && id.number() >= 2)
         .collect();
     reconcile_with(
         root,
@@ -136,7 +137,9 @@ fn reconcile_with(
     pin: bool,
 ) -> Result<Reconciled, ReconcileError> {
     let known = |id: &ModuleId| {
-        BUILT_INS.iter().any(|b| b() == *id) || lua.iter().any(|d| d.id == *id) || instances.contains(id)
+        BUILT_INS.iter().any(|b| b() == *id)
+            || lua.iter().any(|d| d.id == *id && d.id.kind() == ModuleKind::LuaWebview)
+            || instances.contains(id)
     };
     let mut notes = Vec::new();
     let tiled = root.leaves();
@@ -176,7 +179,10 @@ fn reconcile_with(
     }
     if pin {
         let below_root = |id: &ModuleId| {
-            *id == ModuleId::terminal() || lua.iter().any(|d| d.id == *id && d.placement == Placement::BelowRoot)
+            *id == ModuleId::terminal()
+                || lua.iter().any(|d| {
+                    d.id == *id && d.id.kind() == ModuleKind::LuaWebview && d.placement == Placement::BelowRoot
+                })
         };
         pin_bottom_rows(&mut root, &below_root, &mut notes);
     }
@@ -194,22 +200,28 @@ fn reconcile_with(
     }
     let terminal = ModuleId::terminal();
     if !root.leaves().contains(&terminal) && !floating.contains(&terminal) {
-        root = place_new(root, &terminal, Placement::BelowEditor).0;
+        let placement = declared_placement(lua, &terminal, Placement::BelowEditor);
+        root = place_new(root, &terminal, placement).0;
         hidden.insert(terminal.clone());
-        notes.push(format!(
-            "placed '{terminal}' below the editor, hidden, as a first launch does"
-        ));
+        notes.push(if placement == Placement::BelowEditor {
+            format!("placed '{terminal}' below the editor, hidden, as a first launch does")
+        } else {
+            format!("placed '{terminal}' where its open rule says ({placement:?}), hidden")
+        });
     }
     for id in instances {
         if !root.leaves().contains(id) && !floating.contains(id) {
-            root = place_new(root, id, Placement::BelowEditor).0;
+            let placement = declared_placement(lua, id, Placement::BelowEditor);
+            root = place_new(root, id, placement).0;
             hidden.insert(id.clone());
-            notes.push(format!(
-                "placed '{id}' below the editor, hidden: another workspace has it"
-            ));
+            notes.push(if placement == Placement::BelowEditor {
+                format!("placed '{id}' below the editor, hidden: another workspace has it")
+            } else {
+                format!("placed '{id}' where its open rule says ({placement:?}), hidden: another workspace has it")
+            });
         }
     }
-    for decl in lua {
+    for decl in lua.iter().filter(|decl| decl.id.kind() == ModuleKind::LuaWebview) {
         if root.leaves().contains(&decl.id) || floating.contains(&decl.id) {
             continue;
         }
@@ -286,7 +298,7 @@ pub(super) fn first_focus(shown: &[ModuleId], lua: &[ModuleDecl]) -> Option<Modu
         return Some(editor);
     }
     lua.iter()
-        .filter(|decl| decl.placement == Placement::InPlaceOfEditor)
+        .filter(|decl| decl.id.kind() == ModuleKind::LuaWebview && decl.placement == Placement::InPlaceOfEditor)
         .map(|decl| &decl.id)
         .find(|id| shown.contains(id))
         .or_else(|| shown.first())
@@ -436,6 +448,37 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_views_declaration_never_pins_the_agent_of_a_lua_default() {
+        fn row_pin(node: &Node, id: &ModuleId) -> Option<Pin> {
+            let Node::Con(c) = node else { return None };
+            c.children.iter().find_map(|child| {
+                if child.node.leaves() == vec![id.clone()] {
+                    child.pin
+                } else {
+                    row_pin(&child.node, id)
+                }
+            })
+        }
+        let decls = [ModuleDecl {
+            id: ModuleId::agent(),
+            placement: Placement::BelowRoot,
+        }];
+        for (beside, bottom, pinned) in [
+            (ModuleId::terminal(), ModuleId::agent(), false),
+            (ModuleId::agent(), ModuleId::terminal(), true),
+        ] {
+            let root = Node::split(
+                Axis::Column,
+                0.7,
+                Node::split(Axis::Row, 0.6, Node::Leaf(ModuleId::editor()), Node::Leaf(beside)),
+                Node::Leaf(bottom.clone()),
+            );
+            let layout = reconcile_default_floating(root, Vec::new(), &decls).unwrap().layout;
+            assert_eq!(row_pin(&layout.root_node(), &bottom).is_some(), pinned, "{bottom}");
+        }
+    }
+
+    #[test]
     fn a_layout_this_window_can_show_comes_back_unchanged() {
         let r = reconcile(saved(), &set(&[term()]), Some(&agent()), &[], &[]).unwrap();
         same_as(&r, saved());
@@ -540,6 +583,34 @@ mod tests {
         );
         assert_eq!(r.layout.hidden(), &set(&[term()]));
         assert_eq!(r.layout.focus(), &editor());
+    }
+
+    /// A Lua default or a template that names chat views, one tiled and one floating, opens with
+    /// both, as it does with terminal instances: nothing is left out and nothing is noted about them.
+    #[test]
+    fn a_lua_default_keeps_the_chat_views_it_names() {
+        let chat2 = ModuleId::parse("agent#2").unwrap();
+        let chat3 = ModuleId::parse("agent#3").unwrap();
+        let tiled = row(row(leaf(editor()), leaf(agent())), leaf(chat2.clone()));
+        let floats = vec![Float {
+            id: chat3.clone(),
+            rect: FloatRect {
+                cx: 0.5,
+                cy: 0.5,
+                w: 600,
+                h: 400,
+            },
+            scratch: false,
+        }];
+        let r = reconcile_default_floating(tiled, floats, &[]).unwrap();
+        assert!(r.layout.leaves().contains(&chat2), "the tiled chat view stays tiled");
+        assert!(r.layout.is_floating(&chat3), "the floating chat view stays a float");
+        assert!(!r.layout.hidden().contains(&chat2) && !r.layout.hidden().contains(&chat3));
+        assert!(
+            r.notes.iter().all(|n| !n.contains("agent#")),
+            "no note about a chat view: {:?}",
+            r.notes
+        );
     }
 
     /// A default layout with a terminal below a row is a plain `Column` split.
@@ -828,6 +899,98 @@ mod tests {
         assert_eq!(
             reconcile(bad_ratio, &BTreeSet::new(), None, &[], &[]),
             Err(ReconcileError::Layout(LayoutError::Ratio(1.0 - 0.99)))
+        );
+    }
+
+    #[test]
+    fn reconcile_places_the_terminal_and_instances_where_their_declarations_say() {
+        use crate::layout::geometry::{arrange, Frame, Size};
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let root = Node::split(
+            Axis::Row,
+            0.6,
+            Node::Leaf(ModuleId::editor()),
+            Node::Leaf(ModuleId::agent()),
+        );
+        let decls = [ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::BelowRoot,
+        }];
+        let mut layout = reconcile_floating(
+            root.clone(),
+            Vec::new(),
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &decls,
+            &[t2.clone()],
+        )
+        .unwrap()
+        .layout;
+        layout.show(&ModuleId::terminal()).unwrap();
+        layout.show(&t2).unwrap();
+        let size = Size { w: 1280, h: 721 };
+        let r: BTreeMap<ModuleId, _> = arrange(&layout, &Frame::new(size, 1)).modules.into_iter().collect();
+        assert_eq!(
+            r[&ModuleId::terminal()].w,
+            1280,
+            "its declaration: a full-width bottom row"
+        );
+        assert_eq!(
+            r[&t2].w, 1280,
+            "an instance with no declaration of its own follows its kind's"
+        );
+
+        let gone = ModuleId::parse("terminal#5").unwrap();
+        let with_gone = Node::split(Axis::Row, 0.5, root, Node::Leaf(gone.clone()));
+        let decls = [ModuleDecl {
+            id: gone.clone(),
+            placement: Placement::RightOfRoot,
+        }];
+        let reconciled = reconcile_floating(
+            with_gone,
+            Vec::new(),
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &decls,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !reconciled.layout.leaves().contains(&gone),
+            "a declaration never makes a module known"
+        );
+        assert!(
+            reconciled.notes.iter().any(|n| n.contains("left out 'terminal#5'")),
+            "{:?}",
+            reconciled.notes
+        );
+
+        let only_decl = [ModuleDecl {
+            id: ModuleId::parse("agent#3").unwrap(),
+            placement: Placement::RightOfRoot,
+        }];
+        let root = Node::split(
+            Axis::Row,
+            0.6,
+            Node::Leaf(ModuleId::editor()),
+            Node::Leaf(ModuleId::agent()),
+        );
+        let layout = reconcile_floating(
+            root,
+            Vec::new(),
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &only_decl,
+            &[],
+        )
+        .unwrap()
+        .layout;
+        assert!(
+            !layout.modules().contains(&ModuleId::parse("agent#3").unwrap()),
+            "nor places it"
         );
     }
 }

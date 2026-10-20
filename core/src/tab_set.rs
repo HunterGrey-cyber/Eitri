@@ -1,6 +1,6 @@
 //! One window's session tabs: one conversation, and so one `AgentBackend`,
 //! per tab, every one of them running. GTK-free: `eitri_panel::agent_panel` spawns the connect and
-//! handoff workers and hands this set their receivers; the panel's tick calls [`TabSet::pump`], which
+//! handoff workers and hands this set their receivers; the panel's tick calls [`TabSet::pump_views`], which
 //! drains EVERY tab -- `take_ui_delivery` is where the permission policy answers what needs no
 //! human, so a tab that was not pumped would stall on its first `Read`.
 //!
@@ -24,6 +24,7 @@ use crate::agent_bridge::{
 use crate::attention::{Attention, AttentionTracker};
 use crate::saved_tabs::{SavedExternalTab, SavedTab, SavedTabs};
 use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
+pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
 
 /// The first turn of a session started by it, composed when Enter was pressed.
@@ -108,6 +109,9 @@ pub struct PendingHandoff {
     /// path ignores it and it is dropped with the rest of this struct when the command is
     /// dispatched, at which point the worker's send simply fails.
     pub dropped_rx: mpsc::Receiver<()>,
+    /// The chat page the handoff was asked from: it holds the request, so its `command_result` goes
+    /// there even if the tab has moved to another view since.
+    pub page: ViewId,
 }
 
 /// One message typed while a turn ran. `wire` uses the editor context at the moment it was
@@ -234,6 +238,9 @@ pub struct Tab {
     /// The agent this tab runs, chosen when it was opened (or by the session a restore brings back
     /// into it) and kept by `r`. Private so that only the set decides it; [`Tab::agent`] reads it.
     agent: AgentId,
+    /// The chat view that shows this tab: the base view unless the tab was bound to an extra one.
+    /// Private so that only the set binds a tab, which keeps the base view's active tab unbound.
+    view: ViewId,
     pub backend: TabBackend,
     /// Which of the project's own configuration tiers the session of this tab was given; set when
     /// the session is spawned, so a later change of the window's answer leaves running sessions as
@@ -393,6 +400,7 @@ impl Tab {
             title_from_record: false,
             mode,
             agent,
+            view: ViewId::BASE,
             backend: TabBackend::NotStarted,
             project_tiers: None,
             attention: AttentionTracker::default(),
@@ -455,6 +463,11 @@ impl Tab {
     /// The tab's own permission mode. Read-only outside this module -- see the field's own doc.
     pub fn mode(&self) -> SessionModeChoice {
         self.mode
+    }
+
+    /// The chat view that shows this tab ([`ViewId::BASE`] unless it is bound to an extra view).
+    pub fn view_id(&self) -> ViewId {
+        self.view
     }
 
     /// The agent this tab runs.
@@ -655,6 +668,21 @@ pub struct PumpOutput {
     /// Turns whose end snapshot landed this tick, for the status band (empty without a turn
     /// review installed).
     pub review_hints: Vec<crate::turn_review::ReviewHint>,
+    /// What each tab bound to an extra chat view had for its own page this tick, in tab order. The
+    /// base view's active tab is never here: its payload is `active_payload`.
+    pub view_payloads: Vec<ShownPayload>,
+}
+
+/// One payload of a tab bound to an extra chat view, for that view's page: what `active_payload`,
+/// `active_class` and `first_text` are for the base view's active tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownPayload {
+    pub view: ViewId,
+    pub tab: TabId,
+    pub payload: String,
+    pub class: crate::panel_cadence::EnvelopeClass,
+    /// The tab's turn trace saw its first text in this batch.
+    pub first_text: bool,
 }
 
 /// One tab the CLI-mode tripwire failed. See `PumpOutput::tripped`.
@@ -794,7 +822,42 @@ pub struct BypassPlan {
     /// live tab into `NotStarted` under an open prompt; its `y` must not silently change the window
     /// default to bypass.
     pub prompt: tabs::PromptScope,
+    /// The chat page that shows this prompt: the view of the tab it is about, or for the window
+    /// default the page that asked. Only that page's `y` is taken, and the prompt goes when that
+    /// page loses the keys. Never sent to the page: a page knows which page it is.
+    pub page: ViewId,
 }
+
+/// Where a tab is shown: the base view (as its active tab or a background tab) or the extra view it
+/// is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabPlace {
+    Base(TabId),
+    View(ViewId, TabId),
+}
+
+/// Why a tab could not be bound to, or opened in, an extra chat view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewError {
+    /// `ViewId::BASE` given where an extra view is meant.
+    NotAnExtraView,
+    /// The view already shows a tab.
+    Taken(ViewId),
+    /// The base view would be left with no tab: tmux's "can't break with only one pane".
+    OneTabLeft,
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::NotAnExtraView => f.write_str("the base view is not an extra chat view"),
+            ViewError::Taken(view) => write!(f, "agent {} already shows a tab", view.number()),
+            ViewError::OneTabLeft => f.write_str("can't break with only one tab"),
+        }
+    }
+}
+
+impl std::error::Error for ViewError {}
 
 /// What a stop of the background says when the agent left nothing running.
 pub const NOTHING_IN_THE_BACKGROUND: &str = "nothing is running in the background";
@@ -975,6 +1038,9 @@ pub struct TabSet {
     /// What every live backend calls when it folded something, so the window need not poll for it
     /// ([`set_ui_wake`](Self::set_ui_wake)).
     ui_wake: Option<agent::UiWake>,
+    /// The extra chat views the window's layout holds, in any workspace ([`TabSet::set_layout_views`]):
+    /// the only views a restored tab may come back into.
+    layout_views: Vec<ViewId>,
     /// One-shot test hook after `pump` drains a live tab's queue. Fold an event after the drain
     /// and before the next snapshot read in `active_state_payloads` or `Resync`, so the test
     /// reproduces the race without relying on timing.
@@ -1035,6 +1101,7 @@ impl TabSet {
             presence: None,
             retiring: std::collections::BTreeMap::new(),
             ui_wake: None,
+            layout_views: Vec::new(),
             #[cfg(test)]
             after_drain: None,
             #[cfg(test)]
@@ -1344,6 +1411,16 @@ impl TabSet {
     /// [`TabSet::open`]; `told` false leaves the page untold about a mode the agent does not offer, for
     /// a caller that gives the tab its own agent and mode at once (a restore), which says it then.
     fn open_tab(&mut self, agent: AgentId, told: bool) -> TabId {
+        let id = self.insert_tab(agent, told);
+        self.select(id);
+        debug_assert!(self.v1_holds());
+        id
+    }
+
+    /// A new empty tab in the base view at the lowest free number, in tab order, NOT selected: the
+    /// caller selects it or binds it. A tab opened straight into an extra view goes through here so
+    /// it is never the base view's active tab, not even for a moment.
+    fn insert_tab(&mut self, agent: AgentId, told: bool) -> TabId {
         let used: Vec<u16> = self.tabs.iter().map(|t| t.number).collect();
         let id = TabId(self.next_id);
         self.next_id += 1;
@@ -1355,22 +1432,28 @@ impl TabSet {
         };
         self.tabs.push(Tab::new(id, number, mode, agent));
         self.tabs.sort_by_key(|t| t.number);
-        self.select(id);
         id
     }
 
+    /// Makes `id` the base view's active tab. A tab bound to an extra view is never selected (it is
+    /// shown in its own view): `false`, and nothing changes.
     pub fn select(&mut self, id: TabId) -> bool {
-        if self.get(id).is_none() {
+        let Some(tab) = self.get(id) else {
+            return false;
+        };
+        if !tab.view.is_base() {
             return false;
         }
         if id != self.active {
             self.last_active = Some(self.active);
             self.active = id;
             self.note_recent(id);
-            // Changing the active tab drops its pending bypass prompt. The prompt refers to the tab
-            // being left, and a `y` typed after switching must never answer it.
-            self.drop_bypass_prompt();
+            // Changing the active tab drops its pending bypass prompt, so a later `y` cannot approve
+            // bypass for the tab the user has left. Only the base page's prompt is dropped; an extra
+            // view still shows the same tab.
+            self.drop_bypass_prompt_in(ViewId::BASE);
         }
+        debug_assert!(self.v1_holds());
         true
     }
 
@@ -1379,31 +1462,62 @@ impl TabSet {
         self.recency.push(id);
     }
 
-    pub fn select_number(&mut self, number: u16) -> Option<TabId> {
+    /// Tab `number`: a base-view tab is selected; a tab bound to an extra view is only reported, with
+    /// its view, so the caller can give that view the keys. `None` for a number no tab has.
+    pub fn select_number(&mut self, number: u16) -> Option<TabPlace> {
         let id = self.tabs.iter().find(|t| t.number == number)?.id;
+        let place = self.select_place(id);
+        debug_assert!(self.v1_holds());
+        place
+    }
+
+    /// `n` (+1) / `p` (-1), in number order, wrapping, over the base view's tabs only: a
+    /// bound tab is in its own view and never becomes the base view's.
+    pub fn step(&mut self, delta: i32) -> Option<TabId> {
+        let numbers: Vec<u16> = self
+            .tabs
+            .iter()
+            .filter(|t| t.view.is_base())
+            .map(|t| t.number)
+            .collect();
+        let next = tabs::step(&numbers, self.active_tab().number, delta)?;
+        let id = self.tabs.iter().find(|t| t.number == next && t.view.is_base())?.id;
         self.select(id);
+        debug_assert!(self.v1_holds());
         Some(id)
     }
 
-    /// `n` (+1) / `p` (-1), in number order, wrapping.
-    pub fn step(&mut self, delta: i32) -> Option<TabId> {
-        let numbers: Vec<u16> = self.tabs.iter().map(|t| t.number).collect();
-        let next = tabs::step(&numbers, self.active_tab().number, delta)?;
-        self.select_number(next)
+    pub fn select_last(&mut self) -> Option<TabId> {
+        let last = self
+            .last_active
+            .filter(|id| self.get(*id).is_some_and(|t| t.view.is_base()))?;
+        self.select(last);
+        debug_assert!(self.v1_holds());
+        Some(last)
     }
 
-    pub fn select_last(&mut self) -> Option<TabId> {
-        let last = self.last_active.filter(|id| self.get(*id).is_some())?;
-        self.select(last);
-        Some(last)
+    /// Where the base view falls back to when its active tab leaves it (closed or broken out): the
+    /// last active tab if it is still a base-view tab, else the base-view tab now at the leaving tab's
+    /// place among them (or the last one). `base_index` is the leaving tab's index among the base
+    /// view's tabs before it left; `None` when no base-view tab is left.
+    fn base_fallback(&self, base_index: usize) -> Option<TabId> {
+        if let Some(last) = self
+            .last_active
+            .filter(|id| self.get(*id).is_some_and(|t| t.view.is_base()))
+        {
+            return Some(last);
+        }
+        let base = self.base_tabs();
+        base.get(base_index.min(base.len().checked_sub(1)?)).copied()
     }
 
     /// Takes a tab out and hands it back: its backend, pending start or handoff are the caller's to
     /// shut down or watch. A live backend is counted as retiring ([`TabSet::note_retiring`]): the
-    /// caller reports [`TabSet::retire_done`] once its shutdown has returned. The last tab's removal
-    /// opens a fresh tab 1.
+    /// caller reports [`TabSet::retire_done`] once its shutdown has returned. When the base view's
+    /// last tab goes, a fresh tab 1 opens there, whatever the extra views still hold.
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let at = self.tabs.iter().position(|t| t.id == id)?;
+        let base_index = self.base_tabs().iter().position(|t| *t == id);
         let before = self.active;
         let mut tab = self.tabs.remove(at);
         // First, before anything that can take time: a write that has not reached its last check
@@ -1422,21 +1536,199 @@ impl TabSet {
         if self.last_active == Some(id) {
             self.last_active = None;
         }
-        if self.tabs.is_empty() {
+        // A prompt about a tab that is gone can never be answered: it goes with it.
+        if self
+            .pending_bypass
+            .as_ref()
+            .is_some_and(|plan| plan.scope == BypassScope::Tab(id))
+        {
+            self.pending_bypass = None;
+        }
+        if !self.tabs.iter().any(|t| t.view.is_base()) {
             self.open(AgentId::Claude);
             self.last_active = None;
         } else if self.active == id {
-            let fallback = self.tabs[at.min(self.tabs.len() - 1)].id;
-            self.active = self.last_active.take().unwrap_or(fallback);
-            let now_active = self.active;
-            self.note_recent(now_active);
+            let fallback = self
+                .base_fallback(base_index.unwrap_or(0))
+                .expect("a base-view tab is left");
+            self.last_active = None;
+            self.active = fallback;
+            self.note_recent(fallback);
         }
         // `open()` above already dropped it through `select`; this covers the fallback path, which
         // assigns `self.active` directly.
         if self.active != before {
-            self.drop_bypass_prompt();
+            self.drop_bypass_prompt_in(ViewId::BASE);
         }
+        debug_assert!(self.v1_holds());
         Some(tab)
+    }
+
+    /// V1: the base view's active tab exists and is a base-view tab (so the base view always holds
+    /// one), and no extra view holds more than one tab. Checked after every path that moves `active`
+    /// or a binding.
+    fn v1_holds(&self) -> bool {
+        if !self.get(self.active).is_some_and(|t| t.view.is_base()) {
+            return false;
+        }
+        let mut seen = BTreeSet::new();
+        self.tabs
+            .iter()
+            .filter(|t| !t.view.is_base())
+            .all(|t| seen.insert(t.view))
+    }
+
+    /// The chat view that shows `tab`: [`ViewId::BASE`] for a tab it does not have.
+    pub fn view_of(&self, tab: TabId) -> ViewId {
+        self.get(tab).map_or(ViewId::BASE, |t| t.view)
+    }
+
+    /// The tab an extra view shows; `None` for the base view (its tab is [`TabSet::active`]) and for
+    /// a view that shows none.
+    pub fn tab_in(&self, view: ViewId) -> Option<TabId> {
+        if view.is_base() {
+            return None;
+        }
+        self.tabs.iter().find(|t| t.view == view).map(|t| t.id)
+    }
+
+    /// The extra views that hold a tab, ascending.
+    pub fn views(&self) -> Vec<ViewId> {
+        let mut views: Vec<ViewId> = self.tabs.iter().filter(|t| !t.view.is_base()).map(|t| t.view).collect();
+        views.sort();
+        views
+    }
+
+    /// The base view's tabs, in tab order.
+    pub fn base_tabs(&self) -> Vec<TabId> {
+        self.tabs.iter().filter(|t| t.view.is_base()).map(|t| t.id).collect()
+    }
+
+    /// Every tab on screen in some view: the base view's active tab first, then each extra view's
+    /// tab, by view.
+    pub fn shown(&self) -> Vec<(ViewId, TabId)> {
+        let mut shown = vec![(ViewId::BASE, self.active)];
+        shown.extend(
+            self.views()
+                .into_iter()
+                .filter_map(|view| self.tab_in(view).map(|tab| (view, tab))),
+        );
+        shown
+    }
+
+    /// Whether `tab` is on screen in its view: the base view's active tab, or a bound tab.
+    pub fn is_shown(&self, tab: TabId) -> bool {
+        self.get(tab).is_some_and(|t| t.id == self.active || !t.view.is_base())
+    }
+
+    /// Where `tab` is shown; `None` for a tab it does not have.
+    pub fn place_of(&self, tab: TabId) -> Option<TabPlace> {
+        let t = self.get(tab)?;
+        Some(if t.view.is_base() {
+            TabPlace::Base(tab)
+        } else {
+            TabPlace::View(t.view, tab)
+        })
+    }
+
+    /// Whether an answer about `tab` may be taken from chat page `page`: the tab exists and is in
+    /// that page's view. Never compared with the active tab: a base-view tab in the background is
+    /// still the base page's to answer, and a tab that moved to another view is not its old page's.
+    pub fn may_answer(&self, tab: TabId, page: ViewId) -> bool {
+        self.get(tab).is_some_and(|t| t.view == page)
+    }
+
+    /// `prefix !` (tmux's `break-pane`): binds the base view's active tab to the empty extra view
+    /// `view`; the base view then shows its last active tab, or the neighbour. Returns the moved tab.
+    pub fn break_out(&mut self, view: ViewId) -> Result<TabId, ViewError> {
+        if view.is_base() {
+            return Err(ViewError::NotAnExtraView);
+        }
+        if self.tab_in(view).is_some() {
+            return Err(ViewError::Taken(view));
+        }
+        let base = self.base_tabs();
+        if base.len() < 2 {
+            return Err(ViewError::OneTabLeft);
+        }
+        let moved = self.active;
+        let base_index = base
+            .iter()
+            .position(|t| *t == moved)
+            .expect("the active tab is a base-view tab");
+        let at = self.position(moved).expect("the active tab exists");
+        self.tabs[at].view = view;
+        let fallback = self.base_fallback(base_index).expect("two base-view tabs were checked");
+        self.last_active = None;
+        self.active = fallback;
+        self.note_recent(fallback);
+        self.drop_prompts_about(moved);
+        eprintln!("[tabs] tab {} -> agent {}", self.tabs[at].number, view.number());
+        debug_assert!(self.v1_holds());
+        Ok(moved)
+    }
+
+    /// The tab bound to `view` comes back into the base view as its active tab; the tab that was
+    /// active becomes the last active one. `None` when the view shows no tab.
+    pub fn join_back(&mut self, view: ViewId) -> Option<TabId> {
+        let tab = self.tab_in(view)?;
+        let at = self.position(tab).expect("tab_in names a tab it has");
+        self.tabs[at].view = ViewId::BASE;
+        self.drop_prompts_about(tab);
+        // The view is left showing nothing: whatever it was asking goes too.
+        if self.pending_bypass.as_ref().is_some_and(|plan| plan.page == view) {
+            self.pending_bypass = None;
+        }
+        self.select(tab);
+        debug_assert!(self.v1_holds());
+        Some(tab)
+    }
+
+    /// A new chat view's tab: a new empty tab of `agent` at the lowest free number, in the window's
+    /// default mode as [`TabSet::open`] gives it, bound to the empty extra view `view`. The base
+    /// view's active tab is unchanged.
+    pub fn open_in(&mut self, agent: AgentId, view: ViewId) -> Result<TabId, ViewError> {
+        if view.is_base() {
+            return Err(ViewError::NotAnExtraView);
+        }
+        if self.tab_in(view).is_some() {
+            return Err(ViewError::Taken(view));
+        }
+        let id = self.insert_tab(agent, true);
+        let at = self.position(id).expect("just inserted");
+        self.tabs[at].view = view;
+        debug_assert!(self.v1_holds());
+        Ok(id)
+    }
+
+    /// A pick of `tab` (the chooser, a number key): a base-view tab is selected; a bound tab is only
+    /// reported with its view. `None` for a tab it does not have.
+    pub fn select_place(&mut self, tab: TabId) -> Option<TabPlace> {
+        let place = self.place_of(tab)?;
+        if let TabPlace::Base(id) = place {
+            self.select(id);
+        }
+        debug_assert!(self.v1_holds());
+        Some(place)
+    }
+
+    /// Drops what was asked about `tab` where it was shown: its trust question and a bypass prompt
+    /// about it. Used when the tab changes view, so neither page answers it from there.
+    fn drop_prompts_about(&mut self, tab: TabId) {
+        if self
+            .pending_bypass
+            .as_ref()
+            .is_some_and(|plan| plan.scope == BypassScope::Tab(tab))
+        {
+            self.pending_bypass = None;
+        }
+        if let Some(Tab {
+            backend: TabBackend::AwaitingTrust(waiting),
+            ..
+        }) = self.get_mut(tab)
+        {
+            waiting.asking = None;
+        }
     }
 
     /// `prefix ,`: normalized and handed to a live sidecar's record. A tab that
@@ -1503,11 +1795,16 @@ impl TabSet {
     /// to auto, so it is never stranded there once the tab that went with it leaves. Leaving bypass on
     /// an empty tab whose agent has no manual puts the tab in auto but the window default in manual,
     /// as on any other empty tab: auto there is only what that agent offers instead.
-    pub fn cycle_mode(&mut self, id: TabId) -> Result<ModeCycle, String> {
+    pub fn cycle_mode(&mut self, id: TabId, page: ViewId) -> Result<ModeCycle, String> {
+        // A press from a page that does not show the tab is about something else: refused before
+        // anything changes.
+        if let Some(tab) = self.get(id) {
+            if !self.may_answer(id, page) {
+                return Err(format!("tab {} is not shown in this page", tab.number));
+            }
+        }
         // A fresh press supersedes the open prompt. `Confirm` below stores a new one if it builds one.
-        self.pending_bypass = None;
-        self.pending_restore = None;
-        self.drop_trust_questions();
+        self.supersede_prompts(page);
         let at = self
             .tabs
             .iter()
@@ -1560,7 +1857,7 @@ impl TabSet {
                 let tab = &self.tabs[at];
                 match tab.wire_state() {
                     TabStateWire::Ended | TabStateWire::Failed => Err("the session has ended".to_string()),
-                    _ if id != self.active => Err(format!("tab {} is not the one on screen", tab.number)),
+                    _ if !self.is_shown(id) => Err(format!("tab {} is not the one on screen", tab.number)),
                     _ => {
                         let scope_kind = if not_started {
                             tabs::PromptScope::EmptyTab
@@ -1568,6 +1865,7 @@ impl TabSet {
                             tabs::PromptScope::LiveTab
                         };
                         let approve = waiting_cards(tab);
+                        let shown_in = tab.view;
                         let nonce = self.next_nonce;
                         self.next_nonce += 1;
                         let plan = BypassPlan {
@@ -1576,6 +1874,7 @@ impl TabSet {
                             lines: vec![tabs::bypass_prompt(scope_kind, approve.len())],
                             approve,
                             prompt: scope_kind,
+                            page: shown_in,
                         };
                         self.pending_bypass = Some(plan.clone());
                         Ok(ModeCycle::Confirm(plan))
@@ -1590,10 +1889,8 @@ impl TabSet {
     /// auto -> bypass -> manual, entering bypass asked first), applied to the window's remembered
     /// `default_mode` rather than any one tab's own mode. Every open tab keeps whatever mode it
     /// already has; a new tab of an agent that offers no manual mode starts in auto.
-    pub fn cycle_default_mode(&mut self) -> ModeCycle {
-        self.pending_bypass = None;
-        self.pending_restore = None;
-        self.drop_trust_questions();
+    pub fn cycle_default_mode(&mut self, page: ViewId) -> ModeCycle {
+        self.supersede_prompts(page);
         match self.default_mode {
             SessionModeChoice::Bypass => {
                 self.default_mode = SessionModeChoice::Manual;
@@ -1614,6 +1911,7 @@ impl TabSet {
                     approve: Vec::new(),
                     lines: vec![tabs::bypass_prompt(tabs::PromptScope::Default, 0)],
                     prompt: tabs::PromptScope::Default,
+                    page,
                 };
                 self.pending_bypass = Some(plan.clone());
                 ModeCycle::Confirm(plan)
@@ -1624,9 +1922,9 @@ impl TabSet {
     /// Accept `y`/`Y` for a `confirm_bypass` prompt. Check the stored plan before taking it:
     /// a mismatched scope or stale nonce leaves the current prompt untouched, so an old answer
     /// cannot cancel a newer prompt.
-    pub fn confirm_bypass(&mut self, scope: BypassScope, nonce: u64) -> Result<ConfirmOutcome, String> {
+    pub fn confirm_bypass(&mut self, scope: BypassScope, nonce: u64, page: ViewId) -> Result<ConfirmOutcome, String> {
         match &self.pending_bypass {
-            Some(plan) if plan.scope == scope && plan.nonce == nonce => {}
+            Some(plan) if plan.scope == scope && plan.nonce == nonce && plan.page == page => {}
             _ => return Err("that prompt is no longer current".to_string()),
         }
         let plan = self.pending_bypass.take().expect("checked above");
@@ -1635,7 +1933,10 @@ impl TabSet {
                 let Some(at) = self.tabs.iter().position(|t| t.id == id) else {
                     return Err(format!("no tab {}", id.0));
                 };
-                if id != self.active {
+                if !self.may_answer(id, page) {
+                    return Err(format!("tab {} is not shown in this page", self.tabs[at].number));
+                }
+                if !self.is_shown(id) {
                     return Err(format!("tab {} is not the one on screen", self.tabs[at].number));
                 }
                 if matches!(self.tabs[at].wire_state(), TabStateWire::Ended | TabStateWire::Failed) {
@@ -1669,6 +1970,7 @@ impl TabSet {
                         lines: vec![tabs::bypass_prompt(scope_kind, now.len())],
                         approve: now,
                         prompt: scope_kind,
+                        page: plan.page,
                     };
                     self.pending_bypass = Some(fresh.clone());
                     return Ok(ConfirmOutcome::Reprompt(fresh));
@@ -1720,10 +2022,13 @@ impl TabSet {
     /// its own statement (the lock-order rule this module inherits).
     ///
     /// Errors as the panel's own path always did: `no active session` (benign) when the tab is
-    /// gone or holds no live backend.
+    /// gone or holds no live backend. An answer sent by a chat page that does not show the tab (the
+    /// tab moved to another view after the card was drawn there) is refused before anything is read
+    /// or answered, and not benign: the card stays waiting and the agent hears nothing.
     pub fn answer_card(
         &mut self,
         id: TabId,
+        page: ViewId,
         permission_id: &str,
         decision: agent::PermissionDecision,
     ) -> Result<Vec<AgentDomainEvent>, BackendError> {
@@ -1732,6 +2037,15 @@ impl TabSet {
             benign: true,
             folded_events: Vec::new(),
         };
+        if let Some(tab) = self.get(id) {
+            if !self.may_answer(id, page) {
+                return Err(BackendError {
+                    message: format!("tab {} is not shown in this page", tab.number),
+                    benign: false,
+                    folded_events: Vec::new(),
+                });
+            }
+        }
         let tab = self.get_mut(id).ok_or_else(no_session)?;
         let backend = tab.live_mut().ok_or_else(no_session)?;
         // The call exactly as the card showed it: id, tool and input (the review's tightening).
@@ -1757,20 +2071,49 @@ impl TabSet {
         Ok(events)
     }
 
-    /// Clears the current "enter bypass" prompt. Methods that change the active tab call this
-    /// after the id changes, so a stale `y` cannot answer a prompt about a tab no longer on screen.
-    /// Also called when the panel loses focus.
+    /// Clears every prompt of the window: the bypass prompt, the restore question
+    /// and every tab's trust question, in every chat page. Only for the whole window losing the keys;
+    /// a switch within one view drops that view's prompts ([`TabSet::drop_bypass_prompt_in`]).
     pub fn drop_bypass_prompt(&mut self) {
         self.pending_bypass = None;
         self.pending_restore = None;
-        self.drop_trust_questions();
+        for tab in &mut self.tabs {
+            if let TabBackend::AwaitingTrust(waiting) = &mut tab.backend {
+                waiting.asking = None;
+            }
+        }
     }
 
-    /// Takes the question off every tab that waits for the trust answer: the tab keeps its start and
-    /// is asked again, with a fresh nonce, when it is next on screen. An answer to the old nonce is
-    /// refused from here on.
-    fn drop_trust_questions(&mut self) {
-        for tab in &mut self.tabs {
+    /// Clears the prompts chat page `page` shows: the bypass prompt if it is that page's, the restore
+    /// question if `page` is the base page (the only one that asks it), and the trust questions of
+    /// the tabs in that view. Called when the page's view switches tabs or the page loses the keys,
+    /// so a stale `y` typed there can never land on a prompt about a tab the user is no longer
+    /// looking at; another page's prompts stay.
+    pub fn drop_bypass_prompt_in(&mut self, page: ViewId) {
+        if self.pending_bypass.as_ref().is_some_and(|plan| plan.page == page) {
+            self.pending_bypass = None;
+        }
+        if page.is_base() {
+            self.pending_restore = None;
+        }
+        self.drop_trust_questions_in(page);
+    }
+
+    /// A fresh press of the mode key in `page`: the window's one bypass prompt is superseded, whichever
+    /// page showed it, and `page`'s own questions go.
+    fn supersede_prompts(&mut self, page: ViewId) {
+        self.pending_bypass = None;
+        if page.is_base() {
+            self.pending_restore = None;
+        }
+        self.drop_trust_questions_in(page);
+    }
+
+    /// Takes the question off every tab of `view` that waits for the trust answer: the tab keeps its
+    /// start and is asked again, with a fresh nonce, when it is next on screen. An answer to the old
+    /// nonce is refused from here on. A tab in another view keeps its question: it is still shown.
+    fn drop_trust_questions_in(&mut self, view: ViewId) {
+        for tab in self.tabs.iter_mut().filter(|t| t.view == view) {
             if let TabBackend::AwaitingTrust(waiting) = &mut tab.backend {
                 waiting.asking = None;
             }
@@ -1808,11 +2151,15 @@ impl TabSet {
         Ok(nonce)
     }
 
-    /// Whether an answer carrying `nonce` may be taken for `tab` now: the tab is on screen, waiting,
-    /// not already recording, and the question it shows is this one. Changes nothing.
-    pub fn check_trust_answer(&self, tab: TabId, nonce: u64) -> Result<(), String> {
+    /// Whether an answer carrying `nonce` may be taken for `tab` now, sent by chat page `page`: the
+    /// tab is in that page's view and on screen there, waiting, not already recording, and the
+    /// question it shows is this one. Changes nothing.
+    pub fn check_trust_answer(&self, tab: TabId, nonce: u64, page: ViewId) -> Result<(), String> {
         let t = self.get(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
-        if tab != self.active {
+        if !self.may_answer(tab, page) {
+            return Err(format!("tab {} is not shown in this page", t.number));
+        }
+        if !self.is_shown(tab) {
             return Err(format!("tab {} is not the one on screen", t.number));
         }
         let TabBackend::AwaitingTrust(waiting) = &t.backend else {
@@ -1829,8 +2176,8 @@ impl TabSet {
 
     /// An accepted `y`: the question is spent and the tab keeps its start until the worker's second
     /// look at the disk (and the record, when one is kept) decides what happens to it.
-    pub fn mark_recording(&mut self, tab: TabId, nonce: u64) -> Result<(), String> {
-        self.check_trust_answer(tab, nonce)?;
+    pub fn mark_recording(&mut self, tab: TabId, nonce: u64, page: ViewId) -> Result<(), String> {
+        self.check_trust_answer(tab, nonce, page)?;
         if let Some(Tab {
             backend: TabBackend::AwaitingTrust(waiting),
             ..
@@ -1844,8 +2191,8 @@ impl TabSet {
 
     /// An answer taken at once (an `n`, which loads nothing): hands the start over and returns the tab
     /// to empty.
-    pub fn take_answered(&mut self, tab: TabId, nonce: u64) -> Result<DeferredStart, String> {
-        self.check_trust_answer(tab, nonce)?;
+    pub fn take_answered(&mut self, tab: TabId, nonce: u64, page: ViewId) -> Result<DeferredStart, String> {
+        self.check_trust_answer(tab, nonce, page)?;
         Ok(self.take_start(tab).expect("checked to be waiting"))
     }
 
@@ -1868,8 +2215,8 @@ impl TabSet {
 
     /// `Escape` on the question: puts the start off and returns the tab to empty. The same checks as
     /// an answer.
-    pub fn cancel_trust(&mut self, tab: TabId, nonce: u64) -> Result<DeferredStart, String> {
-        self.check_trust_answer(tab, nonce)?;
+    pub fn cancel_trust(&mut self, tab: TabId, nonce: u64, page: ViewId) -> Result<DeferredStart, String> {
+        self.check_trust_answer(tab, nonce, page)?;
         Ok(self.take_start(tab).expect("checked to be waiting"))
     }
 
@@ -2009,7 +2356,10 @@ impl TabSet {
         told: bool,
     ) -> ResumeRoute {
         if let Some(open) = self.tab_with_session(agent, provider_session_id) {
+            // A tab bound to an extra view is not selected (`select` refuses it): the caller gives
+            // that view the keys instead.
             self.select(open);
+            debug_assert!(self.v1_holds());
             return ResumeRoute::SwitchTo(open);
         }
         if held_elsewhere {
@@ -2024,12 +2374,23 @@ impl TabSet {
             let agent = self.get(from).map_or(AgentId::Claude, |t| t.agent.clone());
             self.open_tab(agent, told)
         };
+        debug_assert!(self.v1_holds());
         ResumeRoute::StartIn(target)
     }
 
-    /// One tick over EVERY tab, run when something is due (at most one per 33 ms). The active tab's delivery is serialized for the
-    /// panel; a background tab's feeds its attention and marks it stale, and nothing of it is sent.
+    /// [`TabSet::pump_views`] with every chat view mapped or none: `panel_mapped` for all of them.
     pub fn pump(&mut self, project_root: &Path, panel_mapped: bool) -> PumpOutput {
+        self.pump_views(project_root, &|_| panel_mapped)
+    }
+
+    /// One tick over EVERY tab, run when something is due (at most one per 33 ms). Every
+    /// tab on screen in some view has its delivery serialized for that view's page: the base view's
+    /// active tab into `active_payload`, each tab bound to an extra view into `view_payloads`, mapped
+    /// or not, so a page hidden for a while is still current when it comes back. A background
+    /// base-view tab's feeds its attention and marks it stale, and nothing of it is sent. `mapped`
+    /// says whether a view's page is on screen now: what finishes in a tab whose page is not is left
+    /// unread.
+    pub fn pump_views(&mut self, project_root: &Path, mapped: &dyn Fn(ViewId) -> bool) -> PumpOutput {
         let active = self.active;
         let mut out = PumpOutput {
             active_payload: None,
@@ -2040,6 +2401,7 @@ impl TabSet {
             queue_changed: Vec::new(),
             tripped: Vec::new(),
             review_hints: Vec::new(),
+            view_payloads: Vec::new(),
         };
         // A turn a send started since the last pump (a legacy turn begins this way) is seen here.
         self.sync_presence();
@@ -2052,7 +2414,10 @@ impl TabSet {
         let mut review = self.turn_review.as_mut();
         for tab in &mut self.tabs {
             let is_active = tab.id == active;
-            let on_screen = panel_mapped && is_active;
+            let view = tab.view;
+            // `TabSet::is_shown`, read off the tab itself: the set is borrowed by this loop.
+            let in_a_page = is_active || !view.is_base();
+            let on_screen = in_a_page && mapped(view);
             let TabBackend::Live(backend) = &mut tab.backend else {
                 if let Some(review) = review.as_deref_mut() {
                     review.tab_has_no_session(tab.id.0, wall_clock_ms());
@@ -2209,6 +2574,9 @@ impl TabSet {
                 );
             }
             let mut resynced = false;
+            // This tab's payload for the page that shows it, and its class; handed out below, by view.
+            let mut delivered: Option<(String, crate::panel_cadence::EnvelopeClass)> = None;
+            let mut saw_first_text = false;
             match delivery {
                 RevisedDelivery::Nothing => {}
                 RevisedDelivery::Events(tagged) => {
@@ -2282,9 +2650,9 @@ impl TabSet {
                             &events,
                         ),
                         auto_creates_file: std::mem::take(&mut tab.creates_file_unsent),
-                        // Only the active tab's payload leaves here; a background tab's turns wait
-                        // for the snapshot its next switch sends.
-                        turn_times: if is_active {
+                        // Only a shown tab's payload leaves here; a background tab's turns wait for
+                        // the snapshot its next switch sends.
+                        turn_times: if in_a_page {
                             let times = &tab.notes.turn_times;
                             let fresh = times[times.len() - tab.turn_times_unsent.min(times.len())..].to_vec();
                             tab.turn_times_unsent = 0;
@@ -2301,25 +2669,27 @@ impl TabSet {
                             trace.observe_in_snapshot(in_snapshot);
                         }
                         let first_text = trace.observe(fresh);
-                        if is_active {
-                            out.first_text |= first_text;
+                        if in_a_page {
+                            saw_first_text = first_text;
                         } else if first_text {
                             trace.mark_background();
                         }
                     }
-                    if is_active {
+                    if in_a_page {
                         // Nothing to send when the snapshot carried the whole batch -- unless the
                         // batch produced notes, which that snapshot (serialized before this tab had
                         // folded these events) did not carry; the panel applies notes to what it
                         // already holds (`applyCallNotes`), so they go on their own.
                         if !fresh.is_empty() || !fresh_notes.is_empty() {
-                            out.active_class = crate::panel_cadence::classify_events(fresh, !fresh_notes.is_empty());
-                            out.active_payload = Some(serialize_events_with_notes_for_js(
-                                tab.id,
-                                from_revision,
-                                through_revision,
-                                fresh,
-                                &fresh_notes,
+                            delivered = Some((
+                                serialize_events_with_notes_for_js(
+                                    tab.id,
+                                    from_revision,
+                                    through_revision,
+                                    fresh,
+                                    &fresh_notes,
+                                ),
+                                crate::panel_cadence::classify_events(fresh, !fresh_notes.is_empty()),
                             ));
                             dispatched = true;
                         }
@@ -2449,7 +2819,7 @@ impl TabSet {
                     }
                     tab.attention
                         .resync(pending.iter().filter(|id| !tab.host_answered.contains(*id)).cloned());
-                    if is_active {
+                    if in_a_page {
                         #[cfg(test)]
                         {
                             if let Some(hook) = self.before_resync_snapshot.take() {
@@ -2481,13 +2851,32 @@ impl TabSet {
                             (payload, view.projection.last_revision)
                         };
                         backend.note_ui_snapshot(revision);
-                        out.active_payload = Some(payload);
                         // A snapshot replaces the panel's state: never held behind a cadence slot.
-                        out.active_class = crate::panel_cadence::EnvelopeClass::Immediate;
+                        delivered = Some((payload, crate::panel_cadence::EnvelopeClass::Immediate));
                         dispatched = true;
                     } else {
                         tab.stale = true;
                     }
+                }
+            }
+            if is_active {
+                out.first_text |= saw_first_text;
+                if let Some((payload, class)) = delivered {
+                    out.active_payload = Some(payload);
+                    out.active_class = class;
+                }
+            } else if let Some((payload, class)) = delivered {
+                out.view_payloads.push(ShownPayload {
+                    view,
+                    tab: tab.id,
+                    payload,
+                    class,
+                    first_text: saw_first_text,
+                });
+            } else if saw_first_text {
+                // No payload carries it, so no page will stamp its paint.
+                if let Some(trace) = tab.turn_trace.as_mut() {
+                    trace.mark_background();
                 }
             }
             // After the resync, not inside it: the review learns from the rebuilt projection what
@@ -2647,7 +3036,17 @@ impl TabSet {
     /// before a switch or reload can still draw a card until the next tick answers it and its
     /// resolution arrives.
     pub fn active_state_payloads(&mut self) -> Vec<String> {
-        let tab = self.active_tab_mut();
+        self.state_payloads(self.active)
+    }
+
+    /// [`TabSet::active_state_payloads`] for any tab on screen in some view, for the page that shows
+    /// it. Empty for a tab it does not have, and for a background base-view tab: no page shows that
+    /// one, and its state goes out when it is selected.
+    pub fn state_payloads(&mut self, tab: TabId) -> Vec<String> {
+        if !self.is_shown(tab) {
+            return Vec::new();
+        }
+        let tab = self.get_mut(tab).expect("a shown tab exists");
         tab.stale = false;
         let mut payloads = Vec::new();
         match &mut tab.backend {
@@ -2705,14 +3104,80 @@ impl TabSet {
         payloads
     }
 
+    /// The base page's `tabs` envelope: [`TabSet::tabs_payload_for`] the base view.
     pub fn tabs_payload(&self) -> String {
-        let views: Vec<TabView> = self.tabs.iter().map(|t| t.view(t.resumable(self.kind))).collect();
-        serialize_tabs_for_js(self.active, &views, self.default_mode)
+        self.tabs_payload_for(ViewId::BASE)
     }
 
-    /// The active tab is on screen: what finished in it while away has been seen.
-    pub fn mark_seen(&mut self) {
-        self.active_tab_mut().attention.seen();
+    /// The `tabs` envelope for `view`'s page. The base page lists the base view's tabs, with its
+    /// active one; a tab bound elsewhere is left out, its number a gap as a closed tab's is. An extra
+    /// view's page lists its one tab, as the active one, so a page with one tab shows no strip. A
+    /// view that shows no tab gets an empty list naming no tab as active.
+    pub fn tabs_payload_for(&self, view: ViewId) -> String {
+        let listed: Vec<TabView> = self
+            .tabs
+            .iter()
+            .filter(|t| t.view == view)
+            .map(|t| t.view(t.resumable(self.kind)))
+            .collect();
+        let active = if view.is_base() {
+            self.active
+        } else {
+            // Ids start at 1, so 0 names no tab.
+            self.tab_in(view).unwrap_or(TabId(0))
+        };
+        serialize_tabs_for_js(active, &listed, self.default_mode)
+    }
+
+    /// `tab` is on screen: what finished in it while away has been seen. Nothing for a tab it does
+    /// not have.
+    pub fn mark_seen(&mut self, tab: TabId) {
+        if let Some(tab) = self.get_mut(tab) {
+            tab.attention.seen();
+        }
+    }
+
+    /// The attention of `view`'s tabs: for the base view, its tabs summed; for an extra view, its one
+    /// tab's (nothing when it shows none). Only the window's sum, [`TabSet::attention`], carries
+    /// what closed tabs had been handed: no view held them any more.
+    pub fn attention_of(&self, view: ViewId) -> Attention {
+        let each: Vec<Attention> = self
+            .tabs
+            .iter()
+            .filter(|t| t.view == view)
+            .map(|t| t.attention.attention())
+            .collect();
+        tabs::sum_attention(&each)
+    }
+
+    /// Every tab's own attention with the view showing it, in tab order: what
+    /// [`tabs::views_handed_a_card`] compares between two reports.
+    pub fn tab_attentions(&self) -> Vec<tabs::TabAttention> {
+        self.tabs
+            .iter()
+            .map(|t| tabs::TabAttention {
+                tab: t.id,
+                view: t.view,
+                attention: t.attention.attention(),
+                newest_card: t.attention.newest_pending_stamp(),
+            })
+            .collect()
+    }
+
+    /// The tab of `view` holding its newest pending card.
+    pub fn newest_card_tab_in(&self, view: ViewId) -> Option<TabId> {
+        let stamps: Vec<(TabId, Option<u64>)> = self
+            .tabs
+            .iter()
+            .filter(|t| t.view == view)
+            .map(|t| (t.id, t.attention.newest_pending_stamp()))
+            .collect();
+        tabs::newest_card(&stamps)
+    }
+
+    /// Where the oldest waiting card is shown: [`TabSet::oldest_card_tab`] with its place.
+    pub fn oldest_card_place(&self) -> Option<TabPlace> {
+        self.oldest_card_tab().and_then(|tab| self.place_of(tab))
     }
 
     /// The window's attention: every tab's, summed. Its `arrived` never goes down -- not when a tab
@@ -2775,13 +3240,15 @@ impl TabSet {
         })
     }
 
-    /// `<leader>bo`: the ids `tabs::close_others` would close and their y/n prompt, covering all
-    /// tabs except the active one. Uses [`Self::running_count`]'s running test: a turn in progress or
-    /// still connecting. Returns `None` when only the active tab is open.
+    /// For `<leader>bo`, return the ids `tabs::close_others` would close and a y/n prompt naming them.
+    /// Only other base-view tabs count; tabs in extra views are absent from the base page's strip.
+    /// Use the same running test as [`Self::running_count`]: a turn in progress or still connecting.
+    /// Return `None` when the active tab is the base view's only tab.
     pub fn close_others_plan(&self) -> Option<(Vec<TabId>, String)> {
         let entries: Vec<(TabId, bool)> = self
             .tabs
             .iter()
+            .filter(|t| t.view.is_base())
             .map(|t| {
                 (
                     t.id,
@@ -3147,7 +3614,9 @@ impl TabSet {
     /// and has handed its tabs over to be torn down -- closing every tab is not the user closing
     /// them. A tab is listed when it has a session, which includes one still being resumed. Claude
     /// tabs are listed only on the sidecar backend, the only one that resumes; another agent's tab
-    /// whose agent resumes is listed whatever the window's Claude backend, in `external_tabs`.
+    /// whose agent resumes is listed whatever the window's Claude backend, in `external_tabs`. A tab
+    /// bound to an extra chat view is saved with that view's number, so a restore can put it back
+    /// there; a restore still waiting for its trust answer keeps the views it was saved with.
     ///
     /// `conversation_id` is the project's (`agent::conversation_id_for_cwd`): every session of one
     /// project shares it, and a tab whose backend has not been built yet has none of its own.
@@ -3169,6 +3638,7 @@ impl TabSet {
                         provider_session_id: session,
                         name: tab.name.clone(),
                         mode: tab.mode,
+                        view: saved_view(tab.view),
                     },
                 ))
             })
@@ -3191,6 +3661,7 @@ impl TabSet {
                 provider_session_id: granted.planned.provider_session_id.clone(),
                 name: granted.planned.name.clone(),
                 mode: granted.mode,
+                view: granted.planned.view.and_then(saved_view),
             });
         }
         if self.kind != BackendKind::Sidecar {
@@ -3214,6 +3685,7 @@ impl TabSet {
                         provider_session_id: session,
                         name: tab.name.clone(),
                         mode: tab.mode,
+                        view: saved_view(tab.view),
                     },
                 ))
             })
@@ -3242,6 +3714,7 @@ impl TabSet {
                     provider_session_id: granted.planned.provider_session_id.clone(),
                     name: granted.planned.name.clone(),
                     mode: granted.mode,
+                    view: granted.planned.view.and_then(saved_view),
                 },
             ));
         }
@@ -3439,6 +3912,13 @@ impl TabSet {
     /// start, and a tab it refuses is skipped before any tab is made for it. Afterwards the saved
     /// active tab is the one on screen, or the first that was started when that one was skipped.
     ///
+    /// A tab saved in an extra chat view comes back into that view when the window's layout holds it
+    /// ([`TabSet::set_layout_views`]) and no tab is bound there yet: the first such tab in saved
+    /// order wins. It always comes back as a new tab, never selected and never in `from`, so the base
+    /// view's active tab is never one about to be bound. Every other tab comes back in the base view.
+    /// The base view then shows the saved active tab if it came back there, else the first tab that
+    /// came back there.
+    ///
     /// The returned [`RestoreRun`] is fed the results `collect_starts` reports and says when the last
     /// resume has returned.
     pub fn start_restore<F>(&mut self, from: TabId, go: RestoreGo, mut connect: F) -> RestoreRun
@@ -3472,8 +3952,16 @@ impl TabSet {
                     continue;
                 }
             };
-            let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false) else {
-                continue;
+            let into_view = self.restored_view(&planned);
+            let target = match into_view {
+                Some(view) => self.insert_restored_into(planned.agent.clone(), view),
+                None => {
+                    let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false)
+                    else {
+                        continue;
+                    };
+                    target
+                }
             };
             let at = self.position(target).expect("route_resume names a tab it has");
             self.tabs[at].agent = planned.agent;
@@ -3510,9 +3998,16 @@ impl TabSet {
                     run.awaiting.push(target);
                 }
             }
-            run.order.push(target);
+            // The fallback for a failed active tab must be a tab `select` accepts: one bound to an
+            // extra view is already on screen there and never becomes the base view's active tab.
+            if into_view.is_none() {
+                run.order.push(target);
+            }
             started.push((id, target));
         }
+        // Only a tab that came back in the base view can be its active tab: one bound to an extra
+        // view is already on screen there.
+        started.retain(|(_, tab)| self.view_of(*tab).is_base());
         let on_screen = go
             .active_session
             .as_ref()
@@ -3522,7 +4017,44 @@ impl TabSet {
         if let Some(tab) = on_screen {
             self.select(tab);
         }
+        debug_assert!(self.v1_holds());
         run
+    }
+
+    /// The extra view a restored tab comes back into: the one it was saved in, when the window's
+    /// layout holds that view and no tab is bound there yet. `None` is the base view.
+    fn restored_view(&self, planned: &PlannedTab) -> Option<ViewId> {
+        planned
+            .view
+            .filter(|view| self.layout_views.contains(view) && self.tab_in(*view).is_none())
+    }
+
+    /// A new tab for a restored session, bound to `view`. Never the tab the restore began in and never
+    /// selected, so the base view's active tab is never one about to be bound.
+    fn insert_restored_into(&mut self, agent: AgentId, view: ViewId) -> TabId {
+        let target = self.insert_tab(agent, false);
+        let at = self.position(target).expect("just inserted");
+        self.tabs[at].view = view;
+        eprintln!(
+            "[tabs] tab {} restored into agent {}",
+            self.tabs[at].number,
+            view.number()
+        );
+        target
+    }
+
+    /// Whether the restore's bypass question is open (asked in the base page, not yet answered).
+    pub fn restore_question_open(&self) -> bool {
+        self.pending_restore.is_some()
+    }
+
+    /// The extra chat views the window's layout holds, in any workspace. The window says so before any
+    /// restore, so a restored tab saved in one of them can come back into it.
+    pub fn set_layout_views(&mut self, views: Vec<ViewId>) {
+        let mut views: Vec<ViewId> = views.into_iter().filter(|view| !view.is_base()).collect();
+        views.sort();
+        views.dedup();
+        self.layout_views = views;
     }
 
     /// A restore whose start was put off (a trust question answered `Escape`, too large to show, or
@@ -3530,6 +4062,8 @@ impl TabSet {
     /// and the rest in new tabs, so the saved-tabs file keeps them until the user closes a tab or
     /// starts it over with `r`. Without this the restore's sessions would be in no tab and the next
     /// write of the file would leave them out. A session already open in a tab is not listed twice.
+    /// A tab saved in an extra chat view comes back into it under [`TabSet::start_restore`]'s rule, and
+    /// the base view then shows the saved active tab if it came back there, else its first.
     ///
     /// A dashboard restore (`RestoreGo::reoffer`) is the exception when the window is otherwise empty
     /// (its tab already is): the file was never written, so the tab is only emptied and the offer stands,
@@ -3547,8 +4081,17 @@ impl TabSet {
             if self.tab_with_session(&planned.agent, &id).is_some() {
                 continue;
             }
-            let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false) else {
-                continue;
+            // Into its saved view by the rule a started restore follows, so the next write of the
+            // file still names that view.
+            let target = match self.restored_view(&planned) {
+                Some(view) => self.insert_restored_into(planned.agent.clone(), view),
+                None => {
+                    let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false)
+                    else {
+                        continue;
+                    };
+                    target
+                }
             };
             let at = self.position(target).expect("route_resume names a tab it has");
             self.tabs[at].agent = planned.agent;
@@ -3564,6 +4107,7 @@ impl TabSet {
             };
             kept.push((id, target));
         }
+        kept.retain(|(_, tab)| self.view_of(*tab).is_base());
         let on_screen = go
             .active_session
             .as_ref()
@@ -3573,6 +4117,7 @@ impl TabSet {
         if let Some(tab) = on_screen {
             self.select(tab);
         }
+        debug_assert!(self.v1_holds());
         false
     }
 
@@ -3597,7 +4142,14 @@ impl TabSet {
                 self.remove(tab);
             }
         }
+        debug_assert!(self.v1_holds());
     }
+}
+
+/// What the saved-tabs file records of a tab's view: its number for an extra view, nothing for the
+/// base view, so a window with no chat view writes what it always wrote.
+fn saved_view(view: ViewId) -> Option<u8> {
+    (!view.is_base()).then(|| view.number())
 }
 
 /// The modes a restore's tabs get: saved as they were, except that bypass is given back only when
@@ -4125,6 +4677,7 @@ mod tests {
                 .unwrap(),
             closed_rx,
             dropped_rx,
+            page: ViewId::BASE,
         });
         assert!(set.needs_polling(), "a handoff's close is still running");
         set.get_mut(tab).unwrap().pending_handoff = None;
@@ -4237,7 +4790,7 @@ mod tests {
         assert!(set.select(two));
         assert_eq!(set.select_last(), Some(three), "tmux last-window");
         assert_eq!(set.select_last(), Some(two));
-        assert_eq!(set.select_number(1), Some(one));
+        assert_eq!(set.select_number(1), Some(TabPlace::Base(one)));
         assert_eq!(set.select_number(9), None, "no tab 9: the caller flashes");
         assert_eq!(set.active(), one);
     }
@@ -5131,10 +5684,10 @@ mod tests {
 
         // Before a session starts in `NotStarted`/auto, entering bypass requires confirmation.
         // Confirming also updates the window default, so a new tab inherits it without another prompt.
-        let first_plan = plan(set.cycle_mode(tab));
+        let first_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(first_plan.scope, BypassScope::Tab(tab));
         assert_eq!(
-            set.confirm_bypass(first_plan.scope, first_plan.nonce),
+            set.confirm_bypass(first_plan.scope, first_plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -5152,16 +5705,19 @@ mod tests {
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
         // Leaving bypass works while `next` is on screen: the tab being changed need not be active.
         assert_eq!(
-            set.cycle_mode(tab),
+            set.cycle_mode(tab, ViewId::BASE),
             Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
             "leaving bypass on a live tab moves at once, to manual"
         );
         // Manual -> auto moves at once too, and needs no tab on screen.
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Auto))
+        );
         // Entering bypass again still requires confirmation once `tab` is back on screen,
         // just as it did before the session started.
         set.select(tab);
-        let second_plan = plan(set.cycle_mode(tab));
+        let second_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(second_plan.scope, BypassScope::Tab(tab));
         shut_down_all(&mut set);
     }
@@ -5173,7 +5729,7 @@ mod tests {
         assert_eq!(set.default_mode(), SessionModeChoice::Auto);
         assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Auto);
 
-        let plan = match set.cycle_default_mode() {
+        let plan = match set.cycle_default_mode(ViewId::BASE) {
             ModeCycle::Confirm(plan) => plan,
             other => panic!("auto -> bypass always asks first: {other:?}"),
         };
@@ -5185,7 +5741,7 @@ mod tests {
         );
 
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -5198,19 +5754,19 @@ mod tests {
             "the open tab's own mode is untouched"
         );
         assert_eq!(
-            set.cycle_default_mode(),
+            set.cycle_default_mode(ViewId::BASE),
             ModeCycle::Changed(SessionModeChoice::Manual),
             "leaving bypass moves at once, to manual"
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Manual);
         assert_eq!(
-            set.cycle_default_mode(),
+            set.cycle_default_mode(ViewId::BASE),
             ModeCycle::Changed(SessionModeChoice::Auto),
             "manual -> auto moves at once"
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Auto);
         assert!(
-            matches!(set.cycle_default_mode(), ModeCycle::Confirm(_)),
+            matches!(set.cycle_default_mode(ViewId::BASE), ModeCycle::Confirm(_)),
             "and auto -> bypass asks again"
         );
         assert_eq!(
@@ -5231,7 +5787,7 @@ mod tests {
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        let _plan = plan(set.cycle_mode(tab));
+        let _plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.get(tab).unwrap().mode,
             SessionModeChoice::Auto,
@@ -5278,12 +5834,12 @@ mod tests {
         // `open()` left `second` active. Entering bypass is refused for a tab that is not on screen,
         // so select `first` before requesting the switch.
         set.select(first);
-        let plan = plan(set.cycle_mode(first));
+        let plan = plan(set.cycle_mode(first, ViewId::BASE));
         assert_eq!(plan.approve, vec!["p1".to_string()]);
         assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
 
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 1,
                 resolved: vec![]
@@ -5313,7 +5869,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 1
         });
-        let old_plan = plan(set.cycle_mode(tab));
+        let old_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(old_plan.approve, vec!["p1".to_string()]);
 
         provider.queue(write("p2"));
@@ -5322,7 +5878,7 @@ mod tests {
             set.get(tab).unwrap().attention.attention().pending == 2
         });
 
-        let reprompted = match set.confirm_bypass(old_plan.scope, old_plan.nonce) {
+        let reprompted = match set.confirm_bypass(old_plan.scope, old_plan.nonce, ViewId::BASE) {
             Ok(ConfirmOutcome::Reprompt(plan)) => plan,
             other => panic!("a card arrived while the prompt was up: {other:?}"),
         };
@@ -5341,12 +5897,12 @@ mod tests {
         assert!(provider.resolutions().is_empty(), "no resolution sent by a reprompt");
 
         assert_eq!(
-            set.confirm_bypass(old_plan.scope, old_plan.nonce),
+            set.confirm_bypass(old_plan.scope, old_plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string()),
             "the OLD nonce is dead now"
         );
         assert_eq!(
-            set.confirm_bypass(reprompted.scope, reprompted.nonce),
+            set.confirm_bypass(reprompted.scope, reprompted.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 2,
                 resolved: vec![]
@@ -5363,9 +5919,9 @@ mod tests {
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -5411,9 +5967,9 @@ mod tests {
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -5421,7 +5977,10 @@ mod tests {
         );
 
         // Leaving bypass lands on manual, where the policy answers again (and an edit cards).
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Manual))
+        );
 
         provider.queue(write("p5"));
         provider.queue(read("p6"));
@@ -5439,7 +5998,7 @@ mod tests {
     fn an_empty_tab_confirm_moves_the_window_default_and_new_tabs_inherit_it_unasked() {
         let mut set = set();
         let tab = set.active();
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(plan.scope, BypassScope::Tab(tab));
         assert!(
             plan.lines[0].contains("New sessions in this window start in bypass too"),
@@ -5448,7 +6007,7 @@ mod tests {
         );
 
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -5463,7 +6022,7 @@ mod tests {
             "inherited unasked"
         );
         assert_eq!(
-            set.confirm_bypass(BypassScope::Tab(next), 0),
+            set.confirm_bypass(BypassScope::Tab(next), 0, ViewId::BASE),
             Err("that prompt is no longer current".to_string()),
             "open() left no stray prompt behind"
         );
@@ -5474,11 +6033,11 @@ mod tests {
     fn the_chooser_default_asks_before_bypass_and_not_before_auto() {
         let mut set = set();
         let tab = set.active();
-        match set.cycle_default_mode() {
+        match set.cycle_default_mode(ViewId::BASE) {
             ModeCycle::Confirm(plan) => {
                 assert_eq!(plan.scope, BypassScope::Default);
                 assert_eq!(
-                    set.confirm_bypass(plan.scope, plan.nonce),
+                    set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
                     Ok(ConfirmOutcome::Entered {
                         approved: 0,
                         resolved: vec![]
@@ -5495,12 +6054,12 @@ mod tests {
         );
 
         assert_eq!(
-            set.cycle_default_mode(),
+            set.cycle_default_mode(ViewId::BASE),
             ModeCycle::Changed(SessionModeChoice::Manual),
             "bypass -> manual never asks"
         );
         assert_eq!(
-            set.cycle_default_mode(),
+            set.cycle_default_mode(ViewId::BASE),
             ModeCycle::Changed(SessionModeChoice::Auto),
             "manual -> auto never asks"
         );
@@ -5526,7 +6085,10 @@ mod tests {
                 set.pump(&dir, true);
                 set.get(ended_auto).unwrap().wire_state() == TabStateWire::Ended
             });
-            assert_eq!(set.cycle_mode(ended_auto), Err("the session has ended".to_string()));
+            assert_eq!(
+                set.cycle_mode(ended_auto, ViewId::BASE),
+                Err("the session has ended".to_string())
+            );
             shut_down_all(&mut set);
         }
 
@@ -5536,7 +6098,7 @@ mod tests {
             let mut set = set();
             let starting_tab = set.active();
             let tx = starting(&mut set, starting_tab, None, None);
-            let plan = plan(set.cycle_mode(starting_tab));
+            let plan = plan(set.cycle_mode(starting_tab, ViewId::BASE));
             assert_eq!(plan.approve, Vec::<String>::new());
             assert_eq!(
                 plan.lines,
@@ -5544,7 +6106,7 @@ mod tests {
                 "a starting tab asks like a live one"
             );
             assert_eq!(
-                set.confirm_bypass(plan.scope, plan.nonce),
+                set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
                 Ok(ConfirmOutcome::Entered {
                     approved: 0,
                     resolved: vec![]
@@ -5564,12 +6126,12 @@ mod tests {
                 "the mode survived the failed start"
             );
             assert_eq!(
-                set.cycle_mode(starting_tab),
+                set.cycle_mode(starting_tab, ViewId::BASE),
                 Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
                 "a failed bypass tab still leaves at once"
             );
             assert_eq!(
-                set.cycle_mode(starting_tab),
+                set.cycle_mode(starting_tab, ViewId::BASE),
                 Err("the session has ended".to_string()),
                 "a failed manual tab stays manual, as an ended auto tab stays auto"
             );
@@ -5582,8 +6144,8 @@ mod tests {
             let ended_bypass = set.active();
             let (provider, backend) = live(&dir);
             set.get_mut(ended_bypass).unwrap().backend = TabBackend::Live(backend);
-            let plan = plan(set.cycle_mode(ended_bypass));
-            set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+            let plan = plan(set.cycle_mode(ended_bypass, ViewId::BASE));
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
             set.get_mut(ended_bypass).unwrap().live_mut().unwrap().shutdown();
             provider.queue(AgentDomainEvent::SessionClosed {
                 reason: "closed".into(),
@@ -5593,7 +6155,7 @@ mod tests {
                 set.get(ended_bypass).unwrap().wire_state() == TabStateWire::Ended
             });
             assert_eq!(
-                set.cycle_mode(ended_bypass),
+                set.cycle_mode(ended_bypass, ViewId::BASE),
                 Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
                 "an ended bypass tab still leaves at once"
             );
@@ -5607,8 +6169,8 @@ mod tests {
             let ended_bypass = set.active();
             let (provider, backend) = live(&dir);
             set.get_mut(ended_bypass).unwrap().backend = TabBackend::Live(backend);
-            let plan = plan(set.cycle_mode(ended_bypass));
-            set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+            let plan = plan(set.cycle_mode(ended_bypass, ViewId::BASE));
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
             let default_after_confirm = set.default_mode();
             set.get_mut(ended_bypass).unwrap().live_mut().unwrap().shutdown();
             provider.queue(AgentDomainEvent::SessionClosed {
@@ -5641,9 +6203,9 @@ mod tests {
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -5805,8 +6367,8 @@ mod tests {
         let bypass_tab = set.open(AgentId::Claude);
         let (bypass_provider, backend) = live(&dir);
         set.get_mut(bypass_tab).unwrap().backend = TabBackend::Live(backend);
-        let plan = plan(set.cycle_mode(bypass_tab));
-        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        let plan = plan(set.cycle_mode(bypass_tab, ViewId::BASE));
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
         bypass_provider.queue(AgentDomainEvent::PermissionModeChanged {
             mode: agent::PermissionMode::Auto,
             provider_mode: "default".into(),
@@ -5853,7 +6415,7 @@ mod tests {
             "remove_first",
         ] {
             let (mut set, first, second) = two_tabs(&dir);
-            let plan = plan(set.cycle_mode(first));
+            let plan = plan(set.cycle_mode(first, ViewId::BASE));
             match mutate {
                 "select_second" => {
                     set.select(second);
@@ -5878,7 +6440,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(
-                set.confirm_bypass(plan.scope, plan.nonce),
+                set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
                 Err("that prompt is no longer current".to_string()),
                 "{mutate}"
             );
@@ -5891,18 +6453,18 @@ mod tests {
         // The strongest case: select(second) then back to select(first) -- the SAME tab ends up
         // active again -- still drops the prompt, since the active id genuinely changed in between.
         let (mut set, first, second) = two_tabs(&dir);
-        let first_plan = plan(set.cycle_mode(first));
+        let first_plan = plan(set.cycle_mode(first, ViewId::BASE));
         set.select(second);
         set.select(first);
         assert_eq!(
-            set.confirm_bypass(first_plan.scope, first_plan.nonce),
+            set.confirm_bypass(first_plan.scope, first_plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string())
         );
 
-        let second_plan = plan(set.cycle_mode(first));
+        let second_plan = plan(set.cycle_mode(first, ViewId::BASE));
         set.drop_bypass_prompt();
         assert_eq!(
-            set.confirm_bypass(second_plan.scope, second_plan.nonce),
+            set.confirm_bypass(second_plan.scope, second_plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string())
         );
         shut_down_all(&mut set);
@@ -5920,7 +6482,7 @@ mod tests {
         set.get_mut(second).unwrap().backend = TabBackend::Live(backend);
         set.select(first);
         assert_eq!(
-            set.cycle_mode(second),
+            set.cycle_mode(second, ViewId::BASE),
             Err(format!(
                 "tab {} is not the one on screen",
                 set.get(second).unwrap().number
@@ -5957,11 +6519,11 @@ mod tests {
             "the premise: it has not resolved yet"
         );
 
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(plan.approve, vec!["real-card".to_string()]);
         assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 1,
                 resolved: vec![]
@@ -6015,7 +6577,7 @@ mod tests {
             "the premise: nothing has been pumped, so nothing is a delivered card yet"
         );
 
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert!(
             plan.approve.is_empty(),
             "a request only in the projection, never delivered as a card, must not be offered for \
@@ -6030,9 +6592,9 @@ mod tests {
         let dir = workspace("bypass-leaving-live-drops-default");
         let mut set = set();
         let tab = set.active();
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -6048,7 +6610,10 @@ mod tests {
             "starting the session kept the mode"
         );
 
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Manual))
+        );
         assert_eq!(
             set.default_mode(),
             SessionModeChoice::Auto,
@@ -6071,7 +6636,7 @@ mod tests {
         let (_provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        let live_plan = plan(set.cycle_mode(tab));
+        let live_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(live_plan.prompt, tabs::PromptScope::LiveTab);
         assert_eq!(
             live_plan.lines,
@@ -6086,7 +6651,7 @@ mod tests {
             backend.shutdown();
         }
 
-        let fresh = match set.confirm_bypass(live_plan.scope, live_plan.nonce) {
+        let fresh = match set.confirm_bypass(live_plan.scope, live_plan.nonce, ViewId::BASE) {
             Ok(ConfirmOutcome::Reprompt(fresh)) => fresh,
             other => panic!("the question changed, so the answer must be asked again: {other:?}"),
         };
@@ -6100,7 +6665,7 @@ mod tests {
             "and the window default never moved"
         );
         assert_eq!(
-            set.confirm_bypass(live_plan.scope, live_plan.nonce),
+            set.confirm_bypass(live_plan.scope, live_plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string())
         );
         let next = set.open(AgentId::Claude);
@@ -6119,18 +6684,18 @@ mod tests {
         let dir = workspace("bypass-prompt-kind-changed-2");
         let mut set = set();
         let tab = set.active();
-        let empty_plan = plan(set.cycle_mode(tab));
+        let empty_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(empty_plan.prompt, tabs::PromptScope::EmptyTab);
         let (_provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        let fresh = match set.confirm_bypass(empty_plan.scope, empty_plan.nonce) {
+        let fresh = match set.confirm_bypass(empty_plan.scope, empty_plan.nonce, ViewId::BASE) {
             Ok(ConfirmOutcome::Reprompt(fresh)) => fresh,
             other => panic!("expected a reprompt: {other:?}"),
         };
         assert_eq!(fresh.prompt, tabs::PromptScope::LiveTab);
         assert_eq!(
-            set.confirm_bypass(fresh.scope, fresh.nonce),
+            set.confirm_bypass(fresh.scope, fresh.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: vec![]
@@ -6150,13 +6715,13 @@ mod tests {
         let mut set = set();
         let tab = set.active();
         set.get_mut(tab).unwrap().backend = TabBackend::Failed { reason: "test".into() };
-        let default_plan = match set.cycle_default_mode() {
+        let default_plan = match set.cycle_default_mode(ViewId::BASE) {
             ModeCycle::Confirm(plan) => plan,
             other => panic!("auto -> bypass asks: {other:?}"),
         };
         set.reset(tab).unwrap();
         assert_eq!(
-            set.confirm_bypass(default_plan.scope, default_plan.nonce),
+            set.confirm_bypass(default_plan.scope, default_plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string())
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Auto);
@@ -6215,7 +6780,7 @@ mod tests {
         assert_eq!(set.newest_card_tab(), Some(first));
         assert_eq!(set.attention().pending, 2);
         set.select(first);
-        set.mark_seen();
+        set.mark_seen(first);
         assert!(!set.get(first).unwrap().attention.attention().unread);
     }
 
@@ -6243,6 +6808,27 @@ mod tests {
         let (ids, prompt) = set.close_others_plan().unwrap();
         assert_eq!(ids, vec![second, third]);
         assert_eq!(prompt, "close 2 other tabs? (y/n)");
+    }
+
+    #[test]
+    fn close_others_plan_leaves_out_a_tab_shown_in_an_extra_view() {
+        let mut set = set();
+        let active = set.active();
+        let second = set.open(AgentId::Claude);
+        let third = set.open(AgentId::Claude);
+        set.select(third);
+        let view = ViewId::new(2).unwrap();
+        assert_eq!(set.break_out(view), Ok(third));
+        set.select(active);
+        let (ids, prompt) = set.close_others_plan().unwrap();
+        assert_eq!(ids, vec![second], "the bound tab is not one of the base strip's others");
+        assert_eq!(prompt, "close 1 other tab? (y/n)");
+        set.remove(second);
+        assert_eq!(
+            set.close_others_plan(),
+            None,
+            "the active tab is the base view's only one"
+        );
     }
 
     /// Pumps until the active tab has a payload, returning it with its class.
@@ -7216,7 +7802,7 @@ mod tests {
             "the still-pending sweep must drop a candidate whose own further card is genuinely pending"
         );
 
-        set.answer_card(tab, "perm-edit", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-edit", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         provider.queue(resolved("perm-edit"));
@@ -7350,7 +7936,7 @@ mod tests {
                 .active_payload
                 .is_some_and(|p| p.contains("perm-out"))
         });
-        set.answer_card(tab, "perm-out", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-out", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         provider.queue(resolved("perm-out"));
@@ -7615,7 +8201,7 @@ mod tests {
                 .active_payload
                 .is_some_and(|p| p.contains("perm-pb-cli"))
         });
-        set.answer_card(tab, "perm-pb-cli", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-pb-cli", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         provider.queue(resolved("perm-pb-cli"));
@@ -7714,7 +8300,7 @@ mod tests {
             "the still-pending sweep must drop a candidate whose own further card is genuinely pending"
         );
 
-        set.answer_card(tab, "perm-npm", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-npm", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         provider.queue(resolved("perm-npm"));
@@ -8099,7 +8685,7 @@ mod tests {
             "the id-less follow-up card must still drop the candidate, matched by content"
         );
 
-        set.answer_card(tab, "perm-follow-up", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-follow-up", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         provider.queue(resolved("perm-follow-up"));
@@ -8150,7 +8736,7 @@ mod tests {
             "the answer failed; no candidate was ever recorded"
         );
         provider.refuse_resolutions(false);
-        set.answer_card(tab, "perm-refused", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-refused", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         provider.queue(resolved("perm-refused"));
@@ -8836,7 +9422,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 1
         });
-        set.answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         assert_eq!(provider.resolutions(), vec![("perm-hook".to_string(), true)]);
@@ -8880,6 +9466,7 @@ mod tests {
         });
         set.answer_card(
             tab,
+            ViewId::BASE,
             "perm-denied",
             agent::PermissionDecision::Deny {
                 reason: Some("no".into()),
@@ -8924,7 +9511,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 1
         });
-        set.answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         assert!(set.get(tab).unwrap().human_allowed.contains("toolu_c"));
@@ -8952,9 +9539,9 @@ mod tests {
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: Vec::new()
@@ -9096,14 +9683,14 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 6
         });
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(plan.approve, all);
         assert_eq!(
             plan.lines,
             vec!["Switch to bypass and approve the 6 waiting cards? (y/n)".to_string()]
         );
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 6,
                 resolved: Vec::new()
@@ -9149,7 +9736,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 1
         });
-        let first = plan(set.cycle_mode(tab));
+        let first = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(first.approve, vec!["perm-write".to_string()]);
         provider.queue(cli_prompt(
             "perm-ask",
@@ -9162,14 +9749,14 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 2
         });
-        let again = match set.confirm_bypass(first.scope, first.nonce) {
+        let again = match set.confirm_bypass(first.scope, first.nonce, ViewId::BASE) {
             Ok(ConfirmOutcome::Reprompt(again)) => again,
             other => panic!("a card the prompt did not count asks again, got {other:?}"),
         };
         assert!(provider.resolutions().is_empty(), "{:?}", provider.resolutions());
         assert_eq!(again.approve, vec!["perm-write".to_string(), "perm-ask".to_string()]);
         assert_eq!(
-            set.confirm_bypass(again.scope, again.nonce),
+            set.confirm_bypass(again.scope, again.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 2,
                 resolved: Vec::new()
@@ -9188,12 +9775,12 @@ mod tests {
         let mut set = set();
         let tab = set.active();
         let error = set
-            .answer_card(tab, "perm-x", agent::PermissionDecision::Allow)
+            .answer_card(tab, ViewId::BASE, "perm-x", agent::PermissionDecision::Allow)
             .expect_err("no session");
         assert_eq!(error.message, "no active session");
         assert!(error.benign);
         assert!(set
-            .answer_card(TabId(999), "perm-x", agent::PermissionDecision::Allow)
+            .answer_card(TabId(999), ViewId::BASE, "perm-x", agent::PermissionDecision::Allow)
             .is_err());
     }
 
@@ -9215,7 +9802,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 1
         });
-        set.answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+        set.answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
         assert!(set.get(tab).unwrap().human_allowed.contains("toolu_reused"));
@@ -9307,7 +9894,7 @@ mod tests {
         });
         provider.refuse_resolutions(true);
         assert!(set
-            .answer_card(tab, "perm-hook", agent::PermissionDecision::Allow)
+            .answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .is_err());
         assert!(set.get(tab).unwrap().human_allowed.is_empty());
         shut_down_all(&mut set);
@@ -9323,9 +9910,9 @@ mod tests {
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Ok(ConfirmOutcome::Entered {
                 approved: 0,
                 resolved: Vec::new()
@@ -9546,7 +10133,10 @@ mod tests {
         // Leaving bypass is as it always was: at once, and an empty tab's default goes with it (to
         // manual, where leaving bypass lands).
         let tab = set.active();
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)),);
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
+        );
         assert_eq!(set.default_mode(), SessionModeChoice::Manual);
     }
 
@@ -9559,21 +10149,27 @@ mod tests {
         let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
         let tab = set.active();
         assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Auto))
+        );
         assert_eq!(
             set.default_mode(),
             SessionModeChoice::Auto,
             "an empty tab carries the default"
         );
-        let plan = plan(set.cycle_mode(tab));
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.get(tab).unwrap().mode(),
             SessionModeChoice::Auto,
             "nothing moves before y"
         );
-        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
         assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Bypass);
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Manual))
+        );
         assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
         assert_eq!(
             set.default_mode(),
@@ -9593,12 +10189,15 @@ mod tests {
         let (_provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
         set.get_mut(tab).unwrap().mode = SessionModeChoice::Manual;
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
-        let plan = plan(set.cycle_mode(tab));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Auto))
+        );
+        let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         // Something other than the key moved the tab under the open prompt.
         set.get_mut(tab).unwrap().mode = SessionModeChoice::Manual;
         assert_eq!(
-            set.confirm_bypass(plan.scope, plan.nonce),
+            set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
             Err("that prompt is no longer current".to_string())
         );
         assert_eq!(set.get(tab).unwrap().mode(), SessionModeChoice::Manual);
@@ -9612,16 +10211,19 @@ mod tests {
         let mut set = set();
         let acp = set.open(AgentId::Acp("gem".into()));
         assert_eq!(set.get(acp).unwrap().mode(), SessionModeChoice::Auto);
-        let plan = plan(set.cycle_mode(acp));
-        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
-        assert_eq!(set.cycle_mode(acp), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        let plan = plan(set.cycle_mode(acp, ViewId::BASE));
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
+        assert_eq!(
+            set.cycle_mode(acp, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Auto))
+        );
         assert_eq!(
             set.default_mode(),
             SessionModeChoice::Manual,
             "leaving bypass leaves the window default in manual; the tab's auto is only its agent's stand-in"
         );
         assert!(
-            matches!(set.cycle_mode(acp), Ok(ModeCycle::Confirm(_))),
+            matches!(set.cycle_mode(acp, ViewId::BASE), Ok(ModeCycle::Confirm(_))),
             "auto -> bypass asks"
         );
         shut_down_all(&mut set);
@@ -9674,13 +10276,19 @@ mod tests {
     #[test]
     fn the_window_default_cycles_manual_auto_bypass() {
         let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
-        assert_eq!(set.cycle_default_mode(), ModeCycle::Changed(SessionModeChoice::Auto));
-        let ModeCycle::Confirm(plan) = set.cycle_default_mode() else {
+        assert_eq!(
+            set.cycle_default_mode(ViewId::BASE),
+            ModeCycle::Changed(SessionModeChoice::Auto)
+        );
+        let ModeCycle::Confirm(plan) = set.cycle_default_mode(ViewId::BASE) else {
             panic!("auto -> bypass asks")
         };
-        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
         assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
-        assert_eq!(set.cycle_default_mode(), ModeCycle::Changed(SessionModeChoice::Manual));
+        assert_eq!(
+            set.cycle_default_mode(ViewId::BASE),
+            ModeCycle::Changed(SessionModeChoice::Manual)
+        );
     }
 
     /// A tab saved in manual comes back in manual with no question, whichever way the restore runs:
@@ -9715,6 +10323,7 @@ mod tests {
             title: Some(format!("title of {id}")),
             saved_mode: mode,
             label: format!("title of {id}"),
+            view: None,
         }
     }
 
@@ -11104,16 +11713,16 @@ mod tests {
     fn an_old_nonce_is_refused() {
         let (mut set, tab, first) = asked(first_send("r1", "hi"));
         let second = set.ask_trust(tab).unwrap();
-        assert!(set.check_trust_answer(tab, first).is_err());
-        assert!(set.mark_recording(tab, first).is_err());
-        assert!(set.take_answered(tab, first).is_err());
-        assert!(set.cancel_trust(tab, first).is_err());
+        assert!(set.check_trust_answer(tab, first, ViewId::BASE).is_err());
+        assert!(set.mark_recording(tab, first, ViewId::BASE).is_err());
+        assert!(set.take_answered(tab, first, ViewId::BASE).is_err());
+        assert!(set.cancel_trust(tab, first, ViewId::BASE).is_err());
         assert!(
             awaiting(&set, tab).asking == Some(second),
             "refusals leave the question as it was"
         );
-        assert!(set.check_trust_answer(tab, second).is_ok());
-        assert!(set.check_trust_answer(tab, 0).is_err());
+        assert!(set.check_trust_answer(tab, second, ViewId::BASE).is_ok());
+        assert!(set.check_trust_answer(tab, 0, ViewId::BASE).is_err());
     }
 
     #[test]
@@ -11122,20 +11731,20 @@ mod tests {
         let other = set.open(AgentId::Claude);
         assert_eq!(set.active(), other);
         let nonce = set.ask_trust(first).unwrap();
-        let why = set.check_trust_answer(first, nonce).unwrap_err();
+        let why = set.check_trust_answer(first, nonce, ViewId::BASE).unwrap_err();
         assert!(why.contains("not the one on screen"), "{why}");
-        assert!(set.mark_recording(first, nonce).is_err());
-        assert!(set.take_answered(first, nonce).is_err());
-        assert!(set.cancel_trust(first, nonce).is_err());
+        assert!(set.mark_recording(first, nonce, ViewId::BASE).is_err());
+        assert!(set.take_answered(first, nonce, ViewId::BASE).is_err());
+        assert!(set.cancel_trust(first, nonce, ViewId::BASE).is_err());
         assert!(matches!(set.get(first).unwrap().backend, TabBackend::AwaitingTrust(_)));
         assert!(
-            set.check_trust_answer(other, nonce).is_err(),
+            set.check_trust_answer(other, nonce, ViewId::BASE).is_err(),
             "and not for a tab that waits for nothing"
         );
         set.select(first);
         let nonce = set.ask_trust(first).unwrap();
         assert!(
-            set.check_trust_answer(first, nonce).is_ok(),
+            set.check_trust_answer(first, nonce, ViewId::BASE).is_ok(),
             "on screen again, asked again"
         );
     }
@@ -11152,23 +11761,23 @@ mod tests {
                 }
                 "drop_bypass_prompt" => set.drop_bypass_prompt(),
                 "cycle_mode" => {
-                    let _ = set.cycle_mode(tab);
+                    let _ = set.cycle_mode(tab, ViewId::BASE);
                 }
                 _ => {
-                    let _ = set.cycle_default_mode();
+                    let _ = set.cycle_default_mode(ViewId::BASE);
                 }
             }
             assert!(
-                set.check_trust_answer(tab, nonce).is_err(),
+                set.check_trust_answer(tab, nonce, ViewId::BASE).is_err(),
                 "{how}: the old nonce is refused"
             );
-            assert!(set.take_answered(tab, nonce).is_err(), "{how}");
+            assert!(set.take_answered(tab, nonce, ViewId::BASE).is_err(), "{how}");
             let waiting = awaiting(&set, tab);
             assert_eq!(waiting.asking, None, "{how}");
             assert!(!waiting.recording, "{how}");
             let fresh = set.ask_trust(tab).unwrap();
             assert!(
-                set.check_trust_answer(tab, fresh).is_ok(),
+                set.check_trust_answer(tab, fresh, ViewId::BASE).is_ok(),
                 "{how}: showing it again asks again"
             );
         }
@@ -11177,9 +11786,12 @@ mod tests {
     #[test]
     fn check_trust_answer_consumes_nothing() {
         let (set, tab, nonce) = asked(first_send("r1", "hi"));
-        assert!(set.check_trust_answer(tab, nonce + 1).is_err());
-        assert!(set.check_trust_answer(tab, nonce).is_ok());
-        assert!(set.check_trust_answer(tab, nonce).is_ok(), "a second look still passes");
+        assert!(set.check_trust_answer(tab, nonce + 1, ViewId::BASE).is_err());
+        assert!(set.check_trust_answer(tab, nonce, ViewId::BASE).is_ok());
+        assert!(
+            set.check_trust_answer(tab, nonce, ViewId::BASE).is_ok(),
+            "a second look still passes"
+        );
         let waiting = awaiting(&set, tab);
         assert_eq!(waiting.asking, Some(nonce));
         assert!(!waiting.recording);
@@ -11189,13 +11801,16 @@ mod tests {
     #[test]
     fn an_accepted_answer_hands_the_start_over_once() {
         let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
-        let start = set.take_answered(tab, nonce).unwrap();
+        let start = set.take_answered(tab, nonce, ViewId::BASE).unwrap();
         assert_eq!(start.request_id(), Some("r1"));
         assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
-        assert!(set.take_answered(tab, nonce).is_err(), "the answer is spent");
+        assert!(
+            set.take_answered(tab, nonce, ViewId::BASE).is_err(),
+            "the answer is spent"
+        );
 
         let (mut set, tab, nonce) = asked(resume_of("r2", "sess-9"));
-        let start = set.cancel_trust(tab, nonce).unwrap();
+        let start = set.cancel_trust(tab, nonce, ViewId::BASE).unwrap();
         assert!(
             matches!(start, DeferredStart::Resume { ref provider_session_id, .. } if provider_session_id == "sess-9")
         );
@@ -11206,15 +11821,18 @@ mod tests {
     #[test]
     fn a_recording_tab_waits_for_its_record() {
         let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
-        set.mark_recording(tab, nonce).unwrap();
+        set.mark_recording(tab, nonce, ViewId::BASE).unwrap();
         let waiting = awaiting(&set, tab);
         assert!(waiting.recording);
         assert_eq!(waiting.asking, None);
-        assert!(set.check_trust_answer(tab, nonce).is_err(), "the nonce is spent");
-        assert!(set.take_answered(tab, nonce).is_err());
-        assert!(set.cancel_trust(tab, nonce).is_err());
         assert!(
-            set.mark_recording(tab, nonce).is_err(),
+            set.check_trust_answer(tab, nonce, ViewId::BASE).is_err(),
+            "the nonce is spent"
+        );
+        assert!(set.take_answered(tab, nonce, ViewId::BASE).is_err());
+        assert!(set.cancel_trust(tab, nonce, ViewId::BASE).is_err());
+        assert!(
+            set.mark_recording(tab, nonce, ViewId::BASE).is_err(),
             "no second record for one answer"
         );
         assert!(
@@ -11233,7 +11851,7 @@ mod tests {
 
         // A record that failed asks the tab again, which ends the wait.
         let (mut set, tab, nonce) = asked(first_send("r2", "hi"));
-        set.mark_recording(tab, nonce).unwrap();
+        set.mark_recording(tab, nonce, ViewId::BASE).unwrap();
         let again = set.ask_trust(tab).unwrap();
         assert_ne!(again, nonce);
         let waiting = awaiting(&set, tab);
@@ -11290,7 +11908,7 @@ mod tests {
         assert!(set.get(tab).is_none());
         assert!(set.awaiting_trust().is_empty());
         assert!(
-            set.check_trust_answer(tab, nonce).is_err(),
+            set.check_trust_answer(tab, nonce, ViewId::BASE).is_err(),
             "no answer reaches a closed tab"
         );
         assert_eq!(set.active(), other);
@@ -11349,7 +11967,7 @@ mod tests {
         );
         assert!(set.open_session_ids().is_empty(), "no lease or session is named yet");
         let nonce = set.ask_trust(from).unwrap();
-        let DeferredStart::Restore { go } = set.take_answered(from, nonce).unwrap() else {
+        let DeferredStart::Restore { go } = set.take_answered(from, nonce, ViewId::BASE).unwrap() else {
             panic!("the restore comes back")
         };
         assert_eq!(
@@ -11357,6 +11975,1088 @@ mod tests {
             ["a", "b"],
             "intact, ready to start when the answer allows it"
         );
+    }
+
+    // ---- chat views: a tab bound to an extra view ------------------------------------------------
+
+    fn view(n: u8) -> ViewId {
+        ViewId::new(n).unwrap()
+    }
+
+    #[test]
+    fn breaking_out_binds_the_active_tab_and_the_base_view_keeps_a_base_tab() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        assert_eq!(set.active(), three);
+
+        assert_eq!(set.break_out(view(2)), Ok(three));
+        assert_eq!(set.view_of(three), view(2));
+        assert_eq!(set.get(three).unwrap().view_id(), view(2));
+        assert_eq!(set.tab_in(view(2)), Some(three));
+        assert_eq!(set.active(), two, "the base view shows its last active tab");
+        assert_eq!(set.views(), vec![view(2)]);
+        assert_eq!(set.base_tabs(), vec![one, two]);
+        assert_eq!(set.shown(), vec![(ViewId::BASE, two), (view(2), three)]);
+        assert!(set.is_shown(three) && set.is_shown(two) && !set.is_shown(one));
+        assert_eq!(set.place_of(three), Some(TabPlace::View(view(2), three)));
+        assert_eq!(set.place_of(one), Some(TabPlace::Base(one)));
+        assert_eq!(set.select_last(), None, "the last active tab is cleared by a break");
+
+        assert_eq!(set.break_out(ViewId::BASE), Err(ViewError::NotAnExtraView));
+        assert_eq!(set.break_out(view(2)), Err(ViewError::Taken(view(2))));
+        assert_eq!(set.break_out(view(3)), Ok(two));
+        assert_eq!(set.active(), one, "the neighbour among the base view's tabs");
+        assert_eq!(set.break_out(view(4)), Err(ViewError::OneTabLeft));
+        assert_eq!(set.active(), one);
+        assert_eq!(set.views(), vec![view(2), view(3)]);
+        assert_eq!(set.tab_in(ViewId::BASE), None, "the base view's tab is `active`");
+
+        assert_eq!(
+            ViewError::NotAnExtraView.to_string(),
+            "the base view is not an extra chat view"
+        );
+        assert_eq!(ViewError::Taken(view(2)).to_string(), "agent 2 already shows a tab");
+        assert_eq!(ViewError::OneTabLeft.to_string(), "can't break with only one tab");
+    }
+
+    #[test]
+    fn joining_back_makes_the_tab_the_base_views_active_one() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        let three = set.open(AgentId::Claude);
+        assert_eq!(set.active(), three);
+
+        assert_eq!(set.join_back(view(2)), Some(two));
+        assert_eq!(set.active(), two);
+        assert_eq!(set.view_of(two), ViewId::BASE);
+        assert_eq!(set.tab_in(view(2)), None);
+        assert!(set.views().is_empty());
+        assert_eq!(set.base_tabs(), vec![one, two, three]);
+        assert_eq!(
+            set.select_last(),
+            Some(three),
+            "the tab that was active is the last active one"
+        );
+
+        assert_eq!(set.join_back(view(2)), None, "the view shows no tab");
+        assert_eq!(set.join_back(ViewId::BASE), None);
+        assert_eq!(set.active(), three);
+    }
+
+    #[test]
+    fn may_answer_compares_views_never_the_active_tab() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        let four = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(four));
+        assert_eq!(set.break_out(view(3)), Ok(three));
+        assert_eq!(set.active(), two);
+
+        let expected = [
+            (one, ViewId::BASE),
+            (two, ViewId::BASE),
+            (three, view(3)),
+            (four, view(2)),
+        ];
+        for (tab, its_view) in expected {
+            assert_eq!(set.view_of(tab), its_view);
+            for page in [ViewId::BASE, view(2), view(3), view(4)] {
+                assert_eq!(
+                    set.may_answer(tab, page),
+                    page == its_view,
+                    "tab {tab:?} from page {page:?}"
+                );
+            }
+        }
+        assert!(
+            set.may_answer(one, ViewId::BASE),
+            "a base tab in the background is the base page's"
+        );
+        assert_ne!(set.active(), one);
+        for page in [ViewId::BASE, view(2)] {
+            assert!(!set.may_answer(TabId(999), page), "no such tab");
+        }
+        assert_eq!(set.view_of(TabId(999)), ViewId::BASE);
+    }
+
+    #[test]
+    fn an_answer_from_the_page_a_tab_just_left_is_refused_and_the_card_waits() {
+        let dir = workspace("views-answer-from-the-left-page");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let _other = set.open(AgentId::Claude);
+        set.select(tab);
+
+        provider.queue(gate_write("perm-hook", "toolu_views"));
+        until("the gate's card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().attention.attention().pending == 1
+        });
+        assert_eq!(set.break_out(view(2)), Ok(tab));
+
+        let number = set.get(tab).unwrap().number;
+        let error = set
+            .answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
+            .expect_err("the base page no longer shows the tab");
+        assert_eq!(error.message, format!("tab {number} is not shown in this page"));
+        assert!(!error.benign);
+        assert!(provider.resolutions().is_empty(), "nothing reached the agent");
+        let t = set.get(tab).unwrap();
+        assert!(t
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .contains_key("perm-hook"));
+        assert!(t.card_is_waiting("perm-hook"), "the card still waits");
+
+        set.answer_card(tab, view(2), "perm-hook", agent::PermissionDecision::Allow)
+            .map_err(|e| e.message)
+            .unwrap();
+        assert_eq!(provider.resolutions(), vec![("perm-hook".to_string(), true)]);
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn v1_holds_through_every_path_that_moves_active() {
+        // Every base-view tab closed while an extra view is live: a fresh base tab opens.
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(three));
+        set.remove(two).unwrap();
+        assert_eq!(set.active(), one);
+        set.remove(one).unwrap();
+        let fresh = set.active();
+        assert!(fresh != one && fresh != two && fresh != three);
+        assert_eq!(set.view_of(fresh), ViewId::BASE);
+        assert_eq!(set.get(fresh).unwrap().number, 1);
+        assert_eq!(set.tab_in(view(2)), Some(three), "the view keeps its tab");
+        assert!(set.v1_holds());
+
+        // A break-out whose last active tab is bound: the fallback skips it.
+        let mut set = super::tests::set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(three));
+        assert_eq!(set.active(), two);
+        set.last_active = Some(three);
+        let four = set.open(AgentId::Claude);
+        set.last_active = Some(three);
+        assert_eq!(set.break_out(view(3)), Ok(four));
+        assert!(set.view_of(set.active()).is_base());
+        assert_eq!(
+            set.active(),
+            two,
+            "the neighbour among the base view's tabs, never the bound tab"
+        );
+        assert_eq!(set.select_last(), None);
+        assert_eq!(set.base_tabs(), vec![one, two]);
+        assert!(set.v1_holds());
+
+        // A resume of the session a bound tab holds: switched to, and `active` stays.
+        let mut set = super::tests::set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        set.defer_start(two, resume_of("r1", "sess-bound")).unwrap();
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        assert_eq!(set.active(), one);
+        assert_eq!(
+            set.route_resume(one, &AgentId::Claude, "sess-bound", false),
+            ResumeRoute::SwitchTo(two)
+        );
+        assert_eq!(set.active(), one);
+        assert_eq!(set.view_of(two), view(2));
+        assert!(set.v1_holds());
+
+        // The active tab closed when its neighbour in tab order is bound: the fallback skips it.
+        let mut set = super::tests::set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        set.select(two);
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        set.select(one);
+        set.last_active = None;
+        set.remove(one).unwrap();
+        assert_eq!(set.active(), three, "not tab 2, which is bound");
+        assert!(set.v1_holds());
+        let four = set.open(AgentId::Claude);
+        set.last_active = Some(two);
+        set.remove(four).unwrap();
+        assert_eq!(set.active(), three, "a bound last active tab is not the fallback");
+        assert!(set.v1_holds());
+    }
+
+    #[test]
+    fn select_number_on_a_bound_tab_reports_its_view_and_leaves_active_alone() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        assert_eq!(set.active(), one);
+        let n_two = set.get(two).unwrap().number;
+        assert_eq!(set.select_number(n_two), Some(TabPlace::View(view(2), two)));
+        assert_eq!(set.active(), one);
+        assert!(!set.select(two), "a bound tab is never selected");
+        assert_eq!(set.active(), one);
+        assert_eq!(set.select_place(two), Some(TabPlace::View(view(2), two)));
+        assert_eq!(set.active(), one);
+        assert_eq!(set.select_place(TabId(999)), None);
+        assert_eq!(set.select_number(9), None);
+
+        let three = set.open(AgentId::Claude);
+        assert_eq!(set.select_number(1), Some(TabPlace::Base(one)));
+        assert_eq!(set.active(), one);
+        assert_eq!(set.select_place(three), Some(TabPlace::Base(three)));
+        assert_eq!(set.active(), three);
+        assert_eq!(set.step(1), Some(one), "`n` skips the bound tab 2 and wraps");
+        assert_eq!(set.step(1), Some(three));
+        assert_eq!(set.step(-1), Some(one));
+    }
+
+    #[test]
+    fn a_base_view_switch_drops_only_base_view_trust_questions() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let bound = set.open_in(AgentId::Claude, view(2)).unwrap();
+        set.defer_start(bound, first_send("r-bound", "hi")).unwrap();
+        let bound_nonce = set.ask_trust(bound).unwrap();
+        set.select(one);
+        set.defer_start(one, first_send("r-base", "hello")).unwrap();
+        let base_nonce = set.ask_trust(one).unwrap();
+        assert!(set.check_trust_answer(one, base_nonce, ViewId::BASE).is_ok());
+
+        assert!(set.select(two));
+        assert_eq!(
+            awaiting(&set, one).asking,
+            None,
+            "the base view's question went with its tab"
+        );
+        assert_eq!(
+            awaiting(&set, bound).asking,
+            Some(bound_nonce),
+            "the extra view still shows its own"
+        );
+        assert!(set.check_trust_answer(bound, bound_nonce, view(2)).is_ok());
+        let number = set.get(bound).unwrap().number;
+        assert_eq!(
+            set.check_trust_answer(bound, bound_nonce, ViewId::BASE),
+            Err(format!("tab {number} is not shown in this page"))
+        );
+        set.mark_recording(bound, bound_nonce, view(2)).unwrap();
+        assert!(awaiting(&set, bound).recording);
+    }
+
+    #[test]
+    fn the_bypass_prompt_belongs_to_its_page() {
+        let mut set = set();
+        let base = set.active();
+        let other = set.open(AgentId::Claude);
+        set.select(base);
+        let bound = set.open_in(AgentId::Claude, view(2)).unwrap();
+
+        let built = plan(set.cycle_mode(bound, view(2)));
+        assert_eq!(built.page, view(2));
+        assert_eq!(
+            set.confirm_bypass(built.scope, built.nonce, ViewId::BASE),
+            Err("that prompt is no longer current".to_string())
+        );
+        set.drop_bypass_prompt_in(ViewId::BASE);
+        assert!(set.select(other), "a base-view switch");
+        assert!(
+            set.pending_bypass.is_some(),
+            "the base page's drops leave view 2's prompt"
+        );
+        set.drop_bypass_prompt_in(view(2));
+        assert!(set.pending_bypass.is_none());
+        assert_eq!(
+            set.confirm_bypass(built.scope, built.nonce, view(2)),
+            Err("that prompt is no longer current".to_string())
+        );
+
+        let again = plan(set.cycle_mode(bound, view(2)));
+        assert!(matches!(
+            set.confirm_bypass(again.scope, again.nonce, view(2)),
+            Ok(ConfirmOutcome::Entered { .. })
+        ));
+        assert_eq!(set.get(bound).unwrap().mode(), SessionModeChoice::Bypass);
+
+        // The window default's prompt is the page's that asked.
+        set.default_mode = SessionModeChoice::Auto;
+        let ModeCycle::Confirm(default_plan) = set.cycle_default_mode(view(2)) else {
+            panic!("auto -> bypass asks first");
+        };
+        assert_eq!(default_plan.page, view(2));
+        assert_eq!(
+            set.confirm_bypass(default_plan.scope, default_plan.nonce, ViewId::BASE),
+            Err("that prompt is no longer current".to_string())
+        );
+        assert!(matches!(
+            set.confirm_bypass(default_plan.scope, default_plan.nonce, view(2)),
+            Ok(ConfirmOutcome::Entered { .. })
+        ));
+
+        // The trust questions go only with the page that shows them.
+        let waiting = set.open_in(AgentId::Claude, view(3)).unwrap();
+        set.defer_start(waiting, first_send("r-view", "hi")).unwrap();
+        let view_nonce = set.ask_trust(waiting).unwrap();
+        let shown = set.active();
+        set.defer_start(shown, first_send("r-base", "hello")).unwrap();
+        let _ = set.ask_trust(shown).unwrap();
+        set.drop_bypass_prompt_in(ViewId::BASE);
+        assert_eq!(awaiting(&set, shown).asking, None);
+        assert_eq!(awaiting(&set, waiting).asking, Some(view_nonce));
+        assert!(set.check_trust_answer(waiting, view_nonce, view(3)).is_ok());
+        let base_nonce = set.ask_trust(shown).unwrap();
+        set.drop_bypass_prompt_in(view(3));
+        assert_eq!(awaiting(&set, waiting).asking, None);
+        assert_eq!(awaiting(&set, shown).asking, Some(base_nonce));
+    }
+
+    #[test]
+    fn open_in_never_makes_its_tab_active() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        assert_eq!(set.active(), two);
+        let opened = set.open_in(AgentId::Codex, view(2)).unwrap();
+        assert_eq!(set.active(), two, "the base view's active tab is unchanged");
+        assert_eq!(set.view_of(opened), view(2));
+        assert_eq!(set.tab_in(view(2)), Some(opened));
+        assert_eq!(set.get(opened).unwrap().number, 3, "the lowest free number");
+        assert_eq!(*set.get(opened).unwrap().agent(), AgentId::Codex);
+        assert!(matches!(set.get(opened).unwrap().backend, TabBackend::NotStarted));
+        assert!(!set.recency.contains(&opened), "never active, not even for a moment");
+        assert_eq!(set.select_last(), Some(one), "the last active tab is unchanged too");
+
+        assert_eq!(
+            set.open_in(AgentId::Claude, ViewId::BASE),
+            Err(ViewError::NotAnExtraView)
+        );
+        assert_eq!(set.open_in(AgentId::Claude, view(2)), Err(ViewError::Taken(view(2))));
+        assert_eq!(set.tabs().len(), 3, "a refused open makes no tab");
+    }
+
+    #[test]
+    fn cycle_mode_and_confirm_bypass_accept_a_shown_tab_from_its_own_page() {
+        let mut set = set();
+        let base = set.active();
+        let background = set.open(AgentId::Claude);
+        set.select(base);
+        let bound = set.open_in(AgentId::Claude, view(2)).unwrap();
+        let n = |set: &TabSet, tab: TabId| set.get(tab).unwrap().number;
+
+        assert_eq!(
+            set.cycle_mode(bound, ViewId::BASE),
+            Err(format!("tab {} is not shown in this page", n(&set, bound)))
+        );
+        assert_eq!(
+            set.cycle_mode(base, view(2)),
+            Err(format!("tab {} is not shown in this page", n(&set, base)))
+        );
+        assert_eq!(
+            set.cycle_mode(background, ViewId::BASE),
+            Err(format!("tab {} is not the one on screen", n(&set, background)))
+        );
+
+        let bound_plan = plan(set.cycle_mode(bound, view(2)));
+        assert_eq!(bound_plan.page, view(2));
+        assert!(matches!(
+            set.confirm_bypass(bound_plan.scope, bound_plan.nonce, view(2)),
+            Ok(ConfirmOutcome::Entered { .. })
+        ));
+        let base_plan = plan(set.cycle_mode(base, ViewId::BASE));
+        assert_eq!(base_plan.page, ViewId::BASE);
+        assert!(matches!(
+            set.confirm_bypass(base_plan.scope, base_plan.nonce, ViewId::BASE),
+            Ok(ConfirmOutcome::Entered { .. })
+        ));
+        assert_eq!(set.get(bound).unwrap().mode(), SessionModeChoice::Bypass);
+        assert_eq!(set.get(base).unwrap().mode(), SessionModeChoice::Bypass);
+        assert_eq!(set.get(background).unwrap().mode(), SessionModeChoice::Auto);
+    }
+
+    #[test]
+    fn a_bound_tabs_events_go_to_its_view_and_it_is_never_stale() {
+        let dir = workspace("views-bound-tab-events");
+        let mut set = set();
+        let base = set.active();
+        let (base_provider, backend) = live(&dir);
+        set.get_mut(base).unwrap().backend = TabBackend::Live(backend);
+        let bound = set.open(AgentId::Claude);
+        let (bound_provider, backend) = live(&dir);
+        set.get_mut(bound).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(set.break_out(view(2)), Ok(bound));
+        assert_eq!(set.active(), base);
+
+        bound_provider.queue(started("v1"));
+        bound_provider.queue(text_delta("v1", "from view two"));
+        base_provider.queue(started("b1"));
+        base_provider.queue(text_delta("b1", "from the base view"));
+        let (mut base_text, mut bound_text) = (String::new(), String::new());
+        until("both tabs' text", || {
+            let out = set.pump(&dir, true);
+            base_text += &events_text(out.active_payload.as_deref());
+            for shown in &out.view_payloads {
+                assert_eq!(
+                    (shown.view, shown.tab),
+                    (view(2), bound),
+                    "only the bound tab, in its view"
+                );
+                bound_text += &events_text(Some(&shown.payload));
+            }
+            assert!(out.view_payloads.len() <= 1);
+            assert!(!set.get(bound).unwrap().stale, "a bound tab is never stale");
+            base_text.contains("from the base view") && bound_text.contains("from view two")
+        });
+        assert!(
+            !base_text.contains("from view two"),
+            "the base page gets only its own tab"
+        );
+        assert!(!bound_text.contains("from the base view"));
+
+        // Its view mapped: the turn's end is seen as it happens.
+        bound_provider.queue(completed("v1", agent::TurnOutcome::Completed));
+        until("the bound tab's turn end", || {
+            set.pump_views(&dir, &|_| true);
+            !set.get(bound).unwrap().was_running
+        });
+        assert!(!set.get(bound).unwrap().attention.attention().unread);
+
+        // Its view unmapped: the next turn's end is left unread, and the base page is still told
+        // nothing of it; the tab stays current for its own page.
+        bound_provider.queue(started("v2"));
+        bound_provider.queue(text_delta("v2", "while hidden"));
+        bound_provider.queue(completed("v2", agent::TurnOutcome::Completed));
+        let mut hidden_text = String::new();
+        until("the hidden turn's end", || {
+            let out = set.pump_views(&dir, &|v| v.is_base());
+            assert!(!events_text(out.active_payload.as_deref()).contains("while hidden"));
+            for shown in &out.view_payloads {
+                assert_eq!((shown.view, shown.tab), (view(2), bound));
+                hidden_text += &events_text(Some(&shown.payload));
+            }
+            assert!(!set.get(bound).unwrap().stale, "a bound tab is never stale");
+            set.get(bound).unwrap().attention.attention().unread
+        });
+        assert!(hidden_text.contains("while hidden"), "{hidden_text}");
+        assert!(set.attention_of(view(2)).unread);
+        assert!(!set.attention_of(ViewId::BASE).unread);
+        assert!(set.attention().unread, "the window's sum carries it");
+
+        // The bound tab's own state, for its page; nothing for a background base-view tab.
+        let snapshot = the_snapshot(set.state_payloads(bound));
+        assert!(snapshot_text(&snapshot).contains("while hidden"));
+        let third = set.open(AgentId::Claude);
+        set.select(base);
+        assert!(set.state_payloads(third).is_empty(), "no page shows a background tab");
+        assert!(set.state_payloads(TabId(999)).is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// A bound tab's finished turn carries its duration on the envelope to its own page, and a resync
+    /// sends that page the snapshot, never paced and never to the base page.
+    #[test]
+    fn a_bound_tabs_turn_times_and_resync_snapshot_go_to_its_view() {
+        use crate::panel_cadence::EnvelopeClass::Immediate;
+        let dir = workspace("views-bound-tab-resync");
+        let mut set = set();
+        let base = set.active();
+        let bound = set.open(AgentId::Claude);
+        let (provider, backend) = live(&dir);
+        set.get_mut(bound).unwrap().backend = TabBackend::Live(backend);
+        assert_eq!(set.break_out(view(2)), Ok(bound));
+        assert_eq!(set.active(), base);
+
+        provider.queue(started("t1"));
+        until("the bound tab's turn to start", || {
+            set.pump_views(&dir, &|_| true);
+            set.get(bound).unwrap().was_running
+        });
+        provider.queue(text_delta("t1", "done"));
+        provider.queue(completed("t1", agent::TurnOutcome::Completed));
+        let mut times = None;
+        until("an events payload for view 2 carrying turnTimes", || {
+            let out = set.pump_views(&dir, &|_| true);
+            assert!(out.active_payload.is_none(), "the base page is told nothing of it");
+            for shown in out.view_payloads {
+                assert_eq!((shown.view, shown.tab), (view(2), bound));
+                let value: serde_json::Value = serde_json::from_str(&shown.payload).unwrap();
+                if value["kind"] == "events" && value.get("turnTimes").is_some() {
+                    times = Some(value["turnTimes"].clone());
+                }
+            }
+            times.is_some()
+        });
+        assert_eq!(times.unwrap()[0]["turnId"], "t1");
+        assert_eq!(set.get(bound).unwrap().turn_times_unsent, 0, "the envelope carried it");
+
+        // Without pumping in between: enough to overflow the sidecar's own UI queue.
+        provider.queue(started("t2"));
+        for i in 0..300 {
+            provider.queue(text_delta("t2", &format!("chunk {i}")));
+        }
+        until("the whole stream folded", || {
+            let backend = set.get(bound).unwrap().live().unwrap();
+            let projection = backend.projection();
+            projection.transcript.iter().any(|m| m.text.contains("chunk 299"))
+        });
+        let mut snapshot = None;
+        until("a payload for view 2", || {
+            let out = set.pump_views(&dir, &|_| true);
+            assert!(out.active_payload.is_none(), "the base page is told nothing of it");
+            if let Some(shown) = out.view_payloads.into_iter().next() {
+                assert_eq!((shown.view, shown.tab), (view(2), bound));
+                snapshot = Some((shown.payload, shown.class));
+            }
+            snapshot.is_some()
+        });
+        let (payload, class) = snapshot.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["kind"], "snapshot", "an overflow resyncs: {payload:.120}");
+        assert_eq!(class, Immediate);
+        assert_eq!(
+            value["turnTimes"][0]["turnId"], "t1",
+            "the snapshot carries the durations"
+        );
+        assert!(snapshot_text(&payload).contains("chunk 299"));
+        assert!(!set.get(bound).unwrap().stale, "a bound tab is never stale");
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn the_base_page_lists_base_tabs_and_an_extra_page_its_own() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        set.select(two);
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        assert_eq!(set.active(), three);
+        let parse = |payload: String| -> (u64, Vec<u64>) {
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(value["kind"], "tabs");
+            let numbers = value["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["number"].as_u64().unwrap())
+                .collect();
+            (value["active"].as_u64().unwrap(), numbers)
+        };
+        assert_eq!(
+            parse(set.tabs_payload_for(ViewId::BASE)),
+            (three.0, vec![1, 3]),
+            "the bound tab's number is a gap"
+        );
+        assert_eq!(set.tabs_payload(), set.tabs_payload_for(ViewId::BASE));
+        assert_eq!(
+            parse(set.tabs_payload_for(view(2))),
+            (two.0, vec![2]),
+            "its one tab, as active"
+        );
+        assert_eq!(
+            parse(set.tabs_payload_for(view(3))),
+            (0, vec![]),
+            "a view with no tab names none"
+        );
+        assert_eq!(set.get(one).unwrap().number, 1);
+    }
+
+    #[test]
+    fn mark_seen_marks_the_tab_it_names() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        let ended = [completed("t", agent::TurnOutcome::Completed)];
+        set.get_mut(one).unwrap().attention.observe(&ended, false);
+        set.get_mut(two).unwrap().attention.observe(&ended, false);
+        set.mark_seen(two);
+        assert!(!set.get(two).unwrap().attention.attention().unread, "the tab it names");
+        assert!(
+            set.get(one).unwrap().attention.attention().unread,
+            "the active tab is not it"
+        );
+        set.mark_seen(TabId(999));
+        set.mark_seen(one);
+        assert!(!set.attention().unread);
+    }
+
+    #[test]
+    fn attention_of_a_view_is_its_own_tabs() {
+        let mut set = set();
+        let one = set.active();
+        let two = set.open(AgentId::Claude);
+        let three = set.open(AgentId::Claude);
+        let four = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(3)), Ok(four));
+        set.select(two);
+        assert_eq!(set.break_out(view(2)), Ok(two));
+        assert_eq!(set.base_tabs(), vec![one, three]);
+        set.get_mut(two).unwrap().attention.observe(&[write("oldest")], true);
+        set.get_mut(one).unwrap().attention.observe(&[write("a")], false);
+        set.get_mut(three).unwrap().attention.observe(&[write("b")], false);
+        set.get_mut(three)
+            .unwrap()
+            .attention
+            .observe(&[completed("t", agent::TurnOutcome::Completed)], false);
+
+        let base = set.attention_of(ViewId::BASE);
+        assert_eq!((base.pending, base.unread, base.arrived), (2, true, 2));
+        let bound = set.attention_of(view(2));
+        assert_eq!((bound.pending, bound.unread, bound.arrived), (1, false, 1));
+        assert_eq!(set.attention_of(view(3)).pending, 0);
+        assert_eq!(set.attention_of(view(4)), Attention::default(), "a view with no tab");
+        assert_eq!(set.attention().pending, 3, "the window sums every view");
+        assert_eq!(set.oldest_card_tab(), Some(two));
+        assert_eq!(set.oldest_card_place(), Some(TabPlace::View(view(2), two)));
+        assert_eq!(set.newest_card_tab_in(ViewId::BASE), Some(three));
+        assert_eq!(set.newest_card_tab_in(view(2)), Some(two));
+        assert_eq!(set.newest_card_tab_in(view(3)), None);
+        let each = set.tab_attentions();
+        let of = |tab: TabId| each.iter().find(|t| t.tab == tab).copied().unwrap();
+        assert_eq!((of(two).view, of(two).attention.pending), (view(2), 1));
+        assert_eq!(
+            (of(four).view, of(four).attention.pending, of(four).newest_card),
+            (view(3), 0, None)
+        );
+        assert!(of(three).attention.unread);
+
+        // A closed tab's cards stay in the window's `arrived` only.
+        set.remove(one).unwrap();
+        assert_eq!(set.attention().arrived, 3);
+        assert_eq!(set.attention_of(ViewId::BASE).arrived, 1);
+        set.remove(two).unwrap();
+        assert_eq!(set.oldest_card_place(), Some(TabPlace::Base(three)));
+    }
+
+    #[test]
+    fn a_saved_snapshot_writes_each_bound_tabs_view() {
+        let mut set = set();
+        let failed_with = |set: &mut TabSet, tab: TabId, session: &str| {
+            let t = set.get_mut(tab).unwrap();
+            t.backend = TabBackend::Failed {
+                reason: "refused".to_string(),
+            };
+            t.failed_resume = Some(session.to_string());
+        };
+        let one = set.active();
+        failed_with(&mut set, one, "s-1");
+        let two = set.open(AgentId::Claude);
+        failed_with(&mut set, two, "s-2");
+        let three = set.open(AgentId::Claude);
+        failed_with(&mut set, three, "s-3");
+        let codex = set.open(AgentId::Codex);
+        failed_with(&mut set, codex, "thread-1");
+        let other_codex = set.open(AgentId::Codex);
+        failed_with(&mut set, other_codex, "thread-2");
+        assert_eq!(set.break_out(view(4)), Ok(other_codex));
+        set.select(two);
+        assert_eq!(set.break_out(view(3)), Ok(two));
+        set.select(three);
+
+        let saved = set.saved_snapshot("conv").unwrap();
+        let claude: Vec<(&str, Option<u8>)> = saved
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.view))
+            .collect();
+        assert_eq!(claude, [("s-1", None), ("s-2", Some(3)), ("s-3", None)]);
+        assert_eq!(saved.active, 2, "the base view's active tab, as before");
+        let external: Vec<(&str, Option<u8>)> = saved
+            .external_tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.view))
+            .collect();
+        assert_eq!(external, [("thread-1", None), ("thread-2", Some(4))]);
+
+        // A restore waiting for its trust answer keeps the views it was saved with meanwhile.
+        let mut set = super::tests::set();
+        let from = set.active();
+        let mut a = planned("a", SessionModeChoice::Auto);
+        a.view = ViewId::new(2);
+        let plan = plan_of(vec![a, planned("b", SessionModeChoice::Auto)], None);
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        set.defer_start(from, DeferredStart::Restore { go }).unwrap();
+        let saved = set.saved_snapshot("conv").unwrap();
+        let waiting: Vec<(&str, Option<u8>)> = saved
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.view))
+            .collect();
+        assert_eq!(waiting, [("a", Some(2)), ("b", None)]);
+    }
+
+    fn planned_in(id: &str, view: u8) -> PlannedTab {
+        PlannedTab {
+            view: ViewId::new(view),
+            ..planned(id, SessionModeChoice::Auto)
+        }
+    }
+
+    fn restore_into(set: &mut TabSet, items: Vec<PlannedTab>, active: Option<&str>) -> (TabId, RestoreRun) {
+        let from = set.active();
+        let RestoreStep::Go(go) = set.begin_restore(plan_of(items, active), BypassPolicy::Ask) else {
+            panic!("nothing to ask")
+        };
+        let run = set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
+        assert!(set.v1_holds());
+        (from, run)
+    }
+
+    fn tab_of(set: &TabSet, session: &str) -> TabId {
+        set.tabs()
+            .iter()
+            .find(|t| t.provider_session_id().as_deref() == Some(session))
+            .map(|t| t.id)
+            .expect("the session has a tab")
+    }
+
+    #[test]
+    fn restored_tabs_go_to_their_views_once_and_otherwise_to_the_base_view() {
+        let mut set = set();
+        set.set_layout_views(vec![view(3), ViewId::BASE, view(2), view(3)]);
+        let (from, run) = restore_into(
+            &mut set,
+            vec![planned_in("a", 2), planned_in("b", 2), planned_in("c", 4)],
+            Some("a"),
+        );
+        let (a, b, c) = (tab_of(&set, "a"), tab_of(&set, "b"), tab_of(&set, "c"));
+        assert_eq!(set.view_of(a), view(2), "the first tab naming agent#2 gets it");
+        assert_ne!(
+            a, from,
+            "a tab bound to a view is a new tab, never the one the restore began in"
+        );
+        assert_eq!(set.view_of(b), ViewId::BASE, "agent#2 is taken by then");
+        assert_eq!(b, from, "the first base-view tab goes into the empty tab");
+        assert_eq!(set.view_of(c), ViewId::BASE, "the layout holds no agent#4");
+        assert_eq!(set.tab_in(view(3)), None, "nothing was saved in agent#3");
+        assert_eq!(
+            set.active(),
+            b,
+            "the saved active tab is bound, so the base view shows its first restored tab"
+        );
+        assert!(set.view_of(set.active()).is_base());
+        assert_eq!(set.base_tabs(), vec![b, c]);
+        assert!(run.owns(a) && run.owns(b) && run.owns(c));
+        assert!(
+            run.began_in(from) && run.back_to(a).is_none(),
+            "a failed bound tab goes away"
+        );
+
+        // Not told which views the layout holds: every tab comes back in the base view.
+        let mut set = super::tests::set();
+        let (from, _run) = restore_into(&mut set, vec![planned_in("a", 2), planned_in("b", 3)], Some("b"));
+        assert!(set.views().is_empty());
+        assert_eq!(tab_of(&set, "a"), from);
+        assert_eq!(
+            set.active(),
+            tab_of(&set, "b"),
+            "the saved active tab, in the base view"
+        );
+
+        // A view already showing a tab is not given a second one.
+        let mut set = super::tests::set();
+        let _one = set.active();
+        let held = set.open(AgentId::Claude);
+        assert_eq!(set.break_out(view(2)), Ok(held));
+        set.set_layout_views(vec![view(2)]);
+        let (_from, _run) = restore_into(&mut set, vec![planned_in("a", 2)], Some("a"));
+        assert_eq!(set.tab_in(view(2)), Some(held));
+        assert_eq!(set.view_of(tab_of(&set, "a")), ViewId::BASE);
+        assert_eq!(set.active(), tab_of(&set, "a"));
+    }
+
+    /// The tab the screen falls back to when the restored active tab fails is a base-view tab: one that
+    /// came back bound to an extra view cannot be the base view's active tab.
+    #[test]
+    fn a_failed_restored_active_tab_falls_back_to_a_base_view_tab() {
+        let mut set = set();
+        set.set_layout_views(vec![view(2)]);
+        let (from, mut run) = restore_into(
+            &mut set,
+            vec![
+                planned_in("a", 2),
+                planned("b", SessionModeChoice::Auto),
+                planned("c", SessionModeChoice::Auto),
+            ],
+            Some("b"),
+        );
+        let (a, b, c) = (tab_of(&set, "a"), tab_of(&set, "b"), tab_of(&set, "c"));
+        assert_eq!(set.view_of(a), view(2));
+        assert_eq!((b, set.active()), (from, from));
+        assert_eq!(run.first_survivor(), Some(b), "the bound tab is no place to go back to");
+
+        let back_to = run.back_to(b);
+        run.note_failed(b, "refused");
+        set.get_mut(b).unwrap().backend = TabBackend::Failed {
+            reason: "refused".to_string(),
+        };
+        set.discard_failed_restore(b, back_to);
+        assert_eq!(run.first_survivor(), Some(c));
+        assert!(set.select(c), "the fallback is a tab the base view can show");
+        assert_eq!(set.active(), c);
+        assert_eq!(set.view_of(a), view(2));
+    }
+
+    /// A put-off restore keeps its sessions as failed tabs, each in the view it was saved in under the
+    /// rule a started restore follows, so the next write of the file still names those views.
+    #[test]
+    fn a_put_off_restore_keeps_each_tabs_saved_view() {
+        let mut set = set();
+        set.set_layout_views(vec![view(2)]);
+        let from = set.active();
+        let RestoreStep::Go(go) = set.begin_restore(
+            plan_of(
+                vec![
+                    planned_in("a", 2),
+                    planned("b", SessionModeChoice::Auto),
+                    planned_in("c", 2),
+                ],
+                Some("a"),
+            ),
+            BypassPolicy::Ask,
+        ) else {
+            panic!("nothing to ask")
+        };
+        assert!(!set.keep_put_off_restore(from, go, "put off"));
+        assert!(set.v1_holds());
+        let kept = |set: &TabSet, session: &str| {
+            set.tabs()
+                .iter()
+                .find(|t| t.failed_resume.as_deref() == Some(session))
+                .map(|t| t.id)
+                .expect("the session is kept in a failed tab")
+        };
+        let (a, b, c) = (kept(&set, "a"), kept(&set, "b"), kept(&set, "c"));
+        assert_eq!(set.view_of(a), view(2));
+        assert_ne!(a, from);
+        assert_eq!(
+            b, from,
+            "the first base-view tab goes into the tab the restore began in"
+        );
+        assert_eq!(set.view_of(c), ViewId::BASE, "agent#2 is taken by then");
+        assert_eq!(
+            set.active(),
+            b,
+            "the saved active tab is bound, so the base view shows its first kept tab"
+        );
+        assert!(matches!(set.get(a).unwrap().backend, TabBackend::Failed { .. }));
+        let saved = set.saved_snapshot("conv").unwrap();
+        let mut views: Vec<(&str, Option<u8>)> = saved
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.view))
+            .collect();
+        views.sort();
+        assert_eq!(views, [("a", Some(2)), ("b", None), ("c", None)]);
+
+        // Not told which views the layout holds: every kept tab is in the base view.
+        let mut set = super::tests::set();
+        let from = set.active();
+        let RestoreStep::Go(go) = set.begin_restore(plan_of(vec![planned_in("a", 2)], Some("a")), BypassPolicy::Ask)
+        else {
+            panic!("nothing to ask")
+        };
+        set.keep_put_off_restore(from, go, "put off");
+        assert_eq!(set.get(from).unwrap().failed_resume.as_deref(), Some("a"));
+        assert!(set.views().is_empty());
+    }
+
+    /// The tab half of the layout's invariant run: random opens, breaks, joins, opens in a view,
+    /// closes and selections over empty tabs, checking after every one that the base view's active
+    /// tab is a base-view tab, the base view holds a tab, an extra view holds at most one, and
+    /// `shown()` lists each shown tab once.
+    #[test]
+    fn views_invariant_run() {
+        struct XorShift(u64);
+        impl XorShift {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        fn check(set: &TabSet, step: usize, op: &str) {
+            let active = set.active();
+            let at = |what: &str| format!("step {step} ({op}): {what}");
+            assert!(
+                set.get(active).is_some_and(|t| t.view_id().is_base()),
+                "{}",
+                at("active is a base-view tab")
+            );
+            assert!(!set.base_tabs().is_empty(), "{}", at("the base view holds a tab"));
+            let mut per_view = std::collections::BTreeMap::<ViewId, usize>::new();
+            for t in set.tabs().iter().filter(|t| !t.view_id().is_base()) {
+                *per_view.entry(t.view_id()).or_default() += 1;
+            }
+            assert!(per_view.values().all(|n| *n == 1), "{}", at("one tab per extra view"));
+            let shown = set.shown();
+            assert_eq!(shown.first(), Some(&(ViewId::BASE, active)), "{}", at("active first"));
+            assert_eq!(
+                shown.iter().filter(|(_, t)| *t == active).count(),
+                1,
+                "{}",
+                at("active once")
+            );
+            for t in set.tabs().iter().filter(|t| !t.view_id().is_base()) {
+                assert_eq!(
+                    shown.iter().filter(|s| **s == (t.view_id(), t.id)).count(),
+                    1,
+                    "{}",
+                    at("every bound tab once")
+                );
+            }
+            assert_eq!(shown.len(), 1 + per_view.len(), "{}", at("nothing else shown"));
+            assert!(set.v1_holds(), "{}", at("v1"));
+        }
+
+        let mut rng = XorShift(0x2f2f_2f2f);
+        let mut set = set();
+        let pick_tab = |set: &TabSet, rng: &mut XorShift| set.tabs()[rng.below(set.tabs().len())].id;
+        let pick_view = |rng: &mut XorShift| ViewId::new(2 + rng.below(8) as u8).unwrap();
+        let mut base_kills = 0;
+        for step in 0..5_000 {
+            let op = if rng.below(20) == 0 { 10 } else { rng.below(10) };
+            let name = match op {
+                0 => {
+                    if set.tabs().len() < 14 {
+                        set.open(AgentId::Claude);
+                    }
+                    "open"
+                }
+                1 => {
+                    let free: Vec<ViewId> = (2..=9u8)
+                        .filter_map(ViewId::new)
+                        .filter(|v| set.tab_in(*v).is_none())
+                        .collect();
+                    if !free.is_empty() {
+                        let v = free[rng.below(free.len())];
+                        let before = set.active();
+                        match set.break_out(v) {
+                            Ok(moved) => assert_eq!(moved, before),
+                            Err(e) => assert_eq!(e, ViewError::OneTabLeft),
+                        }
+                    }
+                    "break_out"
+                }
+                2 => {
+                    let v = pick_view(&mut rng);
+                    let held = set.tab_in(v);
+                    assert_eq!(set.join_back(v), held);
+                    if let Some(tab) = held {
+                        assert_eq!(set.active(), tab);
+                    }
+                    "join_back"
+                }
+                3 => {
+                    let v = pick_view(&mut rng);
+                    let before = set.active();
+                    if set.tabs().len() < 14 {
+                        let taken = set.tab_in(v).is_some();
+                        match set.open_in(AgentId::Claude, v) {
+                            Ok(tab) => {
+                                assert!(!taken);
+                                assert_eq!(set.tab_in(v), Some(tab));
+                            }
+                            Err(e) => assert_eq!(e, ViewError::Taken(v)),
+                        }
+                    }
+                    assert_eq!(set.active(), before, "open_in never moves active");
+                    "open_in"
+                }
+                4 => {
+                    let tab = pick_tab(&set, &mut rng);
+                    let its_view = set.view_of(tab);
+                    let views: Vec<ViewId> = set.views();
+                    set.remove(tab).unwrap();
+                    if !its_view.is_base() {
+                        assert_eq!(set.tab_in(its_view), None, "its view is left empty");
+                    } else {
+                        assert_eq!(set.views(), views, "closing a base-view tab leaves the views");
+                    }
+                    "remove"
+                }
+                5 => {
+                    let tab = pick_tab(&set, &mut rng);
+                    let base = set.view_of(tab).is_base();
+                    let before = set.active();
+                    assert_eq!(set.select(tab), base);
+                    assert_eq!(set.active(), if base { tab } else { before });
+                    "select"
+                }
+                6 => {
+                    let n = 1 + rng.below(16) as u16;
+                    let before = set.active();
+                    match set.select_number(n) {
+                        Some(TabPlace::Base(tab)) => assert_eq!(set.active(), tab),
+                        Some(TabPlace::View(v, tab)) => {
+                            assert_eq!(set.tab_in(v), Some(tab));
+                            assert_eq!(set.active(), before);
+                        }
+                        None => assert_eq!(set.active(), before),
+                    }
+                    "select_number"
+                }
+                7 => {
+                    set.step(if rng.below(2) == 0 { 1 } else { -1 });
+                    "step"
+                }
+                8 => {
+                    set.select_last();
+                    "select_last"
+                }
+                9 => {
+                    let tab = pick_tab(&set, &mut rng);
+                    let before = set.active();
+                    match set.select_place(tab) {
+                        Some(TabPlace::Base(id)) => assert_eq!(set.active(), id),
+                        Some(TabPlace::View(_, _)) => assert_eq!(set.active(), before),
+                        None => panic!("the tab exists"),
+                    }
+                    "select_place"
+                }
+                _ => {
+                    // Every base-view tab closed in turn while the views are live: a fresh base
+                    // tab opens, and the views keep theirs.
+                    let views: Vec<(ViewId, TabId)> = set.shown().into_iter().skip(1).collect();
+                    if !views.is_empty() {
+                        base_kills += 1;
+                    }
+                    for tab in set.base_tabs() {
+                        set.remove(tab).unwrap();
+                        check(&set, step, "a base-view kill");
+                    }
+                    assert_eq!(set.shown().into_iter().skip(1).collect::<Vec<_>>(), views);
+                    assert_eq!(set.base_tabs().len(), 1, "one fresh base tab");
+                    "kill the base view"
+                }
+            };
+            check(&set, step, name);
+        }
+        assert!(base_kills > 0, "the run killed the base view while views were live");
     }
 }
 
@@ -11515,11 +13215,11 @@ mod external_tab_tests {
         provider.inner.queue(turn_completed("turn-1"));
         until("the first turn ends", || set.pump(&dir, true).turn_ended.contains(&tab));
         // Bypass is entered as always: asked first, then confirmed.
-        let plan = match set.cycle_mode(tab) {
+        let plan = match set.cycle_mode(tab, ViewId::BASE) {
             Ok(ModeCycle::Confirm(plan)) => plan,
             other => panic!("expected a question, got {other:?}"),
         };
-        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
         send(&mut set, tab, "second");
         assert_eq!(
             provider.policies(),
@@ -11553,11 +13253,11 @@ mod external_tab_tests {
 
         // Entering bypass mid-turn: the waiting card is approved, and what arrives next is allowed
         // at once, while the running turn keeps the reviewer it started with.
-        let plan = match set.cycle_mode(tab) {
+        let plan = match set.cycle_mode(tab, ViewId::BASE) {
             Ok(ModeCycle::Confirm(plan)) => plan,
             other => panic!("expected a question, got {other:?}"),
         };
-        set.confirm_bypass(plan.scope, plan.nonce).unwrap();
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE).unwrap();
         provider.inner.queue(command("p2"));
         until("both answered", || {
             set.pump(&dir, true);
@@ -11573,7 +13273,10 @@ mod external_tab_tests {
         assert_eq!(provider.policies(), vec![reviewer(Reviewer::Agent)], "no new turn yet");
 
         // Out of bypass before the turn ends (to manual): the next request is a card again, at once.
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Manual)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Manual))
+        );
         provider.inner.queue(command("p3"));
         until("the card after leaving bypass", || {
             set.pump(&dir, true);
@@ -11633,7 +13336,10 @@ mod external_tab_tests {
         assert!(provider.inner.decisions().is_empty(), "manual answers nothing itself");
         assert_eq!(provider.policies(), vec![reviewer(Reviewer::User)]);
         // Manual -> auto moves at once; the reviewer follows at the next turn.
-        assert_eq!(set.cycle_mode(tab), Ok(ModeCycle::Changed(SessionModeChoice::Auto)));
+        assert_eq!(
+            set.cycle_mode(tab, ViewId::BASE),
+            Ok(ModeCycle::Changed(SessionModeChoice::Auto))
+        );
         for id in ["p1", "p2"] {
             provider.inner.queue(AgentDomainEvent::PermissionResolved {
                 permission_id: id.into(),
@@ -11766,6 +13472,7 @@ mod external_tab_tests {
             title: Some(format!("title of {id}")),
             saved_mode: mode,
             label: format!("title of {id}"),
+            view: None,
         }
     }
 
@@ -11798,7 +13505,7 @@ mod external_tab_tests {
         let mut asked: Vec<(AgentId, String)> = Vec::new();
         assert!(set.tabs().iter().all(|t| !matches!(t.backend, TabBackend::Starting(_))));
         let nonce = set.ask_trust(from).unwrap();
-        set.mark_recording(from, nonce).unwrap();
+        set.mark_recording(from, nonce, ViewId::BASE).unwrap();
         let Some(DeferredStart::Restore { go }) = set.take_recorded(from) else {
             panic!("the recorded answer hands the restore back")
         };
@@ -11914,6 +13621,7 @@ mod external_tab_tests {
                 provider_session_id: "thread-1".into(),
                 name: None,
                 mode: SessionModeChoice::Bypass,
+                view: None,
             }]
         );
         assert_eq!(saved.active_external, Some(0));

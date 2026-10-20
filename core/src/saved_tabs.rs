@@ -42,6 +42,10 @@ pub struct SavedTab {
     /// The mode the tab was in. `bypass` is kept here because the person who chose it should see it
     /// again -- and be asked about it, never silently given it back, when the tabs are restored.
     pub mode: SessionModeChoice,
+    /// The chat view the tab was shown in, 2 to 9 (`agent#N`); absent for the base view.
+    /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    pub view: Option<u8>,
 }
 
 /// One tab of an agent other than Claude worth bringing back.
@@ -55,6 +59,18 @@ pub struct SavedExternalTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub mode: SessionModeChoice,
+    /// The chat view the tab was shown in, 2 to 9 (`agent#N`); absent for the base view.
+    /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    pub view: Option<u8>,
+}
+
+fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u8::try_from(n).ok())
+        .filter(|n| (2..=crate::layout::module::MAX_INSTANCE).contains(n)))
 }
 
 /// The tabs of one window, in tab-bar order: the Claude tabs, then the other agents' tabs.
@@ -549,6 +565,7 @@ mod tests {
             provider_session_id: session.to_string(),
             name: name.map(str::to_string),
             mode,
+            view: None,
         }
     }
 
@@ -560,6 +577,70 @@ mod tests {
             ],
             active: 1,
             ..SavedTabs::default()
+        }
+    }
+
+    #[test]
+    fn a_tab_in_a_chat_view_keeps_its_view_and_a_build_before_views_still_reads_the_file() {
+        let mut saved = two();
+        saved.tabs[1].view = Some(3);
+        saved.external_tabs = vec![SavedExternalTab {
+            view: Some(2),
+            ..codex("thread-a", SessionModeChoice::Auto)
+        }];
+        let text = encode(&saved, &root());
+        assert_eq!(decode(&text, &root()), Ok(saved.clone()));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["version"], 1, "the version stays 1");
+        assert!(value["tabs"][0].get("view").is_none(), "a base-view tab writes no view");
+        assert_eq!(value["tabs"][1]["view"], 3);
+        assert_eq!(value["external_tabs"][0]["view"], 2);
+        assert!(
+            !encode(&two(), &root()).contains("view"),
+            "a window with no chat view writes what it always wrote"
+        );
+
+        // The entries as a build before views has them: serde ignores the key it does not know.
+        #[derive(Deserialize)]
+        struct BeforeViewsTab {
+            provider_session_id: String,
+            mode: SessionModeChoice,
+        }
+        #[derive(Deserialize)]
+        struct BeforeViewsExternal {
+            agent: AgentId,
+            provider_session_id: String,
+        }
+        #[derive(Deserialize)]
+        struct BeforeViewsFile {
+            tabs: Vec<BeforeViewsTab>,
+            external_tabs: Vec<BeforeViewsExternal>,
+        }
+        let older: BeforeViewsFile = serde_json::from_str(&text).expect("a build before views reads the file");
+        assert_eq!(older.tabs[1].provider_session_id, "s-two");
+        assert_eq!(older.tabs[1].mode, SessionModeChoice::Bypass);
+        assert_eq!(older.external_tabs[0].agent, AgentId::Codex);
+        assert_eq!(older.external_tabs[0].provider_session_id, "thread-a");
+    }
+
+    #[test]
+    fn a_view_that_no_chat_view_can_have_is_read_as_none() {
+        for bad in ["0", "1", "10", "300", "-1", "2.5", "\"2\"", "null", "true"] {
+            let text = format!(
+                r#"{{"version":1,"project_root":"/home/user/project","tabs":[
+                {{"conversation_id":"c","provider_session_id":"s","mode":"auto","view":{bad}}}],"active":0,
+                "external_tabs":[{{"agent":"codex","conversation_id":"c","provider_session_id":"t","mode":"auto","view":{bad}}}]}}"#
+            );
+            let read = decode(&text, &root()).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(read.tabs[0].view, None, "{bad}");
+            assert_eq!(read.external_tabs[0].view, None, "{bad}");
+        }
+        for good in 2..=9u8 {
+            let text = format!(
+                r#"{{"version":1,"project_root":"/home/user/project","tabs":[
+                {{"conversation_id":"c","provider_session_id":"s","mode":"auto","view":{good}}}],"active":0}}"#
+            );
+            assert_eq!(decode(&text, &root()).unwrap().tabs[0].view, Some(good));
         }
     }
 
@@ -602,6 +683,7 @@ mod tests {
                 provider_session_id: "x".to_string(),
                 name: None,
                 mode: SessionModeChoice::Manual,
+                view: None,
             }],
             active_external: None,
         };
@@ -1042,6 +1124,7 @@ mod tests {
             provider_session_id: session.to_string(),
             name: Some("refactor".to_string()),
             mode,
+            view: None,
         }
     }
 
@@ -1158,6 +1241,7 @@ mod measure {
             provider_session_id: format!("s{i}"),
             name: None,
             mode: SessionModeChoice::Auto,
+            view: None,
         };
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();

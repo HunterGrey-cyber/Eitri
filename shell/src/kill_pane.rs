@@ -1,39 +1,55 @@
-//! `prefix x` kills the selected module after a y/n question in `close_prompt`.
-//! The question names the module. Each module ends its running content as follows.
+//! `prefix x`, tmux's `kill-pane`: it closes the module outright rather than hiding it. Stock
+//! tmux binds `x` to `confirm-before -p "kill-pane #P? (y/n)" kill-pane` (checked against a
+//! throwaway `tmux -L xprobe -f /dev/null` server, tmux next-3.7), so Eitri asks first too, in the
+//! window's one y/n (`close_prompt`), naming the module where tmux names the pane's number.
 //!
-//! A terminal receives SIGHUP and returns to its initial hidden placement; `prefix t` starts
-//! a fresh shell. A Lua panel's web process is terminated and the module returns to its hidden
-//! `position`; its key loads the page again. The agent closes all session tabs as `prefix &`
-//! closes one, keeping sessions resumable, then hides in place. `prefix a` opens its session chooser.
+//! What a kill ends, per module:
+//! - **terminal**: its shell is hung up (SIGHUP, as closing a terminal does) and the module goes back
+//!   where a first launch puts it, hidden; `prefix t` starts a fresh shell there.
+//! - **a Lua panel**: its web process is terminated and the module goes back where its `position`
+//!   puts it, hidden; its key loads the page afresh.
+//! - **agent**: every base-view tab is closed as `prefix &` closes one (records stay resumable), and
+//!   the module is hidden in place; `prefix a` opens the chat with the session chooser. A tab shown in
+//!   another chat view keeps running there.
+//! - **a chat view `agent#N`**: its one tab is closed the same way and the view leaves every
+//!   workspace; its page waits idle under its id for the next view of that number.
+//! - **editor**: nvim is asked to `:confirm qall`, so unsaved buffers get nvim's own prompt; only if
+//!   nvim quits does the module go. It cannot come back in this window (`eitri_core::layout::kill`'s
+//!   module doc: the fork's `LiveHarness` owns a winit event loop, which is once per process), and
+//!   the prompt says so. Cancelled in nvim, nothing closes.
 //!
-//! The editor receives `:confirm qall`, so nvim prompts for unsaved buffers. Cancelling keeps it
-//! open. Once nvim quits, the editor cannot restart in this window because `LiveHarness` has
-//! a winit event loop that can run only once per process. The confirmation prompt explains this.
+//! - **the last module on screen**: tmux closes the window when its last pane is killed, and ends when its last window
+//!   is, so `x` here closes Eitri ([`KillScope::Window`]). One question: it names what the window
+//!   close would have asked about (`N running, M queued`), and `y` is taken as the answer to both. The
+//!   editor still goes through `:confirm qall` first, and the window closes when nvim exits.
 //!
-//! Killing the last visible module closes the window ([`KillScope::Window`]). A single question
-//! includes the window close's running and queued counts, and `y` confirms both actions.
-//! The editor still goes through `:confirm qall`, and the window waits for nvim to exit.
+//! - **every window close** never discards unsaved editor changes
+//!   silently: the top bar's close, the compositor's, the last module's
+//!   kill, the terminal's `exit` as the last module -- each asks nvim to `:confirm qall` exactly as
+//!   `prefix x` on the editor does ([`EditorQuit::Window`]), and the window closes only when nvim
+//!   exits. A plain `:qa!`, which the fork's quit would run, discards unsaved buffers AND deletes their
+//!   swap files. The precedent is stock Neovide's own `g:neovide_confirm_quit`, on by default
+//!   (`src/window/settings.rs` in the fork), which makes its window close run `confirm qa` -- and,
+//!   like Neovide's, the quit is an RPC request (`nvim_exec_lua`), never typed keys, which a key nvim
+//!   is waiting for (after `f`) would swallow (`eitri_core::layout::kill::editor_quit_lua`). An
+//!   editor that is not on screen -- hidden, or zoomed away -- is brought on screen for the prompt
+//!   ([`reveal_for_prompt`]); one that was hidden is hidden again if nvim quits, so the saved
+//!   arrangement stays the user's. A second request while nvim is asking is refused, as a second `x`
+//!   is, with what nvim is doing ([`NvimState`]); only when nvim's own loop has not answered for
+//!   [`NVIM_QUIT_PATIENCE`] does it kill nvim instead ([`quit_request`]).
+//! - **a declined window close after nvim exited on its own**: nvim is gone and the window
+//!   stays, so the editor is retired as `prefix x`'s kill of it retires it ([`Reopen::Never`]) --
+//!   never left on screen holding the keys with nothing behind it ([`retire_on_declined_close`]).
+//!   It cannot be restarted in this window (the winit event loop above); `prefix e` then says so.
 //!
-//! Every window close follows the same editor quit path ([`EditorQuit::Window`]), including the
-//! top bar, compositor, last-module kill, and the last terminal's `exit`. `:qa!` would discard
-//! unsaved buffers and delete swap files. The quit request uses `nvim_exec_lua` rather than typed
-//! keys, which nvim could consume as input for a pending command such as `f`.
-//! A hidden or zoomed-away editor is revealed for its prompt ([`reveal_for_prompt`]); one that was
-//! hidden is hidden again if nvim quits, preserving the saved arrangement. A second request while
-//! nvim is asking is refused with its current [`NvimState`]. Only after nvim has failed to answer
-//! for [`NVIM_QUIT_PATIENCE`] does [`quit_request`] kill it instead.
-//!
-//! If a window close is declined after nvim exits on its own, the editor is retired with
-//! [`Reopen::Never`] through [`retire_on_declined_close`]. This avoids leaving an empty editor
-//! holding keyboard focus. `prefix e` explains that it cannot restart in this window.
-//!
-//! This module holds display-free decisions: prompt text, each module's `Reopen` behavior, and
-//! individual editor quit decisions. `editor_quit` coordinates them against a host interface;
-//! `main.rs` carries them out.
+//! This file holds the pure pieces decided without a display: the prompt's text, where each kind of
+//! module is left (`Reopen`), and each single decision of the editor's quit. The flow that strings
+//! those decisions together is `editor_quit` (also display-free, tested against a fake host);
+//! `main.rs` only carries it out.
 
 use std::time::{Duration, Instant};
 
-use eitri_core::layout::{KillScope, Layout, ModuleDecl, ModuleId, ModuleKind, Placement, Reopen};
+use eitri_core::layout::{declared_placement, KillScope, Layout, ModuleDecl, ModuleId, ModuleKind, Placement, Reopen};
 use neovide_editor::CallWatch;
 
 /// The y/n `prefix x` asks. `title` is the module's name as the tray and the strip show it;
@@ -43,6 +59,20 @@ use neovide_editor::CallWatch;
 /// screen, whose kill closes Eitri -- they are the window close's, for every module, so this one
 /// question stands in for that one too.
 pub(crate) fn prompt(id: &ModuleId, title: &str, scope: KillScope, running: usize, queued: usize) -> String {
+    prompt_closing_tab(id, title, scope, None, running, queued)
+}
+
+/// [`prompt`] for a chat view that shows one tab (`agent#N`): the y/n names the tab it closes,
+/// `tab` (its label as the view's strip shows it), ahead of the counts, which are that tab's own. The
+/// base view's kill closes every base-view tab and names none.
+pub(crate) fn prompt_closing_tab(
+    id: &ModuleId,
+    title: &str,
+    scope: KillScope,
+    tab: Option<&str>,
+    running: usize,
+    queued: usize,
+) -> String {
     let mut consequences = Vec::new();
     if scope == KillScope::Window {
         consequences.push("closes Eitri".to_string());
@@ -56,6 +86,9 @@ pub(crate) fn prompt(id: &ModuleId, title: &str, scope: KillScope, running: usiz
     }
     match id.kind() {
         ModuleKind::Agent => {
+            if let Some(tab) = tab {
+                consequences.push(format!("closes tab {tab}"));
+            }
             if running > 0 {
                 consequences.push(format!("{running} running"));
             }
@@ -285,13 +318,15 @@ pub(crate) fn close_is_confirmed(confirmed: Option<&str>, now: Option<&str>) -> 
     now.is_none() || now == confirmed
 }
 
-/// Where the layout leaves a killed module (`eitri_core::layout::Reopen`). `decls` are the Lua
-/// panels as `init.lua` registered them.
+/// Where the layout leaves a killed module (`eitri_core::layout::Reopen`). `decls` are the window's
+/// module declarations: the Lua panels as `init.lua` registered them, each at its open rule's place
+/// when it has one, and the base terminal's when an open rule names it.
 pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     match id.kind() {
-        // Use `BelowEditor` to reopen the terminal below the editor's leaf, matching its first
-        // launch. `BelowRoot` would also span the neighboring Lua `side` panel.
-        ModuleKind::Terminal if id.number() == 1 => Reopen::At(Placement::BelowEditor),
+        // Unless an open rule overrides placement, use `BelowEditor` to reopen the terminal below
+        // the editor's leaf, matching its first launch. `BelowRoot` would also span the neighboring
+        // Lua `side` panel.
+        ModuleKind::Terminal if id.number() == 1 => Reopen::At(declared_placement(decls, id, Placement::BelowEditor)),
         // A numbered terminal was made by the user and has no first-launch place to go back to: it
         // leaves every workspace, and its number is free for the next new terminal.
         ModuleKind::Terminal => Reopen::Remove,
@@ -299,6 +334,9 @@ pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
             .iter()
             .find(|d| d.id == *id)
             .map_or(Reopen::InPlace, |d| Reopen::At(d.placement)),
+        // A numbered chat view was made by the user, as a numbered terminal was: it leaves every
+        // workspace, its page waits idle under its id, and its number is free for the next new view.
+        ModuleKind::Agent if id.number() >= 2 => Reopen::Remove,
         ModuleKind::Agent | ModuleKind::Canvas => Reopen::InPlace,
         ModuleKind::Editor => Reopen::Never,
     }
@@ -691,5 +729,69 @@ mod tests {
         let instance = ModuleId::parse("terminal#2").unwrap();
         assert_eq!(reopen(&instance, &[]), Reopen::Remove);
         assert_eq!(reopen(&ModuleId::terminal(), &[]), Reopen::At(Placement::BelowEditor));
+    }
+
+    #[test]
+    fn a_numbered_chat_view_leaves_the_layout_when_killed() {
+        for n in 2..=9 {
+            let view = ModuleId::parse(&format!("agent#{n}")).unwrap();
+            assert_eq!(reopen(&view, &[]), Reopen::Remove, "{view}");
+        }
+        assert_eq!(
+            reopen(&ModuleId::agent(), &[]),
+            Reopen::InPlace,
+            "the base view stays, hidden"
+        );
+    }
+
+    #[test]
+    fn the_y_n_for_an_extra_view_names_its_tab() {
+        let view = ModuleId::parse("agent#2").unwrap();
+        assert_eq!(
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 0, 0),
+            "kill-pane agent 2? closes tab 3 refactor (y/n)"
+        );
+        assert_eq!(
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 1, 2),
+            "kill-pane agent 2? closes tab 3 refactor, 1 running, 2 queued (y/n)"
+        );
+        assert_eq!(
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, None, 0, 0),
+            "kill-pane agent 2? (y/n)",
+            "a view whose tab has gone names none"
+        );
+        assert_eq!(
+            prompt_closing_tab(&view, "agent 2", KillScope::Window, Some("3 refactor"), 1, 0),
+            "kill-pane agent 2? closes Eitri, 1 running (y/n)",
+            "the last module's kill is the window close's question"
+        );
+        assert_eq!(
+            prompt_closing_tab(
+                &ModuleId::terminal(),
+                "terminal",
+                KillScope::Module,
+                Some("3 refactor"),
+                0,
+                0
+            ),
+            "kill-pane terminal? (y/n)",
+            "only a chat view closes a tab"
+        );
+    }
+
+    /// An open rule moves the base terminal's first-launch place, and a kill brings it back there, not
+    /// below the editor.
+    #[test]
+    fn a_killed_terminal_comes_back_where_its_rule_says() {
+        let decls = [ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::BelowRoot,
+        }];
+        assert_eq!(reopen(&ModuleId::terminal(), &decls), Reopen::At(Placement::BelowRoot));
+        assert_eq!(
+            reopen(&ModuleId::parse("terminal#2").unwrap(), &decls),
+            Reopen::Remove,
+            "a numbered terminal still leaves"
+        );
     }
 }

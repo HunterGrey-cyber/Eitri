@@ -137,6 +137,7 @@ fn template(name: &str) -> Option<&'static str> {
         "next-layout" | "previous-layout" => "t:",
         "rotate-window" => "Dt:UZ",
         "display-panes" => "bd:Nt:",
+        "break-pane" => "abdPF:n:s:t:",
         "kill-pane" | "kill-window" | "next-window" | "previous-window" => "at:",
         "last-window" => "t:",
         "new-window" => "abc:de:F:kn:PSt:",
@@ -661,6 +662,11 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
             parsed.only("")?;
             parsed.at_most(0)?;
             Ok(Action::SelectNumber)
+        }
+        "break-pane" => {
+            parsed.only("")?;
+            parsed.at_most(0)?;
+            Ok(Action::TabBreak)
         }
         "kill-pane" => {
             parsed.only("")?;

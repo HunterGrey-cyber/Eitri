@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use block2::RcBlock;
-use eitri_panel::agent_panel::AgentPanelHandle;
+use eitri_panel::agent_panel::{AgentPanelHandle, ViewId};
 use eitri_panel::panel_document::PanelDocument;
 use eitri_panel::panel_page::{PageSurface, PanelPage};
 use objc2::rc::Retained;
@@ -63,16 +63,16 @@ pub trait PageEvents {
 
 impl PageEvents for AgentPanelHandle {
     fn page_message(&self, raw: &str) {
-        AgentPanelHandle::page_message(self, raw);
+        AgentPanelHandle::page_message(self, ViewId::BASE, raw);
     }
     fn link_clicked(&self, url: Option<&str>) {
-        AgentPanelHandle::link_clicked(self, url);
+        AgentPanelHandle::link_clicked(self, ViewId::BASE, url);
     }
     fn page_gone(&self, reason: &str) {
-        AgentPanelHandle::page_gone(self, reason);
+        AgentPanelHandle::page_gone(self, ViewId::BASE, reason);
     }
     fn page_shown(&self) {
-        AgentPanelHandle::page_shown(self);
+        AgentPanelHandle::page_shown(self, ViewId::BASE);
     }
 }
 
@@ -594,7 +594,7 @@ impl PanelView {
     /// page's messages have somewhere to go.
     pub fn connect(&self, panel: &AgentPanelHandle) {
         self.report_to(Rc::new(panel.clone()));
-        panel.load_first_document();
+        panel.load_document(ViewId::BASE);
     }
 
     /// Cuts the page off from the panel, for a window that is shutting down: called before the panel's own

@@ -71,8 +71,15 @@ const MESSAGE_BUSY: &str = "the review message is still being prepared; try agai
 
 /// What the shell owes the panel after a call into the flow, in order.
 pub enum Out {
-    /// A JSON envelope to dispatch to the panel.
+    /// A JSON envelope for the window as a whole (the interrupted reverts on offer), not for any one
+    /// request or tab.
     Envelope(String),
+    /// A JSON envelope that answers, or is part of the answer to, the panel request `request_id`:
+    /// it goes to the page that sent that request.
+    Answer { request_id: String, payload: String },
+    /// A tab's review draft as it is now, changed by no request of its own: it goes to the page that
+    /// shows the tab.
+    Draft(TabId, String),
     /// A confirmed review went out (or was refused by the backend and left queued): the shell
     /// applies it as it does any flush of a tab's queue, and adds nothing to the prompt history.
     Flushed(TabId, Flush),
@@ -310,6 +317,20 @@ impl ReviewFlow {
                 rx,
             });
         }
+    }
+
+    /// Whether the panel request `request_id` may still be answered: it is being worked out, waits
+    /// for the editor, or its answer is decided and not yet handed out.
+    pub fn owes_answer(&self, request_id: &str) -> bool {
+        self.write.as_ref().is_some_and(|w| w.request_id == request_id)
+            || self.anchors.iter().any(|w| w.request_id == request_id)
+            || self.sends.iter().any(|w| w.request_id == request_id)
+            || self.opens.iter().any(|w| w.request_id == request_id)
+            || self.awaiting.contains_key(request_id)
+            || self
+                .early
+                .iter()
+                .any(|out| matches!(out, Out::Answer { request_id: id, .. } if id == request_id))
     }
 
     /// How many workers this flow has started: a request refused before its worker was built
@@ -1306,13 +1327,10 @@ impl ReviewFlow {
         let tab = work.tab;
         let Some(confirmed) = work.confirm.as_deref() else {
             let queued = tabs.get(tab).is_some_and(would_wait);
-            out.push(Out::Envelope(serialize_review_send_preview_for_js(
-                id,
-                tab,
-                &work.draft,
-                &preview,
-                queued,
-            )));
+            out.push(Out::Answer {
+                request_id: id.to_string(),
+                payload: serialize_review_send_preview_for_js(id, tab, &work.draft, &preview, queued),
+            });
             return;
         };
         if confirmed != preview.digest {
@@ -1397,22 +1415,37 @@ const NOT_RECORDED: &str =
     "reverted, but the tab closed before it was recorded; the replaced bytes are kept in the review store";
 const UNDO_NOT_RECORDED: &str = "undone, but the tab closed before it was recorded";
 
+fn answer(request_id: &str, payload: String) -> Out {
+    Out::Answer {
+        request_id: request_id.to_string(),
+        payload,
+    }
+}
+
 fn failed(request_id: &str, why: &str) -> Out {
-    Out::Envelope(serialize_command_result_for_js(request_id, Err(why)))
+    answer(request_id, serialize_command_result_for_js(request_id, Err(why)))
 }
 
 fn ok(request_id: &str) -> Out {
-    Out::Envelope(serialize_command_result_for_js(request_id, Ok(())))
+    answer(request_id, serialize_command_result_for_js(request_id, Ok(())))
 }
 
 fn ok_with(request_id: &str, message: &str) -> Out {
-    Out::Envelope(serialize_command_ok_with_message_for_js(request_id, message))
+    answer(
+        request_id,
+        serialize_command_ok_with_message_for_js(request_id, message),
+    )
 }
 
-/// The tab's draft as the panel draws it; `None` when the tab is gone.
+/// The tab's draft as the panel draws it, as the answer to `request_id` or on its own; `None` when
+/// the tab is gone.
 fn draft_envelope(request_id: Option<&str>, tab: TabId, tabs: &TabSet) -> Option<Out> {
     let draft = tabs.review_draft(tab).ok()?;
-    Some(Out::Envelope(serialize_review_draft_for_js(request_id, tab, draft)))
+    let payload = serialize_review_draft_for_js(request_id, tab, draft);
+    Some(match request_id {
+        Some(request_id) => answer(request_id, payload),
+        None => Out::Draft(tab, payload),
+    })
 }
 
 /// Why `ticket` is no longer wanted, if it is not: its tab closed, or the tab holds another session.

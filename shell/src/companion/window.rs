@@ -18,7 +18,7 @@ use super::close_watch::{CloseWatcher, ExitDecision};
 use super::link::{self, CompanionLink};
 use super::wm_runner::WmRunner;
 use super::Start;
-use crate::agent_panel::{self, AgentPanelHandle};
+use crate::agent_panel::{self, AgentPanelHandle, ViewId};
 use crate::close_prompt::ClosePrompt;
 use crate::lua::LuaEngine;
 use crate::module_grid::{HostKind, ModuleGrid};
@@ -72,18 +72,18 @@ fn run_tab(
     let switched = match plan.verb {
         TabVerb::New => {
             agent.new_tab();
-            agent.enter_input();
+            agent.enter_input(ViewId::BASE);
             true
         }
         TabVerb::Step(delta) => agent.step(delta),
         TabVerb::Last => agent.select_last(),
-        TabVerb::Select(n) => agent.select_number(n),
+        TabVerb::Select(n) => agent.select_number(n).is_some(),
         TabVerb::Rename => {
-            agent.begin_rename();
+            agent.begin_rename(ViewId::BASE);
             true
         }
         TabVerb::Close => {
-            agent.confirm_close();
+            agent.confirm_close(ViewId::BASE);
             true
         }
         TabVerb::CloseOthers => {
@@ -91,11 +91,11 @@ fn run_tab(
             true
         }
         TabVerb::Choose => {
-            agent.open_chooser();
+            agent.open_chooser(ViewId::BASE);
             true
         }
         TabVerb::Info => {
-            agent.open_detail();
+            agent.open_detail(ViewId::BASE);
             true
         }
         TabVerb::Flash => false,
@@ -239,7 +239,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // The panel is the only module, so these are the pieces the full window wires around its
     // modules, each with the editor left out.
-    agent_panel::install_reload_action(app, &agent);
+    // One chat page: the reload is always the base view's.
+    agent_panel::install_reload_action(app, &agent, Rc::new(|| ViewId::BASE));
     let panel_px = Rc::new(std::cell::Cell::new(config.panel_font_size));
     // With no editor, a size change scales the panel alone.
     let text_size = TextSizeController::install(app, None, agent.clone(), config.panel_font_size, panel_px.clone());
@@ -261,7 +262,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             |_| {},
             move |id, has_keys| {
                 if id.kind() == ModuleKind::Agent {
-                    agent.set_pane_focused(has_keys);
+                    agent.set_pane_focused(ViewId::BASE, has_keys);
                 }
             },
         );
@@ -303,7 +304,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let agent_for_tabs = agent.clone();
         let focus_module = focus_module.clone();
         let toast = toast.clone();
-        agent.on_tab_verb(move |action| run_tab(action, &window, &grid, &agent_for_tabs, &*focus_module, &toast));
+        agent
+            .on_tab_verb(move |_view, action| run_tab(action, &window, &grid, &agent_for_tabs, &*focus_module, &toast));
     }
 
     // The global `f` HINT, over the panel alone.
@@ -407,20 +409,20 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 };
                 match companion_prefix::classify(&action) {
                     CompanionVerb::Tab(tab) => run_tab(tab, &window_for_tabs, &grid, &agent, &*focus_module, &toast),
-                    CompanionVerb::Reload => agent.reload_document_by_hand(),
+                    CompanionVerb::Reload => agent.reload_document_by_hand(ViewId::BASE),
                     CompanionVerb::Keymap => {
                         focus_module(&ModuleId::agent());
-                        agent.open_keymap(None, 0);
+                        agent.open_keymap(ViewId::BASE, None, 0);
                     }
                     CompanionVerb::CommandLine => {
                         focus_module(&ModuleId::agent());
-                        agent.open_command_line();
+                        agent.open_command_line(ViewId::BASE);
                     }
                     CompanionVerb::Text(change) => text_size.apply_panel(change.into()),
                     CompanionVerb::Hint => hint.toggle_from_prefix(keycode),
                     CompanionVerb::Literal => {
                         if let Some(key) = crate::prefix::literal_for(&action, &keymap) {
-                            agent.literal_key(&key);
+                            agent.literal_key(ViewId::BASE, &key);
                         }
                     }
                     CompanionVerb::Select(direction) => {
@@ -456,7 +458,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // The page's stale-mirror recovery and its `pane_nav` ask for the move the chord would have made.
     {
         let move_focus = move_focus.clone();
-        agent.on_nav_fallthrough(move |direction| {
+        agent.on_nav_fallthrough(move |_view, direction| {
             move_focus(&ModuleId::agent(), direction);
         });
     }
@@ -464,7 +466,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         ModuleId::agent(),
         &agent_host,
         move_focus.clone(),
-        Some(agent.nav_intercept()),
+        Some(agent.nav_intercept(ViewId::BASE)),
         false,
     );
     // No key with Super or Hyper held reaches the panel's page (`panel_super.rs`).
@@ -586,11 +588,11 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let agent_for_done = agent.clone();
         let focus_module = focus_module.clone();
         let runner = runner.clone();
-        agent.on_editor_done(move || {
+        agent.on_editor_done(move |_view| {
             focus_module(&ModuleId::agent());
             runner.raise_pid(std::process::id());
-            if !agent_for_done.focus_oldest_card() {
-                agent_for_done.arrive();
+            if !agent_for_done.focus_oldest_card(ViewId::BASE) {
+                agent_for_done.arrive(ViewId::BASE);
             }
         });
     }

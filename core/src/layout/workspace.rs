@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use super::geometry::Frame;
 use super::kill::{kill, Reopen};
-use super::module::{ModuleDecl, ModuleId};
+use super::module::{declared_placement, ModuleDecl, ModuleId, ModuleKind, Placement};
 use super::tree::{Layout, LayoutError};
 
 /// The workspace every window has from its first launch, and the one a file from before workspaces
@@ -110,6 +110,11 @@ pub(crate) fn printable(text: &str) -> String {
 
 /// Makes the layout hold the window's modules, removing absent instances before adding missing modules.
 pub fn fit_to(layout: &mut Layout, modules: &[ModuleId]) -> Vec<String> {
+    fit_to_with(layout, modules, &[])
+}
+
+/// Fits the window's modules, placing missing ones hidden at their declared placement or below the editor.
+pub fn fit_to_with(layout: &mut Layout, modules: &[ModuleId], decls: &[ModuleDecl]) -> Vec<String> {
     let mut notes = Vec::new();
     for id in layout.modules() {
         if id.number() >= 2 && !modules.contains(&id) {
@@ -119,12 +124,15 @@ pub fn fit_to(layout: &mut Layout, modules: &[ModuleId]) -> Vec<String> {
     }
     for id in modules {
         if !layout.contains(id) {
-            let root = super::tree::place_new(layout.root_node(), id, super::module::Placement::BelowEditor).0;
+            let placement = declared_placement(decls, id, Placement::BelowEditor);
+            let root = super::tree::place_new(layout.root_node(), id, placement).0;
             layout.replace_root(root);
             layout.hide_unfocused(id).expect("another module remains shown");
-            notes.push(format!(
-                "placed '{id}' below the editor, hidden: another workspace has it"
-            ));
+            notes.push(if placement == Placement::BelowEditor {
+                format!("placed '{id}' below the editor, hidden: another workspace has it")
+            } else {
+                format!("placed '{id}' where its open rule says, hidden: another workspace has it")
+            });
         }
     }
     notes
@@ -133,6 +141,11 @@ pub fn fit_to(layout: &mut Layout, modules: &[ModuleId]) -> Vec<String> {
 impl Workspaces {
     /// Adds every module held by any workspace to all the others, keeping existing placements.
     pub fn fit_all(&mut self, live: &mut Layout) -> Vec<String> {
+        self.fit_all_with(live, &[])
+    }
+
+    /// Fits every workspace to their combined modules, using declarations for missing modules only.
+    pub fn fit_all_with(&mut self, live: &mut Layout, decls: &[ModuleDecl]) -> Vec<String> {
         let mut modules = Vec::new();
         for (_, layout) in self.each(live) {
             for id in layout.modules() {
@@ -151,7 +164,7 @@ impl Workspaces {
                     .expect("every non-current workspace is stored")
             };
             notes.extend(
-                fit_to(layout, &modules)
+                fit_to_with(layout, &modules, decls)
                     .into_iter()
                     .map(|note| format!("workspace '{name}': {note}")),
             );
@@ -411,9 +424,14 @@ impl Workspaces {
 
     /// Adds a hidden instance below the editor in every stored workspace.
     pub fn add_everywhere(&mut self, id: &ModuleId) {
+        self.add_everywhere_at(id, Placement::BelowEditor);
+    }
+
+    /// Adds a hidden module at `placement` in each stored workspace that lacks it.
+    pub fn add_everywhere_at(&mut self, id: &ModuleId, placement: Placement) {
         for layout in self.stored_mut() {
             if !layout.contains(id) {
-                let root = super::tree::place_new(layout.root_node(), id, super::module::Placement::BelowEditor).0;
+                let root = super::tree::place_new(layout.root_node(), id, placement).0;
                 layout.replace_root(root);
                 layout.hide_unfocused(id).expect("another module remains shown");
             }
@@ -500,7 +518,11 @@ impl Kept {
 /// panel.
 pub(crate) fn built_in_and_registered(lua: &[ModuleDecl]) -> BTreeSet<ModuleId> {
     let mut placed: BTreeSet<ModuleId> = [ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()].into();
-    placed.extend(lua.iter().map(|decl| decl.id.clone()));
+    placed.extend(
+        lua.iter()
+            .filter(|decl| decl.id.kind() == ModuleKind::LuaWebview)
+            .map(|decl| decl.id.clone()),
+    );
     placed
 }
 
@@ -1170,5 +1192,56 @@ mod tests {
         assert!(restored.workspaces.reserved().is_empty());
         assert!(restored.workspaces.kept_for("main").is_none());
         assert!(restored.keep_copy.is_some());
+    }
+
+    #[test]
+    fn a_module_added_everywhere_goes_where_it_is_declared() {
+        use crate::layout::module::{ModuleDecl, Placement};
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut live = layout();
+        let mut ws = Workspaces::single();
+        ws.create_copy(&live);
+        ws.add_everywhere_at(&t2, Placement::RightOfRoot);
+        let stored = ws
+            .each(&live)
+            .into_iter()
+            .find(|(name, _)| *name != ws.current())
+            .unwrap()
+            .1
+            .clone();
+        assert!(stored.hidden().contains(&t2));
+        assert_eq!(stored.leaves().last(), Some(&t2), "right of the root");
+
+        let t3 = ModuleId::parse("terminal#3").unwrap();
+        let decls = [ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::RightOfRoot,
+        }];
+        let notes = fit_to_with(&mut live, &[t3.clone()], &decls);
+        assert_eq!(live.leaves().last(), Some(&t3), "its kind's declaration");
+        assert!(live.hidden().contains(&t3));
+        assert!(notes.iter().any(|n| n.contains("'terminal#3'")), "{notes:?}");
+        assert!(
+            built_in_and_registered(&[
+                ModuleDecl {
+                    id: ModuleId::parse("terminal#4").unwrap(),
+                    placement: Placement::BelowEditor
+                },
+                ModuleDecl {
+                    id: ModuleId::lua("notes"),
+                    placement: Placement::RightOfRoot
+                },
+            ])
+            .into_iter()
+            .eq([
+                ModuleId::editor(),
+                ModuleId::agent(),
+                ModuleId::terminal(),
+                ModuleId::lua("notes")
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()),
+            "a built-in's or an instance's declaration does not make it placed by this window"
+        );
     }
 }

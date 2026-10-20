@@ -146,7 +146,10 @@ mod tests {
     fn an_idle_panel_is_not_ticked_and_a_call_still_is() {
         let page = std::rc::Rc::new(Page::default());
         let handle = AgentPanelHandle::for_host_test(page.clone());
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(
+            eitri_panel::agent_panel::ViewId::BASE,
+            r#"{"type":"ready","request_id":"r1"}"#,
+        );
         let pump = PanelPump::new(handle.clone());
         let mut armed = match pump.start(Instant::now()) {
             Timer::Arm(at) => Some(at),

@@ -144,7 +144,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     // The first launch: the terminal hidden, so its chip alone shows.
     tray.refresh(
         &layout(&[ModuleId::terminal()], ModuleId::editor()),
-        Attention::default(),
+        &|_| Attention::default(),
         &[],
     );
     window.present();
@@ -166,7 +166,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     // `Ctrl+a x` in the editor: its chip shows.
     tray.refresh(
         &layout(&[ModuleId::terminal(), ModuleId::editor()], ModuleId::agent()),
-        Attention::default(),
+        &|_| Attention::default(),
         &[],
     );
     pump(900);

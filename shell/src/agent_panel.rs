@@ -18,7 +18,7 @@ use webkit6::prelude::*;
 use webkit6::{NetworkProxyMode, NetworkProxySettings, NetworkSession, UserContentManager, WebView};
 
 // What the rest of `shell` reaches through `crate::agent_panel::`.
-pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound};
+pub(crate) use eitri_panel::agent_panel::{AgentPanelHandle, HintInbound, ViewId};
 
 /// The embedded, single-file `agent-ui/web` production build -- `shell/build.rs`
 /// guarantees this file exists and is current by the time `shell` itself compiles.
@@ -82,6 +82,18 @@ struct WebKitPage(WebView);
 
 impl PageSurface for WebKitPage {
     fn send(&self, envelope_json: &str) {
+        // The grid probe judges what an idle page was sent from this line: a page that is not live can still show
+        // an empty document while data reaches it, so the page's own inbound line cannot vouch for it. The page's
+        // pointer is the identity the probe logs for each host.
+        #[cfg(feature = "probe")]
+        eprintln!(
+            "[agent_panel] page {:#x}: sent {}",
+            gtk4::glib::object::ObjectType::as_ptr(&self.0) as usize,
+            serde_json::from_str::<serde_json::Value>(envelope_json)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(str::to_owned)))
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
         let script = format!(
             "window.__eitriDispatch && window.__eitriDispatch({});",
             serde_json::to_string(envelope_json).unwrap_or_default()
@@ -136,7 +148,8 @@ impl PanelHost for GtkPanelHost {
 /// `unavailable`: `Some(notice)` when WebKit's sandbox cannot start in this process
 /// (`webkit_sandbox::Decision::Unavailable`). Then no `WebView` -- nor anything else of WebKit's --
 /// is built: the panel's place is `webkit_sandbox::notice_widget(notice)`, and the handle carries the
-/// same state with no page (`AgentPanelHandle::page`'s own doc), no pump, no supervisor client.
+/// same state with no page (`AgentPanelHandle::with_pages`'s own doc), no pump, no supervisor client.
+/// Otherwise the handle is built first and the base view's page built for it by [`build_chat_page`].
 pub(crate) fn build_agent_panel(
     project_dir: PathBuf,
     editor_context: eitri_core::editor_context::ContextSource,
@@ -153,31 +166,63 @@ pub(crate) fn build_agent_panel(
         document: &PANEL_DOCUMENT,
     };
     if let Some(notice) = unavailable {
-        let handle = AgentPanelHandle::new(init, None, Rc::new(GtkPanelHost));
+        let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));
         return (crate::webkit_sandbox::notice_widget(notice), handle);
     }
+    let handle = AgentPanelHandle::new(init, true, Rc::new(GtkPanelHost));
+    let (webview, _page) = build_chat_page(&handle, ViewId::BASE, related);
+
+    // Started once, at construction, rather than when a session starts: it is also what collects a
+    // finished background connect. Previously it was started inside the handler that constructs the
+    // backend, which meant a second start attempt after a failure installed a SECOND timer on the
+    // same state -- every later event would then be dispatched twice. One timer serves every page.
+    start_pump_timer(handle.clone());
+
+    (webview.upcast(), handle)
+}
+
+/// The one way a chat page is built: its own `UserContentManager`, the CSP floor, the ephemeral
+/// network session with the proxy backstop (with `related`, the related page's process and session,
+/// which WebKit shares, so no session of its own is set), the navigation and form-submission lock, the link handler, and the `eitriAgent` handler,
+/// which carries `view` -- the only place a message's page is decided. Attaches the page to `handle` as
+/// `view` and loads its document. The page's `PanelPage` comes back with it, so a page that goes idle
+/// and is reused under the same view is attached again as the same page.
+///
+/// Every chat page of the window -- the base view's and each extra view's -- comes from here, so a page
+/// cannot be built without the policy or with a handler that answers for another view: the view is
+/// moved into the handler's closure when the page is built and is never read from page content.
+pub(crate) fn build_chat_page(
+    handle: &AgentPanelHandle,
+    view: ViewId,
+    related: Option<&WebView>,
+) -> (WebView, Rc<PanelPage>) {
+    // Its own content manager: a manager shared between two pages would deliver one page's messages to
+    // the other page's handler too, and the handler is what says which view a message came from.
     let content_manager = UserContentManager::new();
     // A CSP floor the page cannot loosen, plus a network backstop behind it -- see
     // `panel_content_security_policy` and `PANEL_NETWORK_PROXY_URI`'s doc comments.
-    let network_session = NetworkSession::new_ephemeral();
-    network_session.set_proxy_settings(
-        NetworkProxyMode::Custom,
-        Some(&NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI), &[])),
-    );
     let builder = WebView::builder()
         .user_content_manager(&content_manager)
-        .network_session(&network_session)
         .default_content_security_policy(panel_content_security_policy());
-    // `related-view` is construct-only: it can be given here and nowhere later. The page then shares
-    // the related page's web process.
     let webview = match related {
+        // The first page gets the ephemeral session pointed at the unreachable proxy.
+        None => {
+            let network_session = NetworkSession::new_ephemeral();
+            network_session.set_proxy_settings(
+                NetworkProxyMode::Custom,
+                Some(&NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI), &[])),
+            );
+            builder.network_session(&network_session).build()
+        }
+        // `related-view` is construct-only: it can be given here and nowhere later. The page then shares
+        // the related page's web process and its network session, so the proxy backstop with it. WebKit
+        // ignores a session given together with a related view (and logs a critical for it), so none is.
         Some(related) => builder.related_view(related).build(),
-        None => builder.build(),
     };
     webview.set_hexpand(true);
     webview.set_vexpand(true);
     let page = Rc::new(PanelPage::new(Rc::new(WebKitPage(webview.clone()))));
-    let handle = AgentPanelHandle::new(init, Some(page), Rc::new(GtkPanelHost));
+    handle.attach_page(view, page.clone());
 
     // Security: never let this WebView itself navigate away from its one embedded document.
     // Even sanitized markdown can legitimately contain an external link (a click), and a script
@@ -196,7 +241,7 @@ pub(crate) fn build_agent_panel(
                         match action.navigation_type() {
                             webkit6::NavigationType::LinkClicked => {
                                 let uri = action.request().and_then(|r| r.uri());
-                                handle.link_clicked(uri.as_deref());
+                                handle.link_clicked(view, uri.as_deref());
                                 nav_decision.ignore();
                                 return true;
                             }
@@ -222,26 +267,21 @@ pub(crate) fn build_agent_panel(
     content_manager.register_script_message_handler("eitriAgent", None);
     {
         let handle = handle.clone();
+        // `view` is moved in here, once: whatever the page posts, it is this page's view's message.
         content_manager.connect_script_message_received(Some("eitriAgent"), move |_manager, js_value| {
             let raw = js_value.to_str();
-            handle.page_message(&raw);
+            handle.page_message(view, &raw);
         });
     }
 
-    handle.load_first_document();
+    handle.load_document(view);
 
-    // Back on screen: whatever finished in the active tab while the chat was away has been seen
+    // Back on screen: whatever finished in the tab the page shows while it was away has been seen
     // (the tray's `agent •`).
     {
         let handle = handle.clone();
-        webview.connect_map(move |_| handle.page_shown());
+        webview.connect_map(move |_| handle.page_shown(view));
     }
-
-    // Started once, at construction, rather than when a session starts: it is also what collects a
-    // finished background connect. Previously it was started inside the handler that constructs the
-    // backend, which meant a second start attempt after a failure installed a SECOND timer on the
-    // same state -- every later event would then be dispatched twice.
-    start_pump_timer(handle.clone());
 
     // Recover this WebView's own crash automatically (guarded) instead of leaving the chat
     // blank until the user finds `\u{21bb}`/`prefix r` by hand. See `AgentPanelHandle::page_gone`'s
@@ -252,11 +292,11 @@ pub(crate) fn build_agent_panel(
             if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
                 return;
             }
-            handle.page_gone(&format!("{reason:?}"));
+            handle.page_gone(view, &format!("{reason:?}"));
         });
     }
 
-    (webview.upcast(), handle)
+    (webview, page)
 }
 
 /// Runs the panel's tick when it says: a watch on its wake's descriptor, and one one-shot timer armed for
@@ -424,7 +464,7 @@ thread_local! {
 }
 
 /// The panel's Content-Security-Policy: a floor the page cannot loosen, applied two ways -- as the
-/// `WebView`'s own `default-content-security-policy` (`build_agent_panel`) and as the first element
+/// `WebView`'s own `default-content-security-policy` (`build_chat_page`) and as the first element
 /// of `<head>` (`PanelDocument::themed`), so it is in force before the single-file build's own inlined
 /// `<script>`/`<style>` run. Model output rendered in the panel is untrusted; this is defence in
 /// depth behind the markdown sanitizer, for whatever gets past it. Both copies carry the same
@@ -493,12 +533,15 @@ const PANEL_NETWORK_PROXY_URI: &str = "http://127.0.0.1:9";
 /// Ctrl+Shift+R reload window 2's panel. `ApplicationFlags::NON_UNIQUE`
 /// makes that unreachable by giving each launch its own process, so this only matters if a second
 /// window is ever hosted in one process again.
-pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle) {
+///
+/// `keys_view` names the chat view the reload is for when it runs: the one with the keys, else the base
+/// view's, so `prefix r` in an extra view reloads that view's page and never another's.
+pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle, keys_view: Rc<dyn Fn() -> ViewId>) {
     let action = gtk4::gio::SimpleAction::new("reload-agent-panel", None);
     // Cloned because the caller still needs its own handle afterwards -- `connect_close_request`
     // takes it by move.
     let handle = handle.clone();
-    action.connect_activate(move |_, _| handle.reload_document_by_hand());
+    action.connect_activate(move |_, _| handle.reload_document_by_hand(keys_view()));
     app.add_action(&action);
 }
 
@@ -855,8 +898,12 @@ mod tests {
     #[test]
     fn the_webview_builder_applies_the_content_security_policy() {
         let source = include_str!("agent_panel.rs");
-        let builder_at = source
+        let fn_at = source
+            .find("fn build_chat_page(")
+            .expect("every chat page is built by build_chat_page");
+        let builder_at = source[fn_at..]
             .find("WebView::builder()")
+            .map(|i| fn_at + i)
             .expect("the panel's WebView is built through WebView::builder()");
         let build_at = source[builder_at..]
             .find(".build()")
@@ -869,14 +916,16 @@ mod tests {
         );
     }
 
-    /// The panel's `WebView` uses an ephemeral `NetworkSession` whose proxy is the closed loopback
-    /// "discard" port, so a request that gets past the CSP and the sanitizer still cannot leave.
-    /// Source-scan this constraint because it is a network containment backstop.
+    /// The panel's WebView uses an ephemeral `NetworkSession` with a closed loopback proxy,
+    /// so requests that pass the CSP and sanitizer still cannot leave.
+    /// Check the builder source because constructing a WebView requires a display.
+    /// The scan ends at the first page's `.build()`; pages built with a related view inherit
+    /// that page's session.
     #[test]
     fn the_webview_builder_applies_the_network_proxy_backstop() {
         assert_eq!(PANEL_NETWORK_PROXY_URI, "http://127.0.0.1:9");
         let source = include_str!("agent_panel.rs");
-        // Scoped to `build_agent_panel`'s own body, ending at the WebView `.build()` call -- never
+        // Scoped to `build_chat_page`'s own body, ending at the WebView `.build()` call -- never
         // the whole file. `source` (the whole file, via `include_str!`) includes this very test's own
         // string literals, so searching all of `source` for e.g. "NetworkSession::new_ephemeral()"
         // would always find a match in the assertion below regardless of what the production code
@@ -884,8 +933,8 @@ mod tests {
         // would still leave this test green. `fn_at` keeps the needles below restricted to code that
         // actually ran before the WebView was built.
         let fn_at = source
-            .find("fn build_agent_panel(")
-            .expect("the panel is built by build_agent_panel");
+            .find("fn build_chat_page(")
+            .expect("every chat page is built by build_chat_page");
         let builder_at = source[fn_at..]
             .find("WebView::builder()")
             .map(|i| fn_at + i)
@@ -909,6 +958,139 @@ mod tests {
                 && scope.contains("NetworkProxySettings::new(Some(PANEL_NETWORK_PROXY_URI)"),
             "the ephemeral session must be pointed at the unreachable proxy, not left on WebKit's default"
         );
+    }
+
+    /// The files under `shell/src` whose own pages are not chat pages: the grid probe's test pages, the Lua
+    /// panels and the plugin pages (each with its own scheme, policy and bridge, `plugin_page.rs`).
+    /// Everything else that builds a page builds a chat page.
+    const NOT_CHAT_PAGES: &[&str] = &[
+        "shell/src/grid_probe/",
+        "shell/src/lua/panel.rs",
+        "shell/src/plugin_page.rs",
+    ];
+
+    /// What builds a page, or hands it a message bridge.
+    const PAGE_MAKERS: &[&str] = &[
+        "WebView::builder()",
+        "WebView::new(",
+        "UserContentManager::new()",
+        "register_script_message_handler",
+    ];
+
+    /// Every chat page comes from `build_chat_page`: in the code of `shell/src` (comments, literals and
+    /// test modules blanked), outside the files that build pages that are not chat pages, a `WebView` is
+    /// built, a content manager made and a message handler registered once each, and that once is inside
+    /// `build_chat_page`'s body. A second constructor would be a page without the policy, or with a
+    /// handler that answers for some other view.
+    #[test]
+    fn every_chat_page_is_built_by_the_one_constructor() {
+        use eitri_core::source_scan as scan;
+        let sources = scan::rust_sources(&["shell/src"]);
+        for exempt in NOT_CHAT_PAGES {
+            assert!(
+                sources.iter().any(|source| source.path.starts_with(exempt)),
+                "{exempt} is not under shell/src any more: the list names nothing"
+            );
+        }
+        scan::require_anchors(&sources, &["fn build_chat_page("]);
+        let mut found: Vec<(String, &str, usize)> = Vec::new();
+        let mut in_constructor = std::collections::BTreeMap::new();
+        for source in &sources {
+            if NOT_CHAT_PAGES.iter().any(|exempt| source.path.starts_with(exempt)) {
+                continue;
+            }
+            let code = scan::code_only(&source.text);
+            let code = scan::without(&code, &scan::modules(&code, "tests"));
+            for maker in PAGE_MAKERS {
+                let count = code.matches(maker).count();
+                if count > 0 {
+                    found.push((source.path.clone(), maker, count));
+                }
+            }
+            for body in scan::functions(&code, "build_chat_page") {
+                for maker in PAGE_MAKERS {
+                    *in_constructor.entry(*maker).or_insert(0) += body.matches(maker).count();
+                }
+            }
+        }
+        let expected: Vec<(String, &str, usize)> = [
+            "WebView::builder()",
+            "UserContentManager::new()",
+            "register_script_message_handler",
+        ]
+        .into_iter()
+        .map(|maker| ("shell/src/agent_panel.rs".to_string(), maker, 1))
+        .collect();
+        let mut found_sorted = found.clone();
+        found_sorted.sort();
+        let mut expected_sorted = expected;
+        expected_sorted.sort();
+        assert_eq!(found_sorted, expected_sorted, "a page is built outside build_chat_page");
+        for maker in [
+            "WebView::builder()",
+            "UserContentManager::new()",
+            "register_script_message_handler",
+        ] {
+            assert_eq!(
+                in_constructor.get(maker),
+                Some(&1),
+                "{maker} is not inside build_chat_page"
+            );
+        }
+    }
+
+    /// The `eitriAgent` handler is the only place a message's page is decided, and it decides it from
+    /// the view the page was built for: `build_chat_page` takes `view: ViewId`, its message closure
+    /// hands that `view` to `page_message`, and no message is ever said to come from a fixed view.
+    #[test]
+    fn the_message_handler_carries_the_pages_own_view() {
+        use eitri_core::source_scan as scan;
+        let raw = include_str!("agent_panel.rs");
+        let production = raw.split("#[cfg(test)]\nmod tests {").next().unwrap_or_default();
+        assert_eq!(
+            production
+                .matches("register_script_message_handler(\"eitriAgent\", None)")
+                .count(),
+            1,
+            "the page's bridge is registered once"
+        );
+        assert_eq!(
+            production
+                .matches("connect_script_message_received(Some(\"eitriAgent\")")
+                .count(),
+            1,
+            "the page's bridge is heard once"
+        );
+        let code = scan::code_only(raw);
+        let code = scan::without(&code, &scan::modules(&code, "tests"));
+        let fn_at = code.find("fn build_chat_page(").expect("build_chat_page is defined");
+        let open = fn_at + code[fn_at..].find('{').expect("its body");
+        let signature: String = code[fn_at..open].split_whitespace().collect();
+        assert!(signature.contains("view:ViewId"), "{signature}");
+        let bodies = scan::functions(&code, "build_chat_page");
+        assert_eq!(bodies.len(), 1);
+        let body: String = bodies[0].split_whitespace().collect();
+        let heard_at = body
+            .find(".connect_script_message_received(")
+            .expect("the page's messages are heard in build_chat_page");
+        let closure = &body[heard_at..];
+        let closure = &closure[..closure.find("});").expect("the closure ends")];
+        assert!(
+            closure.contains("move|"),
+            "the view is moved into the handler: {closure}"
+        );
+        assert!(closure.contains(".page_message(view,"), "{closure}");
+        assert_eq!(body.matches(".page_message(").count(), 1, "{body}");
+        for call in ["page_message(", "link_clicked(", "page_shown(", "page_gone("] {
+            for (at, _) in code.match_indices(call) {
+                let rest: String = code[at + call.len()..].split_whitespace().collect();
+                assert!(
+                    !rest.starts_with("ViewId::"),
+                    "a page's {call}..) names a fixed view, not its own"
+                );
+            }
+        }
+        assert_eq!(code.matches("fn build_chat_page(").count(), 1);
     }
 
     thread_local! {
@@ -970,7 +1152,7 @@ mod tests {
         let _owner = context.acquire().expect("glib's default main context");
         let page = std::rc::Rc::new(CountingPage::default());
         let handle = AgentPanelHandle::for_host_test(page.clone());
-        handle.page_message(r#"{"type":"ready","request_id":"r1"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
         start_pump_timer(handle.clone());
         iterate_for(300);
         let before = handle.ticks_run();

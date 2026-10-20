@@ -18,6 +18,16 @@ use super::tree::{Axis, Branch, Layout, LayoutError, MAX_RATIO, MIN_RATIO};
 ///
 /// Refuses a module equal to `target`, or a target absent from the tree or hidden.
 pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Axis) -> Result<(), LayoutError> {
+    place_side(layout, module, target, axis, false)
+}
+
+fn place_side(
+    layout: &mut Layout,
+    module: &ModuleId,
+    target: &ModuleId,
+    axis: Axis,
+    before: bool,
+) -> Result<(), LayoutError> {
     let anchor;
     let target = if layout.is_floating(target) {
         anchor = layout
@@ -48,6 +58,7 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
         module: &ModuleId,
         target: &ModuleId,
         axis: Axis,
+        before: bool,
         layout: &Layout,
     ) -> Result<bool, LayoutError> {
         let Node::Con(c) = root else {
@@ -67,7 +78,10 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
             let half = c.children[i].share / 2.0;
             c.children[i].share = half;
             c.children[i].pin = None;
-            c.children.insert(i + 1, Child::new(Node::Leaf(module.clone()), half));
+            c.children.insert(
+                if before { i } else { i + 1 },
+                Child::new(Node::Leaf(module.clone()), half),
+            );
             if half < MIN_RATIO {
                 let share = 1.0 / c.children.len() as f32;
                 for child in &mut c.children {
@@ -81,14 +95,18 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
         }
         for child in &mut c.children {
             if child.node.leaves().contains(target) {
-                return sibling(&mut child.node, module, target, axis, layout);
+                return sibling(&mut child.node, module, target, axis, before, layout);
             }
         }
         Ok(false)
     }
-    if !sibling(&mut root, module, target, axis, layout)? {
+    if !sibling(&mut root, module, target, axis, before, layout)? {
         root.replace_leaf(target, |target| {
-            Node::split(axis, 0.5, target, Node::Leaf(module.clone()))
+            if before {
+                Node::split(axis, 0.5, Node::Leaf(module.clone()), target)
+            } else {
+                Node::split(axis, 0.5, target, Node::Leaf(module.clone()))
+            }
         });
     }
     layout.take_float(module);
@@ -96,6 +114,103 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
     layout.replace_root(root);
     layout.unhide(module);
     layout.set_focus(module)
+}
+
+/// [`place`] on any side: `Left` and `Up` put `module` before `target`, `Right` and `Down` after it.
+pub fn place_at(layout: &mut Layout, module: &ModuleId, target: &ModuleId, dir: Direction) -> Result<(), LayoutError> {
+    let (axis, before) = match dir {
+        Direction::Left => (Axis::Row, true),
+        Direction::Right => (Axis::Row, false),
+        Direction::Up => (Axis::Column, true),
+        Direction::Down => (Axis::Column, false),
+    };
+    place_side(layout, module, target, axis, before)
+}
+
+/// `module` as a tab beside `target`: into `target`'s own tabbed or stacked container right after it, else both
+/// into a new tabbed container in `target`'s place. `draw` makes it the drawn tab and gives it the keys; without
+/// it, the drawn tab and the keys stay. The same refusals as [`place`].
+pub fn place_as_tab(layout: &mut Layout, module: &ModuleId, target: &ModuleId, draw: bool) -> Result<(), LayoutError> {
+    let anchor;
+    let target = if layout.is_floating(target) {
+        anchor = layout
+            .tiled_anchor()
+            .ok_or_else(|| LayoutError::Floating(target.clone()))?;
+        &anchor
+    } else {
+        target
+    };
+    if module == target {
+        return Err(LayoutError::SameModule(module.clone()));
+    }
+    if layout.is_gone(module) {
+        return Err(LayoutError::Gone(module.clone()));
+    }
+    if !layout.contains(target) {
+        return Err(LayoutError::NotInTree(target.clone()));
+    }
+    if !layout.is_shown(target) {
+        return Err(LayoutError::Hidden(target.clone()));
+    }
+    let mut root = layout
+        .root_node()
+        .without(module)
+        .expect("`target` is another module, still in the tree");
+    fn into_tabs(root: &mut Node, module: &ModuleId, target: &ModuleId, draw: bool) -> Result<bool, LayoutError> {
+        let Node::Con(c) = root else { return Ok(false) };
+        if let Some(i) = c
+            .children
+            .iter()
+            .position(|ch| matches!(&ch.node, Node::Leaf(id) if id == target))
+        {
+            if !matches!(c.layout, ConLayout::Tabbed | ConLayout::Stacked) {
+                return Ok(false);
+            }
+            if c.children.len() >= MAX_CHILDREN {
+                return Err(LayoutError::TooMany { limit: MAX_CHILDREN });
+            }
+            let half = c.children[i].share / 2.0;
+            c.children[i].share = half;
+            c.children.insert(i + 1, Child::new(Node::Leaf(module.clone()), half));
+            if half < MIN_RATIO {
+                let share = 1.0 / c.children.len() as f32;
+                for child in &mut c.children {
+                    child.share = share;
+                }
+            }
+            if draw {
+                c.focus = i + 1;
+            } else if c.focus > i {
+                c.focus += 1;
+            }
+            return Ok(true);
+        }
+        for child in &mut c.children {
+            if child.node.leaves().contains(target) {
+                return into_tabs(&mut child.node, module, target, draw);
+            }
+        }
+        Ok(false)
+    }
+    if !into_tabs(&mut root, module, target, draw)? {
+        root.replace_leaf(target, |target| {
+            let mut tabs = Con::new(
+                ConLayout::Tabbed,
+                vec![Child::new(target, 0.5), Child::new(Node::Leaf(module.clone()), 0.5)],
+            );
+            tabs.focus = usize::from(draw);
+            Node::Con(tabs)
+        });
+    }
+    layout.take_float(module);
+    layout.unzoom();
+    layout.replace_root(root);
+    layout.unhide(module);
+    if draw {
+        layout.set_focus(module)
+    } else {
+        Ok(())
+    }
 }
 
 /// `Ctrl+a H/J/K/L`: `focused` changes places
@@ -534,6 +649,87 @@ mod tests {
             a.rect_of(&bottom).map(|r| (r.w, r.h)),
             Some((1280, 80)),
             "the other row kept its length too"
+        );
+    }
+    #[test]
+    fn a_module_placed_left_or_above_goes_before_its_target() {
+        use crate::layout::fixture::fixture;
+        use crate::layout::geometry::{Direction, Size};
+        use crate::layout::test_support::{rects, same_rects};
+        let size = Size { w: 1280, h: 721 };
+        let base = || fixture("row(editor focus 0.6, agent)");
+        let agent_before = rects(&base(), size)[&agent()];
+
+        let mut layout = base();
+        place_at(&mut layout, &term(), &editor(), Direction::Left).unwrap();
+        let r = rects(&layout, size);
+        let (t, e, a) = (r[&term()], r[&editor()], r[&agent()]);
+        assert!(t.x < e.x && e.x < a.x, "{t:?} {e:?} {a:?}");
+        assert!((t.w - e.w).abs() <= 1, "the two halve the editor's share: {t:?} {e:?}");
+        // The new divider takes a pixel from the shares around it, so the agent's left edge may move by one.
+        assert!(
+            a.x + a.w == agent_before.x + agent_before.w && (a.w - agent_before.w).abs() <= 1,
+            "the agent keeps its place to a pixel: {a:?} {agent_before:?}"
+        );
+        assert_eq!(layout.focus(), &term());
+        assert_eq!(
+            layout.root().children.len(),
+            3,
+            "a sibling in the row, not a nested split"
+        );
+
+        let mut layout = base();
+        place_at(&mut layout, &term(), &editor(), Direction::Up).unwrap();
+        let r = rects(&layout, size);
+        let (t, e) = (r[&term()], r[&editor()]);
+        assert!(t.y < e.y && t.x == e.x && t.w == e.w, "{t:?} {e:?}");
+
+        for (dir, axis) in [(Direction::Right, Axis::Row), (Direction::Down, Axis::Column)] {
+            let (mut by_side, mut by_place) = (base(), base());
+            place_at(&mut by_side, &term(), &editor(), dir).unwrap();
+            place(&mut by_place, &term(), &editor(), axis).unwrap();
+            same_rects(&by_side, &by_place);
+        }
+    }
+
+    #[test]
+    fn a_module_placed_as_a_tab_joins_the_targets_tab_container_or_makes_one() {
+        use crate::layout::fixture::fixture;
+        fn tabs(c: &Con) -> Option<usize> {
+            if matches!(c.layout, ConLayout::Tabbed | ConLayout::Stacked) {
+                return Some(c.children.len());
+            }
+            c.children.iter().find_map(|ch| match &ch.node {
+                Node::Con(inner) => tabs(inner),
+                Node::Leaf(_) => None,
+            })
+        }
+        let mut layout = fixture("row(editor focus 0.6, agent)");
+        place_as_tab(&mut layout, &term(), &editor(), true).unwrap();
+        assert_eq!(tabs(layout.root()), Some(2));
+        assert!(layout.is_visible(&term()) && layout.is_tabbed_away(&editor()));
+        assert_eq!(layout.focus(), &term());
+
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        place_as_tab(&mut layout, &t2, &term(), true).unwrap();
+        assert_eq!(
+            tabs(layout.root()),
+            Some(3),
+            "joins the container the target is a tab of"
+        );
+        assert!(layout.is_visible(&t2) && layout.is_tabbed_away(&term()) && layout.is_tabbed_away(&editor()));
+
+        let mut layout = fixture("row(editor focus 0.6, agent)");
+        place_as_tab(&mut layout, &term(), &editor(), false).unwrap();
+        assert_eq!(tabs(layout.root()), Some(2));
+        assert!(
+            layout.is_visible(&editor()) && layout.is_tabbed_away(&term()),
+            "not drawn, keys unmoved"
+        );
+        assert_eq!(layout.focus(), &editor());
+        assert_eq!(
+            place_as_tab(&mut layout, &editor(), &editor(), true),
+            Err(LayoutError::SameModule(editor()))
         );
     }
 }

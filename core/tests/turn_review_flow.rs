@@ -247,13 +247,31 @@ fn recover(id: &str, entry: &str, answer: &str) -> InboundMessage {
     msg(json!({"type":"review_recover","request_id":id,"entry":entry,"answer":answer}))
 }
 
+/// The text of `out` if it is an envelope. An answer names the request its envelope carries, and a
+/// draft on its own the tab it is about, so the panel can route each to the page it belongs to.
+fn envelope_text(out: &Out) -> Option<&str> {
+    match out {
+        Out::Envelope(text) => Some(text),
+        Out::Answer { request_id, payload } => {
+            let v: Json = serde_json::from_str(payload).expect("an envelope is JSON");
+            assert_eq!(v["requestId"], *request_id, "an answer names its own request");
+            Some(payload)
+        }
+        Out::Draft(tab, payload) => {
+            let v: Json = serde_json::from_str(payload).expect("an envelope is JSON");
+            assert_eq!(v["tab"], tab.0, "a draft names its own tab");
+            assert!(v["requestId"].is_null(), "a draft that answers a request is an answer");
+            Some(payload)
+        }
+        Out::Flushed(..) | Out::QueueChanged(..) | Out::EditorOpened => None,
+    }
+}
+
 /// The envelopes among `outs`, parsed.
 fn envelopes(outs: &[Out]) -> Vec<Json> {
     outs.iter()
-        .filter_map(|out| match out {
-            Out::Envelope(text) => Some(serde_json::from_str(text).expect("an envelope is JSON")),
-            Out::Flushed(..) | Out::QueueChanged(..) | Out::EditorOpened => None,
-        })
+        .filter_map(envelope_text)
+        .map(|text| serde_json::from_str(text).expect("an envelope is JSON"))
         .collect()
 }
 
@@ -265,7 +283,8 @@ fn shape(outs: &[Out]) -> Vec<String> {
             Out::Flushed(..) => "flushed".to_string(),
             Out::QueueChanged(..) => "queue_changed".to_string(),
             Out::EditorOpened => "editor_opened".to_string(),
-            Out::Envelope(text) => {
+            out @ (Out::Envelope(_) | Out::Answer { .. } | Out::Draft(..)) => {
+                let text = envelope_text(out).expect("an envelope");
                 let v: Json = serde_json::from_str(text).unwrap();
                 let kind = v["kind"].as_str().unwrap().to_string();
                 let id = match &v["requestId"] {
@@ -528,6 +547,8 @@ fn a_revert_waits_for_the_editor_then_lands_in_the_draft() {
         shape(&outs)
     );
     assert!(!f.flow.is_idle());
+    assert!(f.flow.owes_answer("r1"), "the request is still to be answered");
+    assert!(!f.flow.owes_answer("r2"));
     assert_eq!(editor.asked(), 1);
     let path_asked = match &editor.asked.borrow()[0].1[0] {
         Value::String(s) => s.as_str().unwrap().to_string(),
@@ -557,6 +578,7 @@ fn a_revert_waits_for_the_editor_then_lands_in_the_draft() {
     assert_eq!(reverts[0].new.replaced, CHANGED);
     assert!(reverts[0].new.undo.is_some());
     assert!(f.flow.is_idle(), "the slot is free again");
+    assert!(!f.flow.owes_answer("r1"), "answered");
     let draft = &envelopes(&outs)[0]["draft"];
     assert_eq!(draft["canUndo"], true);
     assert_eq!(draft["reverts"][0]["what"], "file");

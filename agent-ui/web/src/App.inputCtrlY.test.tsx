@@ -442,6 +442,33 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       expect(answered()).toEqual([]);
     });
 
+    /** A tab that arrives in the page -- another view's tab joined back, or a switch -- brings its
+     *  waiting card with it: that is a change of target like any other, so a Ctrl+y right after the
+     *  arrival is refused, and the arrived card is approved once it has been the target long enough. */
+    it("a tab arriving in the page counts as a change of waiting card: Ctrl+y right after it is refused", () => {
+      const { container } = inInput(0, [TAB1]);
+      const TAB3 = { ...TAB1, id: 3, number: 3, label: "3 new", pending: 1, marker: "needs_input" } as const;
+      dispatch({ kind: "tabs", active: 3, tabs: [TAB3] });
+      dispatch({ kind: "snapshot", tab: 3, throughRevision: 0, state: snapshotState() });
+      const list = cardEvents(1);
+      dispatch({ kind: "events", tab: 3, fromRevision: 0, throughRevision: list.length, events: list });
+      // The switch lands BROWSE; the window hands the composer the keys again, with no key pressed.
+      dispatch({ kind: "enter_input" });
+      wait(30);
+      const box = textarea(container);
+      expect(box).not.toBeNull();
+      expect(document.activeElement).toBe(box);
+      ctrlY(box!);
+      wait(TYPING_GUARD_MS + 50);
+      expect(answered()).toEqual([]);
+      expect(bandMessage(container)).toBe(TARGET_FLASH);
+      ctrlY(textarea(container)!);
+      wait(TYPING_GUARD_MS);
+      expect(answered()).toEqual([
+        expect.objectContaining({ type: "permission_response", tab: 3, permission_id: "perm-1", decision: "allow" }),
+      ]);
+    });
+
     /** The Ctrl+r search stops its own Enter/Tab/Escape, so the typing
      *  guard never saw them. */
     it.each(["Enter", "Tab", "Escape"])("the Ctrl+r search's %s counts as a key: Ctrl+y 20 ms after it approves nothing", (exit) => {

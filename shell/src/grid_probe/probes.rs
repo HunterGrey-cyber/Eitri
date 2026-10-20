@@ -13,10 +13,26 @@ use eitri_core::layout::{ModuleId, Rect};
 
 use super::hosts::{float_term_id, static_id};
 use super::{say, Probe};
-use crate::agent_panel::AgentPanelHandle;
+use crate::agent_panel::{AgentPanelHandle, ViewId};
 use crate::module_grid::HostKind;
 use crate::terminal::TerminalPane;
 use crate::web_host::WebHost;
+use crate::NewViewTab;
+use eitri_core::layout::Axis;
+
+/// The pooled page's view number in the window's panel. Keep it outside 2 through 4,
+/// which the view lifecycle and second-chat probes use for the window's own views and pages.
+fn pool_view() -> ViewId {
+    ViewId::new(9).expect("9 is a chat view's number")
+}
+
+/// What a page posts to say its document is ready: the same message the panel's own document sends, so
+/// the panel answers it as it answers that one, and logs the view it came from.
+const POST_READY: &str =
+    "window.webkit.messageHandlers.eitriAgent.postMessage(JSON.stringify({type:'ready',request_id:'probe'})); 'posted'";
+
+/// An idle page's document: the empty chat, which the panel's document shows until it is sent a tab.
+const SHOWS_EMPTY_CHAT: &str = "String(document.querySelector('.empty-tab .connecting') !== null)";
 
 /// A position that goes 0 to `range` and back, `period` steps each way.
 fn tri(step: u64, period: u64, range: i32) -> i32 {
@@ -668,6 +684,7 @@ impl Probe {
             h: ch,
         };
         let web = self.web_ok();
+        self.p6_views().await;
         self.sample("p6.c0.killed").await;
         for k in 1..=cycles {
             // create: the first cycle makes the hosts, the others reuse them idle in the pool
@@ -694,12 +711,12 @@ impl Probe {
             }
             if web {
                 if k == 1 {
-                    self.make_chat_page(&chat_id, true, chat_at, true).await;
+                    self.make_chat_page(&chat_id, pool_view(), true, chat_at, true).await;
                 } else {
                     self.place(&chat_id, chat_at);
                     let handle = self.made.borrow().pool_chat.as_ref().map(|(_, _, h)| h.clone());
                     if let Some(handle) = handle {
-                        handle.reload_document_by_hand();
+                        handle.reload_document_by_hand(pool_view());
                     }
                 }
             }
@@ -732,21 +749,172 @@ impl Probe {
         say(format!("p6 cycles={cycles}"));
     }
 
-    /// Builds a chat page with `build_agent_panel`, adds it to the grid as a web host under `id`,
-    /// shows it at `at`, and waits for its document. `related` passes the base page to the
-    /// constructor. `pool` retains the page for reuse; otherwise it is kept among the extra pages.
-    async fn make_chat_page(&self, id: &ModuleId, related: bool, at: Rect, pool: bool) -> Option<WebView> {
+    /// Posts a `ready` from `view`'s document, as its own script would, and logs the mark that lets the
+    /// runner read which view the panel took the message to come from (`expect` is the module's number).
+    async fn post_ready(&self, name: &str, expect: u8, view: &WebView) {
+        say(format!("mark ready-{name} expect={expect}"));
+        self.js(view, POST_READY).await;
+        self.sleep(500).await;
+        say("mark none");
+    }
+
+    /// Opens a chat view as `instance.new { kind = "agent" }` does, beside the base chat, and counts its
+    /// host from now on. `None` when the window refused.
+    fn open_view(&self, tracked: &mut Vec<ModuleId>) -> Option<ModuleId> {
+        match (self.ctx.new_chat_view)(crate::OpenHow::Beside(ModuleId::agent(), Axis::Row), NewViewTab::Empty) {
+            Ok(id) => {
+                if !tracked.contains(&id) {
+                    if let Some(host) = self.host(&id) {
+                        self.track(id.as_str(), &host);
+                        tracked.push(id.clone());
+                    }
+                }
+                Some(id)
+            }
+            Err(err) => {
+                say(format!(
+                    "p6 views refused={}",
+                    err.split_whitespace().collect::<Vec<_>>().join("_")
+                ));
+                None
+            }
+        }
+    }
+
+    /// The window's pooled page of `id`, if it has a live one.
+    fn pooled(&self, id: &ModuleId) -> Option<WebView> {
+        self.ctx.chat_views.borrow().get(id).map(|(view, _)| view.clone())
+    }
+
+    /// Exercises the window's own chat view lifecycle. Kill a startup view as `prefix x y`
+    /// would, inspect the next views' numbers and hosts, then repeatedly create and kill
+    /// `agent#2` through `agent#4`. Each `p6 ...` line is a result for the runner to judge.
+    async fn p6_views(&self) {
+        if !self.web_ok() {
+            say("skip p6 views no WebKit in this process");
+            return;
+        }
+        let cycles = self.script.count("p6_view_cycles", self.script.count("p6_cycles", 20));
+        let four = ViewId::new(4).expect("4 is a chat view's number");
+        let four_id = four.module();
+        let (gw, gh) = self.grid_size();
+        let corner = Rect {
+            x: gw - 300,
+            y: gh - 200,
+            w: 280,
+            h: 190,
+        };
+        // The view the saved layout named: its host exists from the start, with a tab of its own.
+        let started = self
+            .startup_views
+            .iter()
+            .find(|(id, _)| *id == four_id)
+            .map(|(_, ptr)| *ptr);
+        let held = self.pooled(&four_id);
+        let ptr_now = held.as_ref().map_or(0, super::page_pointer);
+        say(format!(
+            "p6 start module={four_id} started_ptr={:#x} ptr={ptr_now:#x} live={} holds_tab={}",
+            started.unwrap_or(0),
+            held.is_some(),
+            self.ctx.panel.views().contains(&four)
+        ));
+        let mut tracked: Vec<ModuleId> = Vec::new();
+        if let Some(host) = self.host(&four_id) {
+            self.track(four_id.as_str(), &host);
+            tracked.push(four_id.clone());
+        }
+        let Some(view) = held else {
+            say(format!("p6 views the window opened without {four_id}"));
+            return;
+        };
+        // Shown by the probe for the document's load and the message check, then given back to the layout.
+        self.place(&four_id, corner);
+        self.wait_loaded(&view).await;
+        self.sleep(500).await;
+        self.post_ready("agent#4-start", 4, &view).await;
+        self.ctx.grid.probe_place(&four_id, None);
+        // `prefix x` then `y`, with no key pressed.
+        say(format!("mark idle-{four_id} expect=0"));
+        (self.ctx.kill_chat_view)(&four_id);
+        self.sleep(1500).await;
+        let empty = self
+            .js(&view, SHOWS_EMPTY_CHAT)
+            .await
+            .unwrap_or_else(|| "unknown".to_owned());
+        say(format!(
+            "p6 idle module={four_id} live={} holds_tab={} empty_chat={empty} ptr={:#x}",
+            self.pooled(&four_id).is_some(),
+            self.ctx.panel.views().contains(&four),
+            super::page_pointer(&view)
+        ));
+        say("mark none");
+        self.sample("p6.v0.killed").await;
+        for k in 1..=cycles {
+            let mut ids = Vec::new();
+            for _ in 0..3 {
+                if let Some(id) = self.open_view(&mut tracked) {
+                    ids.push(id);
+                }
+            }
+            self.sleep(1000).await;
+            for id in &ids {
+                let Some(page) = self.pooled(id) else {
+                    say(format!("p6 view cycle={k} module={id} ptr=0x0"));
+                    continue;
+                };
+                let ptr = super::page_pointer(&page);
+                say(format!("p6 view cycle={k} module={id} ptr={ptr:#x}"));
+                if k == 1 {
+                    let number = ViewId::of_module(id).map_or(0, |v| v.number());
+                    let name = if *id == four_id {
+                        "agent#4-reused".to_owned()
+                    } else {
+                        id.to_string()
+                    };
+                    self.post_ready(&name, number, &page).await;
+                }
+            }
+            self.sample(&format!("p6.v{k}.created")).await;
+            for id in ids.iter().rev() {
+                (self.ctx.kill_chat_view)(id);
+            }
+            self.sleep(700).await;
+            self.sample(&format!("p6.v{k}.killed")).await;
+        }
+        say(format!("p6 view_cycles={cycles}"));
+    }
+
+    /// Builds a chat page with `build_chat_page`, attaches it to the window's panel as
+    /// `page_view`, adds it to the grid as a web host under `id`, shows it at `at`, and waits
+    /// for its document. `related` passes the base page to the constructor. `pool` retains
+    /// the page for reuse; otherwise it is kept among the extra pages.
+    async fn make_chat_page(
+        &self,
+        id: &ModuleId,
+        page_view: ViewId,
+        related: bool,
+        at: Rect,
+        pool: bool,
+    ) -> Option<WebView> {
         let base = self.chat_view();
-        let source: eitri_core::editor_context::ContextSource = Rc::new(|| None);
-        let (widget, handle): (gtk4::Widget, AgentPanelHandle) = crate::agent_panel::build_agent_panel(
-            self.ctx.project_root.clone(),
-            source,
-            None,
-            self.ctx.backend_kind,
-            None,
-            if related { base.as_ref() } else { None },
-        );
-        let view = widget.clone().downcast::<WebView>().ok()?;
+        if base.is_none() {
+            return None;
+        }
+        let handle: AgentPanelHandle = self.ctx.panel.clone();
+        // Attaching a page as a view the window already shows would take that view's routing from its
+        // real page, so the probe's numbers must be free in the window it runs in.
+        let window_holds =
+            self.ctx.chat_views.borrow().get(&page_view.module()).is_some() || handle.views().contains(&page_view);
+        if window_holds {
+            say(format!(
+                "skip {id} chat view {} is the window's own; keep agent#{} out of the probe's layout",
+                page_view.number(),
+                page_view.number()
+            ));
+            return None;
+        }
+        let (view, _page) =
+            crate::agent_panel::build_chat_page(&handle, page_view, if related { base.as_ref() } else { None });
         let name = id.to_string();
         view.connect_web_process_terminated(move |_, reason| say(format!("web-process-terminated {name} {reason:?}")));
         let host = WebHost::new(&view);
@@ -781,7 +949,11 @@ impl Probe {
         };
         self.sample("p7.before").await;
         let second_id = ModuleId::lua("probe-chat-2");
-        let Some(second) = self.make_chat_page(&second_id, true, corner(1), false).await else {
+        let (second_view, third_view) = (ViewId::new(2).expect("a view"), ViewId::new(3).expect("a view"));
+        let Some(second) = self
+            .make_chat_page(&second_id, second_view, true, corner(1), false)
+            .await
+        else {
             say("p7 related page could not be built");
             return;
         };
@@ -824,6 +996,9 @@ impl Probe {
             after_base.0 - after_second.0,
             after_base.1 - after_second.1
         ));
+        // the panel's own channel: a `ready` posted from each page is taken for that page's view only
+        self.post_ready("p7-second", 2, &second).await;
+        self.post_ready("p7-base", 1, &base).await;
         // the policy that holds in the base page holds in the second one. The result is left in a page
         // variable and read back: a script cannot hand a promise's value to the host directly.
         const OUTSIDE: &str = "window.__outside = 'pending'; (async function(){var v=null;\
@@ -852,7 +1027,9 @@ impl Probe {
         }
         // the cost of the other way, for the fallback's number
         let third_id = ModuleId::lua("probe-chat-3");
-        let third = self.make_chat_page(&third_id, false, corner(2), false).await;
+        let third = self
+            .make_chat_page(&third_id, third_view, false, corner(2), false)
+            .await;
         if third.is_some() {
             self.sleep(2000).await;
             self.sample("p7.unrelated").await;

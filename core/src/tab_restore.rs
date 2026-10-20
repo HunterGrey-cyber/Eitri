@@ -13,7 +13,7 @@ use agent::ResumableSession;
 use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
 use crate::saved_tabs::SavedTabs;
-use crate::tabs::{label_name, TabId};
+use crate::tabs::{label_name, TabId, ViewId};
 
 /// What happens to the saved tabs at launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,10 @@ pub struct PlannedTab {
     /// `TabSet::begin_restore`, never here.
     pub saved_mode: SessionModeChoice,
     pub label: String,
+    /// The extra chat view the tab was saved in (`agent#N`, N from 2); `None` for the base view.
+    /// Where it comes back is decided by `TabSet::start_restore`, which puts it there only when the
+    /// window's layout holds that view and no other tab is bound to it yet.
+    pub view: Option<ViewId>,
 }
 
 /// Which saved tabs to resume and which are skipped before any resume is tried.
@@ -100,6 +104,7 @@ pub fn plan(
             t.provider_session_id.as_str(),
             t.name.as_deref(),
             t.mode,
+            t.view,
         )
     });
     let external = saved.external_tabs.iter().map(|t| {
@@ -108,9 +113,10 @@ pub fn plan(
             t.provider_session_id.as_str(),
             t.name.as_deref(),
             t.mode,
+            t.view,
         )
     });
-    for (agent, id, saved_name, saved_mode) in claude.chain(external) {
+    for (agent, id, saved_name, saved_mode, saved_view) in claude.chain(external) {
         if open.iter().any(|o| o == id) {
             continue;
         }
@@ -143,6 +149,7 @@ pub fn plan(
             title: record.title.clone(),
             saved_mode,
             label,
+            view: saved_view.and_then(ViewId::new).filter(|view| !view.is_base()),
         });
     }
     let active_session = match saved.active_external {
@@ -208,8 +215,9 @@ pub struct RestoreRun {
     /// The agent that tab ran before, for the same reason.
     pub(crate) first_agent: AgentId,
     pub(crate) pending: BTreeMap<TabId, String>,
-    /// The tabs the restore started, in saved order, until one fails or is closed: where the screen
-    /// goes when the tab it was on did not come back.
+    /// The tabs the restore started in the base view, in saved order, until one fails or is closed:
+    /// where the screen goes when the tab it was on did not come back. A tab that came back bound to
+    /// an extra view is not listed, as the base view cannot show it.
     pub(crate) order: Vec<TabId>,
     /// The tabs brought back holding their resume for their own agent's trust answer: counted as
     /// restored, and started (or not) by that answer, outside this tally.
@@ -355,6 +363,7 @@ mod tests {
                     provider_session_id: id.to_string(),
                     name: name.map(str::to_string),
                     mode: *mode,
+                    view: None,
                 })
                 .collect(),
             active,
@@ -417,6 +426,7 @@ mod tests {
             provider_session_id: id.to_string(),
             name: None,
             mode: Auto,
+            view: None,
         };
         saved.external_tabs = vec![acp("gem", "g-1"), acp("gone", "x-1")];
         let acp_record = |name: &str, id: &str| ResumableSession {
@@ -472,6 +482,51 @@ mod tests {
             plan.active_session.as_deref(),
             Some("gone-0123456789"),
             "the saved active tab, though it is skipped"
+        );
+    }
+
+    #[test]
+    fn a_planned_tab_carries_its_saved_view() {
+        let mut saved = saved(
+            &[
+                ("a", None, Auto),
+                ("b", None, Auto),
+                ("c", None, Auto),
+                ("d", None, Auto),
+            ],
+            0,
+        );
+        saved.tabs[1].view = Some(3);
+        saved.tabs[2].view = Some(1);
+        saved.tabs[3].view = Some(42);
+        saved.external_tabs = vec![crate::saved_tabs::SavedExternalTab {
+            agent: AgentId::Codex,
+            conversation_id: "c".to_string(),
+            provider_session_id: "x".to_string(),
+            name: None,
+            mode: Auto,
+            view: Some(2),
+        }];
+        let records = [
+            record("a", None, None),
+            record("b", None, None),
+            record("c", None, None),
+            record("d", None, None),
+            ResumableSession {
+                provider: AgentId::Codex.record_name(),
+                ..record("x", None, None)
+            },
+        ];
+        let plan = plan(&saved, &records, &[], |_, _| false);
+        let views: Vec<(&str, Option<u8>)> = plan
+            .items
+            .iter()
+            .map(|i| (i.provider_session_id.as_str(), i.view.map(ViewId::number)))
+            .collect();
+        assert_eq!(
+            views,
+            [("a", None), ("b", Some(3)), ("c", None), ("d", None), ("x", Some(2))],
+            "the base view and a number no chat view has are both no view"
         );
     }
 

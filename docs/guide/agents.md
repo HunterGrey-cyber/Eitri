@@ -285,9 +285,45 @@ its composer (see [the composer's keys](keys.md)): the names and descriptions ar
 whose agent has reported none has no menu. `prefix i` has a `context` row,
 which shows how full the agent's context is once the agent reports it. Tokens come without a cost.
 
+## Chat views
+
+The agent panel you start with is the **base view** (`agent`). A **chat view** (`agent#2` to `agent#9`) is another
+page of the same panel, a module of its own in the layout, and it shows exactly one session tab; the base view shows
+all the others, with its tab strip. The keys that make and use them are in [Keys](keys.md#chat-views). What matters
+for an agent is this:
+
+- **A view is only where a tab is shown.** The tab is the window's, whichever agent it runs (Claude, Codex or an ACP
+  agent): it keeps running when its view is hidden, its cards wait for you, and its session is saved with the others.
+  There is one account for the whole window, so every view's tab spends the account the window was started with
+  ([Accounts](configuration.md#accounts)).
+- **`<prefix> !`** breaks the tab you are on out into a view of its own, and from that view joins it back. The base
+  view always keeps a tab, so it refuses with only one. A new view can also start empty (`instance.new { kind =
+  "agent" }`, `eitri.layout.open("agent")`, or a split key then `a` from a chat); its first message asks the
+  [trust question](permissions.md#trusting-a-project) in that view like any first session.
+- **A card is answered only from the page that shows its tab.** The base view shows a tab until you break it out,
+  and an extra view shows its tab; an answer (`a`, `d`, `D`, `Ctrl+y`, a button, the bypass `y` or the trust `y` and
+  `n`) sent from any other page is refused and the card keeps waiting. The case this is for: you press an answer
+  in the base view in the moment `<prefix> !` moves that tab into a view of its own; the answer does not reach the
+  tab, and the card is there to answer from its new view.
+- **A covered view may not answer, and it asks again.** A float over a view covers it (see [A chat under a
+  float](#a-chat-under-a-float)); the check is made per view, so a float over `agent#2` refuses that view's answers and
+  leaves the base view's alone. When it is the trust question that is answered from a covered page, the answer is
+  refused with the reason and the question is shown again in the same page, so it is there to answer once the float is
+  off. A `:trust` typed in a covered page ends as not trusted, with the reason (nothing is recorded), and typing it
+  again once the page is uncovered asks the question.
+- **The base view's strip lists only its own tabs**, so a tab shown in another view leaves a gap in the numbers
+  (the chooser, `w`, lists every tab and names the view of a tab shown in one: ` · agent 2`). A view with one tab
+  draws no strip.
+- **A restored tab comes back in its view** when the layout still has that view and no other tab has claimed it;
+  otherwise it comes back in the base view. A view that is left with no tab, once the restore has finished, is
+  removed.
+- **Each view carries its own attention.** Its chip and strip entry read `agent 2 ⚑1` while a card waits in that
+  view's tab, a new card in a hidden view is revealed under `modules.chat.on_permission = "reveal"` as it is for the
+  base view, and the toast names that view and its way back.
+
 ## A chat under a float
 
-The agent panel can sit under a [float](keys.md#floats-the-scratchpad-and-workspaces) (a terminal in the scratchpad,
+The agent panel, or any [chat view](#chat-views), can sit under a [float](keys.md#floats-the-scratchpad-and-workspaces) (a terminal in the scratchpad,
 say). A chat that a float covers by any amount is still running, and it is treated as covered rather than shown:
 
 - **Its chip is back in the top bar.** While a card waits it reads `agent ⚑N`, as it does when the chat is hidden.

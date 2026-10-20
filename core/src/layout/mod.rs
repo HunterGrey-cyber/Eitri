@@ -16,6 +16,7 @@ pub mod number;
 pub mod ops;
 pub mod persist;
 pub mod reconcile;
+pub mod rules;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tray;
@@ -38,16 +39,17 @@ pub use keys::{
     SplitChoice, StripEntry,
 };
 pub use kill::{can_kill, kill, KillScope, Reopen};
-pub use module::{ModuleDecl, ModuleError, ModuleId, ModuleKind, Placement};
+pub use module::{declared_placement, ModuleDecl, ModuleError, ModuleId, ModuleKind, Placement};
 pub use number::number_plan;
-pub use ops::{even, place, swap, swap_adjacent};
+pub use ops::{even, place, place_as_tab, place_at, swap, swap_adjacent};
 pub use reconcile::{
     reconcile, reconcile_default, reconcile_default_floating, reconcile_floating, ReconcileError, Reconciled,
 };
-pub use tray::{agent_place, agent_place_covered, chip_label, tray, tray_covered};
+pub use rules::{apply_launch_rule, first_launch_decls, open_by_rule, OpenRule, OpenRules, Opened};
+pub use tray::{agent_place, agent_place_covered, chip_label, tray, tray_covered, view_place};
 pub use tree::{Axis, Branch, Layout, LayoutError, Selection, Zoom, ZoomChange};
 
-pub use workspace::{fit_to, WorkspaceError, Workspaces};
+pub use workspace::{fit_to, fit_to_with, WorkspaceError, Workspaces};
 
 pub use verbs::{
     container_mode, cycle_preset, flip, float_at, float_toggle, focus_child, focus_parent, mode_toggle_target,

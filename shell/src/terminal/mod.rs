@@ -49,32 +49,39 @@ pub(crate) fn exit_is_current(reported: u64, current: u64) -> bool {
     reported == current
 }
 
-/// Builds the initial layout with the terminal below the editor's own leaf through
-/// [`eitri_core::layout::Placement::BelowEditor`], then adds Lua panels in registration
-/// order. The agent and Lua side panels keep the window's full height.
-/// The terminal is hidden before widgets are built and first appears on `Ctrl+a t`.
-/// Its hidden split takes no space, leaving the editor its usual leaf.
+/// Builds the first-launch layout with the terminal below the editor's own leaf, using
+/// `Placement::BelowEditor`, then adds Lua panels in registration order. The agent and Lua
+/// `side` panels keep the full window height. The terminal is hidden before the layout is
+/// built into widgets, so it appears only after `Ctrl+a t`. Its hidden split collapses to
+/// the editor's leaf and leaves the visible layout unchanged.
 ///
-/// The terminal always has the editor's width. In the default 1280px window its first
-/// show is 760px wide, from `DEFAULT_EDITOR_SHARE`, and one third of the editor column's
-/// height. A Lua side panel narrows the editor and terminal together.
-/// A Lua bottom panel uses `Placement::BelowRoot` and wraps the whole tree at full width.
-/// Its outer split and the terminal's inner split give the terminal an initial height
-/// of 160px under that panel. A row split does not change height.
-/// Either Lua panel can receive focus when the terminal hides if it was focused more
+/// The terminal is always exactly the editor's width. In the default 1280px window, its
+/// first show is 760px wide and a third of the editor column's height. A Lua `side` panel
+/// reduces that width along with the editor's share. A Lua `bottom` panel uses
+/// `Placement::BelowRoot` and wraps the whole tree, including the editor's nested terminal
+/// and the agent. The two vertical splits compound, so the terminal's first show under a
+/// `bottom` panel is 160px high rather than 240px. A `Row` split does not change height.
+/// Either Lua panel can receive focus when the terminal hides if it held the keys more
 /// recently than the editor or agent.
 ///
-/// Hides the terminal through `eitri_core::layout::hide`, which chooses a focus target
-/// before hiding a focused module; `Layout::hide_unfocused` is private to the layout.
-/// At startup the editor or a Lua main panel has focus, so hiding the terminal reads
-/// no geometry and the supplied frame is only a formality.
-pub(crate) fn initial_layout(lua: &[ModuleDecl]) -> Result<Layout, LayoutError> {
-    let mut decls = vec![ModuleDecl {
-        id: ModuleId::terminal(),
-        placement: Placement::BelowEditor,
-    }];
-    decls.extend_from_slice(lua);
-    let mut layout = Layout::initial(&decls)?;
+/// Hides the terminal through `layout::hide`, which chooses a focus destination before
+/// hiding a focused module. At startup the editor or a Lua `main` panel holds the keys,
+/// so hiding the terminal reads no geometry and the supplied frame is only a placeholder.
+///
+/// `decls` contains the window's declarations. If an open rule already declares a terminal
+/// placement, that placement is used. Only the base terminal and Lua panels intended for
+/// first launch reach `Layout::initial`. A chat view or numbered instance is placed later;
+/// its declaration only supplies its placement. `Layout::initial` rejects placing a module twice.
+pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError> {
+    let mut all = Vec::with_capacity(decls.len() + 1);
+    if !decls.iter().any(|d| d.id == ModuleId::terminal()) {
+        all.push(ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::BelowEditor,
+        });
+    }
+    all.extend_from_slice(decls);
+    let mut layout = Layout::initial(&eitri_core::layout::first_launch_decls(&all))?;
     eitri_core::layout::hide(
         &mut layout,
         &ModuleId::terminal(),

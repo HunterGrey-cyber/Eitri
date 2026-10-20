@@ -100,6 +100,9 @@ pub enum Action {
         name: String,
     },
     WorkspaceNew,
+    /// tmux `break-pane`: the base view's active tab out into a chat view of its own; pressed in that view,
+    /// the tab joins the base view again.
+    TabBreak,
     /// vim `<C-w>H/J/K/L`: move the module to the window's far edge.
     MoveFar(Direction),
     /// i3 `layout toggle split`: switch the containing split's axis.
@@ -424,6 +427,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "tab.close" => (Action::Tab(TabAction::Close), &[]),
         "tab.choose" => (Action::Tab(TabAction::Choose), &[]),
         "tab.info" => (Action::Tab(TabAction::Info), &[]),
+        "tab.break" => (Action::TabBreak, &[]),
         "tab.select" => {
             let n =
                 o.n.ok_or_else(|| bad("n", "is required: the tab's number, as { n = 3 }"))?;
@@ -561,7 +565,8 @@ impl Action {
             | Action::WorkspaceChoose
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
-            | Action::WorkspaceNew => FloatRule::Acts,
+            | Action::WorkspaceNew
+            | Action::TabBreak => FloatRule::Acts,
         }
     }
 
@@ -617,7 +622,8 @@ impl Action {
             | Action::WorkspaceChoose
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
-            | Action::WorkspaceNew => SelectionRule::Resets,
+            | Action::WorkspaceNew
+            | Action::TabBreak => SelectionRule::Resets,
         }
     }
 
@@ -664,7 +670,8 @@ impl Action {
             | Action::WorkspaceChoose
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
-            | Action::WorkspaceNew => true,
+            | Action::WorkspaceNew
+            | Action::TabBreak => true,
             Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Tab(_)
@@ -702,6 +709,7 @@ impl Action {
             Action::WorkspaceRename => "workspace.rename".into(),
             Action::WorkspaceSwitch { .. } => "workspace.switch".into(),
             Action::WorkspaceNew => "workspace.new".into(),
+            Action::TabBreak => "tab.break".into(),
             Action::Zoom => "zoom".into(),
             Action::MoveFar(dir) => format!("move.far-{}", direction_name(*dir)),
             Action::ToggleSplit => "container.toggle-split".into(),
@@ -791,6 +799,9 @@ impl Action {
     /// `module_keys` the module keys a split key takes (`e / a / t`).
     pub fn describe(&self, prefix: &str, module_keys: &str) -> String {
         match self {
+            Action::TabBreak => {
+                "Break this session tab out into a chat view of its own; in that view, join it back".into()
+            }
             Action::FloatToggle => "Float this module over the others, or put a floating one back in the layout".into(),
             Action::FocusModeToggle => {
                 "Give the keys to the most recent module of the other layer, floating or tiled".into()
@@ -912,6 +923,26 @@ impl Action {
 mod tests {
     use super::*;
     use crate::keymap::table::Keymap;
+
+    #[test]
+    fn tab_break_parses_by_name_and_is_a_layout_action() {
+        let got = parse("tab.break", &[], &[]).unwrap();
+        assert_eq!(got.action, Action::TabBreak);
+        assert!(!got.repeatable);
+        assert_eq!(Action::TabBreak.name(), "tab.break");
+        assert!(Action::TabBreak.options().is_empty());
+        assert!(Action::TabBreak.is_layout(), "eitri.layout.run reaches it");
+        assert_eq!(Action::TabBreak.selection_rule(), SelectionRule::Resets);
+        assert_eq!(Action::TabBreak.on_a_float(), FloatRule::Acts);
+        assert_eq!(
+            Action::TabBreak.describe("Ctrl+b", "e / a / t"),
+            "Break this session tab out into a chat view of its own; in that view, join it back"
+        );
+        let err = parse("tab.break", &[("n".into(), OptValue::Int(2))], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not an option of tab.break"), "{err}");
+    }
 
     #[test]
     fn the_float_and_workspace_actions_parse_by_name_and_round_trip() {

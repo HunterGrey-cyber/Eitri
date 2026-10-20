@@ -1,10 +1,12 @@
 //! The top bar's tray: a chip for every module that is not on screen -- hidden,
-//! or zoomed away -- so nothing that keeps running is out of reach. The agent's reads `agent ⚑N`
-//! while cards wait, `agent •` once a turn finished unseen. A chat on screen under a float has its
-//! chip too, for its cards may be hidden; a scratch float stowed in the scratchpad reads `<title> ⌁`.
+//! or zoomed away -- so nothing that keeps running is out of reach. A chat view's reads `agent ⚑N`
+//! (`agent 2 ⚑N`) while its own tabs' cards wait, `agent •` once a turn finished unseen there. A chat
+//! view on screen under a float has its chip too, for its cards may be hidden; a scratch float stowed
+//! in the scratchpad reads `<title> ⌁`.
 //!
 //! One chip per module, made once and never reparented, in a fixed order (the editor, the agent,
-//! the terminal, `terminal 2` to `terminal 9`, then each Lua panel as it registered: [`chip_order`])
+//! `agent 2` to `agent 9`, the terminal, `terminal 2` to `terminal 9`, then each Lua panel as it
+//! registered: [`chip_order`])
 //! -- a chip does not move as the layout
 //! changes; only whether it shows does. Each is a top-bar item (`topbar-item`), so `Ctrl+k` then
 //! `h`/`l`/`Enter` reaches it, HINT labels it (`Slot::Top`), and a click works. Activating one is
@@ -37,8 +39,9 @@ pub(crate) fn module_title(id: &ModuleId, lua: &[(ModuleId, String)]) -> String 
     }
 }
 
-/// A strip entry's text: what the module's chip would read, so a chat on an inactive tab carries its
-/// cards' mark (`agent ⚑1`) where a hidden chat's chip would. Only the agent has an attention.
+/// A strip entry's text: what the module's chip would read, so a chat view on an inactive tab carries
+/// its own tabs' cards' mark (`agent 2 ⚑1`) where a hidden view's chip would. Only a chat view has an
+/// attention; `attention` is that view's.
 pub(crate) fn strip_label(id: &ModuleId, title: &str, attention: Attention) -> String {
     if id.kind() == ModuleKind::Agent {
         chip_label(title, Some(attention))
@@ -66,21 +69,22 @@ pub(crate) fn selection_text(layout: &Layout, title: &dyn Fn(&ModuleId) -> Strin
 }
 
 /// The modules the tray makes a chip for, in chip order: `modules` (the grid's hosts as added), with
-/// a chip for every possible terminal number right after the base terminal's, in number order. Every
-/// number gets its chip when the window is built, hidden until that instance exists and is off screen:
-/// the top bar's item list, which `h`/`l` step through and HINT labels, is fixed when the window is
-/// built, so a chip made later could be neither reached by key nor labelled.
+/// a chip for every possible terminal number right after the base terminal's and every possible chat
+/// view number right after the base chat's, in number order. Every number gets its chip when the window
+/// is built, hidden until that instance exists and is off screen: the top bar's item list, which `h`/`l`
+/// step through and HINT labels, is fixed when the window is built, so a chip made later could be
+/// neither reached by key nor labelled.
 pub(crate) fn chip_order(modules: &[ModuleId]) -> Vec<ModuleId> {
     let numbered =
-        (2..=eitri_core::layout::module::MAX_INSTANCE).filter_map(|n| ModuleId::instance(ModuleKind::Terminal, n).ok());
+        |kind| (2..=eitri_core::layout::module::MAX_INSTANCE).filter_map(move |n| ModuleId::instance(kind, n).ok());
     let mut order = Vec::new();
     for id in modules {
-        if id.kind() == ModuleKind::Terminal && id.number() >= 2 {
+        if id.kind().has_instances() && id.number() >= 2 {
             continue;
         }
         order.push(id.clone());
-        if *id == ModuleId::terminal() {
-            order.extend(numbered.clone());
+        if id.kind().has_instances() {
+            order.extend(numbered(id.kind()));
         }
     }
     order
@@ -132,6 +136,28 @@ pub(crate) fn changed_chips(
         }
     }
     changed
+}
+
+/// Every chip's state ([`chip_state`]) for `layout`, a chat view's chip asking `attention` for its own
+/// view.
+fn chip_states<W>(
+    chips: &[(ModuleId, String, W)],
+    layout: &Layout,
+    attention: &dyn Fn(&ModuleId) -> Attention,
+    covered: &[ModuleId],
+) -> Vec<Option<(String, bool)>> {
+    let off = tray_covered(layout, covered);
+    chips
+        .iter()
+        .map(|(id, title, _)| {
+            let held = if id.kind() == ModuleKind::Agent {
+                attention(id)
+            } else {
+                Attention::default()
+            };
+            chip_state(id, &off, title, held, layout.is_stowed(id))
+        })
+        .collect()
 }
 
 pub(crate) struct Tray {
@@ -196,15 +222,11 @@ impl Tray {
     }
 
     /// Shows a chip for each module off screen in `layout`, and for each of `covered` on screen under a
-    /// float (the chat, whose cards a float may hide), with the agent's `attention`. Touches only the
-    /// chips whose state changed ([`changed_chips`]); the borrow is released before GTK is.
-    pub(crate) fn refresh(&self, layout: &Layout, attention: Attention, covered: &[ModuleId]) {
-        let off = tray_covered(layout, covered);
-        let next = self
-            .chips
-            .iter()
-            .map(|(id, title, _)| chip_state(id, &off, title, attention, layout.is_stowed(id)))
-            .collect();
+    /// float (the chat views, whose cards a float may hide), each chat view's chip with that view's own
+    /// `attention`. Touches only the chips whose state changed ([`changed_chips`]); the borrow is
+    /// released before GTK is.
+    pub(crate) fn refresh(&self, layout: &Layout, attention: &dyn Fn(&ModuleId) -> Attention, covered: &[ModuleId]) {
+        let next = chip_states(&self.chips, layout, attention, covered);
         let changed = changed_chips(&mut self.shown.borrow_mut(), next);
         for (i, state) in changed {
             let chip = &self.chips[i].2;
@@ -259,13 +281,27 @@ mod tests {
             ModuleId::lua("notes"),
         ];
         let order: Vec<String> = chip_order(&modules).iter().map(ToString::to_string).collect();
-        let mut expected = vec!["editor", "agent", "terminal"];
+        let mut expected = vec!["editor", "agent"];
+        let chats: Vec<String> = (2..=9).map(|n| format!("agent#{n}")).collect();
+        expected.extend(chats.iter().map(String::as_str));
+        expected.push("terminal");
         let numbered: Vec<String> = (2..=9).map(|n| format!("terminal#{n}")).collect();
         expected.extend(numbered.iter().map(String::as_str));
         expected.push("lua:notes");
         assert_eq!(
             order, expected,
             "each number once, after the base, before the Lua panels"
+        );
+        let with_view = [
+            ModuleId::agent(),
+            ModuleId::parse("agent#4").unwrap(),
+            ModuleId::terminal(),
+        ];
+        let order = chip_order(&with_view);
+        assert_eq!(
+            order.iter().filter(|id| id.as_str() == "agent#4").count(),
+            1,
+            "a view the window opened with gets its chip once, in number order: {order:?}"
         );
     }
 
@@ -364,7 +400,12 @@ mod tests {
             ..Default::default()
         };
         let chat = ModuleId::agent();
-        let chip = |covered: &[ModuleId]| chip_state(&chat, &tray_covered(&layout, covered), "agent", one, false);
+        let chips = [
+            (chat.clone(), "agent".to_string(), ()),
+            (ModuleId::terminal(), "terminal".to_string(), ()),
+        ];
+        let attention = |id: &ModuleId| if *id == chat { one } else { Attention::default() };
+        let chip = |covered: &[ModuleId]| chip_states(&chips, &layout, &attention, covered)[0].clone();
         assert_eq!(chip(&[]), None, "on screen and clear: no chip");
         assert_eq!(
             chip(std::slice::from_ref(&chat)),
@@ -373,16 +414,77 @@ mod tests {
         );
         assert_eq!(chip(&[]), None, "the float moved off: the chip goes");
         assert_eq!(
-            chip_state(
-                &ModuleId::terminal(),
-                &tray_covered(&layout, std::slice::from_ref(&chat)),
-                "terminal",
-                one,
-                false
-            ),
+            chip_states(&chips, &layout, &attention, std::slice::from_ref(&chat))[1],
             None,
             "the float itself is on screen"
         );
+    }
+
+    /// Each chat view's chip, and its strip entry, carries the attention of its own view's tabs: a card
+    /// in the base view marks `agent`, and `agent 2`'s chip stays plain while its own tab owes nothing.
+    #[test]
+    fn each_chat_chip_carries_its_own_views_attention() {
+        use eitri_core::layout::{hide, Axis, Frame, Node, Size};
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        let two = ModuleId::parse("agent#2").unwrap();
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(two.clone()),
+                ),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        hide(&mut layout, &ModuleId::agent(), &frame).unwrap();
+        hide(&mut layout, &two, &frame).unwrap();
+        let one = Attention {
+            pending: 1,
+            ..Default::default()
+        };
+        let unread = Attention {
+            unread: true,
+            ..Default::default()
+        };
+        let chips = [
+            (ModuleId::editor(), "editor".to_string(), ()),
+            (ModuleId::agent(), "agent".to_string(), ()),
+            (two.clone(), "agent 2".to_string(), ()),
+        ];
+        let base_card = |id: &ModuleId| {
+            if *id == ModuleId::agent() {
+                one
+            } else {
+                Attention::default()
+            }
+        };
+        assert_eq!(
+            chip_states(&chips, &layout, &base_card, &[]),
+            [
+                None,
+                Some(("agent \u{2691}1".to_string(), true)),
+                Some(("agent 2".to_string(), false))
+            ],
+            "the base view's card marks the base view's chip alone"
+        );
+        let view_card = |id: &ModuleId| if *id == two { one } else { unread };
+        assert_eq!(
+            chip_states(&chips, &layout, &view_card, &[]),
+            [
+                None,
+                Some(("agent \u{2022}".to_string(), false)),
+                Some(("agent 2 \u{2691}1".to_string(), true))
+            ],
+            "a card in view 2 asks on view 2's chip"
+        );
+        assert_eq!(strip_label(&two, "agent 2", one), "agent 2 \u{2691}1");
+        assert_eq!(strip_label(&ModuleId::agent(), "agent", Attention::default()), "agent");
     }
 
     #[test]

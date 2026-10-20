@@ -317,6 +317,7 @@ fn default_bindings() -> Vec<Binding> {
     bind("L", Action::WorkspaceLast, false);
     bind("s", Action::WorkspaceChoose, false);
     bind("$", Action::WorkspaceRename, false);
+    bind("!", Action::TabBreak, false);
 
     bind("x", Action::ModuleKill, false);
     bind("c", Action::Tab(TabAction::New), false);
@@ -415,6 +416,7 @@ fn is_tmux_action(action: &Action) -> bool {
         Action::WorkspaceStep { .. }
             | Action::WorkspaceLast
             | Action::WorkspaceChoose
+            | Action::TabBreak
             | Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Split { .. }
@@ -922,6 +924,7 @@ mod tests {
         ("L", "workspace.last", false),
         ("s", "workspace.choose", false),
         ("$", "workspace.rename", false),
+        ("!", "tab.break", false),
         ("x", "module.kill", false),
         ("c", "tab.new", false),
         ("n", "tab.next", false),
@@ -973,6 +976,25 @@ mod tests {
             out.push_str(&format!(" {name}={value}"));
         }
         out
+    }
+
+    #[test]
+    fn bang_breaks_a_tab_out_as_stock_tmux_breaks_a_pane() {
+        let map = Keymap::defaults();
+        let binding = map.lookup(&k("!")).expect("! is bound");
+        assert_eq!(binding.action, Action::TabBreak);
+        assert!(!binding.repeatable, "stock tmux binds it without -r");
+        assert_eq!(crate::keymap::stock::stock_command(&k("!")), Some("break-pane"));
+        assert!(
+            is_tmux_action(&Action::TabBreak),
+            "unbind -a removes it as it removes the other tmux defaults"
+        );
+        assert_eq!(map.keys_for(&Action::TabBreak).len(), 1, "one default key");
+        let err = Keymap::apply_user(&[set("!", "zoom")], &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("tab.break (default)") && err.contains("eitri.keymap.del(\"prefix\", \"!\")"),
+            "{err}"
+        );
     }
 
     #[test]

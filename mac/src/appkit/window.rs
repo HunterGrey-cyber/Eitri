@@ -217,7 +217,7 @@ impl Host {
         {
             self.panel_view
                 .report_to(super::acceptance::recording_events(assembly.panel.clone()));
-            assembly.panel.load_first_document();
+            assembly.panel.load_document(eitri_panel::agent_panel::ViewId::BASE);
         }
         #[cfg(not(feature = "acceptance"))]
         self.panel_view.connect(&assembly.panel);
@@ -485,7 +485,7 @@ impl Host {
     fn page_back_on_screen(&self) {
         let Some(assembly) = self.assembly() else { return };
         if self.page().is_visible() {
-            assembly.panel.page_shown();
+            assembly.panel.page_shown(eitri_panel::agent_panel::ViewId::BASE);
         }
     }
 

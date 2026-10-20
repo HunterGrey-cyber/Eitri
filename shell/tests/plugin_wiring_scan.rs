@@ -106,7 +106,7 @@ fn prefix_question_mark_reads_the_plugin_before_the_chat_takes_the_keys() {
         .expect("the plugin's rows are read");
     let focus = code[arm..].find("give_keys(&chat);").expect("the chat takes the keys");
     let open = code[arm..]
-        .find("agent.open_keymap(plugin,opening);")
+        .find("agent.open_keymap(view,plugin,opening);")
         .expect("opened with the section");
     assert!(read < focus && focus < open);
 }

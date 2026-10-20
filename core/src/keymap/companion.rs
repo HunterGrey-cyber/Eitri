@@ -62,6 +62,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::WorkspaceRename
         | Action::WorkspaceSwitch { .. }
         | Action::WorkspaceNew
+        | Action::TabBreak
         | Action::SelectLast
         | Action::SelectNext
         | Action::Split { .. }
@@ -157,6 +158,7 @@ mod tests {
             (Action::WorkspaceRename, CompanionVerb::Refuse),
             (Action::WorkspaceSwitch { name: "x".into() }, CompanionVerb::Refuse),
             (Action::WorkspaceNew, CompanionVerb::Refuse),
+            (Action::TabBreak, CompanionVerb::Refuse),
             (Action::SelectNumber, CompanionVerb::Refuse),
             (Action::MoveFar(Direction::Left), CompanionVerb::Refuse),
             (Action::Zoom, CompanionVerb::Refuse),

@@ -119,8 +119,8 @@ eitri.command.register({
   `split.below` (they wait for a module key; `eitri.layout.split(id, "right")` or `"below"` does the work), `select.number`
   (it waits for a digit; `eitri.layout.focus(id)` gives a module the keys) and the `repeatable` option, which belongs
   to a key binding. Two more are for terminals: `eitri.layout.run("instance.new", { kind = "terminal" })` opens a
-  new terminal to the right of the module that has the keys, as `<prefix> Alt+Enter` does (`kind = "agent"` is
-  refused for now with `chat views: not in this build`), and a split action takes `cwd`, below.
+  new terminal to the right of the module that has the keys, as `<prefix> Alt+Enter` does (`kind = "agent"` makes a
+  [chat view](keys.md#chat-views) holding a new empty tab instead), and a split action takes `cwd`, below.
 - **`eitri.layout.mark(id)`** marks that module without moving the keys, as `<prefix> m` marks the one that has them.
 - **`eitri.layout.get()`** returns a new table describing the layout as it is now, in the shape
   `eitri.layout.default` takes: `{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`, where
@@ -135,6 +135,15 @@ eitri.command.register({
   centre as a fraction of the window, the size in pixels, the bar included), else at the rectangle it last floated
   at, else centred at 60% of the window. On a module that already floats it moves it to `rect`. The editor never
   floats. Like `<prefix> Alt+Shift+Space`, it refuses the last tiled module in view.
+- **`eitri.layout.rule(target, opts)`**, in `init.lua` only, says where a module opens when the window opens it by
+  itself; it is described under [Where a new module opens](#where-a-new-module-opens).
+- **`eitri.layout.open(kind, opts?)`** opens a new instance of a kind, `"terminal"` or `"agent"` (a new chat view
+  holding a new empty tab), as `eitri.layout.run("instance.new", { kind = ... })` does, but with the choice of where
+  it goes in your hands. Without `opts` your [open rules](#where-a-new-module-opens) decide, and without a rule it
+  opens to the right of the module that has the keys. With `opts`, which take the same keys and values as a rule's, they decide this one
+  opening and nothing else. Like the other runtime calls it is refused while `init.lua` is loading, and it stops with
+  a message for any other kind; a refusal at run time (no free number: `at most 9 terminals`, `at most 9 chat views`)
+  is logged and shown as it is for the key.
 - **`eitri.layout.workspace(name, tree)`**, in `init.lua` only, defines a workspace in the shape `default` takes. A
   window with no saved workspace of that name gets it, after the saved ones in the order the calls come; `main` is
   `eitri.layout.default`'s and is refused here. A workspace you define this way **comes back from its definition**
@@ -151,7 +160,12 @@ the container as a second item (`{ "editor", 0.6 }`), or a table of its own, who
 A child without a share takes an equal part of what the others leave; every share is from 0.05 to 1 and together
 they come to 1. `active = 2` on a tabbed or stacked table names the child shown (counting from 1; the first by
 default). A numbered terminal (`terminal#2` to `terminal#9`) can be a child, as in the example below, and the window
-gives it its own shell once it is shown. A misspelled field stops the launch, naming it. The top table (not a container inside it) may also carry
+gives it its own shell once it is shown; a numbered chat view (`agent#2` to `agent#9`) can be a child or a float
+too, and the window gives it a page of its own. The page starts with no tab of its own: a view named here is kept only
+when a saved tab is bound to it, and otherwise it is removed at startup once the restore settles, with the log line
+`agent#2 holds no tab; removed`. To get a view with a new, empty tab, make it while the window runs
+(`eitri.layout.open("agent")`, `eitri.layout.run("instance.new", { kind = "agent" })`, or `<prefix> !` on a tab) rather than
+naming it here. A misspelled field stops the launch, naming it. The top table (not a container inside it) may also carry
 `floating`, a list of `{ "module", cx = 0.5, cy = 0.5, w = 600, h = 400, scratch = true }`, bottom first: `cx` and
 `cy` are from 0 to 1, `w` and `h` whole pixels from 1 to 16384, and `scratch` (false unless given) starts the
 float put away. The editor stays in the tree; the agent panel may float; a module is in the tree or in the list,
@@ -204,6 +218,57 @@ workspaces) -- it drops the floats, opens those modules tiled (the base terminal
 file to `.v2.json.partial` first. Float positions are all that is lost; no module is. This version then opens them
 tiled, and the copy has the positions.
 
+**Chat views in the file.** A chat view (`agent#2` to `agent#9`) appears in a workspace's tree or `floating` list by
+its id, like a numbered terminal, and every workspace holds the views any workspace names. The saved tabs
+(`eitri/tabs/<hash>.json` in the state directory, a file of their own) carry a `view` number for a tab shown in an extra view. **A
+build from before chat views** leaves an `agent#N` out of the layout with a note and copies the file to
+`<hash>.v2.json.partial` first, so the views are not lost; it ignores `view` in the saved tabs, so each of those tabs
+comes back in the base view. This version too brings a tab back in the base view when the layout no longer holds its
+view, or when a second tab names a view another tab already took.
+
+### Where a new module opens
+
+`eitri.layout.rule(target, opts)`, in `init.lua` only, says where the window puts a
+module it opens by itself: a new terminal or chat view (`<prefix> Alt+Enter`, `instance.new`, `eitri.layout.open`), a tab broken out with `<prefix> !`, a module a launch places, and one that comes back
+after you closed it.
+
+```lua
+eitri.layout.rule("terminal", { at = "below", size = 0.3 })            -- terminals open below the module with the keys
+eitri.layout.rule("agent#2", { float = true, size = { 0.5, 0.6 } })     -- chat view 2: a float, half the window wide and 60% high
+eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- terminal 3: put away in the scratchpad
+```
+
+- **The target** is a kind (`"terminal"` or `"agent"`, which covers every instance of it that has no rule of its
+  own; for `"terminal"` that includes the base `terminal`, while `"agent"` reaches only the numbered chat views
+  `agent#2` to `agent#9`, since the first chat view always opens at the side, or where a layout file puts it) or one
+  module: `"terminal#2"`, `"agent#3"`, `"lua:notes"` for a Lua
+  panel, `"editor"`. Only one rule per target; a target that names nothing Eitri knows stops startup, naming the call.
+- **The options** are `at` (a place, below), `float` (a boolean), `size`, `scratchpad` (a boolean: it floats and
+  opens put away, and implies `float`) and `focus` (a boolean, `true` by default: whether the new module takes the
+  keys; with `false` the keys stay where they were, unless the new module takes the place of the editor that had
+  them). `at` is one of `side` (a new column to the right of the whole window), `bottom` (a new row below the whole
+  window), `main` (in the editor's place, hiding the editor), `below-editor` (a row below the editor's column, a
+  terminal's default place), `right`, `below`, `left`, `above` (beside the module that has the keys, taking half of its space) and `tab` (as a tab of the
+  container the module with the keys is in, which is made tabbed with the two of them if it is split). `size` is the
+  share of its container when the module is tiled (a number above 0 and below 1) and `{ w, h }` or `{ w = ..., h = ... }`,
+  fractions of the window above 0 and at most 1, when it floats; a float with no size opens centred at 60% of the
+  window on each axis.
+- **What is refused,** stopping startup with a message that names the call: an option that is not one of those, a value of the wrong type or out of range, a
+  tiled size given as a table or a floating one as a number, `float` or `scratchpad` together with `at`, a
+  floating editor (the editor never floats; any other rule for it is accepted and never applies, since nothing opens
+  the editor), a target that is neither a kind nor a module id, and a second rule for one target. A rule error stops startup even if your Lua catches it.
+- **Which rule wins.** A rule for the module's own id, then the rule for its kind, then a Lua panel's own `position`,
+  then the built-in default of where it opens: a new terminal or chat view, and a tab broken out, go to the right of the module
+  that has the keys (the base view, for a broken-out tab); a module the window places at a launch or brings back
+  after a close goes where it always did (the terminal below the editor, a Lua panel at its `position`). With no module
+  holding the keys (a first launch, a layout file read at startup) `right`, `left` and `tab` become `side`, and
+  `below` and `above` become `bottom`, with a note in the log for a rule that asked for them.
+- **What a rule never decides.** Anything that says where itself always wins: a split key, a move, a drag,
+  `eitri.layout.float`. A saved layout is never changed by a rule, and a layout from `eitri.layout.default` or
+  `eitri.layout.workspace` places the modules it names. A module that a saved layout or a template lacks, and that a
+  rule would float, comes back tiled at its fallback place, hidden, with a note naming the place. A new module is
+  added hidden to the other workspaces, at the place its rule or kind gives it.
+
 ## How a launch starts
 
 Two settings decide what a new window does with the tabs and the mode of its last session.
@@ -252,7 +317,8 @@ does not exist, stops the launch with a message naming where the name came from,
 whichever account happened to launch the window. An empty value counts as no account.
 
 The account decides which login the sessions use and where their history is read from, so a resumed
-conversation looks in the account's own history.
+conversation looks in the account's own history. A window has one account: every [chat view](keys.md#chat-views)
+spends it, and a tab shown in a view of its own does not start a session under another.
 
 ## Environment variables
 
