@@ -142,6 +142,7 @@ fn template(name: &str) -> Option<&'static str> {
         "new-window" => "abc:de:F:kn:PSt:",
         "command-prompt" => "1CbeFiklI:Np:t:T:",
         "choose-tree" => "F:f:GK:NO:rst:wyZ",
+        "switch-client" => "c:ElnO:prt:T:Z",
         "copy-mode" => "deHMqSs:t:u",
         "send-keys" => "c:FHKlMN:Rt:X",
         "send-prefix" => "2t:",
@@ -700,6 +701,24 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
                 }
                 _ => Err(no_equivalent("command-prompt with that template")),
             }
+        }
+        "switch-client" => {
+            parsed.only("lnp")?;
+            parsed.at_most(0)?;
+            match (parsed.has('n'), parsed.has('p'), parsed.has('l')) {
+                (true, false, false) => Ok(Action::WorkspaceStep { forward: true }),
+                (false, true, false) => Ok(Action::WorkspaceStep { forward: false }),
+                (false, false, true) => Ok(Action::WorkspaceLast),
+                (false, false, false) => {
+                    Err("switch-client without -n, -p or -l: Eitri switches workspaces only by those".into())
+                }
+                _ => Err("switch-client with more than one of -n, -p and -l".into()),
+            }
+        }
+        "choose-tree" if parsed.has('s') => {
+            parsed.only("sZ")?;
+            parsed.at_most(0)?;
+            Ok(Action::WorkspaceChoose)
         }
         "choose-tree" | "choose-window" | "choose-session" => {
             parsed.only("")?;

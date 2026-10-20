@@ -54,6 +54,17 @@ pub enum SelectionRule {
     Resets,
 }
 
+/// What an action does while the module with the keys is floating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatRule {
+    /// Acts on the tiled tree; every float stays where it is.
+    Tiles,
+    /// Refused: a float has no split.
+    Refuses,
+    /// Acts on the float itself.
+    Acts,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// i3 `move left|down|up|right`.
@@ -65,6 +76,30 @@ pub enum Action {
     InstanceNew {
         kind: ModuleKind,
     },
+    /// i3 `floating toggle`.
+    FloatToggle,
+    /// i3 `focus mode_toggle`: between the floating and the tiled layer.
+    FocusModeToggle,
+    /// i3 `scratchpad show`; with a module, that module only.
+    ScratchpadShow {
+        module: Option<ModuleId>,
+    },
+    /// i3 `move scratchpad`.
+    ScratchpadMove,
+    /// tmux `switch-client -n` (`forward: true`) / `-p`.
+    WorkspaceStep {
+        forward: bool,
+    },
+    /// tmux `switch-client -l`.
+    WorkspaceLast,
+    /// tmux `choose-tree -s`: the host draws the chooser, then starts the prefix wait.
+    WorkspaceChoose,
+    /// tmux's `rename-session` prompt.
+    WorkspaceRename,
+    WorkspaceSwitch {
+        name: String,
+    },
+    WorkspaceNew,
     /// vim `<C-w>H/J/K/L`: move the module to the window's far edge.
     MoveFar(Direction),
     /// i3 `layout toggle split`: switch the containing split's axis.
@@ -225,6 +260,8 @@ struct Opts {
     up: Option<bool>,
     cwd: Option<String>,
     kind: Option<String>,
+    module: Option<String>,
+    name: Option<String>,
 }
 
 fn bad(option: &str, why: impl Into<String>) -> ActionError {
@@ -242,11 +279,15 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
             ("n", OptValue::Int(i)) => out.n = Some(*i),
             ("cwd", OptValue::Str(s)) => out.cwd = Some(s.clone()),
             ("kind", OptValue::Str(s)) => out.kind = Some(s.clone()),
+            ("module", OptValue::Str(s)) => out.module = Some(s.clone()),
+            ("name", OptValue::Str(s)) => out.name = Some(s.clone()),
             ("keys", OptValue::Str(s)) => out.keys = Some(s.clone()),
             ("repeatable", OptValue::Bool(b)) => out.repeatable = Some(*b),
             ("up", OptValue::Bool(b)) => out.up = Some(*b),
             ("cells" | "n", other) => return Err(bad(name, format!("must be a whole number, not {}", other.kind()))),
-            ("cwd" | "kind", other) => return Err(bad(name, format!("must be a string, not {}", other.kind()))),
+            ("cwd" | "kind" | "module" | "name", other) => {
+                return Err(bad(name, format!("must be a string, not {}", other.kind())))
+            }
             ("keys", other) => return Err(bad(name, format!("must be one tmux key name, not {}", other.kind()))),
             ("repeatable" | "up", other) => {
                 return Err(bad(name, format!("must be true or false, not {}", other.kind())))
@@ -254,7 +295,7 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
             _ => {
                 return Err(bad(
                     name,
-                    "is not an option (cells, n, keys, repeatable, up, cwd, kind)",
+                    "is not an option (cells, n, keys, repeatable, up, cwd, kind, module, name)",
                 ))
             }
         }
@@ -311,6 +352,42 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
                 _ => return Err(bad("kind", format!("must be \"terminal\" or \"agent\", not {value:?}"))),
             };
             (Action::InstanceNew { kind }, &["kind"])
+        }
+        "float.toggle" => (Action::FloatToggle, &[]),
+        "focus.mode-toggle" => (Action::FocusModeToggle, &[]),
+        "scratchpad.move" => (Action::ScratchpadMove, &[]),
+        "workspace.prev" => (Action::WorkspaceStep { forward: false }, &[]),
+        "workspace.next" => (Action::WorkspaceStep { forward: true }, &[]),
+        "workspace.last" => (Action::WorkspaceLast, &[]),
+        "workspace.choose" => (Action::WorkspaceChoose, &[]),
+        "workspace.rename" => (Action::WorkspaceRename, &[]),
+        "workspace.new" => (Action::WorkspaceNew, &[]),
+        "scratchpad.show" => {
+            let module = o
+                .module
+                .as_deref()
+                .map(ModuleId::parse)
+                .transpose()
+                .map_err(|err| bad("module", format!("must be a module id: {err}")))?;
+            (Action::ScratchpadShow { module }, &["module"])
+        }
+        "workspace.switch" => {
+            let value = o
+                .name
+                .as_deref()
+                .ok_or_else(|| bad("name", "is required: the workspace's name, as { name = \"study\" }"))?;
+            crate::layout::Workspaces::valid_name(value).map_err(|_| {
+                bad(
+                    "name",
+                    format!("must be 1 to 32 characters with no control characters, not {value:?}"),
+                )
+            })?;
+            (
+                Action::WorkspaceSwitch {
+                    name: value.to_string(),
+                },
+                &["name"],
+            )
         }
         "zoom" => (Action::Zoom, &[]),
         "container.toggle-split" => (Action::ToggleSplit, &[]),
@@ -418,6 +495,8 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         (o.up.is_some(), "up"),
         (o.cwd.is_some(), "cwd"),
         (o.kind.is_some(), "kind"),
+        (o.module.is_some(), "module"),
+        (o.name.is_some(), "name"),
     ] {
         if given && !takes.contains(&option) {
             return Err(bad(option, format!("is not an option of {name}")));
@@ -430,6 +509,62 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
 }
 
 impl Action {
+    pub fn on_a_float(&self) -> FloatRule {
+        match self {
+            Action::Even(_)
+            | Action::MainHorizontal
+            | Action::MainVertical
+            | Action::Tiled
+            | Action::CycleLayout { .. }
+            | Action::Rotate { .. }
+            | Action::Flip(_)
+            | Action::LayoutUndo => FloatRule::Tiles,
+            Action::Spread
+            | Action::ContainerTabbed
+            | Action::ContainerStacked
+            | Action::ToggleSplit
+            | Action::Swap(_)
+            | Action::FocusParent
+            | Action::FocusChild => FloatRule::Refuses,
+            Action::Move(_)
+            | Action::MoveFar(_)
+            | Action::Zoom
+            | Action::FloatToggle
+            | Action::ScratchpadMove
+            | Action::ModuleKill
+            | Action::ModuleHide
+            | Action::SwapMarked
+            | Action::MarkToggle
+            | Action::SendPrefix
+            | Action::SendKeys(_)
+            | Action::Split { .. }
+            | Action::Resize { .. }
+            | Action::Select(_)
+            | Action::SelectLast
+            | Action::SelectNext
+            | Action::Module(_)
+            | Action::InstanceNew { .. }
+            | Action::Tab(_)
+            | Action::Hint
+            | Action::PanelReload
+            | Action::PanelKeymap
+            | Action::PanelCommandLine
+            | Action::WindowImmersive
+            | Action::Text(_)
+            | Action::CopyMode { .. }
+            | Action::MarkClear
+            | Action::SelectNumber
+            | Action::FocusModeToggle
+            | Action::ScratchpadShow { .. }
+            | Action::WorkspaceStep { .. }
+            | Action::WorkspaceLast
+            | Action::WorkspaceChoose
+            | Action::WorkspaceRename
+            | Action::WorkspaceSwitch { .. }
+            | Action::WorkspaceNew => FloatRule::Acts,
+        }
+    }
+
     pub fn selection_rule(&self) -> SelectionRule {
         match self {
             Action::Move(_)
@@ -442,9 +577,13 @@ impl Action {
             | Action::Spread
             | Action::FocusParent
             | Action::FocusChild => SelectionRule::Takes,
-            Action::ModuleKill | Action::ModuleHide | Action::Swap(_) | Action::SwapMarked | Action::MarkToggle => {
-                SelectionRule::Refuses
-            }
+            Action::FloatToggle
+            | Action::ScratchpadMove
+            | Action::ModuleKill
+            | Action::ModuleHide
+            | Action::Swap(_)
+            | Action::SwapMarked
+            | Action::MarkToggle => SelectionRule::Refuses,
             Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Split { .. }
@@ -470,7 +609,15 @@ impl Action {
             | Action::CycleLayout { .. }
             | Action::LayoutUndo
             | Action::MarkClear
-            | Action::SelectNumber => SelectionRule::Resets,
+            | Action::SelectNumber
+            | Action::FocusModeToggle
+            | Action::ScratchpadShow { .. }
+            | Action::WorkspaceStep { .. }
+            | Action::WorkspaceLast
+            | Action::WorkspaceChoose
+            | Action::WorkspaceRename
+            | Action::WorkspaceSwitch { .. }
+            | Action::WorkspaceNew => SelectionRule::Resets,
         }
     }
 
@@ -507,7 +654,17 @@ impl Action {
             | Action::MarkToggle
             | Action::MarkClear
             | Action::SwapMarked
-            | Action::SelectNumber => true,
+            | Action::SelectNumber
+            | Action::FloatToggle
+            | Action::FocusModeToggle
+            | Action::ScratchpadShow { .. }
+            | Action::ScratchpadMove
+            | Action::WorkspaceStep { .. }
+            | Action::WorkspaceLast
+            | Action::WorkspaceChoose
+            | Action::WorkspaceRename
+            | Action::WorkspaceSwitch { .. }
+            | Action::WorkspaceNew => true,
             Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Tab(_)
@@ -534,6 +691,17 @@ impl Action {
             Action::FocusParent => "focus.parent".into(),
             Action::FocusChild => "focus.child".into(),
             Action::InstanceNew { .. } => "instance.new".into(),
+            Action::FloatToggle => "float.toggle".into(),
+            Action::FocusModeToggle => "focus.mode-toggle".into(),
+            Action::ScratchpadShow { .. } => "scratchpad.show".into(),
+            Action::ScratchpadMove => "scratchpad.move".into(),
+            Action::WorkspaceStep { forward: false } => "workspace.prev".into(),
+            Action::WorkspaceStep { forward: true } => "workspace.next".into(),
+            Action::WorkspaceLast => "workspace.last".into(),
+            Action::WorkspaceChoose => "workspace.choose".into(),
+            Action::WorkspaceRename => "workspace.rename".into(),
+            Action::WorkspaceSwitch { .. } => "workspace.switch".into(),
+            Action::WorkspaceNew => "workspace.new".into(),
             Action::Zoom => "zoom".into(),
             Action::MoveFar(dir) => format!("move.far-{}", direction_name(*dir)),
             Action::ToggleSplit => "container.toggle-split".into(),
@@ -593,6 +761,8 @@ impl Action {
     /// The options that, with [`Action::name`], parse back to this action.
     pub fn options(&self) -> Vec<(String, OptValue)> {
         match self {
+            Action::ScratchpadShow { module: Some(id) } => vec![("module".into(), OptValue::Str(id.as_str().into()))],
+            Action::WorkspaceSwitch { name } => vec![("name".into(), OptValue::Str(name.clone()))],
             Action::Split {
                 cwd: SplitCwd::Pane, ..
             } => vec![("cwd".into(), OptValue::Str("pane".into()))],
@@ -621,6 +791,26 @@ impl Action {
     /// `module_keys` the module keys a split key takes (`e / a / t`).
     pub fn describe(&self, prefix: &str, module_keys: &str) -> String {
         match self {
+            Action::FloatToggle => "Float this module over the others, or put a floating one back in the layout".into(),
+            Action::FocusModeToggle => {
+                "Give the keys to the most recent module of the other layer, floating or tiled".into()
+            }
+            Action::ScratchpadShow { module: None } => {
+                "Show the scratchpad's module, or put it away again; pressed again, the next".into()
+            }
+            Action::ScratchpadMove => "Send this module to the scratchpad".into(),
+            Action::WorkspaceStep { forward: false } => "Switch to the previous workspace".into(),
+            Action::WorkspaceStep { forward: true } => "Switch to the next workspace".into(),
+            Action::WorkspaceLast => "Switch to the workspace used before this one".into(),
+            Action::WorkspaceChoose => {
+                "Choose a workspace: a digit switches, c makes a new one, x then a digit deletes one".into()
+            }
+            Action::WorkspaceRename => "Rename this workspace".into(),
+            Action::WorkspaceNew => "Make a new workspace as a copy of this one, and switch to it".into(),
+            Action::ScratchpadShow { module: Some(id) } => {
+                format!("Show {id} from the scratchpad, or put it away again")
+            }
+            Action::WorkspaceSwitch { name } => format!("Switch to workspace {name}"),
             Action::SendPrefix => format!("Send {prefix} itself to the pane with the keys"),
             Action::SendKeys(key) => format!("Send {} to the pane with the keys", key.human()),
             Action::Split { axis: Axis::Row, .. } => {
@@ -720,6 +910,168 @@ impl Action {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_float_and_workspace_actions_parse_by_name_and_round_trip() {
+        let cases: Vec<(&str, Action)> = vec![
+            ("float.toggle", Action::FloatToggle),
+            ("focus.mode-toggle", Action::FocusModeToggle),
+            ("scratchpad.show", Action::ScratchpadShow { module: None }),
+            ("scratchpad.move", Action::ScratchpadMove),
+            ("workspace.prev", Action::WorkspaceStep { forward: false }),
+            ("workspace.next", Action::WorkspaceStep { forward: true }),
+            ("workspace.last", Action::WorkspaceLast),
+            ("workspace.choose", Action::WorkspaceChoose),
+            ("workspace.rename", Action::WorkspaceRename),
+            ("workspace.new", Action::WorkspaceNew),
+        ];
+        for (name, action) in cases {
+            assert_eq!(parse(name, &[], &[]).unwrap().action, action, "{name}");
+            assert_eq!(action.name(), name);
+            assert!(action.options().is_empty(), "{name}");
+            assert!(action.is_layout(), "{name}");
+            assert!(!action.describe("Ctrl+b", "e / a / t").is_empty(), "{name}");
+            let err = parse(name, &[("cells".into(), OptValue::Int(2))], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("is not an option of {name}")), "{err}");
+        }
+        for bad in [
+            "float",
+            "float.togle",
+            "scratchpad",
+            "workspace",
+            "workspace.delete",
+            "focus.mode",
+        ] {
+            assert!(parse(bad, &[], &[]).unwrap_err().to_string().contains(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scratchpad_show_takes_a_module_and_workspace_switch_a_name() {
+        let s = |v: &str| OptValue::Str(v.to_string());
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let got = parse("scratchpad.show", &[("module".into(), s("terminal#2"))], &[])
+            .unwrap()
+            .action;
+        assert_eq!(got, Action::ScratchpadShow { module: Some(t2) });
+        assert_eq!(got.options(), vec![("module".to_string(), s("terminal#2"))]);
+        assert_eq!(parse(&got.name(), &got.options(), &[]).unwrap().action, got);
+        let err = parse("scratchpad.show", &[("module".into(), s("chat"))], &[]).unwrap_err();
+        assert!(
+            matches!(&err, ActionError::BadOption { option, why } if option == "module" && why.starts_with("must be a module id: ")),
+            "{err}"
+        );
+        assert_eq!(
+            parse("scratchpad.show", &[("module".into(), OptValue::Int(2))], &[]).unwrap_err(),
+            ActionError::BadOption {
+                option: "module".into(),
+                why: "must be a string, not a number".into()
+            }
+        );
+
+        let got = parse("workspace.switch", &[("name".into(), s("study"))], &[])
+            .unwrap()
+            .action;
+        assert_eq!(got, Action::WorkspaceSwitch { name: "study".into() });
+        assert_eq!(got.options(), vec![("name".to_string(), s("study"))]);
+        assert_eq!(parse(&got.name(), &got.options(), &[]).unwrap().action, got);
+        assert!(got.is_layout());
+        assert_eq!(
+            parse("workspace.switch", &[], &[]).unwrap_err(),
+            ActionError::BadOption {
+                option: "name".into(),
+                why: "is required: the workspace's name, as { name = \"study\" }".into()
+            }
+        );
+        let long = "x".repeat(33);
+        for bad in ["", "a\nb", long.as_str()] {
+            assert_eq!(
+                parse("workspace.switch", &[("name".into(), s(bad))], &[]).unwrap_err(),
+                ActionError::BadOption {
+                    option: "name".into(),
+                    why: format!("must be 1 to 32 characters with no control characters, not {bad:?}")
+                }
+            );
+        }
+        let err = parse("zoom", &[("name".into(), s("x"))], &[]).unwrap_err().to_string();
+        assert!(err.contains("is not an option of zoom"), "{err}");
+        let err = parse("zoom", &[("speed".into(), OptValue::Int(1))], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("(cells, n, keys, repeatable, up, cwd, kind, module, name)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_float_and_workspace_actions_say_whether_they_take_a_selection() {
+        assert_eq!(Action::FloatToggle.selection_rule(), SelectionRule::Refuses);
+        assert_eq!(Action::ScratchpadMove.selection_rule(), SelectionRule::Refuses);
+        for action in [
+            Action::FocusModeToggle,
+            Action::ScratchpadShow { module: None },
+            Action::WorkspaceStep { forward: true },
+            Action::WorkspaceLast,
+            Action::WorkspaceChoose,
+            Action::WorkspaceRename,
+            Action::WorkspaceSwitch { name: "x".into() },
+            Action::WorkspaceNew,
+        ] {
+            assert_eq!(action.selection_rule(), SelectionRule::Resets, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn every_action_says_what_it_does_with_the_keys_on_a_float() {
+        for action in [
+            Action::Even(Axis::Row),
+            Action::MainHorizontal,
+            Action::MainVertical,
+            Action::Tiled,
+            Action::CycleLayout { forward: true },
+            Action::Rotate { down: false },
+            Action::Flip(Axis::Column),
+            Action::LayoutUndo,
+        ] {
+            assert_eq!(action.on_a_float(), FloatRule::Tiles, "{action:?}");
+        }
+        for action in [
+            Action::Spread,
+            Action::ContainerTabbed,
+            Action::ContainerStacked,
+            Action::ToggleSplit,
+            Action::Swap(SwapTarget::Prev),
+            Action::Swap(SwapTarget::Toward(Direction::Left)),
+            Action::FocusParent,
+            Action::FocusChild,
+        ] {
+            assert_eq!(action.on_a_float(), FloatRule::Refuses, "{action:?}");
+        }
+        for action in [
+            Action::FloatToggle,
+            Action::Move(Direction::Left),
+            Action::MoveFar(Direction::Up),
+            Action::Resize {
+                dir: Direction::Right,
+                cells: 5,
+            },
+            Action::Zoom,
+            Action::ModuleKill,
+            Action::ModuleHide,
+            Action::SwapMarked,
+            Action::MarkToggle,
+            Action::SelectNext,
+            Action::ScratchpadMove,
+            Action::ScratchpadShow { module: None },
+            Action::WorkspaceNew,
+            Action::Tab(TabAction::New),
+        ] {
+            assert_eq!(action.on_a_float(), FloatRule::Acts, "{action:?}");
+        }
+    }
+
     use super::*;
     use crate::keymap::table::Keymap;
 
@@ -947,6 +1299,17 @@ mod tests {
     #[test]
     fn is_layout_holds_the_layout_actions_and_nothing_else() {
         let layout = [
+            Action::FloatToggle,
+            Action::FocusModeToggle,
+            Action::ScratchpadShow { module: None },
+            Action::ScratchpadMove,
+            Action::WorkspaceStep { forward: false },
+            Action::WorkspaceStep { forward: true },
+            Action::WorkspaceLast,
+            Action::WorkspaceChoose,
+            Action::WorkspaceRename,
+            Action::WorkspaceSwitch { name: "x".into() },
+            Action::WorkspaceNew,
             Action::Split {
                 axis: Axis::Row,
                 cwd: crate::keymap::action::SplitCwd::Start,
@@ -1076,7 +1439,7 @@ mod tests {
             parse("zoom", &[("wat".into(), OptValue::Int(1))], &[]),
             Err(bad(
                 "wat",
-                "is not an option (cells, n, keys, repeatable, up, cwd, kind)"
+                "is not an option (cells, n, keys, repeatable, up, cwd, kind, module, name)"
             ))
         );
     }

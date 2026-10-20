@@ -43,6 +43,36 @@ pub(crate) struct TopBar {
     /// `selected: <kind> (<titles>)`, beside the mark, shown only while a container is selected
     /// (`tray::selection_text`). Set with [`show_mark`]: the same plain-text segment.
     pub(crate) selection: gtk4::Label,
+    /// The current workspace's name, left of the selection and the mark, shown only while the window
+    /// has more than one workspace ([`workspace_text`], [`show_workspace`]). A top-bar item, ahead of
+    /// the tray's chips: `h`/`l` and HINT reach it, and activating it opens the workspace chooser.
+    pub(crate) workspace: gtk4::Button,
+    /// The workspace button's text, set with [`show_workspace`] as plain text.
+    pub(crate) workspace_label: gtk4::Label,
+    /// Where the current workspace is renamed: hidden until a rename starts, made here so the top bar's
+    /// widgets and items are fixed when it is built.
+    pub(crate) rename: gtk4::Entry,
+}
+
+/// What the top bar says about the workspaces: the current one's name while there are several, and
+/// nothing while there is one -- a window that never made a second workspace shows no word for it.
+pub(crate) fn workspace_text(order: &[String], current: &str) -> Option<String> {
+    (order.len() > 1).then(|| current.to_string())
+}
+
+/// Shows `text` on the workspace button, or hides it. Plain text, never markup: a workspace name is
+/// whatever the user or a state file gave.
+pub(crate) fn show_workspace(button: &gtk4::Button, label: &gtk4::Label, text: Option<&str>) {
+    label.set_text(text.unwrap_or(""));
+    button.set_visible(text.is_some());
+}
+
+/// Opens the rename entry holding `current`, selected, so typing replaces it.
+pub(crate) fn start_rename(entry: &gtk4::Entry, current: &str) {
+    entry.set_text(current);
+    entry.set_visible(true);
+    entry.grab_focus();
+    entry.select_region(0, -1);
 }
 
 /// What the top bar says about the mark `swap.marked` swaps with: nothing without one. The mark
@@ -126,10 +156,31 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     selection.set_valign(gtk4::Align::Center);
     selection.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     selection.set_visible(false);
+    // A button around a label rather than a button's own label, so the name is set with `set_text`
+    // and nothing else. Not focused by a click: a click opens the chooser, whose key is read by the
+    // prefix wherever the keys are, and they stay in the module that had them.
+    let workspace_label = gtk4::Label::new(None);
+    workspace_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let workspace = gtk4::Button::new();
+    workspace.set_child(Some(&workspace_label));
+    workspace.add_css_class("topbar-workspace");
+    workspace.add_css_class("topbar-item");
+    workspace.set_valign(gtk4::Align::Center);
+    workspace.set_focus_on_click(false);
+    workspace.set_tooltip_text(Some("Workspaces"));
+    workspace.set_visible(false);
+    let rename = gtk4::Entry::new();
+    rename.add_css_class("topbar-rename");
+    rename.set_valign(gtk4::Align::Center);
+    rename.set_max_length(eitri_core::layout::workspace::MAX_NAME_CHARS as i32);
+    rename.set_width_chars(12);
+    rename.set_visible(false);
 
     bar.append(&app_name);
     bar.append(&strip);
     bar.append(&project_name);
+    bar.append(&workspace);
+    bar.append(&rename);
     bar.append(&selection);
     bar.append(&mark);
     bar.append(&tray);
@@ -147,6 +198,9 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
         tray,
         mark,
         selection,
+        workspace,
+        workspace_label,
+        rename,
     }
 }
 
@@ -211,6 +265,86 @@ mod tests {
             mark_text(Some(&ModuleId::agent()), &title),
             Some("marked: agent".to_string())
         );
+    }
+
+    #[test]
+    fn the_top_bar_names_the_workspace_only_while_there_are_several() {
+        use super::workspace_text;
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            workspace_text(&names(&["main"]), "main"),
+            None,
+            "one workspace: no word for it"
+        );
+        assert_eq!(
+            workspace_text(&names(&["main", "study"]), "study"),
+            Some("study".to_string())
+        );
+        assert_eq!(
+            workspace_text(&names(&["main", "study", "review"]), "main"),
+            Some("main".to_string()),
+            "main is named too once there are several"
+        );
+    }
+
+    /// A workspace name is the user's or a state file's text: the workspace button's label and the
+    /// rename entry are given it with `set_text`, only in `show_workspace` and `start_rename` (the
+    /// window's code sets no widget's text itself), and nothing in the top bar's code, the window's or
+    /// the prefix strip's sets markup on any widget.
+    #[test]
+    fn a_workspace_name_is_set_as_text_never_markup() {
+        use eitri_core::source_scan as scan;
+        let without_tests = |path: &str| {
+            let code = scan::code_only(&scan::read_required(path).text);
+            scan::without(&code, &scan::modules(&code, "tests"))
+        };
+        let chrome = without_tests("shell/src/chrome.rs");
+        for (setter, writes) in [
+            ("show_workspace", "label.set_text("),
+            ("start_rename", "entry.set_text("),
+        ] {
+            let bodies = scan::functions(&chrome, setter);
+            assert_eq!(bodies.len(), 1, "{setter} is defined once");
+            assert!(
+                bodies[0].contains(writes),
+                "{setter} sets its text with set_text: {}",
+                bodies[0]
+            );
+            assert!(
+                !bodies[0].contains(".set_label("),
+                "{setter}: a button's label is not set"
+            );
+        }
+        for path in ["shell/src/chrome.rs", "shell/src/main.rs", "shell/src/prefix_strip.rs"] {
+            let code = without_tests(path);
+            assert!(!code.contains("markup"), "{path} sets markup somewhere");
+        }
+        // Any other text write would bypass the two setters above: a button's own label replaces
+        // the plain label inside it, and an entry's text can be set or inserted.
+        let setters = [".set_text(", ".set_label(", ".insert_text(", ".set_buffer("];
+        let main = without_tests("shell/src/main.rs");
+        for setter in setters {
+            assert!(
+                !main.contains(setter),
+                "main.rs calls {setter}: a widget's text goes through chrome's setters"
+            );
+        }
+        let outside_setters = {
+            let bodies: Vec<&str> = ["show_workspace", "start_rename"]
+                .iter()
+                .flat_map(|name| scan::functions(&chrome, name))
+                .collect();
+            scan::without(&chrome, &bodies)
+        };
+        for widget in ["workspace_label", "workspace", "rename"] {
+            for setter in setters {
+                let call = format!("{widget}{setter}");
+                assert!(
+                    !outside_setters.contains(&call),
+                    "chrome.rs calls {call} outside show_workspace and start_rename"
+                );
+            }
+        }
     }
 
     #[test]

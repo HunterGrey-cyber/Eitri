@@ -30,6 +30,9 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     // A tabbed or stacked container's strip, and the class on the entry it draws.
     let strip = crate::module_grid::strips::CSS_NAME;
     let active = crate::module_grid::strips::ACTIVE_CLASS;
+    // A float's bar and its grip.
+    let floatbar = crate::module_grid::floatbars::BAR_CSS_NAME;
+    let floatgrip = crate::module_grid::floatbars::GRIP_CSS_NAME;
 
     format!(
         r#"
@@ -71,6 +74,38 @@ window {{
     color: {chrome_muted};
     font-size: 12px;
     margin-right: 8px;
+}}
+
+/* The current workspace's name (`chrome::workspace_text`), only while the window has several: a
+   word about the layout, quiet like the mark beside it. A button only so that `h`/`l`, HINT and a
+   click reach the workspace chooser; its cursor is the top bar's item cursor, below. */
+.topbar-workspace {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    color: {chrome_muted};
+    font-size: 12px;
+    min-height: 22px;
+    padding: 0 4px;
+    margin-right: 8px;
+    border-radius: 3px;
+}}
+
+/* The rename entry, beside the workspace name while a rename is typed: the content's own text pair
+   inside one rule's border, so it reads as the one place typing goes. */
+.topbar-rename {{
+    background-color: {bg};
+    background-image: none;
+    border: 1px solid {border};
+    box-shadow: none;
+    color: {fg};
+    caret-color: {fg};
+    font-size: 12px;
+    min-height: 22px;
+    padding: 0 6px;
+    margin-right: 8px;
+    border-radius: 4px;
 }}
 
 .win-btn {{
@@ -126,6 +161,30 @@ window {{
 {strip} > label.{active} {{
     color: {chrome_fg};
     font-weight: 700;
+}}
+
+/* A float's bar (`module_grid::floatbars`): the strip's quiet pair across the float's top edge, its
+   module's title in the muted colour. A row is 23px plus its 1px rule, a strip row, which is what the
+   geometry gives the bar. The grip is a 12px square in the rule's colour at the float's bottom-right
+   corner. */
+{floatbar} {{
+    background-color: {chrome};
+    background-image: none;
+    border-bottom: 1px solid {border};
+}}
+
+{floatbar} > label {{
+    color: {chrome_muted};
+    font-size: 12px;
+    min-height: 23px;
+    padding: 0 8px;
+}}
+
+{floatgrip} {{
+    background-color: {border};
+    background-image: none;
+    min-width: 12px;
+    min-height: 12px;
 }}
 
 .pane-placeholder {{
@@ -397,12 +456,14 @@ mod tests {
             (".tray-chip.attention", t.chrome_fg, 4.5),
             ("constrip > label", t.chrome_muted, 4.5),
             ("constrip > label.active", t.chrome_fg, 4.5),
+            ("floatbar > label", t.chrome_muted, 4.5),
             (".prefix-strip", t.chrome_fg, 4.5),
             (".prefix-strip .dimmed", t.chrome_muted, 4.5),
             (".prefix-strip .strip-dot", t.chrome_muted, 4.5),
             (".topbar-app-name", t.chrome_fg, 4.5),
             (".topbar-project-name", t.chrome_muted, 4.5),
             (".topbar-mark", t.chrome_muted, 4.5),
+            (".topbar-workspace", t.chrome_muted, 4.5),
             (".win-btn", t.chrome_muted, 4.5),
         ] {
             let body = rule(&css, selector);

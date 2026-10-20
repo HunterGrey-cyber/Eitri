@@ -370,6 +370,19 @@ mod tests {
     }
 
     #[test]
+    fn alt_shift_space_alt_minus_and_alt_underscore_read_as_tmux_names() {
+        assert_eq!(
+            classify(Key::space, ModifierType::ALT_MASK | ModifierType::SHIFT_MASK),
+            key("M-S-Space")
+        );
+        assert_eq!(classify(Key::minus, ModifierType::ALT_MASK), key("M--"));
+        assert_eq!(
+            classify(Key::underscore, ModifierType::ALT_MASK | ModifierType::SHIFT_MASK),
+            key("M-_")
+        );
+    }
+
+    #[test]
     fn alt_shift_h_and_alt_return_read_as_tmux_names() {
         assert_eq!(
             classify(Key::H, ModifierType::ALT_MASK | ModifierType::SHIFT_MASK),

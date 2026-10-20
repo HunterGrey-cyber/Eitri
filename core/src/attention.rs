@@ -184,6 +184,8 @@ impl ChatOnPermission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentPlace {
     OnScreen,
+    /// On screen with a float over part of it: cards may be hidden, so they get a chip and answers are refused.
+    Covered,
     /// Shown on an inactive tab, with no zoom keeping it away.
     TabbedAway,
     /// Hidden, with no zoom on: `reveal` can put it back.
@@ -214,7 +216,8 @@ pub fn react(policy: ChatOnPermission, before: Attention, after: Attention, plac
     if after.arrived <= before.arrived || after.pending == 0 || place == AgentPlace::OnScreen {
         return Reaction::default();
     }
-    let reveal = policy == ChatOnPermission::Reveal && matches!(place, AgentPlace::Hidden | AgentPlace::TabbedAway);
+    let reveal = policy == ChatOnPermission::Reveal
+        && matches!(place, AgentPlace::Hidden | AgentPlace::TabbedAway | AgentPlace::Covered);
     Reaction { toast: !reveal, reveal }
 }
 
@@ -470,5 +473,29 @@ mod tests {
         assert_eq!(second.oldest_pending_stamp(), Some(b_new));
         second.session_ended(true);
         assert_eq!(second.oldest_pending_stamp(), None);
+    }
+
+    #[test]
+    fn a_covered_chat_is_revealed_under_reveal_and_toasted_under_badge() {
+        let before = Attention::default();
+        let after = Attention {
+            pending: 1,
+            unread: false,
+            arrived: 1,
+        };
+        assert_eq!(
+            react(ChatOnPermission::Reveal, before, after, AgentPlace::Covered),
+            Reaction {
+                toast: false,
+                reveal: true
+            }
+        );
+        assert_eq!(
+            react(ChatOnPermission::Badge, before, after, AgentPlace::Covered),
+            Reaction {
+                toast: true,
+                reveal: false
+            }
+        );
     }
 }

@@ -151,7 +151,7 @@ pub fn next_prev_target(keys_in: Option<ModuleKind>, terminals: usize, in_tabs: 
 /// A tab changed from outside the chat: reveal a hidden or inactive chat, keys unmoved, as
 /// `modules.chat.on_permission = "reveal"` does. Under a zoom only the tray chip changes.
 pub fn reveal_on_switch(place: AgentPlace) -> bool {
-    matches!(place, AgentPlace::Hidden | AgentPlace::TabbedAway)
+    matches!(place, AgentPlace::Hidden | AgentPlace::TabbedAway | AgentPlace::Covered)
 }
 
 /// What closing one tab involves.
@@ -880,5 +880,10 @@ mod tests {
             plan(TabAction::Prev, Some(ModuleKind::Terminal), 1, true).verb,
             TabVerb::Sibling(-1)
         );
+    }
+
+    #[test]
+    fn a_tab_switch_reveals_a_covered_chat() {
+        assert!(reveal_on_switch(AgentPlace::Covered));
     }
 }

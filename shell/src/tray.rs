@@ -1,6 +1,7 @@
 //! The top bar's tray: a chip for every module that is not on screen -- hidden,
 //! or zoomed away -- so nothing that keeps running is out of reach. The agent's reads `agent ⚑N`
-//! while cards wait, `agent •` once a turn finished unseen.
+//! while cards wait, `agent •` once a turn finished unseen. A chat on screen under a float has its
+//! chip too, for its cards may be hidden; a scratch float stowed in the scratchpad reads `<title> ⌁`.
 //!
 //! One chip per module, made once and never reparented, in a fixed order (the editor, the agent,
 //! the terminal, `terminal 2` to `terminal 9`, then each Lua panel as it registered: [`chip_order`])
@@ -13,7 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use eitri_core::attention::Attention;
-use eitri_core::layout::{chip_label, tray, ConLayout, Layout, ModuleId, ModuleKind, Selection};
+use eitri_core::layout::{chip_label, tray_covered, ConLayout, Layout, ModuleId, ModuleKind, Selection};
 use gtk4::prelude::*;
 
 /// A module's name on its chip and in the prefix strip: the built-ins by kind, a numbered instance by
@@ -85,21 +86,32 @@ pub(crate) fn chip_order(modules: &[ModuleId]) -> Vec<ModuleId> {
     order
 }
 
-/// One chip's state: `None` when its module is on screen (no chip), else its text and whether it
-/// is asking for the user (the agent holding a card).
+/// The mark a stowed scratch float's chip carries after its title: what tells a module waiting in the
+/// scratchpad from one merely hidden.
+const STOWED_MARK: &str = "\u{2301}";
+
+/// One chip's state: `None` when its module needs no chip (`off_screen` is what does: the modules off
+/// screen and a covered chat), else its text and whether it is asking for the user (the agent holding
+/// a card). `stowed`: the module is a scratch float in the scratchpad, and its chip says so.
 pub(crate) fn chip_state(
     id: &ModuleId,
     off_screen: &[ModuleId],
     title: &str,
     attention: Attention,
+    stowed: bool,
 ) -> Option<(String, bool)> {
     if !off_screen.contains(id) {
         return None;
     }
-    if id.kind() == ModuleKind::Agent {
-        Some((chip_label(title, Some(attention)), attention.pending > 0))
+    let title = if stowed {
+        format!("{title} {STOWED_MARK}")
     } else {
-        Some((chip_label(title, None), false))
+        title.to_string()
+    };
+    if id.kind() == ModuleKind::Agent {
+        Some((chip_label(&title, Some(attention)), attention.pending > 0))
+    } else {
+        Some((chip_label(&title, None), false))
     }
 }
 
@@ -183,14 +195,15 @@ impl Tray {
         *self.on_activate.borrow_mut() = Some(Rc::new(hook));
     }
 
-    /// Shows a chip for each module off screen in `layout`, with the agent's `attention`. Touches only
-    /// the chips whose state changed ([`changed_chips`]); the borrow is released before GTK is.
-    pub(crate) fn refresh(&self, layout: &Layout, attention: Attention) {
-        let off = tray(layout);
+    /// Shows a chip for each module off screen in `layout`, and for each of `covered` on screen under a
+    /// float (the chat, whose cards a float may hide), with the agent's `attention`. Touches only the
+    /// chips whose state changed ([`changed_chips`]); the borrow is released before GTK is.
+    pub(crate) fn refresh(&self, layout: &Layout, attention: Attention, covered: &[ModuleId]) {
+        let off = tray_covered(layout, covered);
         let next = self
             .chips
             .iter()
-            .map(|(id, title, _)| chip_state(id, &off, title, attention))
+            .map(|(id, title, _)| chip_state(id, &off, title, attention, layout.is_stowed(id)))
             .collect();
         let changed = changed_chips(&mut self.shown.borrow_mut(), next);
         for (i, state) in changed {
@@ -264,19 +277,111 @@ mod tests {
             unread: false,
             ..Default::default()
         };
-        assert_eq!(chip_state(&ModuleId::editor(), &off, "editor", two), None);
+        assert_eq!(chip_state(&ModuleId::editor(), &off, "editor", two, false), None);
         assert_eq!(
-            chip_state(&ModuleId::agent(), &off, "agent", two),
+            chip_state(&ModuleId::agent(), &off, "agent", two, false),
             Some(("agent \u{2691}2".to_string(), true))
         );
         assert_eq!(
-            chip_state(&ModuleId::terminal(), &off, "terminal", two),
+            chip_state(&ModuleId::terminal(), &off, "terminal", two, false),
             Some(("terminal".to_string(), false)),
             "the agent's attention is the agent's"
         );
         assert_eq!(
-            chip_state(&ModuleId::agent(), &off, "agent", Attention::default()),
+            chip_state(&ModuleId::agent(), &off, "agent", Attention::default(), false),
             Some(("agent".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn a_stowed_scratch_float_reads_its_mark_on_its_chip() {
+        use eitri_core::layout::{hide, Axis, FloatRect, Frame, Node, Size};
+        let size = Size { w: 1280, h: 721 };
+        let frame = Frame::new(size, 1);
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        layout.add_float(&t2, FloatRect::centred(size, 0.6), true).unwrap();
+        let chip = |layout: &Layout| {
+            let off = tray_covered(layout, &[]);
+            chip_state(&t2, &off, "terminal 2", Attention::default(), layout.is_stowed(&t2))
+        };
+        assert_eq!(chip(&layout), None, "shown: no chip");
+        hide(&mut layout, &t2, &frame).unwrap();
+        assert!(layout.is_stowed(&t2));
+        assert_eq!(chip(&layout), Some(("terminal 2 \u{2301}".to_string(), false)));
+        assert_eq!(
+            chip_state(
+                &ModuleId::terminal(),
+                &[ModuleId::terminal()],
+                "terminal",
+                Attention::default(),
+                false
+            ),
+            Some(("terminal".to_string(), false)),
+            "a module merely hidden has no mark"
+        );
+        let two = Attention {
+            pending: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            chip_state(&ModuleId::agent(), &[ModuleId::agent()], "agent", two, true),
+            Some(("agent \u{2301} \u{2691}2".to_string(), true)),
+            "a stowed chat keeps its cards' mark after the scratchpad's"
+        );
+    }
+
+    /// A chat on screen has a chip only while a float covers it: the window passes what covers it now,
+    /// and the chip goes with the float.
+    #[test]
+    fn a_covered_chat_has_a_chip_only_while_covered() {
+        use eitri_core::layout::{Axis, FloatRect, Node, Size};
+        let size = Size { w: 1280, h: 721 };
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        layout
+            .add_float(&ModuleId::terminal(), FloatRect::centred(size, 0.6), false)
+            .unwrap();
+        let one = Attention {
+            pending: 1,
+            ..Default::default()
+        };
+        let chat = ModuleId::agent();
+        let chip = |covered: &[ModuleId]| chip_state(&chat, &tray_covered(&layout, covered), "agent", one, false);
+        assert_eq!(chip(&[]), None, "on screen and clear: no chip");
+        assert_eq!(
+            chip(std::slice::from_ref(&chat)),
+            Some(("agent \u{2691}1".to_string(), true)),
+            "covered: the chip carries its cards"
+        );
+        assert_eq!(chip(&[]), None, "the float moved off: the chip goes");
+        assert_eq!(
+            chip_state(
+                &ModuleId::terminal(),
+                &tray_covered(&layout, std::slice::from_ref(&chat)),
+                "terminal",
+                one,
+                false
+            ),
+            None,
+            "the float itself is on screen"
         );
     }
 

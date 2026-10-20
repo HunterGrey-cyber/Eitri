@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use super::super::geometry::{arrange, hide, resize, settle_pins, Direction, Frame, Size};
+use super::super::float::FloatRect;
+use super::super::geometry::{arrange, hide, resize, settle_pins, Direction, Frame, Rect, Size};
 use super::super::kill::{kill, Reopen};
 use super::super::module::{ModuleDecl, ModuleId, Placement};
 use super::super::ops::{even, place, swap, swap_adjacent};
@@ -32,6 +33,32 @@ const FRAMES: [Size; 3] = [
     Size { w: 1920, h: 1040 },
     Size { w: 800, h: 600 },
 ];
+const RECTS: [FloatRect; 4] = [
+    FloatRect {
+        cx: 0.5,
+        cy: 0.5,
+        w: 768,
+        h: 433,
+    },
+    FloatRect {
+        cx: 0.1,
+        cy: 0.9,
+        w: 300,
+        h: 200,
+    },
+    FloatRect {
+        cx: 1.0,
+        cy: 0.0,
+        w: 2000,
+        h: 2000,
+    },
+    FloatRect {
+        cx: 0.3,
+        cy: 0.6,
+        w: 40,
+        h: 40,
+    },
+];
 const DIRS: [Direction; 4] = [Direction::Left, Direction::Down, Direction::Up, Direction::Right];
 const PLACEMENTS: [Placement; 4] = [
     Placement::RightOfRoot,
@@ -56,13 +83,13 @@ fn random_layout(rng: &mut Rng) -> Layout {
 }
 
 fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
-    let ids = layout.leaves();
+    let ids = layout.modules();
     let any = ids[rng.below(ids.len())].clone();
     let focus = layout.focus().clone();
     let dir = DIRS[rng.below(4)];
     let axis = if rng.below(2) == 0 { Axis::Row } else { Axis::Column };
     let flag = rng.below(2) == 0;
-    let verb = rng.below(30);
+    let verb = rng.below(38);
     match verb {
         0 => {
             let _ = hide(layout, &any, frame);
@@ -155,19 +182,61 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
             focus_parent(layout);
             layout.toggle_zoom(&focus);
         }
-        _ => {
+        29 => {
             let _ = layout.set_mark(&any);
         }
+        30 => {
+            let id = (2..=4)
+                .map(|number| ModuleId::instance(super::super::module::ModuleKind::Terminal, number).unwrap())
+                .find(|id| !layout.contains(id));
+            if let Some(id) = id {
+                let _ = layout.add_float(&id, RECTS[rng.below(4)], flag);
+            }
+        }
+        31 => {
+            if any.number() >= 2 {
+                let _ = layout.remove(&any);
+            }
+        }
+        32 => {
+            let _ = float_toggle(layout, &focus, frame);
+        }
+        33 => {
+            let _ = scratchpad_move(layout, &focus, frame);
+        }
+        34 => {
+            let _ = scratchpad_show(layout, None, frame);
+        }
+        35 => {
+            let _ = scratchpad_show(layout, Some(&any), frame);
+        }
+        36 => {
+            let _ = move_float(layout, &focus, dir, 40, frame);
+        }
+        37 => {
+            let _ = set_float_rect(
+                layout,
+                &focus,
+                Rect {
+                    x: rng.below(1200) as i32 - 100,
+                    y: rng.below(700) as i32 - 50,
+                    w: 50 + rng.below(1000) as i32,
+                    h: 50 + rng.below(800) as i32,
+                },
+                frame,
+            );
+        }
+        _ => unreachable!(),
     }
-    if matches!(verb, 3 | 5..=19 | 21..=22 | 24..=29) {
+    if matches!(verb, 3 | 5..=19 | 21..=22 | 24..=30 | 32 | 36 | 37) {
         assert_eq!(layout.focus(), &focus, "verb {verb} moved the keys");
     }
 }
 
 fn check(layout: &Layout, label: &str) {
-    let leaves = layout.leaves();
+    let modules = layout.modules();
     let mut seen = BTreeSet::new();
-    for id in &leaves {
+    for id in &modules {
         assert!(seen.insert(id.clone()), "{label}: {id} appears twice");
     }
     assert!(
@@ -175,7 +244,7 @@ fn check(layout: &Layout, label: &str) {
         "{label}: hidden names a stranger"
     );
     assert!(
-        !layout.visible_leaves().is_empty(),
+        !layout.visible_modules().is_empty(),
         "{label}: nothing on screen: {layout:?}"
     );
     if let Selection::Con(id) = layout.selection() {
@@ -189,21 +258,21 @@ fn check(layout: &Layout, label: &str) {
             layout.root().find(*id).is_some(),
             "{label}: zoom names a missing container"
         );
-        assert!(layout.visible_leaves().iter().all(|m| !layout.zoom_hides(m)));
+        assert!(layout.visible_modules().iter().all(|m| !layout.zoom_hides(m)));
     }
     if let Some(z) = layout.zoomed() {
         assert!(!layout.hidden().contains(z), "{label}: {z} zoomed and hidden");
     }
     assert!(
         seen.contains(layout.focus()) && layout.is_in_view(layout.focus()),
-        "{label}: the keys are on {}, hidden or not in the tree",
+        "{label}: the keys are on {}, hidden or not in the layout",
         layout.focus()
     );
     let mut mru = layout.mru().to_vec();
     mru.sort();
-    let mut sorted = leaves.clone();
+    let mut sorted = modules.clone();
     sorted.sort();
-    assert_eq!(mru, sorted, "{label}: the MRU list holds every leaf once");
+    assert_eq!(mru, sorted, "{label}: the MRU list holds every module once");
     assert_eq!(
         layout.root().check(true),
         Ok(()),
@@ -220,14 +289,37 @@ fn check(layout: &Layout, label: &str) {
     if let Some(m) = layout.mark() {
         assert!(seen.contains(m) && !layout.is_gone(m), "{label}: the mark is on {m}");
     }
+    let leaves = layout.leaves();
+    for float in layout.floats() {
+        assert!(
+            !leaves.contains(&float.id),
+            "{label}: {} is tiled and floating",
+            float.id
+        );
+        assert_ne!(float.id, ModuleId::editor(), "{label}: the editor floats");
+        assert!(float.rect.is_valid(), "{label}: invalid float rectangle {float:?}");
+    }
     for size in FRAMES {
-        let modules = arrange(layout, &Frame::new(size, 1)).modules;
+        let arrangement = arrange(layout, &Frame::new(size, 1));
+        for spot in &arrangement.floats {
+            let rect = spot.rect;
+            assert!(
+                rect.x >= 0 && rect.y >= 0 && rect.x + rect.w <= size.w && rect.y + rect.h <= size.h,
+                "{label}: {} {rect:?} outside {size:?}",
+                spot.id
+            );
+            assert!(
+                layout.is_floating(&spot.id) && layout.is_shown(&spot.id),
+                "{label}: stray float spot {spot:?}"
+            );
+        }
+        let modules = arrangement.modules;
         for (i, (a, ra)) in modules.iter().enumerate() {
             assert!(
                 ra.x >= 0 && ra.y >= 0 && ra.x + ra.w <= size.w && ra.y + ra.h <= size.h,
                 "{label}: {a} {ra:?} outside {size:?}"
             );
-            // At most six modules: even all in one row they fit at 32px each in 800x600.
+            // Nine modules (six plus terminal#2..#4) fit at 32px each in an 800x600 frame.
             assert!(ra.w >= 32 && ra.h >= 32, "{label}: {a} {ra:?} below 32px at {size:?}");
             for (b, rb) in &modules[i + 1..] {
                 let apart = ra.x + ra.w <= rb.x || rb.x + rb.w <= ra.x || ra.y + ra.h <= rb.y || rb.y + rb.h <= ra.y;

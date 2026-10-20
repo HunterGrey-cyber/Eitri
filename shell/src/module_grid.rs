@@ -1,15 +1,20 @@
-//! `ModuleGrid` contains every module. Each host gets its parent once in [`ModuleGrid::add`]
-//! and loses it only in `dispose`, when the window goes away. A web module's `WebView` is
-//! parented to its [`WebHost`] before the host is added to the grid.
-//! Hiding uses `set_child_visible(false)`. Zoom, resize, split, swap, move and even operations
-//! allocate the same children again. Unparenting unrealizes the editor, whose Skia
-//! `DirectContext` is created once on the `GLArea`'s GL context and cannot survive unrealization.
-//! Each host logs unrealize in [`ModuleGrid::add`] so unexpected unrealization can be detected.
+//! `ModuleGrid` contains every module and replaces `layout::build_content_area`,
+//! `layout::build_vertical_split` and `PaneLayout`'s index matches.
 //!
-//! Rectangles come from the layout's `arrange` function. The grid measures children's minimum
-//! sizes, allocates the resulting geometry, holds web hosts at their settled size during
-//! resizing ([`throttle`]), and converts divider drags into ratios.
+//! Every module host is parented once in `ModuleGrid::add` and unparented only in `dispose`
+//! when the window closes. Hiding uses `set_child_visible(false)`; layout changes allocate the
+//! same children again. A web module's `WebView` is parented to its `WebHost` before the host
+//! enters the grid. Floating or raising a module reorders children on the same parent through
+//! `ModuleGrid::restack`, without moving the editor. The editor's Skia `DirectContext` is tied
+//! to the `GLArea`'s GL context, and the editor cannot survive unrealize. Unparenting would
+//! unrealize it. Every host logs unrealize in `ModuleGrid::add`, allowing a GUI check that
+//! layout changes preserve this invariant.
+//!
+//! Rectangles come from `layout::arrange`. This container measures children to supply their
+//! minimum sizes, allocates the resulting geometry and holds web hosts at their settled size
+//! during resizing through `throttle`, then turns divider drags into ratios.
 
+pub(crate) mod floatbars;
 pub(crate) mod strips;
 mod throttle;
 
@@ -23,10 +28,12 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
 use eitri_core::layout::{
-    arrange, Axis, ConLayout, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Preset, Rect, Reopen,
-    Size, Strip, Zoom, ZoomChange, DEFAULT_STRIP_PX,
+    arrange, covering, Arrangement, Axis, ConLayout, Direction, Divider, FloatChange, FloatRect, Frame, Layout,
+    LayoutError, ModuleDecl, ModuleId, Nav, Preset, Rect, Reopen, ScratchShow, Size, Strip, WorkspaceError, Workspaces,
+    Zoom, ZoomChange, DEFAULT_STRIP_PX,
 };
 
+use floatbars::{chrome_owners, chrome_plan, grip_rect, ChromeHooks, FloatChrome};
 use strips::{strip_assignments, ConStrip};
 use throttle::{WebThrottle, QUIET};
 
@@ -123,6 +130,20 @@ mod imp {
         pub(super) changed: RefCell<Vec<Rc<dyn Fn()>>>,
         /// Called after a pinned split got its length ([`ModuleGrid::connect_settled`]).
         pub(super) settled: RefCell<Vec<Rc<dyn Fn()>>>,
+        /// The float chrome pool: a bar and a grip per piece ([`floatbars`]).
+        pub(super) chrome: RefCell<Vec<FloatChrome>>,
+        /// Which float each piece of chrome draws, slot by slot ([`floatbars::chrome_owners`]).
+        pub(super) chrome_owners: RefCell<Vec<ModuleId>>,
+        /// The floats the last [`ModuleGrid::restack`] put in the float band: what `child_bands`
+        /// classifies as float hosts, and what `apply` compares the layout's floats with.
+        pub(super) float_band: RefCell<BTreeSet<ModuleId>>,
+        /// A restack asked for from inside an allocation and not yet run.
+        pub(super) restack_queued: Cell<bool>,
+        /// A float bar's text for its module ([`ModuleGrid::set_float_label`]); the id until set.
+        pub(super) float_label: RefCell<Option<StripLabel>>,
+        /// Called with a float's module after a primary press on its bar or grip raised it
+        /// ([`ModuleGrid::connect_float_bar_press`]).
+        pub(super) float_bar_press: RefCell<Vec<StripHook>>,
         /// Hosts the probe places by hand instead of by the layout ([`ModuleGrid::probe_place`]).
         #[cfg(feature = "probe")]
         pub(super) probe_places: RefCell<std::collections::BTreeMap<ModuleId, ProbePlace>>,
@@ -158,6 +179,11 @@ mod imp {
             let strips = std::mem::take(&mut *self.strips.borrow_mut());
             for strip in strips {
                 strip.widget.unparent();
+            }
+            let chrome = std::mem::take(&mut *self.chrome.borrow_mut());
+            for piece in chrome {
+                piece.bar.unparent();
+                piece.grip.unparent();
             }
         }
     }
@@ -345,12 +371,29 @@ impl ModuleGrid {
         }
     }
 
-    /// The grid's children in order, and the band each belongs to. Anything that is neither a handle
-    /// nor a strip is a module host: the grid parents nothing else.
+    /// The grid's children in order, and the band each belongs to. A host is a float host when the
+    /// last [`ModuleGrid::restack`] put it in the float band -- not when the layout floats it now: between
+    /// a layout change and the restack that follows it the two differ, and the bands must describe
+    /// where each child is. Anything that is not a handle, a strip or float chrome is a module host:
+    /// the grid parents nothing else.
     fn child_bands(&self) -> (Vec<gtk4::Widget>, Vec<Band>) {
         let imp = self.imp();
         let handles: Vec<gtk4::Widget> = imp.handles.borrow().iter().map(|h| h.widget.clone().upcast()).collect();
         let strips: Vec<gtk4::Widget> = imp.strips.borrow().iter().map(|s| s.widget.clone().upcast()).collect();
+        let chrome: Vec<gtk4::Widget> = imp
+            .chrome
+            .borrow()
+            .iter()
+            .flat_map(|c| [c.bar.clone().upcast(), c.grip.clone().upcast()])
+            .collect();
+        let float_band = imp.float_band.borrow();
+        let float_hosts: Vec<gtk4::Widget> = imp
+            .hosts
+            .borrow()
+            .iter()
+            .filter(|h| float_band.contains(&h.id))
+            .map(|h| h.widget.clone())
+            .collect();
         let mut children = Vec::new();
         let mut bands = Vec::new();
         let mut child = self.first_child();
@@ -360,12 +403,215 @@ impl ModuleGrid {
                 Band::Handle
             } else if strips.contains(&c) {
                 Band::Strip
+            } else if chrome.contains(&c) {
+                Band::FloatBar
+            } else if float_hosts.contains(&c) {
+                Band::FloatHost
             } else {
                 Band::Host
             });
             children.push(c);
         }
         (children, bands)
+    }
+
+    /// The grid's children as [`restack_moves`] sees them, in order: a piece of float chrome is one
+    /// slot, named where its bar is.
+    fn child_slots(&self) -> Vec<Slot> {
+        let imp = self.imp();
+        let hosts = imp.hosts.borrow();
+        let strips = imp.strips.borrow();
+        let handles = imp.handles.borrow();
+        let chrome = imp.chrome.borrow();
+        let mut slots = Vec::new();
+        let mut child = self.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            let slot = if let Some(h) = hosts.iter().find(|h| h.widget == c) {
+                Slot::Host(h.id.clone())
+            } else if let Some(i) = strips.iter().position(|s| *s.widget.upcast_ref::<gtk4::Widget>() == c) {
+                Slot::Strip(i)
+            } else if let Some(i) = handles.iter().position(|h| *h.widget.upcast_ref::<gtk4::Widget>() == c) {
+                Slot::Handle(i)
+            } else if let Some(i) = chrome.iter().position(|p| *p.bar.upcast_ref::<gtk4::Widget>() == c) {
+                Slot::Chrome(i)
+            } else {
+                // A grip: it moves with its bar.
+                continue;
+            };
+            slots.push(slot);
+        }
+        slots
+    }
+
+    /// The widgets a slot stands for, bottom first: a piece of chrome is its bar, then its grip.
+    fn slot_widgets(&self, slot: &Slot) -> Vec<gtk4::Widget> {
+        let imp = self.imp();
+        match slot {
+            Slot::Host(id) => imp
+                .hosts
+                .borrow()
+                .iter()
+                .filter(|h| h.id == *id)
+                .map(|h| h.widget.clone())
+                .collect(),
+            Slot::Strip(i) => imp
+                .strips
+                .borrow()
+                .get(*i)
+                .map(|s| s.widget.clone().upcast())
+                .into_iter()
+                .collect(),
+            Slot::Handle(i) => imp
+                .handles
+                .borrow()
+                .get(*i)
+                .map(|h| h.widget.clone().upcast())
+                .into_iter()
+                .collect(),
+            Slot::Chrome(i) => imp
+                .chrome
+                .borrow()
+                .get(*i)
+                .map(|p| vec![p.bar.clone().upcast(), p.grip.clone().upcast()])
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Puts every float host, bottom first, each followed by its bar and grip, above every tiled thing,
+    /// and every other host back in the host band. Moves only float hosts, hosts that stopped
+    /// floating, and float chrome, each with `gtk_widget_insert_after` on the grid itself: a sibling
+    /// reorder, which neither unparents nor unrealizes; the editor is never moved. Grows the chrome
+    /// pool first when more floats are on screen than it has ever drawn. Runs from `apply` whenever the
+    /// set of floats on screen changed, and for the z-order alone after a raise.
+    pub(crate) fn restack(&self) {
+        let imp = self.imp();
+        let floats = {
+            let layout = self.layout();
+            let Ok(layout) = layout.try_borrow() else {
+                // Nothing restacks inside one of the layout's own writes; a mistake costs one idle.
+                self.queue_restack();
+                return;
+            };
+            shown_floats(&layout)
+        };
+        let owners = chrome_owners(&imp.chrome_owners.borrow(), &floats);
+        let (make, _) = chrome_plan(imp.chrome.borrow().len(), owners.len());
+        for _ in 0..make {
+            let piece = self.new_chrome();
+            self.insert_in_band(piece.bar.upcast_ref(), Band::FloatBar);
+            piece.grip.insert_after(self, Some(&piece.bar));
+            imp.chrome.borrow_mut().push(piece);
+        }
+        let reassigned = *imp.chrome_owners.borrow() != owners;
+        *imp.chrome_owners.borrow_mut() = owners.clone();
+        let moves = restack_moves(&self.child_slots(), &floats, &owners);
+        let changed = make > 0 || reassigned || !moves.is_empty();
+        // Every widget is looked up before any moves: a reorder runs no code of ours, but nothing
+        // that might should find the pools borrowed.
+        let steps: Vec<(Vec<gtk4::Widget>, Option<gtk4::Widget>)> = moves
+            .iter()
+            .map(|m| {
+                let after = m.after.as_ref().and_then(|a| self.slot_widgets(a).last().cloned());
+                (self.slot_widgets(&m.slot), after)
+            })
+            .collect();
+        for (widgets, mut after) in steps {
+            for widget in widgets {
+                widget.insert_after(self, after.as_ref());
+                after = Some(widget);
+            }
+        }
+        *imp.float_band.borrow_mut() = floats.into_iter().collect();
+        // A restack that found everything in place (the keys moving to the top float, say) costs no
+        // allocation; anything else re-draws the chrome on its floats.
+        if changed {
+            self.queue_allocate();
+        }
+    }
+
+    /// [`ModuleGrid::restack`] after a float went to the top of the layout's z-order, then the change
+    /// hooks: what a raised float covers changed (the chat may be under it now, or out from under the
+    /// float it rose above), and the tray's chip and the chat's attention follow it. No apply ran, so
+    /// nothing else would tell them. The state file's saver writes nothing for it: it compares floats
+    /// as a set.
+    pub(crate) fn restacked_after_raise(&self) {
+        self.restack();
+        self.notify_changed();
+    }
+
+    /// Asks for one [`ModuleGrid::restack`] when the main loop is next idle.
+    fn queue_restack(&self) {
+        if self.imp().restack_queued.replace(true) {
+            return;
+        }
+        let grid = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(grid) = grid.upgrade() {
+                grid.imp().restack_queued.set(false);
+                grid.restack();
+            }
+        });
+    }
+
+    /// A new piece of float chrome, its press and drag wired back to this grid.
+    fn new_chrome(&self) -> FloatChrome {
+        let press = {
+            let grid = self.downgrade();
+            Rc::new(move |id: &ModuleId| {
+                if let Some(grid) = grid.upgrade() {
+                    grid.float_bar_pressed(id);
+                }
+            })
+        };
+        let drag = {
+            let grid = self.downgrade();
+            Rc::new(move |id: &ModuleId, rect: Rect| {
+                if let Some(grid) = grid.upgrade() {
+                    grid.float_dragged(id, rect);
+                }
+            })
+        };
+        FloatChrome::new(&ChromeHooks { press, drag })
+    }
+
+    /// A primary press on a float's bar or grip: the float is raised and restacked, then the hooks run
+    /// with its module (they give it the keys).
+    fn float_bar_pressed(&self, id: &ModuleId) {
+        if self.raise_float(id) {
+            self.restacked_after_raise();
+        }
+        // Cloned out: a hook gives the module the keys, which re-enters the grid.
+        let hooks: Vec<StripHook> = self.imp().float_bar_press.borrow().clone();
+        for hook in hooks {
+            hook(id);
+        }
+    }
+
+    /// Puts the float `id` on top of the z-order (`Layout::raise`). Not a change for the state file: the
+    /// saver compares floats as a set. `false` if it is not a float, is on top already, or the layout is
+    /// being written.
+    fn raise_float(&self, id: &ModuleId) -> bool {
+        self.layout().try_borrow_mut().is_ok_and(|mut layout| layout.raise(id))
+    }
+
+    /// One step of a drag on a float's bar or grip: `rect` is stored as the float's own (core's
+    /// `set_float_rect` fits it into the grid), and the grid is allocated again.
+    fn float_dragged(&self, id: &ModuleId, rect: Rect) {
+        let size = self.size();
+        let moved = {
+            let layout = self.layout();
+            let Ok(mut layout) = layout.try_borrow_mut() else {
+                return;
+            };
+            self.with_frame(size, |frame| {
+                eitri_core::layout::set_float_rect(&mut layout, id, rect, frame)
+            })
+        };
+        if moved {
+            self.queue_allocate();
+            self.notify_changed();
+        }
     }
 
     /// [`ModuleGrid::hosts`], as a function the caller keeps and asks again each time.
@@ -398,9 +644,10 @@ impl ModuleGrid {
         focus_target_of(&self.imp().hosts.borrow(), id).cloned()
     }
 
-    /// Every module and its host in the layout's tree order: HINT's order.
+    /// Every module and its host in the layout's tree order, then the floats bottom first: HINT's and
+    /// `select.number`'s order.
     pub(crate) fn hosts_in_tree_order(&self) -> Vec<(ModuleId, gtk4::Widget)> {
-        let leaves = self.layout().borrow().leaves();
+        let leaves = self.layout().borrow().modules();
         let hosts = self.hosts();
         leaves
             .into_iter()
@@ -412,22 +659,33 @@ impl ModuleGrid {
     /// zoom changes what the grid needs at the least (`measure`). Call after every layout change.
     /// The layout is read, and released, before any child's visibility changes: hiding the focused
     /// widget moves GTK focus, which re-enters `pane_focus` and writes the layout.
+    ///
+    /// **It restacks whenever the set of floats on screen is not the one the last restack put in the
+    /// float band** ([`floats_need_restack`]), so every verb that changes which modules float -- float
+    /// and sink, the scratchpad, a swap between a float and a tile, a far move that docks, a split that
+    /// sinks a float, a kill that reopens one tiled, a workspace switch -- restacks without a list of
+    /// them to keep up. A divider drag or a window resize changes no float and never restacks.
     pub(crate) fn apply(&self) {
-        let wanted: Vec<(gtk4::Widget, bool)> = {
+        let (wanted, floats): (Vec<(gtk4::Widget, bool)>, Vec<ModuleId>) = {
             let layout = self.layout();
             let layout = layout.borrow();
-            self.imp()
+            let wanted = self
+                .imp()
                 .hosts
                 .borrow()
                 .iter()
                 .filter(|h| !self.probe_places_host(&h.id))
                 .map(|h| (h.widget.clone(), layout.is_visible(&h.id)))
-                .collect()
+                .collect();
+            (wanted, shown_floats(&layout))
         };
         for (widget, visible) in wanted {
             if widget.is_child_visible() != visible {
                 widget.set_child_visible(visible);
             }
+        }
+        if floats_need_restack(&self.imp().float_band.borrow(), &floats) {
+            self.restack();
         }
         self.queue_resize();
         self.notify_changed();
@@ -513,6 +771,37 @@ impl ModuleGrid {
             .borrow()
             .clone()
             .unwrap_or_else(|| Rc::new(|id: &ModuleId| id.to_string()))
+    }
+
+    /// The text of a float's bar for its module, applied to every bar on screen now and used for every
+    /// one drawn later; always set as plain text. Until it is set a bar shows the module's id.
+    pub(crate) fn set_float_label(&self, f: impl Fn(&ModuleId) -> String + 'static) {
+        *self.imp().float_label.borrow_mut() = Some(Rc::new(f));
+        self.refresh_float_bars();
+    }
+
+    /// Names every float bar on screen again with the label function, for what it reads that the
+    /// layout does not (a title, a chat's attention). Nothing is measured or allocated.
+    pub(crate) fn refresh_float_bars(&self) {
+        let label = self.float_label();
+        for piece in self.imp().chrome.borrow().iter() {
+            piece.relabel(&*label);
+        }
+    }
+
+    fn float_label(&self) -> StripLabel {
+        self.imp()
+            .float_label
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Rc::new(|id: &ModuleId| id.to_string()))
+    }
+
+    /// `f` runs with a float's module after a primary press on its bar or grip has raised it. What it
+    /// does -- giving the module the keys -- is the caller's, which knows how the window does that.
+    /// Runs with the layout released.
+    pub(crate) fn connect_float_bar_press(&self, f: impl Fn(&ModuleId) + 'static) {
+        self.imp().float_bar_press.borrow_mut().push(Rc::new(f));
     }
 
     /// `Ctrl+a \ <key>` / `Ctrl+a " <key>`: `module` into a new split after `target` along `axis`,
@@ -902,6 +1191,153 @@ impl ModuleGrid {
         Ok(shown)
     }
 
+    /// `float.toggle` (`eitri_core::layout::float_toggle`): floats a tile, or sinks a float beside the
+    /// most recent tile in view. `apply` restacks, since the set of floats changed.
+    pub(crate) fn float_toggle(&self, target: &ModuleId) -> Result<FloatChange, LayoutError> {
+        let size = self.size();
+        let change = {
+            let layout = self.layout();
+            let mut layout = layout.borrow_mut();
+            self.with_frame(size, |frame| {
+                eitri_core::layout::float_toggle(&mut layout, target, frame)
+            })
+        }?;
+        self.apply();
+        Ok(change)
+    }
+
+    /// `move.<dir>` on a float (`eitri_core::layout::move_float`): `px` that way, kept inside the grid.
+    /// `false` when it could not move.
+    pub(crate) fn move_float(&self, target: &ModuleId, dir: Direction, px: i32) -> bool {
+        let size = self.size();
+        let moved = {
+            let layout = self.layout();
+            let mut layout = layout.borrow_mut();
+            self.with_frame(size, |frame| {
+                eitri_core::layout::move_float(&mut layout, target, dir, px, frame)
+            })
+        };
+        if moved {
+            self.apply();
+        }
+        moved
+    }
+
+    /// `eitri.layout.float` (`eitri_core::layout::float_at`): floats `id` at `rect` (its remembered or
+    /// the default rectangle when `None`), or moves a float there. `Ok(false)` when nothing changed.
+    pub(crate) fn float_at(&self, id: &ModuleId, rect: Option<FloatRect>) -> Result<bool, LayoutError> {
+        let size = self.size();
+        let changed = {
+            let layout = self.layout();
+            let mut layout = layout.borrow_mut();
+            self.with_frame(size, |frame| eitri_core::layout::float_at(&mut layout, id, rect, frame))
+        }?;
+        if changed {
+            self.apply();
+        }
+        Ok(changed)
+    }
+
+    /// Stows `target` in [`leave_then_unmap`]'s order: the keys to the module the layout chooses, then
+    /// the unmap (`eitri_core::layout::scratchpad_move`), then the restack.
+    pub(crate) fn scratchpad_move(
+        &self,
+        target: &ModuleId,
+        focus: &dyn Fn(&ModuleId) -> bool,
+    ) -> Result<(), LayoutError> {
+        let size = self.size();
+        let layout = self.layout();
+        self.with_frame(size, |frame| {
+            leave_then_unmap(
+                &layout,
+                |layout| eitri_core::layout::scratchpad_move(layout, target, frame),
+                |next| self.map_arriving(next),
+                |next| {
+                    focus(next);
+                },
+                || self.apply(),
+            )
+        })?;
+        self.restack();
+        Ok(())
+    }
+
+    /// `scratchpad.show` (`eitri_core::layout::scratchpad_show`), in [`scratch_show_in_order`]'s order:
+    /// `Stowed` in [`leave_then_unmap`]'s, then the restack; `Raised`/`Shown`: mapped, restacked, then
+    /// given the keys through `focus`. `Missing` changes nothing: the caller makes the instance.
+    pub(crate) fn scratchpad_show(
+        &self,
+        module: Option<&ModuleId>,
+        focus: &dyn Fn(&ModuleId) -> bool,
+    ) -> Result<ScratchShow, LayoutError> {
+        let size = self.size();
+        let layout = self.layout();
+        self.with_frame(size, |frame| {
+            scratch_show_in_order(
+                &layout,
+                |layout| eitri_core::layout::scratchpad_show(layout, module, frame),
+                |id| self.map_arriving(id),
+                |id| {
+                    focus(id);
+                },
+                || self.apply(),
+                || self.restack(),
+            )
+        })
+    }
+
+    /// The floats over `id` on a fresh arrangement at the grid's size now -- never a stale allocation's
+    /// -- bottom first (`eitri_core::layout::covering`). Empty for a module off screen.
+    pub(crate) fn covered_now(&self, id: &ModuleId) -> Vec<ModuleId> {
+        let size = self.size();
+        let layout = self.layout();
+        let layout = layout.borrow();
+        let arrangement = self.with_frame(size, |frame| arrange(&layout, frame));
+        covering(&arrangement, id)
+    }
+
+    /// Makes `to` the current workspace in [`switch_then_unmap`]'s order: `Workspaces::switch` swaps
+    /// the live layout for `to`'s and names the module that takes the keys there, that module's host is
+    /// mapped and given them through `focus`, `apply` unmaps what `to` does not show (and tells the
+    /// change hooks: the saver, the tray, the mark, the top bar), and `restack` puts `to`'s floats in
+    /// their band in its own z-order -- the same set of floats in another order is still a restack.
+    /// Unmapping first would leave the keys on a host leaving the screen, and GTK's focus chain would
+    /// choose where they went. `Ok(false)` when `to` is current already, and nothing moves. `lua` is the
+    /// window's Lua declarations: where the keys go when `to`'s own last module is not on screen.
+    pub(crate) fn switch_workspace(
+        &self,
+        workspaces: &RefCell<Workspaces>,
+        to: &str,
+        lua: &[ModuleDecl],
+        focus: &dyn Fn(&ModuleId) -> bool,
+    ) -> Result<bool, WorkspaceError> {
+        {
+            let workspaces = workspaces.borrow();
+            if !workspaces.order().iter().any(|name| name == to) {
+                return Err(WorkspaceError::NoSuch(to.to_string()));
+            }
+            if workspaces.current() == to {
+                return Ok(false);
+            }
+        }
+        let layout = self.layout();
+        switch_then_unmap(
+            || workspaces.borrow_mut().switch(&mut layout.borrow_mut(), to, lua),
+            |next| self.map_arriving(next),
+            |next| {
+                focus(next);
+            },
+            || self.apply(),
+            || self.restack(),
+        )?;
+        Ok(true)
+    }
+
+    /// Runs `f` with the frame the layout is allocated in now (a stored workspace's verbs need one).
+    pub(crate) fn with_current_frame<R>(&self, f: impl FnOnce(&Frame) -> R) -> R {
+        self.with_frame(self.size(), f)
+    }
+
     fn allocate_children(&self, width: i32, height: i32) {
         let imp = self.imp();
         // A pinned split that is on screen for the first time keeps the length its ratio gives it at
@@ -932,17 +1368,27 @@ impl ModuleGrid {
             let layout = layout.borrow();
             self.with_frame(Size { w: width, h: height }, |frame| arrange(&layout, frame))
         };
-        let was_on_screen = imp
-            .on_screen
-            .replace(arrangement.modules.iter().map(|(id, _)| id.clone()).collect());
+        let was_on_screen = imp.on_screen.replace(
+            arrangement
+                .modules
+                .iter()
+                .map(|(id, _)| id.clone())
+                .chain(arrangement.floats.iter().map(|spot| spot.id.clone()))
+                .collect(),
+        );
         let mut clips = Vec::new();
         let mut held = false;
         let mut restart_quiet = false;
-        for host in imp.hosts.borrow().iter() {
-            if self.probe_places_host(&host.id) {
+        // The tiled hosts first, then each float's host below its bar, with the same throttle for a
+        // web host either way: a dragged web float is held at its settled size as a resized tile is.
+        let tiled = arrangement.modules.iter().map(|(id, rect)| (id, *rect));
+        let floating = arrangement.floats.iter().map(|spot| (&spot.id, spot.host));
+        for (id, target) in tiled.chain(floating) {
+            if self.probe_places_host(id) {
                 continue;
             }
-            let Some(target) = arrangement.rect_of(&host.id) else {
+            let hosts = imp.hosts.borrow();
+            let Some(host) = hosts.iter().find(|h| h.id == *id) else {
                 continue;
             };
             let rect = match host.kind {
@@ -970,6 +1416,7 @@ impl ModuleGrid {
         }
         *imp.clips.borrow_mut() = clips;
         self.allocate_probe_hosts();
+        self.place_float_chrome(&arrangement);
         let strip_px = self.strip_px();
         self.place_strips(&arrangement.strips);
         if self.strip_px() != strip_px {
@@ -1090,6 +1537,35 @@ impl ModuleGrid {
         }
     }
 
+    /// Draws each float on screen with the piece of chrome that owns it ([`floatbars::chrome_owners`]):
+    /// its bar across the float's top strip row, its grip in the bottom-right corner. Every other piece
+    /// is hidden, and so is every piece while a zoom is on (a zoomed float fills the grid alone, with no
+    /// bar). A float with no piece of its own yet -- the layout changed without an `apply` -- has none
+    /// this pass and asks for a restack, which makes one.
+    fn place_float_chrome(&self, arrangement: &Arrangement) {
+        let imp = self.imp();
+        let owners = imp.chrome_owners.borrow().clone();
+        let label = self.float_label();
+        for (i, piece) in imp.chrome.borrow().iter().enumerate() {
+            let Some(spot) = owners.get(i).and_then(|id| arrangement.float_spot(id)) else {
+                piece.hide();
+                continue;
+            };
+            piece.show(spot, &*label);
+            for (widget, r) in [
+                (piece.bar.upcast_ref::<gtk4::Widget>(), spot.bar),
+                (piece.grip.upcast_ref::<gtk4::Widget>(), grip_rect(spot.rect)),
+            ] {
+                let _ = widget.measure(gtk4::Orientation::Horizontal, -1);
+                let _ = widget.measure(gtk4::Orientation::Vertical, r.w);
+                widget.size_allocate(&gtk4::Allocation::new(r.x, r.y, r.w, r.h), -1);
+            }
+        }
+        if arrangement.floats.iter().any(|spot| !owners.contains(&spot.id)) {
+            self.queue_restack();
+        }
+    }
+
     fn place_handles(&self, dividers: &[Divider]) {
         for (i, handle) in self.imp().handles.borrow().iter().enumerate() {
             let Some(divider) = dividers.get(i) else {
@@ -1197,6 +1673,214 @@ fn leave_then_unmap(
     Ok(())
 }
 
+/// [`ModuleGrid::switch_workspace`]'s order, with its GTK effects passed in so that a test without a
+/// display can see it: [`leave_then_unmap`]'s, with the switch as the leave and one restack after the
+/// unmap. `leave` swaps the layouts and names who gets the keys, borrowing and releasing what it
+/// writes; `map` puts that module's host on screen, `focus` gives it the keys, `unmap` (`apply`) takes
+/// off screen what the arriving workspace does not show, and `restack` orders its floats.
+fn switch_then_unmap<E>(
+    leave: impl FnOnce() -> Result<Option<ModuleId>, E>,
+    map: impl FnOnce(&ModuleId),
+    focus: impl FnOnce(&ModuleId),
+    unmap: impl FnOnce(),
+    restack: impl FnOnce(),
+) -> Result<(), E> {
+    let next = leave()?;
+    if let Some(next) = next {
+        map(&next);
+        focus(&next);
+    }
+    unmap();
+    restack();
+    Ok(())
+}
+
+/// [`ModuleGrid::scratchpad_show`]'s order, with its GTK effects passed in so that a test without a
+/// display can see it. `show` is core's verb. A stow (`Stowed`) leaves the screen in
+/// [`leave_then_unmap`]'s order -- the keys' next owner mapped and given them, then `apply` unmaps the
+/// stowed host -- and then the float band is restacked. A raise or a show (`Raised`/`Shown`) is the
+/// other way round: `apply` maps the shown host, the restack puts it on top, and only then is it given
+/// the keys, so they never land on a host still unmapped or under another float. `Missing` changed
+/// nothing, and nothing runs.
+/// Whether giving `id` the keys raises it (`Layout::set_focus`): a float not on top of the z-order.
+pub(crate) fn would_raise(layout: &Layout, id: &ModuleId) -> bool {
+    layout.is_floating(id) && layout.floats().last().map(|float| &float.id) != Some(id)
+}
+
+fn scratch_show_in_order(
+    layout: &RefCell<Layout>,
+    show: impl FnOnce(&mut Layout) -> Result<ScratchShow, LayoutError>,
+    map: impl Fn(&ModuleId),
+    focus: impl Fn(&ModuleId),
+    apply: impl Fn(),
+    restack: impl FnOnce(),
+) -> Result<ScratchShow, LayoutError> {
+    let outcome: RefCell<Option<ScratchShow>> = RefCell::new(None);
+    leave_then_unmap(
+        layout,
+        |layout| {
+            let shown = show(layout)?;
+            let next = match &shown {
+                ScratchShow::Stowed(next) => next.clone(),
+                _ => None,
+            };
+            *outcome.borrow_mut() = Some(shown);
+            Ok(next)
+        },
+        &map,
+        &focus,
+        || {
+            if !matches!(*outcome.borrow(), Some(ScratchShow::Missing(_))) {
+                apply();
+            }
+        },
+    )?;
+    let shown = outcome.into_inner().expect("core's verb ran and answered");
+    match &shown {
+        ScratchShow::Stowed(_) => restack(),
+        ScratchShow::Raised(id) | ScratchShow::Shown(id) => {
+            restack();
+            map(id);
+            focus(id);
+        }
+        ScratchShow::Missing(_) => {}
+    }
+    Ok(shown)
+}
+
+/// The floats on screen when nothing is zoomed, bottom first: the layout's floats that are not hidden,
+/// as `arrange` lists them. What the float band holds; a zoom unmaps floats but does not change it.
+fn shown_floats(layout: &Layout) -> Vec<ModuleId> {
+    layout
+        .floats()
+        .iter()
+        .filter(|float| layout.is_shown(&float.id))
+        .map(|float| float.id.clone())
+        .collect()
+}
+
+/// Whether `apply` restacks: the set of floats on screen (`floats`, in z-order) is not the set the last
+/// restack put in the float band (`band`). The z-order alone never counts -- a raise restacks by
+/// itself, and must not make every `apply` move widgets.
+fn floats_need_restack(band: &BTreeSet<ModuleId>, floats: &[ModuleId]) -> bool {
+    band.len() != floats.len() || floats.iter().any(|id| !band.contains(id))
+}
+
+/// A grid child as the restack sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Slot {
+    Host(ModuleId),
+    Strip(usize),
+    Handle(usize),
+    /// A piece of float chrome: its bar, then its grip, always together.
+    Chrome(usize),
+}
+
+/// One reorder: put `slot` right after `after` (`None`: first child).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Move {
+    slot: Slot,
+    after: Option<Slot>,
+}
+
+/// The reorders that take `children` to the band order with `floats` (bottom first) floating, chrome `i`
+/// drawing `chrome[i]`: hosts that do not float keep their relative order below every strip; each
+/// float host goes to the top in z-order, followed by its chrome; chrome drawing nothing goes last.
+///
+/// **What moves.** Strips, handles and every host in the host band that stays tiled keep their places:
+/// a host counts as in the host band when it lies below the first child that is not a host. Only float
+/// hosts, hosts above that point that no longer float (they go back to the top of the host band, right
+/// below the first strip or handle), and chrome are named. So a host tiled both before and after is
+/// never named, and neither is the editor, which never floats and is the first host the window adds.
+///
+/// **Why the moves give the order.** Each named slot is put right after its predecessor in the target
+/// order, in that order: no later move puts anything between the two (only the slot that follows a
+/// predecessor in the target goes after it), and the slots not named keep their relative order. A slot
+/// already right after its predecessor is not named, so the result restacks to no moves at all.
+fn restack_moves(children: &[Slot], floats: &[ModuleId], chrome: &[ModuleId]) -> Vec<Move> {
+    let floating = |id: &ModuleId| floats.contains(id);
+    let host_band_end = children
+        .iter()
+        .position(|slot| !matches!(slot, Slot::Host(_)))
+        .unwrap_or(children.len());
+    let named: Vec<&Slot> = children
+        .iter()
+        .enumerate()
+        .filter(|(k, slot)| match slot {
+            Slot::Host(id) => floating(id) || (*id != ModuleId::editor() && *k > host_band_end),
+            Slot::Chrome(_) => true,
+            Slot::Strip(_) | Slot::Handle(_) => false,
+        })
+        .map(|(_, slot)| slot)
+        .collect();
+    let kept: Vec<&Slot> = children.iter().filter(|slot| !named.contains(slot)).collect();
+    let returning = named
+        .iter()
+        .filter(|slot| matches!(slot, Slot::Host(id) if !floating(id)))
+        .copied();
+    let split = kept
+        .iter()
+        .position(|slot| !matches!(slot, Slot::Host(_)))
+        .unwrap_or(kept.len());
+
+    let mut target: Vec<Slot> = kept[..split].iter().map(|s| (*s).clone()).collect();
+    target.extend(returning.cloned());
+    target.extend(kept[split..].iter().map(|s| (*s).clone()));
+    for id in floats {
+        let host = Slot::Host(id.clone());
+        if children.contains(&host) {
+            target.push(host);
+        }
+        if let Some(i) = chrome.iter().position(|c| c == id) {
+            if children.contains(&Slot::Chrome(i)) {
+                target.push(Slot::Chrome(i));
+            }
+        }
+    }
+    for slot in children {
+        if matches!(slot, Slot::Chrome(_)) && !target.contains(slot) {
+            target.push(slot.clone());
+        }
+    }
+    debug_assert_eq!(target.len(), children.len(), "the target is a reordering: {target:?}");
+
+    let mut now: Vec<Slot> = children.to_vec();
+    let mut moves = Vec::new();
+    for (k, slot) in target.iter().enumerate() {
+        if !named.contains(&slot) {
+            continue;
+        }
+        let after = k.checked_sub(1).map(|p| target[p].clone());
+        let at = now
+            .iter()
+            .position(|s| s == slot)
+            .expect("every target slot is a child");
+        let in_place = match &after {
+            None => at == 0,
+            Some(a) => at > 0 && now[at - 1] == *a,
+        };
+        if in_place {
+            continue;
+        }
+        now.remove(at);
+        let to = match &after {
+            None => 0,
+            Some(a) => now.iter().position(|s| s == a).expect("the predecessor is a child") + 1,
+        };
+        now.insert(to, slot.clone());
+        moves.push(Move {
+            slot: slot.clone(),
+            after,
+        });
+    }
+    debug_assert_eq!(now, target, "the moves give the target");
+    debug_assert!(
+        moves.iter().all(|m| m.slot != Slot::Host(ModuleId::editor())),
+        "the editor is never reordered"
+    );
+    moves
+}
+
 /// The layers of the grid's child list, bottom to top. GTK picks and paints in child-list order, so a
 /// band higher up takes a press where its widget overlaps one lower down, and paints over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1207,13 +1891,9 @@ enum Band {
     Strip,
     /// A divider handle: above hosts and strips, so its edge columns are always draggable.
     Handle,
-    /// A floating module's host, above every tiled thing. Nothing floats yet; the variant is here so
-    /// the order that floats need is fixed and tested now, and floating only adds widgets.
-    #[allow(dead_code)]
+    /// A floating module's host, above every tiled thing ([`ModuleGrid::restack`] puts it there).
     FloatHost,
-    /// A floating module's title bar, right after its float host. Unused for the same reason as
-    /// [`Band::FloatHost`].
-    #[allow(dead_code)]
+    /// A float's chrome, its bar and its grip, right after its float host.
     FloatBar,
 }
 
@@ -1280,6 +1960,29 @@ fn dragged_first_px(begin: &Divider, now: &Divider, dx: f64, dy: f64) -> Option<
         Axis::Column => dy,
     };
     Some(now.first_px + offset.round() as i32)
+}
+
+/// Where a dragged bar (`grip: false`) or grip puts the float: the float's whole rectangle as allocated
+/// **now** plus the drag's offset -- moved by a bar, resized from the bottom-right by a grip. The offset
+/// is in the moving widget's own coordinates, and the bar or grip moves under the pointer as the drag
+/// re-allocates it, so it is how far the pointer is from where that widget now is (as
+/// [`dragged_first_px`] explains for a divider). Core's `set_float_rect` then fits the result into the
+/// grid and above the float's minimum.
+fn dragged_float_rect(now: Rect, dx: f64, dy: f64, grip: bool) -> Rect {
+    let (dx, dy) = (dx.round() as i32, dy.round() as i32);
+    if grip {
+        Rect {
+            w: now.w.saturating_add(dx),
+            h: now.h.saturating_add(dy),
+            ..now
+        }
+    } else {
+        Rect {
+            x: now.x.saturating_add(dx),
+            y: now.y.saturating_add(dy),
+            ..now
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1557,6 +2260,7 @@ mod tests {
         // What `main.rs` really allocates: the editor gets its own (unthrottled) target, the agent
         // whatever the throttle just returned.
         let real_arrangement = Arrangement {
+            floats: Vec::new(),
             modules: vec![(editor.clone(), editor_target), (agent.clone(), held.rect)],
             dividers: Vec::new(),
             ..Default::default()
@@ -1584,6 +2288,8 @@ mod tests {
         Map(ModuleId),
         Focus(ModuleId),
         Unmap,
+        /// The float band was put in the arriving workspace's order.
+        Restack,
     }
 
     /// Runs `leave` on `layout` through [`leave_then_unmap`] and records each effect as it runs, with
@@ -1600,7 +2306,7 @@ mod tests {
         leave: impl FnOnce(&mut Layout) -> Result<Option<ModuleId>, LayoutError>,
     ) -> (Result<(), LayoutError>, Vec<Effect>) {
         let effects = RefCell::new(Vec::new());
-        let mapped: RefCell<BTreeSet<ModuleId>> = RefCell::new(layout.borrow().visible_leaves().into_iter().collect());
+        let mapped: RefCell<BTreeSet<ModuleId>> = RefCell::new(layout.borrow().visible_modules().into_iter().collect());
         let result = leave_then_unmap(
             layout,
             |l| {
@@ -1886,60 +2592,77 @@ mod tests {
     }
 
     /// Every add puts its child at its band's place, whatever was added before it and in whatever
-    /// order: hosts, then strips, then handles, then each float host followed by its own bar, and
-    /// inside each band the order things were added in. Every interleaving of six adds over hosts,
-    /// strips, handles and floats (a float host with its bar added right after it) is replayed, so a
-    /// new host, strip or handle added while floats exist is checked to land below the first float
-    /// host.
+    /// order: hosts, then strips, then handles, then each float host followed by its own chrome, and
+    /// inside each band the order things were added in. Every interleaving of five adds over hosts,
+    /// strips, handles and floats (a float host with its chrome added right after it) is replayed on a
+    /// grid with no float, one and two floats already restacked into the float band, so a new host,
+    /// strip or handle added while floats exist is checked to land below the first float host.
     #[test]
-    fn the_band_order_holds_for_every_add() {
-        // What each add brings: a host, a strip, a handle, or a float host and then its bar.
+    fn the_band_order_holds_for_every_add_while_floats_exist() {
+        // What each add brings: a host, a strip, a handle, or a float host and then its chrome.
         const KINDS: [&[Band]; 4] = [
             &[Band::Host],
             &[Band::Strip],
             &[Band::Handle],
             &[Band::FloatHost, Band::FloatBar],
         ];
-        const ADDS: u32 = 6;
-        for mut code in 0..KINDS.len().pow(ADDS) {
-            // Each child is its band and the number of the add that made it.
-            let mut children: Vec<(Band, usize)> = Vec::new();
-            let mut order = Vec::new();
-            for n in 0..ADDS as usize {
-                let kind = KINDS[code % KINDS.len()];
-                code /= KINDS.len();
-                order.push(kind[0]);
-                for &band in kind {
-                    let bands: Vec<Band> = children.iter().map(|(b, _)| *b).collect();
-                    let first_float = bands.iter().position(|b| *b == Band::FloatHost);
-                    let at = band_insert_index(&bands, band);
-                    if band != Band::FloatHost && band != Band::FloatBar {
-                        if let Some(first_float) = first_float {
-                            assert!(at <= first_float, "{order:?}: a {band:?} above the first float host");
+        const ADDS: u32 = 5;
+        // The grid before the adds: the editor, the chat and a handle between them, then each float
+        // already present followed by its chrome, as `restack` leaves them. A float's adds are
+        // numbered from 100 so they never compare below the adds replayed after them.
+        let before = |floats: usize| -> Vec<(Band, usize)> {
+            let mut children = vec![(Band::Host, 0), (Band::Host, 0), (Band::Handle, 0)];
+            for f in 0..floats {
+                children.push((Band::FloatHost, 100 + f));
+                children.push((Band::FloatBar, 100 + f));
+            }
+            children
+        };
+        for present in 0..=2 {
+            for mut code in 0..KINDS.len().pow(ADDS) {
+                // Each child is its band and the number of the add that made it.
+                let mut children = before(present);
+                let mut order = Vec::new();
+                for n in 1..=ADDS as usize {
+                    let kind = KINDS[code % KINDS.len()];
+                    code /= KINDS.len();
+                    order.push(kind[0]);
+                    let n = if kind[0] == Band::FloatHost { 200 + n } else { n };
+                    for &band in kind {
+                        let bands: Vec<Band> = children.iter().map(|(b, _)| *b).collect();
+                        let first_float = bands.iter().position(|b| *b == Band::FloatHost);
+                        let at = band_insert_index(&bands, band);
+                        if band != Band::FloatHost && band != Band::FloatBar {
+                            if let Some(first_float) = first_float {
+                                assert!(
+                                    at <= first_float,
+                                    "{present} floats, {order:?}: a {band:?} above the first float host"
+                                );
+                            }
                         }
+                        children.insert(at, (band, n));
                     }
-                    children.insert(at, (band, n));
                 }
-            }
-            let bands: Vec<Band> = children.iter().map(|(b, _)| *b).collect();
-            assert!(
-                bands.windows(2).all(|w| w[0].rank() <= w[1].rank()),
-                "{order:?}: out of band order: {bands:?}"
-            );
-            for band in [Band::Host, Band::Strip, Band::Handle, Band::FloatHost] {
-                let adds: Vec<usize> = children.iter().filter(|(b, _)| *b == band).map(|(_, n)| *n).collect();
+                let bands: Vec<Band> = children.iter().map(|(b, _)| *b).collect();
                 assert!(
-                    adds.windows(2).all(|w| w[0] < w[1]),
-                    "{order:?}: {band:?}s out of the order they were added in: {adds:?}"
+                    bands.windows(2).all(|w| w[0].rank() <= w[1].rank()),
+                    "{present} floats, {order:?}: out of band order: {bands:?}"
                 );
-            }
-            for (i, (band, n)) in children.iter().enumerate() {
-                if *band == Band::FloatHost {
-                    assert_eq!(
-                        children.get(i + 1),
-                        Some(&(Band::FloatBar, *n)),
-                        "{order:?}: a float host's bar sits right after it: {children:?}"
+                for band in [Band::Host, Band::Strip, Band::Handle, Band::FloatHost] {
+                    let adds: Vec<usize> = children.iter().filter(|(b, _)| *b == band).map(|(_, n)| *n).collect();
+                    assert!(
+                        adds.windows(2).all(|w| w[0] <= w[1]),
+                        "{present} floats, {order:?}: {band:?}s out of the order they were added in: {adds:?}"
                     );
+                }
+                for (i, (band, n)) in children.iter().enumerate() {
+                    if *band == Band::FloatHost {
+                        assert_eq!(
+                            children.get(i + 1),
+                            Some(&(Band::FloatBar, *n)),
+                            "{present} floats, {order:?}: a float host's chrome sits right after it: {children:?}"
+                        );
+                    }
                 }
             }
         }
@@ -2071,6 +2794,818 @@ mod tests {
             focus_target_of(&hosts, &ModuleId::parse("canvas").unwrap()),
             None,
             "a module this grid has no host for"
+        );
+    }
+
+    // ---- Floats in the grid ----
+
+    /// `children` after `moves`, each applied as `gtk_widget_insert_after` does: the slot leaves its
+    /// place and goes right after `after` (first when `None`).
+    fn apply_moves(children: &[Slot], moves: &[Move]) -> Vec<Slot> {
+        let mut now = children.to_vec();
+        for m in moves {
+            let at = now.iter().position(|s| *s == m.slot).expect("a move names a child");
+            now.remove(at);
+            let to = match &m.after {
+                None => 0,
+                Some(a) => now.iter().position(|s| s == a).expect("after names a child") + 1,
+            };
+            now.insert(to, m.slot.clone());
+        }
+        now
+    }
+
+    /// The band a slot is in once `floats` float.
+    fn slot_band(slot: &Slot, floats: &[ModuleId]) -> Band {
+        match slot {
+            Slot::Host(id) if floats.contains(id) => Band::FloatHost,
+            Slot::Host(_) => Band::Host,
+            Slot::Strip(_) => Band::Strip,
+            Slot::Handle(_) => Band::Handle,
+            Slot::Chrome(_) => Band::FloatBar,
+        }
+    }
+
+    /// What `restack` leaves, checked whole: the bands are monotone, the floats are on top in z-order,
+    /// each followed by the chrome that draws it, and restacking again moves nothing.
+    fn assert_restacked(result: &[Slot], floats: &[ModuleId], chrome: &[ModuleId], context: &str) {
+        let bands: Vec<Band> = result.iter().map(|s| slot_band(s, floats)).collect();
+        assert!(
+            bands.windows(2).all(|w| w[0].rank() <= w[1].rank()),
+            "{context}: out of band order: {result:?}"
+        );
+        let mut last = None;
+        for id in floats {
+            let Some(at) = result.iter().position(|s| *s == Slot::Host(id.clone())) else {
+                continue;
+            };
+            assert!(
+                last.is_none_or(|l| l < at),
+                "{context}: {id} out of z-order: {result:?}"
+            );
+            last = Some(at);
+            if let Some(i) = chrome.iter().position(|c| c == id) {
+                assert_eq!(
+                    result.get(at + 1),
+                    Some(&Slot::Chrome(i)),
+                    "{context}: {id}'s chrome right after it: {result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            restack_moves(result, floats, chrome),
+            [],
+            "{context}: a second restack moves nothing"
+        );
+    }
+
+    /// A small xorshift, so the mixed lists below are the same on every run.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self, below: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % below as u64) as usize
+        }
+    }
+
+    /// From thousands of child lists -- tiled hosts in add order with the editor first, strips and
+    /// handles, the floats of a previous restack each with its chrome, idle chrome, and chrome made for
+    /// this restack at the end -- to a new set of floats in a new z-order: no move names the editor or
+    /// a host tiled before and after, tiled hosts keep their order, and the result is restacked.
+    #[test]
+    fn restacking_moves_only_float_hosts_and_their_chrome_never_the_editor() {
+        let modules = [
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::terminal(),
+            ModuleId::parse("terminal#2").unwrap(),
+            ModuleId::lua("a"),
+            ModuleId::lua("b"),
+        ];
+        let mut rng = Xorshift(0x9e37_79b9_7f4a_7c15);
+        // A random subset of everything but the editor, in a random order.
+        let pick_floats = |rng: &mut Xorshift| {
+            let mut floats: Vec<ModuleId> = Vec::new();
+            for _ in 0..rng.next(4) {
+                let id = modules[1 + rng.next(modules.len() - 1)].clone();
+                if !floats.contains(&id) {
+                    floats.push(id);
+                }
+            }
+            floats
+        };
+        for case in 0..5000 {
+            let hosts = 1 + rng.next(modules.len());
+            let present: Vec<ModuleId> = modules[..hosts].to_vec();
+            let was: Vec<ModuleId> = pick_floats(&mut rng)
+                .into_iter()
+                .filter(|id| present.contains(id))
+                .collect();
+            let drew = chrome_owners(&[], &was);
+            let idle = rng.next(2);
+            let strips = rng.next(3);
+            let mut children: Vec<Slot> = present
+                .iter()
+                .filter(|id| !was.contains(id))
+                .map(|id| Slot::Host(id.clone()))
+                .collect();
+            children.extend((0..strips).map(Slot::Strip));
+            children.extend((0..hosts - 1).map(Slot::Handle));
+            for id in &was {
+                children.push(Slot::Host(id.clone()));
+                children.push(Slot::Chrome(drew.iter().position(|d| d == id).unwrap()));
+            }
+            children.extend((drew.len()..drew.len() + idle).map(Slot::Chrome));
+
+            let floats: Vec<ModuleId> = pick_floats(&mut rng)
+                .into_iter()
+                .filter(|id| present.contains(id))
+                .collect();
+            let chrome = chrome_owners(&drew, &floats);
+            // `restack` grows the pool first; a new piece goes in at the end, as `insert_in_band` puts it.
+            let pool = drew.len() + idle;
+            children.extend((pool..chrome.len().max(pool)).map(Slot::Chrome));
+            let context = format!("case {case}: {children:?} from floats {was:?} to {floats:?}");
+
+            let moves = restack_moves(&children, &floats, &chrome);
+            for m in &moves {
+                assert_ne!(m.slot, Slot::Host(ModuleId::editor()), "{context}: the editor moved");
+                assert!(
+                    !matches!(&m.slot, Slot::Host(id) if !was.contains(id) && !floats.contains(id)),
+                    "{context}: a host tiled before and after moved: {m:?}"
+                );
+                assert!(
+                    !matches!(m.slot, Slot::Strip(_) | Slot::Handle(_)),
+                    "{context}: a strip or a handle moved: {m:?}"
+                );
+            }
+            let result = apply_moves(&children, &moves);
+            assert_restacked(&result, &floats, &chrome, &context);
+            let tiled = |list: &[Slot]| -> Vec<Slot> {
+                list.iter()
+                    .filter(|s| matches!(s, Slot::Host(id) if !was.contains(id) && !floats.contains(id)))
+                    .cloned()
+                    .collect()
+            };
+            assert_eq!(
+                tiled(&result),
+                tiled(&children),
+                "{context}: tiled hosts kept their order"
+            );
+        }
+    }
+
+    /// One module floating in one workspace and tiled in the other: each switch moves its host between
+    /// the float band and the host band -- back right below the first strip, then up again -- and the
+    /// editor is never named.
+    #[test]
+    fn a_module_floating_in_one_workspace_and_tiled_in_the_other_changes_band_on_switch() {
+        let (editor, agent, terminal) = (ModuleId::editor(), ModuleId::agent(), ModuleId::terminal());
+        let mut children: Vec<Slot> = stack_as_add_builds(&[editor.clone(), agent.clone(), terminal.clone()])
+            .into_iter()
+            .map(|c| match c {
+                Child::Host(id) => Slot::Host(id),
+                Child::Handle(n) => Slot::Handle(n),
+            })
+            .collect();
+        children.insert(3, Slot::Strip(0));
+        assert_eq!(
+            children,
+            [
+                Slot::Host(editor.clone()),
+                Slot::Host(agent.clone()),
+                Slot::Host(terminal.clone()),
+                Slot::Strip(0),
+                Slot::Handle(0),
+                Slot::Handle(1),
+            ],
+            "the premise"
+        );
+
+        // The workspace where the terminal floats: its host goes on top, then its chrome, made now.
+        let floating = [terminal.clone()];
+        let chrome = chrome_owners(&[], &floating);
+        children.push(Slot::Chrome(0));
+        let moves = restack_moves(&children, &floating, &chrome);
+        assert_eq!(
+            moves,
+            [Move {
+                slot: Slot::Host(terminal.clone()),
+                after: Some(Slot::Handle(1)),
+            }]
+        );
+        let up = apply_moves(&children, &moves);
+        assert_restacked(&up, &floating, &chrome, "floating");
+
+        // The workspace where it is tiled: back right below the first strip.
+        let chrome_tiled = chrome_owners(&chrome, &[]);
+        let moves = restack_moves(&up, &[], &chrome_tiled);
+        assert_eq!(
+            moves,
+            [Move {
+                slot: Slot::Host(terminal.clone()),
+                after: Some(Slot::Host(agent.clone())),
+            }]
+        );
+        let down = apply_moves(&up, &moves);
+        assert_eq!(down, children, "back where it was, the idle chrome last");
+        assert_restacked(&down, &[], &chrome_tiled, "tiled");
+
+        // And up again.
+        let chrome = chrome_owners(&chrome_tiled, &floating);
+        let moves = restack_moves(&down, &floating, &chrome);
+        assert!(moves.iter().all(|m| m.slot != Slot::Host(editor.clone())));
+        assert_eq!(apply_moves(&down, &moves), up);
+    }
+
+    /// `swap.marked` between a float and a tile: the tile's module now floats and the float's is
+    /// tiled. Both hosts change band -- the new float's to the top, followed by chrome 0, which drew the
+    /// old one; the old float's back below the first strip or handle -- and the editor is never named.
+    #[test]
+    fn a_swap_marked_between_a_float_and_a_tile_moves_both_hosts_between_bands() {
+        let (editor, agent, two) = (
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::parse("terminal#2").unwrap(),
+        );
+        let children = [
+            Slot::Host(editor.clone()),
+            Slot::Host(agent.clone()),
+            Slot::Handle(0),
+            Slot::Host(two.clone()),
+            Slot::Chrome(0),
+        ];
+        let floats = [agent.clone()];
+        let chrome = chrome_owners(std::slice::from_ref(&two), &floats);
+        assert_eq!(chrome, std::slice::from_ref(&agent), "chrome 0 draws the new float");
+        let moves = restack_moves(&children, &floats, &chrome);
+        assert!(moves.iter().all(|m| m.slot != Slot::Host(editor.clone())), "{moves:?}");
+        let result = apply_moves(&children, &moves);
+        assert_eq!(
+            result,
+            [
+                Slot::Host(editor.clone()),
+                Slot::Host(two.clone()),
+                Slot::Handle(0),
+                Slot::Host(agent.clone()),
+                Slot::Chrome(0),
+            ]
+        );
+        assert_restacked(&result, &floats, &chrome, "after the swap");
+    }
+
+    /// The predicate `apply` restacks on: a changed set of floats on screen, never the z-order alone
+    /// (a raise restacks by itself) and never an unchanged set.
+    #[test]
+    fn the_floating_set_decides_when_apply_restacks() {
+        let (a, b, c) = (ModuleId::agent(), ModuleId::terminal(), ModuleId::lua("c"));
+        let band: BTreeSet<ModuleId> = [a.clone(), b.clone()].into_iter().collect();
+        assert!(!floats_need_restack(&band, &[a.clone(), b.clone()]), "unchanged");
+        assert!(!floats_need_restack(&band, &[b.clone(), a.clone()]), "another z-order");
+        assert!(
+            floats_need_restack(&band, std::slice::from_ref(&a)),
+            "one sank or was stowed"
+        );
+        assert!(
+            floats_need_restack(&band, &[a.clone(), b.clone(), c.clone()]),
+            "one more floats"
+        );
+        assert!(floats_need_restack(&band, &[a.clone(), c.clone()]), "a swap");
+        assert!(!floats_need_restack(&BTreeSet::new(), &[]), "nothing floats");
+    }
+
+    /// The pool's plan: chrome is made only when more floats are on screen than the pool has ever
+    /// drawn, the rest is hidden and reused, and nothing is ever unparented (the pool never shrinks).
+    /// A raise keeps every float on its own piece, so a bar being dragged keeps drawing its float.
+    #[test]
+    fn float_chrome_grows_with_the_floats_and_idles_what_it_does_not_use() {
+        assert_eq!(chrome_plan(0, 2), (2, 2..2), "the first two floats");
+        assert_eq!(chrome_plan(2, 1), (0, 1..2), "a stow or a sink: one spot fewer");
+        assert_eq!(chrome_plan(2, 2), (0, 2..2), "back to two: slot 1 reused");
+        assert_eq!(chrome_plan(2, 0), (0, 0..2), "none: all hidden, none dropped");
+        assert_eq!(chrome_plan(1, 3), (2, 3..3), "only the missing ones are made");
+        for pool in 0..5 {
+            for spots in 0..5 {
+                let (make, hide) = chrome_plan(pool, spots);
+                assert_eq!(pool + make, pool.max(spots), "the pool never shrinks");
+                assert_eq!(hide, spots..pool + make, "every slot past the floats is hidden");
+            }
+        }
+
+        let (a, b, c) = (ModuleId::agent(), ModuleId::terminal(), ModuleId::lua("c"));
+        let drew = chrome_owners(&[], &[a.clone(), b.clone()]);
+        assert_eq!(drew, [a.clone(), b.clone()]);
+        assert_eq!(
+            chrome_owners(&drew, &[b.clone(), a.clone()]),
+            drew,
+            "a raise moves no float to another piece"
+        );
+        assert_eq!(
+            chrome_owners(&drew, std::slice::from_ref(&b)),
+            std::slice::from_ref(&b),
+            "a float leaving frees its slot"
+        );
+        assert_eq!(
+            chrome_owners(&drew, &[c.clone(), b.clone(), a.clone()]),
+            [a.clone(), b.clone(), c.clone()],
+            "a new float takes the next slot"
+        );
+    }
+
+    /// A switch away from a workspace whose keys are on a float the arriving workspace does not show:
+    /// the arriving keys' host is mapped and given them before `apply` unmaps the float, and the band
+    /// is restacked last. Each effect checks what its real one relies on, as [`leave_and_record`]'s do:
+    /// both cells released, the float off screen in the layout before the keys move, the keys' target
+    /// shown and its host mapped. With the focus and the unmap swapped, GTK's focus chain would choose
+    /// where the keys went from a float leaving the screen.
+    #[test]
+    fn a_workspace_switch_gives_the_keys_before_it_unmaps_a_float_that_held_them() {
+        use std::collections::BTreeMap;
+        let (agent, terminal) = (ModuleId::agent(), ModuleId::terminal());
+        let frame = Frame::new(UNALLOCATED, 1);
+        // `main`: the terminal floats and has the keys, the chat is hidden.
+        let mut main = with_a_float(FloatRect::centred(UNALLOCATED, 0.6), &terminal);
+        eitri_core::layout::hide(&mut main, &agent, &frame).unwrap();
+        main.set_focus(&terminal).unwrap();
+        assert!(
+            !main.is_visible(&agent),
+            "the premise: the chat's host is off screen in main"
+        );
+        // `study`: the first launch's layout, the terminal hidden, the keys on the chat.
+        let mut study = crate::terminal::initial_layout(&[]).unwrap();
+        study.set_focus(&agent).unwrap();
+        assert!(
+            !study.is_visible(&terminal),
+            "the premise: study does not show the terminal"
+        );
+        let workspaces = RefCell::new(
+            Workspaces::from_parts(
+                vec!["main".to_string(), "study".to_string()],
+                BTreeMap::from([("study".to_string(), study)]),
+                "main".to_string(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let layout = RefCell::new(main);
+        let mapped: RefCell<BTreeSet<ModuleId>> = RefCell::new(layout.borrow().visible_modules().into_iter().collect());
+        let effects = RefCell::new(Vec::new());
+        let released = |what: &str| {
+            assert!(layout.try_borrow_mut().is_ok(), "the layout is released before {what}");
+            assert!(
+                workspaces.try_borrow_mut().is_ok(),
+                "the workspaces are released before {what}"
+            );
+        };
+
+        let result = switch_then_unmap(
+            || {
+                let next = workspaces.borrow_mut().switch(&mut layout.borrow_mut(), "study", &[]);
+                effects.borrow_mut().push(Effect::Leave);
+                next
+            },
+            |next| {
+                released("a host maps");
+                if layout.borrow().is_visible(next) && mapped.borrow_mut().insert(next.clone()) {
+                    effects.borrow_mut().push(Effect::Map(next.clone()));
+                }
+            },
+            |next| {
+                released("the keys move");
+                let l = layout.borrow();
+                assert!(!l.is_visible(&terminal), "the float is off screen in the layout first");
+                assert!(l.is_shown(next), "the keys go to a shown module, {next}");
+                assert!(
+                    mapped.borrow().contains(next),
+                    "{next}'s host is mapped before it gets the keys"
+                );
+                effects.borrow_mut().push(Effect::Focus(next.clone()));
+            },
+            || {
+                released("the unmap");
+                assert!(!layout.borrow().is_visible(&terminal), "apply unmaps the float");
+                effects.borrow_mut().push(Effect::Unmap);
+            },
+            || {
+                released("the restack");
+                assert!(shown_floats(&layout.borrow()).is_empty(), "study shows no float");
+                effects.borrow_mut().push(Effect::Restack);
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            effects.into_inner(),
+            [
+                Effect::Leave,
+                Effect::Map(agent.clone()),
+                Effect::Focus(agent.clone()),
+                Effect::Unmap,
+                Effect::Restack,
+            ]
+        );
+        let workspaces = workspaces.borrow();
+        assert_eq!(workspaces.current(), "study");
+        assert_eq!(layout.borrow().focus(), &agent);
+        let left = workspaces.stored("main").unwrap();
+        assert!(left.is_floating(&terminal), "main keeps its float for the way back");
+        assert_eq!(left.focus(), &terminal, "and its keys");
+    }
+
+    /// Giving the keys to a float under another raises it, and what the floats cover changes with
+    /// it: a terminal float raised over the floating chat covers it now. That is the raise the change
+    /// hooks must hear of (`restacked_after_raise`); the float already on top, a tile, or the editor
+    /// raises nothing.
+    #[test]
+    fn giving_the_keys_to_a_lower_float_raises_it_over_what_it_overlaps() {
+        let terminal = ModuleId::terminal();
+        let chat = ModuleId::agent();
+        let rect = FloatRect {
+            cx: 0.5,
+            cy: 0.5,
+            w: 400,
+            h: 300,
+        };
+        let frame = Frame::new(UNALLOCATED, 1);
+        let mut layout = with_a_float(rect, &terminal);
+        assert_eq!(
+            eitri_core::layout::float_at(&mut layout, &chat, Some(rect), &frame),
+            Ok(true)
+        );
+        layout.set_focus(&chat).unwrap();
+        assert!(
+            covering(&arrange(&layout, &frame), &chat).is_empty(),
+            "the chat floats on top"
+        );
+        assert!(would_raise(&layout, &terminal));
+        assert!(!would_raise(&layout, &chat), "on top already");
+        assert!(!would_raise(&layout, &ModuleId::editor()), "a tile is never raised");
+
+        layout.set_focus(&terminal).unwrap();
+        assert_eq!(covering(&arrange(&layout, &frame), &chat), vec![terminal.clone()]);
+        assert!(!would_raise(&layout, &terminal));
+    }
+
+    /// Floats `terminal` at `rect` over the default window with the terminal shown and the keys on
+    /// `keys`.
+    fn with_a_float(rect: FloatRect, keys: &ModuleId) -> Layout {
+        let mut layout = crate::terminal::initial_layout(&[]).unwrap();
+        layout.show(&ModuleId::terminal()).unwrap();
+        let frame = Frame::new(UNALLOCATED, 1);
+        assert_eq!(
+            eitri_core::layout::float_at(&mut layout, &ModuleId::terminal(), Some(rect), &frame),
+            Ok(true)
+        );
+        layout.set_focus(keys).unwrap();
+        layout
+    }
+
+    /// A drag on a float's bar keeps the bar under the pointer, and a drag on its grip keeps the grip
+    /// there, both ways. This replays what GTK hands `drag-update` -- the pointer in the bar's (or the
+    /// grip's) CURRENT coordinates, less where it was grabbed -- one motion event per frame, the grid
+    /// re-arranging between events as it does.
+    #[test]
+    fn a_dragged_float_bar_stays_under_the_pointer() {
+        let terminal = ModuleId::terminal();
+        let frame = Frame::new(UNALLOCATED, 1);
+        let rect_now = |layout: &Layout| arrange(layout, &frame).float_spot(&terminal).unwrap().rect;
+        let float = FloatRect {
+            cx: 0.5,
+            cy: 0.5,
+            w: 400,
+            h: 300,
+        };
+        for (grip, step) in [(false, (15, 7)), (false, (-10, -5)), (true, (10, 6)), (true, (-8, -4))] {
+            let mut layout = with_a_float(float, &terminal);
+            let start = rect_now(&layout);
+            // Where on the bar or the grip the press landed, in its own coordinates.
+            let grabbed = (5, 5);
+            let handle = |r: Rect| if grip { grip_rect(r) } else { r };
+            let origin = handle(start);
+            let pointer_start = (origin.x + grabbed.0, origin.y + grabbed.1);
+            for n in 1..=10 {
+                let pointer = (pointer_start.0 + step.0 * n, pointer_start.1 + step.1 * n);
+                let now = rect_now(&layout);
+                let widget = handle(now);
+                let dx = f64::from(pointer.0 - widget.x - grabbed.0);
+                let dy = f64::from(pointer.1 - widget.y - grabbed.1);
+                let next = dragged_float_rect(now, dx, dy, grip);
+                eitri_core::layout::set_float_rect(&mut layout, &terminal, next, &frame);
+            }
+            let end = rect_now(&layout);
+            let (mx, my) = (step.0 * 10, step.1 * 10);
+            if grip {
+                assert_eq!(
+                    end,
+                    Rect {
+                        w: start.w + mx,
+                        h: start.h + my,
+                        ..start
+                    },
+                    "a grip drag of {mx},{my}"
+                );
+            } else {
+                assert_eq!(
+                    end,
+                    Rect {
+                        x: start.x + mx,
+                        y: start.y + my,
+                        ..start
+                    },
+                    "a bar drag of {mx},{my}"
+                );
+            }
+        }
+        // The rule on its own: a bar moves the rectangle, a grip sizes it from the bottom-right.
+        let r = Rect {
+            x: 100,
+            y: 50,
+            w: 300,
+            h: 200,
+        };
+        assert_eq!(dragged_float_rect(r, -20.4, 9.6, false), Rect { x: 80, y: 60, ..r });
+        assert_eq!(dragged_float_rect(r, -20.4, 9.6, true), Rect { w: 280, h: 210, ..r });
+    }
+
+    /// What GTK's pick finds over a grid with floats, as [`pick`] models it for hosts and handles.
+    #[derive(Debug, PartialEq)]
+    enum Picked {
+        Host(ModuleId),
+        Handle(usize),
+        Bar(ModuleId),
+        Grip(ModuleId),
+    }
+
+    fn pick_slot(children: &[Slot], arrangement: &Arrangement, chrome: &[ModuleId], x: i32, y: i32) -> Option<Picked> {
+        let contains = |r: Rect| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+        children.iter().rev().find_map(|slot| match slot {
+            Slot::Host(id) => arrangement
+                .rect_of(id)
+                .or_else(|| arrangement.float_spot(id).map(|s| s.host))
+                .is_some_and(contains)
+                .then(|| Picked::Host(id.clone())),
+            Slot::Handle(n) => arrangement
+                .dividers
+                .get(*n)
+                .is_some_and(|d| contains(d.rect))
+                .then_some(Picked::Handle(*n)),
+            Slot::Strip(_) => None,
+            Slot::Chrome(i) => {
+                let spot = chrome.get(*i).and_then(|id| arrangement.float_spot(id))?;
+                // The grip is after the bar in the child list: it is picked first.
+                if contains(grip_rect(spot.rect)) {
+                    Some(Picked::Grip(spot.id.clone()))
+                } else if contains(spot.bar) {
+                    Some(Picked::Bar(spot.id.clone()))
+                } else {
+                    None
+                }
+            }
+        })
+    }
+
+    /// A float over the root divider takes every press inside it: on the divider's pixels its host
+    /// does, on its bar the bar, on its grip the grip; outside it the divider is still the handle's.
+    #[test]
+    fn a_press_inside_a_float_reaches_its_host_not_the_split_below() {
+        let terminal = ModuleId::terminal();
+        let layout = with_a_float(
+            FloatRect {
+                cx: 0.6,
+                cy: 0.5,
+                w: 400,
+                h: 300,
+            },
+            &terminal,
+        );
+        let arrangement = arrange(&layout, &Frame::new(UNALLOCATED, 1));
+        let spot = arrangement.float_spot(&terminal).unwrap().clone();
+        let divider = arrangement.dividers[0].clone();
+        assert_eq!(divider.axis, Axis::Row, "the premise: the editor | agent split");
+        assert!(
+            spot.host.x < divider.rect.x && divider.rect.x < spot.host.x + spot.host.w,
+            "the premise: the float's host covers the divider ({spot:?}, {divider:?})"
+        );
+
+        let ids = [ModuleId::editor(), ModuleId::agent(), terminal.clone()];
+        let mut children: Vec<Slot> = stack_as_add_builds(&ids)
+            .into_iter()
+            .map(|c| match c {
+                Child::Host(id) => Slot::Host(id),
+                Child::Handle(n) => Slot::Handle(n),
+            })
+            .collect();
+        let floats = [terminal.clone()];
+        let chrome = chrome_owners(&[], &floats);
+        children.push(Slot::Chrome(0));
+        let children = apply_moves(&children, &restack_moves(&children, &floats, &chrome));
+
+        let r = divider.rect;
+        let middle = spot.host.y + spot.host.h / 2;
+        for x in [r.x, r.x + r.w] {
+            assert_eq!(
+                pick_slot(&children, &arrangement, &chrome, x, middle),
+                Some(Picked::Host(terminal.clone())),
+                "a press at ({x}, {middle}) on the divider under the float"
+            );
+        }
+        let above = spot.rect.y - 10;
+        assert_eq!(
+            pick_slot(&children, &arrangement, &chrome, r.x, above),
+            Some(Picked::Handle(0)),
+            "the divider outside the float is the handle's"
+        );
+        let bar = (spot.bar.x + spot.bar.w / 2, spot.bar.y + spot.bar.h / 2);
+        assert_eq!(
+            pick_slot(&children, &arrangement, &chrome, bar.0, bar.1),
+            Some(Picked::Bar(terminal.clone()))
+        );
+        let grip = grip_rect(spot.rect);
+        assert_eq!(
+            pick_slot(&children, &arrangement, &chrome, grip.x + 6, grip.y + 6),
+            Some(Picked::Grip(terminal.clone()))
+        );
+
+        // Negative control: the same float left in the host band, where it was tiled, loses the
+        // divider's pixels to the handle above it.
+        let unstacked = stack_as_add_builds(&ids)
+            .into_iter()
+            .map(|c| match c {
+                Child::Host(id) => Slot::Host(id),
+                Child::Handle(n) => Slot::Handle(n),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pick_slot(&unstacked, &arrangement, &chrome, r.x, middle),
+            Some(Picked::Handle(0))
+        );
+    }
+
+    /// Stowing the float that holds the keys -- `scratchpad.move`, or `scratchpad.show` on the shown
+    /// scratch float with the keys -- gives them to the most recent module in view before the float's
+    /// host is unmapped, through [`leave_then_unmap`], the door `ModuleGrid::scratchpad_move` and
+    /// `scratchpad_show`'s `Stowed` take. Both tiled modules are tried as the one with the keys last.
+    #[test]
+    fn stowing_the_float_with_the_keys_gives_them_away_before_it_unmaps() {
+        let terminal = ModuleId::terminal();
+        let frame = Frame::new(UNALLOCATED, 1);
+        let float = FloatRect::centred(UNALLOCATED, 0.6);
+        for last in [ModuleId::agent(), ModuleId::editor()] {
+            let mut layout = with_a_float(float, &last);
+            layout.set_focus(&terminal).unwrap();
+            let layout = RefCell::new(layout);
+            let (result, effects) = leave_and_record(&layout, &terminal, |l| {
+                eitri_core::layout::scratchpad_move(l, &terminal, &frame)
+            });
+            assert_eq!(result, Ok(()), "keys last on {last}");
+            assert_eq!(
+                effects,
+                [Effect::Leave, Effect::Focus(last.clone()), Effect::Unmap],
+                "keys last on {last}"
+            );
+            assert!(layout.borrow().is_stowed(&terminal));
+            assert_eq!(layout.borrow().focus(), &last);
+
+            // Shown again, given the keys, and stowed by `scratchpad.show` this time.
+            let shown = eitri_core::layout::scratchpad_show(&mut layout.borrow_mut(), None, &frame);
+            assert_eq!(shown, Ok(ScratchShow::Shown(terminal.clone())));
+            layout.borrow_mut().set_focus(&terminal).unwrap();
+            let (result, effects) =
+                leave_and_record(&layout, &terminal, |l| {
+                    match eitri_core::layout::scratchpad_show(l, None, &frame)? {
+                        ScratchShow::Stowed(next) => Ok(next),
+                        other => panic!("not a stow: {other:?}"),
+                    }
+                });
+            assert_eq!(result, Ok(()), "keys last on {last}");
+            assert_eq!(
+                effects,
+                [Effect::Leave, Effect::Focus(last.clone()), Effect::Unmap],
+                "keys last on {last}"
+            );
+            assert!(layout.borrow().is_stowed(&terminal));
+        }
+    }
+
+    /// What [`scratch_show_in_order`] did, in order.
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Map(ModuleId),
+        Focus(ModuleId),
+        Apply,
+        Restack,
+    }
+
+    fn show_and_record(
+        layout: &RefCell<Layout>,
+        module: Option<&ModuleId>,
+    ) -> (Result<ScratchShow, LayoutError>, Vec<Step>) {
+        let steps = RefCell::new(Vec::new());
+        let frame = Frame::new(UNALLOCATED, 1);
+        let released = |what: &str| {
+            assert!(layout.try_borrow_mut().is_ok(), "the layout is released before {what}");
+        };
+        let result = scratch_show_in_order(
+            layout,
+            |l| eitri_core::layout::scratchpad_show(l, module, &frame),
+            |id| {
+                released("a map");
+                steps.borrow_mut().push(Step::Map(id.clone()));
+            },
+            |id| {
+                released("the keys move");
+                steps.borrow_mut().push(Step::Focus(id.clone()));
+            },
+            || {
+                released("apply");
+                steps.borrow_mut().push(Step::Apply);
+            },
+            || {
+                released("the restack");
+                steps.borrow_mut().push(Step::Restack);
+            },
+        );
+        (result, steps.into_inner())
+    }
+
+    /// `scratchpad.show`'s other answers: a float shown or raised is mapped by `apply` and restacked on
+    /// top before it gets the keys; a stow gives the keys away before `apply` unmaps it; an instance
+    /// that does not exist changes nothing at all.
+    #[test]
+    fn a_shown_scratch_float_is_mapped_and_raised_before_it_gets_the_keys() {
+        let terminal = ModuleId::terminal();
+        let layout = RefCell::new(with_a_float(FloatRect::centred(UNALLOCATED, 0.6), &ModuleId::agent()));
+        let (result, steps) = show_and_record(&layout, Some(&terminal));
+        assert_eq!(result, Ok(ScratchShow::Shown(terminal.clone())));
+        assert_eq!(
+            steps,
+            [
+                Step::Apply,
+                Step::Restack,
+                Step::Map(terminal.clone()),
+                Step::Focus(terminal.clone())
+            ]
+        );
+        layout.borrow_mut().set_focus(&terminal).unwrap();
+
+        let (result, steps) = show_and_record(&layout, None);
+        assert!(matches!(result, Ok(ScratchShow::Stowed(Some(_)))), "{result:?}");
+        let Ok(ScratchShow::Stowed(Some(next))) = result else {
+            unreachable!()
+        };
+        assert_eq!(
+            steps,
+            [
+                Step::Map(next.clone()),
+                Step::Focus(next.clone()),
+                Step::Apply,
+                Step::Restack
+            ]
+        );
+
+        let missing = ModuleId::parse("terminal#3").unwrap();
+        let (result, steps) = show_and_record(&layout, Some(&missing));
+        assert_eq!(result, Ok(ScratchShow::Missing(missing)));
+        assert!(steps.is_empty(), "{steps:?}");
+    }
+
+    /// A module title is the user's text: a float's bar shows `<b>x</b>` as those characters. Read off
+    /// `floatbars.rs`'s code (comments, literals and any test module blanked): no markup setter at all,
+    /// markup never switched on, and the text set in exactly one place, `set_bar_text`, which every
+    /// bar goes through.
+    #[test]
+    fn float_bar_titles_are_set_as_text_never_markup() {
+        use eitri_core::source_scan as scan;
+        let source = scan::read_required("shell/src/module_grid/floatbars.rs");
+        let code = scan::code_only(&source.text);
+        let code = scan::without(&code, &scan::modules(&code, "tests"));
+        let flat: String = code.split_whitespace().collect();
+        for forbidden in [
+            "set_markup(",
+            "set_use_markup(true)",
+            "set_label(",
+            "with_mnemonic(",
+            "set_text_with_mnemonic(",
+            "set_markup_with_mnemonic(",
+        ] {
+            assert!(!flat.contains(forbidden), "floatbars.rs calls {forbidden}");
+        }
+        assert!(
+            flat.contains("set_use_markup(false)"),
+            "markup is switched off on the bar"
+        );
+        assert_eq!(flat.matches(".set_text(").count(), 1, "the text is set in one place");
+        let setter = scan::functions(&code, "set_bar_text");
+        assert_eq!(setter.len(), 1);
+        assert!(setter[0].contains(".set_text("), "{}", setter[0]);
+        // `Label::new(Some(text))` would set text past the one function.
+        assert!(flat.contains("Label::new(None)"), "the bar's label is made empty");
+        assert_eq!(flat.matches("Label::new(").count(), 1);
+        assert!(
+            scan::calls(&code, "set_bar_text") >= 2,
+            "show and relabel both go through it"
         );
     }
 }

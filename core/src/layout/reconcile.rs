@@ -1,28 +1,23 @@
-//! Rebuilds a saved or `init.lua` default layout against the modules this window has.
+//! Rebuilds a file's or Lua default's layout against the modules this window actually has.
 //!
-//! 1. Removes unavailable leaves, such as unregistered Lua panels. Their siblings take the space.
-//!    If this leaves a hidden editor alone in its place, it is shown again so a removed Lua `main`
-//!    panel does not leave the window without an editor. An editor hidden by hand also returns if
-//!    its only neighbour was removed; a note explains the change.
-//! 2. Rejects a tree missing the editor or agent so the caller can fall back to the default.
-//! 3. For `init.lua` defaults only, [`reconcile_default`] pins a full-width bottom terminal or Lua
-//!    `bottom` panel to keep its height when the window grows. `init.lua` cannot express pins.
-//!    Saved layouts retain their own pins, including rows unpinned with `Ctrl+a _`.
-//! 4. Adds a missing terminal below the editor's leaf, hidden, and places missing registered Lua
-//!    panels by their `position`, as on first launch.
-//! 5. Keeps `hidden` entries only for leaves still in the tree. Restores focus if it is shown;
-//!    otherwise chooses the editor, then the first registered Lua panel placed in its place,
-//!    then the first shown module in tree order. Only the active children of tabbed and
-//!    stacked containers are eligible, so focus does not switch to another tab.
-//!    An `init.lua` default has no saved focus. Choosing its first leaf could give the agent the
-//!    keys instead of the editor in `{ 'row', {'agent', 0.4}, {'editor'} }`.
+//! 1. Filters floats in order: the editor stays tiled, unknown modules and tiled duplicates leave,
+//!    repeated floats keep their first entry, and invalid rectangles are clamped with a note.
+//! 2. Prunes unknown tree leaves and shows an editor left alone after its replacement disappears.
+//!    The editor must remain tiled; the chat must be tiled or floating.
+//! 3. Pins a Lua default's bottom rows as a first launch would. A file keeps its own pins.
+//! 4. Places missing terminals, instances and registered Lua panels as a first launch would,
+//!    skipping every module already floating.
+//! 5. Keeps hidden state and float memory only for remaining modules. The editor has no float memory.
+//! 6. Keeps a shown saved focus, otherwise choosing the editor, a Lua panel in its place, or the
+//!    first module in view. Tab containers keep their drawn child when choosing that first focus.
 //!
-//! Each change produces a note so the caller can log why the window did not reopen as it was left.
+//! Every adjustment produces a note so callers can explain why the layout changed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::con::{ConLayout, Node, Pin};
+use super::float::{Float, FloatRect};
 use super::module::{ModuleDecl, ModuleId, Placement};
 use super::tree::{place_new, Layout, LayoutError};
 
@@ -68,22 +63,56 @@ pub fn reconcile(
     lua: &[ModuleDecl],
     instances: &[ModuleId],
 ) -> Result<Reconciled, ReconcileError> {
-    reconcile_with(root, hidden, focus, lua, instances, false)
+    reconcile_floating(root, Vec::new(), BTreeMap::new(), hidden, focus, lua, instances)
 }
 
 /// `init.lua`'s `eitri.layout.default` tree, which has nothing hidden and no focus: [`reconcile`],
-/// and its bottom rows pinned (the module doc's step 3).
+/// and its bottom rows pinned as a first launch would.
 pub fn reconcile_default(root: Node, lua: &[ModuleDecl]) -> Result<Reconciled, ReconcileError> {
+    reconcile_default_floating(root, Vec::new(), lua)
+}
+
+/// A file's or Lua default's tree, floats and remembered rectangles against this window's modules.
+pub fn reconcile_floating(
+    root: Node,
+    floats: Vec<Float>,
+    memory: BTreeMap<ModuleId, FloatRect>,
+    hidden: &BTreeSet<ModuleId>,
+    focus: Option<&ModuleId>,
+    lua: &[ModuleDecl],
+    instances: &[ModuleId],
+) -> Result<Reconciled, ReconcileError> {
+    reconcile_with(root, floats, memory, hidden, focus, lua, instances, false)
+}
+
+/// Reconciles a Lua default, keeping terminal instances named in its tree or floats.
+pub fn reconcile_default_floating(
+    root: Node,
+    floats: Vec<Float>,
+    lua: &[ModuleDecl],
+) -> Result<Reconciled, ReconcileError> {
     let instances: Vec<_> = root
         .leaves()
         .into_iter()
+        .chain(floats.iter().map(|float| float.id.clone()))
         .filter(|id| id.kind() == super::module::ModuleKind::Terminal && id.number() >= 2)
         .collect();
-    reconcile_with(root, &BTreeSet::new(), None, lua, &instances, true)
+    reconcile_with(
+        root,
+        floats,
+        BTreeMap::new(),
+        &BTreeSet::new(),
+        None,
+        lua,
+        &instances,
+        true,
+    )
 }
 
 fn reconcile_with(
     root: Node,
+    floats: Vec<Float>,
+    memory: BTreeMap<ModuleId, FloatRect>,
     hidden: &BTreeSet<ModuleId>,
     focus: Option<&ModuleId>,
     lua: &[ModuleDecl],
@@ -94,6 +123,29 @@ fn reconcile_with(
         BUILT_INS.iter().any(|b| b() == *id) || lua.iter().any(|d| d.id == *id) || instances.contains(id)
     };
     let mut notes = Vec::new();
+    let tiled = root.leaves();
+    let mut floating = BTreeSet::new();
+    let mut kept = Vec::new();
+    for mut float in floats {
+        let id = &float.id;
+        if *id == ModuleId::editor() {
+            notes.push("'editor' never floats; it stays tiled".into());
+        } else if !known(id) {
+            notes.push(format!("left out floating '{id}': this window has no such module"));
+        } else if tiled.contains(id) {
+            notes.push(format!("floating '{id}' is also tiled; it stays tiled"));
+        } else if !floating.insert(id.clone()) {
+            notes.push(format!("floating '{id}' appears twice; the first is kept"));
+        } else {
+            if !float.rect.is_valid() {
+                notes.push(format!(
+                    "floating '{id}': its rectangle was out of range and is clamped"
+                ));
+                float.rect = float.rect.clamped();
+            }
+            kept.push(float);
+        }
+    }
     let mut dropped = Vec::new();
     let mut uncovered = Vec::new();
     let root = prune(root, &known, &mut dropped, &mut uncovered);
@@ -102,7 +154,7 @@ fn reconcile_with(
     }
     let mut root = root.ok_or(ReconcileError::MissingBuiltIn(ModuleId::editor()))?;
     for built_in in [ModuleId::editor(), ModuleId::agent()] {
-        if !root.leaves().contains(&built_in) {
+        if !root.leaves().contains(&built_in) && (built_in == ModuleId::editor() || !floating.contains(&built_in)) {
             return Err(ReconcileError::MissingBuiltIn(built_in));
         }
     }
@@ -112,7 +164,11 @@ fn reconcile_with(
         };
         pin_bottom_rows(&mut root, &below_root, &mut notes);
     }
-    let mut hidden: BTreeSet<ModuleId> = hidden.iter().filter(|id| root.leaves().contains(id)).cloned().collect();
+    let mut hidden: BTreeSet<ModuleId> = hidden
+        .iter()
+        .filter(|id| root.leaves().contains(id) || floating.contains(id))
+        .cloned()
+        .collect();
     let editor = ModuleId::editor();
     if uncovered.contains(&editor) && hidden.remove(&editor) {
         notes.push(format!(
@@ -121,7 +177,7 @@ fn reconcile_with(
         ));
     }
     let terminal = ModuleId::terminal();
-    if !root.leaves().contains(&terminal) {
+    if !root.leaves().contains(&terminal) && !floating.contains(&terminal) {
         root = place_new(root, &terminal, Placement::BelowEditor).0;
         hidden.insert(terminal.clone());
         notes.push(format!(
@@ -129,7 +185,7 @@ fn reconcile_with(
         ));
     }
     for id in instances {
-        if !root.leaves().contains(id) {
+        if !root.leaves().contains(id) && !floating.contains(id) {
             root = place_new(root, id, Placement::BelowEditor).0;
             hidden.insert(id.clone());
             notes.push(format!(
@@ -138,7 +194,7 @@ fn reconcile_with(
         }
     }
     for decl in lua {
-        if root.leaves().contains(&decl.id) {
+        if root.leaves().contains(&decl.id) || floating.contains(&decl.id) {
             continue;
         }
         let (placed, took_editors_place) = place_new(root, &decl.id, decl.placement);
@@ -151,16 +207,38 @@ fn reconcile_with(
             decl.id, decl.placement
         ));
     }
-    let shown: Vec<ModuleId> = root.leaves().into_iter().filter(|id| !hidden.contains(id)).collect();
+    let shown: Vec<ModuleId> = root
+        .leaves()
+        .into_iter()
+        .chain(kept.iter().map(|float| float.id.clone()))
+        .filter(|id| !hidden.contains(id))
+        .collect();
+    let mut kept_memory = BTreeMap::new();
+    for (id, rect) in memory {
+        if id == ModuleId::editor() {
+            notes.push("float memory of 'editor' left out: the editor never floats".into());
+        } else if !root.leaves().contains(&id) && !floating.contains(&id) {
+            notes.push(format!(
+                "float memory of '{id}' left out: this window has no such module"
+            ));
+        } else {
+            kept_memory.insert(id, rect.clamped());
+        }
+    }
     let focus = match focus {
         Some(f) if shown.contains(f) => f.clone(),
         _ => {
             let mut in_view = Vec::new();
             drawn_leaves(&root, &|id| !hidden.contains(id), &mut in_view);
+            in_view.extend(
+                kept.iter()
+                    .filter(|float| !hidden.contains(&float.id))
+                    .map(|float| float.id.clone()),
+            );
             first_focus(&in_view, lua).ok_or(ReconcileError::NothingVisible)?
         }
     };
-    let layout = Layout::from_parts(root, hidden, focus).map_err(ReconcileError::Layout)?;
+    let layout = Layout::from_parts_floating(root, kept, hidden, focus, kept_memory).map_err(ReconcileError::Layout)?;
     Ok(Reconciled { layout, notes })
 }
 
@@ -183,10 +261,10 @@ fn drawn_leaves(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, out: &mut Vec<Mo
     }
 }
 
-/// Step 5 of the module doc, when `focus` cannot be used: where `Layout::initial` gives the keys --
+/// When `focus` cannot be used: where `Layout::initial` gives the keys --
 /// the editor, else the first registered Lua panel in the editor's place -- and otherwise the first
 /// shown module in tree order. `None` only if nothing is shown.
-fn first_focus(shown: &[ModuleId], lua: &[ModuleDecl]) -> Option<ModuleId> {
+pub(super) fn first_focus(shown: &[ModuleId], lua: &[ModuleDecl]) -> Option<ModuleId> {
     let editor = ModuleId::editor();
     if shown.contains(&editor) {
         return Some(editor);
@@ -199,7 +277,7 @@ fn first_focus(shown: &[ModuleId], lua: &[ModuleDecl]) -> Option<ModuleId> {
         .cloned()
 }
 
-/// Step 3 of the module doc, from `node` down: each `below_root` module that is a full-width row at
+/// From `node` down: each `below_root` module that is a full-width row at
 /// the bottom of the window gets the pin a first launch gives it ([`Placement::BelowRoot`]), with no
 /// length yet -- so it divides by its share until it has been on screen, then keeps that height.
 ///

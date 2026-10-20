@@ -52,7 +52,17 @@ pub fn classify(action: &Action) -> CompanionVerb {
         Action::Hint => CompanionVerb::Hint,
         Action::SendPrefix | Action::SendKeys(_) => CompanionVerb::Literal,
         Action::Select(dir) => CompanionVerb::Select(*dir),
-        Action::SelectLast
+        Action::FloatToggle
+        | Action::FocusModeToggle
+        | Action::ScratchpadShow { .. }
+        | Action::ScratchpadMove
+        | Action::WorkspaceStep { .. }
+        | Action::WorkspaceLast
+        | Action::WorkspaceChoose
+        | Action::WorkspaceRename
+        | Action::WorkspaceSwitch { .. }
+        | Action::WorkspaceNew
+        | Action::SelectLast
         | Action::SelectNext
         | Action::Split { .. }
         | Action::CopyMode { .. }
@@ -92,7 +102,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
 /// it says why nothing will happen.
 pub fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
     match waiting {
-        Waiting::No | Waiting::Number => Vec::new(),
+        Waiting::No | Waiting::Number | Waiting::Workspace { .. } => Vec::new(),
         Waiting::Module(_) => vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
         Waiting::Command => {
             let verbs = [
@@ -133,8 +143,20 @@ mod tests {
     /// failing to compile in `classify`.
     #[test]
     fn classify_maps_every_action_family() {
+        assert!(strip_pieces(Waiting::Workspace { deleting: false }, &Keymap::defaults()).is_empty());
         let key = KeySpec::char('x', false, false);
         let cases: Vec<(Action, CompanionVerb)> = vec![
+            (Action::FloatToggle, CompanionVerb::Refuse),
+            (Action::FocusModeToggle, CompanionVerb::Refuse),
+            (Action::ScratchpadShow { module: None }, CompanionVerb::Refuse),
+            (Action::ScratchpadMove, CompanionVerb::Refuse),
+            (Action::WorkspaceStep { forward: false }, CompanionVerb::Refuse),
+            (Action::WorkspaceStep { forward: true }, CompanionVerb::Refuse),
+            (Action::WorkspaceLast, CompanionVerb::Refuse),
+            (Action::WorkspaceChoose, CompanionVerb::Refuse),
+            (Action::WorkspaceRename, CompanionVerb::Refuse),
+            (Action::WorkspaceSwitch { name: "x".into() }, CompanionVerb::Refuse),
+            (Action::WorkspaceNew, CompanionVerb::Refuse),
             (Action::SelectNumber, CompanionVerb::Refuse),
             (Action::MoveFar(Direction::Left), CompanionVerb::Refuse),
             (Action::Zoom, CompanionVerb::Refuse),

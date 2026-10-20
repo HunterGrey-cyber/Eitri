@@ -24,11 +24,12 @@
 //!
 //! The mark, last preset and undo slot are runtime state; no state file reads or writes them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use super::arrange::{con_has_pin_to_settle, has_step, set_step_ratio, Divider};
 use super::con::{Child, Con, ConFault, ConId, ConLayout, Node, MAX_CHILDREN};
+use super::float::{Float, FloatRect};
 use super::module::{ModuleDecl, ModuleId, Placement};
 use super::verbs::Preset;
 
@@ -140,11 +141,23 @@ pub enum LayoutError {
         limit: usize,
     },
     NothingToUndo,
+    EditorNeverFloats,
+    Floating(ModuleId),
+    NotFloating(ModuleId),
+    NoScratch,
+    LastTiled(ModuleId),
+    FloatRect(ModuleId),
 }
 
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LayoutError::EditorNeverFloats => write!(f, "the editor never floats"),
+            LayoutError::Floating(id) => write!(f, "'{id}' is floating; it has no split"),
+            LayoutError::NotFloating(id) => write!(f, "'{id}' is not floating"),
+            LayoutError::NoScratch => write!(f, "the scratchpad is empty"),
+            LayoutError::LastTiled(id) => write!(f, "'{id}' is the last module tiled on screen"),
+            LayoutError::FloatRect(id) => write!(f, "the rectangle of floating '{id}' is out of range"),
             LayoutError::NotAnInstance(id) => write!(f, "'{id}' is not an instance; it cannot leave the layout"),
             LayoutError::NoMark => write!(f, "no module is marked"),
             LayoutError::MarkedIsTarget(id) => write!(f, "'{id}' is the marked module itself"),
@@ -193,6 +206,8 @@ pub enum Zoom {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     root: Con,
+    floats: Vec<Float>,
+    float_memory: BTreeMap<ModuleId, FloatRect>,
     mark: Option<ModuleId>,
     last_preset: Option<Preset>,
     undo: Option<Con>,
@@ -241,6 +256,8 @@ impl Layout {
         mru.extend(leaves.into_iter().filter(|id| *id != focus));
         Ok(Layout {
             root,
+            floats: Vec::new(),
+            float_memory: BTreeMap::new(),
             mark: None,
             last_preset: None,
             undo: None,
@@ -293,18 +310,61 @@ impl Layout {
         Ok(layout)
     }
 
-    /// Rebuilds a layout from state or Lua input. Applies [`Layout::new`]'s checks, then requires
-    /// `hidden` to name only leaves and exclude `focus`. Since `focus` is a leaf, this also ensures
-    /// at least one module stays shown. External input must pass these constructor checks.
+    /// Rebuilds a tiled layout, checking membership, visibility and the tree's invariants.
     pub fn from_parts(root: Node, hidden: BTreeSet<ModuleId>, focus: ModuleId) -> Result<Layout, LayoutError> {
-        let mut layout = Layout::new(root, focus.clone())?;
-        if let Some(stray) = hidden.iter().find(|id| !layout.contains(id)) {
+        Self::from_parts_floating(root, Vec::new(), hidden, focus, BTreeMap::new())
+    }
+
+    /// Rebuilds a layout with floats in the given order, without raising the focused float.
+    pub fn from_parts_floating(
+        root: Node,
+        floats: Vec<Float>,
+        hidden: BTreeSet<ModuleId>,
+        focus: ModuleId,
+        memory: BTreeMap<ModuleId, FloatRect>,
+    ) -> Result<Layout, LayoutError> {
+        let root = into_root(root, None);
+        let leaves = root.leaves();
+        let first = leaves.first().cloned().unwrap_or_else(|| focus.clone());
+        let mut layout = Layout::new(Node::Con(root.clone()), first)?;
+        layout.root = root;
+        let mut modules: BTreeSet<_> = leaves.iter().cloned().collect();
+        for float in &floats {
+            if float.id == ModuleId::editor() {
+                return Err(LayoutError::EditorNeverFloats);
+            }
+            if !modules.insert(float.id.clone()) {
+                return Err(LayoutError::Duplicate(float.id.clone()));
+            }
+            if !float.rect.is_valid() {
+                return Err(LayoutError::FloatRect(float.id.clone()));
+            }
+        }
+        for id in memory.keys() {
+            if *id == ModuleId::editor() {
+                return Err(LayoutError::EditorNeverFloats);
+            }
+            if !modules.contains(id) {
+                return Err(LayoutError::NotInTree(id.clone()));
+            }
+        }
+        if let Some(stray) = hidden.iter().find(|id| !modules.contains(id)) {
             return Err(LayoutError::NotInTree(stray.clone()));
+        }
+        if !modules.contains(&focus) {
+            return Err(LayoutError::NotInTree(focus));
         }
         if hidden.contains(&focus) {
             return Err(LayoutError::Hidden(focus));
         }
+        layout.floats = floats;
+        layout.float_memory = memory;
         layout.hidden = hidden;
+        layout.mru = layout.modules();
+        layout.mru.retain(|id| *id != focus);
+        layout.mru.insert(0, focus.clone());
+        layout.root.focus_leaf(&focus);
+        layout.focus = focus;
         Ok(layout)
     }
 
@@ -472,8 +532,133 @@ impl Layout {
         self.gone.contains(id)
     }
 
+    /// The tiled tree's leaves, in tree order; floats are not leaves ([`Layout::modules`]).
     pub fn leaves(&self) -> Vec<ModuleId> {
         self.root.leaves()
+    }
+
+    pub fn floats(&self) -> &[Float] {
+        &self.floats
+    }
+
+    pub fn float_of(&self, id: &ModuleId) -> Option<&Float> {
+        self.floats.iter().find(|float| &float.id == id)
+    }
+
+    pub fn is_floating(&self, id: &ModuleId) -> bool {
+        self.float_of(id).is_some()
+    }
+
+    /// A hidden scratch float is stowed in the scratchpad.
+    pub fn is_stowed(&self, id: &ModuleId) -> bool {
+        self.hidden.contains(id) && self.float_of(id).is_some_and(|float| float.scratch)
+    }
+
+    /// Every module: tiled leaves in tree order, then floats bottom first.
+    pub fn modules(&self) -> Vec<ModuleId> {
+        let mut modules = self.leaves();
+        modules.extend(self.floats.iter().map(|float| float.id.clone()));
+        modules
+    }
+
+    /// Visible tiled leaves, then visible floats bottom first.
+    pub fn visible_modules(&self) -> Vec<ModuleId> {
+        self.modules().into_iter().filter(|id| self.is_visible(id)).collect()
+    }
+
+    pub fn float_memory(&self) -> &BTreeMap<ModuleId, FloatRect> {
+        &self.float_memory
+    }
+
+    /// The most recently used tiled module that is in view.
+    pub fn tiled_anchor(&self) -> Option<ModuleId> {
+        self.mru
+            .iter()
+            .find(|id| !self.is_floating(id) && self.is_in_view(id))
+            .cloned()
+    }
+
+    /// Adds a new, shown float on top, joining the end of the MRU list.
+    pub fn add_float(&mut self, id: &ModuleId, rect: FloatRect, scratch: bool) -> Result<(), LayoutError> {
+        if *id == ModuleId::editor() {
+            return Err(LayoutError::EditorNeverFloats);
+        }
+        if self.contains(id) {
+            return Err(LayoutError::Duplicate(id.clone()));
+        }
+        if !rect.is_valid() {
+            return Err(LayoutError::FloatRect(id.clone()));
+        }
+        self.floats.push(Float {
+            id: id.clone(),
+            rect,
+            scratch,
+        });
+        self.mru.push(id.clone());
+        Ok(())
+    }
+
+    /// Removes a float, remembering its rectangle and leaving its hidden state alone.
+    pub(crate) fn take_float(&mut self, id: &ModuleId) -> Option<Float> {
+        let index = self.floats.iter().position(|float| &float.id == id)?;
+        let float = self.floats.remove(index);
+        self.float_memory.insert(id.clone(), float.rect);
+        Some(float)
+    }
+
+    /// Puts an existing module above the other floats after it has left the tree.
+    pub(crate) fn push_float(&mut self, float: Float) {
+        debug_assert!(self.contains(&float.id));
+        debug_assert!(!self.is_floating(&float.id) && float.id != ModuleId::editor() && float.rect.is_valid());
+        self.floats.push(float);
+    }
+
+    /// Puts the float `id` at the top of the z-order: `false` when it is not a float or is on top already.
+    /// Public because a press on a float's bar raises it before anything gives it the keys.
+    pub fn raise(&mut self, id: &ModuleId) -> bool {
+        let Some(index) = self.floats.iter().position(|float| &float.id == id) else {
+            return false;
+        };
+        if index + 1 == self.floats.len() {
+            return false;
+        }
+        let float = self.floats.remove(index);
+        self.floats.push(float);
+        true
+    }
+
+    pub(crate) fn lower(&mut self, id: &ModuleId) -> bool {
+        let Some(index) = self.floats.iter().position(|float| &float.id == id) else {
+            return false;
+        };
+        if index == 0 {
+            return false;
+        }
+        let float = self.floats.remove(index);
+        self.floats.insert(0, float);
+        true
+    }
+
+    pub(crate) fn store_float_rect(&mut self, id: &ModuleId, rect: FloatRect) -> bool {
+        let Some(float) = self.floats.iter_mut().find(|float| &float.id == id) else {
+            return false;
+        };
+        if float.rect == rect {
+            return false;
+        }
+        float.rect = rect;
+        true
+    }
+
+    pub(crate) fn set_scratch(&mut self, id: &ModuleId, scratch: bool) -> bool {
+        let Some(float) = self.floats.iter_mut().find(|float| &float.id == id) else {
+            return false;
+        };
+        if float.scratch == scratch {
+            return false;
+        }
+        float.scratch = scratch;
+        true
     }
 
     pub fn contains(&self, id: &ModuleId) -> bool {
@@ -619,6 +804,7 @@ impl Layout {
     /// away is still shown and may take the keys; the move that gives them to it unzooms.
     pub fn set_focus(&mut self, id: &ModuleId) -> Result<(), LayoutError> {
         self.can_focus(id)?;
+        self.raise(id);
         self.root.focus_leaf(id);
         if self.zoomed().is_some_and(|z| self.is_tabbed_away(z)) {
             self.unzoom();
@@ -660,7 +846,7 @@ impl Layout {
         if self.unzoom() {
             return ZoomChange::Unzoomed;
         }
-        let shown = self.leaves().into_iter().filter(|id| self.is_shown(id)).count();
+        let shown = self.modules().into_iter().filter(|id| self.is_shown(id)).count();
         if !self.is_in_view(target) || shown < 2 {
             return ZoomChange::Nothing;
         }
@@ -741,7 +927,7 @@ impl Layout {
         let root = into_root(root, Some(self.root.id));
         let leaves = root.leaves();
         debug_assert!(
-            self.mru.iter().all(|id| leaves.contains(id)),
+            self.mru.iter().all(|id| leaves.contains(id) || self.is_floating(id)),
             "a rearrangement lost a module"
         );
         for id in leaves {
@@ -788,7 +974,7 @@ impl Layout {
         if self.hidden.contains(id) {
             return Ok(false);
         }
-        let others_shown = self.leaves().iter().any(|m| m != id && self.is_shown(m));
+        let others_shown = self.modules().iter().any(|m| m != id && self.is_shown(m));
         if !others_shown {
             return Err(LayoutError::LastVisible(id.clone()));
         }
@@ -808,10 +994,17 @@ impl Layout {
         if !self.contains(id) {
             return Err(LayoutError::NotInTree(id.clone()));
         }
-        let root = self
-            .root_node()
-            .without(id)
-            .ok_or_else(|| LayoutError::LastVisible(id.clone()))?;
+        let root = if self.is_floating(id) {
+            self.take_float(id);
+            None
+        } else {
+            Some(
+                self.root_node()
+                    .without(id)
+                    .ok_or_else(|| LayoutError::LastVisible(id.clone()))?,
+            )
+        };
+        self.float_memory.remove(id);
         if self.zoomed() == Some(id) {
             self.unzoom();
         }
@@ -822,21 +1015,24 @@ impl Layout {
         if self.mark.as_ref() == Some(id) {
             self.clear_mark();
         }
-        self.replace_root(root);
-        let leaves = self.leaves();
-        if !leaves.iter().any(|m| self.is_shown(m)) {
-            let first = leaves
+        if let Some(root) = root {
+            self.replace_root(root);
+        }
+        self.clear_last_preset();
+        let modules = self.modules();
+        if !modules.iter().any(|m| self.is_shown(m)) {
+            let first = modules
                 .iter()
                 .find(|m| **m == ModuleId::editor() && !self.is_gone(m))
-                .or_else(|| leaves.iter().find(|m| !self.is_gone(m)))
+                .or_else(|| modules.iter().find(|m| !self.is_gone(m)))
                 .ok_or_else(|| LayoutError::LastVisible(id.clone()))?;
             self.hidden.remove(first);
         }
         if &self.focus == id {
-            let next = leaves
+            let next = modules
                 .iter()
                 .find(|m| **m == ModuleId::editor() && self.is_shown(m))
-                .or_else(|| leaves.iter().find(|m| self.is_shown(m)))
+                .or_else(|| modules.iter().find(|m| self.is_shown(m)))
                 .expect("a remaining leaf is shown");
             self.set_focus(next)?;
         }
@@ -867,6 +1063,30 @@ fn into_root(node: Node, keep: Option<super::con::ConId>) -> Con {
             }
             root
         }
+    }
+}
+
+impl Layout {
+    /// Copies the arrangement for a new workspace with fresh container ids and no undo,
+    /// selection, zoom, mark or last preset.
+    pub fn fresh_copy(&self) -> Layout {
+        fn renumber(con: &mut Con) {
+            con.id = ConId::fresh();
+            for child in &mut con.children {
+                if let Node::Con(nested) = &mut child.node {
+                    renumber(nested);
+                }
+            }
+        }
+
+        let mut copy = self.clone();
+        renumber(&mut copy.root);
+        copy.undo = None;
+        copy.zoomed = None;
+        copy.mark = None;
+        copy.last_preset = None;
+        copy.selection = Selection::Module;
+        copy
     }
 }
 

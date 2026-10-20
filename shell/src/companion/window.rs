@@ -392,6 +392,11 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                         toast.show(companion_prefix::REFUSED_TEXT);
                         return;
                     }
+                    crate::prefix::PrefixCommand::Workspace(pick) => {
+                        println!("[companion] prefix: workspace {pick:?} refused");
+                        toast.show(companion_prefix::REFUSED_TEXT);
+                        return;
+                    }
                     crate::prefix::PrefixCommand::Run(action) => action,
                     // A module key after a split key: there is nothing to place.
                     crate::prefix::PrefixCommand::Place { module, axis, cwd: _ } => {

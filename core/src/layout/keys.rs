@@ -273,7 +273,7 @@ pub fn split_choice(layout: &Layout, named: &ModuleId) -> SplitChoice {
 
 fn instance_count(layout: &Layout, id: &ModuleId) -> usize {
     if id.kind().has_instances() {
-        layout.leaves().iter().filter(|m| m.kind() == id.kind()).count()
+        layout.modules().iter().filter(|m| m.kind() == id.kind()).count()
     } else {
         1
     }
@@ -421,12 +421,11 @@ mod tests {
 
     #[test]
     fn a_stock_tmux_key_eitri_does_not_bind_stays_reserved() {
-        // `[` and `PPage` are bound to `copy-mode` and `copy-mode -u`, so Lua panels taking them fail
-        // `Bound`, not `StockTmux`. `;` and `o` are bound to `last-pane` and `select-pane -t :.+` too.
-        // `q` is bound to `select.number`; `D` (`choose-client`) remains an unbound stock key.
-        // See `every_character_the_effective_table_binds_refuses_a_lua_panel`.
+        // Bound keys fail `Bound` before the stock-key reservation check: `[` and `PPage`
+        // enter copy mode, `;` and `o` select modules, `q` is `select.number`, and `s` is
+        // `workspace.choose`. `D` (`choose-client`) remains an unbound stock key.
         for (key, command) in [
-            ('s', "choose-tree"),
+            ('d', "detach-client"),
             ('D', "choose-client"),
             (']', "paste-buffer"),
             ('C', "customize-mode"),

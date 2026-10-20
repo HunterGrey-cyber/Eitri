@@ -4,9 +4,14 @@
 //! include those zoomed away: decisions use the unzoomed window.
 
 pub mod containers;
+pub mod floating;
 pub mod move_dir;
 pub mod select;
 pub use containers::{container_mode, switch_tab};
+pub use floating::{
+    float_at, float_toggle, mode_toggle_target, move_float, resize_float, scratchpad_move, scratchpad_show,
+    set_float_rect, FloatChange, ScratchShow,
+};
 pub use move_dir::move_dir;
 pub use select::{focus_child, focus_parent};
 
@@ -68,6 +73,19 @@ pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &
     }
     if !layout.is_shown(target) {
         return Err(LayoutError::Hidden(target.clone()));
+    }
+    if layout.is_floating(target) {
+        let unit = Node::Leaf(target.clone());
+        let rest = layout.root_node();
+        let root = match dir {
+            Direction::Left => Node::split(Axis::Row, 1.0 - RIGHT_OF_ROOT_SHARE, unit, rest),
+            Direction::Right => Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, rest, unit),
+            Direction::Up => Node::split(Axis::Column, 1.0 - BELOW_ROOT_SHARE, unit, rest),
+            Direction::Down => Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, rest, unit),
+        };
+        layout.take_float(target);
+        apply(layout, root);
+        return Ok(true);
     }
     if shown(layout).len() < 2 {
         return Err(LayoutError::LastVisible(target.clone()));
@@ -415,6 +433,40 @@ pub fn swap_marked(layout: &mut Layout, target: &ModuleId) -> Result<ModuleId, L
     }
     if !layout.is_shown(&mark) {
         return Err(LayoutError::MarkHidden(mark));
+    }
+    match (layout.float_of(target).cloned(), layout.float_of(&mark).cloned()) {
+        (Some(a), Some(b)) => {
+            layout.store_float_rect(target, b.rect);
+            layout.store_float_rect(&mark, a.rect);
+            layout.unzoom();
+            return Ok(mark);
+        }
+        (Some(float), None) | (None, Some(float)) => {
+            let tiled = if float.id == *target { &mark } else { target };
+            if *tiled == ModuleId::editor() {
+                return Err(LayoutError::EditorNeverFloats);
+            }
+            let above: Vec<_> = layout
+                .floats()
+                .iter()
+                .skip_while(|f| f.id != float.id)
+                .skip(1)
+                .map(|f| f.id.clone())
+                .collect();
+            let mut root = layout.root_node();
+            root.map_leaves(&|id| if id == tiled { float.id.clone() } else { id.clone() });
+            layout.push_float(super::float::Float {
+                id: tiled.clone(),
+                ..float.clone()
+            });
+            layout.take_float(&float.id);
+            for id in above {
+                layout.raise(&id);
+            }
+            apply(layout, root);
+            return Ok(mark);
+        }
+        (None, None) => {}
     }
     let mut root = layout.root_node();
     root.swap_leaves(target, &mark);

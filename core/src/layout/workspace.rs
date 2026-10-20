@@ -9,8 +9,10 @@ use std::fmt;
 
 use serde_json::{Map, Value};
 
+use super::geometry::Frame;
+use super::kill::{kill, Reopen};
 use super::module::{ModuleDecl, ModuleId};
-use super::tree::Layout;
+use super::tree::{Layout, LayoutError};
 
 /// The workspace every window has from its first launch, and the one a file from before workspaces
 /// is read into.
@@ -24,13 +26,14 @@ pub struct Workspaces {
     order: Vec<String>,
     stored: BTreeMap<String, Layout>,
     current: String,
+    last: Option<String>,
     /// What a later build wrote that this one does not read: top-level keys, and each workspace's own
     /// keys.
     kept: Kept,
 }
 
 /// Keys of the state file this build does not know, carried verbatim so a save by this build does
-/// not drop what a later build keeps there (its floating modules, say). In [`Workspaces`] a workspace
+/// not drop what a later build keeps there (its overlays, say). In [`Workspaces`] a workspace
 /// with no kept keys has no entry; read from a file (`persist::V2State`), every workspace the file
 /// holds has one, empty or not, which tells "the file has this workspace with no such keys" apart
 /// from "the file has no such workspace".
@@ -50,6 +53,9 @@ pub enum WorkspaceError {
     NoCurrent(String),
     /// The stored layouts are not exactly the workspaces other than the current one.
     Stored(String),
+    NoSuch(String),
+    Main,
+    Current(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -60,6 +66,13 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::Name(name) => write!(
                 f,
                 "'{}' is not a workspace name (1 to {MAX_NAME_CHARS} characters, no control characters)",
+                printable(name)
+            ),
+            WorkspaceError::NoSuch(name) => write!(f, "no workspace '{}'", printable(name)),
+            WorkspaceError::Main => write!(f, "'main' keeps its name and is never deleted"),
+            WorkspaceError::Current(name) => write!(
+                f,
+                "'{}' is the current workspace; switch away before deleting it",
                 printable(name)
             ),
             WorkspaceError::Duplicate(name) => write!(f, "workspace '{name}' is named twice"),
@@ -88,13 +101,64 @@ pub(crate) fn printable(text: &str) -> String {
     out
 }
 
+/// Makes the layout hold the window's modules, removing absent instances before adding missing modules.
+pub fn fit_to(layout: &mut Layout, modules: &[ModuleId]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for id in layout.modules() {
+        if id.number() >= 2 && !modules.contains(&id) {
+            layout.remove(&id).expect("a numbered instance can be removed");
+            notes.push(format!("left out '{id}': this window has no such module now"));
+        }
+    }
+    for id in modules {
+        if !layout.contains(id) {
+            let root = super::tree::place_new(layout.root_node(), id, super::module::Placement::BelowEditor).0;
+            layout.replace_root(root);
+            layout.hide_unfocused(id).expect("another module remains shown");
+            notes.push(format!(
+                "placed '{id}' below the editor, hidden: another workspace has it"
+            ));
+        }
+    }
+    notes
+}
+
 impl Workspaces {
+    /// Adds every module held by any workspace to all the others, keeping existing placements.
+    pub fn fit_all(&mut self, live: &mut Layout) -> Vec<String> {
+        let mut modules = Vec::new();
+        for (_, layout) in self.each(live) {
+            for id in layout.modules() {
+                if !modules.contains(&id) {
+                    modules.push(id);
+                }
+            }
+        }
+        let mut notes = Vec::new();
+        for name in &self.order {
+            let layout = if *name == self.current {
+                &mut *live
+            } else {
+                self.stored
+                    .get_mut(name)
+                    .expect("every non-current workspace is stored")
+            };
+            notes.extend(
+                fit_to(layout, &modules)
+                    .into_iter()
+                    .map(|note| format!("workspace '{name}': {note}")),
+            );
+        }
+        notes
+    }
+
     /// One workspace, `main`, current: a first launch, and any window whose file could not be used.
     pub fn single() -> Workspaces {
         Workspaces {
             order: vec![MAIN.to_string()],
             stored: BTreeMap::new(),
             current: MAIN.to_string(),
+            last: None,
             kept: Kept::default(),
         }
     }
@@ -136,6 +200,7 @@ impl Workspaces {
             order,
             stored,
             current,
+            last: None,
             kept,
         })
     }
@@ -148,6 +213,149 @@ impl Workspaces {
             return Err(WorkspaceError::Name(name.to_string()));
         }
         Ok(())
+    }
+
+    /// Swaps the live layout with the target, carrying the window's mark and resetting selections.
+    /// Returns the visible module that takes the keys, or `None` when already current.
+    pub fn switch(
+        &mut self,
+        live: &mut Layout,
+        to: &str,
+        lua: &[ModuleDecl],
+    ) -> Result<Option<ModuleId>, WorkspaceError> {
+        if !self.order.iter().any(|name| name == to) {
+            return Err(WorkspaceError::NoSuch(to.to_string()));
+        }
+        if self.current == to {
+            return Ok(None);
+        }
+        let mark = live.mark().cloned();
+        let mut outgoing = self.stored.remove(to).expect("every non-current workspace is stored");
+        std::mem::swap(live, &mut outgoing);
+        outgoing.clear_mark();
+        outgoing.clear_selection();
+        let old = std::mem::replace(&mut self.current, to.to_string());
+        self.stored.insert(old.clone(), outgoing);
+        self.last = Some(old);
+        live.clear_mark();
+        if let Some(id) = mark.filter(|id| live.contains(id) && !live.is_gone(id)) {
+            let _ = live.set_mark(&id);
+        }
+        live.clear_selection();
+        let focus = if live.is_visible(live.focus()) {
+            Some(live.focus().clone())
+        } else {
+            super::reconcile::first_focus(&live.visible_modules(), lua)
+        };
+        if let Some(id) = &focus {
+            let _ = live.set_focus(id);
+        }
+        Ok(focus)
+    }
+
+    /// The preceding or following workspace in order, wrapping; none when alone.
+    pub fn step(&self, forward: bool) -> Option<String> {
+        let count = self.order.len();
+        if count <= 1 {
+            return None;
+        }
+        let index = self.order.iter().position(|name| *name == self.current)?;
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        Some(self.order[next].clone())
+    }
+
+    /// The workspace left by the latest switch, while it still exists.
+    pub fn last(&self) -> Option<&str> {
+        self.last
+            .as_deref()
+            .filter(|last| self.order.iter().any(|name| name == last))
+    }
+
+    /// The lowest available whole number from 2, as text.
+    pub fn next_free_name(&self) -> String {
+        (2..)
+            .map(|number| number.to_string())
+            .find(|name| !self.order.contains(name))
+            .unwrap()
+    }
+
+    /// Appends a copy with fresh container ids and no arrangement runtime state.
+    pub fn create_copy(&mut self, live: &Layout) -> String {
+        let name = self.next_free_name();
+        self.create(&name, live.fresh_copy())
+            .expect("a free numeric name is valid");
+        name
+    }
+
+    /// Appends a layout containing every module of the window under a new name.
+    pub fn create(&mut self, name: &str, layout: Layout) -> Result<(), WorkspaceError> {
+        Self::valid_name(name)?;
+        if self.order.iter().any(|existing| existing == name) {
+            return Err(WorkspaceError::Duplicate(name.to_string()));
+        }
+        self.order.push(name.to_string());
+        self.stored.insert(name.to_string(), layout);
+        Ok(())
+    }
+
+    /// Removes a stored workspace and its preserved keys, keeping `main` and the current one.
+    pub fn delete(&mut self, name: &str) -> Result<(), WorkspaceError> {
+        if name == MAIN {
+            return Err(WorkspaceError::Main);
+        }
+        if name == self.current {
+            return Err(WorkspaceError::Current(name.to_string()));
+        }
+        if !self.order.iter().any(|existing| existing == name) {
+            return Err(WorkspaceError::NoSuch(name.to_string()));
+        }
+        self.order.retain(|existing| existing != name);
+        self.stored.remove(name);
+        self.kept.per_workspace.remove(name);
+        if self.last.as_deref() == Some(name) {
+            self.last = None;
+        }
+        Ok(())
+    }
+
+    /// Renames the current workspace and carries its preserved keys; `main` keeps its name.
+    pub fn rename_current(&mut self, to: &str) -> Result<(), WorkspaceError> {
+        if self.current == MAIN {
+            return Err(WorkspaceError::Main);
+        }
+        if self.current == to {
+            return Ok(());
+        }
+        Self::valid_name(to)?;
+        if self.order.iter().any(|name| name == to) {
+            return Err(WorkspaceError::Duplicate(to.to_string()));
+        }
+        for name in &mut self.order {
+            if *name == self.current {
+                *name = to.to_string();
+            }
+        }
+        if let Some(keys) = self.kept.per_workspace.remove(&self.current) {
+            self.kept.per_workspace.insert(to.to_string(), keys);
+        }
+        self.current = to.to_string();
+        Ok(())
+    }
+
+    /// Retires a module in every stored layout, showing the chat when nothing else would remain.
+    pub fn retire_everywhere(&mut self, id: &ModuleId, frame: &Frame) {
+        for layout in self.stored.values_mut() {
+            if layout.contains(id) && !layout.is_gone(id) {
+                if let Err(LayoutError::LastVisible(_)) = kill(layout, id, Reopen::Never, frame) {
+                    let _ = layout.show(&ModuleId::agent());
+                    let _ = kill(layout, id, Reopen::Never, frame);
+                }
+            }
+        }
     }
 
     pub fn current(&self) -> &str {
@@ -219,7 +427,7 @@ impl Workspaces {
     pub fn placed(&self, current: &Layout, lua: &[ModuleDecl]) -> BTreeSet<ModuleId> {
         let mut placed = built_in_and_registered(lua);
         for (_, layout) in self.each(current) {
-            placed.extend(layout.leaves());
+            placed.extend(layout.modules());
         }
         placed
     }
@@ -329,8 +537,301 @@ pub(crate) fn modules_named(value: &Value, out: &mut BTreeSet<ModuleId>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_switch_fallback_counts_visible_floats() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = layout();
+        layout
+            .add_float(
+                &t2,
+                crate::layout::FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 600,
+                    h: 300,
+                },
+                false,
+            )
+            .unwrap();
+        let frame = Frame::new(crate::layout::Size { w: 1280, h: 720 }, 1);
+        for id in [ModuleId::agent(), ModuleId::editor()] {
+            if let Some(next) = crate::layout::hide(&mut layout, &id, &frame).unwrap() {
+                layout.set_focus(&next).unwrap();
+            }
+        }
+        assert_eq!(layout.visible_modules(), [t2.clone()]);
+        assert_eq!(
+            super::super::reconcile::first_focus(&layout.visible_modules(), &[]),
+            Some(t2)
+        );
+    }
+
+    #[test]
+    fn fit_to_drops_instances_the_window_has_not_and_adds_what_it_has() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = crate::layout::fixture::fixture("row(editor 0.6, column(agent, terminal#3))");
+        let notes = fit_to(
+            &mut layout,
+            &[ModuleId::editor(), ModuleId::agent(), ModuleId::terminal(), t2.clone()],
+        );
+        assert!(layout.contains(&ModuleId::terminal()) && layout.hidden().contains(&ModuleId::terminal()));
+        assert!(layout.contains(&t2) && layout.hidden().contains(&t2));
+        assert!(!layout.contains(&ModuleId::parse("terminal#3").unwrap()));
+        assert_eq!(
+            notes,
+            vec![
+                "left out 'terminal#3': this window has no such module now".to_string(),
+                "placed 'terminal' below the editor, hidden: another workspace has it".to_string(),
+                "placed 'terminal#2' below the editor, hidden: another workspace has it".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fit_to_counts_a_floating_module_as_present() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = layout();
+        layout
+            .add_float(
+                &t2,
+                crate::layout::FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 600,
+                    h: 300,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(fit_to(&mut layout, &[ModuleId::editor(), ModuleId::agent(), t2.clone()]).is_empty());
+        assert!(layout.is_floating(&t2));
+    }
+
+    #[test]
+    fn fit_all_gives_every_workspace_every_module_any_of_them_holds() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut other = layout();
+        other
+            .add_float(
+                &t2,
+                crate::layout::FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 600,
+                    h: 300,
+                },
+                true,
+            )
+            .unwrap();
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2"]),
+            BTreeMap::from([("2".to_string(), other)]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        let mut live = layout();
+        let notes = ws.fit_all(&mut live);
+        assert!(live.contains(&t2) && live.hidden().contains(&t2) && !live.is_floating(&t2));
+        assert_eq!(
+            notes,
+            vec![
+                "workspace 'main': placed 'terminal#2' below the editor, hidden: another workspace has it".to_string()
+            ]
+        );
+        assert!(
+            ws.stored("2").unwrap().is_floating(&t2),
+            "the workspace that had it keeps it as it was"
+        );
+    }
+
     use super::*;
     use serde_json::json;
+
+    use crate::layout::fixture::fixture;
+
+    #[test]
+    fn a_switch_swaps_the_live_layout_and_switching_back_restores_it_exactly() {
+        let mut live = fixture("row(editor 0.6, agent)");
+        let mut ws = Workspaces::single();
+        assert_eq!(ws.create_copy(&live), "2");
+        assert_eq!(ws.order(), ["main", "2"]);
+        live.toggle_zoom(&ModuleId::editor());
+        live.set_mark(&ModuleId::agent()).unwrap();
+        let main_before = live.clone();
+        assert_eq!(ws.switch(&mut live, "2", &[]), Ok(Some(ModuleId::editor())));
+        assert_eq!(ws.current(), "2");
+        assert!(!live.is_zoomed(), "the copy was made before the zoom");
+        assert_eq!(live.mark(), Some(&ModuleId::agent()), "the mark is the window's");
+        assert_eq!(ws.stored("main").unwrap().mark(), None);
+        assert_eq!(ws.last(), Some("main"));
+        assert_eq!(ws.switch(&mut live, "main", &[]), Ok(Some(ModuleId::editor())));
+        assert!(live.is_zoomed(), "a workspace comes back zoomed as it was left");
+        assert_eq!(live.root(), main_before.root());
+        assert_eq!(live.mark(), Some(&ModuleId::agent()));
+        assert_eq!(ws.switch(&mut live, "main", &[]), Ok(None), "already current");
+        assert_eq!(
+            ws.switch(&mut live, "nope", &[]),
+            Err(WorkspaceError::NoSuch("nope".into()))
+        );
+    }
+
+    #[test]
+    fn a_switch_gives_the_keys_to_a_visible_module_of_the_target() {
+        let mut live = layout();
+        let mut ws = Workspaces::single();
+        ws.create_copy(&live);
+        ws.switch(&mut live, "2", &[]).unwrap();
+        live.set_focus(&ModuleId::agent()).unwrap();
+        live.toggle_zoom(&ModuleId::agent());
+        live.set_focus(&ModuleId::editor()).unwrap();
+        assert!(!live.is_visible(&ModuleId::editor()), "the keys' module is zoomed away");
+        ws.switch(&mut live, "main", &[]).unwrap();
+        assert_eq!(
+            ws.switch(&mut live, "2", &[]),
+            Ok(Some(ModuleId::agent())),
+            "the first visible module instead"
+        );
+        assert_eq!(live.focus(), &ModuleId::agent());
+    }
+
+    #[test]
+    fn a_switch_without_a_visible_saved_focus_prefers_a_lua_panel_in_the_editors_place() {
+        let notes = ModuleId::lua("notes");
+        let lua = [crate::layout::ModuleDecl {
+            id: notes.clone(),
+            placement: crate::layout::Placement::InPlaceOfEditor,
+        }];
+        let mut two = fixture("row(editor 0.5, column(agent, lua:notes))");
+        two.set_focus(&ModuleId::agent()).unwrap();
+        assert!(crate::layout::focus_parent(&mut two), "the column is selected");
+        two.toggle_zoom(&ModuleId::agent());
+        two.set_focus(&ModuleId::editor()).unwrap();
+        assert!(
+            !two.is_visible(&ModuleId::editor()),
+            "the keys' module is outside the zoomed column"
+        );
+        assert!(two.is_visible(&ModuleId::agent()) && two.is_visible(&notes));
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2"]),
+            BTreeMap::from([("2".to_string(), two)]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        let mut live = layout();
+        assert_eq!(
+            ws.switch(&mut live, "2", &lua),
+            Ok(Some(notes)),
+            "not the first visible module, the agent"
+        );
+    }
+
+    #[test]
+    fn prev_and_next_wrap_and_last_is_the_workspace_left_most_recently() {
+        let mut live = layout();
+        let mut ws = Workspaces::single();
+        assert_eq!(ws.step(true), None);
+        assert_eq!(ws.last(), None);
+        ws.create_copy(&live);
+        ws.create_copy(&live);
+        assert_eq!(ws.order(), ["main", "2", "3"]);
+        assert_eq!(ws.step(true).as_deref(), Some("2"));
+        assert_eq!(ws.step(false).as_deref(), Some("3"));
+        ws.switch(&mut live, "3", &[]).unwrap();
+        assert_eq!(ws.step(true).as_deref(), Some("main"));
+        assert_eq!(ws.last(), Some("main"));
+        ws.switch(&mut live, "2", &[]).unwrap();
+        assert_eq!(ws.last(), Some("3"));
+    }
+
+    #[test]
+    fn delete_refuses_main_and_the_current_workspace_and_last_forgets_a_deleted_one() {
+        let mut live = layout();
+        let mut ws = Workspaces::single();
+        ws.create_copy(&live);
+        ws.create_copy(&live);
+        ws.switch(&mut live, "2", &[]).unwrap();
+        ws.switch(&mut live, "3", &[]).unwrap();
+        assert_eq!(ws.last(), Some("2"));
+        assert_eq!(ws.delete("main"), Err(WorkspaceError::Main));
+        assert_eq!(ws.delete("3"), Err(WorkspaceError::Current("3".into())));
+        assert_eq!(ws.delete("9"), Err(WorkspaceError::NoSuch("9".into())));
+        assert_eq!(ws.delete("2"), Ok(()));
+        assert_eq!(ws.order(), ["main", "3"]);
+        assert_eq!(ws.last(), None);
+        assert_eq!(ws.create_copy(&live), "2", "the lowest free number again");
+    }
+
+    #[test]
+    fn rename_moves_the_current_workspaces_name_and_its_kept_keys() {
+        let live = layout();
+        let mut kept = Kept::default();
+        kept.per_workspace.insert(
+            "2".into(),
+            serde_json::Map::from_iter([("future".to_string(), json!(1))]),
+        );
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2"]),
+            BTreeMap::from([("main".to_string(), live.clone())]),
+            "2".into(),
+            kept,
+        )
+        .unwrap();
+        assert_eq!(ws.rename_current("study"), Ok(()));
+        assert_eq!(ws.current(), "study");
+        assert_eq!(ws.order(), ["main", "study"]);
+        assert_eq!(ws.kept_for("study").and_then(|m| m.get("future")), Some(&json!(1)));
+        assert_eq!(ws.kept_for("2"), None);
+        assert_eq!(ws.rename_current("main"), Err(WorkspaceError::Duplicate("main".into())));
+        assert_eq!(ws.rename_current("a\nb"), Err(WorkspaceError::Name("a\nb".into())));
+        assert_eq!(ws.rename_current("study"), Ok(()), "its own name again changes nothing");
+        assert_eq!(Workspaces::single().rename_current("x"), Err(WorkspaceError::Main));
+        assert_eq!(
+            ws.create("study", live.clone()),
+            Err(WorkspaceError::Duplicate("study".into()))
+        );
+        assert_eq!(ws.create("review", live), Ok(()));
+        assert_eq!(ws.order(), ["main", "study", "review"]);
+    }
+
+    #[test]
+    fn a_copy_gets_fresh_container_ids_and_no_runtime_state() {
+        let mut live = fixture("row(editor 0.6, column(agent, terminal))");
+        live.set_mark(&ModuleId::agent()).unwrap();
+        live.toggle_zoom(&ModuleId::editor());
+        let mut ws = Workspaces::single();
+        let name = ws.create_copy(&live);
+        let copy = ws.stored(&name).unwrap();
+        assert_eq!(copy.root(), live.root(), "the same arrangement");
+        let ids: BTreeSet<_> = live.root().ids().into_iter().collect();
+        assert!(
+            copy.root().ids().iter().all(|id| !ids.contains(id)),
+            "no container id shared"
+        );
+        assert_eq!(copy.mark(), None);
+        assert!(!copy.is_zoomed());
+        assert_eq!(copy.selection(), crate::layout::Selection::Module);
+    }
+
+    #[test]
+    fn retiring_a_module_retires_it_in_every_stored_workspace() {
+        let frame = crate::layout::Frame::new(crate::layout::Size { w: 1280, h: 721 }, 1);
+        let mut lone = layout();
+        crate::layout::hide(&mut lone, &ModuleId::agent(), &frame).unwrap();
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2"]),
+            BTreeMap::from([("2".to_string(), lone)]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        ws.retire_everywhere(&ModuleId::editor(), &frame);
+        let two = ws.stored("2").unwrap();
+        assert!(two.is_gone(&ModuleId::editor()));
+        assert!(two.is_shown(&ModuleId::agent()), "something stays on screen");
+        assert_eq!(two.focus(), &ModuleId::agent());
+    }
 
     fn layout() -> Layout {
         Layout::initial(&[]).unwrap()
@@ -619,11 +1120,11 @@ mod tests {
         use super::super::persist::{decode_v2, encode_v2};
         let root = std::path::Path::new("/project");
         let mut file: Value = serde_json::from_str(&encode_v2(&Workspaces::single(), &layout(), root)).unwrap();
-        file["workspaces"][0]["floating"] = json!([{"module": "terminal#2"}]);
+        file["workspaces"][0]["overlays"] = json!([{"module": "terminal#2"}]);
         let restored = decode_v2(&file.to_string(), root, &[]).unwrap();
         let id = ModuleId::parse("terminal#2").unwrap();
         assert_eq!(restored.workspaces.reserved(), [id.clone()]);
-        assert!(restored.workspaces.kept_for("main").unwrap().contains_key("floating"));
+        assert!(restored.workspaces.kept_for("main").unwrap().contains_key("overlays"));
         let mut live = layout();
         live.replace_root(super::super::tree::place_new(live.root_node(), &id, super::super::Placement::BelowEditor).0);
         file["workspaces"][0]["tiled"] = serde_json::from_str::<Value>(&encode_v2(&Workspaces::single(), &live, root))

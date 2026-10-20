@@ -145,6 +145,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     tray.refresh(
         &layout(&[ModuleId::terminal()], ModuleId::editor()),
         Attention::default(),
+        &[],
     );
     window.present();
     pump(600);
@@ -166,6 +167,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     tray.refresh(
         &layout(&[ModuleId::terminal(), ModuleId::editor()], ModuleId::agent()),
         Attention::default(),
+        &[],
     );
     pump(900);
     if !editor_chip.is_mapped() {

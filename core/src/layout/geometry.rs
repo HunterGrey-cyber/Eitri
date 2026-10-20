@@ -13,6 +13,7 @@
 
 use super::arrange::{arrange_tree, con_min, move_divider_in, settle_in, Divider};
 use super::con::{ConId, ConLayout};
+use super::float::{float_floor, float_parts};
 use super::module::ModuleId;
 use super::tree::{Axis, Layout, LayoutError};
 
@@ -72,8 +73,18 @@ pub struct Arrangement {
     pub modules: Vec<(ModuleId, Rect)>,
     pub dividers: Vec<Divider>,
     pub strips: Vec<Strip>,
+    /// Floats on screen, bottom first.
+    pub floats: Vec<FloatSpot>,
     /// Navigation extends the top edge over each enclosing strip without crossing another module.
     pub cells: Vec<(ModuleId, Rect)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSpot {
+    pub id: ModuleId,
+    pub rect: Rect,
+    pub bar: Rect,
+    pub host: Rect,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +102,10 @@ pub struct ConStripEntry {
 }
 
 impl Arrangement {
+    pub fn float_spot(&self, id: &ModuleId) -> Option<&FloatSpot> {
+        self.floats.iter().find(|spot| &spot.id == id)
+    }
+
     pub fn cell_of(&self, id: &ModuleId) -> Option<Rect> {
         self.cells.iter().find(|(m, _)| m == id).map(|(_, r)| *r)
     }
@@ -143,7 +158,20 @@ pub(super) fn arrange_with(layout: &Layout, honour_zoom: bool, frame: &Frame) ->
         (true, Some(super::tree::Zoom::Con(id))) => layout.root().find(*id).unwrap(),
         _ => layout.root(),
     };
-    arrange_tree(root, full, &shown, frame)
+    let mut out = arrange_tree(root, full, &shown, frame);
+    if !(honour_zoom && layout.is_zoomed()) {
+        for float in layout.floats().iter().filter(|float| layout.is_shown(&float.id)) {
+            let rect = float.rect.place(frame.size, float_floor(&float.id, frame));
+            let (bar, host) = float_parts(rect, frame.strip_px);
+            out.floats.push(FloatSpot {
+                id: float.id.clone(),
+                rect,
+                bar,
+                host,
+            });
+        }
+    }
+    out
 }
 
 /// Whether two spans `[a, a + a_len)` and `[b, b + b_len)` share at least one pixel.
@@ -198,6 +226,54 @@ pub enum Nav {
 /// tmux's `select-pane` does, and today's `'R'`/`Ctrl+h` arms did.
 pub fn navigate(layout: &Layout, from: &ModuleId, dir: Direction, frame: &Frame) -> Nav {
     let arrangement = arrange_with(layout, false, frame);
+    if layout.is_floating(from) {
+        let Some(spot) = arrangement.float_spot(from) else {
+            return Nav::Nothing;
+        };
+        let centre = |r: Rect| (i64::from(r.x + r.w / 2), i64::from(r.y + r.h / 2));
+        let (cx, cy) = centre(spot.rect);
+        let on_side = |r| {
+            let (x, y) = centre(r);
+            match dir {
+                Direction::Left => x < cx,
+                Direction::Right => x > cx,
+                Direction::Up => y < cy,
+                Direction::Down => y > cy,
+            }
+        };
+        if let Some((_, next)) = arrangement
+            .floats
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| &f.id != from && on_side(f.rect))
+            .min_by_key(|(z, f)| {
+                let (x, y) = centre(f.rect);
+                ((x - cx).pow(2) + (y - cy).pow(2), std::cmp::Reverse(*z))
+            })
+        {
+            return Nav::Module(next.id.clone());
+        }
+        if let Some((id, _)) = arrangement
+            .cells
+            .iter()
+            .filter(|(_, r)| on_side(*r))
+            .min_by_key(|(id, r)| {
+                let x = cx.clamp(i64::from(r.x), i64::from(r.x + r.w));
+                let y = cy.clamp(i64::from(r.y), i64::from(r.y + r.h));
+                let rank = layout.mru().iter().position(|m| m == id).unwrap_or(usize::MAX);
+                ((cx - x).pow(2) + (cy - y).pow(2), rank, r.y, r.x)
+            })
+        {
+            return Nav::Module(id.clone());
+        }
+        return arrangement
+            .cells
+            .iter()
+            .find(|(_, r)| {
+                cx >= i64::from(r.x) && cx < i64::from(r.x + r.w) && cy >= i64::from(r.y) && cy < i64::from(r.y + r.h)
+            })
+            .map_or(Nav::Nothing, |(id, _)| Nav::Module(id.clone()));
+    }
     if arrangement.rect_of(from).is_none() {
         // `from` is hidden, or not in the tree: nothing moves from it -- not even up to the top bar,
         // which is only "above" a module that is on screen.
@@ -258,6 +334,9 @@ fn edge_divider(arrangement: &Arrangement, leaf: Rect, dir: Direction, trailing:
 /// zoom ends only once one is found: a direction with no divider is a no-op, and a no-op must not
 /// silently undo a zoom. `false` when nothing moved for that reason.
 pub fn resize(layout: &mut Layout, focused: &ModuleId, dir: Direction, px: i32, frame: &Frame) -> bool {
+    if layout.is_floating(focused) {
+        return super::verbs::resize_float(layout, focused, dir, px, frame);
+    }
     let arrangement = arrange_with(layout, false, frame);
     let Some(leaf) = arrangement.cell_of(focused) else {
         return false;

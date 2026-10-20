@@ -38,11 +38,20 @@ pub enum Press {
     Other,
 }
 
+/// What the workspace chooser was answered with: a 0-based position in the window's workspace order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePick {
+    Switch(usize),
+    New,
+    Delete(usize),
+}
+
 /// What the prefix hands `main.rs` to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixCommand {
     Run(Action),
     Number(char),
+    Workspace(WorkspacePick),
     /// After a split key and a module key: open `module` next to the module with the keys, or move it.
     Place {
         module: ModuleId,
@@ -79,6 +88,9 @@ enum State {
         axis: Axis,
         cwd: SplitCwd,
     },
+    AwaitWorkspace {
+        deleting: bool,
+    },
     AwaitNumber {
         until: Instant,
     },
@@ -96,6 +108,9 @@ pub enum Waiting {
     Command,
     Module(Axis),
     Number,
+    Workspace {
+        deleting: bool,
+    },
 }
 
 pub struct Prefix {
@@ -123,11 +138,17 @@ impl Prefix {
 
     pub fn waiting(&self) -> Waiting {
         match self.state {
+            State::AwaitWorkspace { deleting } => Waiting::Workspace { deleting },
             State::Armed => Waiting::Command,
             State::AwaitNumber { .. } => Waiting::Number,
             State::AwaitModule { axis, .. } => Waiting::Module(axis),
             State::Idle | State::Repeat { .. } => Waiting::No,
         }
+    }
+
+    /// Wait without a timer after the host draws the workspace chooser.
+    pub fn await_workspace(&mut self) {
+        self.state = State::AwaitWorkspace { deleting: false };
     }
 
     /// Start waiting after the host draws the digits. A window that refuses the action never
@@ -189,6 +210,30 @@ impl Prefix {
             return Outcome::Swallow;
         }
         match self.state {
+            State::AwaitWorkspace { deleting } => {
+                if press == Press::Modifier {
+                    return Outcome::Swallow;
+                }
+                self.held = Some(keycode);
+                self.state = State::Idle;
+                if let Press::Key(key) = press {
+                    match key.as_char() {
+                        Some(c @ '0'..='9') => {
+                            let index = if c == '0' { 9 } else { (c as u8 - b'1') as usize };
+                            let pick = if deleting {
+                                WorkspacePick::Delete(index)
+                            } else {
+                                WorkspacePick::Switch(index)
+                            };
+                            return Outcome::Run(PrefixCommand::Workspace(pick));
+                        }
+                        Some('c') if !deleting => return Outcome::Run(PrefixCommand::Workspace(WorkspacePick::New)),
+                        Some('x') if !deleting => self.state = State::AwaitWorkspace { deleting: true },
+                        _ => {}
+                    }
+                }
+                Outcome::Swallow
+            }
             State::AwaitNumber { .. } => {
                 if press == Press::Modifier {
                     return Outcome::Swallow;
@@ -664,6 +709,63 @@ mod tests {
         );
         let mut p = armed(with(keymap, &[]), t);
         assert_eq!(p.press(key("="), K1, t), run(Action::Text(TextChange::Larger)));
+    }
+
+    #[test]
+    fn the_workspace_chooser_waits_for_a_digit_c_or_x_then_a_digit() {
+        let t = Instant::now();
+        let mut p = armed(defaults(), t);
+        assert_eq!(p.press(key("s"), K1, t), run(Action::WorkspaceChoose));
+        assert_eq!(p.waiting(), Waiting::No, "the host starts the wait, not the key");
+        p.await_workspace();
+        assert_eq!(p.waiting(), Waiting::Workspace { deleting: false });
+        assert!(p.is_armed());
+        assert_eq!(p.press(key("s"), K1, t), Outcome::Swallow, "the held s's own repeat");
+        assert_eq!(p.press(Press::Modifier, SHIFT_L, t), Outcome::Swallow);
+        assert_eq!(p.waiting(), Waiting::Workspace { deleting: false });
+        p.release(K1);
+        assert_eq!(
+            p.press(key("2"), K2, t + Duration::from_secs(30)),
+            Outcome::Run(PrefixCommand::Workspace(WorkspacePick::Switch(1))),
+            "the chooser has no time limit"
+        );
+        assert_eq!(p.waiting(), Waiting::No);
+
+        let mut p = defaults();
+        p.await_workspace();
+        assert_eq!(
+            p.press(key("0"), K2, t),
+            Outcome::Run(PrefixCommand::Workspace(WorkspacePick::Switch(9)))
+        );
+        let mut p = defaults();
+        p.await_workspace();
+        assert_eq!(
+            p.press(key("c"), K2, t),
+            Outcome::Run(PrefixCommand::Workspace(WorkspacePick::New))
+        );
+        let mut p = defaults();
+        p.await_workspace();
+        assert_eq!(p.press(key("x"), K2, t), Outcome::Swallow);
+        assert_eq!(p.waiting(), Waiting::Workspace { deleting: true });
+        p.release(K2);
+        assert_eq!(
+            p.press(key("3"), K1, t),
+            Outcome::Run(PrefixCommand::Workspace(WorkspacePick::Delete(2)))
+        );
+        assert_eq!(p.waiting(), Waiting::No);
+
+        for press in [Press::Escape, key("q"), key("M-1"), key("C-b"), Press::Other] {
+            let mut p = defaults();
+            p.await_workspace();
+            assert_eq!(p.press(press, K2, t), Outcome::Swallow, "{press:?}");
+            assert_eq!(p.waiting(), Waiting::No, "{press:?}");
+        }
+        let mut p = defaults();
+        p.await_workspace();
+        assert_eq!(p.press(key("x"), K2, t), Outcome::Swallow);
+        p.release(K2);
+        assert_eq!(p.press(key("c"), K1, t), Outcome::Swallow, "c after x makes nothing");
+        assert_eq!(p.waiting(), Waiting::No);
     }
 
     #[test]

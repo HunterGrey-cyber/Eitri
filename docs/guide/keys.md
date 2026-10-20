@@ -87,7 +87,7 @@ screen changes, and the change before the close can no longer be undone.
 **Setting a key that already has an action.** The keys in this section are defaults, and `eitri.keymap.set` on a key
 that has an action stops Eitri at startup with a message that names the call and says to run
 `eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4`, `M-5`, `M-H`,
-`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d` or `M-Enter` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
+`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d`, `M-Enter`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s` or `$` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
 tmux configuration binds the key, the key already counts as yours and your `set` replaces it with no `del`. A `del`
 of a key that nothing is bound to also stops startup, so a `del` line works only from this version on, or when the
 import and your tmux configuration bind that key.
@@ -161,6 +161,78 @@ the next / the previous tab when it is in a tabbed or stacked container, otherwi
 terminal on screen, and do nothing with only one. Terminals have no text-size keys. There are no extra chats yet:
 `Alt+Enter` opens terminals only, and a split key then `a` with the keys in the chat flashes `chat views: not in
 this build`.
+
+### Floats, the scratchpad and workspaces
+
+A **float** is one module drawn over the others at a size and place of its own, with a bar across its top edge
+that holds its title (as the top bar's chips read it, drawn exactly as written) and a small grip at its bottom-right corner. The
+editor never floats; the agent panel can. A **scratch** float is a float you can put away and call back: while
+it is put away it takes no room, its chip in the top bar reads `<title> ⌁`, and it keeps running. A
+**workspace** is a whole arrangement of the same modules under a name; the window can hold several and one is
+shown at a time.
+
+| keys | what they do |
+|---|---|
+| `<prefix> Alt+Shift+Space` | float this module at the size and place it last floated at, else centred at 60% of the window; with the keys on a float, put it back into the layout next to the tiled module you used last. The editor and the last tiled module in view are refused |
+| `<prefix> Alt+_` | send this module to the scratchpad: it floats and is put away |
+| `<prefix> Alt+-` | the scratchpad: put away the shown scratch float that has the keys; else raise a shown scratch float; else show the one put away longest. Repeated presses cycle through them. An empty scratchpad flashes and says how to fill it |
+| `<prefix> Alt+H`, `Alt+J`, `Alt+K`, `Alt+L` | with the keys on a float: move it five cells that way, inside the window (repeats) |
+| `<prefix> Ctrl+Left` ... `Ctrl+Down`, `Alt+Left` ... `Alt+Down` | with the keys on a float: resize it one / five cells with its centre staying put: `Right` and `Down` grow it, `Left` and `Up` shrink it, never below the module's minimum and never beyond the window (repeats) |
+| `<prefix> H` / `J` / `K` | with the keys on a float: dock it as a tiled module at the far left / bottom / top edge |
+| `Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l` | from a float: to the float on that side if one is nearest that way, else to the tiled module on that side, else to the tiled module under the float's middle. A float never leads to the top bar |
+| `<prefix> (` / `<prefix> )` | the previous / the next workspace, wrapping |
+| `<prefix> L` | the workspace you were on before (tmux's `switch-client -l`); it flashes when there is none, or when that one was deleted |
+| `<prefix> s` | choose a workspace (below) |
+| `<prefix> $` | rename this workspace |
+
+Click or drag a float's bar to raise it and move it; drag its grip to resize it. Giving a float the keys (a click,
+`Ctrl+h` and its kin, a HINT label, its chip) raises it above the other floats. The rectangle a float had is
+remembered when it sinks, for the next time it floats, and kept in the layout file.
+
+**What a float does not have.** It has no neighbours in a split, so the keys that arrange the tiled tree either
+leave the floats alone or refuse. The presets (`Alt+1` ... `Alt+5`, `Space`), the flips, rotate and `layout.undo`
+act on the tiled modules only. `E`, tabbed and stacked, `Alt+e`, `Alt+a`, `Alt+d` and the swaps refuse with the
+keys on a float, and the toast reads `a float has no split: <prefix> Alt+Shift+Space sinks it`. A split key with the
+keys on a float opens its module beside the tiled module you used last; a split key that names a floating module
+moves it out of the floats into the tree there. Zooming a tiled module takes every float off the screen (each one
+keeps a chip in the top bar); zooming a float shows it alone.
+
+**The scratchpad as a drop-down.** `scratchpad.show` takes a module, which makes it the one key for one module,
+created on first use when it is a terminal:
+
+```lua
+local k = eitri.keymap
+k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- a drop-down terminal on F2
+```
+
+The first press makes `terminal#2` as `<prefix> Alt+Enter` would, but straight into the scratchpad, shown and with
+the keys; the next one puts it away; a third calls it back. For a module that exists and is not a scratch float,
+the press sends it there and shows it. A chat (`agent#N`) is refused for now (`chat views: not in this build`).
+
+**Workspaces.** `<prefix> s` (or a click on the workspace's name in the top bar, which shows only while there are
+two or more) draws the chooser in the prefix's hint line and waits for one key:
+
+```
+1 main · 2 study · c new · x delete
+```
+
+`1` ... `9` go to that workspace in order, `0` to the tenth; `c` makes a copy of the arrangement you are in
+under the next free number (`2`, `3`, ...) and goes to it; `x` then a digit deletes that workspace. `main` is never
+deleted or renamed, and neither is the one you are in. `$` opens a field in the top bar holding the name: `Enter`
+renames, `Esc` leaves it. A switch gives the keys to the module the workspace last had them on (when it is shown
+there), and keeps the other workspace exactly as it was, zoom included. The agent panel is the same module in every
+workspace, and so are the terminals: a new terminal comes into the other workspaces hidden below the editor.
+
+**Actions with no key.** `focus.mode-toggle` gives the keys to the module you used last on the other layer (a float
+from a tile, a tile from a float; `Alt+Space` is GNOME's, so it has no key). `workspace.new` makes and enters a copy under the next
+free number, and `workspace.switch` takes a `name` (`eitri.keymap.set("prefix", "F3", "workspace.switch", { name =
+"study" })`), making the workspace first when none has that name. Neither has a key; bind them as above.
+
+**The `del` each new default needs.** `Alt+Shift+Space`, `Alt+-`, `Alt+_`, `(`, `)`, `L`, `s` and `$` are
+defaults now, so an `init.lua` that already sets any of them stops at startup until it puts
+`k.del("prefix", "<key>")` before that `set` (the spelling is the one `eitri.keymap` takes: `M-S-Space`, `M--`,
+`M-_`, `(`, `)`, `L`, `s`, `$`). The rule is the one under "Setting a key that already has an action" above,
+tmux import included.
 
 ## Moving between panes
 

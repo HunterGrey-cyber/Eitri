@@ -383,6 +383,13 @@ fn bind_r_is_repeatable_and_a_default_key_is_replaced_in_place() {
 
 /// `(config, what the reason says)`: each a one-line config that is skipped, and the reason.
 const SKIPS: &[(&str, &str)] = &[
+    ("bind k switch-client -t other", "flag -t not imported"),
+    ("bind k switch-client", "switch-client without -n, -p or -l"),
+    (
+        "bind k switch-client -n -p",
+        "switch-client with more than one of -n, -p and -l",
+    ),
+    ("bind k choose-tree -s -w", "flag -w not imported"),
     ("bind -n C-h select-pane -L", "a root key"),
     ("bind -T root C-h select-pane -L", "a root key"),
     (
@@ -1190,5 +1197,23 @@ fn split_cwd_only_follows_the_current_pane_format() {
             },
             false
         ))
+    );
+}
+
+#[test]
+fn switch_client_and_choose_tree_s() {
+    let got = import(
+        "bind ( switch-client -p\nbind ) switchc -n\nbind L switch-client -l\nbind s choose-tree -Zs\n\
+         bind S choose-tree -s\nbind w choose-tree\n",
+    );
+    assert_eq!(got.bound("("), Some((Action::WorkspaceStep { forward: false }, false)));
+    assert_eq!(got.bound(")"), Some((Action::WorkspaceStep { forward: true }, false)));
+    assert_eq!(got.bound("L"), Some((Action::WorkspaceLast, false)));
+    assert_eq!(got.bound("s"), Some((Action::WorkspaceChoose, false)));
+    assert_eq!(got.bound("S"), Some((Action::WorkspaceChoose, false)));
+    assert_eq!(
+        got.bound("w"),
+        Some((Action::Tab(TabAction::Choose), false)),
+        "flagless choose-tree is the tab chooser"
     );
 }

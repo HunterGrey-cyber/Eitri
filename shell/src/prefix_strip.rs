@@ -42,6 +42,7 @@ pub(crate) fn strip_pieces(
     let (heading, runs): (Option<String>, Vec<StripPiece>) = match waiting {
         Waiting::No => return Vec::new(),
         Waiting::Number => return Vec::new(),
+        Waiting::Workspace { .. } => return Vec::new(),
         Waiting::Command => (
             None,
             modules
@@ -95,6 +96,45 @@ pub(crate) fn number_pieces(plan: &[(char, ModuleId)], title: &dyn Fn(&ModuleId)
             text: format!("{digit} {}", title(id)),
             dimmed: false,
         });
+    }
+    pieces
+}
+
+/// The digit the workspace chooser reads for the workspace at `index` in the window's order: `1`-`9`
+/// for the first nine and `0` for the tenth, as tmux's `display-panes` numbers panes; none after
+/// that (those are reached by the previous/next keys and Lua).
+pub(crate) fn workspace_digit(index: usize) -> Option<char> {
+    match index {
+        0..=8 => char::from_digit(index as u32 + 1, 10),
+        9 => Some('0'),
+        _ => None,
+    }
+}
+
+/// The strip while the workspace chooser waits: each workspace a digit reaches, by its digit, then
+/// `c new` and `x delete` -- `1 main · 2 study · c new · x delete`. After `x`, the heading `delete:`
+/// and only the workspaces that can be deleted: every one but `main` and the current one, each by
+/// the digit that deletes it.
+pub(crate) fn workspace_pieces(order: &[String], current: &str, deleting: bool) -> Vec<StripPiece> {
+    let mut runs: Vec<String> = order
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !deleting || (name.as_str() != eitri_core::layout::workspace::MAIN && *name != current))
+        .filter_map(|(i, name)| workspace_digit(i).map(|digit| format!("{digit} {name}")))
+        .collect();
+    if !deleting {
+        runs.push("c new".to_string());
+        runs.push("x delete".to_string());
+    }
+    let mut pieces = Vec::new();
+    if deleting {
+        pieces.push(StripPiece::Heading("delete:".to_string()));
+    }
+    for (i, text) in runs.into_iter().enumerate() {
+        if i > 0 {
+            pieces.push(StripPiece::Dot);
+        }
+        pieces.push(StripPiece::Run { text, dimmed: false });
     }
     pieces
 }
@@ -253,6 +293,24 @@ mod tests {
         let plan = [('1', ModuleId::editor()), ('2', ModuleId::agent())];
         assert_eq!(reads(&number_pieces(&plan, &title)), "1 editor \u{b7} 2 agent");
         assert!(number_pieces(&[], &title).is_empty());
+    }
+
+    #[test]
+    fn the_chooser_strip_numbers_workspaces_and_offers_new_and_delete() {
+        let order: Vec<String> = ["main", "study", "review"].iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            reads(&workspace_pieces(&order, "study", false)),
+            "1 main \u{b7} 2 study \u{b7} 3 review \u{b7} c new \u{b7} x delete"
+        );
+        assert_eq!(
+            reads(&workspace_pieces(&order, "study", true)),
+            "delete: 3 review",
+            "neither main nor the current workspace is offered for deletion"
+        );
+        let many: Vec<String> = (1..=11).map(|n| format!("w{n}")).collect();
+        let strip = reads(&workspace_pieces(&many, "w1", false));
+        assert!(strip.contains("9 w9 \u{b7} 0 w10 \u{b7} c new"), "{strip}");
+        assert!(!strip.contains("w11"), "no digit reaches the eleventh: {strip}");
     }
 
     /// A `·` separates every two runs, including module keys and verbs, so runs with spaces of their

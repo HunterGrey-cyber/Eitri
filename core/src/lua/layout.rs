@@ -6,7 +6,7 @@
 //!   exits naming it once `init.lua` has run -- the discipline `agent.font_size` follows, since
 //!   `init.lua`'s own errors are only logged.
 //! - `eitri.layout.show(id)`, `.hide(id)`, `.focus(id)`, `.split(id, 'right'|'below')`,
-//!   `.run(name, opts?)` and `.mark(id)`, for use
+//!   `.run(name, opts?)`, `.mark(id)` and `.float(id, rect?)`, for use
 //!   inside `eitri.command.register` commands and event handlers: each queues a
 //!   [`LayoutRequest`] that `shell` carries out when the handler returns. Before the window exists
 //!   they refuse, naming `default` as the way to shape the first window.
@@ -23,9 +23,10 @@
 //! starts a leaf with an optional second item: its share of the parent. A container takes its share
 //! as `share = x`. Children without shares divide what remains equally; every share is at least
 //! 0.05 and at most 1, and together they sum to 1. Unknown fields are refused so typos fail at startup.
-//! The tree must hold `editor` and `agent`; anything else this window
-//! does not have is left out when it is reconciled (`layout::reconcile_default`),
-//! with a log line.
+//! Only the top table accepts `floating`, a sequence of module entries with `cx`, `cy`, `w`, `h`
+//! and optional `scratch`. Centres range from 0 to 1, dimensions from 1 to 16384 whole pixels.
+//! The editor stays in the tree; the agent may be tiled or floating. Every module appears once.
+//! Modules this window does not have are left out during reconciliation, with a log line.
 //!
 //! **A bottom row keeps its height**, in either spelling: the terminal, or a
 //! Lua `bottom` panel, that is a full-width row at the bottom of the window -- `{ 'column', {'row', ...},
@@ -45,11 +46,12 @@ use mlua::{Lua, Table, Value};
 
 use crate::keymap::Action;
 use crate::layout::tree::MIN_RATIO;
-use crate::layout::{Axis, Child, Con, ConLayout, Layout, ModuleId, Node};
+use crate::layout::{Axis, Child, Con, ConLayout, Float, FloatRect, Layout, ModuleId, Node, Workspaces, MAX_FLOAT_PX};
 
 /// One queued `eitri.layout` call, for `shell` to carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutRequest {
+    Switch(String),
     Show(ModuleId),
     Hide(ModuleId),
     Focus(ModuleId),
@@ -59,12 +61,22 @@ pub enum LayoutRequest {
     /// `shell` runs it exactly as the prefix does.
     Run(Action),
     Mark(ModuleId),
+    Float(ModuleId, Option<FloatRect>),
+}
+
+/// A default layout's tiled tree and its top table's floating modules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LuaTree {
+    pub tiled: Node,
+    pub floats: Vec<Float>,
 }
 
 /// What `eitri.layout.*` recorded.
 #[derive(Debug, Default)]
 pub struct LayoutStore {
-    default: Option<Result<Node, String>>,
+    default: Option<Result<LuaTree, String>>,
+    defined: Vec<(String, Result<LuaTree, String>)>,
+    workspaces: Option<Rc<RefCell<Workspaces>>>,
     requests: Vec<LayoutRequest>,
     accepting: bool,
     lua_panels: Vec<String>,
@@ -72,6 +84,16 @@ pub struct LayoutStore {
 }
 
 impl LayoutStore {
+    /// Definitions in init.lua order, including errors that must stop startup.
+    pub fn defined_workspaces(&self) -> &[(String, Result<LuaTree, String>)] {
+        &self.defined
+    }
+
+    /// The window's workspaces, so `get()` names them.
+    pub fn attach_workspaces(&mut self, workspaces: Rc<RefCell<Workspaces>>) {
+        self.workspaces = Some(workspaces);
+    }
+
     /// The window's live layout, so `get` reads its current state.
     pub fn attach(&mut self, layout: Rc<RefCell<Layout>>) {
         self.layout = Some(layout);
@@ -83,7 +105,7 @@ impl LayoutStore {
     }
 
     /// `eitri.layout.default`'s tree, or why it is not one. `None` if `init.lua` never called it.
-    pub fn default_tree(&self) -> Option<&Result<Node, String>> {
+    pub fn default_tree(&self) -> Option<&Result<LuaTree, String>> {
         self.default.as_ref()
     }
 
@@ -111,13 +133,63 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                     "eitri.layout.default: only in init.lua, before the window exists".to_string(),
                 ));
             }
-            let parsed = parse_default(&tree).map_err(|e| format!("eitri.layout.default: {e}"));
+            let parsed = parse_tree(&tree).map_err(|e| format!("eitri.layout.default: {e}"));
             let mut store = default_store.borrow_mut();
             if store.default.is_some() {
                 eprintln!("[lua] eitri.layout.default called again -- the later call replaces the earlier");
             }
             store.default = Some(parsed.clone());
             parsed.map(|_| ()).map_err(mlua::Error::RuntimeError)
+        })?,
+    )?;
+
+    let workspace_store = store.clone();
+    table.set(
+        "workspace",
+        lua.create_function(move |_, (name, tree): (Value, Value)| {
+            if workspace_store.borrow().accepting {
+                return Err(mlua::Error::RuntimeError(
+                    "eitri.layout.workspace: only in init.lua, before the window exists".to_string(),
+                ));
+            }
+            let Value::String(name) = name else {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "eitri.layout.workspace: the name must be a string, not a {}",
+                    name.type_name()
+                )));
+            };
+            let name = name.to_str()?.to_string();
+            let call = format!(
+                "eitri.layout.workspace('{}')",
+                crate::layout::workspace::printable(&name)
+            );
+            let parsed = if name == "main" {
+                Err(format!(
+                    "{call}: eitri.layout.default shapes 'main'; give this workspace another name"
+                ))
+            } else {
+                Workspaces::valid_name(&name)
+                    .map_err(|err| format!("{call}: {err}"))
+                    .and_then(|()| parse_tree(&tree).map_err(|err| format!("{call}: {err}")))
+            };
+            let mut store = workspace_store.borrow_mut();
+            if let Some((_, earlier)) = store.defined.iter_mut().find(|(existing, _)| existing == &name) {
+                eprintln!("[lua] {call} called again -- the later call replaces the earlier");
+                *earlier = parsed.clone();
+            } else {
+                store.defined.push((name, parsed.clone()));
+            }
+            parsed.map(|_| ()).map_err(mlua::Error::RuntimeError)
+        })?,
+    )?;
+
+    let switch_store = store.clone();
+    table.set(
+        "switch",
+        lua.create_function(move |_, name: String| {
+            Workspaces::valid_name(&name)
+                .map_err(|err| mlua::Error::RuntimeError(format!("eitri.layout.switch: {err}")))?;
+            queue(&switch_store, "switch", LayoutRequest::Switch(name))
         })?,
     )?;
 
@@ -187,12 +259,43 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                     "eitri.layout.run: select.number waits for a digit; eitri.layout.focus(id) gives a module the keys".to_string()
                 ));
             }
+            if matches!(action, Action::WorkspaceChoose | Action::WorkspaceRename) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "eitri.layout.run: {name} waits for a key; eitri.layout.switch(name) switches workspaces"
+                )));
+            }
             if !action.is_layout() {
                 return Err(mlua::Error::RuntimeError(format!(
                     "eitri.layout.run: {name} is not a layout action"
                 )));
             }
             queue(&run_store, "run", LayoutRequest::Run(action))
+        })?,
+    )?;
+
+    let float_store = store.clone();
+    table.set(
+        "float",
+        lua.create_function(move |_, (id, rect): (String, Value)| {
+            let id = module_arg("float", &id)?;
+            if id == ModuleId::editor() {
+                return Err(mlua::Error::RuntimeError(
+                    "eitri.layout.float: the editor never floats".into(),
+                ));
+            }
+            let rect = match rect {
+                Value::Nil => None,
+                Value::Table(t) => {
+                    Some(parse_float_rect(&t, "eitri.layout.float", None).map_err(mlua::Error::RuntimeError)?)
+                }
+                other => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "eitri.layout.float: expected a table, got {}",
+                        float_type_name(&other)
+                    )))
+                }
+            };
+            queue(&float_store, "float", LayoutRequest::Float(id, rect))
         })?,
     )?;
 
@@ -224,6 +327,22 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 [only] => node_table(lua, &only.node, None)?,
                 _ => con_table(lua, layout.root(), None)?,
             };
+            if !layout.floats().is_empty() {
+                let floats = lua.create_table()?;
+                for (i, float) in layout.floats().iter().enumerate() {
+                    let entry = lua.create_table()?;
+                    entry.raw_set(1, float.id.as_str())?;
+                    entry.set("cx", float.rect.cx)?;
+                    entry.set("cy", float.rect.cy)?;
+                    entry.set("w", float.rect.w)?;
+                    entry.set("h", float.rect.h)?;
+                    if float.scratch {
+                        entry.set("scratch", true)?;
+                    }
+                    floats.raw_set(i + 1, entry)?;
+                }
+                table.set("floating", floats)?;
+            }
             table.set("focus", layout.focus().as_str())?;
             table.set(
                 "hidden",
@@ -239,6 +358,16 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
             };
             table.set("zoomed", zoomed.as_ref().map(ModuleId::as_str))?;
             table.set("marked", layout.mark().map(ModuleId::as_str))?;
+            if let Some(workspaces) = &store.workspaces {
+                let workspaces = workspaces.try_borrow().map_err(|_| {
+                    mlua::Error::RuntimeError("eitri.layout.get: the workspaces are being changed".to_string())
+                })?;
+                table.set("workspace", workspaces.current())?;
+                table.set(
+                    "workspaces",
+                    lua.create_sequence_from(workspaces.order().iter().map(String::as_str))?,
+                )?;
+            }
             Ok(table)
         })?,
     )?;
@@ -306,6 +435,11 @@ fn queue(store: &RefCell<LayoutStore>, call: &str, request: LayoutRequest) -> ml
 
 /// `eitri.layout.default`'s argument as a tree (the module doc's grammar).
 pub fn parse_default(value: &Value) -> Result<Node, String> {
+    parse_tree(value).map(|tree| tree.tiled)
+}
+
+/// Reads the tiled tree and floats together so every module appears only once.
+pub fn parse_tree(value: &Value) -> Result<LuaTree, String> {
     let Value::Table(table) = value else {
         return Err(format!("expected a table, got {}", value.type_name()));
     };
@@ -313,9 +447,10 @@ pub fn parse_default(value: &Value) -> Result<Node, String> {
     if share.is_some() {
         return Err("the whole tree takes no share".to_string());
     }
+    let floats = parse_floats(table.raw_get::<Value>("floating").map_err(|e| e.to_string())?)?;
     let leaves = node.leaves();
     let mut seen = BTreeSet::new();
-    for id in &leaves {
+    for id in leaves.iter().chain(floats.iter().map(|f| &f.id)) {
         if !seen.insert(id.clone()) {
             return Err(format!("'{id}' appears twice"));
         }
@@ -325,7 +460,115 @@ pub fn parse_default(value: &Value) -> Result<Node, String> {
             return Err(format!("the tree has no '{built_in}', which every window has"));
         }
     }
-    Ok(node)
+    Ok(LuaTree { tiled: node, floats })
+}
+
+fn float_type_name(value: &Value) -> &str {
+    if matches!(value, Value::Integer(_) | Value::Number(_)) {
+        "number"
+    } else {
+        value.type_name()
+    }
+}
+
+fn parse_floats(value: Value) -> Result<Vec<Float>, String> {
+    let table = match value {
+        Value::Nil => return Ok(Vec::new()),
+        Value::Table(table) => table,
+        other => {
+            return Err(format!(
+                "floating: expected a table of floats, got {}",
+                float_type_name(&other)
+            ))
+        }
+    };
+    let len = table.raw_len();
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|e| e.to_string())?;
+        if !matches!(key, Value::Integer(i) if i >= 1 && i <= len as i64) {
+            return Err("floating: expected a sequence of floats".into());
+        }
+    }
+    (1..=len)
+        .map(|i| {
+            let at = format!("floating item {i}");
+            let value: Value = table.raw_get(i).map_err(|e| e.to_string())?;
+            let Value::Table(entry) = value else {
+                return Err(format!("{at}: expected a table, got {}", float_type_name(&value)));
+            };
+            let head: Value = entry.raw_get(1).map_err(|e| e.to_string())?;
+            let Value::String(head) = head else {
+                return Err(format!("{at}: the first item must be a module id"));
+            };
+            let id = ModuleId::parse(&head.to_str().map_err(|e| e.to_string())?).map_err(|e| format!("{at}: {e}"))?;
+            if id == ModuleId::editor() {
+                return Err(format!("{at}: the editor never floats"));
+            }
+            let at = format!("{at} ('{id}')");
+            let rect = parse_float_rect(&entry, &at, Some(&id))?;
+            let scratch = match entry.raw_get::<Value>("scratch").map_err(|e| e.to_string())? {
+                Value::Nil => false,
+                Value::Boolean(b) => b,
+                _ => return Err(format!("{at}: scratch is true or false")),
+            };
+            Ok(Float { id, rect, scratch })
+        })
+        .collect()
+}
+
+fn parse_float_rect(table: &Table, at: &str, id: Option<&ModuleId>) -> Result<FloatRect, String> {
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|e| e.to_string())?;
+        match key {
+            Value::Integer(1) if id.is_some() => {}
+            Value::String(s) if matches!(s.to_str().map_err(|e| e.to_string())?.as_ref(), "cx" | "cy" | "w" | "h") => {}
+            Value::String(s) if id.is_some() && s.to_str().map_err(|e| e.to_string())?.as_ref() == "scratch" => {}
+            Value::String(s) => return Err(format!("{at}: unknown field {}", s.to_string_lossy())),
+            _ => {
+                return Err(match id {
+                    Some(id) => format!("{at}: a float is {{'{id}', cx = .., cy = .., w = .., h = ..}}"),
+                    None => format!("{at}: a rectangle is {{cx = .., cy = .., w = .., h = ..}}"),
+                });
+            }
+        }
+    }
+    let fields = ["cx", "cy", "w", "h"].map(|key| table.raw_get::<Value>(key).map_err(|e| e.to_string()));
+    let [cx, cy, w, h] = fields;
+    let values = [cx?, cy?, w?, h?];
+    if values.iter().any(Value::is_nil) {
+        return Err(format!("{at}: cx, cy, w and h are required"));
+    }
+    let mut numbers = [0.0; 4];
+    for (i, value) in values.into_iter().enumerate() {
+        let n = match value {
+            Value::Integer(n) => Some(n as f64),
+            Value::Number(n) => Some(n),
+            _ => None,
+        };
+        let field = ["cx", "cy", "w", "h"][i];
+        let valid = n.is_some_and(|n| {
+            n.is_finite()
+                && if i < 2 {
+                    (0.0..=1.0).contains(&n)
+                } else {
+                    n.fract() == 0.0 && (1.0..=f64::from(MAX_FLOAT_PX)).contains(&n)
+                }
+        });
+        if !valid {
+            return Err(if i < 2 {
+                format!("{at}: {field} is a number from 0 to 1")
+            } else {
+                format!("{at}: {field} is a whole number of pixels from 1 to {MAX_FLOAT_PX}")
+            });
+        }
+        numbers[i] = n.unwrap();
+    }
+    Ok(FloatRect {
+        cx: numbers[0] as f32,
+        cy: numbers[1] as f32,
+        w: numbers[2] as i32,
+        h: numbers[3] as i32,
+    })
 }
 
 /// A node and the share of its parent it asked for.
@@ -411,6 +654,7 @@ fn refuse_other_fields(table: &Table, len: usize, split: bool, head: &str, at: &
             other => format!("a {} key", other.type_name()),
         };
         let message = match name.as_str() {
+            "floating" if at == "the tree" => continue,
             "share" if split => continue,
             "active" if matches!(head, "tabbed" | "stacked") => continue,
             "share" => format!(
@@ -476,9 +720,153 @@ fn container(layout: ConLayout, children: Vec<(Node, Option<f32>)>, head: &str) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_defines_a_template_in_init_lua_only() {
+        let (lua, store) = engine();
+        lua.load(
+            "eitri.layout.workspace('review', { 'row', {'agent'}, {'editor'}, floating = { \
+             {'terminal#2', cx = 0.5, cy = 0.5, w = 600, h = 400, scratch = true} } })",
+        )
+        .exec()
+        .unwrap();
+        {
+            let store = store.borrow();
+            let defined = store.defined_workspaces();
+            assert_eq!(defined.len(), 1);
+            assert_eq!(defined[0].0, "review");
+            let tree = defined[0].1.as_ref().unwrap();
+            assert_eq!(tree.tiled.leaves(), vec![ModuleId::agent(), ModuleId::editor()]);
+            assert_eq!(tree.floats.len(), 1);
+        }
+        for (source, why) in [
+            (
+                "eitri.layout.workspace('main', {'row', {'editor'}, {'agent'}})",
+                "eitri.layout.default shapes 'main'",
+            ),
+            (
+                "eitri.layout.workspace('', {'row', {'editor'}, {'agent'}})",
+                "is not a workspace name",
+            ),
+            (
+                "eitri.layout.workspace('x', {'row', {'editor'}})",
+                "a row needs two or more items",
+            ),
+            (
+                "eitri.layout.workspace(3, {'row', {'editor'}, {'agent'}})",
+                "the name must be a string",
+            ),
+        ] {
+            let err = lua.load(source).exec().unwrap_err().to_string();
+            assert!(
+                err.contains("eitri.layout.workspace") && err.contains(why),
+                "{source}: {err}"
+            );
+        }
+        assert!(
+            store
+                .borrow()
+                .defined_workspaces()
+                .iter()
+                .any(|(name, tree)| name == "x" && tree.is_err()),
+            "a broken template is kept as its error, for the shell to stop on"
+        );
+        store.borrow_mut().accept_requests();
+        let err = lua
+            .load("eitri.layout.workspace('late', {'row', {'editor'}, {'agent'}})")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only in init.lua"), "{err}");
+    }
+
+    #[test]
+    fn switch_queues_a_workspace_name_once_the_window_exists() {
+        let (lua, store) = engine();
+        let err = lua.load("eitri.layout.switch('study')").exec().unwrap_err().to_string();
+        assert!(err.contains("only once the window exists"), "{err}");
+        store.borrow_mut().accept_requests();
+        lua.load("eitri.layout.switch('study')").exec().unwrap();
+        let err = lua.load("eitri.layout.switch('a\\nb')").exec().unwrap_err().to_string();
+        assert!(
+            err.contains("eitri.layout.switch") && err.contains("is not a workspace name"),
+            "{err}"
+        );
+        assert_eq!(
+            store.borrow_mut().take_requests(),
+            [LayoutRequest::Switch("study".to_string())]
+        );
+    }
+
+    #[test]
+    fn get_names_the_current_workspace_and_every_workspace_in_order() {
+        let (lua, store, live) = attached(Layout::initial(&[]).unwrap());
+        let mut ws = crate::layout::Workspaces::single();
+        ws.create_copy(&live.borrow());
+        store.borrow_mut().attach_workspaces(Rc::new(RefCell::new(ws)));
+        let got: String = lua
+            .load("local t = eitri.layout.get(); return t.workspace .. ':' .. table.concat(t.workspaces, ',')")
+            .eval()
+            .unwrap();
+        assert_eq!(got, "main:main,2");
+    }
+
+    #[test]
+    fn get_fed_to_workspace_gives_the_same_arrangement() {
+        use crate::layout::{arrange, reconcile_default_floating, Frame, Size};
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let tabs = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                Child::new(Node::Leaf(t2.clone()), 0.5),
+            ],
+        );
+        let root = Node::split(
+            crate::layout::Axis::Row,
+            0.6,
+            Node::Leaf(ModuleId::editor()),
+            Node::Con(tabs),
+        );
+        let mut live = Layout::new(root, ModuleId::editor()).unwrap();
+        live.add_float(
+            &ModuleId::terminal(),
+            crate::layout::FloatRect {
+                cx: 0.5,
+                cy: 0.45,
+                w: 700,
+                h: 400,
+            },
+            true,
+        )
+        .unwrap();
+        let (lua, store, live) = attached(live);
+        lua.load(
+            "t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.zoomed = nil; t.marked = nil; \
+             t.workspace = nil; t.workspaces = nil",
+        )
+        .exec()
+        .unwrap();
+        // Definitions are accepted only before the window takes requests.
+        store.borrow_mut().accepting = false;
+        lua.load("eitri.layout.workspace('w', t)").exec().unwrap();
+        let tree = store.borrow().defined_workspaces()[0].1.clone().unwrap();
+        let back = reconcile_default_floating(tree.tiled, tree.floats, &[]).unwrap().layout;
+        for size in [
+            Size { w: 1280, h: 721 },
+            Size { w: 1920, h: 1040 },
+            Size { w: 800, h: 600 },
+        ] {
+            let frame = Frame::new(size, 1);
+            let (a, b) = (arrange(&back, &frame), arrange(&live.borrow(), &frame));
+            assert_eq!(a.modules, b.modules, "{size:?}");
+            assert_eq!(a.floats, b.floats, "{size:?}");
+        }
+        assert!(back.float_of(&ModuleId::terminal()).unwrap().scratch);
+    }
+
     use super::*;
     use crate::keymap::Action;
-    use crate::layout::{Direction, Layout};
+    use crate::layout::{Direction, Float, FloatRect, Layout};
 
     fn engine() -> (Lua, Rc<RefCell<LayoutStore>>) {
         let lua = Lua::new();
@@ -534,6 +922,8 @@ mod tests {
                 "eitri.layout.run('zoom', { repeatable = true })",
                 "repeatable is a key binding's option",
             ),
+            ("eitri.layout.run('workspace.choose')", "eitri.layout.switch"),
+            ("eitri.layout.run('workspace.rename')", "eitri.layout.switch"),
             ("eitri.layout.run('split.right')", "eitri.layout.split"),
             ("eitri.layout.run('select.number')", "eitri.layout.focus"),
             ("eitri.layout.run('module.nope')", "module.nope"),
@@ -553,6 +943,7 @@ mod tests {
             "eitri.layout.run('zoom')",
             "eitri.layout.mark('agent')",
             "eitri.layout.get()",
+            "eitri.layout.float('terminal')",
         ] {
             let err = lua.load(source).exec().unwrap_err().to_string();
             assert!(err.contains("only once the window exists"), "{source}: {err}");
@@ -793,6 +1184,10 @@ mod tests {
     }
 
     fn default_of(source: &str) -> Result<Node, String> {
+        default_tree_of(source).map(|tree| tree.tiled)
+    }
+
+    fn default_tree_of(source: &str) -> Result<LuaTree, String> {
         let (lua, store) = engine();
         let _ = lua.load(source).exec();
         let result = store.borrow().default_tree().cloned().expect("default was called");
@@ -998,5 +1393,213 @@ mod tests {
         assert!(lua.load("return eitri.layout.get()[4][1]").eval::<String>().unwrap() == "terminal#2");
         let error = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'terminal#1'} }").unwrap_err();
         assert!(error.contains("instance 1 is 'terminal'"), "{error}");
+    }
+    #[test]
+    fn the_grammar_says_floating_at_the_top_of_the_tree() {
+        let (lua, store) = engine();
+        lua.load(
+            "eitri.layout.default{ 'row', {'editor'}, {'agent'}, floating = { \
+         {'terminal#2', cx = 0.5, cy = 0.45, w = 900, h = 420, scratch = true}, \
+         {'terminal', cx = 0.2, cy = 0.8, w = 300, h = 200} } }",
+        )
+        .exec()
+        .unwrap();
+        let tree = store.borrow().default_tree().cloned().unwrap().unwrap();
+        assert_eq!(tree.tiled.leaves(), vec![ModuleId::editor(), ModuleId::agent()]);
+        assert_eq!(
+            tree.floats,
+            vec![
+                Float {
+                    id: ModuleId::parse("terminal#2").unwrap(),
+                    rect: FloatRect {
+                        cx: 0.5,
+                        cy: 0.45,
+                        w: 900,
+                        h: 420
+                    },
+                    scratch: true
+                },
+                Float {
+                    id: ModuleId::terminal(),
+                    rect: FloatRect {
+                        cx: 0.2,
+                        cy: 0.8,
+                        w: 300,
+                        h: 200
+                    },
+                    scratch: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_float_is_an_error_naming_it() {
+        for (field, message) in [
+            ("floating = 3", "floating: expected a table of floats, got number"),
+            ("floating = { 3 }", "floating item 1: expected a table, got number"),
+            (
+                "floating = { {cx = 0.5} }",
+                "floating item 1: the first item must be a module id",
+            ),
+            (
+                "floating = { {'chat', cx = 0.5, cy = 0.5, w = 10, h = 10} }",
+                "floating item 1: unknown module 'chat'",
+            ),
+            (
+                "floating = { {'editor', cx = 0.5, cy = 0.5, w = 10, h = 10} }",
+                "floating item 1: the editor never floats",
+            ),
+            (
+                "floating = { {'terminal', cx = 0.5, cy = 0.5, w = 10} }",
+                "floating item 1 ('terminal'): cx, cy, w and h are required",
+            ),
+            (
+                "floating = { {'terminal', cx = 1.5, cy = 0.5, w = 10, h = 10} }",
+                "floating item 1 ('terminal'): cx is a number from 0 to 1",
+            ),
+            (
+                "floating = { {'terminal', cx = 0.5, cy = 0.5, w = 0.5, h = 10} }",
+                "floating item 1 ('terminal'): w is a whole number of pixels from 1 to 16384",
+            ),
+            (
+                "floating = { {'terminal', cx = 0.5, cy = 0.5, w = 10, h = 99999} }",
+                "floating item 1 ('terminal'): h is a whole number of pixels from 1 to 16384",
+            ),
+            (
+                "floating = { {'terminal', cx = 0.5, cy = 0.5, w = 10, h = 10, scratch = 1} }",
+                "floating item 1 ('terminal'): scratch is true or false",
+            ),
+            (
+                "floating = { {'terminal', cx = 0.5, cy = 0.5, w = 10, h = 10, size = 3} }",
+                "floating item 1 ('terminal'): unknown field size",
+            ),
+            (
+                "floating = { {'terminal', 0.5, cx = 0.5, cy = 0.5, w = 10, h = 10} }",
+                "floating item 1 ('terminal'): a float is {'terminal', cx = .., cy = .., w = .., h = ..}",
+            ),
+            (
+                "floating = { {'agent', cx = 0.5, cy = 0.5, w = 10, h = 10} }",
+                "'agent' appears twice",
+            ),
+        ] {
+            let source = format!("eitri.layout.default{{ 'row', {{'editor'}}, {{'agent'}}, {field} }}");
+            let err = default_of(&source).unwrap_err();
+            assert!(
+                err.starts_with("eitri.layout.default: ") && err.contains(message),
+                "{source}: {err}"
+            );
+        }
+        let nested = default_of(
+            "eitri.layout.default{ 'row', {'editor'}, {'column', {'agent'}, {'terminal'}, floating = {} } }",
+        )
+        .unwrap_err();
+        assert!(nested.contains("unknown field floating"), "{nested}");
+    }
+
+    #[test]
+    fn get_writes_the_floats_and_reading_them_back_gives_the_same_arrangement() {
+        use crate::layout::{arrange, reconcile_default_floating, Frame, Size};
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = Layout::initial(&[]).unwrap();
+        layout
+            .add_float(
+                &t2,
+                FloatRect {
+                    cx: 0.5,
+                    cy: 0.45,
+                    w: 900,
+                    h: 420,
+                },
+                true,
+            )
+            .unwrap();
+        let (lua, _, live) = attached(layout);
+        let got: String = lua
+            .load(
+                "local f = eitri.layout.get().floating[1]; \
+             return string.format('%s %.2f %.2f %d %d %s', f[1], f.cx, f.cy, f.w, f.h, tostring(f.scratch))",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(got, "terminal#2 0.50 0.45 900 420 true");
+        let table: Value = lua
+            .load(
+                "local t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.zoomed = nil; t.marked = nil; return t",
+            )
+            .eval()
+            .unwrap();
+        let tree = parse_tree(&table).unwrap();
+        let back = reconcile_default_floating(tree.tiled, tree.floats, &[]).unwrap().layout;
+        for size in [
+            Size { w: 1280, h: 721 },
+            Size { w: 1920, h: 1040 },
+            Size { w: 800, h: 600 },
+        ] {
+            let frame = Frame::new(size, 1);
+            assert_eq!(
+                arrange(&back, &frame).floats,
+                arrange(&live.borrow(), &frame).floats,
+                "{size:?}"
+            );
+            assert_eq!(
+                arrange(&back, &frame).modules,
+                arrange(&live.borrow(), &frame).modules,
+                "{size:?}"
+            );
+        }
+        let (empty, _, _) = attached(Layout::initial(&[]).unwrap());
+        let none: Value = empty.load("return eitri.layout.get().floating").eval().unwrap();
+        assert!(none.is_nil(), "no floating key without a float");
+    }
+
+    #[test]
+    fn float_queues_a_module_and_an_optional_rectangle() {
+        let (lua, store, _) = attached(Layout::initial(&[]).unwrap());
+        lua.load("eitri.layout.float('terminal'); eitri.layout.float('terminal#2', { cx = 0.5, cy = 0.4, w = 600, h = 300 })")
+        .exec()
+        .unwrap();
+        assert_eq!(
+            store.borrow_mut().take_requests(),
+            [
+                LayoutRequest::Float(ModuleId::terminal(), None),
+                LayoutRequest::Float(
+                    ModuleId::parse("terminal#2").unwrap(),
+                    Some(FloatRect {
+                        cx: 0.5,
+                        cy: 0.4,
+                        w: 600,
+                        h: 300
+                    })
+                ),
+            ]
+        );
+        for (source, why) in [
+            ("eitri.layout.float('editor')", "the editor never floats"),
+            (
+                "eitri.layout.float('terminal', { cx = 0.5 })",
+                "cx, cy, w and h are required",
+            ),
+            ("eitri.layout.float('terminal', 3)", "expected a table, got number"),
+        ] {
+            let err = lua.load(source).exec().unwrap_err().to_string();
+            assert!(
+                err.contains("eitri.layout.float") && err.contains(why),
+                "{source}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chat_may_float_and_leave_the_tiled_tree() {
+        let tree = default_tree_of(
+            "eitri.layout.default{ 'row', {'editor'}, {'terminal'}, floating = { \
+         {'agent', cx = 0.5, cy = 0.5, w = 600, h = 400} } }",
+        )
+        .unwrap();
+        assert_eq!(tree.tiled.leaves(), vec![ModuleId::editor(), ModuleId::terminal()]);
+        assert_eq!(tree.floats[0].id, ModuleId::agent());
+        let r = crate::layout::reconcile_default_floating(tree.tiled, tree.floats, &[]).unwrap();
+        assert!(r.layout.is_floating(&ModuleId::agent()));
     }
 }

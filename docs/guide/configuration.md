@@ -125,9 +125,24 @@ eitri.command.register({
 - **`eitri.layout.get()`** returns a new table describing the layout as it is now, in the shape
   `eitri.layout.default` takes: `{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`, where
   every child but the last carries its share of the container. It adds `focus` (the module with the keys), `hidden` (a list),
-  `zoomed` and `marked` (a module, or nothing). Pinned bottom rows are not written into the table; the default shape
+  `zoomed` and `marked` (a module, or nothing), `floating` (the floats, bottom first, only when there are any; a
+  scratch float carries `scratch = true`), `workspace` (the name of the workspace you are in) and `workspaces` (every
+  name, in order). Pinned bottom rows are not written into the table; the default shape
   restores a bottom row's height by itself. Called from inside a layout change it stops with a message instead of
   reading half a change.
+
+- **`eitri.layout.float(id, rect?)`** floats that module: at `rect` (`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`: the
+  centre as a fraction of the window, the size in pixels, the bar included), else at the rectangle it last floated
+  at, else centred at 60% of the window. On a module that already floats it moves it to `rect`. The editor never
+  floats. Like `<prefix> Alt+Shift+Space`, it refuses the last tiled module in view.
+- **`eitri.layout.workspace(name, tree)`**, in `init.lua` only, defines a workspace in the shape `default` takes. A
+  window with no saved workspace of that name gets it, after the saved ones in the order the calls come; `main` is
+  `eitri.layout.default`'s and is refused here. A workspace you define this way **comes back from its definition**
+  at the next launch if you delete or rename it in the window, so removing one for good means removing its call.
+  Workspaces without a definition stay deleted or renamed.
+- **`eitri.layout.switch(name)`** goes to that workspace, making it first when there is none: from its definition,
+  else as a copy of the arrangement you are in. `eitri.layout.run("workspace.switch", { name = "study" })` is the
+  same. `workspace.choose` and `workspace.rename` wait for a key or for typing, so `run` refuses them.
 
 **The shape `eitri.layout.default` and `get()` use.** A table starts with `"row"` or `"column"` (two or more
 children, side by side / one above the other), or with `"tabbed"` or `"stacked"` (one or more children, one shown
@@ -136,7 +151,11 @@ the container as a second item (`{ "editor", 0.6 }`), or a table of its own, who
 A child without a share takes an equal part of what the others leave; every share is from 0.05 to 1 and together
 they come to 1. `active = 2` on a tabbed or stacked table names the child shown (counting from 1; the first by
 default). A numbered terminal (`terminal#2` to `terminal#9`) can be a child, as in the example below, and the window
-gives it its own shell once it is shown. A misspelled field stops the launch, naming it. An example with every kind of container:
+gives it its own shell once it is shown. A misspelled field stops the launch, naming it. The top table (not a container inside it) may also carry
+`floating`, a list of `{ "module", cx = 0.5, cy = 0.5, w = 600, h = 400, scratch = true }`, bottom first: `cx` and
+`cy` are from 0 to 1, `w` and `h` whole pixels from 1 to 16384, and `scratch` (false unless given) starts the
+float put away. The editor stays in the tree; the agent panel may float; a module is in the tree or in the list,
+never both. An example with every kind of container:
 
 ```lua
 eitri.layout.default({
@@ -144,6 +163,9 @@ eitri.layout.default({
   { "editor", 0.55 },
   { "tabbed", { "agent" }, { "terminal" }, { "terminal#2" }, active = 1 },
 })
+
+eitri.layout.workspace("study", { "row", { "editor", 0.6 }, { "agent" },
+  floating = { { "terminal#2", cx = 0.5, cy = 0.5, w = 900, h = 420, scratch = true } } })
 ```
 
 **A split that starts in the terminal's directory.** `split.right` and `split.below` take `cwd = "pane"`, which
@@ -167,6 +189,20 @@ of a file this version could only partly use (an unknown kind of container read 
 a key it did not understand), copied before the first save so nothing is lost; a `<hash>.v2.json.unusable` is a
 file it could not use at all (not JSON, another project's, no workspace it could read), set aside before a new
 one is written. Keys in the file that this version does not know are written back unchanged.
+
+A workspace in the file may carry `floating` (its floats, bottom first, each `module`, `cx`, `cy`, `w`, `h` and
+`scratch`) and `float_memory` (the last rectangle of each module that has floated, by module); both are written
+only when they are not empty, so a layout without floats writes the same file as the version before floats. An
+entry the version reading it cannot use is left out with a note, and the original is copied to
+`<hash>.v2.json.partial`. **The version before floats** (the build that has containers and workspaces but no
+floats) reads these two keys as ones it does not know. With **one workspace**, when the floats are numbered
+terminals that no tiled tree holds (`terminal#2` and so on), it keeps them as they were, reserves their numbers and
+writes them back, so this version finds them again; a scratch float that was put away comes back shown. When a float
+names a module that version places itself -- the base `terminal`, the chat, any module's remembered rectangle, or,
+with **two or more workspaces**, any floating terminal (that version keeps it hidden below the editor in the other
+workspaces) -- it drops the floats, opens those modules tiled (the base terminal below the editor), and copies the
+file to `.v2.json.partial` first. Float positions are all that is lost; no module is. This version then opens them
+tiled, and the copy has the positions.
 
 ## How a launch starts
 

@@ -25,10 +25,14 @@ impl FocusHistory {
     }
 }
 
-/// The shown module after `from` in tree order (HINT's order), wrapping; `None` with fewer than two
+/// The next tile in view, then shown floats bottom to top, wrapping; `None` with fewer than two
 /// shown. A zoom does not hide the others here: the caller unzooms, as tmux's `select-pane` does.
 pub fn next_on_screen(layout: &Layout, from: &ModuleId) -> Option<ModuleId> {
-    let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_in_view(id)).collect();
+    let shown: Vec<ModuleId> = layout
+        .modules()
+        .into_iter()
+        .filter(|id| layout.is_in_view(id))
+        .collect();
     if shown.len() < 2 {
         return None;
     }
@@ -39,7 +43,7 @@ pub fn next_on_screen(layout: &Layout, from: &ModuleId) -> Option<ModuleId> {
 /// Walks visible terminals in tree order, wrapping in either direction.
 pub fn next_terminal(layout: &Layout, from: &ModuleId, forward: bool) -> Option<ModuleId> {
     let terminals: Vec<_> = layout
-        .leaves()
+        .modules()
         .into_iter()
         .filter(|id| id.kind() == super::module::ModuleKind::Terminal && layout.is_visible(id))
         .collect();

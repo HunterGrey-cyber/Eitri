@@ -6,12 +6,14 @@
 //! change is saved synchronously.
 //!
 //! Only arrangement changes trigger a save: each workspace's tree, shares and pinned lengths,
-//! hidden modules, and the current workspace ([`Arrangement`]). Each save writes all of this
-//! window's workspaces with keyboard focus as it is when the save occurs.
+//! floating rectangles and remembered rectangles, hidden modules, and the current workspace
+//! ([`Arrangement`]). Each save writes all of this window's workspaces with keyboard focus as
+//! it is when the save occurs.
 //!
 //! Moving keyboard focus by a click, `Ctrl+h/j/k/l` or a HINT label does not trigger a write,
-//! even at close. Focus is saved along with the next arrangement change. Reopening therefore
-//! restores the focus at the last arrangement save, which may differ from the focus at close.
+//! even at close. Raising the float that receives focus does not trigger a write either. Focus
+//! is saved along with the next arrangement change. Reopening therefore restores the focus at
+//! the last arrangement save, which may differ from the focus at close.
 //!
 //! Launching, settling a pinned row's initial length (`ModuleGrid::connect_settled`) and
 //! zooming do not count as changes. Zoom is not stored. Opening, zooming, moving focus and
@@ -52,13 +54,14 @@
 //! time; the arrangement comes from this window.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use eitri_core::layout::persist::{self, Loaded, V2State};
-use eitri_core::layout::{reconcile_default, Con, Layout, ModuleDecl, ModuleId, Node, Workspaces};
+use eitri_core::layout::{reconcile_default_floating, Con, FloatRect, Layout, ModuleDecl, ModuleId, Node, Workspaces};
+use eitri_core::lua::layout::LuaTree;
 use gtk4::glib;
 
 /// The workspaces and the current layout a window opens with, the lines to log about how they were
@@ -81,7 +84,7 @@ use gtk4::glib;
 /// keymap binds it (`Ctrl+b e` by default), so the note names it; `None` when nothing binds one, and
 /// the note then names no key rather than a wrong one.
 pub(crate) fn choose_startup_layout(
-    default: Option<&Node>,
+    default: Option<&LuaTree>,
     loaded: Option<Loaded>,
     lua: &[ModuleDecl],
     show_editor: Option<&str>,
@@ -90,7 +93,8 @@ pub(crate) fn choose_startup_layout(
     let first_launch = |notes: &mut Vec<String>| -> Result<Layout, String> {
         match default {
             Some(tree) => {
-                let r = reconcile_default(tree.clone(), lua).map_err(|e| format!("eitri.layout.default: {e}"))?;
+                let r = reconcile_default_floating(tree.tiled.clone(), tree.floats.clone(), lua)
+                    .map_err(|e| format!("eitri.layout.default: {e}"))?;
                 notes.extend(r.notes.into_iter().map(|n| format!("eitri.layout.default: {n}")));
                 Ok(r.layout)
             }
@@ -132,15 +136,57 @@ pub(crate) fn choose_startup_layout(
     Ok((workspaces, layout, notes, keep_copy))
 }
 
+/// Appends missing init.lua templates after saved workspaces, then shares every module across them.
+pub(crate) fn add_defined_workspaces(
+    workspaces: &mut Workspaces,
+    live: &mut Layout,
+    defined: &[(String, LuaTree)],
+    lua: &[ModuleDecl],
+) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    for (name, tree) in defined {
+        if workspaces.order().contains(name) {
+            notes.push(format!(
+                "workspace '{name}': the saved layout wins over eitri.layout.workspace"
+            ));
+            continue;
+        }
+        let reconciled = reconcile_default_floating(tree.tiled.clone(), tree.floats.clone(), lua)
+            .map_err(|err| format!("eitri.layout.workspace('{name}'): {err}"))?;
+        notes.extend(
+            reconciled
+                .notes
+                .into_iter()
+                .map(|note| format!("workspace '{name}': {note}")),
+        );
+        workspaces
+            .create(name, reconciled.layout)
+            .map_err(|err| format!("eitri.layout.workspace('{name}'): {err}"))?;
+    }
+    notes.extend(workspaces.fit_all(live));
+    Ok(notes)
+}
+
 /// What the state file keeps of the window besides the keys and a later build's kept keys
-/// (`persist::encode_v2`): every workspace's tree with its shares and pinned lengths, and what it
-/// hides, in order, and which one is current. A change of this, and only of this, writes the file
-/// (this module's doc); zoom and the MRU order are not stored at all, and the keys ride along.
-/// Container ids are not compared (`Con`'s equality ignores them).
+/// (`persist::encode_v2`): every workspace's tree with its shares and pinned lengths, its floats and
+/// remembered float rectangles, and what it hides, in order, and which one is current. A change of
+/// this, and only of this, writes the file (this module's doc); zoom and the MRU order are not stored
+/// at all, and the keys ride along. Container ids are not compared (`Con`'s equality ignores them).
 #[derive(Debug, Clone, PartialEq)]
 struct Arrangement {
     current: String,
-    workspaces: Vec<(String, Con, BTreeSet<ModuleId>)>,
+    workspaces: Vec<WorkspaceArrangement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WorkspaceArrangement {
+    name: String,
+    root: Con,
+    hidden: BTreeSet<ModuleId>,
+    /// Sorted by module, not in z-order: giving a float the keys raises it, and a move of the keys
+    /// must not write the file. The order is still written, as it is when something else is.
+    floats: Vec<(ModuleId, FloatRect, bool)>,
+    float_memory: BTreeMap<ModuleId, FloatRect>,
 }
 
 impl Arrangement {
@@ -150,7 +196,21 @@ impl Arrangement {
             workspaces: workspaces
                 .each(current)
                 .into_iter()
-                .map(|(name, layout)| (name.to_string(), layout.root().clone(), layout.saved_hidden()))
+                .map(|(name, layout)| {
+                    let mut floats: Vec<_> = layout
+                        .floats()
+                        .iter()
+                        .map(|float| (float.id.clone(), float.rect, float.scratch))
+                        .collect();
+                    floats.sort_by(|a, b| a.0.cmp(&b.0));
+                    WorkspaceArrangement {
+                        name: name.to_string(),
+                        root: layout.root().clone(),
+                        hidden: layout.saved_hidden(),
+                        floats,
+                        float_memory: layout.float_memory().clone(),
+                    }
+                })
                 .collect(),
         }
     }
@@ -160,8 +220,8 @@ impl Arrangement {
         let current = &self.current;
         self.workspaces
             .iter_mut()
-            .find(|(name, _, _)| name == current)
-            .map(|(_, root, _)| root)
+            .find(|ws| ws.name == *current)
+            .map(|ws| &mut ws.root)
     }
 }
 
@@ -442,6 +502,110 @@ pub(crate) static DEFAULT_CONTEXT_TURN: std::sync::Mutex<()> = std::sync::Mutex:
 
 #[cfg(test)]
 mod tests {
+    use eitri_core::layout::{Float, FloatRect};
+
+    fn template(first: ModuleId, second: ModuleId) -> LuaTree {
+        LuaTree {
+            tiled: Node::split(Axis::Row, 0.5, Node::Leaf(first), Node::Leaf(second)),
+            floats: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn defined_workspaces_open_after_main_on_a_first_launch() {
+        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let notes = add_defined_workspaces(
+            &mut workspaces,
+            &mut layout,
+            &[("review".to_string(), template(ModuleId::agent(), ModuleId::editor()))],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(workspaces.order(), ["main", "review"]);
+        assert_eq!(workspaces.current(), "main");
+        let review = workspaces.stored("review").unwrap();
+        assert_eq!(review.visible_leaves(), [ModuleId::agent(), ModuleId::editor()]);
+        assert!(review.contains(&ModuleId::terminal()) && !review.is_shown(&ModuleId::terminal()));
+        assert!(notes.iter().all(|n| n.starts_with("workspace 'review': ")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_saved_workspace_wins_over_its_template_and_a_new_one_joins_at_the_end() {
+        let main = crate::terminal::initial_layout(&[]).unwrap();
+        let mut study = crate::terminal::initial_layout(&[]).unwrap();
+        study.set_focus(&ModuleId::agent()).unwrap();
+        let saved = Workspaces::from_parts(
+            vec!["main".into(), "study".into()],
+            std::collections::BTreeMap::from([("study".to_string(), study.clone())]),
+            "main".into(),
+            Default::default(),
+        )
+        .unwrap();
+        let loaded = Loaded::Restored(persist::Opened {
+            workspaces: saved,
+            current: main,
+            notes: vec![],
+            keep_copy: None,
+        });
+        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(loaded), &[], None).unwrap();
+        let notes = add_defined_workspaces(
+            &mut workspaces,
+            &mut layout,
+            &[
+                ("study".to_string(), template(ModuleId::agent(), ModuleId::editor())),
+                ("review".to_string(), template(ModuleId::editor(), ModuleId::agent())),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(workspaces.order(), ["main", "study", "review"]);
+        assert_eq!(
+            workspaces.stored("study").unwrap(),
+            &study,
+            "the saved study, not its template"
+        );
+        assert!(
+            notes.contains(&"workspace 'study': the saved layout wins over eitri.layout.workspace".to_string()),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_template_naming_an_instance_gives_it_to_every_workspace() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut review = template(ModuleId::editor(), ModuleId::agent());
+        review.floats.push(Float {
+            id: t2.clone(),
+            rect: FloatRect {
+                cx: 0.5,
+                cy: 0.5,
+                w: 600,
+                h: 300,
+            },
+            scratch: true,
+        });
+        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        add_defined_workspaces(&mut workspaces, &mut layout, &[("review".to_string(), review)], &[]).unwrap();
+        assert!(workspaces.stored("review").unwrap().is_floating(&t2));
+        assert!(layout.contains(&t2) && layout.hidden().contains(&t2) && !layout.is_floating(&t2));
+    }
+
+    #[test]
+    fn a_template_without_the_chat_is_an_error_naming_the_call() {
+        let (mut workspaces, mut layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let err = add_defined_workspaces(
+            &mut workspaces,
+            &mut layout,
+            &[("x".to_string(), template(ModuleId::editor(), ModuleId::terminal()))],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("eitri.layout.workspace('x'): ") && err.contains("'agent'"),
+            "{err}"
+        );
+    }
+
     use super::*;
     use eitri_core::layout::{Axis, Direction, Frame, ModuleId, Placement, Size};
 
@@ -466,8 +630,16 @@ mod tests {
             Node::Leaf(ModuleId::agent()),
             Node::Leaf(ModuleId::editor()),
         );
-        let (_, layout, notes, _) =
-            choose_startup_layout(Some(&tree), Some(restored(left.clone())), &[], None).unwrap();
+        let (_, layout, notes, _) = choose_startup_layout(
+            Some(&LuaTree {
+                tiled: tree.clone(),
+                floats: Vec::new(),
+            }),
+            Some(restored(left.clone())),
+            &[],
+            None,
+        )
+        .unwrap();
         assert_eq!(layout, left);
         assert_eq!(
             notes,
@@ -491,7 +663,16 @@ mod tests {
         );
         for loaded in [None, Some(Loaded::Missing), Some(Loaded::Unusable("corrupt".into()))] {
             let unusable = matches!(loaded, Some(Loaded::Unusable(_)));
-            let (_, layout, notes, _) = choose_startup_layout(Some(&tree), loaded, &[], None).unwrap();
+            let (_, layout, notes, _) = choose_startup_layout(
+                Some(&LuaTree {
+                    tiled: tree.clone(),
+                    floats: Vec::new(),
+                }),
+                loaded,
+                &[],
+                None,
+            )
+            .unwrap();
             assert_eq!(layout.visible_leaves(), [ModuleId::agent(), ModuleId::editor()]);
             assert!(layout.contains(&ModuleId::terminal()) && !layout.is_shown(&ModuleId::terminal()));
             assert_eq!(notes.iter().any(|n| n.contains("corrupt")), unusable, "{notes:?}");
@@ -798,8 +979,16 @@ mod tests {
     fn a_length_settled_on_screen_is_not_a_change_and_moving_it_is() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settle");
         let path = dir.join(persist::file_name_v2(root()));
-        let (_, startup, _, _) =
-            choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
+        let (_, startup, _, _) = choose_startup_layout(
+            Some(&LuaTree {
+                tiled: bottom_row_default(),
+                floats: Vec::new(),
+            }),
+            Some(Loaded::Missing),
+            &[],
+            None,
+        )
+        .unwrap();
         let layout = Rc::new(RefCell::new(startup));
         let saver = saver_for(&dir, &layout);
         assert!(eitri_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()));
@@ -844,8 +1033,16 @@ mod tests {
     #[test]
     fn a_length_settled_on_a_restored_file_is_not_a_change_either() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settled-file");
-        let (_, unsettled, _, _) =
-            choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
+        let (_, unsettled, _, _) = choose_startup_layout(
+            Some(&LuaTree {
+                tiled: bottom_row_default(),
+                floats: Vec::new(),
+            }),
+            Some(Loaded::Missing),
+            &[],
+            None,
+        )
+        .unwrap();
         persist::save(&dir, root(), &Workspaces::single(), &unsettled).unwrap();
         let before = file_text(&dir);
         assert!(before.contains("\"px\": null"), "{before}");
@@ -1301,7 +1498,16 @@ mod tests {
                 Node::Leaf(ModuleId::lua("gone")),
             ),
         );
-        let (_, layout, notes, _) = choose_startup_layout(Some(&tree), None, &[], None).unwrap();
+        let (_, layout, notes, _) = choose_startup_layout(
+            Some(&LuaTree {
+                tiled: tree.clone(),
+                floats: Vec::new(),
+            }),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
         assert!(!layout.contains(&ModuleId::lua("gone")));
         assert_eq!(
             notes,
@@ -1504,9 +1710,9 @@ mod tests {
         assert_eq!(file_text(&dir), window.written());
     }
 
-    /// Keys a later build wrote into the file after this window opened it -- a workspace's floating
-    /// modules, a top-level key -- are taken from the file when this window writes, so its write does
-    /// not erase them; nothing is copied aside for them.
+    /// Keys a later build wrote into the file after this window opened it -- a workspace-level key, a
+    /// top-level key -- are taken from the file when this window writes, so its write does not erase
+    /// them; nothing is copied aside for them.
     #[test]
     fn unknown_keys_written_after_this_window_loaded_survive_its_save() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-kept-later");
@@ -1519,8 +1725,8 @@ mod tests {
         .unwrap();
         let window = Window::open(&dir);
         let mut value: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
-        let floating = serde_json::json!([{"module": "terminal#2", "cx": 0.5, "cy": 0.45, "w": 900, "h": 420}]);
-        value["workspaces"][0]["floating"] = floating.clone();
+        let overlays = serde_json::json!([{"module": "terminal#2", "opacity": 0.8}]);
+        value["workspaces"][0]["overlays"] = overlays.clone();
         value["future"] = serde_json::json!({"a": 1});
         std::fs::write(
             dir.join(persist::file_name_v2(root())),
@@ -1531,14 +1737,14 @@ mod tests {
         window.change();
         window.saver.save_now();
         let again: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
-        assert_eq!(again["workspaces"][0]["floating"], floating);
+        assert_eq!(again["workspaces"][0]["overlays"], overlays);
         assert_eq!(again["future"], serde_json::json!({"a": 1}));
         assert_eq!(file_text(&dir), window.written());
         assert!(!partial(&dir).exists(), "carried, so nothing is copied");
     }
 
     /// Two builds on one project: this window tiles `terminal#2` after it opened the file, and a later
-    /// build then floats a `terminal#2` of its own there. The file's tree does not hold it, so the file
+    /// build then puts a `terminal#2` of its own in a key this build does not know. The file's tree does not hold it, so the file
     /// alone does not show the clash; this window's own layout does. Its write keeps `terminal#2` in
     /// one place, its tree, and the later build's text survives as `.v2.json.partial`.
     #[test]
@@ -1556,16 +1762,16 @@ mod tests {
         eitri_core::layout::place(&mut window.layout.borrow_mut(), &second, &ModuleId::editor(), Axis::Row).unwrap();
 
         let mut value: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
-        value["workspaces"][0]["floating"] = serde_json::json!([{"module": "terminal#2", "w": 900, "h": 420}]);
-        value["workspaces"][0]["float_memory"] = serde_json::json!({"x": 1});
+        value["workspaces"][0]["overlays"] = serde_json::json!([{"module": "terminal#2", "w": 900, "h": 420}]);
+        value["workspaces"][0]["overlay_memory"] = serde_json::json!({"x": 1});
         let later = serde_json::to_string_pretty(&value).unwrap();
         std::fs::write(dir.join(persist::file_name_v2(root())), &later).unwrap();
 
         window.saver.save_now();
         let again: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
-        assert_eq!(again["workspaces"][0].get("floating"), None, "terminal#2 is tiled here");
+        assert_eq!(again["workspaces"][0].get("overlays"), None, "terminal#2 is tiled here");
         assert_eq!(
-            again["workspaces"][0]["float_memory"],
+            again["workspaces"][0]["overlay_memory"],
             serde_json::json!({"x": 1}),
             "a key naming no module of this window is still carried"
         );
@@ -1621,5 +1827,166 @@ mod tests {
             window.written(),
             "a change in the workspace not on screen"
         );
+    }
+
+    #[test]
+    fn a_lua_default_with_a_float_opens_with_it() {
+        use eitri_core::layout::{Float, FloatRect};
+        let tree = LuaTree {
+            tiled: Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::agent()),
+                Node::Leaf(ModuleId::editor()),
+            ),
+            floats: vec![Float {
+                id: ModuleId::terminal(),
+                rect: FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 600,
+                    h: 300,
+                },
+                scratch: false,
+            }],
+        };
+        let (_, layout, notes, copy) = choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], None).unwrap();
+        assert!(layout.is_floating(&ModuleId::terminal()));
+        assert!(!layout.leaves().contains(&ModuleId::terminal()));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(copy.is_none());
+    }
+
+    #[test]
+    fn a_lua_default_whose_chat_floats_opens_with_it() {
+        use eitri_core::layout::{Float, FloatRect};
+        let tree = LuaTree {
+            tiled: Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::terminal()),
+            ),
+            floats: vec![Float {
+                id: ModuleId::agent(),
+                rect: FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 600,
+                    h: 300,
+                },
+                scratch: false,
+            }],
+        };
+        let (_, layout, notes, copy) = choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], None).unwrap();
+        assert!(layout.is_floating(&ModuleId::agent()));
+        assert!(!layout.leaves().contains(&ModuleId::agent()));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(copy.is_none());
+    }
+
+    /// `editor | agent` tiled, with the terminal floating under `terminal#2` and the keys in nvim.
+    fn two_floats() -> Layout {
+        use eitri_core::layout::Float;
+        let float = |id: ModuleId, cx: f32| Float {
+            id,
+            rect: FloatRect {
+                cx,
+                cy: 0.5,
+                w: 600,
+                h: 300,
+            },
+            scratch: false,
+        };
+        Layout::from_parts_floating(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            vec![
+                float(ModuleId::terminal(), 0.4),
+                float(ModuleId::parse("terminal#2").unwrap(), 0.6),
+            ],
+            BTreeSet::new(),
+            ModuleId::editor(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    fn reopened_floats(dir: &Path) -> Layout {
+        let Loaded::Restored(back) = persist::load(dir, root(), &[]) else {
+            panic!("the file")
+        };
+        back.current
+    }
+
+    /// Giving the lower float the keys raises it, and that is a move of the keys: nothing is written.
+    /// The order goes into the file with the next change, as it is then.
+    #[test]
+    fn moving_the_keys_between_floats_writes_nothing() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-float-keys");
+        let path = dir.join(persist::file_name_v2(root()));
+        let window = Window::with(&dir, Workspaces::single(), two_floats(), None);
+        window.layout.borrow_mut().set_focus(&ModuleId::terminal()).unwrap();
+        assert_eq!(
+            window.layout.borrow().floats().last().map(|f| f.id.clone()),
+            Some(ModuleId::terminal()),
+            "raised"
+        );
+        window.saver.save_now();
+        assert!(!path.exists(), "a raise is not a change");
+
+        let second = ModuleId::parse("terminal#2").unwrap();
+        assert!(eitri_core::layout::move_float(
+            &mut window.layout.borrow_mut(),
+            &second,
+            Direction::Down,
+            40,
+            &frame()
+        ));
+        window.saver.save_now();
+        assert_eq!(file_text(&dir), window.written());
+        let ids: Vec<ModuleId> = reopened_floats(&dir).floats().iter().map(|f| f.id.clone()).collect();
+        assert_eq!(
+            ids,
+            [second, ModuleId::terminal()],
+            "bottom first, as it was at the write"
+        );
+    }
+
+    #[test]
+    fn a_moved_float_is_written() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-float-moved");
+        let window = Window::with(&dir, Workspaces::single(), two_floats(), None);
+        let before = window.layout.borrow().float_of(&ModuleId::terminal()).unwrap().rect;
+        assert!(eitri_core::layout::move_float(
+            &mut window.layout.borrow_mut(),
+            &ModuleId::terminal(),
+            Direction::Right,
+            40,
+            &frame()
+        ));
+        window.saver.save_now();
+        let moved = window.layout.borrow().float_of(&ModuleId::terminal()).unwrap().rect;
+        assert_ne!(moved, before);
+        assert_eq!(
+            reopened_floats(&dir).float_of(&ModuleId::terminal()).map(|f| f.rect),
+            Some(moved)
+        );
+    }
+
+    #[test]
+    fn a_stowed_float_is_written_hidden() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-float-stowed");
+        let window = Window::with(&dir, Workspaces::single(), two_floats(), None);
+        eitri_core::layout::scratchpad_move(&mut window.layout.borrow_mut(), &ModuleId::terminal(), &frame()).unwrap();
+        window.saver.save_now();
+        let back = reopened_floats(&dir);
+        assert!(back.is_stowed(&ModuleId::terminal()));
+        assert!(back.hidden().contains(&ModuleId::terminal()));
+        assert!(back.float_of(&ModuleId::terminal()).unwrap().scratch);
     }
 }

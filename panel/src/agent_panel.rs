@@ -602,6 +602,14 @@ struct AgentPanelState {
     /// rather than a plain closure field because the hook must be cloned out of the borrow before
     /// being called -- see `handle_inbound_message`'s HintRequest/HintTargets arms for why.
     hint_hook: Option<Rc<dyn Fn(HintInbound)>>,
+    /// The window's check on every card answer from the page (`AgentPanelHandle::set_answer_gate`):
+    /// `Err(why)` refuses the answer and leaves the card waiting. Cloned out of the borrow before it
+    /// is called, as `hint_hook` is, so a gate that reads the panel cannot find the state held.
+    answer_gate: Option<AnswerGate>,
+    /// The window's word on whether a float covers the chat now (`AgentPanelHandle::set_coverage`). A
+    /// covered chat is off screen for attention: what finishes under a float is not seen. Cloned out
+    /// of the borrow before it is called, as `answer_gate` is.
+    coverage: Option<Coverage>,
     /// Told whenever the window's attention (every tab's, summed: `TabSet::attention`) changes,
     /// with the value before and after: the tray's `agent ⚑N`, the toast, `on_permission`.
     attention_hook: Option<AttentionHook>,
@@ -894,14 +902,17 @@ impl AgentPanelHandle {
         }
     }
 
-    /// The page came on screen: whatever finished in the active tab while the chat was away has been
-    /// seen (the tray's `agent •`).
+    /// The page came on screen, or a float stopped covering it: whatever finished in the active tab
+    /// while the chat was away has been seen (the tray's `agent •`). Nothing is seen while the page is
+    /// unmapped or a float covers it (`set_coverage`).
     pub fn page_shown(&self) {
         self.wake();
-        if self.page.is_none() {
+        let Some(page) = self.page.as_deref() else { return };
+        if self.state.borrow().shutting_down {
             return;
         }
-        if self.state.borrow().shutting_down {
+        // Mapped under a float is not seen: the window calls this again once the float is off it.
+        if !on_screen(&self.state, page) {
             return;
         }
         let before = self.state.borrow().tabs.attention();
@@ -1023,8 +1034,9 @@ impl AgentPanelHandle {
         {
             state.borrow_mut().ticks_run += 1;
         }
-        // The chat's own host: unmapped while it is hidden or zoomed away.
-        let panel_mapped = page.is_visible();
+        // The chat's own host is unmapped while it is hidden or zoomed away; mapped under a float, it
+        // is off screen too.
+        let panel_mapped = on_screen(state, page);
         // Read before anything below changes it: a session installed this tick resets its count.
         let attention_before = state.borrow().tabs.attention();
         let notes = state.borrow().start_notes.drain();
@@ -1763,6 +1775,21 @@ impl AgentPanelHandle {
         self.dispatch(eitri_core::agent_bridge::serialize_hint_end_for_js(session_id));
     }
 
+    /// A check every card answer from the page passes before it is taken; `Err(why)` refuses the answer, which
+    /// leaves the card waiting, and `why` is what the page shows. The window sets it once.
+    pub fn set_answer_gate(&self, gate: Rc<dyn Fn() -> Result<(), String>>) {
+        self.wake();
+        self.state.borrow_mut().answer_gate = Some(gate);
+    }
+
+    /// Whether a float covers the chat now, asked whenever the panel decides if the chat is on screen
+    /// for attention (a turn finishing, a tab switch, the page coming on screen). The window sets it
+    /// once, and calls [`AgentPanelHandle::page_shown`] when a float stops covering the chat.
+    pub fn set_coverage(&self, covered: Rc<dyn Fn() -> bool>) {
+        self.wake();
+        self.state.borrow_mut().coverage = Some(covered);
+    }
+
     /// Where the panel's two HINT messages go. `shell::hint::HintCoordinator` installs this once.
     pub fn on_hint(&self, hook: impl Fn(HintInbound) + 'static) {
         self.wake();
@@ -2325,6 +2352,8 @@ fn panel_state(
         pane_focused: false,
         thinking_display: eitri_core::agent_prefs::ThinkingDisplay::Collapsed,
         hint_hook: None,
+        answer_gate: None,
+        coverage: None,
         attention_hook: None,
         last_tabs_payload: None,
         last_open_ids: Vec::new(),
@@ -2388,6 +2417,8 @@ fn bare_state(
         pane_focused: false,
         thinking_display: eitri_core::agent_prefs::ThinkingDisplay::Collapsed,
         hint_hook: None,
+        answer_gate: None,
+        coverage: None,
         attention_hook: None,
         last_tabs_payload: None,
         last_open_ids: Vec::new(),
@@ -2946,9 +2977,10 @@ fn switch_payloads(state: &mut AgentPanelState) -> Vec<String> {
 /// active tab's state.
 fn send_switch(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) {
     let before = state.borrow().tabs.attention();
+    let shown = on_screen(state, page);
     let payloads = {
         let mut state_ref = state.borrow_mut();
-        if page.is_visible() {
+        if shown {
             state_ref.tabs.mark_seen();
         }
         switch_payloads(&mut state_ref)
@@ -4723,10 +4755,12 @@ fn report_sessions_that_never_opened(state: &Rc<RefCell<AgentPanelState>>, page:
     for (tab, reason) in failed {
         let message = never_opened_message(&reason);
         eprintln!("[agent_panel] tab {}: {message}", tab.0);
+        // Asked before the state is borrowed: the window's coverage probe may read the panel.
+        let shown = on_screen(state, page);
         let (dead, active) = {
             let mut state_ref = state.borrow_mut();
             let active = state_ref.tabs.active() == tab;
-            let on_screen = active && page.is_visible();
+            let on_screen = active && shown;
             let Some(t) = state_ref.tabs.get_mut(tab) else { continue };
             t.reported_start_failure = true;
             t.failed_after_start = false;
@@ -5107,6 +5141,32 @@ fn changed_envelope(last: &mut Option<String>, now: String, document_ready: bool
     Some(now)
 }
 
+/// The window's check on a card answer (`AgentPanelHandle::set_answer_gate`).
+type AnswerGate = Rc<dyn Fn() -> Result<(), String>>;
+
+/// A card answer from the page, through the window's gate first: a refusal returns the gate's words
+/// and never runs `answer`, so the card stays waiting. The gate is asked at the moment of the answer
+/// and with the panel's state released, so what it reads is the window as it is now.
+fn through_answer_gate<T>(gate: Option<&AnswerGate>, answer: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if let Some(gate) = gate {
+        gate()?;
+    }
+    answer()
+}
+
+/// The window's word on whether a float covers the chat (`AgentPanelHandle::set_coverage`).
+type Coverage = Rc<dyn Fn() -> bool>;
+
+/// Whether the chat is on screen for attention: its page mapped and no float over it. The window's
+/// probe is asked with the panel's state released, so it may read the panel.
+fn on_screen(state: &Rc<RefCell<AgentPanelState>>, page: &PanelPage) -> bool {
+    if !page.is_visible() {
+        return false;
+    }
+    let coverage = state.borrow().coverage.clone();
+    !coverage.is_some_and(|covered| covered())
+}
+
 /// A `permission_response`'s own fields, out of the message (see `answer_permission_response`).
 struct PermissionAnswer {
     permission_id: String,
@@ -5327,12 +5387,12 @@ fn apply_outcome(
             // escalating to SIGKILL, then RuntimeThread joins its Tokio thread) would block the
             // whole shell -- editor pane included -- on the GTK main loop.
             let attention_before = state.borrow().tabs.attention();
-            let on_screen = active && page.is_visible();
+            let shown = active && on_screen(state, page);
             let dead = {
                 let mut state_ref = state.borrow_mut();
                 state_ref.tabs.get_mut(tab).map(|t| {
                     // The cards of a session that is gone can no longer be answered.
-                    t.attention.session_ended(on_screen);
+                    t.attention.session_ended(shown);
                     t.failed_after_start = true;
                     t.failed_resume = None;
                     std::mem::replace(
@@ -5696,17 +5756,21 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         message @ InboundMessage::PermissionResponse { .. } => {
             let tab = tab_of(target);
             let answer = PermissionAnswer::of(message).expect("matched as a permission_response above");
-            let (rules_dir, project_dir) = {
+            let (rules_dir, project_dir, gate) = {
                 let s = state.borrow();
-                (s.rules_dir.clone(), s.project_dir.clone())
+                (s.rules_dir.clone(), s.project_dir.clone(), s.answer_gate.clone())
             };
-            let answered = answer_permission_response(
-                &mut state.borrow_mut().tabs,
-                rules_dir.as_deref(),
-                &project_dir,
-                tab,
-                answer,
-            );
+            // `Ctrl+y`, BROWSE's answer keys and a card's own buttons all arrive here, so one gate
+            // covers every way a card is answered.
+            let answered = through_answer_gate(gate.as_ref(), || {
+                answer_permission_response(
+                    &mut state.borrow_mut().tabs,
+                    rules_dir.as_deref(),
+                    &project_dir,
+                    tab,
+                    answer,
+                )
+            });
             match answered {
                 Err(why) => refuse(page, &why),
                 Ok(outcome) => apply_command_outcome(state, page, tab, &request_id, outcome),
@@ -6327,45 +6391,56 @@ fn handle_inbound_message(raw: &str, state: &Rc<RefCell<AgentPanelState>>, page:
         // -- this only re-validates the facts (the nonce, the active tab, exactly
         // the delivered cards still pending) via `apply_confirm_bypass`/`TabSet::confirm_bypass`,
         // which is where all of that is actually checked.
-        InboundMessage::ConfirmBypass { tab, scope, nonce, .. } => match scope.scope(tab) {
-            Err(why) => refuse(page, &why),
-            Ok(scope) => {
-                let before = state.borrow().tabs.attention();
-                match apply_confirm_bypass(state, scope, nonce) {
-                    Ok(eitri_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
-                        // On legacy the approved cards' resolutions exist
-                        // only here (its CLI reports nothing for a hook reply), so without this the
-                        // cards stayed drawn and counted as waiting until the next snapshot. A tab
-                        // scope is always the active tab (`confirm_bypass` refuses any other); the
-                        // window-default scope approves nothing, so `resolved` is empty there.
-                        let payload = {
-                            let state_ref = state.borrow();
-                            let active = state_ref.tabs.active();
-                            returned_events_payload(&state_ref, active, &resolved)
-                        };
-                        if let Some(payload) = payload {
-                            page.send(&payload);
+        //
+        // A tab's `y` approves every card still waiting in it, and the prompt itself may be what a
+        // float hides, so it meets the window's card-answer gate first, with the state released, as a
+        // card answer does: refused from a covered chat, nothing changes, and Shift+Tab asks again
+        // (the page has closed the prompt already).
+        InboundMessage::ConfirmBypass { tab, scope, nonce, .. } => {
+            let gate = state.borrow().answer_gate.clone();
+            match scope
+                .scope(tab)
+                .and_then(|scope| through_answer_gate(gate.as_ref(), || Ok(scope)))
+            {
+                Err(why) => refuse(page, &why),
+                Ok(scope) => {
+                    let before = state.borrow().tabs.attention();
+                    match apply_confirm_bypass(state, scope, nonce) {
+                        Ok(eitri_core::tab_set::ConfirmOutcome::Entered { resolved, .. }) => {
+                            // On legacy the approved cards' resolutions exist
+                            // only here (its CLI reports nothing for a hook reply), so without this the
+                            // cards stayed drawn and counted as waiting until the next snapshot. A tab
+                            // scope is always the active tab (`confirm_bypass` refuses any other); the
+                            // window-default scope approves nothing, so `resolved` is empty there.
+                            let payload = {
+                                let state_ref = state.borrow();
+                                let active = state_ref.tabs.active();
+                                returned_events_payload(&state_ref, active, &resolved)
+                            };
+                            if let Some(payload) = payload {
+                                page.send(&payload);
+                            }
+                            send_tabs(state, page);
+                            // The cards `confirm_bypass` just approved leave the tray at once, rather
+                            // than waiting for a later poll to notice `attention()` dropped.
+                            report_attention(state, before);
+                            ok(page);
                         }
-                        send_tabs(state, page);
-                        // The cards `confirm_bypass` just approved leave the tray at once, rather
-                        // than waiting for a later poll to notice `attention()` dropped.
-                        report_attention(state, before);
-                        ok(page);
+                        Ok(eitri_core::tab_set::ConfirmOutcome::AlreadyBypass) => {
+                            send_tabs(state, page);
+                            ok(page);
+                        }
+                        Ok(eitri_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
+                            // A card arrived while the prompt was up -- nothing changed, and the
+                            // panel is shown the fresh count under a fresh nonce instead.
+                            page.send(&eitri_core::agent_bridge::serialize_confirm_bypass_for_js(&plan));
+                            ok(page);
+                        }
+                        Err(why) => refuse(page, &why),
                     }
-                    Ok(eitri_core::tab_set::ConfirmOutcome::AlreadyBypass) => {
-                        send_tabs(state, page);
-                        ok(page);
-                    }
-                    Ok(eitri_core::tab_set::ConfirmOutcome::Reprompt(plan)) => {
-                        // A card arrived while the prompt was up -- nothing changed, and the
-                        // panel is shown the fresh count under a fresh nonce instead.
-                        page.send(&eitri_core::agent_bridge::serialize_confirm_bypass_for_js(&plan));
-                        ok(page);
-                    }
-                    Err(why) => refuse(page, &why),
                 }
             }
-        },
+        }
     }
 }
 
@@ -6967,6 +7042,151 @@ mod tests {
                 backend.shutdown();
             }
         }
+    }
+
+    /// A card answer from the page meets the window's gate at the moment it arrives: refused while the
+    /// gate says a float covers the chat -- the card still waiting, nothing sent to the agent, the page
+    /// told why -- and the same answer taken once it says the chat is clear. With no gate, answers are
+    /// taken as they always were.
+    #[test]
+    fn a_card_answer_is_refused_only_while_a_float_covers_the_chat_now() {
+        const COVERED: &str = "agent is under terminal 2: C-b M-- from terminal 2 stows it";
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-answer-gate");
+        let (handle, page, _host) = handle_with_recording_page();
+        let state = handle.state.clone();
+        let tab = state.borrow().tabs.active();
+        let (provider, backend) = live_backend(&dir);
+        state.borrow_mut().tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        // A `Write` into `.git` needs a human, so each is left a card.
+        for id in ["perm-1", "perm-2"] {
+            provider.queue(agent::AgentDomainEvent::PermissionRequested {
+                permission_id: id.into(),
+                tool_use_id: None,
+                tool_name: "Write".into(),
+                input: serde_json::json!({ "file_path": format!(".git/{id}"), "content": "" }),
+                provider_prompt: None,
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.borrow().tabs.get(tab).unwrap().attention.attention().pending != 2 {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for the cards");
+            state.borrow_mut().tabs.pump(&dir, true);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let covered = Rc::new(Cell::new(true));
+        let asked = Rc::new(Cell::new(0));
+        handle.set_answer_gate(Rc::new({
+            let covered = covered.clone();
+            let asked = asked.clone();
+            move || {
+                asked.set(asked.get() + 1);
+                if covered.get() {
+                    Err(COVERED.to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        let answer = |request: &str, permission: &str| {
+            handle.page_message(&format!(
+                r#"{{"type":"permission_response","request_id":"{request}","tab":{},"permission_id":"{permission}","decision":"allow"}}"#,
+                tab.0
+            ));
+        };
+
+        answer("r1", "perm-1");
+        assert_eq!(result_for(&page.sent.borrow(), "r1"), Some(Err(COVERED.to_string())));
+        assert!(
+            state.borrow().tabs.get(tab).unwrap().card_is_waiting("perm-1"),
+            "a refused answer leaves the card waiting"
+        );
+        assert!(provider.resolutions().is_empty(), "nothing reached the agent");
+
+        // A tab's bypass `y` approves every card waiting in it, so from a covered chat it meets the
+        // same gate before anything about the prompt is checked, and both cards stay.
+        handle.page_message(&format!(
+            r#"{{"type":"confirm_bypass","request_id":"b1","tab":{},"scope":"tab","nonce":1}}"#,
+            tab.0
+        ));
+        assert_eq!(result_for(&page.sent.borrow(), "b1"), Some(Err(COVERED.to_string())));
+        for id in ["perm-1", "perm-2"] {
+            assert!(
+                state.borrow().tabs.get(tab).unwrap().card_is_waiting(id),
+                "{id} still waits"
+            );
+        }
+        assert!(provider.resolutions().is_empty(), "bypass approved nothing");
+
+        // The float moved off: the gate is asked again, at this answer, and lets it through.
+        covered.set(false);
+        answer("r2", "perm-1");
+        assert_eq!(result_for(&page.sent.borrow(), "r2"), Some(Ok(())));
+        assert_eq!(provider.resolutions(), vec![("perm-1".to_string(), true)]);
+        assert_eq!(asked.get(), 3, "asked once per answer");
+
+        state.borrow_mut().answer_gate = None;
+        answer("r3", "perm-2");
+        assert_eq!(
+            result_for(&page.sent.borrow(), "r3"),
+            Some(Ok(())),
+            "no gate: taken as before"
+        );
+        assert_eq!(
+            provider.resolutions(),
+            vec![("perm-1".to_string(), true), ("perm-2".to_string(), true)]
+        );
+        for mut t in state.borrow_mut().tabs.take_all() {
+            if let TabBackend::Live(backend) = &mut t.backend {
+                backend.shutdown();
+            }
+        }
+    }
+
+    /// A chat a float covers is off screen for attention: what finished in it stays unread while the
+    /// page is mapped under the float, and is seen once the window says the float is off it
+    /// (`page_shown` again). With no probe set, a mapped page is on screen as before.
+    #[test]
+    fn a_chat_under_a_float_leaves_what_finished_unread_until_the_float_is_off_it() {
+        let (handle, page, _host) = handle_with_recording_page();
+        let state = handle.state.clone();
+        let tab = state.borrow().tabs.active();
+        let unread = || state.borrow().tabs.get(tab).unwrap().attention.attention().unread;
+        page.visible.set(true);
+        state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .attention
+            .session_ended(false);
+        assert!(unread());
+
+        let covered = Rc::new(Cell::new(true));
+        handle.set_coverage(Rc::new({
+            let covered = covered.clone();
+            move || covered.get()
+        }));
+        handle.page_shown();
+        assert!(unread(), "mapped under a float is not seen");
+        assert!(!on_screen(&state, handle.page.as_deref().unwrap()));
+
+        covered.set(false);
+        handle.page_shown();
+        assert!(!unread(), "seen once the float is off it");
+        assert!(on_screen(&state, handle.page.as_deref().unwrap()));
+
+        page.visible.set(false);
+        assert!(
+            !on_screen(&state, handle.page.as_deref().unwrap()),
+            "an unmapped page is never on screen"
+        );
+        state.borrow_mut().coverage = None;
+        page.visible.set(true);
+        assert!(
+            on_screen(&state, handle.page.as_deref().unwrap()),
+            "no probe: mapped is on screen"
+        );
     }
 
     /// The panel's own `permission_response` route records the human's approval, so the

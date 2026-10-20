@@ -12,10 +12,18 @@ use crate::attention::{AgentPlace, Attention};
 /// ([`Layout::is_titled_on_strip`]). A module gone for the rest of the window has no chip because
 /// nothing would bring it back.
 pub fn tray(layout: &Layout) -> Vec<ModuleId> {
+    tray_covered(layout, &[])
+}
+
+/// Tray chips plus covered modules on screen, in `modules()` order.
+pub fn tray_covered(layout: &Layout, covered: &[ModuleId]) -> Vec<ModuleId> {
     layout
-        .leaves()
+        .modules()
         .into_iter()
-        .filter(|id| !layout.is_visible(id) && !layout.is_gone(id) && !layout.is_titled_on_strip(id))
+        .filter(|id| {
+            (layout.is_visible(id) && covered.contains(id))
+                || (!layout.is_visible(id) && !layout.is_gone(id) && !layout.is_titled_on_strip(id))
+        })
         .collect()
 }
 
@@ -34,9 +42,18 @@ pub fn chip_label(title: &str, attention: Option<Attention>) -> String {
 
 /// Where the agent is (`attention::react` decides from it).
 pub fn agent_place(layout: &Layout) -> AgentPlace {
+    agent_place_covered(layout, &[])
+}
+
+/// A visible chat in `covered` may have cards hidden by a float.
+pub fn agent_place_covered(layout: &Layout, covered: &[ModuleId]) -> AgentPlace {
     let agent = ModuleId::agent();
     if layout.is_visible(&agent) {
-        AgentPlace::OnScreen
+        if covered.contains(&agent) {
+            AgentPlace::Covered
+        } else {
+            AgentPlace::OnScreen
+        }
     } else if !layout.is_zoomed() && layout.is_tabbed_away(&agent) {
         AgentPlace::TabbedAway
     } else if layout.is_shown(&agent) {
@@ -255,5 +272,22 @@ mod tests {
         hide(&mut three, &ModuleId::agent(), &frame()).unwrap();
         three.toggle_zoom(&ModuleId::editor());
         assert_eq!(agent_place(&three), AgentPlace::HiddenUnderZoom);
+    }
+
+    #[test]
+    fn a_chat_under_a_float_is_covered_and_has_a_chip_while_it_is() {
+        let mut layout = Layout::initial(&[]).unwrap();
+        let agent = ModuleId::agent();
+        assert_eq!(agent_place_covered(&layout, &[agent.clone()]), AgentPlace::Covered);
+        assert_eq!(agent_place_covered(&layout, &[]), AgentPlace::OnScreen);
+        assert_eq!(tray_covered(&layout, &[agent.clone()]), vec![agent.clone()]);
+        assert!(tray_covered(&layout, &[]).is_empty());
+        layout.toggle_zoom(&ModuleId::editor());
+        assert_eq!(agent_place_covered(&layout, &[agent.clone()]), AgentPlace::ZoomedAway);
+        assert_eq!(
+            tray_covered(&layout, &[agent.clone()]),
+            vec![agent],
+            "once, as zoomed away"
+        );
     }
 }

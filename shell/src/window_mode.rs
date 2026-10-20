@@ -167,10 +167,7 @@ impl WindowModes {
         let weak = Rc::downgrade(&this);
         window.connect_notify_local(Some("focus-widget"), move |_, _| {
             let Some(this) = weak.upgrade() else { return };
-            if this.revealed.get() && !this.focus_in_top_bar() {
-                this.revealed.set(false);
-                this.sync_widgets();
-            }
+            this.conceal_top_bar();
         });
 
         this
@@ -229,6 +226,16 @@ impl WindowModes {
     pub(crate) fn reveal_top_bar(&self) {
         if matches!(self.mode.get(), WindowMode::Immersive { .. }) {
             self.revealed.set(true);
+            self.sync_widgets();
+        }
+    }
+
+    /// Hides a revealed top bar again unless the keys are in it: what the keys leaving the bar do, and
+    /// what a reveal made without moving the keys there (the workspace chooser's strip) needs once
+    /// it is no longer wanted, since no focus change will come to hide it.
+    pub(crate) fn conceal_top_bar(&self) {
+        if self.revealed.get() && !self.focus_in_top_bar() {
+            self.revealed.set(false);
             self.sync_widgets();
         }
     }

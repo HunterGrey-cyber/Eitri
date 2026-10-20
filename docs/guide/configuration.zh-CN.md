@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=479946ec2726ce13c617b673606000124d236aa2f45e45b14fe8451fd84f7717 -->
+<!-- translated-from: configuration.md sha256=1852b74477bf72d102a5f245563116954fb75cf0e2a05f2e689c665c467ad385 -->
 
 # 配置
 
@@ -90,9 +90,13 @@ eitri.command.register({
 
 - **`eitri.layout.run(name, options?)`** 对拿着按键的那个模块执行一个布局动作：[按键](keys.zh-CN.md)里“模块”表中的那些（排布、交换、移到边缘、标记、放大、调整大小、隐藏、关闭），以及没有按键的那些（`swap.marked`、`layout.undo`、`layout.previous`、两种翻转、`move.far-right`）。要对别的模块操作，先调用 `eitri.layout.focus(id)`。关闭模块仍然会问那个 `y/n`。不是布局动作的（比如标签页动作）会被拒绝并点名，另外还有三样也会被拒绝：`split.right` 和 `split.below`（它们要等一个模块键；用 `eitri.layout.split(id, "right")` 或 `"below"` 来做这件事）、`select.number`（它要等一个数字；用 `eitri.layout.focus(id)` 让某个模块拿到按键）以及 `repeatable` 选项，它属于按键绑定。另外有两点和终端有关：`eitri.layout.run("instance.new", { kind = "terminal" })` 会在拿着按键的模块右边打开一个新的终端，和 `<prefix> Alt+Enter` 一样（`kind = "agent"` 目前会被拒绝，提示 `chat views: not in this build`）；分割动作带一个 `cwd` 选项，见下面。
 - **`eitri.layout.mark(id)`** 标记那个模块，不移动按键，就像 `<prefix> m` 标记拿着按键的那个模块。
-- **`eitri.layout.get()`** 返回一张描述当前布局的新表，形状和 `eitri.layout.default` 接受的一样：`{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`，其中除最后一个以外的每个子项都带着它在容器里的份额。它另外加上 `focus`（拿着按键的模块）、`hidden`（一个列表）、`zoomed` 和 `marked`（某个模块，或者什么都没有）。固定高度的底部行不会写进这张表；默认的形状会自己恢复底部行的高度。在布局正被修改的过程中调用它会停下并给出信息，而不是读到改了一半的东西。
+- **`eitri.layout.get()`** 返回一张描述当前布局的新表，形状和 `eitri.layout.default` 接受的一样：`{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`，其中除最后一个以外的每个子项都带着它在容器里的份额。它另外加上 `focus`（拿着按键的模块）、`hidden`（一个列表）、`zoomed` 和 `marked`（某个模块，或者什么都没有）、`floating`（浮动窗口，从下往上，只在有浮动窗口时出现；便笺浮动窗口带 `scratch = true`）、`workspace`（你所在工作区的名字）和 `workspaces`（所有名字，按顺序）。固定高度的底部行不会写进这张表；默认的形状会自己恢复底部行的高度。在布局正被修改的过程中调用它会停下并给出信息，而不是读到改了一半的东西。
 
-**`eitri.layout.default` 和 `get()` 用的形状。** 一张表以 `"row"` 或 `"column"` 开头（两个或更多子项，左右并排 / 上下叠放），或者以 `"tabbed"` 或 `"stacked"` 开头（一个或更多子项，同一时刻显示一个，上面是一行标题 / 每个子项各一行标题）。子项是一个模块名，后面可以跟它在容器里的份额作为第二项（`{ "editor", 0.6 }`），也可以是它自己的一张表，份额写成 `share = 0.4`。没有份额的子项平分其余的部分；每个份额在 0.05 到 1 之间，加起来为 1。标签页式或堆叠式的表上，`active = 2` 指明显示哪个子项（从 1 数起，默认第一个）。编号的终端（`terminal#2` 到 `terminal#9`）可以作为子项，如下面的例子，窗口会在它显示出来后给它自己的 shell。拼错的字段会让启动停下，并点出这个字段。一个包含各种容器的例子：
+- **`eitri.layout.float(id, rect?)`** 把那个模块浮起来：放在 `rect`（`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`：中心是窗口的一个比例，大小以像素计，包括那条栏）；没有就用它上次浮动的矩形；再没有就居中、占窗口的 60%。对一个已经浮动的模块，它把它移到 `rect`。编辑器从不浮动。和 `<prefix> Alt+Shift+Space` 一样，它会拒绝视野里最后一个平铺模块。
+- **`eitri.layout.workspace(name, tree)`** 只能在 `init.lua` 里用，按 `default` 接受的形状定义一个工作区。窗口里没有保存过同名工作区时就得到它，排在已保存的之后，按调用的先后顺序；`main` 属于 `eitri.layout.default`，在这里会被拒绝。用这种方式定义的工作区，你在窗口里删除或重命名之后，**下次启动会从它的定义里回来**，所以要彻底去掉一个，就去掉它的调用。没有定义的工作区，删除或重命名之后保持原样。
+- **`eitri.layout.switch(name)`** 去那个工作区，没有就先建：按它的定义，没有定义就复制你现在的排布。`eitri.layout.run("workspace.switch", { name = "study" })` 是一样的。`workspace.choose` 和 `workspace.rename` 要等一个键或等输入，所以 `run` 拒绝它们。
+
+**`eitri.layout.default` 和 `get()` 用的形状。** 一张表以 `"row"` 或 `"column"` 开头（两个或更多子项，左右并排 / 上下叠放），或者以 `"tabbed"` 或 `"stacked"` 开头（一个或更多子项，同一时刻显示一个，上面是一行标题 / 每个子项各一行标题）。子项是一个模块名，后面可以跟它在容器里的份额作为第二项（`{ "editor", 0.6 }`），也可以是它自己的一张表，份额写成 `share = 0.4`。没有份额的子项平分其余的部分；每个份额在 0.05 到 1 之间，加起来为 1。标签页式或堆叠式的表上，`active = 2` 指明显示哪个子项（从 1 数起，默认第一个）。编号的终端（`terminal#2` 到 `terminal#9`）可以作为子项，如下面的例子，窗口会在它显示出来后给它自己的 shell。拼错的字段会让启动停下，并点出这个字段。最外层的表（容器里面的不行）还可以带 `floating`，一个由 `{ "module", cx = 0.5, cy = 0.5, w = 600, h = 400, scratch = true }` 组成的列表，从下往上：`cx` 和 `cy` 在 0 到 1 之间，`w` 和 `h` 是 1 到 16384 的整数像素，`scratch`（不写就是 false）让这个浮动窗口一开始就是收起的。编辑器留在树里；agent 面板可以浮动；一个模块要么在树里、要么在列表里，不会两处都在。一个包含各种容器的例子：
 
 ```lua
 eitri.layout.default({
@@ -100,6 +104,9 @@ eitri.layout.default({
   { "editor", 0.55 },
   { "tabbed", { "agent" }, { "terminal" }, { "terminal#2" }, active = 1 },
 })
+
+eitri.layout.workspace("study", { "row", { "editor", 0.6 }, { "agent" },
+  floating = { { "terminal#2", cx = 0.5, cy = 0.5, w = 900, h = 420, scratch = true } } })
 ```
 
 **在终端所在目录开始的分割。** `split.right` 和 `split.below` 接受 `cwd = "pane"`，它让新终端的 shell 在你分割的那个终端所在的目录里启动（按键按下时从那个 shell 读取）。那个 shell 已经结束、读不到它的目录，或者按键是在不是终端的模块里按的，新的 shell 就在项目根目录启动。不带这个选项，或者 `cwd = "start"`，新的 shell 在项目根目录启动。
@@ -112,6 +119,8 @@ k.set("prefix", "-", "split.below", { cwd = "pane" })
 tmux 导入开着时，带 `-c "#{pane_current_path}"` 的 `split-window` 绑定会变成同样的 `cwd = "pane"`。别的 `-c` 值不会被导入：这个绑定照样能用，它的新 shell 在项目根目录启动。
 
 **布局保存在哪里。** Eitri 记住每个项目的布局，每个工作区一份，保存在状态目录（见下面的 `XDG_STATE_HOME`）里 `eitri/layout/` 下的 `<hash>.v2.json`。有容器之前的那个文件 `<hash>.json`，只在还没有 `.v2.json` 时读一次，之后原封不动地留着，逐字节不变，所以同一个项目上较旧的 Eitri 继续用它自己的文件。旁边的 `<hash>.v2.json.partial` 保存着这个版本只能用上一部分的文件的原件（读成一行的未知容器种类、它放不下的模块、它不认识的键），在第一次保存之前复制好，什么都不会丢；`<hash>.v2.json.unusable` 是它完全无法使用的文件（不是 JSON、属于别的项目、没有它能读的工作区），在写入新文件之前先被放到一边。文件里这个版本不认识的键会原样写回。
+
+文件里的一个工作区可以带 `floating`（它的浮动窗口，从下往上，每个有 `module`、`cx`、`cy`、`w`、`h` 和 `scratch`）和 `float_memory`（每个浮动过的模块最后一次的矩形，按模块排列）；两者只在不为空时才写，所以没有浮动窗口的布局，写出的文件和浮动窗口出现之前的版本写的一样。读它的版本用不了的条目会被丢弃并留一条说明，原件复制到 `<hash>.v2.json.partial`。**浮动窗口出现之前的版本**（有容器和工作区、但没有浮动窗口的那个构建）把这两个键当作它不认识的键。只有**一个工作区**、而且浮动窗口是任何平铺树都没有的编号终端（`terminal#2` 等等）时，它会把它们原样保留，保留它们的编号，并写回，所以这个版本能再找到它们；被收起的便笺浮动窗口会变成显示着的。当某个浮动窗口点名的是那个版本自己会放置的模块时——基础的 `terminal`、聊天、任何模块的记忆矩形，或者在有**两个或更多工作区**时的任何浮动终端（那个版本把它隐藏在其他工作区的编辑器下面）——它会丢弃这些浮动窗口，把这些模块以平铺的方式打开（基础终端在编辑器下面），并先把文件复制到 `.v2.json.partial`。丢掉的只是浮动窗口的位置，不会丢任何模块。这个版本之后会把它们以平铺的方式打开，位置留在那份复制里。
 
 <a id="how-a-launch-starts"></a>
 ## 一次启动怎样开始

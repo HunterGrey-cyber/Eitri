@@ -70,7 +70,7 @@ The layout file's format is unchanged by this section (the next one changes it).
   `H`, `J` and `K`.
 - **A Lua panel keyed `H`, `J` or `K`** now fails at startup with `Bound`; these three were free to panels before.
   Pick another key from the documented free list.
-- `L` is deliberately not bound.
+- `L` is not bound by this section; the floats and workspaces section below binds it to the last workspace.
 
 ## Window layout: containers and terminals (added after 0.2.2)
 
@@ -110,6 +110,47 @@ this build: `instance.new { kind = "agent" }` flashes `chat views: not in this b
   aside before a new one is written). Keys it does not know are written back unchanged, so a later build's data
   survives a save here. Downgrading is safe for the same reason; what you arranged with containers is not seen by
   the older version.
+
+## Window layout: floats, the scratchpad and workspaces (added after 0.2.2)
+
+- **Floats.** A module can float over the others, in a rectangle of its own with a bar across its top edge and a grip
+  at its corner: drag the bar to move it, the grip to size it. The editor never floats. `<prefix> M-S-Space` floats
+  the module with the keys or, on a float, puts it back into the tiling.
+- **The scratchpad.** `<prefix> M-_` sends a module there and `<prefix> M--` shows it, puts it away or cycles through
+  several. `eitri.keymap.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })` makes a drop-down terminal.
+- **Workspaces.** A window holds several named arrangements of the same modules: `(` and `)` step through them, `L`
+  goes to the last one (tmux's `switch-client -l`), `s` chooses (digits, `c` to make a copy, `x` to delete), `$`
+  renames. `eitri.layout.workspace(name, tree)` defines one in `init.lua`, `eitri.layout.switch(name)` goes to one,
+  and `eitri.layout.float(id, rect?)` floats a module from Lua.
+- **A chat under a float** shows its `agent ⚑N` chip and refuses card answers until the float is put away or moved;
+  the message names the float and the key.
+- Without a key, by name only: `focus.mode-toggle`, `workspace.new`, `workspace.switch`.
+
+| key after the prefix | action | from |
+|---|---|---|
+| `M-S-Space` | `float.toggle` | i3 `floating toggle` |
+| `M--` | `scratchpad.show` | i3 `scratchpad show` |
+| `M-_` | `scratchpad.move` | i3 `move scratchpad` |
+| `(` / `)` | `workspace.prev` / `workspace.next` | tmux `switch-client -p` / `-n` |
+| `L` | `workspace.last` | tmux `switch-client -l` |
+| `s` | `workspace.choose` | tmux `choose-tree -s` |
+| `$` | `workspace.rename` | tmux's `rename-session` prompt |
+
+**What this can break:**
+- **A `set` over any of these keys stops startup.** If your `init.lua` sets `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`,
+  `s` or `$` in the prefix table, put `k.del("prefix", "<key>")` before that `set` (a loop that sets `H`, `J`, `K`
+  and `L` to the swaps needs `k.del("prefix", "L")` as well as the three it already has). With the tmux import on and
+  your tmux configuration binding the key, no `del` is needed. A `del` of a key that is not bound also stops startup,
+  so on a version without these defaults the `del` lines stop the launch: add them when you upgrade, not before.
+- **`L` now switches workspaces.** It was free before; with one workspace it flashes.
+- **The layout file gains two keys**, `floating` and `float_memory`, written inside a workspace only when they are not
+  empty, so a layout without floats writes the file the version before floats wrote. That version keeps a one-workspace
+  file's floats of numbered terminals (`terminal#2` and so on) as they were. When a float names a module it places
+  itself -- the base terminal, the chat, or, with two or more workspaces, any floating terminal -- it drops the floats,
+  opens those modules tiled and copies the file to `<hash>.v2.json.partial` first: float positions can be lost that way,
+  never a module.
+- **A workspace defined by `eitri.layout.workspace` comes back** from its definition at the next launch if you delete
+  or rename it in the window; remove its call from `init.lua` to remove it for good.
 
 ## Upgrading from 0.2.1
 

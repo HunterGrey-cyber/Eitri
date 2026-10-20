@@ -261,6 +261,9 @@ fn default_bindings() -> Vec<Binding> {
         },
         false,
     );
+    bind("M-S-Space", Action::FloatToggle, false);
+    bind("M--", Action::ScratchpadShow { module: None }, false);
+    bind("M-_", Action::ScratchpadMove, false);
     bind(
         "%",
         Action::Split {
@@ -309,6 +312,11 @@ fn default_bindings() -> Vec<Binding> {
     bind("m", Action::MarkToggle, false);
     bind("M", Action::MarkClear, false);
     bind("q", Action::SelectNumber, false);
+    bind("(", Action::WorkspaceStep { forward: false }, false);
+    bind(")", Action::WorkspaceStep { forward: true }, false);
+    bind("L", Action::WorkspaceLast, false);
+    bind("s", Action::WorkspaceChoose, false);
+    bind("$", Action::WorkspaceRename, false);
 
     bind("x", Action::ModuleKill, false);
     bind("c", Action::Tab(TabAction::New), false);
@@ -404,7 +412,10 @@ impl TmuxImport {
 fn is_tmux_action(action: &Action) -> bool {
     matches!(
         action,
-        Action::SendPrefix
+        Action::WorkspaceStep { .. }
+            | Action::WorkspaceLast
+            | Action::WorkspaceChoose
+            | Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Split { .. }
             | Action::Zoom
@@ -831,6 +842,43 @@ pub fn check_command_keybinding(command: &str, keybinding: &str, keymap: &Keymap
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_float_and_workspace_defaults() {
+        let map = Keymap::defaults();
+        let bound = |key: &str| {
+            map.lookup(&KeySpec::parse(key).unwrap())
+                .map(|b| (b.action.clone(), b.repeatable))
+        };
+        assert_eq!(bound("M-S-Space"), Some((Action::FloatToggle, false)));
+        assert_eq!(bound("M--"), Some((Action::ScratchpadShow { module: None }, false)));
+        assert_eq!(bound("M-_"), Some((Action::ScratchpadMove, false)));
+        assert_eq!(bound("("), Some((Action::WorkspaceStep { forward: false }, false)));
+        assert_eq!(bound(")"), Some((Action::WorkspaceStep { forward: true }, false)));
+        assert_eq!(bound("L"), Some((Action::WorkspaceLast, false)));
+        assert_eq!(bound("s"), Some((Action::WorkspaceChoose, false)));
+        assert_eq!(bound("$"), Some((Action::WorkspaceRename, false)));
+        for (key, stock) in [
+            ("(", "switch-client"),
+            (")", "switch-client"),
+            ("L", "switch-client"),
+            ("s", "choose-tree"),
+            ("$", "command-prompt"),
+        ] {
+            assert_eq!(
+                crate::keymap::stock::stock_command(&KeySpec::parse(key).unwrap()),
+                Some(stock),
+                "{key} is stock tmux's {stock}"
+            );
+        }
+        for unbound in [
+            Action::FocusModeToggle,
+            Action::WorkspaceNew,
+            Action::WorkspaceSwitch { name: "main".into() },
+        ] {
+            assert!(map.keys_for(&unbound).is_empty(), "{unbound:?} has no default key");
+        }
+    }
+
     use super::*;
     use crate::keymap::stock::{STOCK_PREFIX, STOCK_TMUX_PREFIX};
 
@@ -868,6 +916,9 @@ mod tests {
         ("M-a", "focus.parent", false),
         ("M-d", "focus.child", false),
         ("M-Enter", "instance.new kind=terminal", false),
+        ("M-S-Space", "float.toggle", false),
+        ("M--", "scratchpad.show", false),
+        ("M-_", "scratchpad.move", false),
         ("%", "split.right", false),
         ("\"", "split.below", false),
         ("z", "zoom", false),
@@ -903,6 +954,11 @@ mod tests {
         ("m", "mark.toggle", false),
         ("M", "mark.clear", false),
         ("q", "select.number", false),
+        ("(", "workspace.prev", false),
+        (")", "workspace.next", false),
+        ("L", "workspace.last", false),
+        ("s", "workspace.choose", false),
+        ("$", "workspace.rename", false),
         ("x", "module.kill", false),
         ("c", "tab.new", false),
         ("n", "tab.next", false),
@@ -993,9 +1049,36 @@ mod tests {
         // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
         // bindings), so they need no entry here even though Eitri's action differs from tmux's.
         // `H J K` are vim's `<C-w>H/J/K`; the Alt chords are i3's `$mod` chords after the prefix.
-        const EITRI_ONLY: [&str; 24] = [
-            "C-l", "C-h", "C-j", "C-k", "F11", "e", "a", "C-=", "C-+", "C--", "C-0", "M-e", "H", "J", "K", "M-H",
-            "M-J", "M-K", "M-L", "M-w", "M-s", "M-a", "M-d", "M-Enter",
+        // The float and scratchpad chords are i3's `$mod+Shift+space`, `$mod+minus` and
+        // `$mod+Shift+minus` after the prefix.
+        const EITRI_ONLY: [&str; 27] = [
+            "C-l",
+            "C-h",
+            "C-j",
+            "C-k",
+            "F11",
+            "e",
+            "a",
+            "C-=",
+            "C-+",
+            "C--",
+            "C-0",
+            "M-e",
+            "H",
+            "J",
+            "K",
+            "M-H",
+            "M-J",
+            "M-K",
+            "M-L",
+            "M-w",
+            "M-s",
+            "M-a",
+            "M-d",
+            "M-Enter",
+            "M-S-Space",
+            "M--",
+            "M-_",
         ];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();
@@ -1433,9 +1516,10 @@ mod tests {
                 "{name} has no default key"
             );
         }
-        assert!(
-            map.lookup(&k("L")).is_none(),
-            "L stays unbound until it can keep tmux's meaning"
+        assert_eq!(
+            map.lookup(&k("L")).unwrap().action,
+            Action::WorkspaceLast,
+            "L keeps tmux's switch-client -l"
         );
     }
 

@@ -285,6 +285,25 @@ its composer (see [the composer's keys](keys.md)): the names and descriptions ar
 whose agent has reported none has no menu. `prefix i` has a `context` row,
 which shows how full the agent's context is once the agent reports it. Tokens come without a cost.
 
+## A chat under a float
+
+The agent panel can sit under a [float](keys.md#floats-the-scratchpad-and-workspaces) (a terminal in the scratchpad,
+say). A chat that a float covers by any amount is still running, and it is treated as covered rather than shown:
+
+- **Its chip is back in the top bar.** While a card waits it reads `agent ⚑N`, as it does when the chat is hidden.
+  A turn that finishes while it is covered leaves `agent •`, which goes once the float is off the chat.
+- **A card cannot be answered from it.** A card answer from the covered page (`a`, `d`, `D`, `Ctrl+y`, a button),
+  or the `y` that enters bypass mode, is refused and the card stays waiting. The app name flashes, and the toast and
+  the page say which float covers it and the key that clears it, pressed with the keys in that float:
+  `agent is under terminal 2: <prefix> Alt+- from terminal 2 stows it` for a scratch float, `agent is under
+  terminal: <prefix> Alt+Shift+Space from terminal sinks it` for any other (the action's name when it has no key).
+  From the chat, the first `<prefix> Alt+-` moves the keys into a shown scratch float and the second stows it. The
+  check is made when you answer, against where the floats are then, so the answer goes through the moment the
+  float has moved off or been put away.
+- **With `modules.chat.on_permission = "reveal"`**, a new card puts away the scratch floats that cover the chat,
+  except the one that has the keys (the keys do not move). A float that still covers the
+  chat after that, or any cover with the default `"badge"`, gets the badge and the toast.
+
 ## Known limits
 
 - **What the agent runs without asking is the agent's own business.** For Codex the list is under

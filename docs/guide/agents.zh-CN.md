@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=248c075172084cc6f17ac65fef0a471421ae3ea067514df301934b7f1fd03315 -->
+<!-- translated-from: agents.md sha256=23de91a33ad74aa94ee464c8b3ffc6eb72195d37715c4c37a9c8aaff97d40f73 -->
 
 # Codex 与其他 agent
 
@@ -168,6 +168,14 @@ Eitri 的 Auto 和 Bypass 是 Eitri 自己的：它们立即决定 Eitri 怎样�
 ACP 没有办法把消息插进正在运行的回合，所以回合运行时按 `Enter`，消息会留到回合结束再发。ACP agent 可能发来的计划、会话标题和其他更新都不显示；这类标签页没有速率限制、没有上下文条，也没有模型选择器。agent 报告的命令列表就是输入框里的 `/` 菜单（见[输入框的按键](keys.zh-CN.md)）：名字和说明都按纯文本绘制，agent 还没报告过命令的标签页没有菜单。agent 报告上下文有多满时，`prefix i` 有一行 `context`，agent 报告之后它显示 agent 的上下文有多满。token 不带费用。
 
 <a id="known-limits"></a>
+## 浮动窗口下面的聊天
+
+agent 面板可以放在一个[浮动窗口](keys.zh-CN.md#floats-the-scratchpad-and-workspaces)下面（比如便笺板里的一个终端）。聊天只要被某个浮动窗口盖住了任何一点，它仍在运行，但按“被盖住”处理，而不是按“显示着”处理：
+
+- **它在顶栏里的芯片回来了。** 有卡片等着时读作 `agent ⚑N`，和聊天被隐藏时一样。被盖住时结束的一轮会留下 `agent •`，浮动窗口离开聊天后它才消失。
+- **不能在它上面回答卡片。** 在被盖住的页面上回答卡片（`a`、`d`、`D`、`Ctrl+y`、按钮），或者按进入 bypass 模式的 `y`，都会被拒绝，卡片继续等着。应用名会闪一下，提示和页面会说是哪个浮动窗口盖住了它，以及怎样解除（按键要在那个浮动窗口里时按）：便笺浮动窗口读作 `agent is under terminal 2: <prefix> Alt+- from terminal 2 stows it`，其他浮动窗口读作 `agent is under terminal: <prefix> Alt+Shift+Space from terminal sinks it`（没有键时写动作的名字）。在聊天里按时，第一次 `<prefix> Alt+-` 把按键移进一个显示着的便笺浮动窗口，第二次才把它收起。检查是在你回答的那一刻、按浮动窗口当时的位置做的，所以浮动窗口一挪开或被收起，回答立刻就能通过。
+- **`modules.chat.on_permission = "reveal"` 时**，新来的卡片会收起盖住聊天的便笺浮动窗口，拿着按键的那个除外（按键不动）。这之后仍盖着聊天的浮动窗口，或者默认的 `"badge"` 下的任何遮盖，只得到芯片和提示。
+
 ## 已知限制
 
 - **agent 不经询问运行什么，是 agent 自己的事。** 对 Codex，清单在[Codex 不经询问做什么](#what-codex-does-without-asking)下。对 ACP agent，Eitri 会显示它收到的每个请求，但 agent 因为自己的模式已经允许某个动作而根本没发出的请求，永远不会到你这里。

@@ -18,6 +18,15 @@ use super::tree::{Axis, Branch, Layout, LayoutError, MAX_RATIO, MIN_RATIO};
 ///
 /// Refuses a module equal to `target`, or a target absent from the tree or hidden.
 pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Axis) -> Result<(), LayoutError> {
+    let anchor;
+    let target = if layout.is_floating(target) {
+        anchor = layout
+            .tiled_anchor()
+            .ok_or_else(|| LayoutError::Floating(target.clone()))?;
+        &anchor
+    } else {
+        target
+    };
     if module == target {
         return Err(LayoutError::SameModule(module.clone()));
     }
@@ -82,6 +91,7 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
             Node::split(axis, 0.5, target, Node::Leaf(module.clone()))
         });
     }
+    layout.take_float(module);
     layout.unzoom();
     layout.replace_root(root);
     layout.unhide(module);
@@ -95,6 +105,9 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
 /// module that way nothing happens and a zoom stays on (the rule `resize` follows). The neighbour,
 /// if they swapped.
 pub fn swap(layout: &mut Layout, focused: &ModuleId, dir: Direction, frame: &Frame) -> Option<ModuleId> {
+    if layout.is_floating(focused) {
+        return None;
+    }
     let Nav::Module(other) = navigate(layout, focused, dir, frame) else {
         return None;
     };
@@ -144,6 +157,9 @@ pub(super) fn even_chain(axis: Axis, items: Vec<Node>, shown: usize) -> Node {
 /// wrapping. Every split keeps its axis, ratio and pin, as `swap` does. `None`, and nothing moves,
 /// for a hidden `focused` or one alone on screen.
 pub fn swap_adjacent(layout: &mut Layout, focused: &ModuleId, forward: bool) -> Option<ModuleId> {
+    if layout.is_floating(focused) {
+        return None;
+    }
     let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_in_view(id)).collect();
     let at = shown.iter().position(|id| id == focused)?;
     if shown.len() < 2 {

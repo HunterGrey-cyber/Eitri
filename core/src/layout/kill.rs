@@ -80,7 +80,7 @@ pub fn can_kill(layout: &Layout, id: &ModuleId) -> Result<KillScope, LayoutError
     if layout.is_gone(id) {
         return Err(LayoutError::Gone(id.clone()));
     }
-    let others_shown = layout.leaves().iter().any(|m| m != id && layout.is_shown(m));
+    let others_shown = layout.modules().iter().any(|m| m != id && layout.is_shown(m));
     if layout.is_shown(id) && !others_shown {
         return Ok(KillScope::Window);
     }
@@ -105,6 +105,7 @@ pub fn kill(
     let next = hide(layout, id, frame)?;
     match reopen {
         Reopen::At(placement) => {
+            layout.take_float(id);
             let root = layout
                 .root_node()
                 .without(id)
