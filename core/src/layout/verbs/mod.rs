@@ -67,6 +67,15 @@ fn apply(layout: &mut Layout, root: Node) {
     layout.replace_root(root);
 }
 
+fn wrap_far(unit: Node, rest: Node, dir: Direction) -> Node {
+    match dir {
+        Direction::Left => Node::split(Axis::Row, 1.0 - RIGHT_OF_ROOT_SHARE, unit, rest),
+        Direction::Right => Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, rest, unit),
+        Direction::Up => Node::split(Axis::Column, 1.0 - BELOW_ROOT_SHARE, unit, rest),
+        Direction::Down => Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, rest, unit),
+    }
+}
+
 pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &Frame) -> Result<bool, LayoutError> {
     if !layout.contains(target) {
         return Err(LayoutError::NotInTree(target.clone()));
@@ -77,12 +86,7 @@ pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &
     if layout.is_floating(target) {
         let unit = Node::Leaf(target.clone());
         let rest = layout.root_node();
-        let root = match dir {
-            Direction::Left => Node::split(Axis::Row, 1.0 - RIGHT_OF_ROOT_SHARE, unit, rest),
-            Direction::Right => Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, rest, unit),
-            Direction::Up => Node::split(Axis::Column, 1.0 - BELOW_ROOT_SHARE, unit, rest),
-            Direction::Down => Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, rest, unit),
-        };
+        let root = wrap_far(unit, rest, dir);
         layout.take_float(target);
         apply(layout, root);
         return Ok(true);
@@ -162,12 +166,7 @@ pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &
         .iter()
         .try_fold(tree.clone(), |rest, id| rest.without(id))
         .expect("another module is shown, so it is still in the tree");
-    let root = match dir {
-        Direction::Left => Node::split(Axis::Row, 1.0 - RIGHT_OF_ROOT_SHARE, unit, rest),
-        Direction::Right => Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, rest, unit),
-        Direction::Up => Node::split(Axis::Column, 1.0 - BELOW_ROOT_SHARE, unit, rest),
-        Direction::Down => Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, rest, unit),
-    };
+    let root = wrap_far(unit, rest, dir);
     apply(layout, root);
     Ok(true)
 }

@@ -1,17 +1,33 @@
-//! Rebuilds a file's or Lua default's layout against the modules this window actually has.
+//! A layout from the state file or `init.lua`'s `eitri.layout.default`, rebuilt against the
+//! modules this window actually has.
 //!
-//! 1. Filters floats in order: the editor stays tiled, unknown modules and tiled duplicates leave,
+//! What it does, in order:
+//! 1. Filters floats: the editor stays tiled, unknown modules and tiled duplicates leave,
 //!    repeated floats keep their first entry, and invalid rectangles are clamped with a note.
-//! 2. Prunes unknown tree leaves and shows an editor left alone after its replacement disappears.
-//!    The editor must remain tiled; the chat must be tiled or floating.
-//! 3. Pins a Lua default's bottom rows as a first launch would. A file keeps its own pins.
+//! 2. Drops every leaf this window has no module for, such as a Lua panel no longer registered,
+//!    and its sibling takes the space as a hidden module's does. A hidden editor left alone
+//!    after its replacement panel disappears is shown again: otherwise the window would open
+//!    without nvim until the editor's module key was pressed. The cost is that an editor hidden
+//!    by hand whose only neighbour was a panel since removed comes back too; the note says so.
+//!    Refuses a layout without the tiled editor or without the chat in either layer, since every
+//!    window has both and the caller must fall back to the default if either is missing.
+//! 3. **`init.lua`'s default only** ([`reconcile_default`]): pins a full-width bottom row a first
+//!    launch would have pinned, such as a Lua bottom panel or an explicitly placed terminal.
+//!    `init.lua` has no way to say "pin", and these rows should keep their useful height when
+//!    the window grows. A file keeps its own pins: a row the user unpinned must reopen unpinned.
 //! 4. Places missing terminals, instances and registered Lua panels as a first launch would,
-//!    skipping every module already floating.
-//! 5. Keeps hidden state and float memory only for remaining modules. The editor has no float memory.
-//! 6. Keeps a shown saved focus, otherwise choosing the editor, a Lua panel in its place, or the
-//!    first module in view. Tab containers keep their drawn child when choosing that first focus.
+//!    skipping modules already floating. The base terminal goes hidden below the editor's own
+//!    leaf; registered Lua panels follow their declared positions.
+//! 5. Keeps hidden state only for modules still present and float memory only for remaining
+//!    modules other than the editor.
+//! 6. Gives the keys to a shown saved focus, otherwise where a first launch gives them: the
+//!    editor, else the first registered Lua panel placed in its place, else the first module
+//!    in view. Tabbed and stacked containers keep their drawn child, so choosing focus never
+//!    switches tabs. A Lua default has no saved focus; its first leaf need not be the editor:
+//!    `{ 'row', {'agent', 0.4}, {'editor'} }` should still open with nvim taking the keys.
 //!
-//! Every adjustment produces a note so callers can explain why the layout changed.
+//! Every adjustment produces a note so the caller can explain why the window did not reopen
+//! exactly as it was left.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

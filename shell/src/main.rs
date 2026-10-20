@@ -1377,6 +1377,34 @@ fn build_ui(
             Err(_) => true,
         }));
     }
+    // `prefix ?` and `prefix :` open something in the chat and give it the keys: under a float the
+    // sheet or the line would be out of sight while every key went to it. Scratch floats over the chat
+    // that do not hold the keys are put away first, as for a card that reveals; a float still over it
+    // refuses the key with the text a card answer gets. `None` when the chat can take the keys in view.
+    let chat_covered_refusal: Rc<dyn Fn() -> Option<String>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let title = module_title.clone();
+        let give_keys = give_keys.clone();
+        let stow_key = key_text(&keymap, &Action::ScratchpadShow { module: None });
+        let sink_key = key_text(&keymap, &Action::FloatToggle);
+        Rc::new(move || {
+            let chat = ModuleId::agent();
+            if module_layout.borrow().is_floating(&chat) {
+                // Taking the keys raises a floating chat over every other float.
+                return None;
+            }
+            if !reveal_covered_chat(&grid, &module_layout, &*give_keys) {
+                return None;
+            }
+            let layout = module_layout.borrow();
+            let top = chat_covering(&grid, &layout).last().cloned()?;
+            let scratch = layout.float_of(&top).is_some_and(|float| float.scratch);
+            drop(layout);
+            let key = if scratch { &stow_key } else { &sink_key };
+            Some(covered_text(&title(&chat), &title(&top), key, scratch))
+        })
+    };
     // `show_on_screen` restores `id` where it was hidden and leaves keyboard focus
     // where it is. Lua show calls and module keys for hidden modules use this path.
     // End a zoom first if it would hide `id`, so a successful show puts it on screen.
@@ -2293,9 +2321,14 @@ fn build_ui(
         let workspaces = workspaces.clone();
         let decls = decls.clone();
         let focus_module = focus_module.clone();
+        let keys_return = keys_return.clone();
         Rc::new(move |to| {
             let switched = grid.switch_workspace(&workspaces, to, &decls, &*focus_module)?;
             if switched {
+                // What an open `?` sheet would give back -- the module the keys came from, the chat to
+                // hide, the zoom to put back -- belongs to the workspace left behind: closing the sheet
+                // here must not act on it.
+                keys_return.borrow_mut().superseded();
                 println!("[workspace] switched to {to}");
             }
             Ok(switched)
@@ -2405,6 +2438,7 @@ fn build_ui(
         let on_waiting = on_waiting.clone();
         let keymap_plugins = plugin_panels.clone();
         let keys_return = keys_return.clone();
+        let chat_covered_refusal = chat_covered_refusal.clone();
         let workspaces = workspaces.clone();
         let switch_workspace = switch_workspace.clone();
         let switch_or_make = switch_or_make.clone();
@@ -2704,6 +2738,21 @@ fn build_ui(
                         refuse(&refused_name, &toast, &err);
                         return;
                     }
+                    if let Some(text) = chat_covered_refusal() {
+                        // Nothing opens, so what showing the chat changed is put back.
+                        if showed_sheet {
+                            if let Err(err) = grid.hide_module(&chat, &*focus_module) {
+                                eprintln!("[keys_return] could not hide {chat} again: {err}");
+                            }
+                        }
+                        if let (Some(zoom), Some(keeps)) = (&zoom_before, &from) {
+                            if module_layout.borrow().zoom().is_none() {
+                                grid.restore_zoom(zoom, keeps);
+                            }
+                        }
+                        refuse_text(&refused_name, &toast, &text);
+                        return;
+                    }
                     // Showing the chat ended a zoom that hid it; giving it the keys below chooses its tab if
                     // that tab is not drawn, which ends any zoom left (a container's that holds the chat).
                     let ended_zoom = {
@@ -2731,6 +2780,10 @@ fn build_ui(
                     let chat = ModuleId::agent();
                     if let Err(err) = show_on_screen(&chat) {
                         refuse(&refused_name, &toast, &err);
+                        return;
+                    }
+                    if let Some(text) = chat_covered_refusal() {
+                        refuse_text(&refused_name, &toast, &text);
                         return;
                     }
                     // A close of the `?` sheet may still be on its way from the page: the command line is
@@ -3310,7 +3363,7 @@ fn build_ui(
                     println!("[workspace] renamed to {to}");
                     workspaces_changed();
                 }
-                Err(err) => refuse_text(&refused_name, &toast, &rename_refusal(&err)),
+                Err(err) => refuse_text(&refused_name, &toast, &err.to_string()),
             }
         });
         let keys = EventControllerKey::new();
@@ -4119,15 +4172,6 @@ fn wait_needs_the_top_bar(waiting: prefix::Waiting) -> bool {
     matches!(waiting, prefix::Waiting::Workspace { .. })
 }
 
-/// What a refused rename says. A name already taken is said as a rename's refusal; the rest are
-/// the workspaces' own words.
-fn rename_refusal(err: &WorkspaceError) -> String {
-    match err {
-        WorkspaceError::Duplicate(name) => format!("a workspace is already named '{name}'"),
-        other => other.to_string(),
-    }
-}
-
 /// What a request for a second chat view says: the id parses, but this build cannot make one.
 const CHAT_VIEWS_REFUSED: &str = "chat views: not in this build";
 
@@ -4308,16 +4352,6 @@ mod tests {
         ] {
             assert!(!wait_needs_the_top_bar(waiting), "{waiting:?}");
         }
-    }
-
-    /// A rename to a name another workspace has says so as a rename; other refusals keep their words.
-    #[test]
-    fn a_rename_to_a_taken_name_says_the_name_is_taken() {
-        assert_eq!(
-            rename_refusal(&WorkspaceError::Duplicate("study".into())),
-            "a workspace is already named 'study'"
-        );
-        assert_eq!(rename_refusal(&WorkspaceError::Main), WorkspaceError::Main.to_string());
     }
 
     /// A workspace made by name with no definition in `init.lua` is a copy of the current arrangement;

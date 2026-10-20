@@ -2850,6 +2850,10 @@ mod tests {
             [float("terminal#2", rect(1.0, 0.0, 400, 300), false)]
         );
         assert_eq!(back.keep_copy, None);
+        file["workspaces"][0]["floating"][0]["cx"] = json!(-1e40);
+        let back = decode_v2(&file.to_string(), &root(), &[]).unwrap();
+        assert_eq!(back.current.floats()[0].rect.cx, 0.0);
+        assert_eq!(back.keep_copy, None);
     }
 
     /// A float entry left out makes no instance: no workspace gets it as a hidden tile, and its number

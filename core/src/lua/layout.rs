@@ -1394,6 +1394,7 @@ mod tests {
         let error = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'terminal#1'} }").unwrap_err();
         assert!(error.contains("instance 1 is 'terminal'"), "{error}");
     }
+
     #[test]
     fn the_grammar_says_floating_at_the_top_of_the_tree() {
         let (lua, store) = engine();

@@ -842,43 +842,6 @@ pub fn check_command_keybinding(command: &str, keybinding: &str, keymap: &Keymap
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_float_and_workspace_defaults() {
-        let map = Keymap::defaults();
-        let bound = |key: &str| {
-            map.lookup(&KeySpec::parse(key).unwrap())
-                .map(|b| (b.action.clone(), b.repeatable))
-        };
-        assert_eq!(bound("M-S-Space"), Some((Action::FloatToggle, false)));
-        assert_eq!(bound("M--"), Some((Action::ScratchpadShow { module: None }, false)));
-        assert_eq!(bound("M-_"), Some((Action::ScratchpadMove, false)));
-        assert_eq!(bound("("), Some((Action::WorkspaceStep { forward: false }, false)));
-        assert_eq!(bound(")"), Some((Action::WorkspaceStep { forward: true }, false)));
-        assert_eq!(bound("L"), Some((Action::WorkspaceLast, false)));
-        assert_eq!(bound("s"), Some((Action::WorkspaceChoose, false)));
-        assert_eq!(bound("$"), Some((Action::WorkspaceRename, false)));
-        for (key, stock) in [
-            ("(", "switch-client"),
-            (")", "switch-client"),
-            ("L", "switch-client"),
-            ("s", "choose-tree"),
-            ("$", "command-prompt"),
-        ] {
-            assert_eq!(
-                crate::keymap::stock::stock_command(&KeySpec::parse(key).unwrap()),
-                Some(stock),
-                "{key} is stock tmux's {stock}"
-            );
-        }
-        for unbound in [
-            Action::FocusModeToggle,
-            Action::WorkspaceNew,
-            Action::WorkspaceSwitch { name: "main".into() },
-        ] {
-            assert!(map.keys_for(&unbound).is_empty(), "{unbound:?} has no default key");
-        }
-    }
-
     use super::*;
     use crate::keymap::stock::{STOCK_PREFIX, STOCK_TMUX_PREFIX};
 
@@ -1010,6 +973,43 @@ mod tests {
             out.push_str(&format!(" {name}={value}"));
         }
         out
+    }
+
+    #[test]
+    fn the_float_and_workspace_defaults() {
+        let map = Keymap::defaults();
+        let bound = |key: &str| {
+            map.lookup(&KeySpec::parse(key).unwrap())
+                .map(|b| (b.action.clone(), b.repeatable))
+        };
+        assert_eq!(bound("M-S-Space"), Some((Action::FloatToggle, false)));
+        assert_eq!(bound("M--"), Some((Action::ScratchpadShow { module: None }, false)));
+        assert_eq!(bound("M-_"), Some((Action::ScratchpadMove, false)));
+        assert_eq!(bound("("), Some((Action::WorkspaceStep { forward: false }, false)));
+        assert_eq!(bound(")"), Some((Action::WorkspaceStep { forward: true }, false)));
+        assert_eq!(bound("L"), Some((Action::WorkspaceLast, false)));
+        assert_eq!(bound("s"), Some((Action::WorkspaceChoose, false)));
+        assert_eq!(bound("$"), Some((Action::WorkspaceRename, false)));
+        for (key, stock) in [
+            ("(", "switch-client"),
+            (")", "switch-client"),
+            ("L", "switch-client"),
+            ("s", "choose-tree"),
+            ("$", "command-prompt"),
+        ] {
+            assert_eq!(
+                crate::keymap::stock::stock_command(&KeySpec::parse(key).unwrap()),
+                Some(stock),
+                "{key} is stock tmux's {stock}"
+            );
+        }
+        for unbound in [
+            Action::FocusModeToggle,
+            Action::WorkspaceNew,
+            Action::WorkspaceSwitch { name: "main".into() },
+        ] {
+            assert!(map.keys_for(&unbound).is_empty(), "{unbound:?} has no default key");
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub struct FloatRect {
     pub h: i32,
 }
 
+/// One module above the tiled tree, with its stored rectangle and scratchpad membership.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Float {
     pub id: ModuleId,
@@ -28,7 +29,7 @@ pub const DEFAULT_FLOAT_SHARE: f32 = 0.6;
 pub const MAX_FLOAT_PX: i32 = 16384;
 
 impl FloatRect {
-    /// Centred, with each side rounded to the nearest pixel.
+    /// Centred, with each side rounded to the nearest pixel and fitted to the stored ranges.
     pub fn centred(size: Size, share: f32) -> FloatRect {
         FloatRect {
             cx: 0.5,
@@ -36,6 +37,7 @@ impl FloatRect {
             w: (size.w as f32 * share).round() as i32,
             h: (size.h as f32 * share).round() as i32,
         }
+        .clamped()
     }
 
     /// Fits the rectangle into the grid without changing its stored size.
@@ -50,11 +52,20 @@ impl FloatRect {
     /// Stores the centre and size of a rectangle already placed in the grid.
     pub fn of_rect(rect: Rect, size: Size) -> FloatRect {
         FloatRect {
-            cx: (rect.x + rect.w / 2) as f32 / size.w as f32,
-            cy: (rect.y + rect.h / 2) as f32 / size.h as f32,
+            cx: if size.w > 0 {
+                (rect.x + rect.w / 2) as f32 / size.w as f32
+            } else {
+                0.5
+            },
+            cy: if size.h > 0 {
+                (rect.y + rect.h / 2) as f32 / size.h as f32
+            } else {
+                0.5
+            },
             w: rect.w,
             h: rect.h,
         }
+        .clamped()
     }
 
     pub fn is_valid(&self) -> bool {

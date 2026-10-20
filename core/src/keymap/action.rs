@@ -910,6 +910,9 @@ impl Action {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::keymap::table::Keymap;
+
     #[test]
     fn the_float_and_workspace_actions_parse_by_name_and_round_trip() {
         let cases: Vec<(&str, Action)> = vec![
@@ -1071,9 +1074,6 @@ mod tests {
             assert_eq!(action.on_a_float(), FloatRule::Acts, "{action:?}");
         }
     }
-
-    use super::*;
-    use crate::keymap::table::Keymap;
 
     #[test]
     fn module_actions_name_instances_before_lua_panels() {

@@ -286,6 +286,9 @@ impl ModuleGrid {
             kind != HostKind::Web || widget.is::<WebHost>(),
             "{id}: a web module's host must be a WebHost (web_host's module doc)"
         );
+        // A float may have been applied before its host existed. Its arrival must restore its
+        // z position even though the set of shown floats has not changed.
+        let needs_restack = self.imp().float_band.borrow().contains(&id);
         self.insert_in_band(&widget, Band::Host);
         let unrealized = Rc::new(Cell::new(0u32));
         {
@@ -310,6 +313,9 @@ impl ModuleGrid {
         if needs_handle {
             let handle = self.new_handle();
             self.imp().handles.borrow_mut().push(handle);
+        }
+        if needs_restack {
+            self.restack();
         }
     }
 
@@ -2666,6 +2672,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn adding_a_host_after_its_float_was_applied_restacks_it_above_every_tile() {
+        let terminal = ModuleId::terminal();
+        let agent = ModuleId::agent();
+        let floats = vec![terminal.clone(), agent.clone()];
+        let chrome = floats.clone();
+        let mut children = vec![
+            Slot::Host(ModuleId::editor()),
+            Slot::Handle(0),
+            Slot::Host(agent.clone()),
+            Slot::Chrome(0),
+            Slot::Chrome(1),
+        ];
+        children = apply_moves(&children, &restack_moves(&children, &floats, &chrome));
+        let float_band: BTreeSet<_> = floats.iter().cloned().collect();
+        assert!(!floats_need_restack(&float_band, &floats));
+        // The arriving host is parented below the handles, then add's restack restores its z position.
+        children.insert(1, Slot::Host(terminal.clone()));
+        assert!(float_band.contains(&terminal));
+        let result = apply_moves(&children, &restack_moves(&children, &floats, &chrome));
+        assert_eq!(
+            result,
+            vec![
+                Slot::Host(ModuleId::editor()),
+                Slot::Handle(0),
+                Slot::Host(terminal),
+                Slot::Chrome(0),
+                Slot::Host(agent),
+                Slot::Chrome(1)
+            ]
+        );
+        assert_restacked(&result, &floats, &chrome, "a float host added late");
     }
 
     /// Checks a drag inside a split that starts to the right of the grid's origin. The handle's

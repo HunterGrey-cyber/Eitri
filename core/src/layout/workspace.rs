@@ -33,13 +33,14 @@ pub struct Workspaces {
 }
 
 /// Keys of the state file this build does not know, carried verbatim so a save by this build does
-/// not drop what a later build keeps there (its overlays, say). In [`Workspaces`] a workspace
+/// not drop what a later build keeps there (a hypothetical `future_overlays` key, say). In [`Workspaces`] a workspace
 /// with no kept keys has no entry; read from a file (`persist::V2State`), every workspace the file
 /// holds has one, empty or not, which tells "the file has this workspace with no such keys" apart
 /// from "the file has no such workspace".
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Kept {
     pub top: Map<String, Value>,
+    /// Each workspace's unknown keys, such as a hypothetical `future_overlays`.
     pub per_workspace: BTreeMap<String, Map<String, Value>>,
 }
 
@@ -53,9 +54,14 @@ pub enum WorkspaceError {
     NoCurrent(String),
     /// The stored layouts are not exactly the workspaces other than the current one.
     Stored(String),
+    /// No workspace has the requested name.
     NoSuch(String),
+    /// The permanent main workspace cannot be renamed or deleted.
     Main,
+    /// The current workspace cannot be deleted until the window switches away.
     Current(String),
+    /// A rename or creation requested a name another workspace already owns.
+    Taken(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -75,6 +81,7 @@ impl fmt::Display for WorkspaceError {
                 "'{}' is the current workspace; switch away before deleting it",
                 printable(name)
             ),
+            WorkspaceError::Taken(name) => write!(f, "a workspace named '{}' already exists", printable(name)),
             WorkspaceError::Duplicate(name) => write!(f, "workspace '{name}' is named twice"),
             WorkspaceError::NoCurrent(name) => write!(f, "the current workspace '{name}' is not one of the workspaces"),
             WorkspaceError::Stored(name) => write!(
@@ -295,7 +302,7 @@ impl Workspaces {
     pub fn create(&mut self, name: &str, layout: Layout) -> Result<(), WorkspaceError> {
         Self::valid_name(name)?;
         if self.order.iter().any(|existing| existing == name) {
-            return Err(WorkspaceError::Duplicate(name.to_string()));
+            return Err(WorkspaceError::Taken(name.to_string()));
         }
         self.order.push(name.to_string());
         self.stored.insert(name.to_string(), layout);
@@ -332,7 +339,7 @@ impl Workspaces {
         }
         Self::valid_name(to)?;
         if self.order.iter().any(|name| name == to) {
-            return Err(WorkspaceError::Duplicate(to.to_string()));
+            return Err(WorkspaceError::Taken(to.to_string()));
         }
         for name in &mut self.order {
             if *name == self.current {
@@ -783,16 +790,45 @@ mod tests {
         assert_eq!(ws.order(), ["main", "study"]);
         assert_eq!(ws.kept_for("study").and_then(|m| m.get("future")), Some(&json!(1)));
         assert_eq!(ws.kept_for("2"), None);
-        assert_eq!(ws.rename_current("main"), Err(WorkspaceError::Duplicate("main".into())));
+        assert_eq!(ws.rename_current("main"), Err(WorkspaceError::Taken("main".into())));
+        assert_eq!(
+            ws.rename_current("main").unwrap_err().to_string(),
+            "a workspace named 'main' already exists"
+        );
         assert_eq!(ws.rename_current("a\nb"), Err(WorkspaceError::Name("a\nb".into())));
         assert_eq!(ws.rename_current("study"), Ok(()), "its own name again changes nothing");
         assert_eq!(Workspaces::single().rename_current("x"), Err(WorkspaceError::Main));
         assert_eq!(
             ws.create("study", live.clone()),
-            Err(WorkspaceError::Duplicate("study".into()))
+            Err(WorkspaceError::Taken("study".into()))
         );
         assert_eq!(ws.create("review", live), Ok(()));
         assert_eq!(ws.order(), ["main", "study", "review"]);
+    }
+
+    #[test]
+    fn taken_names_at_runtime_and_duplicate_names_in_input_have_distinct_text() {
+        let mut live = layout();
+        let mut ws = Workspaces::single();
+        ws.create("study", live.clone()).unwrap();
+        ws.create("other", live.clone()).unwrap();
+        ws.switch(&mut live, "other", &[]).unwrap();
+        assert_eq!(
+            ws.rename_current("study").unwrap_err().to_string(),
+            "a workspace named 'study' already exists"
+        );
+        assert_eq!(
+            ws.create("study", live.clone()).unwrap_err().to_string(),
+            "a workspace named 'study' already exists"
+        );
+        let error = Workspaces::from_parts(
+            names(&["main", "study", "study"]),
+            BTreeMap::from([("study".to_string(), live)]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "workspace 'study' is named twice");
     }
 
     #[test]

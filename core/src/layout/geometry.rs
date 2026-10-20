@@ -79,6 +79,7 @@ pub struct Arrangement {
     pub cells: Vec<(ModuleId, Rect)>,
 }
 
+/// A float on screen: its fitted rectangle, top bar and module host, in grid pixels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatSpot {
     pub id: ModuleId,

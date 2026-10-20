@@ -310,12 +310,19 @@ impl Layout {
         Ok(layout)
     }
 
-    /// Rebuilds a tiled layout, checking membership, visibility and the tree's invariants.
+    /// A layout rebuilt from what a state file or `init.lua` holds: [`Layout::new`]'s checks,
+    /// then `hidden`, which must name layout modules and must not include `focus`. Since focus
+    /// belongs to the layout, this also keeps at least one module shown. This and its floating
+    /// counterpart are the only way back into a `Layout` from outside the process, so a file
+    /// cannot skip an invariant the constructors hold by deserialising the model directly.
+    /// This tiled entry point delegates with empty floats and float memory.
     pub fn from_parts(root: Node, hidden: BTreeSet<ModuleId>, focus: ModuleId) -> Result<Layout, LayoutError> {
         Self::from_parts_floating(root, Vec::new(), hidden, focus, BTreeMap::new())
     }
 
     /// Rebuilds a layout with floats in the given order, without raising the focused float.
+    /// Extends [`Layout::from_parts`]'s checks to float membership, rectangles and memory;
+    /// hidden modules and focus may belong to either layer.
     pub fn from_parts_floating(
         root: Node,
         floats: Vec<Float>,
@@ -861,14 +868,15 @@ impl Layout {
     /// Puts back a zoom that something else ended, whichever kind it was, around `keeps`, the module
     /// that holds the keys. Unlike `toggle_zoom` it never reads the selection, so a container
     /// selected meanwhile cannot turn a module's zoom into a container's. `false`, changing nothing,
-    /// when a zoom is on already, `keeps` is not in view, fewer than two modules are shown, or the zoom
-    /// would hide `keeps` (a module zoom of another module; a container that is gone, the root, or
-    /// does not hold `keeps`).
+    /// when a zoom is on already, `keeps` is not in view, fewer than two modules are shown (floats
+    /// count, as they do for `toggle_zoom`: a zoomed float beside one tile is a zoom it could make), or
+    /// the zoom would hide `keeps` (a module zoom of another module; a container that is gone, the
+    /// root, or does not hold `keeps`).
     pub fn restore_zoom(&mut self, zoom: &Zoom, keeps: &ModuleId) -> bool {
         if self.zoomed.is_some() || !self.is_in_view(keeps) {
             return false;
         }
-        let shown = self.leaves().into_iter().filter(|id| self.is_shown(id)).count();
+        let shown = self.modules().into_iter().filter(|id| self.is_shown(id)).count();
         if shown < 2 {
             return false;
         }
@@ -1018,7 +1026,6 @@ impl Layout {
         if let Some(root) = root {
             self.replace_root(root);
         }
-        self.clear_last_preset();
         let modules = self.modules();
         if !modules.iter().any(|m| self.is_shown(m)) {
             let first = modules

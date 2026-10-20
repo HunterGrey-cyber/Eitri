@@ -26,6 +26,7 @@ pub enum ScratchShow {
     Missing(ModuleId),
 }
 
+/// Toggles a shown module between a float and its most recent tiled anchor.
 pub fn float_toggle(layout: &mut Layout, target: &ModuleId, frame: &Frame) -> Result<FloatChange, LayoutError> {
     if *target == ModuleId::editor() {
         return Err(LayoutError::EditorNeverFloats);
@@ -78,6 +79,9 @@ fn sink(layout: &mut Layout, id: &ModuleId) -> Result<(), LayoutError> {
 
 /// Translates a float inside the grid without changing its remembered size.
 pub fn move_float(layout: &mut Layout, id: &ModuleId, dir: Direction, px: i32, frame: &Frame) -> bool {
+    if frame.size.w <= 0 || frame.size.h <= 0 {
+        return false;
+    }
     let Some(float) = layout.float_of(id) else { return false };
     let stored = float.rect;
     let now = stored.place(frame.size, float_floor(id, frame));
@@ -105,6 +109,9 @@ pub fn move_float(layout: &mut Layout, id: &ModuleId, dir: Direction, px: i32, f
 
 /// Grows right/down or shrinks left/up with a fixed centre and the measured minimum.
 pub fn resize_float(layout: &mut Layout, id: &ModuleId, dir: Direction, px: i32, frame: &Frame) -> bool {
+    if frame.size.w <= 0 || frame.size.h <= 0 {
+        return false;
+    }
     let Some(float) = layout.float_of(id) else { return false };
     let mut rect = float.rect;
     match dir {
@@ -116,7 +123,7 @@ pub fn resize_float(layout: &mut Layout, id: &ModuleId, dir: Direction, px: i32,
     let floor = float_floor(id, frame);
     rect.w = rect.w.clamp(floor.w.min(frame.size.w), frame.size.w);
     rect.h = rect.h.clamp(floor.h.min(frame.size.h), frame.size.h);
-    let changed = layout.store_float_rect(id, rect);
+    let changed = layout.store_float_rect(id, rect.clamped());
     if changed {
         layout.unzoom();
     }
@@ -125,7 +132,7 @@ pub fn resize_float(layout: &mut Layout, id: &ModuleId, dir: Direction, px: i32,
 
 /// Stores a dropped rectangle after fitting its size and origin inside the grid.
 pub fn set_float_rect(layout: &mut Layout, id: &ModuleId, mut rect: Rect, frame: &Frame) -> bool {
-    if !layout.is_floating(id) {
+    if !layout.is_floating(id) || frame.size.w <= 0 || frame.size.h <= 0 {
         return false;
     }
     let floor = float_floor(id, frame);
@@ -185,8 +192,11 @@ pub fn scratchpad_move(layout: &mut Layout, target: &ModuleId, frame: &Frame) ->
         return Err(LayoutError::EditorNeverFloats);
     }
     layout.can_focus(target)?;
-    if !layout.visible_modules().iter().any(|m| m != target) {
+    if !layout.modules().iter().any(|m| m != target && layout.is_shown(m)) {
         return Err(LayoutError::LastVisible(target.clone()));
+    }
+    if layout.is_zoomed() && !layout.zoom_hides(target) {
+        layout.unzoom();
     }
     if !layout.is_floating(target) {
         let rect = layout
@@ -230,6 +240,8 @@ fn show_scratch(layout: &mut Layout, id: &ModuleId) -> Result<ScratchShow, Layou
     Ok(ScratchShow::Shown(id.clone()))
 }
 
+/// Stows the focused scratch float, raises a shown one, or shows the oldest stowed one.
+/// Naming a module toggles that scratch float or makes the module scratch and shows it.
 pub fn scratchpad_show(
     layout: &mut Layout,
     module: Option<&ModuleId>,
@@ -370,6 +382,95 @@ mod tests {
     }
     fn spot(layout: &Layout, id: &ModuleId) -> Rect {
         arrange(layout, &frame()).float_spot(id).unwrap().rect
+    }
+
+    #[test]
+    fn stowing_a_zoomed_module_ends_zoom_and_keeps_other_modules_shown() {
+        for container in [false, true] {
+            let mut layout = base();
+            layout.set_focus(&term()).unwrap();
+            if container {
+                assert!(crate::layout::verbs::focus_parent(&mut layout));
+            }
+            layout.toggle_zoom(&term());
+            assert!(layout.is_zoomed());
+            assert!(scratchpad_move(&mut layout, &term(), &frame()).is_ok());
+            assert!(!layout.is_zoomed());
+            assert!(layout.is_stowed(&term()));
+            assert!(layout.float_of(&term()).unwrap().scratch);
+            assert!(layout.is_shown(&editor()) && layout.is_shown(&agent()));
+        }
+        let mut layout = base();
+        hide(&mut layout, &editor(), &frame()).unwrap();
+        hide(&mut layout, &agent(), &frame()).unwrap();
+        assert_eq!(
+            scratchpad_move(&mut layout, &term(), &frame()),
+            Err(LayoutError::LastVisible(term()))
+        );
+    }
+
+    #[test]
+    fn empty_frames_create_valid_floats_and_leave_move_resize_and_drop_unchanged() {
+        for size in [Size { w: 0, h: 0 }, Size { w: 1280, h: 0 }] {
+            let empty = Frame::new(size, 1);
+            let expected = FloatRect {
+                cx: 0.5,
+                cy: 0.5,
+                w: (size.w as f32 * DEFAULT_FLOAT_SHARE).round().max(1.0) as i32,
+                h: (size.h as f32 * DEFAULT_FLOAT_SHARE).round().max(1.0) as i32,
+            };
+            for make in 0..3 {
+                let mut layout = base();
+                match make {
+                    0 => {
+                        float_toggle(&mut layout, &term(), &empty).unwrap();
+                    }
+                    1 => {
+                        float_at(&mut layout, &term(), None, &empty).unwrap();
+                    }
+                    _ => {
+                        scratchpad_move(&mut layout, &term(), &empty).unwrap();
+                    }
+                }
+                assert_eq!(layout.float_of(&term()).unwrap().rect, expected);
+                assert!(layout.floats().iter().all(|f| f.rect.is_valid()));
+            }
+            let mut layout = base();
+            float_toggle(&mut layout, &term(), &frame()).unwrap();
+            let before = layout.clone();
+            assert!(!move_float(&mut layout, &term(), Direction::Right, 50, &empty));
+            assert!(!resize_float(&mut layout, &term(), Direction::Down, 50, &empty));
+            assert!(!set_float_rect(
+                &mut layout,
+                &term(),
+                Rect {
+                    x: 50,
+                    y: 50,
+                    w: 400,
+                    h: 300
+                },
+                &empty
+            ));
+            assert_eq!(layout, before);
+            assert!(layout.floats().iter().all(|f| f.rect.is_valid()));
+        }
+    }
+
+    #[test]
+    fn removing_a_float_keeps_the_preset_cycle_but_removing_a_tile_restarts_it() {
+        use crate::layout::verbs::{cycle_preset, preset, Preset};
+        let mut layout = base();
+        preset(&mut layout, Preset::MainHorizontal).unwrap();
+        layout.add_float(&t2(), centred(), false).unwrap();
+        layout.remove(&t2()).unwrap();
+        assert_eq!(layout.last_preset(), Some(Preset::MainHorizontal));
+        assert_eq!(cycle_preset(&mut layout, true), Ok(Preset::MainVertical));
+
+        let mut layout = crate::layout::fixture::fixture("row(editor, agent, terminal#2)");
+        preset(&mut layout, Preset::MainHorizontal).unwrap();
+        layout.remove(&t2()).unwrap();
+        assert_eq!(layout.last_preset(), None);
+        assert_eq!(cycle_preset(&mut layout, true), Ok(Preset::EvenHorizontal));
     }
 
     #[test]

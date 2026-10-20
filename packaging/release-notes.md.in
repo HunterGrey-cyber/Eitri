@@ -145,7 +145,8 @@ this build: `instance.new { kind = "agent" }` flashes `chat views: not in this b
 - **`L` now switches workspaces.** It was free before; with one workspace it flashes.
 - **The layout file gains two keys**, `floating` and `float_memory`, written inside a workspace only when they are not
   empty, so a layout without floats writes the file the version before floats wrote. That version keeps a one-workspace
-  file's floats of numbered terminals (`terminal#2` and so on) as they were. When a float names a module it places
+  file's floats of numbered terminals (`terminal#2` and so on) as they were. A stowed scratch float comes back
+  shown: that version drops the hidden mark of a module it does not place. When a float names a module it places
   itself -- the base terminal, the chat, or, with two or more workspaces, any floating terminal -- it drops the floats,
   opens those modules tiled and copies the file to `<hash>.v2.json.partial` first: float positions can be lost that way,
   never a module.

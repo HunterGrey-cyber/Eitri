@@ -9,7 +9,7 @@ use super::kill::{can_kill, kill, KillScope, Reopen};
 use super::module::{ModuleDecl, ModuleId, ModuleKind, Placement};
 use super::reconcile::{reconcile_default_floating, reconcile_floating};
 use super::tray::tray;
-use super::tree::{Axis, Layout, LayoutError, DEFAULT_EDITOR_SHARE};
+use super::tree::{Axis, Layout, LayoutError, Zoom, ZoomChange, DEFAULT_EDITOR_SHARE};
 
 fn editor() -> ModuleId {
     ModuleId::editor()
@@ -198,6 +198,25 @@ fn a_zoom_of_a_tiled_module_takes_every_float_off_screen_and_gives_it_a_chip() {
             h: 433
         }
     );
+}
+
+#[test]
+fn a_float_zoom_is_put_back_beside_a_single_tile() {
+    let mut layout = with_float();
+    for id in layout.leaves() {
+        if id != editor() {
+            layout.hide_unfocused(&id).unwrap();
+        }
+    }
+    layout.set_focus(&t2()).unwrap();
+    assert_eq!(
+        layout.toggle_zoom(&t2()),
+        ZoomChange::Zoomed,
+        "one tile and a float is enough to zoom"
+    );
+    layout.unzoom();
+    assert!(layout.restore_zoom(&Zoom::Module(t2()), &t2()));
+    assert_eq!(layout.zoom(), Some(&Zoom::Module(t2())));
 }
 
 #[test]
