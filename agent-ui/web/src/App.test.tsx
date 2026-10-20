@@ -14174,6 +14174,75 @@ describe("#28: prefix : opens the panel's command line", () => {
     expect(document.activeElement).toBe(container.querySelector(".agent-ui-conversation"));
   });
 
+  describe("the empty tab", () => {
+    function startScreen() {
+      const rendered = render(<App />);
+      dispatch({ kind: "hello", ...HELLO });
+      dispatchEmptyTab();
+      dispatch({ kind: "pane_focus", focused: true });
+      dispatch({ kind: "arrive" });
+      act(() => widen(rendered.container));
+      return rendered;
+    }
+
+    function expectBrowseRoot(container: HTMLElement) {
+      const root = container.querySelector<HTMLElement>(".empty-tab")!;
+      expect(root.contains(document.activeElement)).toBe(true);
+      expect(document.activeElement?.tagName).not.toBe("TEXTAREA");
+      expect(modeOf(container)).toBe("browse");
+    }
+
+    it("on the start screen, Esc on the : line gives the keys back to its root in BROWSE", () => {
+      const { container } = startScreen();
+      expectBrowseRoot(container);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        dispatch({ kind: "open_command_line" });
+        expect(document.activeElement).toBe(line(container));
+        fireEvent.keyDown(line(container)!, { key: "Escape" });
+        expect(line(container)).toBeNull();
+        expect(band(container)).toBeNull();
+        expectBrowseRoot(container);
+      }
+    });
+
+    it("on the start screen, from INPUT the : line leaves INPUT for BROWSE, the draft kept", () => {
+      const { container } = startScreen();
+      dispatch({ kind: "enter_input" });
+      const box = container.querySelector<HTMLTextAreaElement>("textarea")!;
+      expect(document.activeElement).toBe(box);
+      expect(modeOf(container)).toBe("input");
+      fireEvent.change(box, { target: { value: "half a thought" } });
+      dispatch({ kind: "open_command_line" });
+      fireEvent.keyDown(line(container)!, { key: "Escape" });
+      expect(line(container)).toBeNull();
+      expectBrowseRoot(container);
+      dispatch({ kind: "enter_input" });
+      expect(modeOf(container)).toBe("input");
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+      expect(container.querySelector<HTMLTextAreaElement>("textarea")!.value).toBe("half a thought");
+    });
+
+    it("on the start screen, Enter on the : line also lands BROWSE", () => {
+      const { container } = startScreen();
+      dispatch({ kind: "open_command_line" });
+      fireEvent.change(line(container)!, { target: { value: "nonsense" } });
+      fireEvent.keyDown(line(container)!, { key: "Enter" });
+      expect(line(container)).toBeNull();
+      expect(band(container)).toBe(":nonsense — no ex commands here; ? lists this panel's keys");
+      expectBrowseRoot(container);
+    });
+
+    it("on the start screen, a prefix w chooser pick lands BROWSE", () => {
+      const { container } = startScreen();
+      dispatch({ kind: "enter_input" });
+      dispatch({ kind: "chooser", open: [{ tab: 1, label: "1 new", marker: null, pending: 0, resumable: true }], records: [] });
+      fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Enter" });
+      expect(lastOfType("select_tab")).toMatchObject({ tab: 1 });
+      expect(container.querySelector(".chooser")).toBeNull();
+      expectBrowseRoot(container);
+    });
+  });
+
   it("from INPUT it leaves INPUT for BROWSE, the draft kept", () => {
     const { container } = startedWithRows();
     enterInputMode(container);

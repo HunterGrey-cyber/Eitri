@@ -2185,9 +2185,9 @@ export default function App() {
     }
     if (!sessionStarted || sessionEnded) return;
     setMode("input");
-    // Every route through `inputRequest` keeps the caret, like `i`/`o` and `Ctrl+j`. Set that
-    // explicitly so an earlier `A` cannot leave `composerCaret` at "end". `A` sets its own caret
-    // and bumps `composerFocusRequest` directly, so it never needs the end-of-draft rule here.
+    // Requests that open the live composer restore its kept caret, matching i, o and Ctrl+j.
+    // A selects the end through a separate focus request, so its caret choice must not carry
+    // over into a later request to resume typing at the saved position.
     setComposerCaret("kept");
     setComposerFocusRequest((n) => n + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3683,11 +3683,10 @@ export default function App() {
       containerRef.current.focus({ preventScroll: true });
       return;
     }
-    // The empty layout: `.agent-ui-root` handles no key, so focusing it strands the keys (GUI pass,
-    // 2026-09-25). The empty tab's live control is its composer, in INPUT -- the same request
-    // `enter_input` makes, which `EmptyTab`'s `Composer` answers by focusing its textarea.
-    startScreenRef.current?.focus({ preventScroll: true });
-    setInputRequest((n) => n + 1);
+    // The start screen owns its BROWSE root. Its arrival edge focuses that root and leaves
+    // INPUT while keeping the draft, just as returning to the conversation's root does.
+    setEmptyLanding("browse");
+    setArriveRequest((n) => n + 1);
   }
 
   /** Feeds Enter and Esc from the `/` and `:` lines to the typing guard before their
@@ -3724,10 +3723,8 @@ export default function App() {
   }
   function onChooserLeave() {
     setChooser(null);
-    // Closing the chooser returns keys to the conversation root, or to the empty tab's dashboard
-    // menu in BROWSE. Use the same `setEmptyLanding` and `setArriveRequest` pair as an arrival.
-    // `returnKeysToRoot` would request INPUT in the empty layout, giving Esc an unintended composer
-    // landing.
+    // Closing the chooser returns to the visible layout's BROWSE root, with the start screen
+    // using the same arrival edge as other keyboard arrivals.
     if (containerRef.current !== null) {
       containerRef.current.focus({ preventScroll: true });
       return;

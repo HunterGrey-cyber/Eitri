@@ -4097,6 +4097,7 @@ dependencies = [
  "eitri-panel",
  "eitri-terminal",
  "futures-channel",
+ "glib 0.22.9",
  "gtk4",
  "libc",
  "libloading 0.9.0",

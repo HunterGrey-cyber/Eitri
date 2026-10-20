@@ -31,8 +31,8 @@ fn the_theme_listener_feeds_every_plugin_page() {
     let at = code.find("feed_pump.listen_theme(feed,").expect("the theme listener");
     let body = scan::braced(&code, at + code[at..].find('{').unwrap());
     let terminal = body
-        .find("terminal.set_colors(")
-        .expect("the terminal follows the theme");
+        .find("pane.set_colors(colors);")
+        .expect("every terminal follows the theme");
     // The freshly derived tokens: the page set carries no size, so a size-only change sends the page nothing.
     let pages = body
         .find("plugin_panels.set_theme(&tokens);")
@@ -104,9 +104,7 @@ fn prefix_question_mark_reads_the_plugin_before_the_chat_takes_the_keys() {
     let read = code[arm..]
         .find("keymap_plugins.declared_rows(&module)")
         .expect("the plugin's rows are read");
-    let focus = code[arm..]
-        .find("focus_module(&chat);")
-        .expect("the chat takes the keys");
+    let focus = code[arm..].find("give_keys(&chat);").expect("the chat takes the keys");
     let open = code[arm..]
         .find("agent.open_keymap(plugin,opening);")
         .expect("opened with the section");
@@ -122,7 +120,7 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
     let kept = body
         .find("keys_return.borrow_mut().opened(")
         .expect("what it opened from is kept");
-    let focus = body.find("focus_module(&chat);").expect("the chat takes the keys");
+    let focus = body.find("give_keys(&chat);").expect("the chat takes the keys");
     assert!(
         show < kept && kept < focus,
         "kept only after the chat is on screen, before it takes the keys"
@@ -152,6 +150,27 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
         hook_body.contains("keys_return.borrow_mut().closed("),
         "the hook asks KeysReturn what to give back"
     );
+    // The zoom goes back after the keys: giving them to a page on a tab not drawn chooses that tab,
+    // which ends any zoom, so a zoom put back first would be lost. Either kind goes back whole.
+    let give = hook_body.find("give_keys(&ret.focus)").expect("the keys go back");
+    let zoom = hook_body
+        .find("grid.restore_zoom(zoom,&ret.focus)")
+        .expect("the zoom goes back through restore_zoom");
+    assert!(give < zoom, "the keys go back before the zoom");
+    assert!(
+        !hook_body.contains("toggle_zoom("),
+        "a toggle reads the selection and the tab"
+    );
+    assert!(
+        hook_body.contains("zoom:layout.zoom(),"),
+        "the close reads either kind of zoom"
+    );
+    let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
+    let arm_body = scan::braced(&code, arm + "Action::PanelKeymap=>".len());
+    assert!(
+        arm_body.contains("layout.zoom().cloned()") && !arm_body.contains("zoomed()"),
+        "the opening keeps either kind of zoom"
+    );
 
     // A command line opened after the sheet forgets it, before the chat takes the keys.
     let line = code.find("Action::PanelCommandLine=>{").expect("the prefix : arm");
@@ -159,7 +178,7 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
     let forget = line_body
         .find("keys_return.borrow_mut().superseded();")
         .expect("the newer request forgets the sheet's pending return");
-    let take = line_body.find("focus_module(&chat);").expect("the chat takes the keys");
+    let take = line_body.find("give_keys(&chat);").expect("the chat takes the keys");
     assert!(forget < take);
 }
 

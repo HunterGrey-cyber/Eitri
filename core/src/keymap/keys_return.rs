@@ -6,15 +6,16 @@
 //! Every opening has a number and only the latest opening's close acts, because the page's
 //! `keymap_closed` message is asynchronous and can arrive after a newer `prefix ?`.
 
-use crate::layout::ModuleId;
+use crate::layout::{ModuleId, Zoom};
 
 /// What `prefix ?` found and changed when it opened the sheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Opened {
     /// The module that held the keys, read before the sheet's module took them.
     pub from: Option<ModuleId>,
-    /// The zoom that `show_on_screen` ended to put the sheet's module on screen.
-    pub ended_zoom: Option<ModuleId>,
+    /// The zoom, of a module or of a container, that putting the sheet's module on screen and giving
+    /// it the keys ended (showing it ends a zoom that hides it; choosing its tab ends any zoom).
+    pub ended_zoom: Option<Zoom>,
     /// The sheet's module was hidden, and `show_on_screen` showed it.
     pub showed_sheet: bool,
 }
@@ -23,7 +24,11 @@ pub struct Opened {
 #[derive(Clone, Copy)]
 pub struct AtClose<'a> {
     pub focused: Option<&'a ModuleId>,
-    pub zoomed: Option<&'a ModuleId>,
+    /// The zoom on now, of either kind.
+    pub zoom: Option<&'a Zoom>,
+    /// Whether the zoom on now keeps a module off screen (`Layout::zoom_hides`): a container's zoom
+    /// hides what lies outside it, which only the layout can say.
+    pub zoom_hides: &'a dyn Fn(&ModuleId) -> bool,
     pub sheet_shown: bool,
     /// Whether a module is in the layout and not hidden now. The module the keys would go back to is
     /// asked before anything moves: it may have been hidden or removed while the sheet was open (a
@@ -31,11 +36,13 @@ pub struct AtClose<'a> {
     pub shown: &'a dyn Fn(&ModuleId) -> bool,
 }
 
-/// What the window does after a close, in this order: hide the sheet's module, zoom, give the keys.
+/// What the window does after a close, in this order: hide the sheet's module, give the keys, put the
+/// zoom back. The zoom goes last because giving the keys to a module on a tab not drawn chooses that
+/// tab, which ends any zoom; and a module zoom cannot be set on a module whose tab is not drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Return {
     pub hide_sheet: bool,
-    pub zoom: Option<ModuleId>,
+    pub zoom: Option<Zoom>,
     pub focus: ModuleId,
 }
 
@@ -72,12 +79,12 @@ impl KeysReturn {
 
     /// The sheet of opening `opening` closed. A number other than the latest changes nothing and
     /// returns `None`. Otherwise what was kept is taken (forgotten), and a `Return` is given only when
-    /// `by_key` is true, `at.focused` is still `sheet`, and no zoom is on except `kept.from`'s own: a
-    /// zoom set meanwhile on any other module (the sheet's included) leaves the keys in the sheet, since
-    /// giving them to a module the zoom hides would put them where nobody can see. A `kept.from` that
-    /// `at.shown` says is not shown leaves the keys, and the chat, where they are. `hide_sheet` is
-    /// `kept.showed_sheet && at.sheet_shown`; `zoom` is `kept.ended_zoom` when `at.zoomed` is `None`;
-    /// `focus` is `kept.from`.
+    /// `by_key` is true, `at.focused` is still `sheet`, and no zoom is on that hides `kept.from`: a
+    /// zoom set meanwhile on any other module (the sheet's included), or on a container that does not
+    /// hold `kept.from`, leaves the keys in the sheet, since giving them to a module the zoom hides
+    /// would put them where nobody can see. A `kept.from` that `at.shown` says is not shown leaves the
+    /// keys, and the chat, where they are. `hide_sheet` is `kept.showed_sheet && at.sheet_shown`;
+    /// `zoom` is `kept.ended_zoom` when `at.zoom` is `None`; `focus` is `kept.from`.
     pub fn closed(&mut self, opening: u64, by_key: bool, at: AtClose<'_>, sheet: &ModuleId) -> Option<Return> {
         if opening != self.opening {
             return None;
@@ -86,16 +93,16 @@ impl KeysReturn {
         if !by_key || at.focused != Some(sheet) {
             return None;
         }
-        if at.zoomed.is_some_and(|zoomed| Some(zoomed) != kept.from.as_ref()) {
+        let from = kept.from?;
+        if at.zoom.is_some() && (at.zoom_hides)(&from) {
             return None;
         }
-        let from = kept.from?;
         if !(at.shown)(&from) {
             return None;
         }
         Some(Return {
             hide_sheet: kept.showed_sheet && at.sheet_shown,
-            zoom: if at.zoomed.is_none() { kept.ended_zoom } else { None },
+            zoom: if at.zoom.is_none() { kept.ended_zoom } else { None },
             focus: from,
         })
     }
@@ -129,10 +136,22 @@ mod tests {
         *id != sheet()
     }
 
-    fn at<'a>(focused: Option<&'a ModuleId>, zoomed: Option<&'a ModuleId>, sheet_shown: bool) -> AtClose<'a> {
+    /// What `Layout::zoom_hides` answers for a module zoom: everything but the zoomed module. A
+    /// container's zoom is spelled out in the tests that need one.
+    fn module_zoom_hides(zoom: Option<&Zoom>) -> &'static dyn Fn(&ModuleId) -> bool {
+        let zoomed = match zoom {
+            None => None,
+            Some(Zoom::Module(id)) => Some(id.clone()),
+            Some(Zoom::Con(_)) => panic!("a container's zoom needs its own zoom_hides"),
+        };
+        Box::leak(Box::new(move |id: &ModuleId| zoomed.as_ref().is_some_and(|z| z != id)))
+    }
+
+    fn at<'a>(focused: Option<&'a ModuleId>, zoom: Option<&'a Zoom>, sheet_shown: bool) -> AtClose<'a> {
         AtClose {
             focused,
-            zoomed,
+            zoom,
+            zoom_hides: module_zoom_hides(zoom),
             sheet_shown,
             shown: if sheet_shown {
                 &every_module_shown
@@ -203,7 +222,7 @@ mod tests {
         let n = keys.opened(
             Opened {
                 from: None,
-                ended_zoom: Some(plugin()),
+                ended_zoom: Some(Zoom::Module(plugin())),
                 showed_sheet: true,
             },
             &sheet,
@@ -245,20 +264,21 @@ mod tests {
     #[test]
     fn the_ended_zoom_comes_back_only_when_no_zoom_is_on() {
         let (sheet, plugin) = (sheet(), plugin());
+        let zoom = Zoom::Module(plugin.clone());
         let opened = Opened {
             from: Some(plugin.clone()),
-            ended_zoom: Some(plugin.clone()),
+            ended_zoom: Some(zoom.clone()),
             showed_sheet: false,
         };
         let mut keys = KeysReturn::default();
         let n = keys.opened(opened.clone(), &sheet);
         let got = keys.closed(n, true, at(Some(&sheet), None, true), &sheet).unwrap();
-        assert_eq!(got.zoom, Some(plugin.clone()));
+        assert_eq!(got.zoom, Some(zoom.clone()));
 
         // The module the keys come back to is zoomed again already: nothing to put back.
         let n = keys.opened(opened, &sheet);
         let got = keys
-            .closed(n, true, at(Some(&sheet), Some(&plugin), true), &sheet)
+            .closed(n, true, at(Some(&sheet), Some(&zoom), true), &sheet)
             .unwrap();
         assert_eq!(got.zoom, None);
         assert_eq!(got.focus, plugin);
@@ -271,13 +291,59 @@ mod tests {
         let mut keys = KeysReturn::default();
         // The chat itself zoomed to read a long sheet: the plugin would be hidden by it.
         let n = keys.opened(from(plugin.clone()), &sheet);
-        assert_eq!(keys.closed(n, true, at(Some(&sheet), Some(&sheet), true), &sheet), None);
-        // Some other module zoomed.
-        let n = keys.opened(from(plugin), &sheet);
+        let sheet_zoom = Zoom::Module(sheet.clone());
         assert_eq!(
-            keys.closed(n, true, at(Some(&sheet), Some(&editor), true), &sheet),
+            keys.closed(n, true, at(Some(&sheet), Some(&sheet_zoom), true), &sheet),
             None
         );
+        // Some other module zoomed.
+        let n = keys.opened(from(plugin), &sheet);
+        let editor_zoom = Zoom::Module(editor);
+        assert_eq!(
+            keys.closed(n, true, at(Some(&sheet), Some(&editor_zoom), true), &sheet),
+            None
+        );
+    }
+
+    /// A container's zoom that showing the chat ended comes back as that container's zoom, not as
+    /// nothing: the layout's `zoomed()` names only a module's zoom.
+    #[test]
+    fn a_container_zoom_comes_back_as_a_container_zoom() {
+        let (sheet, plugin) = (sheet(), plugin());
+        let zoom = Zoom::Con(crate::layout::ConId::fresh());
+        let opened = Opened {
+            from: Some(plugin.clone()),
+            ended_zoom: Some(zoom.clone()),
+            showed_sheet: false,
+        };
+        let mut keys = KeysReturn::default();
+        let n = keys.opened(opened.clone(), &sheet);
+        let got = keys.closed(n, true, at(Some(&sheet), None, true), &sheet).unwrap();
+        assert_eq!(got.zoom, Some(zoom.clone()));
+        assert_eq!(got.focus, plugin);
+
+        // That container zoomed again while the sheet was open, the chat inside it with the plugin: the
+        // keys go back, and nothing more is zoomed.
+        let n = keys.opened(opened.clone(), &sheet);
+        let inside = |_: &ModuleId| false;
+        let at_close = AtClose {
+            focused: Some(&sheet),
+            zoom: Some(&zoom),
+            zoom_hides: &inside,
+            sheet_shown: true,
+            shown: &every_module_shown,
+        };
+        let got = keys.closed(n, true, at_close, &sheet).unwrap();
+        assert_eq!((got.zoom, got.focus), (None, plugin.clone()));
+
+        // A container zoom set meanwhile that leaves the plugin outside: the keys stay in the chat.
+        let n = keys.opened(opened, &sheet);
+        let plugin_outside = |id: &ModuleId| *id == plugin;
+        let at_close = AtClose {
+            zoom_hides: &plugin_outside,
+            ..at_close
+        };
+        assert_eq!(keys.closed(n, true, at_close, &sheet), None);
     }
 
     #[test]
@@ -331,7 +397,8 @@ mod tests {
         let terminal_gone = |id: &ModuleId| *id != terminal;
         let at = AtClose {
             focused: Some(&sheet),
-            zoomed: None,
+            zoom: None,
+            zoom_hides: &|_: &ModuleId| false,
             sheet_shown: true,
             shown: &terminal_gone,
         };

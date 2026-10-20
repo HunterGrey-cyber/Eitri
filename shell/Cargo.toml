@@ -69,6 +69,10 @@ alacritty_terminal = "0.26.0"
 # `eitri_core::test_providers::RecordingProvider`, for the agent panel's per-tab routing tests
 # (the session tabs). Tests only: the normal dependency above stays feature-free.
 eitri-core = { path = "../core", features = ["test-support"] }
+# `tests/end_signals.rs` needs only GLib's main context, no display: it names the crate directly so the
+# display-guard scan (`tests/own_display_scan.rs`) does not read it as opening one. The version gtk4
+# 0.11.4 already resolves, so it adds no crate to the graph and ships in no binary.
+glib = "0.22"
 # `AgentPanelHandle::for_host_test`, for counting how often the panel's own loop wakes. Tests only.
 eitri-panel = { path = "../panel", features = ["test-support"] }
 # Only for `tests/nvim_bin_override.rs`: that test drives a real,
@@ -88,6 +92,11 @@ name = "toolkit_floor"
 # #[test] harness, added explicitly for the same reason `toolkit_floor` is above.
 [[test]]
 name = "web_bundle_freshness"
+
+# A termination signal reaches the window's handler instead of ending the process (`src/end_signals.rs`): a plain
+# #[test] harness that opens no display, in its own binary because it signals its own process.
+[[test]]
+name = "end_signals"
 
 # Guards the rule that every test opening a display starts its own
 # display (2026-09-29): reads `tests/` here and in `neovide-editor` as text, and fails on a file that

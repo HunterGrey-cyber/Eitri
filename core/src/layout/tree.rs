@@ -672,6 +672,30 @@ impl Layout {
         ZoomChange::Zoomed
     }
 
+    /// Puts back a zoom that something else ended, whichever kind it was, around `keeps`, the module
+    /// that holds the keys. Unlike `toggle_zoom` it never reads the selection, so a container
+    /// selected meanwhile cannot turn a module's zoom into a container's. `false`, changing nothing,
+    /// when a zoom is on already, `keeps` is not in view, fewer than two modules are shown, or the zoom
+    /// would hide `keeps` (a module zoom of another module; a container that is gone, the root, or
+    /// does not hold `keeps`).
+    pub fn restore_zoom(&mut self, zoom: &Zoom, keeps: &ModuleId) -> bool {
+        if self.zoomed.is_some() || !self.is_in_view(keeps) {
+            return false;
+        }
+        let shown = self.leaves().into_iter().filter(|id| self.is_shown(id)).count();
+        if shown < 2 {
+            return false;
+        }
+        let around_keeps = match zoom {
+            Zoom::Module(id) => id == keeps,
+            Zoom::Con(id) => *id != self.root.id && self.root.find(*id).is_some_and(|c| c.leaves().contains(keeps)),
+        };
+        if around_keeps {
+            self.zoomed = Some(zoom.clone());
+        }
+        around_keeps
+    }
+
     /// Ends a zoom. `false` if nothing was zoomed. Never touches `hidden` (invariant 4).
     pub fn unzoom(&mut self) -> bool {
         self.zoomed.take().is_some()
@@ -1371,5 +1395,60 @@ mod tests {
         assert_eq!(layout.can_focus(&lua("side")), Err(LayoutError::Hidden(lua("side"))));
         assert_eq!(layout.can_focus(&lua("gone")), Err(LayoutError::NotInTree(lua("gone"))));
         assert_eq!(layout.can_focus(&ModuleId::editor()), Ok(()));
+    }
+
+    /// The editor beside a container of two plugins, `a` with the keys.
+    fn beside_a_container() -> Layout {
+        let pair = Node::Con(Con::new(
+            ConLayout::SplitV,
+            vec![
+                Child::new(Node::Leaf(lua("a")), 0.5),
+                Child::new(Node::Leaf(lua("b")), 0.5),
+            ],
+        ));
+        let root = Node::Con(Con::new(
+            ConLayout::SplitH,
+            vec![Child::new(Node::Leaf(ModuleId::editor()), 0.5), Child::new(pair, 0.5)],
+        ));
+        Layout::new(root, lua("a")).unwrap()
+    }
+
+    #[test]
+    fn restore_zoom_puts_back_either_kind_and_ignores_the_selection() {
+        let mut layout = beside_a_container();
+        let pair = layout.container_of(&lua("a")).unwrap();
+        assert!(layout.restore_zoom(&Zoom::Con(pair), &lua("a")));
+        assert_eq!(layout.zoom(), Some(&Zoom::Con(pair)));
+        assert_eq!(layout.visible_leaves(), vec![lua("a"), lua("b")]);
+        assert!(
+            !layout.restore_zoom(&Zoom::Module(lua("a")), &lua("a")),
+            "a zoom is on already"
+        );
+
+        // A container selected meanwhile: `toggle_zoom` would zoom it, the restore keeps the module's.
+        layout.unzoom();
+        layout.select(Selection::Con(pair));
+        assert!(layout.restore_zoom(&Zoom::Module(lua("a")), &lua("a")));
+        assert_eq!(layout.zoom(), Some(&Zoom::Module(lua("a"))));
+    }
+
+    #[test]
+    fn restore_zoom_refuses_a_zoom_that_would_hide_the_module_with_the_keys() {
+        let mut layout = beside_a_container();
+        let pair = layout.container_of(&lua("a")).unwrap();
+        let root = layout.root().id;
+        assert!(!layout.restore_zoom(&Zoom::Module(lua("b")), &lua("a")));
+        assert!(!layout.restore_zoom(&Zoom::Con(pair), &ModuleId::editor()));
+        assert!(
+            !layout.restore_zoom(&Zoom::Con(root), &lua("a")),
+            "the root is never zoomed"
+        );
+        layout.hide_unfocused(&ModuleId::editor()).unwrap();
+        layout.hide_unfocused(&lua("b")).unwrap();
+        assert!(
+            !layout.restore_zoom(&Zoom::Module(lua("a")), &lua("a")),
+            "the only module shown"
+        );
+        assert_eq!(layout.zoom(), None);
     }
 }

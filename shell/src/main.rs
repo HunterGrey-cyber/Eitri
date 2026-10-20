@@ -10,6 +10,7 @@ mod editor_feeds;
 mod editor_quit;
 mod editor_rpc;
 mod editor_start_failure;
+mod end_signals;
 #[cfg(feature = "probe")]
 mod grid_probe;
 mod hint;
@@ -1654,9 +1655,11 @@ fn build_ui(
             let ret = {
                 let layout = module_layout.borrow();
                 let shown = |id: &ModuleId| layout.is_shown(id);
+                let zoom_hides = |id: &ModuleId| layout.zoom_hides(id);
                 let at = AtClose {
                     focused: focused.as_ref(),
-                    zoomed: layout.zoomed(),
+                    zoom: layout.zoom(),
+                    zoom_hides: &zoom_hides,
                     sheet_shown: layout.is_shown(&chat),
                     shown: &shown,
                 };
@@ -1668,13 +1671,21 @@ fn build_ui(
                     eprintln!("[keys_return] could not hide {chat} again: {err}");
                 }
             }
-            if let Some(zoom) = &ret.zoom {
-                grid.toggle_zoom(zoom);
-            }
             // A module hidden before the close got no `Return` at all; this refusal is only a backstop
-            // for one the hide or zoom just above took away.
+            // for one the hide just above took away.
             if !give_keys(&ret.focus) {
                 println!("[keys_return] {} could not take the keys back", ret.focus);
+                return;
+            }
+            // After the keys, not before: giving them to a module on a tab not drawn chooses that tab,
+            // which ends any zoom, and a module whose tab is not drawn cannot be zoomed.
+            if let Some(zoom) = &ret.zoom {
+                if !grid.restore_zoom(zoom, &ret.focus) {
+                    println!(
+                        "[keys_return] the zoom {zoom:?} could not be put back around {}",
+                        ret.focus
+                    );
+                }
             }
         }
     });
@@ -2339,20 +2350,26 @@ fn build_ui(
                         .and_then(|module| keymap_plugins.declared_rows(&module))
                         .map(|(title, rows)| eitri_core::plugin::keys::plugin_help(&title, rows));
                     let chat = ModuleId::agent();
-                    // What showing the chat is about to change, so closing the sheet can undo it.
-                    let (ended_zoom, showed_sheet) = {
+                    // What showing the chat is about to change, so closing the sheet can undo it. The zoom
+                    // is kept whole, a container's as well as a module's.
+                    let (zoom_before, showed_sheet) = {
                         let layout = module_layout.borrow();
-                        let ended_zoom = if layout.zoom_hides(&chat) {
-                            layout.zoomed().cloned()
-                        } else {
-                            None
-                        };
-                        (ended_zoom, !layout.is_shown(&chat))
+                        (layout.zoom().cloned(), !layout.is_shown(&chat))
                     };
                     if let Err(err) = show_on_screen(&chat) {
                         refuse(&refused_name, &toast, &err);
                         return;
                     }
+                    // Showing the chat ended a zoom that hid it; giving it the keys below chooses its tab if
+                    // that tab is not drawn, which ends any zoom left (a container's that holds the chat).
+                    let ended_zoom = {
+                        let layout = module_layout.borrow();
+                        if layout.zoom().is_none() || layout.is_tabbed_away(&chat) {
+                            zoom_before
+                        } else {
+                            None
+                        }
+                    };
                     let opening = keys_return.borrow_mut().opened(
                         Opened {
                             from,
@@ -2936,13 +2953,38 @@ fn build_ui(
     // every use here only ever needs `&self` methods.) Once nvim is gone, the same
     // connect_close_request -> shutdown() -> glib::Propagation::Proceed pattern as standalone.rs.
     let app_for_close = app.clone();
+    // Set by a termination signal (`end_signals`): the close that follows asks nothing.
+    let ending_by_signal = Rc::new(std::cell::Cell::new(false));
+    {
+        let ending_by_signal = ending_by_signal.clone();
+        let window = window.clone();
+        // The log lines ignore a failed write: a panic in this callback aborts the process before the close.
+        let installed = end_signals::install(move |name| {
+            use std::io::Write as _;
+            if ending_by_signal.replace(true) {
+                let _ = writeln!(std::io::stdout(), "[window] {name}: the window is already closing");
+                return;
+            }
+            end_signals::mark_closing();
+            let _ = writeln!(
+                std::io::stdout(),
+                "[window] {name}: closing the window without its questions; nvim is ended as a close ends it"
+            );
+            window.close();
+        });
+        if let Err(err) = installed {
+            eprintln!("[window] BUG: the termination signals were not handled ({err:?}); they end the process at once");
+        }
+    }
     window.connect_close_request(move |_window| {
         // Confirm running tabs once, then let nvim handle unsaved buffers through `:confirm qall`, as
         // for `prefix x`. The window closes when nvim exits
-        // (`editor_quit::EditorQuitting::window_close`). The `pane.shutdown()` below uses `:qa!`,
-        // which discards unsaved buffers and deletes their swap files, so proceed only after nvim is
-        // gone or never ran. If nvim cannot be killed, refuse the close.
-        if editor_quitting.window_close() == editor_quit::WindowClose::Wait {
+        // (`editor_quit::EditorQuitting::window_close`). Proceed only once nvim is gone or never ran;
+        // refuse a close if nvim cannot be killed. A termination signal skips the prompts because
+        // nobody may be present to answer. Then `pane.shutdown()` ends nvim by closing stdin, sending
+        // SIGTERM and, after five seconds, SIGKILL by pid. It preserves swap files rather than using
+        // `:qa!`.
+        if !ending_by_signal.get() && editor_quitting.window_close() == editor_quit::WindowClose::Wait {
             return glib::Propagation::Stop;
         }
         // First, and synchronously: the debounce may still be waiting on an arrangement
@@ -3855,6 +3897,65 @@ mod tests {
                 .matches(concat!("process_memory::trim_heap", "_after_startup()"))
                 .count(),
             1
+        );
+    }
+
+    /// A termination signal closes the window through its own close, which ends nvim by its pid, and the close
+    /// asks nothing after one: the handlers are installed in `build_ui` before the close handler, and that
+    /// handler reads the signal's flag before it lets `editor_quitting` ask or wait. The signal's own handler
+    /// marks the close for the watchdog and writes nothing that can panic.
+    #[test]
+    fn a_termination_signal_closes_the_window_without_its_questions() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let ui = &src[src.find(concat!("fn build_", "ui(")).expect("build_ui")..];
+        let ui = &ui[..ui
+            .find(concat!("\nfn ", "flash("))
+            .expect("the function after build_ui")];
+        let install = ui
+            .find(concat!("end_signals::", "install("))
+            .expect("build_ui installs the handlers");
+        assert_eq!(ui.matches(concat!("end_signals::", "install(")).count(), 1);
+        let handler = &ui[install..];
+        let close_at = handler
+            .find(concat!("window.", "close()"))
+            .expect("a signal closes the window");
+        let close_request = ui
+            .find(concat!("window.connect_", "close_request("))
+            .expect("the close handler");
+        assert!(
+            install < close_request,
+            "installed before the close handler takes what it moves"
+        );
+        assert!(
+            install + close_at < close_request,
+            "the handler itself closes the window"
+        );
+        // A failed write panics in `println!`, and a panic in this GLib callback aborts the process; the close
+        // is marked first, so the watchdog lets a second signal force.
+        let body = &handler[..close_at];
+        assert!(
+            !body.contains(concat!("println", "!(")),
+            "the handler's own lines may not panic"
+        );
+        assert!(body.contains(concat!("end_signals::", "mark_closing()")));
+        let close = &ui[close_request..];
+        let flag = close
+            .find(concat!("!ending_by_", "signal.get()"))
+            .expect("the close reads the flag");
+        let asks = close
+            .find(concat!("editor_quitting.", "window_close()"))
+            .expect("the close's questions");
+        let shutdown = close
+            .find(concat!("pane.", "shutdown();"))
+            .expect("the close ends nvim");
+        assert!(
+            flag < asks && asks < shutdown,
+            "the flag is read first, and nvim is ended after both"
+        );
+        assert_eq!(
+            end_signals::SIGNALS.map(|(signum, _)| signum),
+            [libc::SIGTERM, libc::SIGINT, libc::SIGHUP]
         );
     }
 

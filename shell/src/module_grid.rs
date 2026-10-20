@@ -24,7 +24,7 @@ use gtk4::subclass::prelude::*;
 
 use eitri_core::layout::{
     arrange, Axis, ConLayout, Direction, Divider, Frame, Layout, LayoutError, ModuleId, Nav, Preset, Rect, Reopen,
-    Size, Strip, ZoomChange, DEFAULT_STRIP_PX,
+    Size, Strip, Zoom, ZoomChange, DEFAULT_STRIP_PX,
 };
 
 use strips::{strip_assignments, ConStrip};
@@ -752,6 +752,17 @@ impl ModuleGrid {
             ZoomChange::Nothing => return,
         }
         self.apply();
+    }
+
+    /// Puts back a zoom something else ended, around `keeps` (`Layout::restore_zoom`). `false`, and
+    /// nothing redrawn, when the layout refuses it.
+    pub(crate) fn restore_zoom(&self, zoom: &Zoom, keeps: &ModuleId) -> bool {
+        let restored = self.layout().borrow_mut().restore_zoom(zoom, keeps);
+        if restored {
+            println!("[module_grid] zoom {zoom:?} put back around {keeps}");
+            self.apply();
+        }
+        restored
     }
 
     /// Ends a zoom, as tmux's `select-pane` and `resize-pane` do first. `false` if none was on.
