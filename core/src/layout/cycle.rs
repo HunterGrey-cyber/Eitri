@@ -28,12 +28,32 @@ impl FocusHistory {
 /// The shown module after `from` in tree order (HINT's order), wrapping; `None` with fewer than two
 /// shown. A zoom does not hide the others here: the caller unzooms, as tmux's `select-pane` does.
 pub fn next_on_screen(layout: &Layout, from: &ModuleId) -> Option<ModuleId> {
-    let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_shown(id)).collect();
+    let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_in_view(id)).collect();
     if shown.len() < 2 {
         return None;
     }
     let at = shown.iter().position(|id| id == from).map_or(0, |i| i + 1);
     Some(shown[at % shown.len()].clone())
+}
+
+/// Walks visible terminals in tree order, wrapping in either direction.
+pub fn next_terminal(layout: &Layout, from: &ModuleId, forward: bool) -> Option<ModuleId> {
+    let terminals: Vec<_> = layout
+        .leaves()
+        .into_iter()
+        .filter(|id| id.kind() == super::module::ModuleKind::Terminal && layout.is_visible(id))
+        .collect();
+    if terminals.len() < 2 {
+        return None;
+    }
+    let at = terminals.iter().position(|id| id == from);
+    let next = match at {
+        Some(at) if forward => (at + 1) % terminals.len(),
+        Some(at) => (at + terminals.len() - 1) % terminals.len(),
+        None if forward => 0,
+        None => terminals.len() - 1,
+    };
+    Some(terminals[next].clone())
 }
 
 #[cfg(test)]
@@ -104,5 +124,51 @@ mod tests {
         .unwrap();
         hide(&mut layout, &t, &frame).unwrap();
         assert_eq!(next_on_screen(&layout, &t), Some(e));
+    }
+
+    #[test]
+    fn next_terminal_walks_terminals_on_screen_in_tree_order() {
+        use super::super::{ModuleDecl, Placement};
+        let ids = ["terminal", "terminal#2", "terminal#3"].map(|s| ModuleId::parse(s).unwrap());
+        let mut layout = Layout::initial(&ids.clone().map(|id| ModuleDecl {
+            id,
+            placement: Placement::BelowEditor,
+        }))
+        .unwrap();
+        let order: Vec<_> = layout.leaves().into_iter().filter(|id| ids.contains(id)).collect();
+        assert_eq!(next_terminal(&layout, &order[0], true), Some(order[1].clone()));
+        assert_eq!(next_terminal(&layout, &order[0], false), Some(order[2].clone()));
+        layout.hide_unfocused(&order[1]).unwrap();
+        assert_eq!(next_terminal(&layout, &order[0], true), Some(order[2].clone()));
+        assert_eq!(next_terminal(&layout, &order[2], true), Some(order[0].clone()));
+        layout.hide_unfocused(&order[2]).unwrap();
+        assert_eq!(next_terminal(&layout, &order[0], true), None);
+    }
+
+    /// A terminal on a tab its container does not draw is not on screen, so `prefix n`/`p` across
+    /// terminals passes over it; it is reached through its container's tabs instead.
+    #[test]
+    fn next_terminal_skips_an_inactive_tab() {
+        use super::super::con::{Child, Con, ConLayout, Node};
+        let [t1, t2, t3] = ["terminal", "terminal#2", "terminal#3"].map(|s| ModuleId::parse(s).unwrap());
+        let leaf = |id: &ModuleId, share: f32| Child::new(Node::Leaf(id.clone()), share);
+        let tabs = Con::new(ConLayout::Tabbed, vec![leaf(&t1, 0.5), leaf(&t2, 0.5)]);
+        let third = 1.0 / 3.0;
+        let root = Con::new(
+            ConLayout::SplitH,
+            vec![
+                Child::new(Node::Con(tabs), third),
+                leaf(&ModuleId::editor(), third),
+                leaf(&t3, third),
+            ],
+        );
+        let layout = Layout::new(Node::Con(root), t1.clone()).unwrap();
+        assert!(
+            layout.is_tabbed_away(&t2),
+            "the premise: terminal#2 is the tab not drawn"
+        );
+        assert_eq!(next_terminal(&layout, &t1, true), Some(t3.clone()));
+        assert_eq!(next_terminal(&layout, &t3, true), Some(t1.clone()));
+        assert_eq!(next_terminal(&layout, &t1, false), Some(t3.clone()));
     }
 }

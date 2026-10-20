@@ -58,7 +58,7 @@ The layout gains verbs that tmux, vim and i3 users expect, with the same keys af
 Without a key, by name only: `move.far-right`, `layout.flip-horizontal`, `layout.flip-vertical`, `layout.previous`,
 `swap.marked` and `layout.undo` (one step, kept in memory). In Lua, `eitri.layout.run(name, options)` runs any layout
 action by its `eitri.keymap` name, `eitri.layout.mark(id)` marks a module and `eitri.layout.get()` reads the layout.
-The layout file's format is unchanged.
+The layout file's format is unchanged by this section (the next one changes it).
 
 **What this can break:**
 - **A `set` over any of these keys stops startup,** as every `set` over a default does: the message names the key and
@@ -71,6 +71,45 @@ The layout file's format is unchanged.
 - **A Lua panel keyed `H`, `J` or `K`** now fails at startup with `Bound`; these three were free to panels before.
   Pick another key from the documented free list.
 - `L` is deliberately not bound.
+
+## Window layout: containers and terminals (added after 0.2.2)
+
+The window is now an i3-style tree of containers: a container can be split, **tabbed** (one module shown, with a
+row of titles) or **stacked** (a row of title for each module), and a window can hold up to nine terminals, each
+with its own shell. New keys, after the prefix (Alt is i3's `$mod`):
+
+| key after the prefix | action | from |
+|---|---|---|
+| `M-H` `M-J` `M-K` `M-L` (repeat) | `move.left`, `move.down`, `move.up`, `move.right`: one step | i3 `move` |
+| `M-w` / `M-s` | `container.tabbed` / `container.stacked` on this module's container; again, back to the split | i3 `layout tabbed` / `stacking` |
+| `M-a` / `M-d` | `focus.parent` / `focus.child`: select a container (the top bar reads `selected: ...`) and go back down | i3 `focus parent` / `focus child` |
+| `M-Enter` | `instance.new` with `kind=terminal`: a new terminal right of the module with the keys | i3 `exec` a terminal |
+
+A split key with the keys in a terminal (`<prefix> %` or `"`, then `t`) opens a new terminal, and `<prefix> n` / `p` in
+a terminal step through its tabs or the terminals on screen. A split binding takes `{ cwd = "pane" }`, so the new shell
+starts in the directory of the terminal you split (`k.set("prefix", "|", "split.right", { cwd = "pane" })`); with the
+tmux import on, `split-window -c "#{pane_current_path}"` becomes that, and any other `-c` value is not imported (the
+binding still works and starts in the project root). In Lua, the layout grammar accepts `'tabbed'` and `'stacked'`
+with `active = n` and the instance ids `terminal#2` to `terminal#9`, and
+`eitri.layout.run("instance.new", { kind = "terminal" })` opens a terminal. Chat views (`agent#2` and up) are not in
+this build: `instance.new { kind = "agent" }` flashes `chat views: not in this build`, and a Lua panel whose id is
+`terminal#2` to `terminal#9` or `agent#2` to `agent#9` is refused at registration.
+
+**What this can break:**
+- **A `set` over any of these keys stops startup.** If your `init.lua` sets `M-H`, `M-J`, `M-K`, `M-L`, `M-w`,
+  `M-s`, `M-a`, `M-d` or `M-Enter` in the prefix table, put `k.del("prefix", "<key>")` before that `set`, as for the
+  keys in the section above. With the tmux import on and your tmux configuration binding the key, no `del` is needed.
+  A `del` of a key that is not bound also stops startup, so on a version without these defaults the `del` lines
+  stop the launch (the key is not bound there): add them when you upgrade, not before.
+- **The layout is kept in a new file.** `<hash>.v2.json` (under `eitri/layout/` in `XDG_STATE_HOME`) holds every
+  workspace of the window. An existing `<hash>.json` is read once, when no `.v2.json` exists yet, and is never
+  written, renamed or deleted, so an older Eitri on the same project keeps its own file and the two do not overwrite
+  each other. The window you upgrade into opens as it was. Two things appear beside the new file when this version
+  could not use a file in full: `<hash>.v2.json.partial` (a copy of the original, made before the first save, when
+  part of it was left out or read differently) and `<hash>.v2.json.unusable` (a file it could not use at all, set
+  aside before a new one is written). Keys it does not know are written back unchanged, so a later build's data
+  survives a save here. Downgrading is safe for the same reason; what you arranged with containers is not seen by
+  the older version.
 
 ## Upgrading from 0.2.1
 

@@ -1,33 +1,41 @@
 //! `eitri.layout.*`: the Lua half of the layout.
 //!
-//! `eitri.layout.default{ ... }` in `init.lua` supplies the first window's tree when no saved
-//! layout is usable. A malformed table is a startup failure: [`LayoutStore::default_tree`]
-//! holds the error for `shell` to report after `init.lua` runs, since Lua errors are only logged.
-//! `agent.font_size` uses the same error handling.
+//! - `eitri.layout.default{ ... }`, in `init.lua`: the first window's tree, used whenever no saved
+//!   layout can be (a first launch, or a state file that cannot be used). A malformed table is a
+//!   startup failure naming the call: [`LayoutStore::default_tree`] holds the error for `shell`, which
+//!   exits naming it once `init.lua` has run -- the discipline `agent.font_size` follows, since
+//!   `init.lua`'s own errors are only logged.
+//! - `eitri.layout.show(id)`, `.hide(id)`, `.focus(id)`, `.split(id, 'right'|'below')`,
+//!   `.run(name, opts?)` and `.mark(id)`, for use
+//!   inside `eitri.command.register` commands and event handlers: each queues a
+//!   [`LayoutRequest`] that `shell` carries out when the handler returns. Before the window exists
+//!   they refuse, naming `default` as the way to shape the first window.
 //!
-//! `eitri.layout.show(id)`, `.hide(id)`, `.focus(id)`, `.split(id, 'right'|'below')`,
-//! `.run(name, opts?)` and `.mark(id)` queue a [`LayoutRequest`] from a command or event handler.
-//! `shell` applies it after the handler returns. Before a window exists, these calls refuse
-//! and name `default` as the way to shape the first window. `eitri.layout.get()` returns a
-//! fresh table of the live layout once the window exists. For layout actions, `run` takes the
-//! same names and options as `eitri.keymap.set`, so keys and Lua calls reach the same verbs.
+//! - `eitri.layout.get()` reads a fresh table of the live layout once the window exists.
 //!
-//! A tree looks like `{ 'row', {'editor', 0.6}, {'column', {'agent'}, {'canvas', 0.5}} }`.
-//! A node starts with `'row'` or `'column'` followed by at least two children, or with a module
-//! id and an optional second item giving its share. Splits take their share as `share = x`.
-//! Shares are inside `(0, 1)`. Unspecified children divide the remainder equally; explicit
-//! shares must leave them room, or sum to 1 if all are given. Other fields are refused so a
-//! typo cannot silently do nothing. A module's share is its second item, not `share = x`.
-//! The tree must contain `editor` and `agent`. Modules unavailable in this window are removed
-//! by `layout::reconcile_default`, with a log line.
+//! `run` takes the names and options `eitri.keymap.set` takes, for layout actions only, so a key
+//! and a Lua call reach every verb the same way.
 //!
-//! A terminal or Lua `bottom` panel that forms a full-width bottom row keeps its pinned
-//! height, with a log line. This applies both to `{ 'column', {'row', ...}, {'terminal'} }`
-//! and to `{ 'column', {'editor'}, {'agent'}, {'terminal'} }`. A panel in the middle of a
-//! column or beside another module in a row divides space by its share.
+//! **The grammar**, for example: `{ 'row', {'editor', 0.6}, {'column', {'agent'},
+//! {'canvas', 0.5}} }`. A container starts with `'row'`/`'column'` (two or more children) or
+//! `'tabbed'`/`'stacked'` (one or more children). Each table makes one flat container. Tabbed and
+//! stacked containers accept `active = n`, the 1-based drawn child, defaulting to 1. A module id
+//! starts a leaf with an optional second item: its share of the parent. A container takes its share
+//! as `share = x`. Children without shares divide what remains equally; every share is at least
+//! 0.05 and at most 1, and together they sum to 1. Unknown fields are refused so typos fail at startup.
+//! The tree must hold `editor` and `agent`; anything else this window
+//! does not have is left out when it is reconciled (`layout::reconcile_default`),
+//! with a log line.
 //!
-//! `show` ends a zoom if needed to expose its module, as `Ctrl+a e`/`a` do. Focusing the
-//! zoomed module itself keeps the zoom.
+//! **A bottom row keeps its height**, in either spelling: the terminal, or a
+//! Lua `bottom` panel, that is a full-width row at the bottom of the window -- `{ 'column', {'row', ...},
+//! {'terminal'} }` or the n-ary `{ 'column', {'editor'}, {'agent'}, {'terminal'} }` -- is pinned as a
+//! first launch pins it, and the log says so. One in the middle of a column, or beside something in a
+//! row, divides by its share.
+//!
+//! `show` puts its module on screen: during a zoom that would keep it off, the zoom ends first, as
+//! `Ctrl+a e`/`a` end it. `focus` onto the zoomed module itself leaves the zoom on, as tmux's
+//! `select-pane` onto the zoomed pane does.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -36,8 +44,8 @@ use std::rc::Rc;
 use mlua::{Lua, Table, Value};
 
 use crate::keymap::Action;
-use crate::layout::tree::{MAX_RATIO, MIN_RATIO};
-use crate::layout::{Axis, Layout, ModuleId, Node};
+use crate::layout::tree::MIN_RATIO;
+use crate::layout::{Axis, Child, Con, ConLayout, Layout, ModuleId, Node};
 
 /// One queued `eitri.layout` call, for `shell` to carry out.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,7 +177,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
             }
             let action = crate::keymap::action::parse(&name, &opts, &run_store.borrow().lua_panels)
                 .map_err(|error| mlua::Error::RuntimeError(format!("eitri.layout.run: {error}")))?.action;
-            if matches!(action, Action::Split(_)) {
+            if matches!(action, Action::Split { .. }) {
                 return Err(mlua::Error::RuntimeError(format!(
                     "eitri.layout.run: {name} waits for a module key; eitri.layout.split(id, 'right'|'below') places one"
                 )));
@@ -212,13 +220,24 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                         .to_string(),
                 )
             })?;
-            let table = node_table(lua, layout.root(), None)?;
+            let table = match layout.root().children.as_slice() {
+                [only] => node_table(lua, &only.node, None)?,
+                _ => con_table(lua, layout.root(), None)?,
+            };
             table.set("focus", layout.focus().as_str())?;
             table.set(
                 "hidden",
                 lua.create_sequence_from(layout.hidden().iter().map(ModuleId::as_str))?,
             )?;
-            table.set("zoomed", layout.zoomed().map(ModuleId::as_str))?;
+            let zoomed = match layout.zoom() {
+                Some(crate::layout::Zoom::Module(id)) => Some(id.clone()),
+                Some(crate::layout::Zoom::Con(id)) => layout
+                    .root()
+                    .find(*id)
+                    .and_then(|c| c.focused_leaf(&|m| layout.is_shown(m))),
+                None => None,
+            };
+            table.set("zoomed", zoomed.as_ref().map(ModuleId::as_str))?;
             table.set("marked", layout.mark().map(ModuleId::as_str))?;
             Ok(table)
         })?,
@@ -229,34 +248,42 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
 }
 
 fn node_table(lua: &Lua, node: &Node, share: Option<f32>) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
     match node {
         Node::Leaf(id) => {
+            let table = lua.create_table()?;
             table.raw_set(1, id.as_str())?;
             if let Some(share) = share {
                 table.raw_set(2, f64::from(share))?;
             }
+            Ok(table)
         }
-        Node::Split {
-            axis,
-            ratio,
-            first,
-            second,
-            ..
-        } => {
-            table.raw_set(
-                1,
-                match axis {
-                    Axis::Row => "row",
-                    Axis::Column => "column",
-                },
-            )?;
-            table.raw_set(2, node_table(lua, first, Some(*ratio))?)?;
-            table.raw_set(3, node_table(lua, second, None)?)?;
-            if let Some(share) = share {
-                table.raw_set("share", f64::from(share))?;
-            }
-        }
+        Node::Con(c) => con_table(lua, c, share),
+    }
+}
+
+/// A container in the default grammar: its orientation, then every child, each but the last with its
+/// share (the last takes what the others leave).
+fn con_table(lua: &Lua, c: &Con, share: Option<f32>) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.raw_set(
+        1,
+        match c.layout {
+            ConLayout::SplitH => "row",
+            ConLayout::SplitV => "column",
+            ConLayout::Tabbed => "tabbed",
+            ConLayout::Stacked => "stacked",
+        },
+    )?;
+    if c.layout.axis().is_none() {
+        table.raw_set("active", c.focus + 1)?;
+    }
+    let last = c.children.len().saturating_sub(1);
+    for (i, child) in c.children.iter().enumerate() {
+        let share = (i < last).then_some(child.share);
+        table.raw_set(i + 2, node_table(lua, &child.node, share)?)?;
+    }
+    if let Some(share) = share {
+        table.raw_set("share", f64::from(share))?;
     }
     Ok(table)
 }
@@ -305,17 +332,21 @@ pub fn parse_default(value: &Value) -> Result<Node, String> {
 fn parse_node(table: &Table, at: &str) -> Result<(Node, Option<f32>), String> {
     let head: Value = table.raw_get(1).map_err(|e| e.to_string())?;
     let Value::String(head) = head else {
-        return Err(format!("{at}: the first item must be 'row', 'column' or a module id"));
+        return Err(format!(
+            "{at}: the first item must be 'row', 'column', 'tabbed', 'stacked' or a module id"
+        ));
     };
     let head = head.to_str().map_err(|e| e.to_string())?.to_string();
     let len = table.raw_len();
-    let axis = match head.as_str() {
-        "row" => Some(Axis::Row),
-        "column" => Some(Axis::Column),
+    let layout = match head.as_str() {
+        "row" => Some(ConLayout::SplitH),
+        "column" => Some(ConLayout::SplitV),
+        "tabbed" => Some(ConLayout::Tabbed),
+        "stacked" => Some(ConLayout::Stacked),
         _ => None,
     };
-    refuse_other_fields(table, len, axis.is_some(), &head, at)?;
-    let Some(axis) = axis else {
+    refuse_other_fields(table, len, layout.is_some(), &head, at)?;
+    let Some(layout) = layout else {
         let id = ModuleId::parse(&head).map_err(|e| format!("{at}: {e}"))?;
         let share = match len {
             1 => None,
@@ -338,17 +369,38 @@ fn parse_node(table: &Table, at: &str) -> Result<(Node, Option<f32>), String> {
             Err(e) => Err(e.to_string()),
         })
         .collect::<Result<_, _>>()?;
-    if children.len() < 2 {
-        return Err(format!("{at}: a {head} needs two or more items"));
+    let tabbed = layout.axis().is_none();
+    if children.len() < if tabbed { 1 } else { 2 } {
+        let count = if tabbed { "one" } else { "two" };
+        return Err(format!("{at}: a {head} needs {count} or more items"));
     }
+    let active = if tabbed {
+        match table.raw_get::<Value>("active").map_err(|e| e.to_string())? {
+            Value::Nil => 1,
+            Value::Integer(n) if n >= 1 && n as usize <= children.len() => n as usize,
+            Value::Number(n) if n.fract() == 0.0 && n >= 1.0 && n <= children.len() as f64 => n as usize,
+            value => {
+                let n = match value {
+                    Value::Integer(n) => n.to_string(),
+                    Value::Number(n) => n.to_string(),
+                    other => format!("{other:?}"),
+                };
+                return Err(format!("{at}: active = {n}: the {head} has {} items", children.len()));
+            }
+        }
+    } else {
+        1
+    };
     let share = match table.raw_get::<Value>("share").map_err(|e| e.to_string())? {
         Value::Nil => None,
         other => Some(share_of(other, &format!("{at}'s share"))?),
     };
-    Ok((chain(axis, children, &head)?, share))
+    let mut c = container(layout, children, &head)?;
+    c.focus = active - 1;
+    Ok((Node::Con(c), share))
 }
 
-/// Everything in a node's table but its `len` items and, on a split, `share`: refused, naming it.
+/// Refuse unknown fields so misspelled shares and active indices cannot silently change a layout.
 fn refuse_other_fields(table: &Table, len: usize, split: bool, head: &str, at: &str) -> Result<(), String> {
     for pair in table.pairs::<Value, Value>() {
         let (key, _) = pair.map_err(|e| e.to_string())?;
@@ -360,6 +412,7 @@ fn refuse_other_fields(table: &Table, len: usize, split: bool, head: &str, at: &
         };
         let message = match name.as_str() {
             "share" if split => continue,
+            "active" if matches!(head, "tabbed" | "stacked") => continue,
             "share" => format!(
                 "{at}: a module's share is its second item, {{'{head}', 0.6}}; share = is for a row or a column"
             ),
@@ -376,14 +429,21 @@ fn share_of(value: Value, at: &str) -> Result<f32, String> {
         Value::Integer(n) => n as f32,
         other => return Err(format!("{at}: a share is a number, got {}", other.type_name())),
     };
-    if !(share > 0.0 && share < 1.0) {
-        return Err(format!("{at}: a share is between 0 and 1, got {share}"));
-    }
     Ok(share)
 }
 
-/// `children` as a right-leaning chain of splits along `axis`, each child at its share.
-fn chain(axis: Axis, children: Vec<(Node, Option<f32>)>, head: &str) -> Result<Node, String> {
+/// Each child keeps its share directly, so parsing never introduces another container.
+fn container(layout: ConLayout, children: Vec<(Node, Option<f32>)>, head: &str) -> Result<Con, String> {
+    for (i, (_, share)) in children.iter().enumerate() {
+        if let Some(share) = share {
+            if !(MIN_RATIO..=1.0).contains(share) {
+                return Err(format!(
+                    "item {} of the {head} gets {share:.3}; a share is 0.05 to 1",
+                    i + 1
+                ));
+            }
+        }
+    }
     let given: f32 = children.iter().filter_map(|(_, s)| *s).sum();
     let unset = children.iter().filter(|(_, s)| s.is_none()).count();
     if unset == 0 && (given - 1.0).abs() > 0.001 {
@@ -396,21 +456,22 @@ fn chain(axis: Axis, children: Vec<(Node, Option<f32>)>, head: &str) -> Result<N
     }
     let each = if unset > 0 { (1.0 - given) / unset as f32 } else { 0.0 };
     let shares: Vec<f32> = children.iter().map(|(_, s)| s.unwrap_or(each)).collect();
-    let mut nodes: Vec<Node> = children.into_iter().map(|(n, _)| n).collect();
-    let mut node = nodes.pop().expect("two or more children");
-    for i in (0..nodes.len()).rev() {
-        let rest: f32 = shares[i..].iter().sum();
-        let ratio = shares[i] / rest;
-        if !(MIN_RATIO..=MAX_RATIO).contains(&ratio) {
+    for (i, share) in shares.iter().enumerate() {
+        if !(MIN_RATIO..=1.0).contains(share) {
             return Err(format!(
-                "item {} of the {head} would get {:.3} of what is left; a split gives each side 0.05 to 0.95",
-                i + 1,
-                ratio
+                "item {} of the {head} gets {share:.3}; a share is 0.05 to 1",
+                i + 1
             ));
         }
-        node = Node::split(axis, ratio, nodes.pop().expect("one per index"), node);
     }
-    Ok(node)
+    Ok(Con::new(
+        layout,
+        children
+            .into_iter()
+            .zip(shares)
+            .map(|((node, _), share)| Child::new(node, share))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -515,6 +576,36 @@ mod tests {
     }
 
     #[test]
+    fn get_names_the_focused_leaf_of_a_zoomed_container() {
+        use crate::layout::{container_mode, focus_parent, ConLayout};
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::agent()),
+                    Node::Leaf(ModuleId::terminal()),
+                ),
+            ),
+            ModuleId::agent(),
+        )
+        .unwrap();
+        container_mode(&mut layout, &ModuleId::agent(), ConLayout::Tabbed).unwrap();
+        focus_parent(&mut layout);
+        layout.toggle_zoom(&ModuleId::agent());
+        assert!(layout.is_zoomed());
+        assert_eq!(layout.zoomed(), None);
+        let (lua, _, _) = attached(layout);
+        assert_eq!(
+            lua.load("return eitri.layout.get().zoomed").eval::<String>().unwrap(),
+            "agent"
+        );
+    }
+
+    #[test]
     fn get_reads_the_live_layout_in_the_default_grammar() {
         let mut layout = Layout::new(
             Node::split(
@@ -594,6 +685,103 @@ mod tests {
     }
 
     #[test]
+    fn the_grammar_says_tabbed_and_stacked_and_get_round_trips_them() {
+        use crate::layout::{arrange, Frame, Size};
+        for head in ["tabbed", "stacked"] {
+            for source in [
+                format!("{{ 'row', {{'editor', 0.6}}, {{'{head}', {{'agent'}}, {{'terminal'}}, active = 2}} }}"),
+                format!("{{'{head}', {{'editor'}}, {{'agent'}}, active = 2}}"),
+                format!("{{'row', {{'editor'}}, {{'{head}', {{'agent'}}, active = 1}} }}"),
+            ] {
+                let lua = Lua::new();
+                let value = lua.load(&format!("return {source}")).eval::<Value>().unwrap();
+                let tree = parse_default(&value).unwrap();
+                let c = tree.as_con().unwrap();
+                let tabs = if source.contains("'row'") {
+                    assert_eq!(c.layout, ConLayout::SplitH);
+                    c.children[1].node.as_con().unwrap()
+                } else {
+                    c
+                };
+                assert_eq!(
+                    tabs.layout,
+                    if head == "tabbed" {
+                        ConLayout::Tabbed
+                    } else {
+                        ConLayout::Stacked
+                    }
+                );
+                assert_eq!(tabs.focus, if source.contains("active = 1") { 0 } else { 1 });
+                let focus = if source.contains("0.6") || source.contains("active = 1") {
+                    ModuleId::editor()
+                } else {
+                    ModuleId::agent()
+                };
+                let layout = Layout::new(tree, focus.clone()).unwrap();
+                let (lua, _, live) = attached(layout);
+                let table: Table = lua.load("return eitri.layout.get()").eval().unwrap();
+                assert_eq!(table.get::<String>("focus").unwrap(), focus.as_str());
+                if table.get::<String>(1).unwrap() == head {
+                    assert_eq!(table.get::<usize>("active").unwrap(), 2);
+                }
+                for key in ["focus", "hidden", "zoomed", "marked"] {
+                    table.raw_set(key, Value::Nil).unwrap();
+                }
+                let back = Layout::new(parse_default(&Value::Table(table)).unwrap(), focus).unwrap();
+                for size in [
+                    Size { w: 1280, h: 721 },
+                    Size { w: 1920, h: 1040 },
+                    Size { w: 800, h: 600 },
+                ] {
+                    let frame = Frame::new(size, 1);
+                    let a = arrange(&back, &frame);
+                    let b = arrange(&live.borrow(), &frame);
+                    assert_eq!(a.modules, b.modules, "{source} {size:?}");
+                    assert_eq!(
+                        a.strips
+                            .iter()
+                            .map(|s| (s.layout, s.rect, &s.entries))
+                            .collect::<Vec<_>>(),
+                        b.strips
+                            .iter()
+                            .map(|s| (s.layout, s.rect, &s.entries))
+                            .collect::<Vec<_>>(),
+                        "{source} {size:?}",
+                    );
+                }
+            }
+        }
+        for (source, message) in [
+            ("{'tabbed'}", "a tabbed needs one or more items"),
+            (
+                "{'tabbed', {'editor'}, {'agent'}, active = 3}",
+                "the tree: active = 3: the tabbed has 2 items",
+            ),
+            (
+                "{'stacked', {'editor'}, {'agent'}, active = 0}",
+                "active = 0: the stacked has 2 items",
+            ),
+            ("{'row', {'editor'}, {'agent'}, active = 1}", "unknown field active"),
+        ] {
+            let lua = Lua::new();
+            let value = lua.load(&format!("return {source}")).eval::<Value>().unwrap();
+            assert!(parse_default(&value).unwrap_err().contains(message), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_row_of_three_is_one_container() {
+        let tree = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'terminal'} }").unwrap();
+        let c = tree.as_con().unwrap();
+        assert_eq!(c.layout, crate::layout::ConLayout::SplitH);
+        assert_eq!(c.children.len(), 3);
+        assert!(c
+            .children
+            .iter()
+            .all(|ch| matches!(ch.node, Node::Leaf(_)) && (ch.share - 1.0 / 3.0).abs() < 1e-6));
+    }
+
+    #[test]
     fn get_while_the_layout_is_being_changed_is_refused_not_a_panic() {
         let (lua, _, live) = attached(Layout::initial(&[]).unwrap());
         let _held = live.borrow_mut();
@@ -644,20 +832,22 @@ mod tests {
         let pinned = |source: &str| {
             let tree = default_of(source).unwrap();
             let r = crate::layout::reconcile_default(tree, &[]).unwrap();
-            let mut pins = Vec::new();
-            fn collect(node: &Node, out: &mut Vec<(ModuleId, bool)>) {
-                if let Node::Split { pin, first, second, .. } = node {
-                    if let Node::Leaf(id) = second.as_ref() {
-                        out.push((id.clone(), pin.is_some()));
-                    }
-                    collect(first, out);
-                    collect(second, out);
-                }
-            }
-            collect(r.layout.root(), &mut pins);
-            pins.into_iter()
-                .find(|(id, _)| *id == ModuleId::terminal())
-                .is_some_and(|(_, p)| p)
+            // Pinned, the terminal keeps the height it settled at when the window grows.
+            let mut layout = r.layout;
+            let height_at = |layout: &Layout, h: i32| {
+                crate::layout::arrange(
+                    layout,
+                    &crate::layout::Frame::new(crate::layout::Size { w: 1280, h }, 1),
+                )
+                .rect_of(&ModuleId::terminal())
+                .unwrap()
+                .h
+            };
+            crate::layout::settle_pins(
+                &mut layout,
+                &crate::layout::Frame::new(crate::layout::Size { w: 1280, h: 721 }, 1),
+            );
+            height_at(&layout, 721) == height_at(&layout, 1041)
         };
         assert!(pinned(
             "eitri.layout.default{ 'column', {'editor'}, {'agent'}, {'terminal'} }"
@@ -671,25 +861,23 @@ mod tests {
         );
     }
 
-    /// tmux's n cells: three children with no shares are a third each, as a chain of two splits.
+    /// Children without shares divide the remaining space equally in one container.
     #[test]
     fn children_without_a_share_divide_what_is_left_equally() {
         let tree = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'lua:notes'} }").unwrap();
-        let Node::Split { ratio, second, .. } = &tree else {
-            panic!("a leaf")
-        };
+        let outer = tree.as_con().expect("a container");
+        let ratio = outer.children[0].share;
         assert!((ratio - 1.0 / 3.0).abs() < 1e-6, "{ratio}");
-        let Node::Split { ratio, .. } = second.as_ref() else {
-            panic!("a leaf")
-        };
-        assert!((ratio - 0.5).abs() < 1e-6, "{ratio}");
+        assert_eq!(outer.children.len(), 3);
+        assert!(outer.children.iter().all(|ch| (ch.share - 1.0 / 3.0).abs() < 1e-6));
         let tree =
             default_of("eitri.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }")
                 .unwrap();
-        let Node::Split { axis, ratio, .. } = &tree else {
-            panic!("a leaf")
-        };
-        assert_eq!((*axis, *ratio), (Axis::Column, 0.7));
+        let outer = tree.as_con().expect("a container");
+        assert_eq!(
+            (outer.layout.axis(), outer.children[0].share),
+            (Some(Axis::Column), 0.7)
+        );
     }
 
     /// A malformed layout table produces an error naming the call and the problem.
@@ -707,7 +895,7 @@ mod tests {
             ),
             (
                 "eitri.layout.default{ 'row', {'editor', 1.2}, {'agent'} }",
-                "between 0 and 1, got 1.2",
+                "item 1 of the row gets 1.200; a share is 0.05 to 1",
             ),
             (
                 "eitri.layout.default{ 'row', {'editor', 0.7}, {'agent', 0.5} }",
@@ -719,7 +907,7 @@ mod tests {
             ),
             (
                 "eitri.layout.default{ 'row', {'editor', 0.97}, {'agent', 0.03} }",
-                "0.05 to 0.95",
+                "a share is 0.05 to 1",
             ),
             (
                 "eitri.layout.default{ 'row', {'editor'}, {'editor'} }",
@@ -798,5 +986,17 @@ mod tests {
             let err = lua.load(source).exec().unwrap_err();
             assert!(err.to_string().contains(why), "{source}: {err}");
         }
+    }
+
+    #[test]
+    fn instance_ids_are_part_of_the_grammar() {
+        let tree = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'terminal#2'} }").unwrap();
+        let layout = crate::layout::reconcile_default(tree, &[]).unwrap().layout;
+        let id = ModuleId::parse("terminal#2").unwrap();
+        assert!(layout.contains(&id));
+        let (lua, _, _) = attached(layout);
+        assert!(lua.load("return eitri.layout.get()[4][1]").eval::<String>().unwrap() == "terminal#2");
+        let error = default_of("eitri.layout.default{ 'row', {'editor'}, {'agent'}, {'terminal#1'} }").unwrap_err();
+        assert!(error.contains("instance 1 is 'terminal'"), "{error}");
     }
 }

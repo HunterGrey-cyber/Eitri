@@ -38,7 +38,7 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> ;` | move the keys back to the module that had them before |
 | `<prefix> o` | move the keys to the next module on screen |
 | `<prefix> z` | zoom this module, or restore it |
-| `<prefix> %` or `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there |
+| `<prefix> %` or `<prefix> "`, then `e`, `a` or `t` | open that module to the right of / below this one, or move it there; with the keys in a terminal, `t` opens a new terminal there (see [Containers and terminals](#containers-and-terminals)) |
 | `<prefix> {` / `<prefix> }` | swap this module with the previous / the next one on screen |
 | `<prefix> Alt+1` / `Alt+2` | every module in one row / in one column, at equal sizes |
 | `<prefix> Alt+3` / `Alt+4` / `Alt+5` | the first module big on top with the others in a row below / big on the left with the others in a column beside it / all modules in a grid (tmux's `main-horizontal`, `main-vertical` and `tiled`) |
@@ -86,8 +86,8 @@ screen changes, and the change before the close can no longer be undone.
 
 **Setting a key that already has an action.** The keys in this section are defaults, and `eitri.keymap.set` on a key
 that has an action stops Eitri at startup with a message that names the call and says to run
-`eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4` or `M-5` (the
-spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
+`eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4`, `M-5`, `M-H`,
+`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d` or `M-Enter` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
 tmux configuration binds the key, the key already counts as yours and your `set` replaces it with no `del`. A `del`
 of a key that nothing is bound to also stops startup, so a `del` line works only from this version on, or when the
 import and your tmux configuration bind that key.
@@ -113,6 +113,54 @@ import and your tmux configuration bind that key.
 A companion window (see [Companion mode](companion.md)) has no layout of its own, so there the prefix keeps
 the tab keys, `r`, `?`, `:`, `f`, sending the prefix itself and the arrow keys, which move toward the
 neighbouring window; every layout key answers `not in a companion window`.
+
+### Containers and terminals
+
+Modules sit in containers. A container is **split** (its modules side by side, or one above the other: what `%`
+and `"` make), **tabbed** (one module shown at a time, with a row of titles above it) or **stacked** (one module
+shown at a time, with a row of title for each module above it). The keys below are i3's `$mod` chords, with Alt
+as `$mod`, pressed after the prefix. A title is the module's name as the top bar's chips show it (`terminal 2`;
+`agent ⚑1` when the agent has a card waiting), and it is drawn exactly as written, never as markup.
+
+| keys | what they do |
+|---|---|
+| `<prefix> Alt+w` / `Alt+s` | make the container this module is in tabbed / stacked; pressed again, the container goes back to the split it was, with its sizes. "This module's container" is the nearest one around it that has another module on screen, so in the default window it is the whole window, not the editor's column with a hidden terminal. With none, nothing happens and the refusal flashes |
+| `<prefix> Alt+H`, `Alt+J`, `Alt+K`, `Alt+L` | move this module one step left / down / up / right (repeats; i3's `move`). It changes places with the module on that side, or goes into the container there beside the module that container shows, or leaves its container for the next one out; at the window's edge nothing happens. `<prefix> H`, `J`, `K` go all the way to the edge instead |
+| `<prefix> Alt+a` / `Alt+d` | select the parent container of what is selected / go back down to the child that has the keys (i3's `focus parent` and `focus child`) |
+| `<prefix> Alt+Enter` | open a new terminal to the right of the module that has the keys; its shell starts in the project root |
+
+**Tabs and stacks.** Click a title, or press `f` and type the title's label (HINT labels every title), to bring
+that module forward and give it the keys. From the keyboard, `Ctrl+h` / `Ctrl+l` step to the tab on the left /
+right in a tabbed container and `Ctrl+k` / `Ctrl+j` to the one above / below in a stacked one; when there is no
+tab that way they go on as between modules. The module that has the keys is always the one shown, so hiding or
+closing it gives the keys to the tab that shows next. A tab that is not shown keeps running: a terminal there goes
+on printing and shows its lines when it comes back, and a chat keeps its session. A chat on a tab that is not
+shown carries `agent ⚑N` on its title while it has cards waiting; with `modules.chat.on_permission` set to
+`"reveal"` a new card brings its tab forward, except when the keys are on a sibling tab of the same container: then
+you get the toast and nothing moves.
+
+**Selecting a container.** `<prefix> Alt+a` selects the container around the module that has the keys, and the
+top bar shows it as `selected: column (editor, terminal)`: the container's kind and the titles of the modules
+shown in it. Pressing it again goes up one more container (the window's own is the last), and `<prefix> Alt+d`
+goes back down. While a container is selected, the keys that arrange (`Alt+H`, `Alt+J`, `Alt+K`, `Alt+L`, `Alt+w`,
+`Alt+s`, `Alt+e`, `z`, `H`, `J`, `K`, `E` and the flips) act on the whole container. The ones that need a single
+module (`x`, hiding a module, the swaps and the marks) refuse and flash `acts on one module`. Giving the keys to
+another module, opening a module with a split key, and `Esc` after the prefix end the selection. Nothing is drawn
+around the selected container; the top bar's text is all there is.
+
+**Terminals.** A window can hold up to nine terminals, `terminal` and `terminal 2` to `terminal 9`, each with its
+own shell. A new one comes from `<prefix> Alt+Enter`, or from a split key with the keys in a terminal:
+`<prefix> %` or `"` and then `t` opens a new terminal on that side, where from any other module `t` opens the one
+terminal. The prefix's hint reads `t new terminal` then, and `t terminal ×3` when several are open. `<prefix> t`
+on its own reaches the terminal that has the keys, or else the one you used last. A split binding with
+`cwd = "pane"` starts the new shell in the directory the terminal you split is in (see
+[Configuration](configuration.md#layout-from-lua)). `<prefix> x` on a numbered terminal ends its shell and removes
+it, after the usual `y/n`; the `terminal` itself is only closed and reopens below the editor. A numbered terminal
+whose shell ends (`exit`) is removed with no question. `<prefix> n` / `<prefix> p` with the keys in a terminal go to
+the next / the previous tab when it is in a tabbed or stacked container, otherwise to the next / the previous
+terminal on screen, and do nothing with only one. Terminals have no text-size keys. There are no extra chats yet:
+`Alt+Enter` opens terminals only, and a split key then `a` with the keys in the chat flashes `chat views: not in
+this build`.
 
 ## Moving between panes
 

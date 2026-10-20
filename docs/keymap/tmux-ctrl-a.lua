@@ -5,14 +5,15 @@
 -- `m`, `q`, `H`, `J` and `K` are Eitri defaults from this version on (mark, select by number and the
 -- far-edge moves), so each is deleted before it is set below. A `del` of a key that is not bound stops
 -- startup, so those lines need this version or later, or the tmux import on with these keys bound in tmux.
+-- The split cwd option needs this version or later.
 local k = eitri.keymap
 k.prefix("C-a")                                             -- base.conf:11
 k.del("prefix", "C-b")                                      -- base.conf:12
 k.set("prefix", "C-a", "send-prefix")                       -- base.conf:14
 k.del("prefix", "%")                                        -- base.conf:49
 k.del("prefix", '"')                                        -- base.conf:50
-k.set("prefix", "\\", "split.right")                        -- base.conf:47
-k.set("prefix", "-", "split.below")                         -- base.conf:48
+k.set("prefix", "\\", "split.right", { cwd = "pane" })      -- base.conf:47
+k.set("prefix", "-", "split.below", { cwd = "pane" })     -- base.conf:48
 k.set("prefix", "|", "layout.even-horizontal")              -- base.conf:53
 k.set("prefix", "_", "layout.even-vertical")                -- base.conf:54
 k.del("prefix", "l")                                        -- stock last-window; here l resizes

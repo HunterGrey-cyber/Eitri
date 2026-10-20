@@ -17,6 +17,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::keymap::action::SplitCwd;
 use crate::keymap::{Action, KeySpec, Keymap};
 use crate::layout::{Axis, ModuleId, ModuleKeys, ModuleKind};
 
@@ -46,6 +47,7 @@ pub enum PrefixCommand {
     Place {
         module: ModuleId,
         axis: Axis,
+        cwd: SplitCwd,
     },
 }
 
@@ -75,6 +77,7 @@ enum State {
     /// After a split key: the next key names the module to place along `axis`.
     AwaitModule {
         axis: Axis,
+        cwd: SplitCwd,
     },
     AwaitNumber {
         until: Instant,
@@ -122,7 +125,7 @@ impl Prefix {
         match self.state {
             State::Armed => Waiting::Command,
             State::AwaitNumber { .. } => Waiting::Number,
-            State::AwaitModule { axis } => Waiting::Module(axis),
+            State::AwaitModule { axis, .. } => Waiting::Module(axis),
             State::Idle | State::Repeat { .. } => Waiting::No,
         }
     }
@@ -218,8 +221,8 @@ impl Prefix {
                 };
                 match self.keymap.lookup(&key) {
                     Some(binding) => match binding.action {
-                        Action::Split(axis) => {
-                            self.state = State::AwaitModule { axis };
+                        Action::Split { axis, cwd } => {
+                            self.state = State::AwaitModule { axis, cwd };
                             Outcome::Swallow
                         }
                         ref action => {
@@ -239,7 +242,7 @@ impl Prefix {
                     },
                 }
             }
-            State::AwaitModule { axis } => {
+            State::AwaitModule { axis, cwd } => {
                 if press == Press::Modifier {
                     return Outcome::Swallow;
                 }
@@ -260,6 +263,7 @@ impl Prefix {
                     Some(module) => Outcome::Run(PrefixCommand::Place {
                         module: module.clone(),
                         axis,
+                        cwd,
                     }),
                     None => Outcome::Swallow,
                 }
@@ -346,7 +350,7 @@ mod tests {
     fn every_default_binding_after_the_prefix_runs_its_action_and_disarms() {
         let t = Instant::now();
         for binding in Keymap::defaults().bindings() {
-            if matches!(binding.action, Action::Split(_)) {
+            if matches!(binding.action, Action::Split { .. }) {
                 continue;
             }
             let mut p = armed(defaults(), t);
@@ -522,6 +526,7 @@ mod tests {
                     Outcome::Run(PrefixCommand::Place {
                         module: ModuleId::agent(),
                         axis,
+                        cwd: SplitCwd::Start,
                     }),
                 ),
                 (
@@ -529,6 +534,7 @@ mod tests {
                     Outcome::Run(PrefixCommand::Place {
                         module: ModuleId::terminal(),
                         axis,
+                        cwd: SplitCwd::Start,
                     }),
                 ),
                 (
@@ -536,6 +542,7 @@ mod tests {
                     Outcome::Run(PrefixCommand::Place {
                         module: ModuleId::agent(),
                         axis,
+                        cwd: SplitCwd::Start,
                     }),
                 ),
                 (key("x"), Outcome::Swallow),
@@ -575,7 +582,8 @@ mod tests {
             p.press(key("G"), K2, t),
             Outcome::Run(PrefixCommand::Place {
                 module: ModuleId::lua("g2"),
-                axis: Axis::Column
+                axis: Axis::Column,
+                cwd: SplitCwd::Start,
             })
         );
         let mut plain = armed(defaults(), t);
@@ -700,5 +708,45 @@ mod tests {
         assert!(p.expire(t + Duration::from_millis(1001)));
         assert_eq!(p.waiting(), Waiting::No);
         assert!(!p.expire(t + Duration::from_millis(2000)), "nothing left to end");
+    }
+
+    #[test]
+    fn a_split_binding_carries_its_cwd_to_the_place() {
+        for cwd in [
+            crate::keymap::action::SplitCwd::Start,
+            crate::keymap::action::SplitCwd::Pane,
+        ] {
+            let map = if cwd == crate::keymap::action::SplitCwd::Start {
+                Keymap::defaults()
+            } else {
+                Keymap::apply_user(
+                    &[
+                        KeymapOp::Del {
+                            table: "prefix".into(),
+                            key: "%".into(),
+                        },
+                        KeymapOp::Set {
+                            table: "prefix".into(),
+                            key: "%".into(),
+                            action: "split.right".into(),
+                            opts: vec![("cwd".into(), crate::keymap::OptValue::Str("pane".into()))],
+                        },
+                    ],
+                    &[],
+                )
+                .unwrap()
+            };
+            let t = Instant::now();
+            let mut p = armed(with(map, &[]), t);
+            assert_eq!(p.press(key("%"), K1, t), Outcome::Swallow);
+            assert_eq!(
+                p.press(key("t"), K2, t),
+                Outcome::Run(PrefixCommand::Place {
+                    module: ModuleId::terminal(),
+                    axis: Axis::Row,
+                    cwd,
+                })
+            );
+        }
     }
 }

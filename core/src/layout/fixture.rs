@@ -15,8 +15,9 @@
 
 use std::collections::BTreeSet;
 
+use super::con::{Node, Pin};
 use super::module::ModuleId;
-use super::tree::{Axis, Branch, Layout, Node, Pin, MAX_RATIO, MIN_RATIO};
+use super::tree::{Axis, Branch, Layout, MAX_RATIO, MIN_RATIO};
 
 struct Child {
     node: Node,
@@ -82,24 +83,20 @@ impl<'a> Parser<'a> {
                 }
                 let pin = child
                     .pin
-                    .map(|px| Pin {
-                        side: Branch::First,
-                        px,
-                    })
-                    .or_else(|| {
-                        tail_pin.take().map(|px| Pin {
-                            side: Branch::Second,
-                            px,
-                        })
-                    });
-                node = Node::Split {
-                    axis,
-                    ratio: child
-                        .ratio
-                        .unwrap_or_else(|| (1.0 / (count - i) as f32).clamp(MIN_RATIO, MAX_RATIO)),
-                    pin,
-                    first: Box::new(child.node),
-                    second: Box::new(node),
+                    .map(|px| (Branch::First, px))
+                    .or_else(|| tail_pin.take().map(|px| (Branch::Second, px)));
+                let ratio = child
+                    .ratio
+                    .unwrap_or_else(|| (1.0 / (count - i) as f32).clamp(MIN_RATIO, MAX_RATIO));
+                node = match pin {
+                    None => Node::split(axis, ratio, child.node, node),
+                    Some((side, px)) => {
+                        let Node::Con(mut c) = Node::pinned(axis, ratio, side, child.node, node) else {
+                            unreachable!("a split is a container")
+                        };
+                        c.children[usize::from(side == Branch::Second)].pin = Some(Pin { px });
+                        Node::Con(c)
+                    }
                 };
             }
             node
@@ -193,7 +190,7 @@ pub(crate) fn fixture(spec: &str) -> Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::tree::{Axis, Branch, Node, Pin};
+    use crate::layout::con::ConLayout;
 
     fn leaf(s: &str) -> Node {
         Node::Leaf(ModuleId::parse(s).unwrap())
@@ -203,8 +200,8 @@ mod tests {
     fn a_two_child_row_is_one_split_at_the_given_ratio() {
         let layout = fixture("row(editor 0.6, agent)");
         assert_eq!(
-            layout.root(),
-            &Node::split(Axis::Row, 0.6, leaf("editor"), leaf("agent"))
+            Some(layout.root()),
+            Node::split(Axis::Row, 0.6, leaf("editor"), leaf("agent")).as_con()
         );
         assert_eq!(layout.focus(), &ModuleId::editor());
         assert!(layout.hidden().is_empty());
@@ -214,25 +211,24 @@ mod tests {
     fn three_children_chain_to_the_right_and_default_to_even() {
         let layout = fixture("column(editor, agent, terminal)");
         assert_eq!(
-            layout.root(),
-            &Node::split(
+            Some(layout.root()),
+            Node::split(
                 Axis::Column,
                 1.0 / 3.0,
                 leaf("editor"),
                 Node::split(Axis::Column, 0.5, leaf("agent"), leaf("terminal"))
             )
+            .as_con()
         );
     }
 
     #[test]
     fn pinned_hidden_and_focus_attach_where_they_are_written() {
         let layout = fixture("row(column(editor 0.6666667, terminal hidden pinned) 0.6, agent focus)");
-        let Node::Split { ratio, first, .. } = layout.root() else {
-            panic!("a split")
-        };
-        assert_eq!(*ratio, 0.6);
+        let root = layout.root();
+        assert_eq!((root.layout, root.children[0].share), (ConLayout::SplitH, 0.6));
         assert_eq!(
-            **first,
+            root.children[0].node,
             Node::pinned(
                 Axis::Column,
                 0.6666667,
@@ -244,20 +240,15 @@ mod tests {
         assert!(layout.hidden().contains(&ModuleId::terminal()));
         assert_eq!(layout.focus(), &ModuleId::agent());
         let layout = fixture("column(terminal pinned 240, lua:notes)");
-        assert_eq!(
-            layout.root(),
-            &Node::Split {
-                axis: Axis::Column,
-                ratio: 0.5,
-                pin: Some(Pin {
-                    side: Branch::First,
-                    px: Some(240)
-                }),
-                first: Box::new(leaf("terminal")),
-                second: Box::new(leaf("lua:notes")),
-            }
-        );
-        assert_eq!(fixture("editor").root(), &leaf("editor"));
+        let Node::Con(mut want) = Node::pinned(Axis::Column, 0.5, Branch::First, leaf("terminal"), leaf("lua:notes"))
+        else {
+            unreachable!()
+        };
+        want.children[0].pin = Some(Pin { px: Some(240) });
+        assert_eq!(layout.root(), &want);
+        let alone = fixture("editor");
+        assert_eq!(alone.root().children.len(), 1, "a module alone is a root of one child");
+        assert_eq!(alone.root().children[0].node, leaf("editor"));
     }
 
     #[test]

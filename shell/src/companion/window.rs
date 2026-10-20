@@ -65,7 +65,7 @@ fn run_tab(
         .as_ref()
         .map(ModuleId::kind);
     // One terminal does not exist here, so the count is zero: `n`/`p` step the chat's tabs.
-    let plan = plan(action, keys_in, 0);
+    let plan = plan(action, keys_in, 0, false);
     if plan.takes_the_keys {
         focus_module(&ModuleId::agent());
     }
@@ -99,7 +99,7 @@ fn run_tab(
             true
         }
         TabVerb::Flash => false,
-        TabVerb::Nothing => return,
+        TabVerb::Nothing | TabVerb::Sibling(_) | TabVerb::Terminal(_) => return,
     };
     if !switched {
         // tmux: "can't find window".
@@ -325,6 +325,9 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             })
         },
         focus_module: focus_module.clone(),
+        // The panel's window has no containers, so no strips.
+        strips: Rc::new(Vec::new),
+        activate_strip: Rc::new(|_: &ModuleId| {}),
         agent: agent.clone(),
     });
     {
@@ -391,7 +394,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                     }
                     crate::prefix::PrefixCommand::Run(action) => action,
                     // A module key after a split key: there is nothing to place.
-                    crate::prefix::PrefixCommand::Place { module, axis } => {
+                    crate::prefix::PrefixCommand::Place { module, axis, cwd: _ } => {
                         println!("[companion] prefix: place {module} {axis:?} refused");
                         toast.show(companion_prefix::REFUSED_TEXT);
                         return;
@@ -429,6 +432,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 strip.show(&pieces);
                 strip_frame.set_visible(!pieces.is_empty());
             },
+            // Nothing here selects a container, so the prefix's own `Esc` has nothing to reset.
+            || {},
         );
     }
 

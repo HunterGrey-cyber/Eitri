@@ -6,7 +6,7 @@ use super::super::geometry::{arrange, hide, resize, settle_pins, Direction, Fram
 use super::super::kill::{kill, Reopen};
 use super::super::module::{ModuleDecl, ModuleId, Placement};
 use super::super::ops::{even, place, swap, swap_adjacent};
-use super::super::tree::{Axis, Layout, Node, MAX_RATIO, MIN_RATIO};
+use super::super::tree::{Axis, Layout};
 use super::*;
 
 /// xorshift64*: a seeded generator without a new dependency.
@@ -62,7 +62,8 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
     let dir = DIRS[rng.below(4)];
     let axis = if rng.below(2) == 0 { Axis::Row } else { Axis::Column };
     let flag = rng.below(2) == 0;
-    match rng.below(22) {
+    let verb = rng.below(30);
+    match verb {
         0 => {
             let _ = hide(layout, &any, frame);
         }
@@ -129,20 +130,37 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
             };
             let _ = kill(layout, &any, reopen, frame);
         }
+        21 => {
+            let _ = container_mode(layout, &focus, ConLayout::Tabbed);
+        }
+        22 => {
+            let _ = container_mode(layout, &focus, ConLayout::Stacked);
+        }
+        23 => {
+            let _ = switch_tab(layout, &any);
+        }
+        24 => {
+            let _ = place(layout, &focus, &any, axis);
+        }
+        25 => {
+            let _ = move_dir(layout, &focus, dir);
+        }
+        26 => {
+            focus_parent(layout);
+        }
+        27 => {
+            focus_child(layout);
+        }
+        28 => {
+            focus_parent(layout);
+            layout.toggle_zoom(&focus);
+        }
         _ => {
             let _ = layout.set_mark(&any);
         }
     }
-}
-
-fn ratios(node: &Node, out: &mut Vec<f32>) {
-    if let Node::Split {
-        ratio, first, second, ..
-    } = node
-    {
-        out.push(*ratio);
-        ratios(first, out);
-        ratios(second, out);
+    if matches!(verb, 3 | 5..=19 | 21..=22 | 24..=29) {
+        assert_eq!(layout.focus(), &focus, "verb {verb} moved the keys");
     }
 }
 
@@ -156,12 +174,28 @@ fn check(layout: &Layout, label: &str) {
         layout.hidden().iter().all(|id| seen.contains(id)),
         "{label}: hidden names a stranger"
     );
-    assert!(!layout.visible_leaves().is_empty(), "{label}: nothing on screen");
+    assert!(
+        !layout.visible_leaves().is_empty(),
+        "{label}: nothing on screen: {layout:?}"
+    );
+    if let Selection::Con(id) = layout.selection() {
+        assert!(
+            layout.root().find(id).is_some(),
+            "{label}: selection names a missing container"
+        );
+    }
+    if let Some(crate::layout::Zoom::Con(id)) = layout.zoom() {
+        assert!(
+            layout.root().find(*id).is_some(),
+            "{label}: zoom names a missing container"
+        );
+        assert!(layout.visible_leaves().iter().all(|m| !layout.zoom_hides(m)));
+    }
     if let Some(z) = layout.zoomed() {
         assert!(!layout.hidden().contains(z), "{label}: {z} zoomed and hidden");
     }
     assert!(
-        seen.contains(layout.focus()) && layout.is_shown(layout.focus()),
+        seen.contains(layout.focus()) && layout.is_in_view(layout.focus()),
         "{label}: the keys are on {}, hidden or not in the tree",
         layout.focus()
     );
@@ -170,11 +204,18 @@ fn check(layout: &Layout, label: &str) {
     let mut sorted = leaves.clone();
     sorted.sort();
     assert_eq!(mru, sorted, "{label}: the MRU list holds every leaf once");
-    let mut rs = Vec::new();
-    ratios(layout.root(), &mut rs);
-    assert!(
-        rs.iter().all(|r| (MIN_RATIO..=MAX_RATIO).contains(r)),
-        "{label}: a ratio out of range {rs:?}"
+    assert_eq!(
+        layout.root().check(true),
+        Ok(()),
+        "{label}: a container breaks an invariant: {:?}",
+        layout.root()
+    );
+    let ids = layout.root().ids();
+    let distinct: BTreeSet<_> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "{label}: a container id appears twice {ids:?}"
     );
     if let Some(m) = layout.mark() {
         assert!(seen.contains(m) && !layout.is_gone(m), "{label}: the mark is on {m}");

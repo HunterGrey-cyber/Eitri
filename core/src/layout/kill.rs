@@ -3,7 +3,7 @@
 //!
 //! `Reopen::At` returns the leaf to its first-launch place, hidden. The terminal goes
 //! below the editor's column at a third of its height; a Lua panel uses its `position`.
-//! The old pinned split is removed; the new one settles its length on the next show.
+//! The old pinned container is removed; the new one settles its length on the next show.
 //!
 //! `Reopen::InPlace` leaves the leaf hidden where it was. The editor and agent use this:
 //! every layout must contain both, and they form the first-launch root.
@@ -55,6 +55,7 @@ pub enum Reopen {
     At(Placement),
     InPlace,
     Never,
+    Remove,
 }
 
 /// What killing a module ends. Killing the last shown module closes the window;
@@ -94,6 +95,9 @@ pub fn kill(
     reopen: Reopen,
     frame: &Frame,
 ) -> Result<Option<ModuleId>, LayoutError> {
+    if reopen == Reopen::Remove && id.number() == 1 {
+        return Err(LayoutError::NotAnInstance(id.clone()));
+    }
     if layout.is_gone(id) {
         return Err(LayoutError::Gone(id.clone()));
     }
@@ -102,8 +106,7 @@ pub fn kill(
     match reopen {
         Reopen::At(placement) => {
             let root = layout
-                .root()
-                .clone()
+                .root_node()
                 .without(id)
                 .expect("a hide succeeded, so another module is still in the tree");
             // A first launch hides the editor under a Lua `main` panel (`place_new`'s `true`). Not
@@ -113,6 +116,7 @@ pub fn kill(
             layout.replace_root(root);
         }
         Reopen::InPlace => {}
+        Reopen::Remove => layout.remove(id)?,
         Reopen::Never => layout.retire(id, was_shown),
     }
     layout.clear_last_preset();
@@ -124,8 +128,9 @@ mod tests {
     use super::super::geometry::{arrange, Size};
     use super::super::module::ModuleDecl;
     use super::super::ops::place;
+    use super::super::test_support::same_rects;
     use super::super::tray::tray;
-    use super::super::tree::{Axis, Node, Pin};
+    use super::super::tree::Axis;
     use super::*;
 
     fn frame() -> Frame<'static> {
@@ -166,17 +171,17 @@ mod tests {
         assert_eq!(layout.focus(), &editor());
         assert!(!layout.is_shown(&term()));
         assert!(!layout.is_gone(&term()));
-        assert_eq!(
-            layout.root(),
-            with_terminal().root(),
-            "the same tree a first launch builds"
-        );
+        let mut expected = with_terminal();
+        let half = super::super::tree::DEFAULT_EDITOR_SHARE / 2.0;
+        expected.root_mut().children[0].share = half / (1.0 - half);
+        expected.root_mut().children[1].share = 1.0 - half / (1.0 - half);
+        expected.hide_unfocused(&term()).unwrap();
+        same_rects(&layout, &expected);
         assert_eq!(layout.visible_leaves(), [editor(), agent()]);
-        // Shown again: a third of the editor column's height, as a first show is -- and only the
-        // editor column's width, not the whole window's (760 of 1280, the agent's 519 untouched).
+        // Reopening takes a third of the editor's height in the column left after removing the sibling.
         layout.show(&term()).unwrap();
         let rect = arrange(&layout, &frame()).rect_of(&term()).unwrap();
-        assert_eq!((rect.w, rect.h), (760, 240));
+        assert_eq!((rect.w, rect.h), (541, 240));
     }
 
     /// The initial layout with a Lua `side` panel: `[[editor / term] | agent] | side`.
@@ -195,11 +200,8 @@ mod tests {
         .unwrap()
     }
 
-    /// A terminal moved next to the side panel and killed there with `Reopen::At(Placement::BelowEditor)`
-    /// comes back under the editor's own leaf only, producing exactly the tree a first launch with the
-    /// same terminal and side panel builds -- not below `[editor | agent]` together (what
-    /// `Placement::BelowEditorAndAgent`, task 6's now-superseded answer, gave it) and not below the
-    /// side panel either.
+    /// Removing a terminal beside the side panel rescales that row, then reopens the terminal
+    /// under the editor alone. The side panel keeps the remaining part of its halved slot.
     #[test]
     fn a_killed_terminal_reopens_below_the_editor_not_the_agent_or_the_side_panel() {
         let mut layout = with_terminal_and_side();
@@ -208,28 +210,33 @@ mod tests {
             kill(&mut layout, &term(), Reopen::At(Placement::BelowEditor), &frame()),
             Ok(Some(ModuleId::lua("side")))
         );
-        assert_eq!(layout.root(), with_terminal_and_side().root());
+        let mut expected = with_terminal_and_side();
+        let kept = 0.67 / (0.67 + 0.33 / 2.0);
+        expected.root_mut().children[0].share = kept;
+        expected.root_mut().children[1].share = 1.0 - kept;
+        expected.hide_unfocused(&term()).unwrap();
+        same_rects(&layout, &expected);
     }
 
-    /// The pin the bottom row had settled goes with the old split: the next show settles anew.
+    /// The pin the bottom row had settled goes with the old container: the next show settles anew.
     #[test]
     fn a_killed_bottom_row_forgets_its_pinned_height() {
+        let height_at = |layout: &Layout, h: i32| {
+            arrange(layout, &Frame::new(Size { w: 1280, h }, 1))
+                .rect_of(&term())
+                .unwrap()
+                .h
+        };
         let mut layout = with_terminal();
         assert!(super::super::geometry::settle_pins(&mut layout, &frame()));
-        let settled = |layout: &Layout| match layout.root() {
-            Node::Split { first, .. } => match first.as_ref() {
-                Node::Split {
-                    pin: Some(Pin { px, .. }),
-                    ..
-                } => *px,
-                other => panic!("not the editor's pinned split: {other:?}"),
-            },
-            other => panic!("not a split: {other:?}"),
-        };
-        assert_eq!(settled(&layout), Some(240));
+        assert_eq!((height_at(&layout, 721), height_at(&layout, 1041)), (240, 240));
         kill(&mut layout, &term(), Reopen::At(Placement::BelowEditor), &frame()).unwrap();
-        assert_eq!(settled(&layout), None);
         assert!(!layout.is_shown(&term()));
+        // Shown again it divides by its share, a third of the editor column at any height, as a
+        // first launch's unsettled row does.
+        layout.show(&term()).unwrap();
+        assert_eq!((height_at(&layout, 721), height_at(&layout, 1041)), (240, 347));
+        same_rects(&layout, &with_terminal());
     }
 
     /// The editor and the agent stay in their leaf; only the hide happens.
@@ -312,5 +319,56 @@ mod tests {
             layout.saved_hidden().contains(&term()),
             "the terminal the user hid stays hidden"
         );
+    }
+
+    #[test]
+    fn removing_an_instance_takes_its_leaf_its_mru_entry_and_the_mark() {
+        let id = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = with_terminal();
+        place(&mut layout, &id, &term(), Axis::Row).unwrap();
+        layout.set_mark(&id).unwrap();
+        let next = kill(&mut layout, &id, Reopen::Remove, &frame()).unwrap().unwrap();
+        assert!(layout.is_shown(&next));
+        assert!(!layout.contains(&id));
+        assert!(!layout.mru().contains(&id));
+        assert_eq!(layout.mark(), None);
+        assert!(arrange(&layout, &frame()).rect_of(&id).is_none());
+        assert_eq!(
+            kill(&mut layout, &editor(), Reopen::Remove, &frame()),
+            Err(LayoutError::NotAnInstance(editor()))
+        );
+    }
+    #[test]
+    fn direct_removal_ends_its_zoom_and_shows_the_editor_if_every_other_leaf_is_hidden() {
+        let id = ModuleId::parse("terminal#2").unwrap();
+        let mut layout = with_terminal();
+        place(&mut layout, &id, &term(), Axis::Row).unwrap();
+        layout.toggle_zoom(&id);
+        layout.remove(&id).unwrap();
+        assert_eq!(layout.zoomed(), None);
+        assert_eq!(layout.focus(), &editor());
+        assert!(layout.mru().iter().all(|m| layout.contains(m)));
+        let mut layout = with_terminal();
+        place(&mut layout, &id, &term(), Axis::Row).unwrap();
+        for other in [editor(), agent(), term()] {
+            hide(&mut layout, &other, &frame()).unwrap();
+        }
+        layout.remove(&id).unwrap();
+        assert_eq!(layout.visible_leaves(), [editor()]);
+        assert_eq!(layout.focus(), &editor());
+    }
+
+    #[test]
+    fn a_base_removal_is_refused_without_changing_the_layout() {
+        let mut layout = with_terminal();
+        let before = layout.clone();
+        let error = LayoutError::NotAnInstance(editor());
+        assert_eq!(
+            error.to_string(),
+            "'editor' is not an instance; it cannot leave the layout"
+        );
+        assert_eq!(layout.remove(&editor()), Err(error.clone()));
+        assert_eq!(kill(&mut layout, &editor(), Reopen::Remove, &frame()), Err(error));
+        assert_eq!(layout, before);
     }
 }

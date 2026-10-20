@@ -154,7 +154,7 @@ impl Shared {
             Pane::Panel => ModuleKind::Agent,
         };
         // No terminal exists here, so the count is zero: `n`/`p` step the chat's tabs.
-        let plan = plan(action, Some(keys_in), 0);
+        let plan = plan(action, Some(keys_in), 0, false);
         // A verb that reads the keys is not run in a panel that cannot have them: a close question would wait,
         // unseen, for the `y` meant for the editor.
         if plan.takes_the_keys && !self.give_panel_keys() {
@@ -191,7 +191,7 @@ impl Shared {
                 true
             }
             TabVerb::Flash => false,
-            TabVerb::Nothing => return,
+            TabVerb::Nothing | TabVerb::Sibling(_) | TabVerb::Terminal(_) => return,
         };
         if !switched {
             // tmux: "can't find window".
@@ -208,7 +208,7 @@ impl Shared {
             }
             PrefixCommand::Run(action) => action,
             // A module key after a split key: there is nothing to place.
-            PrefixCommand::Place { module, axis } => {
+            PrefixCommand::Place { module, axis, cwd: _ } => {
                 crate::log_line!("[mac] prefix: place {module} {axis:?} refused");
                 self.actions.toast(NOT_IN_THIS_WINDOW);
                 return;

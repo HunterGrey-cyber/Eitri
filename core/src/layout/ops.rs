@@ -3,15 +3,18 @@
 //! to allocate existing children elsewhere without reparenting widgets. Each ends a zoom first,
 //! as tmux's corresponding verbs do.
 
+use super::con::{Child, Con, ConLayout, Node, Pin, MAX_CHILDREN};
 use super::geometry::{navigate, Direction, Frame, Nav};
 use super::module::ModuleId;
-use super::tree::{Axis, Branch, Layout, LayoutError, Node, Pin, MAX_RATIO, MIN_RATIO};
+use super::tree::{Axis, Branch, Layout, LayoutError, MAX_RATIO, MIN_RATIO};
 
 /// `Ctrl+a \ <key>` (`Axis::Row`: right of `target`) and `Ctrl+a " <key>` (`Axis::Column`: below
-/// it), and Lua's layout split call. Places `module` in a new split after `target`, taking half
-/// of `target`'s space. An existing module is moved like tmux's `join-pane`: its old leaf is
-/// removed and its sibling takes that space, pin and all. A hidden module becomes shown; an
-/// unplaced module joins the tree. `module` then receives the keys.
+/// it), and Lua's layout split call. Adds a sibling to the immediate parent if its orientation
+/// matches; otherwise wraps the target in a new split. Takes half the target's share unless
+/// that would make a share too small, in which case the container is evened.
+/// An existing module is moved: its old leaf is removed and its sibling takes that space,
+/// pin and all. A hidden module becomes shown; an unplaced module joins the tree.
+/// `module` then receives the keys.
 ///
 /// Refuses a module equal to `target`, or a target absent from the tree or hidden.
 pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Axis) -> Result<(), LayoutError> {
@@ -28,13 +31,57 @@ pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Ax
         return Err(LayoutError::Hidden(target.clone()));
     }
     let mut root = layout
-        .root()
-        .clone()
+        .root_node()
         .without(module)
         .expect("`target` is another module, still in the tree");
-    root.replace_leaf(target, |target| {
-        Node::split(axis, 0.5, target, Node::Leaf(module.clone()))
-    });
+    fn sibling(
+        root: &mut Node,
+        module: &ModuleId,
+        target: &ModuleId,
+        axis: Axis,
+        layout: &Layout,
+    ) -> Result<bool, LayoutError> {
+        let Node::Con(c) = root else {
+            return Ok(false);
+        };
+        if let Some(i) = c
+            .children
+            .iter()
+            .position(|ch| matches!(&ch.node, Node::Leaf(id) if id == target))
+        {
+            if c.layout != ConLayout::of_axis(axis) {
+                return Ok(false);
+            }
+            if c.children.len() >= MAX_CHILDREN {
+                return Err(LayoutError::TooMany { limit: MAX_CHILDREN });
+            }
+            let half = c.children[i].share / 2.0;
+            c.children[i].share = half;
+            c.children[i].pin = None;
+            c.children.insert(i + 1, Child::new(Node::Leaf(module.clone()), half));
+            if half < MIN_RATIO {
+                let share = 1.0 / c.children.len() as f32;
+                for child in &mut c.children {
+                    child.share = share;
+                    if child.node.leaves().iter().any(|m| m == module || layout.is_shown(m)) {
+                        child.pin = None;
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        for child in &mut c.children {
+            if child.node.leaves().contains(target) {
+                return sibling(&mut child.node, module, target, axis, layout);
+            }
+        }
+        Ok(false)
+    }
+    if !sibling(&mut root, module, target, axis, layout)? {
+        root.replace_leaf(target, |target| {
+            Node::split(axis, 0.5, target, Node::Leaf(module.clone()))
+        });
+    }
     layout.unzoom();
     layout.replace_root(root);
     layout.unhide(module);
@@ -51,7 +98,7 @@ pub fn swap(layout: &mut Layout, focused: &ModuleId, dir: Direction, frame: &Fra
     let Nav::Module(other) = navigate(layout, focused, dir, frame) else {
         return None;
     };
-    let mut root = layout.root().clone();
+    let mut root = layout.root_node();
     root.swap_leaves(focused, &other);
     layout.unzoom();
     layout.replace_root(root);
@@ -97,7 +144,7 @@ pub(super) fn even_chain(axis: Axis, items: Vec<Node>, shown: usize) -> Node {
 /// wrapping. Every split keeps its axis, ratio and pin, as `swap` does. `None`, and nothing moves,
 /// for a hidden `focused` or one alone on screen.
 pub fn swap_adjacent(layout: &mut Layout, focused: &ModuleId, forward: bool) -> Option<ModuleId> {
-    let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_shown(id)).collect();
+    let shown: Vec<ModuleId> = layout.leaves().into_iter().filter(|id| layout.is_in_view(id)).collect();
     let at = shown.iter().position(|id| id == focused)?;
     if shown.len() < 2 {
         return None;
@@ -107,18 +154,22 @@ pub fn swap_adjacent(layout: &mut Layout, focused: &ModuleId, forward: bool) -> 
     } else {
         shown[(at + shown.len() - 1) % shown.len()].clone()
     };
-    let mut root = layout.root().clone();
+    let mut root = layout.root_node();
     root.swap_leaves(focused, &other);
     layout.unzoom();
     layout.replace_root(root);
     Some(other)
 }
 
-/// A pinned split whose kept side is a hidden module: the row [`even`] leaves where it is.
+/// A pinned child that is a hidden module, beside the rest of its container: the row [`even`] leaves
+/// where it is.
 pub(super) struct KeptRow {
     axis: Axis,
+    /// The share of the side before the divider, as a split of the row and the rest reads it.
     ratio: f32,
-    pin: Pin,
+    /// Which side of that split the row is on.
+    side: Branch,
+    px: Option<i32>,
     pub(super) id: ModuleId,
 }
 
@@ -126,54 +177,66 @@ impl KeptRow {
     /// The row again, with `rest` where the rest of the tree was.
     pub(super) fn around(self, rest: Node) -> Node {
         let row = Node::Leaf(self.id);
-        let (first, second) = match self.pin.side {
+        let (first, second) = match self.side {
             Branch::First => (row, rest),
             Branch::Second => (rest, row),
         };
-        Node::Split {
-            axis: self.axis,
-            ratio: self.ratio,
-            pin: Some(self.pin),
-            first: Box::new(first),
-            second: Box::new(second),
-        }
+        let Node::Con(mut c) = Node::pinned(self.axis, self.ratio, self.side, first, second) else {
+            unreachable!("a split is a container")
+        };
+        c.children[usize::from(self.side == Branch::Second)].pin = Some(Pin { px: self.px });
+        Node::Con(c)
     }
 }
 
-/// Every pinned split whose kept side is a hidden module's leaf -- a bottom row whose module is
-/// hidden -- outermost first. [`even`] puts each back around the chain it builds, so the row is below
-/// everything the chain holds, as `Ctrl+a t` opens it; a Lua `side` panel that sat beside the row is
-/// now in the chain above it. A row on screen is not one: its module is evened with the rest.
+/// Every pinned child that is a hidden module's leaf and governs the length on its side -- a bottom
+/// row whose module is hidden -- outermost first. [`even`] puts each back around the chain it builds,
+/// so the row is below everything the chain holds, as `Ctrl+a t` opens it; a Lua `side` panel that sat
+/// beside the row is now in the chain above it. A row on screen is not one: its module is evened with
+/// the rest.
 pub(super) fn hidden_bottom_rows(layout: &Layout) -> Vec<KeptRow> {
-    fn walk(node: &Node, layout: &Layout, rows: &mut Vec<KeptRow>) {
-        let Node::Split {
-            axis,
-            ratio,
-            pin,
-            first,
-            second,
-        } = node
-        else {
-            return;
-        };
-        if let Some(pin) = pin {
-            let kept = match pin.side {
-                Branch::First => first,
-                Branch::Second => second,
-            };
-            if let Node::Leaf(id) = kept.as_ref() {
-                if !layout.is_shown(id) {
-                    rows.push(KeptRow {
-                        axis: *axis,
-                        ratio: *ratio,
-                        pin: *pin,
-                        id: id.clone(),
-                    });
+    fn walk(c: &Con, layout: &Layout, rows: &mut Vec<KeptRow>) {
+        let n = c.children.len();
+        if let Some(axis) = c.layout.axis() {
+            for (i, child) in c.children.iter().enumerate() {
+                let (Some(pin), Node::Leaf(id)) = (child.pin, &child.node) else {
+                    continue;
+                };
+                // Once shown, the last child's pin governs unless the child before it on screen has a
+                // pin of its own; children with nothing shown take no step, so they are passed over,
+                // as the arrangement passes over them.
+                let last = i + 1 == n;
+                let before_has_pin = || {
+                    c.children[..i]
+                        .iter()
+                        .rev()
+                        .find(|ch| ch.node.leaves().iter().any(|m| layout.is_shown(m)))
+                        .is_some_and(|ch| ch.pin.is_some())
+                };
+                if n < 2 || layout.is_shown(id) || (last && before_has_pin()) {
+                    continue;
                 }
+                let others: f32 = c
+                    .children
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, ch)| ch.share)
+                    .sum();
+                rows.push(KeptRow {
+                    axis,
+                    ratio: if last { others } else { child.share },
+                    side: if last { Branch::Second } else { Branch::First },
+                    px: pin.px,
+                    id: id.clone(),
+                });
             }
         }
-        walk(first, layout, rows);
-        walk(second, layout, rows);
+        for child in &c.children {
+            if let Node::Con(inner) = &child.node {
+                walk(inner, layout, rows);
+            }
+        }
     }
     let mut rows = Vec::new();
     walk(layout.root(), layout, &mut rows);
@@ -182,9 +245,11 @@ pub(super) fn hidden_bottom_rows(layout: &Layout) -> Vec<KeptRow> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixture::fixture;
     use super::super::geometry::{arrange, hide, settle_pins, Size};
     use super::super::module::{ModuleDecl, Placement};
-    use super::super::tree::{ZoomChange, DEFAULT_EDITOR_SHARE};
+    use super::super::test_support::{same_rects, same_rects_opened};
+    use super::super::tree::{ZoomChange, BELOW_ROOT_SHARE, DEFAULT_EDITOR_SHARE};
     use super::*;
 
     fn editor() -> ModuleId {
@@ -195,9 +260,6 @@ mod tests {
     }
     fn term() -> ModuleId {
         ModuleId::terminal()
-    }
-    fn leaf(id: ModuleId) -> Node {
-        Node::Leaf(id)
     }
     fn frame() -> Frame<'static> {
         Frame::new(Size { w: 1280, h: 721 }, 1)
@@ -220,19 +282,13 @@ mod tests {
     fn the_chat_goes_below_or_left_of_the_editor() {
         let mut layout = Layout::initial(&[]).unwrap();
         place(&mut layout, &agent(), &editor(), Axis::Column).unwrap();
-        assert_eq!(
-            layout.root(),
-            &Node::split(Axis::Column, 0.5, leaf(editor()), leaf(agent()))
-        );
+        same_rects(&layout, &fixture("column(editor 0.5, agent)"));
         assert_eq!(layout.focus(), &agent());
 
         let mut layout = Layout::initial(&[]).unwrap();
         layout.set_focus(&agent()).unwrap();
         place(&mut layout, &editor(), &agent(), Axis::Row).unwrap();
-        assert_eq!(
-            layout.root(),
-            &Node::split(Axis::Row, 0.5, leaf(agent()), leaf(editor()))
-        );
+        same_rects(&layout, &fixture("row(agent 0.5, editor)"));
         assert_eq!(layout.leaves(), [agent(), editor()], "the chat is left of the editor");
     }
 
@@ -242,14 +298,20 @@ mod tests {
     fn placing_a_hidden_module_moves_it_out_of_its_old_split_and_shows_it() {
         let mut layout = window();
         place(&mut layout, &term(), &editor(), Axis::Row).unwrap();
-        assert_eq!(
-            layout.root(),
-            &Node::split(
-                Axis::Row,
-                DEFAULT_EDITOR_SHARE,
-                Node::split(Axis::Row, 0.5, leaf(editor()), leaf(term())),
-                leaf(agent())
+        same_rects(
+            &layout,
+            &Layout::new(
+                Node::Con(Con::new(
+                    ConLayout::SplitH,
+                    vec![
+                        Child::new(Node::Leaf(editor()), DEFAULT_EDITOR_SHARE / 2.0),
+                        Child::new(Node::Leaf(term()), DEFAULT_EDITOR_SHARE / 2.0),
+                        Child::new(Node::Leaf(agent()), 1.0 - DEFAULT_EDITOR_SHARE),
+                    ],
+                )),
+                term(),
             )
+            .unwrap(),
         );
         assert!(layout.is_visible(&term()));
         assert_eq!(layout.focus(), &term());
@@ -350,23 +412,14 @@ mod tests {
         assert!(!layout.is_shown(&term()));
         let widths: Vec<i32> = arrange(&layout, &frame()).modules.iter().map(|(_, r)| r.w).collect();
         assert_eq!(widths, [426, 426, 426]);
-        let Node::Split {
-            pin: Some(_),
-            first: evened,
-            second: bottom,
-            ..
-        } = layout.root()
-        else {
-            panic!("the hidden terminal's row is kept: {:?}", layout.root());
-        };
-        assert_eq!(**bottom, leaf(term()));
-        let mut pins = 0;
-        let mut node = evened.as_ref();
-        while let Node::Split { pin, second, .. } = node {
-            pins += usize::from(pin.is_some());
-            node = second;
-        }
-        assert_eq!(pins, 0);
+        // The terminal's row is kept, pinned, around a row with no pin: shown and settled, the two
+        // place every module alike at every size.
+        same_rects_opened(
+            &layout,
+            &fixture(&format!(
+                "column(row(editor, agent, lua:side) {BELOW_ROOT_SHARE}, terminal hidden pinned)"
+            )),
+        );
         // Shown later, the terminal opens below everything, full width, a third of the height.
         layout.show(&term()).unwrap();
         let a = arrange(&layout, &frame());
@@ -421,12 +474,51 @@ mod tests {
     fn even_vertical_stacks_them_at_equal_heights() {
         let mut layout = Layout::initial(&[]).unwrap();
         even(&mut layout, Axis::Column);
-        assert_eq!(
-            layout.root(),
-            &Node::split(Axis::Column, 0.5, leaf(editor()), leaf(agent()))
-        );
+        same_rects(&layout, &fixture("column(editor, agent)"));
         let heights: Vec<i32> = arrange(&layout, &frame()).modules.iter().map(|(_, r)| r.h).collect();
         assert_eq!(heights, [360, 360]);
+    }
+
+    /// Two hidden bottom rows at the end of one column: the last row's pin governs once it is shown
+    /// alone, because the hidden row before it takes no step, so `even` keeps both rows and the
+    /// terminal reopens as its full-width 120px row.
+    #[test]
+    fn even_keeps_the_last_hidden_row_when_the_row_before_it_is_hidden_too() {
+        use super::super::con::{Child, ConLayout};
+        use std::collections::BTreeSet;
+        let bottom = ModuleId::lua("bottom");
+        let pinned = |node: Node, px: i32| Child {
+            pin: Some(Pin { px: Some(px) }),
+            ..Child::new(node, 0.25)
+        };
+        let root = Node::Con(Con::new(
+            ConLayout::SplitV,
+            vec![
+                Child::new(Node::Leaf(editor()), 0.25),
+                Child::new(Node::Leaf(agent()), 0.25),
+                pinned(Node::Leaf(bottom.clone()), 80),
+                pinned(Node::Leaf(term()), 120),
+            ],
+        ));
+        let mut layout = Layout::from_parts(root, BTreeSet::from([bottom.clone(), term()]), editor()).unwrap();
+        let kept: Vec<ModuleId> = hidden_bottom_rows(&layout).into_iter().map(|row| row.id).collect();
+        assert_eq!(kept, [bottom.clone(), term()]);
+        even(&mut layout, Axis::Row);
+        layout.root().check(true).unwrap();
+        layout.show(&term()).unwrap();
+        let a = arrange(&layout, &frame());
+        assert_eq!(
+            a.rect_of(&term()).map(|r| (r.x, r.y + r.h, r.w, r.h)),
+            Some((0, 721, 1280, 120)),
+            "a full-width 120px row at the bottom"
+        );
+        layout.show(&bottom).unwrap();
+        let a = arrange(&layout, &frame());
+        assert_eq!(
+            a.rect_of(&bottom).map(|r| (r.w, r.h)),
+            Some((1280, 80)),
+            "the other row kept its length too"
+        );
     }
 }
 
@@ -492,5 +584,83 @@ mod swap_adjacent_tests {
         let before = layout.leaves();
         assert_eq!(swap_adjacent(&mut layout, &ModuleId::editor(), true), None);
         assert_eq!(layout.leaves(), before);
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use crate::layout::*;
+    fn start() -> Layout {
+        Layout::new(
+            Node::split(
+                Axis::Row,
+                0.6,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn a_split_along_the_parents_orientation_inserts_a_sibling() {
+        let mut l = start();
+        let root = l.root().id;
+        place(&mut l, &ModuleId::lua("a"), &ModuleId::editor(), Axis::Row).unwrap();
+        assert_eq!(l.root().id, root);
+        for (ch, expected) in l.root().children.iter().zip([0.3, 0.3, 0.4]) {
+            assert!((ch.share - expected).abs() < 1e-6);
+        }
+        assert_eq!(l.focus(), &ModuleId::lua("a"));
+        place(&mut l, &ModuleId::lua("b"), &ModuleId::editor(), Axis::Column).unwrap();
+        assert_eq!(l.root().children[0].node.as_con().unwrap().layout, ConLayout::SplitV);
+        assert_eq!(l.root().children[0].share, 0.3);
+    }
+    #[test]
+    fn splitting_the_newest_module_until_a_half_is_too_small_evens_the_container() {
+        let mut l = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        let mut target = ModuleId::agent();
+        for i in 1..=4 {
+            let next = ModuleId::lua(&format!("m{i}"));
+            place(&mut l, &next, &target, Axis::Row).unwrap();
+            target = next;
+            if i == 3 {
+                assert_eq!(
+                    l.root().children.iter().map(|ch| ch.share).collect::<Vec<_>>(),
+                    vec![0.5, 0.25, 0.125, 0.0625, 0.0625]
+                );
+            }
+        }
+        for ch in &l.root().children {
+            assert!((ch.share - 1.0 / 6.0).abs() < 1e-6);
+        }
+        let a = arrange(&l, &Frame::new(Size { w: 1280, h: 721 }, 1));
+        let widths: Vec<_> = a.modules.iter().map(|(_, r)| r.w).collect();
+        assert!(
+            widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1,
+            "{widths:?}"
+        );
+    }
+    #[test]
+    fn a_twenty_first_child_is_refused() {
+        let children = (0..20)
+            .map(|i| Child::new(Node::Leaf(ModuleId::lua(&format!("m{i}"))), 0.05))
+            .collect();
+        let mut l = Layout::new(Node::Con(Con::new(ConLayout::SplitH, children)), ModuleId::lua("m0")).unwrap();
+        let before = l.clone();
+        assert_eq!(
+            place(&mut l, &ModuleId::lua("x"), &ModuleId::lua("m0"), Axis::Row),
+            Err(LayoutError::TooMany { limit: 20 })
+        );
+        assert_eq!(l, before);
     }
 }

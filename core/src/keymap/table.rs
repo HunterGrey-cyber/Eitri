@@ -242,8 +242,41 @@ fn default_bindings() -> Vec<Binding> {
         ("Right", Direction::Right),
     ];
     bind("C-b", Action::SendPrefix, false);
-    bind("%", Action::Split(Axis::Row), false);
-    bind("\"", Action::Split(Axis::Column), false);
+    for (key, dir) in [
+        ("M-H", Direction::Left),
+        ("M-J", Direction::Down),
+        ("M-K", Direction::Up),
+        ("M-L", Direction::Right),
+    ] {
+        bind(key, Action::Move(dir), true);
+    }
+    bind("M-w", Action::ContainerTabbed, false);
+    bind("M-s", Action::ContainerStacked, false);
+    bind("M-a", Action::FocusParent, false);
+    bind("M-d", Action::FocusChild, false);
+    bind(
+        "M-Enter",
+        Action::InstanceNew {
+            kind: ModuleKind::Terminal,
+        },
+        false,
+    );
+    bind(
+        "%",
+        Action::Split {
+            axis: Axis::Row,
+            cwd: crate::keymap::action::SplitCwd::Start,
+        },
+        false,
+    );
+    bind(
+        "\"",
+        Action::Split {
+            axis: Axis::Column,
+            cwd: crate::keymap::action::SplitCwd::Start,
+        },
+        false,
+    );
     bind("z", Action::Zoom, false);
     for (name, dir) in arrows {
         bind(&format!("C-{name}"), Action::Resize { dir, cells: 1 }, true);
@@ -373,7 +406,7 @@ fn is_tmux_action(action: &Action) -> bool {
         action,
         Action::SendPrefix
             | Action::SendKeys(_)
-            | Action::Split(_)
+            | Action::Split { .. }
             | Action::Zoom
             | Action::Resize { .. }
             | Action::Select(_)
@@ -751,8 +784,8 @@ impl Keymap {
         let groups: [(&str, Is); 6] = [
             ("kill", |a| matches!(a, Action::ModuleKill)),
             ("hide", |a| matches!(a, Action::ModuleHide)),
-            ("right", |a| matches!(a, Action::Split(Axis::Row))),
-            ("below", |a| matches!(a, Action::Split(Axis::Column))),
+            ("right", |a| matches!(a, Action::Split { axis: Axis::Row, .. })),
+            ("below", |a| matches!(a, Action::Split { axis: Axis::Column, .. })),
             ("even", |a| matches!(a, Action::Even(_))),
             ("swap", |a| matches!(a, Action::Swap(_))),
         ];
@@ -826,6 +859,15 @@ mod tests {
     /// This literal fixture checks the table's bindings, options and repeat flags.
     const DEFAULTS_FIXTURE: &[(&str, &str, bool)] = &[
         ("C-b", "send-prefix", false),
+        ("M-H", "move.left", true),
+        ("M-J", "move.down", true),
+        ("M-K", "move.up", true),
+        ("M-L", "move.right", true),
+        ("M-w", "container.tabbed", false),
+        ("M-s", "container.stacked", false),
+        ("M-a", "focus.parent", false),
+        ("M-d", "focus.child", false),
+        ("M-Enter", "instance.new kind=terminal", false),
         ("%", "split.right", false),
         ("\"", "split.below", false),
         ("z", "zoom", false),
@@ -950,9 +992,10 @@ mod tests {
     fn every_default_is_a_stock_tmux_key_or_marked_eitri_only() {
         // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
         // bindings), so they need no entry here even though Eitri's action differs from tmux's.
-        // `H J K` are vim's `<C-w>H/J/K`, `M-e` i3's `$mod+e` pressed after the prefix.
-        const EITRI_ONLY: [&str; 15] = [
-            "C-l", "C-h", "C-j", "C-k", "F11", "e", "a", "C-=", "C-+", "C--", "C-0", "M-e", "H", "J", "K",
+        // `H J K` are vim's `<C-w>H/J/K`; the Alt chords are i3's `$mod` chords after the prefix.
+        const EITRI_ONLY: [&str; 24] = [
+            "C-l", "C-h", "C-j", "C-k", "F11", "e", "a", "C-=", "C-+", "C--", "C-0", "M-e", "H", "J", "K", "M-H",
+            "M-J", "M-K", "M-L", "M-w", "M-s", "M-a", "M-d", "M-Enter",
         ];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();
@@ -1405,6 +1448,32 @@ mod tests {
                 matches!(&err, crate::layout::KeyError::Bound { action: a, .. } if a == action),
                 "{key}: {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_container_and_instance_defaults() {
+        let map = Keymap::defaults();
+        for (key, action, repeatable) in [
+            ("M-H", Action::Move(Direction::Left), true),
+            ("M-J", Action::Move(Direction::Down), true),
+            ("M-K", Action::Move(Direction::Up), true),
+            ("M-L", Action::Move(Direction::Right), true),
+            ("M-w", Action::ContainerTabbed, false),
+            ("M-s", Action::ContainerStacked, false),
+            ("M-a", Action::FocusParent, false),
+            ("M-d", Action::FocusChild, false),
+            (
+                "M-Enter",
+                Action::InstanceNew {
+                    kind: ModuleKind::Terminal,
+                },
+                false,
+            ),
+        ] {
+            let binding = map.lookup(&k(key)).unwrap();
+            assert_eq!(binding.action, action, "{key}");
+            assert_eq!(binding.repeatable, repeatable, "{key}");
         }
     }
 }

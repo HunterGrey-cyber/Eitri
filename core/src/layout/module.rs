@@ -1,12 +1,10 @@
-//! What a module is: one of a **closed** set of kinds, one instance
-//! of each built-in per window, named in the layout tree by a [`ModuleId`]. Nothing here knows what
-//! a widget is; `shell` maps each id to the one widget that hosts it.
+//! Modules belong to a closed set of kinds and are named in the layout tree by a [`ModuleId`].
+//! The terminal and chat view can have numbered instances; the editor and canvas have one per
+//! window. Nothing here knows what a widget is; `shell` maps each id to its host widget.
 
 use std::fmt;
 
-/// The kinds a module can be. **Closed on purpose** (decision a, "customization scope A"): a new
-/// kind is a change to this enum and to `shell`'s own closed `match`, never a plugin, which is what
-/// keeps this from becoming the "dynamic plugin ABI" CLAUDE.md rules out.
+/// The closed set of module kinds keeps widget construction in the host exhaustive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleKind {
     Editor,
@@ -14,13 +12,20 @@ pub enum ModuleKind {
     /// The canvas module, named so layouts can refer to it before it is available.
     Canvas,
     LuaWebview,
-    /// The bottom terminal, hosted as a
-    /// module since it reached `main`. Reserved, and refused by
-    /// [`ModuleId::parse`], until its engine landed.
+    /// A terminal with its own shell.
     Terminal,
 }
 
-/// A module's name in the layout: `editor`, `agent`, `terminal`, `canvas` or `lua:<panel id>`. The
+impl ModuleKind {
+    pub const fn has_instances(self) -> bool {
+        matches!(self, Self::Agent | Self::Terminal)
+    }
+}
+
+/// One digit addresses an instance and keeps its displayed name short.
+pub const MAX_INSTANCE: u8 = 9;
+
+/// A module's name: a built-in id, `terminal#2..#9`, `agent#2..#9`, or `lua:<panel id>`. The
 /// only ways to get one are the constructors below, so [`ModuleId::kind`] is total.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModuleId(String);
@@ -36,7 +41,7 @@ impl ModuleId {
         ModuleId("agent".to_string())
     }
 
-    /// The bottom terminal. One per window, like the editor and the agent.
+    /// The base terminal, whose instance number is one.
     pub fn terminal() -> Self {
         ModuleId("terminal".to_string())
     }
@@ -48,18 +53,92 @@ impl ModuleId {
         ModuleId(format!("{LUA_PREFIX}{panel_id}"))
     }
 
-    /// The inverse of [`ModuleId::as_str`], for module names from state files and Lua layout calls.
-    /// Unknown names are refused with the supplied text in the error.
+    /// The inverse of [`ModuleId::as_str`]. Unknown or noncanonical names are refused.
     pub fn parse(text: &str) -> Result<Self, ModuleError> {
         match text {
-            "editor" => Ok(Self::editor()),
-            "agent" => Ok(Self::agent()),
-            "canvas" => Ok(ModuleId("canvas".to_string())),
-            "terminal" => Ok(Self::terminal()),
-            _ => match text.strip_prefix(LUA_PREFIX) {
-                Some(panel) if !panel.is_empty() => Ok(Self::lua(panel)),
-                _ => Err(ModuleError::Unknown(text.to_string())),
-            },
+            "editor" => return Ok(Self::editor()),
+            "agent" => return Ok(Self::agent()),
+            "canvas" => return Ok(ModuleId("canvas".to_string())),
+            "terminal" => return Ok(Self::terminal()),
+            _ => {}
+        }
+        if let Some((base, suffix)) = text.split_once('#') {
+            let why = match base {
+                "terminal" | "agent" => {
+                    if suffix == "1" {
+                        Some(format!("instance 1 is '{base}'"))
+                    } else if suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'2'..=b'9') {
+                        return Ok(ModuleId(text.to_string()));
+                    } else {
+                        Some("an instance number is 2 to 9".to_string())
+                    }
+                }
+                "editor" | "canvas" => Some(format!("'{base}' has one instance per window")),
+                _ => None,
+            };
+            if let Some(why) = why {
+                return Err(ModuleError::Instance {
+                    text: text.to_string(),
+                    why,
+                });
+            }
+        }
+        match text.strip_prefix(LUA_PREFIX) {
+            Some(panel) if !panel.is_empty() => Ok(Self::lua(panel)),
+            _ => Err(ModuleError::Unknown(text.to_string())),
+        }
+    }
+
+    pub fn instance(kind: ModuleKind, n: u8) -> Result<Self, ModuleError> {
+        let base = match kind {
+            ModuleKind::Editor => "editor",
+            ModuleKind::Agent => "agent",
+            ModuleKind::Canvas => "canvas",
+            ModuleKind::LuaWebview => "lua",
+            ModuleKind::Terminal => "terminal",
+        };
+        let text = format!("{base}#{n}");
+        let why = if kind == ModuleKind::LuaWebview {
+            "a Lua panel is named by its id".to_string()
+        } else if n == 1 {
+            return Self::parse(base);
+        } else if !kind.has_instances() && n >= 2 {
+            format!("'{base}' has one instance per window")
+        } else if !(2..=MAX_INSTANCE).contains(&n) {
+            "an instance number is 2 to 9".to_string()
+        } else {
+            return Ok(ModuleId(text));
+        };
+        Err(ModuleError::Instance { text, why })
+    }
+
+    pub fn number(&self) -> u8 {
+        if self.kind().has_instances() {
+            if let Some((_, number)) = self.0.split_once('#') {
+                return number.parse().expect("a canonical instance number");
+            }
+        }
+        1
+    }
+
+    pub fn base(&self) -> ModuleId {
+        ModuleId(self.base_name().to_string())
+    }
+
+    pub fn lowest_free(kind: ModuleKind, taken: &[ModuleId]) -> Option<ModuleId> {
+        if !kind.has_instances() {
+            return None;
+        }
+        (2..=MAX_INSTANCE)
+            .filter_map(|n| Self::instance(kind, n).ok())
+            .find(|id| !taken.contains(id))
+    }
+
+    fn base_name(&self) -> &str {
+        if self.0.starts_with(LUA_PREFIX) {
+            &self.0
+        } else {
+            self.0.split_once('#').map_or(&self.0, |(base, _)| base)
         }
     }
 
@@ -68,7 +147,7 @@ impl ModuleId {
     }
 
     pub fn kind(&self) -> ModuleKind {
-        match self.0.as_str() {
+        match self.base_name() {
             "editor" => ModuleKind::Editor,
             "agent" => ModuleKind::Agent,
             "canvas" => ModuleKind::Canvas,
@@ -87,12 +166,14 @@ impl fmt::Display for ModuleId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleError {
     Unknown(String),
+    Instance { text: String, why: String },
 }
 
 impl fmt::Display for ModuleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ModuleError::Unknown(name) => write!(f, "unknown module '{name}'"),
+            ModuleError::Instance { text, why } => write!(f, "'{text}': {why}"),
         }
     }
 }
@@ -129,6 +210,115 @@ pub struct ModuleDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_ids_round_trip_and_name_their_kind() {
+        for (text, kind, n, base) in [
+            ("terminal#2", ModuleKind::Terminal, 2, "terminal"),
+            ("terminal#9", ModuleKind::Terminal, 9, "terminal"),
+            ("agent#2", ModuleKind::Agent, 2, "agent"),
+            ("agent#9", ModuleKind::Agent, 9, "agent"),
+        ] {
+            let id = ModuleId::parse(text).unwrap();
+            assert_eq!(
+                (id.as_str(), id.kind(), id.number(), id.base().as_str()),
+                (text, kind, n, base)
+            );
+            assert_eq!(ModuleId::instance(kind, n), Ok(id));
+        }
+        assert_eq!(ModuleId::instance(ModuleKind::Terminal, 1), Ok(ModuleId::terminal()));
+        assert_eq!(ModuleId::instance(ModuleKind::Agent, 1), Ok(ModuleId::agent()));
+        assert_eq!(ModuleId::instance(ModuleKind::Editor, 1), Ok(ModuleId::editor()));
+        assert_eq!(ModuleId::instance(ModuleKind::Canvas, 1), ModuleId::parse("canvas"));
+        for single in [ModuleId::editor(), ModuleId::terminal(), ModuleId::lua("x#2")] {
+            assert_eq!(single.number(), 1, "{single}");
+            assert_eq!(single.base(), single, "{single}");
+        }
+    }
+
+    #[test]
+    fn a_second_spelling_or_an_instance_of_a_single_kind_is_refused() {
+        let range = "an instance number is 2 to 9";
+        for (text, why) in [
+            ("terminal#1", "instance 1 is 'terminal'"),
+            ("agent#1", "instance 1 is 'agent'"),
+            ("terminal#0", range),
+            ("terminal#02", range),
+            ("terminal#10", range),
+            ("terminal#", range),
+            ("terminal#x", range),
+            ("editor#2", "'editor' has one instance per window"),
+            ("canvas#2", "'canvas' has one instance per window"),
+        ] {
+            let err = ModuleId::parse(text).unwrap_err();
+            assert_eq!(
+                err,
+                ModuleError::Instance {
+                    text: text.to_string(),
+                    why: why.to_string()
+                },
+                "{text}"
+            );
+            assert_eq!(err.to_string(), format!("'{text}': {why}"));
+        }
+        assert_eq!(
+            ModuleId::parse("chat#2"),
+            Err(ModuleError::Unknown("chat#2".to_string()))
+        );
+        assert_eq!(
+            ModuleId::instance(ModuleKind::Editor, 2),
+            Err(ModuleError::Instance {
+                text: "editor#2".into(),
+                why: "'editor' has one instance per window".into()
+            })
+        );
+        assert_eq!(
+            ModuleId::instance(ModuleKind::Terminal, 10),
+            Err(ModuleError::Instance {
+                text: "terminal#10".into(),
+                why: range.into()
+            })
+        );
+        assert_eq!(
+            ModuleId::instance(ModuleKind::LuaWebview, 1),
+            Err(ModuleError::Instance {
+                text: "lua#1".into(),
+                why: "a Lua panel is named by its id".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_lua_panel_named_like_an_instance_stays_a_lua_panel() {
+        assert_eq!(ModuleId::parse("lua:x#2"), Ok(ModuleId::lua("x#2")));
+        assert_eq!(ModuleId::lua("x#2").kind(), ModuleKind::LuaWebview);
+        assert_eq!(ModuleId::lua("terminal#2").kind(), ModuleKind::LuaWebview);
+    }
+
+    #[test]
+    fn a_new_instance_takes_the_lowest_free_number_from_two() {
+        let t = |n| ModuleId::instance(ModuleKind::Terminal, n).unwrap();
+        assert_eq!(ModuleId::lowest_free(ModuleKind::Terminal, &[]), Some(t(2)));
+        assert_eq!(
+            ModuleId::lowest_free(ModuleKind::Terminal, &[ModuleId::terminal(), t(2), t(4)]),
+            Some(t(3))
+        );
+        let all: Vec<ModuleId> = (2..=9).map(t).collect();
+        assert_eq!(ModuleId::lowest_free(ModuleKind::Terminal, &all), None);
+        assert_eq!(ModuleId::lowest_free(ModuleKind::Editor, &[]), None);
+        assert_eq!(
+            ModuleId::lowest_free(ModuleKind::Agent, &[ModuleId::agent()]),
+            Some(ModuleId::instance(ModuleKind::Agent, 2).unwrap())
+        );
+    }
+
+    #[test]
+    fn only_the_terminal_and_the_chat_view_have_instances() {
+        assert!(ModuleKind::Terminal.has_instances() && ModuleKind::Agent.has_instances());
+        for kind in [ModuleKind::Editor, ModuleKind::Canvas, ModuleKind::LuaWebview] {
+            assert!(!kind.has_instances(), "{kind:?}");
+        }
+    }
 
     /// Every id a constructor can be handed round-trips. `ModuleId::lua("")` would not (`lua:` is
     /// refused below); nothing reaches it with one, because `lua::panel::parse_panel_spec` refuses

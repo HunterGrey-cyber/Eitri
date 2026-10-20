@@ -39,6 +39,8 @@ pub(crate) struct Context {
     pub(crate) window: gtk4::ApplicationWindow,
     pub(crate) grid: ModuleGrid,
     pub(crate) pane: Rc<NeovideEditorPane>,
+    /// The base terminal's pane, from the window's terminal registry (each numbered instance has its
+    /// own pane there; the probe drives only the base one).
     pub(crate) terminal: TerminalPane,
     /// The base chat page's widget: a `WebView`, or the notice standing in for one.
     pub(crate) agent: gtk4::Widget,

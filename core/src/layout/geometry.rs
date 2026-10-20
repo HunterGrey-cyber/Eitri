@@ -5,13 +5,16 @@
 //! draws no divider, like a `GtkPaned` with one visible child. This lets hidden slots collapse
 //! and gives a zoomed module the full window.
 //!
-//! A pinned split (`tree::Pin`) gives its pinned side the stored length and the other side the
-//! rest, within both minimums, so a bottom row keeps its height as the window grows. Until that
-//! length is known, the split uses its ratio. [`settle_pins`] records the length when both sides
-//! first appear on screen.
+//! A pinned child (`con::Pin`) keeps its stored length while later children share the rest,
+//! within all minimums, so a bottom row keeps its height as the window grows. Until that length
+//! is known, its step uses the shares. [`settle_pins`] records the length when the child first
+//! appears beside another child. [`super::arrange`] does the arithmetic; this file supplies its
+//! inputs from a [`Layout`].
 
+use super::arrange::{arrange_tree, con_min, move_divider_in, settle_in, Divider};
+use super::con::{ConId, ConLayout};
 use super::module::ModuleId;
-use super::tree::{Axis, Branch, Layout, LayoutError, Node, Pin, SplitPath, MAX_RATIO, MIN_RATIO};
+use super::tree::{Axis, Layout, LayoutError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Size {
@@ -36,11 +39,14 @@ pub enum Direction {
     Right,
 }
 
+pub const DEFAULT_STRIP_PX: i32 = 24;
+
 /// What the geometry is computed against: the container's size, the divider's thickness, and each
 /// module's minimum size (what its widget measures; a module with none returns `Size::default()`).
 pub struct Frame<'a> {
     pub size: Size,
     pub handle_px: i32,
+    pub strip_px: i32,
     pub min: &'a dyn Fn(&ModuleId) -> Size,
 }
 
@@ -54,57 +60,10 @@ impl Frame<'static> {
         Frame {
             size,
             handle_px,
+            strip_px: DEFAULT_STRIP_PX,
             min: &no_minimum,
         }
     }
-}
-
-/// One divider on screen: the split it belongs to and everything a drag or a resize needs to turn
-/// a pixel position back into that split's ratio.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Divider {
-    pub path: SplitPath,
-    /// The split's axis: a `Row` split's divider is a vertical line.
-    pub axis: Axis,
-    /// Where the handle is drawn, `handle_px` thick.
-    pub rect: Rect,
-    /// The length the split divides, handle excluded.
-    pub avail: i32,
-    /// How much of `avail` the first child has now.
-    pub first_px: i32,
-    /// The first and second subtrees' minimum lengths along `axis`.
-    pub min_first: i32,
-    pub min_second: i32,
-}
-
-impl Divider {
-    /// The ratio that gives the first child `first_px`, kept off both children's minimums and
-    /// inside `MIN_RATIO..=MAX_RATIO`. Exact: [`arrange`] rounds `avail * ratio` back to `first_px`.
-    pub fn ratio_for(&self, first_px: i32) -> f32 {
-        if self.avail <= 0 {
-            return 0.5;
-        }
-        let hi = (self.avail - self.min_second).max(0);
-        let lo = self.min_first.min(hi);
-        let px = first_px.clamp(lo, hi);
-        (px as f32 / self.avail as f32).clamp(MIN_RATIO, MAX_RATIO)
-    }
-
-    /// `first_px` kept off both children's minimums and inside the same `MIN_RATIO..=MAX_RATIO`
-    /// band a ratio is: what a pinned split stores when its divider is moved.
-    fn clamp_first(&self, first_px: i32) -> i32 {
-        let (band_lo, band_hi) = band(self.avail);
-        let hi = (self.avail - self.min_second).max(0).min(band_hi);
-        let lo = self.min_first.max(band_lo).min(hi);
-        first_px.clamp(lo, hi)
-    }
-}
-
-/// The `MIN_RATIO..=MAX_RATIO` band of `avail` in pixels, `lo <= hi` at any length: the first
-/// child's length a ratio can give, and so the most a pinned length may take at any size.
-fn band(avail: i32) -> (i32, i32) {
-    let hi = (avail as f32 * MAX_RATIO).floor() as i32;
-    (((avail as f32 * MIN_RATIO).ceil() as i32).min(hi), hi)
 }
 
 /// Every module on screen with its rectangle, in tree order, and every divider on screen.
@@ -112,9 +71,29 @@ fn band(avail: i32) -> (i32, i32) {
 pub struct Arrangement {
     pub modules: Vec<(ModuleId, Rect)>,
     pub dividers: Vec<Divider>,
+    pub strips: Vec<Strip>,
+    /// Navigation extends the top edge over each enclosing strip without crossing another module.
+    pub cells: Vec<(ModuleId, Rect)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Strip {
+    pub con: ConId,
+    pub layout: ConLayout,
+    pub rect: Rect,
+    pub entries: Vec<ConStripEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConStripEntry {
+    pub id: ModuleId,
+    pub active: bool,
 }
 
 impl Arrangement {
+    pub fn cell_of(&self, id: &ModuleId) -> Option<Rect> {
+        self.cells.iter().find(|(m, _)| m == id).map(|(_, r)| *r)
+    }
     pub fn rect_of(&self, id: &ModuleId) -> Option<Rect> {
         self.modules.iter().find(|(m, _)| m == id).map(|(_, r)| *r)
     }
@@ -135,7 +114,11 @@ pub fn min_size(layout: &Layout, frame: &Frame) -> Size {
         return (frame.min)(zoomed);
     }
     let shown = |id: &ModuleId| layout.is_shown(id);
-    subtree_min(layout.root(), &shown, frame).unwrap_or_default()
+    let root = match layout.zoom() {
+        Some(super::tree::Zoom::Con(id)) => layout.root().find(*id).unwrap(),
+        _ => layout.root(),
+    };
+    con_min(root, &shown, frame).unwrap_or_default()
 }
 
 /// The same, as if nothing were zoomed. Navigation and resize decide on this, because tmux decides
@@ -151,209 +134,16 @@ pub(super) fn arrange_with(layout: &Layout, honour_zoom: bool, frame: &Frame) ->
     if honour_zoom {
         if let Some(zoomed) = layout.zoomed() {
             out.modules.push((zoomed.clone(), full));
+            out.cells.push((zoomed.clone(), full));
             return out;
         }
     }
     let shown = |id: &ModuleId| layout.is_shown(id);
-    place(layout.root(), full, &mut Vec::new(), &shown, frame, &mut out);
-    out
-}
-
-/// The minimum size of the visible part of `node`, or `None` when nothing in it is visible.
-fn subtree_min(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame) -> Option<Size> {
-    match node {
-        Node::Leaf(id) => shown(id).then(|| (frame.min)(id)),
-        Node::Split {
-            axis, first, second, ..
-        } => match (subtree_min(first, shown, frame), subtree_min(second, shown, frame)) {
-            (None, None) => None,
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (Some(a), Some(b)) => Some(match axis {
-                Axis::Row => Size {
-                    w: a.w + frame.handle_px + b.w,
-                    h: a.h.max(b.h),
-                },
-                Axis::Column => Size {
-                    w: a.w.max(b.w),
-                    h: a.h + frame.handle_px + b.h,
-                },
-            }),
-        },
-    }
-}
-
-/// sw-layout-1 (2026-09-27 Codex sweep): a shown leaf's floor for [`place`]'s own clamp accounting,
-/// never for [`min_size`]'s report to the window manager -- that report must stay exact at 0 when a
-/// module truly registers none (`the_layouts_minimum_is_what_is_on_screen_needs` pins the numbers).
-/// A `GtkGLArea` editor host normally registers no minimum at all, so without this floor a split
-/// whose ratio-driven `wanted` is overridden by a *sibling's* real minimum (`place`'s trailing
-/// `.max(min_a.min(avail))`) can leave a still-shown, still-focused leaf exactly 0 pixels wide or
-/// tall while giving every pixel to the sibling -- reachable through ordinary nested splits and
-/// resizes, not just a contrived minimum.
-///
-/// **32, not the first version's 1**: a 1px editor is as invisible and as
-/// impossible to click as a 0px one, and a shown module has no tray chip to bring it back. 32 logical
-/// px holds a row of editor text at the default font and is a target a pointer lands on; it is below
-/// the 5% the ratio band already guarantees a directly placed leaf at any ordinary window size (36px
-/// of a 721px column), so it only bites where a sibling's own minimum overrides the band, as here.
-const MIN_VISIBLE_LEAF_PX: i32 = 32;
-
-/// Same recursion as [`subtree_min`], but every shown leaf's own minimum is floored to
-/// [`MIN_VISIBLE_LEAF_PX`] along both axes first. Used only inside [`place`]'s clamp math (both the
-/// `(None, None)` visibility check, unaffected by the floor, and the numeric `min_a`/`min_b`), so a
-/// visible sibling's true zero-size registration can still starve a ratio the way `MIN_RATIO` bounds
-/// it -- everywhere except all the way down to zero.
-fn subtree_min_for_place(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame) -> Option<Size> {
-    match node {
-        Node::Leaf(id) => shown(id).then(|| {
-            let m = (frame.min)(id);
-            Size {
-                w: m.w.max(MIN_VISIBLE_LEAF_PX),
-                h: m.h.max(MIN_VISIBLE_LEAF_PX),
-            }
-        }),
-        Node::Split {
-            axis, first, second, ..
-        } => match (
-            subtree_min_for_place(first, shown, frame),
-            subtree_min_for_place(second, shown, frame),
-        ) {
-            (None, None) => None,
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (Some(a), Some(b)) => Some(match axis {
-                Axis::Row => Size {
-                    w: a.w + frame.handle_px + b.w,
-                    h: a.h.max(b.h),
-                },
-                Axis::Column => Size {
-                    w: a.w.max(b.w),
-                    h: a.h + frame.handle_px + b.h,
-                },
-            }),
-        },
-    }
-}
-
-fn along(axis: Axis, size: Size) -> i32 {
-    match axis {
-        Axis::Row => size.w,
-        Axis::Column => size.h,
-    }
-}
-
-fn place(
-    node: &Node,
-    rect: Rect,
-    path: &mut SplitPath,
-    shown: &dyn Fn(&ModuleId) -> bool,
-    frame: &Frame,
-    out: &mut Arrangement,
-) {
-    match node {
-        Node::Leaf(id) => {
-            if shown(id) {
-                out.modules.push((id.clone(), rect));
-            }
-        }
-        Node::Split {
-            axis,
-            ratio,
-            pin,
-            first,
-            second,
-        } => {
-            let (min_a, min_b) = (
-                subtree_min_for_place(first, shown, frame),
-                subtree_min_for_place(second, shown, frame),
-            );
-            let (min_a, min_b) = match (min_a, min_b) {
-                (None, None) => return,
-                (Some(_), None) => {
-                    path.push(Branch::First);
-                    place(first, rect, path, shown, frame, out);
-                    path.pop();
-                    return;
-                }
-                (None, Some(_)) => {
-                    path.push(Branch::Second);
-                    place(second, rect, path, shown, frame, out);
-                    path.pop();
-                    return;
-                }
-                (Some(a), Some(b)) => (along(*axis, a), along(*axis, b)),
-            };
-            let length = match axis {
-                Axis::Row => rect.w,
-                Axis::Column => rect.h,
-            };
-            let handle = frame.handle_px.min(length).max(0);
-            let avail = length - handle;
-            // A pinned length is kept inside the band a ratio has, at this size and not only at the
-            // size it was dragged at: a row dragged to the top of a tall window must not leave the
-            // modules above it 0px (and still able to take the keys) once the window is smaller.
-            let in_band = |px: i32| {
-                let (lo, hi) = band(avail);
-                px.clamp(lo, hi)
-            };
-            let wanted = match pin {
-                Some(Pin {
-                    side: Branch::First,
-                    px: Some(px),
-                }) => in_band(*px),
-                Some(Pin {
-                    side: Branch::Second,
-                    px: Some(px),
-                }) => in_band(avail - px),
-                _ => (avail as f32 * ratio).round() as i32,
-            };
-            let hi = (avail - min_b).max(0);
-            let first_px = wanted.clamp(0, avail).min(hi).max(min_a.min(avail));
-            let second_px = avail - first_px;
-            let (first_rect, handle_rect, second_rect) = match axis {
-                Axis::Row => (
-                    Rect { w: first_px, ..rect },
-                    Rect {
-                        x: rect.x + first_px,
-                        w: handle,
-                        ..rect
-                    },
-                    Rect {
-                        x: rect.x + first_px + handle,
-                        w: second_px,
-                        ..rect
-                    },
-                ),
-                Axis::Column => (
-                    Rect { h: first_px, ..rect },
-                    Rect {
-                        y: rect.y + first_px,
-                        h: handle,
-                        ..rect
-                    },
-                    Rect {
-                        y: rect.y + first_px + handle,
-                        h: second_px,
-                        ..rect
-                    },
-                ),
-            };
-            out.dividers.push(Divider {
-                path: path.clone(),
-                axis: *axis,
-                rect: handle_rect,
-                avail,
-                first_px,
-                min_first: min_a,
-                min_second: min_b,
-            });
-            path.push(Branch::First);
-            place(first, first_rect, path, shown, frame, out);
-            path.pop();
-            path.push(Branch::Second);
-            place(second, second_rect, path, shown, frame, out);
-            path.pop();
-        }
-    }
+    let root = match (honour_zoom, layout.zoom()) {
+        (true, Some(super::tree::Zoom::Con(id))) => layout.root().find(*id).unwrap(),
+        _ => layout.root(),
+    };
+    arrange_tree(root, full, &shown, frame)
 }
 
 /// Whether two spans `[a, a + a_len)` and `[b, b + b_len)` share at least one pixel.
@@ -413,7 +203,24 @@ pub fn navigate(layout: &Layout, from: &ModuleId, dir: Direction, frame: &Frame)
         // which is only "above" a module that is on screen.
         return Nav::Nothing;
     }
-    match neighbor(&arrangement.modules, from, dir, layout.mru(), frame.handle_px) {
+    for (c, i) in layout.ancestors(from).into_iter().rev() {
+        let forward = match (c.layout, dir) {
+            (ConLayout::Tabbed, Direction::Right) | (ConLayout::Stacked, Direction::Down) => true,
+            (ConLayout::Tabbed, Direction::Left) | (ConLayout::Stacked, Direction::Up) => false,
+            _ => continue,
+        };
+        let next = if forward {
+            (i + 1..c.children.len()).find_map(|j| c.children[j].node.focused_leaf(&|m| layout.is_shown(m)))
+        } else {
+            (0..i)
+                .rev()
+                .find_map(|j| c.children[j].node.focused_leaf(&|m| layout.is_shown(m)))
+        };
+        if let Some(id) = next {
+            return Nav::Module(id);
+        }
+    }
+    match neighbor(&arrangement.cells, from, dir, layout.mru(), frame.handle_px) {
         Some(id) => Nav::Module(id),
         None if dir == Direction::Up => Nav::TopBar,
         None => Nav::Nothing,
@@ -452,7 +259,7 @@ fn edge_divider(arrangement: &Arrangement, leaf: Rect, dir: Direction, trailing:
 /// silently undo a zoom. `false` when nothing moved for that reason.
 pub fn resize(layout: &mut Layout, focused: &ModuleId, dir: Direction, px: i32, frame: &Frame) -> bool {
     let arrangement = arrange_with(layout, false, frame);
-    let Some(leaf) = arrangement.rect_of(focused) else {
+    let Some(leaf) = arrangement.cell_of(focused) else {
         return false;
     };
     let Some(divider) =
@@ -469,46 +276,30 @@ pub fn resize(layout: &mut Layout, focused: &ModuleId, dir: Direction, px: i32, 
     move_divider(layout, &divider, divider.first_px + sign * px).is_ok()
 }
 
-/// Puts `divider` where its first child gets `first_px`, kept off both children's minimums: a ratio
-/// on a ratio split, the pinned side's pixels on a pinned one. What a divider drag and
-/// `Ctrl+a h/j/k/l` do. `divider` is one [`arrange`] returned for this layout.
+/// Puts `divider` where the child before it gets `first_px`, kept off both sides' minimums: shares
+/// traded with the next shown child when no pin governs that step, the governing pin's pixels when one
+/// does. What a divider drag and `Ctrl+a h/j/k/l` do. `divider` is one [`arrange`] returned for this
+/// layout; one no longer on screen is refused.
 pub fn move_divider(layout: &mut Layout, divider: &Divider, first_px: i32) -> Result<(), LayoutError> {
-    let ratio = divider.ratio_for(first_px);
-    let (r, pin) = layout.split_at_mut(&divider.path)?;
-    match pin {
-        None => *r = ratio,
-        Some(pin) => {
-            let first = divider.clamp_first(first_px);
-            pin.px = Some(match pin.side {
-                Branch::First => first,
-                Branch::Second => divider.avail - first,
-            });
-        }
+    let shown = layout.shown_set();
+    if move_divider_in(layout.root_mut(), divider, first_px, &|id| shown.contains(id)) {
+        Ok(())
+    } else {
+        Err(LayoutError::NoSuchDivider)
     }
-    Ok(())
 }
 
-/// Gives every pinned split that is on screen with both sides, and has no length yet, the length
-/// its ratio gives it now -- from then on it keeps that length. `true` if one was given. `shell`'s
-/// grid calls this with its real allocation before it arranges, so a bottom row's first show is a
-/// third of the height at the window's size then (`main`'s `shown_position`), and after that the
-/// row keeps its height when the window grows (`main`'s `resize_end_child(false)`).
+/// Gives every pin that governs a step on screen, and has no length yet, the length the shares give it
+/// now -- from then on it keeps that length. `true` if one was given. `shell`'s grid calls this with
+/// its real allocation before it arranges, so a bottom row's first show is a third of the height at
+/// the window's size then (`main`'s `shown_position`), and after that the row keeps its height when
+/// the window grows (`main`'s `resize_end_child(false)`).
 pub fn settle_pins(layout: &mut Layout, frame: &Frame) -> bool {
     let arrangement = arrange(layout, frame);
+    let shown = layout.shown_set();
     let mut settled = false;
     for divider in &arrangement.dividers {
-        if divider.avail <= 0 {
-            continue;
-        }
-        if let Ok((_, Some(pin))) = layout.split_at_mut(&divider.path) {
-            if pin.px.is_none() {
-                pin.px = Some(match pin.side {
-                    Branch::First => divider.first_px,
-                    Branch::Second => divider.avail - divider.first_px,
-                });
-                settled = true;
-            }
-        }
+        settled |= settle_in(layout.root_mut(), divider, &|id| shown.contains(id));
     }
     settled
 }
@@ -524,12 +315,26 @@ pub fn hide(layout: &mut Layout, id: &ModuleId, frame: &Frame) -> Result<Option<
             .into_iter()
             .filter_map(|dir| neighbor(&arrangement.modules, id, dir, layout.mru(), frame.handle_px))
             .collect();
-        layout
-            .mru()
-            .iter()
-            .find(|m| adjacent.contains(m))
-            .or_else(|| layout.mru().iter().find(|m| *m != id && layout.is_shown(m)))
-            .cloned()
+        let tab_next = layout.ancestors(id).into_iter().rev().find_map(|(c, i)| {
+            if c.layout.axis().is_some() {
+                return None;
+            }
+            let mut next = c.clone();
+            let shown = |m: &ModuleId| m != id && layout.is_shown(m);
+            if next.drawn(&shown) == Some(i) {
+                return None;
+            }
+            next.focus = i;
+            next.focused_leaf(&shown)
+        });
+        tab_next.or_else(|| {
+            layout
+                .mru()
+                .iter()
+                .find(|m| adjacent.contains(m))
+                .or_else(|| layout.mru().iter().find(|m| *m != id && layout.is_in_view(m)))
+                .cloned()
+        })
     } else {
         None
     };
@@ -542,8 +347,10 @@ pub fn hide(layout: &mut Layout, id: &ModuleId, frame: &Frame) -> Result<Option<
 
 #[cfg(test)]
 mod tests {
+    use super::super::arrange::MIN_VISIBLE_LEAF_PX;
+    use super::super::con::{ConId, Node};
     use super::super::module::{ModuleDecl, Placement};
-    use super::super::tree::ZoomChange;
+    use super::super::tree::{ZoomChange, MAX_RATIO, MIN_RATIO};
     use super::*;
 
     const HANDLE: i32 = 1;
@@ -585,7 +392,8 @@ mod tests {
 
     #[test]
     fn the_default_tree_splits_the_width_at_the_ratio_with_one_divider() {
-        let a = arrange(&default_tree(), &frame());
+        let layout = default_tree();
+        let a = arrange(&layout, &frame());
         // 1279 * (760 / 1279) = 760: where `main`'s `GtkPaned` put it.
         assert_eq!(
             a.modules,
@@ -594,8 +402,8 @@ mod tests {
         assert_eq!(a.dividers.len(), 1);
         let d = &a.dividers[0];
         assert_eq!(
-            (d.path.clone(), d.axis, d.rect),
-            (vec![], Axis::Row, rect(760, 0, 1, 721))
+            (d.con, d.index, d.axis, d.rect),
+            (layout.root().id, 0, Axis::Row, rect(760, 0, 1, 721))
         );
         assert_eq!((d.avail, d.first_px), (1279, 760));
     }
@@ -612,13 +420,10 @@ mod tests {
                 (bottom(), rect(0, 481, 1280, 240)),
             ]
         );
-        let paths: Vec<(SplitPath, Rect)> = a.dividers.iter().map(|d| (d.path.clone(), d.rect)).collect();
+        let dividers: Vec<(Axis, Rect)> = a.dividers.iter().map(|d| (d.axis, d.rect)).collect();
         assert_eq!(
-            paths,
-            vec![
-                (vec![], rect(0, 480, 1280, 1)),
-                (vec![Branch::First], rect(760, 0, 1, 480))
-            ]
+            dividers,
+            vec![(Axis::Column, rect(0, 480, 1280, 1)), (Axis::Row, rect(760, 0, 1, 480))]
         );
     }
 
@@ -657,7 +462,9 @@ mod tests {
     #[test]
     fn a_minimum_size_holds_the_divider_off_a_module() {
         let mut layout = bottom_tree();
-        layout.set_ratio(&[], 0.95).unwrap();
+        let column = arrange(&layout, &frame()).dividers[0].clone();
+        assert_eq!(column.axis, Axis::Column);
+        layout.set_ratio(&column, 0.95).unwrap();
         let min = |id: &ModuleId| {
             if *id == bottom() {
                 Size { w: 0, h: 80 }
@@ -668,6 +475,7 @@ mod tests {
         let f = Frame {
             size: WINDOW,
             handle_px: HANDLE,
+            strip_px: DEFAULT_STRIP_PX,
             min: &min,
         };
         let a = arrange(&layout, &f);
@@ -708,6 +516,7 @@ mod tests {
         let f = Frame {
             size: WINDOW,
             handle_px: HANDLE,
+            strip_px: DEFAULT_STRIP_PX,
             min: &min,
         };
         let a = arrange(&layout, &f);
@@ -742,6 +551,7 @@ mod tests {
         let f = Frame {
             size: WINDOW,
             handle_px: HANDLE,
+            strip_px: DEFAULT_STRIP_PX,
             min: &min,
         };
         let mut layout = bottom_tree();
@@ -776,6 +586,7 @@ mod tests {
         let f = Frame {
             size: Size { w: 600, h: 400 },
             handle_px: HANDLE,
+            strip_px: DEFAULT_STRIP_PX,
             min: &min,
         };
         let a = arrange(&default_tree(), &f);
@@ -790,7 +601,8 @@ mod tests {
         let d = &a.dividers[0];
         for px in [64, 300, 760, 1000, 1215] {
             let mut layout = default_tree();
-            layout.set_ratio(&d.path, d.ratio_for(px)).unwrap();
+            let d = arrange(&layout, &frame()).dividers[0].clone();
+            layout.set_ratio(&d, d.ratio_for(px)).unwrap();
             assert_eq!(arrange(&layout, &frame()).dividers[0].first_px, px);
         }
         // Past MIN_RATIO/MAX_RATIO it stops there.
@@ -927,27 +739,24 @@ mod tests {
             Node::Leaf(a.clone()),
             Node::split(Axis::Row, 0.5, Node::Leaf(b.clone()), Node::Leaf(c.clone())),
         );
-        let first_px = |layout: &Layout, path: &[Branch]| {
+        let first_px = |layout: &Layout, con: ConId| {
             arrange(layout, &frame())
                 .dividers
                 .iter()
-                .find(|d| d.path == path)
+                .find(|d| d.con == con)
                 .unwrap()
                 .first_px
         };
         let mut layout = Layout::new(root, b.clone()).unwrap();
-        let (outer, inner) = (first_px(&layout, &[]), first_px(&layout, &[Branch::Second]));
+        let (outer_con, inner_con) = (layout.root().id, layout.root().children[1].node.as_con().unwrap().id);
+        let (outer, inner) = (first_px(&layout, outer_con), first_px(&layout, inner_con));
         assert!(resize(&mut layout, &b, Direction::Right, 40, &frame()));
-        assert_eq!(first_px(&layout, &[]), outer, "b's left divider stays");
-        assert_eq!(
-            first_px(&layout, &[Branch::Second]),
-            inner + 40,
-            "b's right divider moves"
-        );
+        assert_eq!(first_px(&layout, outer_con), outer, "b's left divider stays");
+        assert_eq!(first_px(&layout, inner_con), inner + 40, "b's right divider moves");
         // c has no right divider, so its left one (the inner) moves.
         assert!(resize(&mut layout, &c, Direction::Left, 40, &frame()));
-        assert_eq!(first_px(&layout, &[Branch::Second]), inner);
-        assert_eq!(first_px(&layout, &[]), outer);
+        assert_eq!(first_px(&layout, inner_con), inner);
+        assert_eq!(first_px(&layout, outer_con), outer);
     }
 
     /// A zoom does not change where a move goes (the unzoomed geometry decides), and a hidden
@@ -972,28 +781,29 @@ mod tests {
     }
 
     /// Resize targets for both default trees, checked for every focus and direction,
-    /// including every `None`. `[]` names the root split; `[First]` names the row inside
-    /// the bottom tree's column. Each target includes the divider's path and movement sign.
+    /// including every `None`. Each tree has at most one divider per axis: `Row` separates
+    /// the editor and agent, and `Column` sits above the bottom module.
+    /// Each target includes the divider's axis and movement sign.
     #[test]
     fn resize_moves_the_divider_todays_resize_target_moved() {
         use Direction::*;
-        // (tree, focused, dir, Some((path, sign)))
-        let across_default = vec![];
-        let across_bottom = vec![Branch::First];
-        let down = vec![];
-        let cases: Vec<(Layout, ModuleId, Direction, Option<(SplitPath, i32)>)> = vec![
-            (default_tree(), editor(), Left, Some((across_default.clone(), -1))),
-            (default_tree(), editor(), Right, Some((across_default.clone(), 1))),
-            (default_tree(), agent(), Left, Some((across_default.clone(), -1))),
-            (default_tree(), agent(), Right, Some((across_default.clone(), 1))),
+        // (tree, focused, dir, Some((the divider's axis, sign)))
+        let across_default = Axis::Row;
+        let across_bottom = Axis::Row;
+        let down = Axis::Column;
+        let cases: Vec<(Layout, ModuleId, Direction, Option<(Axis, i32)>)> = vec![
+            (default_tree(), editor(), Left, Some((across_default, -1))),
+            (default_tree(), editor(), Right, Some((across_default, 1))),
+            (default_tree(), agent(), Left, Some((across_default, -1))),
+            (default_tree(), agent(), Right, Some((across_default, 1))),
             (default_tree(), editor(), Up, None),
             (default_tree(), agent(), Down, None),
-            (bottom_tree(), editor(), Left, Some((across_bottom.clone(), -1))),
-            (bottom_tree(), agent(), Right, Some((across_bottom.clone(), 1))),
-            (bottom_tree(), editor(), Up, Some((down.clone(), -1))),
-            (bottom_tree(), agent(), Down, Some((down.clone(), 1))),
-            (bottom_tree(), bottom(), Up, Some((down.clone(), -1))),
-            (bottom_tree(), bottom(), Down, Some((down.clone(), 1))),
+            (bottom_tree(), editor(), Left, Some((across_bottom, -1))),
+            (bottom_tree(), agent(), Right, Some((across_bottom, 1))),
+            (bottom_tree(), editor(), Up, Some((down, -1))),
+            (bottom_tree(), agent(), Down, Some((down, 1))),
+            (bottom_tree(), bottom(), Up, Some((down, -1))),
+            (bottom_tree(), bottom(), Down, Some((down, 1))),
             (bottom_tree(), bottom(), Left, None),
             (bottom_tree(), bottom(), Right, None),
         ];
@@ -1007,9 +817,9 @@ mod tests {
                     assert!(!moved, "{label}");
                     assert_eq!(before, after, "{label}");
                 }
-                Some((path, sign)) => {
+                Some((axis, sign)) => {
                     assert!(moved, "{label}");
-                    let px = |a: &Arrangement| a.dividers.iter().find(|d| d.path == path).unwrap().first_px;
+                    let px = |a: &Arrangement| a.dividers.iter().find(|d| d.axis == axis).unwrap().first_px;
                     assert_eq!(px(&after) - px(&before), sign * 40, "{label}");
                 }
             }
@@ -1127,14 +937,15 @@ mod tests {
     fn resize_takes_the_divider_that_borders_the_leaf_not_one_on_the_same_line() {
         let l = ModuleId::lua;
         let f = Frame::new(Size { w: 1001, h: 601 }, HANDLE);
-        let px = |layout: &Layout, path: &[Branch]| {
+        let px = |layout: &Layout, con: ConId| {
             arrange(layout, &f)
                 .dividers
                 .iter()
-                .find(|d| d.path == path)
+                .find(|d| d.con == con)
                 .unwrap()
                 .first_px
         };
+        let child_con = |layout: &Layout, i: usize| layout.root().children[i].node.as_con().unwrap().id;
 
         let rows = Node::split(
             Axis::Column,
@@ -1143,15 +954,15 @@ mod tests {
             Node::split(Axis::Row, 0.5, Node::Leaf(l("c")), Node::Leaf(l("d"))),
         );
         let mut layout = Layout::new(rows, l("c")).unwrap();
-        let (upper, lower) = (px(&layout, &[Branch::First]), px(&layout, &[Branch::Second]));
+        let (upper, lower) = (px(&layout, child_con(&layout, 0)), px(&layout, child_con(&layout, 1)));
         assert_eq!(upper, lower, "the premise: both rows' dividers are on one line");
         assert!(resize(&mut layout, &l("c"), Direction::Right, 40, &f));
         assert_eq!(
-            px(&layout, &[Branch::First]),
+            px(&layout, child_con(&layout, 0)),
             upper,
             "the upper row's divider only shares c's x"
         );
-        assert_eq!(px(&layout, &[Branch::Second]), lower + 40);
+        assert_eq!(px(&layout, child_con(&layout, 1)), lower + 40);
 
         let columns = Node::split(
             Axis::Row,
@@ -1160,15 +971,15 @@ mod tests {
             Node::split(Axis::Column, 0.5, Node::Leaf(l("b")), Node::Leaf(l("d"))),
         );
         let mut layout = Layout::new(columns, l("b")).unwrap();
-        let (left, right) = (px(&layout, &[Branch::First]), px(&layout, &[Branch::Second]));
+        let (left, right) = (px(&layout, child_con(&layout, 0)), px(&layout, child_con(&layout, 1)));
         assert_eq!(left, right, "the premise: both columns' dividers are on one line");
         assert!(resize(&mut layout, &l("b"), Direction::Down, 40, &f));
         assert_eq!(
-            px(&layout, &[Branch::First]),
+            px(&layout, child_con(&layout, 0)),
             left,
             "the left column's divider only shares b's y"
         );
-        assert_eq!(px(&layout, &[Branch::Second]), right + 40);
+        assert_eq!(px(&layout, child_con(&layout, 1)), right + 40);
     }
 
     /// `toggle_zoom`'s "not a hidden module" guard, on its own. `tree.rs`'s test of it hides one of
@@ -1242,7 +1053,7 @@ mod tests {
         let mut layout = bottom_tree();
         settle_pins(&mut layout, &frame());
         let divider = arrange(&layout, &frame()).dividers[0].clone();
-        assert_eq!(divider.path, Vec::<Branch>::new());
+        assert_eq!((divider.con, divider.index), (layout.root().id, 0));
         move_divider(&mut layout, &divider, 400).unwrap();
         assert_eq!(arrange(&layout, &frame()).rect_of(&bottom()).unwrap().h, 320);
         let big = Frame::new(Size { w: 1280, h: 1041 }, HANDLE);
@@ -1271,6 +1082,7 @@ mod tests {
         let at = |h: i32| Frame {
             size: Size { w: 1280, h },
             handle_px: HANDLE,
+            strip_px: DEFAULT_STRIP_PX,
             min: &min,
         };
         let mut layout = bottom_tree();

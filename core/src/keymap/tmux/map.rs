@@ -535,7 +535,14 @@ fn action(command: &Command, vars: &Vars) -> Result<Action, String> {
             parsed.only("hvcplbdf")?;
             parsed.at_most(0)?;
             // tmux: -h splits left/right whatever else is given.
-            Ok(Action::Split(if parsed.has('h') { Axis::Row } else { Axis::Column }))
+            Ok(Action::Split {
+                axis: if parsed.has('h') { Axis::Row } else { Axis::Column },
+                cwd: if parsed.value('c') == Some("#{pane_current_path}") {
+                    crate::keymap::action::SplitCwd::Pane
+                } else {
+                    crate::keymap::action::SplitCwd::Start
+                },
+            })
         }
         "select-pane" => {
             parsed.only("LDURltmM")?;

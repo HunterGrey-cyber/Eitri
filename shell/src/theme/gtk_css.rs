@@ -27,6 +27,9 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     // Use the module grid's CSS node name so its dividers match the rule below.
     // The grid is the only container with dividers.
     let grid = crate::module_grid::CSS_NAME;
+    // A tabbed or stacked container's strip, and the class on the entry it draws.
+    let strip = crate::module_grid::strips::CSS_NAME;
+    let active = crate::module_grid::strips::ACTIVE_CLASS;
 
     format!(
         r#"
@@ -101,6 +104,28 @@ window {{
     background-image: none;
     min-width: 1px;
     min-height: 1px;
+}}
+
+/* A tabbed or stacked container's strip (`module_grid::strips`): the tray chip's quiet pair for
+   every entry, the bar's full text colour and weight for the one the container draws. A row is
+   23px plus its 1px rule, the 24px the geometry assumes before it can measure one, so the first
+   strip on screen does not move what is below it. */
+{strip} {{
+    background-color: {chrome};
+    background-image: none;
+}}
+
+{strip} > label {{
+    color: {chrome_muted};
+    font-size: 12px;
+    min-height: 23px;
+    padding: 0 8px;
+    border-bottom: 1px solid {border};
+}}
+
+{strip} > label.{active} {{
+    color: {chrome_fg};
+    font-weight: 700;
 }}
 
 .pane-placeholder {{
@@ -370,6 +395,8 @@ mod tests {
             (".close-prompt", t.chrome_fg, 4.5),
             (".tray-chip", t.chrome_muted, 4.5),
             (".tray-chip.attention", t.chrome_fg, 4.5),
+            ("constrip > label", t.chrome_muted, 4.5),
+            ("constrip > label.active", t.chrome_fg, 4.5),
             (".prefix-strip", t.chrome_fg, 4.5),
             (".prefix-strip .dimmed", t.chrome_muted, 4.5),
             (".prefix-strip .strip-dot", t.chrome_muted, 4.5),

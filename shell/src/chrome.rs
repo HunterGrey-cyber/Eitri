@@ -40,6 +40,9 @@ pub(crate) struct TopBar {
     pub(crate) tray: gtk4::Box,
     /// `marked: <title>`, left of the tray, shown only while a module is marked ([`mark_text`]).
     pub(crate) mark: gtk4::Label,
+    /// `selected: <kind> (<titles>)`, beside the mark, shown only while a container is selected
+    /// (`tray::selection_text`). Set with [`show_mark`]: the same plain-text segment.
+    pub(crate) selection: gtk4::Label,
 }
 
 /// What the top bar says about the mark `swap.marked` swaps with: nothing without one. The mark
@@ -116,10 +119,18 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
     // A long title gives way rather than widening the bar, as the project name does.
     mark.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     mark.set_visible(false);
+    // Styled as the mark is: both are a word about the layout, not an item to reach.
+    let selection = gtk4::Label::new(None);
+    selection.add_css_class("topbar-mark");
+    selection.add_css_class("topbar-selection");
+    selection.set_valign(gtk4::Align::Center);
+    selection.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    selection.set_visible(false);
 
     bar.append(&app_name);
     bar.append(&strip);
     bar.append(&project_name);
+    bar.append(&selection);
     bar.append(&mark);
     bar.append(&tray);
     bar.append(&reload_agent);
@@ -135,6 +146,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project_root: &Path) -> 
         strip,
         tray,
         mark,
+        selection,
     }
 }
 

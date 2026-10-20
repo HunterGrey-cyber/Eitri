@@ -3,11 +3,19 @@
 //! preset. Finding nothing to do leaves a zoom on. The keys stay on their module. Shown modules
 //! include those zoomed away: decisions use the unzoomed window.
 
+pub mod containers;
+pub mod move_dir;
+pub mod select;
+pub use containers::{container_mode, switch_tab};
+pub use move_dir::move_dir;
+pub use select::{focus_child, focus_parent};
+
+use super::con::{Con, ConId, ConLayout, Node};
 use super::geometry::{arrange_with, Direction, Frame};
 use super::module::ModuleId;
 use super::ops::{even, even_chain, hidden_bottom_rows};
 use super::tree::{
-    Axis, Branch, Layout, LayoutError, Node, BELOW_ROOT_SHARE, DEFAULT_EDITOR_SHARE, MAX_RATIO, MIN_RATIO,
+    Axis, Branch, Layout, LayoutError, Selection, BELOW_ROOT_SHARE, DEFAULT_EDITOR_SHARE, MAX_RATIO, MIN_RATIO,
     RIGHT_OF_ROOT_SHARE,
 };
 
@@ -64,50 +72,78 @@ pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &
     if shown(layout).len() < 2 {
         return Err(LayoutError::LastVisible(target.clone()));
     }
-    let r = arrange_with(layout, false, frame)
-        .rect_of(target)
-        .expect("a shown module has a rectangle");
+    if layout.selection() == Selection::Con(layout.root().id) {
+        return Ok(false);
+    }
+    let arrangement = arrange_with(layout, false, frame);
+    let rects = match layout.selection() {
+        Selection::Module => arrangement.rect_of(target).into_iter().collect::<Vec<_>>(),
+        Selection::Con(id) => {
+            let c = layout.root().find(id).unwrap();
+            let leaves = c.leaves();
+            let ids = c.ids();
+            arrangement
+                .modules
+                .iter()
+                .filter(|(m, _)| leaves.contains(m))
+                .map(|(_, r)| *r)
+                .chain(
+                    arrangement
+                        .strips
+                        .iter()
+                        .filter(|s| ids.contains(&s.con))
+                        .map(|s| s.rect),
+                )
+                .collect()
+        }
+    };
+    if rects.is_empty() {
+        return Ok(false);
+    }
+    let x = rects.iter().map(|r| r.x).min().unwrap();
+    let y = rects.iter().map(|r| r.y).min().unwrap();
+    let right = rects.iter().map(|r| r.x + r.w).max().unwrap();
+    let bottom = rects.iter().map(|r| r.y + r.h).max().unwrap();
     let (w, h) = (frame.size.w.max(0), frame.size.h.max(0));
     let edge = match dir {
-        Direction::Left => r.x == 0 && r.y == 0 && r.h == h,
-        Direction::Right => r.x + r.w == w && r.y == 0 && r.h == h,
-        Direction::Up => r.y == 0 && r.x == 0 && r.w == w,
-        Direction::Down => r.y + r.h == h && r.x == 0 && r.w == w,
+        Direction::Left => x == 0 && y == 0 && bottom == h,
+        Direction::Right => right == w && y == 0 && bottom == h,
+        Direction::Up => y == 0 && x == 0 && right == w,
+        Direction::Down => bottom == h && x == 0 && right == w,
     };
     if edge {
         return Ok(false);
     }
-    fn detach(node: Node, target: &ModuleId, layout: &Layout) -> (Option<Node>, Option<Node>) {
-        if node.leaves().contains(target) && node.leaves().iter().all(|id| id == target || !layout.is_shown(id)) {
-            return (None, Some(node));
+    // The unit is the highest subtree on the way to `target` that holds nothing else shown: the
+    // target with the hidden modules that share its region. Taking its leaves out one by one leaves
+    // what taking the subtree out leaves, and keeps every other container as it was.
+    let tree = layout.root_node();
+    let selected;
+    let mut unit = match layout.selection() {
+        Selection::Module => &tree,
+        Selection::Con(id) => {
+            selected = Node::Con(layout.root().find(id).unwrap().clone());
+            &selected
         }
-        match node {
-            Node::Leaf(_) => (Some(node), None),
-            Node::Split {
-                axis,
-                ratio,
-                pin,
-                first,
-                second,
-            } => {
-                let (first, a) = detach(*first, target, layout);
-                let (second, b) = detach(*second, target, layout);
-                let rest = match (first, second) {
-                    (Some(first), Some(second)) => Some(Node::Split {
-                        axis,
-                        ratio,
-                        pin,
-                        first: Box::new(first),
-                        second: Box::new(second),
-                    }),
-                    (only, None) | (None, only) => only,
-                };
-                (rest, a.or(b))
-            }
-        }
+    };
+    while layout.selection() == Selection::Module && unit.leaves().iter().any(|id| id != target && layout.is_shown(id))
+    {
+        let Node::Con(c) = unit else {
+            unreachable!("a leaf holds only itself")
+        };
+        unit = &c
+            .children
+            .iter()
+            .find(|ch| ch.node.leaves().contains(target))
+            .expect("the target is under every container on its way")
+            .node;
     }
-    let (rest, unit) = detach(layout.root().clone(), target, layout);
-    let (rest, unit) = (rest.unwrap(), unit.unwrap());
+    let unit = unit.clone();
+    let rest = unit
+        .leaves()
+        .iter()
+        .try_fold(tree.clone(), |rest, id| rest.without(id))
+        .expect("another module is shown, so it is still in the tree");
     let root = match dir {
         Direction::Left => Node::split(Axis::Row, 1.0 - RIGHT_OF_ROOT_SHARE, unit, rest),
         Direction::Right => Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, rest, unit),
@@ -118,62 +154,53 @@ pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &
     Ok(true)
 }
 
-// A path lets callers edit a clone only after a usable ancestor has been found.
-fn nearest(node: &Node, target: &ModuleId, layout: &Layout) -> Option<Vec<Branch>> {
-    let Node::Split { first, second, .. } = node else {
-        return None;
-    };
-    let (branch, child) = if first.leaves().contains(target) {
-        (Branch::First, first)
-    } else {
-        (Branch::Second, second)
-    };
-    if let Some(mut path) = nearest(child, target, layout) {
-        path.insert(0, branch);
-        return Some(path);
-    }
-    (has_shown(first, layout) && has_shown(second, layout)).then(Vec::new)
-}
-
-fn at_mut<'a>(node: &'a mut Node, path: &[Branch]) -> &'a mut Node {
-    match path.split_first() {
-        None => node,
-        Some((branch, rest)) => {
-            let Node::Split { first, second, .. } = node else {
-                unreachable!()
-            };
-            at_mut(if *branch == Branch::First { first } else { second }, rest)
+/// The containers on the way from the root to `target`'s leaf, outermost first, each with the index
+/// of its child that holds `target`.
+fn path_to(root: &Con, target: &ModuleId) -> Vec<(ConId, usize)> {
+    let mut path = Vec::new();
+    let mut c = root;
+    while let Some(i) = c.children.iter().position(|ch| ch.node.leaves().contains(target)) {
+        path.push((c.id, i));
+        match &c.children[i].node {
+            Node::Con(inner) => c = inner,
+            Node::Leaf(_) => break,
         }
     }
+    path
 }
 
 pub fn toggle_split(layout: &mut Layout, target: &ModuleId) -> bool {
     if !layout.is_shown(target) {
         return false;
     }
-    let Some(path) = nearest(layout.root(), target, layout) else {
+    let Some(id) = layout.selected_container(target) else {
         return false;
     };
     let mut root = layout.root().clone();
-    let Node::Split { axis, pin, .. } = at_mut(&mut root, &path) else {
-        unreachable!()
+    let c = root.find_mut(id).expect("found in this tree");
+    let split = c.layout.axis().is_some();
+    c.layout = match c.layout {
+        ConLayout::SplitH => ConLayout::SplitV,
+        ConLayout::SplitV => ConLayout::SplitH,
+        ConLayout::Tabbed | ConLayout::Stacked => ConLayout::of_axis(c.last_split),
     };
-    *axis = match axis {
-        Axis::Row => Axis::Column,
-        Axis::Column => Axis::Row,
-    };
-    *pin = None;
-    apply(layout, root);
+    if split {
+        for child in &mut c.children {
+            child.pin = None;
+        }
+    }
+    root.normalise();
+    apply(layout, Node::Con(root));
     true
 }
 
 pub fn rotate(layout: &mut Layout, down: bool) -> bool {
-    let ids = shown(layout);
+    let ids: Vec<_> = shown(layout).into_iter().filter(|id| layout.is_in_view(id)).collect();
     let n = ids.len();
     if n < 2 {
         return false;
     }
-    let mut root = layout.root().clone();
+    let mut root = layout.root_node();
     root.map_leaves(&|id| {
         ids.iter()
             .position(|m| m == id)
@@ -188,36 +215,29 @@ pub fn flip(layout: &mut Layout, axis: Axis) -> bool {
     if shown(layout).len() < 2 {
         return false;
     }
-    fn walk(node: &mut Node, wanted: Axis) -> bool {
-        let Node::Split {
-            axis,
-            ratio,
-            pin,
-            first,
-            second,
-        } = node
-        else {
-            return false;
-        };
-        let mut changed = walk(first, wanted) | walk(second, wanted);
-        if *axis == wanted {
-            std::mem::swap(first, second);
-            *ratio = (1.0 - *ratio).clamp(MIN_RATIO, MAX_RATIO);
-            if let Some(pin) = pin {
-                pin.side = match pin.side {
-                    Branch::First => Branch::Second,
-                    Branch::Second => Branch::First,
-                };
+    // Each child keeps its share and its pin, so a pinned row stays pinned on its module.
+    fn walk(c: &mut Con, wanted: Axis) -> bool {
+        let mut changed = false;
+        for child in &mut c.children {
+            if let Node::Con(inner) = &mut child.node {
+                changed |= walk(inner, wanted);
             }
+        }
+        if c.layout.axis() == Some(wanted) {
+            c.children.reverse();
             changed = true;
         }
         changed
     }
     let mut root = layout.root().clone();
-    if !walk(&mut root, axis) {
+    let selected = match layout.selection() {
+        Selection::Module => &mut root,
+        Selection::Con(id) => root.find_mut(id).expect("selected container exists"),
+    };
+    if !walk(selected, axis) {
         return false;
     }
-    apply(layout, root);
+    apply(layout, Node::Con(root));
     true
 }
 
@@ -305,45 +325,81 @@ pub fn spread(layout: &mut Layout, target: &ModuleId) -> bool {
     if !layout.is_shown(target) {
         return false;
     }
-    let Some(mut path) = nearest(layout.root(), target, layout) else {
+    let Some(nearest) = layout.selected_container(target) else {
         return false;
     };
     let mut root = layout.root().clone();
-    let Node::Split { axis, .. } = at_mut(&mut root, &path) else {
-        unreachable!()
-    };
-    let axis = *axis;
-    while !path.is_empty() {
-        let parent = &path[..path.len() - 1];
-        if !matches!(at_mut(&mut root, parent), Node::Split { axis: a, .. } if *a == axis) {
+    let kind = root.find(nearest).expect("found in this tree").layout;
+    // Up through the parents of the same orientation: the whole row or column `target` is in.
+    let path = select::path_to_con(&root, nearest).expect("the container belongs to this tree");
+    let mut top = nearest;
+    for (id, _) in path.iter().rev() {
+        if root.find(*id).expect("found in this tree").layout != kind {
             break;
         }
-        path.pop();
+        top = *id;
     }
-    fn walk(node: &mut Node, axis: Axis, layout: &Layout) -> usize {
-        if let Node::Split {
-            axis: a,
-            ratio,
-            pin,
-            first,
-            second,
-        } = node
-        {
-            if *a == axis {
-                let a = walk(first, axis, layout);
-                let b = walk(second, axis, layout);
-                if a > 0 && b > 0 {
-                    *ratio = (a as f32 / (a + b) as f32).clamp(MIN_RATIO, MAX_RATIO);
-                }
-                *pin = None;
-                return a + b;
+    fn walk(c: &mut Con, kind: ConLayout, layout: &Layout) -> usize {
+        let counts: Vec<usize> = c
+            .children
+            .iter_mut()
+            .map(|child| match &mut child.node {
+                Node::Con(inner) if inner.layout == kind => walk(inner, kind, layout),
+                node => usize::from(has_shown(node, layout)),
+            })
+            .collect();
+        let total: usize = counts.iter().sum();
+        if let [first, second] = c.children.as_mut_slice() {
+            if counts.iter().all(|n| *n > 0) {
+                first.share = (counts[0] as f32 / total as f32).clamp(MIN_RATIO, MAX_RATIO);
+                second.share = 1.0 - first.share;
             }
+        } else if total > 0 {
+            spread_shares(c, &counts);
         }
-        usize::from(has_shown(node, layout))
+        for child in &mut c.children {
+            child.pin = None;
+        }
+        total
     }
-    walk(at_mut(&mut root, &path), axis, layout);
-    apply(layout, root);
+    walk(root.find_mut(top).expect("found in this tree"), kind, layout);
+    apply(layout, Node::Con(root));
     true
+}
+
+/// The children of `c` with something shown divide the shares they hold now in proportion to
+/// `counts`, the shown cells under each. A child with nothing shown keeps its share: a hidden child's
+/// space goes to the shown ones in proportion to their shares, so their widths still follow `counts`,
+/// and the hidden module takes the same part back when it is shown. No share drops below `MIN_RATIO`:
+/// a child that would is held there and the others divide what is left, again by their counts.
+fn spread_shares(c: &mut Con, counts: &[usize]) {
+    let on: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
+    let budget: f32 = on.iter().map(|&i| c.children[i].share).sum();
+    let mut floored = vec![false; counts.len()];
+    loop {
+        let held = on.iter().filter(|&&i| floored[i]).count() as f32 * MIN_RATIO;
+        let free: Vec<usize> = on.iter().copied().filter(|&i| !floored[i]).collect();
+        let weight = free.iter().map(|&i| counts[i]).sum::<usize>() as f32;
+        let left = (budget - held).max(0.0);
+        let low: Vec<usize> = free
+            .iter()
+            .copied()
+            .filter(|&i| left * counts[i] as f32 / weight < MIN_RATIO)
+            .collect();
+        if low.is_empty() || low.len() == free.len() {
+            for &i in &on {
+                c.children[i].share = if floored[i] || low.contains(&i) {
+                    MIN_RATIO
+                } else {
+                    left * counts[i] as f32 / weight
+                };
+            }
+            return;
+        }
+        for i in low {
+            floored[i] = true;
+        }
+    }
 }
 
 pub fn swap_marked(layout: &mut Layout, target: &ModuleId) -> Result<ModuleId, LayoutError> {
@@ -360,7 +416,7 @@ pub fn swap_marked(layout: &mut Layout, target: &ModuleId) -> Result<ModuleId, L
     if !layout.is_shown(&mark) {
         return Err(LayoutError::MarkHidden(mark));
     }
-    let mut root = layout.root().clone();
+    let mut root = layout.root_node();
     root.swap_leaves(target, &mark);
     apply(layout, root);
     Ok(mark)
@@ -370,3 +426,155 @@ pub fn swap_marked(layout: &mut Layout, target: &ModuleId) -> Result<ModuleId, L
 mod invariant_run;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod spread_wide {
+    use std::collections::BTreeSet;
+
+    use super::super::con::Child;
+    use super::super::geometry::{arrange, Frame, Size};
+    use super::*;
+
+    fn leaf(id: &ModuleId) -> Node {
+        Node::Leaf(id.clone())
+    }
+    fn flat(layout: ConLayout, children: Vec<(Node, f32)>) -> Node {
+        Node::Con(Con::new(
+            layout,
+            children
+                .into_iter()
+                .map(|(node, share)| Child::new(node, share))
+                .collect(),
+        ))
+    }
+    fn widths(layout: &Layout) -> Vec<(ModuleId, i32)> {
+        arrange(layout, &Frame::new(Size { w: 1280, h: 721 }, 1))
+            .modules
+            .into_iter()
+            .map(|(id, r)| (id, r.w))
+            .collect()
+    }
+
+    /// A hidden child in a row of three: the two shown modules are evened between themselves, and the
+    /// hidden one keeps its share for when it is shown.
+    #[test]
+    fn a_hidden_child_does_not_stop_its_shown_siblings_being_evened() {
+        let (editor, agent, term) = (ModuleId::editor(), ModuleId::agent(), ModuleId::terminal());
+        let root = flat(
+            ConLayout::SplitH,
+            vec![(leaf(&editor), 0.6), (leaf(&agent), 0.2), (leaf(&term), 0.2)],
+        );
+        let mut layout = Layout::from_parts(root, BTreeSet::from([agent.clone()]), editor.clone()).unwrap();
+        assert!(spread(&mut layout, &editor));
+        layout.root().check(true).unwrap();
+        let w = widths(&layout);
+        let width = |id: &ModuleId| w.iter().find(|(m, _)| m == id).unwrap().1;
+        assert!((width(&editor) - width(&term)).abs() <= 1, "evened, got {w:?}");
+        assert!(
+            (layout.root().children[1].share - 0.2).abs() < 1e-6,
+            "the hidden child keeps its share"
+        );
+    }
+
+    /// Nineteen cells beside two: the two would get 1/21 each, below the smallest share, so they are
+    /// held at it and the tree stays one `Layout::new` accepts.
+    #[test]
+    fn a_wide_chain_never_pushes_a_sibling_below_the_smallest_share() {
+        let many: Vec<ModuleId> = (0..19).map(|i| ModuleId::lua(&format!("m{i}"))).collect();
+        let inner = flat(
+            ConLayout::SplitH,
+            many.iter().map(|id| (leaf(id), 1.0 / 19.0)).collect(),
+        );
+        let (a, b) = (ModuleId::lua("a"), ModuleId::lua("b"));
+        let root = flat(
+            ConLayout::SplitH,
+            vec![(inner, 0.9), (leaf(&a), 0.05), (leaf(&b), 0.05)],
+        );
+        let mut layout = Layout::from_parts(root, BTreeSet::new(), a.clone()).unwrap();
+        assert!(spread(&mut layout, &a));
+        layout.root().check(true).unwrap();
+        let shares: Vec<f32> = layout.root().children.iter().map(|ch| ch.share).collect();
+        assert!(
+            (shares[1] - MIN_RATIO).abs() < 1e-6 && (shares[2] - MIN_RATIO).abs() < 1e-6,
+            "{shares:?}"
+        );
+        Layout::new(Node::Con(layout.root().clone()), a).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use crate::layout::test_support::same_rects;
+    use crate::layout::*;
+
+    fn sample() -> Layout {
+        Layout::new(
+            Node::split(
+                Axis::Row,
+                0.6,
+                Node::split(
+                    Axis::Column,
+                    0.7,
+                    Node::Leaf(ModuleId::editor()),
+                    Node::Leaf(ModuleId::terminal()),
+                ),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn the_far_move_of_a_selected_container_wraps_the_root_as_phase_one_does() {
+        let mut l = sample();
+        focus_parent(&mut l);
+        let selected = l.selection();
+        let unit = l.root().children[0].node.clone();
+        let rest = l.root().children[1].node.clone();
+        let expected = Layout::new(
+            Node::split(Axis::Row, super::RIGHT_OF_ROOT_SHARE, rest, unit),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        assert_eq!(
+            move_far(
+                &mut l,
+                &ModuleId::editor(),
+                Direction::Right,
+                &Frame::new(Size { w: 1280, h: 721 }, 1)
+            ),
+            Ok(true)
+        );
+        same_rects(&l, &expected);
+        assert_eq!(l.selection(), selected);
+        assert_eq!(l.focus(), &ModuleId::editor());
+    }
+    #[test]
+    fn verbs_that_take_a_selection_act_on_it() {
+        let mut l = sample();
+        focus_parent(&mut l);
+        focus_parent(&mut l);
+        assert_eq!(l.selection(), Selection::Con(l.root().id));
+        assert!(toggle_split(&mut l, &ModuleId::editor()));
+        assert_eq!(l.root().layout, ConLayout::SplitV);
+        assert_eq!(l.root().children[0].node.as_con().unwrap().layout, ConLayout::SplitV);
+        assert!(spread(&mut l, &ModuleId::editor()));
+        assert!((l.root().children[0].share - 2.0 / 3.0).abs() < 1e-6);
+        assert!(container_mode(&mut l, &ModuleId::editor(), ConLayout::Tabbed).unwrap());
+        assert_eq!(l.root().layout, ConLayout::Tabbed);
+
+        let mut l = sample();
+        focus_parent(&mut l);
+        assert!(!flip(&mut l, Axis::Row));
+        assert_eq!(
+            l.root().children[0].node.leaves(),
+            vec![ModuleId::editor(), ModuleId::terminal()]
+        );
+        assert!(flip(&mut l, Axis::Column));
+        assert_eq!(
+            l.root().children[0].node.leaves(),
+            vec![ModuleId::terminal(), ModuleId::editor()]
+        );
+        assert_eq!(l.focus(), &ModuleId::editor());
+    }
+}

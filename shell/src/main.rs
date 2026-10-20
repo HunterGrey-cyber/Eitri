@@ -53,17 +53,19 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
+use eitri_core::keymap::action::{SelectionRule, SplitCwd};
 use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened};
 use eitri_core::keymap::{Action, SwapTarget, TabAction};
 use eitri_core::layout::{
-    Axis, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav, Preset,
-    Reopen,
+    Axis, ConLayout, Direction, KeyAction, KillScope, LayoutError, ModuleDecl, ModuleId, ModuleKeys, ModuleKind, Nav,
+    Preset, Reopen, Selection,
 };
 use eitri_core::plugin::theme::PageTheme;
 use eitri_core::tabs::TabVerb;
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
+use terminal::registry::Terminals;
 use web_host::WebHost;
 
 const APP_ID: &str = "cn.huntergrey.eitri";
@@ -369,7 +371,30 @@ fn build_ui(
     // through any route, via the change hook below. A terminal that is never shown starts no
     // process and touches no font manager. Restoring a layout with the terminal shown starts it at
     // launch.
-    let terminal = terminal::TerminalPane::new(project_root.to_path_buf());
+    //
+    // Every terminal in the window has its own PTY and is stored in one registry by id. A killed
+    // instance's pane stays idle there for reuse by the same numbered instance, whose host the
+    // grid already holds under that id. New panes use the window's current colours, kept up to
+    // date by the theme listener below.
+    let terminal_colors = Rc::new(std::cell::Cell::new(terminal::colors_from(
+        &eitri_core::theme::ThemeTokens::fallback(),
+    )));
+    let make_terminal_pane: Rc<dyn Fn() -> terminal::TerminalPane> = {
+        let root = project_root.to_path_buf();
+        let colors = terminal_colors.clone();
+        Rc::new(move || {
+            let pane = terminal::TerminalPane::new(root.clone());
+            // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to
+            // zero reports a 1-row grid to its shell.
+            pane.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
+            pane.set_colors(colors.get());
+            pane
+        })
+    };
+    let terminals: Rc<RefCell<Terminals<terminal::TerminalPane>>> = Rc::new(RefCell::new(Terminals::new()));
+    terminals
+        .borrow_mut()
+        .take_or_make(&ModuleId::terminal(), || make_terminal_pane());
 
     // The initial layout has `[editor | agent]` with the terminal hidden below both.
     // Lua panels are placed by `position` in registration order (`terminal::initial_layout`,
@@ -480,20 +505,34 @@ fn build_ui(
         .keys_for(&Action::Module(ModuleId::editor()))
         .first()
         .map(|key| format!("{} {}", keymap.prefix().human(), key.human()));
-    let module_layout =
+    // `module_layout` is the current workspace's layout, the one every reader of the live layout holds;
+    // `workspaces` holds the window's other workspaces beside it, and what a later build keeps in the
+    // file.
+    let (workspaces, module_layout, keep_copy) =
         match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls, show_editor.as_deref()) {
-            Ok((layout, notes)) => {
+            Ok((workspaces, layout, notes, keep_copy)) => {
                 for note in notes {
                     println!("[layout] {note}");
                 }
-                Rc::new(RefCell::new(layout))
+                (
+                    Rc::new(RefCell::new(workspaces)),
+                    Rc::new(RefCell::new(layout)),
+                    keep_copy,
+                )
             }
             Err(message) => {
                 eprintln!("eitri: {message}");
                 std::process::exit(1);
             }
         };
-    let layout_saver = layout_state::LayoutSaver::new(state_dir, project_root, module_layout.clone(), decls.clone());
+    let layout_saver = layout_state::LayoutSaver::new(
+        state_dir,
+        project_root,
+        module_layout.clone(),
+        workspaces.clone(),
+        decls.clone(),
+        keep_copy,
+    );
     // Every module's host, added once and never reparented (`module_grid`'s module doc).
     let grid = ModuleGrid::new(module_layout.clone());
     // Wrap the editor in an overlay with a hidden failure-message label before adding it to the
@@ -516,15 +555,27 @@ fn build_ui(
     // The notice that stands in for a `WebView` where WebKit cannot start is wrapped the same way, so
     // the shape does not depend on `webkit_sandbox`.
     grid.add(ModuleId::agent(), &WebHost::new(&agent_widget), &agent_widget, web_host);
-    // The floor `build_vertical_split` gave the bottom slot on `main`: a terminal dragged to zero
-    // reports a 1-row grid to its shell.
-    terminal.widget().set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
-    grid.add(
-        ModuleId::terminal(),
-        terminal.widget(),
-        terminal.widget(),
-        HostKind::Direct,
-    );
+    // Every terminal in the layout the window opens with gets its pane and host now, the base one
+    // first and the numbered ones in number order, so the hosts exist before the first `apply`. None
+    // starts a shell here: each starts when it is first shown (the change hook below).
+    let startup_terminals: Vec<ModuleId> = {
+        let layout = module_layout.borrow();
+        let workspaces = workspaces.borrow();
+        let mut ids: Vec<ModuleId> = workspaces
+            .each(&layout)
+            .into_iter()
+            .flat_map(|(_, layout)| layout.leaves())
+            .filter(|id| id.kind() == ModuleKind::Terminal && id.number() >= 2)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.insert(0, ModuleId::terminal());
+        ids
+    };
+    for id in startup_terminals {
+        let (pane, _) = terminals.borrow_mut().take_or_make(&id, || make_terminal_pane());
+        grid.add(id, pane.widget(), pane.widget(), HostKind::Direct);
+    }
     for (id, slot, widget) in &lua_panels {
         // On the `WebView`: its host measures its one child, so the grid sees the same floor.
         if *slot == PanelSlot::Bottom {
@@ -532,22 +583,37 @@ fn build_ui(
         }
         grid.add(id.clone(), &WebHost::new(widget), widget, web_host);
     }
-    // The terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
-    // `Ctrl+a \ t`, its tray chip, `eitri.layout.show`, a saved layout -- rather than only on the
-    // `Ctrl+a t` path. `start` does nothing once a shell is running or has exited.
+    // A terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
+    // `Ctrl+a \ t`, a new instance, its tray chip, `eitri.layout.show`, a saved layout -- rather than
+    // only on the `Ctrl+a t` path. Every live pane that is shown and has no shell running is started;
+    // `start` does nothing for one whose shell has exited and waits for Enter.
     {
         let module_layout = module_layout.clone();
-        let terminal = terminal.clone();
-        grid.connect_changed(move || match module_layout.try_borrow() {
-            Ok(layout) if layout.is_shown(&ModuleId::terminal()) => {
-                drop(layout);
-                terminal.start();
+        let terminals = terminals.clone();
+        grid.connect_changed(move || {
+            let starting: Vec<terminal::TerminalPane> = {
+                // Hooks run with the layout released (`ModuleGrid::connect_changed`), and nothing
+                // holds the registry across a grid call; these lines are how a caller that breaks
+                // either would show up, instead of a terminal that silently never starts.
+                let Ok(layout) = module_layout.try_borrow() else {
+                    eprintln!("[terminal] BUG: the layout was borrowed when it changed; no shell was started");
+                    return;
+                };
+                let Ok(terminals) = terminals.try_borrow() else {
+                    eprintln!(
+                        "[terminal] BUG: the registry was borrowed when the layout changed; no shell was started"
+                    );
+                    return;
+                };
+                terminals
+                    .live()
+                    .filter(|(id, pane)| layout.is_shown(id) && pane.shell_pid().is_none())
+                    .map(|(_, pane)| pane.clone())
+                    .collect()
+            };
+            for pane in starting {
+                pane.start();
             }
-            Ok(_) => {}
-            // Hooks run with the layout released (`ModuleGrid::connect_changed`); this line is how a
-            // caller that breaks that would show up, instead of a terminal that silently never starts
-            //.
-            Err(_) => eprintln!("[terminal] BUG: the layout was borrowed when it changed; the shell was not started"),
         });
     }
     grid.apply();
@@ -599,6 +665,36 @@ fn build_ui(
             }
             // Read live so modules added after startup are found too.
             grid.focus_target(id).is_some_and(|target| target.grab_focus())
+        })
+    };
+    // Gives a module the keys by any route that chooses one -- a module key, `Ctrl+h/j/k/l`, a digit,
+    // a strip entry, HINT, a tray chip, `eitri.layout.focus`. A module on a tab its container does not
+    // draw has that tab chosen first (`ModuleGrid::switch_tab`, which maps its host before the grab):
+    // a bare grab would put the keys in a host nobody can see, and the layout would then draw a tab
+    // the grid never mapped. `focus_module` stays the bare grab, for the hides and kills that hand the
+    // keys to a module the layout already draws.
+    let give_keys: Rc<dyn Fn(&ModuleId) -> bool> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let focus_module = focus_module.clone();
+        Rc::new(move |id| {
+            let tabbed_away = module_layout.try_borrow().is_ok_and(|layout| layout.is_tabbed_away(id));
+            if !tabbed_away {
+                return focus_module(id);
+            }
+            let grabbed = std::cell::Cell::new(false);
+            let focus = |to: &ModuleId| {
+                let took = focus_module(to);
+                grabbed.set(took);
+                took
+            };
+            match grid.switch_tab(id, &focus) {
+                Ok(()) => grabbed.get(),
+                Err(err) => {
+                    println!("[focus] {id}: its tab could not be chosen: {err}");
+                    false
+                }
+            }
         })
     };
 
@@ -681,10 +777,10 @@ fn build_ui(
     };
     agent_panel_handle.set_theme(&panel_tokens(None));
     pane.set_clear_color(editor_clear(&eitri_core::theme::ThemeTokens::fallback()));
-    terminal.set_colors(terminal::colors_from(&eitri_core::theme::ThemeTokens::fallback()));
-    // When the editor reports or changes its cell height, save it for `panel_tokens` so later
-    // colorscheme changes retain it. Push the height into the panel's live theme through the same
-    // `set_theme` path used for font-size zoom.
+    // Each terminal pane took the fallback colours when created by `make_terminal_pane`. When the
+    // editor reports or changes its cell height, save it for `panel_tokens` so later colorscheme
+    // changes retain it. Push the height into the panel's live theme through the same `set_theme`
+    // path used for font-size zoom.
     {
         let editor_row = editor_row.clone();
         let agent_panel_handle = agent_panel_handle.clone();
@@ -723,7 +819,8 @@ fn build_ui(
         let window_for_theme = window.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         let pane_for_theme = pane.clone();
-        let terminal = terminal.clone();
+        let terminals = terminals.clone();
+        let terminal_colors = terminal_colors.clone();
         let plugin_panels = plugin_panels.clone();
         let editor_font = editor_font.clone();
         let text_size_slot = text_size_slot.clone();
@@ -746,7 +843,14 @@ fn build_ui(
             theme_css.update(&tokens, window_for_theme.upcast_ref());
             agent_panel_handle.set_theme(&panel_tokens(Some(&payload)));
             pane_for_theme.set_clear_color(editor_clear(&tokens));
-            terminal.set_colors(terminal::colors_from(&tokens));
+            // Every terminal pane, idle ones too, so one reused later is already in the theme; and
+            // the colours a pane made later starts with.
+            let colors = terminal::colors_from(&tokens);
+            terminal_colors.set(colors);
+            let panes: Vec<terminal::TerminalPane> = terminals.borrow().each().cloned().collect();
+            for pane in panes {
+                pane.set_colors(colors);
+            }
             // The derived tokens, not the panel's sized ones: a page's set carries no size, so a size-only
             // change leaves it equal and sends the pages nothing.
             plugin_panels.set_theme(&tokens);
@@ -808,16 +912,43 @@ fn build_ui(
     // The tray: a chip for every module off screen, one per module, in the order the
     // grid holds them. Its chips are top-bar items ahead of `↻`, for `h`/`l`, HINT and `Ctrl+k`.
     let tray = tray::Tray::build(
-        &grid
-            .hosts()
+        &tray::chip_order(&grid.hosts().into_iter().map(|(id, _)| id).collect::<Vec<_>>())
             .iter()
-            .map(|(id, _)| (id.clone(), module_title(id)))
+            .map(|id| (id.clone(), module_title(id)))
             .collect::<Vec<_>>(),
     );
     top_bar.tray.append(tray.widget());
     let prefix_strip = Rc::new(prefix_strip::PrefixStrip::new());
     top_bar.strip.append(prefix_strip.widget());
     let top_items: Vec<gtk4::Widget> = tray.items().into_iter().chain(top_bar.items.iter().cloned()).collect();
+    // A strip entry reads as its module's chip would, so a chat on a tab not drawn shows its cards'
+    // mark there (`agent ⚑1`): the tray has no chip for a module its strip already names.
+    {
+        let title = module_title.clone();
+        let agent = agent_panel_handle.clone();
+        grid.set_strip_label(move |id| tray::strip_label(id, &title(id), agent.attention()));
+    }
+    // The selected container, as text in the top bar beside the mark. Refreshed on every change of
+    // the grid, after every action and Lua request, on the prefix's own `Esc`, and when the keys move
+    // (a module taking them ends a selection: `Layout::set_focus`).
+    let refresh_selection: Rc<dyn Fn()> = {
+        let module_layout = module_layout.clone();
+        let label = top_bar.selection.clone();
+        let title = module_title.clone();
+        Rc::new(move || {
+            let Ok(layout) = module_layout.try_borrow() else {
+                eprintln!("[modules] BUG: the layout was borrowed while the selection was redrawn");
+                return;
+            };
+            let text = tray::selection_text(&layout, &*title);
+            drop(layout);
+            chrome::show_mark(&label, text.as_deref());
+        })
+    };
+    {
+        let refresh_selection = refresh_selection.clone();
+        grid.connect_changed(move || refresh_selection());
+    }
 
     // The global `f` HINT draws its GTK labels (top-bar items, the editor, each Lua panel) as
     // overlay children of this, positioned over whatever they label. Its only child is the whole
@@ -876,7 +1007,19 @@ fn build_ui(
                     .collect()
             })
         },
-        focus_module: focus_module.clone(),
+        focus_module: give_keys.clone(),
+        strips: {
+            let grid = grid.clone();
+            Rc::new(move || grid.strip_entries())
+        },
+        activate_strip: {
+            let grid = grid.downgrade();
+            Rc::new(move |id: &ModuleId| {
+                if let Some(grid) = grid.upgrade() {
+                    grid.activate_strip_entry(id);
+                }
+            })
+        },
         agent: agent_panel_handle.clone(),
     });
     {
@@ -902,32 +1045,37 @@ fn build_ui(
     {
         let agent_panel_handle = agent_panel_handle.clone();
         let editor = pane.clone();
-        let terminal = terminal.clone();
+        let terminals = terminals.clone();
         let module_layout = module_layout.clone();
         let focus_history = focus_history.clone();
         let keys_return = keys_return.clone();
         let plugin_panels = plugin_panels.clone();
+        let refresh_selection = refresh_selection.clone();
         pane_focus::install(
             &window,
             grid.live_hosts(),
-            move |id| match module_layout.try_borrow_mut() {
-                Ok(mut layout) => {
-                    // Refused for a hidden module (`Layout::set_focus`): GTK can put focus in an
-                    // unmapped widget, and the layout's `focus` -- what `Ctrl+j` from the top bar
-                    // returns to and the prefix acts on -- must stay on one that can be seen. The
-                    // history hears only what the layout accepted, so it never names a module the
-                    // keys could not have been on.
-                    match layout.set_focus(id) {
-                        Ok(()) => {
-                            focus_history.borrow_mut().note(id);
-                            keys_return.borrow_mut().focus_moved(id, &ModuleId::agent());
+            move |id| {
+                match module_layout.try_borrow_mut() {
+                    Ok(mut layout) => {
+                        // Refused for a hidden module (`Layout::set_focus`): GTK can put focus in an
+                        // unmapped widget, and the layout's `focus` -- what `Ctrl+j` from the top bar
+                        // returns to and the prefix acts on -- must stay on one that can be seen. The
+                        // history hears only what the layout accepted, so it never names a module the
+                        // keys could not have been on.
+                        match layout.set_focus(id) {
+                            Ok(()) => {
+                                focus_history.borrow_mut().note(id);
+                                keys_return.borrow_mut().focus_moved(id, &ModuleId::agent());
+                            }
+                            Err(err) => eprintln!("[pane_focus] {err}; the layout keeps {}", layout.focus()),
                         }
-                        Err(err) => eprintln!("[pane_focus] {err}; the layout keeps {}", layout.focus()),
                     }
+                    // Every writer of the layout releases it before touching focus (`ModuleGrid::apply`,
+                    // `hide_module`); this line is how a new one that does not would show up.
+                    Err(_) => eprintln!("[pane_focus] BUG: the layout was borrowed when focus moved to {id}"),
                 }
-                // Every writer of the layout releases it before touching focus (`ModuleGrid::apply`,
-                // `hide_module`); this line is how a new one that does not would show up.
-                Err(_) => eprintln!("[pane_focus] BUG: the layout was borrowed when focus moved to {id}"),
+                // The keys moving to another module ended any selection; the top bar says so.
+                refresh_selection();
             },
             move |id, has_keys| {
                 println!("[pane_focus] {id} has_keys={has_keys}");
@@ -938,7 +1086,24 @@ fn build_ui(
                         agent_panel_handle.set_editor_has_keys(has_keys);
                     }
                     ModuleKind::Agent => agent_panel_handle.set_pane_focused(has_keys),
-                    ModuleKind::Terminal => terminal.set_focused(has_keys),
+                    // One solid cursor among the terminals: the one taking the keys draws it, and
+                    // every other live terminal is told it has not got them.
+                    ModuleKind::Terminal => {
+                        let panes: Vec<(ModuleId, terminal::TerminalPane)> = match terminals.try_borrow() {
+                            Ok(terminals) => terminals.live().map(|(m, p)| (m.clone(), p.clone())).collect(),
+                            Err(_) => {
+                                eprintln!("[pane_focus] BUG: the registry was borrowed when {id} has_keys={has_keys}");
+                                return;
+                            }
+                        };
+                        for (m, p) in panes {
+                            if m == *id {
+                                p.set_focused(has_keys);
+                            } else if has_keys {
+                                p.set_focused(false);
+                            }
+                        }
+                    }
                     // A plugin page hears this as its `focus` event; a Lua panel that is no plugin has no host.
                     ModuleKind::LuaWebview => plugin_panels.set_has_keys(id, has_keys),
                     _ => {}
@@ -1015,12 +1180,24 @@ fn build_ui(
             let reaction = eitri_core::attention::react(on_permission, before, after, place);
             println!("[attention] agent {after:?} ({place:?}) -> {reaction:?}");
             tray.refresh(&module_layout.borrow(), after);
+            // A chat on a tab not drawn has no chip: its strip entry carries the mark, and a card
+            // arriving or clearing changes no layout, so the entries are relabelled here.
+            grid.refresh_strips();
+            let mut toast_instead = false;
             if reaction.reveal {
-                if let Err(err) = grid.show_module(&ModuleId::agent()) {
-                    eprintln!("[attention] could not reveal the chat: {err}");
+                // Its tab stays behind when the keys are on a sibling tab of the same container
+                // (drawing the chat's would hide them): the toast the badge policy shows is all there
+                // is then, as under a zoom.
+                match reveal_chat_in_grid(&grid, &module_layout) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        println!("[attention] the chat's tab stays behind the keys' tab; a toast instead");
+                        toast_instead = true;
+                    }
+                    Err(err) => eprintln!("[attention] could not reveal the chat: {err}"),
                 }
             }
-            if reaction.toast {
+            if reaction.toast || toast_instead {
                 toast.show(&toast::permission_toast_text(
                     after,
                     agent_panel_handle_for_toast
@@ -1048,7 +1225,7 @@ fn build_ui(
     let focus_and_arrive: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
-        let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let arrive = arrive.clone();
         Rc::new(move |id| {
             let zoom_hides = {
@@ -1059,12 +1236,21 @@ fn build_ui(
             if zoom_hides {
                 grid.unzoom();
             }
-            if focus_module(id) {
+            if give_keys(id) {
                 arrive(id);
             }
             Ok(())
         })
     };
+    // A click on a strip entry chooses that tab and lands there as a module key would.
+    {
+        let focus_and_arrive = focus_and_arrive.clone();
+        grid.connect_strip_activate(move |id| {
+            if let Err(err) = focus_and_arrive(id) {
+                println!("[modules] {id}: its strip entry chose nothing: {err}");
+            }
+        });
+    }
     // `show_on_screen` restores `id` where it was hidden and leaves keyboard focus
     // where it is. Lua show calls and module keys for hidden modules use this path.
     // End a zoom first if it would hide `id`, so a successful show puts it on screen.
@@ -1099,7 +1285,7 @@ fn build_ui(
     {
         let pane = pane.clone();
         let show_on_screen = show_on_screen.clone();
-        let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let module_layout = module_layout.clone();
         agent_panel_handle.on_editor_request(move |request| {
             // `prefix x` quit it, and it cannot come back in this window (`kill_pane`).
@@ -1112,7 +1298,7 @@ fn build_ui(
                 return Err("the editor is not ready yet".to_string());
             }
             show_on_screen(&ModuleId::editor()).map_err(|e| e.to_string())?;
-            focus_module(&ModuleId::editor());
+            give_keys(&ModuleId::editor());
             pane.send_keys(&request.input_keys());
             Ok(())
         });
@@ -1134,14 +1320,14 @@ fn build_ui(
     // review opened there is shown and given the keys, as a draft being edited is.
     {
         agent_panel_handle.set_review_owner(|| Some(eitri_core::review_editor::Owner::Embedded));
-        let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let show_on_screen = show_on_screen.clone();
         agent_panel_handle.on_review_open(move || {
             if let Err(err) = show_on_screen(&ModuleId::editor()) {
                 eprintln!("[review] could not show the editor: {err}");
                 return;
             }
-            focus_module(&ModuleId::editor());
+            give_keys(&ModuleId::editor());
         });
     }
     {
@@ -1158,12 +1344,15 @@ fn build_ui(
     let place_and_arrive: Rc<dyn Fn(&ModuleId, Axis) -> Result<(), LayoutError>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
-        let focus_module = focus_module.clone();
+        let terminals = terminals.clone();
+        let give_keys = give_keys.clone();
         let arrive = arrive.clone();
         Rc::new(move |id, axis| {
+            let live = terminals.borrow().get(id).is_some();
+            placeable_by_id(id, live)?;
             let target = module_layout.borrow().focus().clone();
             grid.place_module(id, &target, axis)?;
-            if focus_module(id) {
+            if give_keys(id) {
                 arrive(id);
             }
             Ok(())
@@ -1231,6 +1420,7 @@ fn build_ui(
         grid: grid.downgrade(),
         show_on_screen: show_on_screen.clone(),
         focus_module: focus_module.clone(),
+        give_keys: give_keys.clone(),
         retire_editor: retire_editor.clone(),
         prompt: kill_prompt.clone(),
         agent: agent_panel_handle.clone(),
@@ -1238,11 +1428,41 @@ fn build_ui(
         app_name: top_bar.app_name.clone(),
         toast: toast.clone(),
     }));
+    // A terminal's kill, by `prefix x` or by its shell ending: it leaves the screen as a hide does --
+    // the keys go to the module the layout chooses, before its host unmaps -- then its shell is hung
+    // up (SIGHUP) and forgotten. A numbered instance leaves the layout and every workspace, and its pane
+    // goes idle under its id; its host stays in the grid, child-invisible, for the next instance of
+    // that number. The base terminal goes back below the editor, hidden, and keeps its pane, so its
+    // next show starts a fresh shell there.
+    let kill_terminal: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>> = {
+        let grid = grid.downgrade();
+        let focus_module = focus_module.clone();
+        // Weak: every pane's own end calls this, and the registry holds the panes.
+        let terminals = Rc::downgrade(&terminals);
+        let workspaces = workspaces.clone();
+        let decls = decls.clone();
+        Rc::new(move |id| {
+            let (Some(grid), Some(terminals)) = (grid.upgrade(), terminals.upgrade()) else {
+                return Ok(());
+            };
+            grid.kill_module(id, kill_pane::reopen(id, &decls), &*focus_module)?;
+            if id.number() >= 2 {
+                terminals.borrow_mut().retire(id);
+                workspaces.borrow_mut().remove_everywhere(id);
+            } else {
+                let base = terminals.borrow().get(id).cloned();
+                if let Some(base) = base {
+                    base.close();
+                }
+            }
+            Ok(())
+        })
+    };
     let kill_now: Rc<dyn Fn(&ModuleId, Option<String>) -> Result<(), String>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
-        let terminal = terminal.clone();
+        let kill_terminal = kill_terminal.clone();
         let agent = agent_panel_handle.clone();
         let lua_pages = lua_pages.clone();
         let decls = decls.clone();
@@ -1262,12 +1482,7 @@ fn build_ui(
             }
             let reopen = kill_pane::reopen(id, &decls);
             match id.kind() {
-                ModuleKind::Terminal => {
-                    grid.kill_module(id, reopen, &*focus_module)
-                        .map_err(|e| e.to_string())?;
-                    // Hangs the shell up (SIGHUP) and forgets it: the next show starts a fresh one.
-                    terminal.close();
-                }
+                ModuleKind::Terminal => kill_terminal(id).map_err(|e| e.to_string())?,
                 ModuleKind::LuaWebview => {
                     grid.kill_module(id, reopen, &*focus_module)
                         .map_err(|e| e.to_string())?;
@@ -1342,51 +1557,6 @@ fn build_ui(
             }
         });
     }
-    // The shell ending by itself -- `exit`, `Ctrl+d`, a signal -- closes the terminal as `prefix x`
-    // does, without asking, as tmux closes a pane whose
-    // process exits (`terminal::closes_on_exit` says which ends). As the last module on screen, tmux's own rule
-    // (closing the last pane closes the window) applies instead: `eitri_core::layout::can_kill`
-    // says which (`terminal::on_exit`), and a `Window` scope closes the window through its own
-    // ordinary path -- `close window? N running (y/n)` when a tab runs -- rather than the module,
-    // leaving the terminal's notice on screen until the window really goes.
-    {
-        let grid = grid.downgrade();
-        let module_layout = module_layout.clone();
-        let focus_module = focus_module.clone();
-        let decls = decls.clone();
-        let window = window.clone();
-        terminal.on_shell_exit(move || {
-            let Some(grid) = grid.upgrade() else { return false };
-            let id = ModuleId::terminal();
-            let scope = match eitri_core::layout::can_kill(&module_layout.borrow(), &id) {
-                Ok(scope) => scope,
-                Err(err) => {
-                    println!("[terminal] the shell ended, and the terminal stays: {err}");
-                    return false;
-                }
-            };
-            match terminal::on_exit(scope) {
-                terminal::OnExit::CloseWindow => {
-                    println!("[terminal] the shell ended; the last module on screen closes Eitri");
-                    window.close();
-                    false
-                }
-                terminal::OnExit::CloseModule => {
-                    match grid.kill_module(&id, kill_pane::reopen(&id, &decls), &*focus_module) {
-                        Ok(()) => {
-                            println!("[terminal] the shell ended; the terminal is closed");
-                            true
-                        }
-                        Err(err) => {
-                            println!("[terminal] the shell ended, and the terminal stays: {err}");
-                            false
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     // A chip is `Ctrl+a <key>` for its module, from the top bar: it never holds the keys itself.
     {
         let open_module = open_module.clone();
@@ -1417,11 +1587,11 @@ fn build_ui(
     // still lands in BROWSE on that row. `false`: the module did not take the keys.
     let land_by_key: Rc<dyn Fn(&ModuleId) -> bool> = {
         let grid = grid.clone();
-        let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         Rc::new(move |to| {
             grid.unzoom();
-            let grabbed = focus_module(to);
+            let grabbed = give_keys(to);
             if grabbed && to.kind() == ModuleKind::Agent {
                 agent_panel_handle.arrive();
             }
@@ -1476,6 +1646,7 @@ fn build_ui(
         let window = window.clone();
         let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let keys_return = keys_return.clone();
         move |opening, return_keys| {
             let chat = ModuleId::agent();
@@ -1502,11 +1673,168 @@ fn build_ui(
             }
             // A module hidden before the close got no `Return` at all; this refusal is only a backstop
             // for one the hide or zoom just above took away.
-            if !focus_module(&ret.focus) {
+            if !give_keys(&ret.focus) {
                 println!("[keys_return] {} could not take the keys back", ret.focus);
             }
         }
     });
+
+    // What every terminal pane gets once, when it is made: its own end, and its own `Ctrl+h/j/k/l`.
+    //
+    // The shell ending by itself -- `exit`, `Ctrl+d`, a signal -- closes that terminal as `prefix x`
+    // does, without asking (`terminal::closes_on_exit` says which ends). A report from a shell that is
+    // no longer the pane's current one (the instance was killed and its number reused since) closes
+    // nothing. As the last module on screen, tmux's own rule (closing the last pane closes the window)
+    // applies instead: `eitri_core::layout::can_kill` says which (`terminal::on_exit`), and a `Window`
+    // scope closes the window through its own ordinary path -- `close window? N running (y/n)` when a
+    // tab runs -- rather than the module, leaving the terminal's notice on screen until the window
+    // really goes.
+    //
+    // `Ctrl+h/j/k/l` in a terminal are Eitri's, always: a capture-phase controller on its own widget,
+    // like the web modules' controllers below, so the chord is claimed before the terminal's key
+    // controller hands it to the shell. Unlike theirs, all four are swallowed even with no module that
+    // way, so what the shell receives never depends on the layout: `Ctrl+k` goes to the most recent
+    // module above it, and the rest are tmux's no-op at the edge unless a module is there. Each moves
+    // from the terminal's own id. The literal forms the shell loses are `Ctrl+a Ctrl+a` and
+    // `Ctrl+a Ctrl+l`.
+    let wire_terminal: Rc<dyn Fn(&ModuleId, &terminal::TerminalPane)> = {
+        let grid = grid.downgrade();
+        let module_layout = module_layout.clone();
+        let terminals = Rc::downgrade(&terminals);
+        let kill_terminal = kill_terminal.clone();
+        let window = window.clone();
+        let move_focus = move_focus.clone();
+        Rc::new(move |id, pane| {
+            {
+                let id = id.clone();
+                let grid = grid.clone();
+                let module_layout = module_layout.clone();
+                let terminals = terminals.clone();
+                let kill_terminal = kill_terminal.clone();
+                let window = window.clone();
+                pane.on_shell_exit(move |reported| {
+                    let Some(terminals) = terminals.upgrade() else {
+                        // The window is going; nothing is left to close.
+                        return false;
+                    };
+                    let current = match terminals.try_borrow() {
+                        // An idle pane (`None`) is a killed instance: its shell's end is late too.
+                        Ok(terminals) => terminals.get(&id).map(terminal::TerminalPane::generation),
+                        Err(_) => {
+                            eprintln!("[terminal] BUG: {id}: the registry was borrowed when its shell ended; it closes nothing");
+                            return false;
+                        }
+                    };
+                    if !current.is_some_and(|current| terminal::exit_is_current(reported, current)) {
+                        println!("[terminal] {id}: the end of an earlier shell (start {reported}) arrived late; it closes nothing");
+                        return false;
+                    }
+                    if grid.upgrade().is_none() {
+                        return false;
+                    }
+                    let scope = match eitri_core::layout::can_kill(&module_layout.borrow(), &id) {
+                        Ok(scope) => scope,
+                        Err(err) => {
+                            println!("[terminal] {id}: the shell ended, and the terminal stays: {err}");
+                            return false;
+                        }
+                    };
+                    match terminal::on_exit(scope) {
+                        terminal::OnExit::CloseWindow => {
+                            println!("[terminal] {id}: the shell ended; the last module on screen closes Eitri");
+                            window.close();
+                            false
+                        }
+                        terminal::OnExit::CloseModule => match kill_terminal(&id) {
+                            Ok(()) => {
+                                println!("[terminal] {id}: the shell ended; the terminal is closed");
+                                true
+                            }
+                            Err(err) => {
+                                println!("[terminal] {id}: the shell ended, and the terminal stays: {err}");
+                                false
+                            }
+                        },
+                    }
+                });
+            }
+            let id = id.clone();
+            let move_focus = move_focus.clone();
+            let controller = EventControllerKey::new();
+            controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            controller.connect_key_pressed(move |_controller, key, _keycode, state| {
+                match terminal::navigation(key, state) {
+                    Some(direction) => {
+                        move_focus(&id, direction);
+                        glib::Propagation::Stop
+                    }
+                    None => glib::Propagation::Proceed,
+                }
+            });
+            pane.widget().add_controller(controller);
+        })
+    };
+    {
+        let panes: Vec<(ModuleId, terminal::TerminalPane)> = terminals
+            .borrow()
+            .live()
+            .map(|(id, pane)| (id.clone(), pane.clone()))
+            .collect();
+        for (id, pane) in panes {
+            wire_terminal(&id, &pane);
+        }
+    }
+
+    // A new terminal instance (`instance.new`, `M-Enter`, or a split key from a terminal): the lowest
+    // number no workspace holds and no data kept for a later build names, a pane from the registry --
+    // the idle one of that number if it was killed before, whose host the grid already holds, else a
+    // new pane with its own host -- placed beside `beside` along `axis`, added hidden to every other
+    // workspace, and given the keys. Its shell starts in `dir` through the change hook, when the
+    // placement shows it. `beside` is checked here, not where the request was made: a split that read
+    // its shell's directory off the GTK thread finds out only now whether its target is still there.
+    let new_terminal: Rc<dyn Fn(&ModuleId, Axis, PathBuf) -> Result<ModuleId, String>> = {
+        let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let workspaces = workspaces.clone();
+        let terminals = terminals.clone();
+        let make_terminal_pane = make_terminal_pane.clone();
+        let wire_terminal = wire_terminal.clone();
+        let give_keys = give_keys.clone();
+        let text_size_controller = text_size_controller.clone();
+        Rc::new(move |beside, axis, dir| {
+            let id = {
+                let layout = module_layout.borrow();
+                if !layout.contains(beside) {
+                    return Err(format!("{beside} has left the layout; no terminal was opened"));
+                }
+                let workspaces = workspaces.borrow();
+                let layouts: Vec<&eitri_core::layout::Layout> =
+                    workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
+                new_terminal_id(&layouts, &workspaces.reserved())
+            }
+            .ok_or_else(|| "at most 9 terminals".to_string())?;
+            let (pane, reused) = terminals.borrow_mut().take_or_make(&id, || make_terminal_pane());
+            pane.set_start_dir(dir);
+            if !grid.has_host(&id) {
+                if reused == terminal::registry::Reused::Yes {
+                    eprintln!("[terminal] BUG: {id} reused a pane the grid has no host for; giving it one");
+                }
+                grid.add(id.clone(), pane.widget(), pane.widget(), HostKind::Direct);
+                // Off screen until the placement below shows it (`ModuleGrid::apply` maps it then).
+                pane.widget().set_child_visible(false);
+                wire_terminal(&id, &pane);
+                wheel_zoom::install(id.clone(), pane.widget().upcast_ref(), text_size_controller.clone());
+            }
+            if let Err(err) = grid.place_module(&id, beside, axis) {
+                terminals.borrow_mut().retire(&id);
+                return Err(err.to_string());
+            }
+            workspaces.borrow_mut().add_everywhere(&id);
+            give_keys(&id);
+            println!("[terminal] {id}: opened beside {beside} ({axis:?})");
+            Ok(id)
+        })
+    };
 
     // The prefix's `Action::Tab` chords and the panel's `tab_verb` messages use the
     // same code, so behavior is shared across both routes. `keymap.ts` resolves the
@@ -1516,23 +1844,42 @@ fn build_ui(
         let module_layout = module_layout.clone();
         let window = window.clone();
         let agent = agent_panel_handle.clone();
-        let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let show_on_screen = show_on_screen.clone();
         let refused_name = top_bar.app_name.clone();
         let toast = toast.clone();
         Rc::new(move |tab_action: TabAction| {
             let chat = ModuleId::agent();
-            let keys_in = pane_focus::focused_module(&window, &grid.hosts())
-                .as_ref()
-                .map(ModuleId::kind);
-            // One terminal today; `n`/`p` there are swallowed.
-            let plan = eitri_core::tabs::plan(tab_action, keys_in, 1);
+            let keys = pane_focus::focused_module(&window, &grid.hosts());
+            let keys_in = keys.as_ref().map(ModuleId::kind);
+            // `n`/`p` in a terminal: its sibling tabs when it sits in a tabbed or stacked container with
+            // another tab to go to, else the terminals on screen, else nothing.
+            let (terminals_on_screen, in_tabs) = {
+                let layout = module_layout.borrow();
+                let on_screen = layout
+                    .leaves()
+                    .iter()
+                    .filter(|id| id.kind() == ModuleKind::Terminal && layout.is_visible(id))
+                    .count();
+                let in_tabs = keys
+                    .as_ref()
+                    .is_some_and(|id| id.kind() == ModuleKind::Terminal && layout.tab_neighbour(id, true).is_some());
+                (on_screen, in_tabs)
+            };
+            let plan = eitri_core::tabs::plan(tab_action, keys_in, terminals_on_screen, in_tabs);
+            let step_to = |to: Option<ModuleId>| match to {
+                Some(to) => {
+                    let grabbed = give_keys(&to);
+                    println!("[tabs] -> {to} (grab_focus={grabbed})");
+                }
+                None => flash(&refused_name),
+            };
             if plan.takes_the_keys {
                 if let Err(err) = show_on_screen(&chat) {
                     refuse(&refused_name, &toast, &err);
                     return;
                 }
-                focus_module(&chat);
+                give_keys(&chat);
             }
             let switched = match plan.verb {
                 TabVerb::New => {
@@ -1564,6 +1911,20 @@ fn build_ui(
                     true
                 }
                 TabVerb::Flash => false,
+                TabVerb::Sibling(delta) => {
+                    let to = keys
+                        .as_ref()
+                        .and_then(|from| module_layout.borrow().tab_neighbour(from, delta > 0));
+                    step_to(to);
+                    return;
+                }
+                TabVerb::Terminal(delta) => {
+                    let to = keys
+                        .as_ref()
+                        .and_then(|from| eitri_core::layout::next_terminal(&module_layout.borrow(), from, delta > 0));
+                    step_to(to);
+                    return;
+                }
                 TabVerb::Nothing => return,
             };
             if !switched {
@@ -1573,22 +1934,16 @@ fn build_ui(
             }
             // A switch from elsewhere shows a hidden chat where it was, keys unmoved;
             // under a zoom only the tray chip changes.
-            if !plan.takes_the_keys
-                && eitri_core::tabs::reveal_on_switch(eitri_core::layout::agent_place(&module_layout.borrow()))
-            {
-                if let Err(err) = grid.show_module(&chat) {
-                    eprintln!("[tabs] could not reveal the chat: {err}");
+            let place = eitri_core::layout::agent_place(&module_layout.borrow());
+            if !plan.takes_the_keys && eitri_core::tabs::reveal_on_switch(place) {
+                match reveal_chat_in_grid(&grid, &module_layout) {
+                    Ok(true) => {}
+                    Ok(false) => println!("[tabs] the chat's tab stays behind the keys' tab"),
+                    Err(err) => eprintln!("[tabs] could not reveal the chat: {err}"),
                 }
             }
         })
     };
-    // `<leader>bd`/`<leader>bo` etc., resolved by the panel's own sequence engine and sent as a
-    // `tab_verb` message -- routed through the very code the prefix's `Action::Tab` arm runs.
-    agent_panel_handle.on_tab_verb({
-        let run_tab_action = run_tab_action.clone();
-        move |tab_action| run_tab_action(tab_action)
-    });
-
     // The mark `swap.marked` swaps with, as text in the top bar. Refreshed after every mark verb and
     // every change of the grid: a module retired or killed takes its mark with it.
     let refresh_mark: Rc<dyn Fn()> = {
@@ -1664,8 +2019,9 @@ fn build_ui(
     // One runner for every key action, from the prefix and from `eitri.layout.run`, so a key and a
     // Lua call cannot drift apart. `keycode` is the key that ran it, which only `hint` reads (that
     // key is still down); Lua passes 0 and cannot run `hint`, which is not a layout action.
-    // Below `move_focus` because `select.*` uses it.
-    let run_action: Rc<dyn Fn(Action, u32)> = {
+    // Below `move_focus` because `select.*` uses it. Reached only through `run_action` below, which
+    // holds the container selection's rules around it.
+    let run_verb: Rc<dyn Fn(Action, u32)> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let editor = pane.clone();
@@ -1673,8 +2029,11 @@ fn build_ui(
         let window_for_focus = window.clone();
         let refused_name = top_bar.app_name.clone();
         let text_size_controller = text_size_controller.clone();
-        let terminal = terminal.clone();
+        let terminals = terminals.clone();
+        let new_terminal = new_terminal.clone();
+        let project_dir = project_root.to_path_buf();
         let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let open_module = open_module.clone();
         let show_on_screen = show_on_screen.clone();
         let move_focus = move_focus.clone();
@@ -1700,6 +2059,8 @@ fn build_ui(
             let target = || module_layout.borrow().focus().clone();
             // The module that holds the keys right now (`pane_focus`'s own definition).
             let focused = || pane_focus::focused_module(&window_for_focus, &grid.hosts());
+            // A terminal's pane by its id: the base terminal or a live instance.
+            let pane_of = |id: &ModuleId| terminals.borrow().get(id).cloned();
             match action {
                 Action::MoveFar(dir) => {
                     let target = target();
@@ -1863,15 +2224,28 @@ fn build_ui(
                         terminal::LiteralTarget::Editor => editor.send_keys(&key.to_vim()),
                         terminal::LiteralTarget::Panel => agent.literal_key(&key),
                         terminal::LiteralTarget::Terminal => match terminal::keys::literal(&key) {
-                            Some(inputs) => inputs.into_iter().for_each(|input| terminal.send(input)),
+                            // To the terminal that holds the keys, whichever instance it is.
+                            Some(inputs) => {
+                                if let Some(pane) = focused().as_ref().and_then(pane_of) {
+                                    inputs.into_iter().for_each(|input| pane.send(input));
+                                }
+                            }
                             None => println!("[prefix] {key}: the terminal takes C-<letter> or one character"),
                         },
                         terminal::LiteralTarget::Neither => {}
                     }
                 }
                 // `Ctrl+a t`'s rule since the terminal's phase 1 (`terminal::toggle_action`), in the
-                // order `ToggleAction::steps` gives and the terminal's own tests pin.
+                // order `ToggleAction::steps` gives and the terminal's own tests pin. The base id is the
+                // key `t`, which reaches the terminal with the keys, else the most recent one, else the
+                // base; a numbered id (`module.terminal#2`) reaches that instance only.
                 Action::Module(id) if id.kind() == ModuleKind::Terminal => {
+                    let id = eitri_core::layout::module_target(&module_layout.borrow(), &id);
+                    if !module_layout.borrow().contains(&id) {
+                        println!("[prefix] {id}: not in this window");
+                        flash(&refused_name);
+                        return;
+                    }
                     let has_keys = focused().as_ref() == Some(&id);
                     let shown = module_layout.borrow().is_shown(&id);
                     for step in terminal::toggle_action(shown, has_keys).steps() {
@@ -1884,9 +2258,13 @@ fn build_ui(
                                     eprintln!("[terminal] not shown: {err}");
                                 }
                             }
-                            terminal::ToggleStep::Start => terminal.start(),
+                            terminal::ToggleStep::Start => {
+                                if let Some(pane) = pane_of(&id) {
+                                    pane.start();
+                                }
+                            }
                             terminal::ToggleStep::FocusTerminal => {
-                                focus_module(&id);
+                                give_keys(&id);
                             }
                             terminal::ToggleStep::Hide => {
                                 if let Err(err) = grid.hide_module(&id, &*focus_module) {
@@ -1898,7 +2276,7 @@ fn build_ui(
                 }
                 Action::Module(id) => {
                     // `v` before the canvas exists, or a module this window has not got.
-                    if !grid.hosts().iter().any(|(m, _)| *m == id) {
+                    if !grid.has_host(&id) {
                         println!("[prefix] {id}: not in this window yet");
                         flash(&refused_name);
                         return;
@@ -1983,7 +2361,7 @@ fn build_ui(
                         },
                         &chat,
                     );
-                    focus_module(&chat);
+                    give_keys(&chat);
                     agent.open_keymap(plugin, opening);
                 }
                 // `prefix :` opens the chat with focus in its command line. Opening the line runs nothing, so
@@ -1997,7 +2375,7 @@ fn build_ui(
                     // A close of the `?` sheet may still be on its way from the page: the command line is
                     // the newer request, and that close must not move the keys out from under it.
                     keys_return.borrow_mut().superseded();
-                    focus_module(&chat);
+                    give_keys(&chat);
                     agent.open_command_line();
                 }
                 Action::WindowImmersive => window_modes.toggle_immersive(),
@@ -2005,13 +2383,70 @@ fn build_ui(
                 // It computes `keys_in` the same way `focused()` does here.
                 Action::Tab(tab_action) => run_tab_action(tab_action),
                 // The prefix never hands a split key back: it waits for a module key instead.
-                Action::Split(_) => {}
+                Action::Split { .. } => {}
+                // i3's `move <dir>`: the module with the keys, or the selected container.
+                Action::Move(dir) => {
+                    let target = target();
+                    match grid.move_dir(&target, dir) {
+                        Ok(true) => {}
+                        Ok(false) => println!("[modules] {target}: nowhere to move {dir:?}"),
+                        Err(err) => refuse(&refused_name, &toast, &err),
+                    }
+                }
+                // i3's `layout tabbed`/`layout stacking`; pressed again, the container's split again.
+                Action::ContainerTabbed | Action::ContainerStacked => {
+                    let mode = if action == Action::ContainerTabbed {
+                        ConLayout::Tabbed
+                    } else {
+                        ConLayout::Stacked
+                    };
+                    let target = target();
+                    match grid.container_mode(&target, mode) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            println!("[modules] {}: no container around {target}", action.name());
+                            flash(&refused_name);
+                        }
+                        Err(err) => refuse(&refused_name, &toast, &err),
+                    }
+                }
+                // i3's `focus parent`/`focus child`: the selection widens or narrows; the top bar
+                // says what is selected (`run_action` redraws it after every action).
+                Action::FocusParent | Action::FocusChild => {
+                    let moved = if action == Action::FocusParent {
+                        grid.focus_parent()
+                    } else {
+                        grid.focus_child()
+                    };
+                    if !moved {
+                        println!("[modules] {}: nothing to select", action.name());
+                        flash(&refused_name);
+                    }
+                }
+                // A new terminal right of the module with the keys, its shell in the project root.
+                Action::InstanceNew {
+                    kind: ModuleKind::Terminal,
+                } => {
+                    if let Err(text) = new_terminal(&target(), Axis::Row, project_dir.clone()) {
+                        refuse_text(&refused_name, &toast, &text);
+                    }
+                }
+                Action::InstanceNew {
+                    kind: ModuleKind::Agent,
+                } => refuse_text(&refused_name, &toast, CHAT_VIEWS_REFUSED),
+                Action::InstanceNew { .. } => {
+                    println!("[prefix] {}: not in this build yet", action.name());
+                    flash(&refused_name);
+                }
                 // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
                 // mode, only while it holds the keys -- elsewhere the same refusal shape as
                 // every other misdirected prefix action (`Action::Module`, above).
                 Action::CopyMode { up } => {
-                    if terminal::copy_mode_entry(focused().as_ref().map(ModuleId::kind)) {
-                        terminal.enter_copy_mode(up);
+                    let focused = focused();
+                    if terminal::copy_mode_entry(focused.as_ref().map(ModuleId::kind)) {
+                        if let Some(pane) = focused.as_ref().and_then(pane_of) {
+                            pane.enter_copy_mode(up);
+                        }
                     } else {
                         println!("[prefix] prefix [ scrolls the terminal");
                         flash(&refused_name);
@@ -2021,28 +2456,94 @@ fn build_ui(
         })
     };
 
+    // The container selection's rules around every action, from a key or `eitri.layout.run`
+    // (`selection_gate`): an action on one module is refused while a container is selected, saying
+    // how to get back to one; one that neither acts on the selection nor refuses it ends it.
+    let one_module_text = one_module_text(&keymap);
+    let run_action: Rc<dyn Fn(Action, u32)> = {
+        let run_verb = run_verb.clone();
+        let module_layout = module_layout.clone();
+        let refused_name = top_bar.app_name.clone();
+        let toast = toast.clone();
+        let refresh_selection = refresh_selection.clone();
+        let one_module_text = one_module_text.clone();
+        Rc::new(move |action: Action, keycode: u32| {
+            let gate = selection_gate(&action, module_layout.borrow().selection());
+            if gate == SelectionGate::Refuse {
+                println!("[modules] {}: {one_module_text}", action.name());
+                flash(&refused_name);
+                toast.show(&one_module_text);
+                return;
+            }
+            run_verb(action, keycode);
+            if gate == (SelectionGate::Run { reset: true }) {
+                clear_selection(&module_layout);
+            }
+            refresh_selection();
+        })
+    };
+    // `<leader>bd`/`<leader>bo` etc., resolved by the panel's own sequence engine and sent as a
+    // `tab_verb` message -- routed through the very code the prefix's `Action::Tab` arm runs, the
+    // container selection's rules included: a tab verb ends a selection whichever route sent it.
+    agent_panel_handle.on_tab_verb({
+        let run_action = run_action.clone();
+        move |tab_action| run_action(Action::Tab(tab_action), 0)
+    });
+
     // The prefix. Installed after every other window-level controller that exists
     // at startup, so it sees keys first; HINT's, added when a HINT starts, still comes before it.
     {
         let refused_name = top_bar.app_name.clone();
         let place_and_arrive = place_and_arrive.clone();
         let land_by_key = land_by_key.clone();
-        let focus_module = focus_module.clone();
+        let give_keys = give_keys.clone();
         let module_layout = module_layout.clone();
         let agent = agent_panel_handle.clone();
         let toast = toast.clone();
         let number_plan = number_plan.clone();
         let run_action = run_action.clone();
         let on_waiting = on_waiting.clone();
+        let refresh_selection = refresh_selection.clone();
+        let escape_layout = module_layout.clone();
+        let escape_refresh = refresh_selection.clone();
+        let split_new_terminal = split_new_terminal(
+            new_terminal.clone(),
+            terminals.clone(),
+            project_root.to_path_buf(),
+            top_bar.app_name.clone(),
+            toast.clone(),
+        );
         let prefix = prefix::install(
             &window,
             keymap.clone(),
             module_keys.clone(),
             move |command, keycode| match command {
-                prefix::PrefixCommand::Place { module, axis } => {
-                    if let Err(err) = place_and_arrive(&module, axis) {
-                        refuse(&refused_name, &toast, &err);
+                // A split key's second half: `split.*` ends a container selection, as its rule says.
+                // From a terminal, the terminal's key makes a new one (`split_choice`); a chat's key from
+                // the chat would make a chat view, which this build has not got.
+                prefix::PrefixCommand::Place { module, axis, cwd } => {
+                    let (choice, target) = {
+                        let layout = module_layout.borrow();
+                        (
+                            eitri_core::layout::split_choice(&layout, &module),
+                            layout.focus().clone(),
+                        )
+                    };
+                    match choice {
+                        eitri_core::layout::SplitChoice::Existing(id) => {
+                            if let Err(err) = place_and_arrive(&id, axis) {
+                                refuse(&refused_name, &toast, &err);
+                            }
+                        }
+                        eitri_core::layout::SplitChoice::NewInstance(ModuleKind::Terminal) => {
+                            split_new_terminal(target, axis, cwd);
+                        }
+                        eitri_core::layout::SplitChoice::NewInstance(_) => {
+                            refuse_text(&refused_name, &toast, CHAT_VIEWS_REFUSED);
+                        }
                     }
+                    clear_selection(&module_layout);
+                    refresh_selection();
                 }
                 // The digits are already down (the wait's end hid them); the number is looked up in
                 // what they showed. A digit with no module there does nothing, as in tmux.
@@ -2059,7 +2560,7 @@ fn build_ui(
                         Some(id) => {
                             let zoomed_here = module_layout.borrow().zoomed() == Some(&id);
                             let grabbed = if zoomed_here {
-                                let grabbed = focus_module(&id);
+                                let grabbed = give_keys(&id);
                                 if grabbed && id.kind() == ModuleKind::Agent {
                                     agent.arrive();
                                 }
@@ -2075,6 +2576,13 @@ fn build_ui(
                 prefix::PrefixCommand::Run(action) => run_action(action, keycode),
             },
             move |waiting| on_waiting(waiting),
+            // `prefix Esc` resets a container selection; a bare `Esc` is the module's own key.
+            move || {
+                if clear_selection(&escape_layout) {
+                    println!("[modules] the selection is back on the module with the keys");
+                }
+                escape_refresh();
+            },
         );
         let _ = prefix_cell.set(prefix);
     }
@@ -2160,30 +2668,6 @@ fn build_ui(
         // page, so the agent panel's `a`/`d`/`D` and the bypass `y`, or a plugin page's own keys,
         // could not refuse it there (`panel_super.rs`).
         panel_super::install(host);
-    }
-
-    // --- Ctrl+h/j/k/l in the terminal: Eitri's, always.
-    // Capture phase on its own widget, like the web modules' controllers above, so the chord is
-    // claimed before the terminal's key controller hands it to the shell. Unlike theirs, all four
-    // are swallowed even with no module that way, so what the shell receives never depends on the
-    // layout: `Ctrl+k` goes to the most recent module above it (the MRU
-    // tie `neighbor()` breaks, which is `main`'s `last_upper_pane`), and the rest are tmux's no-op
-    // at the edge unless a module is there. The literal forms the shell loses are `Ctrl+a Ctrl+a`
-    // and `Ctrl+a Ctrl+l`, above.
-    {
-        let move_focus = move_focus.clone();
-        let controller = EventControllerKey::new();
-        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-            match terminal::navigation(key, state) {
-                Some(direction) => {
-                    move_focus(&ModuleId::terminal(), direction);
-                    glib::Propagation::Stop
-                }
-                None => glib::Propagation::Proceed,
-            }
-        });
-        terminal.widget().add_controller(controller);
     }
 
     // The shell handles Ctrl+h/j/k/l when the editor has no running nvim, since nothing inside can
@@ -2315,11 +2799,21 @@ fn build_ui(
         let place_and_arrive = place_and_arrive.clone();
         let run_action = run_action.clone();
         let refresh_mark = refresh_mark.clone();
+        let refresh_selection = refresh_selection.clone();
+        let one_module_text = one_module_text.clone();
         Rc::new(move || {
             let requests = lua_engine.layout.borrow_mut().take_requests();
             for request in requests {
                 use eitri_core::lua::layout::LayoutRequest;
                 println!("[lua] layout: {request:?}");
+                // The container selection's rules by the action each request stands for; `run`
+                // meets them in `run_action` itself.
+                let gate = lua_request_action(&request)
+                    .map(|action| selection_gate(&action, module_layout.borrow().selection()));
+                if gate == Some(SelectionGate::Refuse) {
+                    eprintln!("[lua] layout: {request:?} refused: {one_module_text}");
+                    continue;
+                }
                 // The same three helpers `Ctrl+a` uses, so the two cannot drift apart.
                 let result = match &request {
                     LayoutRequest::Show(id) => show_on_screen(id),
@@ -2340,7 +2834,11 @@ fn build_ui(
                 if let Err(err) = result {
                     eprintln!("[lua] layout: {request:?} refused: {err}");
                 }
+                if gate == Some(SelectionGate::Run { reset: true }) {
+                    clear_selection(&module_layout);
+                }
             }
+            refresh_selection();
         })
     };
 
@@ -2380,7 +2878,11 @@ fn build_ui(
         window: window.clone(),
         grid: grid.clone(),
         pane: pane.clone(),
-        terminal: terminal.clone(),
+        terminal: terminals
+            .borrow()
+            .get(&ModuleId::terminal())
+            .cloned()
+            .expect("the base terminal keeps its pane in the registry"),
         agent: agent_widget.clone(),
         project_root: project_root.to_path_buf(),
         backend_kind,
@@ -2449,9 +2951,11 @@ fn build_ui(
         layout_saver.save_now();
         // Kills nvim by its pid if it does not exit within the fork's wait (codex p1 #2).
         pane.shutdown();
-        // Hangs the terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
-        // the process exit first, the kernel closing the PTY master hangs it up anyway.
-        terminal.shutdown();
+        // Hangs every terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
+        // the process exit first, the kernel closing each PTY master hangs it up anyway.
+        for terminal in terminals.borrow().each() {
+            terminal.shutdown();
+        }
         // The scratch directory is owned by the panel's `ScratchDir`, which GTK may never drop.
         if let Some(path) = &scratch_path {
             let _ = std::fs::remove_dir_all(path);
@@ -2543,6 +3047,8 @@ struct ShellQuitHost {
     grid: glib::WeakRef<ModuleGrid>,
     show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>>,
     focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
+    /// `build_ui`'s `give_keys`: a tab not drawn is chosen before the grab.
+    give_keys: Rc<dyn Fn(&ModuleId) -> bool>,
     retire_editor: Rc<dyn Fn() -> Result<(), LayoutError>>,
     /// The window's y/n, set once it is installed (after the prefix, so its controller sees keys
     /// first); every call before that finds none.
@@ -2582,10 +3088,21 @@ impl editor_quit::QuitHost for ShellQuitHost {
         self.module_layout.borrow().is_gone(&ModuleId::editor())
     }
     fn show_editor(&self) -> Result<(), LayoutError> {
-        (self.show_on_screen)(&ModuleId::editor())
+        let editor = ModuleId::editor();
+        (self.show_on_screen)(&editor)?;
+        // An editor on a tab not drawn is off screen too (`kill_pane::reveal_for_prompt`): nvim's
+        // prompt must be seen before it is answered, so its tab is chosen, which also gives it the
+        // keys the next step gives it anyway.
+        let tabbed_away = self.module_layout.borrow().is_tabbed_away(&editor);
+        if tabbed_away {
+            if let Some(grid) = self.grid.upgrade() {
+                grid.switch_tab(&editor, &*self.focus_module)?;
+            }
+        }
+        Ok(())
     }
     fn focus_editor(&self) {
-        (self.focus_module)(&ModuleId::editor());
+        (self.give_keys)(&ModuleId::editor());
     }
     fn hide_editor(&self) -> Result<(), LayoutError> {
         match self.grid.upgrade() {
@@ -2659,6 +3176,212 @@ fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
     }
 }
 
+/// Brings the chat back for a reveal that leaves the keys where they are: shown where it was hidden
+/// from and, when it sits in a tabbed or stacked container, its tab drawn. A hidden chat's container
+/// may have gone on drawing a sibling, so showing it alone can leave it on a tab nobody sees; both
+/// steps are taken whichever place it started from. `Ok((changed, drawn))`: `drawn` is `false` when its
+/// tab stays behind the keys' own (drawing it would hide them), so the caller can say so instead.
+fn reveal_chat(layout: &mut eitri_core::layout::Layout) -> Result<(bool, bool), LayoutError> {
+    let chat = ModuleId::agent();
+    let shown = layout.show(&chat)?;
+    let tabbed_away = layout.is_tabbed_away(&chat);
+    let brought = tabbed_away && layout.bring_forward(&chat);
+    Ok((shown || brought, !tabbed_away || brought))
+}
+
+/// [`reveal_chat`] on the window's layout, redrawing the grid when it changed anything. `Ok(true)`
+/// when the chat is on its container's drawn tab now.
+fn reveal_chat_in_grid(grid: &ModuleGrid, layout: &RefCell<eitri_core::layout::Layout>) -> Result<bool, LayoutError> {
+    let (changed, drawn) = reveal_chat(&mut layout.borrow_mut())?;
+    if changed {
+        grid.apply();
+    }
+    Ok(drawn)
+}
+
+/// What a container selection does to an action, before and after it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionGate {
+    /// The action acts on one module, and a container is selected: it does not run.
+    Refuse,
+    /// It runs; with `reset`, the selection goes back to the module with the keys afterwards.
+    Run { reset: bool },
+}
+
+/// The selection's rule for `action` (`Action::selection_rule`) against what is selected now.
+fn selection_gate(action: &Action, selection: Selection) -> SelectionGate {
+    match (action.selection_rule(), selection) {
+        (SelectionRule::Refuses, Selection::Con(_)) => SelectionGate::Refuse,
+        (SelectionRule::Resets, _) => SelectionGate::Run { reset: true },
+        _ => SelectionGate::Run { reset: false },
+    }
+}
+
+/// The key action an `eitri.layout.*` request stands for, so the selection treats a Lua call as it
+/// treats the key: `hide` is `module.hide`, `mark` is `mark.toggle`, `show` and `focus` a module key,
+/// `split` a split key. `None` for `run`, which goes through `run_action` and its rules itself.
+fn lua_request_action(request: &eitri_core::lua::layout::LayoutRequest) -> Option<Action> {
+    use eitri_core::lua::layout::LayoutRequest;
+    match request {
+        LayoutRequest::Hide(_) => Some(Action::ModuleHide),
+        LayoutRequest::Mark(_) => Some(Action::MarkToggle),
+        LayoutRequest::Show(id) | LayoutRequest::Focus(id) => Some(Action::Module(id.clone())),
+        LayoutRequest::Split(_, axis) => Some(Action::Split {
+            axis: *axis,
+            cwd: Default::default(),
+        }),
+        LayoutRequest::Run(_) => None,
+    }
+}
+
+/// What a refusal under a container selection says: how to get back to one module, as the keymap
+/// binds `focus.child` (`acts on one module: C-b M-d`), or its name when no key reaches it.
+fn one_module_text(keymap: &eitri_core::keymap::Keymap) -> Rc<str> {
+    let way = keymap
+        .keys_for(&Action::FocusChild)
+        .first()
+        .map(|key| format!("{} {}", keymap.prefix().human(), key.human()))
+        .unwrap_or_else(|| Action::FocusChild.name());
+    format!("acts on one module: {way}").into()
+}
+
+/// Puts the selection back on the module with the keys; `true` if a container was selected. A
+/// layout borrowed right now (nothing holds it across an action) leaves the selection as it is.
+fn clear_selection(layout: &RefCell<eitri_core::layout::Layout>) -> bool {
+    layout.try_borrow_mut().is_ok_and(|mut layout| layout.clear_selection())
+}
+
+/// A split key from a terminal: a new terminal beside `target`, the module that held the keys at the
+/// keypress, along `axis`. With `cwd = "pane"` and `target` a terminal, the new shell starts where
+/// `target`'s shell is now: `/proc/<pid>/cwd` is read on a worker thread (a slow or hung filesystem
+/// must never stall the window), and the new terminal is made when the answer comes back -- beside
+/// the target captured here, or refused if it has left the layout in the meantime. A shell that has
+/// ended, or a directory that cannot be read, gives the project root and one log line
+/// (`terminal::start_dir`). Otherwise the new shell starts in the project root.
+fn split_new_terminal(
+    new_terminal: Rc<dyn Fn(&ModuleId, Axis, PathBuf) -> Result<ModuleId, String>>,
+    terminals: Rc<RefCell<Terminals<terminal::TerminalPane>>>,
+    root: PathBuf,
+    app_name: gtk4::Label,
+    toast: Rc<toast::Toast>,
+) -> impl Fn(ModuleId, Axis, SplitCwd) {
+    move |target, axis, cwd| {
+        let from_pane = cwd == SplitCwd::Pane && target.kind() == ModuleKind::Terminal;
+        let start_of = {
+            let terminals = terminals.clone();
+            move |target: &ModuleId| {
+                terminals
+                    .borrow()
+                    .get(target)
+                    .map(|pane| ShellStart::of(pane.generation(), pane.shell_pid()))
+            }
+        };
+        let captured = start_of(&target);
+        let pid = captured.and_then(|start| start.pid);
+        let make = {
+            let new_terminal = new_terminal.clone();
+            let target = target.clone();
+            let app_name = app_name.clone();
+            let toast = toast.clone();
+            move |dir: PathBuf| {
+                if let Err(text) = new_terminal(&target, axis, dir) {
+                    refuse_text(&app_name, &toast, &text);
+                }
+            }
+        };
+        if !from_pane {
+            make(root.clone());
+            return;
+        }
+        let root = root.clone();
+        let app_name = app_name.clone();
+        let toast = toast.clone();
+        glib::spawn_future_local(async move {
+            let read = match pid {
+                Some(pid) => gtk4::gio::spawn_blocking(move || std::fs::read_link(format!("/proc/{pid}/cwd")))
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::Error::other("the reading thread panicked"))),
+                None => Err(std::io::Error::other("its shell is not running")),
+            };
+            // The number alone does not name the terminal the key was pressed in: it may have been
+            // killed while the directory was read, and its number given to a new terminal since.
+            if !captured.is_some_and(|captured| captured.still(start_of(&target))) {
+                refuse_text(
+                    &app_name,
+                    &toast,
+                    &format!("{target} closed while its directory was read; no terminal was opened"),
+                );
+                return;
+            }
+            let (dir, note) = terminal::start_dir(read, &root);
+            if let Some(note) = note {
+                println!("[terminal] {note}");
+            }
+            make(dir);
+        });
+    }
+}
+
+/// Whether `id` may be placed by its name (`Ctrl+a \`/`"` + a key, `eitri.layout.split`), given
+/// whether the registry holds a live pane for it. A numbered terminal that was killed keeps its host
+/// in the grid, for the next terminal of that number, but its pane is idle: placed again by name it
+/// would be a terminal with no shell, which the start hook (live panes only) never starts. Only a
+/// new instance brings a numbered terminal back. Every other module is the grid's to judge.
+fn placeable_by_id(id: &ModuleId, live: bool) -> Result<(), LayoutError> {
+    if id.kind() == ModuleKind::Terminal && !live {
+        return Err(LayoutError::NotInTree(id.clone()));
+    }
+    Ok(())
+}
+
+/// Which shell of a terminal pane a split key was pressed against: the pane's start count, and the
+/// shell's pid when one was running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShellStart {
+    generation: u64,
+    pid: Option<u32>,
+}
+
+impl ShellStart {
+    fn of(generation: u64, pid: Option<u32>) -> Self {
+        Self { generation, pid }
+    }
+
+    /// Whether `now` (the target's live pane today, `None` once it is idle or gone) still runs the
+    /// shell captured here. A new start bumps the count, so a pane killed and reused under the same
+    /// number fails; a shell that was running must be the same process, so a pane closed in place
+    /// (the base terminal keeps its pane when killed) fails too. A shell not yet spawned when the key
+    /// was pressed may have spawned since, under the same start.
+    fn still(self, now: Option<ShellStart>) -> bool {
+        let Some(now) = now else {
+            return false;
+        };
+        now.generation == self.generation && (self.pid.is_none() || now.pid == self.pid)
+    }
+}
+
+/// A refusal that has its own words: the app name flashes and the toast says why.
+fn refuse_text(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, text: &str) {
+    println!("[modules] refused: {text}");
+    flash(app_name);
+    toast.show(text);
+}
+
+/// What a request for a second chat view says: the id parses, but this build cannot make one.
+const CHAT_VIEWS_REFUSED: &str = "chat views: not in this build";
+
+/// The id a new terminal takes: the lowest number from 2 to 9 that no workspace's layout holds and
+/// that no data kept for a later build names (that build may still place a terminal of that number,
+/// and two modules must never share a name). `None` when every number is taken.
+fn new_terminal_id(layouts: &[&eitri_core::layout::Layout], reserved: &[ModuleId]) -> Option<ModuleId> {
+    let taken: Vec<ModuleId> = layouts
+        .iter()
+        .flat_map(|layout| layout.leaves())
+        .chain(reserved.iter().cloned())
+        .collect();
+    ModuleId::lowest_free(ModuleKind::Terminal, &taken)
+}
+
 /// Logs a refused layout operation and flashes the top bar's app name for `REFUSAL_FLASH`. A
 /// separate CSS class preserves the prefix indicator if it is armed meanwhile. Another refusal
 /// restarts the flash timer. There is one window per process (`NON_UNIQUE`), so one timer per
@@ -2725,6 +3448,206 @@ fn install_module_nav(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A killed numbered terminal, whose host the grid keeps, is not placed again by name; a live one
+    /// and every other kind are left to the grid.
+    #[test]
+    fn a_killed_instance_is_not_placed_by_name() {
+        let id = |text: &str| ModuleId::parse(text).unwrap();
+        assert_eq!(
+            placeable_by_id(&id("terminal#2"), false),
+            Err(LayoutError::NotInTree(id("terminal#2")))
+        );
+        assert_eq!(placeable_by_id(&id("terminal#2"), true), Ok(()));
+        assert_eq!(placeable_by_id(&id("terminal"), true), Ok(()));
+        assert_eq!(placeable_by_id(&id("agent"), false), Ok(()));
+        assert_eq!(placeable_by_id(&id("editor"), false), Ok(()));
+    }
+
+    /// A split from a terminal goes ahead after its directory is read only if the same shell is
+    /// still there: not once the pane is idle, not after a new start under the same number, not after
+    /// the running shell was closed in place.
+    #[test]
+    fn a_split_from_a_pane_needs_the_same_shell_when_its_directory_comes_back() {
+        let captured = ShellStart::of(3, Some(4100));
+        assert!(captured.still(Some(ShellStart::of(3, Some(4100)))));
+        assert!(!captured.still(None), "killed: the pane went idle");
+        assert!(
+            !captured.still(Some(ShellStart::of(4, Some(4200)))),
+            "the number reused by a new terminal"
+        );
+        assert!(
+            !captured.still(Some(ShellStart::of(4, Some(4100)))),
+            "a new start, whatever its pid"
+        );
+        assert!(
+            !captured.still(Some(ShellStart::of(3, None))),
+            "the shell closed in place"
+        );
+        let unspawned = ShellStart::of(1, None);
+        assert!(
+            unspawned.still(Some(ShellStart::of(1, Some(4300)))),
+            "spawned since, same start"
+        );
+        assert!(!unspawned.still(Some(ShellStart::of(2, Some(4300)))));
+    }
+
+    /// A new terminal takes the lowest free number, skipping one a later build's kept data names
+    /// (it may place that terminal itself), and is refused once every number is taken.
+    #[test]
+    fn a_new_instance_skips_a_reserved_number() {
+        use eitri_core::layout::{Layout, ModuleDecl, Placement};
+        let id = |text: &str| ModuleId::parse(text).unwrap();
+        let below = |ids: &[&str]| -> Layout {
+            let decls: Vec<ModuleDecl> = ids
+                .iter()
+                .map(|text| ModuleDecl {
+                    id: id(text),
+                    placement: Placement::BelowEditor,
+                })
+                .collect();
+            Layout::initial(&decls).unwrap()
+        };
+        let layout = below(&["terminal", "terminal#2"]);
+        assert_eq!(new_terminal_id(&[&layout], &[]), Some(id("terminal#3")));
+        assert_eq!(
+            new_terminal_id(&[&layout], &[id("terminal#3")]),
+            Some(id("terminal#4")),
+            "a reserved number is passed over"
+        );
+        let other = below(&["terminal", "terminal#4"]);
+        assert_eq!(
+            new_terminal_id(&[&layout, &other], &[id("terminal#3")]),
+            Some(id("terminal#5")),
+            "a number another workspace holds is taken too"
+        );
+        let full: Vec<String> = (2..=9).map(|n| format!("terminal#{n}")).collect();
+        let full: Vec<&str> = std::iter::once("terminal")
+            .chain(full.iter().map(String::as_str))
+            .collect();
+        assert_eq!(new_terminal_id(&[&below(&full)], &[]), None, "at most 9 terminals");
+    }
+
+    /// `eitri.layout.hide` and `mark` act on one module, so a selected container refuses them as it
+    /// refuses `module.hide` and `mark.toggle`; `show`, `focus` and `split` end the selection as a
+    /// module key and a split key do; with the module selected, everything runs.
+    #[test]
+    fn a_lua_hide_is_refused_while_a_container_is_selected() {
+        use eitri_core::layout::ConId;
+        use eitri_core::lua::layout::LayoutRequest;
+        let con = Selection::Con(ConId::fresh());
+        let gate = |request: LayoutRequest, selection: Selection| {
+            lua_request_action(&request).map(|action| selection_gate(&action, selection))
+        };
+        let t = ModuleId::terminal();
+        assert_eq!(gate(LayoutRequest::Hide(t.clone()), con), Some(SelectionGate::Refuse));
+        assert_eq!(gate(LayoutRequest::Mark(t.clone()), con), Some(SelectionGate::Refuse));
+        for request in [
+            LayoutRequest::Show(t.clone()),
+            LayoutRequest::Focus(t.clone()),
+            LayoutRequest::Split(t.clone(), Axis::Row),
+        ] {
+            assert_eq!(
+                gate(request.clone(), con),
+                Some(SelectionGate::Run { reset: true }),
+                "{request:?}"
+            );
+        }
+        assert_eq!(
+            gate(LayoutRequest::Run(Action::Zoom), con),
+            None,
+            "run meets the rules itself"
+        );
+        assert_eq!(
+            gate(LayoutRequest::Hide(t.clone()), Selection::Module),
+            Some(SelectionGate::Run { reset: false })
+        );
+        assert_eq!(
+            gate(LayoutRequest::Mark(t), Selection::Module),
+            Some(SelectionGate::Run { reset: false })
+        );
+        // The keys' own path: a verb that takes the selection keeps it.
+        assert_eq!(
+            selection_gate(&Action::ContainerTabbed, con),
+            SelectionGate::Run { reset: false }
+        );
+        assert_eq!(selection_gate(&Action::ModuleKill, con), SelectionGate::Refuse);
+    }
+
+    /// The refusal says how to get back to one module, as the keymap binds `focus.child`.
+    #[test]
+    fn the_one_module_refusal_names_the_way_back() {
+        let keymap = eitri_core::keymap::Keymap::defaults();
+        let text = one_module_text(&keymap);
+        assert!(text.starts_with("acts on one module: "), "{text}");
+        match keymap.keys_for(&Action::FocusChild).first() {
+            Some(key) => assert!(text.ends_with(&key.human()), "{text}"),
+            None => assert!(text.ends_with("focus.child"), "{text}"),
+        }
+    }
+
+    /// A tab verb ends a container selection whichever route sent it: the panel's own `gt` reaches
+    /// `run_action` as the prefix's chord does, and this is the rule it meets there.
+    #[test]
+    fn a_tab_verb_ends_a_container_selection() {
+        let con = Selection::Con(eitri_core::layout::ConId::fresh());
+        for tab_action in [TabAction::Next, TabAction::Prev, TabAction::Select(2), TabAction::New] {
+            assert_eq!(
+                selection_gate(&Action::Tab(tab_action), con),
+                SelectionGate::Run { reset: true },
+                "{tab_action:?}"
+            );
+        }
+    }
+
+    /// A chat hidden from a tabbed container whose other tab then took the keys comes back shown but
+    /// behind that tab, which holds the keys: the reveal reports it so the caller toasts instead. In a
+    /// container beside the keys its tab is drawn and the keys stay where they are.
+    #[test]
+    fn a_hidden_chat_in_a_tabbed_container_is_drawn_or_reported_behind() {
+        use eitri_core::layout::{hide, Child, Con, ConLayout, Frame, Layout, Node, Size};
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        let chat = ModuleId::agent();
+
+        let mut tabs = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::editor()), 0.5),
+                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+            ],
+        );
+        tabs.focus = 1;
+        let mut layout = Layout::new(Node::Con(tabs), chat.clone()).unwrap();
+        let next = hide(&mut layout, &chat, &frame)
+            .unwrap()
+            .expect("the chat held the keys");
+        layout.set_focus(&next).unwrap();
+        assert_eq!(next, ModuleId::editor());
+        assert_eq!(reveal_chat(&mut layout).unwrap(), (true, false));
+        assert!(layout.is_tabbed_away(&chat), "shown, on the tab not drawn");
+        assert_eq!(layout.focus(), &ModuleId::editor());
+
+        let mut tabs = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                Child::new(Node::Leaf(ModuleId::terminal()), 0.5),
+            ],
+        );
+        tabs.focus = 1;
+        let mut layout = Layout::new(
+            Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::editor()), Node::Con(tabs)),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        hide(&mut layout, &chat, &frame).unwrap();
+        assert!(!layout.is_shown(&chat));
+        assert_eq!(reveal_chat(&mut layout).unwrap(), (true, true));
+        assert!(layout.is_visible(&chat));
+        assert_eq!(layout.focus(), &ModuleId::editor());
+
+        assert_eq!(reveal_chat(&mut layout).unwrap(), (false, true), "already on screen");
+    }
 
     /// Checks that `build_application` sets `NON_UNIQUE`, which disables gio's
     /// single-instance behavior. Removing the flag fails this assertion;

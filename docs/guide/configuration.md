@@ -118,14 +118,55 @@ eitri.command.register({
   is not a layout action (a tab action, say) is refused naming it, and so are three more: `split.right` and
   `split.below` (they wait for a module key; `eitri.layout.split(id, "right")` or `"below"` does the work), `select.number`
   (it waits for a digit; `eitri.layout.focus(id)` gives a module the keys) and the `repeatable` option, which belongs
-  to a key binding.
+  to a key binding. Two more are for terminals: `eitri.layout.run("instance.new", { kind = "terminal" })` opens a
+  new terminal to the right of the module that has the keys, as `<prefix> Alt+Enter` does (`kind = "agent"` is
+  refused for now with `chat views: not in this build`), and a split action takes `cwd`, below.
 - **`eitri.layout.mark(id)`** marks that module without moving the keys, as `<prefix> m` marks the one that has them.
 - **`eitri.layout.get()`** returns a new table describing the layout as it is now, in the shape
   `eitri.layout.default` takes: `{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`, where
-  a split's first child carries the split's ratio. It adds `focus` (the module with the keys), `hidden` (a list),
+  every child but the last carries its share of the container. It adds `focus` (the module with the keys), `hidden` (a list),
   `zoomed` and `marked` (a module, or nothing). Pinned bottom rows are not written into the table; the default shape
   restores a bottom row's height by itself. Called from inside a layout change it stops with a message instead of
   reading half a change.
+
+**The shape `eitri.layout.default` and `get()` use.** A table starts with `"row"` or `"column"` (two or more
+children, side by side / one above the other), or with `"tabbed"` or `"stacked"` (one or more children, one shown
+at a time, with a row of titles / a row of title for each). A child is a module name, then optionally its share of
+the container as a second item (`{ "editor", 0.6 }`), or a table of its own, whose share goes in as `share = 0.4`.
+A child without a share takes an equal part of what the others leave; every share is from 0.05 to 1 and together
+they come to 1. `active = 2` on a tabbed or stacked table names the child shown (counting from 1; the first by
+default). A numbered terminal (`terminal#2` to `terminal#9`) can be a child, as in the example below, and the window
+gives it its own shell once it is shown. A misspelled field stops the launch, naming it. An example with every kind of container:
+
+```lua
+eitri.layout.default({
+  "row",
+  { "editor", 0.55 },
+  { "tabbed", { "agent" }, { "terminal" }, { "terminal#2" }, active = 1 },
+})
+```
+
+**A split that starts in the terminal's directory.** `split.right` and `split.below` take `cwd = "pane"`, which
+makes the new terminal's shell start in the directory the terminal you split from is in (read from the shell
+while the key is pressed). When that shell has ended, its directory cannot be read, or the key is pressed in a
+module that is not a terminal, the new shell starts in the project root. Without the option, or with `cwd = "start"`, the new shell starts in the project root.
+
+```lua
+k.set("prefix", "\\", "split.right", { cwd = "pane" })
+k.set("prefix", "-", "split.below", { cwd = "pane" })
+```
+
+With the tmux import on, a `split-window` binding with `-c "#{pane_current_path}"` becomes the same `cwd = "pane"`.
+Any other `-c` value is not imported: the binding still works, and its new shell starts in the project root.
+
+**Where the layout is kept.** Eitri remembers each project's layouts, one for each workspace, in
+`<hash>.v2.json` under `eitri/layout/` in the state directory (see `XDG_STATE_HOME` below). The file from before
+containers, `<hash>.json`, is read once when there is no `.v2.json` yet and then left alone, byte for byte, so an
+older Eitri on the same project keeps using its own file. A `<hash>.v2.json.partial` beside it holds the original
+of a file this version could only partly use (an unknown kind of container read as a row, a module it cannot place,
+a key it did not understand), copied before the first save so nothing is lost; a `<hash>.v2.json.unusable` is a
+file it could not use at all (not JSON, another project's, no workspace it could read), set aside before a new
+one is written. Keys in the file that this version does not know are written back unchanged.
 
 ## How a launch starts
 

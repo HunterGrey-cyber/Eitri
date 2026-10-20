@@ -201,6 +201,7 @@ fn the_configuration_and_the_events_reach_the_panel_and_the_host() {
     assert_eq!(actions.take(), vec![Done::Toast(NOT_IN_THIS_WINDOW.to_string())]);
     assembly.run_prefix(
         PrefixCommand::Place {
+            cwd: eitri_core::keymap::action::SplitCwd::Start,
             module: eitri_core::layout::ModuleId::agent(),
             axis: eitri_core::layout::Axis::Row,
         },

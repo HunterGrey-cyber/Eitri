@@ -1,6 +1,8 @@
-//! The layout as data: a binary tree of splits whose leaves are modules, plus which modules
-//! are hidden, which one is zoomed, and which one last held the keys. Pure and GTK-free:
-//! `shell`'s `ModuleGrid` allocates what [`super::geometry::arrange`] computes from it.
+//! The layout as data: a tree of containers whose leaves are modules ([`super::con`]), plus
+//! which modules are hidden, which one is zoomed, and which one last held the keys.
+//! The root is always a container, even for a single module. A root holding only another container
+//! is replaced by it. Pure and GTK-free: `shell`'s `ModuleGrid` allocates what
+//! [`super::geometry::arrange`] computes from it.
 //!
 //! The invariants enforced here and tested below are:
 //! 1. each `ModuleId` appears at most once in the tree;
@@ -8,21 +10,25 @@
 //! 3. at least one leaf is visible; hiding the last visible leaf is refused;
 //! 4. zoom never changes `hidden`, so ending a zoom cannot show a module that was hidden.
 //!
-//! Every ratio is inside `MIN_RATIO..=MAX_RATIO`. `focus` and every `mru` entry are leaves.
-//! Focus never rests on a hidden module: [`Layout::set_focus`] refuses one, and
+//! Every container below the root has at least two children. Each share is inside `MIN_RATIO..=1`,
+//! and a container's shares sum to 1 ([`super::con::Con::check`]). `focus` and every `mru` entry are
+//! leaves. Focus never rests on a hidden module: [`Layout::set_focus`] refuses one, and
 //! [`super::geometry::hide`] moves focus before hiding the module that holds it.
 //!
-//! A split divides by its ratio unless it is pinned. A [`Pin`] keeps one side's length in pixels
-//! when the available space changes. Modules placed below the whole root ([`Placement::BelowRoot`],
-//! a Lua `bottom` panel) or below the editor's leaf ([`Placement::BelowEditor`], the default terminal)
-//! are pinned, including rows that are not full width. On first show, the ratio gives either module
-//! a third of the available height; [`super::geometry::settle_pins`] then freezes that length.
+//! A container divides by its children's shares unless a child is pinned. A [`super::con::Pin`]
+//! keeps that child's length in pixels when the available space changes. Modules placed below the
+//! whole root ([`Placement::BelowRoot`], a Lua `bottom` panel) or below the editor's leaf
+//! ([`Placement::BelowEditor`], the default terminal) are pinned, including rows that are not full
+//! width. On first show, the share gives either module a third of the available height;
+//! [`super::geometry::settle_pins`] then freezes that length.
 //!
 //! The mark, last preset and undo slot are runtime state; no state file reads or writes them.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
+use super::arrange::{con_has_pin_to_settle, has_step, set_step_ratio, Divider};
+use super::con::{Child, Con, ConFault, ConId, ConLayout, Node, MAX_CHILDREN};
 use super::module::{ModuleDecl, ModuleId, Placement};
 use super::verbs::Preset;
 
@@ -101,208 +107,26 @@ pub enum Branch {
     Second,
 }
 
-/// A split, named by the branches that lead to it from the root (the root split is `[]`).
-pub type SplitPath = Vec<Branch>;
-
-/// A split that keeps one side's length when the length it divides changes (this file's doc). The
-/// other side takes whatever is left, within both sides' minimum sizes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pin {
-    /// The child whose length is kept.
-    pub side: Branch,
-    /// That child's length in pixels, once the split has been on screen with both sides; `None`
-    /// until then, and the split divides by its ratio.
-    pub px: Option<i32>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Node {
-    Leaf(ModuleId),
-    Split {
-        axis: Axis,
-        /// The first child's share of the length the split divides, `MIN_RATIO..=MAX_RATIO`. A
-        /// pinned split uses it only until its pin has a length.
-        ratio: f32,
-        pin: Option<Pin>,
-        first: Box<Node>,
-        second: Box<Node>,
-    },
-}
-
-impl Node {
-    pub fn split(axis: Axis, ratio: f32, first: Node, second: Node) -> Node {
-        Node::Split {
-            axis,
-            ratio,
-            pin: None,
-            first: Box::new(first),
-            second: Box::new(second),
-        }
-    }
-
-    /// A split whose `side` keeps its length once it has one ([`Pin`]); until then it divides by
-    /// `ratio`.
-    pub fn pinned(axis: Axis, ratio: f32, side: Branch, first: Node, second: Node) -> Node {
-        Node::Split {
-            axis,
-            ratio,
-            pin: Some(Pin { side, px: None }),
-            first: Box::new(first),
-            second: Box::new(second),
-        }
-    }
-
-    /// Every leaf, in tree order (first before second, depth first): for a layout built from
-    /// splits this is reading order, which is what HINT labels in.
-    pub fn leaves(&self) -> Vec<ModuleId> {
-        let mut out = Vec::new();
-        self.collect_leaves(&mut out);
-        out
-    }
-
-    fn collect_leaves(&self, out: &mut Vec<ModuleId>) {
-        match self {
-            Node::Leaf(id) => out.push(id.clone()),
-            Node::Split { first, second, .. } => {
-                first.collect_leaves(out);
-                second.collect_leaves(out);
-            }
-        }
-    }
-
-    fn ratios(&self, out: &mut Vec<f32>) {
-        if let Node::Split {
-            ratio, first, second, ..
-        } = self
-        {
-            out.push(*ratio);
-            first.ratios(out);
-            second.ratios(out);
-        }
-    }
-
-    fn pins(&self, out: &mut Vec<Pin>) {
-        if let Node::Split { pin, first, second, .. } = self {
-            out.extend(*pin);
-            first.pins(out);
-            second.pins(out);
-        }
-    }
-
-    fn any_leaf(&self, shown: &dyn Fn(&ModuleId) -> bool) -> bool {
-        match self {
-            Node::Leaf(id) => shown(id),
-            Node::Split { first, second, .. } => first.any_leaf(shown) || second.any_leaf(shown),
-        }
-    }
-
-    /// A pinned split with no length yet and a `shown` leaf on both sides, anywhere below.
-    fn has_pin_to_settle(&self, shown: &dyn Fn(&ModuleId) -> bool) -> bool {
-        match self {
-            Node::Leaf(_) => false,
-            Node::Split { pin, first, second, .. } => {
-                (matches!(pin, Some(Pin { px: None, .. })) && first.any_leaf(shown) && second.any_leaf(shown))
-                    || first.has_pin_to_settle(shown)
-                    || second.has_pin_to_settle(shown)
-            }
-        }
-    }
-
-    fn at_path_mut(&mut self, path: &[Branch]) -> Option<&mut Node> {
-        match (path.split_first(), self) {
-            (None, node) => Some(node),
-            (Some((branch, rest)), Node::Split { first, second, .. }) => match branch {
-                Branch::First => first.at_path_mut(rest),
-                Branch::Second => second.at_path_mut(rest),
-            },
-            (Some(_), Node::Leaf(_)) => None,
-        }
-    }
-
-    /// This tree without the leaf `id`, whose sibling takes the split's place, as a hidden module's
-    /// sibling takes its space. The split goes with its ratio and its pin. `None` if `id` was the
-    /// whole tree; unchanged if `id` is not in it.
-    pub(super) fn without(self, id: &ModuleId) -> Option<Node> {
-        match self {
-            Node::Leaf(leaf) if leaf == *id => None,
-            Node::Leaf(leaf) => Some(Node::Leaf(leaf)),
-            Node::Split {
-                axis,
-                ratio,
-                pin,
-                first,
-                second,
-            } => match (first.without(id), second.without(id)) {
-                (Some(first), Some(second)) => Some(Node::Split {
-                    axis,
-                    ratio,
-                    pin,
-                    first: Box::new(first),
-                    second: Box::new(second),
-                }),
-                (Some(only), None) | (None, Some(only)) => Some(only),
-                (None, None) => None,
-            },
-        }
-    }
-
-    /// The leaves `a` and `b` exchange places; every split keeps its axis, ratio and pin.
-    pub(super) fn swap_leaves(&mut self, a: &ModuleId, b: &ModuleId) {
-        match self {
-            Node::Leaf(id) if id == a => *id = b.clone(),
-            Node::Leaf(id) if id == b => *id = a.clone(),
-            Node::Leaf(_) => {}
-            Node::Split { first, second, .. } => {
-                first.swap_leaves(a, b);
-                second.swap_leaves(a, b);
-            }
-        }
-    }
-
-    pub(super) fn map_leaves(&mut self, f: &dyn Fn(&ModuleId) -> ModuleId) {
-        match self {
-            Node::Leaf(id) => *id = f(id),
-            Node::Split { first, second, .. } => {
-                first.map_leaves(f);
-                second.map_leaves(f);
-            }
-        }
-    }
-
-    /// Replaces the leaf `id` with `with(leaf)`. `false` if there is no such leaf.
-    pub(super) fn replace_leaf(&mut self, id: &ModuleId, with: impl FnOnce(Node) -> Node) -> bool {
-        match self {
-            Node::Leaf(leaf) if leaf == id => {
-                let old = std::mem::replace(self, Node::Leaf(id.clone()));
-                *self = with(old);
-                true
-            }
-            Node::Leaf(_) => false,
-            Node::Split { first, second, .. } => {
-                if first.leaves().contains(id) {
-                    first.replace_leaf(id, with)
-                } else {
-                    second.replace_leaf(id, with)
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutError {
     /// Invariant 1.
     Duplicate(ModuleId),
     /// A module the tree does not contain.
     NotInTree(ModuleId),
+    NotAnInstance(ModuleId),
     /// A hidden module cannot hold the keys.
     Hidden(ModuleId),
     /// Invariant 3: this hide would leave nothing on screen.
     LastVisible(ModuleId),
-    /// A ratio outside `MIN_RATIO..=MAX_RATIO`, or not a number.
+    /// A ratio outside `MIN_RATIO..=MAX_RATIO`, or a share below `MIN_RATIO`, or not a number.
     Ratio(f32),
-    /// A path that does not lead to a split.
-    NotASplit(SplitPath),
+    /// A divider that is no longer on screen: its container is gone, or the children on either side
+    /// of it are not both shown any more.
+    NoSuchDivider,
+    /// A container whose shares do not add up to 1.
+    ShareSum(f32),
+    /// A container with no children, or one below the root with a single child.
+    Unnormalised,
     /// A pinned length below zero.
     Pin(i32),
     /// A module cannot be placed next to itself (tmux: "source and target panes must be different").
@@ -321,6 +145,7 @@ pub enum LayoutError {
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LayoutError::NotAnInstance(id) => write!(f, "'{id}' is not an instance; it cannot leave the layout"),
             LayoutError::NoMark => write!(f, "no module is marked"),
             LayoutError::MarkedIsTarget(id) => write!(f, "'{id}' is the marked module itself"),
             LayoutError::MarkHidden(id) => write!(f, "the marked module '{id}' is hidden"),
@@ -331,7 +156,9 @@ impl fmt::Display for LayoutError {
             LayoutError::Hidden(id) => write!(f, "module '{id}' is hidden and cannot hold the keys"),
             LayoutError::LastVisible(id) => write!(f, "'{id}' is the last module on screen"),
             LayoutError::Ratio(r) => write!(f, "ratio {r} is outside {MIN_RATIO}..={MAX_RATIO}"),
-            LayoutError::NotASplit(path) => write!(f, "{path:?} does not lead to a split"),
+            LayoutError::NoSuchDivider => write!(f, "that divider is no longer on screen"),
+            LayoutError::ShareSum(sum) => write!(f, "a container's shares add up to {sum}, not 1"),
+            LayoutError::Unnormalised => write!(f, "a container holds no children, or only one below the root"),
             LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
             LayoutError::SameModule(id) => write!(f, "'{id}' cannot be placed next to itself"),
             LayoutError::Gone(id) => write!(f, "'{id}' was closed and cannot be reopened in this window"),
@@ -351,14 +178,27 @@ pub enum ZoomChange {
     Nothing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Module,
+    Con(ConId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Zoom {
+    Module(ModuleId),
+    Con(ConId),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
-    root: Node,
+    root: Con,
     mark: Option<ModuleId>,
     last_preset: Option<Preset>,
-    undo: Option<Node>,
+    undo: Option<Con>,
     hidden: BTreeSet<ModuleId>,
-    zoomed: Option<ModuleId>,
+    zoomed: Option<Zoom>,
+    selection: Selection,
     /// The module that last held the keys (`pane_focus`'s "last pane"). What `Ctrl+a m` zooms,
     /// `Ctrl+a h/j/k/l` resizes around, and the top bar's `Ctrl+j` returns to.
     focus: ModuleId,
@@ -374,9 +214,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// A layout over `root` with nothing hidden or zoomed. Refuses a tree that breaks invariant 1,
-    /// a ratio out of range, and a `focus` that is not a leaf.
+    /// A layout over `root` with nothing hidden or zoomed. A module alone becomes a root of one child,
+    /// and a root holding only another container is that container. Refuses a tree that breaks
+    /// invariant 1, a container [`Con::check`] refuses, and a `focus` that is not a leaf.
     pub fn new(root: Node, focus: ModuleId) -> Result<Layout, LayoutError> {
+        let mut root = into_root(root, None);
         let leaves = root.leaves();
         let mut seen = BTreeSet::new();
         for id in &leaves {
@@ -384,19 +226,17 @@ impl Layout {
                 return Err(LayoutError::Duplicate(id.clone()));
             }
         }
-        let mut ratios = Vec::new();
-        root.ratios(&mut ratios);
-        if let Some(bad) = ratios.into_iter().find(|r| !(MIN_RATIO..=MAX_RATIO).contains(r)) {
-            return Err(LayoutError::Ratio(bad));
-        }
-        let mut pins = Vec::new();
-        root.pins(&mut pins);
-        if let Some(bad) = pins.into_iter().filter_map(|p| p.px).find(|px| *px < 0) {
-            return Err(LayoutError::Pin(bad));
-        }
+        root.check(true).map_err(|fault| match fault {
+            ConFault::Share(share) => LayoutError::Ratio(share),
+            ConFault::ShareSum(sum) => LayoutError::ShareSum(sum),
+            ConFault::Empty | ConFault::OneChild | ConFault::Focus(_) => LayoutError::Unnormalised,
+            ConFault::Pin(px) => LayoutError::Pin(px),
+            ConFault::TooMany(_) => LayoutError::TooMany { limit: MAX_CHILDREN },
+        })?;
         if !seen.contains(&focus) {
             return Err(LayoutError::NotInTree(focus));
         }
+        root.focus_leaf(&focus);
         let mut mru = vec![focus.clone()];
         mru.extend(leaves.into_iter().filter(|id| *id != focus));
         Ok(Layout {
@@ -406,6 +246,7 @@ impl Layout {
             undo: None,
             hidden: BTreeSet::new(),
             zoomed: None,
+            selection: Selection::Module,
             focus,
             mru,
             gone: BTreeSet::new(),
@@ -467,8 +308,28 @@ impl Layout {
         Ok(layout)
     }
 
-    pub fn root(&self) -> &Node {
+    pub fn root(&self) -> &Con {
         &self.root
+    }
+
+    /// The tree as a node, for the verbs that rebuild it: the root container, or the one module a root
+    /// of one child holds (so a split around it never nests a container of one child).
+    pub(super) fn root_node(&self) -> Node {
+        match self.root.children.as_slice() {
+            [only] if self.root.layout.axis().is_some() => only.node.clone(),
+            _ => Node::Con(self.root.clone()),
+        }
+    }
+
+    /// The root container, for the verbs that change shares, pins and layouts in place.
+    pub(super) fn root_mut(&mut self) -> &mut Con {
+        &mut self.root
+    }
+
+    /// Every module not hidden: what a change made through [`Layout::root_mut`] reads while it holds
+    /// the tree.
+    pub(super) fn shown_set(&self) -> BTreeSet<ModuleId> {
+        self.leaves().into_iter().filter(|id| self.is_shown(id)).collect()
     }
 
     pub fn hidden(&self) -> &BTreeSet<ModuleId> {
@@ -484,7 +345,56 @@ impl Layout {
     }
 
     pub fn zoomed(&self) -> Option<&ModuleId> {
+        match self.zoom() {
+            Some(Zoom::Module(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn zoom(&self) -> Option<&Zoom> {
         self.zoomed.as_ref()
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed.is_some()
+    }
+
+    pub fn selection(&self) -> Selection {
+        self.selection
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        let selected = self.selection != Selection::Module;
+        self.selection = Selection::Module;
+        selected
+    }
+
+    pub(super) fn select(&mut self, selection: Selection) {
+        self.selection = selection;
+    }
+
+    pub(super) fn selected_container(&self, target: &ModuleId) -> Option<ConId> {
+        match self.selection {
+            Selection::Module => self.container_of(target),
+            Selection::Con(id) => Some(id),
+        }
+    }
+
+    fn retain_selection(&mut self) {
+        if let Selection::Con(id) = self.selection {
+            if self.root.find(id).is_none() {
+                self.clear_selection();
+            }
+        }
+        if let Some(Zoom::Con(id)) = self.zoom() {
+            if self
+                .root
+                .find(*id)
+                .is_none_or(|c| !c.leaves().iter().any(|m| self.is_shown(m)))
+            {
+                self.unzoom();
+            }
+        }
     }
 
     pub fn focus(&self) -> &ModuleId {
@@ -546,6 +456,8 @@ impl Layout {
         self.unzoom();
         std::mem::swap(&mut old, &mut self.root);
         self.undo = Some(old);
+        self.retain_selection();
+        self.set_focus(&self.focus.clone())?;
         self.last_preset = None;
         Ok(())
     }
@@ -576,14 +488,121 @@ impl Layout {
 
     /// On screen now: shown, and not zoomed away.
     pub fn is_visible(&self, id: &ModuleId) -> bool {
-        self.is_shown(id) && self.zoomed.as_ref().is_none_or(|z| z == id)
+        if !self.is_shown(id) || self.zoom_hides(id) {
+            return false;
+        }
+        let ancestors = self.ancestors(id);
+        let start = match self.zoom() {
+            Some(Zoom::Con(z)) => ancestors
+                .iter()
+                .position(|(c, _)| c.id == *z)
+                .unwrap_or(ancestors.len()),
+            Some(Zoom::Module(_)) => return true,
+            None => 0,
+        };
+        ancestors[start..]
+            .iter()
+            .all(|(c, i)| c.layout.axis().is_some() || c.drawn(&|m| self.is_shown(m)) == Some(*i))
+    }
+
+    pub(crate) fn ancestors(&self, id: &ModuleId) -> Vec<(&Con, usize)> {
+        let mut out = Vec::new();
+        let mut c = &self.root;
+        while let Some(i) = c.children.iter().position(|ch| ch.node.leaves().contains(id)) {
+            out.push((c, i));
+            match &c.children[i].node {
+                Node::Con(inner) => c = inner,
+                Node::Leaf(_) => break,
+            }
+        }
+        out
+    }
+
+    pub fn is_tabbed_away(&self, id: &ModuleId) -> bool {
+        self.is_shown(id)
+            && self
+                .ancestors(id)
+                .iter()
+                .any(|(c, i)| c.layout.axis().is_none() && c.drawn(&|m| self.is_shown(m)) != Some(*i))
+    }
+
+    /// Whether `id` has its own entry on a tab strip that is on screen now: a tabbed or stacked
+    /// container above it is drawn, and the entry for the child holding `id` names `id` (a child that
+    /// is itself a container is named by the module it would draw). A module on an inactive tab of a
+    /// container that is itself on an inactive tab has no such entry, and neither does anything
+    /// under a zoom that leaves its strip off screen.
+    pub fn is_titled_on_strip(&self, id: &ModuleId) -> bool {
+        if !self.is_shown(id) {
+            return false;
+        }
+        let shown = |m: &ModuleId| self.is_shown(m);
+        let ancestors = self.ancestors(id);
+        let start = match self.zoom() {
+            Some(Zoom::Con(z)) => match ancestors.iter().position(|(c, _)| c.id == *z) {
+                Some(at) => at,
+                None => return false,
+            },
+            Some(Zoom::Module(_)) => return false,
+            None => 0,
+        };
+        for (c, i) in &ancestors[start..] {
+            if c.layout.axis().is_some() {
+                continue;
+            }
+            if c.children[*i].node.focused_leaf(&shown).as_ref() == Some(id) {
+                return true;
+            }
+            if c.drawn(&shown) != Some(*i) {
+                return false;
+            }
+        }
+        false
+    }
+
+    pub fn is_in_view(&self, id: &ModuleId) -> bool {
+        self.is_shown(id) && !self.is_tabbed_away(id)
+    }
+
+    pub fn container_of(&self, id: &ModuleId) -> Option<super::con::ConId> {
+        self.ancestors(id).into_iter().rev().find_map(|(c, i)| {
+            c.children
+                .iter()
+                .enumerate()
+                .any(|(j, ch)| j != i && ch.node.leaves().iter().any(|m| self.is_shown(m)))
+                .then_some(c.id)
+        })
+    }
+
+    pub fn bring_forward(&mut self, id: &ModuleId) -> bool {
+        if !self.is_shown(id) {
+            return false;
+        }
+        let old = self.root.clone();
+        self.root.focus_leaf(id);
+        if !self.is_visible(&self.focus) {
+            self.root = old;
+            return false;
+        }
+        true
+    }
+
+    pub fn tab_neighbour(&self, id: &ModuleId, forward: bool) -> Option<ModuleId> {
+        let (c, i) = self
+            .ancestors(id)
+            .into_iter()
+            .rev()
+            .find(|(c, _)| c.layout.axis().is_none())?;
+        let n = c.children.len();
+        (1..n)
+            .map(|offset| (i + if forward { offset } else { n - offset }) % n)
+            .find_map(|j| c.children[j].node.focused_leaf(&|m| self.is_shown(m)))
     }
 
     /// Whether [`super::geometry::settle_pins`] has anything to do: nothing zoomed, and a pinned
     /// split with no length yet and a shown module on each side. Cheap -- no geometry -- so the grid
     /// asks it on every allocation and arranges twice only on the one where a pin settles.
     pub fn has_pin_to_settle(&self) -> bool {
-        self.zoomed.is_none() && self.root.has_pin_to_settle(&|id| self.is_shown(id))
+        self.zoomed.is_none() && con_has_pin_to_settle(&self.root, &|id| self.is_shown(id))
     }
 
     /// Every module on screen now, in tree order.
@@ -600,6 +619,13 @@ impl Layout {
     /// away is still shown and may take the keys; the move that gives them to it unzooms.
     pub fn set_focus(&mut self, id: &ModuleId) -> Result<(), LayoutError> {
         self.can_focus(id)?;
+        self.root.focus_leaf(id);
+        if self.zoomed().is_some_and(|z| self.is_tabbed_away(z)) {
+            self.unzoom();
+        }
+        if self.focus != *id {
+            self.clear_selection();
+        }
         self.focus = id.clone();
         self.mru.retain(|m| m != id);
         self.mru.insert(0, id.clone());
@@ -621,7 +647,11 @@ impl Layout {
     /// Whether a zoom hides `id`: showing or focusing another module must end the zoom first.
     /// Returns `false` for the zoomed module itself, so focusing it with `Ctrl+a a` leaves the zoom on.
     pub fn zoom_hides(&self, id: &ModuleId) -> bool {
-        self.zoomed.as_ref().is_some_and(|z| z != id)
+        match self.zoom() {
+            Some(Zoom::Module(z)) => z != id,
+            Some(Zoom::Con(c)) => self.root.find(*c).is_none_or(|c| !c.leaves().contains(id)),
+            None => false,
+        }
     }
 
     /// `Ctrl+a m`/`z`: zoom `target`, or end the zoom if one is on (whatever `target` is, as
@@ -631,10 +661,14 @@ impl Layout {
             return ZoomChange::Unzoomed;
         }
         let shown = self.leaves().into_iter().filter(|id| self.is_shown(id)).count();
-        if !self.is_shown(target) || shown < 2 {
+        if !self.is_in_view(target) || shown < 2 {
             return ZoomChange::Nothing;
         }
-        self.zoomed = Some(target.clone());
+        self.zoomed = Some(match self.selection {
+            Selection::Module => Zoom::Module(target.clone()),
+            Selection::Con(id) if id != self.root.id => Zoom::Con(id),
+            Selection::Con(_) => return ZoomChange::Nothing,
+        });
         ZoomChange::Zoomed
     }
 
@@ -651,29 +685,36 @@ impl Layout {
         if self.gone.contains(id) {
             return Err(LayoutError::Gone(id.clone()));
         }
-        Ok(self.hidden.remove(id))
+        let changed = self.hidden.remove(id);
+        if self.zoomed().is_some_and(|z| self.is_tabbed_away(z)) {
+            self.unzoom();
+        }
+        Ok(changed)
     }
 
-    /// Sets the ratio of the split at `path`, clamped into `MIN_RATIO..=MAX_RATIO`. A NaN changes
-    /// nothing (a divider dragged by a broken pointer event must not wedge the tree). On a pinned
-    /// split it also forgets the pinned length, so the ratio is what the next allocation shows and
-    /// is then frozen again. A drag and `Ctrl+a h/j/k/l` go through
-    /// [`super::geometry::move_divider`], which keeps a pin in pixels.
-    pub fn set_ratio(&mut self, path: &[Branch], ratio: f32) -> Result<(), LayoutError> {
-        let (r, pin) = self.split_at_mut(path)?;
-        if !ratio.is_nan() {
-            *r = ratio.clamp(MIN_RATIO, MAX_RATIO);
-            if let Some(pin) = pin {
-                pin.px = None;
-            }
+    /// Sets the share of the step `divider` draws (a divider [`super::geometry::arrange`] returned for
+    /// this layout), clamped into `MIN_RATIO..=MAX_RATIO`: the child before it gets that part of what
+    /// the two children on either side of it hold. A NaN changes nothing (a divider dragged by a broken
+    /// pointer event must not wedge the tree). If a pinned length governs that step it is forgotten, so
+    /// the share is what the next allocation shows and is then frozen again. A drag and
+    /// `Ctrl+a h/j/k/l` go through [`super::geometry::move_divider`], which keeps a pin in pixels.
+    pub fn set_ratio(&mut self, divider: &Divider, ratio: f32) -> Result<(), LayoutError> {
+        let shown = self.shown_set();
+        let shown = |id: &ModuleId| shown.contains(id);
+        if !has_step(&self.root, divider, &shown) {
+            return Err(LayoutError::NoSuchDivider);
         }
+        set_step_ratio(&mut self.root, divider, ratio, &shown);
         Ok(())
     }
 
     /// Replaces the tree with `root`, for `super::ops`, which rearranges the tree and keeps the
     /// other invariants itself. `root` must hold every module this layout holds; it may hold one
-    /// more (a module placed for the first time), which joins the end of the MRU list.
+    /// more (a module placed for the first time), which joins the end of the MRU list. A module alone
+    /// becomes a root of one child that keeps the old root's id; a root holding only another container
+    /// is that container.
     pub(super) fn replace_root(&mut self, root: Node) {
+        let root = into_root(root, Some(self.root.id));
         let leaves = root.leaves();
         debug_assert!(
             self.mru.iter().all(|id| leaves.contains(id)),
@@ -688,6 +729,8 @@ impl Layout {
         if old != self.root {
             self.undo = Some(old);
         }
+        self.root.focus_leaf(&self.focus);
+        self.retain_selection();
         self.last_preset = None;
     }
 
@@ -710,15 +753,6 @@ impl Layout {
         self.hidden.remove(id)
     }
 
-    /// The ratio and the pin of the split at `path`: what the geometry turns a divider position back
-    /// into (`move_divider`, `settle_pins`).
-    pub(super) fn split_at_mut(&mut self, path: &[Branch]) -> Result<(&mut f32, &mut Option<Pin>), LayoutError> {
-        match self.root.at_path_mut(path) {
-            Some(Node::Split { ratio, pin, .. }) => Ok((ratio, pin)),
-            _ => Err(LayoutError::NotASplit(path.to_vec())),
-        }
-    }
-
     /// Hides `id`. Refuses the last shown module (invariant 3). A zoom on `id` ends with it. Does
     /// not move focus: [`super::geometry::hide`] is the entry point that does, and the only one
     /// `shell` calls. `pub(super)` so nothing outside this module can hide the focused module
@@ -734,19 +768,100 @@ impl Layout {
         if !others_shown {
             return Err(LayoutError::LastVisible(id.clone()));
         }
-        if self.zoomed.as_ref() == Some(id) {
+        if self.zoomed() == Some(id) {
             self.zoomed = None;
         }
         self.hidden.insert(id.clone());
+        self.retain_selection();
         Ok(true)
     }
+
+    /// Removes a numbered instance, giving its keys to the editor or the first shown leaf.
+    pub fn remove(&mut self, id: &ModuleId) -> Result<(), LayoutError> {
+        if id.number() == 1 {
+            return Err(LayoutError::NotAnInstance(id.clone()));
+        }
+        if !self.contains(id) {
+            return Err(LayoutError::NotInTree(id.clone()));
+        }
+        let root = self
+            .root_node()
+            .without(id)
+            .ok_or_else(|| LayoutError::LastVisible(id.clone()))?;
+        if self.zoomed() == Some(id) {
+            self.unzoom();
+        }
+        self.mru.retain(|m| m != id);
+        self.hidden.remove(id);
+        self.gone.remove(id);
+        self.retired_shown.remove(id);
+        if self.mark.as_ref() == Some(id) {
+            self.clear_mark();
+        }
+        self.replace_root(root);
+        let leaves = self.leaves();
+        if !leaves.iter().any(|m| self.is_shown(m)) {
+            let first = leaves
+                .iter()
+                .find(|m| **m == ModuleId::editor() && !self.is_gone(m))
+                .or_else(|| leaves.iter().find(|m| !self.is_gone(m)))
+                .ok_or_else(|| LayoutError::LastVisible(id.clone()))?;
+            self.hidden.remove(first);
+        }
+        if &self.focus == id {
+            let next = leaves
+                .iter()
+                .find(|m| **m == ModuleId::editor() && self.is_shown(m))
+                .or_else(|| leaves.iter().find(|m| self.is_shown(m)))
+                .expect("a remaining leaf is shown");
+            self.set_focus(next)?;
+        }
+        Ok(())
+    }
 }
+/// `node` as a root container: a module alone is a root of one child (with `keep` as its id when
+/// given, so the root a change leaves with one module is still the same container), and a root holding
+/// only another container is replaced by that container, as often as that holds.
+fn into_root(node: Node, keep: Option<super::con::ConId>) -> Con {
+    match node {
+        Node::Leaf(_) => {
+            let mut root = Con::new(ConLayout::SplitH, vec![Child::new(node, 1.0)]);
+            if let Some(id) = keep {
+                root.id = id;
+            }
+            root
+        }
+        Node::Con(mut root) => {
+            while root.children.len() == 1 && matches!(root.children[0].node, Node::Con(_)) {
+                let Some(Child {
+                    node: Node::Con(inner), ..
+                }) = root.children.pop()
+                else {
+                    unreachable!()
+                };
+                root = inner;
+            }
+            root
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::con::Pin;
+    use super::super::geometry::{arrange, Frame, Size};
     use super::*;
 
     fn lua(id: &str) -> ModuleId {
         ModuleId::lua(id)
+    }
+
+    /// The container a split of two builds, for comparing with a layout's root.
+    fn con(node: Node) -> Con {
+        match node {
+            Node::Con(c) => c,
+            Node::Leaf(id) => panic!("{id} is a module, not a container"),
+        }
     }
 
     fn decl(id: &str, placement: Placement) -> ModuleDecl {
@@ -770,12 +885,12 @@ mod tests {
         let layout = Layout::initial(&[]).unwrap();
         assert_eq!(
             layout.root(),
-            &Node::split(
+            &con(Node::split(
                 Axis::Row,
                 DEFAULT_EDITOR_SHARE,
                 Node::Leaf(ModuleId::editor()),
                 Node::Leaf(ModuleId::agent())
-            )
+            ))
         );
         assert_eq!(layout.focus(), &ModuleId::editor());
         assert_eq!(layout.mru(), &[ModuleId::editor(), ModuleId::agent()]);
@@ -800,13 +915,13 @@ mod tests {
         );
         assert_eq!(
             layout.root(),
-            &Node::pinned(
+            &con(Node::pinned(
                 Axis::Column,
                 BELOW_ROOT_SHARE,
                 Branch::Second,
                 Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, row, Node::Leaf(lua("right"))),
                 Node::Leaf(lua("below"))
-            )
+            ))
         );
         assert_eq!(
             layout.visible_leaves(),
@@ -1110,31 +1225,35 @@ mod tests {
     }
 
     #[test]
-    fn set_ratio_clamps_ignores_nan_and_refuses_a_leaf_path() {
+    fn set_ratio_clamps_ignores_nan_and_refuses_a_divider_no_longer_on_screen() {
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
         let mut layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
-        let ratio_at = |layout: &Layout, path: &[Branch]| {
-            let mut node = layout.root();
-            for branch in path {
-                node = match (node, branch) {
-                    (Node::Split { first, .. }, Branch::First) => first,
-                    (Node::Split { second, .. }, Branch::Second) => second,
-                    _ => panic!("not a split"),
-                };
-            }
-            match node {
-                Node::Split { ratio, .. } => *ratio,
-                Node::Leaf(_) => panic!("a leaf"),
-            }
+        let divider = |layout: &Layout, axis: Axis| {
+            arrange(layout, &frame)
+                .dividers
+                .into_iter()
+                .find(|d| d.axis == axis)
+                .unwrap()
         };
-        layout.set_ratio(&[Branch::First], 0.99).unwrap();
-        assert_eq!(ratio_at(&layout, &[Branch::First]), MAX_RATIO);
-        layout.set_ratio(&[], 0.0).unwrap();
-        assert_eq!(ratio_at(&layout, &[]), MIN_RATIO);
-        layout.set_ratio(&[], f32::NAN).unwrap();
-        assert_eq!(ratio_at(&layout, &[]), MIN_RATIO, "NaN changes nothing");
+        let row = divider(&layout, Axis::Row);
+        layout.set_ratio(&row, 0.99).unwrap();
+        // MAX_RATIO of the row's 1279px.
+        assert_eq!(divider(&layout, Axis::Row).first_px, 1215);
+        let column = divider(&layout, Axis::Column);
+        layout.set_ratio(&column, 0.0).unwrap();
+        // MIN_RATIO of the column's 720px.
+        assert_eq!(divider(&layout, Axis::Column).first_px, 36);
+        let before = layout.clone();
+        layout.set_ratio(&column, f32::NAN).unwrap();
+        assert_eq!(layout, before, "NaN changes nothing");
+        let mut stale = column.clone();
+        stale.con = super::super::con::ConId::fresh();
+        assert_eq!(layout.set_ratio(&stale, 0.5), Err(LayoutError::NoSuchDivider));
+        super::super::geometry::hide(&mut layout, &lua("below"), &frame).unwrap();
         assert_eq!(
-            layout.set_ratio(&[Branch::Second], 0.5),
-            Err(LayoutError::NotASplit(vec![Branch::Second]))
+            layout.set_ratio(&column, 0.5),
+            Err(LayoutError::NoSuchDivider),
+            "the bottom module is hidden: the column draws no divider"
         );
     }
 
@@ -1144,46 +1263,42 @@ mod tests {
     #[test]
     fn a_module_placed_below_the_root_is_pinned_on_its_own_side_and_nothing_else_is() {
         let layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
-        match layout.root() {
-            Node::Split { axis, ratio, pin, .. } => {
-                assert_eq!((*axis, *ratio), (Axis::Column, BELOW_ROOT_SHARE));
-                assert_eq!(
-                    *pin,
-                    Some(Pin {
-                        side: Branch::Second,
-                        px: None
-                    })
-                );
+        let root = layout.root();
+        assert_eq!(
+            (root.layout, root.children[0].share),
+            (ConLayout::SplitV, BELOW_ROOT_SHARE)
+        );
+        assert_eq!(
+            (root.children[0].pin, root.children[1].pin),
+            (None, Some(Pin { px: None }))
+        );
+        fn pins(c: &Con, out: &mut Vec<Pin>) {
+            for child in &c.children {
+                out.extend(child.pin);
+                if let Node::Con(inner) = &child.node {
+                    pins(inner, out);
+                }
             }
-            Node::Leaf(_) => panic!("a leaf"),
         }
         for placement in [Placement::RightOfRoot, Placement::InPlaceOfEditor] {
             let layout = Layout::initial(&[decl("x", placement)]).unwrap();
-            let mut pins = Vec::new();
-            layout.root().pins(&mut pins);
-            assert!(pins.is_empty(), "{placement:?}: {pins:?}");
+            let mut found = Vec::new();
+            pins(layout.root(), &mut found);
+            assert!(found.is_empty(), "{placement:?}: {found:?}");
         }
     }
 
-    /// `set_ratio` on a pinned split forgets the pinned length: the ratio is what shows next.
+    /// `set_ratio` on a step a pin governs forgets the pinned length: the share is what shows next.
     #[test]
     fn set_ratio_forgets_a_pinned_length() {
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
         let mut layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
-        *layout.split_at_mut(&[]).unwrap().1 = Some(Pin {
-            side: Branch::Second,
-            px: Some(240),
-        });
-        layout.set_ratio(&[], 0.5).unwrap();
-        assert_eq!(
-            layout.split_at_mut(&[]).unwrap(),
-            (
-                &mut 0.5,
-                &mut Some(Pin {
-                    side: Branch::Second,
-                    px: None
-                })
-            )
-        );
+        layout.root_mut().children[1].pin = Some(Pin { px: Some(240) });
+        let column = arrange(&layout, &frame).dividers[0].clone();
+        assert_eq!(column.first_px, 480, "720 less the pinned 240");
+        layout.set_ratio(&column, 0.5).unwrap();
+        assert_eq!(layout.root().children[1].pin, Some(Pin { px: None }));
+        assert_eq!(arrange(&layout, &frame).rect_of(&lua("below")).unwrap().h, 360);
     }
 
     /// Rebuilding from a state file applies every `Layout::new` check
@@ -1229,11 +1344,8 @@ mod tests {
             "everything hidden is refused through the focus: it is always a leaf"
         );
         let mut bad_pin = root();
-        if let Node::Split { pin, .. } = &mut bad_pin {
-            *pin = Some(Pin {
-                side: Branch::Second,
-                px: Some(-1),
-            });
+        if let Node::Con(c) = &mut bad_pin {
+            c.children[1].pin = Some(Pin { px: Some(-1) });
         }
         assert_eq!(
             Layout::from_parts(bad_pin, BTreeSet::new(), ModuleId::editor()),

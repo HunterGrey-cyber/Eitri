@@ -3,7 +3,8 @@
 //! while cards wait, `agent •` once a turn finished unseen.
 //!
 //! One chip per module, made once and never reparented, in a fixed order (the editor, the agent,
-//! the terminal, then each Lua panel as it registered) -- a chip does not move as the layout
+//! the terminal, `terminal 2` to `terminal 9`, then each Lua panel as it registered: [`chip_order`])
+//! -- a chip does not move as the layout
 //! changes; only whether it shows does. Each is a top-bar item (`topbar-item`), so `Ctrl+k` then
 //! `h`/`l`/`Enter` reaches it, HINT labels it (`Slot::Top`), and a click works. Activating one is
 //! `Ctrl+a <key>` for its module (`main.rs`'s `open_module`).
@@ -12,14 +13,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use eitri_core::attention::Attention;
-use eitri_core::layout::{chip_label, tray, Layout, ModuleId, ModuleKind};
+use eitri_core::layout::{chip_label, tray, ConLayout, Layout, ModuleId, ModuleKind, Selection};
 use gtk4::prelude::*;
 
-/// A module's name on its chip and in the prefix strip: the built-ins by kind, a Lua panel by the
-/// `title` it registered with (its id if it is somehow not in `lua`).
+/// A module's name on its chip and in the prefix strip: the built-ins by kind, a numbered instance by
+/// its kind and number (`terminal 2`), a Lua panel by the `title` it registered with (its id if it is
+/// somehow not in `lua`).
 pub(crate) fn module_title(id: &ModuleId, lua: &[(ModuleId, String)]) -> String {
     match id.kind() {
         ModuleKind::Editor => "editor".to_string(),
+        ModuleKind::Agent | ModuleKind::Terminal if id.number() >= 2 => {
+            format!("{} {}", id.base(), id.number())
+        }
         ModuleKind::Agent => "agent".to_string(),
         ModuleKind::Terminal => "terminal".to_string(),
         ModuleKind::Canvas => "canvas".to_string(),
@@ -29,6 +34,55 @@ pub(crate) fn module_title(id: &ModuleId, lua: &[(ModuleId, String)]) -> String 
             .map(|(_, title)| title.clone())
             .unwrap_or_else(|| id.as_str().to_string()),
     }
+}
+
+/// A strip entry's text: what the module's chip would read, so a chat on an inactive tab carries its
+/// cards' mark (`agent ⚑1`) where a hidden chat's chip would. Only the agent has an attention.
+pub(crate) fn strip_label(id: &ModuleId, title: &str, attention: Attention) -> String {
+    if id.kind() == ModuleKind::Agent {
+        chip_label(title, Some(attention))
+    } else {
+        chip_label(title, None)
+    }
+}
+
+/// What the top bar says about a selected container: `None` while the selection is the module with
+/// the keys, else `selected: <kind> (<titles>)` with the container's shown modules in tree order. The
+/// selection is shown only as this text, as the mark is: an outline would take room from the modules.
+pub(crate) fn selection_text(layout: &Layout, title: &dyn Fn(&ModuleId) -> String) -> Option<String> {
+    let Selection::Con(id) = layout.selection() else {
+        return None;
+    };
+    let con = layout.root().find(id)?;
+    let kind = match con.layout {
+        ConLayout::SplitH => "row",
+        ConLayout::SplitV => "column",
+        ConLayout::Tabbed => "tabbed",
+        ConLayout::Stacked => "stacked",
+    };
+    let titles: Vec<String> = con.leaves().iter().filter(|m| layout.is_shown(m)).map(title).collect();
+    Some(format!("selected: {kind} ({})", titles.join(", ")))
+}
+
+/// The modules the tray makes a chip for, in chip order: `modules` (the grid's hosts as added), with
+/// a chip for every possible terminal number right after the base terminal's, in number order. Every
+/// number gets its chip when the window is built, hidden until that instance exists and is off screen:
+/// the top bar's item list, which `h`/`l` step through and HINT labels, is fixed when the window is
+/// built, so a chip made later could be neither reached by key nor labelled.
+pub(crate) fn chip_order(modules: &[ModuleId]) -> Vec<ModuleId> {
+    let numbered =
+        (2..=eitri_core::layout::module::MAX_INSTANCE).filter_map(|n| ModuleId::instance(ModuleKind::Terminal, n).ok());
+    let mut order = Vec::new();
+    for id in modules {
+        if id.kind() == ModuleKind::Terminal && id.number() >= 2 {
+            continue;
+        }
+        order.push(id.clone());
+        if *id == ModuleId::terminal() {
+            order.extend(numbered.clone());
+        }
+    }
+    order
 }
 
 /// One chip's state: `None` when its module is on screen (no chip), else its text and whether it
@@ -173,6 +227,36 @@ mod tests {
     }
 
     #[test]
+    fn an_instances_title_carries_its_number() {
+        let title = |text: &str| module_title(&ModuleId::parse(text).unwrap(), &[]);
+        assert_eq!(title("terminal#2"), "terminal 2");
+        assert_eq!(title("terminal#9"), "terminal 9");
+        assert_eq!(title("agent#3"), "agent 3");
+        assert_eq!(title("terminal"), "terminal", "the base keeps its plain name");
+        assert_eq!(title("agent"), "agent");
+    }
+
+    #[test]
+    fn instance_chips_follow_the_base_terminal_in_number_order() {
+        let modules = [
+            ModuleId::editor(),
+            ModuleId::agent(),
+            ModuleId::terminal(),
+            ModuleId::parse("terminal#3").unwrap(),
+            ModuleId::lua("notes"),
+        ];
+        let order: Vec<String> = chip_order(&modules).iter().map(ToString::to_string).collect();
+        let mut expected = vec!["editor", "agent", "terminal"];
+        let numbered: Vec<String> = (2..=9).map(|n| format!("terminal#{n}")).collect();
+        expected.extend(numbered.iter().map(String::as_str));
+        expected.push("lua:notes");
+        assert_eq!(
+            order, expected,
+            "each number once, after the base, before the Lua panels"
+        );
+    }
+
+    #[test]
     fn a_chip_shows_only_off_screen_and_only_the_agents_asks() {
         let off = [ModuleId::agent(), ModuleId::terminal()];
         let two = Attention {
@@ -194,6 +278,74 @@ mod tests {
             chip_state(&ModuleId::agent(), &off, "agent", Attention::default()),
             Some(("agent".to_string(), false))
         );
+    }
+
+    #[test]
+    fn the_selection_reads_its_kind_and_modules() {
+        use eitri_core::layout::{focus_parent, Axis, Node};
+        let title = |id: &ModuleId| module_title(id, &[]);
+        let mut layout = Layout::new(
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::split(
+                    Axis::Column,
+                    0.5,
+                    Node::Leaf(ModuleId::editor()),
+                    Node::Leaf(ModuleId::terminal()),
+                ),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        assert_eq!(
+            selection_text(&layout, &title),
+            None,
+            "no selection: the module with the keys"
+        );
+        assert!(focus_parent(&mut layout));
+        assert_eq!(
+            selection_text(&layout, &title),
+            Some("selected: column (editor, terminal)".to_string())
+        );
+        assert!(focus_parent(&mut layout));
+        assert_eq!(
+            selection_text(&layout, &title),
+            Some("selected: row (editor, terminal, agent)".to_string())
+        );
+        layout.clear_selection();
+        assert_eq!(selection_text(&layout, &title), None);
+    }
+
+    #[test]
+    fn a_strip_entry_reads_like_a_chip() {
+        let one = Attention {
+            pending: 1,
+            ..Default::default()
+        };
+        assert_eq!(strip_label(&ModuleId::agent(), "agent", one), "agent \u{2691}1");
+        assert_eq!(strip_label(&ModuleId::terminal(), "terminal", one), "terminal");
+        assert_eq!(strip_label(&ModuleId::editor(), "editor", one), "editor");
+    }
+
+    /// The window relabels the strips on every change of attention (`refresh_strips` beside the
+    /// tray's refresh); what each refresh shows is this function over the attention it is given.
+    #[test]
+    fn a_card_arriving_relabels_the_strip_entry() {
+        let none = Attention::default();
+        let one = Attention {
+            pending: 1,
+            arrived: 1,
+            ..Default::default()
+        };
+        let before = strip_label(&ModuleId::agent(), "agent", none);
+        let after = strip_label(&ModuleId::agent(), "agent", one);
+        assert_eq!(before, "agent");
+        assert_eq!(after, "agent \u{2691}1");
+        assert_ne!(before, after, "the entry's text changes with the card");
+        let cleared = strip_label(&ModuleId::agent(), "agent", none);
+        assert_eq!(cleared, "agent", "and back when it is answered");
     }
 
     /// A refresh with nothing new touches no chip: a divider drag refreshes the tray on every motion

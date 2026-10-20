@@ -130,14 +130,16 @@ pub enum NextPrevTarget {
     CanvasRevisions,
     /// The terminal's terminals, once there is more than one.
     Terminals,
+    Siblings,
     /// One terminal: the key is taken and does nothing.
     Swallowed,
 }
 
 /// `keys_in` is the kind of the module holding the keys, `None` for the top bar.
-pub fn next_prev_target(keys_in: Option<ModuleKind>, terminals: usize) -> NextPrevTarget {
+pub fn next_prev_target(keys_in: Option<ModuleKind>, terminals: usize, in_tabs: bool) -> NextPrevTarget {
     match keys_in {
         Some(ModuleKind::Canvas) => NextPrevTarget::CanvasRevisions,
+        Some(ModuleKind::Terminal) if in_tabs => NextPrevTarget::Siblings,
         Some(ModuleKind::Terminal) if terminals > 1 => NextPrevTarget::Terminals,
         Some(ModuleKind::Terminal) => NextPrevTarget::Swallowed,
         Some(ModuleKind::Agent) | Some(ModuleKind::Editor) | Some(ModuleKind::LuaWebview) | None => {
@@ -146,10 +148,10 @@ pub fn next_prev_target(keys_in: Option<ModuleKind>, terminals: usize) -> NextPr
     }
 }
 
-/// A tab changed from outside the chat: show a hidden chat where it was, keys unmoved, as
+/// A tab changed from outside the chat: reveal a hidden or inactive chat, keys unmoved, as
 /// `modules.chat.on_permission = "reveal"` does. Under a zoom only the tray chip changes.
 pub fn reveal_on_switch(place: AgentPlace) -> bool {
-    place == AgentPlace::Hidden
+    matches!(place, AgentPlace::Hidden | AgentPlace::TabbedAway)
 }
 
 /// What closing one tab involves.
@@ -314,6 +316,8 @@ pub fn newest_card(tabs: &[(TabId, Option<u64>)]) -> Option<TabId> {
 pub enum TabVerb {
     New,
     Step(i32),
+    Sibling(i32),
+    Terminal(i32),
     Last,
     Select(u16),
     Rename,
@@ -336,7 +340,7 @@ pub struct TabVerbPlan {
     pub takes_the_keys: bool,
 }
 
-pub fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: usize) -> TabVerbPlan {
+pub fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: usize, in_tabs: bool) -> TabVerbPlan {
     let (verb, takes_the_keys) = match action {
         TabAction::New => (TabVerb::New, true),
         TabAction::Rename => (TabVerb::Rename, true),
@@ -352,10 +356,12 @@ pub fn plan(action: TabAction, keys_in: Option<ModuleKind>, terminals: usize) ->
         TabAction::Select(n) => (TabVerb::Select(u16::from(n)), false),
         TabAction::Next | TabAction::Prev => {
             let delta = if action == TabAction::Next { 1 } else { -1 };
-            let verb = match next_prev_target(keys_in, terminals) {
+            let verb = match next_prev_target(keys_in, terminals, in_tabs) {
                 NextPrevTarget::ChatTabs => TabVerb::Step(delta),
                 NextPrevTarget::CanvasRevisions => TabVerb::Flash,
-                NextPrevTarget::Terminals | NextPrevTarget::Swallowed => TabVerb::Nothing,
+                NextPrevTarget::Siblings => TabVerb::Sibling(delta),
+                NextPrevTarget::Terminals => TabVerb::Terminal(delta),
+                NextPrevTarget::Swallowed => TabVerb::Nothing,
             };
             (verb, false)
         }
@@ -505,21 +511,21 @@ mod tests {
     #[test]
     fn n_and_p_act_on_what_the_module_with_the_keys_owns() {
         use NextPrevTarget::*;
-        assert_eq!(next_prev_target(Some(ModuleKind::Agent), 1), ChatTabs);
+        assert_eq!(next_prev_target(Some(ModuleKind::Agent), 1, false), ChatTabs);
         assert_eq!(
-            next_prev_target(Some(ModuleKind::Editor), 1),
+            next_prev_target(Some(ModuleKind::Editor), 1, false),
             ChatTabs,
             "from the editor, focus unmoved"
         );
-        assert_eq!(next_prev_target(Some(ModuleKind::LuaWebview), 1), ChatTabs);
-        assert_eq!(next_prev_target(None, 1), ChatTabs, "the top bar holds the keys");
-        assert_eq!(next_prev_target(Some(ModuleKind::Canvas), 1), CanvasRevisions);
+        assert_eq!(next_prev_target(Some(ModuleKind::LuaWebview), 1, false), ChatTabs);
+        assert_eq!(next_prev_target(None, 1, false), ChatTabs, "the top bar holds the keys");
+        assert_eq!(next_prev_target(Some(ModuleKind::Canvas), 1, false), CanvasRevisions);
         assert_eq!(
-            next_prev_target(Some(ModuleKind::Terminal), 1),
+            next_prev_target(Some(ModuleKind::Terminal), 1, false),
             Swallowed,
             "one terminal: swallowed"
         );
-        assert_eq!(next_prev_target(Some(ModuleKind::Terminal), 2), Terminals);
+        assert_eq!(next_prev_target(Some(ModuleKind::Terminal), 2, false), Terminals);
     }
 
     #[test]
@@ -779,27 +785,30 @@ mod tests {
             TabAction::Choose,
             TabAction::Info,
         ] {
-            assert!(plan(action, Some(ModuleKind::Editor), 1).takes_the_keys, "{action:?}");
+            assert!(
+                plan(action, Some(ModuleKind::Editor), 1, false).takes_the_keys,
+                "{action:?}"
+            );
         }
         assert_eq!(
-            plan(TabAction::CloseOthers, Some(ModuleKind::Editor), 1).verb,
+            plan(TabAction::CloseOthers, Some(ModuleKind::Editor), 1, false).verb,
             TabVerb::CloseOthers,
             "<leader>bo closes the other tabs"
         );
         assert_eq!(
-            plan(TabAction::New, Some(ModuleKind::Editor), 1).verb,
+            plan(TabAction::New, Some(ModuleKind::Editor), 1, false).verb,
             TabVerb::New,
             "a new tab is useless without the keys"
         );
         for action in [TabAction::Next, TabAction::Prev, TabAction::Last, TabAction::Select(2)] {
             assert!(
-                !plan(action, Some(ModuleKind::Editor), 1).takes_the_keys,
+                !plan(action, Some(ModuleKind::Editor), 1, false).takes_the_keys,
                 "switching never moves the keys: {action:?}"
             );
         }
-        assert_eq!(plan(TabAction::Select(2), None, 1).verb, TabVerb::Select(2));
+        assert_eq!(plan(TabAction::Select(2), None, 1, false).verb, TabVerb::Select(2));
         assert_eq!(
-            plan(TabAction::Last, Some(ModuleKind::Terminal), 1).verb,
+            plan(TabAction::Last, Some(ModuleKind::Terminal), 1, false).verb,
             TabVerb::Last,
             "a verb from anywhere"
         );
@@ -807,23 +816,26 @@ mod tests {
 
     #[test]
     fn n_and_p_follow_the_module_with_the_keys() {
-        assert_eq!(plan(TabAction::Next, Some(ModuleKind::Agent), 1).verb, TabVerb::Step(1));
         assert_eq!(
-            plan(TabAction::Prev, Some(ModuleKind::Editor), 1).verb,
+            plan(TabAction::Next, Some(ModuleKind::Agent), 1, false).verb,
+            TabVerb::Step(1)
+        );
+        assert_eq!(
+            plan(TabAction::Prev, Some(ModuleKind::Editor), 1, false).verb,
             TabVerb::Step(-1)
         );
         assert_eq!(
-            plan(TabAction::Next, None, 1).verb,
+            plan(TabAction::Next, None, 1, false).verb,
             TabVerb::Step(1),
             "from the top bar"
         );
         assert_eq!(
-            plan(TabAction::Next, Some(ModuleKind::Canvas), 1).verb,
+            plan(TabAction::Next, Some(ModuleKind::Canvas), 1, false).verb,
             TabVerb::Flash,
             "no canvas yet"
         );
         assert_eq!(
-            plan(TabAction::Next, Some(ModuleKind::Terminal), 1).verb,
+            plan(TabAction::Next, Some(ModuleKind::Terminal), 1, false).verb,
             TabVerb::Nothing,
             "swallowed"
         );
@@ -851,5 +863,22 @@ mod tests {
         let shown = record_stamp("1791522750000");
         assert!(shown.starts_with("2026-10-0"), "{shown}");
         assert_eq!(shown.len(), "2026-10-09 05:12".len());
+    }
+
+    #[test]
+    fn prefix_n_and_p_in_a_terminal_step_tabs_then_terminals() {
+        use NextPrevTarget::*;
+        assert_eq!(next_prev_target(Some(ModuleKind::Terminal), 1, true), Siblings);
+        assert_eq!(next_prev_target(Some(ModuleKind::Terminal), 2, false), Terminals);
+        assert_eq!(next_prev_target(Some(ModuleKind::Terminal), 1, false), Swallowed);
+        assert_eq!(next_prev_target(Some(ModuleKind::Agent), 3, true), ChatTabs);
+        assert_eq!(
+            plan(TabAction::Next, Some(ModuleKind::Terminal), 2, false).verb,
+            TabVerb::Terminal(1)
+        );
+        assert_eq!(
+            plan(TabAction::Prev, Some(ModuleKind::Terminal), 1, true).verb,
+            TabVerb::Sibling(-1)
+        );
     }
 }

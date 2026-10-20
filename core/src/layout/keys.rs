@@ -231,6 +231,58 @@ pub fn key_action(layout: &Layout, id: &ModuleId, has_keys: bool) -> KeyAction {
     }
 }
 
+/// A kind's focused instance, then its most recently used instance, then its base id.
+pub fn choose_instance(layout: &Layout, kind: ModuleKind) -> ModuleId {
+    if layout.focus().kind() == kind {
+        return layout.focus().clone();
+    }
+    if let Some(id) = layout.mru().iter().find(|id| id.kind() == kind) {
+        return id.clone();
+    }
+    match kind {
+        ModuleKind::Editor => ModuleId::editor(),
+        ModuleKind::Agent => ModuleId::agent(),
+        ModuleKind::Terminal => ModuleId::terminal(),
+        ModuleKind::Canvas => ModuleId::parse("canvas").expect("a built-in id"),
+        ModuleKind::LuaWebview => unreachable!("a Lua panel is addressed by its own id"),
+    }
+}
+
+/// Base ids of kinds with instances follow their most recently used instance.
+pub fn module_target(layout: &Layout, id: &ModuleId) -> ModuleId {
+    if id.number() == 1 && id.kind().has_instances() {
+        choose_instance(layout, id.kind())
+    } else {
+        id.clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitChoice {
+    NewInstance(ModuleKind),
+    Existing(ModuleId),
+}
+
+pub fn split_choice(layout: &Layout, named: &ModuleId) -> SplitChoice {
+    if named.kind().has_instances() && layout.focus().kind() == named.kind() {
+        SplitChoice::NewInstance(named.kind())
+    } else {
+        SplitChoice::Existing(module_target(layout, named))
+    }
+}
+
+fn instance_count(layout: &Layout, id: &ModuleId) -> usize {
+    if id.kind().has_instances() {
+        layout.leaves().iter().filter(|m| m.kind() == id.kind()).count()
+    } else {
+        1
+    }
+}
+
+fn new_terminal(layout: &Layout, id: &ModuleId) -> bool {
+    id.kind() == ModuleKind::Terminal && matches!(split_choice(layout, id), SplitChoice::NewInstance(_))
+}
+
 /// One module key in the prefix strip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripEntry {
@@ -239,6 +291,8 @@ pub struct StripEntry {
     pub module: ModuleId,
     /// Hidden, or never placed: the strip dims it.
     pub dimmed: bool,
+    pub count: usize,
+    pub new_instance: bool,
 }
 
 /// What the top bar lists after a split key: every module key, the built-ins first, a hidden module
@@ -250,6 +304,8 @@ pub fn strip(keys: &ModuleKeys, layout: &Layout) -> Vec<StripEntry> {
             key: key.to_string(),
             module: module.clone(),
             dimmed: !layout.is_shown(module),
+            count: instance_count(layout, module),
+            new_instance: new_terminal(layout, module),
         })
         .collect()
 }
@@ -275,6 +331,8 @@ pub fn strip_direct(keys: &ModuleKeys, keymap: &Keymap, layout: &Layout) -> Vec<
                 key: direct.join(" "),
                 module: module.clone(),
                 dimmed: !layout.is_shown(module),
+                count: instance_count(layout, module),
+                new_instance: new_terminal(layout, module),
             })
         })
         .collect()
@@ -580,5 +638,77 @@ mod tests {
         );
         let after_split: Vec<String> = strip(&keys, &layout).into_iter().map(|e| e.key).collect();
         assert_eq!(after_split, ["e", "a", "t"]);
+    }
+
+    fn instances() -> Layout {
+        Layout::initial(&["terminal", "terminal#2", "terminal#3"].map(|name| ModuleDecl {
+            id: ModuleId::parse(name).unwrap(),
+            placement: Placement::BelowEditor,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_key_of_a_kind_with_instances_picks_the_instance() {
+        let mut layout = instances();
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let t3 = ModuleId::parse("terminal#3").unwrap();
+        layout.set_focus(&t2).unwrap();
+        assert_eq!(choose_instance(&layout, ModuleKind::Terminal), t2);
+        layout.set_focus(&t3).unwrap();
+        layout.set_focus(&ModuleId::editor()).unwrap();
+        assert_eq!(choose_instance(&layout, ModuleKind::Terminal), t3);
+        assert_eq!(
+            choose_instance(&Layout::initial(&[]).unwrap(), ModuleKind::Terminal),
+            ModuleId::terminal()
+        );
+    }
+
+    #[test]
+    fn a_numbered_module_action_addresses_its_own_instance() {
+        let mut layout = instances();
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let t3 = ModuleId::parse("terminal#3").unwrap();
+        layout.set_focus(&t3).unwrap();
+        assert_eq!(module_target(&layout, &t2), t2);
+        assert_eq!(module_target(&layout, &ModuleId::terminal()), t3);
+        assert_eq!(module_target(&layout, &ModuleId::editor()), ModuleId::editor());
+    }
+
+    #[test]
+    fn a_split_key_from_inside_a_terminal_opens_a_new_one() {
+        let mut layout = instances();
+        layout.set_focus(&ModuleId::terminal()).unwrap();
+        assert_eq!(
+            split_choice(&layout, &ModuleId::terminal()),
+            SplitChoice::NewInstance(ModuleKind::Terminal)
+        );
+        layout.set_focus(&ModuleId::editor()).unwrap();
+        assert_eq!(
+            split_choice(&layout, &ModuleId::terminal()),
+            SplitChoice::Existing(choose_instance(&layout, ModuleKind::Terminal))
+        );
+        assert_eq!(
+            split_choice(&layout, &ModuleId::editor()),
+            SplitChoice::Existing(ModuleId::editor())
+        );
+    }
+
+    #[test]
+    fn the_prefix_strip_counts_instances_and_offers_a_new_terminal() {
+        let mut layout = instances();
+        let map = Keymap::defaults();
+        let keys = ModuleKeys::build(&[], &map).unwrap();
+        for focused in [ModuleId::terminal(), ModuleId::editor()] {
+            layout.set_focus(&focused).unwrap();
+            for entries in [strip(&keys, &layout), strip_direct(&keys, &map, &layout)] {
+                let terminal = entries.iter().find(|e| e.module == ModuleId::terminal()).unwrap();
+                assert_eq!(terminal.count, 3);
+                assert_eq!(terminal.new_instance, focused == ModuleId::terminal());
+                let editor = entries.iter().find(|e| e.module == ModuleId::editor()).unwrap();
+                assert_eq!(editor.count, 1);
+                assert!(!editor.new_instance);
+            }
+        }
     }
 }

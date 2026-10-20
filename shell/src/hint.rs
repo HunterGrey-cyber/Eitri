@@ -158,6 +158,8 @@ impl Held {
 
 struct Active {
     session_id: u64,
+    /// The strip entries as they were when the HINT started: their labels sit where these were.
+    strips: Vec<(ModuleId, gtk4::Widget)>,
     order: TargetOrder,
     /// `None` while waiting for the panel's answer.
     plan: Option<LabelPlan>,
@@ -185,6 +187,10 @@ pub(crate) struct HintCoordinator {
     modules: ModuleHosts,
     /// Lands on a module the way that module takes focus (the editor tells the input method).
     focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
+    /// [`HintWidgets::strips`].
+    strips: StripEntries,
+    /// [`HintWidgets::activate_strip`].
+    activate_strip: Rc<dyn Fn(&ModuleId)>,
     agent: AgentPanelHandle,
     next_session: Cell<u64>,
     active: RefCell<Option<Active>>,
@@ -211,7 +217,28 @@ pub(crate) struct HintWidgets {
     /// headless would notice.
     pub(crate) modules: ModuleHosts,
     pub(crate) focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
+    /// Every container strip's entries that name a module now, with their label widgets
+    /// (`ModuleGrid::strip_entries`): labelled after every module, so the modules keep the labels
+    /// they had before strips existed.
+    pub(crate) strips: StripEntries,
+    /// What landing on a strip entry does: the same as a click on it.
+    pub(crate) activate_strip: Rc<dyn Fn(&ModuleId)>,
     pub(crate) agent: AgentPanelHandle,
+}
+
+/// Strip entries with their modules, read when a HINT starts.
+pub(crate) type StripEntries = Rc<dyn Fn() -> Vec<(ModuleId, gtk4::Widget)>>;
+
+/// `order` with the strip entries' slots moved behind every other target. The entries are passed
+/// to the plan as top-bar slots numbered from `top_items` on (`Slot::Top(top_items + k)` is the
+/// k-th entry), which `order_targets` puts first; their labels go last instead, so a window with no
+/// tabbed container is labelled exactly as before and a strip never takes a module's label.
+pub(crate) fn strips_after_modules(mut order: TargetOrder, top_items: usize) -> TargetOrder {
+    let is_strip = |slot: &Slot| matches!(slot, Slot::Top(i) if *i >= top_items);
+    let strips: Vec<Slot> = order.before.iter().filter(|s| is_strip(s)).cloned().collect();
+    order.before.retain(|s| !is_strip(s));
+    order.after.extend(strips);
+    order
 }
 
 /// Whether the widget is mapped and has a non-zero width and height.
@@ -231,6 +258,8 @@ impl HintCoordinator {
             agent_widget: w.agent_widget,
             modules: w.modules,
             focus_module: w.focus_module,
+            strips: w.strips,
+            activate_strip: w.activate_strip,
             agent: w.agent,
             next_session: Cell::new(0),
             active: RefCell::new(None),
@@ -260,9 +289,15 @@ impl HintCoordinator {
         self.active.borrow().as_ref().map(|a| a.session_id)
     }
 
-    fn layout(&self) -> WindowLayout {
+    /// The window as HINT plans it; `strips`' entries follow the top bar's items as top slots.
+    fn layout(&self, strips: &[(ModuleId, gtk4::Widget)]) -> WindowLayout {
         WindowLayout {
-            top_visible: self.top_items.iter().map(visible).collect(),
+            top_visible: self
+                .top_items
+                .iter()
+                .chain(strips.iter().map(|(_, w)| w))
+                .map(visible)
+                .collect(),
             modules: (self.modules)()
                 .iter()
                 .map(|(id, host)| (id.clone(), visible(host)))
@@ -270,8 +305,15 @@ impl HintCoordinator {
         }
     }
 
+    /// The strip entry a top slot past the top bar's items stands for, in the HINT that is up.
+    fn strip_entry(&self, i: usize) -> Option<(ModuleId, gtk4::Widget)> {
+        let k = i.checked_sub(self.top_items.len())?;
+        self.active.borrow().as_ref()?.strips.get(k).cloned()
+    }
+
     fn slot_widget(&self, slot: &Slot) -> Option<gtk4::Widget> {
         match slot {
+            Slot::Top(i) if *i >= self.top_items.len() => self.strip_entry(*i).map(|(_, w)| w),
             Slot::Top(i) => self.top_items.get(*i).cloned(),
             Slot::Module(id) => (self.modules)()
                 .into_iter()
@@ -313,7 +355,8 @@ impl HintCoordinator {
         // such report could not be explained from the log at all. One line each way now.
         println!("[hint] session {session_id} started (held={held:?})");
 
-        let order = order_targets(&self.layout());
+        let strips = (self.strips)();
+        let order = strips_after_modules(order_targets(&self.layout(&strips)), self.top_items.len());
         let panel_asked = order.ask_panel;
         let restore_focus = gtk4::prelude::GtkWindowExt::focus(&self.window);
 
@@ -414,6 +457,7 @@ impl HintCoordinator {
 
         *self.active.borrow_mut() = Some(Active {
             session_id,
+            strips,
             order,
             plan: None,
             session: None,
@@ -636,6 +680,12 @@ impl HintCoordinator {
                     Slot::Module(id) => {
                         (self.focus_module)(id);
                     }
+                    // A strip entry: as if it were clicked, which chooses its tab.
+                    Slot::Top(i) if *i >= self.top_items.len() => {
+                        if let Some((id, _)) = self.strip_entry(*i) {
+                            (self.activate_strip)(&id);
+                        }
+                    }
                     Slot::Top(_) => {
                         if let Some(w) = self.slot_widget(&slot) {
                             w.grab_focus();
@@ -817,6 +867,51 @@ mod tests {
         assert_eq!(held, Held::Key(A));
         assert!(!held.press(F, Key::f));
         assert_eq!(held, Held::Key(F));
+    }
+
+    /// Strip entries are labelled after every module (and after the chat's own labels): the
+    /// modules keep the labels they had before a container was tabbed. Landing on one is the same
+    /// slot it was planned as, so the entry is found by its place among the strips.
+    #[test]
+    fn strip_entries_are_labelled_after_the_modules() {
+        // Two top-bar items, then two strip entries (the second not on screen).
+        let layout = WindowLayout {
+            top_visible: vec![true, true, true, false],
+            modules: vec![(ModuleId::editor(), true), (ModuleId::terminal(), true)],
+        };
+        let order = strips_after_modules(order_targets(&layout), 2);
+        assert_eq!(
+            order.before,
+            [
+                Slot::Top(0),
+                Slot::Top(1),
+                Slot::Module(ModuleId::editor()),
+                Slot::Module(ModuleId::terminal())
+            ]
+        );
+        assert_eq!(order.after, [Slot::Top(2)], "the entry on screen, last");
+        let plan = order.plan(0);
+        assert_eq!(order.landing(&plan, 4), Some(Landing::Gtk(Slot::Top(2))));
+
+        // With the chat on screen its labels sit between; the strips still come after it all.
+        let layout = WindowLayout {
+            top_visible: vec![true, true],
+            modules: vec![
+                (ModuleId::editor(), true),
+                (ModuleId::agent(), true),
+                (ModuleId::terminal(), true),
+            ],
+        };
+        let order = strips_after_modules(order_targets(&layout), 1);
+        assert_eq!(order.before, [Slot::Top(0), Slot::Module(ModuleId::editor())]);
+        assert_eq!(order.after, [Slot::Module(ModuleId::terminal()), Slot::Top(1)]);
+
+        // No strips: the order is exactly what it was.
+        let layout = WindowLayout {
+            top_visible: vec![true],
+            modules: vec![(ModuleId::editor(), true)],
+        };
+        assert_eq!(strips_after_modules(order_targets(&layout), 1), order_targets(&layout));
     }
 
     /// `prefix f`: the prefix saw the press, so the HINT starts already holding that key by

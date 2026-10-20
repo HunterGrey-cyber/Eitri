@@ -67,6 +67,12 @@ fn named(key: Key) -> Option<KeyName> {
     })
 }
 
+/// Whether a press is the prefix's own `Esc`: `Esc` while the prefix waited for a key, whatever it
+/// waited for (a command, a module after a split key, a digit).
+pub(crate) fn prefix_escape(escape: bool, was: Waiting) -> bool {
+    escape && was != Waiting::No
+}
+
 pub(crate) fn classify(key: Key, state: ModifierType) -> Press {
     if MODIFIER_KEYS.contains(&key) {
         return Press::Modifier;
@@ -104,6 +110,8 @@ pub(crate) fn classify(key: Key, state: ModifierType) -> Press {
 /// that ran it (HINT needs it: that key is still down); `on_waiting` hears every change of
 /// `waiting()` made here, including one `on_command` made through the returned prefix. A change
 /// made later, from outside (a timer ending the digit wait), is the caller's to announce.
+/// `on_escape` runs when `Esc` reaches a prefix that is waiting for a key: the prefix's own `Esc`,
+/// which disarms it. A bare `Esc` belongs to the module with the keys and never reaches it.
 /// Cancelled by the window losing activation and by any click.
 pub(crate) fn install(
     window: &gtk4::ApplicationWindow,
@@ -111,6 +119,7 @@ pub(crate) fn install(
     module_keys: Rc<ModuleKeys>,
     on_command: impl Fn(PrefixCommand, u32) + 'static,
     on_waiting: impl Fn(Waiting) + 'static,
+    on_escape: impl Fn() + 'static,
 ) -> Rc<RefCell<Prefix>> {
     let prefix = Rc::new(RefCell::new(Prefix::new(keymap, module_keys)));
     let on_waiting: Rc<dyn Fn(Waiting)> = Rc::new(on_waiting);
@@ -121,10 +130,12 @@ pub(crate) fn install(
         let prefix = prefix.clone();
         let on_waiting = on_waiting.clone();
         keys.connect_key_pressed(move |_, key, keycode, state| {
+            let press = classify(key, state);
+            let escape = press == Press::Escape;
             let (outcome, was, now) = {
                 let mut p = prefix.borrow_mut();
                 let was = p.waiting();
-                let outcome = p.press(classify(key, state), keycode, Instant::now());
+                let outcome = p.press(press, keycode, Instant::now());
                 (outcome, was, p.waiting())
             };
             if was != now {
@@ -132,6 +143,9 @@ pub(crate) fn install(
                 // window refusing input.
                 println!("[prefix] armed={} waiting={now:?}", now != Waiting::No);
                 on_waiting(now);
+            }
+            if prefix_escape(escape, was) {
+                on_escape();
             }
             match outcome {
                 Outcome::Pass => glib::Propagation::Proceed,
@@ -215,6 +229,34 @@ mod tests {
         assert_eq!(p.press(key("C-b"), PREFIX, t), Outcome::Swallow);
         p.release(PREFIX);
         p
+    }
+
+    /// `prefix Esc` is the prefix's own key, told to the window (which resets a container selection
+    /// with it); a bare `Esc` passes to the module with the keys and is not.
+    #[test]
+    fn only_the_prefixs_own_escape_is_told() {
+        let t = Instant::now();
+        let mut p = armed(defaults(), t);
+        let was = p.waiting();
+        assert_eq!(
+            p.press(Press::Escape, K1, t),
+            Outcome::Swallow,
+            "the armed prefix takes it"
+        );
+        assert!(prefix_escape(true, was));
+        assert_eq!(p.waiting(), Waiting::No);
+        p.release(K1);
+        let was = p.waiting();
+        assert_eq!(
+            p.press(Press::Escape, K1, t),
+            Outcome::Pass,
+            "a bare Esc is the module's"
+        );
+        assert!(!prefix_escape(true, was));
+        assert!(
+            !prefix_escape(false, Waiting::Command),
+            "another key while armed is not Esc"
+        );
     }
 
     #[test]
@@ -325,5 +367,14 @@ mod tests {
             Outcome::Swallow,
             "S-Up is unbound, never select.up"
         );
+    }
+
+    #[test]
+    fn alt_shift_h_and_alt_return_read_as_tmux_names() {
+        assert_eq!(
+            classify(Key::H, ModifierType::ALT_MASK | ModifierType::SHIFT_MASK),
+            key("M-H")
+        );
+        assert_eq!(classify(Key::Return, ModifierType::ALT_MASK), key("M-Enter"));
     }
 }

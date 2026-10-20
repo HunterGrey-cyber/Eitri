@@ -1,18 +1,21 @@
-//! The top bar's tray: one chip for each module that is not on screen, hidden
-//! or zoomed away, so nothing that is running is out of reach. A chip is a top-bar item, so
-//! `Ctrl+k` then `h`/`l`/`Enter` reaches it, HINT labels it, and a click works.
+//! The top bar's tray: chips for modules not on screen. A module whose own title is on a strip on
+//! screen needs no chip; one tabbed away with no such title (an inactive tab inside a container that
+//! is itself an inactive tab, or under a zoom) gets one, or nothing would show that it is there --
+//! nor carry the chat's waiting cards. A chip is a top-bar item, so `Ctrl+k` then `h`/`l`/`Enter`
+//! reaches it, HINT labels it, and a click works.
 
 use super::module::ModuleId;
 use super::tree::Layout;
 use crate::attention::{AgentPlace, Attention};
 
-/// Every module that is not on screen, in tree order: the tray's chips, left to right. A module gone
-/// for the rest of the window (`super::kill`) has none: nothing would bring it back.
+/// Every module not on screen, in tree order, except one titled on a strip that is
+/// ([`Layout::is_titled_on_strip`]). A module gone for the rest of the window has no chip because
+/// nothing would bring it back.
 pub fn tray(layout: &Layout) -> Vec<ModuleId> {
     layout
         .leaves()
         .into_iter()
-        .filter(|id| !layout.is_visible(id) && !layout.is_gone(id))
+        .filter(|id| !layout.is_visible(id) && !layout.is_gone(id) && !layout.is_titled_on_strip(id))
         .collect()
 }
 
@@ -34,9 +37,11 @@ pub fn agent_place(layout: &Layout) -> AgentPlace {
     let agent = ModuleId::agent();
     if layout.is_visible(&agent) {
         AgentPlace::OnScreen
+    } else if !layout.is_zoomed() && layout.is_tabbed_away(&agent) {
+        AgentPlace::TabbedAway
     } else if layout.is_shown(&agent) {
         AgentPlace::ZoomedAway
-    } else if layout.zoomed().is_some() {
+    } else if layout.is_zoomed() {
         AgentPlace::HiddenUnderZoom
     } else {
         AgentPlace::Hidden
@@ -51,6 +56,129 @@ mod tests {
 
     fn frame() -> Frame<'static> {
         Frame::new(Size { w: 1280, h: 721 }, 1)
+    }
+
+    fn tabbed_chat() -> Layout {
+        use super::super::{Child, Con, ConLayout, Node};
+        Layout::new(
+            Node::Con(Con::new(
+                ConLayout::Tabbed,
+                vec![
+                    Child::new(Node::Leaf(ModuleId::editor()), 0.5),
+                    Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                ],
+            )),
+            ModuleId::editor(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_chat_on_an_inactive_tab_is_tabbed_away_and_reveal_brings_it() {
+        use crate::attention::{react, ChatOnPermission};
+        let mut layout = tabbed_chat();
+        let place = agent_place(&layout);
+        assert_eq!(place, AgentPlace::TabbedAway);
+        assert!(crate::tabs::reveal_on_switch(place));
+        let after = Attention {
+            arrived: 1,
+            pending: 1,
+            ..Default::default()
+        };
+        assert!(react(ChatOnPermission::Reveal, Attention::default(), after, place).reveal);
+        assert!(react(ChatOnPermission::Badge, Attention::default(), after, place).toast);
+        assert!(!layout.bring_forward(&ModuleId::agent()));
+        layout.toggle_zoom(&ModuleId::editor());
+        assert_eq!(agent_place(&layout), AgentPlace::ZoomedAway);
+
+        use super::super::{Axis, Child, Con, ConLayout, Node};
+        let mut tabs = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                Child::new(Node::Leaf(ModuleId::terminal()), 0.5),
+            ],
+        );
+        tabs.focus = 1;
+        let mut layout = Layout::new(
+            Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::editor()), Node::Con(tabs)),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        assert_eq!(agent_place(&layout), AgentPlace::TabbedAway);
+        assert!(layout.bring_forward(&ModuleId::agent()));
+        assert_eq!(agent_place(&layout), AgentPlace::OnScreen);
+        assert_eq!(layout.focus(), &ModuleId::editor());
+    }
+
+    #[test]
+    fn an_inactive_tab_has_no_chip() {
+        let mut layout = tabbed_chat();
+        assert!(tray(&layout).is_empty());
+        hide(&mut layout, &ModuleId::agent(), &frame()).unwrap();
+        assert_eq!(tray(&layout), [ModuleId::agent()]);
+    }
+
+    /// An outer tabbed container drawing the terminal, its other tab an inner tabbed container of the
+    /// chat and `terminal#2` that remembers `terminal#2`: the outer strip's entry for the inner one
+    /// names `terminal#2`, the inner strip is not on screen, so the chat has no title anywhere and gets
+    /// a chip -- which carries its waiting cards. `terminal#2` has its entry and no chip.
+    #[test]
+    fn a_tab_with_no_title_on_screen_gets_a_chip() {
+        use super::super::{Child, Con, ConLayout, Node};
+        let second = ModuleId::parse("terminal#2").unwrap();
+        let mut inner = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                Child::new(Node::Leaf(second.clone()), 0.5),
+            ],
+        );
+        inner.focus = 1;
+        let outer = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::terminal()), 0.5),
+                Child::new(Node::Con(inner), 0.5),
+            ],
+        );
+        let mut layout = Layout::new(
+            Node::split(
+                super::super::Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Con(outer),
+            ),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        // `Layout::new` draws the editor's own path; the outer container draws its first tab.
+        assert!(layout.is_visible(&ModuleId::terminal()));
+        assert!(layout.is_titled_on_strip(&second));
+        assert!(!layout.is_titled_on_strip(&ModuleId::agent()));
+        assert_eq!(tray(&layout), [ModuleId::agent()]);
+        assert_eq!(
+            chip_label(
+                "agent",
+                Some(Attention {
+                    pending: 1,
+                    ..Default::default()
+                })
+            ),
+            "agent \u{2691}1"
+        );
+
+        // With the inner container drawn, its own strip names the chat: no chip.
+        layout.set_focus(&second).unwrap();
+        assert!(layout.is_titled_on_strip(&ModuleId::agent()));
+        assert!(tray(&layout).is_empty());
+
+        // A zoom leaves no strip on screen: every module off screen has its chip.
+        layout.toggle_zoom(&second);
+        assert_eq!(
+            tray(&layout),
+            [ModuleId::editor(), ModuleId::terminal(), ModuleId::agent()]
+        );
     }
 
     #[test]

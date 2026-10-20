@@ -17,6 +17,8 @@ mod input_queue;
 pub(crate) mod keys;
 mod pane;
 pub(crate) mod pointer;
+// The window's terminals are kept in this registry.
+pub(crate) mod registry;
 
 pub(crate) use pane::TerminalPane;
 
@@ -27,6 +29,25 @@ use gtk4::gdk::{Key, ModifierType};
 use terminal_render::RgbColor;
 
 use crate::layout::Direction;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn start_dir(read: std::io::Result<PathBuf>, root: &Path) -> (PathBuf, Option<String>) {
+    match read {
+        Ok(dir) => (dir, None),
+        Err(error) => (
+            root.to_path_buf(),
+            Some(format!(
+                "Could not read the shell's directory: {error}; using {}",
+                root.display()
+            )),
+        ),
+    }
+}
+
+/// Whether an exit report belongs to the pane's current session.
+pub(crate) fn exit_is_current(reported: u64, current: u64) -> bool {
+    reported == current
+}
 
 /// Builds the initial layout with the terminal below the editor's own leaf through
 /// [`eitri_core::layout::Placement::BelowEditor`], then adds Lua panels in registration
@@ -351,15 +372,15 @@ mod tests {
 
         // The user drags the divider; `Ctrl+a t` with the keys in the terminal hides it, and the
         // keys go up first -- to the agent, which had them last above it. The terminal's own pinned
-        // divider is no longer the root split (`path == []` is the editor/agent row now): it is the
-        // one Column-axis divider, nested one level in.
+        // divider is not the root container's (that one separates the editor and the agent): it is
+        // the one Column-axis divider, nested one level in.
         let divider = shown
             .dividers
             .iter()
             .find(|d| d.axis == eitri_core::layout::Axis::Column)
             .unwrap()
             .clone();
-        layout.set_ratio(&divider.path, divider.ratio_for(400)).unwrap();
+        layout.set_ratio(&divider, divider.ratio_for(400)).unwrap();
         let dragged = arrange(&layout, &frame()).rect_of(&term());
         assert_ne!(dragged, shown.rect_of(&term()), "the drag moved it");
         layout.set_focus(&agent()).unwrap();
@@ -540,5 +561,26 @@ mod tests {
         let colors = colors_from(&ThemeTokens::fallback());
         assert_eq!(colors.cursor, None);
         assert_eq!(colors.cursor_coloring(), terminal_render::CursorColoring::CellInverse);
+    }
+}
+
+#[cfg(test)]
+mod start_dir_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_start_directory_falls_back_to_the_project_root() {
+        let root = Path::new("/project");
+        assert_eq!(
+            start_dir(Ok(PathBuf::from("/tmp")), root),
+            (PathBuf::from("/tmp"), None)
+        );
+        let error = Error::from(ErrorKind::NotFound);
+        let message = error.to_string();
+        let (dir, notice) = start_dir(Err(error), root);
+        assert_eq!(dir, root);
+        assert!(notice.unwrap().contains(&message));
     }
 }

@@ -12,7 +12,8 @@
 //!    panels by their `position`, as on first launch.
 //! 5. Keeps `hidden` entries only for leaves still in the tree. Restores focus if it is shown;
 //!    otherwise chooses the editor, then the first registered Lua panel placed in its place,
-//!    then the first shown module in tree order.
+//!    then the first shown module in tree order. Only the active children of tabbed and
+//!    stacked containers are eligible, so focus does not switch to another tab.
 //!    An `init.lua` default has no saved focus. Choosing its first leaf could give the agent the
 //!    keys instead of the editor in `{ 'row', {'agent', 0.4}, {'editor'} }`.
 //!
@@ -21,8 +22,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use super::con::{ConLayout, Node, Pin};
 use super::module::{ModuleDecl, ModuleId, Placement};
-use super::tree::{place_new, Axis, Branch, Layout, LayoutError, Node, Pin};
+use super::tree::{place_new, Layout, LayoutError};
 
 /// Every window has an editor, an agent and a terminal.
 const BUILT_INS: [fn() -> ModuleId; 3] = [ModuleId::editor, ModuleId::agent, ModuleId::terminal];
@@ -64,14 +66,20 @@ pub fn reconcile(
     hidden: &BTreeSet<ModuleId>,
     focus: Option<&ModuleId>,
     lua: &[ModuleDecl],
+    instances: &[ModuleId],
 ) -> Result<Reconciled, ReconcileError> {
-    reconcile_with(root, hidden, focus, lua, false)
+    reconcile_with(root, hidden, focus, lua, instances, false)
 }
 
 /// `init.lua`'s `eitri.layout.default` tree, which has nothing hidden and no focus: [`reconcile`],
 /// and its bottom rows pinned (the module doc's step 3).
 pub fn reconcile_default(root: Node, lua: &[ModuleDecl]) -> Result<Reconciled, ReconcileError> {
-    reconcile_with(root, &BTreeSet::new(), None, lua, true)
+    let instances: Vec<_> = root
+        .leaves()
+        .into_iter()
+        .filter(|id| id.kind() == super::module::ModuleKind::Terminal && id.number() >= 2)
+        .collect();
+    reconcile_with(root, &BTreeSet::new(), None, lua, &instances, true)
 }
 
 fn reconcile_with(
@@ -79,9 +87,12 @@ fn reconcile_with(
     hidden: &BTreeSet<ModuleId>,
     focus: Option<&ModuleId>,
     lua: &[ModuleDecl],
+    instances: &[ModuleId],
     pin: bool,
 ) -> Result<Reconciled, ReconcileError> {
-    let known = |id: &ModuleId| BUILT_INS.iter().any(|b| b() == *id) || lua.iter().any(|d| d.id == *id);
+    let known = |id: &ModuleId| {
+        BUILT_INS.iter().any(|b| b() == *id) || lua.iter().any(|d| d.id == *id) || instances.contains(id)
+    };
     let mut notes = Vec::new();
     let mut dropped = Vec::new();
     let mut uncovered = Vec::new();
@@ -117,6 +128,15 @@ fn reconcile_with(
             "placed '{terminal}' below the editor, hidden, as a first launch does"
         ));
     }
+    for id in instances {
+        if !root.leaves().contains(id) {
+            root = place_new(root, id, Placement::BelowEditor).0;
+            hidden.insert(id.clone());
+            notes.push(format!(
+                "placed '{id}' below the editor, hidden: another workspace has it"
+            ));
+        }
+    }
     for decl in lua {
         if root.leaves().contains(&decl.id) {
             continue;
@@ -134,10 +154,33 @@ fn reconcile_with(
     let shown: Vec<ModuleId> = root.leaves().into_iter().filter(|id| !hidden.contains(id)).collect();
     let focus = match focus {
         Some(f) if shown.contains(f) => f.clone(),
-        _ => first_focus(&shown, lua).ok_or(ReconcileError::NothingVisible)?,
+        _ => {
+            let mut in_view = Vec::new();
+            drawn_leaves(&root, &|id| !hidden.contains(id), &mut in_view);
+            first_focus(&in_view, lua).ok_or(ReconcileError::NothingVisible)?
+        }
     };
     let layout = Layout::from_parts(root, hidden, focus).map_err(ReconcileError::Layout)?;
     Ok(Reconciled { layout, notes })
+}
+
+/// The shown modules of `node` that its tab containers draw, in tree order: a tabbed or stacked
+/// container contributes only its drawn child's, so the keys never start on a tab the tree does not
+/// draw and giving them never switches the tab it chose.
+fn drawn_leaves(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, out: &mut Vec<ModuleId>) {
+    match node {
+        Node::Leaf(id) => {
+            if shown(id) {
+                out.push(id.clone());
+            }
+        }
+        Node::Con(c) if c.layout.axis().is_none() => {
+            if let Some(i) = c.drawn(shown) {
+                drawn_leaves(&c.children[i].node, shown, out);
+            }
+        }
+        Node::Con(c) => c.children.iter().for_each(|ch| drawn_leaves(&ch.node, shown, out)),
+    }
 }
 
 /// Step 5 of the module doc, when `focus` cannot be used: where `Layout::initial` gives the keys --
@@ -156,48 +199,43 @@ fn first_focus(shown: &[ModuleId], lua: &[ModuleDecl]) -> Option<ModuleId> {
         .cloned()
 }
 
-/// From `node` down, pin each `below_root` module that forms a full-width bottom row, as
-/// [`Placement::BelowRoot`] does on first launch. With no length yet, the pin divides by its
-/// ratio until it has been on screen, then keeps that height.
+/// Step 3 of the module doc, from `node` down: each `below_root` module that is a full-width row at
+/// the bottom of the window gets the pin a first launch gives it ([`Placement::BelowRoot`]), with no
+/// length yet -- so it divides by its share until it has been on screen, then keeps that height.
 ///
-/// For a `Column` split whose second child is a `below_root` module, pin that child and continue
-/// into the first child. This follows the first-child spine built by `Layout::initial` and
-/// Lua's `{ 'column', {'row', ...}, {'terminal'} }`.
-/// If the second child is another `Column` split, continue into it. This follows the chain
-/// built by an n-ary Lua column, including `{ 'column', {'editor'}, {'agent'}, {'terminal'} }`.
-/// A module in the middle of a column or beside another module in a row keeps its ratio.
+/// The last child of a vertical container on the first-child spine spans the window's bottom.
+/// Only a below-root leaf there gets a pin; a module in the middle or beside another stays a share.
+/// The walk goes on into the first child only below such a leaf: with anything else last, the
+/// first child is not at the bottom, and a below-root module inside it stays a share. Existing pins
+/// keep their lengths when the window grows.
 fn pin_bottom_rows(node: &mut Node, below_root: &dyn Fn(&ModuleId) -> bool, notes: &mut Vec<String>) {
-    let Node::Split {
-        axis: Axis::Column,
-        pin,
-        first,
-        second,
-        ..
-    } = node
-    else {
+    let Node::Con(c) = node else {
         return;
     };
-    match second.as_ref() {
-        Node::Leaf(id) if below_root(id) => {
-            if pin.is_none() {
-                *pin = Some(Pin {
-                    side: Branch::Second,
-                    px: None,
-                });
-                notes.push(format!(
-                    "pinned '{id}' below everything, as a first launch does: it keeps its height when the window grows"
-                ));
-            }
-            pin_bottom_rows(first, below_root, notes);
-        }
-        Node::Split { axis: Axis::Column, .. } => pin_bottom_rows(second, below_root, notes),
-        _ => {}
+    if c.layout != ConLayout::SplitV || c.children.len() < 2 {
+        return;
     }
+    let unpinned = c.children.iter().all(|ch| ch.pin.is_none());
+    let last = c.children.len() - 1;
+    let Node::Leaf(id) = &c.children[last].node else {
+        return;
+    };
+    if !below_root(id) {
+        return;
+    }
+    if unpinned {
+        notes.push(format!(
+            "pinned '{id}' below everything, as a first launch does: it keeps its height when the window grows"
+        ));
+        c.children[last].pin = Some(Pin { px: None });
+    }
+    pin_bottom_rows(&mut c.children[0].node, below_root, notes);
 }
 
-/// `node` without the leaves `keep` refuses, each collapsed into its sibling. `None` if nothing is
-/// left. The refused ids go into `dropped`, in tree order; a leaf left alone where a split was, by a
-/// refused sibling, goes into `uncovered` (step 1's hidden editor).
+/// `node` without the leaves `keep` refuses. A container left with one child is replaced by it, which
+/// takes the container's place; one left with more has their shares scaled back up to 1. `None` if
+/// nothing is left. The refused ids go into `dropped`, in tree order; a leaf left alone where a
+/// container was, by refused siblings, goes into `uncovered` (step 1's hidden editor).
 fn prune(
     node: Node,
     keep: &dyn Fn(&ModuleId) -> bool,
@@ -213,37 +251,54 @@ fn prune(
                 None
             }
         }
-        Node::Split {
-            axis,
-            ratio,
-            pin,
-            first,
-            second,
-        } => match (
-            prune(*first, keep, dropped, uncovered),
-            prune(*second, keep, dropped, uncovered),
-        ) {
-            (Some(first), Some(second)) => Some(Node::Split {
-                axis,
-                ratio,
-                pin,
-                first: Box::new(first),
-                second: Box::new(second),
-            }),
-            (Some(only), None) | (None, Some(only)) => {
-                if let Node::Leaf(id) = &only {
-                    uncovered.push(id.clone());
-                }
-                Some(only)
+        Node::Con(mut c) => {
+            let before = c.children.len();
+            let focus = c.focus;
+            let mut kept_before_focus = 0;
+            c.children = std::mem::take(&mut c.children)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, mut ch)| {
+                    ch.node = prune(ch.node, keep, dropped, uncovered)?;
+                    if i < focus {
+                        kept_before_focus += 1;
+                    }
+                    Some(ch)
+                })
+                .collect();
+            if !c.children.is_empty() && c.children.len() != before {
+                // The remembered child (the drawn tab) stays the same child while it survives, and
+                // passes to the one that followed it, wrapping, when it was left out.
+                c.focus = kept_before_focus % c.children.len();
             }
-            (None, None) => None,
-        },
+            match c.children.len() {
+                0 => None,
+                1 if before > 1 => {
+                    let only = c.children.pop().expect("one child").node;
+                    if let Node::Leaf(id) = &only {
+                        uncovered.push(id.clone());
+                    }
+                    Some(only)
+                }
+                n => {
+                    if n != before {
+                        let sum: f32 = c.children.iter().map(|ch| ch.share).sum();
+                        for ch in &mut c.children {
+                            ch.share /= sum;
+                        }
+                    }
+                    Some(Node::Con(c))
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::same_rects_opened;
     use super::super::tree::{Axis, Branch, BELOW_ROOT_SHARE, DEFAULT_EDITOR_SHARE, RIGHT_OF_ROOT_SHARE};
+    use super::super::{Child, Con};
     use super::*;
 
     fn editor() -> ModuleId {
@@ -264,6 +319,12 @@ mod tests {
     fn set(ids: &[ModuleId]) -> BTreeSet<ModuleId> {
         ids.iter().cloned().collect()
     }
+    /// `r`'s layout puts every module where `want` does, with `r`'s own hidden modules and keys: as
+    /// it is, and with everything shown and every pin settled.
+    fn same_as(r: &Reconciled, want: Node) {
+        let want = Layout::from_parts(want, r.layout.hidden().clone(), r.layout.focus().clone()).unwrap();
+        same_rects_opened(&r.layout, &want);
+    }
     /// What a window with a terminal saves: `[editor | agent]` over the (pinned) terminal.
     fn saved() -> Node {
         Node::pinned(
@@ -282,8 +343,8 @@ mod tests {
 
     #[test]
     fn a_layout_this_window_can_show_comes_back_unchanged() {
-        let r = reconcile(saved(), &set(&[term()]), Some(&agent()), &[]).unwrap();
-        assert_eq!(r.layout.root(), &saved());
+        let r = reconcile(saved(), &set(&[term()]), Some(&agent()), &[], &[]).unwrap();
+        same_as(&r, saved());
         assert_eq!(r.layout.hidden(), &set(&[term()]));
         assert_eq!(r.layout.focus(), &agent());
         assert!(r.notes.is_empty(), "{:?}", r.notes);
@@ -299,8 +360,8 @@ mod tests {
             saved(),
             row(leaf(ModuleId::lua("gone")), leaf(ModuleId::parse("canvas").unwrap())),
         );
-        let r = reconcile(with_gone, &set(&[ModuleId::lua("gone")]), Some(&editor()), &[]).unwrap();
-        assert_eq!(r.layout.root(), &saved());
+        let r = reconcile(with_gone, &set(&[ModuleId::lua("gone")]), Some(&editor()), &[], &[]).unwrap();
+        same_as(&r, saved());
         assert!(r.layout.hidden().is_empty());
         assert_eq!(
             r.notes,
@@ -325,15 +386,23 @@ mod tests {
             &BTreeSet::new(),
             Some(&editor()),
             std::slice::from_ref(&side),
+            &[],
         )
         .unwrap();
-        assert_eq!(r.layout.root(), &kept);
+        same_as(&r, kept);
         assert!(r.notes.is_empty());
 
-        let r = reconcile(saved(), &BTreeSet::new(), Some(&editor()), std::slice::from_ref(&side)).unwrap();
-        assert_eq!(
-            r.layout.root(),
-            &Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, saved(), leaf(side.id.clone()))
+        let r = reconcile(
+            saved(),
+            &BTreeSet::new(),
+            Some(&editor()),
+            std::slice::from_ref(&side),
+            &[],
+        )
+        .unwrap();
+        same_as(
+            &r,
+            Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, saved(), leaf(side.id.clone())),
         );
         assert_eq!(r.notes, ["placed 'lua:side' where a first launch does (RightOfRoot)"]);
 
@@ -341,7 +410,14 @@ mod tests {
             id: ModuleId::lua("main"),
             placement: Placement::InPlaceOfEditor,
         };
-        let r = reconcile(saved(), &BTreeSet::new(), Some(&editor()), std::slice::from_ref(&main)).unwrap();
+        let r = reconcile(
+            saved(),
+            &BTreeSet::new(),
+            Some(&editor()),
+            std::slice::from_ref(&main),
+            &[],
+        )
+        .unwrap();
         assert!(r.layout.hidden().contains(&editor()));
         assert_eq!(
             r.layout.focus(),
@@ -354,19 +430,19 @@ mod tests {
     /// leaf, hidden until `Ctrl+a t`, leaving the agent untouched.
     #[test]
     fn a_missing_terminal_is_placed_below_the_editor_and_hidden() {
-        let r = reconcile(row(leaf(editor()), leaf(agent())), &BTreeSet::new(), None, &[]).unwrap();
-        assert_eq!(
-            r.layout.root(),
-            &row(
+        let r = reconcile(row(leaf(editor()), leaf(agent())), &BTreeSet::new(), None, &[], &[]).unwrap();
+        same_as(
+            &r,
+            row(
                 Node::pinned(
                     Axis::Column,
                     BELOW_ROOT_SHARE,
                     Branch::Second,
                     leaf(editor()),
-                    leaf(term())
+                    leaf(term()),
                 ),
-                leaf(agent())
-            )
+                leaf(agent()),
+            ),
         );
         assert_eq!(r.layout.hidden(), &set(&[term()]));
         assert_eq!(r.layout.focus(), &editor());
@@ -380,9 +456,9 @@ mod tests {
         let upper = || Node::split(Axis::Row, 0.6, leaf(editor()), leaf(agent()));
         let lua_default = Node::split(Axis::Column, 0.7, upper(), leaf(term()));
         let r = reconcile_default(lua_default, &[]).unwrap();
-        assert_eq!(
-            r.layout.root(),
-            &Node::pinned(Axis::Column, 0.7, Branch::Second, upper(), leaf(term()))
+        same_as(
+            &r,
+            Node::pinned(Axis::Column, 0.7, Branch::Second, upper(), leaf(term())),
         );
         assert_eq!(
             r.notes,
@@ -391,32 +467,132 @@ mod tests {
 
         let editor_below = Node::split(Axis::Column, 0.5, row(leaf(agent()), leaf(term())), leaf(editor()));
         let r = reconcile_default(editor_below.clone(), &[]).unwrap();
-        assert_eq!(r.layout.root(), &editor_below);
+        same_as(&r, editor_below);
         assert!(r.notes.is_empty(), "{:?}", r.notes);
     }
 
-    /// A bottom row keeps its height in the n-ary spelling: `{ 'column', {'editor'},
-    /// {'agent'}, {'terminal'} }` becomes `Column(editor, Column(agent, terminal))`.
-    /// The terminal is full width at the bottom and is pinned. A terminal in the middle is not.
+    /// The final leaf of a flat column spans its bottom and keeps its height when the window grows.
+    /// A terminal in the middle is not a bottom row and keeps its share.
     #[test]
     fn the_last_row_of_an_n_ary_lua_column_is_pinned() {
-        let stack =
-            |a: Node, b: Node, c: Node| Node::split(Axis::Column, 1.0 / 3.0, a, Node::split(Axis::Column, 0.5, b, c));
+        let stack = |a: Node, b: Node, c: Node| {
+            Node::Con(Con::new(
+                ConLayout::SplitV,
+                vec![
+                    Child::new(a, 1.0 / 3.0),
+                    Child::new(b, 1.0 / 3.0),
+                    Child::new(c, 1.0 / 3.0),
+                ],
+            ))
+        };
         let r = reconcile_default(stack(leaf(editor()), leaf(agent()), leaf(term())), &[]).unwrap();
-        assert_eq!(
-            r.layout.root(),
-            &Node::split(
-                Axis::Column,
-                1.0 / 3.0,
-                leaf(editor()),
-                Node::pinned(Axis::Column, 0.5, Branch::Second, leaf(agent()), leaf(term()))
-            )
-        );
+        let mut expected = stack(leaf(editor()), leaf(agent()), leaf(term()));
+        let Node::Con(c) = &mut expected else { unreachable!() };
+        c.children[2].pin = Some(Pin { px: None });
+        same_as(&r, expected);
         assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
 
         let middle = stack(leaf(editor()), leaf(term()), leaf(agent()));
         let r = reconcile_default(middle.clone(), &[]).unwrap();
-        assert_eq!(r.layout.root(), &middle);
+        same_as(&r, middle);
+    }
+
+    /// A below-root module inside the first child of a column is not at the window's bottom when
+    /// something else is below it, so it stays a share.
+    #[test]
+    fn a_bottom_row_inside_the_upper_part_of_a_column_is_not_pinned() {
+        let upper = Node::split(Axis::Column, 0.5, leaf(editor()), leaf(term()));
+        let nested = Node::split(Axis::Column, 0.7, upper, leaf(agent()));
+        let r = reconcile_default(nested.clone(), &[]).unwrap();
+        same_as(&r, nested);
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+    }
+
+    /// Leaving a module out of a tabbed container keeps the drawn tab on the same child, or on the
+    /// one that followed it, instead of leaving a focus that points past the end.
+    #[test]
+    fn leaving_out_a_tab_keeps_the_drawn_tab_in_range() {
+        let tabs = |ids: [ModuleId; 3], focus: usize| {
+            let mut c = Con::new(
+                ConLayout::Tabbed,
+                ids.into_iter().map(|id| Child::new(leaf(id), 1.0 / 3.0)).collect(),
+            );
+            c.focus = focus;
+            row(leaf(editor()), Node::Con(c))
+        };
+        let gone = ModuleId::lua("gone");
+        let drawn = |r: &Reconciled| {
+            let root = r.layout.root();
+            let c = root.children[1].node.as_con().expect("the tabbed container").clone();
+            (c.children.len(), c.focus, c.children[c.focus].node.leaves())
+        };
+        // The last tab is the drawn one and is left out: the first tab follows it.
+        let r = reconcile(
+            tabs([agent(), term(), gone.clone()], 2),
+            &BTreeSet::new(),
+            Some(&editor()),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(drawn(&r), (2, 0, vec![agent()]));
+        // A tab before the drawn one is left out: the drawn tab is still the terminal.
+        let r = reconcile(
+            tabs([gone.clone(), agent(), term()], 2),
+            &BTreeSet::new(),
+            Some(&editor()),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(drawn(&r), (2, 1, vec![term()]));
+        // The drawn tab is in the middle and is left out: the one after it is drawn.
+        let r = reconcile(
+            tabs([agent(), gone, term()], 1),
+            &BTreeSet::new(),
+            Some(&editor()),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(drawn(&r), (2, 1, vec![term()]));
+    }
+
+    /// `eitri.layout.default{ 'tabbed', {'editor'}, {'agent'}, {'terminal'}, active = 2 }`: the
+    /// chat is drawn as asked and takes the keys, rather than the editor taking them and switching the
+    /// tab back. Nested inside a split, the editor beside a stacked container keeps the keys and the
+    /// stacked container keeps its own choice.
+    #[test]
+    fn the_keys_start_on_the_tab_the_tree_draws() {
+        let tabs = |layout: ConLayout, ids: Vec<ModuleId>, active: usize| {
+            let n = ids.len() as f32;
+            let mut c = Con::new(
+                layout,
+                ids.into_iter().map(|id| Child::new(leaf(id), 1.0 / n)).collect(),
+            );
+            c.focus = active;
+            Node::Con(c)
+        };
+        let r = reconcile_default(tabs(ConLayout::Tabbed, vec![editor(), agent(), term()], 1), &[]).unwrap();
+        assert_eq!(r.layout.focus(), &agent());
+        assert_eq!(r.layout.root().focus, 1, "the tab asked for is drawn");
+        assert!(r.layout.is_visible(&agent()));
+        assert!(r.layout.is_tabbed_away(&editor()));
+
+        let inner = tabs(ConLayout::Stacked, vec![editor(), agent()], 1);
+        let r = reconcile_default(row(inner, leaf(term())), &[]).unwrap();
+        assert_eq!(r.layout.focus(), &agent(), "the editor's stack draws the chat");
+        let stack = r.layout.root().children[0].node.as_con().unwrap();
+        assert_eq!(stack.focus, 1);
+
+        let r = reconcile_default(
+            row(leaf(editor()), tabs(ConLayout::Tabbed, vec![agent(), term()], 1)),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.layout.focus(), &editor());
+        let tabbed = r.layout.root().children[1].node.as_con().unwrap();
+        assert_eq!(tabbed.focus, 1, "the terminal is still the drawn tab");
     }
 
     /// A saved file keeps the arrangement the window left. `Ctrl+a _` with the terminal shown
@@ -430,12 +606,12 @@ mod tests {
             leaf(editor()),
             Node::split(Axis::Column, 0.5, leaf(agent()), leaf(term())),
         );
-        let r = reconcile(evened.clone(), &BTreeSet::new(), Some(&editor()), &[]).unwrap();
-        assert_eq!(r.layout.root(), &evened);
+        let r = reconcile(evened.clone(), &BTreeSet::new(), Some(&editor()), &[], &[]).unwrap();
+        same_as(&r, evened);
         assert!(r.notes.is_empty(), "{:?}", r.notes);
         let two_level = Node::split(Axis::Column, 0.7, row(leaf(editor()), leaf(agent())), leaf(term()));
-        let r = reconcile(two_level.clone(), &BTreeSet::new(), Some(&editor()), &[]).unwrap();
-        assert_eq!(r.layout.root(), &two_level);
+        let r = reconcile(two_level.clone(), &BTreeSet::new(), Some(&editor()), &[], &[]).unwrap();
+        same_as(&r, two_level);
     }
 
     /// A layout saved with a Lua `main` panel -- `Row(lua:main, editor)`, the editor hidden -- and
@@ -457,7 +633,7 @@ mod tests {
             ),
             leaf(term()),
         );
-        let r = reconcile(saved.clone(), &set(&[editor(), term()]), Some(&main), &[]).unwrap();
+        let r = reconcile(saved.clone(), &set(&[editor(), term()]), Some(&main), &[], &[]).unwrap();
         assert!(r.layout.is_shown(&editor()), "{:?}", r.notes);
         assert_eq!(r.layout.focus(), &editor());
         assert_eq!(
@@ -473,11 +649,11 @@ mod tests {
             id: main.clone(),
             placement: Placement::InPlaceOfEditor,
         };
-        let r = reconcile(saved, &set(&[editor(), term()]), Some(&main), &[decl]).unwrap();
+        let r = reconcile(saved, &set(&[editor(), term()]), Some(&main), &[decl], &[]).unwrap();
         assert!(!r.layout.is_shown(&editor()), "the panel is still there");
         assert!(r.notes.is_empty(), "{:?}", r.notes);
 
-        let r = reconcile(saved_with_side(), &set(&[editor(), term()]), Some(&agent()), &[]).unwrap();
+        let r = reconcile(saved_with_side(), &set(&[editor(), term()]), Some(&agent()), &[], &[]).unwrap();
         assert!(
             !r.layout.is_shown(&editor()),
             "hidden beside the chat, which is still there"
@@ -489,16 +665,16 @@ mod tests {
     fn a_tree_without_the_editor_or_the_agent_is_refused() {
         let no_agent = row(leaf(editor()), leaf(term()));
         assert_eq!(
-            reconcile(no_agent, &BTreeSet::new(), None, &[]),
+            reconcile(no_agent, &BTreeSet::new(), None, &[], &[]),
             Err(ReconcileError::MissingBuiltIn(agent()))
         );
         let no_editor = row(leaf(agent()), leaf(ModuleId::lua("gone")));
         assert_eq!(
-            reconcile(no_editor, &BTreeSet::new(), None, &[]),
+            reconcile(no_editor, &BTreeSet::new(), None, &[], &[]),
             Err(ReconcileError::MissingBuiltIn(editor()))
         );
         assert_eq!(
-            reconcile(leaf(ModuleId::lua("gone")), &BTreeSet::new(), None, &[]),
+            reconcile(leaf(ModuleId::lua("gone")), &BTreeSet::new(), None, &[], &[]),
             Err(ReconcileError::MissingBuiltIn(editor())),
             "nothing left at all"
         );
@@ -508,12 +684,12 @@ mod tests {
     /// a file that hides everything is refused rather than opened blank.
     #[test]
     fn the_keys_land_on_a_shown_module_and_a_layout_with_none_is_refused() {
-        let r = reconcile(saved(), &set(&[editor(), term()]), Some(&editor()), &[]).unwrap();
+        let r = reconcile(saved(), &set(&[editor(), term()]), Some(&editor()), &[], &[]).unwrap();
         assert_eq!(r.layout.focus(), &agent());
-        let r = reconcile(saved(), &set(&[term()]), Some(&ModuleId::lua("gone")), &[]).unwrap();
+        let r = reconcile(saved(), &set(&[term()]), Some(&ModuleId::lua("gone")), &[], &[]).unwrap();
         assert_eq!(r.layout.focus(), &editor());
         assert_eq!(
-            reconcile(saved(), &set(&[editor(), agent(), term()]), None, &[]),
+            reconcile(saved(), &set(&[editor(), agent(), term()]), None, &[], &[]),
             Err(ReconcileError::NothingVisible)
         );
     }
@@ -525,9 +701,9 @@ mod tests {
     #[test]
     fn without_a_usable_focus_the_keys_go_where_a_first_launch_gives_them() {
         let chat_left = Node::split(Axis::Row, 0.4, leaf(agent()), leaf(editor()));
-        let r = reconcile(chat_left.clone(), &BTreeSet::new(), None, &[]).unwrap();
+        let r = reconcile(chat_left.clone(), &BTreeSet::new(), None, &[], &[]).unwrap();
         assert_eq!(r.layout.focus(), &editor());
-        let r = reconcile(chat_left, &BTreeSet::new(), Some(&ModuleId::lua("gone")), &[]).unwrap();
+        let r = reconcile(chat_left, &BTreeSet::new(), Some(&ModuleId::lua("gone")), &[], &[]).unwrap();
         assert_eq!(r.layout.focus(), &editor());
 
         let side = ModuleDecl {
@@ -542,7 +718,7 @@ mod tests {
             leaf(side.id.clone()),
             row(leaf(agent()), row(leaf(main.id.clone()), leaf(editor()))),
         );
-        let r = reconcile(tree, &set(&[editor()]), None, &[side, main.clone()]).unwrap();
+        let r = reconcile(tree, &set(&[editor()]), None, &[side, main.clone()], &[]).unwrap();
         assert_eq!(r.layout.focus(), &main.id);
     }
 
@@ -550,13 +726,14 @@ mod tests {
     fn a_tree_that_breaks_an_invariant_is_refused() {
         let twice = row(saved(), leaf(editor()));
         assert_eq!(
-            reconcile(twice, &BTreeSet::new(), None, &[]),
+            reconcile(twice, &BTreeSet::new(), None, &[], &[]),
             Err(ReconcileError::Layout(LayoutError::Duplicate(editor())))
         );
+        // The agent's share, 1 - 0.99, is the one below the minimum.
         let bad_ratio = Node::split(Axis::Row, 0.99, leaf(editor()), leaf(agent()));
         assert_eq!(
-            reconcile(bad_ratio, &BTreeSet::new(), None, &[]),
-            Err(ReconcileError::Layout(LayoutError::Ratio(0.99)))
+            reconcile(bad_ratio, &BTreeSet::new(), None, &[], &[]),
+            Err(ReconcileError::Layout(LayoutError::Ratio(1.0 - 0.99)))
         );
     }
 }

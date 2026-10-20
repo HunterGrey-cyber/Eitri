@@ -135,15 +135,20 @@ pub(crate) fn clear_if_cancelled(quitting: &mut QuitInFlight, generation: u32) -
 /// What `main.rs`'s `ask_nvim_to_quit` does with the editor before nvim draws its prompt in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reveal {
-    /// Show an editor that is hidden or zoomed away, ending any zoom. Use `Layout::is_visible`:
-    /// `is_shown` ignores zoom and could leave nvim's prompt off screen while the editor holds
-    /// the keys, letting the next `n` or `d` answer an unseen prompt.
+    /// Not on screen (hidden, zoomed away, or on a tab its container does not draw): shown, which
+    /// ends a zoom and, for a tab, chooses it (`main.rs`'s `ShellQuitHost::show_editor`).
+    /// `Layout::is_visible`, not `is_shown`, which ignores a zoom and a tab -- a close with the agent
+    /// zoomed left nvim's prompt waiting unseen while the editor took the keys, and the next `n` or
+    /// `d` answered it blind.
     pub(crate) show: bool,
     /// Hidden (not merely zoomed away): hidden again if nvim quits. A zoom is not saved
     /// (`eitri_core::layout::persist`), so ending one changes nothing the window keeps.
     pub(crate) rehide: bool,
 }
 
+/// What the editor needs before nvim's prompt is drawn in it. An editor on a tab not drawn is shown in
+/// the layout's terms but off screen, so it is shown (its tab chosen) and, never having been hidden,
+/// not hidden again.
 pub(crate) fn reveal_for_prompt(layout: &Layout, editor: &ModuleId) -> Reveal {
     Reveal {
         show: !layout.is_visible(editor),
@@ -286,7 +291,10 @@ pub(crate) fn reopen(id: &ModuleId, decls: &[ModuleDecl]) -> Reopen {
     match id.kind() {
         // Use `BelowEditor` to reopen the terminal below the editor's leaf, matching its first
         // launch. `BelowRoot` would also span the neighboring Lua `side` panel.
-        ModuleKind::Terminal => Reopen::At(Placement::BelowEditor),
+        ModuleKind::Terminal if id.number() == 1 => Reopen::At(Placement::BelowEditor),
+        // A numbered terminal was made by the user and has no first-launch place to go back to: it
+        // leaves every workspace, and its number is free for the next new terminal.
+        ModuleKind::Terminal => Reopen::Remove,
         ModuleKind::LuaWebview => decls
             .iter()
             .find(|d| d.id == *id)
@@ -517,6 +525,31 @@ mod tests {
     }
 
     #[test]
+    fn an_editor_on_a_tab_not_drawn_is_brought_on_screen_for_the_prompt() {
+        use eitri_core::layout::{Child, Con, ConLayout, Node};
+        let editor = ModuleId::editor();
+        let layout = Layout::new(
+            Node::Con(Con::new(
+                ConLayout::Tabbed,
+                vec![
+                    Child::new(Node::Leaf(ModuleId::editor()), 0.5),
+                    Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                ],
+            )),
+            ModuleId::agent(),
+        )
+        .unwrap();
+        assert!(layout.is_tabbed_away(&editor), "the case");
+        assert_eq!(
+            reveal_for_prompt(&layout, &editor),
+            Reveal {
+                show: true,
+                rehide: false
+            }
+        );
+    }
+
+    #[test]
     fn a_window_close_joining_a_kill_of_the_editor_closes_the_window() {
         let window = EditorQuit::Window {
             confirmed: Some("close window? 1 running (y/n)".into()),
@@ -651,5 +684,12 @@ mod tests {
         assert_eq!(reopen(&ModuleId::lua("unknown"), &decls), Reopen::InPlace);
         assert_eq!(reopen(&ModuleId::agent(), &decls), Reopen::InPlace);
         assert_eq!(reopen(&ModuleId::editor(), &decls), Reopen::Never);
+    }
+
+    #[test]
+    fn a_killed_terminal_instance_is_removed_and_the_base_terminal_goes_below_the_editor() {
+        let instance = ModuleId::parse("terminal#2").unwrap();
+        assert_eq!(reopen(&instance, &[]), Reopen::Remove);
+        assert_eq!(reopen(&ModuleId::terminal(), &[]), Reopen::At(Placement::BelowEditor));
     }
 }

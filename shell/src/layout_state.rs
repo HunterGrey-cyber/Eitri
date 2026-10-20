@@ -5,9 +5,9 @@
 //! Arrangement changes are saved 500ms after the last change. At window close, an unwritten
 //! change is saved synchronously.
 //!
-//! Only arrangement changes trigger a save: the tree, its ratios and pinned lengths, and the
-//! hidden modules ([`Arrangement`]). Each save writes this window's whole layout with keyboard
-//! focus as it is when the save occurs.
+//! Only arrangement changes trigger a save: each workspace's tree, shares and pinned lengths,
+//! hidden modules, and the current workspace ([`Arrangement`]). Each save writes all of this
+//! window's workspaces with keyboard focus as it is when the save occurs.
 //!
 //! Moving keyboard focus by a click, `Ctrl+h/j/k/l` or a HINT label does not trigger a write,
 //! even at close. Focus is saved along with the next arrangement change. Reopening therefore
@@ -18,23 +18,38 @@
 //! closing without changing the arrangement leaves the file alone and keeps following the
 //! default layout, including one added to `init.lua` later.
 //!
-//! With two windows on one project (`NON_UNIQUE`), each writes its own whole layout and the
+//! With two windows on one project (`NON_UNIQUE`), each writes all its own workspaces and the
 //! last write wins (`persist::save`). A zoom or drag can delay a save, so an earlier change can
 //! be written after a later change in another window. The saved arrangement is not merged with
-//! the file. A window that only moves focus writes nothing and cannot overwrite another
+//! the file: this window's workspaces replace the other window's changes, including removals
+//! and renames. A window that only moves focus writes nothing and cannot overwrite another
 //! window's arrangement.
 //!
-//! A module absent from this window's layout, such as an unregistered Lua panel or a later
+//! A module absent from this window's layouts, such as an unregistered Lua panel or a later
 //! build's `canvas`, leaves the file at the next arrangement save. Moving focus alone leaves it
 //! in the file.
 //!
-//! Before every write, the file is read again to check whether this build can use it. An
-//! unusable file is set aside whole as `.json.unusable` (`persist::set_aside`), including one
-//! made unusable since launch by an edit or another build. A usable file is replaced with this
-//! window's layout.
+//! Before every write, the file is read again. A file this build cannot use at all is set aside
+//! whole as `.v2.json.unusable` (`persist::set_aside_v2`). A file it can carry only in part,
+//! such as one containing an unknown workspace or container layout, is first copied to
+//! `.v2.json.partial` (`persist::copy_aside_v2`).
+//!
+//! Keys preserved for a later build are taken from the current file
+//! (`Workspaces::retake_kept`), so a window opened earlier does not erase newly written keys it
+//! cannot interpret. If there is no file or the file is unusable, the window keeps the keys it
+//! opened with. A preserved entry naming a module already placed in any of this window's
+//! workspaces is excluded (`Kept::drop_placed`) to avoid placing that module twice. The file is
+//! copied to `.v2.json.partial` in that case.
+//!
+//! A file read only in part at launch is copied aside before the first write only if it is
+//! still byte-identical to the bytes read at launch. If another window has replaced it, this
+//! window must not overwrite that window's backup with its older copy.
 //!
 //! Saving focus alone into the file's current arrangement can drop a module placed by another
 //! window. Saving only after arrangement changes avoids that merge.
+//!
+//! The later build's preserved keys are the only entries taken from the current file at write
+//! time; the arrangement comes from this window.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -42,32 +57,35 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use eitri_core::layout::persist::{self, Loaded};
-use eitri_core::layout::{reconcile_default, Layout, ModuleDecl, ModuleId, Node};
+use eitri_core::layout::persist::{self, Loaded, V2State};
+use eitri_core::layout::{reconcile_default, Con, Layout, ModuleDecl, ModuleId, Node, Workspaces};
 use gtk4::glib;
 
-/// The layout a window opens with, and the lines to log about how it was chosen.
+/// The workspaces and the current layout a window opens with, the lines to log about how they were
+/// chosen, and the text of a file this window opened only in part (copied aside before its first
+/// write; `None` otherwise).
 ///
 /// - `default`: `eitri.layout.default`'s tree, if `init.lua` gave one; an error there is the
 ///   caller's startup failure, not handled here.
 /// - `loaded`: this project's state file, if the state directory is known.
 ///
-/// The file wins whenever it can be used: a project reopens as it was left. Otherwise the Lua
-/// default, reconciled like a file (a module this window lacks is left out, the terminal placed if
-/// missing); otherwise the built-in first launch (`terminal::initial_layout`).
+/// The file wins whenever it can be used: a project reopens as it was left, a version 1 file
+/// migrated into one workspace. Otherwise the Lua default, reconciled like a file (a module this
+/// window lacks is left out, the terminal placed if missing); otherwise the built-in first launch
+/// (`terminal::initial_layout`). Both of those are one workspace, `main`.
 ///
 /// Whichever it is, a layout that hides the editor says so: nvim is started by the editor's first
 /// frame (`neovide-editor`'s render callback builds it), so neither nvim nor the window's colours,
 /// which follow nvim's colorscheme, come until the editor is shown. `prefix x` in the editor makes
-/// that one keypress and one relaunch away. `show_editor` is the key
-/// that shows it, as the effective keymap binds it (`Ctrl+b e` by default), so the note names it;
-/// `None` when nothing binds one, and the note then names no key rather than a wrong one.
+/// that one keypress and one relaunch away. `show_editor` is the key that shows it, as the effective
+/// keymap binds it (`Ctrl+b e` by default), so the note names it; `None` when nothing binds one, and
+/// the note then names no key rather than a wrong one.
 pub(crate) fn choose_startup_layout(
     default: Option<&Node>,
     loaded: Option<Loaded>,
     lua: &[ModuleDecl],
     show_editor: Option<&str>,
-) -> Result<(Layout, Vec<String>), String> {
+) -> Result<(Workspaces, Layout, Vec<String>, Option<String>), String> {
     let mut notes = Vec::new();
     let first_launch = |notes: &mut Vec<String>| -> Result<Layout, String> {
         match default {
@@ -79,23 +97,30 @@ pub(crate) fn choose_startup_layout(
             None => crate::terminal::initial_layout(lua).map_err(|e| e.to_string()),
         }
     };
-    let layout = match loaded {
-        Some(Loaded::Restored(r)) => {
-            notes.extend(r.notes);
+    let (workspaces, layout, keep_copy) = match loaded {
+        Some(Loaded::Restored(opened)) | Some(Loaded::Migrated(opened)) => {
+            notes.extend(opened.notes);
             notes.push("reopened as it was left".to_string());
             if default.is_some() {
                 notes.push("eitri.layout.default shapes a project with no saved layout; this one has one".to_string());
             }
-            r.layout
+            if opened.keep_copy.is_some() {
+                notes.push(
+                    "what this build cannot carry of the file is kept: the file is copied as .v2.json.partial \
+                     before this window first writes it"
+                        .to_string(),
+                );
+            }
+            (opened.workspaces, opened.current, opened.keep_copy)
         }
         Some(Loaded::Unusable(why)) => {
             notes.push(format!(
-                "{why}; opening the default layout (the file is kept: it is set aside as .json.unusable \
-                 the first time this window saves)"
+                "{why}; opening the default layout (a version 2 file is kept: it is set aside as .v2.json.unusable \
+                 the first time this window saves; a version 1 file is never written)"
             ));
-            first_launch(&mut notes)?
+            (Workspaces::single(), first_launch(&mut notes)?, None)
         }
-        Some(Loaded::Missing) | None => first_launch(&mut notes)?,
+        Some(Loaded::Missing) | None => (Workspaces::single(), first_launch(&mut notes)?, None),
     };
     if !layout.is_shown(&ModuleId::editor()) {
         let way_back = show_editor.map(|key| format!(" ({key})")).unwrap_or_default();
@@ -104,62 +129,68 @@ pub(crate) fn choose_startup_layout(
              is shown{way_back}"
         ));
     }
-    Ok((layout, notes))
+    Ok((workspaces, layout, notes, keep_copy))
 }
 
-/// What the state file keeps of a layout besides the keys (`persist::encode`): the tree with its
-/// ratios and pinned lengths, and what is hidden. A change of this, and only of this, writes the file
+/// What the state file keeps of the window besides the keys and a later build's kept keys
+/// (`persist::encode_v2`): every workspace's tree with its shares and pinned lengths, and what it
+/// hides, in order, and which one is current. A change of this, and only of this, writes the file
 /// (this module's doc); zoom and the MRU order are not stored at all, and the keys ride along.
+/// Container ids are not compared (`Con`'s equality ignores them).
 #[derive(Debug, Clone, PartialEq)]
 struct Arrangement {
-    root: Node,
-    hidden: BTreeSet<ModuleId>,
+    current: String,
+    workspaces: Vec<(String, Con, BTreeSet<ModuleId>)>,
 }
 
 impl Arrangement {
-    fn of(layout: &Layout) -> Arrangement {
+    fn of(workspaces: &Workspaces, current: &Layout) -> Arrangement {
         Arrangement {
-            root: layout.root().clone(),
-            hidden: layout.saved_hidden(),
+            current: workspaces.current().to_string(),
+            workspaces: workspaces
+                .each(current)
+                .into_iter()
+                .map(|(name, layout)| (name.to_string(), layout.root().clone(), layout.saved_hidden()))
+                .collect(),
         }
+    }
+
+    /// The current workspace's tree: the one a pinned row settles in on screen.
+    fn current_root_mut(&mut self) -> Option<&mut Con> {
+        let current = &self.current;
+        self.workspaces
+            .iter_mut()
+            .find(|(name, _, _)| name == current)
+            .map(|(_, root, _)| root)
     }
 }
 
-/// Returns the remaining debounce delay, or `None` once [`persist::SAVE_DEBOUNCE_MS`] has
-/// passed since the last change. One timer handles a burst of changes, such as divider drag
-/// motion events. If it fires early, it is armed again for the remaining delay instead of being
-/// removed and re-added on every change.
+/// How much longer the debounce waits, given how long ago the last change was: `None` once
+/// [`persist::SAVE_DEBOUNCE_MS`] has passed. The timer is armed once for a burst of changes -- a
+/// divider drag reports one per motion event -- and, when it fires early, armed again for what is
+/// left, rather than removed and re-added for every change.
 fn debounce_left(since_last_change: Duration) -> Option<Duration> {
     Duration::from_millis(persist::SAVE_DEBOUNCE_MS)
         .checked_sub(since_last_change)
         .filter(|left| !left.is_zero())
 }
 
-/// `base` with each pinned length it did not have yet taken from `now`'s split at the same place:
-/// what `settle_pins` just gave the layout. Where the two trees differ, `base` is left as it is.
-fn take_settled_lengths(base: &mut Node, now: &Node) {
-    if let (
-        Node::Split {
-            pin: base_pin,
-            first: base_first,
-            second: base_second,
-            ..
-        },
-        Node::Split {
-            pin: now_pin,
-            first: now_first,
-            second: now_second,
-            ..
-        },
-    ) = (base, now)
-    {
-        if let (Some(base_pin), Some(now_pin)) = (base_pin.as_mut(), now_pin) {
-            if base_pin.px.is_none() && base_pin.side == now_pin.side {
+/// `base` with each pinned length it did not have yet taken from `now`: what `settle_pins` just gave
+/// the layout. Containers are matched child by child where both have the same orientation and the
+/// same number of children; where the two trees differ, `base` is left as it is.
+fn take_settled_lengths(base: &mut Con, now: &Con) {
+    if base.layout != now.layout || base.children.len() != now.children.len() {
+        return;
+    }
+    for (base_child, now_child) in base.children.iter_mut().zip(&now.children) {
+        if let (Some(base_pin), Some(now_pin)) = (base_child.pin.as_mut(), now_child.pin) {
+            if base_pin.px.is_none() {
                 base_pin.px = now_pin.px;
             }
         }
-        take_settled_lengths(base_first, now_first);
-        take_settled_lengths(base_second, now_second);
+        if let (Node::Con(base_con), Node::Con(now_con)) = (&mut base_child.node, &now_child.node) {
+            take_settled_lengths(base_con, now_con);
+        }
     }
 }
 
@@ -168,10 +199,16 @@ fn take_settled_lengths(base: &mut Node, now: &Node) {
 pub(crate) struct LayoutSaver {
     dir: Option<PathBuf>,
     project_root: PathBuf,
+    /// The current workspace's layout, the one on screen.
     layout: Rc<RefCell<Layout>>,
+    /// Every workspace of the window; the current one's layout is `layout`.
+    workspaces: Rc<RefCell<Workspaces>>,
     /// The registered Lua panels: the file read again before a write is decoded as `load` decodes
-    /// it, so that "unusable" means what it meant when the window opened.
+    /// it, so that "unusable" and "partly usable" mean what they meant when the window opened.
     lua: Vec<ModuleDecl>,
+    /// The exact text of a file this window opened only in part, until its first write copies it
+    /// aside (or finds the file is no longer those bytes).
+    keep_copy: RefCell<Option<String>>,
     pending: RefCell<Option<glib::SourceId>>,
     /// When the grid last reported a change: what a debounce timer that fires checks.
     last_change: Cell<Option<Instant>>,
@@ -182,13 +219,16 @@ pub(crate) struct LayoutSaver {
 
 impl LayoutSaver {
     /// `dir` is `persist::state_dir`'s answer; `None` (no usable `XDG_STATE_HOME` or `HOME`) saves
-    /// nothing, said once here. `layout` is the startup layout, not yet changed: a launch is not a
-    /// change, whether it opened a file, the Lua default or the first launch.
+    /// nothing, said once here. `layout` and `workspaces` are the startup ones, not yet changed: a
+    /// launch is not a change, whether it opened a file, the Lua default or the first launch.
+    /// `keep_copy` is `choose_startup_layout`'s.
     pub(crate) fn new(
         dir: Option<PathBuf>,
         project_root: &Path,
         layout: Rc<RefCell<Layout>>,
+        workspaces: Rc<RefCell<Workspaces>>,
         lua: Vec<ModuleDecl>,
+        keep_copy: Option<String>,
     ) -> Rc<LayoutSaver> {
         if dir.is_none() {
             eprintln!(
@@ -196,12 +236,14 @@ impl LayoutSaver {
                  layout will not be kept"
             );
         }
-        let base = Arrangement::of(&layout.borrow());
+        let base = Arrangement::of(&workspaces.borrow(), &layout.borrow());
         Rc::new(LayoutSaver {
             dir,
             project_root: project_root.to_path_buf(),
             layout,
+            workspaces,
             lua,
+            keep_copy: RefCell::new(keep_copy),
             pending: RefCell::new(None),
             last_change: Cell::new(None),
             base: RefCell::new(base),
@@ -211,9 +253,8 @@ impl LayoutSaver {
     /// The grid's change hook: the layout changed, so it is compared and written 500ms after the
     /// last change, or at close. A change that leaves the arrangement as it was -- a zoom, or its end,
     /// which a move of the keys out of a zoomed module also reports -- arms nothing, and a change
-    /// while the timer already waits only
-    /// moves the time it waits for ([`debounce_left`]). The grid's own startup `apply` never reaches
-    /// this hook: `main` connects it after that `apply`.
+    /// while the timer already waits only moves the time it waits for ([`debounce_left`]). The grid's
+    /// own startup `apply` never reaches this hook: `main` connects it after that `apply`.
     pub(crate) fn changed(self: &Rc<Self>) {
         if self.dir.is_none() {
             return;
@@ -239,59 +280,155 @@ impl LayoutSaver {
         *self.pending.borrow_mut() = Some(source);
     }
 
-    /// Whether the arrangement differs from `base`. `false` while the layout is borrowed: the timer
-    /// is armed by the next change, and the close handler saves whatever it is.
+    /// The arrangement now; `None` while the layout or the workspaces are borrowed.
+    fn arrangement(&self) -> Option<Arrangement> {
+        let layout = self.layout.try_borrow().ok()?;
+        let workspaces = self.workspaces.try_borrow().ok()?;
+        Some(Arrangement::of(&workspaces, &layout))
+    }
+
+    /// Whether the arrangement differs from `base`. `false` while either is borrowed: the timer is
+    /// armed by the next change, and the close handler saves whatever it is.
     fn arrangement_changed(&self) -> bool {
-        match self.layout.try_borrow() {
-            Ok(layout) => Arrangement::of(&layout) != *self.base.borrow(),
-            Err(_) => false,
-        }
+        self.arrangement().is_some_and(|now| now != *self.base.borrow())
     }
 
     /// The grid's settle hook: a pinned split got its length on screen. That is not a change, so the
     /// length joins `base`.
     pub(crate) fn settled(&self) {
         if let Ok(layout) = self.layout.try_borrow() {
-            take_settled_lengths(&mut self.base.borrow_mut().root, layout.root());
+            if let Some(root) = self.base.borrow_mut().current_root_mut() {
+                take_settled_lengths(root, layout.root());
+            }
         }
     }
 
-    /// Writes this window's layout now if its arrangement changed since `base`, dropping a pending
-    /// timer: the close handler's call, and the timer's. The file is read again first, only to know
-    /// whether it can be used: one this build cannot use is set aside, and nothing is written if it
-    /// cannot be (this module's doc).
+    /// Before the first write after opening a file only in part: its bytes copied aside, if the file
+    /// is still those bytes. `false` when that could not be done and nothing may be written yet; the
+    /// copy is tried again at the next save.
+    fn copy_what_was_opened(&self, dir: &Path) -> bool {
+        let Some(opened) = self.keep_copy.borrow().clone() else {
+            return true;
+        };
+        match persist::read_v2_text(dir, &self.project_root) {
+            Ok(Some(text)) if text == opened => match persist::copy_aside_v2(dir, &self.project_root, &opened) {
+                Ok(aside) => println!(
+                    "[layout] the file this window opened, of which this build could not carry everything, is \
+                     kept as {}",
+                    aside.display()
+                ),
+                Err(err) => {
+                    eprintln!("[layout] could not copy aside the file this window opened ({err}); not saved");
+                    return false;
+                }
+            },
+            // Another window wrote since, or the file is gone: what is there is not the text this
+            // window opened, and not this window's to keep.
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("[layout] could not read the file to copy it aside ({err}); not saved");
+                return false;
+            }
+        }
+        *self.keep_copy.borrow_mut() = None;
+        true
+    }
+
+    /// The file as it is now, made safe to write over: wholly unusable, set aside; partly usable, its
+    /// text copied aside; usable or partly, its kept keys taken. A kept key naming a module this
+    /// window places -- in any of its workspaces now, not only in the file's trees -- is not taken: a
+    /// later build may have floated a module this window has since tiled, and writing both would put
+    /// it in two places; the file's text is copied aside instead, as for a partly usable file.
+    /// `false` when that could not be done and nothing may be written.
+    fn make_way(&self, dir: &Path) -> bool {
+        let (text, mut kept, mut copy) = match persist::v2_state(dir, &self.project_root, &self.lua) {
+            V2State::Missing => return true,
+            V2State::Usable(text, kept) => (text, kept, false),
+            V2State::Partly(text, kept) => (text, kept, true),
+            V2State::Unusable(_) => {
+                return match persist::set_aside_v2(dir, &self.project_root) {
+                    Ok(aside) => {
+                        println!(
+                            "[layout] the file this build could not use is kept as {}",
+                            aside.display()
+                        );
+                        true
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(err) => {
+                        eprintln!("[layout] could not set aside the file this build could not use ({err}); not saved");
+                        false
+                    }
+                };
+            }
+        };
+        let placed = match (self.layout.try_borrow(), self.workspaces.try_borrow()) {
+            (Ok(layout), Ok(workspaces)) => workspaces.placed(&layout, &self.lua),
+            _ => {
+                eprintln!("[layout] the layout was busy; not saved this time");
+                return false;
+            }
+        };
+        let dropped = kept.drop_placed(&placed);
+        copy |= !dropped.is_empty();
+        if copy {
+            match persist::copy_aside_v2(dir, &self.project_root, &text) {
+                Ok(aside) => println!(
+                    "[layout] the file, part of which this build cannot carry, is kept as {}",
+                    aside.display()
+                ),
+                Err(err) => {
+                    eprintln!(
+                        "[layout] could not copy aside the file this build can only partly use ({err}); not saved"
+                    );
+                    return false;
+                }
+            }
+        }
+        for note in dropped {
+            println!("[layout] {note}");
+        }
+        match self.workspaces.try_borrow_mut() {
+            Ok(mut workspaces) => {
+                workspaces.retake_kept(kept);
+                true
+            }
+            Err(_) => {
+                eprintln!("[layout] the workspaces were busy; not saved this time");
+                false
+            }
+        }
+    }
+
+    /// Writes this window's workspaces now if their arrangement changed since `base`, dropping a
+    /// pending timer: the close handler's call, and the timer's. The file is read again first, to
+    /// know what the write replaces (this module's doc); nothing is written if what must be kept of
+    /// it cannot be.
     pub(crate) fn save_now(&self) {
         if let Some(source) = self.pending.borrow_mut().take() {
             source.remove();
         }
         let Some(dir) = &self.dir else { return };
-        let Ok(layout) = self.layout.try_borrow() else {
-            eprintln!("[layout] the layout was busy; not saved this time");
-            return;
+        let (now, current) = match (self.layout.try_borrow(), self.workspaces.try_borrow()) {
+            (Ok(layout), Ok(workspaces)) => (Arrangement::of(&workspaces, &layout), layout.clone()),
+            _ => {
+                eprintln!("[layout] the layout was busy; not saved this time");
+                return;
+            }
         };
-        let now = Arrangement::of(&layout);
         if now == *self.base.borrow() {
             return;
         }
-        let to_write = layout.clone();
-        drop(layout);
-        // Reload before setting the file aside: it may have become unusable since startup, or
-        // another window may have already replaced it with a valid file. Do not move that new
-        // file over the unusable bytes the other window preserved.
-        if let Loaded::Unusable(_) = persist::load(dir, &self.project_root, &self.lua) {
-            match persist::set_aside(dir, &self.project_root) {
-                Ok(aside) => println!(
-                    "[layout] the file this build could not use is kept as {}",
-                    aside.display()
-                ),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    eprintln!("[layout] could not set aside the file this build could not use ({err}); not saved");
-                    return;
-                }
-            }
+        // Not flags set at startup: the file may have changed since -- a hand-edit, another window,
+        // another build -- and what was true of it when this window opened says nothing of it now.
+        if !self.copy_what_was_opened(dir) || !self.make_way(dir) {
+            return;
         }
-        match persist::save(dir, &self.project_root, &to_write) {
+        let Ok(workspaces) = self.workspaces.try_borrow() else {
+            eprintln!("[layout] the workspaces were busy; not saved this time");
+            return;
+        };
+        match persist::save(dir, &self.project_root, &workspaces, &current) {
             Ok(_) => *self.base.borrow_mut() = now,
             Err(err) => eprintln!("[layout] could not save {}: {err}", dir.display()),
         }
@@ -309,9 +446,11 @@ mod tests {
     use eitri_core::layout::{Axis, Direction, Frame, ModuleId, Placement, Size};
 
     fn restored(layout: Layout) -> Loaded {
-        Loaded::Restored(eitri_core::layout::Reconciled {
-            layout,
+        Loaded::Restored(persist::Opened {
+            workspaces: Workspaces::single(),
+            current: layout,
             notes: vec!["a note".to_string()],
+            keep_copy: None,
         })
     }
 
@@ -327,7 +466,8 @@ mod tests {
             Node::Leaf(ModuleId::agent()),
             Node::Leaf(ModuleId::editor()),
         );
-        let (layout, notes) = choose_startup_layout(Some(&tree), Some(restored(left.clone())), &[], None).unwrap();
+        let (_, layout, notes, _) =
+            choose_startup_layout(Some(&tree), Some(restored(left.clone())), &[], None).unwrap();
         assert_eq!(layout, left);
         assert_eq!(
             notes,
@@ -351,7 +491,7 @@ mod tests {
         );
         for loaded in [None, Some(Loaded::Missing), Some(Loaded::Unusable("corrupt".into()))] {
             let unusable = matches!(loaded, Some(Loaded::Unusable(_)));
-            let (layout, notes) = choose_startup_layout(Some(&tree), loaded, &[], None).unwrap();
+            let (_, layout, notes, _) = choose_startup_layout(Some(&tree), loaded, &[], None).unwrap();
             assert_eq!(layout.visible_leaves(), [ModuleId::agent(), ModuleId::editor()]);
             assert!(layout.contains(&ModuleId::terminal()) && !layout.is_shown(&ModuleId::terminal()));
             assert_eq!(notes.iter().any(|n| n.contains("corrupt")), unusable, "{notes:?}");
@@ -365,7 +505,7 @@ mod tests {
             id: ModuleId::lua("side"),
             placement: Placement::RightOfRoot,
         }];
-        let (layout, notes) = choose_startup_layout(None, Some(Loaded::Missing), &side, None).unwrap();
+        let (_, layout, notes, _) = choose_startup_layout(None, Some(Loaded::Missing), &side, None).unwrap();
         assert_eq!(layout, crate::terminal::initial_layout(&side).unwrap());
         assert!(notes.is_empty());
     }
@@ -383,7 +523,8 @@ mod tests {
             &eitri_core::layout::Frame::new(eitri_core::layout::Size { w: 1280, h: 721 }, 1),
         )
         .unwrap();
-        let (layout, notes) = choose_startup_layout(None, Some(restored(left.clone())), &[], Some("Ctrl+b e")).unwrap();
+        let (_, layout, notes, _) =
+            choose_startup_layout(None, Some(restored(left.clone())), &[], Some("Ctrl+b e")).unwrap();
         assert!(!layout.is_shown(&ModuleId::editor()));
         assert_eq!(
             notes.last().map(String::as_str),
@@ -393,7 +534,7 @@ mod tests {
             )
         );
         // With nothing bound to show the editor, the note names no key rather than a wrong one.
-        let (_, notes) = choose_startup_layout(None, Some(restored(left)), &[], None).unwrap();
+        let (_, _, notes, _) = choose_startup_layout(None, Some(restored(left)), &[], None).unwrap();
         assert_eq!(
             notes.last().map(String::as_str),
             Some(
@@ -401,7 +542,7 @@ mod tests {
                  it is shown"
             )
         );
-        let (_, notes) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
+        let (_, _, notes, _) = choose_startup_layout(None, Some(Loaded::Missing), &[], None).unwrap();
         assert!(notes.iter().all(|n| !n.contains("editor is hidden")), "{notes:?}");
     }
 
@@ -412,7 +553,18 @@ mod tests {
     }
 
     fn saver_for(dir: &Path, layout: &Rc<RefCell<Layout>>) -> Rc<LayoutSaver> {
-        LayoutSaver::new(Some(dir.to_path_buf()), root(), layout.clone(), Vec::new())
+        LayoutSaver::new(
+            Some(dir.to_path_buf()),
+            root(),
+            layout.clone(),
+            one_workspace(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn one_workspace() -> Rc<RefCell<Workspaces>> {
+        Rc::new(RefCell::new(Workspaces::single()))
     }
 
     /// A window opened on this project's file, as `main` opens one.
@@ -420,16 +572,16 @@ mod tests {
         let Loaded::Restored(r) = persist::load(dir, root(), lua) else {
             panic!("a good file")
         };
-        Rc::new(RefCell::new(r.layout))
+        Rc::new(RefCell::new(r.current))
     }
 
     fn file_text(dir: &Path) -> String {
-        std::fs::read_to_string(dir.join(persist::file_name(root()))).unwrap()
+        std::fs::read_to_string(dir.join(persist::file_name_v2(root()))).unwrap()
     }
 
     /// What the file holds after a write of `layout`, byte for byte: this window's whole layout.
     fn written_by(layout: &Rc<RefCell<Layout>>) -> String {
-        persist::encode(&layout.borrow(), root())
+        persist::encode_v2(&Workspaces::single(), &layout.borrow(), root())
     }
 
     fn frame() -> Frame<'static> {
@@ -439,11 +591,11 @@ mod tests {
     /// A launch is not a change: the saver writes nothing until the
     /// arrangement changes, so a file `load` could not use survives a window opened and closed
     /// untouched -- a click into the chat included -- and the first write that does replace it sets
-    /// it aside whole, as `.json.unusable`.
+    /// it aside whole, as `.v2.json.unusable`.
     #[test]
     fn nothing_is_written_until_the_layout_changes_and_an_unusable_file_is_kept() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver");
-        let path = dir.join(persist::file_name(root()));
+        let path = dir.join(persist::file_name_v2(root()));
         std::fs::write(&path, "{ a typo").unwrap();
         let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
         let saver = saver_for(&dir, &layout);
@@ -457,7 +609,7 @@ mod tests {
 
         layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
         saver.save_now();
-        let aside = dir.join(format!("{}.unusable", persist::file_name(root())));
+        let aside = dir.join(format!("{}.unusable", persist::file_name_v2(root())));
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ a typo");
         assert!(matches!(persist::load(&dir, root(), &[]), Loaded::Restored(_)));
 
@@ -479,7 +631,7 @@ mod tests {
     #[test]
     fn moving_the_keys_writes_nothing_with_or_without_a_file() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-keys");
-        let path = dir.join(persist::file_name(root()));
+        let path = dir.join(persist::file_name_v2(root()));
         let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
         let saver = saver_for(&dir, &layout);
         layout.borrow_mut().set_focus(&ModuleId::agent()).unwrap();
@@ -529,7 +681,13 @@ mod tests {
     #[test]
     fn an_arrangement_change_writes_this_windows_layout_with_the_keys_where_they_are() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-arrangement");
-        persist::save(&dir, root(), &crate::terminal::initial_layout(&[]).unwrap()).unwrap();
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
         let layout = opened(&dir, &[]);
         let saver = saver_for(&dir, &layout);
         let before = file_text(&dir);
@@ -552,7 +710,13 @@ mod tests {
     #[test]
     fn two_windows_the_later_arrangement_change_wins_and_a_click_writes_nothing() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-two-arrangements");
-        persist::save(&dir, root(), &crate::terminal::initial_layout(&[]).unwrap()).unwrap();
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
         let (first, second) = (opened(&dir, &[]), opened(&dir, &[]));
         let first_saver = saver_for(&dir, &first);
         let second_saver = saver_for(&dir, &second);
@@ -588,13 +752,26 @@ mod tests {
     #[test]
     fn a_module_this_window_lacks_leaves_the_file_only_with_its_arrangement_change() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-foreign-module");
-        persist::save(&dir, root(), &crate::terminal::initial_layout(&[]).unwrap()).unwrap();
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
         let lua = vec![ModuleDecl {
             id: ModuleId::lua("notes"),
             placement: Placement::RightOfRoot,
         }];
         let (first, second) = (opened(&dir, &lua), opened(&dir, &[]));
-        let first_saver = LayoutSaver::new(Some(dir.clone()), root(), first.clone(), lua.clone());
+        let first_saver = LayoutSaver::new(
+            Some(dir.clone()),
+            root(),
+            first.clone(),
+            one_workspace(),
+            lua.clone(),
+            None,
+        );
         let second_saver = saver_for(&dir, &second);
         first.borrow_mut().show(&ModuleId::terminal()).unwrap();
         first_saver.save_now();
@@ -620,8 +797,8 @@ mod tests {
     #[test]
     fn a_length_settled_on_screen_is_not_a_change_and_moving_it_is() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settle");
-        let path = dir.join(persist::file_name(root()));
-        let (startup, _) =
+        let path = dir.join(persist::file_name_v2(root()));
+        let (_, startup, _, _) =
             choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
         let layout = Rc::new(RefCell::new(startup));
         let saver = saver_for(&dir, &layout);
@@ -667,9 +844,9 @@ mod tests {
     #[test]
     fn a_length_settled_on_a_restored_file_is_not_a_change_either() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settled-file");
-        let (unsettled, _) =
+        let (_, unsettled, _, _) =
             choose_startup_layout(Some(&bottom_row_default()), Some(Loaded::Missing), &[], None).unwrap();
-        persist::save(&dir, root(), &unsettled).unwrap();
+        persist::save(&dir, root(), &Workspaces::single(), &unsettled).unwrap();
         let before = file_text(&dir);
         assert!(before.contains("\"px\": null"), "{before}");
         let layout = opened(&dir, &[]);
@@ -698,7 +875,7 @@ mod tests {
     #[test]
     fn a_second_window_does_not_set_aside_the_file_the_first_one_wrote() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-two-windows");
-        std::fs::write(dir.join(persist::file_name(root())), "{ a typo").unwrap();
+        std::fs::write(dir.join(persist::file_name_v2(root())), "{ a typo").unwrap();
         let first = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
         let second = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
         let first_saver = saver_for(&dir, &first);
@@ -707,12 +884,12 @@ mod tests {
         first_saver.save_now();
         eitri_core::layout::even(&mut second.borrow_mut(), Axis::Column);
         second_saver.save_now();
-        let aside = dir.join(format!("{}.unusable", persist::file_name(root())));
+        let aside = dir.join(format!("{}.unusable", persist::file_name_v2(root())));
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ a typo");
         let Loaded::Restored(saved) = persist::load(&dir, root(), &[]) else {
             panic!("the second window's layout")
         };
-        assert_eq!(saved.layout.root(), second.borrow().root(), "the last to save wins");
+        assert_eq!(saved.current.root(), second.borrow().root(), "the last to save wins");
     }
 
     /// A file that becomes unusable while the window is open -- here a hand-edit with a typo, made
@@ -722,9 +899,15 @@ mod tests {
     #[test]
     fn a_file_made_unusable_while_the_window_is_open_is_set_aside_not_overwritten() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-edited");
-        let path = dir.join(persist::file_name(root()));
-        let aside = dir.join(format!("{}.unusable", persist::file_name(root())));
-        persist::save(&dir, root(), &crate::terminal::initial_layout(&[]).unwrap()).unwrap();
+        let path = dir.join(persist::file_name_v2(root()));
+        let aside = dir.join(format!("{}.unusable", persist::file_name_v2(root())));
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
         let layout = opened(&dir, &[]);
         let saver = saver_for(&dir, &layout);
         std::fs::write(&path, "{ \"version\": 1, a typo made in nvim").unwrap();
@@ -761,8 +944,14 @@ mod tests {
     #[test]
     fn a_deleted_file_is_not_written_again_for_a_click() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-deleted");
-        let path = dir.join(persist::file_name(root()));
-        persist::save(&dir, root(), &crate::terminal::initial_layout(&[]).unwrap()).unwrap();
+        let path = dir.join(persist::file_name_v2(root()));
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
         let layout = opened(&dir, &[]);
         let saver = saver_for(&dir, &layout);
         std::fs::remove_file(&path).unwrap();
@@ -829,7 +1018,7 @@ mod tests {
             .acquire()
             .expect("glib's default main context, which no other test in this crate uses");
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-debounce");
-        let path = dir.join(persist::file_name(root()));
+        let path = dir.join(persist::file_name_v2(root()));
         let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
         let saver = saver_for(&dir, &layout);
         let _disarm = Disarm(saver.clone());
@@ -876,14 +1065,14 @@ mod tests {
 
     /// A set-aside that fails for any reason but `NotFound` writes nothing, so an unusable file is
     /// never written over even when it cannot be moved -- here because a directory sits where
-    /// `.json.unusable` goes, which fails the rename for root too. The change is not lost: `base`
+    /// `.v2.json.unusable` goes, which fails the rename for root too. The change is not lost: `base`
     /// has not moved, so the next save, the close's included, tries again, and once the way is clear
     /// the file is set aside and this window's layout written.
     #[test]
     fn a_set_aside_that_fails_writes_nothing_over_the_unusable_file() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-set-aside-fails");
-        let path = dir.join(persist::file_name(root()));
-        let aside = dir.join(format!("{}.unusable", persist::file_name(root())));
+        let path = dir.join(persist::file_name_v2(root()));
+        let aside = dir.join(format!("{}.unusable", persist::file_name_v2(root())));
         std::fs::write(&path, "{ a typo").unwrap();
         std::fs::create_dir_all(aside.join("in the way")).unwrap();
         let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
@@ -910,7 +1099,7 @@ mod tests {
     #[test]
     fn a_failed_write_is_tried_again() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-failed-write");
-        let path = dir.join(persist::file_name(root()));
+        let path = dir.join(persist::file_name_v2(root()));
         std::fs::create_dir_all(persist::temporary(&path).join("in the way")).unwrap();
         let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
         let saver = saver_for(&dir, &layout);
@@ -931,7 +1120,7 @@ mod tests {
     #[test]
     fn a_settle_does_not_swallow_a_length_the_window_changed() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-settle-after-resize");
-        let path = dir.join(persist::file_name(root()));
+        let path = dir.join(persist::file_name_v2(root()));
         let logs = ModuleId::lua("logs");
         let lua = vec![ModuleDecl {
             id: logs.clone(),
@@ -946,7 +1135,7 @@ mod tests {
         }
         eitri_core::layout::settle_pins(&mut start, &frame());
         let layout = Rc::new(RefCell::new(start));
-        let saver = LayoutSaver::new(Some(dir.clone()), root(), layout.clone(), lua);
+        let saver = LayoutSaver::new(Some(dir.clone()), root(), layout.clone(), one_workspace(), lua, None);
 
         layout.borrow_mut().set_focus(&ModuleId::terminal()).unwrap();
         assert!(eitri_core::layout::resize(
@@ -968,6 +1157,73 @@ mod tests {
         assert_eq!(file_text(&dir), written_by(&layout));
     }
 
+    /// A pinned child of a container with three children, one pin settled in `now` and not in `base`.
+    fn three_children(settled: Option<i32>, layout: eitri_core::layout::ConLayout) -> Con {
+        use eitri_core::layout::{Child, Pin};
+        let leaf = |name: &str| Node::Leaf(ModuleId::lua(name));
+        let mut bottom = Child::new(leaf("c"), 0.2);
+        bottom.pin = Some(Pin { px: settled });
+        Con::new(
+            layout,
+            vec![Child::new(leaf("a"), 0.5), Child::new(leaf("b"), 0.3), bottom],
+        )
+    }
+
+    /// The settle hook copies a pin's length into `base` where `base` had none, in a container of any
+    /// size; a base whose shape differs from the layout's keeps its own pins as they are.
+    #[test]
+    fn take_settled_lengths_copies_a_settled_pin_into_the_base() {
+        use eitri_core::layout::ConLayout::{SplitH, SplitV};
+        let pin_of = |con: &Con| con.children[2].pin.unwrap().px;
+
+        let mut base = three_children(None, SplitV);
+        take_settled_lengths(&mut base, &three_children(Some(240), SplitV));
+        assert_eq!(pin_of(&base), Some(240), "the unsettled pin took the settled length");
+
+        let mut kept = three_children(Some(100), SplitV);
+        take_settled_lengths(&mut kept, &three_children(Some(240), SplitV));
+        assert_eq!(
+            pin_of(&kept),
+            Some(100),
+            "a length the base already had is not replaced"
+        );
+
+        let mut other_axis = three_children(None, SplitV);
+        take_settled_lengths(&mut other_axis, &three_children(Some(240), SplitH));
+        assert_eq!(
+            pin_of(&other_axis),
+            None,
+            "a container of another orientation is left alone"
+        );
+
+        let mut other_count = three_children(None, SplitV);
+        let mut shorter = three_children(Some(240), SplitV);
+        shorter.children.remove(1);
+        take_settled_lengths(&mut other_count, &shorter);
+        assert_eq!(
+            pin_of(&other_count),
+            None,
+            "a container with another child count is left alone"
+        );
+
+        // The same walk reaches a pin below the first level.
+        let nested = |settled| {
+            Con::new(
+                SplitH,
+                vec![
+                    eitri_core::layout::Child::new(Node::Con(three_children(settled, SplitV)), 0.5),
+                    eitri_core::layout::Child::new(Node::Leaf(ModuleId::lua("d")), 0.5),
+                ],
+            )
+        };
+        let mut base = nested(None);
+        take_settled_lengths(&mut base, &nested(Some(77)));
+        let Node::Con(inner) = &base.children[0].node else {
+            unreachable!()
+        };
+        assert_eq!(pin_of(inner), Some(77));
+    }
+
     /// The debounce's one timer: armed once, and when it fires before 500ms have passed since the
     /// last change, armed again for what is left.
     #[test]
@@ -987,7 +1243,7 @@ mod tests {
     #[test]
     fn only_the_arrangement_is_a_change() {
         let layout = crate::terminal::initial_layout(&[]).unwrap();
-        let base = Arrangement::of(&layout);
+        let base = Arrangement::of(&Workspaces::single(), &layout);
         let mut keys = layout.clone();
         keys.set_focus(&ModuleId::agent()).unwrap();
         let mut zoomed = layout.clone();
@@ -996,10 +1252,38 @@ mod tests {
         shown.show(&ModuleId::terminal()).unwrap();
         let mut even = layout.clone();
         eitri_core::layout::even(&mut even, Axis::Row);
-        assert_eq!(Arrangement::of(&keys), base, "a click");
-        assert_eq!(Arrangement::of(&zoomed), base, "a zoom");
-        assert_ne!(Arrangement::of(&shown), base, "a module shown");
-        assert_ne!(Arrangement::of(&even), base, "a ratio");
+        assert_eq!(Arrangement::of(&Workspaces::single(), &keys), base, "a click");
+        assert_eq!(Arrangement::of(&Workspaces::single(), &zoomed), base, "a zoom");
+        assert_ne!(Arrangement::of(&Workspaces::single(), &shown), base, "a module shown");
+        assert_ne!(Arrangement::of(&Workspaces::single(), &even), base, "a ratio");
+
+        // With two workspaces: a change in the stored one is a change, and so is which one is current.
+        let two = |current: &str, study: &Layout| {
+            let mut stored = std::collections::BTreeMap::new();
+            stored.insert(
+                if current == "main" { "study" } else { "main" }.to_string(),
+                study.clone(),
+            );
+            Workspaces::from_parts(
+                vec!["main".to_string(), "study".to_string()],
+                stored,
+                current.to_string(),
+                Default::default(),
+            )
+            .unwrap()
+        };
+        let base = Arrangement::of(&two("main", &layout), &layout);
+        assert_eq!(Arrangement::of(&two("main", &layout), &keys), base, "a click");
+        assert_ne!(
+            Arrangement::of(&two("main", &shown), &layout),
+            base,
+            "a module shown in the other workspace"
+        );
+        assert_ne!(
+            Arrangement::of(&two("study", &layout), &layout),
+            base,
+            "the other workspace current"
+        );
     }
 
     /// A Lua default naming a Lua panel that did not register is not a failure: the panel is left
@@ -1017,7 +1301,7 @@ mod tests {
                 Node::Leaf(ModuleId::lua("gone")),
             ),
         );
-        let (layout, notes) = choose_startup_layout(Some(&tree), None, &[], None).unwrap();
+        let (_, layout, notes, _) = choose_startup_layout(Some(&tree), None, &[], None).unwrap();
         assert!(!layout.contains(&ModuleId::lua("gone")));
         assert_eq!(
             notes,
@@ -1025,6 +1309,317 @@ mod tests {
                 "eitri.layout.default: left out 'lua:gone': this window has no such module",
                 "eitri.layout.default: placed 'terminal' below the editor, hidden, as a first launch does"
             ]
+        );
+    }
+
+    /// A window opened on this project's file as `main` opens one: the current layout, every
+    /// workspace, and a saver given what `choose_startup_layout` gives it.
+    struct Window {
+        layout: Rc<RefCell<Layout>>,
+        workspaces: Rc<RefCell<Workspaces>>,
+        saver: Rc<LayoutSaver>,
+    }
+
+    impl Window {
+        fn open(dir: &Path) -> Window {
+            let loaded = persist::load(dir, root(), &[]);
+            let (workspaces, layout, _, keep_copy) = choose_startup_layout(None, Some(loaded), &[], None).unwrap();
+            Window::with(dir, workspaces, layout, keep_copy)
+        }
+
+        fn with(dir: &Path, workspaces: Workspaces, layout: Layout, keep_copy: Option<String>) -> Window {
+            let layout = Rc::new(RefCell::new(layout));
+            let workspaces = Rc::new(RefCell::new(workspaces));
+            let saver = LayoutSaver::new(
+                Some(dir.to_path_buf()),
+                root(),
+                layout.clone(),
+                workspaces.clone(),
+                Vec::new(),
+                keep_copy,
+            );
+            Window {
+                layout,
+                workspaces,
+                saver,
+            }
+        }
+
+        /// What a write of this window puts in the file, byte for byte.
+        fn written(&self) -> String {
+            persist::encode_v2(&self.workspaces.borrow(), &self.layout.borrow(), root())
+        }
+
+        /// A change of the arrangement: the terminal shown, or hidden if it is shown.
+        fn change(&self) {
+            let mut layout = self.layout.borrow_mut();
+            if layout.is_shown(&ModuleId::terminal()) {
+                eitri_core::layout::hide(&mut layout, &ModuleId::terminal(), &frame()).unwrap();
+            } else {
+                layout.show(&ModuleId::terminal()).unwrap();
+            }
+        }
+    }
+
+    fn partial(dir: &Path) -> PathBuf {
+        dir.join(format!("{}.partial", persist::file_name_v2(root())))
+    }
+
+    fn two_workspaces(study: &Layout) -> Workspaces {
+        let mut stored = std::collections::BTreeMap::new();
+        stored.insert("study".to_string(), study.clone());
+        Workspaces::from_parts(
+            vec!["main".to_string(), "study".to_string()],
+            stored,
+            "main".to_string(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    /// `main` and `study`, the second naming a module no build has: a file this build opens only in
+    /// part.
+    fn partly_usable_text() -> String {
+        let main = crate::terminal::initial_layout(&[]).unwrap();
+        let text = persist::encode_v2(&two_workspaces(&main), &main, root());
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["workspaces"][1]["tiled"]["children"][1]["node"]["module"],
+            "agent"
+        );
+        value["workspaces"][1]["tiled"]["children"][1]["node"]["module"] = serde_json::json!("chat");
+        serde_json::to_string_pretty(&value).unwrap()
+    }
+
+    /// A project last left by a build before workspaces opens from its version 1 file, says so, and
+    /// writes only the version 2 file.
+    #[test]
+    fn a_migrated_file_says_so() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-migrated");
+        let v1 = dir.join(persist::file_name(root()));
+        let text = r#"{"version": 1, "project_root": "/home/user/project",
+            "root": {"type": "split", "axis": "row", "ratio": 0.5942142,
+                "first": {"type": "split", "axis": "column", "ratio": 0.6666667,
+                    "pin": {"side": "second", "px": 240},
+                    "first": {"type": "leaf", "module": "editor"},
+                    "second": {"type": "leaf", "module": "terminal"}},
+                "second": {"type": "leaf", "module": "agent"}},
+            "hidden": [], "focus": "editor"}"#;
+        std::fs::write(&v1, text).unwrap();
+        let (workspaces, layout, notes, keep_copy) =
+            choose_startup_layout(None, Some(persist::load(&dir, root(), &[])), &[], None).unwrap();
+        assert_eq!(workspaces, Workspaces::single());
+        assert!(layout.is_shown(&ModuleId::terminal()));
+        assert_eq!(
+            notes,
+            ["migrated from the version 1 layout file", "reopened as it was left"]
+        );
+        assert_eq!(keep_copy, None);
+
+        let window = Window::with(&dir, workspaces, layout, keep_copy);
+        window.change();
+        window.saver.save_now();
+        assert_eq!(file_text(&dir), window.written());
+        assert_eq!(
+            std::fs::read_to_string(&v1).unwrap(),
+            text,
+            "the version 1 file is never written"
+        );
+    }
+
+    /// A file this window opened only in part has the bytes it read copied aside before its first
+    /// write, and then the window's own workspaces are written.
+    #[test]
+    fn the_saver_copies_a_partly_unusable_file_before_its_first_write() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-partial");
+        let text = partly_usable_text();
+        std::fs::write(dir.join(persist::file_name_v2(root())), &text).unwrap();
+        let window = Window::open(&dir);
+        assert_eq!(window.workspaces.borrow().order(), ["main"]);
+        window.layout.borrow_mut().set_focus(&ModuleId::agent()).unwrap();
+        window.saver.save_now();
+        assert!(!partial(&dir).exists(), "a click writes nothing, and copies nothing");
+        assert_eq!(file_text(&dir), text);
+
+        window.change();
+        window.saver.save_now();
+        assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), text);
+        assert_eq!(file_text(&dir), window.written());
+    }
+
+    /// Two windows that opened the same partly usable file: the first to write copies it aside; the
+    /// second finds the file is the first one's now, not the text it opened, and copies nothing over
+    /// the copy -- here a later copy, of another partly usable text the first window found and kept,
+    /// which a second window copying what it opened would replace.
+    #[test]
+    fn a_second_window_does_not_copy_aside_the_file_the_first_one_wrote() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-partial-two");
+        let text = partly_usable_text();
+        std::fs::write(dir.join(persist::file_name_v2(root())), &text).unwrap();
+        let (first, second) = (Window::open(&dir), Window::open(&dir));
+        first.change();
+        first.saver.save_now();
+        assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), text);
+        assert_eq!(file_text(&dir), first.written());
+
+        // The file made partly unusable again, differently, and the first window writing over it:
+        // the copy is of that text now.
+        let later = text.replace("\"chat\"", "\"pane\"");
+        assert_ne!(later, text);
+        std::fs::write(dir.join(persist::file_name_v2(root())), &later).unwrap();
+        first.change();
+        first.saver.save_now();
+        assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), later);
+        assert_eq!(file_text(&dir), first.written());
+
+        eitri_core::layout::even(&mut second.layout.borrow_mut(), Axis::Column);
+        second.saver.save_now();
+        assert_eq!(
+            std::fs::read_to_string(partial(&dir)).unwrap(),
+            later,
+            "the file is not the text the second window opened, so that text is not copied over the copy"
+        );
+        assert_eq!(file_text(&dir), second.written(), "the later writer wins, whole");
+        assert_ne!(second.written(), first.written());
+    }
+
+    /// A file made partly unusable after this window opened it -- a hand edit, another build -- has its
+    /// text copied aside before this window writes over it.
+    #[test]
+    fn a_file_made_partly_unusable_while_open_is_copied_before_the_write() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-partial-later");
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
+        let window = Window::open(&dir);
+        let text = partly_usable_text();
+        std::fs::write(dir.join(persist::file_name_v2(root())), &text).unwrap();
+        window.change();
+        window.saver.save_now();
+        assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), text);
+        assert_eq!(file_text(&dir), window.written());
+    }
+
+    /// Keys a later build wrote into the file after this window opened it -- a workspace's floating
+    /// modules, a top-level key -- are taken from the file when this window writes, so its write does
+    /// not erase them; nothing is copied aside for them.
+    #[test]
+    fn unknown_keys_written_after_this_window_loaded_survive_its_save() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-kept-later");
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
+        let window = Window::open(&dir);
+        let mut value: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
+        let floating = serde_json::json!([{"module": "terminal#2", "cx": 0.5, "cy": 0.45, "w": 900, "h": 420}]);
+        value["workspaces"][0]["floating"] = floating.clone();
+        value["future"] = serde_json::json!({"a": 1});
+        std::fs::write(
+            dir.join(persist::file_name_v2(root())),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        window.change();
+        window.saver.save_now();
+        let again: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
+        assert_eq!(again["workspaces"][0]["floating"], floating);
+        assert_eq!(again["future"], serde_json::json!({"a": 1}));
+        assert_eq!(file_text(&dir), window.written());
+        assert!(!partial(&dir).exists(), "carried, so nothing is copied");
+    }
+
+    /// Two builds on one project: this window tiles `terminal#2` after it opened the file, and a later
+    /// build then floats a `terminal#2` of its own there. The file's tree does not hold it, so the file
+    /// alone does not show the clash; this window's own layout does. Its write keeps `terminal#2` in
+    /// one place, its tree, and the later build's text survives as `.v2.json.partial`.
+    #[test]
+    fn a_kept_key_naming_a_module_this_window_placed_since_it_opened_is_not_written_back() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-kept-placed-since");
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
+        let window = Window::open(&dir);
+        let second = ModuleId::parse("terminal#2").unwrap();
+        eitri_core::layout::place(&mut window.layout.borrow_mut(), &second, &ModuleId::editor(), Axis::Row).unwrap();
+
+        let mut value: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
+        value["workspaces"][0]["floating"] = serde_json::json!([{"module": "terminal#2", "w": 900, "h": 420}]);
+        value["workspaces"][0]["float_memory"] = serde_json::json!({"x": 1});
+        let later = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::write(dir.join(persist::file_name_v2(root())), &later).unwrap();
+
+        window.saver.save_now();
+        let again: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();
+        assert_eq!(again["workspaces"][0].get("floating"), None, "terminal#2 is tiled here");
+        assert_eq!(
+            again["workspaces"][0]["float_memory"],
+            serde_json::json!({"x": 1}),
+            "a key naming no module of this window is still carried"
+        );
+        assert!(file_text(&dir).contains("\"terminal#2\""), "in the tree");
+        assert_eq!(file_text(&dir), window.written());
+        assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), later);
+        assert!(window.workspaces.borrow().reserved().is_empty());
+        let Loaded::Restored(back) = persist::load(&dir, root(), &[]) else {
+            panic!("the file")
+        };
+        assert!(back.keep_copy.is_none(), "what was written holds terminal#2 once");
+    }
+
+    #[test]
+    fn the_saver_writes_every_workspace() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-every-workspace");
+        let mut study = crate::terminal::initial_layout(&[]).unwrap();
+        eitri_core::layout::even(&mut study, Axis::Row);
+        let window = Window::with(
+            &dir,
+            two_workspaces(&study),
+            crate::terminal::initial_layout(&[]).unwrap(),
+            None,
+        );
+        window.change();
+        window.saver.save_now();
+        assert_eq!(file_text(&dir), window.written());
+        let Loaded::Restored(back) = persist::load(&dir, root(), &[]) else {
+            panic!("the file")
+        };
+        assert_eq!(back.workspaces.order(), ["main", "study"]);
+        assert_eq!(back.workspaces.stored("study").unwrap().root(), study.root());
+    }
+
+    /// With several workspaces too, a move of the keys writes nothing; a change in any workspace,
+    /// the one not on screen included, is written.
+    #[test]
+    fn a_move_of_the_keys_writes_nothing() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-keys-workspaces");
+        let path = dir.join(persist::file_name_v2(root()));
+        let layout = crate::terminal::initial_layout(&[]).unwrap();
+        let window = Window::with(&dir, two_workspaces(&layout), layout, None);
+        window.layout.borrow_mut().set_focus(&ModuleId::agent()).unwrap();
+        window.saver.save_now();
+        assert!(!path.exists(), "a click");
+
+        for stored in window.workspaces.borrow_mut().stored_mut() {
+            stored.show(&ModuleId::terminal()).unwrap();
+        }
+        window.saver.save_now();
+        assert_eq!(
+            file_text(&dir),
+            window.written(),
+            "a change in the workspace not on screen"
         );
     }
 }

@@ -54,7 +54,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
         Action::Select(dir) => CompanionVerb::Select(*dir),
         Action::SelectLast
         | Action::SelectNext
-        | Action::Split(_)
+        | Action::Split { .. }
         | Action::CopyMode { .. }
         | Action::Zoom
         | Action::Resize { .. }
@@ -64,6 +64,12 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::ModuleHide
         | Action::ModuleKill
         | Action::WindowImmersive
+        | Action::Move(_)
+        | Action::ContainerTabbed
+        | Action::ContainerStacked
+        | Action::FocusParent
+        | Action::FocusChild
+        | Action::InstanceNew { .. }
         | Action::MoveFar(_)
         | Action::ToggleSplit
         | Action::Rotate { .. }
@@ -165,7 +171,24 @@ mod tests {
                 Action::Tab(TabAction::Select(3)),
                 CompanionVerb::Tab(TabAction::Select(3)),
             ),
-            (Action::Split(Axis::Column), CompanionVerb::Refuse),
+            (
+                Action::Split {
+                    axis: Axis::Column,
+                    cwd: crate::keymap::action::SplitCwd::Start,
+                },
+                CompanionVerb::Refuse,
+            ),
+            (Action::Move(Direction::Left), CompanionVerb::Refuse),
+            (Action::ContainerTabbed, CompanionVerb::Refuse),
+            (Action::ContainerStacked, CompanionVerb::Refuse),
+            (Action::FocusParent, CompanionVerb::Refuse),
+            (Action::FocusChild, CompanionVerb::Refuse),
+            (
+                Action::InstanceNew {
+                    kind: crate::layout::ModuleKind::Terminal,
+                },
+                CompanionVerb::Refuse,
+            ),
             (Action::CopyMode { up: true }, CompanionVerb::Refuse),
         ];
         for (action, want) in cases {

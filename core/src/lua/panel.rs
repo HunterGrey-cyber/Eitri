@@ -6,7 +6,7 @@
 
 use mlua::Table;
 
-use crate::layout::Placement;
+use crate::layout::{ModuleId, Placement};
 
 /// A Lua panel's `position`: `main`, `side` or `bottom`.
 ///
@@ -67,6 +67,11 @@ pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
         return Err(mlua::Error::RuntimeError(
             "eitri.panel.register: id must not be empty".to_string(),
         ));
+    }
+    if ModuleId::parse(&id).is_ok_and(|module| module.kind().has_instances() && module.number() > 1) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "eitri.panel.register: id '{id}' is the name of an instance (terminal#2..#9 and agent#2..#9 are reserved)"
+        )));
     }
     let title: String = spec.get("title")?;
     let position: String = spec.get("position")?;
@@ -141,6 +146,27 @@ mod tests {
         )
         .eval()
         .unwrap()
+    }
+
+    fn spec_with_id(lua: &Lua, id: &str) -> Table {
+        let spec = valid_spec(lua);
+        spec.set("id", id).unwrap();
+        spec
+    }
+
+    #[test]
+    fn an_id_spelled_like_an_instance_is_refused() {
+        let lua = Lua::new();
+        for id in ["terminal#2", "terminal#9", "agent#2", "agent#9"] {
+            let err = parse_panel_spec(&spec_with_id(&lua, id)).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("eitri.panel.register: id '{id}' is the name of an instance")),
+                "{err}"
+            );
+        }
+        for id in ["terminal#1", "notes#2", "terminal#10"] {
+            assert!(parse_panel_spec(&spec_with_id(&lua, id)).is_ok(), "{id}");
+        }
     }
 
     #[test]

@@ -40,8 +40,31 @@ pub enum TextChange {
     Reset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SplitCwd {
+    #[default]
+    Start,
+    Pane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionRule {
+    Takes,
+    Refuses,
+    Resets,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// i3 `move left|down|up|right`.
+    Move(Direction),
+    ContainerTabbed,
+    ContainerStacked,
+    FocusParent,
+    FocusChild,
+    InstanceNew {
+        kind: ModuleKind,
+    },
     /// vim `<C-w>H/J/K/L`: move the module to the window's far edge.
     MoveFar(Direction),
     /// i3 `layout toggle split`: switch the containing split's axis.
@@ -80,7 +103,10 @@ pub enum Action {
     /// Hand the pane with the keys this key.
     SendKeys(KeySpec),
     /// Wait for a module key, then open it right of (`Row`) or below (`Column`) the focused module.
-    Split(Axis),
+    Split {
+        axis: Axis,
+        cwd: SplitCwd,
+    },
     Zoom,
     Resize {
         dir: Direction,
@@ -162,7 +188,7 @@ impl fmt::Display for ActionError {
             ActionError::Unknown { action } => write!(f, "{action:?} is not an action"),
             ActionError::NoSuchModule { action } => write!(
                 f,
-                "{action:?} names no module (editor, agent, terminal, canvas, or a Lua panel's id)"
+                "{action:?} names no module (editor, agent, terminal, terminal#2..#9, agent#2..#9, canvas, or a Lua panel's id)"
             ),
             ActionError::BadOption { option, why } => write!(f, "option {option:?} {why}"),
         }
@@ -197,6 +223,8 @@ struct Opts {
     keys: Option<String>,
     repeatable: Option<bool>,
     up: Option<bool>,
+    cwd: Option<String>,
+    kind: Option<String>,
 }
 
 fn bad(option: &str, why: impl Into<String>) -> ActionError {
@@ -212,15 +240,23 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
         match (name.as_str(), value) {
             ("cells", OptValue::Int(i)) => out.cells = Some(*i),
             ("n", OptValue::Int(i)) => out.n = Some(*i),
+            ("cwd", OptValue::Str(s)) => out.cwd = Some(s.clone()),
+            ("kind", OptValue::Str(s)) => out.kind = Some(s.clone()),
             ("keys", OptValue::Str(s)) => out.keys = Some(s.clone()),
             ("repeatable", OptValue::Bool(b)) => out.repeatable = Some(*b),
             ("up", OptValue::Bool(b)) => out.up = Some(*b),
             ("cells" | "n", other) => return Err(bad(name, format!("must be a whole number, not {}", other.kind()))),
+            ("cwd" | "kind", other) => return Err(bad(name, format!("must be a string, not {}", other.kind()))),
             ("keys", other) => return Err(bad(name, format!("must be one tmux key name, not {}", other.kind()))),
             ("repeatable" | "up", other) => {
                 return Err(bad(name, format!("must be true or false, not {}", other.kind())))
             }
-            _ => return Err(bad(name, "is not an option (cells, n, keys, repeatable, up)")),
+            _ => {
+                return Err(bad(
+                    name,
+                    "is not an option (cells, n, keys, repeatable, up, cwd, kind)",
+                ))
+            }
         }
     }
     Ok(out)
@@ -244,8 +280,38 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
             let key = KeySpec::parse(text).map_err(|e| bad("keys", e.to_string()))?;
             (Action::SendKeys(key), &["keys"])
         }
-        "split.right" => (Action::Split(Axis::Row), &[]),
-        "split.below" => (Action::Split(Axis::Column), &[]),
+        "split.right" | "split.below" => {
+            let cwd = match o.cwd.as_deref().unwrap_or("start") {
+                "start" => SplitCwd::Start,
+                "pane" => SplitCwd::Pane,
+                value => return Err(bad("cwd", format!("must be \"start\" or \"pane\", not {value:?}"))),
+            };
+            (
+                Action::Split {
+                    axis: if name == "split.right" { Axis::Row } else { Axis::Column },
+                    cwd,
+                },
+                &["cwd"],
+            )
+        }
+        "container.tabbed" => (Action::ContainerTabbed, &[]),
+        "container.stacked" => (Action::ContainerStacked, &[]),
+        "focus.parent" => (Action::FocusParent, &[]),
+        "focus.child" => (Action::FocusChild, &[]),
+        "instance.new" => {
+            let value = o.kind.as_deref().ok_or_else(|| {
+                bad(
+                    "kind",
+                    "is required: \"terminal\" or \"agent\", as { kind = \"terminal\" }",
+                )
+            })?;
+            let kind = match value {
+                "terminal" => ModuleKind::Terminal,
+                "agent" => ModuleKind::Agent,
+                _ => return Err(bad("kind", format!("must be \"terminal\" or \"agent\", not {value:?}"))),
+            };
+            (Action::InstanceNew { kind }, &["kind"])
+        }
         "zoom" => (Action::Zoom, &[]),
         "container.toggle-split" => (Action::ToggleSplit, &[]),
         "rotate.up" => (Action::Rotate { down: false }, &[]),
@@ -307,6 +373,8 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         _ => {
             if let Some(dir) = name.strip_prefix("move.far-") {
                 (Action::MoveFar(direction(dir).ok_or_else(unknown)?), &[])
+            } else if let Some(dir) = name.strip_prefix("move.") {
+                (Action::Move(direction(dir).ok_or_else(unknown)?), &[])
             } else if let Some(dir) = name.strip_prefix("resize.") {
                 let dir = direction(dir).ok_or_else(unknown)?;
                 let cells = o.cells.unwrap_or(1);
@@ -327,6 +395,9 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
                     "editor" | "agent" | "terminal" | "canvas" => {
                         ModuleId::parse(module).expect("a built-in module name")
                     }
+                    instance if ModuleId::parse(instance).is_ok_and(|id| id.kind().has_instances()) => {
+                        ModuleId::parse(instance).expect("a canonical instance name")
+                    }
                     panel if lua_panels.iter().any(|p| p == panel) => ModuleId::lua(panel),
                     _ => {
                         return Err(ActionError::NoSuchModule {
@@ -345,6 +416,8 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         (o.n.is_some(), "n"),
         (o.keys.is_some(), "keys"),
         (o.up.is_some(), "up"),
+        (o.cwd.is_some(), "cwd"),
+        (o.kind.is_some(), "kind"),
     ] {
         if given && !takes.contains(&option) {
             return Err(bad(option, format!("is not an option of {name}")));
@@ -357,10 +430,60 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
 }
 
 impl Action {
+    pub fn selection_rule(&self) -> SelectionRule {
+        match self {
+            Action::Move(_)
+            | Action::MoveFar(_)
+            | Action::Zoom
+            | Action::ContainerTabbed
+            | Action::ContainerStacked
+            | Action::ToggleSplit
+            | Action::Flip(_)
+            | Action::Spread
+            | Action::FocusParent
+            | Action::FocusChild => SelectionRule::Takes,
+            Action::ModuleKill | Action::ModuleHide | Action::Swap(_) | Action::SwapMarked | Action::MarkToggle => {
+                SelectionRule::Refuses
+            }
+            Action::SendPrefix
+            | Action::SendKeys(_)
+            | Action::Split { .. }
+            | Action::Resize { .. }
+            | Action::Select(_)
+            | Action::SelectLast
+            | Action::SelectNext
+            | Action::Even(_)
+            | Action::Module(_)
+            | Action::InstanceNew { .. }
+            | Action::Tab(_)
+            | Action::Hint
+            | Action::PanelReload
+            | Action::PanelKeymap
+            | Action::PanelCommandLine
+            | Action::WindowImmersive
+            | Action::Text(_)
+            | Action::CopyMode { .. }
+            | Action::Rotate { .. }
+            | Action::MainHorizontal
+            | Action::MainVertical
+            | Action::Tiled
+            | Action::CycleLayout { .. }
+            | Action::LayoutUndo
+            | Action::MarkClear
+            | Action::SelectNumber => SelectionRule::Resets,
+        }
+    }
+
     /// What `eitri.layout.run` accepts; every new action must decide here whether it is layout.
     pub fn is_layout(&self) -> bool {
         match self {
-            Action::Split(_)
+            Action::Move(_)
+            | Action::ContainerTabbed
+            | Action::ContainerStacked
+            | Action::FocusParent
+            | Action::FocusChild
+            | Action::InstanceNew { .. }
+            | Action::Split { .. }
             | Action::Zoom
             | Action::Resize { .. }
             | Action::Select(_)
@@ -403,8 +526,14 @@ impl Action {
         match self {
             Action::SendPrefix => "send-prefix".into(),
             Action::SendKeys(_) => "send-keys".into(),
-            Action::Split(Axis::Row) => "split.right".into(),
-            Action::Split(Axis::Column) => "split.below".into(),
+            Action::Split { axis: Axis::Row, .. } => "split.right".into(),
+            Action::Split { axis: Axis::Column, .. } => "split.below".into(),
+            Action::Move(dir) => format!("move.{}", direction_name(*dir)),
+            Action::ContainerTabbed => "container.tabbed".into(),
+            Action::ContainerStacked => "container.stacked".into(),
+            Action::FocusParent => "focus.parent".into(),
+            Action::FocusChild => "focus.child".into(),
+            Action::InstanceNew { .. } => "instance.new".into(),
             Action::Zoom => "zoom".into(),
             Action::MoveFar(dir) => format!("move.far-{}", direction_name(*dir)),
             Action::ToggleSplit => "container.toggle-split".into(),
@@ -464,6 +593,22 @@ impl Action {
     /// The options that, with [`Action::name`], parse back to this action.
     pub fn options(&self) -> Vec<(String, OptValue)> {
         match self {
+            Action::Split {
+                cwd: SplitCwd::Pane, ..
+            } => vec![("cwd".into(), OptValue::Str("pane".into()))],
+            Action::InstanceNew { kind } => vec![(
+                "kind".into(),
+                OptValue::Str(
+                    match kind {
+                        ModuleKind::Terminal => "terminal",
+                        ModuleKind::Agent => "agent",
+                        ModuleKind::Editor => "editor",
+                        ModuleKind::Canvas => "canvas",
+                        ModuleKind::LuaWebview => "lua",
+                    }
+                    .into(),
+                ),
+            )],
             Action::SendKeys(key) => vec![("keys".into(), OptValue::Str(key.to_string()))],
             Action::Resize { cells, .. } => vec![("cells".into(), OptValue::Int(i64::from(*cells)))],
             Action::Tab(TabAction::Select(n)) => vec![("n".into(), OptValue::Int(i64::from(*n)))],
@@ -478,12 +623,24 @@ impl Action {
         match self {
             Action::SendPrefix => format!("Send {prefix} itself to the pane with the keys"),
             Action::SendKeys(key) => format!("Send {} to the pane with the keys", key.human()),
-            Action::Split(Axis::Row) => {
+            Action::Split { axis: Axis::Row, .. } => {
                 format!("Then a module key ({module_keys}): open it right of this one, or move it there")
             }
-            Action::Split(Axis::Column) => {
+            Action::Split { axis: Axis::Column, .. } => {
                 format!("Then a module key ({module_keys}): open it below this one, or move it there")
             }
+            Action::Move(dir) => format!(
+                "Move this module (or the selected container) one step {}",
+                direction_name(*dir)
+            ),
+            Action::ContainerTabbed => "Make this module's container tabbed, or restore its split".into(),
+            Action::ContainerStacked => "Make this module's container stacked, or restore its split".into(),
+            Action::FocusParent => "Select the container around this module, then its parent".into(),
+            Action::FocusChild => "Narrow the selection toward the module with the keys".into(),
+            Action::InstanceNew {
+                kind: ModuleKind::Terminal,
+            } => "Open a new terminal".into(),
+            Action::InstanceNew { .. } => "Open a new chat view".into(),
             Action::Zoom => "Zoom this module, or restore".into(),
             Action::MoveFar(Direction::Left) => "Move this module to the window's far left".into(),
             Action::MoveFar(Direction::Down) => "Move this module to the window's bottom".into(),
@@ -565,6 +722,38 @@ impl Action {
 mod tests {
     use super::*;
     use crate::keymap::table::Keymap;
+
+    #[test]
+    fn module_actions_name_instances_before_lua_panels() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        assert_eq!(
+            parse("module.terminal#2", &[], &[]).unwrap().action,
+            Action::Module(t2.clone())
+        );
+        assert_eq!(Action::Module(t2).name(), "module.terminal#2");
+        assert_eq!(
+            parse("module.agent#9", &[], &[]).unwrap().action,
+            Action::Module(ModuleId::parse("agent#9").unwrap())
+        );
+        for bad in ["module.terminal#1", "module.terminal#10", "module.editor#2"] {
+            assert!(
+                matches!(parse(bad, &[], &[]), Err(ActionError::NoSuchModule { .. })),
+                "{bad}"
+            );
+        }
+        // A Lua panel whose id is not an instance spelling still resolves.
+        assert_eq!(
+            parse("module.notes#2", &[], &["notes#2".to_string()]).unwrap().action,
+            Action::Module(ModuleId::lua("notes#2"))
+        );
+        // An invalid instance spelling can still name a registered Lua panel.
+        assert_eq!(
+            parse("module.terminal#1", &[], &["terminal#1".to_string()])
+                .unwrap()
+                .action,
+            Action::Module(ModuleId::lua("terminal#1"))
+        );
+    }
 
     #[test]
     fn every_default_action_round_trips_through_its_lua_name() {
@@ -758,7 +947,10 @@ mod tests {
     #[test]
     fn is_layout_holds_the_layout_actions_and_nothing_else() {
         let layout = [
-            Action::Split(Axis::Row),
+            Action::Split {
+                axis: Axis::Row,
+                cwd: crate::keymap::action::SplitCwd::Start,
+            },
             Action::Zoom,
             Action::Resize {
                 dir: Direction::Left,
@@ -790,6 +982,167 @@ mod tests {
         }
         for action in other {
             assert!(!action.is_layout(), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn the_container_and_instance_actions_parse_by_name_and_round_trip() {
+        for (name, action) in [
+            ("move.left", Action::Move(Direction::Left)),
+            ("move.down", Action::Move(Direction::Down)),
+            ("move.up", Action::Move(Direction::Up)),
+            ("move.right", Action::Move(Direction::Right)),
+            ("container.tabbed", Action::ContainerTabbed),
+            ("container.stacked", Action::ContainerStacked),
+            ("focus.parent", Action::FocusParent),
+            ("focus.child", Action::FocusChild),
+        ] {
+            assert_eq!(parse(name, &[], &[]).unwrap().action, action);
+            assert_eq!(action.name(), name);
+            assert!(action.options().is_empty());
+            assert!(action.is_layout());
+            assert!(!action.describe("Ctrl+b", "e / a / t").is_empty());
+            assert_eq!(
+                parse(name, &[("cells".into(), OptValue::Int(2))], &[]),
+                Err(bad("cells", format!("is not an option of {name}")))
+            );
+        }
+        for name in ["move.sideways", "move", "focus.sibling", "container.scroll"] {
+            assert_eq!(parse(name, &[], &[]), Err(ActionError::Unknown { action: name.into() }));
+        }
+    }
+
+    #[test]
+    fn instance_new_takes_a_kind() {
+        for (name, kind) in [("terminal", ModuleKind::Terminal), ("agent", ModuleKind::Agent)] {
+            let action = Action::InstanceNew { kind };
+            let opts = vec![("kind".into(), OptValue::Str(name.into()))];
+            assert_eq!(parse("instance.new", &opts, &[]).unwrap().action, action);
+            assert_eq!(action.name(), "instance.new");
+            assert_eq!(action.options(), opts);
+            assert!(action.is_layout());
+        }
+        assert_eq!(
+            parse("instance.new", &[], &[]),
+            Err(bad(
+                "kind",
+                "is required: \"terminal\" or \"agent\", as { kind = \"terminal\" }"
+            ))
+        );
+        for (value, why) in [
+            (
+                OptValue::Str("editor".into()),
+                "must be \"terminal\" or \"agent\", not \"editor\"",
+            ),
+            (OptValue::Int(3), "must be a string, not a number"),
+        ] {
+            assert_eq!(
+                parse("instance.new", &[("kind".into(), value)], &[]),
+                Err(bad("kind", why))
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_takes_cwd_start_or_pane() {
+        for cwd in [SplitCwd::Start, SplitCwd::Pane] {
+            let action = Action::Split { axis: Axis::Row, cwd };
+            let opts = if cwd == SplitCwd::Start {
+                vec![]
+            } else {
+                vec![("cwd".into(), OptValue::Str("pane".into()))]
+            };
+            assert_eq!(action.options(), opts);
+            assert_eq!(parse("split.right", &opts, &[]).unwrap().action, action);
+        }
+        assert_eq!(
+            parse("split.right", &[("cwd".into(), OptValue::Str("start".into()))], &[])
+                .unwrap()
+                .action,
+            Action::Split {
+                axis: Axis::Row,
+                cwd: SplitCwd::Start
+            }
+        );
+        assert_eq!(
+            parse("split.right", &[("cwd".into(), OptValue::Str("home".into()))], &[]),
+            Err(bad("cwd", "must be \"start\" or \"pane\", not \"home\""))
+        );
+        assert_eq!(
+            parse("zoom", &[("cwd".into(), OptValue::Str("pane".into()))], &[]),
+            Err(bad("cwd", "is not an option of zoom"))
+        );
+        assert_eq!(
+            parse("zoom", &[("wat".into(), OptValue::Int(1))], &[]),
+            Err(bad(
+                "wat",
+                "is not an option (cells, n, keys, repeatable, up, cwd, kind)"
+            ))
+        );
+    }
+
+    #[test]
+    fn every_action_says_whether_it_takes_a_selection() {
+        for action in [
+            Action::Move(Direction::Left),
+            Action::MoveFar(Direction::Up),
+            Action::Zoom,
+            Action::ContainerTabbed,
+            Action::ContainerStacked,
+            Action::ToggleSplit,
+            Action::Flip(Axis::Row),
+            Action::Spread,
+            Action::FocusParent,
+            Action::FocusChild,
+        ] {
+            assert_eq!(action.selection_rule(), SelectionRule::Takes, "{action:?}");
+        }
+        for action in [
+            Action::ModuleKill,
+            Action::ModuleHide,
+            Action::Swap(SwapTarget::Next),
+            Action::SwapMarked,
+            Action::MarkToggle,
+        ] {
+            assert_eq!(action.selection_rule(), SelectionRule::Refuses, "{action:?}");
+        }
+        for action in [
+            Action::SendPrefix,
+            Action::SendKeys(KeySpec::parse("C-l").unwrap()),
+            Action::Split {
+                axis: Axis::Row,
+                cwd: SplitCwd::Start,
+            },
+            Action::Resize {
+                dir: Direction::Up,
+                cells: 1,
+            },
+            Action::Select(Direction::Left),
+            Action::SelectLast,
+            Action::SelectNext,
+            Action::Even(Axis::Row),
+            Action::Rotate { down: false },
+            Action::MainHorizontal,
+            Action::MainVertical,
+            Action::Tiled,
+            Action::CycleLayout { forward: true },
+            Action::LayoutUndo,
+            Action::MarkClear,
+            Action::SelectNumber,
+            Action::Module(ModuleId::terminal()),
+            Action::InstanceNew {
+                kind: ModuleKind::Terminal,
+            },
+            Action::Tab(TabAction::New),
+            Action::Hint,
+            Action::PanelReload,
+            Action::PanelKeymap,
+            Action::PanelCommandLine,
+            Action::WindowImmersive,
+            Action::Text(TextChange::Reset),
+            Action::CopyMode { up: false },
+        ] {
+            assert_eq!(action.selection_rule(), SelectionRule::Resets, "{action:?}");
         }
     }
 }

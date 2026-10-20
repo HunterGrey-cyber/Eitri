@@ -262,8 +262,26 @@ mod tests {
         assert_eq!(action("C-b"), None);
         assert_eq!(action("%"), None);
         assert_eq!(action("\""), None);
-        assert_eq!(action("\\"), Some((Action::Split(Axis::Row), false)));
-        assert_eq!(action("-"), Some((Action::Split(Axis::Column), false)));
+        assert_eq!(
+            action("\\"),
+            Some((
+                Action::Split {
+                    axis: Axis::Row,
+                    cwd: crate::keymap::action::SplitCwd::Pane
+                },
+                false
+            ))
+        );
+        assert_eq!(
+            action("-"),
+            Some((
+                Action::Split {
+                    axis: Axis::Column,
+                    cwd: crate::keymap::action::SplitCwd::Pane
+                },
+                false
+            ))
+        );
         assert_eq!(action("|"), Some((Action::Even(Axis::Row), false)));
         assert_eq!(action("_"), Some((Action::Even(Axis::Column), false)));
         assert_eq!(

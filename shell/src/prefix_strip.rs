@@ -34,8 +34,9 @@ pub(crate) fn strip_pieces(
     title: &dyn Fn(&ModuleId) -> String,
     verbs: &[String],
 ) -> Vec<StripPiece> {
+    let after_split = matches!(waiting, Waiting::Module(_));
     let modules = entries.iter().map(|entry| StripPiece::Run {
-        text: format!("{} {}", entry.key, title(&entry.module)),
+        text: entry_text(entry, title, after_split),
         dimmed: entry.dimmed,
     });
     let (heading, runs): (Option<String>, Vec<StripPiece>) = match waiting {
@@ -66,6 +67,20 @@ pub(crate) fn strip_pieces(
         pieces.push(run);
     }
     pieces
+}
+
+/// One module key's run: `t terminal`, `t terminal ×3` while three terminals are in the layout (the key
+/// reaches one of them, `eitri_core::layout::module_target`'s), and after a split key that makes a new
+/// terminal (the keys are in a terminal), `t new terminal`. Armed, the same key in a terminal toggles
+/// that terminal, so the strip never says `new` there.
+fn entry_text(entry: &StripEntry, title: &dyn Fn(&ModuleId) -> String, after_split: bool) -> String {
+    if after_split && entry.new_instance {
+        format!("{} new {}", entry.key, title(&entry.module))
+    } else if entry.count > 1 {
+        format!("{} {} \u{00d7}{}", entry.key, title(&entry.module), entry.count)
+    } else {
+        format!("{} {}", entry.key, title(&entry.module))
+    }
 }
 
 /// The strip while `select.number` waits for a digit: each number and the module it reaches,
@@ -146,16 +161,22 @@ mod tests {
                 key: "e".into(),
                 module: ModuleId::editor(),
                 dimmed: false,
+                count: 1,
+                new_instance: false,
             },
             StripEntry {
                 key: "a".into(),
                 module: ModuleId::agent(),
                 dimmed: false,
+                count: 1,
+                new_instance: false,
             },
             StripEntry {
                 key: "t".into(),
                 module: ModuleId::terminal(),
                 dimmed: true,
+                count: 1,
+                new_instance: false,
             },
         ]
     }
@@ -204,6 +225,27 @@ mod tests {
         let right = strip_pieces(Waiting::Module(Axis::Row), &entries(), "agent", &title, &verbs());
         assert_eq!(right[0], StripPiece::Heading("right of agent:".to_string()));
         assert!(strip_pieces(Waiting::No, &entries(), "agent", &title, &verbs()).is_empty());
+    }
+
+    #[test]
+    fn a_module_key_with_several_instances_shows_their_count_and_a_new_one_says_so() {
+        let mut entries = entries();
+        entries[2].dimmed = false;
+        entries[2].count = 3;
+        let armed = strip_pieces(Waiting::Command, &entries, "terminal", &title, &[]);
+        assert_eq!(reads(&armed), "e editor \u{b7} a agent \u{b7} t terminal \u{d7}3");
+        entries[2].new_instance = true;
+        let armed = strip_pieces(Waiting::Command, &entries, "terminal", &title, &[]);
+        assert_eq!(
+            reads(&armed),
+            "e editor \u{b7} a agent \u{b7} t terminal \u{d7}3",
+            "armed, the terminal's key toggles it rather than making one"
+        );
+        let after_split = strip_pieces(Waiting::Module(Axis::Row), &entries, "terminal", &title, &[]);
+        assert_eq!(
+            reads(&after_split),
+            "right of terminal: e editor \u{b7} a agent \u{b7} t new terminal"
+        );
     }
 
     #[test]

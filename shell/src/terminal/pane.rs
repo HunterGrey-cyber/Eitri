@@ -97,6 +97,7 @@ struct State {
     /// A shell is wanted (`start` was called). Spawned once there is an `allocation`.
     wanted: bool,
     session: Option<TerminalSession>,
+    generation: u64,
     /// The shell exited, OR the metrics/spawn failed before one ever started: the last frame (or
     /// the failure message) stays, and Enter restarts it.
     exited: bool,
@@ -141,7 +142,7 @@ struct State {
     cwd: PathBuf,
     /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
     /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
-    on_shell_exit: Option<Rc<dyn Fn() -> bool>>,
+    on_shell_exit: Option<Rc<dyn Fn(u64) -> bool>>,
 }
 
 /// What becomes of an input-method commit ([`State::route_commit`]).
@@ -165,6 +166,7 @@ impl State {
             allocation: None,
             wanted: false,
             session: None,
+            generation: 0,
             exited: false,
             frame: None,
             cursor: None,
@@ -480,8 +482,32 @@ impl TerminalPane {
     /// set late, `GtkIMMulticontext` rebuilds its delegate with it, focus included).
     pub(crate) fn start(&self) {
         self.im.set_client_widget(Some(&self.area));
-        self.state.borrow_mut().wanted = true;
+        {
+            let mut state = self.state.borrow_mut();
+            state.generation += 1;
+            state.wanted = true;
+        }
         ensure_session(&self.state, &self.area, &self.im);
+    }
+
+    /// The running shell's pid, absent before spawn and after exit.
+    pub(crate) fn shell_pid(&self) -> Option<u32> {
+        let state = self.state.borrow();
+        if state.exited {
+            None
+        } else {
+            state.session.as_ref().map(TerminalSession::pid)
+        }
+    }
+
+    /// The directory used by the next shell; a running shell keeps its own directory.
+    pub(crate) fn set_start_dir(&self, dir: PathBuf) {
+        self.state.borrow_mut().cwd = dir;
+    }
+
+    /// The identity of the current start, retained across a close until the next start.
+    pub(crate) fn generation(&self) -> u64 {
+        self.state.borrow().generation
     }
 
     /// Whether the pane holds the keys: a solid cursor or a hollow one (`pane_focus`'s rule).
@@ -555,12 +581,13 @@ impl TerminalPane {
     }
 
     /// `f` runs when the shell ends by itself in a way that closes the module (`super::closes_on_exit`),
-    /// after the notice has been published and with this pane's state released. It takes the module
+    /// with that session's generation, after the notice has been published and with this pane's state
+    /// released. It takes the module
     /// off screen and says whether it did; if it did, the pane is [`Self::close`]d. If it could not
     /// -- the terminal is the last module on screen (`super::OnExit::CloseWindow`), so `f` closes
     /// the window instead of the module -- this pane is left alone: the notice stays and Enter
     /// restarts, until the window really goes.
-    pub(crate) fn on_shell_exit(&self, f: impl Fn() -> bool + 'static) {
+    pub(crate) fn on_shell_exit(&self, f: impl Fn(u64) -> bool + 'static) {
         self.state.borrow_mut().on_shell_exit = Some(Rc::new(f));
     }
 
@@ -580,6 +607,12 @@ impl TerminalPane {
         let mut state = self.state.borrow_mut();
         state.wanted = false;
         state.session = None;
+    }
+}
+
+impl super::registry::Pane for TerminalPane {
+    fn close(&self) {
+        TerminalPane::close(self);
     }
 }
 
@@ -761,7 +794,7 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             s.exited = true;
             println!("[terminal] {}", exit.notice());
             if super::closes_on_exit(&exit) {
-                closed_by_exit = s.on_shell_exit.clone();
+                closed_by_exit = s.on_shell_exit.clone().map(|callback| (callback, s.generation));
             }
         }
         let flash_until = if update.events.bell {
@@ -819,8 +852,8 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
 
     // Last, with nothing borrowed: the hook kills the module, unmapping this pane, whose handler
     // borrows the state. Then the pane forgets the shell, as `TerminalPane::close` does.
-    if let Some(closed_by_exit) = closed_by_exit {
-        if closed_by_exit() {
+    if let Some((closed_by_exit, generation)) = closed_by_exit {
+        if closed_by_exit(generation) && super::exit_is_current(generation, state.borrow().generation) {
             state.borrow_mut().close();
             im.reset();
             area.queue_render();
@@ -830,7 +863,11 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
 
 /// Enter after the shell exited: a fresh session on a fresh PTY, in the same place.
 fn restart(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext) {
-    state.borrow_mut().forget_session();
+    {
+        let mut state = state.borrow_mut();
+        state.forget_session();
+        state.generation += 1;
+    }
     ensure_session(state, area, im);
 }
 

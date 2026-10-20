@@ -184,6 +184,8 @@ impl ChatOnPermission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentPlace {
     OnScreen,
+    /// Shown on an inactive tab, with no zoom keeping it away.
+    TabbedAway,
     /// Hidden, with no zoom on: `reveal` can put it back.
     Hidden,
     /// Hidden while another module is zoomed: showing it would not put it on screen, so `reveal`
@@ -212,7 +214,7 @@ pub fn react(policy: ChatOnPermission, before: Attention, after: Attention, plac
     if after.arrived <= before.arrived || after.pending == 0 || place == AgentPlace::OnScreen {
         return Reaction::default();
     }
-    let reveal = policy == ChatOnPermission::Reveal && place == AgentPlace::Hidden;
+    let reveal = policy == ChatOnPermission::Reveal && matches!(place, AgentPlace::Hidden | AgentPlace::TabbedAway);
     Reaction { toast: !reveal, reveal }
 }
 

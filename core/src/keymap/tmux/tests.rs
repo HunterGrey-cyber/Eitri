@@ -154,11 +154,47 @@ fn the_panels_literal_key_rule_is_still_c_a_only() {
 #[test]
 fn split_window() {
     let got = import("bind \\\\ split-window -h -c \"#{pane_current_path}\"\nbind - split-window -v\nbind _ splitw\n");
-    assert_eq!(got.bound("\\"), Some((Action::Split(Axis::Row), false)));
-    assert_eq!(got.bound("-"), Some((Action::Split(Axis::Column), false)));
-    assert_eq!(got.bound("_"), Some((Action::Split(Axis::Column), false)));
+    assert_eq!(
+        got.bound("\\"),
+        Some((
+            Action::Split {
+                axis: Axis::Row,
+                cwd: crate::keymap::action::SplitCwd::Pane
+            },
+            false
+        ))
+    );
+    assert_eq!(
+        got.bound("-"),
+        Some((
+            Action::Split {
+                axis: Axis::Column,
+                cwd: crate::keymap::action::SplitCwd::Start
+            },
+            false
+        ))
+    );
+    assert_eq!(
+        got.bound("_"),
+        Some((
+            Action::Split {
+                axis: Axis::Column,
+                cwd: crate::keymap::action::SplitCwd::Start
+            },
+            false
+        ))
+    );
     let got = import("bind | split-window -h -b -d -f -l 30% -p 20\n");
-    assert_eq!(got.bound("|"), Some((Action::Split(Axis::Row), false)));
+    assert_eq!(
+        got.bound("|"),
+        Some((
+            Action::Split {
+                axis: Axis::Row,
+                cwd: crate::keymap::action::SplitCwd::Start
+            },
+            false
+        ))
+    );
 }
 
 #[test]
@@ -1130,4 +1166,29 @@ fn the_layout_commands_tmux_binds_come_across() {
     ] {
         assert_eq!(got.bound(key), Some((action, false)), "{key}");
     }
+}
+
+#[test]
+fn split_cwd_only_follows_the_current_pane_format() {
+    let got = import("bind - split-window -v -c \"#{pane_current_path}\"\nbind | split-window -h -c /tmp\n");
+    assert_eq!(
+        got.bound("-"),
+        Some((
+            Action::Split {
+                axis: Axis::Column,
+                cwd: crate::keymap::action::SplitCwd::Pane
+            },
+            false
+        ))
+    );
+    assert_eq!(
+        got.bound("|"),
+        Some((
+            Action::Split {
+                axis: Axis::Row,
+                cwd: crate::keymap::action::SplitCwd::Start
+            },
+            false
+        ))
+    );
 }
