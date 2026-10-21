@@ -105,16 +105,16 @@ pub fn kill(
     let next = hide(layout, id, frame)?;
     match reopen {
         Reopen::At(placement) => {
-            layout.take_float(id);
-            let root = layout
-                .root_node()
-                .without(id)
-                .expect("a hide succeeded, so another module is still in the tree");
-            // A first launch hides the editor under a Lua `main` panel (`place_new`'s `true`). Not
-            // here: the panel is hidden, so hiding the editor too would empty its region, and the
-            // editor's visibility is the user's own by now.
-            let (root, _took_editors_place) = place_new(root, id, placement);
-            layout.replace_root(root);
+            // The module can be the root's only tile while everything else floats: taking it out
+            // leaves no tree to place it into, so it stays hidden where it is, as `InPlace` leaves it.
+            if let Some(root) = layout.root_node().without(id) {
+                layout.take_float(id);
+                // A first launch hides the editor under a Lua `main` panel (`place_new`'s `true`). Not
+                // here: the panel is hidden, so hiding the editor too would empty its region, and the
+                // editor's visibility is the user's own by now.
+                let (root, _took_editors_place) = place_new(root, id, placement);
+                layout.replace_root(root);
+            }
         }
         Reopen::InPlace => {}
         Reopen::Remove => layout.remove(id)?,
@@ -253,6 +253,31 @@ mod tests {
         assert_eq!(layout.root(), &before);
         assert_eq!(layout.visible_leaves(), [editor()]);
         assert_eq!(layout.show(&agent()), Ok(true), "it can come back");
+    }
+
+    /// The editor is the root's only tile and the agent floats: a kill that reopens at a placement has
+    /// no tree to place it into, so the module stays hidden where it is rather than panicking.
+    #[test]
+    fn a_lone_tiles_kill_with_a_placement_leaves_it_hidden_in_place() {
+        use super::super::con::Node;
+        use super::super::float::FloatRect;
+        let mut layout = Layout::new(Node::Leaf(editor()), editor()).unwrap();
+        let rect = FloatRect {
+            cx: 0.5,
+            cy: 0.5,
+            w: 768,
+            h: 433,
+        };
+        layout.add_float(&agent(), rect, false).unwrap();
+        assert_eq!(can_kill(&layout, &editor()), Ok(KillScope::Module));
+        let result = kill(&mut layout, &editor(), Reopen::At(Placement::BelowEditor), &frame());
+        assert_eq!(result, Ok(Some(agent())));
+        assert!(!layout.is_shown(&editor()));
+        assert!(!layout.is_gone(&editor()));
+        assert!(layout.contains(&editor()), "it is still in the tree");
+        assert!(layout.visible_leaves().is_empty());
+        assert!(layout.is_shown(&agent()), "the float stays on screen");
+        assert_eq!(layout.show(&editor()), Ok(true), "it can come back");
     }
 
     /// tmux: killing the last pane closes the window. The layout never hides the last module, so

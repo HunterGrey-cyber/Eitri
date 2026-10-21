@@ -21,10 +21,17 @@ let removeInstallation: (() => void) | undefined;
 let generation = 0;
 let installedRows: Row[] | null = null;
 
+/** How deep the search below a `display: contents` element goes; a wrapper chain longer than this is not a list item. */
+const CONTENTS_DEPTH = 8;
+
 /** Whether CSS renders `el` at all: a `display: none` ancestor (a folded contents group) leaves it with no box, and
  *  focusing it fails, which would trap list movement on it. `checkVisibility` where the engine has it, else an
- *  element with no client rects is not rendered. */
-function isRendered(el: HTMLElement): boolean {
+ *  element with no client rects is not rendered. An element that is itself `display: contents` has no box either way
+ *  but its children are drawn in its place, so it counts as rendered when one of them does. */
+function isRendered(el: HTMLElement, depth = 0): boolean {
+  if (depth < CONTENTS_DEPTH && getComputedStyle(el).display === "contents") {
+    return [...el.children].some((child) => isRendered(child as HTMLElement, depth + 1));
+  }
   if (typeof el.checkVisibility === "function") return el.checkVisibility();
   return el.getClientRects().length > 0;
 }

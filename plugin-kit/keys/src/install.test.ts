@@ -1126,6 +1126,49 @@ describe("a focus list", () => {
     key("j", {}, document.activeElement!);
     expect(document.activeElement!.id).toBe("c3");
   });
+  describe("display: contents items", () => {
+    const html =
+      '<nav data-eitri-list><a id="d1" href="#1">1</a>' +
+      '<a id="d2" href="#2" data-contents="1"><span id="d2s">2</span></a>' +
+      '<a id="d3" href="#3">3</a></nav>';
+    /** Styles and boxes as an engine reports them: `data-contents` is `display: contents`, which has no box of its
+     *  own, so `checkVisibility` and the client rects both say no; everything else has one. */
+    function stubLayout(boxless: (el: HTMLElement) => boolean) {
+      const real = window.getComputedStyle.bind(window);
+      vi.spyOn(window, "getComputedStyle").mockImplementation(((el: Element) => {
+        const style = real(el);
+        return new Proxy(style, {
+          get: (target, prop) => (prop === "display" && (el as HTMLElement).dataset.contents ? "contents" : Reflect.get(target, prop)),
+        });
+      }) as typeof window.getComputedStyle);
+      for (const el of document.querySelectorAll<HTMLElement>("nav, nav *")) {
+        const boxed = !el.dataset.contents && !boxless(el);
+        Object.defineProperty(el, "checkVisibility", { configurable: true, value: () => boxed });
+        Object.defineProperty(el, "getClientRects", {
+          configurable: true,
+          value: () => (boxed ? [new DOMRect(0, 0, 10, 10)] : []) as unknown as DOMRectList,
+        });
+      }
+    }
+    it("keeps a link that is itself display: contents when a child is drawn", async () => {
+      document.body.insertAdjacentHTML("beforeend", html);
+      stubLayout(() => false);
+      await start();
+      document.getElementById("d1")!.focus();
+      key("j", {}, document.activeElement!);
+      expect(document.activeElement!.id).toBe("d2");
+      key("j", {}, document.activeElement!);
+      expect(document.activeElement!.id).toBe("d3");
+    });
+    it("still skips a display: contents link whose children are not drawn either", async () => {
+      document.body.insertAdjacentHTML("beforeend", html);
+      stubLayout((el) => el.id === "d2s");
+      await start();
+      document.getElementById("d1")!.focus();
+      key("j", {}, document.activeElement!);
+      expect(document.activeElement!.id).toBe("d3");
+    });
+  });
 });
 
 describe("find rows", () => {

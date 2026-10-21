@@ -180,9 +180,6 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
         20 => {
             let reopen = match rng.below(3) {
                 0 => Reopen::InPlace,
-                // The window never reopens the editor at a placement (it is retired or kept in place),
-                // and `kill` relies on that: the editor can be the only tile once the rest float.
-                1 if any == ModuleId::editor() => Reopen::InPlace,
                 1 => Reopen::At(Placement::BelowEditor),
                 _ => Reopen::Never,
             };
