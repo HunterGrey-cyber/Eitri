@@ -978,13 +978,21 @@ mod tests {
         let mut writer = TabWriter::new(Some(dir.to_path_buf()), root());
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = std::sync::Mutex::new(release_rx);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = std::sync::Mutex::new(entered_tx);
         writer.before_write = Some(std::sync::Arc::new(move || {
+            let _ = entered_tx.lock().unwrap().send(());
             let _ = release_rx
                 .lock()
                 .unwrap()
                 .recv_timeout(std::time::Duration::from_secs(10));
         }));
         writer.observe(Some(numbered(1)));
+        // The writer must have taken set 1 before set 2 arrives, or the two are folded into one queued set and the
+        // write under way is set 2.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the writer took the first set");
         writer.observe(Some(numbered(2)));
         writer.disable();
         assert!(!writer.is_enabled());

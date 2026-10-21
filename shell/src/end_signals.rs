@@ -512,6 +512,22 @@ mod tests {
 
     /// A pty pair opened close-on-exec: other tests of this binary start processes meanwhile, and a forked child
     /// that inherited the master would keep it open and the slave from hanging up.
+    /// Waits until the terminal `fd` reports its hangup. A child that another test thread forks before it execs
+    /// holds a dropped master for a moment, and until every copy of the master is closed the terminal is not hung up.
+    fn wait_for_hangup(fd: RawFd) {
+        let mut fds = [libc::pollfd {
+            fd,
+            events: 0,
+            revents: 0,
+        }];
+        // SAFETY: `fds` is one valid `pollfd`.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 5000) };
+        assert!(
+            ready == 1 && fds[0].revents & libc::POLLHUP != 0,
+            "the terminal reports the hangup once its master is closed"
+        );
+    }
+
     fn openpty() -> (std::fs::File, std::fs::File) {
         // SAFETY: `posix_openpt`, `grantpt`, `unlockpt`, `ptsname_r` and `open` on descriptors and a buffer owned
         // here; each result is checked before it is used.
@@ -534,6 +550,7 @@ mod tests {
     fn a_hung_up_terminal_is_pointed_at_dev_null_and_writes_succeed_again() {
         let (master, mut slave) = openpty();
         drop(master);
+        wait_for_hangup(slave.as_raw_fd());
         let before = slave.write(b"x");
         assert_eq!(
             before.map_err(|e| e.raw_os_error()),
@@ -608,6 +625,7 @@ mod tests {
         };
         let null = std::fs::File::open("/dev/null").unwrap();
         drop(master);
+        wait_for_hangup(watched.as_raw_fd());
         let context = glib::MainContext::new();
         watch_hangups(&context, &[watched.as_raw_fd()]);
         assert_eq!(
