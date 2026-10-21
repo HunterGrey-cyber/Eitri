@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=08c29cf77f97d38f4ef7acd3a310060c78d2f998b971a88e65609cfc0bbe0465 -->
+<!-- translated-from: README.md sha256=620d5ce64afe92541c435a6743ff12402d8acb1d4722e925615cde0dd5654d14 -->
 
 <div align="center">
 
@@ -7,7 +7,7 @@
 
 <h1>Eitri</h1>
 
-<p><b>你的 Neovim，与 Claude Code 并肩。</b></p>
+<p><b>你的 Neovim，加上一堆 agent、终端和网页，放进一个平铺式“窗口”管理器。</b></p>
 
 <p>
 <a href="https://eitri.cc/zh/">官网</a> ·

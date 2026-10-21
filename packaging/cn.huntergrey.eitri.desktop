@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Eitri
-Comment=Your Neovim, with Claude Code beside it.
-Comment[zh_CN]=你的 Neovim，与 Claude Code 并肩。
+Comment=Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager.
+Comment[zh_CN]=你的 Neovim，加上一堆 agent、终端和网页，放进一个平铺式“窗口”管理器。
 Exec=/usr/bin/eitri --quiet %f
 Icon=cn.huntergrey.eitri
 StartupWMClass=cn.huntergrey.eitri

@@ -6,7 +6,7 @@ English | [简体中文](README.zh-CN.md)
 
 <h1>Eitri</h1>
 
-<p><b>Your Neovim, with Claude Code beside it.</b></p>
+<p><b>Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager.</b></p>
 
 <p>
 <a href="https://eitri.cc">Website</a> ·

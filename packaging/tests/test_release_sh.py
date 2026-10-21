@@ -32,6 +32,9 @@ rc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rc)
 
 _SCRATCH_ROOT = os.path.expanduser("~/.cache/eitri-release-sh-tests")
+# The tagline, as the README, the desktop entry, the package description and the release notes give it.
+TAGLINE = "Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager."
+TAGLINE_ZH = "你的 Neovim，加上一堆 agent、终端和网页，放进一个平铺式“窗口”管理器。"
 _VERDANDI_REV = "0123456789abcdef0123456789abcdef01234567"
 _NVIM_PIN = "NVIM_VERSION=0.11.4\nNVIM_SHA256_linux_x86_64=" + "ab" * 32 + "\n"
 _DOCKER_EXIT = 97
@@ -1553,9 +1556,9 @@ class ReleaseNotesBilingual(unittest.TestCase):
 
     def test_the_page_has_both_halves_in_order_and_no_leftover_placeholder(self):
         notes = self.render()
-        self.assertIn("Eitri 1.0.0-rc.1 -- Your Neovim, with Claude Code beside it", notes)
+        self.assertIn("Eitri 1.0.0-rc.1 -- " + TAGLINE, notes)
         self.assertIn("\n---\n\n## 简体中文\n", notes)
-        self.assertLess(notes.index("## 简体中文"), notes.index("Eitri 1.0.0-rc.1 -- 你的 Neovim，与 Claude Code 并肩"))
+        self.assertLess(notes.index("## 简体中文"), notes.index("Eitri 1.0.0-rc.1 -- " + TAGLINE_ZH))
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 
     def test_the_chinese_half_names_the_same_release_facts_as_the_english_one(self):

@@ -406,6 +406,9 @@ GNOME_EXT_DST = "/usr/share/gnome-shell/extensions/eitri@huntergrey.cn"
 GNOME_EXT_FILES = ["metadata.json", "extension.js", "direction.js", "policy.js"]
 OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
 ICON_NAME = "cn.huntergrey.eitri"
+# The tagline, as the README, the desktop entry, the package description and the release notes give it.
+TAGLINE = "Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager."
+TAGLINE_ZH = "你的 Neovim，加上一堆 agent、终端和网页，放进一个平铺式“窗口”管理器。"
 # Every file under packaging/icons/hicolor, as the package path it must land at.
 ICON_FILES = {
     "16x16/apps/cn.huntergrey.eitri.png",
@@ -522,8 +525,8 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
             lines = f.read().splitlines()
         self.assertIn(f"Icon={ICON_NAME}", lines)
         self.assertIn(f"StartupWMClass={ICON_NAME}", lines)
-        self.assertIn("Comment=Your Neovim, with Claude Code beside it.", lines)
-        self.assertIn("Comment[zh_CN]=\u4f60\u7684 Neovim\uff0c\u4e0e Claude Code \u5e76\u80a9\u3002", lines)
+        self.assertIn("Comment=" + TAGLINE, lines)
+        self.assertIn("Comment[zh_CN]=" + TAGLINE_ZH, lines)
         self.assertFalse(os.path.exists(os.path.join(_HERE, "eitri.desktop")))
 
 
