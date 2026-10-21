@@ -8,8 +8,8 @@
 //! child and exits within one.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io::{PipeReader, PipeWriter, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -251,12 +251,19 @@ struct Shared {
     /// Whether the run's process group may still be signalled. Cleared once the group is known to be gone,
     /// so a late signal cannot reach a process group that reused the number.
     group_live: Mutex<bool>,
-    /// Written when the run ends, to release readers blocked on a pipe that an outside process holds open.
-    closer: Option<OwnedFd>,
+    /// Readable once the run has ended, to release readers blocked on a pipe that an outside process holds open.
+    /// A plain pipe rather than an eventfd, which Apple targets do not have.
+    closer: Option<PipeReader>,
+    /// The closer's write end, taken by the first `finish`: the signal is one byte, written once.
+    closer_write: Mutex<Option<PipeWriter>>,
 }
 
 impl Shared {
     fn new() -> Arc<Shared> {
+        let (closer, closer_write) = match std::io::pipe() {
+            Ok((r, w)) => (Some(r), Some(w)),
+            Err(_) => (None, None),
+        };
         Arc::new(Shared {
             out: Mutex::new(Out {
                 lines: VecDeque::new(),
@@ -275,7 +282,8 @@ impl Shared {
             done_changed: Condvar::new(),
             stop: Mutex::new(None),
             group_live: Mutex::new(true),
-            closer: new_eventfd(),
+            closer,
+            closer_write: Mutex::new(closer_write),
         })
     }
 
@@ -285,12 +293,10 @@ impl Shared {
             out.exit = Some(kind);
             out.closed = true;
         }
-        if let Some(fd) = &self.closer {
-            let one = 1u64.to_ne_bytes();
-            // SAFETY: a valid eventfd and an 8-byte buffer; a failed write only leaves readers to their EOF.
-            unsafe {
-                libc::write(fd.as_raw_fd(), one.as_ptr().cast(), one.len());
-            }
+        if let Some(mut writer) = lock(&self.closer_write).take() {
+            // A failed write only leaves the readers to their EOF; dropping the end afterwards also hangs the
+            // pipe up, so a reader that polls later still sees it.
+            let _ = writer.write_all(&[1]);
         }
         *lock(&self.done) = true;
         self.done_changed.notify_all();
@@ -323,14 +329,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn new_eventfd() -> Option<OwnedFd> {
-    // SAFETY: `eventfd` returns a new descriptor or -1; a descriptor is owned by exactly one `OwnedFd`.
-    unsafe {
-        let fd = libc::eventfd(0, libc::EFD_CLOEXEC);
-        (fd >= 0).then(|| OwnedFd::from_raw_fd(fd))
-    }
-}
-
 /// Signals the group led by `pgid`. The group exists from the moment `spawn` returns (the child made it
 /// before exec, or the spawn failed), so there is no fallback to the process alone.
 fn signal_group(pgid: u32, signal: libc::c_int) {
@@ -354,6 +352,7 @@ fn spawn(launch: &Launch) -> std::io::Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // SAFETY: `getpid` has no preconditions.
+    #[cfg(target_os = "linux")]
     let parent = unsafe { libc::getpid() };
     // SAFETY: only async-signal-safe calls run between fork and exec.
     unsafe {
@@ -799,6 +798,31 @@ fn drain(out: &mut Out, run: u64, events: &mut Vec<TaskEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reader_blocked_on_a_silent_pipe_is_released_when_the_run_ends() {
+        let shared = Shared::new();
+        // The write end stays open and silent for the whole test: only the closer can release the reader.
+        let (silent_read, _silent_write) = std::io::pipe().expect("pipe");
+        let closer = shared.closer.as_ref().map(AsRawFd::as_raw_fd);
+        assert!(closer.is_some(), "the run-ended pipe could not be made");
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn({
+            let shared = shared.clone();
+            move || {
+                let closer = shared.closer.as_ref().map(AsRawFd::as_raw_fd);
+                let _ = tx.send(wait_readable(silent_read.as_raw_fd(), closer));
+            }
+        });
+        shared.finish(ExitKind::Exited(0));
+        // A second finish must not block on the one-byte pipe.
+        shared.finish(ExitKind::Exited(0));
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader was not released");
+        assert!(!got, "a reader must stop once the run has ended");
+        reader.join().expect("reader thread");
+    }
 
     #[test]
     fn the_rate_window_admits_a_steady_day_and_refuses_a_burst_until_it_drains() {
