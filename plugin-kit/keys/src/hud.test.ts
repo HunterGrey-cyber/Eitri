@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
-import { forgetStatus, setDimmed, setModeWords, showMessage, showMode, showStatus } from "./hud";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { forgetStatus, setDimmed, setModeWords, showMessage, showMode, showStatus, showWhichKey } from "./hud";
 import { STYLE_ID, STYLE_TEXT, ensureStyle } from "./style";
 
 const COLOUR_ONLY = ["background", "background-color", "color", "border-color", "outline-color", "font-family"];
@@ -15,6 +15,7 @@ afterEach(() => {
   setModeWords(undefined);
   showMode("normal", "");
   showMessage("");
+  showWhichKey("");
   forgetStatus();
   setDimmed(false);
   document.body.replaceChildren();
@@ -82,8 +83,27 @@ describe("the HUD", () => {
     expect(part("message").textContent).toBe("saved");
     expect(part("status").textContent).toBe("item 3/8");
     expect([...hud().children].map((c) => c.className))
-      .toEqual(["eitri-keys-mode", "eitri-keys-pending", "eitri-keys-message", "eitri-keys-status"]);
+      .toEqual(["eitri-keys-mode", "eitri-keys-pending", "eitri-keys-whichkey", "eitri-keys-message", "eitri-keys-status"]);
     expect(hud().getAttribute("role")).toBe("status");
+  });
+
+  it("shows the which-key line in place of the message, and the message again when it goes", () => {
+    showMode("normal", "z");
+    showMessage("saved");
+    showWhichKey("z → a 折叠 · R 全展开");
+    expect(part("whichkey").textContent).toBe("z → a 折叠 · R 全展开");
+    expect(part("message").hidden).toBe(true);
+    expect(part("message").textContent).toBe("saved");
+    showWhichKey("");
+    expect(part("whichkey").textContent).toBe("");
+    expect(part("message").hidden).toBe(false);
+    expect(part("message").textContent).toBe("saved");
+  });
+
+  it("draws the which-key line as text", () => {
+    showWhichKey('z → a <img src=x onerror="alert(1)">');
+    expect(hud().querySelector("img")).toBeNull();
+    expect(part("whichkey").textContent).toBe('z → a <img src=x onerror="alert(1)">');
   });
 
   it("keeps the status across messages, mode changes and a dim, until it is replaced or cleared", () => {
@@ -112,5 +132,28 @@ describe("the HUD", () => {
     expect(hud().querySelector("b, img, i")).toBeNull();
     expect(part("status").textContent).toBe('<img src=x onerror="alert(1)">');
     for (const el of [hud(), ...hud().querySelectorAll<HTMLElement>("*")]) expect(el.getAttribute("style")).toBeNull();
+  });
+});
+
+describe("rendering", () => {
+  it("render writes no DOM when nothing it shows changed", () => {
+    showMode("normal", "g");
+    showMessage("saved");
+    const span = part("mode");
+    const set = vi.fn();
+    const textContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent")!;
+    Object.defineProperty(span, "textContent", {
+      configurable: true,
+      get: () => textContent.get!.call(span),
+      set: (value: string) => { set(value); textContent.set!.call(span, value); },
+    });
+    showMode("normal", "g");
+    showMessage("saved");
+    showStatus("");
+    setDimmed(false);
+    expect(set).not.toHaveBeenCalled();
+    showMode("hint", "g");
+    expect(set).toHaveBeenCalledWith("HINT");
+    expect(span.textContent).toBe("HINT");
   });
 });

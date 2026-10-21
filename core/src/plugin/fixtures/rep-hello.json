@@ -12,6 +12,14 @@
     ],
     "host": "eitri",
     "keys_kit": 1,
+    "keys_settings": {
+      "scroll_step": 60,
+      "smooth": true,
+      "prefix_wait": true,
+      "which_key_delay": 200,
+      "hint_chars": "sadfjklewcmpgh",
+      "find_case": "smart"
+    },
     "module_key": null,
     "prefix": "Ctrl+b",
     "protocol": 1,

@@ -129,6 +129,8 @@ impl PluginPanels {
             .collect();
         let store_root = PluginStore::eitri_root_from_env();
         let mut panels = Vec::new();
+        let keys_settings =
+            eitri_core::plugin::kit_settings::from_config(|key| engine.config.borrow().get(key).map(str::to_owned))?;
         for (plugin, key, slot) in loaded {
             let id = plugin.manifest.id.clone();
             let clash = engine.panels.borrow().entries().iter().any(|e| e.id == id);
@@ -190,6 +192,7 @@ impl PluginPanels {
                     let overrides = keymap.plugin_user(&id).to_vec();
                     let host = Rc::new(PluginHost::new(plugin.clone(), page, wake.waker(), store, overrides));
                     host.set_prefix_key(keymap.prefix());
+                    host.set_keys_settings(keys_settings.clone());
                     // The view already wears `theme`; the host records it so it sends nothing for the same set.
                     host.set_theme(theme);
                     host.set_module_key(key.as_deref());

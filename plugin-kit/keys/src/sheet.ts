@@ -1,10 +1,13 @@
-import type { KitLabels } from "./index";
-import { DEFAULT_PAGE_LABEL, isGenericAction, type Row } from "./rows";
+import type { KitGroup, KitLabels } from "./index";
+import { isGenericAction, type Row } from "./rows";
+import { currentSettings } from "./settings";
 import { ensureStyle } from "./style";
 
+let pendingG = false;
 let restoreFocus: HTMLElement | null = null;
 
 export function closeSheet(): boolean {
+  pendingG = false;
   const sheet = document.getElementById("eitri-keys-sheet");
   if (!sheet) return false;
   sheet.remove();
@@ -16,6 +19,32 @@ export function closeSheet(): boolean {
 export function sheetIsOpen(): boolean {
   return document.getElementById("eitri-keys-sheet") !== null;
 }
+
+export function sheetKey(key: string): boolean {
+  const sheet = document.getElementById("eitri-keys-sheet");
+  const wasG = pendingG;
+  pendingG = false;
+  if (!sheet) return false;
+  switch (key) {
+    case "q": case "?": closeSheet(); break;
+    case "j": sheet.scrollTop += currentSettings().scrollStep; break;
+    case "k": sheet.scrollTop -= currentSettings().scrollStep; break;
+    case "d": sheet.scrollTop += Math.floor(sheet.clientHeight / 2); break;
+    case "u": sheet.scrollTop -= Math.floor(sheet.clientHeight / 2); break;
+    case "G": sheet.scrollTop = sheet.scrollHeight; break;
+    case "g":
+      if (wasG) sheet.scrollTop = 0;
+      else pendingG = true;
+      break;
+    default: return false;
+  }
+  return true;
+}
+
+const GROUPS: KitGroup[] = ["scroll", "history", "link", "find", "hint", "sheet", "mode"];
+const GROUP_LABELS: Record<KitGroup, string> = {
+  scroll: "scroll", history: "history", link: "pages", find: "find", hint: "hints", sheet: "help", mode: "leave",
+};
 
 export function openSheet(rows: Row[], labels?: KitLabels): void {
   ensureStyle();
@@ -29,25 +58,38 @@ export function openSheet(rows: Row[], labels?: KitLabels): void {
   const title = document.createElement("h2");
   title.textContent = labels?.sheetTitle ?? "Keys";
   sheet.append(title);
+  const contexts = new Map<string, Row[]>();
   for (const row of rows) {
     if (!row.keys.length || isGenericAction(row.action)) continue;
-    const line = document.createElement("p");
-    line.className = "eitri-keys-sheet-row";
-    const keys = document.createElement("kbd");
-    keys.textContent = row.keys.join(" / ");
-    line.append(keys, document.createTextNode(`  ${row.context}  ${row.desc}`));
-    sheet.append(line);
+    if (!contexts.has(row.context)) contexts.set(row.context, []);
+    contexts.get(row.context)!.push(row);
+  }
+  for (const [context, contextRows] of contexts) {
+    if (context) {
+      const heading = document.createElement("h3");
+      heading.className = "eitri-keys-sheet-context";
+      heading.textContent = context;
+      sheet.append(heading);
+    }
+    for (const row of contextRows) {
+      const line = document.createElement("p");
+      line.className = "eitri-keys-sheet-row";
+      const keys = document.createElement("kbd");
+      keys.textContent = row.keys.join(" / ");
+      line.append(keys, document.createTextNode(`  ${row.desc}`));
+      sheet.append(line);
+    }
   }
   const folded = rows.filter((row) => row.keys.length && isGenericAction(row.action));
   if (folded.length) {
-    const context = folded[0].context;
-    const label = context && folded.every((row) => row.context === context)
-      ? context : labels?.page ?? DEFAULT_PAGE_LABEL;
     const line = document.createElement("p");
-    line.className = "eitri-keys-sheet-row";
-    const keys = document.createElement("kbd");
-    keys.textContent = folded.map((row) => row.keys.join(" / ")).join(" ");
-    line.append(keys, document.createTextNode(`  ${label}`));
+    line.className = "eitri-keys-sheet-row eitri-keys-sheet-generic";
+    line.textContent = GROUPS.flatMap((group) => {
+      const grouped = folded.filter((row) => row.action.split(".")[0] === group);
+      return grouped.length
+        ? [`${labels?.groups?.[group] ?? GROUP_LABELS[group]} ${grouped.map((row) => row.keys.join(" / ")).join(" ")}`]
+        : [];
+    }).join(" · ");
     sheet.append(line);
   }
   const footer = document.createElement("p");

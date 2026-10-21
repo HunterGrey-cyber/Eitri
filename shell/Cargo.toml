@@ -196,6 +196,12 @@ harness = false
 name = "panel_jk_hold"
 harness = false
 
+# A held `j`/`k` on a plugin page (the keyboard kit on a long plain page), measured frame by frame the same
+# way: its own Xvfb, keys through XTEST with the server's own auto-repeat. A plain `main` for the same reason.
+[[test]]
+name = "plugin_page_jk_hold"
+harness = false
+
 # The GNOME Shell extension's caller against a private `dbus-daemon` and a fake of the extension. A
 # plain `main` so that `own_x_server::isolate` runs first (the guard asks it of every file that names
 # a GTK crate); it never opens a window.

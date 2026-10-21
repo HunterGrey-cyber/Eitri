@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { activate, assignLabels, collectTargets, placeLabel } from "./hints";
+import type { InstallOptions } from "./index";
 import { install, setCurrent } from "./install";
 import { GENERIC_ROWS } from "./rows";
 import { STYLE_TEXT } from "./style";
@@ -62,9 +63,9 @@ function labelRect(label: HTMLElement, size = { width: 20, height: 16 }) {
   return { left, top, right: left + size.width, bottom: top + size.height };
 }
 
-async function start(targets?: () => { el: Element; rank?: number }[]) {
+async function start(targets?: () => { el: Element; rank?: number }[], initial?: InstallOptions["initial"]) {
   const run = vi.fn(() => true);
-  cleanup = await install({ rows: [], run, targets });
+  cleanup = await install({ rows: [], run, targets, initial });
   return run;
 }
 
@@ -266,6 +267,33 @@ describe("hint labels", () => {
 });
 
 describe("installed hint mode", () => {
+  it("Backspace takes back the last typed letter and cancels only when nothing is typed", async () => {
+    const targets = Array.from({ length: 15 }, () => button());
+    let clicks = 0;
+    for (const target of targets) target.addEventListener("click", () => clicks++);
+    await start();
+    key("f");
+    const multi = labels().find((label) => label.textContent!.length > 1)!.textContent!;
+    key(multi[0]);
+    expect(labels().filter((label) => !label.hidden).length).toBeLessThan(15);
+    expect(key("Backspace").defaultPrevented).toBe(true);
+    expect(labels().filter((label) => !label.hidden)).toHaveLength(15);
+    expect(document.getElementById("eitri-keys-hud")!.dataset.mode).toBe("hint");
+    expect(key("Backspace").defaultPrevented).toBe(true);
+    expect(labels()).toHaveLength(0);
+    expect(document.getElementById("eitri-keys-hud")!.dataset.mode).toBe("normal");
+    expect(clicks).toBe(0);
+  });
+
+  it("draws labels from the configured letters", async () => {
+    for (let i = 0; i < 3; i++) button(10 + i * 40);
+    await start(undefined, { timeoutlen: 1000, hasKeys: true, settings: { hint_chars: "ab" } });
+    key("f");
+    const texts = labels().map((label) => label.textContent!);
+    expect(texts).toHaveLength(3);
+    expect(texts.every((text) => /^[ab]+$/.test(text))).toBe(true);
+  });
+
   it("enters on f and typing a full label clicks once without calling the page action", async () => {
     const el = button();
     let clicks = 0;

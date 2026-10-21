@@ -163,10 +163,12 @@ export function activate(el: Element): void {
   target.click?.();
 }
 
-export function startHints(root: Document, extra: HintTarget[], origin: { x: number; y: number }) {
+export function startHints(
+  root: Document, extra: HintTarget[], origin: { x: number; y: number }, alphabet = "sadfjklewcmpgh",
+) {
   const targets = collectTargets(root, extra);
   if (kept && !targets.some(({ el }) => el === kept!.el)) kept = null;
-  const labels = assignLabels(targets, origin, undefined, kept);
+  const labels = assignLabels(targets, origin, alphabet, kept);
   ensureStyle(root);
   const overlay = root.createElement("div");
   overlay.id = "eitri-keys-hints";
@@ -233,6 +235,11 @@ export function startHints(root: Document, extra: HintTarget[], origin: { x: num
     feed(key: string): Element | null {
       if (!active) return null;
       if (key === "Escape") { cancel(); return null; }
+      if (key === "Backspace") {
+        if (prefix) { prefix = prefix.slice(0, -1); show(); }
+        else cancel();
+        return null;
+      }
       prefix += key.length === 1 ? key.toLowerCase() : key;
       for (const [el, label] of labels) {
         if (label === prefix && !gone.has(el)) {

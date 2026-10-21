@@ -7,16 +7,20 @@ afterEach(() => { document.body.replaceChildren(); vi.restoreAllMocks(); });
 
 it("names the generic rows in English by default", () => {
   expect(GENERIC_ROWS.map(({ action, keys, context, desc }) => [action, keys.join(" "), context, desc])).toEqual([
-    ["scroll.down", "j", "page", "scroll down"],
-    ["scroll.up", "k", "page", "scroll up"],
-    ["scroll.half_down", "d", "page", "half a page down"],
-    ["scroll.half_up", "u", "page", "half a page up"],
+    ["scroll.down", "j <C-e>", "page", "scroll down"],
+    ["scroll.up", "k <C-y>", "page", "scroll up"],
+    ["scroll.half_down", "d <C-d>", "page", "half a page down"],
+    ["scroll.half_up", "u <C-u>", "page", "half a page up"],
+    ["scroll.page_down", "<C-f>", "page", "a page down"],
     ["scroll.top", "gg", "page", "top of the page"],
     ["scroll.bottom", "G", "page", "bottom of the page"],
-    ["history.back", "H", "page", "back"],
-    ["history.forward", "L", "page", "forward"],
+    ["history.back", "H <C-o>", "page", "back"],
+    ["history.forward", "L <C-i>", "page", "forward"],
     ["link.prev", "[[", "page", "previous page"],
     ["link.next", "]]", "page", "next page"],
+    ["find.start", "/", "page", "find in the page"],
+    ["find.next", "n", "page", "next match"],
+    ["find.prev", "N", "page", "previous match"],
     ["hint.start", "f", "page", "hint mode"],
     ["sheet.open", "?", "page", "this sheet"],
     ["mode.escape", "<Esc>", "page", "leave a mode"],
@@ -25,10 +29,10 @@ it("names the generic rows in English by default", () => {
 
 it("replaces the generic words with the page's labels, keeping the defaults it leaves out", () => {
   const rows = genericRows({ page: "页面", generic: { "scroll.down": "向下滚动" } });
-  expect(rows[0]).toEqual({ action: "scroll.down", keys: ["j"], context: "页面", desc: "向下滚动" });
-  expect(rows[1]).toEqual({ action: "scroll.up", keys: ["k"], context: "页面", desc: "scroll up" });
+  expect(rows[0]).toEqual({ action: "scroll.down", keys: ["j", "<C-e>"], context: "页面", desc: "向下滚动" });
+  expect(rows[1]).toEqual({ action: "scroll.up", keys: ["k", "<C-y>"], context: "页面", desc: "scroll up" });
   expect(GENERIC_ROWS[0].context).toBe("page");
-  expect(mergeRows([], { page: "页面" })).toEqual(genericRows({ page: "页面" }));
+  expect(mergeRows([], { page: "页面" }, "Ctrl+b")).toEqual(genericRows({ page: "页面" }));
 });
 
 it("tells a generic action from a page action", () => {

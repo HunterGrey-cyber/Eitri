@@ -20,10 +20,17 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
       const labels: KitLabels = {modes: {normal: "N"}, page: "page", generic: {"scroll.down": "down"},
         sheetTitle: "Keys", sheetFooter: "Esc closes", sheetClose: "Close"};
       const opts: InstallOptions = {rows: [row], run: () => true, labels};
+      const v3: InstallOptions = { rows: [row], run: () => true, initial: { timeoutlen: 1000,
+        hasKeys: true, prefix: "Ctrl+b", settings: { scroll_step: 40 } },
+        find: { root: () => document.querySelector("main"), exclude: ".chrome" },
+        labels: { messages: { "find.count": "{index}/{total}" } } };
+      window.eitriKeys.findRefresh();
+      window.eitriKeys.findSeed("query");
       const stroke: KeyStroke = {key: "x", ctrl: false, shift: false};
       const action: GenericAction = "hint.start";
-      const version: 2 = window.eitriKeys.version;
+      const version: 3 = window.eitriKeys.version;
       window.eitriKeys.install(opts);
+      window.eitriKeys.install(v3);
       window.eitriKeys.status("s");
       const keys: string[] = window.eitriKeys.keys(action);
       window.eitriKeys.message(stroke.key + keys.join("") + String(version));

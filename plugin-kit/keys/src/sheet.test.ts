@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, expect, it } from "vitest";
-import { closeSheet, openSheet } from "./sheet";
+import { afterEach, describe, expect, it } from "vitest";
+import { closeSheet, openSheet, sheetKey } from "./sheet";
 import { GENERIC_ROWS, genericRows } from "./rows";
 import type { Row } from "./rows";
 
@@ -19,41 +19,96 @@ afterEach(() => {
   document.head.replaceChildren();
 });
 
-it("lists the page's rows first, then one folded line for the generic rows", () => {
+function contexts() {
+  return [...document.querySelectorAll("#eitri-keys-sheet .eitri-keys-sheet-context")].map((h) => h.textContent);
+}
+function genericLine() {
+  return document.querySelector("#eitri-keys-sheet .eitri-keys-sheet-generic")?.textContent ?? null;
+}
+
+it("lists the page's rows under their contexts, then one line of the generic rows by group", () => {
   openSheet([...GENERIC_ROWS, ...pageRows]);
+  expect(contexts()).toEqual(["reading", "item"]);
   expect(rowTexts()).toEqual([
-    "]q / <C-n>  reading  next item",
-    "1  item  pick",
-    "j k d u gg G H L [[ ]] f ? <Esc>  page",
+    "]q / <C-n>  next item",
+    "1  pick",
+    "scroll j / <C-e> k / <C-y> d / <C-d> u / <C-u> <C-f> gg G · history H / <C-o> L / <C-i> · pages [[ ]] · find / n N · hints f · help ? · leave <Esc>",
   ]);
+  expect(genericLine()).toBe(rowTexts().at(-1));
 });
 
-it("folds a page row that reuses a generic action, and leaves out a row with no key", () => {
+it("folds a page row that reuses a generic action into its group, and leaves out a row with no key", () => {
   openSheet([
     { action: "hint.start", keys: ["F"], context: "page", desc: "labels" },
     pageRows[0],
     { action: "item.gone", keys: [], context: "x", desc: "y" },
   ]);
-  expect(rowTexts()).toEqual(["]q / <C-n>  reading  next item", "F  page"]);
+  expect(contexts()).toEqual(["reading"]);
+  expect(rowTexts()).toEqual(["]q / <C-n>  next item", "hints F"]);
 });
 
-it("labels the folded line with labels.page when the folded rows share no context", () => {
-  openSheet([
-    { action: "scroll.down", keys: ["j", "<C-e>"], context: "a", desc: "down" },
-    { action: "scroll.up", keys: ["k"], context: "b", desc: "up" },
-  ], { page: "P" });
-  expect(rowTexts()).toEqual(["j / <C-e> k  P"]);
+it("names the groups with the page's labels, keeping the defaults it leaves out", () => {
+  openSheet([...GENERIC_ROWS, ...pageRows], { groups: { scroll: "滚动", history: "历史" } });
+  expect(genericLine()).toBe(
+    "滚动 j / <C-e> k / <C-y> d / <C-d> u / <C-u> <C-f> gg G · 历史 H / <C-o> L / <C-i> · pages [[ ]] · find / n N · hints f · help ? · leave <Esc>",
+  );
 });
 
-it("uses the page's labels for the title, footer, close button and folded line", () => {
+it("puts a row with no context before the first heading, without a heading of its own", () => {
+  openSheet([{ action: "a.b", keys: ["x"], context: "", desc: "plain" }, pageRows[1]]);
+  expect(contexts()).toEqual(["item"]);
+  expect(rowTexts()).toEqual(["x  plain", "1  pick"]);
+});
+
+it("uses the page's labels for the title, footer and close button", () => {
   openSheet([...genericRows({ page: "页面" }), ...pageRows],
     { page: "页面", sheetTitle: "按键", sheetFooter: "Esc 关闭", sheetClose: "关闭" });
   const sheet = document.getElementById("eitri-keys-sheet")!;
   expect(sheet.getAttribute("aria-label")).toBe("按键");
   expect(sheet.querySelector("h2")!.textContent).toBe("按键");
-  expect(rowTexts().at(-1)).toBe("j k d u gg G H L [[ ]] f ? <Esc>  页面");
   expect(sheet.querySelector(".eitri-keys-sheet-muted")!.textContent).toBe("Esc 关闭");
   expect(sheet.querySelector("button")!.textContent).toBe("关闭");
+});
+
+describe("keys inside the sheet", () => {
+  const sized = () => {
+    const sheet = document.getElementById("eitri-keys-sheet")!;
+    Object.defineProperty(sheet, "clientHeight", { configurable: true, value: 300 });
+    Object.defineProperty(sheet, "scrollHeight", { configurable: true, value: 2000 });
+    return sheet;
+  };
+  it.each(["q", "?"])("%s closes it", (k) => {
+    openSheet(GENERIC_ROWS);
+    expect(sheetKey(k)).toBe(true);
+    expect(document.getElementById("eitri-keys-sheet")).toBeNull();
+  });
+  it("j and k move the sheet by one step, d and u by half its height", () => {
+    openSheet(GENERIC_ROWS);
+    const sheet = sized();
+    sheetKey("j");
+    expect(sheet.scrollTop).toBe(60);
+    sheetKey("d");
+    expect(sheet.scrollTop).toBe(210);
+    sheetKey("k");
+    expect(sheet.scrollTop).toBe(150);
+    sheetKey("u");
+    expect(sheet.scrollTop).toBe(0);
+  });
+  it("gg goes to the top and G to the bottom; a lone g does nothing yet", () => {
+    openSheet(GENERIC_ROWS);
+    const sheet = sized();
+    expect(sheetKey("G")).toBe(true);
+    expect(sheet.scrollTop).toBe(2000);
+    expect(sheetKey("g")).toBe(true);
+    expect(sheet.scrollTop).toBe(2000);
+    expect(sheetKey("g")).toBe(true);
+    expect(sheet.scrollTop).toBe(0);
+  });
+  it("any other key is not the sheet's", () => {
+    openSheet(GENERIC_ROWS);
+    expect(sheetKey("x")).toBe(false);
+    expect(document.getElementById("eitri-keys-sheet")).not.toBeNull();
+  });
 });
 
 it("defaults to English", () => {

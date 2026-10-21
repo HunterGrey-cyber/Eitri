@@ -1,14 +1,22 @@
 const NATIVE_CONTROL = "button, a, summary, input, select, textarea, [role=button], [role=tab], [role=option], [role=checkbox], [role=switch]";
 
-export function blockedEvent(ev: KeyboardEvent, heldSuper: boolean): boolean {
+/** `spaceToKeys`: the page binds a sequence that starts with Space, so Space on a focused control belongs to the
+ *  keys; Enter still activates the control, so every control stays reachable. */
+export function blockedEvent(ev: KeyboardEvent, heldSuper: boolean, spaceToKeys = false): boolean {
   const focused = ev.target instanceof Element ? ev.target : document.activeElement;
   return ev.defaultPrevented || ev.isComposing || ev.keyCode === 229 || heldSuper ||
     ev.getModifierState("Super") || ev.getModifierState("Hyper") ||
-    ((ev.key === "Enter" || ev.key === " ") && !!focused?.closest(NATIVE_CONTROL));
+    ((ev.key === "Enter" || (ev.key === " " && !spaceToKeys)) && !!focused?.closest(NATIVE_CONTROL));
 }
 
-export function shouldSkip(ev: KeyboardEvent, heldSuper: boolean): boolean {
-  return blockedEvent(ev, heldSuper) || ev.ctrlKey || ev.altKey || ev.metaKey;
+export function shouldSkip(ev: KeyboardEvent, heldSuper: boolean, spaceToKeys = false): boolean {
+  return blockedEvent(ev, heldSuper, spaceToKeys) || ev.ctrlKey || ev.altKey || ev.metaKey;
+}
+
+/** Esc, or vim's other spelling of it, Ctrl+[, which a keyboard without a reachable Esc key relies on. */
+export function isEscape(ev: KeyboardEvent): boolean {
+  if (ev.altKey || ev.metaKey) return false;
+  return ev.key === "Escape" ? !ev.ctrlKey : ev.key === "[" && ev.ctrlKey && !ev.shiftKey;
 }
 
 // Input types that take typed text. A checkbox, radio, button, range, colour or file input takes no text, so focusing

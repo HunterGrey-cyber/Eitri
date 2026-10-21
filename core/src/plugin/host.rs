@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::editor::{self, decode_apply, decode_clear};
 use super::keys::{self, EffectiveRow, PluginKeyOp};
+use super::kit_settings::KeysSettings;
 use super::load::{LoadedPlugin, ResolvedTask, TaskRefusal};
 use super::protocol::{
     self, ErrorCode, ExitStatus, FocusEvent, FocusTarget, Inbound, KeyRowArg, KeysConfig, OnOff, Reply, StreamName,
@@ -208,6 +209,7 @@ struct PluginHostState {
     prefix_label: String,
     /// The key that shows this plugin's module after the prefix, if the registration gave one.
     module_key: Option<String>,
+    keys_settings: KeysSettings,
     /// The window's appearance as this page last received it.
     theme: PageTheme,
     /// The current document's declared key table, with the user's overrides applied.
@@ -333,6 +335,7 @@ impl PluginHost {
             prefix_key: Chord::of(&stock_prefix),
             prefix_label: stock_prefix.human(),
             module_key: None,
+            keys_settings: KeysSettings::default(),
             theme: PageTheme::fallback(),
             declared: None,
         };
@@ -421,6 +424,11 @@ impl PluginHost {
     fn send_theme(&self) {
         let data = self.state.borrow().theme.to_json();
         self.page.send(&protocol::event_text("theme", &data));
+    }
+
+    /// Read at startup, so these settings reach the page in hello and never as an event.
+    pub fn set_keys_settings(&self, settings: KeysSettings) {
+        self.state.borrow_mut().keys_settings = settings;
     }
 
     /// The page's keyboard settings, all three each time, so a page never merges a partial update.
@@ -646,13 +654,14 @@ impl PluginHost {
         // is delivered once (in the tail) and not again as output.
         let runs = self.state.borrow_mut().tasks.attach();
         self.state.borrow_mut().hello = true;
-        let (timeoutlen, prefix, module_key, theme) = {
+        let (timeoutlen, prefix, module_key, theme, keys_settings) = {
             let st = self.state.borrow();
             (
                 st.timeoutlen,
                 st.prefix_label.clone(),
                 st.module_key.clone(),
                 st.theme.to_json(),
+                st.keys_settings.clone(),
             )
         };
         let manifest = &self.plugin.manifest;
@@ -677,6 +686,7 @@ impl PluginHost {
                 "roots": roots,
                 "runs": runs,
                 "keys_kit": 1,
+                "keys_settings": keys_settings,
                 "timeoutlen": timeoutlen,
                 "prefix": prefix,
                 "module_key": module_key,
@@ -1411,6 +1421,28 @@ mod tests {
     }
 
     #[test]
+    fn hello_carries_the_keys_settings() {
+        let r = rig(vec![]);
+        let sent = r.hello();
+        let reply = sent.iter().find(|m| m["re"] == 1).expect("a reply");
+        assert_eq!(
+            reply["result"]["keys_settings"],
+            serde_json::to_value(KeysSettings::default()).unwrap()
+        );
+        let r = rig(vec![]);
+        r.host.set_keys_settings(KeysSettings {
+            scroll_step: 40,
+            which_key_delay: None,
+            ..KeysSettings::default()
+        });
+        assert!(r.page.take().is_empty(), "recording the settings sends nothing");
+        let sent = r.hello();
+        let reply = sent.iter().find(|m| m["re"] == 1).expect("a reply");
+        assert_eq!(reply["result"]["keys_settings"]["scroll_step"], 40);
+        assert_eq!(reply["result"]["keys_settings"]["which_key_delay"], Value::Null);
+    }
+
+    #[test]
     fn hello_reply_keys_and_keyboard_values_match_the_shared_fixture() {
         let fixture: Value = serde_json::from_str(include_str!("fixtures/rep-hello.json")).unwrap();
         let r = rig(vec![]);
@@ -1425,7 +1457,7 @@ mod tests {
             reply["result"].as_object().unwrap().keys().collect::<Vec<_>>(),
             fixture["result"].as_object().unwrap().keys().collect::<Vec<_>>()
         );
-        for key in ["keys_kit", "timeoutlen", "prefix", "module_key"] {
+        for key in ["keys_kit", "timeoutlen", "prefix", "module_key", "keys_settings"] {
             assert_eq!(reply["result"][key], fixture["result"][key], "{key}");
         }
         let fixture_vars = fixture["result"]["theme"]["vars"]
