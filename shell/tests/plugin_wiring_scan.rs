@@ -125,6 +125,21 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
         show < kept && kept < focus,
         "kept only after the chat is on screen, before it takes the keys"
     );
+    // The sheet's view is the one holding the keys (else the base view's), read before anything moves, and the
+    // covered check and the opening use that same view.
+    let view = body
+        .find("letview=from.as_ref().and_then(ViewId::of_module).unwrap_or(ViewId::BASE);")
+        .expect("the view comes from the module that held the keys");
+    let chat = body
+        .find("letchat=view.module();")
+        .expect("the sheet's module is that view's");
+    let covered = body
+        .find("chat_covered_refusal(view)")
+        .expect("the covered check asks about that view");
+    let open = body
+        .find("agent.open_keymap(view,plugin,opening);")
+        .expect("the sheet opens in that view's page");
+    assert!(view < chat && chat < show && show < covered && covered < kept && kept < open);
 
     // Reported only for a move the layout accepted: inside the `Ok(())` arm of `layout.set_focus`.
     let install = code.find("pane_focus::install(").expect("the focus tracker");

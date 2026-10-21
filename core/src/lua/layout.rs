@@ -390,6 +390,33 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
         })?,
     )?;
 
+    let export_store = store.clone();
+    table.set(
+        "export",
+        lua.create_function(move |_, ()| {
+            let store = export_store
+                .try_borrow()
+                .map_err(|_| mlua::Error::RuntimeError("eitri.layout.export: the layout is being changed".into()))?;
+            let live = store.layout.as_ref().filter(|_| store.accepting).ok_or_else(|| {
+                mlua::Error::RuntimeError(
+                    "eitri.layout.export: only once the window exists (in a command or an event handler)".into(),
+                )
+            })?;
+            let layout = live
+                .try_borrow()
+                .map_err(|_| mlua::Error::RuntimeError("eitri.layout.export: the layout is being changed".into()))?;
+            let workspaces = store
+                .workspaces
+                .as_ref()
+                .map(|ws| ws.try_borrow())
+                .transpose()
+                .map_err(|_| {
+                    mlua::Error::RuntimeError("eitri.layout.export: the workspaces are being changed".into())
+                })?;
+            Ok(crate::layout::export_lua(&layout, workspaces.as_deref()))
+        })?,
+    )?;
+
     table.set(
         "get",
         lua.create_function(move |lua, ()| {
@@ -1585,6 +1612,41 @@ mod tests {
         assert!(
             err.contains("eitri.layout.get") && err.contains("being changed"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn export_waits_for_the_window_and_reads_the_live_layout() {
+        let (lua, _) = engine();
+        let err = lua.load("eitri.layout.export()").exec().unwrap_err().to_string();
+        assert!(
+            err.contains("eitri.layout.export") && err.contains("only once the window exists"),
+            "{err}"
+        );
+        let (lua, store, live) = attached(Layout::initial(&[]).unwrap());
+        assert_eq!(
+            lua.load("return eitri.layout.export()").eval::<String>().unwrap(),
+            crate::layout::export_lua(&live.borrow(), None),
+        );
+        let held = live.borrow_mut();
+        let err = lua.load("eitri.layout.export()").exec().unwrap_err().to_string();
+        assert!(
+            err.contains("eitri.layout.export") && err.contains("being changed"),
+            "{err}"
+        );
+        drop(held);
+        let ws = Rc::new(RefCell::new(crate::layout::Workspaces::single()));
+        store.borrow_mut().attach_workspaces(ws.clone());
+        let held = ws.borrow_mut();
+        let err = lua.load("eitri.layout.export()").exec().unwrap_err().to_string();
+        assert!(
+            err.contains("eitri.layout.export") && err.contains("workspaces are being changed"),
+            "{err}"
+        );
+        drop(held);
+        assert_eq!(
+            lua.load("return eitri.layout.export()").eval::<String>().unwrap(),
+            crate::layout::export_lua(&live.borrow(), Some(&ws.borrow())),
         );
     }
 

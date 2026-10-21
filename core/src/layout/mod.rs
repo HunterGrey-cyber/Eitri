@@ -3,6 +3,7 @@
 pub mod arrange;
 pub mod con;
 pub mod cycle;
+pub mod export;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub mod float;
@@ -29,6 +30,7 @@ pub mod workspace;
 pub use arrange::Divider;
 pub use con::{Child, Con, ConId, ConLayout, Node, Pin, MAX_CHILDREN};
 pub use cycle::{next_on_screen, next_terminal, FocusHistory};
+pub use export::export_lua;
 pub use float::{covering, float_floor, float_parts, obscured, Float, FloatRect, DEFAULT_FLOAT_SHARE, MAX_FLOAT_PX};
 pub use geometry::{
     arrange, hide, min_size, move_divider, navigate, neighbor, resize, settle_pins, Arrangement, ConStripEntry,

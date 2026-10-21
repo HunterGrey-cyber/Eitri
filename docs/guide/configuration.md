@@ -131,6 +131,28 @@ eitri.command.register({
   restores a bottom row's height by itself. Called from inside a layout change it stops with a message instead of
   reading half a change.
 
+- **`eitri.layout.export()`** returns the window's layout as the `init.lua` calls that make it at a first launch:
+  `eitri.layout.default(...)` for `main`, then `eitri.layout.workspace(name, ...)` for every other workspace, in the
+  shape below, floats included. What that shape has no field for is not written: which module has the keys, the
+  zoom, the mark, a pinned bottom row's height. A hidden module stays where it is in the tree, shown at a first
+  launch, and a comment names it. Numbered chat views are left out, with a comment saying so, since a view named in
+  `init.lua` is removed at startup unless a saved tab holds it (an [open rule](#where-a-new-module-opens) says where
+  one opens instead). Like `get()`, it works only once the window exists. Bound to a key of your own, it writes the
+  layout to a file you can paste from:
+
+  ```lua
+  eitri.command.register({
+    id = "layout-export",
+    title = "Write the layout as init.lua calls",
+    keybinding = "<Control><Alt>e",
+    action = function()
+      local file = assert(io.open(os.getenv("HOME") .. "/eitri-layout.lua", "w"))
+      file:write(eitri.layout.export())
+      file:close()
+    end,
+  })
+  ```
+
 - **`eitri.layout.float(id, rect?)`** floats that module: at `rect` (`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`: the
   centre as a fraction of the window, the size in pixels, the bar included), else at the rectangle it last floated
   at, else centred at 60% of the window. On a module that already floats it moves it to `rect`. The editor never

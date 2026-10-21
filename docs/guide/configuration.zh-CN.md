@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=a2c164b8210231599249cf91ca602a7786b52ac7d4bdb573a467f2ecb2611f75 -->
+<!-- translated-from: configuration.md sha256=695f659ca70cd5e026ad2dd12aa0083bff825c91dc44e7931749b5f718b7df6f -->
 
 # 配置
 
@@ -91,6 +91,21 @@ eitri.command.register({
 - **`eitri.layout.run(name, options?)`** 对拿着按键的那个模块执行一个布局动作：[按键](keys.zh-CN.md)里“模块”表中的那些（排布、交换、移到边缘、标记、放大、调整大小、隐藏、关闭），以及没有按键的那些（`swap.marked`、`layout.undo`、`layout.previous`、两种翻转、`move.far-right`）。要对别的模块操作，先调用 `eitri.layout.focus(id)`。关闭模块仍然会问那个 `y/n`。不是布局动作的（比如标签页动作）会被拒绝并点名，另外还有三样也会被拒绝：`split.right` 和 `split.below`（它们要等一个模块键；用 `eitri.layout.split(id, "right")` 或 `"below"` 来做这件事）、`select.number`（它要等一个数字；用 `eitri.layout.focus(id)` 让某个模块拿到按键）以及 `repeatable` 选项，它属于按键绑定。另外有两点和终端有关：`eitri.layout.run("instance.new", { kind = "terminal" })` 会在拿着按键的模块右边打开一个新的终端，和 `<prefix> Alt+Enter` 一样（`kind = "agent"` 则会建出一个带新的空标签页的[聊天视图](keys.zh-CN.md#chat-views)）；分割动作带一个 `cwd` 选项，见下面。
 - **`eitri.layout.mark(id)`** 标记那个模块，不移动按键，就像 `<prefix> m` 标记拿着按键的那个模块。
 - **`eitri.layout.get()`** 返回一张描述当前布局的新表，形状和 `eitri.layout.default` 接受的一样：`{ "row", { "editor", 0.6 }, { "column", { "agent" }, { "terminal" } } }`，其中除最后一个以外的每个子项都带着它在容器里的份额。它另外加上 `focus`（拿着按键的模块）、`hidden`（一个列表）、`zoomed` 和 `marked`（某个模块，或者什么都没有）、`floating`（浮动窗口，从下往上，只在有浮动窗口时出现；便笺浮动窗口带 `scratch = true`）、`workspace`（你所在工作区的名字）和 `workspaces`（所有名字，按顺序）。固定高度的底部行不会写进这张表；默认的形状会自己恢复底部行的高度。在布局正被修改的过程中调用它会停下并给出信息，而不是读到改了一半的东西。
+
+- **`eitri.layout.export()`** 把窗口的布局写成能在第一次启动时摆出它的 `init.lua` 调用：`main` 写成 `eitri.layout.default(...)`，其余每个工作区按顺序写成 `eitri.layout.workspace(name, ...)`，形状和下面说的一样，浮动窗口也在内。那种形状没有字段表达的不写：哪个模块拿着按键、缩放、标记、固定高度的底部行的高度。隐藏的模块留在树里原来的位置，第一次启动时会显示出来，并有一行注释点出它。编号的聊天视图不写进去，并有注释说明，因为写在 `init.lua` 里的视图除非有保存的标签页绑着，否则启动时就会被移除（要说它在哪里打开，用[打开规则](#where-a-new-module-opens)）。和 `get()` 一样，它只在窗口存在之后才能用。绑到你自己的一个键上，它就把布局写进一个文件，方便你从里面复制：
+
+  ```lua
+  eitri.command.register({
+    id = "layout-export",
+    title = "Write the layout as init.lua calls",
+    keybinding = "<Control><Alt>e",
+    action = function()
+      local file = assert(io.open(os.getenv("HOME") .. "/eitri-layout.lua", "w"))
+      file:write(eitri.layout.export())
+      file:close()
+    end,
+  })
+  ```
 
 - **`eitri.layout.float(id, rect?)`** 把那个模块浮起来：放在 `rect`（`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`：中心是窗口的一个比例，大小以像素计，包括那条栏）；没有就用它上次浮动的矩形；再没有就居中、占窗口的 60%。对一个已经浮动的模块，它把它移到 `rect`。编辑器从不浮动。和 `<prefix> Alt+Shift+Space` 一样，它会拒绝视野里最后一个平铺模块。
 - **`eitri.layout.rule(target, opts)`** 只能在 `init.lua` 里用，决定窗口自己打开一个模块时把它放在哪里；见[新模块开在哪里](#where-a-new-module-opens)。

@@ -2350,6 +2350,15 @@ fn build_ui(
             let ((webview, page), reused) = chat_views
                 .borrow_mut()
                 .take_or_make(id, || agent_panel::build_chat_page(&agent, view, Some(base)));
+            // Says which of the pool's two answers this was, so a log shows a page reused rather than built.
+            println!(
+                "[chat] {id}: page {}",
+                if reused == chat_views::Reused::Yes {
+                    "reused"
+                } else {
+                    "built"
+                }
+            );
             if reused == chat_views::Reused::Yes && !was_live {
                 // The same page, still answering for this view only: it starts again from an empty
                 // record and a fresh document.
