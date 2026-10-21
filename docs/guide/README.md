@@ -9,11 +9,20 @@ cards in a panel next to it, all driven from the keyboard.
 
 ## The window
 
-- **The editor.** A real Neovim running your own `init.lua`, plugins, LSP and keymaps.
-- **The agent panel.** Claude Code's conversation (or Codex's, or another agent's), one tab per session: rendered replies, each edit as its own
-  diff row, and a card to approve or deny what the agent may not run on its own.
-- **The bottom terminal.** A shell below the editor. It is hidden when a window first opens and
-  only starts once you show it.
+The window is made of modules you arrange yourself, i3/tmux style:
+
+- **[The editor](keys.md#moving-between-panes).** A real Neovim running your own `init.lua`, plugins, LSP and keymaps.
+- **[Chat views](keys.md#chat-views).** The base agent panel and `agent#2` to `agent#9`, each its own page;
+  break a session tab out into a view to see conversations side by side, with their replies, diffs and permission cards.
+- **[Terminals](keys.md#containers-and-terminals).** The bottom terminal and `terminal#2` to `terminal#9`,
+  each with its own shell, started when you first show it.
+- **[Plugin and Lua pages](configuration.md#where-a-new-module-opens).** Pages you add are modules alongside the built-in ones.
+- **[Containers](keys.md#containers-and-terminals).** Split modules side by side or one above another, or put them in tabbed or stacked containers.
+- **[Floats and the scratchpad](keys.md#floats-the-scratchpad-and-workspaces).** Float a module over the others, or stow it and call it back; it keeps running. The editor stays tiled.
+- **[Workspaces](keys.md#floats-the-scratchpad-and-workspaces).** Keep several arrangements of the same modules and switch between them.
+
+Set [open rules](configuration.md#where-a-new-module-opens) in `~/.config/eitri/init.lua` to choose where new modules
+go. Use [`eitri.layout.export()`](configuration.md#layout-from-lua) to turn an arrangement into startup layout calls for that file.
 
 ## What it is not
 

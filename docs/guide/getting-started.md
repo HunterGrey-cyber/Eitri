@@ -79,6 +79,33 @@ and removes, with the diff inside it.
 After a turn that edited files, `c` in browsing shows what changed on disk during it; see
 [Turn review](turn-review.md).
 
+## Arranging the window
+
+Try arranging the modules after your first turn. Here `<prefix>` means press `Ctrl+b`, let go, then press
+the next key or chord, as in tmux. These are the defaults; if Eitri has picked up your tmux bindings, see
+[Your tmux keys](keys.md#your-tmux-keys).
+
+1. With the keys in the agent panel, press `<prefix> "`, then `t`: the bottom terminal opens below it and
+   takes the keys. `<prefix> %` splits to the right instead; either split waits for a module to open or move there.
+2. Press `<prefix> o` to move the keys to the next module on screen, and again until they are back in the
+   terminal. `<prefix> Left`, `Right`, `Up` and `Down` go to the module on that side.
+3. In the terminal, press `<prefix> Alt+Enter` to open a second terminal to its right, with its own shell
+   in the project root.
+4. With the second terminal focused, press `<prefix> Alt+Shift+Space` to float it. Then `<prefix> Alt+_`
+   stows it in the scratchpad. `<prefix> Alt+-` calls it back; press that sequence again to stow it again.
+5. Press `<prefix> s`, then `c` to create a second workspace as a copy of this arrangement and switch to it.
+   `<prefix> L` returns to the previous workspace. The modules are shared; each workspace keeps its own arrangement.
+6. Move to the base agent panel. Press `<prefix> c` to add a second chat tab, then `<prefix> !` to break that
+   tab into its own view beside the panel. The base view must keep at least one tab. In the new view,
+   `<prefix> !` joins the tab back.
+7. To make a starting layout for projects without a saved one, put `eitri.layout.default(...)` in
+   `~/.config/eitri/init.lua`. Once the window is running, `eitri.layout.export()` returns the layout calls to
+   paste there, including workspaces and floats; [Configuration](configuration.md#layout-from-lua) shows how to
+   save that text from a Lua command. Numbered chat views are left out of the export: they need a saved tab
+   to survive startup, so use [open rules](configuration.md#where-a-new-module-opens) to place new views.
+
+See [Keys](keys.md#the-prefix) for tabbed and stacked containers, resizing and the rest of the layout keys.
+
 ## When Eitri asks
 
 Some tool calls wait for you. Eitri draws a permission card in the conversation, next to the call it gates,

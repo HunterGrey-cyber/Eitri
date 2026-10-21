@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=67ece0a91ee5ac257e317b8a3f80838ad1747f88b9dba94b15ba991d1ede0d6a -->
+<!-- translated-from: getting-started.md sha256=68f207cb77f9dd5c5e0a5ef921dd3ddd4ea5d8cdf7e98efbf71a8fefde7fe280 -->
 
 # 快速上手
 
@@ -46,6 +46,20 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 - 在输入框里按 `Ctrl+g`，会在 Neovim 里编辑你的草稿；`:wq` 把它带回来。
 
 在一个编辑过文件的回合之后，在浏览模式里按 `c` 可以看这个回合期间磁盘上改了什么；见[回合审阅](turn-review.zh-CN.md)。
+
+## 排布窗口
+
+第一个回合之后，试着排一排模块。这里的 `<prefix>` 是先按 `Ctrl+b`，松开，再按后面的键或组合键，和 tmux 一样。这些都是默认键；如果 Eitri 拿到了你的 tmux 绑定，见[你的 tmux 键位](keys.zh-CN.md#your-tmux-keys)。
+
+1. 按键在 agent 面板里时，按 `<prefix> "`，再按 `t`：底部终端会在它下面打开，并拿到按键。`<prefix> %` 则向右分割；两种分割都会等你选一个模块，把它打开或移到那里。
+2. 按 `<prefix> o` 把按键交给屏幕上的下一个模块，一直按到按键回到终端。`<prefix> Left`、`Right`、`Up` 和 `Down` 则去那一侧的模块。
+3. 在终端里按 `<prefix> Alt+Enter`，在它右边打开第二个终端，有自己的 shell，从项目根目录开始。
+4. 第二个终端拿着按键时，按 `<prefix> Alt+Shift+Space` 让它浮起来，再按 `<prefix> Alt+_` 把它收进便笺板。`<prefix> Alt+-` 把它叫回来；再按一遍这个序列，又把它收起来。
+5. 按 `<prefix> s`，再按 `c`，复制当前排布，建一个第二工作区并切过去。`<prefix> L` 回到之前的工作区。模块是同一批，每个工作区保留自己的排布。
+6. 移到基础 agent 面板。按 `<prefix> c` 添加第二个聊天标签页，再按 `<prefix> !` 把这个标签页拆进面板旁边独立的视图。基础视图必须至少留下一个标签页。在新视图里按 `<prefix> !`，就把标签页并回去。
+7. 要为还没有保存过布局的项目设置起始布局，在 `~/.config/eitri/init.lua` 里写 `eitri.layout.default(...)`。窗口运行起来之后，`eitri.layout.export()` 会返回能粘贴到那里的布局调用，包括工作区和浮动窗口；[配置](configuration.zh-CN.md#layout-from-lua)里有用 Lua 命令把这段文字存下来的例子。导出会略去编号聊天视图：它们要有保存的标签页才能在启动后留下来，所以用[打开规则](configuration.zh-CN.md#where-a-new-module-opens)安排新视图的位置。
+
+标签式、堆叠式容器、调整大小和其余布局按键，见[按键](keys.zh-CN.md#前缀)。
 
 <a id="when-eitri-asks"></a>
 ## Eitri 什么时候会问你
