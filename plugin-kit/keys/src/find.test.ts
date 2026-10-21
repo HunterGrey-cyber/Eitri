@@ -8,6 +8,7 @@ import { GENERIC_ROWS } from "./rows";
 
 let cleanup: (() => void) | undefined;
 let y = 0;
+let x = 0;
 /** Each placed element's top in document coordinates; jsdom lays nothing out. */
 let tops: Map<Element, number>;
 let rangeRect: PropertyDescriptor | undefined;
@@ -19,12 +20,17 @@ function rect(top: number, height = 20, width = 100): DOMRect {
 
 beforeEach(() => {
   y = 0;
+  x = 0;
   tops = new Map();
   window.eitriPlugin = { call: vi.fn(async () => ({ rows: GENERIC_ROWS })), on: () => () => {} };
   Object.defineProperty(window, "scrollY", { configurable: true, get: () => y });
   // Reduced motion makes every scroll one instant write.
   Object.defineProperty(window, "matchMedia", { configurable: true, value: (q: string) => ({ matches: q.includes("reduce") }) });
-  vi.spyOn(window, "scrollTo").mockImplementation(((opts: ScrollToOptions) => { y = opts.top!; }) as typeof window.scrollTo);
+  Object.defineProperty(window, "scrollX", { configurable: true, get: () => x });
+  vi.spyOn(window, "scrollTo").mockImplementation(((opts: ScrollToOptions) => {
+    if (opts.top !== undefined) y = opts.top;
+    if (opts.left !== undefined) x = opts.left;
+  }) as typeof window.scrollTo);
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
     const top = tops.get(this);
     return top === undefined ? rect(0, 0, 0) : rect(top - y);
@@ -533,5 +539,124 @@ describe("options", () => {
     await start();
     key("n");
     expect(hudMessage()).toBe("no previous search");
+  });
+});
+
+describe("revealing a match sideways", () => {
+  function box(width: number, clientWidth: number, scrollLeft = 0) {
+    const el = document.createElement("div");
+    el.style.overflowX = "auto";
+    let left = scrollLeft;
+    Object.defineProperty(el, "scrollWidth", { configurable: true, get: () => width });
+    Object.defineProperty(el, "clientWidth", { configurable: true, get: () => clientWidth });
+    Object.defineProperty(el, "scrollLeft", { configurable: true, get: () => left, set: (v: number) => { left = v; } });
+    const scrollTo = vi.fn((o: ScrollToOptions) => { if (o.left !== undefined) left = o.left; });
+    Object.defineProperty(el, "scrollTo", { configurable: true, value: scrollTo });
+    return { el, scrollTo };
+  }
+  const sized = (left: number, width = 100) =>
+    ({ x: left, y: 0, left, top: 0, right: left + width, bottom: 20, width, height: 20, toJSON: () => ({}) }) as DOMRect;
+  /** Lays every placed element out by `place`: its left edge in window coordinates, given the scrolls now. */
+  function layout(place: Map<Element, () => number>, width = 100) {
+    vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+      const left = place.get(this);
+      return left === undefined ? rect(0, 0, 0) : sized(left(), width);
+    });
+  }
+
+  it("a match beyond the right edge of a non-wrapping block is scrolled in, with a margin", async () => {
+    const pre = box(2000, 400);
+    const p = document.createElement("p");
+    p.textContent = "alpha";
+    pre.el.append(p);
+    document.body.append(pre.el);
+    layout(new Map([[pre.el, () => 50], [p, () => 50 + 1500 - pre.el.scrollLeft]]));
+    await start();
+    search("alpha");
+    expect(hudMessage()).toBe("[1/1]");
+    // The match's right edge ends 24px inside the view's right edge.
+    expect(pre.el.scrollLeft).toBe(1500 + 100 - 400 + 24);
+    expect(pre.scrollTo).toHaveBeenCalledWith({ left: 1224, behavior: "instant" });
+  });
+
+  it("a match already in view leaves the block where it is", async () => {
+    const pre = box(2000, 400);
+    const p = document.createElement("p");
+    p.textContent = "alpha";
+    pre.el.append(p);
+    document.body.append(pre.el);
+    layout(new Map([[pre.el, () => 50], [p, () => 50 + 100 - pre.el.scrollLeft]]));
+    await start();
+    search("alpha");
+    expect(pre.scrollTo).not.toHaveBeenCalled();
+    expect(pre.el.scrollLeft).toBe(0);
+  });
+
+  it("a match clipped on the left is scrolled back in, and n reaches a second match the same way", async () => {
+    const pre = box(2000, 400, 1500);
+    const a = document.createElement("p");
+    const b = document.createElement("p");
+    a.textContent = "alpha one";
+    b.textContent = "alpha two";
+    pre.el.append(a, b);
+    document.body.append(pre.el);
+    layout(new Map([[pre.el, () => 50], [a, () => 50 + 100 - pre.el.scrollLeft], [b, () => 50 + 1700 - pre.el.scrollLeft]]));
+    await start();
+    search("alpha");
+    expect(hudMessage()).toBe("[1/2]");
+    expect(pre.el.scrollLeft).toBe(100 - 24);
+    key("n");
+    expect(hudMessage()).toBe("[2/2]");
+    expect(pre.el.scrollLeft).toBe(1700 + 100 - 400 + 24);
+    key("N", { shiftKey: true });
+    expect(pre.el.scrollLeft).toBe(100 - 24);
+  });
+
+  it("an outer scroller moves only when the match is still outside its view after the inner one moved", async () => {
+    // The inner block sits at the outer one's left edge, and the match is inside the inner block's view once it
+    // scrolls: the outer view needs no move. A second, farther inner block pokes out of the outer view.
+    const outer = box(3000, 600);
+    const inner = box(2000, 400);
+    const p = document.createElement("p");
+    p.textContent = "alpha";
+    inner.el.append(p);
+    outer.el.append(inner.el);
+    document.body.append(outer.el);
+    layout(new Map([
+      [outer.el, () => 0],
+      [inner.el, () => 100 - outer.el.scrollLeft],
+      [p, () => 100 - outer.el.scrollLeft + 1500 - inner.el.scrollLeft],
+    ]));
+    await start();
+    search("alpha");
+    expect(inner.el.scrollLeft).toBe(1224);
+    expect(outer.scrollTo).not.toHaveBeenCalled();
+
+    // Moved so that the inner view is cut off by the outer's right edge: the outer one scrolls too.
+    inner.el.scrollLeft = 0;
+    outer.el.scrollLeft = 0;
+    layout(new Map([
+      [outer.el, () => 0],
+      [inner.el, () => 500 - outer.el.scrollLeft],
+      [p, () => 500 - outer.el.scrollLeft + 1500 - inner.el.scrollLeft],
+    ]));
+    search("alpha");
+    // The inner move leaves the match 500 + 400 - 124 = 776 from the outer's left, past its 600px view.
+    expect(inner.el.scrollLeft).toBe(1224);
+    expect(outer.el.scrollLeft).toBe(776 + 100 - 600 + 24);
+  });
+
+  it("the window scrolls sideways when the match is beyond its view", async () => {
+    Object.defineProperty(document.documentElement, "scrollWidth", { configurable: true, value: 4000 });
+    Object.defineProperty(document.documentElement, "clientWidth", { configurable: true, value: 1000 });
+    const p = document.createElement("p");
+    p.textContent = "alpha";
+    document.body.append(p);
+    layout(new Map([[p, () => 2500 - x]]));
+    await start();
+    search("alpha");
+    expect(x).toBe(2500 + 100 - 1000 + 24);
+    delete (document.documentElement as unknown as Record<string, unknown>).scrollWidth;
+    delete (document.documentElement as unknown as Record<string, unknown>).clientWidth;
   });
 });

@@ -21,6 +21,14 @@ let removeInstallation: (() => void) | undefined;
 let generation = 0;
 let installedRows: Row[] | null = null;
 
+/** Whether CSS renders `el` at all: a `display: none` ancestor (a folded contents group) leaves it with no box, and
+ *  focusing it fails, which would trap list movement on it. `checkVisibility` where the engine has it, else an
+ *  element with no client rects is not rendered. */
+function isRendered(el: HTMLElement): boolean {
+  if (typeof el.checkVisibility === "function") return el.checkVisibility();
+  return el.getClientRects().length > 0;
+}
+
 export function keysOf(action: string): string[] {
   return [...(installedRows?.find((row) => row.action === action)?.keys ?? [])];
 }
@@ -304,7 +312,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
       const list = active?.closest("[data-eitri-list]");
       if (list) {
         const items = [...list.querySelectorAll<HTMLElement>("a[href], button")]
-          .filter((item) => !item.closest('[hidden], [aria-hidden="true"]'));
+          .filter((item) => !item.closest('[hidden], [aria-hidden="true"]') && isRendered(item));
         const index = items.indexOf(active as HTMLElement);
         const next = index < 0 ? (action === "scroll.down" ? 0 : items.length - 1)
           : Math.max(0, Math.min(items.length - 1, index + (action === "scroll.down" ? 1 : -1)));

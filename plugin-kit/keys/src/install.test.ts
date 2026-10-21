@@ -1072,6 +1072,12 @@ describe("the sheet's own keys, through the installation", () => {
 });
 
 describe("a focus list", () => {
+  // jsdom lays nothing out, so every element reports no box; a rendered element is one that reports a rect.
+  beforeEach(() => {
+    vi.spyOn(HTMLElement.prototype, "getClientRects").mockImplementation(function (this: HTMLElement) {
+      return (this.dataset.unrendered ? [] : [new DOMRect(0, 0, 10, 10)]) as unknown as DOMRectList;
+    });
+  });
   it("j and k move focus between the list's links instead of scrolling", async () => {
     document.body.insertAdjacentHTML("beforeend",
       '<nav data-eitri-list><a id="l1" href="#1">1</a><a id="l2" href="#2">2</a><button id="l3">3</button></nav>');
@@ -1095,6 +1101,30 @@ describe("a focus list", () => {
     document.getElementById("m1")!.focus();
     key("j", {}, document.activeElement!);
     expect(document.activeElement!.id).toBe("m3");
+  });
+  const folded =
+    '<nav data-eitri-list><a id="c1" href="#1">1</a><ol><li><a id="c2" href="#2" data-unrendered="1">2</a></li></ol>' +
+    '<a id="c3" href="#3">3</a></nav>';
+  it("skips items CSS does not render (a display: none group), by client rects without checkVisibility", async () => {
+    document.body.insertAdjacentHTML("beforeend", folded);
+    await start();
+    document.getElementById("c1")!.focus();
+    key("j", {}, document.activeElement!);
+    expect(document.activeElement!.id).toBe("c3");
+    key("k", {}, document.activeElement!);
+    expect(document.activeElement!.id).toBe("c1");
+  });
+  it("skips items checkVisibility reports as not rendered", async () => {
+    document.body.insertAdjacentHTML("beforeend", folded);
+    // The rect check would keep c2; checkVisibility, where the engine has it, decides instead.
+    vi.spyOn(HTMLElement.prototype, "getClientRects").mockImplementation(() => [new DOMRect(0, 0, 10, 10)] as unknown as DOMRectList);
+    const c2 = document.getElementById("c2")!;
+    Object.defineProperty(c2, "checkVisibility", { configurable: true, value: () => false });
+    for (const id of ["c1", "c3"]) Object.defineProperty(document.getElementById(id)!, "checkVisibility", { configurable: true, value: () => true });
+    await start();
+    document.getElementById("c1")!.focus();
+    key("j", {}, document.activeElement!);
+    expect(document.activeElement!.id).toBe("c3");
   });
 });
 

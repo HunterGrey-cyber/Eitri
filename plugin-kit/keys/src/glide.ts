@@ -342,6 +342,45 @@ export function scrollerOf(focused: Element | null): ScrollTargetEl {
   return null;
 }
 
+/** The nearest ancestor of `from` (itself included) that scrolls sideways, or `null` for the window; the walk stops
+ *  before the body and the root for the same reason as `scrollerOf`'s. */
+export function hScrollerOf(from: Element | null): ScrollTargetEl {
+  for (let el = from; el; el = el.parentElement) {
+    if (el === document.body || el === document.documentElement || el === document.scrollingElement) return null;
+    if (SCROLLABLE.has(getComputedStyle(el).overflowX) && el.scrollWidth > el.clientWidth) return el;
+  }
+  return null;
+}
+
+/** The furthest a sideways scroll goes; unbounded where the engine reports no scroll width. */
+export function maxXOf(el: ScrollTargetEl): number {
+  if (el !== null) return el.scrollWidth > 0 ? Math.max(0, el.scrollWidth - el.clientWidth) : Number.POSITIVE_INFINITY;
+  const root = document.documentElement;
+  const width = Math.max(root.scrollWidth, document.body?.scrollWidth ?? 0);
+  const view = (document.scrollingElement ?? root).clientWidth || window.innerWidth;
+  return width > 0 ? Math.max(0, width - view) : Number.POSITIVE_INFINITY;
+}
+
+/** The width `el` (`null`: the window) shows. */
+export function viewWidthOf(el: ScrollTargetEl): number {
+  return el === null ? (document.documentElement.clientWidth || window.innerWidth) : el.clientWidth;
+}
+
+/** Moves `el` (`null`: the window) sideways to `left` at once and returns where it is now. The vertical position and
+ *  any glide are left alone, since a glide only writes the top. */
+export function jumpX(el: ScrollTargetEl, left: number): number {
+  const target = Math.round(clamp(left, 0, maxXOf(el)));
+  if (el === null) {
+    if (target !== Math.round(window.scrollX)) window.scrollTo({ left: target, behavior: "instant" });
+    return target;
+  }
+  if (target !== Math.round(el.scrollLeft)) {
+    if (typeof el.scrollTo === "function") el.scrollTo({ left: target, behavior: "instant" });
+    else el.scrollLeft = target;
+  }
+  return target;
+}
+
 function topOf(el: ScrollTargetEl): number {
   return el === null ? window.scrollY : el.scrollTop;
 }

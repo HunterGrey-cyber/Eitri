@@ -1,4 +1,4 @@
-import { jump, maxOf, scrollerOf, scrollToAnimated, type ScrollTargetEl } from "./glide";
+import { hScrollerOf, jump, jumpX, maxOf, maxXOf, scrollerOf, scrollToAnimated, viewWidthOf, type ScrollTargetEl } from "./glide";
 import { showMessage } from "./hud";
 import type { KitMessage } from "./index";
 import { currentSettings, type FindCase } from "./settings";
@@ -280,6 +280,36 @@ function paint(): void {
   }
 }
 
+/** The gap kept between a match and the edge of a view it was scrolled sideways into. */
+const SIDE_MARGIN = 24;
+
+/** Brings the match into view horizontally in every enclosing scroller that scrolls sideways, innermost first, then
+ *  the window. Like the vertical pass, an outer scroller moves only if the match is still outside its view after the
+ *  inner moves, and each move is taken into account before the next is worked out. A match already in view stays
+ *  where it is, and one that is not is moved the least that leaves `SIDE_MARGIN` between it and the edge it came
+ *  from (a match wider than the view is lined up with the left edge). Sideways moves are always jumps. */
+function revealSideways(range: Range, rect: DOMRect): void {
+  let left = rect.left;
+  let el = hScrollerOf(range.startContainer.parentElement);
+  for (;;) {
+    const viewLeft = el === null ? 0 : el.getBoundingClientRect().left;
+    const view = viewWidthOf(el);
+    const margin = Math.min(SIDE_MARGIN, view / 4);
+    const width = rect.width;
+    const right = left + width;
+    if (left < viewLeft + margin || right > viewLeft + view - margin) {
+      const from = el === null ? window.scrollX : el.scrollLeft;
+      const want = width > view - 2 * margin || left < viewLeft + margin
+        ? from + left - viewLeft - margin
+        : from + right - viewLeft - view + margin;
+      const to = jumpX(el, Math.min(want, maxXOf(el)));
+      left -= to - from;
+    }
+    if (el === null) break;
+    el = hScrollerOf(el.parentElement);
+  }
+}
+
 /** Puts the current match's top a third of the way down its own scroller's view, then moves every scroller around
  *  that one (the window last) whose view the match would still be outside of, the same way, so the match ends up on
  *  screen. Only the innermost scroller glides, since a glide runs on one scroller at a time; the outer ones jump. */
@@ -287,6 +317,7 @@ function reveal(): void {
   const range = ranges[index];
   const rect = range && rectOf(range);
   if (!range || !rect) return;
+  revealSideways(range, rect);
   const chain: ScrollTargetEl[] = [];
   let el = scrollerOf(range.startContainer.parentElement);
   for (;;) {
