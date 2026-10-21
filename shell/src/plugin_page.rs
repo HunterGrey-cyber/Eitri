@@ -42,12 +42,11 @@ pub(crate) struct PageSpec {
 pub(crate) struct PageHooks {
     /// A message the page posted while on its own origin.
     pub(crate) on_message: Rc<dyn Fn(&str)>,
-    /// A new document started loading: the host must hear `host.hello` again before it sends events.
-    pub(crate) on_loading: Rc<dyn Fn()>,
-    /// A document was committed (a load, a reload, a back/forward-cache restore): the host sends it the
-    /// current theme, which a restored document would otherwise never hear.
+    /// A document was committed (a load, a reload, a back/forward-cache restore): a new document starts, which
+    /// must say `host.hello` again, and the host sends it the current theme, which a restored document would
+    /// otherwise never hear. Only a commit counts: a load that never commits leaves the running document as it was.
     pub(crate) on_committed: Rc<dyn Fn()>,
-    /// A clicked `http`, `https` or `mailto` link.
+    /// An `http`, `https` or `mailto` link the user clicked.
     pub(crate) open_outside: Rc<dyn Fn(&str)>,
 }
 
@@ -170,18 +169,41 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
         NetworkProxyMode::Custom,
         Some(&NetworkProxySettings::new(Some(page_policy::PROXY_BACKSTOP), &ignore)),
     );
-    // The downloads are the page's own `blob:` files, plus a same-origin `<a download>` or a site file the view
-    // cannot show (WebKit turns those into downloads after the navigation lock has let them through). Whichever
-    // starts one, only site files or the page's own data can be saved, and each goes under a safe name in the
-    // download directory, never over an existing file.
+    // The downloads are the page's own `blob:` files, plus a same-origin `<a download>` (WebKit turns those into
+    // downloads after the navigation lock has let them through). Whichever starts one, only site files or the
+    // page's own data can be saved, and each goes under a safe name in the download directory, never over an
+    // existing file. Choosing the name stats the directory, which can hang on a network mount, so it runs on a
+    // worker thread: the handler claims the decision at once and WebKit holds the download until it is set.
     {
         let downloads = spec.downloads.clone();
+        let id = spec.id.clone();
         session.connect_download_started(move |_, download| {
             download.set_allow_overwrite(false);
-            let downloads = downloads.clone();
+            let (downloads, id) = (downloads.clone(), id.clone());
             download.connect_decide_destination(move |download, suggested| {
-                let target = page_policy::download_destination(&downloads, suggested);
-                download.set_destination(&target.to_string_lossy());
+                let (download, dir, suggested, id) =
+                    (download.clone(), downloads.clone(), suggested.to_owned(), id.clone());
+                glib::spawn_future_local(async move {
+                    let target = {
+                        let suggested = suggested.clone();
+                        gio::spawn_blocking(move || page_policy::download_destination(&dir, &suggested)).await
+                    };
+                    match target {
+                        Ok(Some(target)) => download.set_destination(&target.to_string_lossy()),
+                        Ok(None) => {
+                            eprintln!(
+                                "[plugin {id}] not saving {}: every name for it is taken",
+                                suggested.escape_debug()
+                            );
+                            download.cancel();
+                        }
+                        // A worker that panicked leaves no destination; the download is not left waiting.
+                        Err(_) => {
+                            eprintln!("[plugin {id}] not saving {}: no destination", suggested.escape_debug());
+                            download.cancel();
+                        }
+                    }
+                });
                 true
             });
         });
@@ -217,8 +239,9 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
         });
     }
 
-    // The navigation lock: the page stays on its own origin; a clicked web or mail link is handed out, anything
-    // else is refused, and so is every new window.
+    // The navigation lock: the page stays on its own origin; a web or mail link the user clicked (or pressed
+    // Enter on) is handed out, a script's `click()` on one opens nothing, anything else is refused, and so is
+    // every new window.
     {
         let id = spec.id.clone();
         let open_outside = hooks.open_outside.clone();
@@ -239,7 +262,14 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
                 match page_policy::navigation(&id, &uri) {
                     Navigation::Stay => false,
                     Navigation::Outside(url) => {
-                        if action.navigation_type() == webkit6::NavigationType::LinkClicked {
+                        let link_clicked = action.navigation_type() == webkit6::NavigationType::LinkClicked;
+                        // WebKit runs every script the host sends the page (`evaluate_javascript`) as a user
+                        // gesture, and the page's promise continuations inherit it, so `is_user_gesture` alone
+                        // passes a script's `click()` made after any host reply. A mouse button is reported only
+                        // for a trusted click (the user's press, or Enter on a focused link, which WebKit turns
+                        // into one), which no script can make.
+                        let by_user = action.is_user_gesture() && action.mouse_button() != 0;
+                        if page_policy::opens_outside(link_clicked, by_user) {
                             open_outside(&url);
                         }
                         decision.ignore();
@@ -261,12 +291,11 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
     }
 
     {
-        let on_loading = hooks.on_loading.clone();
         let on_committed = hooks.on_committed.clone();
-        webview.connect_load_changed(move |_, event| match event {
-            webkit6::LoadEvent::Started => on_loading(),
-            webkit6::LoadEvent::Committed => on_committed(),
-            _ => {}
+        webview.connect_load_changed(move |_, event| {
+            if event == webkit6::LoadEvent::Committed {
+                on_committed();
+            }
         });
     }
 
@@ -333,5 +362,53 @@ mod tests {
         // code it adapts must be inside it, not only in the release's licence collection.
         assert!(KIT_JS.contains("Copyright (c) 2010 Phil Crosby, Ilya Sukhar."));
         assert!(KIT_JS.contains("The above copyright notice and this permission notice shall be included in"));
+    }
+
+    /// The `(` at `open` to its matching `)`, as a byte range of `code`.
+    fn paren_span(code: &str, open: usize) -> std::ops::Range<usize> {
+        let mut depth = 0usize;
+        for (at, c) in code[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open..open + at + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses from byte {open}");
+    }
+
+    /// Choosing a download's name stats the download directory, which can hang on a network mount, so the
+    /// destination handler only ever asks for it on a worker thread.
+    #[test]
+    fn the_download_destination_is_chosen_off_the_gtk_thread() {
+        use eitri_core::source_scan as scan;
+        let code = scan::code_only(&scan::read_required("shell/src/plugin_page.rs").text);
+        let handlers: Vec<&str> = code
+            .match_indices("connect_decide_destination(")
+            .map(|(at, _)| {
+                let open = at + code[at..].find('{').expect("the handler has a body");
+                scan::braced(&code, open)
+            })
+            .collect();
+        assert_eq!(handlers.len(), 1, "one destination handler");
+        let body = handlers[0];
+        let workers: Vec<std::ops::Range<usize>> = body
+            .match_indices("gio::spawn_blocking(")
+            .map(|(at, m)| paren_span(body, at + m.len() - 1))
+            .collect();
+        let calls: Vec<usize> = body.match_indices("download_destination(").map(|(at, _)| at).collect();
+        assert!(!calls.is_empty(), "the handler chooses the destination");
+        for at in calls {
+            assert!(
+                workers.iter().any(|w| w.contains(&at)),
+                "download_destination is called outside gio::spawn_blocking: {}",
+                &body[at.saturating_sub(80)..(at + 40).min(body.len())]
+            );
+        }
     }
 }

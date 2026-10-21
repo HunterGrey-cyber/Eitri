@@ -193,6 +193,11 @@ impl Origin {
         &self.host
     }
 
+    /// The port a connection to this origin uses: the written one, or `https`'s 443.
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(443)
+    }
+
     pub fn as_str(&self) -> String {
         match self.port {
             Some(port) => format!("https://{}:{port}", self.host),

@@ -8,6 +8,11 @@
 /// relative link is still a link click that the host's navigation guard hands to `link_clicked`.
 pub const PANEL_BASE_URI: &str = "https://eitri.invalid/";
 
+/// What an idle chat page holds: a blank page at the same secure base, so the host's navigation lock
+/// still holds, with nothing to run and nothing kept in memory for a chat no one sees. A page is given
+/// the panel again when it is reused.
+pub const IDLE_DOCUMENT: &str = "<!doctype html><html data-eitri-idle=\"1\"><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\"></head><body></body></html>";
+
 /// The bundle and the content security policy derived from it, computed once.
 pub struct PanelDocument {
     html: &'static str,

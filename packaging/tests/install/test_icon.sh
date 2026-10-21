@@ -429,13 +429,16 @@ t_upgrade_with_an_unwritable_icon_directory_leaves_no_temporary_names() {
 	expect_rc 0
 	serve 1.1.0 1.0.0
 	before=$(snap_but_staging "$TH")
+	# Put back the mode the directory had, not a fixed one: the snapshot holds it, and it follows the
+	# umask the run started under (0700 under a umask of 077).
+	apps_mode=$(stat -c %a "$(data_of)/icons/hicolor/48x48/apps")
 	chmod 0555 "$(data_of)/icons/hicolor/48x48/apps"
 	if [ -w "$(data_of)/icons/hicolor/48x48/apps" ]; then
-		chmod 0755 "$(data_of)/icons/hicolor/48x48/apps"
+		chmod "$apps_mode" "$(data_of)/icons/hicolor/48x48/apps"
 		return 0
 	fi
 	inst_net
-	chmod 0755 "$(data_of)/icons/hicolor/48x48/apps"
+	chmod "$apps_mode" "$(data_of)/icons/hicolor/48x48/apps"
 	expect_fail "an upgrade with an unwritable icon directory"
 	expect_out "cannot write $(data_of)/icons/hicolor/48x48/apps/.cn.huntergrey.eitri.png.tmp."
 	expect_no_out 'installed Eitri 1.1.0'

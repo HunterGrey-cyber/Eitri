@@ -8,8 +8,8 @@ use super::manifest::Origin;
 use super::roots::has_control;
 
 pub const SCHEME: &str = "eitri-plugin";
-/// The discard port on loopback: a request that gets past the policy dies here, unless its host is one the
-/// manifest declared.
+/// The discard port on loopback: a request that gets past the policy dies here, unless it is for a declared
+/// origin's host and port (see [`proxy_ignore_hosts`] for how far that reaches).
 pub const PROXY_BACKSTOP: &str = "http://127.0.0.1:9";
 /// What the entry shows while the site has not been built. No script.
 pub const NOT_BUILT_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Not built</title></head>\
@@ -74,14 +74,31 @@ pub fn csp_floor(origins: &[Origin]) -> String {
     )
 }
 
+/// The proxy's ignore list: each declared origin's `host:port`, once. GLib matches such an entry for every
+/// subdomain of the host too, and for either scheme on that port; ignore-hosts has no narrower form, so that is
+/// what the backstop lets through.
 pub fn proxy_ignore_hosts(origins: &[Origin]) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
     for o in origins {
-        if !hosts.iter().any(|h| h == o.host()) {
-            hosts.push(o.host().to_owned());
+        // GLib reads an IPv6 literal's port only when the address is in brackets.
+        let entry = if o.host().contains(':') {
+            format!("[{}]:{}", o.host(), o.port())
+        } else {
+            format!("{}:{}", o.host(), o.port())
+        };
+        if !hosts.contains(&entry) {
+            hosts.push(entry);
         }
     }
     hosts
+}
+
+/// Whether an outside address a navigation names is handed to the desktop: only for a link the user clicked.
+/// `user_gesture` is the user's own press, not a script acting in a gesture's name. A script's `click()` on a
+/// link is a link click too, and passing it would let a page send data out in a URL, or open tabs and mail
+/// drafts in a loop.
+pub fn opens_outside(link_clicked: bool, user_gesture: bool) -> bool {
+    link_clicked && user_gesture
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,21 +183,31 @@ pub fn download_name(suggested: &str) -> String {
     }
 }
 
-/// Where a download goes: `dir/<name>`, or `<stem>-<n>.<ext>` with the first `n` that names no file yet.
-pub fn download_destination(dir: &Path, suggested: &str) -> PathBuf {
+/// How many numbered names a download tries after its own before it is cancelled: each try is a file system
+/// call, and a directory full of earlier exports must not make one save cost thousands of them.
+pub const MAX_NAME_PROBES: u32 = 1000;
+
+/// Where a download goes: `dir/<name>`, or `<stem>-<n>.<ext>` with the first `n` up to [`MAX_NAME_PROBES`] that
+/// names no file yet; `None` when all of them are taken. It touches the disk, so it is called off the GTK thread.
+pub fn download_destination(dir: &Path, suggested: &str) -> Option<PathBuf> {
+    destination_with(dir, suggested, Path::exists)
+}
+
+/// [`download_destination`] with the existence check given, so the probing order and its cap are testable
+/// without a disk.
+pub fn destination_with(dir: &Path, suggested: &str, exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let name = download_name(suggested);
     let first = dir.join(&name);
-    if !first.exists() {
-        return first;
+    if !exists(&first) {
+        return Some(first);
     }
     let (stem, ext) = match name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => (stem.to_owned(), format!(".{ext}")),
         _ => (name.clone(), String::new()),
     };
-    (1..)
+    (1..=MAX_NAME_PROBES)
         .map(|n| dir.join(format!("{stem}-{n}{ext}")))
-        .find(|p| !p.exists())
-        .unwrap_or(first)
+        .find(|p| !exists(p))
 }
 
 pub fn mime_for(name: &str) -> Option<&'static str> {
@@ -282,7 +309,30 @@ mod tests {
             .find(|d| d.trim_start().starts_with("script-src"))
             .unwrap();
         assert_eq!(script.trim(), "script-src 'self'", "no inline or eval script, ever");
-        assert_eq!(proxy_ignore_hosts(&origins), ["learn.example.org"]);
+        assert_eq!(proxy_ignore_hosts(&origins), ["learn.example.org:443"]);
+    }
+
+    #[test]
+    fn the_proxy_lets_through_each_declared_host_on_its_port_once() {
+        let origins = [
+            Origin::parse("https://learn.example.org").unwrap(),
+            Origin::parse("https://api.example.org:8443").unwrap(),
+            Origin::parse("https://learn.example.org:443").unwrap(),
+            Origin::parse("https://learn.example.org:444").unwrap(),
+        ];
+        assert_eq!(
+            proxy_ignore_hosts(&origins),
+            ["learn.example.org:443", "api.example.org:8443", "learn.example.org:444"]
+        );
+        assert!(proxy_ignore_hosts(&[]).is_empty());
+    }
+
+    #[test]
+    fn only_a_users_click_opens_outside() {
+        assert!(opens_outside(true, true));
+        assert!(!opens_outside(true, false), "a script's click() on a link");
+        assert!(!opens_outside(false, true), "a gesture that is not a link click");
+        assert!(!opens_outside(false, false));
     }
 
     #[test]
@@ -336,10 +386,36 @@ mod tests {
         assert_eq!(download_name(""), "download");
         assert!(download_name(&"x".repeat(500)).len() <= 100);
         let s = Scratch::new("dl");
-        assert_eq!(download_destination(&s.0, "log.jsonl"), s.0.join("log.jsonl"));
+        assert_eq!(download_destination(&s.0, "log.jsonl"), Some(s.0.join("log.jsonl")));
         std::fs::write(s.0.join("log.jsonl"), "").unwrap();
         std::fs::write(s.0.join("log-1.jsonl"), "").unwrap();
-        assert_eq!(download_destination(&s.0, "log.jsonl"), s.0.join("log-2.jsonl"));
+        assert_eq!(download_destination(&s.0, "log.jsonl"), Some(s.0.join("log-2.jsonl")));
+    }
+
+    #[test]
+    fn a_destination_probe_gives_up_after_its_cap() {
+        let dir = Path::new("/downloads");
+        assert_eq!(destination_with(dir, "x.txt", |_| true), None);
+        assert_eq!(
+            destination_with(dir, "x.txt", |p| p.ends_with("x.txt") || p.ends_with("x-1.txt")),
+            Some(dir.join("x-2.txt"))
+        );
+        let last = format!("x-{MAX_NAME_PROBES}.txt");
+        assert_eq!(
+            destination_with(dir, "x.txt", |p| !p.ends_with(&last)),
+            Some(dir.join(&last)),
+            "the last numbered name is still tried"
+        );
+        let probed = std::cell::Cell::new(0u32);
+        destination_with(dir, "x.txt", |_| {
+            probed.set(probed.get() + 1);
+            true
+        });
+        assert_eq!(
+            probed.get(),
+            MAX_NAME_PROBES + 1,
+            "its own name, then each numbered one once"
+        );
     }
 
     fn site(s: &Scratch) -> std::path::PathBuf {

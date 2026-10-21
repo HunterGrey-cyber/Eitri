@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{workspace::MAIN, Con, ConLayout, Layout, ModuleKind, Node, Workspaces};
+use super::{con::unwritten_share, workspace::MAIN, Con, ConLayout, Layout, ModuleKind, Node, Workspaces};
 
 /// The layout of every workspace as `init.lua` calls, in the grammar `eitri.layout.default` reads.
 ///
@@ -69,8 +69,10 @@ pub fn export_lua(live: &Layout, workspaces: Option<&Workspaces>) -> String {
     let calls = layouts
         .iter()
         .map(|(name, layout)| {
+            // A tabbed or stacked root keeps its tab strip with one child, so only a split root of
+            // one child is written as that child.
             let mut tree = match layout.root().children.as_slice() {
-                [only] => node(&only.node, None),
+                [only] if layout.root().layout.axis().is_some() => node(&only.node, None),
                 _ => container(layout.root(), None),
             };
             if !layout.floats().is_empty() {
@@ -156,9 +158,21 @@ fn container(con: &Con, share: Option<f32>) -> String {
         ConLayout::Tabbed => "tabbed",
         ConLayout::Stacked => "stacked",
     };
+    // The last share is left out when the grammar's remainder reads it back as the same `f32`.
+    // Trading shares in `f32` lets a container's shares drift off 1 by a rounding error; the share is
+    // then written, since a remainder off by that error can move a divider by a pixel.
+    let n = con.children.len();
+    // A lone child (a tabbed root left with one tile) is given the whole container either way.
+    let last_read_back = match con.children.split_last() {
+        Some((last, rest)) if !rest.is_empty() => {
+            unwritten_share(rest.iter().map(|child| child.share), 1) as f32 == last.share
+        }
+        _ => true,
+    };
     let mut fields = vec![quote(head)];
     for (i, child) in con.children.iter().enumerate() {
-        fields.push(node(&child.node, (i + 1 < con.children.len()).then_some(child.share)));
+        let written = i + 1 < n || !last_read_back;
+        fields.push(node(&child.node, written.then_some(child.share)));
     }
     if con.layout.axis().is_none() && con.focus != 0 {
         fields.push(format!("active = {}", con.focus + 1));
@@ -216,7 +230,8 @@ fn wrap(call: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{arrange, hide, FloatRect, Frame, ModuleId, Size};
+    use crate::layout::verbs::float_toggle;
+    use crate::layout::{arrange, hide, move_divider, Axis, Child, FloatRect, Frame, ModuleId, Size};
     use crate::lua::layout::{parse_default, parse_tree};
     use mlua::{Lua, Table, Value};
 
@@ -431,5 +446,161 @@ mod tests {
         assert!(text.lines().any(|line| line.starts_with("  ")));
         let (_lua, captured) = capture(&text);
         same(&live, captured.get("main").unwrap());
+    }
+
+    fn leaf(id: &str) -> Node {
+        Node::Leaf(ModuleId::parse(id).unwrap())
+    }
+
+    fn row_of(shares: &[f32], ids: &[&str]) -> Layout {
+        let row = Con::new(
+            ConLayout::SplitH,
+            ids.iter()
+                .zip(shares)
+                .map(|(id, share)| Child::new(leaf(id), *share))
+                .collect(),
+        );
+        row.check(true).unwrap();
+        Layout::from_parts_floating(
+            Node::Con(row),
+            Vec::new(),
+            Default::default(),
+            ModuleId::editor(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_exported_text_of_a_row_at_its_minimum_reads_back() {
+        let four = ["editor", "agent", "terminal", "terminal#2"];
+        let three = ["editor", "agent", "terminal"];
+        for (shares, ids) in [
+            (&[0.6, 0.2, 0.15, 0.05][..], &four[..]),
+            (&[0.90000004, 0.050000012, 0.050000012][..], &three[..]),
+            (&[0.13694398, 0.049999997, 0.813056][..], &three[..]),
+        ] {
+            let live = row_of(shares, ids);
+            let text = export_lua(&live, None);
+            let (_lua, captured) = capture(&text);
+            same(&live, captured.get("main").unwrap());
+        }
+    }
+
+    /// xorshift64*: a seeded generator without a new dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const FRAMES: [Size; 3] = [
+        Size { w: 1280, h: 721 },
+        Size { w: 1920, h: 1040 },
+        Size { w: 800, h: 600 },
+    ];
+
+    fn even_con(layout: ConLayout, nodes: Vec<Node>) -> Con {
+        let share = 1.0 / nodes.len() as f32;
+        Con::new(layout, nodes.into_iter().map(|node| Child::new(node, share)).collect())
+    }
+
+    /// A flat row, sometimes holding a column, dragged by its dividers to arbitrary pixels: whatever
+    /// shares the drags leave, the exported text reads back to the same layout and exports again
+    /// unchanged.
+    #[test]
+    fn dragged_rows_and_columns_round_trip_through_the_text() {
+        const IDS: [&str; 6] = ["editor", "agent", "terminal", "terminal#2", "terminal#3", "terminal#4"];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for case in 0..3000 {
+            let n = 2 + rng.below(5);
+            let mut ids = IDS[..n].to_vec();
+            for i in (1..ids.len()).rev() {
+                ids.swap(i, rng.below(i + 1));
+            }
+            let mut nodes: Vec<Node> = ids.iter().map(|id| leaf(id)).collect();
+            if n >= 3 && rng.below(3) == 0 {
+                let len = 2 + rng.below(3.min(n - 1) - 1);
+                let column: Vec<Node> = nodes.drain(..len).collect();
+                let at = rng.below(nodes.len() + 1);
+                nodes.insert(at, Node::Con(even_con(ConLayout::SplitV, column)));
+            }
+            let mut live = Layout::from_parts_floating(
+                Node::Con(even_con(ConLayout::SplitH, nodes)),
+                Vec::new(),
+                Default::default(),
+                ModuleId::editor(),
+                Default::default(),
+            )
+            .unwrap();
+            for _ in 0..1 + rng.below(12) {
+                let size = FRAMES[rng.below(FRAMES.len())];
+                let dividers = arrange(&live, &Frame::new(size, 1)).dividers;
+                let divider = &dividers[rng.below(dividers.len())];
+                let length = match divider.axis {
+                    Axis::Row => size.w,
+                    Axis::Column => size.h,
+                };
+                let _ = move_divider(&mut live, divider, rng.below(length as usize + 1) as i32);
+            }
+
+            let text = export_lua(&live, None);
+            let (_lua, captured) = capture(&text);
+            let value: Value = captured.get("main").unwrap();
+            let tiled = parse_default(&value).unwrap_or_else(|err| panic!("case {case}: {err}\n{text}"));
+            if let Node::Con(con) = &tiled {
+                con.check(true)
+                    .unwrap_or_else(|err| panic!("case {case}: {err:?}\n{text}"));
+            }
+            let back = Layout::from_parts_floating(
+                tiled,
+                Vec::new(),
+                Default::default(),
+                live.focus().clone(),
+                Default::default(),
+            )
+            .unwrap_or_else(|err| panic!("case {case}: {err:?}\n{text}"));
+            for size in FRAMES {
+                let frame = Frame::new(size, 1);
+                assert_eq!(
+                    arrange(&back, &frame).modules,
+                    arrange(&live, &frame).modules,
+                    "case {case} at {size:?}:\n{text}"
+                );
+            }
+            assert_eq!(export_lua(&back, None), text, "case {case}");
+        }
+    }
+
+    #[test]
+    fn a_tabbed_root_with_one_tile_left_exports_as_tabbed() {
+        let mut live = layout(r#"{ "tabbed", { "editor" }, { "agent" } }"#);
+        float_toggle(&mut live, &ModuleId::agent(), &Frame::new(FRAMES[0], 1)).unwrap();
+        let text = export_lua(&live, None);
+        assert!(text.contains(r#"{ "tabbed", { "editor" }"#), "{text}");
+        let (_lua, captured) = capture(&text);
+        let value: Value = captured.get("main").unwrap();
+        let tree = parse_tree(&value).unwrap();
+        let back = Layout::from_parts_floating(
+            tree.tiled,
+            tree.floats,
+            Default::default(),
+            ModuleId::editor(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(back.root().layout, ConLayout::Tabbed);
+        same(&live, value);
     }
 }

@@ -342,7 +342,8 @@ impl Workspaces {
         Ok(())
     }
 
-    /// Renames the current workspace and carries its preserved keys; `main` keeps its name.
+    /// Renames the current workspace and carries its preserved keys; `main` keeps its name, and no
+    /// workspace takes it.
     pub fn rename_current(&mut self, to: &str) -> Result<(), WorkspaceError> {
         if self.current == MAIN {
             return Err(WorkspaceError::Main);
@@ -354,6 +355,11 @@ impl Workspaces {
         if self.order.iter().any(|name| name == to) {
             return Err(WorkspaceError::Taken(to.to_string()));
         }
+        // Only reachable while `main` is missing: a workspace renamed to it would become the one
+        // that can never be renamed or deleted, and would stand in for the window's default layout.
+        if to == MAIN {
+            return Err(WorkspaceError::Main);
+        }
         for name in &mut self.order {
             if *name == self.current {
                 *name = to.to_string();
@@ -364,6 +370,18 @@ impl Workspaces {
         }
         self.current = to.to_string();
         Ok(())
+    }
+
+    /// Puts `main` back, first in order and stored (not current), as `layout`; `false`, changing
+    /// nothing, when `main` is already there. A saved file that lost `main` would otherwise open
+    /// without the workspace every window has.
+    pub fn restore_main(&mut self, layout: Layout) -> bool {
+        if self.order.iter().any(|name| name == MAIN) {
+            return false;
+        }
+        self.order.insert(0, MAIN.to_string());
+        self.stored.insert(MAIN.to_string(), layout);
+        true
     }
 
     /// Retires a module in every stored layout, showing the chat when nothing else would remain.
@@ -826,6 +844,34 @@ mod tests {
         );
         assert_eq!(ws.create("review", live), Ok(()));
         assert_eq!(ws.order(), ["main", "study", "review"]);
+    }
+
+    #[test]
+    fn main_can_never_be_a_rename_target() {
+        let mut ws =
+            Workspaces::from_parts(vec!["study".into()], BTreeMap::new(), "study".into(), Kept::default()).unwrap();
+        assert_eq!(ws.rename_current("main"), Err(WorkspaceError::Main));
+        assert_eq!(ws.current(), "study");
+        assert_eq!(ws.order(), ["study"]);
+    }
+
+    #[test]
+    fn main_is_restored_first_and_not_current_only_when_missing() {
+        let mut ws = Workspaces::from_parts(
+            vec!["study".into(), "review".into()],
+            BTreeMap::from([("review".to_string(), layout())]),
+            "study".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        assert!(ws.restore_main(layout()));
+        assert_eq!(ws.order(), ["main", "study", "review"]);
+        assert_eq!(ws.current(), "study");
+        assert_eq!(ws.stored("main"), Some(&layout()));
+        let before = ws.clone();
+        assert!(!ws.restore_main(layout()));
+        assert_eq!(ws, before);
+        assert_eq!(ws.delete("main"), Err(WorkspaceError::Main));
     }
 
     #[test]

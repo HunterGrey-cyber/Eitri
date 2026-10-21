@@ -43,12 +43,11 @@ pub fn float_toggle(layout: &mut Layout, target: &ModuleId, frame: &Frame) -> Re
 
 fn sink(layout: &mut Layout, id: &ModuleId) -> Result<(), LayoutError> {
     let anchor = layout.tiled_anchor();
-    let mut root = layout.root_node();
-    if let Some(anchor) = anchor {
+    let root = if let Some(anchor) = anchor {
         let (parent, i) = *path_to(layout.root(), &anchor).last().expect("the anchor is tiled");
-        let Node::Con(root_con) = &mut root else {
-            unreachable!("the root is a container")
-        };
+        // The anchor's parent may be a root of one child, which `root_node` would hand back as the bare
+        // leaf: edit the root container itself so that parent is always there to insert into.
+        let mut root_con = layout.root().clone();
         let parent = root_con.find_mut(parent).expect("the parent belongs to the root");
         if parent.children.len() >= MAX_CHILDREN {
             return Err(LayoutError::TooMany { limit: MAX_CHILDREN });
@@ -69,9 +68,15 @@ fn sink(layout: &mut Layout, id: &ModuleId) -> Result<(), LayoutError> {
         if matches!(parent.layout, ConLayout::Tabbed | ConLayout::Stacked) {
             parent.focus = i + 1;
         }
+        Node::Con(root_con)
     } else {
-        root = Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, root, Node::Leaf(id.clone()));
-    }
+        Node::split(
+            Axis::Row,
+            RIGHT_OF_ROOT_SHARE,
+            layout.root_node(),
+            Node::Leaf(id.clone()),
+        )
+    };
     layout.take_float(id);
     layout.replace_root(root);
     layout.set_focus(id)
@@ -186,8 +191,25 @@ pub fn float_at(
     Ok(true)
 }
 
+/// Runs `verb` on a copy of the layout and keeps the copy only when it succeeds, so a verb refused
+/// half way through (after it has shown, unzoomed or floated something) leaves nothing changed.
+fn all_or_nothing<T>(
+    layout: &mut Layout,
+    verb: impl FnOnce(&mut Layout) -> Result<T, LayoutError>,
+) -> Result<T, LayoutError> {
+    let mut trial = layout.clone();
+    let result = verb(&mut trial)?;
+    *layout = trial;
+    Ok(result)
+}
+
 /// Stows a module at the bottom of the scratchpad and chooses the next owner as a hide does.
+/// A refusal changes nothing.
 pub fn scratchpad_move(layout: &mut Layout, target: &ModuleId, frame: &Frame) -> Result<Option<ModuleId>, LayoutError> {
+    all_or_nothing(layout, |layout| stow(layout, target, frame))
+}
+
+fn stow(layout: &mut Layout, target: &ModuleId, frame: &Frame) -> Result<Option<ModuleId>, LayoutError> {
     if *target == ModuleId::editor() {
         return Err(LayoutError::EditorNeverFloats);
     }
@@ -241,7 +263,8 @@ fn show_scratch(layout: &mut Layout, id: &ModuleId) -> Result<ScratchShow, Layou
 }
 
 /// Stows the focused scratch float, raises a shown one, or shows the oldest stowed one.
-/// Naming a module toggles that scratch float or makes the module scratch and shows it.
+/// Naming a module toggles that scratch float or makes the module scratch and shows it; a refusal
+/// changes nothing.
 pub fn scratchpad_show(
     layout: &mut Layout,
     module: Option<&ModuleId>,
@@ -265,12 +288,14 @@ pub fn scratchpad_show(
                 show_scratch(layout, id)
             };
         }
-        layout.show(id)?;
-        if !layout.is_floating(id) {
-            float_at(layout, id, None, frame)?;
-        }
-        layout.set_scratch(id, true);
-        return show_scratch(layout, id);
+        return all_or_nothing(layout, |layout| {
+            layout.show(id)?;
+            if !layout.is_floating(id) {
+                float_at(layout, id, None, frame)?;
+            }
+            layout.set_scratch(id, true);
+            show_scratch(layout, id)
+        });
     }
     let focus = layout.focus().clone();
     if layout.float_of(&focus).is_some_and(|f| f.scratch) && layout.is_shown(&focus) {
@@ -1000,5 +1025,99 @@ mod tests {
             "evened: a half of 0.05 is too small"
         );
         assert_eq!(l.root().check(true), Ok(()));
+    }
+
+    #[test]
+    fn sinking_a_float_beside_the_lone_tiled_editor_makes_a_row() {
+        let mut layout = Layout::initial(&[]).unwrap();
+        assert_eq!(float_toggle(&mut layout, &agent(), &frame()), Ok(FloatChange::Floated));
+        assert_eq!(layout.leaves(), vec![editor()]);
+        assert_eq!(float_toggle(&mut layout, &agent(), &frame()), Ok(FloatChange::Sank));
+        let root = layout.root();
+        assert_eq!(root.layout, ConLayout::SplitH);
+        assert_eq!(
+            root.children.iter().map(|ch| ch.node.clone()).collect::<Vec<_>>(),
+            vec![Node::Leaf(editor()), Node::Leaf(agent())]
+        );
+        assert_eq!(root.check(true), Ok(()));
+        assert_eq!(layout.focus(), &agent());
+        let a = arrange(&layout, &frame());
+        assert!(a.rect_of(&editor()).is_some() && a.rect_of(&agent()).is_some());
+    }
+
+    #[test]
+    fn sinking_beside_a_lone_tile_that_is_not_the_editor_makes_a_row() {
+        let mut layout = Layout::new(Node::Leaf(agent()), agent()).unwrap();
+        layout.add_float(&t2(), centred(), false).unwrap();
+        layout.set_focus(&t2()).unwrap();
+        assert_eq!(float_toggle(&mut layout, &t2(), &frame()), Ok(FloatChange::Sank));
+        let root = layout.root();
+        assert_eq!(root.layout, ConLayout::SplitH);
+        assert_eq!(
+            root.children.iter().map(|ch| ch.node.clone()).collect::<Vec<_>>(),
+            vec![Node::Leaf(agent()), Node::Leaf(t2())]
+        );
+        assert_eq!(root.check(true), Ok(()));
+        assert_eq!(layout.focus(), &t2());
+    }
+
+    #[test]
+    fn sinking_into_a_one_child_tabbed_root_keeps_the_tabs() {
+        use crate::layout::con::Con;
+        let tabs = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(editor()), 0.5),
+                Child::new(Node::Leaf(agent()), 0.5),
+            ],
+        );
+        let mut layout = Layout::new(Node::Con(tabs), editor()).unwrap();
+        assert_eq!(float_toggle(&mut layout, &agent(), &frame()), Ok(FloatChange::Floated));
+        assert_eq!(layout.root().layout, ConLayout::Tabbed);
+        assert_eq!(layout.root().children.len(), 1);
+        assert_eq!(float_toggle(&mut layout, &agent(), &frame()), Ok(FloatChange::Sank));
+        let root = layout.root();
+        assert_eq!(root.check(true), Ok(()));
+        assert_eq!(root.layout, ConLayout::Tabbed);
+        assert_eq!(
+            root.children.iter().map(|ch| ch.node.clone()).collect::<Vec<_>>(),
+            vec![Node::Leaf(editor()), Node::Leaf(agent())]
+        );
+        assert_eq!(root.focus, 1, "the sunk module is the drawn tab");
+        assert_eq!(layout.focus(), &agent());
+    }
+
+    #[test]
+    fn a_refused_scratchpad_show_leaves_the_layout_unchanged() {
+        let mut layout = Layout::initial(&[]).unwrap();
+        place(&mut layout, &t2(), &agent(), Axis::Column).unwrap();
+        layout.add_float(&t3(), centred(), false).unwrap();
+        for id in [t2(), agent(), editor()] {
+            hide(&mut layout, &id, &frame()).unwrap();
+        }
+        assert!(layout.is_shown(&t3()) && !layout.is_shown(&t2()));
+        let before = layout.clone();
+        assert_eq!(
+            scratchpad_show(&mut layout, Some(&t2()), &frame()),
+            Err(LayoutError::LastTiled(t2()))
+        );
+        assert_eq!(layout, before);
+    }
+
+    #[test]
+    fn a_refused_scratchpad_move_leaves_the_layout_unchanged() {
+        let mut layout = Layout::initial(&[]).unwrap();
+        layout.add_float(&t3(), centred(), false).unwrap();
+        hide(&mut layout, &editor(), &frame()).unwrap();
+        layout.set_focus(&agent()).unwrap();
+        layout.toggle_zoom(&agent());
+        assert!(layout.is_zoomed());
+        let before = layout.clone();
+        assert_eq!(
+            scratchpad_move(&mut layout, &agent(), &frame()),
+            Err(LayoutError::LastTiled(agent()))
+        );
+        assert_eq!(layout, before);
+        assert!(layout.is_zoomed());
     }
 }

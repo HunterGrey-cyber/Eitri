@@ -7542,6 +7542,57 @@ describe("App refused commands", () => {
     }
   });
 
+  /* A page that loses the keys may be about to lose its tab as well (a join back into the base page
+     follows at once), so what was typed in the last debounce window has to reach Rust now, not when
+     the timer fires on a page that no longer shows the tab. */
+  it("pane_focus false posts the pending draft at once", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: "fix the test" } });
+      expect(lastOfType("draft")).toBeUndefined();
+      dispatch({ kind: "pane_focus", focused: false });
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "fix the test" });
+      // The superseded timer posts nothing more.
+      act(() => vi.advanceTimersByTime(300));
+      expect(posted.filter((m) => m.type === "draft")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /* After a join or a break-out, the page the tab left can post its last mirror after the tab's new page was
+     given Rust's older copy; Rust offers it on, marked late. It must not wipe what was typed here since. */
+  it("a late draft replaces the box only while the box still holds the copy Rust gave it", () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = startedApp();
+      const box = container.querySelector("textarea")!;
+      dispatch({ kind: "draft", tab: 1, text: "fix the te" });
+      dispatch({ kind: "draft", tab: 1, text: "fix the test", late: true });
+      expect(box.value).toBe("fix the test");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toBeUndefined();
+
+      dispatch({ kind: "draft", tab: 1, text: "fix the te" });
+      fireEvent.change(box, { target: { value: "fix the te, and the docs" } });
+      dispatch({ kind: "draft", tab: 1, text: "fix the test", late: true });
+      expect(box.value).toBe("fix the te, and the docs");
+      act(() => vi.advanceTimersByTime(300));
+      expect(lastOfType("draft")).toMatchObject({ tab: 1, text: "fix the te, and the docs" });
+
+      // An edit already mirrored is newer too.
+      dispatch({ kind: "draft", tab: 1, text: "fix the te" });
+      fireEvent.change(box, { target: { value: "fix it" } });
+      act(() => vi.advanceTimersByTime(300));
+      dispatch({ kind: "draft", tab: 1, text: "fix the test", late: true });
+      expect(box.value).toBe("fix it");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   function runningApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });

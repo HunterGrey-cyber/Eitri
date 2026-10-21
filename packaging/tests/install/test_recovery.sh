@@ -346,14 +346,17 @@ t_upgrade_unwritable_bindir() {
 	expect_rc 0
 	serve 1.1.0 1.0.0
 	before=$(snap_but_staging "$TH")
+	# Put back the mode the directory had, not a fixed one: the snapshot holds it, and it follows the
+	# umask the run started under (0700 under a umask of 077).
+	bin_mode=$(stat -c %a "$TH/.local/bin")
 	chmod 0555 "$TH/.local/bin"
 	if [ -w "$TH/.local/bin" ]; then
 		# Run as root, the directory is writable anyway: nothing to test.
-		chmod 0755 "$TH/.local/bin"
+		chmod "$bin_mode" "$TH/.local/bin"
 		return 0
 	fi
 	inst_net
-	chmod 0755 "$TH/.local/bin"
+	chmod "$bin_mode" "$TH/.local/bin"
 	expect_fail "an upgrade with an unwritable ~/.local/bin"
 	expect_out "cannot write $TH/.local/bin/.eitri.tmp."
 	expect_no_out 'installed Eitri 1.1.0'

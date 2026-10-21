@@ -1,13 +1,17 @@
 -- Sets whether nvim shows diagnostics and inlay hints for the buffers under one directory, and puts back
 -- what was there. Called with (op, opts): op is 'apply' or 'clear'; every value is an argument. One owner
--- (a plugin id) holds one root at a time. Runs on LuaJIT and PUC 5.1.
+-- (a plugin id) holds one root at a time; several owners may hold the same buffer. Runs on LuaJIT and PUC 5.1.
 local op, opts = ...
 
-local all = rawget(_G, '__eitri_plugin_assist')
-if all == nil then
-  all = {}
-  rawset(_G, '__eitri_plugin_assist', all)
+-- `owners`: owner -> its state. `buffers`: bufnr -> the one record of a buffer, shared by every owner holding it,
+-- so the value put back after the last owner is the buffer's own and never another owner's setting. `seq` orders
+-- applies, so the owner applied most recently is the one whose values stay when another clears.
+local reg = rawget(_G, '__eitri_plugin_assist')
+if reg == nil then
+  reg = { owners = {}, buffers = {}, seq = 0 }
+  rawset(_G, '__eitri_plugin_assist', reg)
 end
+local all, shared = reg.owners, reg.buffers
 
 local function have_diag()
   return type(vim.diagnostic) == 'table'
@@ -66,20 +70,21 @@ local function set(bufnr, d, h)
   end
 end
 
--- Puts this owner's wanted values on one buffer, recording what the buffer had the first time this owner
--- touched it. Later applies keep that first baseline.
+-- Puts this owner's wanted values on one buffer, recording what the buffer had the first time any owner
+-- touched it. Later applies, by this owner or another, keep that first baseline.
 local function assert_on(state, bufnr)
   if state.torn or not under(state.root, bufnr) then
     return false
   end
-  local b = state.buffers[bufnr]
+  local b = shared[bufnr]
   if b == nil then
     local d, h = read(bufnr)
     -- Before any server attaches, hints read as off whatever the configuration will do; that is no value to
     -- restore, so the hint baseline waits for the first look after an attach.
-    b = { base_d = d, base_h = h, hint_pending = h ~= nil and not attached(bufnr) }
-    state.buffers[bufnr] = b
+    b = { base_d = d, base_h = h, hint_pending = h ~= nil and not attached(bufnr), owners = {} }
+    shared[bufnr] = b
   end
+  b.owners[state.owner] = true
   -- A pending hint baseline means the buffer's hint value still has to be learned from the configuration, so
   -- hints are left alone until settle: writing the owner's value now would be read back as the baseline, or
   -- would overwrite what the configuration enabled before it was read. Without a server there is nothing to show.
@@ -97,7 +102,7 @@ end
 -- run, then puts this owner's values back. The owner has written no hint value while the baseline was pending,
 -- so what is read here is the configuration's.
 local function settle(state, bufnr)
-  local b = state.buffers[bufnr]
+  local b = shared[bufnr]
   if b ~= nil and b.hint_pending and attached(bufnr) then
     local _, h = read(bufnr)
     b.base_h = h
@@ -106,8 +111,21 @@ local function settle(state, bufnr)
   assert_on(state, bufnr)
 end
 
--- Restores each value that still holds what this owner set; a value the user changed since is left, and
--- counted. Per buffer and per setting.
+-- The owner applied most recently among those still holding the buffer.
+local function latest_holder(b)
+  local best = nil
+  for owner in pairs(b.owners) do
+    local state = all[owner]
+    if state ~= nil and (best == nil or state.seq > best.seq) then
+      best = state
+    end
+  end
+  return best
+end
+
+-- Lets go of this owner's buffers. A buffer another owner still holds gets that owner's values back and
+-- nothing restored. On a buffer this owner held last, each value that still holds what was set is restored to
+-- the buffer's baseline; a value the user changed since is left, and counted. Per buffer and per setting.
 local function clear(owner)
   local state = all[owner]
   if state == nil then
@@ -117,23 +135,33 @@ local function clear(owner)
   all[owner] = nil
   pcall(vim.api.nvim_del_augroup_by_name, 'EitriPluginAssist_' .. owner)
   local restored, left = 0, 0
-  for bufnr, b in pairs(state.buffers) do
-    if vim.api.nvim_buf_is_valid(bufnr) then
-      local d, h = read(bufnr)
-      if b.set_d ~= nil and d ~= nil then
-        if d == b.set_d then
-          set(bufnr, b.base_d, nil)
-          restored = restored + 1
-        else
-          left = left + 1
-        end
+  for bufnr, b in pairs(shared) do
+    if b.owners[owner] then
+      b.owners[owner] = nil
+      local holder = latest_holder(b)
+      local valid = vim.api.nvim_buf_is_valid(bufnr)
+      if holder == nil or not valid then
+        shared[bufnr] = nil
       end
-      if b.set_h ~= nil and h ~= nil then
-        if h == b.set_h then
-          set(bufnr, nil, b.base_h)
-          restored = restored + 1
-        else
-          left = left + 1
+      if valid and holder ~= nil then
+        assert_on(holder, bufnr)
+      elseif valid then
+        local d, h = read(bufnr)
+        if b.set_d ~= nil and d ~= nil then
+          if d == b.set_d then
+            set(bufnr, b.base_d, nil)
+            restored = restored + 1
+          else
+            left = left + 1
+          end
+        end
+        if b.set_h ~= nil and h ~= nil then
+          if h == b.set_h then
+            set(bufnr, nil, b.base_h)
+            restored = restored + 1
+          else
+            left = left + 1
+          end
         end
       end
     end
@@ -150,9 +178,11 @@ local function apply(o)
     state = nil
   end
   if state == nil then
-    state = { root = o.root, buffers = {}, torn = false }
+    state = { owner = owner, root = o.root, torn = false }
     all[owner] = state
   end
+  reg.seq = reg.seq + 1
+  state.seq = reg.seq
   state.want_d = o.diagnostics
   state.want_h = o.inlay_hints
   -- Configurations often turn hints on when a server attaches, from the attach itself, a scheduled call or a

@@ -111,8 +111,8 @@ impl FloatChrome {
     }
 
     /// Names the bar again with `label`, if it draws a float now.
-    // Called through the grid's `refresh_float_bars`, which the window's title updates call.
-    #[allow(dead_code)]
+    // Called through the grid's `refresh_float_bars`, which `set_float_label` runs so a new label
+    // reaches a bar already on screen.
     pub(super) fn relabel(&self, label: &dyn Fn(&ModuleId) -> String) {
         let drawn = self.current.borrow().as_ref().map(|(id, _)| id.clone());
         if let Some(id) = drawn {

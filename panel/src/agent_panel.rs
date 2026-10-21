@@ -24,7 +24,7 @@
 //! tab's full snapshot. A message from a page is handled as that page's: its view comes from the
 //! handler the page was built with, never from what the page says.
 
-use crate::panel_document::{PanelDocument, PANEL_BASE_URI};
+use crate::panel_document::{PanelDocument, IDLE_DOCUMENT, PANEL_BASE_URI};
 use crate::panel_page::{PanelHost, PanelPage};
 use crate::trust_gate::{AnswerOutcome, Asked, CommandAnswer, GateEvent, Route, TrustGate};
 use agent::setting_sources::ProjectTrust;
@@ -1097,8 +1097,11 @@ impl AgentPanelHandle {
     }
 
     /// `view`'s page leaves routing: its record is dropped, what its pacer held is let go, the prompts
-    /// it showed go, and its document is loaded again, so it shows the empty chat and nothing of the
-    /// tab it showed. It still takes the theme and the font. The base view's page never goes idle.
+    /// it showed go, and it is given a blank document at the panel's base ([`IDLE_DOCUMENT`]), so it
+    /// shows nothing of the tab it showed and holds no chat while no one sees it; reusing the page
+    /// loads the panel again ([`Self::load_document`]). Envelopes sent to it meanwhile are dropped by
+    /// the blank page, and its background still follows the theme. The base view's page never goes
+    /// idle.
     pub fn idle_page(&self, view: ViewId) {
         self.wake();
         if view.is_base() {
@@ -1118,9 +1121,7 @@ impl AgentPanelHandle {
         }
         let discarded = page.pacer().borrow_mut().discard_pending();
         trace_discarded_first_texts(&self.state, discarded);
-        // Called by path: a `.load_document(` call in this file is read as a document load that must
-        // name the secure base, and this one only reaches `load_document`'s own load, which does.
-        AgentPanelHandle::load_document(self, view);
+        page.load_document(IDLE_DOCUMENT, PANEL_BASE_URI);
     }
 
     /// Paints `view`'s page's background and loads the themed document into it, live or idle; called
@@ -1137,11 +1138,13 @@ impl AgentPanelHandle {
     }
 
     /// A message `view`'s page posted (the `eitriAgent` handler that page was built with). A page that
-    /// is not live -- idle, or never attached -- has nothing to say: its message is dropped.
+    /// is not live -- idle, or never attached -- has nothing to say: its message is dropped, save the
+    /// one late mirror of the tab that just left it (`late_draft_from_idle_page`).
     pub fn page_message(&self, view: ViewId, raw: &str) {
         self.wake();
         match self.pages.live(view) {
             Some(page) => handle_inbound_message(raw, &self.state, &self.pages, view, &page),
+            None if late_draft_from_idle_page(raw, &self.state, &self.pages, view) => {}
             None => eprintln!(
                 "[agent_panel] view {}: a message from a page that is not live was dropped",
                 view.number()
@@ -1827,8 +1830,8 @@ impl AgentPanelHandle {
         Self::dispatch_to(&page, &payload);
     }
 
-    /// [`dispatch`](Self::dispatch) to every page, idle ones included: what a page reused later must
-    /// already know when it shows its empty chat (the keymap, how thinking is shown, the editor link).
+    /// [`dispatch`](Self::dispatch) to every page, idle ones included (the keymap, how thinking is
+    /// shown, the editor link). An idle page's blank document runs nothing and drops it.
     fn dispatch_every(&self, payload: String) {
         for page in self.pages.every() {
             Self::dispatch_to(&page, &payload);
@@ -4825,11 +4828,14 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
                 request_id: command,
                 tab,
             } => {
-                let shown = state
-                    .page_of(tab)
-                    .is_some()
-                    .then(|| state.trust.ask_command(tab, &command))
-                    .flatten();
+                // Shown only in the page the command was typed in, while that page still shows the
+                // tab: a tab that moved to another page while the check ran must not take the prompt
+                // with it, since that page never typed the command and could answer it.
+                let in_its_page = match state.trust_commands.get(&command) {
+                    Some(record) => state.page_of(tab) == Some(record.typed_in),
+                    None => state.page_of(tab).is_some(),
+                };
+                let shown = in_its_page.then(|| state.trust.ask_command(tab, &command)).flatten();
                 match shown {
                     Some(Asked::Prompt(message)) => out.push(Dest::Tab(tab), message),
                     // Too large to show, or not ready: the command is over.
@@ -4843,7 +4849,8 @@ fn trust_events(state: &mut AgentPanelState) -> TrustOut {
                             out.push(typed_in, serialize_command_result_for_js(&request_id, Err(&why)));
                         }
                     }
-                    // The tab is not on screen any more: `:trust` is answered on the next poll.
+                    // The tab is not on screen in the page that typed it any more: `:trust` ends as
+                    // not trusted on the next poll, in that page.
                     None => state.trust.drop_command_prompt(),
                 }
             }
@@ -6710,6 +6717,46 @@ const RESTORE_IS_THE_BASE_PAGES: &str = "protocol: the last session's tabs are r
 /// What an extra page is told when it asks to close the other tabs: it shows one.
 const ONE_TAB_HERE: &str = "this view shows one tab: there are no others to close";
 
+/// The one late mirror of `tab` from the page it was just moved out of (`TabSet::take_late_draft`,
+/// already taken): it is newer than the copy the tab's new page was given, so the tab keeps it and that
+/// page is offered it, marked late, so that a box edited there since keeps its own newer text.
+fn deliver_late_draft(state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, tab: TabId, text: &str) {
+    let shown = {
+        let mut state = state.borrow_mut();
+        state.tabs.set_draft(tab, text);
+        state.shown_in(tab)
+    };
+    if let Some(shown) = shown {
+        pages.send(shown, &eitri_core::agent_bridge::serialize_late_draft_for_js(tab, text));
+    }
+}
+
+/// A message from `view`'s page after it stopped being live. A view emptied by its tab leaving is
+/// retired on the loop's next turn, which can come before its document has delivered the mirror its
+/// composer flushed as the keys went; that mirror is still the tab's newest text, so it is taken as the
+/// late draft it is. Nothing else from such a page is acted on, and nothing is answered: its document
+/// is being replaced. Whether the message was taken.
+fn late_draft_from_idle_page(raw: &str, state: &Rc<RefCell<AgentPanelState>>, pages: &Pages, view: ViewId) -> bool {
+    if view.is_base() || state.borrow().shutting_down {
+        return false;
+    }
+    let Some(message) = parse_inbound_message(raw) else {
+        return false;
+    };
+    if !matches!(message, InboundMessage::Draft { .. }) {
+        return false;
+    }
+    let resolved = state.borrow().tabs.resolve(message.tab_ref());
+    let (Ok(Some(tab)), InboundMessage::Draft { text, .. }) = (resolved, message) else {
+        return false;
+    };
+    if !state.borrow_mut().tabs.take_late_draft(tab, view) {
+        return false;
+    }
+    deliver_late_draft(state, pages, tab, &text);
+    true
+}
+
 /// One message from `view`'s page (`page`). Every answer goes back to that page; what changes for a
 /// tab goes to the page that shows it.
 fn handle_inbound_message(
@@ -6734,12 +6781,20 @@ fn handle_inbound_message(
     // active one" -- a permission answered just after a switch must reach the tab that asked.
     // Bound before the `match`: a scrutinee's temporaries live to the end of the whole match.
     let resolved = state.borrow().tabs.resolve(message.tab_ref());
+    // Whether this is the one `draft` the page a tab just left may still post for it.
+    let mut late_draft = false;
     let target = match resolved {
-        // An extra page that shows no tab yet has no tab to command.
-        Ok(Some(_)) if !view.is_base() && state.borrow().tabs.tab_in(view).is_none() => {
-            eprintln!("[agent_panel] refused {request_id}: {NO_TAB_HERE}");
-            page.send(&serialize_command_result_for_js(&request_id, Err(NO_TAB_HERE)));
-            return;
+        // An extra page that shows no tab has no tab to command, but the tab that just left it may be
+        // owed the mirror its composer flushed as the keys went.
+        Ok(Some(tab)) if !view.is_base() && state.borrow().tabs.tab_in(view).is_none() => {
+            late_draft =
+                matches!(message, InboundMessage::Draft { .. }) && state.borrow_mut().tabs.take_late_draft(tab, view);
+            if !late_draft {
+                eprintln!("[agent_panel] refused {request_id}: {NO_TAB_HERE}");
+                page.send(&serialize_command_result_for_js(&request_id, Err(NO_TAB_HERE)));
+                return;
+            }
+            Some(tab)
         }
         Ok(target) => target,
         Err(protocol) => {
@@ -6901,8 +6956,19 @@ fn handle_inbound_message(
             }
         }
         InboundMessage::RestoreAnswer { nonce, keep_bypass, .. } => {
-            let result = answer_restore_question(&mut state.borrow_mut(), nonce, keep_bypass);
-            match deliver_restore(state, pages, result) {
+            // A `y` resumes the saved bypass tabs in bypass, so it meets the window's gate like any
+            // answer that loosens permissions. Refused, the question is left as it was: the same
+            // nonce can still be answered and the restore key asks it again. An `n` loosens nothing.
+            let gate = state.borrow().answer_gate.clone();
+            let gated = if keep_bypass {
+                through_answer_gate(gate.as_ref(), view, || Ok(()))
+            } else {
+                Ok(())
+            };
+            match gated.and_then(|()| {
+                let result = answer_restore_question(&mut state.borrow_mut(), nonce, keep_bypass);
+                deliver_restore(state, pages, result)
+            }) {
                 Ok(()) => ok(page),
                 Err(why) => refuse(page, &why),
             }
@@ -7456,8 +7522,21 @@ fn handle_inbound_message(
             }
         }
         InboundMessage::Draft { text, .. } => {
-            // A mirror, answered with nothing.
-            state.borrow_mut().tabs.set_draft(tab_of(target), &text);
+            // A mirror, answered with nothing, from the page whose view holds the tab (a base-view tab
+            // in the background included: the base page flushes as it switches away from it).
+            let tab = tab_of(target);
+            let mut state_ref = state.borrow_mut();
+            let held_here = page_may_answer(&state_ref.tabs, tab, view);
+            if held_here.is_ok() {
+                state_ref.tabs.set_draft(tab, &text);
+            } else if late_draft || state_ref.tabs.take_late_draft(tab, view) {
+                drop(state_ref);
+                deliver_late_draft(state, pages, tab, &text);
+            } else if let Err(why) = held_here {
+                drop(state_ref);
+                eprintln!("[agent_panel] refused {request_id}: {why}");
+                refuse(page, &why);
+            }
         }
         InboundMessage::HistoryPush { text, .. } => {
             remember_prompts(state, pages, std::slice::from_ref(&text));
@@ -14819,6 +14898,108 @@ mod tests {
         assert!(agent::lease::SessionLease::try_acquire("claude", &canonical, "s-1").is_ok());
     }
 
+    /// A restore question's `y` resumes the saved bypass tabs in bypass, so from a chat a float covers
+    /// it meets the same gate as a card answer: refused, nothing is started and the question is kept,
+    /// so the same `y` goes through once the float is off the chat.
+    #[test]
+    fn a_bypass_restore_y_from_a_covered_chat_is_refused_and_the_question_stays() {
+        const COVERED: &str = "agent is under terminal 2: C-b M-- from terminal 2 stows it";
+        let (state, dir) = restore_panel("gate-restore-y", &[("s-1", None, Bypass)], &["s-1"]);
+        let page = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        // Attaching the page starts its record afresh, so it is ready only from here.
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
+        let from = state.borrow().tabs.active();
+        let RestoreResult::Question(question) = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard)
+        else {
+            panic!("a bypass tab is asked about first")
+        };
+        let covered = Rc::new(Cell::new(true));
+        let asked = Rc::new(Cell::new(0));
+        handle.set_answer_gate(Rc::new({
+            let covered = covered.clone();
+            let asked = asked.clone();
+            move |view: ViewId| {
+                assert_eq!(view, ViewId::BASE, "asked with the view of the page that answered");
+                asked.set(asked.get() + 1);
+                if covered.get() {
+                    Err(COVERED.to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        let answer = |request: &str| {
+            handle.page_message(
+                ViewId::BASE,
+                &format!(
+                    r#"{{"type":"restore_answer","request_id":"{request}","nonce":{},"keep_bypass":true}}"#,
+                    question.nonce
+                ),
+            );
+        };
+
+        answer("r1");
+        assert_eq!(result_for(&page.sent.borrow(), "r1"), Some(Err(COVERED.to_string())));
+        assert_eq!(asked.get(), 1, "the gate is asked once, with the base view");
+        assert!(
+            state.borrow().tabs.awaiting_trust().is_empty(),
+            "nothing waits to start"
+        );
+        let canonical = dir.to_string_lossy().into_owned();
+        assert!(
+            agent::lease::SessionLease::try_acquire("claude", &canonical, "s-1").is_ok(),
+            "nothing was started"
+        );
+
+        covered.set(false);
+        answer("r2");
+        assert_eq!(
+            result_for(&page.sent.borrow(), "r2"),
+            Some(Ok(())),
+            "the question was kept for the same nonce"
+        );
+        assert_eq!(asked.get(), 2);
+    }
+
+    /// A restore question's `n` resumes nothing in bypass, so it is not asked of the gate.
+    #[test]
+    fn a_restore_n_is_not_asked_of_the_gate() {
+        let (state, _dir) = restore_panel("gate-restore-n", &[("s-1", None, Bypass)], &["s-1"]);
+        let page = Rc::new(RecordingPage::default());
+        let handle = AgentPanelHandle::over(
+            state.clone(),
+            Some(Rc::new(PanelPage::new(page.clone() as Rc<dyn PageSurface>))),
+        );
+        // Attaching the page starts its record afresh, so it is ready only from here.
+        state.borrow_mut().page_mut(ViewId::BASE).document_ready = true;
+        let from = state.borrow().tabs.active();
+        let RestoreResult::Question(question) = ask_for_restore(&mut state.borrow_mut(), from, RestoreAsk::Dashboard)
+        else {
+            panic!("a bypass tab is asked about first")
+        };
+        let asked = Rc::new(Cell::new(0));
+        handle.set_answer_gate(Rc::new({
+            let asked = asked.clone();
+            move |_view: ViewId| {
+                asked.set(asked.get() + 1);
+                Err("covered".to_string())
+            }
+        }));
+        handle.page_message(
+            ViewId::BASE,
+            &format!(
+                r#"{{"type":"restore_answer","request_id":"n1","nonce":{},"keep_bypass":false}}"#,
+                question.nonce
+            ),
+        );
+        assert_eq!(result_for(&page.sent.borrow(), "n1"), Some(Ok(())));
+        assert_eq!(asked.get(), 0, "an `n` is not asked of the gate");
+    }
+
     #[test]
     fn an_answer_for_another_tab_is_refused() {
         let (state, fx) = trust_panel("trust-other-tab");
@@ -15534,6 +15715,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn post_draft(handle: &AgentPanelHandle, from: ViewId, request: &str, tab: TabId, text: &str) {
+        let message = serde_json::json!({ "type": "draft", "request_id": request, "tab": tab.0, "text": text });
+        handle.page_message(from, &message.to_string());
+    }
+
+    #[test]
+    fn a_late_draft_from_the_page_a_tab_just_left_reaches_it() {
+        let (handle, base, second) = handle_with_two_pages();
+        let moved = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        assert_eq!(handle.break_out(view(2)), Ok(moved));
+        post_draft(&handle, view(2), "d-1", moved, "fix the te");
+        assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft, "fix the te");
+
+        assert_eq!(handle.join_back(view(2)), Ok(moved));
+        clear(&[&base, &second]);
+        post_draft(&handle, view(2), "d-2", moved, "fix the test");
+        assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft, "fix the test");
+        assert_eq!(
+            result_for(&second.sent.borrow(), "d-2"),
+            None,
+            "a mirror is answered with nothing"
+        );
+        let told: Vec<serde_json::Value> = base.sent.borrow().iter().map(|e| json_of(e)).collect();
+        assert!(
+            told.contains(
+                &serde_json::json!({ "kind": "draft", "tab": moved.0, "text": "fix the test", "late": true })
+            ),
+            "the base page's box is offered it: {told:?}"
+        );
+
+        post_draft(&handle, view(2), "d-3", moved, "fix the test again");
+        assert_eq!(
+            result_for(&second.sent.borrow(), "d-3"),
+            Some(Err(NO_TAB_HERE.to_string())),
+            "taken once"
+        );
+        assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft, "fix the test");
+
+        let third = attach_recording_page(&handle, view(3));
+        handle.page_message(view(3), READY);
+        handle.open_in(view(3)).unwrap();
+        post_draft(&handle, view(3), "d-4", moved, "not mine");
+        let number = handle.state.borrow().tabs.get(moved).unwrap().number;
+        assert_eq!(
+            result_for(&third.sent.borrow(), "d-4"),
+            Some(Err(format!("tab {number} is not shown in this page")))
+        );
+        assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft, "fix the test");
+    }
+
+    #[test]
+    fn a_late_draft_reaches_the_tab_after_the_emptied_view_s_page_went_idle() {
+        let (handle, base, second) = handle_with_two_pages();
+        let moved = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        assert_eq!(handle.break_out(view(2)), Ok(moved));
+        post_draft(&handle, view(2), "d-1", moved, "fix the te");
+        let emptied = Rc::new(RefCell::new(Vec::<ViewId>::new()));
+        handle.on_view_empty({
+            let emptied = emptied.clone();
+            move |view| emptied.borrow_mut().push(view)
+        });
+        assert_eq!(handle.join_back(view(2)), Ok(moved));
+        assert_eq!(*emptied.borrow(), vec![view(2)]);
+        // The window retires the emptied view on the loop's next turn, which can come before the
+        // document delivers what its composer flushed as the keys went.
+        handle.idle_page(view(2));
+        assert!(handle.pages.live(view(2)).is_none(), "the emptied view's page is idle");
+        clear(&[&base, &second]);
+
+        post_draft(&handle, view(2), "d-2", moved, "fix the test");
+        assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft, "fix the test");
+        let told: Vec<serde_json::Value> = base.sent.borrow().iter().map(|e| json_of(e)).collect();
+        assert!(
+            told.contains(
+                &serde_json::json!({ "kind": "draft", "tab": moved.0, "text": "fix the test", "late": true })
+            ),
+            "the base page's box is offered it: {told:?}"
+        );
+        assert_eq!(
+            result_for(&second.sent.borrow(), "d-2"),
+            None,
+            "an idle page is answered nothing"
+        );
+
+        // Taken once; nothing else an idle page posts is acted on.
+        post_draft(&handle, view(2), "d-3", moved, "fix the test again");
+        assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft, "fix the test");
+        handle.page_message(view(2), READY);
+        assert!(
+            second.sent.borrow().is_empty(),
+            "an idle page is sent nothing: {:?}",
+            second.sent.borrow()
+        );
+    }
+
     #[test]
     fn the_receiving_page_gets_the_tabs_snapshot_with_its_pending_card() {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -15665,7 +15941,7 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_page_is_told_nothing_and_reloads_empty() {
+    fn an_idle_page_is_told_nothing_and_holds_a_blank_document() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("views-idle");
         let (handle, _base, second) = handle_with_two_pages();
@@ -15677,11 +15953,22 @@ mod tests {
         });
         let documents = second.documents.borrow().len();
         handle.idle_page(view(2));
-        assert_eq!(
-            second.documents.borrow().len(),
-            documents + 1,
-            "its document is loaded again, empty"
-        );
+        assert_eq!(second.documents.borrow().len(), documents + 1, "a document is loaded");
+        let panel = {
+            let state = handle.state.borrow();
+            state.document.themed(&state.theme.css_vars())
+        };
+        {
+            let loaded = second.documents.borrow();
+            let (html, base) = loaded.last().unwrap();
+            assert_eq!(
+                (html.as_str(), base.as_str()),
+                (IDLE_DOCUMENT, PANEL_BASE_URI),
+                "a blank document at the panel's secure base"
+            );
+            assert!(!html.contains("<script"), "nothing to run: {html}");
+            assert_ne!(*html, panel, "not the panel");
+        }
         assert!(handle.state.borrow().page(view(2)).is_none(), "its record is gone");
         clear(&[&second]);
         provider.queue(write_card("perm-2"));
@@ -15698,6 +15985,15 @@ mod tests {
             second.sent.borrow()
         );
         assert!(handle.state.borrow().page(view(2)).is_none());
+
+        // Reused, as the window reuses a pooled page: attached again, then the panel is loaded.
+        handle.attach_page(view(2), Rc::new(PanelPage::new(second.clone() as Rc<dyn PageSurface>)));
+        handle.load_document(view(2));
+        assert_eq!(
+            second.documents.borrow().last().cloned(),
+            Some((panel, PANEL_BASE_URI.to_string())),
+            "the panel again once reused"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16532,6 +16828,38 @@ mod tests {
         });
         assert!(matches!(result_for(&second.sent.borrow(), "c2"), Some(Err(_))));
         assert_eq!(result_for(&base.sent.borrow(), "c2"), None);
+    }
+
+    /// A `:trust` whose tab breaks out of the base page while the gate is still checking the project
+    /// is never shown in the page the tab moved to: that page never typed it. It ends, unrecorded, in
+    /// the page it was typed in.
+    #[test]
+    fn a_trust_prompt_whose_tab_broke_out_before_the_check_returned_is_never_shown() {
+        let TrustViews {
+            handle,
+            base,
+            second: _second,
+            tab: _tab,
+            fx,
+            hold,
+        } = trust_views("views-trust-command-moves-early");
+        let first = handle.state.borrow().tabs.active();
+        handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        handle.state.borrow_mut().tabs.select(first);
+        let third = attach_recording_page(&handle, view(3));
+        handle.page_message(view(3), READY);
+
+        // The worker cannot finish the command's check until the tab has moved.
+        hold.close();
+        trust_command_from(&handle, ViewId::BASE, "c1", "trust");
+        assert_eq!(handle.break_out(view(3)), Ok(first));
+        hold.open();
+        poll_trust_until(&handle, "c1's end", || result_for(&base.sent.borrow(), "c1").is_some());
+
+        assert!(matches!(result_for(&base.sent.borrow(), "c1"), Some(Err(_))));
+        assert!(prompts(&third.sent.borrow()).is_empty(), "{:?}", third.sent.borrow());
+        assert_eq!(result_for(&third.sent.borrow(), "c1"), None);
+        assert!(!fx.record_file().exists(), "nothing recorded");
     }
 
     /// Two pages number their requests alike: a `:untrust` from page 2 and a `:trust` from the base

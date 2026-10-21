@@ -700,9 +700,11 @@ impl ModuleGrid {
     /// `f` runs after every change to the layout: each [`ModuleGrid::apply`] and a divider drag. A
     /// pinned split getting its length (`settle_pins`, inside an allocation) is not one: nothing
     /// moved on screen, and the state file's save that follows the change which put the split on
-    /// screen -- 500ms later -- already holds the length. What hangs off it: the per-project state
-    /// file's debounced save, the top bar's tray, and starting the terminal's shell once it is shown
-    /// however it got there. Runs with the layout released.
+    /// screen -- 500ms later -- already holds the length. What hangs off it, all in the window's
+    /// setup: starting the terminal's shell once it is shown however it got there, the per-project
+    /// state file's debounced save, the top bar's selection and mark texts, bringing a killed module
+    /// back fresh when it is shown again, the tray (with telling a chat view a float has left it
+    /// that it is on screen), and the current workspace's name. Runs with the layout released.
     pub(crate) fn connect_changed(&self, f: impl Fn() + 'static) {
         self.imp().changed.borrow_mut().push(Rc::new(f));
     }
@@ -786,8 +788,9 @@ impl ModuleGrid {
         self.refresh_float_bars();
     }
 
-    /// Names every float bar on screen again with the label function, for what it reads that the
-    /// layout does not (a title, a chat's attention). Nothing is measured or allocated.
+    /// Names every float bar on screen again with the label function [`ModuleGrid::set_float_label`]
+    /// installs (the window gives a module's title), so a new label reaches the bars already drawn.
+    /// Nothing is measured or allocated.
     pub(crate) fn refresh_float_bars(&self) {
         let label = self.float_label();
         for piece in self.imp().chrome.borrow().iter() {
@@ -878,14 +881,6 @@ impl ModuleGrid {
             self.apply();
         }
         swapped
-    }
-
-    /// `eitri_core::layout::even` on its own: an even split that is not a preset, so `layout.next`
-    /// does not count it. The keys' `even-*` go through [`ModuleGrid::preset`] instead, which does.
-    #[allow(dead_code)]
-    pub(crate) fn even_modules(&self, axis: Axis) {
-        eitri_core::layout::even(&mut self.layout().borrow_mut(), axis);
-        self.apply();
     }
 
     // The verbs below share one shape: the layout is borrowed only while core changes it, and

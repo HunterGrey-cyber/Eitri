@@ -2260,6 +2260,13 @@ pub fn serialize_draft_for_js(tab: crate::tabs::TabId, text: &str) -> String {
     json!({ "kind": "draft", "tab": tab.0, "text": text }).to_string()
 }
 
+/// The last mirror of `tab` from the page it was just moved out of, which reached Rust after the tab's
+/// new page was given the older copy. Marked `late`: the new page takes it only while its box still holds
+/// that older copy, since anything typed there since is newer and goes out as its own mirror.
+pub fn serialize_late_draft_for_js(tab: crate::tabs::TabId, text: &str) -> String {
+    json!({ "kind": "draft", "tab": tab.0, "text": text, "late": true }).to_string()
+}
+
 /// Rust's copy of the box right after it refused the send `refused` (a request id) and the page put the
 /// message back itself: the page already holds the message and what was typed after it, and this copy may
 /// trail that, so the page skips it. Every other `draft` is applied.
@@ -6270,6 +6277,10 @@ mod tests {
         assert_eq!(
             value(serialize_draft_for_js(tab, "half")),
             json!({ "kind": "draft", "tab": 4, "text": "half" })
+        );
+        assert_eq!(
+            value(serialize_late_draft_for_js(tab, "half")),
+            json!({ "kind": "draft", "tab": 4, "text": "half", "late": true })
         );
         assert_eq!(
             value(serialize_queue_taken_for_js(tab, &["a".into(), "b".into()])),

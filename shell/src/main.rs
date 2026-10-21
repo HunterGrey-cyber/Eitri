@@ -4317,17 +4317,23 @@ fn build_ui(
     {
         let ending_by_signal = ending_by_signal.clone();
         let window = window.clone();
-        // The log lines ignore a failed write: a panic in this callback aborts the process before the close.
+        // The log lines are written only if stdout takes them at once: a panic in this callback aborts the process
+        // before the close, and a write blocked on a full pipe would hold the close up.
         let installed = end_signals::install(move |name| {
-            use std::io::Write as _;
             if ending_by_signal.replace(true) {
-                let _ = writeln!(std::io::stdout(), "[window] {name}: the window is already closing");
+                end_signals::write_if_writable(
+                    1,
+                    format!("[window] {name}: the window is already closing\n").as_bytes(),
+                );
                 return;
             }
             end_signals::mark_closing();
-            let _ = writeln!(
-                std::io::stdout(),
-                "[window] {name}: closing the window without its questions; nvim is ended as a close ends it"
+            end_signals::write_if_writable(
+                1,
+                format!(
+                    "[window] {name}: closing the window without its questions; nvim is ended as a close ends it\n"
+                )
+                .as_bytes(),
             );
             window.close();
         });
@@ -4881,9 +4887,12 @@ fn split_new_terminal(
         let toast = toast.clone();
         glib::spawn_future_local(async move {
             let read = match pid {
-                Some(pid) => gtk4::gio::spawn_blocking(move || std::fs::read_link(format!("/proc/{pid}/cwd")))
-                    .await
-                    .unwrap_or_else(|_| Err(std::io::Error::other("the reading thread panicked"))),
+                // The stat that tells a removed directory runs here too, off the GTK thread.
+                Some(pid) => gtk4::gio::spawn_blocking(move || {
+                    terminal::usable_dir(std::fs::read_link(format!("/proc/{pid}/cwd")))
+                })
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("the reading thread panicked"))),
                 None => Err(std::io::Error::other("its shell is not running")),
             };
             // The number alone does not name the terminal the key was pressed in: it may have been
@@ -6032,9 +6041,31 @@ mod tests {
         let src = include_str!("main.rs");
         let calls = src.matches(concat!(".enter", "_input(")).count();
         assert_eq!(calls, 1, "only the new-tab path may land in INPUT");
+        // Scoped to the two closures: a count over the whole file stays green while other
+        // callers of `arrive` remain, even after the keyboard path stops calling it.
+        fn body_after<'a>(code: &'a str, anchor: &str) -> &'a str {
+            let at = code
+                .find(anchor)
+                .unwrap_or_else(|| panic!("no `{anchor}` in main.rs; was it renamed?"));
+            let open = at
+                + code[at..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("no body after `{anchor}`"));
+            eitri_core::source_scan::braced(code, open)
+        }
+        let code = eitri_core::source_scan::code_only(src);
+        let land_by_key = body_after(&code, concat!("let land_by_key: Rc<dyn Fn(&Module", "Id) -> bool>"));
         assert!(
-            src.matches(concat!(".arr", "ive(")).count() >= 2,
-            "move_focus and arrive both use it"
+            land_by_key.contains(concat!(".arr", "ive(view)")),
+            "landing by key must tell the agent panel the view arrived"
+        );
+        let move_focus = body_after(
+            &code,
+            concat!("let move_focus: Rc<dyn Fn(&Module", "Id, Direction) -> bool>"),
+        );
+        assert!(
+            move_focus.contains(concat!("land_by_", "key(&to)")),
+            "a Ctrl+h/j/k/l move must land through land_by_key"
         );
     }
 
@@ -6112,7 +6143,7 @@ mod tests {
     /// A termination signal closes the window through its own close, which ends nvim by its pid, and the close
     /// asks nothing after one: the handlers are installed in `build_ui` before the close handler, and that
     /// handler reads the signal's flag before it lets `editor_quitting` ask or wait. The signal's own handler
-    /// marks the close for the watchdog and writes nothing that can panic.
+    /// marks the close for the watchdog and writes nothing that can panic or block.
     #[test]
     fn a_termination_signal_closes_the_window_without_its_questions() {
         // Split literals, so this test's own text is not counted.
@@ -6146,6 +6177,15 @@ mod tests {
         assert!(
             !body.contains(concat!("println", "!(")),
             "the handler's own lines may not panic"
+        );
+        assert!(
+            !body.contains(concat!("writeln", "!(")),
+            "the handler's own lines may not block on a full pipe"
+        );
+        assert_eq!(
+            body.matches(concat!("end_signals::", "write_if_writable(")).count(),
+            2,
+            "both lines go through the write that never blocks"
         );
         assert!(body.contains(concat!("end_signals::", "mark_closing()")));
         let close = &ui[close_request..];

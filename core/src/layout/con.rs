@@ -44,6 +44,17 @@ impl ConLayout {
 }
 /// At the minimum share, a split can hold at most twenty children.
 pub const MAX_CHILDREN: usize = 20;
+/// How far below `MIN_RATIO` a share may sit and still count as the minimum: trading shares in `f32`
+/// leaves a share at the minimum a rounding error short of it. The Lua grammar accepts the same range,
+/// so a layout the model holds always reads back from its exported text.
+pub(crate) const SHARE_SLACK: f32 = 1e-6;
+/// The share the Lua grammar gives each of `unset` children whose share a container's text leaves
+/// out, from the shares it does write, in order. Computed in `f64` so a remainder at the minimum is
+/// not pushed below it by `f32` rounding; the export uses the same sum to tell whether leaving a
+/// share out reads back the same `f32`.
+pub(crate) fn unwritten_share(written: impl Iterator<Item = f32>, unset: usize) -> f64 {
+    (1.0 - written.map(f64::from).sum::<f64>()) / unset as f64
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pin {
     pub px: Option<i32>,
@@ -273,7 +284,7 @@ impl Con {
         }
         if n >= 2 {
             for ch in &self.children {
-                if !(MIN_RATIO - 1e-6..=1.0).contains(&ch.share) {
+                if !(MIN_RATIO - SHARE_SLACK..=1.0).contains(&ch.share) {
                     return Err(ConFault::Share(ch.share));
                 }
             }

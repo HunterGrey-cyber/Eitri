@@ -3,6 +3,8 @@
 //! what the page declared with what the user overrode in `init.lua`. The page applies the merged table
 //! itself; the host only checks it, keeps it for the `?` sheet, and hands it back.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::keymap::root;
 use crate::keymap::Chord;
 
@@ -383,6 +385,10 @@ pub fn validate(rows: Vec<KeyRowArg>, prefix_key: &Chord) -> Result<Vec<KeyRow>,
         return Err(format!("{} rows; a page may declare at most {MAX_ROWS}", rows.len()));
     }
     let mut out: Vec<KeyRow> = Vec::with_capacity(rows.len());
+    let mut actions: HashSet<String> = HashSet::with_capacity(rows.len());
+    // Every key of the rows checked so far, as its strokes, to the action holding it: a declaration may hold
+    // thousands of keys, and each is parsed once and looked up once.
+    let mut held: HashMap<Vec<Chord>, String> = HashMap::new();
     for row in rows {
         if !action_ok(&row.action) {
             return Err(format!(
@@ -390,7 +396,7 @@ pub fn validate(rows: Vec<KeyRowArg>, prefix_key: &Chord) -> Result<Vec<KeyRow>,
                 row.action
             ));
         }
-        if out.iter().any(|r| r.action == row.action) {
+        if actions.contains(&row.action) {
             return Err(format!("{:?} is declared twice", row.action));
         }
         if row.keys.is_empty() || row.keys.len() > MAX_KEYS_PER_ROW {
@@ -400,18 +406,26 @@ pub fn validate(rows: Vec<KeyRowArg>, prefix_key: &Chord) -> Result<Vec<KeyRow>,
                 row.keys.len()
             ));
         }
+        let mut strokes_of_row = Vec::with_capacity(row.keys.len());
         for key in &row.keys {
-            check_key(key, prefix_key).map_err(|why| format!("{:?}: {why}", row.action))?;
+            // A key that does not parse is refused here, so two spellings of one key always meet as strokes.
+            let strokes = check_key(key, prefix_key).map_err(|why| format!("{:?}: {why}", row.action))?;
             // The page's kit would run only one of the two, and the `?` sheets would still list both.
-            if let Some(other) = out.iter().find(|r| r.keys.iter().any(|k| same_key(k, key))) {
+            if let Some(other) = held.get(&strokes) {
                 return Err(format!(
-                    "{key:?} is held by both {:?} and {:?}; a key names one action",
-                    other.action, row.action
+                    "{key:?} is held by both {other:?} and {:?}; a key names one action",
+                    row.action
                 ));
             }
+            strokes_of_row.push(strokes);
         }
         check_text("context", &row.action, &row.context, MAX_CONTEXT_CHARS)?;
         check_text("desc", &row.action, &row.desc, MAX_DESC_CHARS)?;
+        // A row's keys are compared only with earlier rows', so one key written twice in a row is not refused.
+        for strokes in strokes_of_row {
+            held.insert(strokes, row.action.clone());
+        }
+        actions.insert(row.action.clone());
         out.push(KeyRow {
             action: row.action,
             keys: row.keys,
@@ -869,6 +883,69 @@ mod tests {
             &stock_prefix()
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_key_spelled_two_ways_in_two_rows_is_still_refused() {
+        let prefix = stock_prefix();
+        for (first, second) in [("g<Enter>", "g<CR>"), ("<lt>x", "<LT>x"), ("<Esc>G", "<esc><S-g>")] {
+            assert!(
+                validate(vec![arg("scroll.top", &[second])], &prefix).is_ok(),
+                "{second}"
+            );
+            let err = validate(
+                vec![
+                    arg("hint.start", &[first]),
+                    arg("item.next", &["n"]),
+                    arg("scroll.top", &["j", second]),
+                ],
+                &prefix,
+            )
+            .expect_err(second);
+            assert!(err.contains(&format!("{second:?} is held by both")), "{err}");
+            assert!(
+                err.contains("\"hint.start\"") && err.contains("\"scroll.top\""),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_grows_linearly_with_the_declaration() {
+        let prefix = stock_prefix();
+        // Key `i` is `i` written in base ten with the letters `a` to `j`, one letter per stroke, so every key
+        // is distinct and as long as a key may be.
+        let key = |i: usize| -> String {
+            (0..MAX_STROKES as u32)
+                .map(|d| (b'a' + (i / 10usize.pow(d) % 10) as u8) as char)
+                .collect()
+        };
+        let declaration = |n: usize| -> Vec<KeyRowArg> {
+            (0..n)
+                .map(|r| KeyRowArg {
+                    action: format!("a{r}"),
+                    keys: (0..MAX_KEYS_PER_ROW).map(|k| key(r * MAX_KEYS_PER_ROW + k)).collect(),
+                    context: "items".into(),
+                    desc: "does a thing".into(),
+                })
+                .collect()
+        };
+        let best_of_three = |n: usize| {
+            let rows = declaration(n);
+            (0..3)
+                .map(|_| {
+                    let rows = rows.clone();
+                    let start = std::time::Instant::now();
+                    assert_eq!(validate(rows, &prefix).expect("a valid declaration").len(), n);
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let (small, large) = (best_of_three(20), best_of_three(200));
+        // Ten times the rows: about ten times the time when each key is checked once, about a hundred when
+        // each key is compared with every earlier row's keys.
+        assert!(large < small * 30, "20 rows took {small:?}, 200 rows took {large:?}");
     }
 
     #[test]

@@ -31,8 +31,8 @@ fn pool_view() -> ViewId {
 const POST_READY: &str =
     "window.webkit.messageHandlers.eitriAgent.postMessage(JSON.stringify({type:'ready',request_id:'probe'})); 'posted'";
 
-/// An idle page's document: the empty chat, which the panel's document shows until it is sent a tab.
-const SHOWS_EMPTY_CHAT: &str = "String(document.querySelector('.empty-tab .connecting') !== null)";
+/// Whether a page holds the blank document an idle chat page is given in place of the panel.
+const SHOWS_IDLE_DOCUMENT: &str = "String(document.documentElement.dataset.eitriIdle === '1')";
 
 /// A position that goes 0 to `range` and back, `period` steps each way.
 fn tri(step: u64, period: u64, range: i32) -> i32 {
@@ -837,12 +837,12 @@ impl Probe {
         say(format!("mark idle-{four_id} expect=0"));
         (self.ctx.kill_chat_view)(&four_id);
         self.sleep(1500).await;
-        let empty = self
-            .js(&view, SHOWS_EMPTY_CHAT)
+        let idle_document = self
+            .js(&view, SHOWS_IDLE_DOCUMENT)
             .await
             .unwrap_or_else(|| "unknown".to_owned());
         say(format!(
-            "p6 idle module={four_id} live={} holds_tab={} empty_chat={empty} ptr={:#x}",
+            "p6 idle module={four_id} live={} holds_tab={} idle_document={idle_document} ptr={:#x}",
             self.pooled(&four_id).is_some(),
             self.ctx.panel.views().contains(&four),
             super::page_pointer(&view)

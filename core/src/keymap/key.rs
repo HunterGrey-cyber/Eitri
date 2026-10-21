@@ -254,7 +254,7 @@ fn row(key: KeyName) -> &'static (&'static str, KeyName, &'static str, &'static 
 
 /// A chord as GTK or the keymap names it, normalised for comparison: a key that is one character is
 /// that character (lowercase for an ASCII letter), anything else keeps its GTK keysym name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chord {
     pub ctrl: bool,
     pub alt: bool,

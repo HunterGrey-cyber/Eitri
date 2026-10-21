@@ -99,9 +99,9 @@ fn attach(c: &mut Case, path: &Path) {
     );
 }
 
-fn apply(c: &mut Case, diagnostics: bool, hints: bool) -> Value {
+fn apply(c: &mut Case, owner: &str, diagnostics: bool, hints: bool) -> Value {
     let opts = opts_map(&[
-        ("owner", "demo".into()),
+        ("owner", owner.into()),
         ("root", s(&c.root.clone())),
         ("diagnostics", diagnostics.into()),
         ("inlay_hints", hints.into()),
@@ -109,10 +109,10 @@ fn apply(c: &mut Case, diagnostics: bool, hints: bool) -> Value {
     c.nvim.lua(PLUGIN_ASSIST_LUA, vec!["apply".into(), opts])
 }
 
-fn clear(c: &mut Case) -> (u64, u64) {
+fn clear(c: &mut Case, owner: &str) -> (u64, u64) {
     let v = c.nvim.lua(
         PLUGIN_ASSIST_LUA,
-        vec!["clear".into(), opts_map(&[("owner", "demo".into())])],
+        vec!["clear".into(), opts_map(&[("owner", owner.into())])],
     );
     let get = |k: &str| {
         v.as_map()
@@ -146,12 +146,12 @@ fn assist_applies_then_clears_exactly_and_leaves_buffers_outside_alone() {
     attach(&mut c, &a);
     let before_a = state(&mut c, &a);
     let before_out = state(&mut c, &outside);
-    let applied = apply(&mut c, false, false);
+    let applied = apply(&mut c, "demo", false, false);
     assert_eq!(field(&applied, "buffers").as_u64(), Some(1));
     assert_eq!(field(&applied, "partial").as_bool(), Some(false));
     assert_eq!(state(&mut c, &a), (false, false));
     assert_eq!(state(&mut c, &outside), before_out, "outside the root is untouched");
-    assert_eq!(clear(&mut c), (2, 0));
+    assert_eq!(clear(&mut c, "demo"), (2, 0));
     assert_eq!(state(&mut c, &a), before_a);
     assert_eq!(state(&mut c, &outside), before_out);
     let gone = c.nvim.lua(
@@ -169,10 +169,10 @@ fn raising_a_setting_keeps_the_first_baseline() {
     edit(&mut c, &a);
     attach(&mut c, &a);
     set(&mut c, &a, true, true);
-    apply(&mut c, false, false);
-    apply(&mut c, true, false);
+    apply(&mut c, "demo", false, false);
+    apply(&mut c, "demo", true, false);
     assert_eq!(state(&mut c, &a), (true, false));
-    clear(&mut c);
+    clear(&mut c, "demo");
     assert_eq!(
         state(&mut c, &a),
         (true, true),
@@ -188,10 +188,10 @@ fn a_value_the_user_changed_is_left_alone() {
     edit(&mut c, &a);
     attach(&mut c, &a);
     set(&mut c, &a, true, false);
-    apply(&mut c, false, false);
+    apply(&mut c, "demo", false, false);
     set(&mut c, &a, true, false);
     assert_eq!(
-        clear(&mut c),
+        clear(&mut c, "demo"),
         (1, 1),
         "hints restored, diagnostics left as the user set them"
     );
@@ -213,7 +213,7 @@ fn reassert_holds_after_an_lsp_attach_that_turns_hints_on() {
         vec![],
     );
     edit(&mut c, &a);
-    apply(&mut c, true, false);
+    apply(&mut c, "demo", true, false);
     attach(&mut c, &a);
     c.nvim.flush_scheduled();
     // Past the first retry, then past the late enable and the retry after it.
@@ -225,7 +225,7 @@ fn reassert_holds_after_an_lsp_attach_that_turns_hints_on() {
     edit(&mut c, &b);
     c.nvim.flush_scheduled();
     assert!(!state(&mut c, &b).1);
-    clear(&mut c);
+    clear(&mut c, "demo");
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn a_hint_baseline_read_before_a_server_attaches_settles_after_it() {
     );
     edit(&mut c, &a);
     // Applied before any server is attached: the hint baseline read now is not the one to restore.
-    apply(&mut c, true, false);
+    apply(&mut c, "demo", true, false);
     attach(&mut c, &a);
     c.nvim.lua("vim.wait(600)", vec![]);
     assert_eq!(
@@ -249,7 +249,7 @@ fn a_hint_baseline_read_before_a_server_attaches_settles_after_it() {
         (true, false),
         "the owner's value holds after the attach"
     );
-    clear(&mut c);
+    clear(&mut c, "demo");
     assert_eq!(
         state(&mut c, &a),
         (true, true),
@@ -264,7 +264,7 @@ fn an_owner_value_applied_before_an_attach_is_not_taken_as_the_baseline() {
     let a = c.a.clone();
     // No configuration enables hints, and they start off.
     edit(&mut c, &a);
-    apply(&mut c, true, true);
+    apply(&mut c, "demo", true, true);
     attach(&mut c, &a);
     c.nvim.lua("vim.wait(600)", vec![]);
     assert_eq!(
@@ -272,7 +272,7 @@ fn an_owner_value_applied_before_an_attach_is_not_taken_as_the_baseline() {
         (true, true),
         "the owner's value holds after the attach"
     );
-    clear(&mut c);
+    clear(&mut c, "demo");
     assert_eq!(
         state(&mut c, &a),
         (true, false),
@@ -291,7 +291,7 @@ fn a_buffer_event_before_the_first_retry_does_not_hide_the_configurations_hints(
         vec![],
     );
     edit(&mut c, &a);
-    apply(&mut c, true, false);
+    apply(&mut c, "demo", true, false);
     attach(&mut c, &a);
     // After the configuration's scheduled enable and before the first retry at 100 ms.
     c.nvim.lua("vim.wait(30)", vec![]);
@@ -302,7 +302,7 @@ fn a_buffer_event_before_the_first_retry_does_not_hide_the_configurations_hints(
     c.nvim.flush_scheduled();
     c.nvim.lua("vim.wait(600)", vec![]);
     assert_eq!(state(&mut c, &a), (true, false), "the owner's value holds");
-    clear(&mut c);
+    clear(&mut c, "demo");
     assert_eq!(
         state(&mut c, &a),
         (true, true),
@@ -312,19 +312,52 @@ fn a_buffer_event_before_the_first_retry_does_not_hide_the_configurations_hints(
 
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn two_owners_restore_the_buffers_own_baseline_whichever_clears_last() {
+    for (first, last) in [("one", "two"), ("two", "one")] {
+        let mut c = case(&format!("owners-{first}"));
+        let a = c.a.clone();
+        edit(&mut c, &a);
+        attach(&mut c, &a);
+        set(&mut c, &a, true, true);
+        apply(&mut c, "one", false, false);
+        apply(&mut c, "two", false, false);
+        assert_eq!(state(&mut c, &a), (false, false));
+        assert_eq!(
+            clear(&mut c, first),
+            (0, 0),
+            "another owner still holds the buffer: nothing is restored"
+        );
+        assert_eq!(state(&mut c, &a), (false, false), "the remaining owner's values hold");
+        c.nvim.lua(
+            "vim.api.nvim_exec_autocmds('BufEnter', { buffer = vim.fn.bufnr(...), modeline = false })",
+            vec![s(&a)],
+        );
+        c.nvim.flush_scheduled();
+        assert_eq!(state(&mut c, &a), (false, false));
+        assert_eq!(clear(&mut c, last), (2, 0), "clearing {first} then {last}");
+        assert_eq!(
+            state(&mut c, &a),
+            (true, true),
+            "the buffer's values from before any owner, clearing {first} then {last}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_missing_api_reports_partial() {
     let mut c = case("partial");
     let a = c.a.clone();
     edit(&mut c, &a);
     c.nvim.lua("vim.lsp.inlay_hint = {}", vec![]);
-    let applied = apply(&mut c, false, false);
+    let applied = apply(&mut c, "demo", false, false);
     assert_eq!(field(&applied, "partial").as_bool(), Some(true));
     let diag = c.nvim.lua(
         "return vim.diagnostic.is_enabled({ bufnr = vim.fn.bufnr(...) })",
         vec![s(&a)],
     );
     assert_eq!(diag, Value::from(false), "what exists is still applied");
-    clear(&mut c);
+    clear(&mut c, "demo");
 }
 
 #[test]

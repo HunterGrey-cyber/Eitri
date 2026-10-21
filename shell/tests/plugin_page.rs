@@ -1,6 +1,8 @@
 //! A plugin page in the real WebKitGTK, on its own Xvfb (never the desktop): the scheme serves the site and
-//! refuses a path out of it, the CSP blocks inline script, the navigation lock holds, a link click is handed
-//! out, and the bridge round-trips through a real `PluginHost` whose manifest declares only `state`, so an
+//! refuses a path out of it, the CSP blocks inline script, the navigation lock holds, a script's `click()` on
+//! an outside link opens nothing while a real click on it (`xdotool`, aimed at this test's own server) is
+//! handed out, an in-origin load that never commits leaves the running document its hello, and the
+//! bridge round-trips through a real `PluginHost` whose manifest declares only `state`, so an
 //! undeclared verb is refused. A second run, with its own site and host, follows the window's theme: the
 //! first frame and a reload paint from the host's user style sheet, a sheet swapped on a loaded document is
 //! recorded as restyled live or not, the `theme` event delivers the new set, and a document restored by going
@@ -37,7 +39,8 @@ mod plugin_page;
 
 const INDEX: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>t</title>
 <script>window.webkit.messageHandlers.eitriPlugin.postMessage(JSON.stringify({v:1,id:900,verb:"log.append",args:{stream:"probe",items:[{inline:true}]}}));</script>
-<script src="/app.js"></script></head><body><a id="ext" href="https://example.invalid/x">x</a></body></html>
+<script src="/app.js"></script></head><body><a id="ext" href="https://example.invalid/x"
+style="position:fixed;left:0;top:0;width:120px;height:40px;display:block">x</a></body></html>
 "#;
 
 const APP: &str = r#"(async () => {
@@ -58,6 +61,12 @@ const APP: &str = r#"(async () => {
   document.body.append(save);
   save.click();
   await report({ saved: true });
+  location.href = "/font.woff";
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const row = { action: "item.next", keys: ["]q"], context: "c", desc: "d" };
+  try { await window.eitriPlugin.call("keys.declare", { rows: [row] }); await report({ declared: "ok" }); }
+  catch (e) { await report({ declared: e.code }); }
+  document.getElementById("ext").focus();
   location.href = "https://example.invalid/away";
   setTimeout(() => { report({ done: location.href }); }, 500);
 })();
@@ -87,13 +96,41 @@ fn state_only_plugin(root: &Path) -> (PathBuf, BTreeMap<String, String>) {
     (dir, settings)
 }
 
-fn run() -> Result<Vec<String>, String> {
+/// The title the first run's window carries, for `xdotool` to find it by.
+fn window_title() -> String {
+    format!("eitri-plugin-page-test-{}", std::process::id())
+}
+
+/// Runs `xdotool` on the window titled `title` on `display` (`%1` in `then` names it). The display is passed
+/// explicitly, never inherited, so the input can reach no other server.
+fn xdotool(display: &str, title: &str, then: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new("timeout")
+        .args(["10", "xdotool", "search", "--sync", "--onlyvisible", "--name"])
+        .arg(format!("^{title}$"))
+        .args(then)
+        .env("DISPLAY", display)
+        .output()
+        .map_err(|e| format!("running timeout/xdotool: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        // `timeout` answers 127 when it cannot run the command at all.
+        Some(127) => Err("xdotool is not installed: the real-click check needs it".into()),
+        _ => Err(format!(
+            "xdotool failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+fn run(display: &str) -> Result<Vec<String>, String> {
     let root = scratch_root("")?;
     let (dir, settings) = state_only_plugin(&root);
     let site = dir.join("build/site");
     std::fs::write(site.join("index.html"), INDEX).unwrap();
     std::fs::write(site.join("app.js"), APP).unwrap();
     std::fs::write(site.join("data.json"), "{\"ok\":true}").unwrap();
+    std::fs::write(site.join("font.woff"), "wOFF").unwrap();
     std::fs::write(root.join("secret.txt"), "secret").unwrap();
     std::os::unix::fs::symlink(root.join("secret.txt"), site.join("link.txt")).unwrap();
 
@@ -111,8 +148,15 @@ fn run() -> Result<Vec<String>, String> {
                 }
             })
         },
-        on_loading: Rc::new(|| {}),
-        on_committed: Rc::new(|| {}),
+        on_committed: {
+            let cell = host_cell.clone();
+            Rc::new(move || {
+                let host = cell.borrow().clone();
+                if let Some(host) = host {
+                    host.page_committed();
+                }
+            })
+        },
         open_outside: {
             let opened = opened.clone();
             Rc::new(move |url: &str| opened.borrow_mut().push(url.to_owned()))
@@ -128,6 +172,7 @@ fn run() -> Result<Vec<String>, String> {
         downloads: downloads.clone(),
     };
     let window = gtk4::Window::new();
+    window.set_title(Some(&window_title()));
     window.set_default_size(800, 600);
     let webview = plugin_page::build(&spec, hooks, &PageTheme::fallback());
     window.set_child(Some(&webview));
@@ -188,9 +233,68 @@ fn run() -> Result<Vec<String>, String> {
     );
     all &= check(get("inline").is_null(), "the inline script never ran".into());
     all &= check(
-        *opened.borrow() == ["https://example.invalid/x"],
-        format!("the link click went outside: {:?}", opened.borrow()),
+        opened.borrow().is_empty(),
+        format!(
+            "a script's click() on an outside link opened nothing: {:?}",
+            opened.borrow()
+        ),
     );
+    all &= check(
+        get("declared") == "ok",
+        format!(
+            "after an in-origin load that never committed, the running document still declares its keys: {}",
+            get("declared")
+        ),
+    );
+    // WebKit's default answer to a main-frame response it cannot show is to ignore it, not to save it; the
+    // load is abandoned either way, which is what the declaration above depends on.
+    let font_saved = downloads.join("font.woff").exists();
+    // A real click inside the link, in this window's own surface coordinates.
+    let inside = gtk4::graphene::Point::new(60.0, 20.0);
+    let at = webview
+        .compute_point(&window, &inside)
+        .ok_or("the view has no position in its window")?;
+    let (dx, dy) = window.surface_transform();
+    let (x, y) = (
+        (f64::from(at.x()) + dx).round() as i32,
+        (f64::from(at.y()) + dy).round() as i32,
+    );
+    let (x_, y_) = (x.to_string(), y.to_string());
+    let clicked = xdotool(
+        display,
+        &window_title(),
+        &["mousemove", "--window", "%1", &x_, &y_, "click", "1"],
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while clicked.is_ok() && opened.borrow().is_empty() && Instant::now() < deadline {
+        while context.iteration(false) {}
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    all &= check(
+        clicked.is_ok() && *opened.borrow() == ["https://example.invalid/x"],
+        format!(
+            "a real click on the link at ({x}, {y}) went outside: {:?} {}",
+            opened.borrow(),
+            clicked.err().unwrap_or_default()
+        ),
+    );
+    // Enter on the link the page focused: WebKit turns it into a trusted click, so it is expected to go out too;
+    // recorded rather than required, since whether the key reaches the view depends on this server's focus.
+    let before = opened.borrow().len();
+    let pressed = xdotool(
+        display,
+        &window_title(),
+        &["windowfocus", "--sync", "%1", "key", "Return"],
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        while context.iteration(false) {}
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let enter = match pressed {
+        Ok(()) => format!("{}", opened.borrow().len() > before),
+        Err(e) => format!("not tried: {e}"),
+    };
     let entry = "eitri-plugin://demo/index.html";
     all &= check(
         get("done") == entry,
@@ -205,6 +309,8 @@ fn run() -> Result<Vec<String>, String> {
         saved == "saved\n",
         format!("the page's own blob was saved under a safe name: {saved:?}"),
     );
+    report.push(format!("info the in-origin font was saved as a download: {font_saved}"));
+    report.push(format!("info Enter on the focused link went outside: {enter}"));
     let _ = std::fs::remove_dir_all(&root);
     if all {
         Ok(report)
@@ -421,7 +527,6 @@ fn run_theme() -> Result<(Vec<String>, bool), String> {
                 }
             })
         },
-        on_loading: with_host(PluginHost::page_loading),
         on_committed: with_host(PluginHost::page_committed),
         open_outside: Rc::new(|_: &str| {}),
     };
@@ -582,7 +687,7 @@ fn main() {
         return;
     }
     let server = own_x_server::init_gtk("plugin_page", "1280x800x24");
-    let outcome = run().and_then(|mut report| {
+    let outcome = run(server.display()).and_then(|mut report| {
         let (theme, live) = run_theme()?;
         report.extend(theme);
         report.push(format!("P2 live restyle: {}", if live { "live" } else { "not live" }));

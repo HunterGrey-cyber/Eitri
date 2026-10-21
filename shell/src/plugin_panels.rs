@@ -161,14 +161,6 @@ impl PluginPanels {
                                 }
                             })
                         },
-                        on_loading: {
-                            let cell = cell.clone();
-                            Rc::new(move || {
-                                if let Some(pump) = cell.get() {
-                                    pump.host.page_loading();
-                                }
-                            })
-                        },
                         on_committed: {
                             let cell = cell.clone();
                             Rc::new(move || {

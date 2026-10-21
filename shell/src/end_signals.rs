@@ -15,11 +15,14 @@
 //! context of its own listens too, so a signal still ends the process when the GTK thread cannot answer (blocked
 //! in a call that does not return, for one): [`decide`] ends it with `_exit(128 + signal)` when the window has not
 //! answered the first signal within [`ANSWER_WITHIN`], or when a second signal arrives while the first is still
-//! unanswered or a close is already under way -- the second `Ctrl+C` forces, as in most programs. That hard path
-//! runs no teardown: nvim is not ended by its pid, the agent's children are not shut down, and an nvim that was
-//! in the state above stays behind, as it does after `SIGKILL` or a crash. One signal answered in time takes the
-//! close and nothing else: the watchdog reads its clock before the window's flags, and reads the flags again just
-//! before it acts on the bound, so an answer that came in time is never overtaken by a stale read.
+//! unanswered or a close is already under way -- the second `Ctrl+C` forces, as in most programs -- or when a
+//! close the window started for one answered signal is still running [`CLOSE_WITHIN`] after it (a GTK thread that
+//! blocked in the close, writing to a pipe whose reader stopped, for one). That hard path runs no teardown: nvim
+//! is not ended by its pid, the agent's children are not shut down, and an nvim that was in the state above stays
+//! behind, as it does after `SIGKILL` or a crash. One signal answered in time takes the close and nothing else
+//! while the close runs within its own bounds: the watchdog reads its clock before the window's flags, and reads
+//! the flags again just before it acts on the bound, so an answer that came in time is never overtaken by a stale
+//! read.
 //!
 //! **Order.** GLib hands a signal only to the sources that exist when it arrives, so [`install`] starts the
 //! watchdog and waits until its sources are attached before it adds the window's. A signal in between reaches the
@@ -35,7 +38,11 @@
 //! every write with `EIO`, and `println!` panics on that -- on the GTK thread inside a GLib callback, which aborts
 //! the process before the close has ended nvim. So each of descriptors 0, 1 and 2 that is a hung-up terminal is
 //! pointed at `/dev/null` first ([`detach_hung_up_terminals`]), by whichever listener sees the signal first; a
-//! terminal still there, a log file or a pipe is left alone.
+//! terminal still there, a log file or a pipe is left alone. A process started with `setsid` or disowned by its
+//! shell gets no `SIGHUP` at all, and even a forwarded one comes a little after the hangup, so the watchdog also
+//! watches each of those descriptors that is a terminal for the hangup itself ([`watch_hangups`]) and detaches it
+//! when its wake runs; one that has already hung up when the watch starts is detached then. What is left is a write on the GTK thread in the same instant as the hangup, before the
+//! watchdog has run; a relay pipe for stdout and stderr would close that too, and is not done.
 //!
 //! glib 0.22.9 (which gtk4 0.11.4 pulls in) has no `unix_signal_add_local` and no unix signal source, so this calls
 //! `g_unix_signal_add_full` and `g_unix_signal_source_new` itself, as `neovide_editor`'s `fd_watch` calls
@@ -58,6 +65,20 @@ pub(crate) const SIGNALS: [(i32, &str); 3] = [
 /// How long the window has to answer the first signal before the watchdog ends the process. A dispatch on a
 /// responsive GTK thread takes milliseconds; this is far above that and still short for someone waiting.
 pub(crate) const ANSWER_WITHIN: Duration = Duration::from_secs(5);
+
+/// How long, from the first signal, a close the window has started may run before the watchdog ends the process.
+/// It is longer than every bound that close may wait out, added as if they ran one after another, plus 5 s:
+/// - the agent panel's `SESSION_CLOSE_BACKSTOP` (18 s), the session teardown whose drop is what kills a sidecar
+///   that does not go;
+/// - its `SAVED_TABS_BACKSTOP` (5 s; `CONNECT_CLOSE_BACKSTOP` and `HANDOFF_CLOSE_BACKSTOP`, 3 s each, are shorter);
+/// - nvim's `NVIM_QUIT_PATIENCE` (5 s), after which `NeovideEditorPane::shutdown` kills it;
+/// - a plugin task group's stop, `eitri_core::plugin::tasks::GRACE` (2 s);
+/// - the plugin pages' hold in `plugin_panels::shutdown` (that grace and 1 s more, 3 s).
+///
+/// That is 33 s; 38 s with the margin, rounded up. A shorter bound would end a healthy close before the session
+/// teardown escalates, and leave the very `claude` and sidecar processes that teardown exists to end. Raising any
+/// of those bounds means raising this one.
+pub(crate) const CLOSE_WITHIN: Duration = Duration::from_secs(40);
 
 /// The window's listener has run for a signal.
 static ANSWERED: AtomicBool = AtomicBool::new(false);
@@ -122,6 +143,12 @@ pub(crate) fn decide(w: Watch) -> Verdict {
             why: "the window did not answer the termination signal within 5 s",
         };
     }
+    if w.answered && w.closing && w.elapsed >= CLOSE_WITHIN {
+        return Verdict::Exit {
+            signal: w.first,
+            why: "the window's close did not end the process in time",
+        };
+    }
     Verdict::Wait
 }
 
@@ -159,6 +186,42 @@ unsafe extern "C" {
         notify: ffi::GDestroyNotify,
     ) -> std::ffi::c_uint;
     fn g_unix_signal_source_new(signum: std::ffi::c_int) -> *mut ffi::GSource;
+    fn g_unix_fd_source_new(fd: std::ffi::c_int, condition: ffi::GIOCondition) -> *mut ffi::GSource;
+}
+
+/// A watched terminal hung up: point it at `/dev/null` and stop watching it (once detached it is no terminal
+/// any more, and a hung-up descriptor would wake the poll again at once). Runs on the watchdog thread.
+unsafe extern "C" fn hung_up(
+    fd: std::ffi::c_int,
+    _condition: ffi::GIOCondition,
+    _data: ffi::gpointer,
+) -> ffi::gboolean {
+    detach_hung_up_terminals(&[fd]);
+    ffi::GFALSE
+}
+
+/// Watches each of `fds` that is a terminal now for its hangup, on `context`, and detaches it when it hangs up
+/// ([`detach_hung_up_terminals`]), whether or not a `SIGHUP` ever reaches this process: one started with
+/// `setsid` or disowned by its shell gets none when its terminal closes. One that has already hung up when this
+/// runs is detached here: `isatty` fails on it, so it would get no source, and no hangup event is left to come.
+pub(crate) fn watch_hangups(context: &glib::MainContext, fds: &[RawFd]) {
+    type FdFunc = unsafe extern "C" fn(std::ffi::c_int, ffi::GIOCondition, ffi::gpointer) -> ffi::gboolean;
+    for &fd in fds {
+        // SAFETY: `isatty` reads a descriptor number. The source is new, its callback has the signature a unix fd
+        // source calls (GLib's own API takes it cast to `GSourceFunc`), it carries no data, and the context it is
+        // attached to keeps it, so our reference is dropped at once.
+        unsafe {
+            if libc::isatty(fd) != 1 {
+                detach_hung_up_terminals(&[fd]);
+                continue;
+            }
+            let source = g_unix_fd_source_new(fd, ffi::G_IO_HUP | ffi::G_IO_ERR);
+            let callback = std::mem::transmute::<FdFunc, unsafe extern "C" fn(ffi::gpointer) -> ffi::gboolean>(hung_up);
+            ffi::g_source_set_callback(source, Some(callback), std::ptr::null_mut(), None);
+            ffi::g_source_attach(source, context.as_ptr());
+            ffi::g_source_unref(source);
+        }
+    }
 }
 
 unsafe extern "C" fn trampoline(data: ffi::gpointer) -> ffi::gboolean {
@@ -258,6 +321,7 @@ fn start_watchdog() -> std::io::Result<()> {
                 ffi::g_source_unref(source);
             }
         }
+        watch_hangups(&context, &[0, 1, 2]);
         let _ = attached.send(());
         loop {
             let seen = SEEN.load(Ordering::SeqCst);
@@ -343,26 +407,57 @@ mod tests {
         }
     }
 
+    fn ms(d: Duration) -> u64 {
+        d.as_millis() as u64
+    }
+
     #[test]
     fn one_signal_answered_in_time_is_left_to_the_close() {
         assert_eq!(decide(watch(0, false, false, 60_000)), Verdict::Wait);
         assert_eq!(decide(watch(1, false, false, 4_999)), Verdict::Wait);
-        // Answered: the close takes as long as it takes (nvim's own end allows 5 s, the agent's teardown more).
-        assert_eq!(decide(watch(1, true, true, 60_000)), Verdict::Wait);
+        // Answered: the close runs within its own bounds (nvim's end allows 5 s, the agent's teardown more).
+        assert_eq!(decide(watch(1, true, true, 30_000)), Verdict::Wait);
         assert_eq!(decide(watch(1, true, false, 60_000)), Verdict::Wait);
     }
 
     #[test]
-    fn a_signal_answered_is_never_ended_by_the_bound_whatever_the_clock_reads() {
+    fn a_signal_answered_is_not_ended_by_the_answer_bound_whatever_the_clock_reads() {
         for elapsed_ms in [0, 4_999, 5_000, 5_001, 60_000, u64::MAX / 2] {
-            for closing in [false, true] {
-                assert_eq!(
-                    decide(watch(1, true, closing, elapsed_ms)),
-                    Verdict::Wait,
-                    "{elapsed_ms} ms"
-                );
-            }
+            assert_eq!(
+                decide(watch(1, true, false, elapsed_ms)),
+                Verdict::Wait,
+                "{elapsed_ms} ms"
+            );
         }
+        for elapsed_ms in [0, 4_999, 5_000, 5_001, ms(CLOSE_WITHIN) - 1] {
+            assert_eq!(
+                decide(watch(1, true, true, elapsed_ms)),
+                Verdict::Wait,
+                "{elapsed_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_that_outlasts_its_bounds_ends_the_process() {
+        assert_eq!(decide(watch(1, true, true, ms(CLOSE_WITHIN) - 1)), Verdict::Wait);
+        for elapsed_ms in [ms(CLOSE_WITHIN), ms(CLOSE_WITHIN) + 1, u64::MAX / 2] {
+            let Verdict::Exit { signal, .. } = decide(watch(1, true, true, elapsed_ms)) else {
+                panic!("a close still running after {elapsed_ms} ms was not ended");
+            };
+            assert_eq!(signal, libc::SIGTERM, "the first signal's own number");
+        }
+    }
+
+    #[test]
+    fn the_close_bound_covers_every_bound_the_close_waits_out() {
+        let session = Duration::from_secs(18);
+        let saved_tabs = Duration::from_secs(5);
+        let nvim = Duration::from_secs(5);
+        let tasks = eitri_core::plugin::tasks::GRACE;
+        let pages = eitri_core::plugin::tasks::GRACE + Duration::from_secs(1);
+        let margin = Duration::from_secs(5);
+        assert!(CLOSE_WITHIN >= session + saved_tabs + nvim + tasks + pages + margin);
     }
 
     #[test]
@@ -451,6 +546,77 @@ mod tests {
             std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())).unwrap(),
             std::path::Path::new("/dev/null")
         );
+    }
+
+    /// The device a descriptor points at, `(st_dev, st_rdev, st_ino)`.
+    fn device_of(fd: RawFd) -> (u64, u64, u64) {
+        // SAFETY: `fstat` into a zeroed struct this function owns.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd, &mut st), 0, "fstat {fd}");
+            (st.st_dev as u64, st.st_rdev as u64, st.st_ino as u64)
+        }
+    }
+
+    #[test]
+    fn a_hung_up_terminal_is_detached_without_a_signal() {
+        use std::os::fd::FromRawFd;
+        let (master, slave) = openpty();
+        // SAFETY: a close-on-exec duplicate of a descriptor this test owns, owned by the `File` from here on.
+        let mut watched = unsafe {
+            let fd = libc::fcntl(slave.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+            assert!(fd >= 0, "dup the slave: {}", std::io::Error::last_os_error());
+            std::fs::File::from_raw_fd(fd)
+        };
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let null_device = device_of(null.as_raw_fd());
+        let context = glib::MainContext::new();
+        watch_hangups(&context, &[watched.as_raw_fd()]);
+        // Nothing happens while the terminal is there.
+        for _ in 0..5 {
+            context.iteration(false);
+        }
+        assert_ne!(
+            device_of(watched.as_raw_fd()),
+            null_device,
+            "a live terminal is left alone"
+        );
+        drop(master);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while device_of(watched.as_raw_fd()) != null_device && Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            device_of(watched.as_raw_fd()),
+            null_device,
+            "the hung-up terminal is pointed at /dev/null with no signal"
+        );
+        assert_eq!(watched.write(b"x").expect("a write after the hangup"), 1);
+        drop(slave);
+    }
+
+    #[test]
+    fn a_terminal_already_hung_up_when_the_watch_starts_is_detached() {
+        use std::os::fd::FromRawFd;
+        let (master, slave) = openpty();
+        // SAFETY: a close-on-exec duplicate of a descriptor this test owns, owned by the `File` from here on.
+        let mut watched = unsafe {
+            let fd = libc::fcntl(slave.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+            assert!(fd >= 0, "dup the slave: {}", std::io::Error::last_os_error());
+            std::fs::File::from_raw_fd(fd)
+        };
+        let null = std::fs::File::open("/dev/null").unwrap();
+        drop(master);
+        let context = glib::MainContext::new();
+        watch_hangups(&context, &[watched.as_raw_fd()]);
+        assert_eq!(
+            device_of(watched.as_raw_fd()),
+            device_of(null.as_raw_fd()),
+            "a terminal that hung up before the watch is pointed at /dev/null by the watch itself"
+        );
+        assert_eq!(watched.write(b"x").expect("a write after the detach"), 1);
+        drop(slave);
     }
 
     #[test]

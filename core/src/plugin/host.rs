@@ -415,9 +415,13 @@ impl PluginHost {
         self.state.borrow().theme.clone()
     }
 
-    /// A document was committed in the view (a load, a reload, a back/forward-cache restore): it gets the
-    /// current `theme` event. No other state changes.
+    /// A document was committed in the view (a load, a reload, a crash's recovery, a back/forward-cache
+    /// restore): it is a new document, which must say hello again, and nothing still out for the old one is
+    /// answered. It gets the current `theme` event at once. A load that only started is not a new document:
+    /// one that never commits (a download, an ignored response, a cancelled navigation) leaves the running
+    /// document its hello, its table and its events.
     pub fn page_committed(&self) {
+        self.new_document();
         self.send_theme();
     }
 
@@ -523,12 +527,6 @@ impl PluginHost {
             then,
         });
         None
-    }
-
-    /// A new document started loading (a reload, a crash's recovery, a navigation): it must say hello again,
-    /// and nothing still out for the old one is answered.
-    pub fn page_loading(&self) {
-        self.new_document();
     }
 
     fn new_document(&self) {
@@ -696,8 +694,8 @@ impl PluginHost {
     }
 
     fn keys_declare(&self, re: u64, rows: Vec<KeyRowArg>) -> Reply {
-        // A document that has not said hello may be the previous one, still running script after a new
-        // load started: its table would stand for a page that never declared one.
+        // Hello opens a document's session with the host; a table declared before it would belong to a
+        // document that has not said it is ready, and might never.
         let (hello, prefix_key) = {
             let st = self.state.borrow();
             (st.hello, st.prefix_key.clone())
@@ -1516,8 +1514,9 @@ mod tests {
         r.hello();
         assert_eq!(r.declare(json!([row("item.next", &["]q"])]))["ok"], true);
         assert!(r.host.declared_rows().is_some());
-        r.host.page_loading();
+        r.host.page_committed();
         assert!(r.host.declared_rows().is_none(), "a reloaded page declares again");
+        r.page.take();
         r.host.set_has_keys(true);
         assert!(r.page.take().is_empty(), "the new document has not said hello");
         let sent = r.hello();
@@ -1544,13 +1543,35 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_starts_a_new_document() {
+        let r = rig(vec![]);
+        r.hello();
+        assert_eq!(r.declare(json!([row("item.next", &["]q"])]))["ok"], true);
+        r.host.page_committed();
+        assert!(
+            r.host.declared_rows().is_none(),
+            "the committed document has declared nothing"
+        );
+        r.page.take();
+        let reply = r.declare(json!([row("item.next", &["]q"])]));
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(
+            reply["error"]["code"], "bad_request",
+            "the new document has not said hello"
+        );
+    }
+
+    #[test]
     fn the_old_document_declaring_while_the_new_one_loads_leaves_no_table() {
         let r = rig(vec![]);
         r.hello();
         assert_eq!(r.declare(json!([row("item.next", &["]q"])]))["ok"], true);
-        r.host.page_loading();
-        // The old document still runs script until the new one commits.
-        assert_eq!(r.declare(json!([row("old.row", &["x"])]))["ok"], false);
+        // While a load is only provisional the old document is still the one shown, and may change its table;
+        // a load that never commits (a download, a cancelled navigation) leaves it in place.
+        let reply = r.declare(json!([row("old.row", &["x"])]));
+        assert_eq!(reply["ok"], true, "{reply}");
+        r.host.page_committed();
+        r.page.take();
         r.hello();
         assert!(
             r.host.declared_rows().is_none(),
@@ -1746,7 +1767,8 @@ mod tests {
     fn after_a_new_load_a_change_still_sends_the_event_and_the_next_hello_has_the_newest() {
         let r = rig(vec![]);
         r.hello();
-        r.host.page_loading();
+        r.host.page_committed();
+        r.page.take();
         let theme = light_theme();
         r.host.set_theme(&theme);
         assert_eq!(r.page.take(), vec![port_entry(&theme), theme_event(&theme)]);
@@ -1766,7 +1788,6 @@ mod tests {
         r.page.take();
         r.host.page_committed();
         assert_eq!(r.page.take(), vec![theme_event(&theme)]);
-        r.host.page_loading();
         r.host.page_committed();
         r.host.set_has_keys(false);
         r.host.set_timeoutlen(300);

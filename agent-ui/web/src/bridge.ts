@@ -325,8 +325,10 @@ type InboundHandler = (
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
      *  a reset or a scratch-editor return -- never while the user is typing. `refused` names the send
      *  whose refusal this follows (a first message the trust question put off), which the page has put
-     *  back into the box itself. */
-    | { kind: "draft"; tab: TabId; text: string; refused?: string }
+     *  back into the box itself. `late` marks the last mirror of the page the tab was just moved out of,
+     *  which reached Rust after this page was given the older copy: it replaces the box only while the box
+     *  still holds that copy. */
+    | { kind: "draft"; tab: TabId; text: string; refused?: string; late?: boolean }
     /** Reply to `take_back_queue`: the queue's texts, for the panel to merge into
      *  the box itself. */
     | { kind: "queue_taken"; tab: TabId; texts: string[] }

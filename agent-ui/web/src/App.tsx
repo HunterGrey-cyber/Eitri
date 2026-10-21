@@ -936,6 +936,9 @@ export default function App() {
    *  holds the message and what was typed after it. Forgotten once the mirror it goes with is delivered. */
   const refusedEchoRef = useRef<{ tab: TabId; requestId: string; at: number } | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** The last copy of the box Rust gave this page, and for which tab: a `late` draft replaces the box only
+   *  while it still holds exactly this, since anything typed since is newer than the late copy. */
+  const givenDraftRef = useRef<{ tab: TabId; text: string } | null>(null);
   function flushDraft() {
     refusedEchoRef.current = null;
     if (draftTimerRef.current !== null) clearTimeout(draftTimerRef.current);
@@ -2546,6 +2549,10 @@ export default function App() {
         // or touch any other state -- it is not about the panel's own keys.
         applyEditorTyping(document.documentElement, payload.typing, payload.periodMs);
       } else if (payload.kind === "pane_focus") {
+        // The keys leaving can be the first half of the tab leaving this page (a join back into the
+        // base page follows at once); a draft still waiting out its debounce would then be posted by a
+        // page that no longer shows the tab, so it goes out now.
+        if (!payload.focused) flushDraft();
         // A prefix is for the next key. GTK captures pane-switch keys before the WebView sees them,
         // so clear pending prefixes, counts, leader sequences and box timers here. Otherwise
         // returning to the pane could complete a stale chord or apply an old count to a new `j`.
@@ -3291,6 +3298,13 @@ export default function App() {
         setQueueError(payload.error);
         setQueueNote(payload.note ?? null);
         setQueueSteers(payload.enterSteers ?? null);
+      } else if (
+        payload.kind === "draft" &&
+        payload.late === true &&
+        !(givenDraftRef.current?.tab === payload.tab && draftRef.current === givenDraftRef.current.text)
+      ) {
+        // The page this tab just left sent its last mirror after the tab arrived here, and the box has been
+        // edited since: that edit is newer, and its own mirror tells Rust so.
       } else if (payload.kind === "draft" && takeRefusedEcho(payload.tab, payload.refused)) {
         // The echo of a refused send this page put back itself: Rust's copy of the box can trail what was typed
         // since, and the box already holds the message and everything typed after it. Nothing to apply.
@@ -3298,6 +3312,7 @@ export default function App() {
         // Rust's copy wins only when it is sent: a switch, `ready`, a reset, a scratch return.
         restoreSeq.current += 1;
         draftRef.current = payload.text;
+        givenDraftRef.current = { tab: payload.tab, text: payload.text };
         pendingDraftRef.current = null;
         setRestoredDraft({ text: payload.text, seq: restoreSeq.current });
       } else if (payload.kind === "queue_taken") {

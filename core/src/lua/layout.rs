@@ -47,6 +47,7 @@ use std::rc::Rc;
 use mlua::{Lua, Table, Value};
 
 use crate::keymap::Action;
+use crate::layout::con::{unwritten_share, SHARE_SLACK};
 use crate::layout::rules::{OpenRule, OpenRules, RuleSize, RuleTarget};
 use crate::layout::tree::MIN_RATIO;
 use crate::layout::{
@@ -170,13 +171,28 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                     "eitri.layout.workspace: only in init.lua, before the window exists".to_string(),
                 ));
             }
-            let Value::String(name) = name else {
-                return Err(mlua::Error::RuntimeError(format!(
+            let name = match &name {
+                Value::String(name) => name
+                    .to_str()
+                    .map(|name| name.to_string())
+                    .map_err(|_| "eitri.layout.workspace: the name must be UTF-8".to_string()),
+                other => Err(format!(
                     "eitri.layout.workspace: the name must be a string, not a {}",
-                    name.type_name()
-                )));
+                    other.type_name()
+                )),
             };
-            let name = name.to_str()?.to_string();
+            // A refused name is still recorded, so a definition called under pcall stops startup
+            // instead of vanishing. Its empty name matches no valid workspace.
+            let name = match name {
+                Ok(name) => name,
+                Err(message) => {
+                    workspace_store
+                        .borrow_mut()
+                        .defined
+                        .push((String::new(), Err(message.clone())));
+                    return Err(mlua::Error::RuntimeError(message));
+                }
+            };
             let call = format!(
                 "eitri.layout.workspace('{}')",
                 crate::layout::workspace::printable(&name)
@@ -218,7 +234,14 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 rule_store.borrow_mut().rule_error.get_or_insert(message.clone());
                 return Err(mlua::Error::RuntimeError(message));
             };
-            let target = target.to_str()?.to_string();
+            let target = match target.to_str() {
+                Ok(target) => target.to_string(),
+                Err(_) => {
+                    let message = "eitri.layout.rule: the target must be UTF-8".to_string();
+                    rule_store.borrow_mut().rule_error.get_or_insert(message.clone());
+                    return Err(mlua::Error::RuntimeError(message));
+                }
+            };
             let call = format!("eitri.layout.rule('{}')", crate::layout::workspace::printable(&target));
             let parsed = RuleTarget::parse(&target)
                 .map_err(|e| format!("{call}: {e}"))
@@ -901,10 +924,16 @@ fn share_of(value: Value, at: &str) -> Result<f32, String> {
 }
 
 /// Each child keeps its share directly, so parsing never introduces another container.
+///
+/// Shares are accepted in the model's own range (`Con::check`'s), down to `SHARE_SLACK` below the
+/// minimum: an exported layout holds shares a rounding error short of 0.05 after a drag, and the
+/// text must read back. The unspecified share is computed in `f64`, so the `f32` rounding of the
+/// subtraction does not push a share at the minimum below the range.
 fn container(layout: ConLayout, children: Vec<(Node, Option<f32>)>, head: &str) -> Result<Con, String> {
+    let lowest = MIN_RATIO - SHARE_SLACK;
     for (i, (_, share)) in children.iter().enumerate() {
         if let Some(share) = share {
-            if !(MIN_RATIO..=1.0).contains(share) {
+            if !(lowest..=1.0).contains(share) {
                 return Err(format!(
                     "item {} of the {head} gets {share:.3}; a share is 0.05 to 1",
                     i + 1
@@ -912,26 +941,32 @@ fn container(layout: ConLayout, children: Vec<(Node, Option<f32>)>, head: &str) 
             }
         }
     }
-    let given: f32 = children.iter().filter_map(|(_, s)| *s).sum();
+    let given: f64 = children.iter().filter_map(|(_, s)| s.map(f64::from)).sum();
     let unset = children.iter().filter(|(_, s)| s.is_none()).count();
     if unset == 0 && (given - 1.0).abs() > 0.001 {
-        return Err(format!("the {head}'s shares add up to {given}, not 1"));
+        return Err(format!("the {head}'s shares add up to {}, not 1", given as f32));
     }
     if unset > 0 && given >= 1.0 {
         return Err(format!(
-            "the {head}'s shares add up to {given}, leaving nothing for the rest"
+            "the {head}'s shares add up to {}, leaving nothing for the rest",
+            given as f32
         ));
     }
-    let each = if unset > 0 { (1.0 - given) / unset as f32 } else { 0.0 };
-    let shares: Vec<f32> = children.iter().map(|(_, s)| s.unwrap_or(each)).collect();
-    for (i, share) in shares.iter().enumerate() {
-        if !(MIN_RATIO..=1.0).contains(share) {
+    let each = if unset > 0 {
+        let each = unwritten_share(children.iter().filter_map(|(_, s)| *s), unset);
+        // Rounding to `f32` cannot carry a value at or above an `f32` bound below it.
+        if each < f64::from(lowest) {
+            let i = children.iter().position(|(_, s)| s.is_none()).unwrap_or(0);
             return Err(format!(
-                "item {} of the {head} gets {share:.3}; a share is 0.05 to 1",
+                "item {} of the {head} gets {each:.3}; a share is 0.05 to 1",
                 i + 1
             ));
         }
-    }
+        each as f32
+    } else {
+        0.0
+    };
+    let shares: Vec<f32> = children.iter().map(|(_, s)| s.unwrap_or(each)).collect();
     Ok(Con::new(
         layout,
         children
@@ -2069,5 +2104,46 @@ mod tests {
         assert_eq!(tree.floats[0].id, ModuleId::agent());
         let r = crate::layout::reconcile_default_floating(tree.tiled, tree.floats, &[]).unwrap();
         assert!(r.layout.is_floating(&ModuleId::agent()));
+    }
+
+    #[test]
+    fn a_workspace_named_by_a_non_string_or_non_utf8_value_stops_startup() {
+        let (lua, store) = engine();
+        lua.load("assert(not pcall(eitri.layout.workspace, 42, {'editor'}))")
+            .exec()
+            .unwrap();
+        lua.load(r"assert(not pcall(eitri.layout.workspace, '\255', {'editor'}))")
+            .exec()
+            .unwrap();
+        let store = store.borrow();
+        let defined = store.defined_workspaces();
+        assert_eq!(defined.len(), 2);
+        let errors: Vec<_> = defined.iter().map(|(_, tree)| tree.clone().unwrap_err()).collect();
+        assert!(errors[0].contains("must be a string, not a"), "{errors:?}");
+        assert!(errors[1].contains("must be UTF-8"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_rule_target_that_is_not_utf8_stops_startup() {
+        let (lua, store) = engine();
+        lua.load(r"assert(not pcall(eitri.layout.rule, '\255', {at = 'side'}))")
+            .exec()
+            .unwrap();
+        let error = store.borrow().rules().map(|_| ()).unwrap_err();
+        assert!(error.contains("must be UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn a_left_out_share_at_the_minimum_is_computed_in_double_precision() {
+        let lua = Lua::new();
+        let value = lua
+            .load(r#"return { "row", { "editor", 0.6 }, { "agent", 0.2 }, { "terminal", 0.15 }, { "terminal#2" } }"#)
+            .eval::<Value>()
+            .unwrap();
+        let Node::Con(row) = parse_default(&value).unwrap() else {
+            panic!("a row parses as a container");
+        };
+        row.check(true).unwrap();
+        assert!(row.children[3].share < MIN_RATIO, "{}", row.children[3].share);
     }
 }

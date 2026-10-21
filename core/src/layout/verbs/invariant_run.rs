@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use super::super::con::Child;
 use super::super::float::FloatRect;
 use super::super::geometry::{arrange, hide, resize, settle_pins, Direction, Frame, Rect, Size};
 use super::super::kill::{kill, Reopen};
@@ -82,6 +83,33 @@ fn random_layout(rng: &mut Rng) -> Layout {
     Layout::initial(&extra).expect("distinct ids")
 }
 
+/// A root of one tile -- the editor alone, or one time in three a tabbed root holding only the editor
+/// -- with every other module floating: the start where a sink's anchor is the root's only child.
+fn lone_tile_layout(rng: &mut Rng) -> Layout {
+    let editor = ModuleId::editor();
+    let root = if rng.below(3) == 0 {
+        Node::Con(Con::new(
+            ConLayout::Tabbed,
+            vec![Child::new(Node::Leaf(editor.clone()), 1.0)],
+        ))
+    } else {
+        Node::Leaf(editor.clone())
+    };
+    let mut layout = Layout::new(root, editor).expect("one tile is a valid layout");
+    let mut floats = vec![ModuleId::agent()];
+    for name in EXTRA {
+        if rng.below(4) != 0 {
+            floats.push(ModuleId::parse(name).unwrap());
+        }
+    }
+    for id in floats {
+        layout
+            .add_float(&id, RECTS[rng.below(RECTS.len())], false)
+            .expect("a new module with a valid rectangle");
+    }
+    layout
+}
+
 fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
     let ids = layout.modules();
     let any = ids[rng.below(ids.len())].clone();
@@ -152,6 +180,9 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
         20 => {
             let reopen = match rng.below(3) {
                 0 => Reopen::InPlace,
+                // The window never reopens the editor at a placement (it is retired or kept in place),
+                // and `kill` relies on that: the editor can be the only tile once the rest float.
+                1 if any == ModuleId::editor() => Reopen::InPlace,
                 1 => Reopen::At(Placement::BelowEditor),
                 _ => Reopen::Never,
             };
@@ -339,6 +370,20 @@ fn twenty_thousand_random_verbs_keep_every_invariant() {
             let frame = Frame::new(FRAMES[rng.below(3)], 1);
             step(&mut rng, &mut layout, &frame);
             check(&layout, &format!("run {run}, step {n}"));
+        }
+    }
+}
+
+#[test]
+fn lone_tile_starts_keep_every_invariant() {
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    for run in 0..50 {
+        let mut layout = lone_tile_layout(&mut rng);
+        check(&layout, &format!("lone run {run}, start"));
+        for n in 0..100 {
+            let frame = Frame::new(FRAMES[rng.below(3)], 1);
+            step(&mut rng, &mut layout, &frame);
+            check(&layout, &format!("lone run {run}, step {n}"));
         }
     }
 }

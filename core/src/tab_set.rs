@@ -241,6 +241,11 @@ pub struct Tab {
     /// The chat view that shows this tab: the base view unless the tab was bound to an extra one.
     /// Private so that only the set binds a tab, which keeps the base view's active tab unbound.
     view: ViewId,
+    /// The view this tab was just moved out of, whose page may still post one `draft` for it: its
+    /// composer mirrors on a timer and flushes when it loses the keys, which can land after the move.
+    /// Cleared once that draft is taken, or as soon as the draft is set any other way (a newer
+    /// mirror, an nvim edit, a send, a start-over): that copy is newer than the late one.
+    left_view: Option<ViewId>,
     pub backend: TabBackend,
     /// Which of the project's own configuration tiers the session of this tab was given; set when
     /// the session is spawned, so a later change of the window's answer leaves running sessions as
@@ -401,6 +406,7 @@ impl Tab {
             mode,
             agent,
             view: ViewId::BASE,
+            left_view: None,
             backend: TabBackend::NotStarted,
             project_tiers: None,
             attention: AttentionTracker::default(),
@@ -1658,6 +1664,7 @@ impl TabSet {
             .expect("the active tab is a base-view tab");
         let at = self.position(moved).expect("the active tab exists");
         self.tabs[at].view = view;
+        self.tabs[at].left_view = Some(ViewId::BASE);
         let fallback = self.base_fallback(base_index).expect("two base-view tabs were checked");
         self.last_active = None;
         self.active = fallback;
@@ -1674,6 +1681,7 @@ impl TabSet {
         let tab = self.tab_in(view)?;
         let at = self.position(tab).expect("tab_in names a tab it has");
         self.tabs[at].view = ViewId::BASE;
+        self.tabs[at].left_view = Some(view);
         self.drop_prompts_about(tab);
         // The view is left showing nothing: whatever it was asking goes too.
         if self.pending_bypass.as_ref().is_some_and(|plan| plan.page == view) {
@@ -2270,6 +2278,7 @@ impl TabSet {
             parts.push(std::mem::take(&mut tab.draft));
         }
         tab.draft = parts.join("\n\n");
+        tab.left_view = None;
         tab.queue_error = None;
         tab.queue_note = None;
         tab.rule_offers.clear();
@@ -3490,6 +3499,7 @@ impl TabSet {
         let draft = match done {
             crate::scratch::EditDone::Written(text) => {
                 tab.draft = text.clone();
+                tab.left_view = None;
                 Some(text.clone())
             }
             _ => None,
@@ -3525,6 +3535,7 @@ impl TabSet {
                     if *text != tab.draft && Some(text.as_str()) != tab.draft.strip_suffix('\n') =>
                 {
                     tab.draft = text.clone();
+                    tab.left_view = None;
                     Some(text.clone())
                 }
                 _ => None,
@@ -3547,10 +3558,25 @@ impl TabSet {
         held.into_iter().map(|q| q.text).collect()
     }
 
-    /// Mirror the panel's draft without echoing it back.
+    /// Store the panel's draft mirror without echoing it.
+    /// This copy is newer than any late mirror from the page the tab left, so
+    /// [`TabSet::take_late_draft`] must no longer accept that page's copy.
     pub fn set_draft(&mut self, id: TabId, text: &str) -> bool {
         let Some(tab) = self.get_mut(id) else { return false };
         tab.draft = text.to_string();
+        tab.left_view = None;
+        true
+    }
+
+    /// Whether a `draft` for `tab` from `from`'s page is the one late mirror of the page the tab was
+    /// just moved out of (`break_out`, `join_back`): true once, and only while no newer copy has come
+    /// in since the move. Any other draft for a tab another page shows is not this page's to give.
+    pub fn take_late_draft(&mut self, tab: TabId, from: ViewId) -> bool {
+        let Some(t) = self.get_mut(tab) else { return false };
+        if t.left_view != Some(from) {
+            return false;
+        }
+        t.left_view = None;
         true
     }
 
@@ -3561,6 +3587,7 @@ impl TabSet {
     pub fn note_sent(&mut self, id: TabId) {
         if let Some(tab) = self.get_mut(id) {
             tab.draft.clear();
+            tab.left_view = None;
         }
     }
 
@@ -3926,10 +3953,11 @@ impl TabSet {
         F: FnMut(&AgentId, &str) -> Result<RestoreConnect, String>,
     {
         let total = go.tabs.len() + go.skipped.len();
+        let into = self.restore_holder(from);
         let mut run = RestoreRun::new(
-            from,
-            self.get(from).map_or(self.default_mode, |t| t.mode),
-            self.get(from).map_or(AgentId::Claude, |t| t.agent.clone()),
+            into,
+            self.get(into).map_or(self.default_mode, |t| t.mode),
+            self.get(into).map_or(AgentId::Claude, |t| t.agent.clone()),
             total,
             go.skipped,
         );
@@ -3956,7 +3984,7 @@ impl TabSet {
             let target = match into_view {
                 Some(view) => self.insert_restored_into(planned.agent.clone(), view),
                 None => {
-                    let ResumeRoute::StartIn(target) = self.route_resume_told(from, &planned.agent, &id, false, false)
+                    let ResumeRoute::StartIn(target) = self.route_resume_told(into, &planned.agent, &id, false, false)
                     else {
                         continue;
                     };
@@ -4057,9 +4085,21 @@ impl TabSet {
         self.layout_views = views;
     }
 
+    /// The tab a restore asked from `from` routes its base-view sessions into. The tab the restore was
+    /// asked from can have moved to an extra view while the restore waited (the trust question): its
+    /// base-view sessions then come back into the base view's active tab instead, which is reused when
+    /// empty like any tab a resume starts from.
+    fn restore_holder(&self, from: TabId) -> TabId {
+        if self.view_of(from).is_base() {
+            from
+        } else {
+            self.active
+        }
+    }
+
     /// A restore whose start was put off (a trust question answered `Escape`, too large to show, or
     /// refused): its sessions come back as failed tabs holding their resume ids, the first in `from`
-    /// and the rest in new tabs, so the saved-tabs file keeps them until the user closes a tab or
+    /// (the base view's active tab when `from` has since been broken out) and the rest in new tabs, so the saved-tabs file keeps them until the user closes a tab or
     /// starts it over with `r`. Without this the restore's sessions would be in no tab and the next
     /// write of the file would leave them out. A session already open in a tab is not listed twice.
     /// A tab saved in an extra chat view comes back into it under [`TabSet::start_restore`]'s rule, and
@@ -4074,6 +4114,7 @@ impl TabSet {
         if go.reoffer && self.is_pristine() {
             return true;
         }
+        let from = self.restore_holder(from);
         let mut kept: Vec<(String, TabId)> = Vec::new();
         for granted in go.tabs {
             let GrantedTab { planned, mode } = granted;
@@ -10480,6 +10521,150 @@ mod tests {
             SessionModeChoice::Bypass,
             "init.lua said bypass is fine"
         );
+    }
+
+    #[test]
+    fn a_late_draft_is_taken_once_from_the_view_the_tab_left_and_never_after_a_newer_one() {
+        let mut set = set();
+        let first = set.active();
+        set.open(AgentId::Claude);
+        assert!(set.select(first));
+        let view = ViewId::new(2).unwrap();
+        assert_eq!(set.break_out(view), Ok(first));
+        assert!(
+            !set.take_late_draft(first, ViewId::new(3).unwrap()),
+            "not the view it left"
+        );
+        assert!(set.take_late_draft(first, ViewId::BASE));
+        assert!(!set.take_late_draft(first, ViewId::BASE), "taken once");
+        assert_eq!(set.join_back(view), Some(first));
+        assert!(set.set_draft(first, "newer, from the page that shows it"));
+        assert!(!set.take_late_draft(first, view), "a newer copy came in since the move");
+    }
+
+    #[test]
+    fn a_late_draft_is_not_taken_once_the_draft_was_set_any_other_way() {
+        use crate::scratch::EditDone;
+        let mut set = set();
+        let first = set.active();
+        set.open(AgentId::Claude);
+        assert!(set.select(first));
+        let view = ViewId::new(2).unwrap();
+        let joined = |set: &mut TabSet| {
+            assert_eq!(set.break_out(view), Ok(first));
+            assert_eq!(set.join_back(view), Some(first));
+        };
+
+        joined(&mut set);
+        set.begin_scratch_edit(first, 1).unwrap();
+        set.finish_scratch_edit(1, &EditDone::Written("edited in nvim".into()))
+            .unwrap();
+        assert!(
+            !set.take_late_draft(first, view),
+            "an nvim edit came back after the move"
+        );
+        assert_eq!(set.get(first).unwrap().draft, "edited in nvim");
+
+        joined(&mut set);
+        set.begin_scratch_edit(first, 2).unwrap();
+        set.cancel_scratch_edits(&[(2, EditDone::Written("saved as nvim went".into()))]);
+        assert!(
+            !set.take_late_draft(first, view),
+            "an edit saved as the editor went away"
+        );
+
+        joined(&mut set);
+        set.note_sent(first);
+        assert!(!set.take_late_draft(first, view), "the draft was just sent");
+
+        joined(&mut set);
+        set.begin_scratch_edit(first, 3).unwrap();
+        set.finish_scratch_edit(3, &EditDone::Discarded).unwrap();
+        assert!(
+            set.take_late_draft(first, view),
+            "an edit that saved nothing leaves the late mirror due"
+        );
+    }
+
+    #[test]
+    fn a_put_off_restore_whose_holder_broke_out_keeps_its_sessions_in_the_base_view() {
+        let mut set = set();
+        let first = set.active();
+        set.open(AgentId::Claude);
+        assert!(set.select(first));
+        let from = set.active();
+        let view = ViewId::new(2).unwrap();
+        assert_eq!(set.break_out(view), Ok(from));
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+            ],
+            Some("a"),
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        assert!(!set.keep_put_off_restore(from, go, "put off"));
+        assert!(set.v1_holds());
+        for id in ["a", "b"] {
+            let tab = set
+                .tabs()
+                .iter()
+                .find(|t| t.failed_resume.as_deref() == Some(id))
+                .map(|t| t.id)
+                .unwrap_or_else(|| panic!("session {id} is kept"));
+            assert_eq!(set.view_of(tab), ViewId::BASE, "session {id} is kept in the base view");
+        }
+        assert_eq!(set.get(from).unwrap().failed_resume, None, "the moved tab holds none");
+        assert_eq!(set.view_of(from), view);
+        let saved = set.saved_snapshot("conv").unwrap();
+        assert!(
+            saved.tabs.iter().all(|t| t.view.is_none()),
+            "no kept session is saved as agent#2's"
+        );
+    }
+
+    #[test]
+    fn a_restore_whose_holder_broke_out_resumes_in_the_base_view() {
+        let mut set = set();
+        let first = set.active();
+        set.open(AgentId::Claude);
+        assert!(set.select(first));
+        let from = set.active();
+        let view = ViewId::new(2).unwrap();
+        assert_eq!(set.break_out(view), Ok(from));
+        assert_eq!(set.view_of(from), view);
+        let plan = plan_of(
+            vec![
+                planned("a", SessionModeChoice::Auto),
+                planned("b", SessionModeChoice::Auto),
+            ],
+            Some("a"),
+        );
+        let RestoreStep::Go(go) = set.begin_restore(plan, BypassPolicy::Ask) else {
+            panic!("no question")
+        };
+        let run = set.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
+        for id in ["a", "b"] {
+            let tab = set
+                .tab_with_session(&AgentId::Claude, id)
+                .unwrap_or_else(|| panic!("session {id} came back"));
+            assert_eq!(
+                set.view_of(tab),
+                ViewId::BASE,
+                "session {id} came back in the base view"
+            );
+            assert!(run.owns(tab));
+        }
+        assert_eq!(
+            set.get(from).unwrap().provider_session_id(),
+            None,
+            "the moved tab holds none"
+        );
+        assert!(!run.began_in(from));
+        assert!(set.view_of(set.active()).is_base());
+        assert_eq!(set.active_tab().provider_session_id().as_deref(), Some("a"));
     }
 
     #[test]

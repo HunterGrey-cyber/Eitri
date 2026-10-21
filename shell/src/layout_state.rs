@@ -61,6 +61,7 @@ use std::time::{Duration, Instant};
 
 use eitri_core::layout::persist::{self, Loaded, V2State};
 use eitri_core::layout::rules::{OpenPoint, NOMINAL_GRID};
+use eitri_core::layout::workspace::MAIN;
 use eitri_core::layout::{
     apply_launch_rule, first_launch_decls, reconcile_default_floating, Con, FloatRect, Layout, ModuleDecl, ModuleId,
     ModuleKind, Node, OpenRules, Placement, Workspaces,
@@ -138,10 +139,21 @@ pub(crate) fn choose_startup_layout(
         Ok(layout)
     };
     let (workspaces, layout, keep_copy) = match loaded {
-        Some(Loaded::Restored(opened)) | Some(Loaded::Migrated(opened)) => {
-            notes.extend(opened.notes);
+        Some(Loaded::Restored(mut opened)) | Some(Loaded::Migrated(mut opened)) => {
+            notes.extend(std::mem::take(&mut opened.notes));
+            // Every window has `main`, and the export writes it as `eitri.layout.default`: a file that
+            // lost it gets it back as a first launch would build it, so the window never runs without it.
+            let main_lost = !opened.workspaces.order().iter().any(|name| name == MAIN);
+            if main_lost {
+                let main = first_launch(&mut notes)?;
+                opened.workspaces.restore_main(main);
+                notes.push(format!(
+                    "workspace '{MAIN}' could not be read; it is the default layout again"
+                ));
+            }
             notes.push("reopened as it was left".to_string());
-            if default.is_some() {
+            // A `main` put back is shaped by the Lua default, so saying it did not apply would be wrong.
+            if default.is_some() && !main_lost {
                 notes.push("eitri.layout.default shapes a project with no saved layout; this one has one".to_string());
             }
             if opened.keep_copy.is_some() {
@@ -605,6 +617,115 @@ mod tests {
         assert!(
             notes.contains(&"workspace 'study': the saved layout wins over eitri.layout.workspace".to_string()),
             "{notes:?}"
+        );
+    }
+
+    /// A saved file whose `main` could not be read opens with `main` back, first and as the default
+    /// layout, and the workspace that was current stays current; one that had `main` current opens
+    /// the first readable workspace, as the file's reader chose.
+    #[test]
+    fn a_saved_file_without_main_gets_main_back_first() {
+        let mut study = crate::terminal::initial_layout(&[]).unwrap();
+        study.set_focus(&ModuleId::agent()).unwrap();
+        let loaded = || {
+            Loaded::Restored(persist::Opened {
+                workspaces: Workspaces::from_parts(
+                    vec!["study".into()],
+                    Default::default(),
+                    "study".into(),
+                    Default::default(),
+                )
+                .unwrap(),
+                current: study.clone(),
+                notes: vec![],
+                keep_copy: Some("the file".to_string()),
+            })
+        };
+        let (workspaces, layout, notes, keep_copy) =
+            choose_startup_layout(None, Some(loaded()), &[], &OpenRules::default(), None).unwrap();
+        assert_eq!(workspaces.order(), ["main", "study"]);
+        assert_eq!(workspaces.current(), "study");
+        assert_eq!(layout, study);
+        let (_, first_launch, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+        assert_eq!(workspaces.stored("main"), Some(&first_launch));
+        assert!(
+            notes.contains(&"workspace 'main' could not be read; it is the default layout again".to_string()),
+            "{notes:?}"
+        );
+        assert_eq!(keep_copy.as_deref(), Some("the file"));
+        assert!(eitri_core::layout::export_lua(&layout, Some(&workspaces)).contains("eitri.layout.default("));
+
+        // A file whose current workspace was the unreadable `main`: decode made the first readable
+        // workspace current, and that holds.
+        let text = persist::encode_v2(
+            &Workspaces::from_parts(
+                vec!["main".into(), "study".into()],
+                std::collections::BTreeMap::from([("study".to_string(), study.clone())]),
+                "main".into(),
+                Default::default(),
+            )
+            .unwrap(),
+            &first_launch,
+            root(),
+        );
+        let mut file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        file["workspaces"][0]["tiled"]["children"][0]["share"] = serde_json::json!(0.99);
+        let opened = persist::decode_v2(&file.to_string(), root(), &[]).unwrap();
+        assert_eq!(opened.workspaces.order(), ["study"]);
+        let (workspaces, layout, notes, keep_copy) =
+            choose_startup_layout(None, Some(Loaded::Restored(opened)), &[], &OpenRules::default(), None).unwrap();
+        assert_eq!(workspaces.order(), ["main", "study"]);
+        assert_eq!(workspaces.current(), "study");
+        assert_eq!(layout, study);
+        assert_eq!(workspaces.stored("main"), Some(&first_launch));
+        assert!(
+            notes.contains(&"workspace 'main' was current and cannot be used; 'study' is current".to_string()),
+            "{notes:?}"
+        );
+        assert!(
+            notes.contains(&"workspace 'main' could not be read; it is the default layout again".to_string()),
+            "{notes:?}"
+        );
+        assert!(keep_copy.is_some(), "the bytes read are kept");
+    }
+
+    /// With `init.lua`'s default, the `main` put back is that default.
+    #[test]
+    fn main_put_back_is_the_lua_default_when_there_is_one() {
+        let tree = LuaTree {
+            tiled: Node::split(
+                Axis::Column,
+                0.5,
+                Node::Leaf(ModuleId::agent()),
+                Node::Leaf(ModuleId::editor()),
+            ),
+            floats: Vec::new(),
+        };
+        let study = crate::terminal::initial_layout(&[]).unwrap();
+        let loaded = Loaded::Restored(persist::Opened {
+            workspaces: Workspaces::from_parts(
+                vec!["study".into()],
+                Default::default(),
+                "study".into(),
+                Default::default(),
+            )
+            .unwrap(),
+            current: study,
+            notes: vec![],
+            keep_copy: None,
+        });
+        let (workspaces, _, notes, _) =
+            choose_startup_layout(Some(&tree), Some(loaded), &[], &OpenRules::default(), None).unwrap();
+        let (_, lua_default, _, _) =
+            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+        assert_eq!(workspaces.order(), ["main", "study"]);
+        assert_eq!(workspaces.stored("main"), Some(&lua_default));
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.starts_with("eitri.layout.default shapes a project with no saved layout")),
+            "the default shaped the main put back: {notes:?}"
         );
     }
 

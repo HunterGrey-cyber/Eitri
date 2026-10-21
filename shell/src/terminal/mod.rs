@@ -31,6 +31,20 @@ use terminal_render::RgbColor;
 use crate::layout::Direction;
 use std::path::{Path, PathBuf};
 
+/// Keeps a directory read from `/proc/<pid>/cwd` only if it still is one. The kernel names a directory that has
+/// been removed `"<path> (deleted)"`, which no shell can start in; every shell candidate would fail on it, and a
+/// retry would read the same path again. Stats the path, so it runs off the GTK thread with the read.
+pub(crate) fn usable_dir(read: std::io::Result<PathBuf>) -> std::io::Result<PathBuf> {
+    let dir = read?;
+    match std::fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => Ok(dir),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the shell's directory is gone",
+        )),
+    }
+}
+
 pub(crate) fn start_dir(read: std::io::Result<PathBuf>, root: &Path) -> (PathBuf, Option<String>) {
     match read {
         Ok(dir) => (dir, None),
@@ -589,5 +603,53 @@ mod start_dir_tests {
         let (dir, notice) = start_dir(Err(error), root);
         assert_eq!(dir, root);
         assert!(notice.unwrap().contains(&message));
+    }
+
+    /// A fresh directory of this test's own under the system's scratch directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("eitri-start-dir-{}-{label}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_directory_that_is_gone_is_not_a_start_directory() {
+        let scratch = Scratch::new("gone");
+        let gone = scratch.0.join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        let deleted = PathBuf::from(format!("{} (deleted)", gone.display()));
+        assert!(
+            usable_dir(Ok(deleted.clone())).is_err(),
+            "the kernel's name for a removed cwd"
+        );
+        assert!(usable_dir(Ok(gone.clone())).is_err(), "a path with nothing there");
+        let file = scratch.0.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(usable_dir(Ok(file)).is_err(), "a file is not a directory");
+        let named = scratch.0.join("x (deleted)");
+        std::fs::create_dir(&named).unwrap();
+        assert_eq!(
+            usable_dir(Ok(named.clone())).unwrap(),
+            named,
+            "a directory really named so"
+        );
+        assert!(usable_dir(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
+
+        let root = Path::new("/project");
+        let (dir, note) = start_dir(usable_dir(Ok(deleted)), root);
+        assert_eq!(dir, root);
+        assert!(note.expect("a note says why").contains("gone"));
     }
 }

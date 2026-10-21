@@ -196,7 +196,7 @@ fn a_reloaded_page_reattaches_to_a_running_watch() {
     assert!(line.contains("check_started"), "{line}");
 
     // The page reloads; the run goes on, and the new page's hello hands it back with its tail.
-    rig.host.page_loading();
+    rig.host.page_committed();
     let hello = rig.reply(rig.send("host.hello", json!({})));
     assert_eq!(
         hello["result"]["runs"],
@@ -204,7 +204,7 @@ fn a_reloaded_page_reattaches_to_a_running_watch() {
     );
 
     // Reloaded again and not yet ready: the end of the run is not sent to a page that has not said hello.
-    rig.host.page_loading();
+    rig.host.page_committed();
     let before = rig.page.events("task.exit").len();
     let cancel = rig.send("task.cancel", json!({"run": run}));
     assert_eq!(rig.reply(cancel)["ok"], true);
@@ -425,7 +425,7 @@ fn a_line_held_for_the_next_batch_reaches_a_returning_page_once() {
         assert!(Instant::now() < deadline, "the watch never printed");
         std::thread::sleep(Duration::from_millis(5));
     }
-    rig.host.page_loading();
+    rig.host.page_committed();
     let id = rig.send("host.hello", json!({}));
     let hello = rig.page.replies_to(id).remove(0);
     let tail = hello["result"]["runs"][0]["tail"].clone();
@@ -516,7 +516,7 @@ fn an_answer_still_out_when_the_page_reloads_never_reaches_the_new_page() {
     raw(3, "editor.open", json!({"path": file.display().to_string()}));
     rig.asked(1, Instant::now());
     raw(4, "state.read", json!({"key": "nope"}));
-    rig.host.page_loading();
+    rig.host.page_committed();
     let mark = rig.page.0.borrow().len();
     rig.editor.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Map(vec![
         ("how".into(), "edit".into()),

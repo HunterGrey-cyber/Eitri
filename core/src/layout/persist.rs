@@ -895,16 +895,17 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
             _ => {}
         }
     }
-    let mut instances = BTreeSet::new();
-    for item in &items {
+    // The instances one workspace makes: its tiled leaves, and the float entries it reads. Only an
+    // entry the workspace reads makes an instance: one it leaves out is gone, with its note, and must
+    // not come back as a hidden tile holding an instance number. The entry is read again with its
+    // workspace, which notes what is wrong with it.
+    let own_instances = |item: &Value| {
+        let mut found = BTreeSet::new();
         if let Some(tiled) = item.get("tiled") {
-            instances_in(tiled, &makes_instance, &mut instances);
+            instances_in(tiled, &makes_instance, &mut found);
         }
         if reader == Reader::ThisBuild {
             if let Some(Value::Array(floats)) = item.get("floating") {
-                // Only an entry the workspace reads makes an instance: one it leaves out is gone, with its
-                // note, and must not come back as a hidden tile holding an instance number. The entry is
-                // read again with its workspace, which notes what is wrong with it.
                 let (mut unused_notes, mut unused_copy) = (Vec::new(), false);
                 for float in floats {
                     let Ok((id, _, _)) = read_float_entry(float, &FLOAT_KEYS, "", &mut unused_notes, &mut unused_copy)
@@ -912,9 +913,35 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
                         continue;
                     };
                     if makes_instance(&id) {
-                        instances.insert(id);
+                        found.insert(id);
                     }
                 }
+            }
+        }
+        found
+    };
+    // Only a workspace that reads makes instances: one left out is gone, with its note, and the
+    // modules it tiles must not come back as hidden tiles holding instance numbers in the others.
+    // Each item is read here as the loop below reads it, knowing its own instances (a workspace
+    // that shows only instances must still read) but not the other workspaces' yet.
+    let mut instances = BTreeSet::new();
+    {
+        let (mut scratch_notes, mut scratch_copy) = (Vec::new(), false);
+        let mut seen = BTreeSet::new();
+        for item in &items {
+            let Value::Object(map) = item else {
+                continue;
+            };
+            let mut map = map.clone();
+            let Ok(name) = take_str(&mut map, "name") else {
+                continue;
+            };
+            if Workspaces::valid_name(&name).is_err() || !seen.insert(name.clone()) {
+                continue;
+            }
+            let own: Vec<ModuleId> = own_instances(item).into_iter().collect();
+            if read_workspace(&name, map, lua, &mut scratch_notes, &mut scratch_copy, &own, reader).is_ok() {
+                instances.extend(own);
             }
         }
     }
@@ -2958,6 +2985,112 @@ mod tests {
             assert!(!study.contains(&id(gone)), "{gone}");
         }
         assert!(back.workspaces.reserved().is_empty());
+    }
+
+    /// A workspace left out makes no instance either: the modules it tiles are gone with it, and do
+    /// not come back as hidden tiles holding instance numbers in the workspaces that open.
+    #[test]
+    fn a_workspace_left_out_makes_no_instance() {
+        let file = |extra: Vec<Value>| {
+            json!({
+                "version": 2,
+                "project_root": "/home/user/project",
+                "current": "main",
+                "workspaces": [
+                    {"name": "main", "focus": "editor", "hidden": [],
+                     "tiled": json_of(&one(&plain()))["workspaces"][0]["tiled"].clone()},
+                    {"name": "x", "focus": "editor", "hidden": [],
+                     "tiled": {"type": "con", "layout": "splith", "children": [
+                        {"share": 0.6, "node": {"type": "leaf", "module": "editor"}},
+                        {"share": 0.5, "node": {"type": "con", "layout": "splitv", "children": extra}}
+                     ]}}
+                ]
+            })
+            .to_string()
+        };
+        let leaf = |module: &str, share: f64| json!({"share": share, "node": {"type": "leaf", "module": module}});
+
+        let text = file(vec![
+            leaf("agent", 0.25),
+            leaf("terminal", 0.25),
+            leaf("terminal#2", 0.25),
+            leaf("agent#3", 0.25),
+        ]);
+        let back = decode_v2(&text, &root(), &[]).unwrap();
+        assert_eq!(back.workspaces.order(), ["main"]);
+        assert_eq!(back.notes.len(), 1, "{:?}", back.notes);
+        assert!(
+            back.notes[0].starts_with("workspace 'x' left out: a container's shares add up to 1.1"),
+            "{:?}",
+            back.notes
+        );
+        assert_eq!(back.keep_copy.as_deref(), Some(text.as_str()));
+        for gone in ["terminal#2", "agent#3"] {
+            assert!(!back.current.contains(&id(gone)), "{gone}");
+            for name in back.workspaces.order() {
+                if let Some(stored) = back.workspaces.stored(name) {
+                    assert!(!stored.contains(&id(gone)), "{gone} in {name}");
+                }
+            }
+        }
+        assert!(back.workspaces.reserved().is_empty());
+
+        // Eight of them would otherwise use up every instance number a terminal can take.
+        let mut many = vec![leaf("agent", 0.1), leaf("terminal", 0.1)];
+        many.extend((2..=9).map(|n| leaf(&format!("terminal#{n}"), 0.1)));
+        let back = decode_v2(&file(many), &root(), &[]).unwrap();
+        assert_eq!(back.workspaces.order(), ["main"]);
+        for n in 2..=9 {
+            let gone = format!("terminal#{n}");
+            assert!(!back.current.contains(&id(&gone)), "{gone}");
+        }
+        assert!(back.workspaces.reserved().is_empty());
+    }
+
+    /// A workspace that shows only instances is one the window saves itself (hide refuses only the
+    /// last visible module), so the first pass must read it knowing its own instances.
+    #[test]
+    fn a_workspace_showing_only_instances_still_opens() {
+        let leaf = |module: &str| json!({"share": 0.25, "node": {"type": "leaf", "module": module}});
+        let workspace = |name: &str, tiled_extra: bool, floating: Value| {
+            let mut children = vec![leaf("editor"), leaf("agent"), leaf("terminal")];
+            if tiled_extra {
+                children.push(leaf("terminal#2"));
+            }
+            let total = children.len() as f64;
+            for child in &mut children {
+                child["share"] = json!(1.0 / total);
+            }
+            json!({"name": name, "focus": "terminal#2", "hidden": ["editor", "agent", "terminal"],
+                   "tiled": {"type": "con", "layout": "splith", "children": children},
+                   "floating": floating})
+        };
+        let file = |workspaces: Vec<Value>| {
+            json!({
+                "version": 2,
+                "project_root": "/home/user/project",
+                "current": "main",
+                "workspaces": workspaces,
+            })
+            .to_string()
+        };
+        let float = json!([{"module": "terminal#2", "cx": 0.5, "cy": 0.45, "w": 900, "h": 420, "scratch": false}]);
+        for main in [workspace("main", true, json!([])), workspace("main", false, float)] {
+            let back = decode_v2(&file(vec![main.clone()]), &root(), &[]).unwrap();
+            assert_eq!(back.workspaces.order(), ["main"]);
+            assert!(back.notes.is_empty(), "{:?}", back.notes);
+            assert_eq!(back.keep_copy, None);
+            assert!(back.current.contains(&id("terminal#2")));
+
+            let mut logs = workspace("logs", false, json!([]));
+            logs["focus"] = json!("editor");
+            logs["hidden"] = json!([]);
+            let back = decode_v2(&file(vec![main, logs]), &root(), &[]).unwrap();
+            assert_eq!(back.workspaces.order(), ["main", "logs"]);
+            // `logs` gets main's instance as a hidden tile, as any workspace does; nothing is left out.
+            assert!(!back.notes.iter().any(|n| n.contains("left out")), "{:?}", back.notes);
+            assert!(back.current.contains(&id("terminal#2")));
+        }
     }
 
     #[test]
