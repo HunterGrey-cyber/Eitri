@@ -13,11 +13,11 @@ pub enum SwapTarget {
     Prev,
     /// tmux `swap-pane -D`.
     Next,
-    /// The neighbour that way, as `Ctrl+h/j/k/l` would choose it.
+    /// The neighbour that way, as `Ctrl+h/j/k/l` would choose it (prefix `H/J/K/L`).
     Toward(Direction),
 }
 
-/// Session tabs. Bound in phase 1, run in phase 2.
+/// Session tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabAction {
     New,
@@ -27,7 +27,8 @@ pub enum TabAction {
     Select(u8),
     Rename,
     Close,
-    /// Close every other tab. Panel-only for now; not bound after the prefix.
+    /// Close every other tab (LazyVim "Delete Other Buffers", `keymaps.lua:43-45`). Panel-only for
+    /// now: not bound after the prefix.
     CloseOthers,
     Choose,
     Info,
@@ -178,24 +179,25 @@ pub enum Action {
     /// `Row` is tmux's `even-horizontal` (every module side by side); `Column` is `even-vertical`.
     Even(Axis),
     ModuleHide,
-    /// tmux's `kill-pane`: close the module with the keys and end what runs in it, after a y/n
-    ///. `ModuleHide` stays an action of its own for a config that wants it.
+    /// tmux's `kill-pane`: close the module with the keys and end what runs in it, after a y/n,
+    /// since what it ends cannot be brought back. `ModuleHide` stays an action of its own for a
+    /// config that wants it.
     ModuleKill,
     Module(ModuleId),
     Tab(TabAction),
     Hint,
     PanelReload,
     PanelKeymap,
-    /// tmux `command-prompt` (`prefix :`): show and focus the chat, then open the panel's `:` command
-    /// line, which runs nothing. Binding `:` prevents the prefix from swallowing it and leaving the
-    /// following letters to run as panel keys.
+    /// tmux `command-prompt` (`prefix :`): show the chat with the keys and
+    /// open the panel's `:` command line, which runs nothing. Before it was bound, an armed prefix
+    /// swallowed the `:` and the letters typed after it ran as panel keys.
     PanelCommandLine,
     WindowImmersive,
-    /// The pane with the keys only.
+    /// The pane with the keys only (not bound by default).
     Text(TextChange),
     /// tmux `copy-mode` (`up: false`) / `copy-mode -u` (`up: true`): enter the terminal's read-only
     /// scrollback view, where the view is or scrolled up one page. Acts only when the
-    /// terminal holds the keys; elsewhere it flashes the refusal.
+    /// terminal holds the keys; elsewhere it flashes the refusal (`shell`).
     CopyMode {
         up: bool,
     },

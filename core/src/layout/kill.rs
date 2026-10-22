@@ -1,45 +1,64 @@
-//! `prefix x` (`module.kill`) removes the module from the screen and has `shell` end
-//! what ran in it. The layout determines where it can reopen.
+//! `prefix x` (keymap action `module.kill`, tmux's `kill-pane`, which closes a pane rather than
+//! hiding it): the module leaves the screen, as a hide does, and what ran in it is
+//! ended by `shell`. The layout's half is here, and it differs from [`super::hide`] in where the
+//! module is left for next time:
 //!
-//! `Reopen::At` returns the leaf to its first-launch place, hidden. The terminal goes
-//! below the editor's column at a third of its height; a Lua panel uses its `position`.
-//! The old pinned container is removed; the new one settles its length on the next show.
+//! - [`Reopen::At`]: its leaf goes back where a first launch puts it, hidden -- so the next show is
+//!   a fresh module in its default place (the terminal below the editor's own column at a third of
+//!   its height since 2026-09-28; a Lua panel by its `position`), not the place it was
+//!   killed from. A pinned container it was in goes with it; the new one settles its length on its
+//!   next show, as a first show does.
+//! - [`Reopen::InPlace`]: its leaf stays where it was, hidden. The editor and the agent: every
+//!   layout has both (`reconcile` refuses one without them), and neither has a first-launch
+//!   placement of its own -- they ARE the first launch's root.
+//! - [`Reopen::Never`]: hidden where it was, and marked gone for the rest of this window
+//!   ([`Layout::is_gone`]): no show, no place, no tray chip. The editor after nvim quit: `shell`
+//!   starts no second `nvim --embed` in the window, although the editor pane itself can now start
+//!   one on its own widget (`neovide-editor`'s `NeovideEditorPane::restart`; every harness shares
+//!   the fork's one event loop). Gone is never written to the state
+//!   file, and neither is the hide the retirement itself made: a module retired while shown is
+//!   saved shown, so a relaunch opens with it where it was ([`Layout::saved_hidden`]; it used to be
+//!   saved hidden, and a relaunch opened without the editor until `prefix e`). One the user had
+//!   hidden stays hidden. The
+//!   precedent is this project's own rule for nvim's quit prompt (`shell`'s `kill_pane::Reveal::
+//!   rehide`): what the window saves is the user's arrangement, not what a close or a quit did to
+//!   it -- and a first launch, which is what `Reopen::At` restores for every other module, shows the
+//!   editor.
 //!
-//! `Reopen::InPlace` leaves the leaf hidden where it was. The editor and agent use this:
-//! every layout must contain both, and they form the first-launch root.
-//!
-//! `Reopen::Never` leaves the leaf hidden and gone for this window (`Layout::is_gone`):
-//! no show, placement or tray chip. After nvim quits, `shell` starts no second
-//! `nvim --embed` in the window. The editor pane itself can restart on its widget,
-//! with all harnesses sharing one event loop.
-//! Gone is not saved. `Layout::saved_hidden` also excludes hiding caused by retirement,
-//! so a module retired while shown reopens shown on relaunch. A module the user hid stays
-//! hidden. Saving preserves the user's arrangement, as `kill_pane::Reveal::rehide` does
-//! for the quit prompt.
-//!
-//! Focus moves first, as for a hide (`super::hide`). `kill` refuses the last shown module;
-//! `KillScope::Window` tells `shell` to close the window instead.
+//! The keys leave first, exactly as a hide's do (`super::hide`). The last module on screen is not the
+//! layout's to kill ([`kill`] refuses it, as a hide does): it is the window's ([`KillScope::Window`],
+//! 2026-09-26 later), and `shell` closes the window.
 
 use super::geometry::{hide, Frame};
 use super::module::{ModuleId, Placement};
 use super::tree::{place_new, Layout, LayoutError};
 
-/// Lua run by `shell` for `prefix x` on the editor and for window close. `generation`
-/// is bumped before each send (`kill_pane::QuitInFlight`) so a cancellation can be
-/// distinguished from a later quit of the same editor.
+/// The Lua `shell` has nvim run to quit the editor -- `prefix x` on it, and every window close
+/// -- carrying `generation`, the quit's own number, bumped by `shell` before
+/// each send (`kill_pane::QuitInFlight`), so a cancel can be told apart from a later, different
+/// quit of the same editor.
 ///
-/// Send this as an RPC request (`nvim_exec_lua`). Typed `<Cmd>` input can be consumed
-/// as a pending character after `f`/`t`/`r`/`m`/`q`/`Ctrl-W`, inside `getchar()`, or after
-/// an insert-mode `Ctrl-V`. The remaining Lua can then execute as Normal-mode commands
-/// and alter the buffer. A request types nothing and runs when nvim next handles it,
-/// which in these states is after the awaited key (`core/tests/editor_quit_with_real_nvim.rs`).
+/// **Sent as an RPC request (`nvim_exec_lua`), never typed.** It used to go
+/// through `nvim_input` as `<Cmd>lua …<CR>`, and typed keys are read as whatever nvim is
+/// waiting for: after `f`/`t`/`r`/`m`/`q`/`Ctrl-W`, inside `getchar()` (flash.nvim, leap) or after an
+/// insert-mode `Ctrl-V`, the `<Cmd>` was taken as that one character and the rest ran as Normal-mode
+/// commands -- measured on nvim 0.12.5 after `f`: `u` undid the user's last edit, `a` inserted this
+/// Lua into the buffer, and nvim was left in Insert mode, neither quitting nor answering. A request
+/// types nothing: nvim takes it when its loop next takes one, which in those states is after the key
+/// it is waiting for (`core/tests/editor_quit_with_real_nvim.rs`). Stock Neovide's own window close
+/// is the same kind of request (its `ParallelCommand::Quit` runs `exit_handler.lua` through
+/// `nvim_exec_lua`, `confirm qa` under `g:neovide_confirm_quit`).
 ///
-/// `pcall(vim.cmd, 'confirm qall')` returns only if nvim stays alive, whether the quit was
-/// cancelled, interrupted with `Ctrl+c`, or stopped by an error in `QuitPre`/`ExitPre`.
-/// Only then is the generation sent on the existing pane-switch socket. Connection,
-/// write and close use `pcall`, as in `core/src/theme/nvim_theme.lua`, so a failed write
-/// does not raise E5108 in the editor. The request's response also reports that the chunk
-/// returned; `shell` reads it so cancellation is seen even without the socket shim.
+/// `pcall(vim.cmd, 'confirm qall')` returns only when nvim did NOT exit (a genuine quit ends the
+/// process before any Lua after it can run) -- cancelled, interrupted with `Ctrl+c`, or stopped by a
+/// user `QuitPre`/`ExitPre` autocommand that errors, all three swallowed by the `pcall` the same way.
+/// Only then is the generation written, on the pane-switch socket (`EITRI_PANE_SWITCH_SOCKET`,
+/// already set on the nvim child for `vim-tmux-navigator`) rather than a socket of its own -- one
+/// more socket is one more private path and listener to keep -- mirroring `core/src/theme/nvim_theme.lua`'s own
+/// `send()`: `pcall(vim.fn.sockconnect, 'pipe', p, {rpc = false})`, then a `pcall`-wrapped
+/// `chansend` (an unprotected one would raise E5108 in the user's editor on a failed write) and
+/// `chanclose`. The request's own response says the same thing (the chunk returned); `shell` reads
+/// that too, so a cancel is seen even where the shim is missing.
 pub fn editor_quit_lua(generation: u32) -> String {
     format!(
         "pcall(vim.cmd, 'confirm qall') \
@@ -58,8 +77,8 @@ pub enum Reopen {
     Remove,
 }
 
-/// What killing a module ends. Killing the last shown module closes the window;
-/// otherwise it removes only that module.
+/// What a kill of a module ends (tmux: killing the last pane closes the window, and killing the
+/// last window ends tmux).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillScope {
     /// Another module is on screen: [`kill`] takes this one off it.

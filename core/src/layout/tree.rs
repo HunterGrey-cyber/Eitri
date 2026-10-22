@@ -1,26 +1,33 @@
-//! The layout as data: a tree of containers whose leaves are modules ([`super::con`]), plus
-//! which modules are hidden, which one is zoomed, and which one last held the keys.
-//! The root is always a container, even for a single module. A root holding only another container
-//! is replaced by it. Pure and GTK-free: `shell`'s `ModuleGrid` allocates what
-//! [`super::geometry::arrange`] computes from it.
+//! The layout as data: a tree of containers whose leaves are modules
+//! ([`super::con`]), plus which modules are hidden, which one is zoomed, and which one last held the
+//! keys. The root is always a container: a layout of one module is a root holding that one leaf, and a
+//! root holding only another container is replaced by it, so a change that leaves one container
+//! under the root never wraps it in an empty one. Pure and GTK-free: `shell`'s `ModuleGrid`
+//! allocates what [`super::geometry::arrange`] computes from it, and never decides layout itself.
 //!
-//! The invariants enforced here and tested below are:
+//! **The invariants**, each enforced here and each held by a test below:
 //! 1. each `ModuleId` appears at most once in the tree;
-//! 2. `hidden` names only leaves in the tree;
-//! 3. at least one leaf is visible; hiding the last visible leaf is refused;
-//! 4. zoom never changes `hidden`, so ending a zoom cannot show a module that was hidden.
+//! 2. `hidden` names only leaves that are in the tree;
+//! 3. at least one leaf is visible (a hide that would leave none is refused);
+//! 4. **zoom never touches `hidden`**: zoom is its own field, so ending a zoom can never resurrect a
+//!    module the user closed (today's `PaneLayout::unzoom` showed every child).
 //!
-//! Every container below the root has at least two children. Each share is inside `MIN_RATIO..=1`,
-//! and a container's shares sum to 1 ([`super::con::Con::check`]). `focus` and every `mru` entry are
-//! leaves. Focus never rests on a hidden module: [`Layout::set_focus`] refuses one, and
-//! [`super::geometry::hide`] moves focus before hiding the module that holds it.
+//! Plus the ones this file adds because the rest of the model leans on them: every container below
+//! the root holds two or more children, every share is inside `MIN_RATIO..=1` and a container's shares
+//! add up to 1 ([`super::con::Con::check`]); `focus` and every `mru` entry are leaves; and **the keys
+//! never sit on a hidden module** -- [`Layout::set_focus`] refuses one, and
+//! [`super::geometry::hide`] moves them before it hides the module that holds them (a test holds
+//! that a hidden module never holds focus).
 //!
-//! A container divides by its children's shares unless a child is pinned. A [`super::con::Pin`]
-//! keeps that child's length in pixels when the available space changes. Modules placed below the
-//! whole root ([`Placement::BelowRoot`], a Lua `bottom` panel) or below the editor's leaf
-//! ([`Placement::BelowEditor`], the default terminal) are pinned, including rows that are not full
-//! width. On first show, the share gives either module a third of the available height;
-//! [`super::geometry::settle_pins`] then freezes that length.
+//! **A container divides by its children's shares, unless a child is pinned.** A
+//! [`super::con::Pin`] keeps that child's length in pixels when the space the container divides
+//! changes, as an IDE's bottom panel keeps its height when the window grows. A module placed below
+//! the whole root is pinned ([`Placement::BelowRoot`]: a Lua `bottom` panel), and so, since
+//! 2026-09-28, is one placed below the editor's own leaf alone ([`Placement::BelowEditor`]:
+//! the terminal's default place, the same rule applied to a row that is not full width). Either
+//! module's first show still divides by the
+//! share, a third of the height at whatever size the window has then, as `main`'s `shown_position`
+//! did; [`super::geometry::settle_pins`] then freezes that length.
 //!
 //! The mark, last preset and undo slot are runtime state; no state file reads or writes them.
 
@@ -55,8 +62,8 @@ pub const BELOW_ROOT_SHARE: f32 = 2.0 / 3.0;
 /// a third of the width.
 pub const RIGHT_OF_ROOT_SHARE: f32 = 0.67;
 
-/// The split between a module placed in the editor's leaf and the hidden editor.
-/// It collapses until the editor is shown again, letting the module fill the leaf.
+/// The split a module placed in the editor's leaf makes with the (hidden) editor. Only seen once
+/// the editor is shown again: until then the split collapses and the module fills the leaf.
 const IN_PLACE_SHARE: f32 = 0.5;
 
 /// Puts module `id`, which `root` does not contain, where `placement` says. `true` when
@@ -429,11 +436,12 @@ impl Layout {
         &self.hidden
     }
 
-    /// The saved hidden set excludes modules that were shown when retired, such as the editor
-    /// after nvim ended (`super::kill`'s `Reopen::Never`). Retirement ends the process without
-    /// changing the saved arrangement, so relaunch shows those modules where they were.
-    /// A module hidden by the user stays hidden. A module moved to another window is likewise
-    /// saved as it was when it left; its absence does not change this window's saved arrangement.
+    /// What the state file keeps as hidden: [`Layout::hidden`] without the modules that were on
+    /// screen when they were retired (`super::kill`'s `Reopen::Never` -- the editor after nvim
+    /// ended). Their retirement is about the process, not the arrangement, so a relaunch shows them
+    /// where they were; one the user had hidden stays hidden.
+    /// A module away in the other window is written as it was when it left, for the same reason: its
+    /// absence here is about where it lives, not how the user arranged this window.
     pub fn saved_hidden(&self) -> BTreeSet<ModuleId> {
         self.hidden
             .iter()
@@ -964,8 +972,9 @@ impl Layout {
         Ok(())
     }
 
-    /// Whether a zoom hides `id`: showing or focusing another module must end the zoom first.
-    /// Returns `false` for the zoomed module itself, so focusing it with `Ctrl+a a` leaves the zoom on.
+    /// A zoom is on, and it is not `id`'s: putting `id` on screen -- giving it the keys, showing it
+    /// -- has to end it first. `false` for the zoomed module itself: tmux's `select-pane` onto the
+    /// zoomed pane leaves the zoom on, and so does `Ctrl+a a` onto a zoomed chat.
     pub fn zoom_hides(&self, id: &ModuleId) -> bool {
         match self.zoom() {
             Some(Zoom::Module(z)) => z != id,

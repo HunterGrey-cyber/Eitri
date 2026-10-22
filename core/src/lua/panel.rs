@@ -41,8 +41,11 @@ impl PanelRegistry {
 
 /// A Lua panel's `position`: `main`, `side` or `bottom`.
 ///
-/// This is a first-launch placement hint. The layout is a tree of modules, and
-/// [`PanelSlot::placement`] says where a panel goes the first time.
+/// **Since the layout became a tree of modules this is a first-launch placement hint and nothing
+/// more.** It used to
+/// be the layout itself: three fixed slots, one panel each, a later registration replacing the
+/// earlier one -- including the built-in editor and agent. Now the layout is a tree of modules,
+/// and [`PanelSlot::placement`] says where in it a panel goes the first time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelSlot {
     Main,
@@ -91,9 +94,9 @@ pub struct ParsedPanelSpec {
 /// `cargo test`.
 pub fn parse_panel_spec(spec: &Table) -> mlua::Result<ParsedPanelSpec> {
     let id: String = spec.get("id")?;
-    // The panel's module is `lua:<id>`, and `ModuleId::parse` rejects `lua:` alone.
-    // An empty id would be dropped from saved state and reset the panel's placement on every launch.
-    // Reject it here, just like an unknown `position`.
+    // The panel's module is `lua:<id>`, and `lua:` alone names nothing `ModuleId::parse` accepts:
+    // the layout's state file would drop it on every read and reopen the panel at its default placement
+    // on every launch. Refused here, the same way an unknown `position` is.
     if id.is_empty() {
         return Err(mlua::Error::RuntimeError(
             "eitri.panel.register: id must not be empty".to_string(),

@@ -41,8 +41,7 @@ pub fn install(lua: &Lua, eitri: &Table, bus: Rc<RefCell<EventBus>>) -> mlua::Re
 
 /// Calls every handler subscribed to `event_name`, in registration order, with `payload`. A
 /// handler that errors is logged and skipped -- one broken plugin handler must not stop the
-/// rest, matching `Kernel::load_init_file`'s "never let Lua crash the shell" discipline
-///.
+/// rest, matching `Kernel::load_init_file`'s "never let Lua crash the shell" discipline.
 ///
 /// Takes `bus: &RefCell<EventBus>` (not an already-borrowed `&EventBus`) so it can control its
 /// own borrow's lifetime: the borrow is taken only long enough to clone out the `Rc<RegistryKey>`

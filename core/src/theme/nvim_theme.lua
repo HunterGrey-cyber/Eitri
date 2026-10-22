@@ -58,20 +58,23 @@ local function snapshot()
   })
 end
 
--- Send synchronously: `sockconnect` connects before returning and `chansend` writes this
--- small line into the socket before another autocommand runs. An asynchronous libuv write
--- waits for nvim's loop, so a slow VimEnter handler can leave the connection silent past
--- the shell's read timeout. A 400ms handler lost both asynchronous payloads but neither
--- synchronous payload. `last_sent` holds the last line written; only the timer reads it.
+-- Synchronous on purpose. `sockconnect` connects before it returns and `chansend` writes a line
+-- this small straight into the socket, so it is in the kernel before any other autocommand runs.
+-- An asynchronous libuv write waits for nvim's loop to turn -- i.e. after every other VimEnter
+-- handler in the user's config, which can take hundreds of milliseconds -- and the shell drops a
+-- connection that stays silent past its read timeout. (Measured: a 400ms VimEnter
+-- handler lost both payloads with the async write, none with this one.)
+-- The last line this file got into the socket. Only the timer below reads it.
 local last_sent = nil
 -- Set by the teardown. A resnapshot the timer already queued with `schedule_wrap` still runs once
 -- after the timer is closed, and must write nothing then.
 local torn = false
 
--- The timer uses `only_if_changed` because every received payload restyles the window and
--- rethemes the panel on the GTK thread. The shell does not deduplicate, so repeated idle
--- snapshots would repeat that work. Autocommand sends remain unconditional. Set `last_sent`
--- only after `chansend` writes the line, so a failed send is retried on the next tick.
+-- `only_if_changed` is the timer's: every payload the shell receives restyles the whole window and
+-- re-themes the panel on its GTK thread, and the shell does not deduplicate, so re-sending an
+-- unchanged snapshot every few seconds costs every idle window that work forever. An
+-- autocommand's send stays unconditional. `last_sent` is set only after
+-- `chansend` wrote the line, so a send that failed is retried by the next tick.
 local function send(only_if_changed)
   if torn then
     return
@@ -106,7 +109,7 @@ vim.api.nvim_create_autocmd("OptionSet", { group = augroup, pattern = { "backgro
 -- nvim has no "a highlight group changed" event at all, so a bare
 -- `nvim_set_hl` call -- or an autocmd registered AFTER this file's own, which therefore fires
 -- after the snapshot above already went out -- never triggers a re-send. Reachable directly from
--- LazyVim setups, where plugins commonly tweak highlight groups from
+-- an ordinary LazyVim setup, where plugins commonly tweak highlight groups from
 -- post-colorscheme/VimEnter autocmds. A periodic re-snapshot is the cheapest self-healing fix that
 -- needs no new event: it bounds how stale the panel can stay after such a change to
 -- RESNAPSHOT_INTERVAL_MS rather than for the rest of the session. It sends only a snapshot that

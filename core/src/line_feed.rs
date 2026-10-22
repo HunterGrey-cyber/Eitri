@@ -1,17 +1,22 @@
-//! The bounded, newest-wins line reader shared by nvim-to-host push sockets in this crate.
-//! The caller's `accept` closure decides which lines are valid.
-//! Each bound keeps a stalled or oversized sender from monopolizing the GTK driver.
-//! Read [`NewestLineReader`] before changing a bound.
+//! The bounded, newest-wins line reader every nvim->host push socket in this crate shares.
+//!
+//! Extracted verbatim from `editor_context::feed`,
+//! where it was written and reviewed first; the only generalization is that the "is this line
+//! valid" decision is the caller's `accept` closure rather than one fixed parser. Read the doc on
+//! [`NewestLineReader`] before changing a bound: each one exists because a stalled or oversized
+//! sender must not monopolize the GTK driver that polls this.
 
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
-// A stalled or oversized sender must not monopolize the GTK driver. These limits allow the
-// editor-context updates sent every 150ms, including a bounded 400-line selection. They cannot
-// fit the maximum nvim-keys report: 2000 maps with 200 characters each for `rhs` and `desc`, plus
-// uncut `lhs` values, need about 800KB before JSON overhead. This cap allows roughly 131 bytes
-// per map at 2000 maps. An oversized report is dropped whole; the host keeps its last good one.
+// A stalled/oversized sender must not monopolize the GTK driver. The editor-context snippet
+// normally sends a small update every 150ms; these limits also leave room for its bounded 400-line
+// selection. They do NOT leave room for a full nvim-keys report at its own stated bounds: 2000
+// maps of up to 200 characters each for `rhs` and `desc` (`lhs` is not cut at all) is about 800KB
+// before JSON overhead -- roughly 131 bytes of budget per map at 2000 maps, not 400. An oversized
+// report is dropped whole and the host keeps its last good one, so a report is never half applied;
+// whether to lower MAX_MAPS/MAX_TEXT to fit under this cap is a later decision, not made here.
 pub(crate) const MAX_PENDING_CONNECTIONS: usize = 16;
 pub(crate) const MAX_ACCEPTS_PER_POLL: usize = 16;
 pub(crate) const MAX_LINE_BYTES: usize = 256 * 1024;

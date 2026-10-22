@@ -1,8 +1,8 @@
 //! The twin of `agent`'s `every_sock_path_in_this_crate_is_built_here`, over this crate.
 //!
 //! `agent`'s version walks `agent/src` and `agent/tests` only, and its doc promises that "a new
-//! construction site elsewhere fails a test rather than a Mac". L2 T5 added two construction
-//! sites here, outside that walk, and made that promise narrower than it reads. Today's two
+//! construction site elsewhere fails a test rather than a Mac". Two construction sites were added
+//! here on 2026-09-17, outside that walk, and made that promise narrower than it reads. Today's two
 //! paths are each pinned by an exact-length test of their own, so nothing was broken -- but a
 //! *third* socket added to this crate later would have escaped the only systematic guard there
 //! is. This restores it rather than rewording the promise.
@@ -31,7 +31,7 @@ const NEVER_BOUND: &[(&str, &str)] = &[
         "src/instance_dir.rs",
         "sweep_entries_owned_by(&root, BIND_PREFIX, \"s.sock\"",
     ),
-    // The full-backlog test (v1 hardening C4) runs the sweep on its own thread so a hang shows up
+    // The full-backlog test runs the sweep on its own thread so a hang shows up
     // as `recv_timeout` expiring rather than wedging the whole test process; the thread's clone of
     // `root` is named differently so the closure can move it while the original stays usable after
     // `thread::spawn` returns.

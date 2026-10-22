@@ -1,5 +1,6 @@
-//! Classifies one nvim mapping as a tab action and translates an nvim `lhs` into a panel key sequence.
-//! These pure functions are tested here; `effective()` handles precedence with defaults and `init.lua`.
+//! Turning one nvim mapping into a tab action, and one nvim `lhs` into the panel's own
+//! key sequence. Pure and unit-tested here; precedence against the defaults and
+//! `init.lua` (`effective()`) lives in `keymap::panel`, not this file.
 
 use super::NvimMap;
 use crate::keymap::{PanelKey, PanelSeq, TabAction};
@@ -15,8 +16,9 @@ const COMMANDS: &[(&str, usize, TabAction)] = &[
     ("enew", 3, TabAction::New),
 ];
 
-/// Recognises `%bd|e#`-style mappings that delete all buffers and reopen the alternate.
-/// Callback mappings for closing other buffers are matched by `desc` below.
+/// `%bd|e#`-style: a vim idiom older than any plugin (wipe every buffer, then reopen the
+/// alternate) -- LazyVim's own "Delete Other Buffers" runs Snacks.bufdelete instead, a callback
+/// matched by `desc` below, but a hand-written mapping often spells it this way.
 fn close_others_idiom(word: &str) -> bool {
     let Some(rest) = word.strip_prefix('%') else {
         return false;
@@ -121,7 +123,7 @@ fn tokenize(text: &str) -> Result<Vec<RawToken>, String> {
 /// A token to the panel's own key, or an error naming it: only `<Space>`/`<lt>`/`<Bslash>`/`<Bar>`
 /// among brackets are recognised, and everything else -- a Ctrl/Alt chord, `<Tab>`, `<CR>`, an
 /// arrow, an `F` key, a mouse button -- belongs to `shell`'s own accelerators, never to a panel
-/// sequence.
+/// sequence (the same rule `panel::parse_seq` holds).
 fn token_to_key(token: &RawToken, text: &str) -> Result<PanelKey, String> {
     Ok(match token {
         RawToken::Bracket(name) => match name.as_str() {
@@ -141,7 +143,7 @@ fn token_to_key(token: &RawToken, text: &str) -> Result<PanelKey, String> {
     })
 }
 
-/// nvim's `lhs` into a panel sequence, substituting nvim's
+/// nvim's `lhs` (already through `keytrans`) into a panel sequence, substituting nvim's
 /// own effective leader (`nvim_leader`, `nvim_leader_token`'s return) for [`PanelKey::Leader`] when
 /// `lhs` starts with it: a `\bd` in an nvim with no `mapleader` becomes `Space b d`
 /// under the panel's own leader, the same binding either way.

@@ -42,32 +42,57 @@ pub struct EditorContext {
 pub const CONTENT_LIMIT: usize = 2000;
 pub const TRUNCATION_MARKER: &str = "\n... (truncated)";
 
-/// Fixed-name built-in CLI commands with `type: "local"`, including aliases, in version 2.1.283.
-/// These commands execute locally instead of passing their arguments to the model.
-/// A turn beginning with one of these commands gets no appended editor context.
+/// The built-in slash commands Claude Code 2.1.283 defines as `type: "local"` under a fixed name,
+/// with their aliases -- the commands its own code runs, rather than handing their argument to the
+/// model as prompt text.
 ///
-/// The router splits at the first whitespace: `name` is the command and `args` is the trimmed
-/// remainder. Each local command parses its own arguments, so appended context would become
-/// part of a model name, effort level, session name, path, configuration value or other argument.
+/// A turn whose first word is one of these
+/// never carries the context block. The CLI's router splits a slash turn at the first whitespace
+/// (`ZEe` in the 2.1.283 bundle: `name` up to the first `\s`, `args` everything after it, trimmed)
+/// and each of these commands parses `args` itself, so a block appended after the user's text
+/// becomes part of the argument -- the model name (`/model haiku\n\nThe user opened ...`, which
+/// `/model` rejects), the effort level ("Invalid argument"), a session name (`/rename`, `/clear
+/// <name>`), a path (`/add-dir`), a `key=value` (`/config`), compaction instructions (`/compact`) or a
+/// goal (`/goal`). None of them wants it.
 ///
-/// Command definitions can put `name` before `type`, or hold the name in a variable.
-/// Matching only `{type:"local",name:...}` misses `keybindings`, `rewind` and its aliases
-/// `checkpoint` and `undo`, plus `low-priority` and `claim-credit`. The lookup matches exact names
-/// or aliases, as does [`names_a_cli_local_command`]. Commands are included even when they lack
-/// `supportsNonInteractive`: a headless reply still does not pass their arguments to the model.
+/// **How it was read, not remembered.** `/scratch/auto-parity/cli-2.1.283.strings`: every object
+/// literal carrying `type:"local"`, in any key order, and its `aliases:[…]`. The first extraction
+/// matched only the literal `{type:"local",name:"…"` and missed four: two whose
+/// `name` comes before `type` (`keybindings`; `rewind`, with `checkpoint` and `undo`) and two whose name
+/// is a variable (`Sae` = `low-priority`, `MOt` = `claim-credit`). A re-read should search the same
+/// way. The lookup is exact (`e.name===n || e.aliases?.includes(n)`), and so is
+/// [`names_a_cli_local_command`]. Included whether or not the entry says `supportsNonInteractive`
+/// (nine do not: `claim-credit`, `install-slack-app`, `keybindings`, `low-priority`, `radio`,
+/// `rewind`, `stickers`, `update`, `voice`) -- a headless CLI answers those without the model either,
+/// so a block there is never read.
 ///
-/// Upsell stubs are omitted because they ignore their arguments, and their names can also name
-/// user skills whose arguments should keep editor context. Plugin commands registered at runtime
-/// are also omitted because their names are unknown here. Their `command.run` hooks receive
-/// `args`, so appended context can still corrupt those arguments. The `system/init` command list
-/// has no type information and is not forwarded by the sidecar. Handling this case requires
-/// command types on the wire or context sent separately from command text.
+/// **Two kinds of `type: "local"` command this list cannot name, left off on purpose.**
+/// - The Claude-for-Enterprise upsell stubs `z0()` builds (`ultraplan`, `teleport`/`tp`,
+///   `remote-control`/`rc`, `schedule`/`routines`, `autofix-pr`): each answers an upsell message
+///   without reading its argument, and a name like `schedule` is one a user's skill can have too,
+///   whose argument is prompt text that should keep the block.
+/// - A command a plugin registers at run time through its hooks module (`$.command.register`, built
+///   by `Jgn` as `type:"local"`, `supportsNonInteractive:!0`, `loadedFrom:"plugin"`): its
+///   `command.run` hook receives `args` the same way, so `/choose-profile staging` with a file open
+///   reaches it as `staging` plus the block. Its name is whatever the plugin chose, and Eitri never
+///   sees the CLI's command table: `system/init`'s `slash_commands` lists names with no type, and the
+///   sidecar does not forward it. Hooks modules are early access in 2.1.283 -- off for installed
+///   plugins unless `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is set or the `tengu_plugin_hooks_modules`
+///   rollout turns them on (built-in plugins load regardless; the one built-in registration found,
+///   the diff panel's `/diff`, takes no argument). Still open: closing it needs the command's type on
+///   the wire, or the context sent apart from the text.
 ///
-/// Prompt commands and skills keep the block because their arguments reach the model.
-/// Unknown slash commands may be skills or ordinary model text, so they keep it too.
-/// Interactive `local-jsx` commands are omitted because headless replies ignore their arguments.
-/// For `/model` and `/effort`, the headless CLI uses their `local` definitions.
-/// A newer CLI can add local commands that receive context until this list is updated.
+/// **What keeps the block, and why.** The CLI's `type: "prompt"` commands (`/init`, `/review`,
+/// `/security-review`, `/doctor`, and every skill) substitute their argument into a prompt the model
+/// reads, which is where the block goes on any ordinary turn; an unknown `/word` is either a
+/// user's skill or reaches the model as text. Its `type: "local-jsx"` commands (the interactive
+/// pickers and wizards: `/help`, `/export`, ...) reply "isn't available in this environment"
+/// headless without reading their argument (measured 2026-09-27), so
+/// they are left out rather than listed for no effect -- `/model` and `/effort` have a `local-jsx`
+/// twin too, and it is their `local` definition a headless CLI runs.
+///
+/// A newer CLI can add a local command this list does not name; that command then gets the block
+/// until this list is re-read -- a stale list fails that one command, nothing wider.
 pub const CLI_LOCAL_COMMANDS: &[&str] = &[
     "__remote-workflow",
     "add-dir",
@@ -130,10 +155,11 @@ pub const CLI_LOCAL_COMMANDS: &[&str] = &[
     "workflow-launch-exec",
 ];
 
-/// Whether the CLI runs `user_text` as one of [`CLI_LOCAL_COMMANDS`], with or without
-/// arguments. Matches its parsing: trim text, require `/`, take the name up to whitespace,
-/// and compare exactly, so `/Model` differs from `/model`. Argument forms must match too
-/// because the picker sends them.
+/// Whether the CLI would run `user_text` as one of [`CLI_LOCAL_COMMANDS`], argument or not: the
+/// CLI's own parse -- the text trimmed, a leading `/`, the name up to the first whitespace -- and
+/// its own exact match (`/Model` is not `/model` there, so not here). Replaces
+/// `is_bare_slash_picker_command`, which exempted only a bare `/model`/`/effort` and so
+/// left the argument form -- what the picker itself sends -- broken.
 fn names_a_cli_local_command(user_text: &str) -> bool {
     let Some(rest) = user_text.trim().strip_prefix('/') else {
         return false;
@@ -187,8 +213,8 @@ pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> St
 /// Truncates on a CHARACTER boundary, not a byte one.
 ///
 /// `&s[..CONTENT_LIMIT]` panics mid-codepoint, and a selection of CJK or emoji reaches this
-/// function as a matter of course in this project -- the editor's own IME work exists because the
-/// editor accepts Chinese input.
+/// function as a matter of course in this project -- the editor's own IME work exists because CJK
+/// text is typed into it.
 fn truncate(content: &str) -> String {
     if content.chars().count() <= CONTENT_LIMIT {
         return content.to_string();

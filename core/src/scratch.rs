@@ -1,7 +1,8 @@
-//! The shell-to-nvim scratch bridge uses the existing RPC in `LiveHarness`.
-//! One `nvim_input` sends a `<Cmd>lua` call with a hex-only argument. Bodies travel as files in a
-//! per-window 0700 directory; edit results return through marker files polled by the panel's
-//! 33 ms tick.
+//! The shell -> nvim half of the read-only row view (`Ctrl+g` in BROWSE) and the draft editor
+//! (`Ctrl+g` in INPUT), over the existing RPC in `LiveHarness` rather than a new socket. One
+//! `nvim_input` of a `<Cmd>lua` call whose only argument is hex, so nothing typed is ever read as
+//! Lua; bodies travel as files in a per-window 0700 directory; an
+//! edit's result comes back as a marker file the agent panel's 33 ms tick polls.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,7 +44,7 @@ impl ScratchRequest {
     }
 }
 
-/// `gf`: request `:edit <path>` at the optional line.
+/// `gf`: `:edit <path>` and the line.
 pub fn open_request(path: &Path, line: Option<u32>) -> ScratchRequest {
     ScratchRequest::of(serde_json::json!({ "op": "open", "path": path.to_string_lossy(), "line": line }))
 }
@@ -315,9 +316,10 @@ impl PendingEdit {
     }
 }
 
-/// Whether nvim's buffer name `file` lies inside scratch directory `dir`, such as a draft or
-/// read-only view. The editor-context feed drops these reports so the status line and next turn
-/// keep naming the user's file. Compare path components so `<dir>x/...` is not inside `dir`.
+/// Whether nvim's buffer name `file` lies inside the scratch directory `dir`: a `Ctrl+g` draft or a
+/// read-only row view, Eitri's own buffer and never a file the user is working on. The editor-context
+/// feed drops such a report, so the composer's editor-context line and the next turn keep naming the
+/// file the user was in (seen 2026-09-25). Compared by path component, so `<dir>x/…` is not inside.
 pub fn holds(dir: &Path, file: &str) -> bool {
     !file.is_empty() && Path::new(file).starts_with(dir)
 }
@@ -429,7 +431,7 @@ impl ScratchDir {
         })))
     }
 
-    /// C5: the draft in an editable buffer whose wipe writes the marker.
+    /// The draft in an editable buffer whose wipe writes the marker.
     pub fn prepare_edit(&mut self, text: &str) -> io::Result<(ScratchRequest, PendingEdit)> {
         let id = self.next_id();
         let edit = PendingEdit {

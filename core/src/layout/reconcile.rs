@@ -38,7 +38,7 @@ use super::float::{Float, FloatRect};
 use super::module::{declared_placement, ModuleDecl, ModuleId, ModuleKind, Placement};
 use super::tree::{place_new, Layout, LayoutError};
 
-/// Every window has an editor, an agent and a terminal.
+/// Every window has these three (the terminal since the module layout began hosting it).
 const BUILT_INS: [fn() -> ModuleId; 3] = [ModuleId::editor, ModuleId::agent, ModuleId::terminal];
 
 /// A reconciled layout, and what was changed to get it.

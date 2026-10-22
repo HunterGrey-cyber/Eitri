@@ -31,7 +31,7 @@ pub fn tray_covered(layout: &Layout, covered: &[ModuleId]) -> Vec<ModuleId> {
 }
 
 /// A chip's text: the module's title, and for the agent what it is holding -- `agent ⚑2` while cards
-/// wait (decision b), `agent •` once a turn finished while it was away.
+/// wait, `agent •` once a turn finished while it was away.
 pub fn chip_label(title: &str, attention: Option<Attention>) -> String {
     match attention {
         Some(Attention { pending, unread, .. }) if pending > 0 => {

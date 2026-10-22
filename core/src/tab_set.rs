@@ -101,10 +101,16 @@ pub struct AwaitingTrust {
 
 /// A handoff whose session close is still running on a worker thread.
 ///
-/// Build the command before moving the session to the worker, while its state is readable.
-/// Dispatch it only after `closed_rx` reports, so the session is closed and flushed before
-/// the user can start the displayed command. Closing runs off the GTK main loop because
-/// the sidecar's `close_session` RPC can block for up to 10 seconds and freeze the editor.
+/// The command is built BEFORE the session is taken -- it is derived from the session's own state,
+/// which stops being readable the moment ownership moves to the worker -- and dispatched only after
+/// `closed_rx` reports. That ordering is the whole reason this struct exists rather than a straight
+/// reply: the session must be closed and flushed before the CLI starts, so the CLI resumes a
+/// complete transcript nobody else is writing, and the user cannot start it before they have seen
+/// the command.
+///
+/// Closing runs off the GTK main loop for the same reason every other teardown here does: the
+/// sidecar path's `close_session` is a unary RPC bounded at 10s, and blocking the main loop on it
+/// would freeze the editor pane too.
 pub struct PendingHandoff {
     pub request_id: String,
     pub command: agent::handoff::ClaudeResumeCommand,
@@ -118,8 +124,8 @@ pub struct PendingHandoff {
     pub dropped_rx: mpsc::Receiver<()>,
 }
 
-/// One message typed while a turn ran. `wire` uses the editor context at the moment it was
-/// queued; `text` is what was typed.
+/// One message typed while a turn ran. `wire` is composed against the editor context of the
+/// moment it was queued; `text` is what was typed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Queued {
     pub text: String,
@@ -179,7 +185,7 @@ pub enum SendNow {
 }
 
 /// Not boxed: a window holds a handful of tabs, `Live` is the state a tab spends its life in, and
-/// the plan's interface matches on `Live(AgentBackend)` directly.
+/// callers match on `Live(AgentBackend)` directly.
 #[allow(clippy::large_enum_variant)]
 pub enum TabBackend {
     /// An empty tab: a live composer and no process. A session is created on the first
@@ -230,9 +236,11 @@ pub struct Tab {
     pub number: u16,
     /// The rename (`prefix ,`), already normalized.
     pub name: Option<String>,
-    /// The tab's permission mode survives panel reloads. Keep it private so entering bypass can
-    /// only happen through `cycle_mode`/`confirm_bypass`, which require confirmation.
-    /// `mode()` provides read-only access; this module's tests may write the field directly.
+    /// Was React's `startedPermissionMode`; now survives a panel reload.
+    /// Private outside this module for the same reason `host_answered` is: the rule that
+    /// entering bypass always asks first only holds if nothing but `cycle_mode`/`confirm_bypass` can
+    /// ever move it there. `mode()` below is the read-only way out; this module's own tests still
+    /// write the field directly.
     mode: SessionModeChoice,
     /// The agent this tab runs, chosen when it was opened (or by the session a restore brings back
     /// into it) and kept by `r`. Private so that only the set decides it; [`Tab::agent`] reads it.
@@ -255,7 +263,8 @@ pub struct Tab {
     /// that swaps `Failed` in sets it.
     pub failed_resume: Option<String>,
     pub pending_handoff: Option<PendingHandoff>,
-    /// Held per tab here so a panel reload cannot lose the last terminal handoff.
+    /// Held here, not only in the WebView, so a panel reload cannot lose it (see the doc this field
+    /// had on `AgentPanelState` before session tabs; it moved per tab with them).
     pub last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
     /// The scratch edit of the draft in nvim, when one is open (set by the shell's round trip).
     pub editing_draft: Option<u64>,
@@ -443,9 +452,9 @@ impl Tab {
         }
     }
 
-    /// Whether `permission_id` is still waiting for the user: a live backend's projection lists it
-    /// as pending and `user_answered` does not contain it. The panel checks this before saving an
-    /// "Always allow" rule.
+    /// Whether `permission_id` is a card still waiting for the user here: its live backend's
+    /// projection lists it as pending and the user has not already answered it (`user_answered`).
+    /// What the panel's "Always allow" checks before saving a rule.
     pub fn card_is_waiting(&self, permission_id: &str) -> bool {
         !self.session.user_answered.contains(permission_id)
             && self
@@ -712,9 +721,9 @@ pub struct PumpOutput {
     /// Tabs whose queue changed in this tick (a message put into the turn was read, or held again): the
     /// caller sends the active one's queue to the panel.
     pub queue_changed: Vec<TabId>,
-    /// Tabs failed this tick because their CLI reported an ungated permission mode, with each
-    /// backend removed for shutdown. The caller shuts them down off the GTK thread, as it does for
-    /// closed tabs (`eitri_panel::agent_panel`'s `spawn_teardown`).
+    /// Tabs this tick failed because their CLI reported an ungated permission mode,
+    /// each with the backend taken out of it, retired. The caller shuts each one down off the
+    /// GTK thread exactly as it does a closed tab's (`eitri_panel::agent_panel`'s `spawn_teardown`).
     pub tripped: Vec<Tripped>,
     /// Turns whose end snapshot landed this tick, for the status band (empty without a turn
     /// review installed).
@@ -901,7 +910,7 @@ pub enum ResumeRoute {
     StartIn(TabId),
 }
 
-/// Whether entering bypass changes one tab's mode or the window's remembered `default_mode`
+/// Which mode a bypass entry moves: one tab's own mode, or the window's remembered `default_mode`
 /// for tabs not yet started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BypassScope {
@@ -909,24 +918,24 @@ pub enum BypassScope {
     Default,
 }
 
-/// A pending "enter bypass" prompt, held in `TabSet::pending_bypass` until `y`/`n` answers it.
-/// `serialize_confirm_bypass_for_js` sends only `lines`. Rust keeps `approve` so the panel
-/// never counts cards or echoes an id back.
+/// A pending "enter bypass" prompt, stored on `TabSet::pending_bypass` until `y`/`n` answers it.
+/// `approve` never reaches the panel (`serialize_confirm_bypass_for_js` sends only
+/// `lines`) -- Rust keeps the list so the panel never counts cards or echoes an id back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BypassPlan {
     pub scope: BypassScope,
-    /// Identifies the exact prompt being accepted, so a stale confirmation cannot accept a newer one.
+    /// Answers a stale confirm: only the exact prompt shown, by this nonce, may be accepted.
     pub nonce: u64,
     /// The delivered cards this entry would approve if confirmed now, `seq`-ordered -- the same set
     /// `confirm_bypass` re-derives fresh (`waiting_cards`) and compares against before acting.
     pub approve: Vec<String>,
-    /// Lines shown by `tabs::bypass_prompt`: the y/n prompt and any warning.
+    /// What the panel shows (`tabs::bypass_prompt`), one or more lines (the y/n plus any warning).
     pub lines: Vec<String>,
-    /// Which `tabs::bypass_prompt` text `lines` contains, and thus what the user is agreeing to.
-    /// A live-tab prompt says nothing about new sessions; an empty-tab prompt says they use bypass too.
-    /// `confirm_bypass` checks this again and reprompts if it changed. A terminal handoff can turn a
-    /// live tab into `NotStarted` under an open prompt; its `y` must not silently change the window
-    /// default to bypass.
+    /// Which of `tabs::bypass_prompt`'s texts `lines` is -- what the user is agreeing to. A live
+    /// tab's prompt says nothing about new sessions; an empty tab's says they will use bypass too.
+    /// `confirm_bypass` re-derives it and reprompts when it no longer matches (a live tab handed
+    /// off to a terminal becomes `NotStarted` under an open live-tab prompt, and its `y` would then
+    /// move the window default into bypass).
     pub prompt: tabs::PromptScope,
     /// The chat page that shows this prompt: the view of the tab it is about, or for the window
     /// default the page that asked. Only that page's `y` is taken, and the prompt goes when that
@@ -1001,8 +1010,8 @@ pub enum ConfirmOutcome {
     /// The tab was already in bypass by the time this confirm arrived (a race, not an error):
     /// nothing to do.
     AlreadyBypass,
-    /// A delivered card arrived after the plan was built and is absent from `approve`.
-    /// Nothing changed; show the fresh plan's prompt instead.
+    /// A delivered card arrived after the plan was built and is not in `approve`: nothing
+    /// changed; the caller should show the fresh plan's prompt instead.
     Reprompt(BypassPlan),
 }
 
@@ -1104,8 +1113,8 @@ pub struct TabSet {
     next_id: u64,
     kind: BackendKind,
     default_mode: SessionModeChoice,
-    /// At most one pending "enter bypass" prompt. A fresh mode-key press supersedes it;
-    /// a tab-switching call drops it.
+    /// An "enter bypass" prompt on screen, if any: at most one at a time, a fresh press on the
+    /// mode key (or any tab-switching call) superseding or dropping whatever was open.
     pending_bypass: Option<BypassPlan>,
     /// The next `BypassPlan::nonce`, starting at 1 so `0` is never a valid nonce to compare against.
     next_nonce: u64,
@@ -1115,7 +1124,7 @@ pub struct TabSet {
     /// (`attention`) never goes down when a tab closes: [`crate::attention::react`] reads only its
     /// growth.
     removed_arrived: u64,
-    /// Project prefix rules shared by the window. Every tab's pump applies them.
+    /// The project's saved prefix rules, window-level: every tab's pump applies them.
     rules: agent::PrefixRules,
     /// The tabs that were active, least recent first and each once: where the saved active tab falls
     /// back to when the active one has no session to save.
@@ -1183,18 +1192,21 @@ pub struct TabSet {
     /// The extra chat views the window's layout holds, in any workspace ([`TabSet::set_layout_views`]):
     /// the only views a restored tab may come back into.
     layout_views: Vec<ViewId>,
-    /// One-shot test hook after `pump` drains a live tab's queue. Fold an event after the drain
-    /// and before the next snapshot read in `active_state_payloads` or `Resync`, so the test
-    /// reproduces the race without relying on timing.
+    /// Test seam: run once, right after `pump`'s next drain of a live tab's queue,
+    /// so a test folds an event exactly where the race is -- after a drain and before the next
+    /// snapshot read, `active_state_payloads`' or the `Resync` arm's own a few lock cycles later --
+    /// rather than hoping a timing probe lands there.
     #[cfg(test)]
     after_drain: Option<BackendSeam>,
-    /// Test-only: also deliver events already covered by a snapshot, so tests can demonstrate
-    /// duplicate delivery and capture both versions for the reducer test.
+    /// Test-only: deliver what a snapshot already carried as well, as before the drain left those
+    /// events out, so a test can show what leaving them out prevents (and record both for the reducer
+    /// test).
     #[cfg(test)]
     redeliver_covered: bool,
-    /// One-shot test hook just before the `Resync` snapshot read, after the early turn-clock read,
-    /// the projection read and `approve_pending`'s bypass sweep. This reaches the race that
-    /// `after_drain`, which runs before those lock cycles, cannot.
+    /// Test seam: run once, right before the `Resync` arm's own snapshot read --
+    /// after its early turn-clock read and its own further lock cycles (its one read of the projection
+    /// and `approve_pending`'s bypass sweep), which is exactly where that race is and where
+    /// `after_drain` (fired right after the drain, before any of those) cannot reach.
     #[cfg(test)]
     before_resync_snapshot: Option<BackendSeam>,
 }
@@ -1600,8 +1612,8 @@ impl TabSet {
         self.mode_note.take()
     }
 
-    /// Rules apply to every tab from the next pump. A rule added after a card appeared does not
-    /// answer that card.
+    /// The rules apply to every tab from the next pump; a card already on screen is not
+    /// answered by a rule added after it arrived.
     pub fn set_rules(&mut self, rules: agent::PrefixRules) {
         self.rules = rules;
     }
@@ -1655,9 +1667,9 @@ impl TabSet {
             self.last_active = Some(self.active);
             self.active = id;
             self.note_recent(id);
-            // Changing the active tab drops its pending bypass prompt, so a later `y` cannot approve
-            // bypass for the tab the user has left. Only the base page's prompt is dropped; an extra
-            // view still shows the same tab.
+            // Every method that MOVES the active tab drops a pending bypass prompt --
+            // it was about the tab the user is leaving, and a `y` typed after switching away must
+            // never land on it. Only the base page's: an extra view still shows what it showed.
             self.drop_bypass_prompt_in(ViewId::BASE);
         }
         debug_assert!(self.v1_holds());
@@ -1721,7 +1733,7 @@ impl TabSet {
     /// Takes a tab out and hands it back: its live backend, retired, its pending start or handoff are
     /// the caller's to shut down or watch; the caller reports [`TabSet::retire_done`] once the retired
     /// backend's shutdown has returned. When the base view's last tab goes, a fresh tab 1 opens there
-    ///, whatever the extra views still hold.
+    /// whatever the extra views still hold.
     ///
     /// A tab frozen for a move is not taken out (`None`, as for a tab that is not here): its backend is
     /// the other window's to take up, and retiring it here would shut that session down. It leaves
@@ -1786,7 +1798,7 @@ impl TabSet {
         debug_assert!(self.v1_holds());
     }
 
-    /// V1: the base view's active tab exists and is a base-view tab (so the base view always holds
+    /// The invariant: the base view's active tab exists and is a base-view tab (so the base view always holds
     /// one), and no extra view holds more than one tab. Checked after every path that moves `active`
     /// or a binding.
     fn v1_holds(&self) -> bool {
@@ -2029,7 +2041,8 @@ impl TabSet {
                 return Err(format!("tab {} is not shown in this page", tab.number));
             }
         }
-        // A fresh press supersedes the open prompt. `Confirm` below stores a new one if it builds one.
+        // A fresh press supersedes whatever prompt was already open; `Confirm` below stores a
+        // new one if it builds one.
         self.supersede_prompts(page);
         let at = self
             .tabs
@@ -2145,9 +2158,9 @@ impl TabSet {
         }
     }
 
-    /// Accept `y`/`Y` for a `confirm_bypass` prompt. Check the stored plan before taking it:
-    /// a mismatched scope or stale nonce leaves the current prompt untouched, so an old answer
-    /// cannot cancel a newer prompt.
+    /// `y`/`Y` to a `confirm_bypass` prompt. Compares against the STORED plan
+    /// before taking it: a mismatched scope or a stale nonce leaves the CURRENT prompt exactly as it
+    /// was, so an answer to an old prompt can never cancel a newer, still-open one.
     pub fn confirm_bypass(&mut self, scope: BypassScope, nonce: u64, page: ViewId) -> Result<ConfirmOutcome, String> {
         match &self.pending_bypass {
             Some(plan) if plan.scope == scope && plan.nonce == nonce && plan.page == page => {}
@@ -2181,12 +2194,13 @@ impl TabSet {
                 if self.tabs[at].mode != SessionModeChoice::Auto {
                     return Err("that prompt is no longer current".to_string());
                 }
-                // Recompute what `y` would approve now. A card delivered after the prompt was built must
-                // never be silently approved.
+                // Re-derive what `y` would approve NOW, not what the plan said when it was
+                // built -- a card delivered while the prompt was up must never be silently approved.
                 let now = waiting_cards(&self.tabs[at]);
-                // Recheck which question the prompt asks: a terminal handoff can turn a live tab into
-                // `NotStarted` while it is open. Confirming an empty tab also changes the window default, which
-                // the live-tab prompt did not ask permission to change.
+                // And re-derive WHICH question it is: the tab can change kind under an open prompt
+                // (a terminal handoff turns a live tab into `NotStarted`), and an empty tab's `y`
+                // also moves the window default -- which a live tab's prompt never said (the only way
+                // into bypass is a confirmed prompt or a confirmed window default).
                 let scope_kind = if matches!(self.tabs[at].backend, TabBackend::NotStarted) {
                     tabs::PromptScope::EmptyTab
                 } else {
@@ -2206,8 +2220,9 @@ impl TabSet {
                     self.pending_bypass = Some(fresh.clone());
                     return Ok(ConfirmOutcome::Reprompt(fresh));
                 }
-                // `now` is already a subset of `plan.approve`, so it is their intersection. Only cards
-                // that are still pending and delivered are approved.
+                // `now` is already a subset of `plan.approve` (checked above), so it IS the
+                // intersection a stale prompt needs -- nothing besides a still-pending, still-delivered card
+                // is ever approved.
                 let tab = &mut self.tabs[at];
                 tab.mode = SessionModeChoice::Bypass;
                 if matches!(tab.backend, TabBackend::NotStarted) {
@@ -2281,7 +2296,7 @@ impl TabSet {
         }
         let tab = self.get_mut(id).ok_or_else(no_session)?;
         let backend = tab.live_mut().ok_or_else(no_session)?;
-        // The call exactly as the card showed it: id, tool and input (the review's tightening).
+        // The call exactly as the card showed it: id, tool and input, so the approval answers that call only.
         let call: Option<(String, String, serde_json::Value)> = backend
             .projection()
             .pending_permissions
@@ -2297,8 +2312,9 @@ impl TabSet {
                 tab.session.human_allowed.record(&tool_use_id, &tool_name, &input);
             }
         }
-        // A successful answer removes the rule offer and adds the id to `user_answered`, preventing
-        // a new offer for this card. A failed answer leaves both the card and its offer open.
+        // The card is answered, whatever the decision, so its rule
+        // offer goes now and is never made again (`user_answered`'s doc). Only on success: a refused
+        // answer leaves the card open and its offer with it.
         tab.session.rule_offers.remove(permission_id);
         tab.session.user_answered.insert(permission_id.to_string());
         Ok(())
@@ -2552,7 +2568,7 @@ impl TabSet {
         })
     }
 
-    /// Resolve an explicit tab reference; reject missing or unknown tab ids.
+    /// A command that names no tab, or a tab that is not here, is refused rather than run on another.
     pub fn resolve(&self, tab_ref: TabRef) -> Result<Option<TabId>, String> {
         match tab_ref {
             TabRef::WindowLevel => Ok(None),
@@ -3298,17 +3314,19 @@ impl TabSet {
         collected
     }
 
-    /// After a switch or `ready`, send the active tab's snapshot if it has a backend, or its
-    /// handoff card if it has one, even when the tab is not stale.
+    /// After a switch or on `ready`: the active tab's own state. Its snapshot if it has a backend, or
+    /// its handoff card if it has one. Always sent, not only when stale: the page holds only the active tab's state.
     ///
-    /// Read without draining. The sidecar's ingestion thread can fold and queue events after the
-    /// last drain, so the snapshot may already cover queued events. Read its revision under the
-    /// serialization guard and store it through `AgentBackend::note_ui_snapshot`. The next `pump`
-    /// omits covered events from the panel payload but still applies them to the tab's turn end,
-    /// attention, notes and trace. This leaves window attention unchanged here; `shell` reports
-    /// it around ticks and switches, but not panel reloads. A request folded in the roughly 33 ms
-    /// before a switch or reload can still draw a card until the next tick answers it and its
-    /// resolution arrives.
+    /// **Reads; never drains.** The sidecar's ingestion
+    /// thread folds and queues on its own, so this snapshot can already carry events the tab's queue
+    /// still holds -- whatever folded after the last tick's drain. Its revision, read under the guard
+    /// it is serialized from, is noted on the backend (`AgentBackend::note_ui_snapshot`), and the next
+    /// `pump` leaves every event tagged at or below it out of the panel's payload while still folding
+    /// all of them into the tab's own bookkeeping: its turn's end, its attention, its notes, its trace.
+    /// So nothing here moves the window's attention, which `shell` reports around the tick and a
+    /// switch but not around a panel reload. The one cost, the same as before any of this: a request
+    /// the policy will answer at the next tick, folded in the ~33 ms before a switch or a reload, is
+    /// drawn as a card until its resolution arrives.
     pub fn active_state_payloads(&mut self) -> Vec<String> {
         self.state_payloads(self.active)
     }
@@ -3482,7 +3500,7 @@ impl TabSet {
         tabs::newest_card(&stamps)
     }
 
-    /// Count tabs with a turn in progress or a connection still starting.
+    /// A turn in progress, or a connect: closing either abandons work.
     pub fn running_count(&self) -> usize {
         self.tabs
             .iter()
@@ -3490,9 +3508,9 @@ impl TabSet {
             .count()
     }
 
-    /// `<leader>bd` asks before losing a running turn, a connect in flight or queued messages,
-    /// the facts named by `close_prompt`. Like `:bd` with unsaved changes, it asks only when there
-    /// is something to lose. `prefix &` always asks through `confirm-before`.
+    /// `<leader>bd`: vim's `:bd` closes a buffer at once unless it has changes to lose (E89); here the
+    /// things to lose are a running turn, a connect in flight, and queued messages -- the facts `close_prompt`
+    /// names. `prefix &` does not ask this: it is tmux's `confirm-before` and always asks.
     pub fn close_needs_confirm(&self, id: TabId) -> bool {
         self.get(id).is_some_and(|t| {
             matches!(t.backend, TabBackend::Starting(_) | TabBackend::AwaitingTrust(_))
@@ -3514,10 +3532,11 @@ impl TabSet {
         })
     }
 
-    /// For `<leader>bo`, return the ids `tabs::close_others` would close and a y/n prompt naming them.
-    /// Only other base-view tabs count; tabs in extra views are absent from the base page's strip.
-    /// Use the same running test as [`Self::running_count`]: a turn in progress or still connecting.
-    /// Return `None` when the active tab is the base view's only tab.
+    /// `<leader>bo`: the ids `tabs::close_others` would close, and the y/n
+    /// naming them, over every base-view tab but the active one: a tab shown in an extra view is not
+    /// in the base page's strip, so it is not one of its others. Same "running" test as
+    /// [`Self::running_count`] (a turn in progress, or still connecting). `None` when the active tab
+    /// is the base view's only one.
     pub fn close_others_plan(&self) -> Option<(Vec<TabId>, String)> {
         let entries: Vec<(TabId, bool)> = self
             .tabs
@@ -3533,8 +3552,10 @@ impl TabSet {
         tabs::close_others(&entries, self.active())
     }
 
-    /// `wire` already includes the editor context captured when the message was composed.
-    /// When `steerable` is false, the message waits for the turn's end regardless of later Enter presses.
+    /// Allowed on a starting, trust-waiting or live tab; an empty, failed or ended tab refuses it, and so
+    /// does a tab that is moving to the other window or being handed off to a terminal. `wire` is already
+    /// composed with the editor context of this moment, the context the message was written against.
+    /// `steerable` false keeps the message for the turn's end whatever Enter does later (a confirmed review).
     pub fn queue_message(
         &mut self,
         id: TabId,
@@ -3645,15 +3666,17 @@ impl TabSet {
         changed
     }
 
-    /// Send the held queue as one turn when the tab can accept it.
+    /// One turn from the whole queue, only when the tab can take one.
     ///
-    /// A message sent into the previous turn has either had its outcome reported, been held again,
-    /// or started a follow-up turn through `AgentProvider::steer_turn`. A running turn prevents
-    /// another send. Messages with no reported outcome are retried, accepting possible duplicate
-    /// delivery rather than silently losing them.
+    /// Only held messages go out. A message sent into the turn that just ended has its outcome reported
+    /// before that end, or else the agent runs it in a follow-up turn whose start arrives with that end
+    /// (`AgentProvider::steer_turn`), so by now it has left the queue or is held again, or a turn runs and
+    /// nothing is sent; one a provider never reported on goes out too, so that it may reach the agent
+    /// twice rather than not at all.
     ///
-    /// Read delivery outcomes and the active turn under one projection lock. Separate reads could
-    /// straddle a delivery and turn completion, making a read message look unreported and sending it twice.
+    /// What the agent reported and whether a turn runs are read under one hold of the projection: read
+    /// apart, a delivery and the turn's end folded between the two reads would make a message the agent
+    /// read look unreported, and it would be sent again.
     pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
         // A turn already starting in the tab takes the queue at its end, as a running turn does: sent
         // now, the queue would be a second turn the agent refuses.
@@ -3826,7 +3849,8 @@ impl TabSet {
         Ok(self.flush_queue(id))
     }
 
-    /// Queue nonempty text, then interrupt a running turn or flush the queue.
+    /// `Ctrl+Enter`: while a turn runs, the text is queued and the turn interrupted, and the queue goes
+    /// out when it ends; while idle, it is queued and flushed at once.
     pub fn send_now(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<SendNow, String> {
         if self.moving.contains(&id.0) {
             return Err(MOVING.to_string());
@@ -3842,7 +3866,7 @@ impl TabSet {
         Ok(SendNow::Flushed(self.flush_queue(id)))
     }
 
-    /// C5: `id` is the scratch request now holding `tab`'s draft.
+    /// `id` is the scratch request now holding `tab`'s draft.
     ///
     /// Known limit: an edit whose buffer is never wiped (nvim quit with `:qa!`, where `BufWipeout`
     /// does not fire, or crashed) writes no marker, so `editing_draft` stays set and every later
@@ -3968,7 +3992,7 @@ impl TabSet {
         self.tabs.iter().map(|t| t.session.queue.len()).sum()
     }
 
-    /// The window is closing; take every queued text, tab by tab, for the history.
+    /// The window is closing; every queued text, tab by tab, for the history.
     pub fn take_every_queued_text(&mut self) -> Vec<String> {
         self.tabs
             .iter_mut()
@@ -4926,14 +4950,17 @@ fn note_new_files(
     fresh
 }
 
-/// Returns delivered cards this tab can approve now, in `seq` order. Intersects the attention
-/// tray with pending permission ids and excludes requests already answered by the host. Bypass
-/// includes every CLI prompt regardless of its reason. Non-live tabs return no cards because
-/// they have no session holding pending requests.
+/// Recomputes `rule_offers` when the set of pending permission ids changed; `true` if the offers did.
+/// Only `projection()` is read, once, and released before anything else is touched.
+/// The delivered cards this tab could approve right now: its own attention
+/// tray, intersected with the projection's still-pending ids and with anything it has not already
+/// host-answered, `seq`-ordered (the order the panel shows them in). The CLI's own prompts are among
+/// them whatever they say about why they asked: bypass approves every card. Empty unless the tab is
+/// `Live` -- a `NotStarted`/`Starting`/`Failed` tab has no session to hold a pending request at all.
 ///
-/// Reads `projection()` once and releases it before touching anything else. Both
-/// `BypassPlan::approve` and the recheck in `confirm_bypass` use this function so confirmation
-/// approves the same set that the prompt counted.
+/// This one function builds every `BypassPlan::approve` and every re-check `confirm_bypass`
+/// makes against a stored plan: both need exactly the same answer to "what would `y` approve right
+/// now", so there is one place that answer comes from.
 fn waiting_cards(tab: &Tab) -> Vec<String> {
     let Some(backend) = tab.live() else {
         return Vec::new();

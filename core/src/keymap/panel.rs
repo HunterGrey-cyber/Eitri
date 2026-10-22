@@ -1,6 +1,6 @@
-//! The agent panel's BROWSE key table: a leader, tab-as-buffer keys, and the effects of
-//! `init.lua`'s `"panel"` table and the embedded nvim's mappings.
-//! Keys use vim's `<>` notation.
+//! The agent panel's own BROWSE key table: a leader, tab-as-buffer keys, and
+//! what `init.lua`'s `"panel"` table and the embedded nvim's mappings do to it.
+//! Keys are vim's `<>` notation (nvim: intro.txt), not tmux's: these are vim keys.
 
 use super::TabAction;
 use crate::nvim_keys::{classify, nvim_leader_token, translate_lhs, NvimReport};
@@ -176,14 +176,16 @@ impl PanelSeq {
     }
 }
 
-/// These keys already have meanings alone in BROWSE (`keymap.ts`'s `resolveKey`).
-/// `o` and `A` enter INPUT like `i`, so panel bindings and nvim leaders or mappings must not
-/// shadow them. `:` opens the panel's command line and is reserved the same way.
+/// Alone in BROWSE these already mean something (keymap.ts `resolveKey`). `o` and `A`
+/// joined `i` the same day as its own two INPUT
+/// aliases but were never added here, so an `eitri.keymap.set("panel", "o"/"A", ...)` -- or an
+/// nvim `mapleader`/mapping on either -- silently shadowed a frozen key instead of being refused.
+/// `:` opens the panel's own command line, so it is refused the same way.
 const FIXED: &str = "jkhladioAyYDfrnNG/?:0123456789";
 const PENDING: &str = "gz[]";
-/// BROWSE pairs completed by reserved prefixes (the web side's `FIXED_PAIRS`).
-/// `gx`, `zz`/`zt`/`zb`, `za`/`zo`/`zc` and `[p`/`]p` are reserved even before their actions are
-/// bound, so user bindings cannot claim them and later change meaning.
+/// The BROWSE pairs a reserved prefix already completes, or will (the web side's `FIXED_PAIRS`):
+/// `gx`, `zz`/`zt`/`zb`, `za`/`zo`/`zc` and `[p`/`]p` are reserved ahead of the keys that bind them,
+/// so a table binding can never claim one first and change its meaning later.
 const TAKEN_PAIRS: &[&str] = &[
     "gg", "gf", "gx", "zh", "zl", "zz", "zt", "zb", "za", "zo", "zc", "[[", "]]", "[]", "][", "[p", "]p",
 ];
@@ -218,7 +220,7 @@ pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f
 
 /// The 17 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
-/// LazyVim/nvim/which-key line it copies, or `eitri-only` with why (spec, "Rule for every line").
+/// LazyVim/nvim/which-key line it copies, or `eitri-only` with why, so no row is invented.
 pub fn default_bindings() -> Vec<PanelBinding> {
     vec![
         // lazyvim: config/keymaps.lua:34-35 (<S-h>/<S-l> = bprevious/bnext, "Prev/Next Buffer")
@@ -244,8 +246,8 @@ pub fn default_bindings() -> Vec<PanelBinding> {
             action: PanelAction::Tab(TabAction::Next),
             source: PanelSource::Default,
         },
-        // vim: `:help gt` / `:help gT` (next/previous tab page). Without these defaults, a vim user
-        // pressed them and nothing happened; a session tab is the panel's tab page, so they step like
+        // vim: `:help gt` / `:help gT` (next/previous tab page). A vim user presses them expecting the
+        // next tab; a session tab is the panel's tab page, so they step like
         // `L`/`H`. `g` is a reserved prefix, so these reach the table through `resolveKey`'s pending
         // pair lookup, the same way `[b`/`]b` do.
         PanelBinding {
@@ -270,7 +272,8 @@ pub fn default_bindings() -> Vec<PanelBinding> {
             action: PanelAction::Tab(TabAction::Close),
             source: PanelSource::Default,
         },
-        // Close every other tab after a y/n prompt naming the tab count and how many are running.
+        // lazyvim: keymaps.lua:43-45 ("Delete Other Buffers"): close every other tab, after a y/n
+        // prompt naming the count and how many are running.
         PanelBinding {
             seq: parse_seq("<leader>bo").unwrap(),
             action: PanelAction::Tab(TabAction::CloseOthers),
@@ -301,8 +304,8 @@ pub fn default_bindings() -> Vec<PanelBinding> {
             action: PanelAction::Tab(TabAction::Info),
             source: PanelSource::Default,
         },
-        // eitri-only: the handoff button leaves the bottom; mock: bottom.html names
-        // `Space t`
+        // eitri-only: the handoff button leaves the bottom bar, so the leader key `Space t` takes
+        // its place
         PanelBinding {
             seq: parse_seq("<leader>t").unwrap(),
             action: PanelAction::Handoff,
@@ -331,8 +334,8 @@ pub fn default_bindings() -> Vec<PanelBinding> {
     ]
 }
 
-/// Panel keymap `set` and `del` calls recorded from `init.lua`.
-/// Applied over the defaults and nvim's own mappings in [`effective`].
+/// `init.lua`'s recorded `eitri.keymap.set("panel", ...)`/`.del("panel", ...)` calls: applied over
+/// the defaults and, before this, over nvim's own mappings in [`effective`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelUserTable {
     pub sets: Vec<PanelBinding>,
@@ -340,9 +343,10 @@ pub struct PanelUserTable {
 }
 
 impl PanelUserTable {
-    /// Sets a panel binding, reporting the supplied key/action text on failure. Refuses an invalid
-    /// key, a reserved BROWSE key, an unknown action, or a sequence already bound by an undeleted
-    /// default or an earlier `set`. `table.rs` wraps the message as `KeymapError::Panel`.
+    /// `eitri.keymap.set("panel", key, action)`: fails naming the call's own key/action text when
+    /// the key does not parse, is one of the reserved BROWSE keys, the action name is unknown, or
+    /// the sequence is already bound (by a default not yet `del`'d, or by an earlier `set`) --
+    /// `table.rs` wraps the message as `KeymapError::Panel`.
     pub fn set(&mut self, key: &str, action: &str) -> Result<(), String> {
         let seq = parse_seq(key)?;
         if let Some(why) = reserved(&seq) {
@@ -403,8 +407,8 @@ pub enum LeaderSource {
     Unusable,
 }
 
-/// The merged table `shell` sends in the `keymap` envelope.
-/// `PartialEq` lets the caller send it only when it changes.
+/// The merged table `shell` ships in the `keymap` envelope (sent only on change, hence
+/// `PartialEq`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelKeymap {
     pub leader: PanelKey,
@@ -415,9 +419,10 @@ pub struct PanelKeymap {
     pub bindings: Vec<PanelBinding>,
 }
 
-/// nvim's `mapleader`, already `keytrans`'d: no report is `Default`; no `mapleader` in a report
-/// is `Unset`. One key, either `Space` or an unreserved `Char`, is `Mapleader`. Multiple keys,
-/// unparsable tokens and reserved keys fall back to Space as `Unusable` and are logged.
+/// nvim's `mapleader`, already `keytrans`'d: no report yet is `Default`; a
+/// report with no `mapleader` is `Unset`; one key, `Space` or a `Char` free of the reservations,
+/// is `Mapleader`; anything else -- more than one key, an unparsable token, a reserved key -- falls
+/// back to Space as `Unusable` and is logged.
 fn leader_of(report: Option<&NvimReport>, log: &mut Vec<String>) -> (PanelKey, String, LeaderSource) {
     let Some(report) = report else {
         return (PanelKey::Space, "Space".to_string(), LeaderSource::Default);

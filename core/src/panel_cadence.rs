@@ -1,24 +1,30 @@
-//! Paces the agent panel's stream while the user types in the editor. Added panel latency
-//! is acceptable, but updates should stay even.
+//! Pacing the agent panel's stream while the user types in the editor: the panel may lag a
+//! little, but its stream should look smooth.
 //!
-//! GDK shares one frame clock across the toplevel. A WebKit frame caused by the panel can delay
-//! the editor's next frame by up to one refresh. There is no API here to start a cycle early,
-//! so pacing reduces and spaces panel frames while the user types.
+//! **Why.** GDK's frame clock is one clock for the whole toplevel: a WebKit frame the panel causes
+//! delays the editor's next frame by up to one refresh, so a key pressed within ~8 ms of a panel
+//! frame lands two refreshes late (measured 2026-09-29).
+//! Eitri has no API to start a cycle early; the lever is to cause fewer, better-spaced panel
+//! cycles while the user types.
 //!
-//! While the editor holds the keys and a key was pressed within [`TYPING_WINDOW`],
-//! [`PanelCadence`] holds [`EnvelopeClass::Stream`] envelopes and releases them at a fixed cadence
-//! (default [`DEFAULT_CADENCE_HZ`] = 5/s, every 200 ms), whole and in order. Outside that window,
-//! the stream runs at full rate. Release slots advance each period, so repeated keys cannot
-//! keep postponing a release.
+//! **What.** While the editor holds the keys AND a key was pressed in it within [`TYPING_WINDOW`],
+//! [`PanelCadence`] holds the active tab's stream envelopes ([`EnvelopeClass::Stream`]) and releases
+//! them at a fixed, even cadence (default [`DEFAULT_CADENCE_HZ`] = 5/s = every 200 ms), each release
+//! carrying everything that arrived since the previous one, whole and in order. Outside that window
+//! the stream goes at today's full rate. **No hold-then-burst**: the slot grid advances by one
+//! period per release whether or not keys keep coming, so an auto-repeating key cannot starve the
+//! panel and no release is larger than one period's arrivals.
 //!
-//! [`EnvelopeClass::Immediate`] includes permission cards and resolutions, turn and session
-//! boundaries, snapshots, notes, tab changes, greetings, replies, and anything beyond plain stream
-//! content. Everything is immediate while the panel holds the keys. Immediate delivery first
-//! flushes pending content ([`Route::FlushPendingThenSend`]) to preserve wire order. When in doubt,
-//! classify an envelope as `Immediate`.
+//! **What is never delayed** ([`EnvelopeClass::Immediate`]): anything but a batch of plain stream
+//! content -- permission cards and their resolutions, turn start/end, session end, a snapshot
+//! (resync), notes, `tabs`, `hello`, replies, tab switches -- and everything while the panel (not
+//! the editor) holds the keys. Sending one first hands over whatever is pending
+//! ([`Route::FlushPendingThenSend`]) so the wire order is the order things happened in. When in
+//! doubt an envelope is `Immediate`.
 //!
-//! This module has no clock of its own or GTK dependency: each method takes an `Instant`, so
-//! pacing is testable without a display. `panel/src/panel_pacer.rs` owns the WebView.
+//! This module is pure (no clock of its own: every method takes an `Instant`, no GTK), so the
+//! rules are testable without a display; `panel/src/panel_pacer.rs` is the thin half that owns the
+//! WebView.
 
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
@@ -30,8 +36,9 @@ use agent::AgentDomainEvent;
 pub const CADENCE_KEY: &str = "agent.typing_cadence_hz";
 
 /// Default pushes per second while typing when `init.lua` supplies no value.
-/// A rate of 5/s spaces panel updates to reduce late editor frames; perceived stream smoothness
-/// still needs manual verification.
+/// With a 165 Hz display and a 30 ms/message stream, measured late keypresses were 6.2% at 5/s,
+/// 8.8% at 8/s, 9.9% at 12/s, and 20.9% at full rate. Perceived stream smoothness still needs
+/// manual verification.
 pub const DEFAULT_CADENCE_HZ: u32 = 5;
 
 /// What the config key accepts: a whole number of pushes per second in this range, or `"off"`.

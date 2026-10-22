@@ -87,16 +87,19 @@ local function position_at(lnum, col)
   return { 0, lnum, byte, col - vim.fn.virtcol({ lnum, byte }, 1)[1] }
 end
 
--- Finds a capped endpoint that preserves a block's display-column range. Keeping the original
--- corner's byte column on a different line can widen the block because tabs and characters
--- occupy different display columns.
+-- Where a blockwise selection over the line cap ends instead. A block is a
+-- DISPLAY-column range applied to every line, taken from its two corners. Moving the lower corner
+-- up to the cap line and keeping its byte column is not that range once the lines differ: a byte
+-- column 2 that was `b` on the true end line is the `X` of `\tXYZ` at display column 9 on a capped
+-- line, and the block silently widened to columns the user never selected (this very function
+-- once returned `abcdefghi` for a selection of `ab`).
 --
--- Tries the lowest line within the cap at candidate display columns and keeps a corner only
--- when getregion's column rules yield the original block. If a wide character, a tab without
--- virtual editing, or a short line prevents that, tries the line above. This may keep fewer
--- lines but never different columns. Returns nil if even the first line cannot preserve the
--- range; the caller then sends only the truncation marker. Tries at most MAX_SELECTION_LINES
--- lines.
+-- So the lower corner is placed on the lowest line within the cap, at the display column the real
+-- one had, and kept only if getregion's own rule then yields exactly the original block. A line
+-- where no position can (a wide character or, with 'virtualedit' off, a <Tab> straddling the edge,
+-- or a line too short) gives way to the one above it: fewer lines, never other columns. Only the
+-- first line can be left, and nil means not even it could -- the caller then sends only the
+-- truncation marker. At most MAX_SELECTION_LINES lines are tried, a few calls each.
 local function capped_block_end(first, last)
   local first_start, first_end = display_span(first)
   local last_start, last_end = display_span(last)
@@ -156,8 +159,9 @@ local function selection()
   if fetch_last[2] - first[2] >= MAX_SELECTION_LINES then
     line_capped = true
     if mode == "\22" then
-      -- A block uses the same display-column range on every line. Neither the far right nor
-      -- the original corner's byte column on another line preserves it; use capped_block_end.
+      -- Blockwise selects a COLUMN RANGE that applies to every included line, so neither the far
+      -- right (the block grew to full-line width) nor the real corner's byte column on another
+      -- line (it grew to wherever that byte sits there) will do: see capped_block_end.
       local ok_end, corner = pcall(capped_block_end, first, last)
       fetch_last = ok_end and corner or nil
     else

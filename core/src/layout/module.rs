@@ -9,7 +9,7 @@ use std::fmt;
 pub enum ModuleKind {
     Editor,
     Agent,
-    /// The canvas module, named so layouts can refer to it before it is available.
+    /// The canvas, not built yet. Named now so a layout that mentions it parses the day it exists.
     Canvas,
     LuaWebview,
     /// A terminal with its own shell.
@@ -180,8 +180,8 @@ impl fmt::Display for ModuleError {
 
 impl std::error::Error for ModuleError {}
 
-/// Where a module goes when a layout is first built with it.
-/// `PanelSlot` supplies this initial placement hint only.
+/// Where a module goes the first time a layout is built with it. A hint for the first
+/// launch only: `PanelSlot` survives as exactly this and nothing more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     /// A new split to the right of the whole root. Lua `position = "side"`.
@@ -191,17 +191,23 @@ pub enum Placement {
     /// The editor's own leaf: the module takes the editor's place and the editor is **hidden**,
     /// not gone. Lua `position = "main"`.
     InPlaceOfEditor,
-    /// A new column split below only the editor's leaf, pinned like [`Placement::BelowRoot`].
-    /// This is the terminal's default placement, keeping the agent and side panels at full height.
-    /// Falls back to [`Placement::BelowRoot`] if the editor is absent after
-    /// [`super::kill::Reopen::Never`]. Only the terminal uses this for first-launch placement.
+    /// A new column split below the editor's own leaf only, pinned the way [`Placement::BelowRoot`]
+    /// is -- the terminal's default place since 2026-09-28: below the editor column only, so the
+    /// agent panel (and any side panel) keep
+    /// their full height. Superseded `Placement::BelowEditorAndAgent` (2026-09-26), which
+    /// wrapped `[editor | agent]` together -- in the default window that was the whole root, so the
+    /// terminal used to come back full width below everything, exactly what this variant now avoids.
+    /// Falls back to [`Placement::BelowRoot`] if the editor is not in the tree (it was killed with
+    /// [`super::kill::Reopen::Never`]). Never a first-launch placement of anything but the terminal
+    /// today -- `place_new`'s own doc.
     BelowEditor,
 }
 
-/// A module beyond the editor and agent built into every window. Its key lives in
-/// [`super::keys::ModuleKeys`] and its title in `shell`'s `tray::module_title`.
-/// Keeping them separate avoids adding fields to the literal constructed by
-/// `shell/src/terminal/mod.rs::initial_layout`.
+/// A module the layout is built with beyond the two built-ins every window has (the editor and the
+/// agent). A module's `title` and `key` live beside it, not on it: a module's key
+/// is in [`super::keys::ModuleKeys`] and its title is `shell`'s `tray::module_title`, because
+/// `shell/src/terminal/mod.rs::initial_layout` builds this struct by literal and a new field would be
+/// an edit in the terminal's own files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDecl {
     pub id: ModuleId,

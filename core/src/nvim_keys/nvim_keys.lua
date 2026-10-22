@@ -1,11 +1,12 @@
--- The nvim-keys feed loads with --cmd before the user's config. It installs autocommands and
--- one dict watcher, changing no setting or mapping. It writes one JSON line to the configured
--- socket only when the report differs from the last one sent.
+-- Eitri nvim-keys feed. Loaded with --cmd before the user's config; installs
+-- autocommands and one dict watcher, changes no setting and no mapping. Writes one JSON line per
+-- report to EITRI_KEYS_SOCKET, only when the report differs from the last one sent.
 --
--- Under `--cmd` (`dofile`, no arguments), use the socket from the spawn environment.
--- When injected into a running nvim, take the socket from the argument table instead: inherited
--- environment variables may name a different window and feed the wrong panel.
--- An injected chunk returns a function that undoes it.
+-- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
+-- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
+-- not look at the environment at all: an nvim started inside another Eitri window inherits that
+-- window's variables, and reading them would feed the wrong panel. An injected chunk returns a
+-- function that undoes it.
 local opts = ...
 local socket
 if type(opts) == "table" then

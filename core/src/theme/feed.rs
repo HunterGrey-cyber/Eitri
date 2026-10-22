@@ -1,19 +1,26 @@
-//! The nvim-to-host theme protocol: a per-window socket for snapshots, the Lua sender,
-//! and the parser. This module has no toolkit dependencies.
+//! The nvim → host half of the theme *protocol*: the per-window socket the embedded nvim writes
+//! snapshots to, the Lua snippet that writes them, and the parser that reads them. Toolkit-free.
 //!
-//! Push snapshots because colorscheme changes happen inside nvim and the host cannot know
-//! when to ask. This leaves the keyboard's RPC pipe untouched and needs no fork change.
-//! `shell::theme::feed` owns the polling timer and calls [`ThemePayloadReader::poll`] each tick.
-//! As with [`crate::pane_switch`], the protocol lives in core and polling stays in shell.
+//! Push rather than pull because a colorscheme change happens inside nvim; a host has no way to
+//! know when to ask. It never touches the RPC pipe the keyboard path uses, and needs no fork change.
 //!
-//! Both sides of the Lua/Rust contract live here. [`NVIM_THEME_LUA`] is the adjacent
-//! `nvim_theme.lua`; tests check it against `tokens::GROUPS_READ` and
-//! [`crate::theme::payload::PAYLOAD_VERSION`].
+//! The half that is **not** here is the polling driver: `shell::theme::feed` owns the
+//! `glib::timeout_add_local` timer that calls [`ThemePayloadReader::poll`] once a tick and repaints.
+//! Same split, and the same reason, as [`crate::pane_switch`]: the protocol in the core and the
+//! polling driver in the shell, so another host reuses the protocol with its own timer.
 //!
-//! Use [`crate::line_feed::NewestLineReader`] with nonblocking reads, bounded work per poll,
-//! a bounded line size and a bounded connection lifetime. Blocking `read_line` with only a
-//! per-syscall timeout lets trickled bytes or successive silent connections stall the GTK
-//! thread indefinitely. A per-syscall timeout alone also leaves the line size unbounded.
+//! **Both halves of the Lua↔Rust contract now live in this crate** (2026-09-17):
+//! [`NVIM_THEME_LUA`] is `nvim_theme.lua` beside this file, and the two tests that pin it against
+//! `tokens::GROUPS_READ` and [`crate::theme::payload::PAYLOAD_VERSION`] are below.
+//! They used to sit in `shell`, one crate away from everything they assert about.
+//!
+//! **Since 2026-09-27:** the accept path used to put every accepted stream back into
+//! BLOCKING mode and `read_line` it with only a per-syscall `SO_RCVTIMEO`, so a sender trickling
+//! bytes slower than that timeout -- or simply several silent connections in a row -- blocked the
+//! GTK thread that polls this feed for as long as it kept going, with no cap on a line's size at
+//! all. It now shares [`crate::line_feed::NewestLineReader`] with `editor_context` and `nvim_keys`:
+//! non-blocking, a bounded per-poll read budget, a bounded line size and a bounded connection
+//! lifetime. See that module's doc for the bounds themselves.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -24,13 +31,13 @@ use crate::theme::payload::{parse_payload, NvimThemePayload};
 
 /// The directory-name prefix [`crate::instance_dir`] keys this module's directories on.
 ///
-/// Terse on purpose (L2 T5, 2026-09-17). It was `neovibe-theme-`, which with a hyphenated uuid and
+/// Terse on purpose (2026-09-17). It was `neovibe-theme-`, which with a hyphenated uuid and
 /// a `theme.sock` inside came to 117 bytes under macOS's 49-byte `TMPDIR` -- 14 over the 103-byte
 /// limit [`agent::socket_path::MAX_SOCKET_PATH_BYTES`] enforces, so this socket could not be bound
 /// on macOS at all. See `SWEPT_NAMES` for what becomes of the old directories.
 pub(crate) const DIR_PREFIX: &str = "nv-th-";
 
-/// The socket file inside that directory. `theme.sock` before L2 T5; see [`DIR_PREFIX`].
+/// The socket file inside that directory. `theme.sock` before 2026-09-17; see [`DIR_PREFIX`].
 const SOCKET_NAME: &str = "t.sock";
 
 /// The snippet's own file name. Not shortened with the others: it is `dofile`d and named by an
@@ -39,7 +46,7 @@ const SOCKET_NAME: &str = "t.sock";
 const LUA_NAME: &str = "theme.lua";
 
 /// Every `(directory prefix, socket file)` pair this module has ever used, current first. The
-/// second row is what builds before L2 T5 (2026-09-17) wrote, swept alongside the current one for
+/// second row is what builds before 2026-09-17 wrote, swept alongside the current one for
 /// the reason `crate::pane_switch`'s own `SWEPT_NAMES` gives: the sweep matches by prefix, so a
 /// rename with no second sweep orphans every pre-rename directory permanently.
 /// `the_sweep_still_reclaims_a_pre_l2_t5_directory` pins that the legacy row is really swept.
@@ -171,9 +178,9 @@ impl Drop for ThemeFeed {
 }
 
 /// The theme-feed reader: [`NewestLineReader`]'s bounded, newest-wins polling with
-/// [`parse_payload`] as its acceptance test (sw-theme-1). A malformed newer payload never discards
+/// [`parse_payload`] as its acceptance test. A malformed newer payload never discards
 /// the last valid one; the bounds and freshness rules are documented, and tested, in
-/// [`crate::line_feed`]. **The macOS accept-mode fix (L2 T5, 2026-09-17: an accepted stream copies
+/// [`crate::line_feed`]. **The macOS accept-mode fix (2026-09-17: an accepted stream copies
 /// its listener's non-blocking flag there, unlike Linux, so it must be set explicitly) now lives
 /// once in `NewestLineReader` itself rather than once per protocol.**
 pub struct ThemePayloadReader(NewestLineReader);

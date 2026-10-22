@@ -18,8 +18,8 @@ pub struct RecordingProvider {
     /// While on, every `interrupt_turn` fails as a broken transport would: a fatal error, the session gone.
     failing_interrupts: AtomicBool,
     refusing: AtomicBool,
-    /// While enabled, refuse every `resolve_permission` with a provider error.
-    /// This exercises `AgentBackend::approve_pending`'s failed-allow path, which keeps a card.
+    /// While on, every `resolve_permission` is refused as a provider error. Covers
+    /// `AgentBackend::approve_pending`'s failed-allow path ("fail toward a card").
     refusing_resolutions: AtomicBool,
     interrupt_capable: bool,
     /// Every `close_session` that reached the provider: what a backend's shutdown does.

@@ -79,11 +79,11 @@ const LINK_GROUPS: [&str; 3] = ["@markup.link.label", "@markup.link", "Underline
 /// **Add a name here in the same edit that makes `derive` read it.**
 ///
 /// `#[cfg(test)]` again, and the round trip is worth recording. It was gated when its reader was a
-/// test in `shell` and this constant was in `shell` too. L2 T1 (2026-09-17) moved the constant into
+/// test in `shell` and this constant was in `shell` too. A move on 2026-09-17 took the constant into
 /// this crate and left the reader behind, which forced the gate off: `#[cfg(test)]` only compiles an
 /// item in when the crate carrying it is itself built as a test target, not when it is a dependency
 /// of another crate's tests, so a gated constant here would simply not have existed from `shell`'s
-/// side. L2 T5 moved the reader -- and `nvim_theme.lua`, the file it asserts about -- into this
+/// side. A later move took the reader -- and `nvim_theme.lua`, the file it asserts about -- into this
 /// crate as well, so the contract is once more entirely inside one crate and the gate costs nothing.
 ///
 /// `pub(crate)`, not `pub`: under `#[cfg(test)]` a `pub` here advertises an item that cannot exist
@@ -141,7 +141,7 @@ pub struct ThemeTokens {
     pub bg: Rgb,
     pub fg: Rgb,
     pub surface: Rgb,
-    /// Text drawn on `surface` (sw-theme-2): the global `fg` is guarded against `bg`, not against
+    /// Text drawn on `surface`: the global `fg` is guarded against `bg`, not against
     /// `surface`, and a scheme whose floating background is not close to `bg` -- the shipped
     /// `zaibatsu`'s `NormalFloat` is `fg=#0e0024/bg=#ffffff` against a `Normal` of
     /// `fg=#ffffff/bg=#0e0024` -- can make `fg` on `surface` unreadable (1.0:1, measured). Derived
@@ -258,13 +258,15 @@ pub struct ThemeTokens {
     pub font_size_px: f32,
     /// `"light"` or `"dark"`, for CSS `color-scheme`.
     pub color_scheme: &'static str,
-    /// The editor's cell height in panel CSS px, set by `shell` from `connect_cell_size_changed`.
-    /// This lets the panel's bottom input row match the editor's status row height. The signal
-    /// reports GTK logical px, which differ from CSS px when WebKitGTK applies desktop text
-    /// scaling; `shell/src/webkit_zoom.rs` converts them. `None` until nvim reports a font.
-    /// Carried through `ready` and reloads like `font_size_px`, without a new envelope.
-    /// `css_vars()` emits `--nv-editor-row` only for `Some`, so a reload before the editor's first
-    /// frame uses the `24px` fallback in `index.css`.
+    /// The editor's own cell height, in the panel's CSS px, set by `shell` from `neovide-editor`'s
+    /// `connect_cell_size_changed` -- which reports GTK logical px, a different unit whenever
+    /// WebKitGTK zooms the page for the desktop's text scaling (`shell/src/webkit_zoom.rs`
+    /// converts) -- `None` until nvim has reported a font, so the composer's mode line can be sized to
+    /// match the editor's status line beside it. Carried
+    /// through the `ready` handshake and a reload the same way `font_size_px` is, with no new
+    /// envelope: `--nv-editor-row` only appears in `css_vars()` when this is `Some`, so a reload
+    /// before the editor's first frame gets `index.css`'s own `24px` fallback rather than a
+    /// missing variable.
     pub editor_row_px: Option<f32>,
     /// nvim's `'cmdheight'`, the rows the editor keeps under its statusline, so the panel's status band
     /// can sit on the statusline's row instead of the command line's. Sent as `--nv-editor-cmd-rows`
@@ -356,7 +358,7 @@ impl ThemeTokens {
         let comment = g.fg_of(&["Comment"]);
         let function = g.fg_of(&["Function"]);
 
-        // Text on surface is guarded against surface itself (sw-theme-2), toward whichever of
+        // Text on surface is guarded against surface itself, toward whichever of
         // Normal's colours stands out more from it -- the same idiom `chrome_fg` uses against
         // `chrome` just below, with the same pole fallback `hint_fg` needs.
         let surface_toward = if surface.contrast(bg) >= surface.contrast(fg) {
@@ -379,9 +381,9 @@ impl ThemeTokens {
         } else {
             fg
         };
-        // sw-theme-4: `chrome_fg`/`chrome_muted` used to call plain `ensure_contrast`, which can
-        // hand back a failing colour when neither of Normal's own colours reaches TEXT_CONTRAST
-        // against `chrome` -- `hint_fg` already had the pole fallback these two were missing.
+        // Plain `ensure_contrast` can hand back a failing colour when neither of Normal's own colours
+        // reaches TEXT_CONTRAST against `chrome`, so `chrome_fg` and `chrome_muted` take the same pole
+        // fallback `hint_fg` uses.
         let chrome_fg = ensure_contrast_with_pole(
             g.fg_of(&["StatusLine"]).unwrap_or(fg),
             chrome,
@@ -405,11 +407,11 @@ impl ThemeTokens {
             TEXT_CONTRAST,
         );
 
-        // sw-theme-3: `muted` used to be guarded only against `bg`, though `index.css` also paints
+        // `muted` used to be guarded only against `bg`, though `index.css` also paints
         // it directly on a `cursorline` fill (the detail popover's and chooser's current row). It is
         // guarded against both at once: a second guard run after the first, toward `fg`, walked a
-        // Comment colour sitting on the far side of `bg` from `fg` back across `bg` (whole-branch
-        // review: black on a `#767676` bg became `#e6e6e6`, 3.64:1 there).
+        // Comment colour sitting on the far side of `bg` from `fg` back across `bg` (black on a
+        // `#767676` bg became `#e6e6e6`, 3.64:1 there).
         let muted = ensure_contrast_against_both(
             comment.unwrap_or_else(|| bg.mix(fg, 0.5)),
             bg,

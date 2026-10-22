@@ -1,15 +1,17 @@
-//! Geometry over a [`Layout`]: module rectangles, dividers, neighbours and `Ctrl+a h/j/k/l` moves.
-//! Uses integer arithmetic over the size supplied by `shell`; no widget is measured here.
+//! The geometry over a [`Layout`]: where each module goes, where each divider
+//! goes, which module is "next to" which, and what `Ctrl+a h/j/k/l` moves. Pure integer arithmetic
+//! over the size `shell` hands in; nothing here measures a widget.
 //!
-//! A split with no visible module on one side gives its whole rectangle to the other side and
-//! draws no divider, like a `GtkPaned` with one visible child. This lets hidden slots collapse
-//! and gives a zoomed module the full window.
+//! **Why the rectangles collapse.** A split with nothing visible on one side gives the whole
+//! rectangle to the other side and draws no divider. That reproduces, on purpose, what a `GtkPaned`
+//! with one visible child does -- which is exactly what today's zoom and a hidden bottom slot rely
+//! on. A zoom is the extreme case: the zoomed module alone, at full size.
 //!
-//! A pinned child (`con::Pin`) keeps its stored length while later children share the rest,
-//! within all minimums, so a bottom row keeps its height as the window grows. Until that length
-//! is known, its step uses the shares. [`settle_pins`] records the length when the child first
-//! appears beside another child. [`super::arrange`] does the arithmetic; this file supplies its
-//! inputs from a [`Layout`].
+//! **A pinned child** (`con::Pin`) keeps the length it stores and the children after it
+//! share the rest, within everyone's minimums -- so a bottom row keeps its height when the window
+//! grows. Until the pin has a length its step divides by the shares, and [`settle_pins`] records that
+//! length the first time it is on screen beside another child. The arithmetic is
+//! [`super::arrange`]'s; this file turns a [`Layout`] into its inputs.
 
 use super::arrange::{arrange_tree, con_min, move_divider_in, settle_in, Divider};
 use super::con::{ConId, ConLayout};
@@ -384,10 +386,10 @@ pub fn settle_pins(layout: &mut Layout, frame: &Frame) -> bool {
     settled
 }
 
-/// Hides `id`. If it holds the keys, first chooses its most recently used geometric neighbour,
-/// or the most recently used shown module if there is no neighbour. Returns that module so
-/// `shell` can give it GTK focus **before** unmapping `id`; otherwise GTK's focus chain chooses.
-/// Returns `Ok(None)` when `id` did not hold the keys.
+/// Hides `id`. If `id` holds the keys, first chooses where they go -- the most
+/// recently used of its geometric neighbours, else the most recently used module still shown --
+/// and returns it: `shell` must give that module GTK focus **before** it unmaps `id`, or GTK's own
+/// focus chain picks (it was seen to pick the WebView). `Ok(None)` when `id` did not hold the keys.
 pub fn hide(layout: &mut Layout, id: &ModuleId, frame: &Frame) -> Result<Option<ModuleId>, LayoutError> {
     let next = if layout.focus() == id {
         let arrangement = arrange_with(layout, false, frame);

@@ -1,6 +1,7 @@
-//! Project permission rules live in the state directory under `permissions/<16 hex>.json`.
-//! Nothing is written into the project. Edit this file to remove a rule; `prefix i` shows its path.
-//! An unusable file is set aside as `.json.unusable` and read as no rules, yielding more cards.
+//! The rules saved from a card's third button, per project: `$XDG_STATE_HOME/eitri/permissions/<16 hex>.json`.
+//! Claude Code writes `.claude/settings.local.json` into the repository; Eitri writes nothing into
+//! the project. Removing a rule is editing this file; `prefix i` shows its path. An unusable file is
+//! set aside as `.json.unusable` and read as no rules, which fails toward more cards.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

@@ -1,7 +1,8 @@
-//! The prefix table holds stock tmux defaults and applies `init.lua` keymap calls with
-//! `apply_user`. Startup fails, naming both sides, for `set` on a bound key, a prefix equal
-//! to a root chord, or a Lua command's `keybinding` equal to the prefix or a root chord.
-//! Lua panel keys are checked in `crate::layout::keys`, where those keys are built.
+//! The prefix table: the defaults (stock tmux), what `init.lua`'s `eitri.keymap` calls
+//! make of it (`apply_user`), and the collision rules that are hard startup failures naming both
+//! sides (`set` on a bound key; the prefix equals a root chord; a Lua command's `keybinding` equals
+//! the prefix or a root chord). The fourth, a Lua panel's key, is
+//! `crate::layout::keys`'s, since it is checked where panel keys are built.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -341,8 +342,9 @@ fn default_bindings() -> Vec<Binding> {
         Action::SendKeys(KeySpec::parse("C-l").expect("C-l parses")),
         false,
     );
-    // Like `C-l` above, send the literal chord to the pane with the keys.
-    // Without the prefix, `Ctrl+h/j/k/l` still navigate between modules.
+    // Bound like `C-l` above -- the literal chord, to whichever pane holds the keys
+    // (vim-tmux-navigator's README: `bind C-l send-keys 'C-l'`). `Ctrl+h/j/k/l` themselves (with no
+    // prefix) stay Eitri's own navigation, unaffected by these.
     for name in ["C-h", "C-j", "C-k"] {
         bind(
             name,
@@ -362,8 +364,8 @@ fn default_bindings() -> Vec<Binding> {
     bind("e", Action::Module(ModuleId::editor()), false);
     bind("a", Action::Module(ModuleId::agent()), false);
     bind("t", Action::Module(ModuleId::terminal()), false);
-    // `v` is reserved for the canvas (`crate::layout::keys::RESERVED_FOR_CANVAS`),
-    // so it is not bound in this table.
+    // tmux `copy-mode` / `copy-mode -u`: `v` is deliberately not bound here any more --
+    // reserved for the canvas (`crate::layout::keys::RESERVED_FOR_CANVAS`), not this table.
     bind("[", Action::CopyMode { up: false }, false);
     bind("PPage", Action::CopyMode { up: true }, false);
     out
@@ -575,7 +577,7 @@ impl Keymap {
         Ok((map, import))
     }
 
-    /// The default bindings with the stock prefix `C-b`.
+    /// Stock tmux's prefix `C-b` and its default table.
     pub fn defaults() -> Keymap {
         Keymap {
             prefix: KeySpec::parse(super::stock::STOCK_PREFIX).expect("C-b parses"),

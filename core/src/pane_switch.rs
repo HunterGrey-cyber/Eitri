@@ -1,19 +1,26 @@
-//! The pane-switch protocol: a private directory, a fake-`tmux` symlink, a socket for
-//! one-letter directions, and a message parser. The same socket carries `Q <generation>`, sent by
-//! [`crate::layout::kill::editor_quit_lua`] when its `:confirm qall` request is cancelled.
+//! The pane-switch *protocol*: the private directory, the fake-`tmux` symlink, the socket the shim
+//! writes one direction letter to, and the parser that reads it -- plus, since 2026-09-26, a
+//! second message on the same socket: `Q <generation>`, sent by
+//! [`crate::layout::kill::editor_quit_lua`] when a `:confirm qall` it asked nvim for is cancelled.
 //! Toolkit-free.
 //!
-//! The directory also holds `nav_fallback.lua`, loaded with `--cmd`, which lets `Ctrl+h/j/k/l`
-//! leave the editor when vim-tmux-navigator is absent and from Visual mode; `Ctrl+l` also leaves
-//! from Insert mode. It writes the same direction letters to the same socket, so it lives beside
-//! the protocol.
+//! Since v1 the same directory also holds
+//! `nav_fallback.lua`, a `--cmd`-loaded snippet that gives `Ctrl+h/j/k/l` a way out of the editor
+//! when vim-tmux-navigator is absent, from Visual mode, and (`Ctrl+l` only) from Insert
+//! mode, writing the same letters to the same socket as the shim. It lives here because leaving can
+//! only work where the socket does.
 //!
-//! `shell::pane_switch` owns the `glib::timeout_add_local` timer. It constructs a
-//! [`PaneSwitchReader`] once and calls [`PaneSwitchReader::poll`] each tick, applying focus
-//! switches or kill-cancellation clears.
-//! Keeping the protocol separate lets another UI reuse it with its own run-loop timer.
-//! The reasons for faking tmux and the meaning of each focus direction are documented in
-//! `shell::pane_switch`, which owns panes and focus.
+//! The half that is **not** here is the polling driver: `shell::pane_switch` owns the
+//! `glib::timeout_add_local` timer that constructs a [`PaneSwitchReader`] once and calls
+//! [`PaneSwitchReader::poll`] every tick, handing each message to a GTK focus grab or a
+//! kill-cancellation clear. That split -- the protocol in the core, the polling driver in the
+//! shell -- is what lets a second host (the macOS host) reuse every line below with its own
+//! run-loop timer.
+//!
+//! The *why* of the mechanism as a whole -- why `shell` fakes tmux for the embedded nvim instead of
+//! intercepting `Ctrl+h`/`Ctrl+l` itself, and why each direction means what it means -- stays in
+//! `shell::pane_switch`'s own module doc, because it is about panes and focus, which this crate has
+//! neither of.
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
@@ -66,22 +73,25 @@ const MAX_ACCEPTS_PER_POLL: usize = 16;
 const MAX_PENDING_AGE: Duration = Duration::from_secs(2);
 
 /// Hard cap on how many connections [`PaneSwitchReader`] retains at once, across every age.
-/// Without this, senders that connect without writing could accumulate about 1280 open descriptors
-/// before [`MAX_PENDING_AGE`] evicts the first one, exceeding a typical 1024-fd soft `RLIMIT_NOFILE`.
-/// The cap bounds retained descriptors independently of the accept rate and age limit. Once it is
-/// hit, `poll` stops accepting for that call; excess connections wait in the kernel backlog, just
-/// as they do past [`MAX_ACCEPTS_PER_POLL`].
+/// Without this, a same-user sender that connects without ever writing (the case [`MAX_PENDING_AGE`]
+/// exists for) could accumulate up to `MAX_ACCEPTS_PER_POLL * (MAX_PENDING_AGE / POLL_INTERVAL)` --
+/// about 1280 -- open file descriptors before its own age evicts even the first one, which can
+/// exceed a typical 1024-fd soft `RLIMIT_NOFILE` (a same-user, 0700-directory
+/// sender gains nothing from this beyond running its own process out of descriptors first, but the
+/// bound belongs in the type rather than only in the two numbers above). Once the cap is hit,
+/// `poll` simply stops accepting for the rest of that call; a burst past it waits in the kernel's
+/// own backlog the same way a burst past [`MAX_ACCEPTS_PER_POLL`] already does.
 const MAX_PENDING_CONNECTIONS: usize = 64;
 
 /// The directory-name prefix [`crate::instance_dir`] keys this module's directories on.
 ///
-/// Terse on purpose (L2 T5, 2026-09-17). It was `neovibe-pane-switch-`, which with a hyphenated
+/// Terse on purpose (2026-09-17). It was `neovibe-pane-switch-`, which with a hyphenated
 /// uuid and a `switch.sock` inside came to 124 bytes under macOS's 49-byte `TMPDIR` -- 21 over the
 /// 103-byte limit [`agent::socket_path::MAX_SOCKET_PATH_BYTES`] enforces, so this socket could not
 /// be bound on macOS at all. See `SWEPT_NAMES` for what becomes of the old directories.
 pub(crate) const DIR_PREFIX: &str = "nv-ps-";
 
-/// The socket file inside that directory. `switch.sock` before L2 T5; see [`DIR_PREFIX`].
+/// The socket file inside that directory. `switch.sock` before 2026-09-17; see [`DIR_PREFIX`].
 const SOCKET_NAME: &str = "s.sock";
 
 /// Every `(directory prefix, socket file)` pair this module has ever used, current first.
@@ -99,9 +109,9 @@ const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME), ("neovibe-pane
 /// variable, never bound, so no `sockaddr_un` limit applies to it.
 const NAV_LUA_NAME: &str = "nav_fallback.lua";
 
-/// Navigation fallback for Normal and Visual modes. Normal mode tries a window move and sends
-/// its direction to the next pane if it stays at nvim's edge. Visual mode keeps the selection
-/// at that edge. Installed only where the global mapping is empty, nvim's own default or a
+/// The nav fallback itself: a Lua copy of
+/// vim-tmux-navigator's `s:TmuxAwareNavigate` for Normal mode, plus a Visual-mode one that keeps the
+/// selection at nvim's edge, installed only where the global slot is empty, nvim's own default or a
 /// plain `<C-W>{dir}` move.
 pub(crate) const NAV_FALLBACK_LUA: &str = include_str!("nav_fallback.lua");
 
@@ -134,7 +144,7 @@ pub struct PaneSwitchChannel {
 }
 
 /// Reclaims directories this module's earlier, now-dead processes left behind, under both the
-/// current and the pre-L2-T5 names.
+/// current and the older (before 2026-09-17) names.
 ///
 /// Separate from [`PaneSwitchChannel::bind`] so a host can run it even on a path that is about to
 /// give up (`shell` cannot bind without its shim binary, and still owes the sweep).
@@ -367,25 +377,42 @@ pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
     }
 }
 
-/// Reads [`PaneMessage`]s without blocking the caller on a slow or trickling sender.
-/// Construct once per channel and retain across polls: a fresh reader loses buffered bytes from
-/// partial connections.
+/// Reads [`PaneMessage`]s off a pane-switch socket without ever blocking the caller on a slow or
+/// trickling sender (the theme feed reads its socket the same way). Construct once per channel and
+/// retain across polls -- a fresh reader
+/// per call loses every partial connection's buffered bytes and reintroduces the bug below.
 ///
-/// A per-read `SO_RCVTIMEO` does not bound a blocking `read_line`: each successful partial read
-/// resets the timeout, so a trickling sender can hold the caller and its main loop for the whole
-/// trickle. `poll` uses non-blocking reads and retains incomplete connections for the next call.
+/// **Before this:** each accepted connection was read with a blocking `read_line` under a
+/// per-connection `SO_RCVTIMEO`. That timeout is only ever consulted between two reads that each
+/// return *something*; a sender trickling its line in slowly (one byte at a time, well under the
+/// timeout) resets the clock on every successful partial read and holds the caller -- and the GTK
+/// main loop it runs on -- for the whole trickle rather than for the stated timeout. Measured at
+/// **3.2x the stated bound** for this module specifically -- 160.8ms against a 50ms `READ_TIMEOUT`
+/// (an "18x" figure is the *theme feed's* own measurement on its 100ms timeout, a different module)
+/// -- and reproduced again against this module's own old `accept_pending_messages` before the
+/// change landed -- see `p3_a1_a_trickled_message_never_holds_one_poll_past_its_budget`'s own doc.
+/// `poll` never blocks on a read: every read is non-blocking, and an incomplete connection is kept
+/// (not waited on) for the next call.
 ///
-/// Delivers messages in accept order. [`crate::line_feed::NewestLineReader`] cannot be reused:
-/// it keeps only the newest snapshot, while each direction is a discrete keypress. Dropping or
-/// reordering a message could move focus or clear a kill flag without the requested sequence.
-/// Only the oldest connection is read until it completes, closes, or reaches [`MAX_PENDING_AGE`].
-/// A stuck sender therefore delays later messages rather than letting them overtake it.
+/// **Delivers every message in accept order, and never lets a newer connection's message overtake
+/// an older, still-incomplete one.** [`crate::line_feed::NewestLineReader`] is not reused here for
+/// exactly that reason -- it is *newest-wins*, built for a feed where only the latest snapshot
+/// matters and an older one may be silently superseded. A pane-switch direction is a discrete
+/// keypress: dropping or reordering one would move focus, or clear a kill flag, somewhere the user
+/// never asked for. `poll` only
+/// ever reads its oldest pending connection; a newer one is not looked at until the older
+/// completes, is closed, or ages out (see [`MAX_PENDING_AGE`]) -- so a stuck sender blocks the
+/// messages behind it rather than letting them overtake it.
 ///
-/// Each accepted stream is explicitly made non-blocking. Linux does not copy the listener's flag
-/// to accepted streams, so omitting this step would reintroduce blocking reads. macOS copies it.
-/// Streams whose mode cannot be set are skipped; those exceeding [`MAX_MESSAGE_BYTES`] are
-/// logged and dropped. A dropped message costs a focus switch or leaves a kill flag for the user
-/// to retry; this channel does not gate tool execution.
+/// **Each accepted stream is made non-blocking explicitly.** `listener` is already non-blocking
+/// (the host polls it from a main loop that must not stall), and Linux does *not* carry that flag
+/// onto the fd `accept()` returns -- an accepted stream defaults to blocking there unless this is
+/// done, which would silently reintroduce the same hang this type exists to remove. (macOS copies
+/// the listener's flag instead, `rust-lang/rust#67027`, so it needed the opposite explicit call
+/// under the old blocking-read design.) A stream whose mode cannot be set is skipped, and one that grows past
+/// [`MAX_MESSAGE_BYTES`] is dropped with a log rather than retained without bound -- like the old
+/// code, this channel has nothing to fail closed *to*: a dropped message costs one focus switch or
+/// one stuck kill flag the user can retry, not a security boundary.
 pub struct PaneSwitchReader {
     listener: UnixListener,
     pending: VecDeque<PendingConnection>,
@@ -475,9 +502,10 @@ impl PaneSwitchReader {
 
     fn poll_at(&mut self, now: Instant) -> Vec<PaneMessage> {
         for _ in 0..MAX_ACCEPTS_PER_POLL {
-            // Stop accepting at `MAX_PENDING_CONNECTIONS` so senders that never write cannot grow the
-            // queue without bound. Excess connections wait in the kernel backlog, as they do past
-            // `MAX_ACCEPTS_PER_POLL`.
+            // As [`MAX_PENDING_CONNECTIONS`]'s own doc says: stop accepting once the
+            // cap is hit, rather than letting a same-user sender that never writes grow this queue
+            // without bound. A connection past the cap waits in the kernel's own backlog, same as
+            // one past `MAX_ACCEPTS_PER_POLL` already does.
             if self.pending.len() >= MAX_PENDING_CONNECTIONS {
                 break;
             }
@@ -503,17 +531,28 @@ impl PaneSwitchReader {
             }
         }
 
-        // Read each front connection before deciding whether to evict it for staleness. A complete
-        // message may already be waiting behind a silent connection with the same `accepted_at`.
-        // An age-only sweep would discard both without reading the ready message. Deliver `Complete`
-        // results even when stale; evict only connections that remain `Pending` after the read.
+        // Staleness eviction is merged into the read loop below rather than
+        // run as its own pass beforehand. The earlier two-pass shape evicted every stale connection
+        // at the *front* before ever attempting a read on any of them -- so a silent connection and
+        // a connection whose complete message was already sitting unread, accepted in the same poll
+        // (sharing one `accepted_at`), both aged out together: the sweep dropped the silent one,
+        // found the next front equally stale, and dropped that one too without ever calling
+        // `read_available` on it, discarding an already-complete message. Reading it here, in the
+        // same pass that decides staleness, means a front that is old enough to evict is still tried
+        // once first -- if that read turns out `Complete`, the message is delivered instead of lost;
+        // only a front that is *still* `Pending` after that read is the "never completed a message"
+        // case the eviction log line describes.
         //
-        // Start the read budget here on the real clock and check it after each read. The accept loop
-        // has its own bound, and a preemption before this point must not prevent the first read.
-        // `now` is for ageing connections, including simulated ageing in tests; using it for the
-        // wall-clock deadline could disable the budget or exhaust it before any work.
-        // Each poll with pending work tries its front connection at least once. The loop stays bounded
-        // because every pass either removes the front connection or stops.
+        // The time budget starts *here*, on the real clock, and is checked
+        // after each read rather than before the first one. It used to be `now + MAX_POLL_DURATION`
+        // checked at the top of this loop, which (a) charged the accept loop above -- already bounded
+        // on its own by `MAX_ACCEPTS_PER_POLL` -- against the read budget, and (b) let a poll that had
+        // been preempted for 5ms before reaching this line return nothing at all, however complete its
+        // front message was. `now` is still the clock for *ageing* (tests move it forward to age a
+        // connection), but it is the wrong clock for a wall-clock budget: a `now` in the future
+        // disabled the budget and one in the past exhausted it before any work. Every poll now
+        // reads its front connection at least once, so each makes progress; the loop stays bounded,
+        // since every pass either removes the front connection or stops.
         let mut budget = MAX_READ_BYTES_PER_POLL;
         let deadline = Instant::now() + self.read_time_budget;
         let mut messages = Vec::new();

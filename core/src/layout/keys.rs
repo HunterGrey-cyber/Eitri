@@ -1,17 +1,20 @@
-//! Keys after `Ctrl+a` select modules: `e` the editor, `a` the agent, `t` the terminal,
-//! and each Lua panel's own `key`. `v` is reserved for the canvas until it is available.
-//! It is unbound in the prefix table but still refused to Lua panels with
-//! `KeyError::Reserved` ([`RESERVED_FOR_CANVAS`]).
+//! The keys after `Ctrl+a` that name a module: `e` the editor, `a`
+//! the agent, `t` the terminal, and each Lua panel's own `key`. `v` is the canvas's once it is
+//! built, and is reserved until then ([`RESERVED_FOR_CANVAS`]): unbound in the
+//! prefix table, but still refused to a Lua panel with its own `KeyError::Reserved`.
 //!
-//! A Lua panel's key is checked against the effective keymap after `init.lua` and against
-//! stock tmux's prefix bindings (`crate::keymap::stock`). This prevents a panel from
-//! shadowing an active binding or a tmux key that may be supported later. A clash is a
-//! startup failure naming the key and binding, reported by `shell` as a `KeyError`.
+//! **A Lua panel's key is checked against the effective keymap and stock tmux** (since
+//! 2026-09-25, replacing a static `RESERVED` list): a key the prefix
+//! table binds after `init.lua`, default or the user's, is refused naming that binding; so is any
+//! key stock tmux binds after its prefix (`crate::keymap::stock`), so a panel never shadows a tmux
+//! reflex a later phase might adopt. A clash is a startup failure naming the key (`KeyError`,
+//! reported by `shell` after `init.lua` has run, the way `agent.font_size` is).
 //!
-//! Capitals of built-in module keys are also refused: `E`, `A`, `T` and `V`.
-//! After a split key, the prefix accepts `A` for `a` only after an exact match fails.
-//! Shift can still be held from typing `"`, so a panel keyed `A` would intercept that
-//! shortcut. Two Lua panels keyed `g` and `G` are allowed.
+//! **So is the capital of a built-in module's key** -- `E`, `A`, `T`, and `V` for the canvas's `v`
+//! -- with its own message. After a split key the prefix takes `A` for `a` (`"` is Shift+' on the
+//! US layout, and Shift is often still down), but only once an exact match has failed: a panel
+//! keyed `A` would take that slip. Two Lua panels keyed `g`
+//! and `G` are allowed.
 
 use std::fmt;
 
@@ -19,9 +22,9 @@ use super::module::{ModuleId, ModuleKind};
 use super::tree::Layout;
 use crate::keymap::{stock, Action, KeySpec, Keymap, Source};
 
-/// The built-in modules' keys.
-/// Their capitals, including the reserved canvas key's `V`, cannot be taken by a Lua panel:
-/// [`BUILT_IN_CAPITALS`].
+/// The built-in modules' keys. The canvas's `v` joins them once the canvas is built.
+///
+/// Their capitals are not a Lua panel's to take (this module's doc): [`BUILT_IN_CAPITALS`].
 const BUILT_IN: [(char, fn() -> ModuleId); 3] = [
     ('e', ModuleId::editor),
     ('a', ModuleId::agent),
@@ -32,8 +35,8 @@ const BUILT_IN: [(char, fn() -> ModuleId); 3] = [
 /// key after a split key (this module's doc).
 pub const BUILT_IN_CAPITALS: [char; 4] = ['E', 'A', 'T', 'V'];
 
-/// `v` stays free of the prefix table and every Lua panel so the canvas can use it
-/// without taking a key from an existing configuration.
+/// `v`, kept free of the prefix table and of every Lua panel, so the canvas can take it once it is
+/// built (this module's doc) without a v1 config having to give it back up.
 pub const RESERVED_FOR_CANVAS: char = 'v';
 
 /// Every module key this window answers to, in the order the prefix strip shows them: the built-ins,
@@ -207,7 +210,7 @@ impl ModuleKeys {
 pub enum KeyAction {
     /// Hidden: show it back where it was hidden from, and give it the keys.
     ShowAndFocus,
-    /// Never placed: open it right of the module with the keys and give it focus.
+    /// Never placed (the canvas): open it right of the module with the keys, which gives it them.
     Place,
     /// Shown -- on screen, or zoomed away -- without the keys: give it them, ending a zoom that keeps
     /// it off screen first, as a move does (`Layout::zoom_hides`). The zoomed module itself keeps its
@@ -217,7 +220,7 @@ pub enum KeyAction {
     Hide,
 }
 
-/// `Ctrl+a <key>` on `id`. The terminal's own `Ctrl+a t` is the same rule
+/// `Ctrl+a <key>` on `id` (its four cases). The terminal's own `Ctrl+a t` is the same rule
 /// (`shell::terminal::toggle_action`), with its shell started on the way.
 pub fn key_action(layout: &Layout, id: &ModuleId, has_keys: bool) -> KeyAction {
     if !layout.contains(id) {
@@ -296,7 +299,7 @@ pub struct StripEntry {
 }
 
 /// What the top bar lists after a split key: every module key, the built-ins first, a hidden module
-/// dimmed. These are fixed whatever the user rebinds.
+/// dimmed. These are fixed whatever the user rebinds, so the strip always names the modules.
 pub fn strip(keys: &ModuleKeys, layout: &Layout) -> Vec<StripEntry> {
     keys.entries()
         .iter()

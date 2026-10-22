@@ -1,15 +1,26 @@
-//! Asserts this crate's `Cargo.toml` has no GTK or WebKit dependency.
+//! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKit dependency.
 //!
-//! Compiler errors catch uses of missing dependencies, but adding an unused toolkit dependency
-//! would still break this crate's toolkit independence and its macOS build.
-//! This test checks the manifest so `cargo test` catches such additions even without a `use` line.
+//! Every other check of the property this crate exists to guarantee -- the point of splitting it
+//! out, letting the compiler guard the boundary -- has so far been a human running
+//! `cargo tree -p eitri-core | grep -ci gtk` by hand and writing the result down in a commit
+//! message or a doc comment. That checks the code, correctly: nothing in `core/src` can name
+//! `gtk4`, because nothing here depends on it. But it checks nothing about the *manifest* --
+//! there is nothing today stopping someone from adding `gtk4 = "0.11"` to `core/Cargo.toml` and
+//! never having a single `use gtk4::...` line to trip a compiler error over. This crate existing
+//! at all is what makes the macOS port possible (`shell` cannot build there; `eitri-core` must
+//! be able to); a GTK dependency slipping into the manifest, whether used or not, would silently
+//! undo the one property the split was for. This test makes that failure loud and
+//! immediate -- a red `cargo test` on the commit that adds it, not a fact someone has to remember
+//! to go check by hand.
 //!
-//! Like `socket_path_guard.rs`, this is a self-contained scan with no crate-parsing dependency.
+//! Modeled on `socket_path_guard.rs`: a narrow, self-contained scan with no crate-parsing
+//! dependency of its own, kept in its own file for the same reason that one is.
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-/// Package names or prefixes, such as `gtk4-sys`, forbidden as dependencies of this crate.
-/// GDK is published as `gdk4`, which neither `gdk` nor `gdk-` matches.
+/// Package names (or the start of one, for a `gtk4-sys`-shaped transitive) that must never appear
+/// as a dependency of this crate. `gdk4`, `gsk4` and `gio` were added later: gtk4-rs publishes GDK
+/// as `gdk4`, which neither `gdk` nor `gdk-` matched.
 const FORBIDDEN: &[&str] = &["gtk4", "webkit6", "glib", "gio", "gdk", "gdk4", "gsk4"];
 
 fn is_forbidden(package: &str) -> bool {
@@ -109,8 +120,9 @@ fn manifest_declares_no_gtk_or_webkit_dependency() {
     );
 }
 
-/// Checks dependency declaration forms and similar text that must not be treated as dependencies.
-/// Sub-tables and renamed packages must be detected as well as ordinary dependency entries.
+/// Every shape the scan must see, one manifest each, and the shapes it must not mistake for one.
+/// The sub-table and the two renames were missed by the first version of this scan: each was
+/// replayed through it and none was flagged.
 #[test]
 fn every_way_a_manifest_can_declare_a_dependency_is_seen() {
     let flagged = [

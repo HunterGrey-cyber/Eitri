@@ -1,7 +1,7 @@
-//! `↑`/`↓` and `Ctrl+r` browse prompts for the working directory. History lives in the state
-//! directory under `history/<16 hex>.jsonl`, named like the layout file and written atomically.
-//! Nothing is written inside the project. An unreadable file is set aside as `.jsonl.unusable`
-//! and read as empty.
+//! `↑`/`↓` and `Ctrl+r` over this project's prompts, "per working
+//! directory" as Claude Code keeps them (docs, #command-history). `$XDG_STATE_HOME/eitri/history/
+//! <16 hex>.jsonl`, named like the layout file, written atomically, never inside the project. A
+//! file that cannot be read is set aside as `.jsonl.unusable` and read as empty.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

@@ -9,7 +9,7 @@
 //! with every filesystem/exec/env read passed in, which is what every test in this file drives.
 //!
 //! **A private copy is never put on `PATH`, never linked into `~/.local/bin`, and this module never
-//! creates, replaces or removes anything named `nvim`/`vim`/`vi`** --
+//! creates, replaces or removes anything named `nvim`/`vim`/`vi`**, so the user's own editor stays untouched --
 //! everything here only ever *reads*.
 //!
 //! **How the choice reaches the fork.** `main()` does not route this through
@@ -47,15 +47,15 @@ pub const MINIMUM_VERSION: (u64, u64, u64) = (0, 10, 0);
 
 /// `$XDG_DATA_HOME/eitri/<this>`: where the installer's `tar --strip-components=1`
 /// lands a version, and where [`resolve`] looks for one. The exact path a match is built from is
-/// `<root>/<X.Y.Z>/bin/nvim` -- the layout contract this module shares with that task.
+/// `<root>/<X.Y.Z>/bin/nvim` -- the layout contract this module shares with the installer.
 pub const PRIVATE_NVIM_SUBDIR: &str = "eitri/nvim";
 
 /// How long [`resolve`]'s own `<path> --version` probe waits before giving up. A `PATH` `nvim` can
 /// be anything -- a wrapper script, a stuck mount -- and startup must never hang on it.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The result of [`resolve`], including whether `main()` should set `NEOVIM_BIN`
-/// and the information needed to print the startup choice and its reason.
+/// What [`resolve`] settled on, and everything `main()` needs to act on it (set `NEOVIM_BIN`, or
+/// not) and print its one startup line saying what was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
     /// `EITRI_NVIM` named this file explicitly.
@@ -97,8 +97,9 @@ pub enum PathNvim {
 }
 
 impl Choice {
-    /// The path `main()` should write into [`NEOVIM_BIN_ENV`], or `None` to leave it alone.
-    /// [`Choice::Inherited`] preserves the existing value; [`Choice::Path`] uses the default lookup.
+    /// The path `main()` should write into [`NEOVIM_BIN_ENV`] on this process, or `None` on the two
+    /// branches that must leave it alone: [`Choice::Inherited`] (never overwritten) and
+    /// [`Choice::Path`] (the fork's own default lookup already does the right thing).
     pub fn neovim_bin_to_set(&self) -> Option<&Path> {
         match self {
             Choice::Explicit(path) | Choice::Private { path, .. } => Some(path),
@@ -129,25 +130,34 @@ impl Choice {
     }
 }
 
-/// Chooses the nvim binary from supplied filesystem, process and environment observations.
-/// The decision can be tested without a real process or filesystem.
+/// The pure decision, the module doc's order in five steps: every filesystem, exec and environment
+/// read passed in, so
+/// this is driven entirely by this file's own tests with no real process, nvim or filesystem.
 ///
-/// `nvim_override` is the raw value of [`NVIM_OVERRIDE_ENV`], if set.
-/// `inherited_neovim_bin` is the value of [`NEOVIM_BIN_ENV`] before resolution. Any write made by
-/// `main()` after [`resolve`] returns is separate from this input.
-/// `is_file` validates explicit and inherited paths without requiring real files in tests.
-/// `path_nvim` is the executable named `nvim` found on `PATH`, or `None`.
-/// `private_candidates` contains unfiltered entries directly under the application's nvim directory,
-/// paired with their `bin/nvim` paths. This function accepts only three numeric version components
-/// separated by dots and sorts by version. A sibling named `nvim-linux-x86_64/` is excluded.
-/// `version_of` runs `<path> --version` and parses the first line. It is called at most once,
-/// only when `private_candidates` is non-empty and `path_nvim` is `Some`. Without an installed copy,
-/// [`Choice::Path`] wins either way, so no probe is needed.
+/// - `nvim_override`: [`NVIM_OVERRIDE_ENV`]'s raw value, if set.
+/// - `inherited_neovim_bin`: [`NEOVIM_BIN_ENV`]'s raw value, if the caller's own environment already
+///   had it set before anything here decided something -- never what this module itself would go on
+///   to write, which only happens in `main()`, after `resolve` has already returned.
+/// - `is_file`: validates steps 1 and 2's path. A closure, rather than calling `Path::is_file`
+///   directly, so "not a file" can be asserted with no real filesystem.
+/// - `path_nvim`: the result of a `PATH` walk for an executable literally named `nvim`, or `None`
+///   when nothing on `PATH` matches.
+/// - `private_candidates`: every directory entry [`resolve`] found directly under
+///   `$XDG_DATA_HOME/eitri/nvim`, each paired with the `bin/nvim` path inside it. **Unfiltered**
+///   -- this function applies the `^[0-9]+\.[0-9]+\.[0-9]+$` pattern and the version sort, so a
+///   `nvim-linux-x86_64/`-named sibling (the official tarball's own top directory, never searched)
+///   is excluded here rather than by a caller having to agree about which names count.
+/// - `version_of`: runs `<path> --version`, parses its first line, and is called **at most once** --
+///   and only when `private_candidates` is non-empty *and* `path_nvim` is `Some`. A host with no
+///   private copy at all never pays for this probe, because the answer is [`Choice::Path`] either
+///   way.
 ///
-/// Returns `Err`, naming the variable, only when an explicit or inherited value is not an absolute
-/// path to a file. Relative paths could be validated against `shell`'s working directory but executed
-/// from the project directory, naming different files. A bare inherited `NEOVIM_BIN` command is
-/// also refused, even though the embedded editor could otherwise look it up on `PATH`.
+/// Returns `Err` only for steps 1 and 2's own validation failure, naming the variable: the value is
+/// not an absolute path, or not a file. **Absolute, for both**, because of the fork's spawn, which sets
+/// the child's working directory to the project, so a relative value would be checked here against
+/// `shell`'s own cwd and then run from a different directory -- two files, one name. (A bare command
+/// name in an inherited `NEOVIM_BIN`, which the fork would look up on `PATH`, is refused by the same
+/// rule.)
 pub fn decide(
     nvim_override: Option<&OsStr>,
     inherited_neovim_bin: Option<&OsStr>,
@@ -285,12 +295,15 @@ fn list_private_candidates(root: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// Find the first executable `<dir>/nvim` in `PATH`. This crate is Unix-only, so there is
-/// no `$PATHEXT` handling.
+/// A `which`-style `PATH` walk for an executable literally named `nvim`: the first `PATH` entry
+/// holding a file at `<dir>/nvim` this process can execute. No `$PATHEXT` handling -- this crate
+/// does not compile off unix (this crate's own top-level doc).
 ///
-/// Skip relative and empty entries. An empty entry means the current directory, and a relative
-/// match here would use this process's cwd. The `NEOVIM_BIN` spawn uses `current_dir(project)`,
-/// so the same relative path could run a different file.
+/// **A relative (or empty, PATH's own "means `.`" convention) entry is skipped, never joined**:
+/// this function's caller resolves it against *this* process's own cwd, but the pinned
+/// fork's own `NEOVIM_BIN` spawn resolves a relative value against the *project* directory instead
+/// (`current_dir(project)`, fork `src/bridge/command.rs:79-89`) -- so a relative match here could
+/// name a different file from the one that actually runs.
 fn which_nvim(path_var: Option<&OsStr>) -> Option<PathBuf> {
     let path_var = path_var?;
     std::env::split_paths(path_var).find_map(|dir| {
@@ -307,24 +320,35 @@ fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// Maximum stdout bytes read by [`version_of_binary`] from `<path> --version`.
-/// Only the first line is parsed; normal version output fits comfortably within this bound.
+/// Above this many bytes of `<path> --version`'s stdout, [`version_of_binary`] stops reading:
+/// a real `nvim`'s first line -- the only line [`parse_nvim_version_line`] ever looks at -- is a
+/// few dozen bytes, and its whole `--version` dump is a few hundred more.
 const VERSION_PROBE_MAX_OUTPUT_BYTES: u64 = 4096;
 
-/// Run `<path> --version`, parse its first line and stop after [`VERSION_PROBE_TIMEOUT`].
+/// Runs `<path> --version`, parses its first line, gives up after [`VERSION_PROBE_TIMEOUT`].
 ///
-/// The binary comes from `PATH`, so bound both output and runtime. Read stdout through
-/// [`VERSION_PROBE_MAX_OUTPUT_BYTES`]-capped [`std::io::Read::take`] to limit memory use.
-/// Always call `kill()` before `wait()`: a capped read can finish while the child is still
-/// writing, and waiting without killing could block forever on a full pipe. Killing an
-/// already-exited, unreaped Unix child leaves its real exit status available to `wait()`.
-/// stdin is null and stderr is discarded.
+/// **Bounded two ways, because `path` is a `PATH` entry this process does not control**: stdout is
+/// piped and read through
+/// [`VERSION_PROBE_MAX_OUTPUT_BYTES`]-capped [`std::io::Read::take`] rather than
+/// `Command::output()`'s unbounded buffer, so a binary that never stops printing cannot grow this
+/// process's memory without bound; and the child is always `kill()`ed before `wait()`, on every
+/// path out of this function, not only the timeout one -- a capped read can finish (having read
+/// its fill) well before such a binary would ever exit on its own, and an unkilled child still
+/// writing into a pipe nobody is draining would otherwise block `wait()` forever. Signalling an
+/// already-exited, unreaped child is a harmless no-op on Unix (there is nothing left to receive
+/// it), so `wait()` still reports that real exit status rather than the kill's, and a well-behaved
+/// `nvim --version` (which closes stdout and exits immediately after printing) is unaffected.
+/// stdin is null and stderr is discarded; neither is read.
 ///
-/// Do not join the reader thread after a timeout. Killing the child closes its pipe end,
-/// allowing the blocked read and the thread to finish independently.
-/// No `.env` or `.env_clear` call reads this process's environment: `Command::spawn` inherits
-/// `environ` at exec time. An outstanding probe therefore makes no concurrent `getenv` or
-/// `setenv` call during `main()`'s later `std::env::set_var(NEOVIM_BIN_ENV, ..)`.
+/// The reader thread is **not joined** on the timeout path: past the deadline it is abandoned
+/// rather than made this function's problem, the same trade this codebase already makes for other
+/// bounded subprocess waits -- killing the child there closes its end of the pipe, which is what
+/// lets that thread's own blocked read return and the thread end on its own. This never touches
+/// this process's own environment -- no `.env`/`.env_clear` call, so `Command::spawn` inherits
+/// `environ` directly at `exec` time rather than reading it through `getenv` -- which is what makes
+/// `main()`'s later `unsafe { std::env::set_var(NEOVIM_BIN_ENV, ..) }` (documented at that call
+/// site) safe even if a probe from an earlier `resolve()` call is still outstanding: nothing here
+/// ever calls `getenv`/`setenv` concurrently with it.
 fn version_of_binary(path: &Path) -> Option<(u64, u64, u64)> {
     let mut child = std::process::Command::new(path)
         .arg("--version")

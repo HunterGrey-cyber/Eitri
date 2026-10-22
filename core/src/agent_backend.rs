@@ -37,9 +37,9 @@ const LEGACY_CAPABILITIES: ProviderCapabilities = ProviderCapabilities {
     resume: false,
     fork: false,
     interrupt: true,
-    // This backend always passes `--permission-mode default` and the hook.
-    // Bypass works by answering `allow` under that gate, so it needs only
-    // the interactive permission capability below.
+    // False since 2026-09-27: this backend never starts the CLI in `bypassPermissions` any
+    // more -- it always passes `--permission-mode default` and the hook. Eitri's bypass is its own
+    // `allow` under that gate, which needs only the capability below.
     bypass_permission_mode: false,
     // Its interactive gate is the `PreToolUse` hook relay, which is this backend's primary,
     // end-to-end-verified permission mechanism -- not the leaky `can_use_tool` it also listens to.
@@ -64,8 +64,8 @@ const _: () = {
         !LEGACY_CAPABILITIES.fork,
         "fork must not be advertised before it works end to end"
     );
-    // Every offered mode uses the interactive gate. Bypass answers `allow` under it;
-    // this backend never starts the CLI ungated.
+    // Every offered mode is honoured through the interactive gate (bypass is Eitri answering
+    // `allow` under it), and this backend never starts the CLI ungated.
     assert!(
         LEGACY_CAPABILITIES.interactive_permission_mode,
         "every offered permission mode needs the interactive gate"
@@ -271,14 +271,18 @@ impl BackendKind {
         }
     }
 
-    /// Reads the backend environment variable and `agent::LEGACY_BACKEND_COMPILED`.
+    /// Reads `EITRI_AGENT_BACKEND` and `agent::LEGACY_BACKEND_COMPILED`.
     ///
-    /// `legacy_flag` carries `main()`'s `--legacy` value. Passing it in keeps the selection testable,
-    /// as with `explicit` in [`choose`].
+    /// `legacy_flag` is `main()`'s own `--legacy`, read the same way it reads `--clean` -- passed
+    /// in rather than read here for the same testability reason `explicit` is (see [`choose`]).
     ///
-    /// Unrecognized values and missing sidecar artifacts select the sidecar. A typo emits a warning.
-    /// Legacy requires an explicit `--legacy` flag or the environment value `legacy`, and a build
-    /// with legacy support compiled in. Otherwise the explicit legacy request returns `Err`.
+    /// **Correction (2026-09-27):** this used to fall back
+    /// to `legacy` on an unrecognized value or on "unset, no sidecar artifact" -- described just
+    /// below until this correction. Legacy is now the gated backend (`agent::LEGACY_BACKEND_COMPILED`,
+    /// off in every release), so a typo or a missing artifact can no longer land there: both now
+    /// select the sidecar, with a warning for the typo. Only an explicit `--legacy` or
+    /// `EITRI_AGENT_BACKEND=legacy` can still select legacy, and only in a build that compiled it
+    /// in -- otherwise `Err` names why. See [`choose`]'s own doc for the resulting matrix.
     ///
     /// [`choose`]: Self::choose
     pub fn from_env(legacy_flag: bool) -> Result<Self, BackendChoiceError> {
@@ -290,18 +294,33 @@ impl BackendKind {
         )
     }
 
-    /// [`from_env`](Self::from_env)'s decision over caller-supplied values.
-    /// Inputs keep tests from mutating the shared process environment or reading an override
-    /// from a different source. `legacy_compiled` lets one test binary exercise both build modes.
+    /// [`from_env`](Self::from_env)'s decision, over values a caller supplies.
     ///
-    /// `legacy_flag` or `explicit = Some("legacy")` selects legacy only when it is compiled in.
-    /// Otherwise the result is an error naming [`agent::LEGACY_NOT_IN_BUILD`] and the source
-    /// of the request. The flag takes precedence because the environment may be inherited.
-    /// All other values select the sidecar, including unset, empty and unrecognized values.
-    /// A typo or missing artifact must not cause a fallback to the gated legacy backend.
-    /// [`agent::SidecarAvailability`] affects the message, not the backend choice. It distinguishes
-    /// an installed artifact, a checkout to build, and a missing sidecar. The missing case emits
-    /// [`agent::NO_SIDECAR_HINT`]; attempting to spawn it then fails with the same hint.
+    /// Separate so the matrix is testable without mutating the process environment, which every
+    /// other test in this binary shares. That is not hygiene for its own sake: the same shape --
+    /// a function taking an override as a signal while reading its value from the environment
+    /// itself -- was a real bug in `locate_verdandi_checkout` earlier the same day, and a test is
+    /// what found it. `legacy_compiled` is an input for the identical reason: it lets one test
+    /// binary exercise both the release matrix (`legacy_compiled = false`) and the development one
+    /// (`legacy_compiled = true`) without a `cfg`-gated test module.
+    ///
+    /// **The matrix:**
+    /// - `--legacy` (`legacy_flag`) or `EITRI_AGENT_BACKEND=legacy` (`explicit`) asks for legacy.
+    ///   When `legacy_compiled`, that ask is granted. When it is not (every release build), it is
+    ///   `Err` naming [`agent::LEGACY_NOT_IN_BUILD`] and which of the two asked -- the flag wins the
+    ///   naming when both are given, because it is a decision made on *this* invocation's command
+    ///   line, where the env var could be an inherited leftover nobody meant to set today.
+    /// - Everything else selects the sidecar, in both builds alike: an explicit `"sidecar"`, unset,
+    ///   empty (a wrapper script's `VAR=`, treated as unset), and -- since this correction -- an
+    ///   unrecognized value too (it used to fall back to legacy, which is exactly the direction
+    ///   a typo must not go now that legacy is the gated backend) and unset with no artifact
+    ///   installed (it used to fall back to legacy for want of one; now it says
+    ///   [`agent::NO_SIDECAR_HINT`] and starts the sidecar path anyway, which fails with that same
+    ///   hint when it actually tries to spawn one). `sidecar` ([`agent::SidecarAvailability`]) only
+    ///   shapes which sentence this prints -- it is not part of the choice between backends. It was
+    ///   a `bool` (`packaged_sidecar_available`) until that made the "not installed" sentence
+    ///   appear above a named `EITRI_VERDANDI_CHECKOUT` the spawn was about to build; the third
+    ///   value names that case.
     pub fn choose(
         explicit: Option<&str>,
         legacy_flag: bool,
@@ -325,8 +344,10 @@ impl BackendKind {
             });
         }
 
-        // Every remaining case selects the sidecar in either build.
-        // Warn on an unrecognized value so a typo cannot silently choose a backend.
+        // Every remaining case selects the sidecar -- there is no fallback to legacy left
+        // in this function at all, in either build. An unrecognized value still gets its own
+        // warning, because a typo silently landing on ANY backend without a word about it is worse
+        // than the sidecar it now lands on.
         if let Some(other) = explicit {
             if other != "sidecar" && !other.is_empty() {
                 eprintln!(
@@ -443,16 +464,23 @@ pub enum AgentBackend {
 }
 
 impl AgentBackend {
-    /// Constructs the selected backend. A cold sidecar checkout runs `npm ci` and `npm run build`,
-    /// which can block for minutes. Call this off the GTK main thread, as `agent_panel`'s connect worker does.
-    /// `resume` carries the provider session id to continue, or `None` for a fresh session.
-    /// A resume that cannot be honored returns an error so it cannot silently start a fresh session.
+    /// Constructs the selected backend. **Blocking, and for the sidecar path potentially for
+    /// minutes** (a cold Verdandi checkout runs `npm ci` and `npm run build`), so callers must run
+    /// this off the GTK main thread -- see `agent_panel`'s connect worker.
+    /// `resume` carries the Claude provider session id to continue, or `None` for a fresh session.
     ///
-    /// Every session on both backends is gated. The tab's permission mode is read when answering
-    /// requests in `take_revised_ui_delivery`, rather than sent to the CLI.
+    /// A resume that cannot be honored fails as a resume. It is never downgraded into a fresh
+    /// session anywhere on this path -- resume is checked end to end precisely to catch that
+    /// silent substitution, and doing it in the host would reintroduce one layer above where the
+    /// protocol was fixed.
     ///
-    /// `project` controls loading the project's Claude configuration (`.claude/`, `.mcp.json`,
-    /// `CLAUDE.md`) on both backends. The caller supplies it for every session, including resumes.
+    /// No permission mode: every session on both backends is gated, and the tab's mode is
+    /// read at the one point that answers requests (`take_revised_ui_delivery`), never sent to
+    /// the CLI.
+    ///
+    /// `project` decides whether the project's own Claude configuration (its `.claude/`,
+    /// `.mcp.json`, `CLAUDE.md`) loads, on both backends. The caller states it for every session,
+    /// a resume included; nothing here defaults it.
     pub fn start(
         kind: BackendKind,
         project_dir: &Path,
@@ -724,11 +752,13 @@ impl AgentBackend {
         }
     }
 
-    /// Reports the server's advertised capabilities intersected with those this client implements.
-    /// `AgentConversation` and `ClaudeSidecarProvider` apply that intersection.
+    /// Effective capabilities: what the server advertises, intersected with what this client can
+    /// actually drive end to end (`AgentConversation`/`ClaudeSidecarProvider` apply the
+    /// intersection; this just reports it).
     ///
-    /// Legacy advertises nothing over a wire, so its capabilities describe its implementation:
-    /// it supports interruption, has no resume or fork, and runs every session gated.
+    /// The legacy backend advertises nothing over a wire, so its capabilities are stated from what
+    /// its code demonstrably does: it interrupts, it has no resume and no fork, and it runs every
+    /// session gated.
     pub fn capabilities(&self) -> ProviderCapabilities {
         match self {
             AgentBackend::Legacy(_) => LEGACY_CAPABILITIES,
@@ -936,10 +966,11 @@ impl AgentBackend {
         }
     }
 
-    /// Stores the revision of the snapshot handed to the panel. The next drain takes it
-    /// through [`Self::take_ui_snapshot_revision`] and omits events at or below that
-    /// revision. Keeping it on the backend prevents a snapshot revision from surviving
-    /// replacement of its session.
+    /// Records that the panel was just handed a snapshot of this backend read at `revision`, for the
+    /// next drain to take back ([`Self::take_ui_snapshot_revision`]) and leave every event tagged at
+    /// or below it out of its `events` payload, so the page never applies an event twice that the
+    /// snapshot already holds. Kept by the backend itself, never by the tab, so a snapshot's
+    /// revision cannot outlive the session it was read from, whichever way that session is replaced.
     pub fn note_ui_snapshot(&mut self, revision: u64) {
         match self {
             AgentBackend::Legacy(session) => {
@@ -1045,8 +1076,9 @@ impl AgentBackend {
                     RevisedDelivery::Events(kept)
                 }
             }
-            // A `Resync` carries no events to filter; the UI rebuilds from the projection.
-            // `TabSet::pump` handles bypass requests in its `Resync` arm and hides ids in `host_answered`.
+            // A `Resync` carries no events to filter: the UI is about to rebuild from the
+            // projection instead. See `answer_what_needs_no_human`'s own note on the window that
+            // leaves open, and `TabSet::pump`'s own Resync arm for how bypass sweeps it.
             other => other,
         }
     }
@@ -1278,31 +1310,36 @@ impl AgentBackend {
         session_tripped(&self.projection())
     }
 
-    /// Answers `allow` to ids still pending on this session, in the supplied order (sorted by
-    /// `seq` by the caller). Skips ids already resolved or unknown. Returns only successfully
-    /// answered ids so the caller can extend `host_answered`. `why` labels the log message.
-    /// Returns `Approved`.
+    /// Answers `allow` to each id in `ids` that is still pending on THIS session, in the order
+    /// given (the caller sorts by `seq`); an id that is not pending is skipped silently -- resolved
+    /// already, or never real. Returns the ids it actually answered, so the caller can extend
+    /// `host_answered` with exactly those and no others (`Approved`). `why` is the log label ("on entering bypass" / "in bypass after a resync").
     ///
-    /// Resolutions arrive through the pump, including legacy's local hook replies.
+    /// Resolutions arrive through the pump, including the legacy backend's local hook replies.
     ///
-    /// Collects pending requests and drops the projection guard before answering.
-    /// `projection()` holds the sidecar ingestion mutex and `respond_permission` locks it
-    /// again, so retaining the guard would deadlock.
+    /// Collects the pending set in one statement, guard dropped before any answer -- the same
+    /// lock-order rule `answer_what_needs_no_human` follows (the 2026-09-15 GTK freeze:
+    /// `projection()` holds the sidecar's ingestion mutex and `respond_permission` locks it again).
     ///
-    /// If `respond_permission` fails, the id is omitted so its card remains available to the
-    /// user. If the user answers concurrently, the provider refuses the duplicate answer and
-    /// the error is logged.
+    /// **Fails toward a card, never toward a silent grant.** If `respond_permission` errors, the id
+    /// is not added to the returned list -- the caller does not hide it, so it stays drawn as a card
+    /// and the user can still answer it themselves. A double answer (the user pressed `y` on a card
+    /// the same tick this entered bypass) is accepted: the second `respond_permission` is refused by
+    /// the provider, logged, and otherwise harmless.
     ///
-    /// Answers nothing after the CLI reports an ungated mode. `TabSet::pump` checks this
-    /// before a resync, but `TabSet::confirm_bypass` calls directly between pumps. The
-    /// projection can already contain the report before the tab is marked `Failed`.
+    /// **Nothing is answered once the CLI has reported an ungated mode** -- the same
+    /// rule `answer_what_needs_no_human` holds. `TabSet::pump`'s own tripwire check already keeps this
+    /// from being reached on the Resync path, but `TabSet::confirm_bypass` calls this directly,
+    /// off the 33ms pump, so a report the background ingestion has already folded into the projection
+    /// but that pump has not yet turned into a `Failed` tab could otherwise still be approved here.
+    /// The projection is read again before each answer, not once per batch: ingestion keeps folding
+    /// while the earlier answers are sent, and a trip it folds there stops every answer after it.
     ///
-    /// Reads the projection again before each answer. Ingestion continues while earlier
-    /// answers are sent, so a trip folded during the batch stops subsequent answers.
-    ///
-    /// In bypass, CLI prompts are answered regardless of their reason, including
-    /// `permissions.ask`, unknown kinds, and missing reasons. Prompts naming a call are
-    /// returned in `Approved::prompts` with the bypass note for that call's row.
+    /// **The CLI's own prompts are answered here like any other request**, whatever they say about
+    /// why they asked (one the user's own `permissions.ask` rule forced, one of a kind this build does
+    /// not know, one that gives no reason): both callers are bypass, which lets everything through.
+    /// Each one that names its call comes back in `Approved::prompts` with the row note a bypass
+    /// tab's own answer gives it, for the caller to put on that call's row.
     pub fn approve_pending(&mut self, ids: &[String], why: &str) -> Approved {
         // Its own statement, guard dropped before any answer -- the same lock-order rule the
         // collection below follows.
@@ -1734,7 +1771,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
 }
 
 /// The calls the user approved on a card in one tab, each kept with the tool and the exact input the
-/// card showed. `TabSet::answer_card` records
+/// card showed, so an approval answers only the very call the user saw. `TabSet::answer_card` records
 /// one on an Approve that reached the provider; `matches` is the only test the Auto rule applies to
 /// the CLI's own prompt, and `consume` uses an approval up once it answered one.
 ///
@@ -1787,18 +1824,23 @@ impl HumanApprovals {
 /// The row note of an external agent's request this host allowed because the tab is in bypass.
 pub const EXTERNAL_BYPASS_NOTE: &str = "allowed in bypass";
 
-/// A CLI prompt answered without a card, identified by tool-use id, and the note displayed on
-/// its call's row. `ProviderPrompt::label` identifies the prompt.
+/// A CLI prompt answered without a card, and the note its call's row shows, so the transcript says
+/// who answered it: "Claude Code asked — allowed in bypass" / "— allowed with your
+/// approval" (`ProviderPrompt::label` names whose question it was).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptAnsweredForYou {
     pub tool_use_id: String,
     pub note: String,
 }
 
-/// A `Write`/`Edit`/`NotebookEdit` call whose gate the acceptEdits fast path answered `allow`.
-/// Keeps the tool-use id and exact `(tool_name, input)` the answer saw for the row's auto note.
-/// A later CLI prompt for the same call can have an empty tool-use id, so
-/// `note_auto_edit_answers` also matches by content to remove the candidate.
+/// A `Write`/`Edit`/`NotebookEdit` call whose gate the acceptEdits fast path answered `allow`
+/// ("allowed by auto" on the row once the call completes), with the exact `(tool_name, input)` the
+/// answer saw. Kept alongside the tool-use id so a LATER card for the exact same call -- the CLI's
+/// own follow-up prompt,
+/// whose request can carry an EMPTY tool-use id (Verdandi's `permissionBroker.ts` sends `toolUseId:
+/// ''` when the CLI gave none; `translate.rs` maps that to `None`) -- can still be matched by
+/// content and drop the candidate in `note_auto_edit_answers`, which the ordinary "same id" removal
+/// there can never see at all: it has no id to compare against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FastPathAnsweredForYou {
     pub tool_use_id: String,
@@ -1806,9 +1848,10 @@ pub struct FastPathAnsweredForYou {
     pub input: serde_json::Value,
 }
 
-/// A call allowed by a saved prefix rule, with the rule text displayed after completion and
-/// the exact `(tool_name, input)` that was approved. `note_rule_answers` matches it by
-/// content like [`FastPathAnsweredForYou`] when a later prompt has no tool-use id.
+/// A call whose gate a saved prefix rule answered `allow`, with the rule in Claude Code's own syntax
+/// ("allowed by rule `Bash(npm ci *)`" once the call completes) and the exact
+/// `(tool_name, input)` the answer saw, kept for the same reason and matched the same way as
+/// [`FastPathAnsweredForYou`] in `note_rule_answers`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleAnsweredForYou {
     pub tool_use_id: String,
@@ -1817,12 +1860,13 @@ pub struct RuleAnsweredForYou {
     pub input: serde_json::Value,
 }
 
-/// Answers made without a card, keyed by tool-use id for the call's row notes.
-/// `answer_what_needs_no_human` records them when it answers. The tab set uses these entries
-/// rather than inferring an answer from the absence of a card.
+/// What one delivery answered without a card that a call's row says something about, each by
+/// tool-use id, recorded by `answer_what_needs_no_human` at the moment it answered: the tab set
+/// turns these into row notes and never infers them from a card's absence, which was also true of
+/// a call that failed before any hook ran.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnsweredForYou {
-    /// The CLI's own prompts (O3), each with its note.
+    /// The CLI's own prompts, each with its note.
     pub prompts: Vec<PromptAnsweredForYou>,
     /// `Write`/`Edit`/`NotebookEdit` calls whose gate the acceptEdits fast path answered `allow`.
     pub by_the_fast_path: Vec<FastPathAnsweredForYou>,
@@ -1952,13 +1996,19 @@ fn client_implements_resume(kind: BackendKind) -> bool {
     }
 }
 
-/// A picker row's display title: the CLI's own title, then the persisted title, then none.
-/// This only changes `session` on its way to the frontend. It does not write the conversation
-/// record, so `ConversationRecord::title` keeps its first-one-wins behavior and `updated_at`
-/// is unchanged. Each greeting reads the transcript again, so resuming refreshes the row.
+/// One picker row's title: the CLI's own, then Eitri's own, then none -- each a real title from a
+/// real source, so a row is recognisable without an invented label.
 ///
-/// A missing or unreadable transcript, no `ai-title` within `AI_TITLE_TAIL_BYTES`, or an
-/// unrenderable title leaves `session.title` unchanged. No title is invented.
+/// The layering is **display only**. `session` is a value on its way to the frontend; nothing here
+/// writes, so `ConversationRecord::title` keeps its first-one-wins rule, `updated_at` stays what it
+/// means, and the question "what if the CLI changes its title later" never has to be answered
+/// (`agent::transcript`'s constraint 3). Each greeting re-reads, so a resume refreshes the row.
+///
+/// **A row never invents a title.** A transcript that cannot be found, cannot be read, holds no
+/// `ai-title` within `AI_TITLE_TAIL_BYTES`, or holds one this code cannot render, all leave
+/// `session.title` exactly as it was -- which is the row as it looked before this existed. That
+/// degradation is silent by design and is pinned by a test rather than by this comment
+/// (`with_no_ai_title_a_row_reads_exactly_as_it_did_before`).
 fn title_for(canonical_cwd: &str, mut session: ResumableSession) -> ResumableSession {
     if let Some(title) = agent::transcript::transcript_path(canonical_cwd, &session.provider_session_id)
         .ok()
@@ -2005,19 +2055,33 @@ pub struct BackendGreeting {
     pub project_dir: PathBuf,
     pub permission_modes: &'static [&'static str],
     pub expected_verdandi_revision: Option<&'static str>,
-    /// Previous conversations in this workspace that can be resumed, newest first.
-    /// Empty when there is nothing to continue, as in a fresh workspace.
+    /// Every previous conversation in THIS workspace worth offering, newest first. Empty when
+    /// there is nothing to continue, which is the normal case for a fresh workspace.
     ///
-    /// Entries require a persisted provider session id, a provider that advertised `resume`
-    /// when the session was saved, and a backend kind that implements resume.
-    /// The saved advertisement is used because no provider exists yet at the start screen.
-    /// `ClaudeSidecarProvider::resume_session` checks the live handshake when resume is
-    /// attempted. If support has disappeared, resume fails instead of starting a fresh session.
+    /// Non-empty only when all three terms hold: the provider advertised `resume` when the record
+    /// was written (server side), this backend kind implements resume (client side), and this
+    /// workspace has at least one persisted provider session id.
     ///
-    /// `for_kind` reads the CLI's `type:"ai-title"` transcript entry through
-    /// `agent::transcript::newest_ai_title` on every greeting. This display title takes
-    /// precedence over the stored title without writing to disk. A row without a title
-    /// shows its session id and timestamps rather than an invented label.
+    /// The server term is the LAST-KNOWN advertisement rather than a live one, because the start
+    /// screen has to decide before any provider exists. It is re-checked for real when resume is
+    /// attempted -- `ClaudeSidecarProvider::resume_session` refuses outright if the live handshake
+    /// no longer advertises it -- so a stale `true` here produces an honest failure, never a silent
+    /// fresh session.
+    ///
+    /// **What one entry can say is thin, and deliberately not padded.** `agent::ResumableSession`
+    /// carries a provider name, a Claude session id and two timestamps -- no title, no first
+    /// prompt, no turn count. See its own doc for why the one place on disk that could supply a
+    /// subject line (Claude's private transcript) is off limits. A picker built on this offers
+    /// "which session" and "when"; it must not invent "what about".
+    ///
+    /// **Correction (2026-09-20): that transcript is no longer off limits for a
+    /// title.** `for_kind` below layers the CLI's own `type:"ai-title"` line over `title` at
+    /// DISPLAY time (`agent::transcript::newest_ai_title`), read fresh on every greeting and never
+    /// written to disk -- see `agent::transcript`'s module doc, constraint 3, and
+    /// `agent::ResumableSession`'s own doc, both corrected in the same commit. The sentence this
+    /// correction sits under is otherwise unchanged, and its last clause is the load-bearing half:
+    /// each level of the ladder is a real title from a real source, and a row with none still shows
+    /// its id and its timestamps rather than an invented label.
     pub resumable: Vec<ResumableSession>,
     /// The configured Claude account's name (`agent::account::configured`), `null` when none is
     /// set. Read, never written, here -- the same asymmetry as

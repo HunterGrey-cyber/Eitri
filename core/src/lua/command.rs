@@ -71,13 +71,20 @@ impl CommandRegistry {
     }
 }
 
-/// Whether `id` is safe in `main.rs`'s `cmd-{id}` GIO action name and
-/// `set_accels_for_action("app.cmd-{id}", ...)`. Spaces or parentheses in a bound id can trigger
-/// a GTK assertion that aborts the process. `::` can silently bind a different action:
-/// `x::y` parses as action `x` with target `y`.
-/// Validate at registration before GTK sees the id. Like GIO's `g_action_name_is_valid`,
-/// accept only a nonempty sequence of ASCII alphanumerics, `-` and `.`.
-/// This implementation keeps `core` independent of `gio`.
+/// Whether `id` is safe to embed in `main.rs`'s `cmd-{id}` GIO action name
+/// (`set_accels_for_action("app.cmd-{id}", ...)`). A probe against the real libgtk-4
+/// 4.22.5/glib2 2.88.3 this product links found that once such an id is bound to a
+/// keybinding, GTK does not return an error Rust code could catch: a space or `(`/`)` triggers a
+/// GTK-CRITICAL then a hard assertion failure that core-dumps the whole process, and `::` parses
+/// silently into a *different* action (`x::y` binds the accel to action `x`, target `y`) rather
+/// than failing at all. So this has to be refused here, at registration, before `main.rs` ever
+/// sees it: ASCII alphanumerics, `-` and `.` only. **Correction (2026-09-27):** an
+/// earlier revision of this comment called that "deliberately narrower than GIO's real
+/// `g_action_name_is_valid`, which allows more punctuation" -- checked against the system
+/// glib2 2.88.3 this product links (`Gio.Action.name_is_valid`), that is false: GIO's own rule
+/// accepts exactly ASCII alphanumerics, `-` and `.` too (`a.b`/`a-b` valid; `a_b`, `a+b`, `a:b`,
+/// `a/b`, non-ASCII and the empty string all rejected). The two rules are the same, not narrower
+/// -- this is simply a from-scratch reimplementation so `core` need not depend on `gio`.
 fn is_valid_command_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }

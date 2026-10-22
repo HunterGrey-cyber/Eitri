@@ -1,9 +1,11 @@
-//! Records Lua keymap prefix, set and delete calls without applying or validating them here.
-//! Tables are `"prefix"`, `"panel"` and `"plugin:<id>"`; plugin page keys use vim notation.
-//! After `init.lua`, `shell` passes the calls to `Keymap::apply_user`, so invalid keys, unknown
-//! actions and collisions fail startup with the call named. Raising only a Lua error here
-//! would let the window open with a different keymap than requested.
-//! Wrong argument types are also retained as [`KeymapOp::Invalid`].
+//! `eitri.keymap.prefix(key)`, `.set(table, key, action, opts)`, `.del(table, key)`. The tables
+//! are `"prefix"`, `"panel"` and `"plugin:<id>"` (a plugin page's own keys, in vim's
+//! notation). Each call is **recorded, never applied or checked here**: `shell` hands the recording to
+//! `eitri_core::keymap::Keymap::apply_user` once `init.lua` has run, so every mistake -- a bad
+//! key, an unknown action, a collision -- is a startup failure naming the call. A Lua error raised
+//! from here would only be logged (`Kernel::load_init_file`), and the window would open with a
+//! keymap the user did not write. That includes an argument of the wrong type: it is recorded as
+//! [`KeymapOp::Invalid`].
 
 use std::cell::RefCell;
 use std::rc::Rc;

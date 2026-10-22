@@ -164,20 +164,35 @@ impl Kernel {
         let init_refusals = init_refusals(&lua);
         let eitri = lua.create_table()?;
 
-        // `Lua::new()` includes `./?.lua;./?/init.lua` in its default `package.path`. Since `shell`
-        // keeps the opened project's working directory, an unguarded `require` could run a module
-        // planted in that project instead of a configuration module. Limit `require` to the config
-        // directory's `lua/` subtree and disable native C module loading.
+        // `Lua::new()` (mlua's vendored lua54) leaves `package.path` at its compiled-in default,
+        // whose entries include `./?.lua;./?/init.lua` -- i.e. Lua's own `require` searches the
+        // process's *current working directory* by default. `shell` never `chdir`s away from the
+        // project it opens, so that cwd is normally the project the user has open, not the
+        // user's config directory -- an unguarded `require` in `init.lua` would let a file
+        // planted in the opened *project* shadow, or simply run as, one of the user's own config
+        // modules. Route `require` at the config
+        // directory only, mirroring nvim's own `lua/` directory convention, and close C module
+        // loading (`cpath = ""`) since nothing here ships a native Lua module.
         //
-        // Do not interpolate `config_dir` into Lua's `;`- and `?`-based path syntax. A literal `;` in
-        // the directory name could inject a relative search entry and reopen the cwd search.
-        // Empty `package.path` and replace `package.searchers[2]` with a Rust closure that uses
-        // `Path::join`, so directory characters are never parsed as search patterns. Remove the C
-        // searcher and all-in-one loader (`package.searchers[3]` and `[4]`) as well as emptying `cpath`.
+        // The config-dir-only entries are not built by string-interpolating `config_dir` into
+        // `package.path`'s own `;`-and-`?`-separated pattern syntax (`"{config_dir}/lua/?.lua;..."`). A `config_dir`
+        // that itself contains a literal `;` -- an entirely ordinary Unix path character, and
+        // exactly what a misconfigured `EITRI_CONFIG_DIR` could contain -- splits into an
+        // extra, *relative* search entry once Lua parses that string, reopening precisely the
+        // cwd-search hole this function exists to close (e.g. `EITRI_CONFIG_DIR=
+        // "/home/user/config;plugins"` leaves a `plugins/lua/?.lua` entry that resolves against
+        // the launch cwd, not the config dir). `package.path` is no longer built by string
+        // interpolation at all: it is emptied, and a Rust closure is installed as the "Lua
+        // path" searcher (`package.searchers[2]`, replacing Lua's own) that joins `config_dir`
+        // with `Path::join` and never re-parses it as pattern syntax, so no character
+        // `config_dir` contains, `;` included, can ever inject a second entry. The default C-path
+        // searcher and all-in-one loader (`package.searchers[3]`/`[4]`) are removed outright
+        // rather than left relying on `cpath == ""` alone to make them harmless.
         //
-        // `require` therefore ignores both `package.path` and `package.cpath`. Extending either in
-        // `init.lua` has no effect, and `package.searchpath` describes a path `require` does not use.
-        // `<config_dir>/lua/` is the only place `require` looks.
+        // **So `package.path` and `package.cpath` are read by nothing**: an
+        // `init.lua` that extends either -- the usual Lua idiom for a second module directory --
+        // changes nothing, silently, and `package.searchpath` answers for a path `require` never
+        // consults. `<config_dir>/lua/` is the only place `require` looks.
         let package: Table = lua.globals().get("package")?;
         package.set("path", "")?;
         package.set("cpath", "")?;

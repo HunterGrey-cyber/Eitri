@@ -221,22 +221,27 @@ pub fn close_steps(facts: &CloseFacts) -> Vec<CloseStep> {
     steps
 }
 
-/// Selects the bypass prompt built by `TabSet::cycle_mode` or `cycle_default_mode`. The text
-/// distinguishes an existing session, an empty tab, and the window default.
+/// Which prompt `TabSet::cycle_mode`/`cycle_default_mode` builds for a move into bypass:
+/// the text depends on whether the tab already has a session, or whether this is the window
+/// default rather than any one tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptScope {
     /// A tab with a live or starting session: this entry only ever applies to that one tab.
     LiveTab,
-    /// A `NotStarted` tab: entering bypass also changes the window default, so the prompt says
-    /// so.
+    /// A `NotStarted` tab: entering bypass here also moves the window default, so the text
+    /// says so.
     EmptyTab,
     /// The chooser's own default, not any open tab.
     Default,
 }
 
-/// Builds four English bypass prompts, each ending in `(y/n)`. `waiting` counts delivered cards
-/// that a `LiveTab` entry would approve. Only `LiveTab` reads it: a `NotStarted` tab has no
-/// session, and the window default is not a tab.
+/// The four bypass prompts, in English (since 2026-09-29). The band and every other prompt and flash it
+/// draws (`close 2 "docs"? (y/n)`, `close window? ...`) are English; these four, written in
+/// Chinese at first, were the only text in it that was not. Their structure is unchanged:
+/// what is asked and when, and `(y/n)` ends every one. `waiting`
+/// -- the number of delivered cards a `LiveTab` entry would approve -- is read only for `LiveTab`;
+/// the other two scopes never have cards to approve (a `NotStarted` tab has no session and the
+/// window default is not a tab at all).
 pub fn bypass_prompt(scope: PromptScope, waiting: usize) -> String {
     match scope {
         PromptScope::LiveTab if waiting == 0 => "Switch to bypass? (y/n)".to_string(),
@@ -358,11 +363,12 @@ pub fn linked_window_close_prompt(
     ))
 }
 
-/// For `<leader>bo`, return every tab except `active` and one y/n prompt with the total and
-/// running counts, such as `close 3 other tabs? 1 running (y/n)`. Each `entries` pair contains
-/// a tab id and whether it is running: a turn in progress or still connecting, as in
-/// `TabSet::running_count`. Return `None` when there are no other tabs, so the caller does
-/// not prompt, just as `window_close_prompt` does when nothing is running or queued.
+/// `<leader>bo`: every tab but `active`, and the one
+/// y/n naming how many close and how many of them are running, e.g. `close 3 other tabs? 1 running
+/// (y/n)`. `entries` is every open tab's id paired with whether it is running (a turn in progress,
+/// or still connecting -- the same test `TabSet::running_count` uses). `None` when there is nothing
+/// to close (the active tab is the only one open): the caller should not prompt at all, the same as
+/// `window_close_prompt`'s `None` for "nothing running or queued".
 pub fn close_others(entries: &[(TabId, bool)], active: TabId) -> Option<(Vec<TabId>, String)> {
     let others: Vec<(TabId, bool)> = entries.iter().copied().filter(|(id, _)| *id != active).collect();
     if others.is_empty() {
@@ -389,7 +395,7 @@ pub fn sum_attention(each: &[Attention]) -> Attention {
     })
 }
 
-/// The tab holding the card that arrived first, of every card still pending.
+/// The tab holding the card that arrived first, of every card still pending (`prefix a`).
 pub fn oldest_card(tabs: &[(TabId, Option<u64>)]) -> Option<TabId> {
     tabs.iter()
         .filter_map(|(id, stamp)| stamp.map(|s| (s, *id)))

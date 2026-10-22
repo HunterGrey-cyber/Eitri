@@ -78,7 +78,7 @@ pub(crate) fn ensure_contrast(color: Rgb, against: Rgb, toward: Rgb, min: f64) -
     toward
 }
 
-/// [`ensure_contrast`], with a black/white pole as the guard of last resort (sw-theme-4).
+/// [`ensure_contrast`], with a black/white pole as the guard of last resort.
 ///
 /// `ensure_contrast` can hand back a colour that still fails `min`: a scheme's own two colours
 /// cannot always carry text on a mid-luminance surface (rose-pine dawn's `IncSearch`, `#d7827e`,
@@ -88,8 +88,8 @@ pub(crate) fn ensure_contrast(color: Rgb, against: Rgb, toward: Rgb, min: f64) -
 /// stopping at the first step that passes, for the same reason `ensure_contrast` does, rather than
 /// jumping straight to a pure black or white that would erase the scheme's own character.
 ///
-/// First written for `hint_fg`; sw-theme-4 found `chrome_fg`/`chrome_muted` had been left without
-/// it, extracted here so every surface-guarded text token shares one implementation.
+/// First written for `hint_fg`; `chrome_fg` and `chrome_muted` need it too, so it lives here and
+/// every surface-guarded text token shares one implementation.
 pub(crate) fn ensure_contrast_with_pole(color: Rgb, against: Rgb, toward: Rgb, min: f64) -> Rgb {
     let guarded = ensure_contrast(color, against, toward, min);
     if guarded.contrast(against) >= min {
@@ -104,7 +104,7 @@ pub(crate) fn ensure_contrast_with_pole(color: Rgb, against: Rgb, toward: Rgb, m
     ensure_contrast(color, against, pole, min)
 }
 
-/// A text colour painted on two backgrounds, guarded against both at once (sw-theme-3).
+/// A text colour painted on two backgrounds, guarded against both at once.
 ///
 /// Two single-background guards in a row cannot do this: the second one mixes toward its own
 /// target with no regard for the first background, and when `color` sits on the far side of `a`

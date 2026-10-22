@@ -1,10 +1,14 @@
-//! The GTK-free half of `shell`: the agent stack, theme token derivation, process and filesystem
-//! plumbing, and the Lua kernel's pure half. No `gtk4`, `webkit6` or `glib` dependency belongs here.
-//! `shell` depends on this crate; this crate must never depend back on `shell`.
+//! `eitri-core`: the GTK-free half of `shell` -- the agent stack, theme token derivation, the
+//! process/filesystem plumbing under them, and the Lua kernel's pure half -- extracted so the
+//! compiler enforces the boundary (no `gtk4`/`webkit6`/`glib` dependency here, so a macOS host
+//! can build on it). `shell` depends on this crate;
+//! this crate must never depend back on `shell`.
 //!
-//! This crate requires Unix: `instance_dir` uses `std::os::unix::net` and, through
-//! `agent::process_probe::pid_is_alive`, `libc::kill`. This permits Linux and macOS builds
-//! without depending on a UI toolkit.
+//! **Not "platform-independent".** `instance_dir` uses `std::os::unix::net` and, transitively
+//! (through `agent::process_probe::pid_is_alive`), `libc::kill` -- this crate does not compile off
+//! unix. That is expected, not a regression: unix (Linux and macOS both) is what the macOS port
+//! actually needs, and the property this crate promises is toolkit independence, not host
+//! independence.
 
 pub mod agent_backend;
 pub mod agent_bridge;

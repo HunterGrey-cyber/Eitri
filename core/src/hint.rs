@@ -1,8 +1,10 @@
-//! Pure logic for the global `f` HINT: label assignment, typing state, and distributing one
-//! label set across window regions. `shell::hint` uses module ids and the panel uses target
-//! indices, so both share label assignments without GTK or WebView dependencies. The window
-//! is a list of modules in tree order; regions follow the layout rather than fixed main,
-//! side, and bottom slots.
+//! The pure half of the global `f` HINT.
+//! Label assignment, the typing state machine and the split of one label set across the window's
+//! regions. No GTK and no WebView: `shell::hint` drives this with module ids, the panel with its
+//! own target indices, and neither can disagree with the other about which label is whose.
+//!
+//! **The window is a list of modules in tree order** since the layout became data: the regions used to be the
+//! three fixed slots (main, side, bottom), and a layout that is data has no fixed slots.
 
 use crate::layout::{ModuleId, ModuleKind};
 
@@ -104,7 +106,7 @@ pub enum Region {
     After(usize),
 }
 
-/// One label set, split in spec order: GTK targets before the panel, the panel, GTK after it.
+/// One label set, split in label order: GTK targets before the panel, the panel, GTK after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelPlan {
     pub before: Vec<String>,
@@ -160,8 +162,8 @@ pub enum Slot {
     Module(ModuleId),
 }
 
-/// The window state `shell` sees when a HINT starts.
-/// A visible widget is mapped and has a non-zero size.
+/// What `shell` sees of the window when a HINT starts. Visibility means what a person can see:
+/// mapped, with a non-zero size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowLayout {
     pub top_visible: Vec<bool>,
@@ -190,7 +192,7 @@ pub enum Landing {
     Panel(usize),
 }
 
-/// The GTK targets in spec order around the panel's, and whether the panel is asked for its own.
+/// The GTK targets in label order around the panel's, and whether the panel is asked for its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetOrder {
     /// Top bar items, then every visible module ahead of the agent in tree order.
@@ -202,9 +204,10 @@ pub struct TargetOrder {
     pub after: Vec<Slot>,
 }
 
-/// Orders visible top bar items first, then visible modules in tree order, with the agent's
-/// own labels at its position. For `[editor | agent]` with an optional bottom panel, this gives
-/// top bar, main slot, panel, bottom slot.
+/// The label order: the visible top bar items, then the visible modules in tree
+/// order, with the agent's own labels where the agent sits. For the window as it was before the
+/// modules design -- `[editor | agent]`, with or without a panel below -- that is exactly the old
+/// order: top bar, main slot, panel, bottom slot.
 pub fn order_targets(layout: &WindowLayout) -> TargetOrder {
     let mut before: Vec<Slot> = layout
         .top_visible

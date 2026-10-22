@@ -1,10 +1,14 @@
-//! Transport for nvim reports: nvim pushes one JSON line per changed report, and the host polls.
+//! The transport half of the nvim report: a fourth
+//! nvim->host push socket, nvim writing one JSON line per changed report, the host polling.
 //!
-//! Uses the same instance directory scheme, `--cmd` loader, non-blocking listener and bounded
-//! `crate::line_feed` reader as `crate::editor_context::feed`.
+//! Deliberately a structural copy of `crate::editor_context::feed` -- same instance directory
+//! scheme, same `--cmd` loader, same non-blocking listener drained from the host's main loop, and
+//! the same bounded reader (`crate::line_feed`) -- because that protocol is in production and its
+//! failure modes are already paid for. Read that module's comments before changing anything here.
 //!
-//! Treat nvim-supplied bytes as untrusted. Drop a whole line if [`super::parse_report`] rejects
-//! it as a v1 report or it exceeds the line cap. The host keeps its last good report.
+//! What crosses this socket is nvim-supplied bytes, so the reader treats it as untrusted: a line
+//! that is not a v1 report ([`super::parse_report`]), or is larger than the line cap, is dropped
+//! whole and the host keeps its last good report.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};

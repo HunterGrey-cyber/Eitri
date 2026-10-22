@@ -1,21 +1,29 @@
-//! Tracks answerable permission cards and unseen turn completion for chats off screen. The
-//! tray displays `agent ⚑N` through `layout::tray::chip_label`. A new card raises a toast or
-//! shows the chat when `modules.chat.on_permission = reveal`.
+//! What a chat that is not on screen owes the user: how
+//! many permission cards it is holding, and whether a turn finished while nobody was looking. The
+//! top bar's tray reads it as `agent ⚑N` (`layout::tray::chip_label`); a card arriving while the chat
+//! is away also raises a toast, or with `modules.chat.on_permission = reveal` shows the chat again.
 //!
-//! Counts `PermissionRequested` events delivered to the UI, then removes ids no longer
-//! pending in the projection. Automatically answered sidecar requests can stay pending until
-//! `PermissionResolved` arrives on a later pump. Counting the projection alone would briefly
-//! show a badge for each such request. Legacy panel answers are detected through the
-//! projection even without a delivered resolution event.
+//! **Counted from what the panel was handed, never from the projection alone.** On the sidecar
+//! path a request the permission policy answered itself stays in `pending_permissions` until the
+//! provider's `PermissionResolved` arrives on a later pump (`AgentBackend::answer_what_needs_no_human`'s
+//! own doc). Counting the projection would light `⚑1` for a moment on every `Read`. So the tracker
+//! counts the `PermissionRequested` events that reached the UI -- exactly the cards the panel draws
+//! -- and drops each one the projection no longer holds, which is how an answer given from the panel
+//! (`respond_permission`, on legacy never a delivered event) stops counting.
 //!
-//! For resync, `TabSet::pump` supplies pending ids minus `Tab::host_answered`, excluding
-//! requests already answered locally in bypass or by the classifier.
-//! [`AttentionTracker::resync`] counts exactly the set it receives.
+//! **That gap is closed as of 2026-09-27, not by counting less here.**
+//! [`AttentionTracker::resync`] still takes whatever set the caller hands it, but `TabSet::pump`
+//! now passes the projection's pending ids MINUS `Tab::host_answered` -- the ids Eitri
+//! itself already answered, in bypass or under the classifier -- so a request nobody needs to see
+//! a card for is never counted here either. The fix stays in the caller, not in `resync` itself:
+//! this tracker still counts exactly the set it is handed.
 //!
-//! [`AttentionTracker::session_ended`] clears the count because ended cards can no longer be
-//! answered, even if still drawn. Ending off screen also sets `unread`, so losing the last
-//! waiting card does not remove every sign of the ended session. `shell` calls it whenever a
-//! session is removed, including fatal commands and sessions that never opened.
+//! **A session that ends owes nothing** ([`AttentionTracker::session_ended`]): its cards can no
+//! longer be answered, so they stop counting even though the panel still draws them -- the count is
+//! of cards still answerable. Ended off screen, it also sets `unread`: without that, a hidden chat
+//! whose session died with a card waiting would go from `agent ⚑1` back to a bare `agent`, its only
+//! sign gone. `shell` calls it at every place it takes a session away,
+//! not only on the event that says so: a fatal command, or a session that never opened.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agent::AgentDomainEvent;
 
 /// One clock for every tracker in the process, so the oldest card across session tabs is
-/// comparable. Relaxed: only the order of stamps from one
+/// comparable (`prefix a` goes to the oldest). Relaxed: only the order of stamps from one
 /// thread (the GTK main loop) is ever compared.
 static ARRIVAL_CLOCK: AtomicU64 = AtomicU64::new(1);
 
@@ -120,9 +128,10 @@ impl AttentionTracker {
         self.cards.retain(|id, _| still_pending(id));
     }
 
-    /// Ids of cards still held by this tracker, oldest arrival first.
-    /// A bypass entry approves these cards through `TabSet::waiting_cards`. Since `cards` is keyed
-    /// by id, sort by the stamp assigned by `observe` or `resync` rather than by map key.
+    /// The ids this tracker still holds a card for, oldest arrival first (`TabSet::waiting_cards`:
+    /// a bypass entry approves exactly these). `cards` is keyed by id, not
+    /// by arrival order, so this sorts by the stamp `observe`/`resync` assigned rather than walking
+    /// the map's own (alphabetical) key order.
     pub fn card_ids(&self) -> Vec<String> {
         let mut ids: Vec<(&String, &u64)> = self.cards.iter().collect();
         ids.sort_by_key(|(_, stamp)| **stamp);
@@ -200,18 +209,20 @@ pub enum AgentPlace {
 /// What a change of attention asks the window to do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reaction {
-    /// Raise the toast (decision b: "a top-bar chip `agent ⚑N` and a toast").
+    /// Raise the toast, beside the top-bar chip `agent ⚑N`.
     pub toast: bool,
     /// Show the chat where it was hidden from, without moving the keys.
     pub reveal: bool,
 }
 
-/// A new card off screen raises a toast, or reveals the chat with `Reveal` when nothing is
-/// zoomed. Cards already on screen need no reaction. Detect arrivals through increases in
-/// [`Attention::arrived`]: replacing one card can leave `pending` unchanged. Resetting a
-/// tracker decreases `arrived` and must not react. Require a waiting card too, since cards
-/// answered, cancelled, or ended within the same pump should produce neither an empty toast
-/// nor an unnecessary reveal.
+/// A card that arrives while the chat is not on screen: a toast, or with `Reveal` and nothing
+/// zoomed, the chat itself. A card that arrives while it is on screen is already in view. "Arrives"
+/// is [`Attention::arrived`] growing, not `pending`: a card answered and a new one in the same pump
+/// leave `pending` unchanged. A tracker reset for a new session starts
+/// `arrived` again at 0, which is a decrease, and never a reaction. And only a card still waiting
+/// reacts: one that arrived and was answered, cancelled or ended with its session in the same pump
+/// has gone by the time `shell` looks, so a toast would say "0 permission cards waiting" and a
+/// reveal would show the chat for nothing.
 pub fn react(policy: ChatOnPermission, before: Attention, after: Attention, place: AgentPlace) -> Reaction {
     if after.arrived <= before.arrived || after.pending == 0 || place == AgentPlace::OnScreen {
         return Reaction::default();

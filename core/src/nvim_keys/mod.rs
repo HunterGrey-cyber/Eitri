@@ -1,7 +1,9 @@
-//! Reads `mapleader`, `timeoutlen`, `timeout` and global Normal-mode mappings from nvim.
-//! This module shapes and classifies the JSON line delivered by the nvim-to-shell push socket.
-//! Only wire version `v: 1` is accepted. Unknown versions and malformed JSON are dropped whole,
-//! so the caller can keep its last good report.
+//! The nvim report: `mapleader`, `timeoutlen`/
+//! `timeout`, and every global Normal-mode mapping, read off a fourth nvim->shell push socket
+//! (`feed` builds the socket itself; this module only shapes and classifies the JSON line it
+//! carries). `v: 1` is the only wire version this reads; anything else -- a `v` this
+//! crate does not know, or JSON it cannot parse at all -- is dropped whole, and the caller keeps
+//! its last good report.
 
 pub mod classify;
 pub mod feed;
@@ -10,7 +12,7 @@ pub use classify::{classify, translate_lhs};
 
 use serde::Deserialize;
 
-/// One nvim Normal-mode mapping: `lhs` already through
+/// One nvim Normal-mode mapping (`vim.api.nvim_get_keymap("n")`): `lhs` already through
 /// `vim.fn.keytrans`, `rhs` absent for a Lua callback, `desc` optional, and `callback` true exactly
 /// when there is no `rhs` because a Lua function runs it instead.
 #[derive(Debug, Clone, Deserialize)]
@@ -40,8 +42,7 @@ pub fn nvim_leader_token(report: &NvimReport) -> &str {
 }
 
 /// `line` parses only at wire version 1. Unparsable JSON, or a `v` this crate does not
-/// know, is `None` -- never a partially-applied report -- so the caller keeps its last good one
-///.
+/// know, is `None` -- never a partially-applied report -- so the caller keeps its last good one.
 pub fn parse_report(line: &[u8]) -> Option<NvimReport> {
     serde_json::from_slice::<NvimReport>(line)
         .ok()

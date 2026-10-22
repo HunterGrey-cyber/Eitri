@@ -1,15 +1,16 @@
-//! Stock tmux's prefix table is the fixture for checking defaults. Its keys stay reserved
-//! so a Lua panel cannot shadow a binding that may be supported later.
+//! Stock tmux's prefix table, as probed -- the fixture the default table is checked against, and
+//! the keys a Lua panel may never take: every key stock tmux binds in its prefix table stays
+//! reserved, so a Lua panel never shadows a tmux reflex that a later phase might adopt.
 //!
-//! To probe tmux next-3.7, use a server with no config. It exits because it has no sessions;
-//! remove its stale socket afterwards.
+//! Probed 2026-09-25 on tmux next-3.7, a throwaway server with no config, which exits by itself
+//! since it has no sessions (remove its stale socket afterwards):
 //!
 //! ```sh
 //! tmux -L specprobe -f /dev/null start-server \; list-keys -T prefix
 //! ```
 //!
-//! It reports `prefix C-b`, `base-index 0`, `repeat-time 500`. Probe again after an upgrade;
-//! changes to the stock table affect both the fixture and the reserved keys.
+//! It reports `prefix C-b`, `base-index 0`, `repeat-time 500`. Re-probe on a tmux upgrade; a changed
+//! stock table changes which keys a Lua panel may take, so it is a deliberate change, not a silent edit here.
 
 use super::key::KeySpec;
 

@@ -1,14 +1,18 @@
--- Navigation fallback, loaded with --cmd before the user's config. At load it installs only
--- autocommands. At scheduled VimEnter, User VeryLazy and User LazyLoad, it gives
--- <C-h>/<C-j>/<C-k>/<C-l> in Normal and Visual mode a way out of the editor where the global
--- mapping is empty, nvim's default, or a plain window move. Other mappings and all buffer-local
--- mappings are left alone. Insert mode gets <C-l> only where its global mapping is empty;
--- <C-h>/<C-j>/<C-k> keep their Insert meanings: backspace, newline and digraph.
+-- Eitri nav fallback. Loaded with --cmd before
+-- the user's config, like the theme and nvim-keys feeds. It sets no option and no mapping at load:
+-- it only installs autocommands, and at VimEnter (scheduled), User VeryLazy and User LazyLoad it
+-- gives each of <C-h>/<C-j>/<C-k>/<C-l>, in Normal and Visual mode, a way out of the editor --
+-- but only where the global slot is empty, nvim's own default, or a plain window move. Anything
+-- else (vim-tmux-navigator, a lazy.nvim key stub, smart-splits, a user's own mapping) is left
+-- alone, and buffer-local mappings are never touched. Insert mode gets <C-l> alone,
+-- and only where its global slot is empty: <C-h>/<C-j>/<C-k> keep vim's own
+-- Insert meanings (backspace, newline, digraph).
 --
--- Under `--cmd` (`dofile`, no arguments), use the socket from the spawn environment.
--- When injected into a running nvim, take the socket from the argument table instead: inherited
--- environment variables may name a different window and send keys to the wrong panel.
--- An injected chunk returns a function that undoes it.
+-- Called two ways. Under `--cmd` (`dofile`, no arguments) the socket comes from the environment the
+-- host set at spawn. Injected into an already running nvim, the chunk gets a table instead and must
+-- not look at the environment at all: an nvim started inside another Eitri window inherits that
+-- window's variables, and reading them would send the keys to the wrong panel. An injected chunk
+-- returns a function that undoes it.
 local opts = ...
 local socket
 if type(opts) == "table" then
@@ -30,11 +34,15 @@ local KEYS = {
 }
 local DESC = "eitri: window or pane "
 
--- Send synchronously so a busy callback or an editor exit cannot lose a queued letter.
--- `vim.fn.sockconnect`, `chansend` and `chanclose` finish before the mapping returns.
--- An asynchronous `pipe:connect`/`pipe:write` would defer the write to a later event-loop turn.
--- Each `pcall` absorbs connection or write errors, so a missing listener costs one keypress
--- and never raises an error in the editor.
+-- Synchronous, like `core/src/layout/kill.rs`'s `editor_quit_lua` and
+-- `core/src/theme/nvim_theme.lua`'s own `send()`. Before this, the asynchronous
+-- `pipe:connect`/`pipe:write` pair queued the actual write for a *later* turn of nvim's event
+-- loop, so nvim staying busy in the same callback that pressed the key -- or exiting before that
+-- later turn ever comes -- could lose the letter outright. `vim.fn.sockconnect`/`chansend`/
+-- `chanclose` complete before this function returns, so the write is already on the wire by the
+-- time the caller (the mapping) does. Every `pcall` swallows exactly what the async version's
+-- `err`/missing-listener branches did: a missing listener, same as before, costs one keypress and
+-- never an error in the user's editor.
 local function send(letter)
   local ok, chan = pcall(vim.fn.sockconnect, "pipe", socket, { rpc = false })
   if not ok or chan == 0 then
@@ -59,9 +67,10 @@ local function normal(key)
   end
 end
 
--- Visual mode: at nvim's edge (`winnr('<dir>') == winnr()`), send the direction letter and
--- keep the selection as the panel's editor context. Otherwise leave Visual mode with <Esc>
--- and move to the neighboring window.
+-- Visual (eitri-only -- the plugin maps Normal mode only). The mapping runs like <Cmd>, so
+-- Visual mode is not ended: at nvim's edge (`winnr('<dir>') == winnr()`, :h winnr()) the letter is
+-- sent and the selection stays, as the editor context the panel shows. Otherwise Visual is left
+-- (<Esc>) and the window changes, as the plugin's `:<C-U>` form does in Normal mode.
 local function visual(key)
   if vim.fn.winnr(key.dir) == vim.fn.winnr() then
     send(key.letter)
@@ -75,13 +84,17 @@ local function visual(key)
   end
 end
 
--- Insert mode: leave Insert first, then navigate as in Normal mode. Move to a neighboring
--- window, or send the direction letter to the next pane at nvim's edge.
+-- Insert (eitri-only, like Visual -- vim-tmux-navigator and LazyVim map Normal mode only,
+-- so a plain nvim typed a literal ^L here and the keys never left the editor). Insert mode is left
+-- first, as <Esc> would, then the key does what Normal mode's does: move to the window beyond, or at
+-- nvim's edge send the letter to the pane beyond. Insert mode ends either way, since the keys are
+-- about to leave this pane.
 --
--- `:stopinsert` takes effect after this callback returns. Moving inside the callback would
--- end Insert in the destination window, step its cursor left and fire InsertLeave there,
--- while leaving the source cursor unchanged. Schedule navigation so Insert ends in the
--- source window before either moving focus or sending the letter.
+-- `:stopinsert` only takes effect once this mapping's callback returns (it sets a flag the Insert loop
+-- reads), so moving the window inside the callback ended Insert mode in the DESTINATION window: its
+-- cursor stepped left a column, InsertLeave fired in its buffer, and the window the user was typing
+-- in never stepped back. The move is scheduled instead, to run after Insert has ended
+-- where it started; at the edge the letter goes out from there too.
 local function insert(key)
   vim.cmd.stopinsert()
   vim.schedule(function()

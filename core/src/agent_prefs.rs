@@ -1,6 +1,8 @@
-//! Remembers the permission mode for empty session tabs per project, outside the project
-//! directory. Uses the layout file naming scheme and writes a neighboring `.tmp` file before
-//! renaming it. Unusable files are set aside as `.json.unusable` and treated as missing.
+//! The permission mode an empty session tab starts in, remembered per project:
+//! `$XDG_STATE_HOME/eitri/agent/<16 hex>.json`, named like the layout file
+//! (`state_paths::file_name`) and written the same way -- a `.tmp` beside it, then renamed.
+//! Never inside the project. A file that cannot be used is set aside as `.json.unusable` and read as
+//! nothing, as the layout file is.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -60,9 +62,10 @@ pub fn load_mode(dir: &Path, project_root: &Path) -> LoadedMode {
     LoadedMode::Remembered(file.permission_mode)
 }
 
-/// Refuses bypass with `InvalidInput` in every build, before writing anything. A
-/// `debug_assert!` would disappear in release builds. Both callers log save failures and
-/// continue.
+/// Bypass is never written to disk, so no launch starts in it. Refused with an `InvalidInput`
+/// error, in every build: this was a `debug_assert!`, which a release build compiles out, so the
+/// rule held only because every caller happens to save on `ModeCycle::Changed(Auto)` alone. Both
+/// callers already log a failed save and carry on, so the refusal needs no new plumbing.
 pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> std::io::Result<PathBuf> {
     if mode == SessionModeChoice::Bypass {
         return Err(std::io::Error::new(
@@ -290,8 +293,12 @@ pub fn startup_mode(dir: Option<&Path>, project_root: &Path) -> (SessionModeChoi
         );
     };
     match load_mode(dir, project_root) {
-        // A remembered bypass starts in auto. Leave the saved file untouched and return a
-        // note explaining the mode change.
+        // A launch never starts in bypass, even from a file written before bypass stopped being
+        // saved. The file is deliberately left alone -- `save_mode` refuses bypass, and nothing
+        // here rewrites it to `auto` either (the next auto that is saved does), and the note says
+        // why the user's
+        // old setting is not honoured, rather than silently starting in a different mode than
+        // before.
         LoadedMode::Remembered(SessionModeChoice::Bypass) => (
             SessionModeChoice::Auto,
             vec![

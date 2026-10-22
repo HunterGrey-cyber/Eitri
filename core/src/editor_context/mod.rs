@@ -1,24 +1,31 @@
-//! What the editor is showing, sent to the agent.
+//! wire 1 -- what the editor is showing, told to the agent.
 //!
-//! [`compose`] is pure and decides what the model reads. The transport follows
-//! `crate::theme::feed`: nvim pushes over one Unix socket and the host polls.
+//! Split the way `theme` is: [`compose`] is pure and decides what the model reads; the transport is
+//! a push protocol over one Unix socket, nvim writing and the host polling, following
+//! `crate::theme::feed`'s shape.
 
 pub mod compose;
 pub mod feed;
 
 pub use compose::{compose_turn_text, EditorContext, Selection, CONTENT_LIMIT, TRUNCATION_MARKER};
 
-/// The inverse of [`compose_turn_text`], re-exported here so both directions are available
-/// together. Defined in `agent::history::composed_block` because this crate depends on
-/// `agent`, whose transcript reader needs the inverse. Defining it here would create a
-/// dependency cycle. [`compose`] tests `strip(compose(t, ctx)) == t` beside the forward
-/// cases.
+/// The inverse of [`compose_turn_text`], re-exported here so that the two directions are reachable
+/// from one place, so a change to one direction is made beside the other.
+///
+/// It is *defined* in `agent::history::composed_block` rather than in [`compose`] for a reason the
+/// crate graph forces: `eitri-core` depends on `agent`, and the transcript reader that needs the
+/// inverse lives in `agent`, so defining it here would require `agent -> eitri-core -> agent`.
+/// The property that ties the two together -- `strip(compose(t, ctx)) == t` -- is asserted in
+/// [`compose`]'s own tests, beside the cases for the forward direction.
 pub use agent::history::strip_composed_block;
 
-/// Provides the editor context at send time through a closure, keeping the socket out of the panel.
-/// Tests can return a constant; production reads the cache filled by `shell::editor_context`.
-/// The call must return immediately because it runs on the GTK main loop between a keypress and
-/// sending a turn. RPC or a whole-buffer read would delay input; the latter can take 33 ms.
+/// What a turn composer asks, at send time, for where the user is.
+///
+/// A closure rather than the feed itself, so the agent panel never learns that a socket exists: it
+/// asks a question and gets an answer or `None`. A test hands it a constant; production hands it a
+/// read of the cache `shell::editor_context`'s poller fills. Reading it must be instant -- the call
+/// happens on the GTK main loop between a keypress and a turn going out, which is not a place to
+/// perform RPC. Measured: a whole-buffer read there is 33ms.
 pub type ContextSource = std::rc::Rc<dyn Fn() -> Option<EditorContext>>;
 
 /// `inner` while `open` is set, nothing otherwise: a detached editor's file and selection must not

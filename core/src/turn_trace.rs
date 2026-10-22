@@ -59,10 +59,10 @@ pub struct TurnTrace {
     /// The first text arrived while this turn's tab was not the one on screen:
     /// no paint will be reported, so the trace completes without one.
     background: bool,
-    /// The turn's start or first text reached the panel inside a snapshot, through
-    /// `observe_in_snapshot`. The panel measures paint only for text received as events and
-    /// resets that measurement only on a `turn_started` event. A paint report may never arrive,
-    /// so this trace completes without waiting for one.
+    /// The turn's start or its first text reached the panel inside a snapshot, not as `events`
+    /// (`observe_in_snapshot`): the panel measures a paint only for text it received
+    /// as events, and resets that measurement only on a `turn_started` it received as events, so a
+    /// paint report for this turn may never come and the trace completes without waiting for one.
     in_snapshot: bool,
 }
 
@@ -89,8 +89,8 @@ impl TurnTrace {
         }
     }
 
-    /// The turn's first text arrived while its tab was off screen.
-    /// Nothing will paint it, so complete the trace without a paint mark.
+    /// The turn's first text reached this side while its tab was not the one on screen: nothing
+    /// will paint it, so the trace completes without a paint mark.
     pub fn mark_background(&mut self) {
         self.background = true;
     }

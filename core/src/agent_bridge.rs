@@ -1,6 +1,5 @@
 //! JSON message types and (de)serialization for the Rust<->JS bridge between `shell` and
-//! `agent-ui/web`'s embedded frontend, v2 protocol
-//!: every
+//! `agent-ui/web`'s embedded frontend, v2 protocol: every
 //! JS->Rust command carries a `requestId`; Rust replies with exactly one `command_result` per
 //! command, and pushes a revisioned `events`/`snapshot` envelope independently of any specific
 //! command. See agent-ui/web/src/types.ts for the exact TS-side shapes these must match.
@@ -69,7 +68,7 @@ impl SessionModeChoice {
     }
 }
 
-/// C1's mirror: what the page currently is, for the `Ctrl+j`/`Ctrl+k` decision this
+/// The page's mode mirror: what the page currently is, for the `Ctrl+j`/`Ctrl+k` decision this
 /// module makes in Rust. `Browse` is a live tab's BROWSE (or the dashboard menu), with no overlay
 /// open and a box that can take INPUT; `Input` is the live composer (or the dashboard's), with no
 /// overlay open; `Other` is everything else -- an overlay open, an ended/starting/failed tab, and so
@@ -84,7 +83,7 @@ pub enum PanelKeys {
     Other,
 }
 
-/// C1's `Ctrl+j`/`Ctrl+k` direction: `Down` is `Ctrl+j` (BROWSE -> INPUT), `Up` is
+/// The `Ctrl+j`/`Ctrl+k` direction: `Down` is `Ctrl+j` (BROWSE -> INPUT), `Up` is
 /// `Ctrl+k` (INPUT -> BROWSE). Only these two travel through this mechanism -- `Ctrl+h`/`Ctrl+l`
 /// never do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -167,8 +166,9 @@ pub enum InboundMessage {
         /// `InboundMessage` is already internally tagged on `type`.
         #[serde(default)]
         reason: Option<String>,
-        /// Allows the request and saves the rule Rust offered for this permission id through
-        /// `rule_offers`. The panel supplies no rule text.
+        /// The card's third button: allow, and save the rule Rust offered for this permission id
+        /// (`rule_offers`). The rule itself is never taken from the panel, so a page cannot save a
+        /// rule broader than the one it was shown.
         #[serde(default)]
         remember: bool,
     },
@@ -232,7 +232,7 @@ pub enum InboundMessage {
         #[serde(default)]
         turn_id: Option<String>,
     },
-    /// `↑` on the box's first line with a queue: returns the whole queue as `queue_taken`.
+    /// `↑` on the box's first line with a queue: the whole queue back, as `queue_taken`.
     TakeBackQueue {
         request_id: String,
         #[serde(default)]
@@ -245,14 +245,14 @@ pub enum InboundMessage {
         tab: Option<u64>,
         text: String,
     },
-    /// The box's text, mirrored 300 ms after the last change. No `command_result`.
+    /// The box's text, mirrored 300 ms after the last change, not on every key. No `command_result`.
     Draft {
         request_id: String,
         #[serde(default)]
         tab: Option<u64>,
         text: String,
     },
-    /// `Ctrl+g` in INPUT (C5): edit `text` in an nvim scratch buffer; `:wq` returns it.
+    /// `Ctrl+g` in INPUT: edit `text` in an nvim scratch buffer; `:wq` returns it.
     EditDraft {
         request_id: String,
         #[serde(default)]
@@ -264,7 +264,7 @@ pub enum InboundMessage {
         request_id: String,
         text: String,
     },
-    /// `gf` or a click on a path opens it.
+    /// `gf` or a click on a path.
     OpenPath {
         request_id: String,
         path: String,
@@ -399,27 +399,27 @@ pub enum InboundMessage {
         request_id: String,
     },
     /// Sent after `confirm_close_others`'s y/n is answered `y`: the same close path as `CloseTab`,
-    /// run once per tab.
+    /// run once per tab (`tabs::close_others`).
     /// Window-level and carries no tab list of its own -- like `TabVerb`, whichever tabs are still
     /// "every tab but the active one" by the time this arrives decides, recomputed fresh rather
     /// than trusting a set the user could have changed while the prompt was open.
     CloseOthers {
         request_id: String,
     },
-    /// C1's mirror, posted whenever the page's effective mode changes and once after
+    /// The page's mode mirror, posted whenever the page's effective mode changes and once after
     /// `ready`. See [`PanelKeys`]'s own doc.
     PanelKeys {
         request_id: String,
         mode: PanelKeys,
     },
-    /// C1's stale-mirror recovery: a `nav_key` the page could not apply against its own
+    /// The mode mirror's stale-state recovery: a `nav_key` the page could not apply against its own
     /// current state. `shell` runs `move_focus(agent, direction)`, i.e. exactly what the chord would
     /// have done had the panel never intercepted it.
     NavFallthrough {
         request_id: String,
         direction: NavKeyDirection,
     },
-    /// Ctrl+w h/j/k/l in BROWSE: move keyboard focus from the panel in that direction, by geometry.
+    /// Ctrl+w h/j/k/l in BROWSE: move the keys from the panel that way, by geometry.
     PaneNav {
         request_id: String,
         direction: PaneNavDirection,
@@ -433,10 +433,10 @@ pub enum InboundMessage {
         opening: u64,
         return_keys: bool,
     },
-    /// `gx` opens this web link in the system browser. The page sends a WHATWG-normalized
-    /// address from `agent-ui/web/src/nav.ts#webUrl`; `shell` rechecks it in
-    /// `panel/src/links.rs#web_url` before `gtk4::UriLauncher`. No `serde(default)`: a
-    /// missing address is malformed.
+    /// gx: open this web link in the system browser. The page sends the WHATWG-normalized address
+    /// (`agent-ui/web/src/nav.ts#webUrl`); `shell` re-checks it (`panel/src/links.rs#web_url`) before it
+    /// reaches `gtk4::UriLauncher`. No `serde(default)`: a message with no address is malformed, never "open
+    /// nothing".
     OpenUrl {
         request_id: String,
         url: String,
@@ -456,17 +456,19 @@ pub enum InboundMessage {
         nonce: u64,
         keep_bypass: bool,
     },
-    /// `y`/`Y` answers a `confirm_bypass` prompt under the panel's typed-input checks. Names
-    /// the tab, or `null` for the window default, and the displayed nonce so stale prompts
-    /// cannot answer newer ones. Routed at window level through `tab_ref` because
-    /// `tab`/`scope` identifies its target, as for `TabVerb`.
+    /// `y`/`Y` to a `confirm_bypass` prompt: the panel's own answer, guarded by its
+    /// typed-input rules, naming the tab (or `null` for the window default) and the nonce
+    /// it was shown so a stale prompt can never answer a newer one. Window-level for routing
+    /// (`tab_ref` -> `WindowLevel`): it names its own tab in `tab`/`scope`, the same shape `TabVerb`
+    /// already uses, rather than being addressed to "the active tab".
     ConfirmBypass {
         request_id: String,
         #[serde(default)]
         tab: Option<u64>,
         scope: BypassScopeWire,
-        // No `#[serde(default)]`: a missing nonce is a protocol error. An answer must
-        // identify the exact prompt shown, rather than whichever prompt is current.
+        // No `#[serde(default)]`: a `confirm_bypass` with no nonce is a protocol error (a client
+        // that does not know which prompt it is answering), never "the current one" -- the nonce's whole
+        // point is that only the exact prompt shown may be answered.
         nonce: u64,
     },
     /// `y` or `n` to the workspace-trust question of one tab. The page echoes the prompt's
@@ -532,9 +534,10 @@ impl BypassScopeWire {
     }
 }
 
-/// A `tab_verb` payload carries the same actions as `Action::Tab`, including `close_others`.
-/// `Select` and `Rename` use `SelectTab` and `RenameTab` because they need a number or text
-/// that a verb alone cannot carry.
+/// A `tab_verb` message's payload: the same actions the prefix's own `Action::Tab` arm
+/// runs, minus `Select`/`Rename` (those travel as `SelectTab`/`RenameTab`, which already carry the
+/// number or the text a verb alone cannot). `close_others` is here so `<leader>bo` travels the
+/// same way `close` carries `<leader>bd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TabVerbWire {
@@ -553,7 +556,8 @@ pub enum TabVerbWire {
 pub enum TabRef {
     /// A message about the whole panel (`ready`, the HINT pair).
     WindowLevel,
-    /// A tab command that names none: a protocol error, never "the active one".
+    /// A tab command that names none: a protocol error, never "the active one", which may have
+    /// changed by the time the command arrives.
     Missing,
     Named(crate::tabs::TabId),
 }
@@ -805,21 +809,41 @@ pub fn serialize_command_ok_with_message_for_js(request_id: &str, message: &str)
     json!({ "kind": "command_result", "requestId": request_id, "ok": true, "message": message }).to_string()
 }
 
-/// `{"kind":"hello","backend":...,"permissionModes":[...],"resumableSessions":[...],...}` is sent
-/// once in reply to `ready`, before any snapshot. The backend supplies its runtime capabilities
-/// and the sessions this workspace can resume so the frontend can build its start screen.
+/// `{"kind":"hello","backend":...,"permissionModes":[...],"resumableSessions":[...],...}` -- sent once,
+/// in reply to the frontend's `ready`, BEFORE any snapshot.
 ///
-/// `permissionModes` is not narrowed by backend name. Both backends implement an interactive gate
-/// and offer the same supported policies.
+/// It exists because the frontend's start screen cannot be honest without it. What a backend can
+/// offer is a runtime fact -- which permission policies this client can drive, which Verdandi
+/// baseline it expects, which sessions this workspace remembers -- and hardcoding any of it into
+/// the frontend would make the frontend wrong for whichever backend it was not written against.
 ///
-/// `resumableSessions` contains sessions for which the server advertised resume, the client
-/// implements it, and this workspace has a persisted provider session id. The frontend renders
-/// exactly this array. An empty array means there is nothing to continue.
+/// `permissionModes` is deliberately NOT narrowed by backend name: both backends have a real,
+/// separately verified interactive gate, so both currently offer the same two. (This doc previously
+/// said "the sidecar path ships BYPASS only in this milestone", which stopped being true when
+/// `CLIENT_IMPLEMENTED_PERMISSION_MODES` replaced the per-backend narrowing -- see
+/// `agent_backend::tests::both_backends_offer_the_same_permission_policies_because_both_implement_them`.)
 ///
-/// Each entry includes the provider, session id, timestamps and display title.
-/// `BackendGreeting::for_kind` prefers the CLI transcript's `type:"ai-title"` line, falls back to
-/// the persisted first-prompt title, then to `null`. The frontend is not told the title's source,
-/// so a missing transcript title silently uses the fallback. It must not invent a label.
+/// `resumableSessions` is the whole resume gate: one entry per session for which the server
+/// advertised resume, this client implements it, AND this workspace has a persisted provider
+/// session id. The frontend renders its conversation picker on exactly that array and nothing else,
+/// so no row can appear for a workspace with nothing to continue, and an empty array is the normal
+/// state rather than a missing one.
+///
+/// Each entry carries only what a record knows: a provider name, the Claude session id, and the two
+/// timestamps. There is no title and no summary anywhere in this payload because there is none on
+/// disk -- see `agent::ResumableSession`'s own doc for why the one file that could supply one is
+/// deliberately not read. A frontend rendering this must not invent a label for a row.
+/// **Correction (2026-09-19): there is a `title` now** -- the first line of the session's first
+/// prompt, recorded by this project at write time (`agent::persistence::title_from_prompt`), not read
+/// from anyone else's file. It is `null` for a session recorded before titles were kept, and the
+/// rule stands for those rows: no label is invented.
+/// **Correction (2026-09-20): "not read from anyone else's file" is no longer
+/// true of this field.** `BackendGreeting::for_kind` fills it from the CLI's own `type:"ai-title"`
+/// line where the transcript has one, falling back to the recorded title and then to `null`
+/// (`agent::transcript`'s constraint 3). **The frontend is deliberately not told which level a
+/// title came from**: source would otherwise leak into rendering, and the whole point of the
+/// fallback is that losing the CLI's line returns the picker silently to how it looks today.
+/// Nothing about the payload's SHAPE changes, and the no-invented-label rule is untouched.
 pub fn serialize_hello_for_js(greeting: &crate::agent_backend::BackendGreeting) -> String {
     serialize_hello_with_restore_for_js(greeting, None)
 }
@@ -850,7 +874,7 @@ pub fn serialize_hello_with_restore_for_js(
             "name": r.name,
         })).collect::<Vec<_>>(),
         "expectedVerdandiRevision": greeting.expected_verdandi_revision,
-        // `agent::account`'s configured name, or `null` when none is set.
+        // `agent::account`'s configured name, `null` when none is set.
         "account": greeting.account,
         "restore": restore.map(|offer| json!({ "labels": offer.labels, "bypass": offer.bypass })),
     })
@@ -900,9 +924,12 @@ pub fn serialize_editor_typing_for_js(typing: bool, period_ms: u32) -> String {
     json!({ "kind": "editor_typing", "typing": typing, "periodMs": period_ms }).to_string()
 }
 
-/// `{"kind":"enter_input"}` opens the composer with a blinking caret when the user enters the
-/// panel by keyboard (`Ctrl+l` from the editor). A row click still lands in BROWSE on that row.
-/// This is a separate envelope because `pane_focus` cannot distinguish those arrival routes.
+/// `{"kind":"enter_input"}`: the user moved INTO the panel with the keyboard (`Ctrl+l` from the
+/// editor), so the panel should open its composer with a blinking caret, the way it did before the
+/// three-mode rework made BROWSE the landing mode: arriving by keyboard means the user is about to
+/// type. A separate envelope rather than a flag on `pane_focus`, because only
+/// the keyboard route should do it. A click on a row still lands in BROWSE on that row, which is
+/// what the click points at, and `pane_focus` cannot tell the two apart.
 pub fn serialize_enter_input_for_js() -> String {
     json!({ "kind": "enter_input" }).to_string()
 }
@@ -910,8 +937,8 @@ pub fn serialize_enter_input_for_js() -> String {
 /// `{"kind":"arrive"}`: the keys moved into the panel by keyboard -- replaces
 /// `enter_input` at the two arrival sites. Unlike `enter_input`, arriving lands BROWSE
 /// rather than opening the composer straight into INPUT. Which row it lands on is the page's own
-/// decision, not something this envelope carries: a waiting card, else the last row for a reader
-/// who was following it, else the row and scroll they left (a design decision, 2026-09-29).
+/// choice, not something this envelope carries: a waiting card, else the last row for a reader
+/// who was following it, else the row and scroll they left.
 pub fn serialize_arrive_for_js() -> String {
     json!({ "kind": "arrive" }).to_string()
 }
@@ -921,21 +948,24 @@ pub fn serialize_arrive_for_js() -> String {
 /// to BROWSE with its cursor on the oldest pending card. `shell` sends it only when the count it
 /// keeps (`crate::attention`) is above zero; a panel that finds no card takes the composer instead,
 /// as it does for `enter_input`. `tab` names the session tab it is about; the panel drops it unless
-/// that tab is active.
+/// that tab is active, the only one it draws.
 pub fn serialize_focus_permission_for_js(tab: crate::tabs::TabId) -> String {
     json!({ "kind": "focus_permission", "tab": tab.0 }).to_string()
 }
 
-/// `{"kind":"keymap", ...}` supplies the `?` overlay from `crate::keymap`.
-/// `window` comes from the root table and `prefixKeys` from the effective prefix table.
-/// The readable prefix is used in the heading `After <prefix>`.
+/// `{"kind":"keymap", ...}`: the `?` overlay's two `shell` sections, generated from
+/// `eitri_core::keymap` -- `window` from the root table, `prefixKeys` from the
+/// effective prefix table -- and the prefix as a person reads it, for the heading `After <prefix>`.
+/// Sent on every `ready`.
 ///
-/// Also carries the panel's BROWSE table as `panel` and the effective new-tab chord as
-/// `newTabChord` for the chooser's `New session` row. Sent on every `ready` and again when
-/// `effective()` changes.
+/// Also carries the agent panel's own BROWSE table, `panel` (`effective()`'s), and
+/// `newTabChord` -- the prefix chord that opens a new tab, spelled
+/// out for the chooser's `New session` row (`Ctrl+b c`, from the effective prefix
+/// table). Sent again whenever `effective()`'s result changes, same as before.
 ///
-/// `tmuxSkipped` lists config lines the import skipped, with `<file>:<line>`, their text and the
-/// reason, for the overlay's skipped-lines section. Empty when nothing was skipped or import is off.
+/// `tmuxSkipped`: the lines of the user's tmux config the import did not take, each as
+/// `<file>:<line>` and what was written with why, for the overlay's "Skipped from tmux" section;
+/// empty when nothing was skipped or the import is off.
 pub fn serialize_keymap_for_js(
     prefix: &str,
     window: &[crate::keymap::HelpRow],
@@ -1004,7 +1034,7 @@ pub fn serialize_keymap_for_js(
 }
 
 /// `{"kind":"literal_key","key":"C-a"}`: `send-prefix`/`send-keys` with the panel holding the keys
-///. WebKitGTK cannot be handed a key, so the panel acts on the ones it knows --
+/// WebKitGTK cannot be handed a key, so the panel acts on the ones it knows --
 /// `C-a`, select all in a text field -- and ignores the rest. `key` is tmux's spelling.
 pub fn serialize_literal_key_for_js(key: &str) -> String {
     json!({ "kind": "literal_key", "key": key }).to_string()
@@ -1020,14 +1050,14 @@ pub fn serialize_open_keymap_for_js(plugin: Option<&crate::plugin::keys::PluginK
     }
 }
 
-/// `{"kind":"open_command_line"}`: `prefix :` opens the panel's `:` line in BROWSE. It runs
-/// no commands: Enter explains that and Esc closes it. The field captures letters typed after
-/// the chord so they do not run as panel keys.
+/// `{"kind":"open_command_line"}`: `prefix :` (tmux `command-prompt`) -- open
+/// the panel's `:` line, in BROWSE. The line runs nothing (Enter says so, Esc closes it); it exists so
+/// the letters typed after the chord land in a box instead of running as panel keys.
 pub fn serialize_open_command_line_for_js() -> String {
     json!({ "kind": "open_command_line" }).to_string()
 }
 
-/// `{"kind":"nav_key","direction":"down"}` / `"up"`: C1's decision, made in Rust
+/// `{"kind":"nav_key","direction":"down"}` / `"up"`: the `Ctrl+j`/`Ctrl+k` decision, made in Rust
 /// from the `panel_keys` mirror -- `Ctrl+j` claimed in BROWSE, or `Ctrl+k` claimed in INPUT. The page
 /// applies it against its own current state and, if that no longer matches, replies
 /// `nav_fallthrough` (`InboundMessage::NavFallthrough`).
@@ -1434,27 +1464,30 @@ pub fn serialize_events_for_js(
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallNotes {
     /// Tool-use id -> the saved prefix rule that answered its permission request (`Bash(git log *)`,
-    /// for example).
+    /// shown as the row's note).
     pub allowed_by_rule: BTreeMap<String, String>,
     /// Permission id -> the call's tool-use id, for a `Write` whose file did not exist when its card
     /// was raised: the card says it creates a file rather than warning about
     /// overwriting one it cannot see.
     pub creates_file: BTreeMap<String, Option<String>>,
-    /// Maps tool-use ids to row notes for CLI prompts answered locally without a card. The
-    /// note explains whether bypass or user approval allowed the call.
+    /// Tool-use id -> the note for a call whose CLI prompt Eitri answered without a card, so the row
+    /// says who answered: "Claude Code asked — allowed in bypass" / "— allowed with your approval".
     pub prompt_notes: BTreeMap<String, String>,
-    /// Tool-use ids of `Write`/`Edit`/`NotebookEdit` calls allowed by the acceptEdits fast
-    /// path without a card. The row displays "allowed by auto" through
-    /// `tab_set::note_auto_edit_answers`; no separate message is needed. Captured by
-    /// `AgentBackend::answer_what_needs_no_human` when answering, rather than inferred from a
-    /// missing card.
+    /// Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered without a
+    /// card (`agent::permission_policy`'s module doc, "The acceptEdits fast path").
+    /// No message of its own -- unlike `allowed_by_rule` there is only one fast path, so the row just
+    /// says "allowed by auto" (`tab_set::note_auto_edit_answers`). Recorded where the fast path
+    /// answers (`AgentBackend::answer_what_needs_no_human`), never inferred from a missing card
+    /// (a missing card is also all that a call which failed before any hook ran leaves behind).
     pub allowed_by_auto: BTreeSet<String>,
-    /// Tool-use ids of `Write` calls allowed without a card over a path that did not exist just
-    /// before the answer, either through the acceptEdits fast path in `Auto` or through bypass.
-    /// `creates_file` only learns from delivered cards, so it cannot identify these new files.
-    /// This set keeps their rows from showing an overwrite warning for a file that did not exist.
-    /// Its source is `AgentBackend::answer_what_needs_no_human`'s `AnsweredForYou::creates_file`.
-    /// The wire key `autoCreatesFile` covers bypass answers too.
+    /// Tool-use ids of a `Write` answered `allow` without a card -- by the acceptEdits fast path in
+    /// Auto, or in bypass -- over a path where nothing existed just before the answer was sent.
+    /// `creates_file` above only ever
+    /// learns this from a delivered `PermissionRequested`, which neither answer leaves -- so without
+    /// this, such a call kept `creates_file_call` false forever and its row showed the overwrite
+    /// warning ("Writes the whole file...") for a file that never existed, exactly backwards. Its
+    /// only source is `AgentBackend::answer_what_needs_no_human`'s `AnsweredForYou::creates_file`.
+    /// The name (and the wire key `autoCreatesFile`) predate bypass joining it.
     pub auto_creates_file: BTreeSet<String>,
     /// How long each finished turn ran, oldest first (`TurnTime`). The tab keeps every one it
     /// stamped; a batch's notes hold only those that ended in it. The panel's "Worked for" line and
@@ -1504,11 +1537,12 @@ impl CallNotes {
     }
 }
 
-/// [`serialize_events_for_js`], plus nonempty notes for this batch: `ruleNotes` pairs
-/// tool-use ids with saved rules, `createsFile` pairs permission ids with nullable tool-use
-/// ids, and `autoNotes` and `autoCreatesFile` contain tool-use ids, including bypass writes
-/// in the latter. `turnTimes` carries `turnId`, `startedAtMs`, `endedAtMs`, and nullable
-/// `anchorSeq` for turns ending in this batch. Empty fields are omitted.
+/// [`serialize_events_for_js`], plus what `notes` says about this batch:
+/// `"ruleNotes":[{"toolUseId":..,"rule":"Bash(git log *)"}]`,
+/// `"createsFile":[{"permissionId":..,"toolUseId":..|null}]`,
+/// `"autoNotes":["toolu_..", ...]`, and
+/// `"autoCreatesFile":["toolu_..", ...]` (a bypass `Write` too), and `"turnTimes":[{"turnId":..,"startedAtMs":..,"endedAtMs":..,"anchorSeq":..|null}]`
+/// for the turns that ended in this batch. Each is left out when empty.
 pub fn serialize_events_with_notes_for_js(
     tab: crate::tabs::TabId,
     from_revision: u64,
@@ -1576,17 +1610,17 @@ pub struct SnapshotView<'a> {
     /// thread's lock, so a snapshot is serialized directly out of canonical state rather than from a
     /// copy of a whole conversation.
     pub projection: crate::agent_backend::ProjectionRef<'a>,
-    /// Permission ids omitted from `pendingPermissions` by `serialize_snapshot_for_js`.
-    /// `Tab::host_answered` holds requests already answered locally while awaiting provider
-    /// resolution. `None` is used only by tests constructing a bare `SnapshotView` without a
-    /// hidden set.
+    /// Permission ids `serialize_snapshot_for_js` must omit from `pendingPermissions`:
+    /// requests Eitri itself already answered (`Tab::host_answered`) and is waiting on the
+    /// provider's resolution for. `None` only in tests that build a bare `SnapshotView` literal
+    /// directly and have no such set to hide.
     pub hidden_pending: Option<&'a BTreeSet<String>>,
 }
 
 impl<'a> SnapshotView<'a> {
-    /// `hidden` is `Tab::host_answered`. Omit these ids from `pendingPermissions` so requests
-    /// already answered locally neither draw cards nor count in the tray. Tool calls and
-    /// transcript entries remain visible.
+    /// `hidden` is `Tab::host_answered`: every id in it is dropped from `pendingPermissions` (never
+    /// from tool calls or the transcript) so a request Eitri answered on the user's behalf never
+    /// draws a card, and the tray never counts it either.
     pub fn of(backend: &'a crate::agent_backend::AgentBackend, hidden: &'a BTreeSet<String>) -> Self {
         Self {
             // An external agent runs on neither Claude backend.
@@ -1615,7 +1649,7 @@ impl<'a> SnapshotView<'a> {
 /// projection's `sessionId` is Verdandi's. Collapsing them would defeat the entire point of keeping
 /// them apart -- and would eventually send Claude's id back as a session_id, which the sidecar
 /// answers with SESSION_NOT_FOUND. `tab` names the session tab it is about; the panel drops it
-/// unless that tab is active.
+/// unless that tab is active, the only one it draws.
 pub fn serialize_snapshot_for_js(
     tab: crate::tabs::TabId,
     view: &SnapshotView<'_>,
@@ -1624,12 +1658,13 @@ pub fn serialize_snapshot_for_js(
     serialize_snapshot_with_notes_for_js(tab, view, turn_started_at_ms, &CallNotes::default())
 }
 
-/// [`serialize_snapshot_for_js`], with notes preserved across reloads and tab switches.
-/// `allowedByRule` identifies calls allowed by saved rules. `createsFile: true` marks a
-/// `Write` card and its call when the file did not exist, including calls answered by the
-/// acceptEdits fast path without a card (`CallNotes::creates_file_call`). `allowedByAuto:
-/// true` marks `Write`/`Edit`/`NotebookEdit` calls answered by that fast path. Other entries
-/// omit these fields, as in the events payload.
+/// [`serialize_snapshot_for_js`], with what `notes` says so a reload or a tab switch keeps it:
+/// `allowedByRule` on each tool call a saved prefix rule answered,
+/// `createsFile: true` on a `Write` card, and on its tool call, whose file did not exist when the
+/// card was raised OR when a card was never raised at all because the acceptEdits fast path
+/// answered it (`CallNotes::creates_file_call`), and `allowedByAuto: true` on
+/// a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered. Absent on
+/// every other entry, as in the events payload.
 pub fn serialize_snapshot_with_notes_for_js(
     tab: crate::tabs::TabId,
     view: &SnapshotView<'_>,
@@ -1746,7 +1781,7 @@ pub fn serialize_snapshot_with_notes_for_js(
             if notes.creates_file.contains_key(&p.permission_id) {
                 entry["createsFile"] = json!(true);
             }
-            // O3: the CLI's own prompt, with its words, so a reload or a tab switch keeps the
+            // The CLI's own prompt, with its words, so a reload or a tab switch keeps the
             // reason its card was drawn for. Absent on the gate's own request, as on the events path
             // (where the event itself carries `provider_prompt` in snake_case).
             if let Some(prompt) = &p.provider_prompt {
@@ -1864,7 +1899,7 @@ pub fn serialize_snapshot_with_notes_for_js(
         // Whether the last block is still being written, for the same reason as the bit above: a
         // snapshot taken mid-thought must not split the thought, or draw it as finished.
         "thinkingOpen": projection.thinking_open,
-        // the tab's last reported usage, so a tab switch or a panel reload
+        // The tab's last reported usage, so a tab switch or a panel reload
         // shows the figure the band draws without waiting for the next turn to report one. An
         // explicit `null` until a provider has reported something (never a zeroed object), then
         // `agent::UsageInfo` as it derives: SNAKE_CASE inside, the same shape the `turn_completed`
@@ -1893,8 +1928,8 @@ pub fn serialize_snapshot_with_notes_for_js(
             "bypassPermissionMode": capabilities.bypass_permission_mode,
             // What Enter does while a turn runs: puts the message into the turn, or holds it for the end.
             "steer": capabilities.steer,
-            // No `modeSwitch`: live sessions keep their CLI mode, and the tab's permission
-            // mode is local to the client.
+            // No `modeSwitch` since 2026-09-27: nothing switches a live session's CLI mode any
+            // more; the tab's own mode is local to the host.
         },
         "provider": provider,
     });
@@ -1924,14 +1959,24 @@ pub fn serialize_snapshot_with_notes_for_js(
     .to_string()
 }
 
-/// `{"kind":"handoff","tab":...,"command":...,"cwd":...,"providerSessionId":...}` supplies the
-/// command that continues the closed conversation in the user's terminal.
-/// `agent_panel::collect_pending_handoff` dispatches it only after session shutdown completes,
-/// so the session is closed and flushed before the command is shown.
+/// `{"kind":"handoff","tab":...,"command":...,"cwd":...,"providerSessionId":...}` -- the
+/// conversation has been closed here and this is the command that continues it in the user's own
+/// terminal.
 ///
-/// `providerSessionId` is read from the command's argv so the displayed id matches the resumed id.
-/// No process has been spawned and no lease taken, so the frontend shows a concurrency warning.
-/// `tab` identifies the session tab. The panel drops the envelope unless that tab is active.
+/// Dispatched only AFTER the real session shutdown has completed (`agent_panel`'s
+/// `collect_pending_handoff`), so the ordering a handoff needs -- close and flush before the CLI
+/// starts, so the CLI resumes a complete transcript that nobody else is writing -- holds by
+/// construction rather than by hope: the command has not been shown yet while Eitri is still
+/// driving the session.
+///
+/// `providerSessionId` is read back out of the command's own argv rather than passed in beside it,
+/// so the id the panel displays and the id the command resumes are the same value by construction.
+///
+/// **It carries no claim of exclusivity, because there is none to make.** Nothing was spawned and
+/// no lease was taken; the frontend renders a concurrency warning on this path, because two CLIs
+/// resuming one session interleave its transcript, and even a held lease could not stop another
+/// `claude` of the same user from writing it, with no lock both sides honour. `tab` names the
+/// session tab it is about; the panel drops it unless that tab is active, the only one it draws.
 pub fn serialize_handoff_for_js(tab: crate::tabs::TabId, command: &agent::handoff::ClaudeResumeCommand) -> String {
     json!({
         "kind": "handoff",
@@ -1950,7 +1995,7 @@ pub fn serialize_handoff_for_js(tab: crate::tabs::TabId, command: &agent::handof
 /// cannot otherwise detect (e.g. `AgentSession::start` failing because `claude` isn't on `PATH`).
 /// Distinct from `command_result`'s `ok:false` (which reports one command's own failure without
 /// ending the session) -- this envelope means the whole `AgentSession` is gone. `tab` names the
-/// session tab it is about; the panel drops it unless that tab is active.
+/// session tab it is about; the panel drops it unless that tab is active, the only one it draws.
 pub fn serialize_error_for_js(tab: crate::tabs::TabId, message: &str) -> String {
     json!({ "kind": "error", "tab": tab.0, "message": message }).to_string()
 }
@@ -2164,7 +2209,7 @@ pub struct TabView {
     pub mode: SessionModeChoice,
     pub marker: Option<crate::tabs::Marker>,
     pub pending: usize,
-    /// Whether this tab's session can be resumed later; false on legacy.
+    /// Whether a record of this tab's session can be resumed later (false on legacy, which writes no records).
     pub resumable: bool,
     /// Why a `failed` tab failed, shown when it is.
     pub failure: Option<String>,
@@ -2174,18 +2219,20 @@ pub struct TabView {
     /// Whether `r` on this ended tab continues its session in place (its agent stopped it with the
     /// conversation whole) rather than emptying the tab to a start screen.
     pub resumes_on_r: bool,
-    /// The first prompt's title or the resumed record's display title; `null` before one exists.
+    /// The first prompt's title, or the resumed record's display title; `null` before one exists.
     /// Filled from `Tab.title` in `Tab::view`.
     pub title: Option<String>,
     /// The agent the tab runs, as records name it: `claude`, `codex`, `acp:<name>`.
     pub agent: String,
 }
 
-/// `{"kind":"tabs",...}` carries every tab and the active id. Sent on `ready` and when tabs
-/// change, before the active tab's snapshot on a switch so the panel can identify it. Also
-/// carries `defaultMode` from `TabSet::default_mode`, used by fresh tabs and resumes into new
-/// tabs. The chooser reads its mode line from this field, so cycling the mode needs no new
-/// chooser payload.
+/// `{"kind":"tabs",...}`: every tab and which one is active. Sent on `ready` and whenever any of it
+/// changes; always BEFORE the active tab's snapshot on a switch, so the panel knows which tab the
+/// snapshot is for.
+///
+/// Also carries `defaultMode` (`TabSet::default_mode`): the mode a fresh tab, or a resume into a
+/// new tab, takes -- the chooser derives its
+/// mode line from this rather than re-deriving it, so a cycle never needs the chooser re-sent.
 pub fn serialize_tabs_for_js(active: crate::tabs::TabId, tabs: &[TabView], default_mode: SessionModeChoice) -> String {
     let tabs: Vec<Value> = tabs
         .iter()
@@ -2304,8 +2351,9 @@ pub fn serialize_confirm_close_for_js(tab: crate::tabs::TabId, lines: &[String])
     json!({ "kind": "confirm_close", "tab": tab.0, "lines": lines }).to_string()
 }
 
-/// `<leader>bo`: the footer's y/n prompt to close every tab except the active one.
-/// Carries the tab ids and `tabs::close_others` prompt lines in the same shape as `confirm_close`.
+/// `<leader>bo`: the footer's y/n prompt for every tab but the active one,
+/// naming which ones (`tabs::close_others`'s prompt, wrapped as a single line the same shape
+/// `confirm_close`'s `lines` already is).
 pub fn serialize_confirm_close_others_for_js(tabs: &[crate::tabs::TabId], lines: &[String]) -> String {
     let ids: Vec<u64> = tabs.iter().map(|t| t.0).collect();
     json!({ "kind": "confirm_close_others", "tabs": ids, "lines": lines }).to_string()
@@ -2366,7 +2414,7 @@ pub fn serialize_history_for_js(entries: &[String]) -> String {
     json!({ "kind": "history", "entries": entries }).to_string()
 }
 
-/// The pending permission ids for which a prefix rule is offered, with each rule's display text.
+/// Which pending cards a rule saved from a card would answer, and the rule's words.
 pub fn serialize_rule_offers_for_js(
     tab: crate::tabs::TabId,
     offers: &std::collections::BTreeMap<String, agent::PrefixRule>,
@@ -2378,7 +2426,8 @@ pub fn serialize_rule_offers_for_js(
     json!({ "kind": "rule_offers", "tab": tab.0, "offers": offers }).to_string()
 }
 
-/// What V1's line says: the file, relative to the project when inside it, and a selection's lines.
+/// What the composer's editor-context line says: the file, relative to the project when inside it,
+/// and a selection's lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSummary {
     pub file: String,
@@ -2404,7 +2453,7 @@ pub fn context_summary(
     })
 }
 
-/// V1. Window-level: the editor is the window's.
+/// The composer's editor-context line. Window-level: the editor is the window's.
 pub fn serialize_editor_context_for_js(summary: Option<&ContextSummary>) -> String {
     json!({
         "kind": "editor_context",
@@ -2421,7 +2470,7 @@ pub fn serialize_editor_link_for_js(state: &str, text: &str) -> String {
     json!({ "kind": "editor_link", "state": state, "text": text }).to_string()
 }
 
-/// Whether this tab's draft is out in an nvim scratch buffer (C5).
+/// Whether this tab's draft is out in an nvim scratch buffer.
 pub fn serialize_scratch_for_js(tab: crate::tabs::TabId, editing: bool) -> String {
     json!({ "kind": "scratch", "tab": tab.0, "editing": editing }).to_string()
 }
@@ -2431,9 +2480,10 @@ pub fn serialize_notice_for_js(text: &str) -> String {
     json!({ "kind": "notice", "text": text }).to_string()
 }
 
-/// `{"kind":"confirm_bypass","tab":...,"scope":...,"nonce":...,"lines":[...]}`.
-/// Rust retains and rechecks the approval list when confirmation arrives; `plan.approve` is not sent.
-/// The panel only displays `lines` and answers with the supplied tab, scope and nonce.
+/// `{"kind":"confirm_bypass","tab":...,"scope":...,"nonce":...,"lines":[...]}` -- the wire contract
+/// the panel and Rust share. **Never emits `plan.approve`**: Rust keeps that list (and reads it
+/// again when `confirm_bypass` comes back), so the panel counts nothing and echoes no
+/// id back -- it only shows `lines` and answers with the tab/scope/nonce it was given.
 pub fn serialize_confirm_bypass_for_js(plan: &crate::tab_set::BypassPlan) -> String {
     let (tab, scope) = match plan.scope {
         crate::tab_set::BypassScope::Tab(id) => (Value::from(id.0), "tab"),

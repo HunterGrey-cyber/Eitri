@@ -1,4 +1,4 @@
--- Eitri's scratch buffers. Loaded by one
+-- Eitri's scratch buffers: the read-only row view and the draft editor. Loaded by one
 -- `--cmd` like editor_context.lua. shell calls EitriScratch.call('<hex>') through nvim_input's
 -- <Cmd>; the hex is a JSON request, so nothing the request carries is ever read as keys.
 -- Injected over RPC, it is given no options and returns the function that removes the global.

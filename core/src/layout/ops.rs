@@ -1,7 +1,7 @@
-//! The tmux verbs that rearrange the tree: place or move a module beside another, swap modules,
-//! or even a row or column. They build new trees over the same modules, allowing `shell`'s grid
-//! to allocate existing children elsewhere without reparenting widgets. Each ends a zoom first,
-//! as tmux's corresponding verbs do.
+//! The tmux verbs that rearrange the tree: open a module next to
+//! another or move it there, swap two modules, even a row or a column. Each is a new tree over the
+//! same modules, never a new widget: `shell`'s grid allocates the same children somewhere else, which
+//! is the whole reason it never reparents. Each ends a zoom first, as tmux's own do.
 
 use super::con::{insert_halving, Child, Con, ConLayout, Node, Pin, MAX_CHILDREN};
 use super::geometry::{navigate, Direction, Frame, Nav};
@@ -9,14 +9,15 @@ use super::module::ModuleId;
 use super::tree::{Axis, Branch, Layout, LayoutError, MAX_RATIO, MIN_RATIO};
 
 /// `Ctrl+a \ <key>` (`Axis::Row`: right of `target`) and `Ctrl+a " <key>` (`Axis::Column`: below
-/// it), and Lua's layout split call. Adds a sibling to the immediate parent if its orientation
-/// matches; otherwise wraps the target in a new split. Takes half the target's share unless
-/// that would make a share too small, in which case the container is evened.
-/// An existing module is moved: its old leaf is removed and its sibling takes that space,
-/// pin and all. A hidden module becomes shown; an unplaced module joins the tree.
-/// `module` then receives the keys.
+/// it), and `eitri.layout.split`. The immediate parent receives a sibling when its orientation
+/// matches; otherwise a new split wraps the target. Each takes half the target's share unless
+/// that would make a share too small, in which case the container is evened. A module already in the tree is
+/// MOVED, as tmux's `join-pane` moves a pane -- never duplicated: its old leaf goes, and its sibling
+/// takes that space, pin and all. A hidden module is shown by being placed; a module never placed
+/// (the canvas) joins the tree here. `module` then has the keys, as tmux's new pane does.
 ///
-/// Refuses a module equal to `target`, or a target absent from the tree or hidden.
+/// Refused: `module` is `target`; `target` is not in the tree or is hidden (`target` is the module
+/// with the keys, which is never hidden).
 pub fn place(layout: &mut Layout, module: &ModuleId, target: &ModuleId, axis: Axis) -> Result<(), LayoutError> {
     place_side(layout, module, target, axis, false)
 }
@@ -204,7 +205,7 @@ pub fn place_as_tab(layout: &mut Layout, module: &ModuleId, target: &ModuleId, d
     }
 }
 
-/// `Ctrl+a H/J/K/L`: `focused` changes places
+/// `Ctrl+a H/J/K/L` (`base.conf:64-67`, tmux's `swap-pane`): `focused` changes places
 /// with its neighbour in `dir`, chosen as `Ctrl+h/j/k/l` would choose it (`navigate`, on the
 /// unzoomed geometry). The two leaves exchange ids and every split keeps its axis, ratio and pin, so
 /// the space stays where it was and the modules move through it. `focused` keeps the keys. With no
@@ -270,7 +271,7 @@ pub(super) fn even_con(axis: Axis, mut items: Vec<Node>, shown: usize) -> Node {
     ))
 }
 
-/// `swap.prev` / `swap.next`: `focused` changes places
+/// `swap.prev` / `swap.next` (tmux's `swap-pane -U/-D`): `focused` changes places
 /// with the module before or after it among those on screen, in tree order (HINT's order),
 /// wrapping. Every split keeps its axis, ratio and pin, as `swap` does. `None`, and nothing moves,
 /// for a hidden `focused` or one alone on screen.
