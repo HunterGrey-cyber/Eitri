@@ -1,8 +1,7 @@
-//! tmux's key names, which is what `init.lua` writes: modifiers `C-` `M-` `S-`, then one
-//! character or a name. Shift is folded into a character (`H`, never `S-h`), as `shell` folds it
-//! today; `S-` exists only for keys that have no character (`S-Up`). `Chord` is the other spelling a
-//! key has here -- a GTK accelerator (`<Control>equal`) -- normalised so the two can be compared,
-//! which is what the collision checks between the prefix, the root table and a Lua `keybinding` do.
+//! tmux's key names, which is what `init.lua` writes: modifiers `C-` `M-` `S-`, then one character
+//! or a name. Shift is folded into a character (`H`, never `S-h`), as the shell folds it; `S-` exists
+//! only for keys that have no character (`S-Up`). `Chord` normalises Eitri's accelerator notation
+//! (`<Control>equal`) so collision checks can compare the prefix, root keys and Lua `keybinding`s.
 
 use std::fmt;
 
@@ -47,7 +46,7 @@ const NAMED: [(&str, KeyName, &str, &str, &str); 14] = [
     ("NPage", KeyName::NPage, "PageDown", "PageDown", "Page_Down"),
 ];
 
-/// GTK keysym names that are one character, so `<Control>equal` and `C-=` compare equal.
+/// xkb keysym names that are one character, so `<Control>equal` and `C-=` compare equal.
 const KEYSYM_CHARS: [(&str, char); 20] = [
     ("equal", '='),
     ("minus", '-'),
@@ -70,6 +69,11 @@ const KEYSYM_CHARS: [(&str, char); 20] = [
     ("less", '<'),
     ("greater", '>'),
 ];
+
+/// The xkb keysym name for a character with a named spelling.
+pub fn keysym_name(c: char) -> Option<&'static str> {
+    KEYSYM_CHARS.iter().find(|(_, ch)| *ch == c).map(|(name, _)| *name)
+}
 
 /// A key as the keymap names it: its modifiers and the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -252,8 +256,8 @@ fn row(key: KeyName) -> &'static (&'static str, KeyName, &'static str, &'static 
         .expect("every KeyName but Char and F has a NAMED row")
 }
 
-/// A chord as GTK or the keymap names it, normalised for comparison: a key that is one character is
-/// that character (lowercase for an ASCII letter), anything else keeps its GTK keysym name.
+/// A chord normalised for comparison: a one-character key is that character (lowercase for an
+/// ASCII letter); anything else keeps its xkb keysym name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chord {
     pub ctrl: bool,
@@ -263,8 +267,11 @@ pub struct Chord {
 }
 
 impl Chord {
-    /// A GTK accelerator string (`<Control><Shift>f`, `F11`, `<Primary>h`).
-    pub fn from_gtk(accel: &str) -> Result<Chord, String> {
+    /// Eitri's accelerator notation, as `init.lua`'s `keybinding` takes it: `<Control>`, `<Ctrl>`,
+    /// `<Ctl>`, `<Primary>`, `<Alt>`, `<Mod1>`, `<Shift>`, `<Shft>` and an xkb key name. Modifier
+    /// names are read in any case (`<primary>t`), as GTK reads them, so a keybinding that registers
+    /// in GTK is also the chord the collision checks compare.
+    pub fn from_accel(accel: &str) -> Result<Chord, String> {
         let mut chord = Chord {
             ctrl: false,
             alt: false,
@@ -273,11 +280,12 @@ impl Chord {
         };
         let mut rest = accel;
         while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
-            match &rest[1..end + 1] {
-                "Control" | "Ctrl" | "Primary" => chord.ctrl = true,
-                "Alt" | "Mod1" => chord.alt = true,
-                "Shift" => chord.shift = true,
-                other => return Err(format!("{accel:?} holds <{other}>, a modifier Eitri does not read")),
+            let name = &rest[1..end + 1];
+            match name.to_ascii_lowercase().as_str() {
+                "control" | "ctrl" | "ctl" | "primary" => chord.ctrl = true,
+                "alt" | "mod1" => chord.alt = true,
+                "shift" | "shft" => chord.shift = true,
+                _ => return Err(format!("{accel:?} holds <{name}>, a modifier Eitri does not read")),
             }
             rest = &rest[end + 2..];
         }
@@ -412,7 +420,7 @@ mod tests {
 
     #[test]
     fn gtk_accelerators_read_as_chords_comparable_with_tmux_keys() {
-        let c = Chord::from_gtk("<Control>equal").unwrap();
+        let c = Chord::from_accel("<Control>equal").unwrap();
         assert_eq!(
             c,
             Chord {
@@ -423,21 +431,31 @@ mod tests {
             }
         );
         assert_eq!(
-            Chord::from_gtk("<Primary>h").unwrap(),
+            Chord::from_accel("<Primary>h").unwrap(),
             Chord::of(&KeySpec::parse("C-h").unwrap())
         );
         assert_eq!(
-            Chord::from_gtk("<Control>H").unwrap(),
+            Chord::from_accel("<Control>H").unwrap(),
             Chord::of(&KeySpec::parse("C-h").unwrap())
         );
         assert_eq!(
-            Chord::from_gtk("F11").unwrap(),
+            Chord::from_accel("F11").unwrap(),
             Chord::of(&KeySpec::parse("F11").unwrap())
         );
-        assert!(Chord::from_gtk("<Control><Shift>f").unwrap().shift);
-        assert_eq!(Chord::from_gtk("<Control>KP_Add").unwrap().key, "KP_Add");
-        assert!(Chord::from_gtk("<Control>").is_err(), "no key");
-        assert!(Chord::from_gtk("<Super>x").is_err(), "a modifier Eitri does not read");
-        assert_eq!(Chord::from_gtk("<Control>equal").unwrap().human(), "Ctrl+=");
+        assert!(Chord::from_accel("<Control><Shift>f").unwrap().shift);
+        assert_eq!(Chord::from_accel("<Control>KP_Add").unwrap().key, "KP_Add");
+        assert!(Chord::from_accel("<Control>").is_err(), "no key");
+        assert_eq!(
+            Chord::from_accel("<primary>t").unwrap(),
+            Chord::of(&KeySpec::parse("C-t").unwrap()),
+            "GTK reads modifier names in any case, so the collision checks must too"
+        );
+        assert_eq!(
+            Chord::from_accel("<CONTROL><mod1><shft>r").unwrap(),
+            Chord::from_accel("<Control><Alt><Shift>r").unwrap()
+        );
+        assert!(Chord::from_accel("<Super>x").is_err(), "a modifier Eitri does not read");
+        assert!(Chord::from_accel("<super>x").is_err(), "a modifier Eitri does not read");
+        assert_eq!(Chord::from_accel("<Control>equal").unwrap().human(), "Ctrl+=");
     }
 }

@@ -5,10 +5,12 @@
 //! when the window closes. Hiding uses `set_child_visible(false)`; layout changes allocate the
 //! same children again. A web module's `WebView` is parented to its `WebHost` before the host
 //! enters the grid. Floating or raising a module reorders children on the same parent through
-//! `ModuleGrid::restack`, without moving the editor. The editor's Skia `DirectContext` is tied
-//! to the `GLArea`'s GL context, and the editor cannot survive unrealize. Unparenting would
-//! unrealize it. Every host logs unrealize in `ModuleGrid::add`, allowing a GUI check that
-//! layout changes preserve this invariant.
+//! `ModuleGrid::restack`, without moving the editor. The terminal's `GtkGLArea` has no
+//! unrealize handler, and reparenting unrealizes a `WebView`. Re-realizing a GL module in
+//! another toplevel with a new GL context, frame clock and scale has not been tested. The
+//! editor releases its Skia state on unrealize and keeps nvim across re-realize, so it no
+//! longer requires this restriction on its own. Every host logs unrealize in `ModuleGrid::add`,
+//! allowing a GUI check that layout changes preserve this invariant.
 //!
 //! Rectangles come from `layout::arrange`. This container measures children to supply their
 //! minimum sizes, allocates the resulting geometry and holds web hosts at their settled size
@@ -67,6 +69,9 @@ pub(crate) type ModuleHosts = Rc<dyn Fn() -> Vec<(ModuleId, gtk4::Widget)>>;
 
 /// What runs when a strip entry is clicked, with the entry's module.
 type StripHook = Rc<dyn Fn(&ModuleId)>;
+
+/// A hook told of a settle, with the tree as the settle left it ([`ModuleGrid::connect_settled`]).
+type SettledHook = Rc<dyn Fn(&eitri_core::layout::Con)>;
 
 /// A strip entry's text for its module.
 type StripLabel = Rc<dyn Fn(&ModuleId) -> String>;
@@ -129,7 +134,7 @@ mod imp {
         /// Called after every change to the layout ([`ModuleGrid::connect_changed`]).
         pub(super) changed: RefCell<Vec<Rc<dyn Fn()>>>,
         /// Called after a pinned split got its length ([`ModuleGrid::connect_settled`]).
-        pub(super) settled: RefCell<Vec<Rc<dyn Fn()>>>,
+        pub(super) settled: RefCell<Vec<SettledHook>>,
         /// The float chrome pool: a bar and a grip per piece ([`floatbars`]).
         pub(super) chrome: RefCell<Vec<FloatChrome>>,
         /// Which float each piece of chrome draws, slot by slot ([`floatbars::chrome_owners`]).
@@ -720,9 +725,10 @@ impl ModuleGrid {
 
     /// `f` runs after a pinned split got its length (`settle_pins`, inside an allocation) -- which
     /// [`ModuleGrid::connect_changed`] does not report, since nothing moved -- so the state file's
-    /// saver can count the length as what the window opened with rather than as a change. Runs with
-    /// the layout released, inside `size_allocate`: a hook must not touch a widget.
-    pub(crate) fn connect_settled(&self, f: impl Fn() + 'static) {
+    /// saver can count the length as what the window opened with rather than as a change. It is given
+    /// the tree as the settle left it, so a hook that hands it on later does not read a change made
+    /// since. Runs with the layout released, inside `size_allocate`: a hook must not touch a widget.
+    pub(crate) fn connect_settled(&self, f: impl Fn(&eitri_core::layout::Con) + 'static) {
         self.imp().settled.borrow_mut().push(Rc::new(f));
     }
 
@@ -1383,15 +1389,16 @@ impl ModuleGrid {
                 .try_borrow()
                 .is_ok_and(|layout| layout.has_pin_to_settle())
         {
-            let settled = self.layout().try_borrow_mut().is_ok_and(|mut layout| {
+            let settled = self.layout().try_borrow_mut().ok().and_then(|mut layout| {
                 self.with_frame(Size { w: width, h: height }, |frame| {
                     eitri_core::layout::settle_pins(&mut layout, frame)
                 })
+                .then(|| layout.root().clone())
             });
-            if settled {
-                let hooks: Vec<Rc<dyn Fn()>> = imp.settled.borrow().clone();
+            if let Some(root) = settled {
+                let hooks: Vec<SettledHook> = imp.settled.borrow().clone();
                 for hook in hooks {
-                    hook();
+                    hook(&root);
                 }
             }
         }

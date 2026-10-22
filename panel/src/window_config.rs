@@ -41,7 +41,7 @@ pub struct WindowConfig {
     pub tmux_skipped: Vec<eitri_core::keymap::HelpRow>,
     /// Which window manager the companion window asks to move focus (`companion.wm`). Read by every
     /// window so a bad value fails the same way everywhere; only the companion window uses it.
-    pub companion_wm: eitri_core::wm::WmChoice,
+    pub companion_wm: eitri_core::compositor::WmChoice,
     /// `review.enabled` and `review.hint`: whether turn review runs, and whether a finished turn
     /// puts a hint in the status band.
     pub review: ReviewConfig,
@@ -80,8 +80,8 @@ pub fn parse_panel_font_size(raw: Option<&str>) -> Result<f32, String> {
 /// `companion.wm`: `"auto"` (the default), `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"`; anything
 /// else is a startup failure naming the key, like `agent.font_size`. `Err` is the text after
 /// "eitri: ".
-pub fn parse_companion_wm(raw: Option<&str>) -> Result<eitri_core::wm::WmChoice, String> {
-    eitri_core::wm::parse_config(raw)
+pub fn parse_companion_wm(raw: Option<&str>) -> Result<eitri_core::compositor::WmChoice, String> {
+    eitri_core::compositor::parse_config(raw)
 }
 
 /// The account this window spends, from `VERDANDI_CLAUDE_ACCOUNT` or else `init.lua`'s
@@ -266,7 +266,7 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         keymap.bindings().len()
     );
 
-    let companion_wm = parse_companion_wm(kernel.config.borrow().get(eitri_core::wm::CONFIG_KEY))?;
+    let companion_wm = parse_companion_wm(kernel.config.borrow().get(eitri_core::compositor::CONFIG_KEY))?;
 
     // Whether turn review runs (`review.enabled`, default true) and whether a finished turn puts a
     // hint in the status band (`review.hint`, default false). Anything but true/false is a startup
@@ -447,14 +447,18 @@ mod tests {
         let err = parse_companion_wm(Some("i3")).unwrap_err();
         assert!(err.contains("companion.wm"), "{err}");
         assert!(err.contains("\"i3\""), "{err}");
-        assert_eq!(parse_companion_wm(None), Ok(eitri_core::wm::WmChoice::Auto));
+        assert_eq!(parse_companion_wm(None), Ok(eitri_core::compositor::WmChoice::Auto));
         assert_eq!(
             parse_companion_wm(Some("gnome")),
-            Ok(eitri_core::wm::WmChoice::Fixed(eitri_core::wm::Wm::Gnome))
+            Ok(eitri_core::compositor::WmChoice::Fixed(
+                eitri_core::compositor::Wm::Gnome
+            ))
         );
         assert_eq!(
             parse_companion_wm(Some("sway")),
-            Ok(eitri_core::wm::WmChoice::Fixed(eitri_core::wm::Wm::Sway))
+            Ok(eitri_core::compositor::WmChoice::Fixed(
+                eitri_core::compositor::Wm::Sway
+            ))
         );
     }
 

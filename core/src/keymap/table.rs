@@ -486,7 +486,7 @@ impl Keymap {
                     } else if let Some((id, _)) = claims
                         .command_keybindings
                         .iter()
-                        .find(|(_, accel)| Chord::from_gtk(accel).is_ok_and(|c| c == chord))
+                        .find(|(_, accel)| Chord::from_accel(accel).is_ok_and(|c| c == chord))
                     {
                         skip(format!("taken by init.lua: command {id}'s keybinding; {keeps}"));
                     } else {
@@ -822,7 +822,7 @@ impl Keymap {
 /// or a root chord would never fire (the prefix and the root controllers see the key first). An
 /// accelerator `Chord` cannot read uses a modifier Eitri never binds, so it cannot collide.
 pub fn check_command_keybinding(command: &str, keybinding: &str, keymap: &Keymap) -> Result<(), KeymapError> {
-    let Ok(chord) = Chord::from_gtk(keybinding) else {
+    let Ok(chord) = Chord::from_accel(keybinding) else {
         return Ok(());
     };
     let hits = if chord == Chord::of(keymap.prefix()) {
@@ -1258,6 +1258,10 @@ mod tests {
         assert!(err.contains("Ctrl+h (move to the module left)"), "{err}");
         assert!(check_command_keybinding("x", "<Control>equal", &map).is_err());
         assert!(check_command_keybinding("x", "<Control>g", &map).is_ok());
+        assert!(
+            check_command_keybinding("x", "<primary>b", &map).is_err(),
+            "a lowercase modifier name is the same chord in GTK, so it collides too"
+        );
         assert!(
             check_command_keybinding("x", "<Super>x", &map).is_ok(),
             "a chord Eitri never binds"

@@ -132,7 +132,11 @@ impl WindowModes {
             }
         });
         app.add_action(&action);
-        app.set_accels_for_action("app.fullscreen", eitri_core::keymap::root::accels("fullscreen"));
+        let accels: Vec<String> = eitri_core::keymap::root::chords_of("fullscreen")
+            .iter()
+            .map(|root| crate::gtk_host::keys::gtk_accel(&root.chord()))
+            .collect();
+        app.set_accels_for_action("app.fullscreen", &accels.iter().map(String::as_str).collect::<Vec<_>>());
 
         // The compositor answering. Which of the three things it can mean is `classify_window_notify`'s
         // job; the one that moves the mode is a change nothing here asked for.

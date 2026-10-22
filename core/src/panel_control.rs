@@ -942,7 +942,7 @@ fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU
             // its pid and its place in the process tree say nothing any more.
             let chain = match close_with {
                 Some(close_with) => {
-                    if check_close_with(*close_with, peer.pid, &crate::wm::proc_stat).is_err() {
+                    if check_close_with(*close_with, peer.pid, &crate::proc_chain::proc_stat).is_err() {
                         let _ = reply_line(&stream, "refused: close_with is not the sender's child");
                         return;
                     }
@@ -950,7 +950,7 @@ fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU
                 }
                 None => peer
                     .pid
-                    .map(|pid| crate::wm::ppid_chain(pid, &crate::wm::proc_stat, SENDER_CHAIN_MAX))
+                    .map(|pid| crate::proc_chain::ppid_chain(pid, &crate::proc_chain::proc_stat, SENDER_CHAIN_MAX))
                     .unwrap_or_default(),
             };
             // The process tree was read by pid. If the process that connected is still alive now,
@@ -1760,7 +1760,7 @@ mod tests {
         assert_eq!(received.sender_chain.first(), Some(&std::process::id()));
         assert_eq!(
             received.sender_chain,
-            crate::wm::ppid_chain(std::process::id(), &crate::wm::proc_stat, 32)
+            crate::proc_chain::ppid_chain(std::process::id(), &crate::proc_chain::proc_stat, 32)
         );
         // A raise names no editor, so it carries no chain.
         let raised = exchange(&sock, &server, &Request::Raise).unwrap();
@@ -1776,7 +1776,11 @@ mod tests {
         let server = ours(claim(&dir, &root(), None));
         let sock = socket_path(&dir, &root()).unwrap();
         let (nvim, _listener) = fake_nvim(&scratch);
-        let start_of = |pid: u32| stat_parent_and_start(&crate::wm::proc_stat(pid).unwrap()).unwrap().1;
+        let start_of = |pid: u32| {
+            stat_parent_and_start(&crate::proc_chain::proc_stat(pid).unwrap())
+                .unwrap()
+                .1
+        };
         let with = |pid: u32, start: u64| Request::Attach {
             addr: nvim.clone(),
             close_with: Some(CloseWith { pid, start }),

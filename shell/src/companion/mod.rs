@@ -12,7 +12,7 @@ mod close_watch;
 mod gnome_shell;
 mod link;
 mod requests;
-mod window;
+pub(crate) mod window;
 mod wm_runner;
 
 use std::cell::Cell;

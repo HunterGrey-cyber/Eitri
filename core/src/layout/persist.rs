@@ -52,10 +52,10 @@ pub const V1: u32 = 1;
 /// The version this build reads and writes, `<hash>.v2.json`. A file of any other version is not read.
 pub const V2: u32 = 2;
 
-/// How long after the last change the file is written. In `shell` (`layout_state::LayoutSaver`) only
+/// How long after the last change the file is written. In the window controller (`wm::persist::Saver`) only
 /// a change of the arrangement arms the timer, not a move of the keys; a change while it waits pushes
 /// back when it fires, and a timer that fires early is armed again for what is left rather than
-/// restarted. The close writes synchronously, and only a change still unwritten.
+/// restarted. The close waits for the write, and writes only a change still unwritten.
 pub const SAVE_DEBOUNCE_MS: u64 = 500;
 
 /// The keys of a version 2 file this build reads, at the top level and in a workspace; anything else

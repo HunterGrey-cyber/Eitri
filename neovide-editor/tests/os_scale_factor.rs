@@ -25,8 +25,8 @@
 //! Ignored unless requested: it spawns `nvim` (>= 0.10 on `PATH`) and starts its own `Xvfb`
 //! for the clipboard without creating a window. `shell/tests/support/own_x_server.rs`
 //! starts the display before winit connects and removes inherited `WAYLAND_DISPLAY` and
-//! `DISPLAY`. A plain `main` (`harness = false`) keeps the single winit `EventLoop`
-//! on the main thread. Run without a display wrapper:
+//! `DISPLAY`. A plain `main` (`harness = false`) keeps winit's event loop on the main
+//! thread; libtest runs each test on a separate thread. Run without a display wrapper:
 //!
 //!     cargo test -p neovide-editor --test os_scale_factor -- --ignored
 use std::time::{Duration, Instant};

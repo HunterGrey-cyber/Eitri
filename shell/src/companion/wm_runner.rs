@@ -1,4 +1,4 @@
-//! The GTK-side half of companion focus: it turns `eitri_core::wm`'s argv lists into commands run
+//! The GTK-side half of companion focus: it turns `eitri_core::compositor`'s argv lists into commands run
 //! on a worker thread. Nothing here waits for a command on the GTK thread: a key that moves focus
 //! is claimed at once and the worker finishes the move (or finds nothing to move to) afterwards.
 //!
@@ -16,8 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use eitri_core::compositor::{self, WindowRef, Wm};
 use eitri_core::layout::Direction;
-use eitri_core::wm::{self, WindowRef, Wm};
+use eitri_core::proc_chain;
 
 use super::gnome_shell::{GnomeCalls, GnomeShell};
 
@@ -75,7 +76,12 @@ impl WmRunner {
             shell.probe();
             shell as Rc<dyn GnomeCalls>
         });
-        let runner = Rc::new(Self::with_adapters(wm, real_exec(wm), Arc::new(wm::proc_stat), gnome));
+        let runner = Rc::new(Self::with_adapters(
+            wm,
+            real_exec(wm),
+            Arc::new(proc_chain::proc_stat),
+            gnome,
+        ));
         runner.resend_partner_when_the_extension_returns();
         runner
     }
@@ -130,8 +136,8 @@ impl WmRunner {
     /// GNOME without its extension says how to get it.
     fn no_adapter_notice(&self) -> Option<&'static str> {
         match self.wm {
-            Wm::None => Some(wm::NO_ADAPTER_NOTICE),
-            Wm::Gnome if self.gnome().is_none() => Some(wm::GNOME_NO_EXTENSION_NOTICE),
+            Wm::None => Some(compositor::NO_ADAPTER_NOTICE),
+            Wm::Gnome if self.gnome().is_none() => Some(compositor::GNOME_NO_EXTENSION_NOTICE),
             _ => None,
         }
     }
@@ -209,7 +215,7 @@ impl WmRunner {
             }
             return;
         }
-        self.raise(move |read_stat| wm::ppid_chain(nvim_pid, read_stat, CHAIN_MAX));
+        self.raise(move |read_stat| proc_chain::ppid_chain(nvim_pid, read_stat, CHAIN_MAX));
     }
 
     /// Tells the GNOME extension which window is the editor's, by nvim's own pid and its
@@ -220,7 +226,7 @@ impl WmRunner {
             return;
         }
         let chain = match nvim_pid {
-            Some(pid) => wm::ppid_chain(pid, &*self.read_stat, CHAIN_MAX),
+            Some(pid) => proc_chain::ppid_chain(pid, &*self.read_stat, CHAIN_MAX),
             None => Vec::new(),
         };
         if chain.is_empty() && self.partner.chain.borrow().is_empty() {
@@ -265,7 +271,7 @@ impl WmRunner {
             // put it back), else the sender.
             if chain.is_some() {
                 if let Some(pid) = editor_pid {
-                    let editor_chain = wm::ppid_chain(pid, &*self.read_stat, CHAIN_MAX);
+                    let editor_chain = proc_chain::ppid_chain(pid, &*self.read_stat, CHAIN_MAX);
                     if !editor_chain.is_empty() {
                         self.partner.change_to(&editor_chain);
                     }
@@ -276,7 +282,7 @@ impl WmRunner {
         match chain {
             Some(chain) => {
                 let generation = generation.expect("counted for an attach");
-                let editor_chain = editor_pid.map(|pid| wm::ppid_chain(pid, &*self.read_stat, CHAIN_MAX));
+                let editor_chain = editor_pid.map(|pid| proc_chain::ppid_chain(pid, &*self.read_stat, CHAIN_MAX));
                 let (after, partner) = (gnome.clone(), self.partner.clone());
                 gnome.set_partner(
                     chain,
@@ -361,10 +367,13 @@ fn move_focus_blocking(
     log: &dyn Fn(&str),
 ) {
     if wm == Wm::Sway {
-        let windows = wm::list_windows_argv(wm)
+        let windows = compositor::list_windows_argv(wm)
             .and_then(|argv| exec(argv).ok())
-            .and_then(|json| wm::parse_windows(wm, &json).ok());
-        match windows.as_deref().and_then(|windows| wm::has_neighbour(windows, dir)) {
+            .and_then(|json| compositor::parse_windows(wm, &json).ok());
+        match windows
+            .as_deref()
+            .and_then(|windows| compositor::has_neighbour(windows, dir))
+        {
             Some(false) => {
                 log(&format!(
                     "[companion] sway: no window {dir:?} of the panel; the key stops here"
@@ -376,7 +385,7 @@ fn move_focus_blocking(
             Some(true) => {}
         }
     }
-    if let Some(argv) = wm::move_focus_argv(wm, dir) {
+    if let Some(argv) = compositor::move_focus_argv(wm, dir) {
         let _ = exec(argv);
     }
 }
@@ -385,22 +394,24 @@ fn move_focus_blocking(
 /// nothing is run and one line names the chain: inside tmux it ends at the tmux server, which owns
 /// no window.
 fn raise_blocking(wm: Wm, exec: &dyn Fn(Vec<String>) -> Result<String, String>, chain: &[u32], log: &dyn Fn(&str)) {
-    let Some(list) = wm::list_windows_argv(wm) else { return };
+    let Some(list) = compositor::list_windows_argv(wm) else {
+        return;
+    };
     let Ok(json) = exec(list) else { return };
-    let windows: Vec<WindowRef> = match wm::parse_windows(wm, &json) {
+    let windows: Vec<WindowRef> = match compositor::parse_windows(wm, &json) {
         Ok(windows) => windows,
         Err(err) => {
             log(&format!("[companion] {} adapter: {err}", wm_name(wm)));
             return;
         }
     };
-    let Some(target) = wm::first_window_owner(chain, &windows) else {
+    let Some(target) = compositor::first_window_owner(chain, &windows) else {
         log(&format!(
             "[companion] raise: no window owned by any process in {chain:?}; nothing raised"
         ));
         return;
     };
-    match wm::focus_window_argv(wm, target) {
+    match compositor::focus_window_argv(wm, target) {
         Some(argv) => {
             let _ = exec(argv);
         }
@@ -447,7 +458,7 @@ mod tests {
         for dir in [Direction::Left, Direction::Right, Direction::Left] {
             assert!(!runner.move_focus(dir, &|text| notices.borrow_mut().push(text.to_string())));
         }
-        assert_eq!(*notices.borrow(), vec![wm::NO_ADAPTER_NOTICE.to_string()]);
+        assert_eq!(*notices.borrow(), vec![compositor::NO_ADAPTER_NOTICE.to_string()]);
     }
 
     #[test]
@@ -458,7 +469,7 @@ mod tests {
             250 => Some("250 (zsh) S 1 0 0".to_string()),
             _ => None,
         };
-        let chain = wm::ppid_chain(300, &stat, CHAIN_MAX);
+        let chain = proc_chain::ppid_chain(300, &stat, CHAIN_MAX);
         assert_eq!(chain, vec![300, 250]);
         let (exec, seen) = fake(sway_tree(0, 500));
         let lines = RefCell::new(Vec::new());
@@ -790,7 +801,7 @@ mod tests {
         let runner = WmRunner::with_commands(Wm::None, fake("").0, Arc::new(|_| None));
         let notices = RefCell::new(Vec::new());
         assert!(!runner.editor_edge(Direction::Left, &|t| notices.borrow_mut().push(t.to_string())));
-        assert_eq!(*notices.borrow(), vec![wm::NO_ADAPTER_NOTICE.to_string()]);
+        assert_eq!(*notices.borrow(), vec![compositor::NO_ADAPTER_NOTICE.to_string()]);
     }
 
     #[test]
@@ -801,7 +812,10 @@ mod tests {
         assert!(!runner.move_focus(Direction::Left, &say), "the key goes on to the page");
         assert!(!runner.editor_edge(Direction::Right, &say));
         assert!(!runner.move_focus(Direction::Down, &say));
-        assert_eq!(*notices.borrow(), vec![wm::GNOME_NO_EXTENSION_NOTICE.to_string()]);
+        assert_eq!(
+            *notices.borrow(),
+            vec![compositor::GNOME_NO_EXTENSION_NOTICE.to_string()]
+        );
         runner.raise_pid(std::process::id());
         runner.raise_editor(300);
         runner.set_partner_from(Some(300));
@@ -821,6 +835,9 @@ mod tests {
         fake.present.set(Some(false));
         assert!(!runner.move_focus(Direction::Left, &|t| notices.borrow_mut().push(t.to_string())));
         assert_eq!(fake.calls().len(), 1);
-        assert_eq!(*notices.borrow(), vec![wm::GNOME_NO_EXTENSION_NOTICE.to_string()]);
+        assert_eq!(
+            *notices.borrow(),
+            vec![compositor::GNOME_NO_EXTENSION_NOTICE.to_string()]
+        );
     }
 }

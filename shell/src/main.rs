@@ -14,6 +14,7 @@ mod editor_start_failure;
 mod end_signals;
 #[cfg(feature = "probe")]
 mod grid_probe;
+mod gtk_host;
 mod hint;
 mod kill_pane;
 mod layout;
@@ -40,6 +41,20 @@ mod webkit_zoom;
 mod wheel_zoom;
 mod window_config;
 mod window_mode;
+// Kept beside `gtk_host` rather than declared inside it: `tests/gtk_host_conformance.rs` compiles
+// `gtk_host` on its own, and the wiring calls the window's own controllers, which only this binary has.
+#[path = "gtk_host/wire.rs"]
+mod wire;
+// Beside `gtk_host` for the same reason: the hooks it registers are the agent panel's, which the
+// conformance test's build of `gtk_host` does not have, and its tests read the companion window's.
+#[path = "gtk_host/panel_wiring.rs"]
+mod panel_wiring;
+// Beside `gtk_host` for the same reason: the services and the surface constructors act on the window's own
+// registry, pages and grid.
+#[path = "gtk_host/services.rs"]
+mod gtk_host_services;
+#[path = "gtk_host/surfaces.rs"]
+mod gtk_host_surfaces;
 mod xft_dpi;
 
 // The panel's crash guard lives in `eitri-panel`; the alias keeps `crate::webview_crash_guard::` working.
@@ -57,7 +72,7 @@ use gtk4::{Application, ApplicationWindow, EventControllerKey};
 
 use agent_panel::ViewId;
 use chat_views::ChatViews;
-use eitri_core::attention::AgentPlace;
+use eitri_core::attention::{AgentPlace, Attention};
 use eitri_core::keymap::action::{FloatRule, SelectionRule, SplitCwd};
 use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened as KeysOpened};
 use eitri_core::keymap::prefix::WorkspacePick;
@@ -71,12 +86,14 @@ use eitri_core::layout::{
 };
 use eitri_core::plugin::theme::PageTheme;
 use eitri_core::tabs::TabVerb;
-use eitri_panel::panel_page::PanelPage;
+use eitri_core::wm::module::SurfaceDecl;
+use eitri_core::wm::start::StartStep;
+use eitri_core::wm::{Ended, HostEvent, SurfaceKind, TermEvent, WinId};
 use lua::{LuaEngine, PanelSlot};
 use module_grid::{HostKind, ModuleGrid};
-use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
+use neovide_editor::NeovideEditorPane;
 use terminal::registry::Terminals;
-use web_host::WebHost;
+use wire::{wire_host, WireDeps, WireKind};
 
 const APP_ID: &str = "cn.huntergrey.eitri";
 
@@ -402,22 +419,81 @@ fn build_ui(
     nvim_extra_args.extend(scratch_dir.as_ref().map(|dir| dir.nvim_args()).unwrap_or_default());
     let scratch_path = scratch_dir.as_ref().map(|dir| dir.path().to_path_buf());
 
-    // `Rc` because two separate closures need it after this function returns: the agent panel's
-    // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
-    // `NeovideEditorPane` is deliberately not `Clone`.
+    // What the editor is launched with: the feeds' env and `--cmd`, the project root, `--clean`. The
+    // editor phase below launches it with exactly this.
     //
     // `cwd` is set from the same resolved root the agent panel gets below, not left to the nvim
     // child's inherited process cwd: the two panes silently disagreeing about which project is
     // open is a worse failure than either one pointing somewhere unexpected.
-    let pane = Rc::new(NeovideEditorPane::with_options(NeovideEditorPaneOptions {
-        clean: want_clean,
-        child_env: nvim_child_env,
+    let editor_spawn = eitri_core::wm::EditorSpawn {
+        env: nvim_child_env,
+        args: nvim_extra_args,
         cwd: Some(project_root.to_path_buf()),
-        extra_nvim_args: nvim_extra_args,
-    }));
+        clean: want_clean,
+    };
+
+    // The window controller, behind its driver: the GTK host and the GLib scheduler, both attached to the
+    // driver. The window's start is the controller's start plan (`eitri_core::wm::start::start_plan`), walked
+    // here in its order: each `driver.start` below is one phase, with the shell's own work for that phase beside
+    // it, written out in sequence because each phase's work builds what later phases' closures capture.
+    let wm_scheduler = gtk_host::scheduler::GlibScheduler::new();
+    let wm_host = gtk_host::GtkHost::new();
+    let driver = {
+        let controller = eitri_core::wm::Controller::new(wm_scheduler.clone());
+        let driver = eitri_core::wm::Driver::new(controller, wm_host.clone(), wm_scheduler.clone());
+        let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
+        wm_host.attach(Rc::downgrade(&sink));
+        wm_scheduler.attach(Rc::downgrade(&sink));
+        driver
+    };
+    // The feeds are bound above: the controller keeps the launch settings they make until the editor phase.
+    driver.start(
+        WinId::MAIN,
+        StartStep::Feeds {
+            spawn: editor_spawn.clone(),
+        },
+    );
+    // The window, created and not shown, so no later op names a window that does not exist; its close requests,
+    // focus changes and activation reach the controller from here on.
+    wm_host.set_application(app);
+    driver.start(
+        WinId::MAIN,
+        StartStep::Window {
+            spec: eitri_core::wm::WindowSpec {
+                role: eitri_core::wm::WindowRole::Main,
+                presence: eitri_core::wm::EditorPresence::Owned,
+                title: chrome::window_title(&chrome::project_display_name(project_root), None),
+            },
+        },
+    );
+    let window: ApplicationWindow = wm_host
+        .window(WinId::MAIN)
+        .and_then(|window| window.downcast().ok())
+        .expect("the window phase opened the window");
+    window.add_css_class("shell-root");
+    // The editor, launched with `editor_spawn`; its host joins the grid at the surfaces phase. That host
+    // is a small overlay carrying a hidden failure-message label, not the bare `GtkGLArea` -- see
+    // `editor_start_failure`'s own doc for why this has to wrap the widget before it is ever handed to the grid.
+    //
+    // `pane` is an `Rc` because two separate closures need it after this function returns: the agent panel's
+    // Ctrl+h handler (to hand focus back) and the window's close handler (to shut nvim down).
+    // `NeovideEditorPane` is deliberately not `Clone`.
+    let editor_maker = gtk_host_surfaces::EditorMaker::new(Rc::downgrade(&wm_host));
+    wm_host.set_surface_maker(editor_maker.clone());
+    driver.start(WinId::MAIN, StartStep::Editor);
+    let gtk_host_surfaces::MadeEditor {
+        pane,
+        host: editor_host,
+        failure: editor_start_failure_label,
+    } = editor_maker.take().expect("the editor phase made the editor");
 
     let config_dir = config_dir();
     let lua_engine = Rc::new(LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"));
+    // What the kernel phase's `init.lua` and the requests phase's `shell:ready` run on.
+    wm_host.set_lua(Rc::new(gtk_host_services::LuaKernel {
+        engine: lua_engine.clone(),
+        init_file: config_dir.join("init.lua"),
+    }));
 
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
@@ -436,8 +512,11 @@ fn build_ui(
     // The panel reads the context when its tick runs, and its tick runs only when woken.
     crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
 
-    lua_engine.load_init_file(&config_dir.join("init.lua"));
+    // `init.lua`: its Lua panels and the plugins it loads are registered before the config is read.
+    driver.start(WinId::MAIN, StartStep::Kernel);
 
+    // The window config, the keymap, the plugins' panels, the module keys and the keys help.
+    driver.start(WinId::MAIN, StartStep::Config);
     let config = match window_config::load(&lua_engine) {
         Ok(config) => config,
         Err(message) => {
@@ -505,40 +584,45 @@ fn build_ui(
     // `Layout::initial`, `PanelSlot::placement`). Every window has editor, agent, and
     // terminal modules outside the Lua registry, so Lua panels do not replace them.
     // A Lua `bottom` panel goes below the terminal.
-    let lua_panels: Vec<(ModuleId, PanelSlot, gtk4::Widget)> = lua_engine
-        .panels
-        .borrow()
-        .entries()
-        .iter()
-        .map(|entry| (ModuleId::lua(&entry.id), entry.slot, entry.widget.clone()))
-        .collect();
-    // Keep each Lua panel's page for `prefix x`: killing ends its web process,
-    // and its module key loads this page again (`kill_pane`). The fourth element is
-    // its crash-loop guard. Revival resets the guard, re-arming automatic recovery
-    // just as `AgentPanelHandle::reload_document_by_hand` does for the chat panel.
-    let lua_pages: Rc<
-        Vec<(
-            ModuleId,
-            gtk4::Widget,
-            String,
-            Rc<RefCell<webview_crash_guard::WebViewCrashGuard>>,
-        )>,
-    > = Rc::new(
-        lua_engine
-            .panels
-            .borrow()
+    let lua_panels: Vec<(ModuleId, PanelSlot, gtk4::Widget)> = {
+        let panels = lua_engine.panels.borrow();
+        panels
             .entries()
             .iter()
             .map(|entry| {
                 (
-                    ModuleId::lua(&entry.id),
-                    entry.widget.clone(),
-                    entry.url.clone(),
-                    entry.crash_guard.clone(),
+                    entry.module.clone(),
+                    entry.slot,
+                    panels
+                        .views
+                        .widget(&entry.module)
+                        .expect("registered panel view")
+                        .clone(),
                 )
             })
-            .collect(),
-    );
+            .collect()
+    };
+    // A killed panel reloads its URL on reopening. Manual recovery resets the same shared guard
+    // that its view's crash handler checks, including a deferred plugin page's handler.
+    let lua_pages: gtk_host_services::LuaPages = Rc::new({
+        let panels = lua_engine.panels.borrow();
+        panels
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.module.clone(),
+                    panels
+                        .views
+                        .widget(&entry.module)
+                        .expect("registered panel view")
+                        .clone(),
+                    entry.url.clone(),
+                    panels.views.guard(&entry.module).expect("registered panel guard"),
+                )
+            })
+            .collect()
+    });
     // The plugin modules that start hidden: the window never places them by itself. Each has its host, its
     // page entry and its module key from startup; its page is built the first time it is shown, and its
     // first show opens it by its own rule (`open_plugin_module`).
@@ -657,7 +741,7 @@ fn build_ui(
     // `module_layout` is the current workspace's layout, the one every reader of the live layout holds;
     // `workspaces` holds the window's other workspaces beside it, and what a later build keeps in the
     // file.
-    let (workspaces, module_layout, keep_copy) = match layout_state::choose_startup_layout(
+    let (workspaces, module_layout, keep_copy) = match eitri_core::wm::persist::choose_startup_layout(
         lua_default.as_ref(),
         loaded,
         &decls,
@@ -695,7 +779,7 @@ fn build_ui(
             std::process::exit(1);
         }
     };
-    match layout_state::add_defined_workspaces(
+    match eitri_core::wm::persist::add_defined_workspaces(
         &mut workspaces.borrow_mut(),
         &mut module_layout.borrow_mut(),
         &defined,
@@ -712,21 +796,28 @@ fn build_ui(
             std::process::exit(1);
         }
     }
-    let layout_saver = layout_state::LayoutSaver::new(
+    let mut layout_saver = layout_state::saver(
         state_dir,
         project_root,
-        module_layout.clone(),
-        workspaces.clone(),
+        &module_layout,
+        &workspaces,
         decls.clone(),
         keep_copy,
     );
     layout_saver.set_deferred(deferred.clone());
+    // The window's layouts and its saver, given to the controller before any hook that posts to it.
+    driver.start(
+        WinId::MAIN,
+        StartStep::Layout {
+            parts: eitri_core::wm::WindowParts {
+                layout: module_layout.clone(),
+                workspaces: workspaces.clone(),
+                saver: Some(layout_saver),
+            },
+        },
+    );
     // Every module's host, added once and never reparented (`module_grid`'s module doc).
     let grid = ModuleGrid::new(module_layout.clone());
-    // Wrap the editor in an overlay with a hidden failure-message label before adding it to the
-    // grid, so startup errors can appear in the editor's area without reparenting its widget.
-    let (editor_host, editor_start_failure_label) = editor_start_failure::install(pane.widget());
-    grid.add(ModuleId::editor(), &editor_host, pane.widget(), HostKind::Direct);
     // With no `WebView` in this process (`webkit_sandbox`), the chat's and each Lua panel's place is
     // a plain GTK notice: allocated directly, as the editor is, rather than held at a settled size
     // like a `WebView` being resized.
@@ -735,17 +826,32 @@ fn build_ui(
     } else {
         HostKind::Direct
     };
-    // Every web module -- the chat and each Lua panel -- sits at (0,0) of a `WebHost` of its own
-    // rather than in the grid directly, and takes the keys through its `WebView` (its focus target):
-    // WebKitGTK adds the `WebView`'s position in its parent to the input method's caret rectangle,
-    // which GTK4's input methods then translate to the window a second time, so a `WebView` at the
-    // module's own x put the candidate window that far right of the caret (`web_host`'s module doc).
-    // The notice that stands in for a `WebView` where WebKit cannot start is wrapped the same way, so
-    // the shape does not depend on `webkit_sandbox`.
-    grid.add(ModuleId::agent(), &WebHost::new(&agent_widget), &agent_widget, web_host);
+    // Every extra chat view's page, keyed by its module id: a view that leaves the layout keeps its page
+    // here, idle, for the next view of that number only (`chat_views`'s module doc). The base view's page
+    // is the `related` one of each: the pages share its web process (and so its memory).
+    let chat_views: gtk_host_surfaces::ChatPool = Rc::new(RefCell::new(ChatViews::new()));
+    let base_webview: Option<webkit6::WebView> = agent_widget.downcast_ref::<webkit6::WebView>().cloned();
+    // One constructor per kind of host (`gtk_host_surfaces`): each adds its host to the grid and names it
+    // as the module's surface, and wires nothing. The hosts built here are wired once, below, where the
+    // window's key handling exists; a host made later is wired by what makes it.
+    let surfaces = Rc::new(gtk_host_surfaces::Surfaces {
+        host: Rc::downgrade(&wm_host),
+        grid: grid.downgrade(),
+        web_host,
+        terminals: terminals.clone(),
+        make_terminal_pane: make_terminal_pane.clone(),
+        chat_views: chat_views.clone(),
+        agent: agent_panel_handle.clone(),
+        base_webview: base_webview.clone(),
+        chat_notice: panel_notice.unwrap_or(CHAT_VIEWS_NEED_WEBKIT).to_string(),
+        lua_pages: lua_pages.clone(),
+        plugin_panels: plugin_panels.clone(),
+        base_page: agent_widget.clone(),
+        editor: Some((editor_host, pane.widget().clone())),
+    });
     // Every terminal in the layout the window opens with gets its pane and host now, the base one
     // first and the numbered ones in number order, so the hosts exist before the first `apply`. None
-    // starts a shell here: each starts when it is first shown (the change hook below).
+    // starts a shell here: each starts when it is first shown (the controller's module lifecycle).
     let startup_terminals: Vec<ModuleId> = {
         let layout = module_layout.borrow();
         let workspaces = workspaces.borrow();
@@ -760,20 +866,9 @@ fn build_ui(
         ids.insert(0, ModuleId::terminal());
         ids
     };
-    for id in startup_terminals {
-        let (pane, _) = terminals.borrow_mut().take_or_make(&id, || make_terminal_pane());
-        grid.add(id, pane.widget(), pane.widget(), HostKind::Direct);
-    }
-    // Every extra chat view's page, keyed by its module id: a view that leaves the layout keeps its page
-    // here, idle, for the next view of that number only (`chat_views`'s module doc). The base view's page
-    // is the `related` one of each: the pages share its web process (and so its memory).
-    let chat_views: Rc<RefCell<ChatViews<(webkit6::WebView, Rc<PanelPage>)>>> = Rc::new(RefCell::new(ChatViews::new()));
-    let base_webview: Option<webkit6::WebView> = agent_widget.downcast_ref::<webkit6::WebView>().cloned();
     // Every chat view the layout the window opens with holds, in any workspace, gets its page and host
-    // now, as the numbered terminals do, so the hosts exist before the first `apply`. The panel is told
-    // which views there are before the base page's `ready` can start a restore, so a restored tab saved
-    // in one of them comes back into it. Where WebKit cannot start, each view's place is the notice the
-    // base view shows.
+    // now, as the numbered terminals do, so the hosts exist before the first `apply`. Where WebKit cannot
+    // start, each view's place is the notice the base view shows.
     let startup_chat_views: Vec<ModuleId> = {
         let layout = module_layout.borrow();
         let workspaces = workspaces.borrow();
@@ -781,33 +876,103 @@ fn build_ui(
             workspaces.each(&layout).into_iter().map(|(_, layout)| layout).collect();
         extra_chat_views(&layouts)
     };
-    for id in &startup_chat_views {
-        let view = ViewId::of_module(id).expect("a chat module");
-        match &base_webview {
-            Some(base) => {
-                let ((webview, _), _) = chat_views.borrow_mut().take_or_make(id, || {
-                    agent_panel::build_chat_page(&agent_panel_handle, view, Some(base))
-                });
-                grid.add(id.clone(), &WebHost::new(&webview), &webview, web_host);
-            }
-            None => {
-                let notice = webkit_sandbox::notice_widget(panel_notice.unwrap_or(CHAT_VIEWS_NEED_WEBKIT));
-                grid.add(id.clone(), &WebHost::new(&notice), &notice, web_host);
-            }
-        }
-        println!("[chat] {id}: its page and host made at startup");
-    }
-    agent_panel_handle.set_layout_views(startup_chat_views.iter().filter_map(ViewId::of_module).collect());
-    for (id, slot, widget) in &lua_panels {
+    for (_, slot, widget) in &lua_panels {
         // On the `WebView`: its host measures its one child, so the grid sees the same floor.
         if *slot == PanelSlot::Bottom {
             widget.set_size_request(-1, layout::BOTTOM_MIN_HEIGHT);
         }
-        grid.add(id.clone(), &WebHost::new(widget), widget, web_host);
     }
+    // The hosts the window opens with, each made by the controller's `CreateSurface` (which declares it, so its
+    // lifecycle effects for the startup layout follow the apply below) and added to the grid in this order: the
+    // editor's, the base chat's, every startup terminal's, every startup chat view's, every Lua panel's (a plugin
+    // that starts hidden gets its host and its wiring now and its page on its first show).
+    //
+    // Every web module -- the chat and each Lua panel -- sits at (0,0) of a `WebHost` of its own
+    // rather than in the grid directly, and takes the keys through its `WebView` (its focus target):
+    // WebKitGTK adds the `WebView`'s position in its parent to the input method's caret rectangle,
+    // which GTK4's input methods then translate to the window a second time, so a `WebView` at the
+    // module's own x put the candidate window that far right of the caret (`web_host`'s module doc).
+    // The notice that stands in for a `WebView` where WebKit cannot start is wrapped the same way, so
+    // the shape does not depend on `webkit_sandbox`.
+    let startup_surfaces: Vec<SurfaceDecl> = {
+        let plugin_modules = plugin_panels.modules();
+        let lua_entries: Vec<(ModuleId, String, String, String)> = lua_engine
+            .panels
+            .borrow()
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.module.clone(),
+                    entry.id.clone(),
+                    entry.url.clone(),
+                    entry.title.clone(),
+                )
+            })
+            .collect();
+        let mut made = vec![
+            SurfaceDecl {
+                module: ModuleId::editor(),
+                kind: SurfaceKind::Editor { spawn: editor_spawn },
+                deferred: false,
+            },
+            SurfaceDecl {
+                module: ModuleId::agent(),
+                kind: SurfaceKind::Chat { view: ViewId::BASE },
+                deferred: false,
+            },
+        ];
+        made.extend(startup_terminals.iter().map(|id| SurfaceDecl {
+            module: id.clone(),
+            kind: SurfaceKind::Terminal {
+                cwd: project_root.to_path_buf(),
+            },
+            deferred: false,
+        }));
+        made.extend(startup_chat_views.iter().filter_map(|id| {
+            Some(SurfaceDecl {
+                module: id.clone(),
+                kind: SurfaceKind::Chat {
+                    view: ViewId::of_module(id)?,
+                },
+                deferred: false,
+            })
+        }));
+        made.extend(lua_entries.into_iter().map(|(id, plugin, url, title)| {
+            if plugin_modules.contains(&id) {
+                SurfaceDecl {
+                    deferred: plugin_panels.starts_hidden(&id),
+                    kind: SurfaceKind::PluginPage { plugin },
+                    module: id,
+                }
+            } else {
+                SurfaceDecl {
+                    module: id,
+                    kind: SurfaceKind::LuaPanel { url, title },
+                    deferred: false,
+                }
+            }
+        }));
+        made
+    };
+    let startup_modules: Vec<ModuleId> = startup_surfaces.iter().map(|decl| decl.module.clone()).collect();
+    wm_host.set_surface_maker(surfaces.clone());
+    driver.start(
+        WinId::MAIN,
+        StartStep::Surfaces {
+            decls: startup_surfaces,
+        },
+    );
+    // The window cannot open without them: each was made from what this window registered a moment ago.
+    for id in &startup_modules {
+        assert!(grid.has_host(id), "{id}: its host was not made at startup");
+    }
+    // The panel is told which views there are before the base page's `ready` can start a restore, so a restored
+    // tab saved in one of them comes back into it.
+    agent_panel_handle.set_layout_views(startup_chat_views.iter().filter_map(ViewId::of_module).collect());
     // A plugin that starts hidden costs no web process until its module is first shown. A layout that
-    // reopens one shown builds its page now; every later first show, by any route, builds it in the
-    // change hook below.
+    // reopens one shown builds its page now; every later first show, by any route, builds it through the
+    // controller's module lifecycle.
     let shown_at_start: Vec<ModuleId> = {
         let layout = module_layout.borrow();
         deferred.iter().filter(|id| layout.is_shown(id)).cloned().collect()
@@ -815,97 +980,44 @@ fn build_ui(
     for id in &shown_at_start {
         plugin_panels.build_page(id, &plugin_panels.theme());
     }
-    // A terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
-    // `Ctrl+a \ t`, a new instance, its tray chip, `eitri.layout.show`, a saved layout -- rather than
-    // only on the `Ctrl+a t` path. Every live pane that is shown and has no shell running is started;
-    // `start` does nothing for one whose shell has exited and waits for Enter.
-    {
-        let module_layout = module_layout.clone();
-        let terminals = terminals.clone();
-        grid.connect_changed(move || {
-            let starting: Vec<terminal::TerminalPane> = {
-                // Hooks run with the layout released (`ModuleGrid::connect_changed`), and nothing
-                // holds the registry across a grid call; these lines are how a caller that breaks
-                // either would show up, instead of a terminal that silently never starts.
-                let Ok(layout) = module_layout.try_borrow() else {
-                    eprintln!("[terminal] BUG: the layout was borrowed when it changed; no shell was started");
-                    return;
-                };
-                let Ok(terminals) = terminals.try_borrow() else {
-                    eprintln!(
-                        "[terminal] BUG: the registry was borrowed when the layout changed; no shell was started"
-                    );
-                    return;
-                };
-                terminals
-                    .live()
-                    .filter(|(id, pane)| layout.is_shown(id) && pane.shell_pid().is_none())
-                    .map(|(_, pane)| pane.clone())
-                    .collect()
-            };
-            for pane in starting {
-                pane.start();
-            }
-        });
-    }
-    // A plugin that starts hidden gets its page the first time its module is shown, however it got there:
-    // its key, `module.<id>`, a split key, a tray chip, a workspace switch, `eitri.layout.show`.
-    {
-        let module_layout = module_layout.clone();
-        let plugin_panels = plugin_panels.clone();
-        let deferred = deferred.clone();
-        grid.connect_changed(move || {
-            // Bound before any build: a build adds a widget, and nothing may hold the layout across it.
-            let building: Vec<ModuleId> = {
-                let Ok(layout) = module_layout.try_borrow() else {
-                    eprintln!("[plugin] BUG: the layout was borrowed when it changed; no page was built");
-                    return;
-                };
-                deferred
-                    .iter()
-                    .filter(|id| layout.is_shown(id) && !plugin_panels.is_built(id))
-                    .cloned()
-                    .collect()
-            };
-            for id in building {
-                plugin_panels.build_page(&id, &plugin_panels.theme());
-            }
-        });
-    }
-    // Each plugin host hears whether its module is drawn: nvim follows a buffer for a page only while it is. Hooked
-    // before the startup `apply`, which runs it once for the layout the window opens with.
-    {
-        let module_layout = module_layout.clone();
-        let plugin_panels = plugin_panels.clone();
-        let modules = plugin_panels.modules();
-        grid.connect_changed(move || {
-            // Read and released before any host is told: nothing may hold the layout across a host call.
-            let visible: Vec<ModuleId> = {
-                let Ok(layout) = module_layout.try_borrow() else {
-                    eprintln!("[plugin] BUG: the layout was borrowed when it changed; no plugin was told it is drawn");
-                    return;
-                };
-                layout.visible_modules()
-            };
-            for id in &modules {
-                plugin_panels.set_on_screen(id, visible.contains(id));
-            }
-        });
-    }
+    // What the controller's module lifecycle calls: a terminal's shell started the first time it is shown,
+    // however it got there, a start-hidden plugin's page built on its first show, each plugin host told
+    // whether its module is drawn, and a killed module shown again started fresh. Given before the startup
+    // `apply`, whose lifecycle effects come right after it.
+    wm_host.set_services(Rc::new(gtk_host_services::Services {
+        terminals: terminals.clone(),
+        plugin_panels: plugin_panels.clone(),
+        agent: agent_panel_handle.clone(),
+        lua_pages: lua_pages.clone(),
+    }));
     grid.apply();
-    // Every change of the arrangement is written to this project's state file, 500ms after the last
-    // one, and once more when the window closes if it is still unwritten; a change of the
-    // keys alone never is. Hooked up only now, after the startup `apply`: a launch is not a change
-    // (`layout_state`'s module doc).
+    // The startup layout is applied: the lifecycle effects of the modules the surfaces phase declared follow at
+    // once -- each shown terminal's shell, each shown start-hidden page, each plugin told whether it is drawn --
+    // and the launch is not a change, so nothing is saved for it. Every host the window opens with was made by
+    // the walk, so no module is left to declare here.
     {
-        let layout_saver = layout_saver.clone();
-        grid.connect_changed(move || layout_saver.changed());
+        let hosted: Vec<SurfaceDecl> = Vec::new();
+        driver.startup_applied(WinId::MAIN, hosted);
+    }
+    // Every change of the arrangement is written to this project's state file, 500ms after the last
+    // one, and once more when the window closes if it is still unwritten; a change of the keys alone
+    // never is. The controller decides; this only tells it. Hooked up only now, after the startup
+    // `apply`: a launch is not a change (`eitri_core::wm::persist`'s module doc).
+    {
+        let driver = driver.clone();
+        grid.connect_changed(move || driver.post(HostEvent::LayoutChangedByShell { win: WinId::MAIN }));
     }
     // A pinned row getting its length on its first frame is not a change: the saver takes it as
-    // what the window opened with (`layout_state`'s module doc).
+    // what the window opened with. Reported after the allocation that settled it, from the driver's idle,
+    // so nothing is decided inside an allocation.
     {
-        let layout_saver = layout_saver.clone();
-        grid.connect_settled(move || layout_saver.settled());
+        let driver = driver.clone();
+        grid.connect_settled(move |root| {
+            driver.post_deferred(HostEvent::Settled {
+                win: WinId::MAIN,
+                root: root.clone(),
+            })
+        });
     }
 
     // Gives a module the keys. The editor goes through `NeovideEditorPane::grab_focus`, which also
@@ -950,6 +1062,8 @@ fn build_ui(
             grid.focus_target(id).is_some_and(|target| target.grab_focus())
         })
     };
+    // The controller's `Focus` ops give the keys this way too, the first focus after the window is shown among them.
+    wm_host.set_focus(focus_module.clone());
     // Gives a module the keys by any route that chooses one -- a module key, `Ctrl+h/j/k/l`, a digit,
     // a strip entry, HINT, a tray chip, `eitri.layout.focus`. A module on a tab its container does not
     // draw has that tab chosen first (`ModuleGrid::switch_tab`, which maps its host before the grab):
@@ -981,16 +1095,10 @@ fn build_ui(
         })
     };
 
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title(chrome::window_title(&chrome::project_display_name(project_root), None))
-        .default_width(1280)
-        .default_height(760)
-        // No HeaderBar: decorated(false) suppresses GTK's own CSD titlebar entirely -- the
-        // custom top bar built below (chrome::build_top_bar) is the only titlebar.
-        .decorated(false)
-        .build();
-    window.add_css_class("shell-root");
+    // The chrome: the top bar, the window's content, and every controller and hook, installed in the order below.
+    // The window has no HeaderBar (it is undecorated): the custom top bar built here (chrome::build_top_bar) is
+    // its only titlebar.
+    driver.start(WinId::MAIN, StartStep::Chrome);
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.add_css_class("shell-root");
@@ -1179,26 +1287,21 @@ fn build_ui(
         }
     }
 
-    // `Ctrl`+wheel over a module: the text size of that pane only. Every host
-    // exists by now -- the editor, the agent, the terminal and each Lua panel were added above.
-    for (id, host) in grid.hosts() {
-        wheel_zoom::install(id, &host, text_size_controller.clone());
-    }
     // Every Lua panel's page follows the window's text size: a plugin's page once its view is built
-    // (at startup, or at its first show), any other Lua panel's view now.
+    // (at startup, or at its first show), any other Lua panel's view now. This attaches the view; its
+    // host's `Ctrl`+wheel comes from `wire_host`, when the controller makes that host.
     {
         let controller = text_size_controller.clone();
         plugin_panels.set_page_built(Rc::new(move |id: &ModuleId, view: &webkit6::WebView| {
             controller.attach_page(id.clone(), view);
         }));
         let plugin_modules = plugin_panels.modules();
-        for entry in lua_engine.panels.borrow().entries() {
-            let id = ModuleId::lua(&entry.id);
-            if plugin_modules.contains(&id) {
+        for (id, widget, _, _) in lua_pages.iter() {
+            if plugin_modules.contains(id) {
                 continue;
             }
-            if let Some(view) = entry.widget.downcast_ref::<webkit6::WebView>() {
-                text_size_controller.attach_page(id, view);
+            if let Some(view) = widget.downcast_ref::<webkit6::WebView>() {
+                text_size_controller.attach_page(id.clone(), view);
             }
         }
     }
@@ -1336,9 +1439,14 @@ fn build_ui(
         },
         agent: agent_panel_handle.clone(),
     });
+    // The panel's hooks, each built below where its captures are, and registered together once the
+    // last is built (`panel_wiring`).
+    let mut panel_hooks = panel_wiring::PanelHooks::default();
     {
         let coordinator = hint_coordinator.clone();
-        agent_panel_handle.on_hint(move |message| coordinator.on_panel(message));
+        panel_hooks.on_hint = Some(Box::new(move |message: agent_panel::HintInbound| {
+            coordinator.on_panel(message)
+        }));
     }
 
     // The module that held the keys before the one holding them now: `prefix ;`'s target (tmux's
@@ -1517,7 +1625,7 @@ fn build_ui(
         // card: the hook fires from the pump (`report_attention`) after its own state borrow is
         // already dropped, so this is safe and never re-enters a held `RefCell`.
         let agent_panel_handle_for_toast = agent_panel_handle.clone();
-        agent_panel_handle.on_attention(move |_before, after, handed| {
+        let on_attention = move |_before: Attention, after: Attention, handed: &[ViewId]| {
             let agent = &agent_panel_handle_for_toast;
             {
                 let layout = module_layout.borrow();
@@ -1578,12 +1686,13 @@ fn build_ui(
                     ));
                 }
             }
-        });
+        };
+        panel_hooks.on_attention = Some(Box::new(on_attention));
     }
     // The one-line result of bringing the last window's tabs back.
     {
         let toast = toast.clone();
-        agent_panel_handle.on_toast(move |text| toast.show(text));
+        panel_hooks.on_toast = Some(Box::new(move |text: &str| toast.show(text)));
     }
     // Share the three module arrival operations across module keys, tray chips,
     // split keys, and Lua layout calls so every route uses the same behavior.
@@ -1648,7 +1757,7 @@ fn build_ui(
         let toast = toast.clone();
         let stow_key = key_text(&keymap, &Action::ScratchpadShow { module: None });
         let sink_key = key_text(&keymap, &Action::FloatToggle);
-        agent_panel_handle.set_answer_gate(Rc::new(move |view: ViewId| {
+        panel_hooks.set_answer_gate = Some(Rc::new(move |view: ViewId| {
             let chat = view.module();
             let Ok(layout) = module_layout.try_borrow() else {
                 // Nothing holds the layout across a page message; were something to, the answer is
@@ -1780,7 +1889,7 @@ fn build_ui(
         let show_on_screen = show_on_screen.clone();
         let give_keys = give_keys.clone();
         let module_layout = module_layout.clone();
-        agent_panel_handle.on_editor_request(move |request| {
+        panel_hooks.on_editor_request = Some(Box::new(move |request: &eitri_core::scratch::ScratchRequest| {
             // `prefix x` quit it, and it cannot come back in this window (`kill_pane`).
             if module_layout.borrow().is_gone(&ModuleId::editor()) {
                 return Err(LayoutError::Gone(ModuleId::editor()).to_string());
@@ -1794,7 +1903,7 @@ fn build_ui(
             give_keys(&ModuleId::editor());
             pane.send_keys(&request.input_keys());
             Ok(())
-        });
+        }));
     }
     // Turn review's questions to the editor, with the same two refusals: the editor quit for good,
     // or its nvim not running.
@@ -1806,27 +1915,27 @@ fn build_ui(
         // One handle on this window's editor, shared: the chat's turn review and every plugin page ask through it.
         let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> =
             Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present));
-        agent_panel_handle.set_editor_rpc(editor_rpc.clone());
+        panel_hooks.set_editor_rpc = Some(editor_rpc.clone());
         plugin_panels.set_editor(editor_rpc);
     }
     // The review overlay in this window's own nvim: the module goes with the window, and a file the
     // review opened there is shown and given the keys, as a draft being edited is.
     {
-        agent_panel_handle.set_review_owner(|| Some(eitri_core::review_editor::Owner::Embedded));
+        panel_hooks.set_review_owner = Some(Box::new(|| Some(eitri_core::review_editor::Owner::Embedded)));
         let give_keys = give_keys.clone();
         let show_on_screen = show_on_screen.clone();
-        agent_panel_handle.on_review_open(move || {
+        panel_hooks.on_review_open = Some(Box::new(move || {
             if let Err(err) = show_on_screen(&ModuleId::editor()) {
                 eprintln!("[review] could not show the editor: {err}");
                 return;
             }
             give_keys(&ModuleId::editor());
-        });
+        }));
     }
     {
         let focus_and_arrive = focus_and_arrive.clone();
         // Back to the view the edit's tab is in; to the base view when that view has gone meanwhile.
-        agent_panel_handle.on_editor_done(move |view| {
+        panel_hooks.on_editor_done = Some(Box::new(move |view: ViewId| {
             let returned = focus_and_arrive(&view.module()).or_else(|err| {
                 if view.is_base() {
                     Err(err)
@@ -1837,7 +1946,7 @@ fn build_ui(
             if let Err(err) = returned {
                 eprintln!("[scratch] could not return the keys to the chat: {err}");
             }
-        });
+        }));
     }
     // `place_and_arrive`: `id` into a new split after the module with the keys, along `axis`, moved
     // there if it is elsewhere, and the keys to it (`Ctrl+a \`/`"` + a key, `Ctrl+a <key>` for a
@@ -1918,10 +2027,10 @@ fn build_ui(
     };
 
     // `prefix x`, tmux's `kill-pane`.
-    // `killed` holds the modules killed and not shown since: a show brings each back fresh (the hook
-    // below). The editor never is -- it cannot come back (`Reopen::Never`). `kill_prompt` is the
-    // window's y/n, installed after the prefix below so its controller sees keys first.
-    let killed: Rc<RefCell<std::collections::BTreeSet<ModuleId>>> = Rc::default();
+    // Each kill tells the controller once the grid has taken the module off screen: its module lifecycle
+    // ends what the kill ends and brings the module back fresh when it is shown again. The editor never
+    // comes back (`Reopen::Never`). `kill_prompt` is the window's y/n, installed after the prefix below
+    // so its controller sees keys first.
     let kill_prompt: Rc<std::cell::OnceCell<Rc<close_prompt::ClosePrompt>>> = Rc::default();
     // The editor closed for the rest of this window once nvim is gone (`Reopen::Never`: it cannot
     // come back, `kill_pane`), the keys going to its neighbour, and the pane released on the next
@@ -1935,12 +2044,20 @@ fn build_ui(
         let workspaces = workspaces.clone();
         let released = Rc::downgrade(&pane);
         let plugin_panels = plugin_panels.clone();
+        let driver = Rc::downgrade(&driver);
         Rc::new(move || {
             let Some(grid) = grid.upgrade() else { return Ok(()) };
             grid.kill_module(&ModuleId::editor(), Reopen::Never, &*focus_module)?;
             // No editor is coming back to this window: a page following one says so.
             plugin_panels.editor_closed();
             grid.with_current_frame(|frame| workspaces.borrow_mut().retire_everywhere(&ModuleId::editor(), frame));
+            if let Some(driver) = driver.upgrade() {
+                driver.post(HostEvent::SurfaceEnded {
+                    win: WinId::MAIN,
+                    module: ModuleId::editor(),
+                    why: Ended::Retired,
+                });
+            }
             println!("[modules] editor: nvim quit; the editor is closed for this window");
             let released = released.clone();
             glib::idle_add_local_once(move || {
@@ -1982,11 +2099,22 @@ fn build_ui(
         let terminals = Rc::downgrade(&terminals);
         let workspaces = workspaces.clone();
         let decls = decls.clone();
+        // Weak for the same reason.
+        let driver = Rc::downgrade(&driver);
         Rc::new(move |id| {
             let (Some(grid), Some(terminals)) = (grid.upgrade(), terminals.upgrade()) else {
                 return Ok(());
             };
-            grid.kill_module(id, kill_pane::reopen(id, &decls), &*focus_module)?;
+            let reopen = kill_pane::reopen(id, &decls);
+            grid.kill_module(id, reopen, &*focus_module)?;
+            // Its next show starts a fresh shell: the base terminal's, or that of the next instance of this number.
+            if let Some(driver) = driver.upgrade() {
+                driver.post(HostEvent::SurfaceEnded {
+                    win: WinId::MAIN,
+                    module: id.clone(),
+                    why: Ended::Killed { reopen },
+                });
+            }
             if id.number() >= 2 {
                 terminals.borrow_mut().retire(id);
                 workspaces.borrow_mut().remove_everywhere(id);
@@ -2064,7 +2192,7 @@ fn build_ui(
         let window = window.clone();
         let grid = grid.downgrade();
         let agent = agent_panel_handle.clone();
-        agent_panel_handle.on_view_empty(move |view| {
+        panel_hooks.on_view_empty = Some(Box::new(move |view: ViewId| {
             if view.is_base() || chat_busy.borrow().contains(&view) {
                 return;
             }
@@ -2106,7 +2234,7 @@ fn build_ui(
                     Err(err) => println!("[chat] {id} holds no tab and could not be removed: {err}"),
                 }
             });
-        });
+        }));
     }
     let kill_now: Rc<dyn Fn(&ModuleId, Option<String>) -> Result<(), String>> = {
         let grid = grid.clone();
@@ -2116,11 +2244,9 @@ fn build_ui(
         let focus_module = focus_module.clone();
         let kill_terminal = kill_terminal.clone();
         let agent = agent_panel_handle.clone();
-        let lua_pages = lua_pages.clone();
         let decls = decls.clone();
-        let killed = killed.clone();
         let editor_quitting = editor_quitting.clone();
-        let plugin_panels = plugin_panels.clone();
+        let driver = driver.clone();
         Rc::new(move |id, confirmed| {
             let scope = eitri_core::layout::can_kill(&module_layout.borrow(), id).map_err(|e| e.to_string())?;
             if scope == KillScope::Window {
@@ -2135,23 +2261,16 @@ fn build_ui(
             let reopen = kill_pane::reopen(id, &decls);
             match id.kind() {
                 ModuleKind::Terminal => kill_terminal(id).map_err(|e| e.to_string())?,
+                // Off screen first; then the controller stops a plugin's runs and ends the page's web process,
+                // in that order, and loads the page again when it is next shown.
                 ModuleKind::LuaWebview => {
                     grid.kill_module(id, reopen, &*focus_module)
                         .map_err(|e| e.to_string())?;
-                    // A no-op for a Lua panel that is not a plugin.
-                    plugin_panels.stop(id);
-                    if let Some((_, widget, _, _)) = lua_pages.iter().find(|(m, _, _, _)| m == id) {
-                        // A plugin page built after startup sits inside its module's slot; one never built
-                        // has no web process to end.
-                        let webview = plugin_panels
-                            .webview(id)
-                            .or_else(|| widget.downcast_ref::<webkit6::WebView>().cloned());
-                        if let Some(webview) = webview {
-                            use webkit6::prelude::*;
-                            webview.terminate_web_process();
-                        }
-                    }
-                    killed.borrow_mut().insert(id.clone());
+                    driver.post(HostEvent::SurfaceEnded {
+                        win: WinId::MAIN,
+                        module: id.clone(),
+                        why: Ended::Killed { reopen },
+                    });
                 }
                 // An extra view: its one tab closed, then the view leaves the layout and every workspace,
                 // and its page goes idle under its id.
@@ -2170,7 +2289,12 @@ fn build_ui(
                     grid.kill_module(id, reopen, &*focus_module)
                         .map_err(|e| e.to_string())?;
                     println!("[modules] {id}: killed, {closed} session tab(s) closed");
-                    killed.borrow_mut().insert(id.clone());
+                    // Its next show opens its session chooser.
+                    driver.post(HostEvent::SurfaceEnded {
+                        win: WinId::MAIN,
+                        module: id.clone(),
+                        why: Ended::Killed { reopen },
+                    });
                 }
                 // nvim decides, through its own `:confirm qall` (`editor_quit::EditorQuitting::
                 // kill_editor`): a running nvim is asked, an exited one retired, one that never ran
@@ -2181,55 +2305,6 @@ fn build_ui(
             Ok(())
         })
     };
-    // A killed module shown again, however it got there -- its key, its tray chip,
-    // `eitri.layout.show`, a split key -- comes back fresh: the chat opens its session chooser, a
-    // Lua panel loads its page again. (The terminal's shell starts through the hook above, which
-    // starts one whenever it is shown and none runs.)
-    {
-        let module_layout = module_layout.clone();
-        let killed = killed.clone();
-        let agent = agent_panel_handle.clone();
-        let lua_pages = lua_pages.clone();
-        let plugin_panels = plugin_panels.clone();
-        grid.connect_changed(move || {
-            let revived: Vec<ModuleId> = {
-                let Ok(layout) = module_layout.try_borrow() else {
-                    eprintln!("[modules] BUG: the layout was borrowed when it changed; nothing revived");
-                    return;
-                };
-                killed
-                    .borrow()
-                    .iter()
-                    .filter(|id| layout.is_shown(id))
-                    .cloned()
-                    .collect()
-            };
-            for id in revived {
-                killed.borrow_mut().remove(&id);
-                println!("[modules] {id}: shown again after a kill, starting it fresh");
-                match id.kind() {
-                    ModuleKind::Agent => agent.open_chooser(ViewId::of_module(&id).expect("a chat module")),
-                    ModuleKind::LuaWebview => {
-                        if let Some((_, widget, url, crash_guard)) = lua_pages.iter().find(|(m, _, _, _)| *m == id) {
-                            let webview = plugin_panels
-                                .webview(&id)
-                                .or_else(|| widget.downcast_ref::<webkit6::WebView>().cloned());
-                            if let Some(webview) = webview {
-                                use webkit6::prelude::*;
-                                webview.load_uri(url);
-                            }
-                            // This IS the manual recovery a give-up message points the user at
-                            // (`prefix x`, then this panel's own key): re-arm the guard so a later,
-                            // unrelated crash is caught fresh rather than silently dropped as
-                            // `CrashResponse::AlreadyGivenUp`.
-                            crash_guard.borrow_mut().reset();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
     // A chip is `Ctrl+a <key>` for its module, from the top bar: it never holds the keys itself.
     {
         let open_module = open_module.clone();
@@ -2332,25 +2407,25 @@ fn build_ui(
     // C1's stale-mirror recovery: the page could not apply a `nav_key` against its own
     // current state (the mirror was a keystroke stale, or INPUT is refused on a dead session), so it
     // asks Rust to do exactly what the chord would have done.
-    agent_panel_handle.on_nav_fallthrough({
+    panel_hooks.on_nav_fallthrough = Some(Box::new({
         let move_focus = move_focus.clone();
-        move |view: ViewId, direction| {
+        move |view: ViewId, direction: Direction| {
             move_focus(&view.module(), direction);
         }
-    });
+    }));
 
     // The `?` sheet that `prefix ?` opened was closed. When its own keys (or a click outside it) closed it
     // and the keys are still in the chat, they go back to the module that held them, with the zoom and the
     // hidden chat that opening it changed put back. Every borrow is released before anything moves, since
     // moving the keys re-enters the layout and this hook's own state through `pane_focus`.
-    agent_panel_handle.on_keymap_closed({
+    panel_hooks.on_keymap_closed = Some(Box::new({
         let grid = grid.clone();
         let window = window.clone();
         let module_layout = module_layout.clone();
         let focus_module = focus_module.clone();
         let give_keys = give_keys.clone();
         let keys_return = keys_return.clone();
-        move |opening, return_keys| {
+        move |opening: u64, return_keys: bool| {
             // Only an opening in the base view keeps a return: a chat view holding the keys opens the
             // sheet in its own page, where the keys already are.
             let chat = ModuleId::agent();
@@ -2391,9 +2466,15 @@ fn build_ui(
                 }
             }
         }
-    });
+    }));
 
-    // What every terminal pane gets once, when it is made: its own end, and its own `Ctrl+h/j/k/l`.
+    // What every terminal pane gets once, when it is made: what its shell's start and end do. Its own
+    // `Ctrl+h/j/k/l` is one of its host's controllers, from `wire_host` (`wire`).
+    //
+    // Each start of a shell -- the first, a fresh one after a kill, and Enter after an exit -- and the
+    // end of the pane's current shell are told to the controller, so its module lifecycle knows whether a
+    // shell runs there: one shown again with a shell running gets no second one. The end is told before
+    // what it does, so a kill it causes comes after it.
     //
     // The shell ending by itself -- `exit`, `Ctrl+d`, a signal -- closes that terminal as `prefix x`
     // does, without asking (`terminal::closes_on_exit` says which ends). A report from a shell that is
@@ -2403,22 +2484,28 @@ fn build_ui(
     // scope closes the window through its own ordinary path -- `close window? N running (y/n)` when a
     // tab runs -- rather than the module, leaving the terminal's notice on screen until the window
     // really goes.
-    //
-    // `Ctrl+h/j/k/l` in a terminal are Eitri's, always: a capture-phase controller on its own widget,
-    // like the web modules' controllers below, so the chord is claimed before the terminal's key
-    // controller hands it to the shell. Unlike theirs, all four are swallowed even with no module that
-    // way, so what the shell receives never depends on the layout: `Ctrl+k` goes to the most recent
-    // module above it, and the rest are tmux's no-op at the edge unless a module is there. Each moves
-    // from the terminal's own id. The literal forms the shell loses are `Ctrl+a Ctrl+a` and
-    // `Ctrl+a Ctrl+l`.
     let wire_terminal: Rc<dyn Fn(&ModuleId, &terminal::TerminalPane)> = {
         let grid = grid.downgrade();
         let module_layout = module_layout.clone();
         let terminals = Rc::downgrade(&terminals);
         let kill_terminal = kill_terminal.clone();
         let window = window.clone();
-        let move_focus = move_focus.clone();
+        // Weak: the registry holds the panes, and the controller's host holds the registry.
+        let driver = Rc::downgrade(&driver);
         Rc::new(move |id, pane| {
+            {
+                let id = id.clone();
+                let driver = driver.clone();
+                pane.on_shell_start(move |pid| {
+                    if let Some(driver) = driver.upgrade() {
+                        driver.post(HostEvent::Terminal(TermEvent::Started {
+                            win: WinId::MAIN,
+                            module: id.clone(),
+                            pid,
+                        }));
+                    }
+                });
+            }
             {
                 let id = id.clone();
                 let grid = grid.clone();
@@ -2426,6 +2513,7 @@ fn build_ui(
                 let terminals = terminals.clone();
                 let kill_terminal = kill_terminal.clone();
                 let window = window.clone();
+                let driver = driver.clone();
                 pane.on_shell_exit(move |reported| {
                     let Some(terminals) = terminals.upgrade() else {
                         // The window is going; nothing is left to close.
@@ -2442,6 +2530,12 @@ fn build_ui(
                     if !current.is_some_and(|current| terminal::exit_is_current(reported, current)) {
                         println!("[terminal] {id}: the end of an earlier shell (start {reported}) arrived late; it closes nothing");
                         return false;
+                    }
+                    if let Some(driver) = driver.upgrade() {
+                        driver.post(HostEvent::Terminal(TermEvent::Exited {
+                            win: WinId::MAIN,
+                            module: id.clone(),
+                        }));
                     }
                     if grid.upgrade().is_none() {
                         return false;
@@ -2472,20 +2566,6 @@ fn build_ui(
                     }
                 });
             }
-            let id = id.clone();
-            let move_focus = move_focus.clone();
-            let controller = EventControllerKey::new();
-            controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            controller.connect_key_pressed(move |_controller, key, _keycode, state| {
-                match terminal::navigation(key, state) {
-                    Some(direction) => {
-                        move_focus(&id, direction);
-                        glib::Propagation::Stop
-                    }
-                    None => glib::Propagation::Proceed,
-                }
-            });
-            pane.widget().add_controller(controller);
         })
     };
     {
@@ -2499,28 +2579,37 @@ fn build_ui(
         }
     }
 
+    // What every module host's controllers act through (`wire`): the startup hosts are wired
+    // below, once the window's key handling exists, and a host made later is wired where it is made.
+    let wire_deps = Rc::new(WireDeps {
+        move_focus: move_focus.clone(),
+        nav_intercept: {
+            let agent = agent_panel_handle.clone();
+            Rc::new(move |view| agent.nav_intercept(view))
+        },
+        text_size: text_size_controller.clone(),
+    });
+    // The controller's `CreateSurface` and `DropSurface`: the same constructors, a host made there wired
+    // there, and what a kill or a retirement ends.
+    wm_host.set_surface_maker(Rc::new(gtk_host_surfaces::SurfaceOps {
+        surfaces: surfaces.clone(),
+        wire_deps: wire_deps.clone(),
+        wire_terminal: wire_terminal.clone(),
+    }));
     // A terminal instance's pane, with its shell to start in `dir`: the registry's idle pane of that
     // number if it was killed before, whose host the grid already holds, else a new pane with its own
     // host, off screen until something shows it.
     let host_terminal: Rc<dyn Fn(&ModuleId, PathBuf)> = {
-        let grid = grid.clone();
-        let terminals = terminals.clone();
-        let make_terminal_pane = make_terminal_pane.clone();
+        let surfaces = surfaces.clone();
         let wire_terminal = wire_terminal.clone();
-        let text_size_controller = text_size_controller.clone();
-        Rc::new(move |id, dir| {
-            let (pane, reused) = terminals.borrow_mut().take_or_make(id, || make_terminal_pane());
-            pane.set_start_dir(dir);
-            if !grid.has_host(id) {
-                if reused == terminal::registry::Reused::Yes {
-                    eprintln!("[terminal] BUG: {id} reused a pane the grid has no host for; giving it one");
-                }
-                grid.add(id.clone(), pane.widget(), pane.widget(), HostKind::Direct);
-                // Off screen until a placement shows it (`ModuleGrid::apply` maps it then).
-                pane.widget().set_child_visible(false);
+        let wire_deps = wire_deps.clone();
+        Rc::new(move |id, dir| match surfaces.terminal(id, dir) {
+            Ok(Some(pane)) => {
                 wire_terminal(id, &pane);
-                wheel_zoom::install(id.clone(), pane.widget().upcast_ref(), text_size_controller.clone());
+                wire_host(WireKind::Terminal, id, pane.widget().upcast_ref(), &wire_deps);
             }
+            Ok(None) => {}
+            Err(err) => eprintln!("[terminal] BUG: {id}: no host was made: {err}"),
         })
     };
     // A new terminal instance: the lowest number no workspace holds and no data kept for a later build
@@ -2541,6 +2630,7 @@ fn build_ui(
         let give_keys = give_keys.clone();
         let rules = rules.clone();
         let decls = decls.clone();
+        let driver = driver.clone();
         Rc::new(move |how, dir| {
             let id = {
                 let layout = module_layout.borrow();
@@ -2555,7 +2645,7 @@ fn build_ui(
                 new_instance_id(ModuleKind::Terminal, &layouts, &workspaces.reserved())
             }
             .ok_or_else(|| "at most 9 terminals".to_string())?;
-            host_terminal(&id, dir);
+            host_terminal(&id, dir.clone());
             let opened = match open_instance(&grid, &rules, &id, &how, &*give_keys) {
                 Ok(opened) => opened,
                 Err(err) => {
@@ -2566,6 +2656,12 @@ fn build_ui(
             workspaces
                 .borrow_mut()
                 .add_everywhere_at(&id, declared_placement(&decls, &id, Placement::BelowEditor));
+            // Placed: the controller now holds the instance, and starts its shell once it is shown.
+            driver.post(HostEvent::Declared {
+                win: WinId::MAIN,
+                module: id.clone(),
+                kind: SurfaceKind::Terminal { cwd: dir },
+            });
             println!("[terminal] {id}: opened {}", how.describe(&opened));
             Ok(id)
         })
@@ -2584,6 +2680,7 @@ fn build_ui(
         let host_terminal = host_terminal.clone();
         let rules = rules.clone();
         let decls = decls.clone();
+        let driver = driver.clone();
         Rc::new(move |id, dir| {
             {
                 let layout = module_layout.borrow();
@@ -2595,7 +2692,7 @@ fn build_ui(
                     return Err(format!("{id}: another workspace holds it"));
                 }
             }
-            host_terminal(id, dir);
+            host_terminal(id, dir.clone());
             let size = rule_for(&rules, id, OpenPoint::NewInstance, None).size;
             let rect = grid.with_current_frame(|frame| eitri_core::layout::rules::float_rect(size, frame.size));
             // Added as a plain float: the scratchpad's show that follows makes it a scratch float and
@@ -2608,6 +2705,11 @@ fn build_ui(
             workspaces
                 .borrow_mut()
                 .add_everywhere_at(id, declared_placement(&decls, id, Placement::BelowEditor));
+            driver.post(HostEvent::Declared {
+                win: WinId::MAIN,
+                module: id.clone(),
+                kind: SurfaceKind::Terminal { cwd: dir },
+            });
             println!("[terminal] {id}: opened as a float for the scratchpad");
             Ok(())
         })
@@ -2618,71 +2720,19 @@ fn build_ui(
     // by the one constructor, with the base view's page as its related one -- and, the first time, its
     // host, off screen until a placement shows it, with the keys' routes every web module has.
     let host_chat_view: Rc<dyn Fn(&ModuleId) -> Result<(), String>> = {
-        let grid = grid.clone();
-        let chat_views = chat_views.clone();
-        let agent = agent_panel_handle.clone();
-        let base_webview = base_webview.clone();
-        let move_focus = move_focus.clone();
-        let text_size_controller = text_size_controller.clone();
+        let surfaces = surfaces.clone();
+        let wire_deps = wire_deps.clone();
         Rc::new(move |id| {
-            let Some(base) = base_webview.as_ref() else {
-                return Err(CHAT_VIEWS_NEED_WEBKIT.to_string());
-            };
-            let view = ViewId::of_module(id)
-                .filter(|view| !view.is_base())
-                .ok_or_else(|| format!("{id} is not an extra chat view"))?;
-            let was_live = chat_views.borrow().get(id).is_some();
-            let ((webview, page), reused) = chat_views
-                .borrow_mut()
-                .take_or_make(id, || agent_panel::build_chat_page(&agent, view, Some(base)));
-            // Says which of the pool's two answers this was, so a log shows a page reused rather than built.
-            println!(
-                "[chat] {id}: page {}",
-                if reused == chat_views::Reused::Yes {
-                    "reused"
-                } else {
-                    "built"
-                }
-            );
-            if reused == chat_views::Reused::Yes && !was_live {
-                // The same page, still answering for this view only: it starts again from an empty
-                // record and a fresh document.
-                agent.attach_page(view, page);
-                agent.load_document(view);
-            }
-            if !grid.has_host(id) {
-                if reused == chat_views::Reused::Yes {
-                    eprintln!("[chat] BUG: {id} reused a page the grid has no host for; giving it one");
-                }
-                let host = WebHost::new(&webview);
-                grid.add(id.clone(), &host, &webview, web_host);
-                // Off screen until a placement shows it (`ModuleGrid::apply` maps it then).
-                host.set_child_visible(false);
-                let host: gtk4::Widget = host.upcast();
-                install_module_nav(
-                    id.clone(),
-                    &host,
-                    move_focus.clone(),
-                    Some(agent.nav_intercept(view)),
-                    false,
-                );
-                panel_super::install(&host);
-                wheel_zoom::install(id.clone(), &host, text_size_controller.clone());
+            if let Some(host) = surfaces.chat_view(id, CHAT_VIEWS_NEED_WEBKIT)? {
+                wire_host(WireKind::Chat, id, &host, &wire_deps);
             }
             Ok(())
         })
     };
     // A page that never got its view placed waits idle under its id.
     let retire_chat_page: Rc<dyn Fn(&ModuleId)> = {
-        let chat_views = chat_views.clone();
-        let agent = agent_panel_handle.clone();
-        Rc::new(move |id| {
-            if chat_views.borrow_mut().retire(id) {
-                if let Some(view) = ViewId::of_module(id) {
-                    agent.idle_page(view);
-                }
-            }
-        })
+        let surfaces = surfaces.clone();
+        Rc::new(move |id| surfaces.retire_chat_page(id))
     };
     // A new chat view: the lowest `agent#N` no workspace holds and no kept data reserves, its page and
     // host (`host_chat_view`), its tab -- a new empty tab of the window's default agent, or the base
@@ -2703,6 +2753,7 @@ fn build_ui(
         let give_keys = give_keys.clone();
         let rules = rules.clone();
         let decls = decls.clone();
+        let driver = driver.clone();
         Rc::new(move |how, tab| {
             let id = {
                 let layout = module_layout.borrow();
@@ -2747,6 +2798,12 @@ fn build_ui(
             workspaces
                 .borrow_mut()
                 .add_everywhere_at(&id, declared_placement(&decls, &id, Placement::BelowEditor));
+            // Placed, its page kept: the controller now holds the view.
+            driver.post(HostEvent::Declared {
+                win: WinId::MAIN,
+                module: id.clone(),
+                kind: SurfaceKind::Chat { view },
+            });
             if opened.takes_keys {
                 agent.arrive(view);
             }
@@ -2770,6 +2827,7 @@ fn build_ui(
         let chat_busy = chat_busy.clone();
         let rules = rules.clone();
         let decls = decls.clone();
+        let driver = driver.clone();
         Rc::new(move |id| {
             {
                 let layout = module_layout.borrow();
@@ -2806,6 +2864,11 @@ fn build_ui(
             workspaces
                 .borrow_mut()
                 .add_everywhere_at(id, declared_placement(&decls, id, Placement::BelowEditor));
+            driver.post(HostEvent::Declared {
+                win: WinId::MAIN,
+                module: id.clone(),
+                kind: SurfaceKind::Chat { view },
+            });
             println!("[chat] {id}: opened as a float for the scratchpad");
             Ok(())
         })
@@ -3030,7 +3093,7 @@ fn build_ui(
         let refused_name = top_bar.app_name.clone();
         let toast = toast.clone();
         let agent = agent_panel_handle.clone();
-        agent_panel_handle.on_show_view(move |view| {
+        panel_hooks.on_show_view = Some(Box::new(move |view: ViewId| {
             let id = view.module();
             if let Err(err) = show_on_screen(&id) {
                 refuse(&refused_name, &toast, &err);
@@ -3039,7 +3102,7 @@ fn build_ui(
             if give_keys(&id) {
                 agent.arrive(view);
             }
-        });
+        }));
     }
     // The mark `swap.marked` swaps with, as text in the top bar. Refreshed after every mark verb and
     // every change of the grid: a module retired or killed takes its mark with it.
@@ -3085,12 +3148,12 @@ fn build_ui(
     }
     refresh_workspace();
     // A rename or a delete changes what the state file holds without changing any layout, so the
-    // grid's change hook never hears of it: the saver and the top bar are told here.
+    // grid's change hook never hears of it: the controller and the top bar are told here.
     let workspaces_changed: Rc<dyn Fn()> = {
-        let layout_saver = layout_saver.clone();
+        let driver = driver.clone();
         let refresh_workspace = refresh_workspace.clone();
         Rc::new(move || {
-            layout_saver.changed();
+            driver.post(HostEvent::LayoutChangedByShell { win: WinId::MAIN });
             refresh_workspace();
         })
     };
@@ -4045,16 +4108,20 @@ fn build_ui(
     // `<leader>bd`/`<leader>bo` etc., resolved by the panel's own sequence engine and sent as a
     // `tab_verb` message -- routed through the very code the prefix's `Action::Tab` arm runs, the
     // container selection's rules included: a tab verb ends a selection whichever route sent it.
-    agent_panel_handle.on_tab_verb({
+    panel_hooks.on_tab_verb = Some(Box::new({
         let run_action = run_action.clone();
         let tab_verb_view = tab_verb_view.clone();
-        move |view, tab_action| {
+        move |view: ViewId, tab_action: TabAction| {
             tab_verb_view.set(Some(view));
             run_action(Action::Tab(tab_action), 0);
             // A gate that refused the action never reached `run_tab_action`, which takes it.
             tab_verb_view.set(None);
         }
-    });
+    }));
+    // Every hook is built: the panel gets them all at once. Nothing since the first was built can
+    // have made the panel call one, since the window is still being built and no page message is
+    // read before the main loop runs again.
+    panel_wiring::wire_panel(&agent_panel_handle, panel_hooks);
 
     // The prefix. Installed after every other window-level controller that exists
     // at startup, so it sees keys first; HINT's, added when a HINT starts, still comes before it.
@@ -4241,33 +4308,19 @@ fn build_ui(
         });
     }
 
-    // --- From a web module (the agent panel, a Lua panel): a capture-phase controller on its host
-    // (`install_module_nav`), one per web module here; a web module added later installs its own.
-    // The host is the `WebHost` around the `WebView` since 2026-09-29, an ancestor of the focus
-    // widget rather than the focus widget itself. That changes nothing here: GTK runs capture-phase
-    // controllers on every ancestor of the target, top down, before any controller on the target
-    // (`gtk_propagate_event_internal`, gtkmain.c, GTK 4.22.5), and WebKit's second delivery of a key
-    // the page did not handle starts at the window again (`pane_switch::LetThrough`).
-    // Only the agent host gets an intercept: `Ctrl+j`/`Ctrl+k` claimed for the
-    // composer, decided from the panel's own `panel_keys` mirror. A Lua panel has no such mode and
-    // passes `None`, so every chord there still goes straight to `move_focus`.
-    // A Lua panel's page (a plugin's among them) never gets `Ctrl+h/j/k/l`, even with no module that way:
-    // what such a page does with a key must not depend on where its module sits. The agent panel still
-    // gets the chord at an edge, as its own keys expect.
-    for (id, host) in grid
-        .hosts()
-        .iter()
-        .filter(|(id, _)| matches!(id.kind(), ModuleKind::Agent | ModuleKind::LuaWebview))
+    // --- Every host the window opens with -- the editor, each terminal, each chat view and each Lua
+    // panel, a plugin's page among them, built yet or not -- gets its controllers here, once: the keys'
+    // routes, the Super filter and `Ctrl`+wheel zoom, as its kind gets them (`wire`). A host
+    // made later is wired where it is made (`host_terminal`, `host_chat_view`).
     {
-        // Each chat view's intercept reads its own page's mode.
-        let intercept: Option<Rc<dyn Fn(Direction) -> bool>> =
-            ViewId::of_module(id).map(|view| agent_panel_handle.nav_intercept(view));
-        let swallow_at_edge = id.kind() == ModuleKind::LuaWebview;
-        install_module_nav(id.clone(), host, move_focus.clone(), intercept, swallow_at_edge);
-        // No key with Super or Hyper held reaches a web module's page: WebKitGTK does not tell the
-        // page, so the agent panel's `a`/`d`/`D` and the bypass `y`, or a plugin page's own keys,
-        // could not refuse it there (`panel_super.rs`).
-        panel_super::install(host);
+        let plugin_modules = plugin_panels.modules();
+        for (id, host) in grid.hosts() {
+            let Some(kind) = WireKind::of_module(&id, plugin_modules.contains(&id)) else {
+                eprintln!("[modules] BUG: {id} has a host, but nothing wires a host of its kind");
+                continue;
+            };
+            wire_host(kind, &id, &host, &wire_deps);
+        }
     }
 
     // The shell handles Ctrl+h/j/k/l when the editor has no running nvim, since nothing inside can
@@ -4584,19 +4637,22 @@ fn build_ui(
         });
         app.add_action(&action);
         if let Some(keybinding) = &entry.keybinding {
-            app.set_accels_for_action(&format!("app.{action_name}"), &[keybinding.as_str()]);
+            let accel = gtk_host::keys::registered_accel(keybinding);
+            app.set_accels_for_action(&format!("app.{action_name}"), &[&accel]);
         }
     }
 
     // The layout's first focus: where the keys were when this project's last arrangement change was
     // written, from
-    // its state file (`layout_state`'s module doc); else the editor, or a Lua `main` panel that hid
-    // it (`Layout::initial`, `reconcile`). Read BEFORE `present()`: GTK4's `gtk_window_show` moves
+    // its state file (`eitri_core::wm::persist`'s module doc); else the editor, or a Lua `main` panel that hid
+    // it (`Layout::initial`, `reconcile`). Read BEFORE the window is shown: GTK4's `gtk_window_show` moves
     // focus Tab-forward when there is none, and were that ever to land inside a module, `pane_focus`
     // would rewrite the layout's `focus` before this line read it. Today a top-bar item (a tray chip,
     // or `↻`) is the first focusable widget, so it never has.
     let first = module_layout.borrow().focus().clone();
-    window.present();
+    // The probe starts before the present phase, whose show and first focus are one batch: it runs nothing that
+    // needs the window shown, and the tabs it opens in the startup chat views still exist before the first focus
+    // arrives in one, as when it started between the two.
     #[cfg(feature = "probe")]
     grid_probe::start_if_requested(grid_probe::Context {
         app: app.clone(),
@@ -4622,13 +4678,23 @@ fn build_ui(
         },
         chat_views: chat_views.clone(),
     });
-    // Call `grab_focus()` after `present()`, since a widget must be shown to take focus.
-    // Then call `arrive` as module keys do, so restored chat focus uses the same
-    // arrival behavior as other keyboard routes. At launch the panel may still be
-    // on its start screen or loading, so arrival may have no visible effect.
-    if focus_module(&first) {
-        arrive(&first);
-    }
+    // The window shown, then the first module given the keys through `focus_module`: after the show, matching
+    // standalone.rs's own `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
+    // meaningless. A chat view that took the keys is arrived at, as `Ctrl+a a` arrives: a project whose file
+    // has the keys in the chat reopens with them there the way every other keyboard route lands. At launch
+    // the panel has no session yet -- it is on its start screen, and its page may not have loaded -- so
+    // today `enter_input` is refused there and this changes nothing on screen; it is written so that a launch
+    // that resumes a session by itself lands in the composer, or on a waiting card, without anyone having to
+    // remember this line. No activation token is handed over: GTK presents with the one the launcher set in
+    // the environment, as it always has.
+    driver.start(
+        WinId::MAIN,
+        StartStep::Present {
+            activation: None,
+            arrive: ViewId::of_module(&first),
+            first,
+        },
+    );
 
     // The one real v1 event: fires once the window is actually up, so any Lua handler reacting
     // to it sees a fully-built shell (panels registered, commands bound, window shown).
@@ -4648,7 +4714,8 @@ fn build_ui(
         store.set_lua_panels(panel_ids);
     }
     lua_engine.layout.borrow_mut().accept_requests();
-    lua_engine.emit("shell:ready");
+    // `shell:ready`, after the window is shown; what its handlers queue is applied right after.
+    driver.start(WinId::MAIN, StartStep::Requests);
     apply_layout_requests();
 
     // Startup leaves free but resident heap pages behind (the GPU driver's shader compiles, above all);
@@ -4662,8 +4729,8 @@ fn build_ui(
     // that still needs it afterward -- this watch included -- must clone it first, the same
     // pattern `lua_engine`'s own comment two blocks up documents for itself.
     {
-        let window = window.clone();
-        agent_panel::watch_supervisor(agent_panel_handle.clone(), Rc::new(move || window.present()));
+        let raised = window.clone();
+        agent_panel::watch_supervisor(agent_panel_handle.clone(), Rc::new(move || raised.present()));
     }
 
     // Registered last: this is `pane`'s final use in this function, so its `Rc` can be moved in
@@ -4712,10 +4779,10 @@ fn build_ui(
         if !ending_by_signal.get() && editor_quitting.window_close() == editor_quit::WindowClose::Wait {
             return glib::Propagation::Stop;
         }
-        // First, and synchronously: the debounce may still be waiting on an arrangement
-        // change. With none unwritten this writes nothing -- a click never does (`layout_state`'s
-        // module doc says what is written when).
-        layout_saver.save_now();
+        // First, and synchronously: the debounce may still be waiting on an arrangement change. With
+        // none unwritten this writes nothing -- a click never does (`eitri_core::wm::persist`'s module
+        // doc says what is written when).
+        driver.persist_now(WinId::MAIN);
         // Kills nvim by its pid if it does not exit within the fork's wait (codex p1 #2).
         pane.shutdown();
         // Hangs every terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
@@ -5699,17 +5766,19 @@ fn refusal_text(err: &LayoutError) -> String {
     gone_editor_toast_text(err).unwrap_or_else(|| err.to_string())
 }
 
-/// Installs Ctrl+h/j/k/l navigation on a web module host, both at startup and for modules added
-/// later. The navigator inside Neovim never sees these keys, because Neovim is not the focused
-/// widget here. Capture phase runs before the `WebView` can consume the chord; bubble phase would
-/// be too late. A successful focus move consumes the chord.
+/// `Ctrl+h/j/k/l` from a web module (the agent panel, a Lua panel), on its host: a capture-phase
+/// controller, because `vim-tmux-navigator` lives inside Neovim, which is not the focused widget
+/// here, so nothing would ever run; capture, not bubble, because a `WebView` handles key events
+/// itself and would otherwise consume the chord before a bubble-phase controller on the same widget
+/// ran. Only a chord that moves is claimed. Called only by `wire::wire_host`, once per web
+/// module host.
 ///
-/// `intercept` runs after the `LetThrough` second-delivery check and before `move_focus`. A
-/// claimed chord reaches neither `move_focus` nor the page. Only the agent host passes an
-/// interceptor; Lua panels pass `None`.
+/// `intercept` is consulted after the `LetThrough` second-delivery check and before
+/// `move_focus`: a chord it claims stops right there, never reaching `move_focus` or the page. Only
+/// the agent host's caller passes one; a Lua panel passes `None`.
 ///
-/// With `swallow_at_edge`, a chord with no module in that direction stops here rather than
-/// reaching the page, so WebKit has no event to return to GTK.
+/// `swallow_at_edge`: a chord with no module that way stops here instead of going on to the page
+/// (`pane_switch::nav_outcome`), so nothing is let through and WebKit has nothing to hand back.
 fn install_module_nav(
     id: ModuleId,
     host: &gtk4::Widget,
@@ -6615,12 +6684,12 @@ mod tests {
         );
     }
 
-    /// Keyboard arrivals enter BROWSE. A new tab opens the composer instead,
-    /// since an empty tab has nothing to browse.
+    /// Every keyboard arrival lands in BROWSE, except the
+    /// new-tab path, which still opens the composer -- an empty tab has nothing to browse.
     #[test]
     fn keyboard_arrival_is_browse_and_only_a_new_tab_types() {
-        // Split literals, so this test's own text is not counted.
-        let src = include_str!("main.rs");
+        let (_, src) =
+            eitri_core::source_scan::function_in(&eitri_core::source_scan::rust_sources(&["shell/src"]), "build_ui");
         let calls = src.matches(concat!(".enter", "_input(")).count();
         assert_eq!(calls, 1, "only the new-tab path may land in INPUT");
         // Scoped to the two closures: a count over the whole file stays green while other
@@ -6635,7 +6704,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("no body after `{anchor}`"));
             eitri_core::source_scan::braced(code, open)
         }
-        let code = eitri_core::source_scan::code_only(src);
+        let code = src;
         let land_by_key = body_after(&code, concat!("let land_by_key: Rc<dyn Fn(&Module", "Id) -> bool>"));
         assert!(
             land_by_key.contains(concat!(".arr", "ive(view)")),
@@ -6693,10 +6762,8 @@ mod tests {
         let jit = concat!("process_memory::ui_process_jsc", "_without_jit()");
         assert_eq!(body.matches(jit).count(), 1, "called exactly once in main");
         assert!(body.find(jit) < body.find(concat!("build_", "application()")));
-        let ui = &src[src.find(concat!("fn build_", "ui(")).expect("build_ui")..];
-        let ui = &ui[..ui
-            .find(concat!("\nfn ", "flash("))
-            .expect("the function after build_ui")];
+        let (_, ui) =
+            eitri_core::source_scan::function_in(&eitri_core::source_scan::rust_sources(&["shell/src"]), "build_ui");
         assert_eq!(
             ui.matches(concat!("process_memory::trim_heap", "_after_startup()"))
                 .count(),
@@ -6728,12 +6795,8 @@ mod tests {
     /// marks the close for the watchdog and writes nothing that can panic or block.
     #[test]
     fn a_termination_signal_closes_the_window_without_its_questions() {
-        // Split literals, so this test's own text is not counted.
-        let src = include_str!("main.rs");
-        let ui = &src[src.find(concat!("fn build_", "ui(")).expect("build_ui")..];
-        let ui = &ui[..ui
-            .find(concat!("\nfn ", "flash("))
-            .expect("the function after build_ui")];
+        let (_, ui) =
+            eitri_core::source_scan::function_in(&eitri_core::source_scan::rust_sources(&["shell/src"]), "build_ui");
         let install = ui
             .find(concat!("end_signals::", "install("))
             .expect("build_ui installs the handlers");
@@ -6888,30 +6951,21 @@ mod tests {
         ];
         let sources = scan::rust_sources(&["shell/src"]);
         scan::require_anchors(&sources, &["fn build_ui(", "fn flash(", "fn refuse_said("]);
-        let file = scan::file_with(&sources, "fn build_ui(");
-        let code_text = scan::code_only(&file.text);
-        let raw: Vec<char> = file.text.chars().collect();
-        let code: Vec<char> = code_text.chars().collect();
-        assert_eq!(
-            raw.len(),
-            code.len(),
-            "code_only keeps one char for every char it reads"
-        );
-        let bodies = scan::functions(&code_text, "build_ui");
-        assert_eq!(bodies.len(), 1, "one build_ui in {}", file.path);
-        let body_at = bodies[0].as_ptr() as usize - code_text.as_ptr() as usize;
-        let start = code_text[..body_at].chars().count();
-        let end = start + bodies[0].chars().count();
-        let ident = |c: char| c.is_alphanumeric() || c == '_';
-        let word: Vec<char> = "flash".chars().collect();
+        let (_, code_text) = scan::function_in(&sources, "build_ui");
+        let (_, raw_text) = scan::function_in_raw(&sources, "build_ui");
+        let code = code_text.as_bytes();
+        let start = 0;
+        let end = code.len();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let word = b"flash";
         let mut found = vec![0usize; FLASH_ONLY.len()];
         let mut bare = Vec::new();
-        for at in start..end - word.len() {
+        for at in start + 1..end - word.len() {
             if code[at..at + word.len()] != word[..]
                 || ident(code[at - 1])
-                || code[at - 1] == '.'
+                || code[at - 1] == b'.'
                 || ident(code[at + word.len()])
-                || code[at + word.len()..end].iter().find(|c| !c.is_whitespace()) != Some(&'(')
+                || code[at + word.len()..end].iter().find(|c| !c.is_ascii_whitespace()) != Some(&b'(')
             {
                 continue;
             }
@@ -6922,17 +6976,17 @@ mod tests {
             loop {
                 open -= 1;
                 match code[open] {
-                    '}' => depth += 1,
-                    '{' if depth == 0 => break,
-                    '{' => depth -= 1,
+                    b'}' => depth += 1,
+                    b'{' if depth == 0 => break,
+                    b'{' => depth -= 1,
                     _ => {}
                 }
             }
             let head = (start..open)
                 .rev()
-                .find(|&j| matches!(code[j], ';' | '{' | '}'))
+                .find(|&j| matches!(code[j], b';' | b'{' | b'}'))
                 .unwrap_or(start);
-            let arm: String = raw[head + 1..at].iter().collect();
+            let arm = &raw_text[head + 1..at];
             let hits: Vec<usize> = (0..FLASH_ONLY.len())
                 .filter(|&k| arm.contains(FLASH_ONLY[k].0))
                 .collect();

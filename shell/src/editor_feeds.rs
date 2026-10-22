@@ -22,6 +22,7 @@ use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel, PaneSwitchReader};
 use eitri_core::plugin::follow_feed::{FollowBatch, FollowReader, FollowSocket};
 use eitri_core::theme::feed::{ThemeFeed, ThemePayloadReader};
 use eitri_core::theme::payload::NvimThemePayload;
+use eitri_core::wm::feeds::{self, Arm, PumpEvent, PumpWake};
 
 /// What a feed's consumer wants done with each thing that arrives. Held as an `Rc` so the pump can
 /// let go of its slot before it calls the handler, and a handler may therefore reach the pump again.
@@ -37,6 +38,16 @@ enum Wake {
     Watches(Vec<glib::SourceId>),
     /// A poll is running; what wakes the pump next is decided when it ends.
     Polling,
+}
+
+impl Wake {
+    fn policy(&self) -> PumpWake {
+        match self {
+            Self::Timer => PumpWake::Timer,
+            Self::Watches(_) => PumpWake::Watches,
+            Self::Polling => PumpWake::Polling,
+        }
+    }
 }
 
 pub(crate) struct FeedPump {
@@ -73,52 +84,52 @@ impl FeedPump {
 
     /// The timer fired: poll, and keep the timer only while there is more to read.
     fn on_timer(&self) -> glib::ControlFlow {
-        let timer = std::mem::replace(&mut *self.wake.borrow_mut(), Wake::Polling);
-        self.tick();
-        if self.feeds.borrow().is_quiet() {
-            // The timer's id is dropped, not removed: returning `Break` removes it.
-            *self.wake.borrow_mut() = self.watches();
-            glib::ControlFlow::Break
-        } else {
-            *self.wake.borrow_mut() = timer;
-            glib::ControlFlow::Continue
-        }
+        self.dispatch(PumpEvent::TimerFired)
     }
 
     /// A listening socket became readable: poll at once, then wait as the feeds' state says.
     fn on_ready(&self) -> glib::ControlFlow {
-        let woken = std::mem::replace(&mut *self.wake.borrow_mut(), Wake::Polling);
-        if let Wake::Watches(watches) = woken {
-            // The one dispatching now included: GLib defers its destruction until it returns.
-            for watch in watches {
-                watch.remove();
-            }
-        }
-        self.tick();
-        self.settle();
-        glib::ControlFlow::Break
+        self.dispatch(PumpEvent::ListenerReady)
     }
 
-    /// After a reader was added or a watch fired: watch the sockets if the feeds are quiet, else
-    /// poll on the timer. Does nothing while a poll is running; that poll decides when it ends.
+    /// A reader added during a poll is included when that poll decides its next wake.
     fn rearm(&self) {
+        self.dispatch(PumpEvent::ReaderAdded);
+    }
+
+    fn dispatch(&self, event: PumpEvent) -> glib::ControlFlow {
         let woken = std::mem::replace(&mut *self.wake.borrow_mut(), Wake::Polling);
-        match woken {
-            Wake::Watches(watches) => {
+        let now = woken.policy();
+        let before = feeds::before(now, event);
+        let previous = if before.remove_watches {
+            if let Wake::Watches(watches) = woken {
+                // The dispatching watch is included; its destruction waits until the callback returns.
                 for watch in watches {
                     watch.remove();
                 }
-                self.settle();
             }
-            other => *self.wake.borrow_mut() = other,
+            Wake::Polling
+        } else {
+            woken
+        };
+        if before.tick {
+            self.tick();
+        }
+        let (_, arm) = feeds::after(now, event, self.feeds.borrow().is_quiet());
+        self.settle(arm, previous);
+        if arm == Arm::KeepTimer {
+            glib::ControlFlow::Continue
+        } else {
+            // A dispatching timer removes itself on Break, rather than being removed from outside.
+            glib::ControlFlow::Break
         }
     }
 
-    fn settle(&self) {
-        let next = if self.feeds.borrow().is_quiet() {
-            self.watches()
-        } else {
-            self.timer()
+    fn settle(&self, arm: Arm, previous: Wake) {
+        let next = match arm {
+            Arm::KeepTimer | Arm::Nothing => previous,
+            Arm::ArmTimer => self.timer(),
+            Arm::AddWatches => self.watches(),
         };
         *self.wake.borrow_mut() = next;
     }
@@ -151,7 +162,12 @@ impl FeedPump {
                     for watch in watches {
                         watch.remove();
                     }
-                    return self.timer();
+                    let (next, arm) = feeds::watch_refused();
+                    debug_assert_eq!((next, arm), (PumpWake::Timer, Arm::ArmTimer));
+                    return match arm {
+                        Arm::ArmTimer => self.timer(),
+                        _ => unreachable!("a refused watch needs a timer"),
+                    };
                 }
             }
         }
@@ -504,7 +520,13 @@ mod tests {
         // Both windows make the hookup.
         use eitri_core::source_scan as scan;
         let sources = scan::rust_sources(&["shell/src"]);
-        for anchor in ["fn build_ui(", "fn build(app: &Application, start: &Start)"] {
+        let (file, body) = scan::function_in(&sources, "build_ui");
+        assert!(
+            body.contains("wake_panel_on_context(&feed_pump"),
+            "{} does not wake its panel on a context change",
+            file.path
+        );
+        for anchor in ["fn build(app: &Application, start: &Start)"] {
             let file = scan::file_with(&sources, anchor);
             assert!(
                 scan::code_only(&file.text).contains("wake_panel_on_context(&feed_pump"),

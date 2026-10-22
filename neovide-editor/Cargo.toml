@@ -40,8 +40,9 @@ serde_json = "1"
 # version gtk4 0.11.4 already resolves.
 glib = "0.22"
 
-# A plain `main`, not libtest: winit allows one `EventLoop` per process and only on the main
-# thread, so each real `LiveHarness` case runs in a fresh child copy of this binary.
+# A plain `main`, not libtest: each real `LiveHarness` case runs in a fresh child copy of this
+# binary, one case per child, so it can start its own Xvfb before anything connects to a display and
+# keep GTK and winit on that child's main thread.
 [[test]]
 name = "unfocused_cursor"
 harness = false
@@ -60,4 +61,16 @@ harness = false
 
 [[test]]
 name = "os_scale_factor"
+harness = false
+
+[[test]]
+name = "multi_nvim"
+harness = false
+
+[[test]]
+name = "shared_watch"
+harness = false
+
+[[test]]
+name = "realized_restart"
 harness = false

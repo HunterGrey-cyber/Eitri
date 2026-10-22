@@ -1,51 +1,43 @@
-//! `prefix x`, tmux's `kill-pane`: it closes the module outright rather than hiding it. Stock
-//! tmux binds `x` to `confirm-before -p "kill-pane #P? (y/n)" kill-pane` (checked against a
-//! throwaway `tmux -L xprobe -f /dev/null` server, tmux next-3.7), so Eitri asks first too, in the
-//! window's one y/n (`close_prompt`), naming the module where tmux names the pane's number.
+//! `prefix x` terminates a module rather than merely hiding it. The window's y/n prompt
+//! (`close_prompt`) names the module and asks for confirmation.
 //!
-//! What a kill ends, per module:
-//! - **terminal**: its shell is hung up (SIGHUP, as closing a terminal does) and the module goes back
-//!   where a first launch puts it, hidden; `prefix t` starts a fresh shell there.
-//! - **a Lua panel**: its web process is terminated and the module goes back where its `position`
-//!   puts it, hidden; its key loads the page afresh.
-//! - **agent**: every base-view tab is closed as `prefix &` closes one (records stay resumable), and
-//!   the module is hidden in place; `prefix a` opens the chat with the session chooser. A tab shown in
-//!   another chat view keeps running there.
-//! - **a chat view `agent#N`**: its one tab is closed the same way and the view leaves every
-//!   workspace; its page waits idle under its id for the next view of that number.
-//! - **editor**: nvim is asked to `:confirm qall`, so unsaved buffers get nvim's own prompt; only if
-//!   nvim quits does the module go. It cannot come back in this window (`eitri_core::layout::kill`'s
-//!   module doc: the fork's `LiveHarness` owns a winit event loop, which is once per process), and
-//!   the prompt says so. Cancelled in nvim, nothing closes.
+//! Killing a terminal sends SIGHUP to its shell and returns the module to its first-launch
+//! position, hidden. `prefix t` starts a fresh shell there. Killing a Lua panel terminates its
+//! web process and returns the module to its declared `position`, hidden. Its key loads the
+//! page afresh.
 //!
-//! - **the last module on screen**: tmux closes the window when its last pane is killed, and ends when its last window
-//!   is, so `x` here closes Eitri ([`KillScope::Window`]). One question: it names what the window
-//!   close would have asked about (`N running, M queued`), and `y` is taken as the answer to both. The
-//!   editor still goes through `:confirm qall` first, and the window closes when nvim exits.
+//! Killing the agent closes every base-view tab as `prefix &` closes one, leaving sessions
+//! resumable. The module is hidden in place; `prefix a` opens the chat with the session
+//! chooser. A tab shown in another chat view keeps running there. Killing a chat view `agent#N`
+//! closes its one tab the same way and removes the view from every workspace. Its page waits
+//! idle under its id for the next view of that number.
 //!
-//! - **every window close** never discards unsaved editor changes
-//!   silently: the top bar's close, the compositor's, the last module's
-//!   kill, the terminal's `exit` as the last module -- each asks nvim to `:confirm qall` exactly as
-//!   `prefix x` on the editor does ([`EditorQuit::Window`]), and the window closes only when nvim
-//!   exits. A plain `:qa!`, which the fork's quit would run, discards unsaved buffers AND deletes their
-//!   swap files. The precedent is stock Neovide's own `g:neovide_confirm_quit`, on by default
-//!   (`src/window/settings.rs` in the fork), which makes its window close run `confirm qa` -- and,
-//!   like Neovide's, the quit is an RPC request (`nvim_exec_lua`), never typed keys, which a key nvim
-//!   is waiting for (after `f`) would swallow (`eitri_core::layout::kill::editor_quit_lua`). An
-//!   editor that is not on screen -- hidden, or zoomed away -- is brought on screen for the prompt
-//!   ([`reveal_for_prompt`]); one that was hidden is hidden again if nvim quits, so the saved
-//!   arrangement stays the user's. A second request while nvim is asking is refused, as a second `x`
-//!   is, with what nvim is doing ([`NvimState`]); only when nvim's own loop has not answered for
-//!   [`NVIM_QUIT_PATIENCE`] does it kill nvim instead ([`quit_request`]).
-//! - **a declined window close after nvim exited on its own**: nvim is gone and the window
-//!   stays, so the editor is retired as `prefix x`'s kill of it retires it ([`Reopen::Never`]) --
-//!   never left on screen holding the keys with nothing behind it ([`retire_on_declined_close`]).
-//!   It cannot be restarted in this window (the winit event loop above); `prefix e` then says so.
+//! Killing the editor asks nvim to `:confirm qall`, so unsaved buffers get nvim's own prompt.
+//! The module leaves only if nvim quits. The shell does not start a second nvim in this window,
+//! though the pane could; the close prompt says so. Cancelling in nvim closes nothing.
 //!
-//! This file holds the pure pieces decided without a display: the prompt's text, where each kind of
-//! module is left (`Reopen`), and each single decision of the editor's quit. The flow that strings
-//! those decisions together is `editor_quit` (also display-free, tested against a fake host);
-//! `main.rs` only carries it out.
+//! Killing the last module on screen closes the window ([`KillScope::Window`]). One prompt
+//! names the window close's consequences (`N running, M queued`), and `y` confirms both the
+//! kill and the window close. The editor still goes through `:confirm qall` first, and the
+//! window closes when nvim exits.
+//!
+//! Every window close, including the top bar, compositor, last module's kill and terminal exit
+//! as the last module, asks nvim to `:confirm qall` ([`EditorQuit::Window`]). The window closes
+//! only when nvim exits. This protects unsaved buffers and their swap files from a forced
+//! `:qa!`. The quit uses an RPC request (`nvim_exec_lua`) so a pending key command such as `f`
+//! cannot consume it. A hidden or zoomed-away editor is revealed for the prompt
+//! ([`reveal_for_prompt`]); an editor that was hidden is hidden again if nvim quits, preserving
+//! the saved arrangement. Another quit request while nvim is asking is refused with its current
+//! state ([`NvimState`]). If nvim's own loop has not answered for [`NVIM_QUIT_PATIENCE`],
+//! [`quit_request`] kills nvim instead.
+//!
+//! If a window close is declined after nvim has already exited, the editor is retired
+//! ([`Reopen::Never`], [`retire_on_declined_close`]). This prevents an empty editor from
+//! holding keyboard focus. It is not restarted in this window; `prefix e` explains that.
+//!
+//! This file holds the prompt text, where each module is left (`Reopen`), and the individual
+//! editor quit decisions without requiring a display. `editor_quit` connects those decisions
+//! and is tested against a fake host. `main.rs` carries out the actions.
 
 use std::time::{Duration, Instant};
 

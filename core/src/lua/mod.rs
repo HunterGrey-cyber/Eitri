@@ -2,9 +2,9 @@
 //! host passes it the installer for `eitri.panel.register` (`shell` builds a WebKitGTK view,
 //! `kernel::refuse_panels` is for a host with no Lua panels).
 //!
-//! `panel` here is only the pure validation/resolution half of `eitri.panel.register`.
-//! `PanelEntry`, `PanelRegistry` and the real widget-constructing `install` stay in
-//! `shell::lua::panel`, because `PanelEntry` holds a `gtk4::Widget`.
+//! `panel` owns registration validation, URL resolution and the widgetless `PanelEntry` /
+//! `PanelRegistry`. The shell owns `PanelViews`, its widgets and their crash guards, and the
+//! widget-constructing installer.
 
 pub mod agent;
 pub mod command;

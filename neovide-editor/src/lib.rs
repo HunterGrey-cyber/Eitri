@@ -15,6 +15,7 @@ pub mod fd_watch;
 mod frame_clock;
 mod gl_interop;
 mod keyboard;
+mod live_watch;
 mod mouse;
 mod nvim_child;
 mod nvim_rpc;
@@ -28,6 +29,12 @@ pub(crate) static DEFAULT_CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::M
 
 pub use editor_area::PresentationCounts;
 pub use nvim_rpc::{CallWatch, NvimMode};
+
+/// The priority of the one watch on the editors' shared event-loop fd, `None` while no editor pane
+/// on this thread has a live harness. Diagnostic: the multi-pane tests read it.
+pub fn event_loop_watch_priority() -> Option<std::ffi::c_int> {
+    live_watch::watch_priority()
+}
 
 /// What [`NeovideEditorPane::exec_lua`] calls with nvim's answer, on the session's call thread: the
 /// value, or the error text (nvim's, or why the connection could not answer). It must not touch
@@ -96,7 +103,9 @@ const FAILED_COLOR: Color4f = Color4f::new(0.5, 0.05, 0.05, 1.0);
 /// `Option<LiveHarness>`) so the render callback can paint a "starting nvim..." placeholder frame
 /// *before* the one real, observed blocking call in this crate (`LiveHarness::with_options`) runs.
 /// `NotStarted` -> one placeholder frame painted+presented -> `Starting` -> next render callback
-/// performs the blocking construction -> `Ready`/`Failed`.
+/// performs the blocking construction -> `Ready`/`Failed`. A restart
+/// ([`NeovideEditorPane::restart`]) takes an `Exited` pane back to `NotStarted`, and the same path
+/// runs again on the same widget.
 pub enum LiveState {
     NotStarted,
     Starting,
@@ -104,10 +113,52 @@ pub enum LiveState {
     Failed(String),
     /// nvim quit and the host let this pane go ([`NeovideEditorPane::release_exited`]): the harness
     /// is shut down and dropped, so nothing -- a focus report, a resize, a key -- can reach its
-    /// closed command channel (`send_ui` panics on one). Never left: a second `nvim --embed` cannot
-    /// be started in this process, because `LiveHarness` builds a winit `EventLoop` and winit allows
-    /// one per process (`EventLoopError::RecreationAttempt`).
+    /// closed command channel (`send_ui` panics on one). The process can start another
+    /// `nvim --embed`: harnesses share one event loop per thread, so a new one joins it rather than
+    /// building a second winit `EventLoop`. [`NeovideEditorPane::restart`] starts one in this pane.
     Exited,
+}
+
+impl LiveState {
+    /// The variant's name, for a log line or a refusal that says which state it found.
+    pub fn name(&self) -> &'static str {
+        match self {
+            LiveState::NotStarted => "NotStarted",
+            LiveState::Starting => "Starting",
+            LiveState::Ready(_) => "Ready",
+            LiveState::Failed(_) => "Failed",
+            LiveState::Exited => "Exited",
+        }
+    }
+}
+
+/// Why [`NeovideEditorPane::restart`] did nothing: the pane was not [`LiveState::Exited`]. `state`
+/// is the name of the state it was in ([`LiveState::name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartRefused {
+    pub state: &'static str,
+}
+
+impl std::fmt::Display for RestartRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the editor pane is {}, and only a pane whose nvim ended and was released can restart",
+            self.state
+        )
+    }
+}
+
+impl std::error::Error for RestartRefused {}
+
+/// The refusal [`NeovideEditorPane::restart`] returns from `state`, or `None` when it may restart:
+/// only from `Exited`. Every other state still has, or is about to have, a harness of its own, and
+/// a second one started over it would leave the first running with nothing to end it.
+fn restart_refusal(state: &LiveState) -> Option<RestartRefused> {
+    match state {
+        LiveState::Exited => None,
+        other => Some(RestartRefused { state: other.name() }),
+    }
 }
 
 /// `(fb_w, fb_h, cell_w bits, cell_h bits, cols, rows)`: what `LiveSession::log_layout_if_changed`
@@ -116,6 +167,9 @@ type LayoutLogKey = (i32, i32, u32, u32, u32, u32);
 
 pub struct LiveSession {
     pub(crate) harness: LiveHarness,
+    /// This pane's registration with the event-loop watch (`live_watch`), held for as long as the
+    /// harness: the registry keeps only a weak reference.
+    live: Rc<live_watch::PaneLive>,
     start: Instant,
     last_frame: Instant,
     animation_clock: AnimationClock,
@@ -165,10 +219,6 @@ pub struct LiveSession {
     /// position at all, so a scroll event's target grid cell has to come from here -- the last
     /// place the pointer was actually seen.
     pub(crate) last_pointer_pos: Cell<(f64, f64)>,
-    /// `LiveHarness::fullscreen_setting()` as the tick callback last read it, so the host's
-    /// `on_fullscreen_setting` callback fires on a change and not on every tick. Starts at
-    /// Neovide's own default (`false`), so a value `init.lua` set is reported on the first tick.
-    last_fullscreen_setting: Cell<bool>,
     /// The framebuffer size in device pixels last reported by `GLArea::resize`.
     /// Shared by rendering, resizing and the tick so mouse hit testing uses the size actually drawn
     /// through `gl_interop::current_content_region` and `gl_interop::GridLayout`.
@@ -203,8 +253,13 @@ static NEXT_SESSION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
-        // Before the harness's fields drop: a watch on a closed (or reused) fd number is a bug.
-        self.wants_frame.release_watch();
+        // The pane leaves the event-loop watch with its harness; the last pane out removes it.
+        live_watch::unregister(Rc::as_ptr(&self.live));
+        self.wants_frame.session_ended();
+        // The harness drops after this body, and a harness not already shut down shuts itself down
+        // then, pumping the shared loop: the other panes are swept once that is over (the sweep
+        // is queued now and runs from the main loop, after the drop).
+        live_watch::after_outside_pump(None);
     }
 }
 
@@ -216,11 +271,13 @@ impl LiveSession {
         nvim_process: Arc<nvim_child::NvimProcess>,
         driver: &Rc<TickDriver>,
     ) -> Self {
-        // A new harness: the driver's fd watch starts afresh on its fd.
-        driver.session_started();
+        // A ready harness: the event-loop watch wakes this pane from now on.
+        let live = live_watch::PaneLive::new(harness.event_loop_fd(), driver);
+        live_watch::register(Rc::downgrade(&live));
         let now = Instant::now();
         Self {
             harness,
+            live,
             start: now,
             last_frame: now,
             animation_clock: AnimationClock::default(),
@@ -234,7 +291,6 @@ impl LiveSession {
             active_drag: Cell::new(None),
             scroll_position: Cell::new((0.0, 0.0)),
             last_pointer_pos: Cell::new((0.0, 0.0)),
-            last_fullscreen_setting: Cell::new(false),
             fb_size,
             last_logged_layout: Cell::new(None),
             nvim_process,
@@ -438,9 +494,13 @@ pub struct NeovideEditorPane {
     key_activity: keyboard::KeyActivity,
     /// The tick callback's registration and the event-loop fd watch (`tick_driver`).
     tick_driver: Rc<TickDriver>,
+    /// What the next nvim is started with, read by the render callback when it builds the harness:
+    /// the construction's options, until [`NeovideEditorPane::restart`] replaces them.
+    spawn_options: Rc<RefCell<NeovideEditorPaneOptions>>,
 }
 
-/// Construction-time options for [`NeovideEditorPane::with_options`]. Each field is forwarded to
+/// Construction-time options for [`NeovideEditorPane::with_options`], and a restart's for
+/// [`NeovideEditorPane::restart`]. Each field is forwarded to
 /// the `LiveHarnessOptions` field of the same name, so this crate stays a pass-through rather than
 /// growing a `with_this_and_that` constructor per combination a host happens to need.
 #[derive(Default)]
@@ -893,12 +953,7 @@ impl NeovideEditorPane {
     /// Same as [`NeovideEditorPane::new`], with every construction-time knob this pane forwards to
     /// `LiveHarnessOptions` spelled out. See [`NeovideEditorPaneOptions`] for what each one means.
     pub fn with_options(options: NeovideEditorPaneOptions) -> Self {
-        let NeovideEditorPaneOptions {
-            clean,
-            child_env,
-            cwd,
-            extra_nvim_args,
-        } = options;
+        let spawn_options = Rc::new(RefCell::new(options));
         // A `GtkGLArea` whose snapshot presents through the pane's own tiled buffers
         // (`editor_area`); every handler below is connected to it as a plain `GLArea`.
         let gl_area: GLArea = glib::Object::builder::<editor_area::EditorGlArea>()
@@ -922,6 +977,13 @@ impl NeovideEditorPane {
         let pending_fullscreen: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let scale_factor_callback: ScaleFactorCallbackSlot = Rc::new(RefCell::new(None));
         let scale_watch: Rc<ScaleWatch> = Rc::new(ScaleWatch::new(1.0));
+        // `LiveHarness::fullscreen_setting()` as the service last read it, so the host's
+        // `on_fullscreen_setting` callback fires on a change and not on every run. Starts at
+        // Neovide's own default (`false`), so a value `init.lua` set is reported on the first run.
+        // The pane's, not a session's, as `scale_watch` is: a restarted nvim's value is compared
+        // with the one the host was last told, so a host that followed the ended nvim into
+        // fullscreen hears the new nvim's `false`.
+        let last_fullscreen_setting: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cell_size_callback: CellSizeCallbackSlot = Rc::new(RefCell::new(None));
         let start_failed_callback: StartFailedCallbackSlot = Rc::new(RefCell::new(None));
         // Set when the `Failed` arm first paints `FAILED_COLOR` and the message.
@@ -1126,14 +1188,15 @@ impl NeovideEditorPane {
         {
             let skia_state = skia_state.clone();
             let live_state = live_state.clone();
-            // `child_env` and `cwd` are moved into this closure by the `move` below -- neither is
-            // needed again in this function, and this closure is the only place `LiveHarness` is
-            // ever constructed.
+            // This closure is the only place `LiveHarness` is ever constructed, so it is the one
+            // reader of the options a start (the first, or a restart) uses.
+            let spawn_options = spawn_options.clone();
             let clear_color = clear_color.clone();
             let focused = focused.clone();
             let pending_fullscreen = pending_fullscreen.clone();
             let scale_watch_for_ready = scale_watch.clone();
             let scale_watch_for_render = scale_watch.clone();
+            let last_fullscreen_for_render = last_fullscreen_setting.clone();
             let tick_driver_for_render = tick_driver.clone();
             let fb_size = fb_size.clone();
             let cell_size_callback_for_render = cell_size_callback.clone();
@@ -1229,13 +1292,14 @@ impl NeovideEditorPane {
                         fill_content_region(canvas, &content_region, STARTING_COLOR);
 
                         let os_scale_factor = widget.scale_factor() as f64;
+                        let spawn = spawn_options.borrow();
+                        let (clean, cwd) = (spawn.clean, spawn.cwd.clone());
                         let options = LiveHarnessOptions {
                             os_scale_factor,
-                            extra_nvim_args: nvim_args(clean, &extra_nvim_args),
-                            // Cloned rather than moved because this closure is `Fn` and runs on
-                            // every frame -- but this arm is the one-shot construction pass, so
-                            // the clone happens exactly once per pane.
-                            child_env: child_env.clone(),
+                            extra_nvim_args: nvim_args(clean, &spawn.extra_nvim_args),
+                            // Cloned rather than moved because a restart may start from these
+                            // options again; this arm runs once per start, so the clone does too.
+                            child_env: spawn.child_env.clone(),
                             cwd: cwd.clone(),
                             // Off, unconditionally, for this embedding -- the opposite of the
                             // `LiveHarnessOptions` default, and the one place this crate takes a
@@ -1268,6 +1332,7 @@ impl NeovideEditorPane {
                             startup_message_capture: false,
                             ..Default::default()
                         };
+                        drop(spawn);
                         println!(
                             "[live] constructing LiveHarness::with_options(os_scale_factor={os_scale_factor}, \
                              clean={clean}, cwd={cwd:?}) -- this performs a real, synchronous nvim \
@@ -1393,6 +1458,8 @@ impl NeovideEditorPane {
                         });
                         session.log_layout_if_changed(fb_w, fb_h, snapped_scale, &layout);
                         let animating = session.harness.render_frame(canvas, Some(&layout.region), dt);
+                        // `render_frame` pumped every pane's batches outside the watch.
+                        live_watch::after_outside_pump(Some(Rc::as_ptr(&session.live)));
                         if !same_grid_scale(snapped_scale, session.harness.grid_scale()) {
                             // `render_frame` pumps nvim and applies `g:neovide_scale_factor` and `guifont` changes before
                             // reading `grid_scale`. This frame was snapped for the old cell height, so the new rows
@@ -1428,7 +1495,7 @@ impl NeovideEditorPane {
                             exited,
                             close_requested: session.close_requested.get(),
                             fullscreen_changed: session.harness.fullscreen_setting()
-                                != session.last_fullscreen_setting.get(),
+                                != last_fullscreen_for_render.get(),
                             scale_changed: scale_watch_for_render.would_change(session.harness.scale_factor_setting()),
                         });
                         tick_wanted_after_render = Some(tick_still_wanted(TickInputs {
@@ -1549,6 +1616,7 @@ impl NeovideEditorPane {
             // calls straight back into `set_scale_factor_setting`.
             let scale_factor_callback_for_tick = scale_factor_callback.clone();
             let scale_watch_for_tick = scale_watch.clone();
+            let last_fullscreen_for_tick = last_fullscreen_setting.clone();
             let tick_stats = Rc::new(TickStats::new());
             let fb_size = fb_size.clone();
             // One-shot: `[layout] note:` is printed at most once per pane.
@@ -1556,7 +1624,6 @@ impl NeovideEditorPane {
             // Read only here; the render callback's `Failed` arm is the sole writer.
             // See `failed_tick_should_render`.
             let failed_painted_for_tick = failed_painted.clone();
-            let driver_for_service = Rc::downgrade(&tick_driver);
             let service: Service = Rc::new(move |widget: &GLArea, source: ServiceSource| {
                 let mut live = live_state.borrow_mut();
                 // Set from inside the `Ready` arm below, then acted on only *after* `live` is
@@ -1569,10 +1636,16 @@ impl NeovideEditorPane {
                 let issued = match &mut *live {
                     LiveState::Ready(session) => {
                         // Cheap, non-blocking drain of any nvim redraw traffic that arrived since
-                        // the last tick.
-                        session.harness.pump(Duration::ZERO);
+                        // the last tick. Inside a wake only the first pane's service pumps, so every
+                        // pane is inspected after the one pump that applied its batches.
+                        live_watch::pump_once_per_pass(|| session.harness.pump(Duration::ZERO));
+                        // The pump applied every pane's batches; from a tick, the watch did not see
+                        // them, so the other panes are swept (a wake services every pane itself).
+                        if source == ServiceSource::Tick {
+                            live_watch::after_outside_pump(Some(Rc::as_ptr(&session.live)));
+                        }
                         let fullscreen = session.harness.fullscreen_setting();
-                        if session.last_fullscreen_setting.replace(fullscreen) != fullscreen {
+                        if last_fullscreen_for_tick.replace(fullscreen) != fullscreen {
                             fullscreen_changed = Some(fullscreen);
                         }
                         // One call, one `ScaleObservation`, used below for both the callback and
@@ -1731,27 +1804,17 @@ impl NeovideEditorPane {
                 tick_stats.record(source, issued);
 
                 // Whether another tick cycle is wanted, read after every callback above (one may
-                // have asked for a frame), and the fd watch once a harness exists. Pending service
-                // work is zero here: this run just consumed it.
-                let (need, fd) = match &*live_state.borrow() {
-                    LiveState::Ready(session) => (
-                        tick_still_wanted(TickInputs {
-                            animating: session.last_animating.get(),
-                            wants_frame: session.wants_frame.get(),
-                            exit_pending: session.harness.has_neovim_exited() && !session.close_requested.get(),
-                            service_pending: false,
-                        }),
-                        Some(session.harness.event_loop_fd()),
-                    ),
-                    other => (
-                        sessionless_tick_should_render(other, failed_painted_for_tick.get()),
-                        None,
-                    ),
-                };
-                if let (Some(fd), Some(driver)) = (fd, driver_for_service.upgrade()) {
-                    driver.watch_fd(fd);
+                // have asked for a frame). Pending service work is zero here: this run just
+                // consumed it.
+                match &*live_state.borrow() {
+                    LiveState::Ready(session) => tick_still_wanted(TickInputs {
+                        animating: session.last_animating.get(),
+                        wants_frame: session.wants_frame.get(),
+                        exit_pending: session.harness.has_neovim_exited() && !session.close_requested.get(),
+                        service_pending: false,
+                    }),
+                    other => sessionless_tick_should_render(other, failed_painted_for_tick.get()),
                 }
-                need
             });
             tick_driver.attach(&gl_area, service);
             tick_driver.kick();
@@ -1773,6 +1836,7 @@ impl NeovideEditorPane {
             start_failed_callback,
             key_activity,
             tick_driver,
+            spawn_options,
         }
     }
 
@@ -2097,13 +2161,20 @@ impl NeovideEditorPane {
             println!("[live] end_nvim: nvim's stdin is closed; watching pid {watched:?} until it has gone");
         } else {
             let live = Rc::downgrade(&self.live_state);
+            // The timer belongs to the session it ends. nvim may answer the SIGTERM well inside the
+            // delay, and a host may release the pane and restart it before the timer fires: the
+            // session it finds then is a new nvim, whose stdin it must leave open.
+            let ending = session.serial;
             glib::timeout_add_local_once(schedule.hang_up_after, move || {
                 let Some(live) = live.upgrade() else { return };
                 let mut live = live.borrow_mut();
-                if let LiveState::Ready(session) = &mut *live {
-                    // Idempotent, and harmless once nvim has gone.
-                    session.harness.hang_up();
-                    println!("[live] end_nvim: nvim's stdin is closed");
+                match &mut *live {
+                    LiveState::Ready(session) if session.serial == ending => {
+                        // Idempotent, and harmless once nvim has gone.
+                        session.harness.hang_up();
+                        println!("[live] end_nvim: nvim's stdin is closed");
+                    }
+                    _ => println!("[live] end_nvim: the session it was to end has gone; nothing to close"),
                 }
             });
             println!(
@@ -2188,7 +2259,8 @@ impl NeovideEditorPane {
     /// keeps its window open without the editor (`shell`'s `prefix x`): shuts the harness down --
     /// nvim is already gone, so this does not wait for it -- drops it, and leaves the pane
     /// [`LiveState::Exited`], where every method is a no-op and nothing is sent to the closed
-    /// connection. `false`, changing nothing, if nvim has not exited or never started.
+    /// connection, until a [`restart`](Self::restart). `false`, changing nothing, if nvim has not
+    /// exited or never started.
     pub fn release_exited(&self) -> bool {
         let mut live = self.live_state.borrow_mut();
         let LiveState::Ready(session) = &mut *live else {
@@ -2203,12 +2275,47 @@ impl NeovideEditorPane {
             return false;
         }
         session.close_requested.set(true);
-        // The harness (and its event loop's fd) is dropped just below: no watch may outlive it.
-        self.tick_driver.unwatch_fd();
+        // The shared event loop's fd outlives every harness, so leaving the watch is not what keeps
+        // it off a closed fd: the pane leaves because nothing of it is left to wake, and the last
+        // pane out removes the watch.
+        live_watch::unregister(Rc::as_ptr(&session.live));
+        self.tick_driver.session_ended();
         session.harness.shutdown();
+        // Its shutdown pumped the shared loop, perhaps applying another pane's batches.
+        live_watch::after_outside_pump(None);
         *live = LiveState::Exited;
-        println!("[live] nvim exited and the host released the pane; it stays empty");
+        println!("[live] nvim exited and the host released the pane; it stays empty until a restart");
         true
+    }
+
+    /// Starts a new nvim in a pane whose nvim ended and was released ([`release_exited`]), with
+    /// `options` in place of the ones the pane was built with (they are kept for any later
+    /// restart). The pane goes back to [`LiveState::NotStarted`] on the widget it has -- no new
+    /// `GtkGLArea`, nothing reparented or unrealized -- and the next render paints the placeholder
+    /// and then launches nvim, exactly as at first start, so the launch blocks this thread as that
+    /// one does. The callbacks the host registered stay registered and report on the new nvim.
+    /// Returns at once; a pane that is not shown starts once it is drawn.
+    ///
+    /// Refused, changing nothing, unless the pane is [`LiveState::Exited`]: the error names the
+    /// state it found.
+    ///
+    /// [`release_exited`]: Self::release_exited
+    pub fn restart(&self, options: NeovideEditorPaneOptions) -> Result<(), RestartRefused> {
+        {
+            let mut live = self.live_state.borrow_mut();
+            if let Some(refused) = restart_refusal(&live) {
+                println!("[live] restart refused: the pane is {}", refused.state);
+                return Err(refused);
+            }
+            *self.spawn_options.borrow_mut() = options;
+            *live = LiveState::NotStarted;
+        }
+        println!("[live] restart: the pane starts a new nvim on its own widget");
+        // The tick stopped when the pane was released; the service asks for frames again while
+        // the pane is not started, and the render advances the start one frame at a time.
+        self.tick_driver.kick();
+        self.widget.queue_render();
+        Ok(())
     }
 
     /// Shuts down the live `nvim --embed` connection if one started. Ends nvim by closing stdin and
@@ -2232,12 +2339,15 @@ impl NeovideEditorPane {
             session.ending.set(Some((at, schedule)));
             // On this thread, blocking: `end` closes stdin itself when the schedule says, since an
             // earlier `end_nvim`'s timer cannot run until this returns.
-            // No watch on the fd of a harness that is being torn down.
-            self.tick_driver.unwatch_fd();
+            // A harness being torn down has nothing left for the watch to wake.
+            live_watch::unregister(Rc::as_ptr(&session.live));
+            self.tick_driver.session_ended();
             let harness = &mut session.harness;
             let ended = nvim_child::end(&session.nvim_process, at, schedule, &mut || harness.hang_up());
             println!("[live] shutdown(): nvim's stdin is closed ({ended:?}); tearing the harness down");
             let exited_cleanly = session.harness.shutdown();
+            // Its shutdown pumped the shared loop, perhaps applying another pane's batches.
+            live_watch::after_outside_pump(None);
             println!("[live] LiveHarness::shutdown() returned {exited_cleanly}");
             exited_cleanly
         } else {
@@ -2250,8 +2360,9 @@ impl NeovideEditorPane {
 mod tests {
     use super::{
         build_start_failure_message, cell_size_changed, exit_events, failed_tick_should_render, nvim_args,
-        os_scale_to_apply, run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, ExitEvents,
-        LiveState, RemapKick, ScaleWatch, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        os_scale_to_apply, restart_refusal, run_detached, sessionless_tick_should_render, spawn_named,
+        tick_should_render, ExitEvents, LiveState, RemapKick, RestartRefused, ScaleWatch, NVIM_INSTALL_URL,
+        NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -2569,6 +2680,25 @@ mod tests {
         assert!(
             !sessionless_tick_should_render(&LiveState::Exited, false),
             "a released pane never draws"
+        );
+    }
+
+    /// Only a released pane may start a new nvim: any other state has, or is about to have, a
+    /// harness, and the refusal says which state it found.
+    #[test]
+    fn only_an_exited_pane_may_restart() {
+        assert_eq!(restart_refusal(&LiveState::Exited), None);
+        for (state, name) in [
+            (LiveState::NotStarted, "NotStarted"),
+            (LiveState::Starting, "Starting"),
+            (LiveState::Failed("nvim could not start".into()), "Failed"),
+        ] {
+            assert_eq!(restart_refusal(&state), Some(RestartRefused { state: name }));
+        }
+        let refused = RestartRefused { state: "Ready" };
+        assert!(
+            refused.to_string().contains("Ready"),
+            "the message names the state: {refused}"
         );
     }
 }

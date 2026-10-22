@@ -1,43 +1,110 @@
-//! The root table holds keys that work without a prefix. GTK accelerators (`ROOT_ACCELS`)
-//! are registered by `shell` from this table only; `shell/src` holds no accelerator literals.
-//! `Ctrl+h/j/k/l` use capture-phase controllers in `pane_switch` and `terminal::navigation`.
-//! They are listed here so neither the prefix nor a Lua `keybinding` can take them.
+//! The root keys work with no prefix. `ROOT_ACCELS` holds the chords registered by the shell;
+//! `Ctrl+h/j/k/l` use capture-phase navigation controllers and are listed for collision checks.
 //!
-//! No root chord combines Control and Shift, to avoid input-method hotkey conflicts.
-//! Use `prefix f`/`r`/`F11` in place of `Ctrl+Shift+F`/`R`/`F11`. `<Control>plus` is
-//! excluded because it requires `Ctrl+Shift+=` on a US layout.
+//! No root chord holds `Ctrl+Shift`, which conflicts with input-method hotkeys. `plus` is omitted
+//! because it requires Shift on a US keyboard.
 
 use super::key::Chord;
 
-/// One app action and the accelerators that fire it.
+/// A static root chord, independent of the host's accelerator spelling.
+#[derive(Debug, Clone, Copy)]
+pub struct RootChord {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub key: &'static str,
+}
+
+impl RootChord {
+    pub fn chord(&self) -> Chord {
+        Chord {
+            ctrl: self.ctrl,
+            alt: self.alt,
+            shift: self.shift,
+            key: self.key.into(),
+        }
+    }
+}
+
+/// One app action and the chords that fire it.
 #[derive(Debug, Clone, Copy)]
 pub struct RootAccel {
     /// The gio action name, without `app.`.
     pub action: &'static str,
-    pub accels: &'static [&'static str],
+    pub chords: &'static [RootChord],
     pub what: &'static str,
 }
 
 pub const ROOT_ACCELS: &[RootAccel] = &[
     RootAccel {
         action: "fullscreen",
-        accels: &["F11"],
+        chords: &[RootChord {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            key: "F11",
+        }],
         what: "Fullscreen",
     },
     RootAccel {
         action: "text-larger",
-        accels: &["<Control>equal", "<Control>KP_Add"],
+        chords: &[
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "=",
+            },
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "KP_Add",
+            },
+        ],
         what: "Text size larger (both panes)",
     },
     RootAccel {
         action: "text-smaller",
-        accels: &["<Control>minus", "<Control>KP_Subtract"],
+        chords: &[
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "-",
+            },
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "KP_Subtract",
+            },
+        ],
         what: "Text size smaller (both panes)",
     },
     RootAccel {
         action: "text-reset",
         // Keypad 0 with NumLock off reports as KP_Insert, not KP_0 (2026-09-23).
-        accels: &["<Control>0", "<Control>KP_0", "<Control>KP_Insert"],
+        chords: &[
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "0",
+            },
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "KP_0",
+            },
+            RootChord {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                key: "KP_Insert",
+            },
+        ],
         what: "Text size reset (both panes)",
     },
 ];
@@ -50,13 +117,13 @@ pub const NAV_KEYS: [(char, &str); 4] = [
     ('l', "move to the module right"),
 ];
 
-/// The accelerators `action` is registered with.
-pub fn accels(action: &str) -> &'static [&'static str] {
+/// The chords `action` is registered with.
+pub fn chords_of(action: &str) -> &'static [RootChord] {
     ROOT_ACCELS
         .iter()
         .find(|row| row.action == action)
         .unwrap_or_else(|| panic!("no root accelerator row for app action {action:?}"))
-        .accels
+        .chords
 }
 
 /// Every root chord, with how a collision message names it.
@@ -75,42 +142,33 @@ pub fn chords() -> Vec<(Chord, String)> {
         })
         .collect();
     for row in ROOT_ACCELS {
-        for accel in row.accels {
-            let chord = Chord::from_gtk(accel).expect("ROOT_ACCELS holds only accelerators Chord reads");
-            out.push((chord, format!("{} ({})", spell(accel), row.what.to_lowercase())));
+        for root in row.chords {
+            out.push((
+                root.chord(),
+                format!("{} ({})", spell_chord(root), row.what.to_lowercase()),
+            ));
         }
     }
     out
 }
 
 /// Keysym names a person reads differently, and how.
-const SPELLED: [(&str, &str); 7] = [
-    ("equal", "="),
-    ("plus", "+"),
-    ("minus", "-"),
+const SPELLED: [(&str, &str); 4] = [
     ("KP_Add", "Keypad+"),
     ("KP_Subtract", "Keypad-"),
     ("KP_0", "Keypad0"),
     ("KP_Insert", "Keypad0 (NumLock off)"),
 ];
 
-/// A GTK accelerator as the overlay prints it: `<Control>equal` is `Ctrl+=`.
-pub fn spell(accel: &str) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut rest = accel;
-    while let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
-        parts.push(match &rest[1..end + 1] {
-            "Control" | "Primary" => "Ctrl".to_string(),
-            other => other.to_string(),
-        });
-        rest = &rest[end + 2..];
-    }
-    parts.push(match SPELLED.iter().find(|(keysym, _)| *keysym == rest) {
+/// A root chord as the overlay prints it: `=` with Control is `Ctrl+=`.
+fn spell_chord(root: &RootChord) -> String {
+    let mut chord = root.chord();
+    chord.key = match SPELLED.iter().find(|(key, _)| *key == root.key) {
         Some((_, spelled)) => spelled.to_string(),
-        None if rest.chars().count() == 1 => rest.to_uppercase(),
-        None => rest.to_string(),
-    });
-    parts.join("+")
+        None if root.key.chars().count() == 1 => root.key.to_uppercase(),
+        None => root.key.to_string(),
+    };
+    chord.human()
 }
 
 /// One line of the `?` overlay.
@@ -138,7 +196,7 @@ pub fn help_rows() -> Vec<HelpRow> {
     ];
     for row in ROOT_ACCELS {
         rows.push(HelpRow {
-            keys: row.accels.iter().map(|a| spell(a)).collect::<Vec<_>>().join(" / "),
+            keys: row.chords.iter().map(spell_chord).collect::<Vec<_>>().join(" / "),
             what: row.what.to_string(),
         });
     }
@@ -153,8 +211,49 @@ pub fn help_rows() -> Vec<HelpRow> {
 mod tests {
     use super::*;
 
-    /// No root chord combines Control and Shift, to avoid input-method hotkey conflicts.
-    /// `plus` requires Shift+= on a US layout, and uppercase letters require Shift too.
+    #[test]
+    fn root_chords_are_chords_not_accelerator_strings() {
+        for row in ROOT_ACCELS {
+            let RootAccel { action, chords, what } = *row;
+            assert!(!action.is_empty());
+            assert!(!what.is_empty());
+            assert!(!chords.is_empty());
+            for root in chords {
+                let _: Chord = root.chord();
+            }
+        }
+    }
+
+    #[test]
+    fn the_accelerator_notation_still_reads() {
+        for (action, old) in [
+            ("fullscreen", vec!["F11"]),
+            ("text-larger", vec!["<Control>equal", "<Control>KP_Add"]),
+            ("text-smaller", vec!["<Control>minus", "<Control>KP_Subtract"]),
+            ("text-reset", vec!["<Control>0", "<Control>KP_0", "<Control>KP_Insert"]),
+        ] {
+            let roots = chords_of(action);
+            assert_eq!(roots.len(), old.len());
+            for (root, accel) in roots.iter().zip(old) {
+                assert_eq!(Chord::from_accel(accel).unwrap(), root.chord());
+            }
+        }
+        for (accel, key) in [("<Control><Alt>r", "r"), ("<Control><Alt>e", "e")] {
+            assert_eq!(
+                Chord::from_accel(accel).unwrap(),
+                Chord {
+                    ctrl: true,
+                    alt: true,
+                    shift: false,
+                    key: key.into(),
+                }
+            );
+        }
+        assert!(Chord::from_accel("<Super>x").is_err());
+    }
+
+    /// Control and Shift together conflict with input-method hotkeys. `plus` is Shift+= on a US
+    /// layout, and an uppercase letter needs Shift, so both count.
     #[test]
     fn no_root_chord_holds_control_and_shift() {
         for (chord, what) in chords() {
@@ -166,8 +265,8 @@ mod tests {
             );
         }
         for row in ROOT_ACCELS {
-            for accel in row.accels {
-                assert!(!accel.contains("<Shift>"), "{} binds {accel}", row.action);
+            for root in row.chords {
+                assert!(!root.shift, "{} binds {root:?}", row.action);
             }
         }
     }
@@ -183,7 +282,10 @@ mod tests {
 
     #[test]
     fn the_root_accelerators_are_the_specs_table() {
-        let got: Vec<(&str, Vec<&str>)> = ROOT_ACCELS.iter().map(|r| (r.action, r.accels.to_vec())).collect();
+        let got: Vec<(&str, Vec<Chord>)> = ROOT_ACCELS
+            .iter()
+            .map(|r| (r.action, r.chords.iter().map(RootChord::chord).collect()))
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -192,17 +294,23 @@ mod tests {
                 ("text-smaller", vec!["<Control>minus", "<Control>KP_Subtract"]),
                 ("text-reset", vec!["<Control>0", "<Control>KP_0", "<Control>KP_Insert"]),
             ]
+            .into_iter()
+            .map(|(action, accels)| (
+                action,
+                accels.into_iter().map(|a| Chord::from_accel(a).unwrap()).collect()
+            ))
+            .collect::<Vec<_>>()
         );
         assert_eq!(
-            accels("text-reset"),
-            ["<Control>0", "<Control>KP_0", "<Control>KP_Insert"]
+            chords_of("text-reset").iter().map(RootChord::chord).collect::<Vec<_>>(),
+            ["<Control>0", "<Control>KP_0", "<Control>KP_Insert"].map(|a| Chord::from_accel(a).unwrap())
         );
     }
 
     #[test]
     #[should_panic(expected = "hint")]
     fn an_action_with_no_row_is_a_programming_error() {
-        accels("hint");
+        chords_of("hint");
     }
 
     #[test]
@@ -265,12 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn spell_reads_an_accelerator_as_a_person_types_it() {
-        assert_eq!(spell("F11"), "F11");
-        assert_eq!(spell("<Control>equal"), "Ctrl+=");
-        assert_eq!(spell("<Control>KP_Add"), "Ctrl+Keypad+");
-        assert_eq!(spell("<Control>KP_Insert"), "Ctrl+Keypad0 (NumLock off)");
-        assert_eq!(spell("<Control>0"), "Ctrl+0");
+    fn spell_chord_reads_a_root_chord_as_a_person_types_it() {
+        let spelled = |action: &str| chords_of(action).iter().map(spell_chord).collect::<Vec<_>>();
+        assert_eq!(spelled("fullscreen"), ["F11"]);
+        assert_eq!(spelled("text-larger"), ["Ctrl+=", "Ctrl+Keypad+"]);
+        assert_eq!(spelled("text-smaller"), ["Ctrl+-", "Ctrl+Keypad-"]);
+        assert_eq!(
+            spelled("text-reset"),
+            ["Ctrl+0", "Ctrl+Keypad0", "Ctrl+Keypad0 (NumLock off)"]
+        );
     }
 
     #[test]
@@ -278,8 +389,11 @@ mod tests {
         let rows = help_rows();
         let keys: Vec<&str> = rows.iter().flat_map(|r| r.keys.split(" / ")).collect();
         for row in ROOT_ACCELS {
-            for accel in row.accels {
-                assert!(keys.contains(&spell(accel).as_str()), "{accel} missing from {keys:?}");
+            for root in row.chords {
+                assert!(
+                    keys.contains(&spell_chord(root).as_str()),
+                    "{root:?} missing from {keys:?}"
+                );
             }
         }
         for (letter, _) in NAV_KEYS {

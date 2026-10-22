@@ -143,6 +143,9 @@ struct State {
     /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
     /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
     on_shell_exit: Option<Rc<dyn Fn(u64) -> bool>>,
+    /// Told each time a shell is spawned, with its pid; set by `main.rs` ([`TerminalPane::on_shell_start`]).
+    /// Called with no borrow of this state held.
+    on_shell_start: Option<Rc<dyn Fn(u32)>>,
 }
 
 /// What becomes of an input-method commit ([`State::route_commit`]).
@@ -184,6 +187,7 @@ impl State {
             focused: false,
             cwd,
             on_shell_exit: None,
+            on_shell_start: None,
         }
     }
 
@@ -591,6 +595,13 @@ impl TerminalPane {
         self.state.borrow_mut().on_shell_exit = Some(Rc::new(f));
     }
 
+    /// `f` runs each time a shell is spawned in this pane -- at its first allocation after a start, or
+    /// at once when the pane is laid out, and on the Enter that restarts an exited one -- with the
+    /// shell's pid, with this pane's state released.
+    pub(crate) fn on_shell_start(&self, f: impl Fn(u32) + 'static) {
+        self.state.borrow_mut().on_shell_start = Some(Rc::new(f));
+    }
+
     /// `prefix x` (or the shell's own end): the shell is hung up if it still runs, and the pane
     /// forgets it -- its screen, its cursor, anything queued behind a paste (and the input method is reset) -- so the
     /// next [`Self::start`] is a fresh shell on a blank pane, as the first one was. Does not wait:
@@ -717,7 +728,15 @@ fn ensure_session(state: &Rc<RefCell<State>>, area: &GLArea, im: &IMMulticontext
             return;
         }
     };
-    state.borrow_mut().session = Some(session);
+    let pid = session.pid();
+    let started = {
+        let mut s = state.borrow_mut();
+        s.session = Some(session);
+        s.on_shell_start.clone()
+    };
+    if let Some(started) = started {
+        started(pid);
+    }
     let state = Rc::downgrade(state);
     let area = area.downgrade();
     let im = im.downgrade();

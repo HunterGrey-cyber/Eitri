@@ -78,6 +78,47 @@ pub fn file_with<'a>(sources: &'a [Source], needle: &str) -> &'a Source {
     }
 }
 
+/// The unique function named `name`, with comments, literals and test modules blanked.
+///
+/// # Panics
+/// When no function or more than one function matches, naming the files searched or matched.
+pub fn function_in<'a>(sources: &'a [Source], name: &str) -> (&'a Source, String) {
+    function_body(sources, name, false)
+}
+
+/// The unique function named `name`, retaining its original comments and literals.
+///
+/// # Panics
+/// When no function or more than one function matches, naming the files searched or matched.
+pub fn function_in_raw<'a>(sources: &'a [Source], name: &str) -> (&'a Source, String) {
+    function_body(sources, name, true)
+}
+
+fn function_body<'a>(sources: &'a [Source], name: &str, raw: bool) -> (&'a Source, String) {
+    let mut hits = Vec::new();
+    for source in sources {
+        let code = code_only(&source.text);
+        let code = without(&code, &modules(&code, "tests"));
+        for body in functions(&code, name) {
+            let start = body.as_ptr() as usize - code.as_ptr() as usize;
+            let text = if raw {
+                &source.text[start..start + body.len()]
+            } else {
+                body
+            };
+            hits.push((source, text.to_owned()));
+        }
+    }
+    assert!(
+        hits.len() == 1,
+        "expected one function `{name}`, found {} (read: {}; matched: {})",
+        hits.len(),
+        sources.iter().map(|s| s.path.as_str()).collect::<Vec<_>>().join(", "),
+        hits.iter().map(|(s, _)| s.path.as_str()).collect::<Vec<_>>().join(", "),
+    );
+    hits.pop().unwrap()
+}
+
 /// # Panics
 /// Unless each of `anchors` appears in the code ([`code_only`]) of at least one of `sources`.
 pub fn require_anchors(sources: &[Source], anchors: &[&str]) {
@@ -132,7 +173,7 @@ fn read_dirs(sources: &[Source]) -> String {
 }
 
 /// `text` with every comment, string literal and character literal replaced by spaces (line
-/// breaks kept), so neither a brace nor a word inside one counts.
+/// breaks and byte offsets kept), so neither a brace nor a word inside one counts.
 pub fn code_only(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(chars.len());
@@ -228,7 +269,18 @@ pub fn code_only(text: &str) -> String {
         out.push(c);
         i += 1;
     }
-    out.into_iter().collect()
+    // A blanked Unicode character still occupies its original number of bytes for raw slices.
+    chars
+        .into_iter()
+        .zip(out)
+        .fold(String::new(), |mut text, (original, masked)| {
+            if masked == ' ' {
+                text.extend(std::iter::repeat_n(' ', original.len_utf8()));
+            } else {
+                text.push(masked);
+            }
+            text
+        })
 }
 
 /// The byte positions just after every whole-word occurrence of `word`.
@@ -330,6 +382,35 @@ pub fn calls(code: &str, name: &str) -> usize {
 #[cfg(test)]
 mod walker_tests {
     use super::*;
+
+    #[test]
+    fn function_in_finds_one_function_across_files_and_refuses_two() {
+        let mut sources = vec![
+            Source {
+                path: "a.rs".into(),
+                text: "// é\nfn other() {}\n#[cfg(test)] mod tests { fn wanted() {} }".into(),
+            },
+            Source {
+                path: "b.rs".into(),
+                text: "// é\nfn wanted() { let text = \"héllo\"; }".into(),
+            },
+        ];
+        let (file, body) = function_in(&sources, "wanted");
+        assert_eq!(file.path, "b.rs");
+        assert!(body.contains("let text ="));
+        assert!(!body.contains("héllo"));
+        let (raw_file, raw) = function_in_raw(&sources, "wanted");
+        assert_eq!(raw_file.path, file.path);
+        assert_eq!(raw, "{ let text = \"héllo\"; }");
+        assert_eq!(body.len(), raw.len());
+        assert!(std::panic::catch_unwind(|| function_in(&sources, "missing")).is_err());
+        sources[0].text.push_str("\nfn wanted() {}");
+        let failure = std::panic::catch_unwind(|| function_in(&sources, "wanted")).unwrap_err();
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("a.rs") && message.contains("b.rs"));
+        sources[0].text.push_str("\nfn other() {}");
+        assert!(std::panic::catch_unwind(|| function_in(&sources, "other")).is_err());
+    }
 
     #[test]
     #[should_panic(expected = "cannot read")]

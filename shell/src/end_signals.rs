@@ -48,6 +48,8 @@
 //! `g_unix_signal_add_full` and `g_unix_signal_source_new` itself, as `neovide_editor`'s `fd_watch` calls
 //! `g_unix_fd_add_full`; the window's closure is wrapped in a [`ThreadGuard`] for the same reason it gives.
 
+use eitri_core::wm::end_signals::{decide, Outcome, Watch, ANSWER_WITHIN, CLOSE_WITHIN};
+
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -61,24 +63,6 @@ pub(crate) const SIGNALS: [(i32, &str); 3] = [
     (libc::SIGINT, "SIGINT"),
     (libc::SIGHUP, "SIGHUP"),
 ];
-
-/// How long the window has to answer the first signal before the watchdog ends the process. A dispatch on a
-/// responsive GTK thread takes milliseconds; this is far above that and still short for someone waiting.
-pub(crate) const ANSWER_WITHIN: Duration = Duration::from_secs(5);
-
-/// How long, from the first signal, a close the window has started may run before the watchdog ends the process.
-/// It is longer than every bound that close may wait out, added as if they ran one after another, plus 5 s:
-/// - the agent panel's `SESSION_CLOSE_BACKSTOP` (18 s), the session teardown whose drop is what kills a sidecar
-///   that does not go;
-/// - its `SAVED_TABS_BACKSTOP` (5 s; `CONNECT_CLOSE_BACKSTOP` and `HANDOFF_CLOSE_BACKSTOP`, 3 s each, are shorter);
-/// - nvim's `NVIM_QUIT_PATIENCE` (5 s), after which `NeovideEditorPane::shutdown` kills it;
-/// - a plugin task group's stop, `eitri_core::plugin::tasks::GRACE` (2 s);
-/// - the plugin pages' hold in `plugin_panels::shutdown` (that grace and 1 s more, 3 s).
-///
-/// That is 33 s; 38 s with the margin, rounded up. A shorter bound would end a healthy close before the session
-/// teardown escalates, and leave the very `claude` and sidecar processes that teardown exists to end. Raising any
-/// of those bounds means raising this one.
-pub(crate) const CLOSE_WITHIN: Duration = Duration::from_secs(40);
 
 /// The window's listener has run for a signal.
 static ANSWERED: AtomicBool = AtomicBool::new(false);
@@ -99,57 +83,6 @@ fn epoch() -> Instant {
 /// The window says its close is under way: from now on a further signal ends the process at once.
 pub(crate) fn mark_closing() {
     CLOSING.store(true, Ordering::SeqCst);
-}
-
-/// What the watchdog knows when it decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Watch {
-    /// Termination signals seen so far.
-    pub(crate) seen: u32,
-    pub(crate) first: i32,
-    pub(crate) last: i32,
-    /// The window's listener has run.
-    pub(crate) answered: bool,
-    /// The window has started its close.
-    pub(crate) closing: bool,
-    /// Since the first signal.
-    pub(crate) elapsed: Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verdict {
-    Wait,
-    /// `_exit(128 + signal)`, with the reason written to stderr first.
-    Exit {
-        signal: i32,
-        why: &'static str,
-    },
-}
-
-/// The watchdog's rule (the module doc says why).
-pub(crate) fn decide(w: Watch) -> Verdict {
-    if w.seen == 0 {
-        return Verdict::Wait;
-    }
-    if w.seen >= 2 && (!w.answered || w.closing) {
-        return Verdict::Exit {
-            signal: w.last,
-            why: "a second termination signal",
-        };
-    }
-    if !w.answered && w.elapsed >= ANSWER_WITHIN {
-        return Verdict::Exit {
-            signal: w.first,
-            why: "the window did not answer the termination signal within 5 s",
-        };
-    }
-    if w.answered && w.closing && w.elapsed >= CLOSE_WITHIN {
-        return Verdict::Exit {
-            signal: w.first,
-            why: "the window's close did not end the process in time",
-        };
-    }
-    Verdict::Wait
 }
 
 /// Points each of `fds` that is a terminal which has hung up (its writes fail with `EIO`; `isatty` says so by
@@ -341,7 +274,7 @@ fn start_watchdog() -> std::io::Result<()> {
                 closing: CLOSING.load(Ordering::SeqCst),
                 elapsed: now.saturating_sub(first_at),
             };
-            if decide(watch) != Verdict::Wait {
+            if decide(watch) != Outcome::Wait {
                 // Read the flags once more just before acting: an answer that arrived meanwhile withdraws an end
                 // by the bound.
                 let fresh = Watch {
@@ -349,7 +282,7 @@ fn start_watchdog() -> std::io::Result<()> {
                     closing: CLOSING.load(Ordering::SeqCst),
                     ..watch
                 };
-                if let Verdict::Exit { signal, why } = decide(fresh) {
+                if let Outcome::Exit { signal, why } = decide(fresh) {
                     hard_exit(signal, why);
                 }
             }
@@ -396,70 +329,6 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
-    fn watch(seen: u32, answered: bool, closing: bool, elapsed_ms: u64) -> Watch {
-        Watch {
-            seen,
-            first: libc::SIGTERM,
-            last: if seen >= 2 { libc::SIGINT } else { libc::SIGTERM },
-            answered,
-            closing,
-            elapsed: Duration::from_millis(elapsed_ms),
-        }
-    }
-
-    fn ms(d: Duration) -> u64 {
-        d.as_millis() as u64
-    }
-
-    #[test]
-    fn one_signal_answered_in_time_is_left_to_the_close() {
-        assert_eq!(decide(watch(0, false, false, 60_000)), Verdict::Wait);
-        assert_eq!(decide(watch(1, false, false, 4_999)), Verdict::Wait);
-        // Answered: the close runs within its own bounds (nvim's end allows 5 s, the agent's teardown more).
-        assert_eq!(decide(watch(1, true, true, 30_000)), Verdict::Wait);
-        assert_eq!(decide(watch(1, true, false, 60_000)), Verdict::Wait);
-    }
-
-    #[test]
-    fn a_signal_answered_is_not_ended_by_the_answer_bound_whatever_the_clock_reads() {
-        for elapsed_ms in [0, 4_999, 5_000, 5_001, 60_000, u64::MAX / 2] {
-            assert_eq!(
-                decide(watch(1, true, false, elapsed_ms)),
-                Verdict::Wait,
-                "{elapsed_ms} ms"
-            );
-        }
-        for elapsed_ms in [0, 4_999, 5_000, 5_001, ms(CLOSE_WITHIN) - 1] {
-            assert_eq!(
-                decide(watch(1, true, true, elapsed_ms)),
-                Verdict::Wait,
-                "{elapsed_ms} ms"
-            );
-        }
-    }
-
-    #[test]
-    fn a_close_that_outlasts_its_bounds_ends_the_process() {
-        assert_eq!(decide(watch(1, true, true, ms(CLOSE_WITHIN) - 1)), Verdict::Wait);
-        for elapsed_ms in [ms(CLOSE_WITHIN), ms(CLOSE_WITHIN) + 1, u64::MAX / 2] {
-            let Verdict::Exit { signal, .. } = decide(watch(1, true, true, elapsed_ms)) else {
-                panic!("a close still running after {elapsed_ms} ms was not ended");
-            };
-            assert_eq!(signal, libc::SIGTERM, "the first signal's own number");
-        }
-    }
-
-    #[test]
-    fn the_close_bound_covers_every_bound_the_close_waits_out() {
-        let session = Duration::from_secs(18);
-        let saved_tabs = Duration::from_secs(5);
-        let nvim = Duration::from_secs(5);
-        let tasks = eitri_core::plugin::tasks::GRACE;
-        let pages = eitri_core::plugin::tasks::GRACE + Duration::from_secs(1);
-        let margin = Duration::from_secs(5);
-        assert!(CLOSE_WITHIN >= session + saved_tabs + nvim + tasks + pages + margin);
-    }
-
     #[test]
     fn a_full_pipe_is_not_written_and_does_not_block() {
         let (_read_end, write_end) = std::io::pipe().expect("a pipe");
@@ -489,25 +358,6 @@ mod tests {
             write_if_writable(w.as_raw_fd(), b"reason\n"),
             "an empty pipe takes the line"
         );
-    }
-
-    #[test]
-    fn an_unanswered_signal_ends_the_process_after_the_bound_with_its_own_number() {
-        let Verdict::Exit { signal, .. } = decide(watch(1, false, false, 5_000)) else {
-            panic!("not ended at the bound");
-        };
-        assert_eq!(signal, libc::SIGTERM);
-    }
-
-    #[test]
-    fn a_second_signal_forces_unless_the_first_was_answered_and_no_close_began() {
-        for (answered, closing) in [(false, false), (true, true), (false, true)] {
-            let Verdict::Exit { signal, .. } = decide(watch(2, answered, closing, 10)) else {
-                panic!("a second signal did not force (answered {answered}, closing {closing})");
-            };
-            assert_eq!(signal, libc::SIGINT, "the second signal's own number");
-        }
-        assert_eq!(decide(watch(2, true, false, 10)), Verdict::Wait);
     }
 
     /// A pty pair opened close-on-exec: other tests of this binary start processes meanwhile, and a forked child

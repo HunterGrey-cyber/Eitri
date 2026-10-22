@@ -540,7 +540,14 @@ impl TextSizeController {
                 }
             });
             app.add_action(&action);
-            app.set_accels_for_action(&format!("app.{name}"), eitri_core::keymap::root::accels(name));
+            let accels: Vec<String> = eitri_core::keymap::root::chords_of(name)
+                .iter()
+                .map(|root| crate::gtk_host::keys::gtk_accel(&root.chord()))
+                .collect();
+            app.set_accels_for_action(
+                &format!("app.{name}"),
+                &accels.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
         }
 
         if let Some(editor) = &this.editor {
@@ -1389,7 +1396,7 @@ mod tests {
         assert_eq!(TEXT_SIZE_ACTIONS[2].1, TextStep::Reset);
         for (name, _) in TEXT_SIZE_ACTIONS.iter().copied() {
             assert!(
-                !eitri_core::keymap::root::accels(name).is_empty(),
+                !eitri_core::keymap::root::chords_of(name).is_empty(),
                 "{name} has no root accelerator"
             );
         }

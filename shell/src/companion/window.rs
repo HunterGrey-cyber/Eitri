@@ -9,19 +9,23 @@ use gtk4::{Application, ApplicationWindow};
 
 use eitri_core::companion::attach::LinkState;
 use eitri_core::companion::{Sockets, SCRATCH_CALL_LUA};
+use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::keymap::TabAction;
 use eitri_core::layout::{Direction, Layout, ModuleId, ModuleKeys, ModuleKind};
 use eitri_core::pane_switch::PaneSwitchChannel;
 use eitri_core::panel_control::{ControlServer, Request};
+use eitri_core::review_editor::Owner;
+use eitri_core::scratch::ScratchRequest;
 
 use super::close_watch::{CloseWatcher, ExitDecision};
 use super::link::{self, CompanionLink};
 use super::wm_runner::WmRunner;
 use super::Start;
-use crate::agent_panel::{self, AgentPanelHandle, ViewId};
+use crate::agent_panel::{self, AgentPanelHandle, HintInbound, ViewId};
 use crate::close_prompt::ClosePrompt;
 use crate::lua::LuaEngine;
 use crate::module_grid::{HostKind, ModuleGrid};
+use crate::panel_wiring::{wire_panel, PanelHooks};
 use crate::prefix_strip::PrefixStrip;
 use crate::text_size::TextSizeController;
 use crate::toast::Toast;
@@ -31,6 +35,9 @@ use eitri_core::keymap::companion::{self as companion_prefix, CompanionVerb};
 
 /// Moves the keys toward the window on one side of the panel; `false` when nothing was claimed.
 type MoveFocus = Rc<dyn Fn(&ModuleId, Direction) -> bool>;
+
+/// Hands a draft or a `gf` to the attached editor; `Err` says why it could not.
+type EditorRequest = Rc<dyn Fn(&ScratchRequest) -> Result<(), String>>;
 
 /// Everything the later steps of a companion window reach into.
 #[allow(dead_code)] // read by the attach and the window-manager moves, which come next
@@ -107,6 +114,60 @@ fn run_tab(
     }
 }
 
+/// What the companion's panel hooks act on, each built by the window from its own pieces.
+pub(crate) struct CompanionHookParts {
+    /// The one-line result of a restore at launch (`agent.restore`), in the window's toast.
+    pub(crate) toast: Rc<dyn Fn(&str)>,
+    /// The panel's own `<leader>` tab verbs (`bd`, `bo`, ...), run as the prefix's tab chords run them.
+    pub(crate) run_tab: Rc<dyn Fn(TabAction)>,
+    /// The panel's half of the global `f` HINT.
+    pub(crate) hint: Rc<dyn Fn(HintInbound)>,
+    /// A move toward the window on one side of the panel; `false` when nothing was claimed.
+    pub(crate) move_focus: MoveFocus,
+    /// The attached nvim, which turn review asks through the window's link.
+    pub(crate) editor_rpc: Rc<dyn EditorRpc>,
+    /// Which editor holds the review overlay, as the link knows it.
+    pub(crate) review_owner: Rc<dyn Fn() -> Option<Owner>>,
+    /// A file the review opened is in the user's own window: brings it forward.
+    pub(crate) review_open: Rc<dyn Fn()>,
+    /// A draft or a `gf`, handed to the attached editor as one call.
+    pub(crate) editor_request: EditorRequest,
+    /// An edit came back: the keys return to the panel.
+    pub(crate) editor_done: Rc<dyn Fn()>,
+}
+
+/// The companion's panel hooks: every one the main window installs but the five in
+/// [`COMPANION_OMITS`](crate::panel_wiring::COMPANION_OMITS). The window has one chat view, the
+/// base one, so the view a hook is handed is always that view.
+pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
+    let CompanionHookParts {
+        toast,
+        run_tab,
+        hint,
+        move_focus,
+        editor_rpc,
+        review_owner,
+        review_open,
+        editor_request,
+        editor_done,
+    } = parts;
+    PanelHooks {
+        on_hint: Some(Box::new(move |message: HintInbound| hint(message))),
+        on_toast: Some(Box::new(move |text: &str| toast(text))),
+        on_editor_request: Some(Box::new(move |request: &ScratchRequest| editor_request(request))),
+        set_editor_rpc: Some(editor_rpc),
+        set_review_owner: Some(Box::new(move || review_owner())),
+        on_review_open: Some(Box::new(move || review_open())),
+        on_editor_done: Some(Box::new(move |_view: ViewId| editor_done())),
+        // The page's stale-mirror recovery and its `pane_nav` ask for the move the chord would have made.
+        on_nav_fallthrough: Some(Box::new(move |_view: ViewId, direction: Direction| {
+            move_focus(&ModuleId::agent(), direction);
+        })),
+        on_tab_verb: Some(Box::new(move |_view: ViewId, action: TabAction| run_tab(action))),
+        ..PanelHooks::default()
+    }
+}
+
 /// Builds and presents the window. The agent panel is built after `init.lua` has run and
 /// `window_config::load` has read its keys, because that call applies `agent.account` and
 /// `agent.user_settings`, which have to be in place before anything reads a transcript or starts a
@@ -151,7 +212,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // How focus moves to another window, and how a window is brought forward: through the window
     // manager's own tool, run off the GTK thread.
-    let runner = WmRunner::new(eitri_core::wm::resolve(config.companion_wm, &|name| {
+    let runner = WmRunner::new(eitri_core::compositor::resolve(config.companion_wm, &|name| {
         std::env::var_os(name)
     }));
 
@@ -250,7 +311,6 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         .find(|(id, _)| id.kind() == ModuleKind::Agent)
         .map(|(_, host)| host)
         .expect("the companion layout holds the agent");
-    crate::wheel_zoom::install(ModuleId::agent(), &agent_host, text_size.clone());
 
     // Which module has the keys: the panel's cursor is solid while the window is active and the
     // keys are in it, hollow when the window manager moves focus to another window.
@@ -274,10 +334,10 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     bar.set_visible(false);
     let toast = Toast::install(&overlay, bar.upcast_ref());
     // The one-line result of a restore at launch (`agent.restore`).
-    {
+    let toast_hook: Rc<dyn Fn(&str)> = {
         let toast = toast.clone();
-        agent.on_toast(move |text| toast.show(text));
-    }
+        Rc::new(move |text: &str| toast.show(text))
+    };
     let strip = PrefixStrip::new();
     let strip_frame = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     strip_frame.add_css_class("module-toast");
@@ -298,15 +358,14 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // The panel's own `<leader>` tab verbs (`bd`, `bo`, ...) run the code the prefix's tab chords
     // run, so a verb behaves the same whichever route sent it.
-    {
+    let run_tab_hook: Rc<dyn Fn(TabAction)> = {
         let window = window.clone();
         let grid = grid.clone();
         let agent_for_tabs = agent.clone();
         let focus_module = focus_module.clone();
         let toast = toast.clone();
-        agent
-            .on_tab_verb(move |_view, action| run_tab(action, &window, &grid, &agent_for_tabs, &*focus_module, &toast));
-    }
+        Rc::new(move |action: TabAction| run_tab(action, &window, &grid, &agent_for_tabs, &*focus_module, &toast))
+    };
 
     // The global `f` HINT, over the panel alone.
     let hint = crate::hint::HintCoordinator::new(crate::hint::HintWidgets {
@@ -332,10 +391,10 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         activate_strip: Rc::new(|_: &ModuleId| {}),
         agent: agent.clone(),
     });
-    {
+    let hint_hook: Rc<dyn Fn(HintInbound)> = {
         let hint = hint.clone();
-        agent.on_hint(move |message| hint.on_panel(message));
-    }
+        Rc::new(move |message: HintInbound| hint.on_panel(message))
+    };
 
     // The `?` overlay's window and prefix sections, re-sent whenever the attached editor's own keys
     // report changes.
@@ -454,23 +513,22 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     );
 
     // The panel's own `Ctrl+h/j/k/l`: claimed for the composer where the panel says so, else a move
-    // toward the neighbouring window.
-    // The page's stale-mirror recovery and its `pane_nav` ask for the move the chord would have made.
-    {
-        let move_focus = move_focus.clone();
-        agent.on_nav_fallthrough(move |_view, direction| {
-            move_focus(&ModuleId::agent(), direction);
-        });
-    }
-    crate::install_module_nav(
-        ModuleId::agent(),
+    // toward the neighbouring window (`move_focus`, which the panel's fallthrough hook also takes).
+    // The panel's host gets what every chat host gets (`wire`): its `Ctrl+h/j/k/l`, the
+    // Super filter that keeps a Super chord off its page, and `Ctrl`+wheel zoom.
+    crate::wire::wire_host(
+        crate::wire::WireKind::Chat,
+        &ModuleId::agent(),
         &agent_host,
-        move_focus.clone(),
-        Some(agent.nav_intercept(ViewId::BASE)),
-        false,
+        &crate::wire::WireDeps {
+            move_focus: move_focus.clone(),
+            nav_intercept: {
+                let agent = agent.clone();
+                Rc::new(move |view| agent.nav_intercept(view))
+            },
+            text_size: text_size.clone(),
+        },
     );
-    // No key with Super or Hyper held reaches the panel's page (`panel_super.rs`).
-    crate::panel_super::install(&agent_host);
 
     // `eitri-supervisor` asks a window to come to the front.
     {
@@ -535,20 +593,21 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     };
 
     // Turn review asks the attached nvim through the same link, and polls its answers.
-    agent.set_editor_rpc(link.clone());
-    {
+    let review_owner: Rc<dyn Fn() -> Option<Owner>> = {
         let owner = link.clone();
-        agent.set_review_owner(move || owner.review_owner());
-        // A file the review opened is in the user's own window: bringing it forward is the window
-        // manager's job, as for a draft.
+        Rc::new(move || owner.review_owner())
+    };
+    // A file the review opened is in the user's own window: bringing it forward is the window
+    // manager's job, as for a draft.
+    let review_open: Rc<dyn Fn()> = {
         let link = link.clone();
         let runner = runner.clone();
-        agent.on_review_open(move || {
+        Rc::new(move || {
             if let Some(pid) = link.nvim_pid() {
                 runner.raise_editor(pid);
             }
-        });
-    }
+        })
+    };
 
     // The edge letters nvim's own navigator sends when the cursor is at nvim's last window: they
     // continue as a move toward the window beyond it. The channel carries no shim, so only a
@@ -570,10 +629,10 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // A draft or a `gf` goes to the editor as one call; the editor is not shown or focused, it is
     // the user's own window.
-    {
+    let editor_request: EditorRequest = {
         let link = link.clone();
         let runner = runner.clone();
-        agent.on_editor_request(move |request| {
+        Rc::new(move |request: &ScratchRequest| {
             link.exec_lua_for("scratch", SCRATCH_CALL_LUA, vec![request.hex().into()])?;
             // The editor is the user's own window, so bringing it forward is the window manager's
             // job; nothing here waits for it.
@@ -581,21 +640,38 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 runner.raise_editor(pid);
             }
             Ok(())
-        });
-    }
+        })
+    };
     // An edit that came back: the keys return to the panel, on the oldest card if one waits.
-    {
+    let editor_done: Rc<dyn Fn()> = {
         let agent_for_done = agent.clone();
         let focus_module = focus_module.clone();
         let runner = runner.clone();
-        agent.on_editor_done(move |_view| {
+        Rc::new(move || {
             focus_module(&ModuleId::agent());
             runner.raise_pid(std::process::id());
             if !agent_for_done.focus_oldest_card(ViewId::BASE) {
                 agent_for_done.arrive(ViewId::BASE);
             }
-        });
-    }
+        })
+    };
+    // Every hook the panel gets here, registered once its last one is built. Nothing above can make
+    // the panel call one: the window is still being built, and no page message is read before the
+    // main loop runs again.
+    wire_panel(
+        &agent,
+        companion_hooks(CompanionHookParts {
+            toast: toast_hook,
+            run_tab: run_tab_hook,
+            hint: hint_hook,
+            move_focus: move_focus.clone(),
+            editor_rpc: link.clone(),
+            review_owner,
+            review_open,
+            editor_request,
+            editor_done,
+        }),
+    );
 
     // What a second `eitri panel` or `:EitriPanel` asked of this one, read off the control socket's
     // thread. Only the last attach counts: two inside one tick would otherwise connect twice.

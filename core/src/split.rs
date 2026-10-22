@@ -168,7 +168,7 @@ pub fn wait_for_socket(sock: &Path, child: &mut Child, euid: u32, deadline: Dura
 /// pid it names one process for good, which a pid alone does not once it is reused. `None` for a
 /// process that is gone, and off Linux.
 pub fn proc_start_time(pid: u32) -> Option<u64> {
-    crate::wm::proc_stat(pid)
+    crate::proc_chain::proc_stat(pid)
         .as_deref()
         .and_then(panel_control::stat_parent_and_start)
         .map(|(_, start)| start)

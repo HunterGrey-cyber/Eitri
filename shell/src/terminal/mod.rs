@@ -24,7 +24,9 @@ pub(crate) mod registry;
 
 pub(crate) use pane::TerminalPane;
 
-use eitri_core::layout::{Frame, Layout, LayoutError, ModuleDecl, ModuleId, ModuleKind, Placement};
+use eitri_core::layout::ModuleKind;
+#[cfg(test)]
+use eitri_core::layout::{Layout, LayoutError, ModuleDecl};
 use eitri_core::theme::ThemeTokens;
 use eitri_terminal::{ExitInfo, TerminalColors};
 use gtk4::gdk::{Key, ModifierType};
@@ -88,22 +90,12 @@ pub(crate) fn exit_is_current(reported: u64, current: u64) -> bool {
 /// placement, that placement is used. Only the base terminal and Lua panels intended for
 /// first launch reach `Layout::initial`. A chat view or numbered instance is placed later;
 /// its declaration only supplies its placement. `Layout::initial` rejects placing a module twice.
+///
+/// Uses `wm::persist::first_launch_layout`, which also supplies the first-launch layout
+/// when there is no Lua default. The shell tests start from the same layout.
+#[cfg(test)]
 pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError> {
-    let mut all = Vec::with_capacity(decls.len() + 1);
-    if !decls.iter().any(|d| d.id == ModuleId::terminal()) {
-        all.push(ModuleDecl {
-            id: ModuleId::terminal(),
-            placement: Placement::BelowEditor,
-        });
-    }
-    all.extend_from_slice(decls);
-    let mut layout = Layout::initial(&eitri_core::layout::first_launch_decls(&all))?;
-    eitri_core::layout::hide(
-        &mut layout,
-        &ModuleId::terminal(),
-        &Frame::new(crate::module_grid::UNALLOCATED, 1),
-    )?;
-    Ok(layout)
+    eitri_core::wm::persist::first_launch_layout(decls)
 }
 
 /// What `Ctrl+a t` does.
@@ -260,7 +252,7 @@ pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
 mod tests {
     use super::*;
     use crate::module_grid::UNALLOCATED;
-    use eitri_core::layout::{arrange, hide, navigate, Nav, Rect, ZoomChange};
+    use eitri_core::layout::{arrange, hide, navigate, Frame, ModuleId, Nav, Placement, Rect, ZoomChange};
 
     fn editor() -> ModuleId {
         ModuleId::editor()
@@ -295,6 +287,13 @@ mod tests {
         assert_eq!(layout.visible_leaves(), [editor(), agent()]);
         assert_eq!(layout.focus(), &editor());
         assert_eq!(on_screen(&layout), on_screen(&Layout::initial(&[]).unwrap()));
+    }
+
+    /// The first launch hides the terminal against the same stand-in size the grid computes against before its
+    /// first allocation, so the two never disagree about the startup layout.
+    #[test]
+    fn the_first_launch_frame_is_the_grids_unallocated_size() {
+        assert_eq!(eitri_core::wm::persist::FIRST_LAUNCH_FRAME, UNALLOCATED);
     }
 
     /// A Lua `bottom` panel goes under the whole layout, including the terminal's place below

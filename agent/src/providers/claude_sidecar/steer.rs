@@ -342,6 +342,8 @@ impl<R> SteerGate<R> {
 
     /// The gate of a session taken over from another process: nothing open or held, and the messages
     /// that process had given up on, so a delivery that still comes for one is passed on there too.
+    /// Only a move takes a session over, and moves exist only on Linux.
+    #[cfg(target_os = "linux")]
     pub(crate) fn taken_over(given_up: Vec<(String, String)>) -> Self {
         let mut gate = Self::default();
         let skip = given_up.len().saturating_sub(MAX_OPEN_STEERS);
@@ -752,6 +754,7 @@ mod tests {
         assert_eq!(gate.hand_over(), Ok(Vec::new()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_message_given_up_on_is_handed_over_and_a_late_delivery_is_honoured_by_the_taker() {
         let mut gate: Gate = SteerGate::default();

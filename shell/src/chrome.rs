@@ -333,8 +333,7 @@ mod tests {
 
     /// A workspace name is the user's or a state file's text: the workspace button's label and the
     /// rename entry are given it with `set_text`, only in `show_workspace` and `start_rename` (the
-    /// window's code sets no widget's text itself), and nothing in the top bar's code, the window's or
-    /// the prefix strip's sets markup on any widget.
+    /// window's code sets no widget's text itself).
     #[test]
     fn a_workspace_name_is_set_as_text_never_markup() {
         use eitri_core::source_scan as scan;
@@ -359,14 +358,10 @@ mod tests {
                 "{setter}: a button's label is not set"
             );
         }
-        for path in ["shell/src/chrome.rs", "shell/src/main.rs", "shell/src/prefix_strip.rs"] {
-            let code = without_tests(path);
-            assert!(!code.contains("markup"), "{path} sets markup somewhere");
-        }
         // Any other text write would bypass the two setters above: a button's own label replaces
         // the plain label inside it, and an entry's text can be set or inserted.
         let setters = [".set_text(", ".set_label(", ".insert_text(", ".set_buffer("];
-        let main = without_tests("shell/src/main.rs");
+        let (_, main) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
         for setter in setters {
             assert!(
                 !main.contains(setter),
@@ -389,6 +384,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn check_markup(sources: &[eitri_core::source_scan::Source]) {
+        use eitri_core::source_scan as scan;
+        let allowlist = [
+            (
+                "shell/src/hint.rs",
+                "on_targets",
+                "sets label_markup's output, which escapes every piece",
+            ),
+            (
+                "shell/src/hint.rs",
+                "show_prefix",
+                "sets label_markup's output, which escapes every piece",
+            ),
+            (
+                "shell/src/editor_start_failure.rs",
+                "show",
+                "escapes its message with markup_escape_text before it is set",
+            ),
+        ];
+        for source in sources {
+            let code = scan::code_only(&source.text);
+            let code = scan::without(&code, &scan::modules(&code, "tests"));
+            // Every way gtk4-rs sets widget text as markup: the setters, the constructor and the builder
+            // properties. A form left off this list would pass the scan unseen.
+            for setter in [
+                "set_markup",
+                "set_markup_with_mnemonic",
+                "set_use_markup",
+                "set_tooltip_markup",
+                "with_markup",
+                "use_markup",
+                "tooltip_markup",
+            ] {
+                for end in scan::word_ends(&code, setter) {
+                    let before = code[..end - setter.len()].trim_end();
+                    let after = code[end..].trim_start();
+                    if !after.starts_with('(') || before.ends_with("fn") {
+                        continue;
+                    }
+                    if setter == "set_use_markup" || setter == "use_markup" {
+                        let argument = after[1..].trim_start();
+                        if !argument
+                            .strip_prefix("true")
+                            .is_some_and(|rest| rest.trim_start().starts_with(')'))
+                        {
+                            continue;
+                        }
+                    }
+                    let enclosing = scan::word_ends(&code, "fn")
+                        .into_iter()
+                        .filter_map(|at| {
+                            let rest = code[at..].trim_start();
+                            let len = rest
+                                .chars()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .map(char::len_utf8)
+                                .sum::<usize>();
+                            (len > 0).then_some(&rest[..len])
+                        })
+                        .flat_map(|name| scan::functions(&code, name).into_iter().map(move |body| (name, body)))
+                        .filter(|(_, body)| {
+                            let start = body.as_ptr() as usize - code.as_ptr() as usize;
+                            start <= end && end < start + body.len()
+                        })
+                        .min_by_key(|(_, body)| body.len());
+                    let allowed = enclosing.is_some_and(|(name, _)| {
+                        allowlist
+                            .iter()
+                            .any(|(path, allowed_name, _reason)| source.path == *path && name == *allowed_name)
+                    });
+                    assert!(allowed, "{} calls {setter} outside the allowed functions", source.path);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_widget_text_is_set_as_markup_outside_the_allowlist() {
+        check_markup(&eitri_core::source_scan::rust_sources(&["shell/src"]));
+    }
+
+    #[test]
+    fn the_markup_scan_catches_a_set_markup_in_a_new_file() {
+        let fixture = [eitri_core::source_scan::Source {
+            path: "shell/src/new_widget.rs".into(),
+            text: "fn show() { label.set_markup(&text); }".into(),
+        }];
+        assert!(std::panic::catch_unwind(|| check_markup(&fixture)).is_err());
+    }
+
+    #[test]
+    fn the_markup_scan_catches_an_allowlisted_call_in_a_new_place() {
+        let fixture = [eitri_core::source_scan::Source {
+            path: "shell/src/hint.rs".into(),
+            text: "fn elsewhere() { label.set_markup(&text); }".into(),
+        }];
+        assert!(std::panic::catch_unwind(|| check_markup(&fixture)).is_err());
+    }
+
+    #[test]
+    fn the_markup_scan_catches_the_tooltip_constructor_and_builder_forms() {
+        for text in [
+            "fn show() { button.set_tooltip_markup(Some(&text)); }",
+            "fn show() { let label = gtk::Label::with_markup(&text); }",
+            "fn show() { let label = gtk::Label::builder().label(&text).use_markup(true).build(); }",
+            "fn show() { let button = gtk::Button::builder().tooltip_markup(&text).build(); }",
+        ] {
+            let fixture = [eitri_core::source_scan::Source {
+                path: "shell/src/new_widget.rs".into(),
+                text: text.into(),
+            }];
+            assert!(
+                std::panic::catch_unwind(|| check_markup(&fixture)).is_err(),
+                "a markup form the scan must refuse passed: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_markup_scan_passes_the_safe_form() {
+        check_markup(&[eitri_core::source_scan::Source {
+            path: "shell/src/new_widget.rs".into(),
+            text: "fn show() { label.set_use_markup(false); let markup = text; label_markup(&markup); \
+                   let other = gtk::Label::builder().use_markup(false).build(); }"
+                .into(),
+        }]);
     }
 
     #[test]

@@ -1,15 +1,5 @@
-//! Registers plugin panels with `id`, `title`, `position`, and `content`.
-//! `content` must be `{ type = "webview", url = "..." }` in v1. It is validated here
-//! so invalid content fails before reaching GTK.
-//!
-//! The registry holds only Lua panels. Every window has editor and agent modules;
-//! each Lua panel adds a module placed by its `position` (`PanelSlot::placement`).
-//! `main.rs` turns this registry into `ModuleDecl`s in the shared layout.
-//!
-//! `PanelSlot`, `ParsedPanelSpec`, `parse_panel_spec`, and `resolve_panel_url` live
-//! in the core Lua panel module and do not touch GTK or WebKit. This module keeps
-//! `PanelEntry`, which holds a `gtk4::Widget`, and `install`, which builds a
-//! `webkit6::WebView`.
+//! Lua panel views and their crash recovery. Registration order and replacement live in core;
+//! the shell retains widgets and their shared crash guards by module id.
 
 use eitri_core::lua::panel::{parse_panel_spec, resolve_panel_url, PanelSlot};
 use gtk4::prelude::*;
@@ -19,61 +9,89 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use webkit6::prelude::*;
 
-/// One Lua panel. Generic over the widget only so the registry's rules are tested without a
-/// display; the product always holds a `gtk4::Widget`.
-pub(crate) struct PanelEntry<W = gtk4::Widget> {
-    pub(crate) id: String,
-    /// Its name on the tray chip and in the prefix strip.
-    pub(crate) title: String,
-    /// Where it goes the first time (`PanelSlot::placement`), nothing more.
-    pub(crate) slot: PanelSlot,
-    /// Its module key after `Ctrl+a`, as written. `main.rs` checks all panel keys together with
-    /// `ModuleKeys::build` once `init.lua` has run.
-    pub(crate) key: Option<String>,
-    /// The page it loads, resolved against the config directory: what a `prefix x`'d panel loads
-    /// afresh when its key reopens it (2026-09-26).
-    pub(crate) url: String,
-    pub(crate) widget: W,
-    /// This panel's crash-loop guard. `main.rs`'s
-    /// revive-on-next-show path (`prefix x`, then this panel's own key) resets it right where it
-    /// reruns `load_uri` -- the manual recovery the panel's own give-up message tells the user to
-    /// try -- the same way `AgentPanelHandle::reload_document_by_hand` resets the chat's own guard.
-    /// Without that, a guard that already gave up stays terminal forever (see
-    /// `WebViewCrashGuard::reset`'s own doc), so a LATER, unrelated crash after a successful manual
-    /// recovery would be silently swallowed with no reload and no message. `Rc<RefCell<_>>` because
-    /// `install_crash_recovery`'s own closure, connected on the `WebView`, holds the other handle to
-    /// the same guard.
-    pub(crate) crash_guard: Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>>,
+type CrashGuard = Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>>;
+
+/// Views may be built on either side of registration, so neither operation discards the other half.
+pub(crate) struct PanelViews<W = gtk4::Widget> {
+    views: std::collections::HashMap<eitri_core::layout::ModuleId, (Option<W>, CrashGuard)>,
 }
 
-/// The Lua panels, in registration order -- the order `Layout::initial` places them in.
-pub(crate) struct PanelRegistry<W = gtk4::Widget> {
-    entries: Vec<PanelEntry<W>>,
-}
-
-impl<W> Default for PanelRegistry<W> {
+impl<W> Default for PanelViews<W> {
     fn default() -> Self {
-        PanelRegistry { entries: Vec::new() }
+        Self {
+            views: Default::default(),
+        }
     }
 }
 
-impl<W> PanelRegistry<W> {
-    /// A second registration with the same `id` replaces the first, as a second registration to
-    /// the same slot always did; it goes last, where it was registered. Two panels with different
-    /// ids and the same `position` are both placed now -- one of them no longer disappears.
-    pub(crate) fn register(&mut self, entry: PanelEntry<W>) {
-        if let Some(i) = self.entries.iter().position(|e| e.id == entry.id) {
-            eprintln!(
-                "[lua] panel '{}' registered again -- replaced by the new registration",
-                entry.id
-            );
-            self.entries.remove(i);
+impl<W> PanelViews<W> {
+    pub(crate) fn insert_guard(&mut self, module: eitri_core::layout::ModuleId, guard: CrashGuard) {
+        match self.views.entry(module) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().1 = guard,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((None, guard));
+            }
         }
-        self.entries.push(entry);
     }
 
-    pub(crate) fn entries(&self) -> &[PanelEntry<W>] {
-        &self.entries
+    pub(crate) fn set_widget(&mut self, module: &eitri_core::layout::ModuleId, widget: W) {
+        self.views
+            .entry(module.clone())
+            .or_insert_with(|| {
+                (
+                    None,
+                    Rc::new(RefCell::new(
+                        crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+                    )),
+                )
+            })
+            .0 = Some(widget);
+    }
+
+    pub(crate) fn widget(&self, module: &eitri_core::layout::ModuleId) -> Option<&W> {
+        self.views.get(module).and_then(|(widget, _)| widget.as_ref())
+    }
+
+    pub(crate) fn guard(&self, module: &eitri_core::layout::ModuleId) -> Option<CrashGuard> {
+        self.views.get(module).map(|(_, guard)| guard.clone())
+    }
+}
+
+/// The shell installer hands the declaration and view to their separate owners in one call.
+pub(crate) struct PanelEntry {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) slot: PanelSlot,
+    pub(crate) key: Option<String>,
+    pub(crate) url: String,
+    pub(crate) widget: gtk4::Widget,
+    pub(crate) crash_guard: CrashGuard,
+}
+
+/// Adapter for the shell's installers; core alone decides registration order and replacement.
+#[derive(Default)]
+pub(crate) struct PanelRegistry {
+    registry: eitri_core::lua::panel::PanelRegistry,
+    pub(crate) views: PanelViews,
+}
+
+impl PanelRegistry {
+    pub(crate) fn register(&mut self, entry: PanelEntry) {
+        let module = eitri_core::layout::ModuleId::lua(&entry.id);
+        self.views.insert_guard(module.clone(), entry.crash_guard);
+        self.views.set_widget(&module, entry.widget);
+        self.registry.register(eitri_core::lua::panel::PanelEntry {
+            module,
+            id: entry.id,
+            title: entry.title,
+            slot: entry.slot,
+            key: entry.key,
+            url: entry.url,
+        });
+    }
+
+    pub(crate) fn entries(&self) -> &[eitri_core::lua::panel::PanelEntry] {
+        self.registry.entries()
     }
 }
 
@@ -127,19 +145,12 @@ pub(crate) fn install(
     Ok(())
 }
 
-/// Reloads a Lua panel after its web process crashes, using `WebViewCrashGuard` to limit crash
-/// loops. Skips `TerminatedByApi`: `kill_pane` deliberately terminates the process for
-/// `prefix x`, and showing the module again already reloads it. `id` is only for logging.
+/// Reload after a crash, but stop after repeated failures. Deliberate process termination is
+/// ignored because reopening the module already reloads its page. The shared guard lets that
+/// manual recovery reset the same crash count the signal handler checks.
 ///
-/// Returns the shared guard so the caller can reset it when reviving the panel on its next
-/// show.
-///
-/// The signal closure uses the callback's `WebView` argument rather than capturing an owned
-/// clone. Capturing a clone would create a strong reference cycle through the view's
-/// signal-handler storage, preventing a replaced panel from being freed.
-///
-/// `give_up_base` is the address used for the give-up notice. `None` uses `about:blank`; a view
-/// with restricted navigation passes an allowed address instead.
+/// The handler uses the signal's view argument to avoid a strong reference cycle through the
+/// view's own signal storage. `give_up_base` stays inside a navigation-locked page's allowed origin.
 pub(crate) fn install_crash_recovery(
     webview: &webkit6::WebView,
     id: String,
@@ -154,7 +165,7 @@ pub(crate) fn install_crash_recovery(
 }
 
 /// [`install_crash_recovery`] with a guard made earlier: a view built after its panel was registered answers to
-/// the guard the registry already holds, so the revive path resets the one the signal asks.
+/// the guard its views already hold, so the revive path resets the one the signal asks.
 pub(crate) fn install_crash_recovery_into(
     webview: &webkit6::WebView,
     id: String,
@@ -190,44 +201,37 @@ pub(crate) fn install_crash_recovery_into(
 mod tests {
     use super::*;
 
-    fn entry(id: &str, slot: PanelSlot, widget: &'static str) -> PanelEntry<&'static str> {
-        PanelEntry {
-            id: id.to_string(),
-            title: id.to_string(),
-            slot,
+    #[test]
+    fn a_view_built_after_its_panel_registered_finds_its_crash_guard() {
+        let module = eitri_core::layout::ModuleId::lua("notes");
+        let mut registry = eitri_core::lua::panel::PanelRegistry::default();
+        let mut views = PanelViews::<&'static str>::default();
+        let guard = Rc::new(RefCell::new(
+            crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+        ));
+        registry.register(eitri_core::lua::panel::PanelEntry {
+            module: module.clone(),
+            id: "notes".into(),
+            title: "Notes".into(),
+            slot: PanelSlot::Side,
             key: None,
-            url: format!("file:///{id}.html"),
-            widget,
-            // `WebViewCrashGuard` is GTK-free (`shell::webview_crash_guard`'s own doc), so these
-            // registry-only tests -- which deliberately never touch a real `WebView` -- can still
-            // construct a real one rather than needing an `Option`.
-            crash_guard: Rc::new(RefCell::new(
-                crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
-            )),
-        }
+            url: "file:///notes.html".into(),
+        });
+        views.insert_guard(module.clone(), guard.clone());
+        views.set_widget(&module, "notes view");
+        assert!(Rc::ptr_eq(&views.guard(&module).unwrap(), &guard));
+        assert_eq!(views.widget(&module), Some(&"notes view"));
     }
-
     #[test]
-    fn panels_keep_their_registration_order_and_two_in_one_position_both_stay() {
-        let mut registry = PanelRegistry::default();
-        registry.register(entry("a", PanelSlot::Bottom, "a1"));
-        registry.register(entry("b", PanelSlot::Bottom, "b1"));
-        registry.register(entry("c", PanelSlot::Side, "c1"));
-        let ids: Vec<&str> = registry.entries().iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, ["a", "b", "c"]);
-    }
-
-    #[test]
-    fn registering_an_id_again_replaces_it_and_moves_it_last() {
-        let mut registry = PanelRegistry::default();
-        registry.register(entry("a", PanelSlot::Bottom, "a1"));
-        registry.register(entry("b", PanelSlot::Side, "b1"));
-        registry.register(entry("a", PanelSlot::Main, "a2"));
-        let seen: Vec<(&str, PanelSlot, &str)> = registry
-            .entries()
-            .iter()
-            .map(|e| (e.id.as_str(), e.slot, e.widget))
-            .collect();
-        assert_eq!(seen, [("b", PanelSlot::Side, "b1"), ("a", PanelSlot::Main, "a2")]);
+    fn a_view_built_before_registration_keeps_its_widget_when_the_guard_arrives() {
+        let module = eitri_core::layout::ModuleId::lua("notes");
+        let mut views = PanelViews::<&'static str>::default();
+        views.set_widget(&module, "notes view");
+        let guard = Rc::new(RefCell::new(
+            crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
+        ));
+        views.insert_guard(module.clone(), guard.clone());
+        assert_eq!(views.widget(&module), Some(&"notes view"));
+        assert!(Rc::ptr_eq(&views.guard(&module).unwrap(), &guard));
     }
 }

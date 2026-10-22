@@ -10,8 +10,9 @@
 //! (`shell/tests/support/own_x_server.rs`), started in the case's child process and pointed to
 //! before winit connects, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took
 //! the session's Wayland/X11 display, the desktop's from any agent shell. It is a plain `main`
-//! (`harness = false`) that re-executes itself once per case, because winit allows one `EventLoop`
-//! per process, on the main thread only; the parent connects to no display. Run with, and no
+//! (`harness = false`) that re-executes itself once per case, so each case starts its own Xvfb
+//! before anything connects to a display (winit's event loop is built on the main thread, once, and
+//! keeps its display connection for the process's life); the parent connects to no display. Run with, and no
 //! wrapper is needed:
 //!
 //!     cargo test -p neovide-editor --test unfocused_cursor -- --ignored
@@ -143,8 +144,8 @@ struct Case {
     unfocused_visible: bool,
 }
 
-/// Runs one case in a child copy of this binary: winit allows one `EventLoop` per process, and
-/// only on the main thread, so every `LiveHarness` needs a fresh process.
+/// Runs one case in a child copy of this binary, so the case has its own Xvfb: every `LiveHarness`
+/// in a process shares one event loop, connected to the display it first found.
 fn run_case(case: &Case) -> (usize, usize) {
     let spec = format!(
         "{}\n{}\n{}\n{}",

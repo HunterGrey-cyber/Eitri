@@ -595,7 +595,8 @@ impl PluginPanels {
     }
 
     /// Views and gone lines to their hosts (each host pumped once after); commands back in order for the window:
-    /// `Show`, `Hide` and `Toggle` as sent, `Auto` as `Show` only when that host's `auto_show` is on. A line for an
+    /// `Show`, `Hide` and `Toggle` as sent, `Auto` as sent only when that host's `auto_show` is on (still `Auto`, so
+    /// the window shows only a hidden module and leaves a zoom or a tab the user chose alone). A line for an
     /// owner that is not a loaded plugin wanting the feed is dropped. Views go first: the reader lets a gone line
     /// out only when it is newer than every view of its plugin let out so far, so this is the order nvim sent
     /// them in. After the editor's end and before a new session, views and gone lines are dropped: they describe
@@ -645,7 +646,7 @@ impl PluginPanels {
                     let Some(pump) = self.follower(&owner) else { continue };
                     let module = ModuleId::lua(&owner);
                     match cmd {
-                        FollowCmd::Auto if pump.host.auto_show() => commands.push((module, FollowCmd::Show)),
+                        FollowCmd::Auto if pump.host.auto_show() => commands.push((module, FollowCmd::Auto)),
                         FollowCmd::Auto => {}
                         _ => commands.push((module, cmd)),
                     }
@@ -1127,10 +1128,10 @@ mod tests {
             panels.route_follow(lines(), now),
             [
                 (demo(), FollowCmd::Toggle),
-                (demo(), FollowCmd::Show),
+                (demo(), FollowCmd::Auto),
                 (demo(), FollowCmd::Hide)
             ],
-            "an automatic show is a show where its setting is on"
+            "an automatic show passes where its setting is on, still marked automatic"
         );
 
         // A window whose plugins neither follow nor define commands binds no socket.
@@ -1242,6 +1243,34 @@ mod tests {
         window.covered.set(true);
         apply_follow_commands(&window, vec![(demo(), FollowCmd::Hide)]);
         assert_eq!(*window.calls.borrow(), ["hide"], "a hide hides it wherever it is");
+    }
+
+    #[test]
+    fn an_automatic_show_routed_from_the_feed_leaves_a_zoomed_preview_alone() {
+        let scratch = Scratch::new("panels-follow-auto-zoom");
+        let (panels, _) = demo_and_other(&scratch, true);
+        let window = RecordingWindow {
+            panels: &panels,
+            shown: Cell::new(true),
+            covered: Cell::new(true),
+            calls: RefCell::default(),
+        };
+        let routed = panels.route_follow(batch(vec![cmd("demo", FollowCmd::Auto)]), Instant::now());
+        apply_follow_commands(&window, routed);
+        assert!(
+            window.calls.borrow().is_empty(),
+            "a new buffer must not end the zoom or switch the tab over a preview already shown"
+        );
+
+        window.shown.set(false);
+        window.covered.set(false);
+        let routed = panels.route_follow(batch(vec![cmd("demo", FollowCmd::Auto)]), Instant::now());
+        apply_follow_commands(&window, routed);
+        assert_eq!(
+            *window.calls.borrow(),
+            ["show"],
+            "a hidden preview opens on a new buffer"
+        );
     }
 
     fn view(owner: &str) -> eitri_core::plugin::follow_feed::ViewLine {

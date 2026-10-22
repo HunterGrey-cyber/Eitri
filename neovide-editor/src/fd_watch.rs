@@ -20,9 +20,9 @@ use gtk4::glib::{self, ffi, thread_guard::ThreadGuard, translate::*};
 
 type Callback = ThreadGuard<Box<dyn FnMut(glib::IOCondition) -> glib::ControlFlow>>;
 
-/// The priority the pane's event-loop watch runs at (`TickDriver::watch_fd`), and the one
+/// The priority the editors' event-loop watch runs at ([`add_event_loop_watch`]), and the one
 /// `tests/fd_watch_priority.rs` holds: `G_PRIORITY_DEFAULT_IDLE` (200), below GDK's paint
-/// priority (120), so a flood of redraw batches never starves a paint (plan review F1).
+/// priority (120), so a flood of redraw batches never starves a paint.
 pub const EVENT_LOOP_WATCH_PRIORITY: std::ffi::c_int = ffi::G_PRIORITY_DEFAULT_IDLE;
 
 /// `add_local` was called from a thread that does not own the default main context, where the
@@ -83,4 +83,36 @@ pub fn add_local(
             Some(destroy),
         ))
     })
+}
+
+/// The conditions the event-loop watch asks for: readable, plus the two that mean the fd is gone.
+pub const EVENT_LOOP_WATCH_CONDITION: glib::IOCondition = glib::IOCondition::IN
+    .union(glib::IOCondition::ERR)
+    .union(glib::IOCondition::HUP);
+
+/// Watches the editors' shared event-loop fd at [`EVENT_LOOP_WATCH_PRIORITY`]: the one place that
+/// watch is made, so the priority test holds the code the editors run, not a copy of its numbers.
+pub fn add_event_loop_watch(
+    fd: RawFd,
+    func: impl FnMut(glib::IOCondition) -> glib::ControlFlow + 'static,
+) -> Result<glib::SourceId, NotOwner> {
+    add_local(fd, EVENT_LOOP_WATCH_CONDITION, EVENT_LOOP_WATCH_PRIORITY, func)
+}
+
+/// The priority of a source still attached to the default main context, `None` once it is gone,
+/// and `None` when another thread owns that context (its priority cannot be read safely there).
+pub fn source_priority(id: &glib::SourceId) -> Option<std::ffi::c_int> {
+    // The lookup hands back a pointer the context owns without taking a reference. A source is
+    // destroyed when its callback returns `Break`, which happens while some thread dispatches the
+    // context; holding the context for the lookup and the read means no other thread can be
+    // dispatching (and freeing) it in between. Removing it through its `SourceId` would need the
+    // id, which the caller is lending here. Acquiring is recursive, so the owning thread passes.
+    let context = glib::MainContext::default();
+    let _held = context.acquire().ok()?;
+    // SAFETY: a lookup by id on the default context, which this thread holds until the read is
+    // done, so the source cannot be destroyed between the lookup and the read.
+    unsafe {
+        let source = ffi::g_main_context_find_source_by_id(context.to_glib_none().0, id.as_raw());
+        (!source.is_null()).then(|| ffi::g_source_get_priority(source))
+    }
 }

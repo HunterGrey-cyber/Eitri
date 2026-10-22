@@ -9,9 +9,9 @@
 //! every layout must contain both, and they form the first-launch root.
 //!
 //! `Reopen::Never` leaves the leaf hidden and gone for this window (`Layout::is_gone`):
-//! no show, placement or tray chip. After nvim quits, a second `nvim --embed` cannot start
-//! in this process because `LiveHarness` creates an event loop that can be created only
-//! once per process.
+//! no show, placement or tray chip. After nvim quits, `shell` starts no second
+//! `nvim --embed` in the window. The editor pane itself can restart on its widget,
+//! with all harnesses sharing one event loop.
 //! Gone is not saved. `Layout::saved_hidden` also excludes hiding caused by retirement,
 //! so a module retired while shown reopens shown on relaunch. A module the user hid stays
 //! hidden. Saving preserves the user's arrangement, as `kill_pane::Reveal::rehide` does

@@ -137,8 +137,8 @@ harness = false
 name = "band_xft_zoom"
 harness = false
 
-# A plain `main`, because winit allows one `EventLoop` per process, on the main thread only (the
-# same reason `neovide-editor`'s own ignored `LiveHarness` tests are `harness = false`). Needs `nvim`
+# A plain `main`, because winit builds its event loop on the main thread only, and libtest runs each
+# test on a thread of its own (as `neovide-editor`'s own ignored `LiveHarness` tests are). Needs `nvim`
 # (>= 0.10) on `PATH` and a display for winit's clipboard (no window is ever shown) -- since 2026-09-29
 # its own `Xvfb` (`tests/support/own_x_server.rs`), never the session's. Proves the pinned fork
 # honours `NEOVIM_BIN`: see the file's own header.
@@ -207,4 +207,17 @@ harness = false
 # a GTK crate); it never opens a window.
 [[test]]
 name = "gnome_shell_bus"
+harness = false
+
+# A plain `main`, because GTK must own the main thread; opt-in with `-- --ignored`. Starts its own
+# `Xvfb` (`tests/support/own_x_server.rs`; see the file's header). The GTK host of the window contract
+# (`src/gtk_host/`) passes the contract's conformance scripts in a real window: the signals GTK emits
+# while an op runs are reported while it applies, and only a close from outside asks the sink.
+[[test]]
+name = "gtk_host_conformance"
+harness = false
+
+# GTK owns the main thread; this opt-in test starts its own isolated Xvfb.
+[[test]]
+name = "command_accels"
 harness = false

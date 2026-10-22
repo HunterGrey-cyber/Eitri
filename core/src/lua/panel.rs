@@ -1,12 +1,43 @@
-//! The GTK-free half of `eitri.panel.register({ id, title, position, content })`: parsing and
-//! validating a plugin's registration table, and resolving its `content.url` to a real URL. No
-//! GTK/WebKit touched here, which is exactly why this (unlike the real widget construction) gets
-//! a direct `cargo test` -- see `shell::lua::panel` for the half that builds a real
-//! `webkit6::WebView` and installs this into the Lua runtime.
+//! Lua panel validation, URL resolution and widgetless registration order. The shell builds the
+//! views and keeps their crash guards separately, so registration rules need no display.
 
 use mlua::Table;
 
 use crate::layout::{ModuleId, Placement};
+
+/// A Lua panel's declaration, independent of its host view.
+pub struct PanelEntry {
+    pub module: ModuleId,
+    pub id: String,
+    pub title: String,
+    pub slot: PanelSlot,
+    pub key: Option<String>,
+    pub url: String,
+}
+
+/// Lua panels in the registration order used for their initial placement.
+#[derive(Default)]
+pub struct PanelRegistry {
+    entries: Vec<PanelEntry>,
+}
+
+impl PanelRegistry {
+    /// Replacing an id moves it last; different ids sharing a position both stay.
+    pub fn register(&mut self, entry: PanelEntry) {
+        if let Some(i) = self.entries.iter().position(|e| e.id == entry.id) {
+            eprintln!(
+                "[lua] panel '{}' registered again -- replaced by the new registration",
+                entry.id
+            );
+            self.entries.remove(i);
+        }
+        self.entries.push(entry);
+    }
+
+    pub fn entries(&self) -> &[PanelEntry] {
+        &self.entries
+    }
+}
 
 /// A Lua panel's `position`: `main`, `side` or `bottom`.
 ///
@@ -133,6 +164,72 @@ pub fn resolve_panel_url(config_dir: &std::path::Path, raw: &str) -> String {
 mod tests {
     use super::*;
     use mlua::Lua;
+
+    fn entry(id: &str, slot: PanelSlot) -> PanelEntry {
+        PanelEntry {
+            module: ModuleId::lua(id),
+            id: id.into(),
+            title: id.into(),
+            slot,
+            key: None,
+            url: format!("file:///{id}.html"),
+        }
+    }
+
+    #[test]
+    fn panels_keep_their_registration_order_and_two_in_one_position_both_stay() {
+        let mut registry = PanelRegistry::default();
+        registry.register(entry("a", PanelSlot::Bottom));
+        registry.register(entry("b", PanelSlot::Bottom));
+        registry.register(entry("c", PanelSlot::Side));
+        let ids: Vec<&str> = registry.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn registering_an_id_again_replaces_it_and_moves_it_last() {
+        let mut registry = PanelRegistry::default();
+        registry.register(entry("a", PanelSlot::Bottom));
+        registry.register(entry("b", PanelSlot::Side));
+        registry.register(entry("a", PanelSlot::Main));
+        let seen: Vec<(&str, PanelSlot)> = registry.entries().iter().map(|e| (e.id.as_str(), e.slot)).collect();
+        assert_eq!(seen, [("b", PanelSlot::Side), ("a", PanelSlot::Main)]);
+        assert_eq!(registry.entries()[1].module, ModuleId::lua("a"));
+    }
+
+    #[test]
+    fn a_panel_registered_twice_is_replaced_in_registration_order() {
+        panels_keep_their_registration_order_and_two_in_one_position_both_stay();
+        registering_an_id_again_replaces_it_and_moves_it_last();
+    }
+
+    #[test]
+    fn the_registry_has_no_widget() {
+        use crate::source_scan::{braced, code_only, read_required};
+        let source = read_required("core/src/lua/panel.rs");
+        let code = code_only(&source.text).split_whitespace().collect::<Vec<_>>().join(" ");
+        let declaration = code
+            .split_once("pub struct PanelEntry")
+            .expect("panel entry declaration")
+            .1;
+        assert!(
+            declaration.trim_start().starts_with('{'),
+            "entry must not have generic parameters"
+        );
+        let body = braced(declaration, declaration.find('{').unwrap());
+        let fields: Vec<_> = body[1..body.len() - 1]
+            .split(',')
+            .filter_map(|field| {
+                field
+                    .split_once(':')
+                    .map(|(_, ty)| ty.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            ["ModuleId", "String", "String", "PanelSlot", "Option<String>", "String"]
+        );
+    }
 
     fn valid_spec(lua: &Lua) -> Table {
         lua.load(

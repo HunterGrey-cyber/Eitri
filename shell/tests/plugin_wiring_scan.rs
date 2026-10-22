@@ -1,24 +1,67 @@
-//! Where the window wires its plugin pages, read from `main.rs` as code: installed before the Lua panels are
+//! Where the window wires its plugin pages, read from `build_ui` as code: installed before the Lua panels are
 //! read (so a plugin is placed, keyed and killed as one), given the window's one editor handle and its layout,
 //! stopped by a kill of its module, and shut down when the window closes; told when its module holds the keys
-//! and what the editor's `timeoutlen` is; its keys read for `prefix ?` before the chat takes them; and its host
-//! given the Super filter and the edge rule for `Ctrl+h/j/k/l`. Also, from `plugin_page.rs`: the kit's reserved
-//! path is answered before the plugin's site is looked up, and a page build applies and logs its policy and
-//! proxy plan, and every answer of the scheme carries `nosniff`.
+//! and what the editor's `timeoutlen` is; its keys read for `prefix ?` before the chat takes them; and every
+//! host's controllers, the Super filter and the edge rule for `Ctrl+h/j/k/l` among them, installed by `wire_host`
+//! alone. Also, from `plugin_page.rs`: the kit's reserved path is answered before the plugin's site is looked up,
+//! and a page build applies and logs its policy and proxy plan, and every answer of the scheme carries `nosniff`.
 
 use eitri_core::source_scan as scan;
 
-fn main_rs() -> String {
-    let source = scan::read_required("shell/src/main.rs");
+fn build_ui_code() -> String {
+    let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+    code.split_whitespace().collect()
+}
+
+/// A shell file as code (comments and literals blanked, its tests cut), whitespace removed.
+fn file_code(path: &str) -> String {
+    let source = scan::read_required(path);
     let code = scan::code_only(&source.text);
     scan::without(&code, &scan::modules(&code, "tests"))
         .split_whitespace()
         .collect()
 }
 
+/// What each `grid.connect_changed(` in `code` (whitespace removed) is handed: the text up to its closing `)`.
+fn change_hooks(code: &str) -> Vec<&str> {
+    code.match_indices("grid.connect_changed(")
+        .map(|(at, call)| {
+            let open = at + call.len() - 1;
+            let mut depth = 0usize;
+            for (i, c) in code[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &code[open..=open + i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced parentheses from byte {open}");
+        })
+        .collect()
+}
+
+/// The match arm that starts at `pattern` in `code`, up to the next arm of the same enum (`next`) or the end.
+fn arm<'a>(code: &'a str, pattern: &str, next: &str) -> &'a str {
+    let at = code.find(pattern).unwrap_or_else(|| panic!("`{pattern}`"));
+    let rest = &code[at + pattern.len()..];
+    let end = rest.find(next).map_or(code.len(), |end| at + pattern.len() + end);
+    &code[at..end]
+}
+
+/// The block a `let` binds in `code` (whitespace removed), from the first `{` after its anchor.
+fn let_block<'a>(code: &'a str, anchor: &str) -> &'a str {
+    let at = code.find(anchor).unwrap_or_else(|| panic!("`{anchor}`"));
+    scan::braced(code, at + code[at..].find('{').unwrap())
+}
+
 #[test]
 fn plugins_are_installed_before_the_lua_panels_are_read() {
-    let code = main_rs();
+    let code = build_ui_code();
     let install = code
         .find("plugin_panels::PluginPanels::install(&lua_engine,&keymap,&PageTheme::fallback())")
         .expect("installed");
@@ -28,7 +71,7 @@ fn plugins_are_installed_before_the_lua_panels_are_read() {
 
 #[test]
 fn the_theme_listener_feeds_every_plugin_page() {
-    let code = main_rs();
+    let code = build_ui_code();
     let at = code.find("feed_pump.listen_theme(feed,").expect("the theme listener");
     let body = scan::braced(&code, at + code[at..].find('{').unwrap());
     let terminal = body
@@ -64,8 +107,8 @@ fn a_committed_document_gets_the_theme_and_a_host_its_module_key() {
 
 #[test]
 fn plugins_share_the_windows_editor_handle_and_get_the_layout() {
-    let code = main_rs();
-    assert!(code.contains("agent_panel_handle.set_editor_rpc(editor_rpc.clone());"));
+    let code = build_ui_code();
+    assert!(code.contains("panel_hooks.set_editor_rpc=Some(editor_rpc.clone());"));
     assert!(code.contains("plugin_panels.set_editor(editor_rpc);"));
     assert_eq!(
         code.matches("EmbeddedEditorRpc::new(").count(),
@@ -77,22 +120,35 @@ fn plugins_share_the_windows_editor_handle_and_get_the_layout() {
 
 #[test]
 fn a_killed_plugin_module_stops_and_a_closing_window_shuts_plugins_down() {
-    let code = main_rs();
-    let arm = code
+    let code = build_ui_code();
+    let at = code
         .find("ModuleKind::LuaWebview=>{grid.kill_module(")
         .expect("the Lua panel kill arm");
-    let stop = code[arm..]
-        .find("plugin_panels.stop(id);")
-        .expect("stopped in that arm");
-    let terminate = code[arm..].find("terminate_web_process()").unwrap();
-    assert!(stop < terminate, "stopped before its web process ends");
+    let kill_arm = scan::braced(&code, at + "ModuleKind::LuaWebview=>".len());
+    let killed = kill_arm.find("grid.kill_module(").unwrap();
+    let told = kill_arm
+        .find("HostEvent::SurfaceEnded{")
+        .expect("the kill is told to the controller");
+    assert!(killed < told, "told once the module is off screen");
+    assert!(kill_arm.contains("why:Ended::Killed{reopen}"), "{kill_arm}");
+    // What the kill ends is the controller's batch: the stop, then the web process's end.
+    assert!(!kill_arm.contains(".stop("), "{kill_arm}");
+    assert!(!kill_arm.contains("terminate_web_process()"), "{kill_arm}");
+    let services = file_code("shell/src/gtk_host/services.rs");
+    assert!(arm(&services, "PluginOp::Terminate{", "PluginOp::").contains("self.plugin_panels.stop(module);"));
+    let surfaces = file_code("shell/src/gtk_host/surfaces.rs");
+    assert!(arm(&surfaces, "DropWhy::Killed=>", "DropWhy::").contains("self.surfaces.end_web_process(module)"));
+    let raw = scan::code_only(&scan::read_required("shell/src/gtk_host/surfaces.rs").text);
+    let end = scan::functions(&raw, "end_web_process");
+    assert_eq!(end.len(), 1, "one end of a killed page's web process");
+    assert!(end[0].contains("terminate_web_process()"));
     let close = code.find("window.connect_close_request(").unwrap();
     assert!(code[close..].contains("plugin_panels.shutdown(&app_for_close);"));
 }
 
 #[test]
 fn a_plugin_hears_its_focus_and_the_editors_timeoutlen() {
-    let code = main_rs();
+    let code = build_ui_code();
     assert!(code.contains("ModuleKind::LuaWebview=>plugin_panels.set_has_keys(id,has_keys),"));
     let listen = code.find("feed_pump.listen_keys(feed,").expect("the keys feed");
     assert!(code[listen..].contains("plugin_panels.set_timeoutlen(report.timeoutlen);"));
@@ -100,7 +156,7 @@ fn a_plugin_hears_its_focus_and_the_editors_timeoutlen() {
 
 #[test]
 fn prefix_question_mark_reads_the_plugin_before_the_chat_takes_the_keys() {
-    let code = main_rs();
+    let code = build_ui_code();
     let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
     let read = code[arm..]
         .find("keymap_plugins.declared_rows(&module)")
@@ -114,7 +170,7 @@ fn prefix_question_mark_reads_the_plugin_before_the_chat_takes_the_keys() {
 
 #[test]
 fn prefix_question_mark_keeps_what_it_opened_from() {
-    let code = main_rs();
+    let code = build_ui_code();
     let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
     let body = &code[arm..];
     let show = body.find("show_on_screen(&chat)").expect("the chat is put on screen");
@@ -159,9 +215,9 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
 
     // The close hook's own body asks what to give back.
     let hook = code
-        .find("agent_panel_handle.on_keymap_closed({")
+        .find("panel_hooks.on_keymap_closed=Some(Box::new({")
         .expect("the close hook is installed");
-    let hook_body = scan::braced(&code, hook + "agent_panel_handle.on_keymap_closed(".len());
+    let hook_body = scan::braced(&code, hook + "panel_hooks.on_keymap_closed=Some(Box::new(".len());
     assert!(
         hook_body.contains("keys_return.borrow_mut().closed("),
         "the hook asks KeysReturn what to give back"
@@ -198,14 +254,98 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
     assert!(forget < take);
 }
 
+/// The non-test code of every shell source (comments and literals blanked), with each file's path.
+fn shell_code() -> Vec<(String, String)> {
+    scan::rust_sources(&["shell/src"])
+        .into_iter()
+        .map(|source| {
+            let code = scan::code_only(&source.text);
+            let code = scan::without(&code, &scan::modules(&code, "tests"));
+            (source.path, code)
+        })
+        .collect()
+}
+
+/// The block bound by `anchor` (whitespace removed) in `code` (whitespace removed), from its first `{`.
+fn bound_block<'a>(code: &'a str, anchor: &str) -> &'a str {
+    let at = code.find(anchor).unwrap_or_else(|| panic!("`{anchor}`"));
+    scan::braced(code, at + code[at..].find('{').unwrap())
+}
+
+/// How many times `code` calls each controller installer a host gets.
+fn installer_calls(code: &str) -> [(&'static str, usize); 4] {
+    let plain: String = code.split_whitespace().collect();
+    [
+        ("install_module_nav", scan::calls(code, "install_module_nav")),
+        ("panel_super::install", plain.matches("panel_super::install(").count()),
+        ("wheel_zoom::install", plain.matches("wheel_zoom::install(").count()),
+        ("terminal::navigation", plain.matches("terminal::navigation(").count()),
+    ]
+}
+
 #[test]
-fn every_web_module_host_gets_the_super_filter_and_lua_pages_swallow_at_edges() {
-    let code = main_rs();
-    assert!(code.contains("letswallow_at_edge=id.kind()==ModuleKind::LuaWebview;"));
-    // Straight after the nav controller and before the loop body ends: for every host, not under an `if`.
-    assert!(code.contains(
-        "install_module_nav(id.clone(),host,move_focus.clone(),intercept,swallow_at_edge);panel_super::install(host);}"
-    ));
+fn every_host_gets_its_controllers_from_wire_host() {
+    let files = shell_code();
+    let (_, wire) = files
+        .iter()
+        .find(|(path, _)| path.ends_with("gtk_host/wire.rs"))
+        .expect("the wiring's file");
+    let wire_host = scan::functions(wire, "wire_host");
+    assert_eq!(wire_host.len(), 1, "one wire_host");
+
+    // Every controller a host gets is installed from inside wire_host and nowhere else.
+    let inside = installer_calls(wire_host[0]);
+    for (i, (name, count)) in inside.iter().enumerate() {
+        assert!(*count > 0, "wire_host installs `{name}`");
+        let everywhere: usize = files.iter().map(|(_, code)| installer_calls(code)[i].1).sum();
+        assert_eq!(everywhere, *count, "`{name}` is called outside wire_host");
+    }
+
+    // Each host-creating site wires its host once: the runtime terminal and chat view, the startup loop over every
+    // host, the companion's window, the controller's surface maker. Nothing else calls wire_host.
+    let (_, build_ui) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+    assert_eq!(
+        scan::calls(&build_ui, "wire_host"),
+        3,
+        "two runtime paths and the startup loop"
+    );
+    let build_ui: String = build_ui.split_whitespace().collect();
+    for anchor in ["lethost_terminal:", "lethost_chat_view:"] {
+        assert_eq!(
+            bound_block(&build_ui, anchor).matches("wire_host(").count(),
+            1,
+            "`{anchor}` wires the host it makes, once"
+        );
+    }
+    let (_, companion) = files
+        .iter()
+        .find(|(path, _)| path.ends_with("companion/window.rs"))
+        .expect("the companion's window");
+    assert_eq!(
+        scan::calls(companion, "wire_host"),
+        1,
+        "the companion wires its one host once"
+    );
+    // The controller's `CreateSurface` wires the host it makes: a terminal's, a chat view's.
+    let (_, surfaces) = files
+        .iter()
+        .find(|(path, _)| path.ends_with("gtk_host/surfaces.rs"))
+        .expect("the surface constructors");
+    assert_eq!(
+        scan::calls(surfaces, "wire_host"),
+        2,
+        "the surface maker wires a terminal and a chat view"
+    );
+    let total: usize = files.iter().map(|(_, code)| scan::calls(code, "wire_host")).sum();
+    assert_eq!(total, 6, "no other path wires a host");
+
+    // A plugin page built on its first show fills a slot whose host was wired at startup.
+    let (_, build_page) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_page");
+    assert!(
+        installer_calls(&build_page).iter().all(|(_, count)| *count == 0),
+        "build_page installs a controller"
+    );
+    assert_eq!(scan::calls(&build_page, "wire_host"), 0, "build_page wires a host");
 }
 
 #[test]
@@ -244,28 +384,15 @@ fn the_kit_path_is_answered_before_any_site_file_is_looked_up() {
     assert!(kit < doc);
 }
 
-/// `code`'s byte offset `at` in `text`: `code_only` keeps one character for each character of the source, so the
-/// two line up by character, not by byte.
-fn source_offset(text: &str, code: &str, at: usize) -> usize {
-    let chars = code[..at].chars().count();
-    text.char_indices().nth(chars).map_or(text.len(), |(byte, _)| byte)
-}
-
 /// The source text (literals kept) of the `code` slice `part`, whitespace removed.
 fn source_of(text: &str, code: &str, part: &str) -> String {
     let start = part.as_ptr() as usize - code.as_ptr() as usize;
-    let (from, to) = (
-        source_offset(text, code, start),
-        source_offset(text, code, start + part.len()),
-    );
-    text[from..to].split_whitespace().collect()
+    text[start..start + part.len()].split_whitespace().collect()
 }
 
 #[test]
 fn a_page_build_logs_its_policy_and_proxy_and_uses_the_plan() {
     let source = scan::read_required("shell/src/plugin_page.rs");
-    // Not cut at the tests module: blanking it could change its byte length, and these offsets must line up with
-    // the source by character.
     let code = scan::code_only(&source.text);
     let build = scan::functions(&code, "build");
     assert_eq!(build.len(), 1, "one page build");
@@ -346,28 +473,29 @@ fn every_answer_of_the_scheme_carries_nosniff() {
 /// every later route), and opened by its own rule through one function from every show path.
 #[test]
 fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
-    let code = main_rs();
-    let hooks: Vec<usize> = code.match_indices("grid.connect_changed(").map(|(at, _)| at).collect();
-    let first_hook = *hooks.first().expect("a change hook");
+    let code = build_ui_code();
+    let apply = code.find("grid.apply();").expect("the startup apply");
+    let startup = code
+        .find("driver.startup_applied(WinId::MAIN,hosted);")
+        .expect("the startup layout's lifecycle effects");
+    assert!(apply < startup, "the startup layout's effects follow its apply");
     let builds: Vec<usize> = code
         .match_indices("plugin_panels.build_page(")
         .map(|(at, _)| at)
         .collect();
     assert!(
-        builds.iter().any(|at| *at < first_hook),
+        builds.iter().any(|at| *at < apply),
         "a layout that reopens the module shown builds its page at startup"
     );
-    let built_in_a_hook = hooks.iter().any(|at| {
-        let after = at + "grid.connect_changed(".len();
-        code[after..].starts_with("move||{") && {
-            let body = scan::braced(&code, after + "move||".len());
-            body.contains("plugin_panels.build_page(")
-        }
-    });
     assert!(
-        built_in_a_hook,
-        "a change hook builds the page on the module's first show"
+        change_hooks(&code).iter().all(|hook| !hook.contains("build_page(")),
+        "no change hook builds a page: the controller's lifecycle does, on the module's first show"
     );
+    // Declared as a page that waits for its first show.
+    assert!(code.contains("deferred:plugin_panels.starts_hidden(&id),kind:SurfaceKind::PluginPage{plugin},"));
+    let services = file_code("shell/src/gtk_host/services.rs");
+    let build = arm(&services, "PluginOp::Build{", "PluginOp::");
+    assert!(build.contains("self.plugin_panels.build_page(module,"), "{build}");
     assert!(code.contains("eitri_core::layout::persist::load_with(dir,project_root,&decls,&deferred)"));
     assert!(code.contains("layout_saver.set_deferred(deferred.clone());"));
     // A switch or an open gives the keys before the change hooks run: the grab builds the page first.
@@ -409,18 +537,15 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
         "its module key opens it by its rule"
     );
 
-    let source = scan::read_required("shell/src/main.rs");
-    let text = scan::code_only(&source.text);
-    let opener = scan::functions(&text, "open_plugin_module");
-    assert_eq!(opener.len(), 1, "one way to open it");
-    assert!(opener[0].contains("plugin_open_rule(") && opener[0].contains("add_everywhere_at("));
+    let sources = scan::rust_sources(&["shell/src"]);
+    let (_, opener) = scan::function_in(&sources, "open_plugin_module");
+    assert!(opener.contains("plugin_open_rule(") && opener.contains("add_everywhere_at("));
     assert!(
-        !opener[0].contains("build_page("),
+        !opener.contains("build_page("),
         "an open the grid refuses builds no page"
     );
-    let rule = scan::functions(&text, "plugin_open_rule");
-    assert_eq!(rule.len(), 1);
-    assert!(rule[0].contains("resolve_own("));
+    let (_, rule) = scan::function_in(&sources, "plugin_open_rule");
+    assert!(rule.contains("resolve_own("));
 
     // The page is built in one closure, which logs the build after it.
     let source = scan::read_required("shell/src/plugin_panels.rs");
@@ -445,7 +570,7 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
 /// on); and the trace switch is a probe build's alone.
 #[test]
 fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
-    let code = main_rs();
+    let code = build_ui_code();
     assert_eq!(code.matches("FollowSocket::bind()").count(), 1, "one follow socket");
     let wants = code
         .find("ifplugin_panels.wants_follow_feed(){")
@@ -461,12 +586,15 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
     let route = closure.find("plugin_panels.route_follow(").expect("the lines routed");
     assert!(apply < route, "the routed commands are what is applied");
 
-    let on_screen = code.match_indices("grid.connect_changed(").any(|(at, _)| {
-        let after = at + "grid.connect_changed(".len();
-        code[after..].starts_with("move||{")
-            && scan::braced(&code, after + "move||".len()).contains("plugin_panels.set_on_screen(")
-    });
-    assert!(on_screen, "a change hook tells each host whether its module is drawn");
+    // Each host is told whether its module is drawn by the controller's lifecycle, after every change.
+    assert!(
+        change_hooks(&code).iter().all(|hook| !hook.contains("set_on_screen(")),
+        "no change hook in build_ui tells a host whether it is drawn"
+    );
+    let services = file_code("shell/src/gtk_host/services.rs");
+    assert!(
+        arm(&services, "PluginOp::OnScreen{", "PluginOp::").contains("self.plugin_panels.set_on_screen(module,*on);")
+    );
 
     for listener in ["feed_pump.listen_theme(feed,", "feed_pump.listen_keys(feed,"] {
         let at = code.find(listener).expect(listener);
@@ -491,8 +619,8 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
     assert!(code[close..].contains("socket.cleanup();"));
 
     // The switch's attribute and variable are literals, which the code-only text blanks: read the source.
-    let source = scan::read_required("shell/src/main.rs");
-    let text: String = source.text.split_whitespace().collect();
+    let (_, raw) = scan::function_in_raw(&scan::rust_sources(&["shell/src"]), "build_ui");
+    let text: String = raw.split_whitespace().collect();
     assert_eq!(text.matches("trace::set_enabled(true)").count(), 1);
     assert!(text.contains(
         "#[cfg(feature=\"probe\")]ifstd::env::var_os(\"EITRI_PLUGIN_TRACE\").is_some_and(|v|v==\"1\"){eitri_core::plugin::trace::set_enabled(true);}"
@@ -506,4 +634,135 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
         .collect();
     assert!(code.contains("doc_slot:doc_slot.clone(),"));
     assert!(code.contains("ifletSome(slot)=&doc_slot{host.set_doc_slot(slot.clone());}"));
+}
+
+/// A runtime open says it hosts the module only once the open has succeeded, after every refusal and rollback:
+/// a refused open declares nothing, and the controller never holds a module whose host went back.
+#[test]
+fn a_runtime_open_declares_only_after_it_succeeded() {
+    let code = build_ui_code();
+    for anchor in [
+        "letnew_chat_view:Rc<dynFn(OpenHow,NewViewTab)->Result<ModuleId,String>>=",
+        "letnew_scratch_chat_view:Rc<dynFn(&ModuleId)->Result<(),String>>=",
+    ] {
+        let body = let_block(&code, anchor);
+        let declared: Vec<usize> = body.match_indices("HostEvent::Declared{").map(|(at, _)| at).collect();
+        assert_eq!(declared.len(), 1, "`{anchor}` declares once");
+        let rollback = body.rfind("retire_chat_page(").expect("a refused placement rolls back");
+        let placed = body.rfind("add_everywhere_at(").expect("added to the other workspaces");
+        assert!(rollback < declared[0] && placed < declared[0], "`{anchor}`: {body}");
+        assert!(body.contains("kind:SurfaceKind::Chat{view},"), "{anchor}");
+    }
+    for anchor in [
+        "letnew_terminal:Rc<dynFn(OpenHow,PathBuf)->Result<ModuleId,String>>=",
+        "letnew_scratch_terminal:Rc<dynFn(&ModuleId,PathBuf)->Result<(),String>>=",
+    ] {
+        let body = let_block(&code, anchor);
+        let declared: Vec<usize> = body.match_indices("HostEvent::Declared{").map(|(at, _)| at).collect();
+        assert_eq!(declared.len(), 1, "`{anchor}` declares once");
+        let refusals = ["returnErr(", "?;", "?)"].iter().filter_map(|r| body.rfind(r)).max();
+        let last = refusals.expect("the open can be refused");
+        assert!(
+            last < declared[0],
+            "`{anchor}`: the declaration comes after its last refusal"
+        );
+        let placed = body.rfind("add_everywhere_at(").expect("added to the other workspaces");
+        assert!(placed < declared[0], "{anchor}");
+        assert!(body.contains("kind:SurfaceKind::Terminal{cwd:dir},"), "{anchor}");
+    }
+    // A plugin module is hosted from startup: its open declares nothing.
+    let sources = scan::rust_sources(&["shell/src"]);
+    let (_, opener) = scan::function_in(&sources, "open_plugin_module");
+    assert!(!opener.contains("Declared"));
+}
+
+/// What starts a terminal's shell, builds a deferred page, tells a plugin it is drawn and brings a killed module
+/// back is the controller's module lifecycle; no change hook in `build_ui` does any of them.
+#[test]
+fn no_lifecycle_hook_is_left_in_build_ui() {
+    let code = build_ui_code();
+    let hooks = change_hooks(&code);
+    assert!(!hooks.is_empty(), "build_ui still registers change hooks");
+    for hook in hooks {
+        for call in [".start()", "build_page(", "set_on_screen(", "open_chooser("] {
+            assert!(!hook.contains(call), "a change hook calls `{call}`: {hook}");
+        }
+    }
+    // The kills and the retirement tell the controller after the grid's kill.
+    for anchor in [
+        "letkill_terminal:Rc<dynFn(&ModuleId)->Result<(),LayoutError>>=",
+        "letretire_editor:Rc<dynFn()->Result<(),LayoutError>>=",
+    ] {
+        let body = let_block(&code, anchor);
+        let killed = body.find("grid.kill_module(").expect("the grid's kill");
+        let told = body.find("HostEvent::SurfaceEnded{").expect("told to the controller");
+        assert!(killed < told, "{anchor}");
+    }
+    let services = file_code("shell/src/gtk_host/services.rs");
+    assert!(arm(&services, "TermOp::Start{", "TermOp::").contains("start_pane(&self.terminals,module)"));
+    assert!(arm(&services, "ChatOp::OpenChooser{", "ChatOp::").contains("self.agent.open_chooser(*view);"));
+    let reload = arm(&services, "PluginOp::Reload{", "PluginOp::");
+    assert!(reload.contains("webview.load_uri(url);") && reload.contains("crash_guard.borrow_mut().reset();"));
+}
+
+/// The window's start is the controller's start plan, walked in its order from `build_ui`: each phase one
+/// `driver.start` call, the Lua layout requests accepted before the requests phase and applied after it, and
+/// nothing left in `build_ui` that the plan's ops now do (building the window, loading `init.lua`, showing the
+/// window, emitting `shell:ready`).
+#[test]
+fn build_ui_walks_the_start_plan() {
+    use eitri_core::wm::start::{start_plan, StartPhase};
+    let code = build_ui_code();
+    let name = |phase: &StartPhase| match phase {
+        StartPhase::Feeds => "Feeds",
+        StartPhase::Window => "Window",
+        StartPhase::Editor => "Editor",
+        StartPhase::Kernel => "Kernel",
+        StartPhase::Config => "Config",
+        StartPhase::Layout => "Layout",
+        StartPhase::Surfaces => "Surfaces",
+        StartPhase::Chrome => "Chrome",
+        StartPhase::Present => "Present",
+        StartPhase::Requests => "Requests",
+    };
+    let mut at = Vec::new();
+    for phase in start_plan() {
+        let call = format!("driver.start(WinId::MAIN,StartStep::{}", name(phase));
+        let found: Vec<usize> = code.match_indices(&call).map(|(i, _)| i).collect();
+        assert_eq!(found.len(), 1, "`{call}` appears once in build_ui");
+        // The next character ends the variant's name, so `Feeds` is not found inside a longer name.
+        let next = code[found[0] + call.len()..].chars().next();
+        assert!(matches!(next, Some('{' | ')')), "`{call}` names the phase itself");
+        at.push(found[0]);
+    }
+    assert!(
+        at.windows(2).all(|w| w[0] < w[1]),
+        "the phases run in the plan's order: {at:?}"
+    );
+    let requests = *at.last().unwrap();
+    let accept = code
+        .find(".accept_requests();")
+        .expect("the layout requests are accepted");
+    let apply = code
+        .rfind("apply_layout_requests();")
+        .expect("the queued requests are applied");
+    assert!(accept < requests, "accepted before shell:ready is emitted");
+    assert!(requests < apply, "applied after shell:ready's handlers queued theirs");
+    // What the plan's ops do is not done again here. Read with literals kept and whole-line comments dropped.
+    let (_, raw) = scan::function_in_raw(&scan::rust_sources(&["shell/src"]), "build_ui");
+    let raw: String = raw
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<String>()
+        .split_whitespace()
+        .collect();
+    for gone in [
+        "ApplicationWindow::builder",
+        "load_init_file(",
+        "window.present()",
+        "emit(\"shell:ready\")",
+        ".open_window(",
+    ] {
+        assert!(!raw.contains(gone), "build_ui still has `{gone}`");
+    }
 }
