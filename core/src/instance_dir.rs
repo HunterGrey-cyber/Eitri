@@ -512,7 +512,7 @@ pub(crate) mod tests {
         let name = a.file_name().unwrap().to_str().unwrap();
         assert_eq!(stale_instance_dir_pid(name, PREFIX), Some(std::process::id()));
         // The 32-hex `simple` form, not the 36-byte hyphenated one: those four bytes are what put
-        // `shell`'s two sockets back under macOS's 103-byte cap (L2 T5).
+        // `shell`'s two sockets back under macOS's 103-byte cap.
         assert_eq!(
             name.len() - PREFIX.len() - std::process::id().to_string().len() - 1,
             32,
@@ -548,7 +548,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The sweep still recognises what a pre-L2-T5 build wrote. Without this, every directory an
+    /// The sweep still recognises what a build from before the 32-hex uuid form wrote (a hyphenated
+    /// uuid). Without this, every directory an
     /// older `shell` leaked would be *permanently* unreclaimable -- and unlike the prefix rename,
     /// which each caller answers by sweeping its own legacy prefix too, this half needs no second
     /// call, only a parser that keeps accepting the old spelling.
@@ -602,8 +603,8 @@ pub(crate) mod tests {
     /// test nests a fixture root under `TMPDIR`, so the bound path is
     /// `<TMPDIR>/<root>/<prefix>0-<uuid>/<sock>`, and with `PREFIX` and a hyphenated uuid that came
     /// to **131 bytes** under macOS's 49-byte `TMPDIR` -- past the 103-byte cap, so the `bind`
-    /// below could not have run on a Mac at all. (Pre-existing, and found by L2 T5's follow-up
-    /// while adding `lib.rs`'s socket-path scanner; nothing about it was T5's doing.) This module
+    /// below could not have run on a Mac at all. (Found while adding `lib.rs`'s socket-path
+    /// scanner; the overlong path predates the shorter uuid form.) This module
     /// is generic over the prefix, so shortening the fixture's costs the test nothing -- what it is
     /// about is the sweep's two liveness checks, not any particular name.
     const BIND_PREFIX: &str = "p-";
@@ -637,9 +638,9 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An entry belonging to another user is skipped before connecting, so its full listener queue
-    /// cannot hang startup. The sweep receives a different uid to simulate a directory belonging to
-    /// another user. With the real uid, the same fixture is probed.
+    /// Entries another user owns are skipped before connecting, so a full backlog cannot hang
+    /// startup. Since this test cannot create another user's directory, it supplies a different
+    /// uid as ours; the real-uid control proves the same fixture is probed when ownership matches.
     #[test]
     fn another_users_directory_is_never_connected_to() {
         let root = std::env::temp_dir().join(format!("nvo{}", std::process::id()));
@@ -670,10 +671,10 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A directory owned by this user but writable by the group or others must not be connected to.
-    /// Another account could replace its socket with a listener whose queue is full between the
-    /// ownership check and the connect. `0755` remains acceptable because only this user can rename
-    /// its entries; requiring exactly `0700` would leave stale directories from older builds behind.
+    /// Never connect through an owned directory writable by group or others: a group member could
+    /// replace its socket with a full-backlog listener between the ownership check and connect.
+    /// An older build's 0775 directory is unsafe, but 0755 is accepted because only its owner can
+    /// rename entries. Requiring exactly 0700 would leak safe stale directories from older builds.
     #[test]
     fn a_group_writable_directory_is_never_connected_to() {
         let root = std::env::temp_dir().join(format!("nvg{}", std::process::id()));
@@ -695,7 +696,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// C4(b): a live listener whose accept queue is completely full must never hang the sweep. The
+    /// A live listener whose accept queue is completely full must never hang the sweep. The
     /// old blocking `UnixStream::connect` sleeps until the peer's queue has room, which for a
     /// listener that never calls `accept` is forever. Filling the queue with non-blocking raw
     /// connects until one answers `EAGAIN`/`EWOULDBLOCK` reproduces exactly that state; the sweep is

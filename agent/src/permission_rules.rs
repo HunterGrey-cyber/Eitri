@@ -404,10 +404,10 @@ mod tests {
         assert_eq!(suggest("   ").map(|r| r.display()), None);
     }
 
-    /// Do not suggest prefixes that authorize more than the approved command's subcommand or
-    /// program. `git -C sub log` must not offer `git *`, which would also allow `git push
-    /// --force`. `timeout 5 cargo test` must not offer `timeout 5 *`, which could run any
-    /// program. The card's `a` still approves only this call.
+    /// Suggestions must not span more than the approved command. An option before the subcommand
+    /// (`git -C sub log`) must not offer `git *`, which would also allow `git push --force`.
+    /// A wrapper (`timeout 5 cargo test`) must not offer `timeout 5 *`, which would allow
+    /// `timeout 5 rm -rf src`. Neither suggestion is offered; the card's `a` still answers one call.
     #[test]
     fn no_rule_is_offered_that_would_span_every_subcommand_or_any_program() {
         // Its own repository, canonical as a session's root is (the policy cards a root that does not
@@ -417,7 +417,7 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let bash = |command: &str| offer("Bash", &json!({ "command": command }), &root).map(|r| r.display());
 
-        // The shapes the review reproduced, each still a card the policy refused for a
+        // Each input is still a card the policy refused for a
         // replaceable reason -- so without this check they WOULD be offered.
         for command in ["timeout 5 cargo test", "rm -rf sub"] {
             let c = classify_permission_request("Bash", &json!({ "command": command }), &root);
@@ -426,8 +426,9 @@ mod tests {
                 "{command}: {c:?}"
             );
         }
-        // `git -C sub log` has two independent guards: the global-option reason cannot be
-        // replaced by a saved rule, and no prefix rule is suggested. Check both.
+        // `git -C sub log` is guarded twice: the policy's
+        // own reason for a leading git global option is no longer one a rule replaces, AND the
+        // suggestion still offers nothing, each checked on its own.
         let c = classify_permission_request("Bash", &json!({ "command": "git -C sub log" }), &root);
         assert!(c.needs_a_human() && !REPLACEABLE_BY_A_RULE.contains(&c.reason), "{c:?}");
         assert_eq!(suggest("git -C sub log"), None, "an option hides the subcommand");

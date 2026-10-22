@@ -1,51 +1,61 @@
 //! Real GTK/GLArea regressions for cursor animation and presentation-surface lifetime.
 //!
-//! Run in an isolated GUI sandbox with a headless compositor:
+//! Run ONLY in the one, isolated GUI sandbox permitted by AGENTS.md:
 //! `cargo test -p neovide-editor --test cursor_animation -- --ignored`
-//! The test measures GL/dmabuf presentation and needs a real compositor rather than Xvfb.
-//! Before GTK initialises, `sandbox_wayland_socket` rejects an unset `WAYLAND_DISPLAY`,
-//! a missing or non-socket path, and paths inside the login runtime directory `/run/user/`.
-//! It also rejects sockets with the same device and inode as a login runtime socket,
-//! including aliases reached through bind mounts or hard links. `DISPLAY` and
-//! `WAYLAND_SOCKET` are removed, and `GDK_BACKEND=wayland` is set.
+//! Since 2026-09-29 it refuses anything else before GTK initialises (`sandbox_wayland_socket`): a
+//! `WAYLAND_DISPLAY` that is unset, missing, not a socket, or resolves into the login runtime
+//! directory (`/run/user/`, where a desktop's sockets live; every sandbox harness here uses a
+//! private runtime directory of its own), and any X display -- `DISPLAY` and `WAYLAND_SOCKET` are
+//! dropped and `GDK_BACKEND=wayland` set. Unlike the Xvfb tests (`shell/tests/support/own_x_server.rs`)
+//! it cannot start a display of its own: it measures GL/dmabuf presentation on a real compositor.
+//! A path is not an identity, so it also refuses a socket that IS one
+//! of the login runtime directory's, reached through a bind mount or a hard link (same device and
+//! inode), and -- once GTK has connected, before any window exists -- a compositor with any output
+//! that is not `HEADLESS-<n>` (`require_headless_outputs`): a real screen, or a window on one, as a
+//! nested compositor's output is. And it runs GTK's own input method, never an inherited
+//! `GTK_IM_MODULE`: with `fcitx` the pane's input context reached for fcitx5 over the session bus as
+//! soon as it took focus -- on the live desktop's bus.
+//! Checking outputs only after `gtk4::init()` connects would let a
+//! desktop whose runtime directory is not `/run/user/` (`/tmp/runtime-<user>`) be connected to before
+//! it was refused. Now, before GTK, the process listening on the socket is found through `/proc`
+//! without connecting, and must have been started with `WLR_BACKENDS=headless`
+//! (`require_headless_compositor`); the output check stays as the second, after-connect half. A
+//! headless compositor someone watches remotely (wayvnc) still passes both.
+//! The listener is found by the socket file itself, as the kernel
+//! records it, not by the name `/proc/net/unix` prints (a rename, a bind mount or another mount
+//! namespace could make that name lead to a desktop's socket); its holder must also map `libwlroots`
+//! (a compositor that is not wlroots ignores `WLR_BACKENDS`); and it runs with no session bus, as the
+//! Xvfb tests do (`own_x_server::cut_session_bus`). Every run, `--ignored` or not, first holds the
+//! refusal chain against fake compositors (`refusal_chain_self_test`), and
+//! `shell/tests/own_display_scan.rs` checks that `main` still calls it all, in order.
+//! The kernel's answer is believed only whole. A `NLMSG_DONE` carrying a
+//! negative errno (a dump that failed part way), a reply flagged `NLM_F_DUMP_INTR` (the table changed
+//! under it) and an attribute that does not add up are each an error, not the listeners found so far
+//! (`parse_unix_diag_reply`, held on synthetic replies by `netlink_parser_self_test`). The refusal chain
+//! skips, and says so, a case its machine cannot construct: with no `NETLINK_SOCK_DIAG` nothing can be
+//! looked up, and as root or with `CAP_SYS_PTRACE` a non-dumpable holder is readable; the runtime check
+//! is relaxed for neither. The scan now also requires GTK to be initialised exactly once, after the checks,
+//! and every refusal in `main` to exit. The headless sway this test runs against must be started inside
+//! the same `bwrap` wrapper as the test: a sway started outside it is not dumpable (`cap_sys_nice=ep`), so
+//! the test refuses it, whatever it was started with.
+//! A plain main keeps GTK and winit on the main thread. The test starts a real clean nvim,
+//! drives the product pane, and reads its actual GL framebuffer after GTK paints. Red cursor
+//! pixels on a black background prove intermediate positions; the harness's cursor getter only
+//! reports the destination and would not prove animation. Readback is deliberately test-only.
 //!
-//! `require_headless_compositor` identifies the listener without connecting to it. Kernel
-//! socket-file identity is used because renames, bind mounts and mount namespaces can
-//! make the path printed by `/proc/net/unix` refer to another socket. The process holding
-//! the listener must have `WLR_BACKENDS=headless` in its initial environment and map
-//! `libwlroots`; other compositors can ignore that variable. This check runs before GTK
-//! connects, even when the desktop runtime directory is outside `/run/user/`.
-//! After connecting, but before creating a window, `require_headless_outputs` rejects any
-//! output not named `HEADLESS-<n>`. A remotely viewed headless compositor can pass both checks.
-//! GTK uses its own input method, ignoring inherited `GTK_IM_MODULE`, and runs without a
-//! session bus. Otherwise an input method can contact the desktop's service when focused.
+//! Which presentation path ran is printed, before and after the re-realize (`presentation:`), and
+//! so are the pane's counts over the whole run, from its first frame through the motion checks,
+//! the three resizes and the re-realize (`presentation counts:`, `NeovideEditorPane::presentation_counts`,
+//! never reset). `-- --ignored --expect-own-buffers` fails if a single one of those frames went
+//! through `GtkGLArea`'s texture or the own-buffer path failed even once -- a fallback that a later
+//! re-realize or size change recovered from included; `EITRI_EDITOR_DMABUF=0 ... -- --ignored
+//! --expect-fallback` forces the fallback and fails if any frame was drawn into the own buffers, so
+//! both paths pass the same pixel checks.
 //!
-//! `parse_unix_diag_reply` rejects incomplete kernel dumps: a negative errno in `NLMSG_DONE`,
-//! `NLM_F_DUMP_INTR`, or a malformed attribute is an error. `netlink_parser_self_test` checks
-//! synthetic replies. Every run first exercises the refusal chain against fake compositors
-//! with `refusal_chain_self_test`. Unsupported self-test cases are reported and skipped:
-//! `NETLINK_SOCK_DIAG` may be unavailable, and root or `CAP_SYS_PTRACE` can read a holder
-//! that is not dumpable. Runtime checks are never relaxed. `shell/tests/own_display_scan.rs`
-//! checks call order, exactly one GTK initialisation after validation, and exit on refusal.
-//! Start headless sway inside the same `bwrap` wrapper as the test. A sway started outside
-//! it with `cap_sys_nice=ep` is not dumpable and is refused.
-//!
-//! A plain main keeps GTK and winit on the main thread. The test starts a clean nvim,
-//! drives the pane, and reads its GL framebuffer after GTK paints. Red cursor pixels on a
-//! black background prove intermediate positions; the cursor getter reports only the
-//! destination. Framebuffer readback is limited to the test.
-//!
-//! `presentation:` reports the path before and after re-realize. `presentation counts:`
-//! prints `NeovideEditorPane::presentation_counts` for the entire run, including motion,
-//! three resizes and re-realize, without resets. `-- --ignored --expect-own-buffers` fails
-//! if any frame uses the `GtkGLArea` texture or buffer presentation fails even once,
-//! including failures recovered by re-realize or resizing. With buffer presentation
-//! disabled, `-- --ignored --expect-fallback` fails if any frame uses the pane's own buffers.
-//! Both paths must pass the same pixel checks.
-//!
-//! An independent nvim RPC confirms each input's destination before the GTK loop resumes,
-//! making the idle-gap regression independent of redraw arrival timing. These synchronized
-//! cases test animation correctness, not input-to-photon latency or GPU throughput.
+//! An independent nvim RPC confirms each input's destination BEFORE the GTK loop resumes. This
+//! makes the idle-gap regression deterministic instead of depending on whether nvim's redraw
+//! happens to arrive before or after an extra, still-unchanged frame. These synchronized cases
+//! test animation correctness, not input-to-photon latency or production GPU throughput.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CString};
@@ -887,7 +897,7 @@ fn presentation_lifetime(
     capture.enabled.set(false);
 }
 
-// ---- Typing-latency cases --------------
+// ---- Typing-latency cases ----------------------------------------------------------------
 //
 // Redraws are event driven: nvim's batch wakes the pane through an fd watch, the tick runs only while a
 // frame is wanted, and a key press no longer forces a stale frame. Each case prints its numbers.
@@ -1493,21 +1503,21 @@ fn login_runtime_sockets() -> Vec<(u64, u64, PathBuf)> {
     found
 }
 
-/// Checks that the socket file at `resolved` has a headless wlroots listener without
-/// connecting to it. The listener must be bound to that file in this network namespace.
-/// Each readable process holding it must have `WLR_BACKENDS=headless` in its initial
-/// environment and map a `libwlroots` library. A socket with no listener or no readable holder is
-/// refused before `gtk4::init()` connects. `require_headless_outputs` checks the reported
-/// outputs after GTK connects.
+/// Find the compositor listening at `resolved` without connecting. It must be a headless
+/// wlroots compositor: identify the listener by the socket file's device and inode from
+/// `NETLINK_SOCK_DIAG`, find its holders through `/proc/<pid>/fd`, and inspect every readable
+/// holder's initial environment and mapped libraries. Refuse a socket with no listener in
+/// this network namespace or no readable holder. `require_headless_outputs` additionally
+/// checks the reported outputs after GTK connects.
 ///
-/// `unix_listeners_by_file` uses `NETLINK_SOCK_DIAG` to obtain the device and inode of each
-/// listener's socket file, then compares them with `stat` of `resolved`. The path printed
-/// by `/proc/net/unix` is only the name used at bind time. A rename, bind mount or another
-/// mount namespace can make that name refer to a different socket.
+/// A path from `/proc/net/unix` is only the name the listener bound under. Rename, bind mount
+/// or another mount namespace can make that name point to a desktop socket instead, so
+/// compare the kernel's bound-file identity with this process's stat of the resolved file.
 ///
-/// The environment alone is insufficient: a compositor that is not wlroots can inherit
-/// `WLR_BACKENDS=headless` and ignore it while using real outputs. Requiring a mapped
-/// `libwlroots` library checks that the variable applies to the holder.
+/// `WLR_BACKENDS=headless` alone is insufficient: a non-wlroots compositor such as Mutter
+/// can inherit and ignore it while using real outputs. Require a mapped `libwlroots` too.
+/// Desktop compositors and nested wayland/x11 backends must be refused before GTK connects,
+/// regardless of where their runtime directory lives.
 fn require_headless_compositor(resolved: &Path) -> Result<u32, String> {
     let meta = std::fs::metadata(resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
     let file = kernel_file_id(&meta);
@@ -1607,13 +1617,15 @@ mod diag {
     pub const HEADER: usize = 16; // struct nlmsghdr
 }
 
-/// Parse one datagram of a `NETLINK_SOCK_DIAG` dump reply, adding listeners to `found` as
-/// `(socket inode, device, file inode)`. Return `Ok(true)` at the end of the dump and
-/// `Ok(false)` when more is to come.
+/// One datagram of a `NETLINK_SOCK_DIAG` dump reply, parsed: every listener it lists goes into `found` as
+/// `(socket inode, device, file inode)`. `Ok(true)` when the datagram ends the dump, `Ok(false)` when
+/// more is to come.
 ///
-/// Reject incomplete, inconsistent or failed dumps so callers cannot treat a partial listener
-/// list as complete. A negative errno in `NLMSG_DONE`, `NLM_F_DUMP_INTR`, or a malformed
-/// attribute must fail the parse.
+/// **Fail closed:** anything that is not a whole, consistent, successful dump is
+/// an error, and the listeners found before it are not returned -- a partial list would be judged as if it
+/// were the whole one. A parser must not return what it had on a `NLMSG_DONE` carrying a negative errno
+/// (the kernel's way of saying the dump failed part way), ignore `NLM_F_DUMP_INTR` (the dump changed
+/// underneath it), or stop only its attribute loop rather than the parse on an attribute that does not add up.
 fn parse_unix_diag_reply(data: &[u8], found: &mut Vec<(u32, u32, u32)>) -> Result<bool, String> {
     use diag::*;
     let u32_at = |data: &[u8], at: usize| u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
@@ -2023,9 +2035,9 @@ fn refusal_chain_self_test() {
         &socket,
         &format!("(pid {pid}) was started with WLR_BACKENDS=headless but maps no libwlroots"),
     );
-    // The headless listener's original name now leads to another socket. Renaming here models
-    // what a bind mount or another mount namespace can also do. `/proc/net/unix` still prints
-    // the headless listener's path, so the path alone cannot identify the socket file.
+    // Codex's (a): the name a headless listener was bound under now leads to a different socket
+    // (renamed here; a bind mount or another mount namespace does the same). `/proc/net/unix` still
+    // prints the headless one's path, so a name-only check approves it; the file is the other's.
     let (headless, _) = start("renamed", Some("headless"), true, false);
     let (other, other_pid) = start("impostor", None, true, false);
     std::fs::rename(&headless, dir.join("renamed.moved")).expect("moving the headless socket away");
@@ -2304,9 +2316,8 @@ fn main() {
     if let Ok(Some(kind)) = neovide_editor::detach_stdin_from_nvim() {
         println!("[stdin] a {kind} on stdin would reach nvim as a buffer; stdin is /dev/null now");
     }
-    // No session bus, as every guarded test runs: a
-    // bare run on the desktop's own bus would ask it for the accessibility bus and D-Bus-activate the
-    // portal and GVfs services, which then run with the desktop session's real `HOME`.
+    // Cut the session bus with `own_x_server::cut_session_bus` before GTK can ask for
+    // accessibility or activate portal and GVfs services using the real user's home.
     own_x_server::cut_session_bus("cursor_animation");
     let sandbox_socket = match sandbox_wayland_socket() {
         Ok(socket) => {

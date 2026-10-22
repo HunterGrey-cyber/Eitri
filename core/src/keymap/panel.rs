@@ -539,9 +539,9 @@ mod tests {
 
     #[test]
     fn the_fixed_browse_keys_are_reserved() {
-        // `o` is an alias for `i`, and `A` enters INPUT with the caret at the end.
-        // Both must be fixed BROWSE keys so a panel binding or nvim leader/mapping cannot shadow them.
-        // `:` opens the panel's command line, so it is fixed too.
+        // `o` aliases `i`, and `A` opens INPUT with the caret at the end. Both are fixed BROWSE keys,
+        // so Lua bindings and nvim mappings must not shadow them. `:` opens the panel command line
+        // and must be protected the same way.
         for key in [
             "j", "k", "h", "l", "a", "d", "i", "o", "A", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", ":", "5",
         ] {
@@ -560,8 +560,8 @@ mod tests {
         }
     }
 
-    /// The panel binding API refuses `o` and `A` just as it refuses `i`,
-    /// so user bindings cannot shadow their built-in BROWSE meanings.
+    /// The public API used by `eitri.keymap.set("panel", "o", ...)` must refuse both `o` and `A`
+    /// so a user binding cannot silently shadow a fixed BROWSE key.
     #[test]
     fn o_and_a_are_refused_by_set_the_same_way_i_is() {
         let mut table = PanelUserTable::default();

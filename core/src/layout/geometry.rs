@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(a.dividers[0].ratio_for(700), 640.0 / 720.0);
     }
 
-    /// sw-layout-1 (2026-09-27 Codex sweep): a nested split whose outer ratio is pushed toward
+    /// Seen 2026-09-27: a nested split whose outer ratio is pushed toward
     /// `MAX_RATIO` can compute a shown, focused leaf's rect to zero height even though nothing
     /// hides it. `agent | (terminal / editor)`, terminal's own minimum 80px and editor's 0 (as a
     /// `GtkGLArea` editor host normally reports): the outer split, capped at the inner subtree's
@@ -603,8 +603,8 @@ mod tests {
         };
         let a = arrange(&layout, &f);
         let editor_rect = a.rect_of(&editor()).expect("editor is shown");
-        // Not merely more than zero: the first floor was 1px, and a 1px
-        // editor is as invisible and as impossible to click as a 0px one.
+        // An editor floor must be usable, not merely positive: a 1px editor is as invisible and
+        // impossible to click as a 0px editor.
         assert!(
             editor_rect.h >= 24,
             "editor is shown and focused, but its rect is {editor_rect:?}"
@@ -753,10 +753,10 @@ mod tests {
         );
     }
 
-    /// `Ctrl+h/j/k/l` navigation on the default tree, checked row by row. The editor uses
-    /// letters from the tmux shim. The panel sends `Ctrl+h` to the editor and `Ctrl+k` to the
-    /// top bar, while `Ctrl+l` and `Ctrl+j` pass through to the WebView.
-    /// A pass-through is `Nothing` here: `shell` lets the key continue.
+    /// The default layout preserves directional navigation. The editor side uses the tmux shim's
+    /// letters (`pane_switch.rs`, `main.rs`'s `'R'`/`'U'`/catch-all arms). The panel capture controller
+    /// sends `Ctrl+h` to the editor and `Ctrl+k` to the top bar, while `Ctrl+l` and `Ctrl+j` pass to
+    /// the WebView. Pass-through is `Nothing` here so the shell lets the key continue.
     #[test]
     fn navigation_reproduces_todays_dispatch_on_the_default_tree() {
         use Direction::*;
@@ -922,8 +922,8 @@ mod tests {
         assert_eq!(layout.zoomed(), None);
     }
 
-    /// Hiding the module with the keys chooses their next destination first,
-    /// so focus never stays on a hidden module.
+    /// Hiding the module holding the keys chooses their destination first, so a hidden module
+    /// never retains focus.
     #[test]
     fn hiding_the_focused_module_hands_the_keys_to_its_most_recent_neighbour_first() {
         let mut layout = bottom_tree();
@@ -961,10 +961,10 @@ mod tests {
         assert_eq!(layout.focus(), &editor(), "a refused hide leaves the keys alone");
     }
 
-    /// A geometric neighbour takes focus before a more recently used non-neighbour. The test above
-    /// cannot distinguish these choices because its most recent module is also a neighbour.
-    /// A Lua `side` panel right of `[editor | agent]` distinguishes them: only the agent neighbours
-    /// it, even when the editor was used more recently.
+    /// Hiding a focused module chooses a neighbor before the most recent module. The preceding
+    /// trees cannot distinguish those choices because the most recent module is also a neighbor.
+    /// A Lua `side` panel right of `[editor | agent]` separates them: only the agent is adjacent,
+    /// even when the editor was used more recently.
     #[test]
     fn hiding_the_focused_module_prefers_a_neighbour_over_a_more_recent_non_neighbour() {
         let side = ModuleId::lua("side");
@@ -1011,10 +1011,10 @@ mod tests {
         assert!(layout.is_visible(layout.focus()));
     }
 
-    /// Two dividers on one line: `[a | b]` over `[c | d]` at equal ratios, as `even` can build.
-    /// `Ctrl+a l` from `c` moves the lower divider bordering `c`, rather than the upper divider at
-    /// the same x. Across the other axis, `Ctrl+a j` from `b` in `[a / c] | [b / d]` moves the right
-    /// column's divider.
+    /// Two dividers on one line: `[a | b]` over `[c | d]` at equal ratios, what `ops::even` builds
+    /// routinely. `Ctrl+a l` from `c` moves the LOWER row's divider -- the one on `c`'s edge -- and
+    /// not the upper row's, which sits at the same x but borders `a` and `b`. The same across the
+    /// other axis: `Ctrl+a j` from `b` in `[a / c] | [b / d]` moves the right column's divider.
     #[test]
     fn resize_takes_the_divider_that_borders_the_leaf_not_one_on_the_same_line() {
         let l = ModuleId::lua;
@@ -1077,9 +1077,9 @@ mod tests {
         assert_eq!(arrange(&layout, &frame()).modules.len(), 2);
     }
 
-    /// A bottom row keeps its height when the window grows. Without a settled pin, its ratio makes it
-    /// grow from 240px (a third of the default window) to 347px at `F11` and 360px immersive. Once
-    /// its pin has a length, the bottom module keeps that length at every window height.
+    /// A bottom row keeps its height when the window grows, matching `GtkPaned`'s
+    /// `resize_end_child(false)`: a 240px terminal stays 240px through `F11`, rather than growing
+    /// with a ratio. Once the bottom module's pin has a length, every window height preserves it.
     #[test]
     fn a_pinned_bottom_row_keeps_its_height_when_the_window_grows() {
         let height_at = |layout: &Layout, h: i32| {
@@ -1178,11 +1178,10 @@ mod tests {
         assert_eq!(arrange(&layout, &at(721)).rect_of(&bottom()).unwrap().h, 240);
     }
 
-    /// A pinned length stays inside the band a ratio has at EVERY size, not only at the size it was
-    /// dragged at (the plan review's probe): a bottom row dragged to the top of a fullscreen window
-    /// keeps 95% of it, and when the window is made smaller the modules above keep 5% -- 36px of
-    /// 720, where the stored 988px alone would leave them 0px while the keys could still go there.
-    /// Grown back, the row is the height it was dragged to.
+    /// Pinned lengths remain within ratio bounds at every window size. A bottom row dragged to
+    /// 95% of fullscreen must leave 5% for the modules above when shrunk: 36px of a 720px window,
+    /// rather than zero if its stored 988px were used directly. Growing again restores its dragged
+    /// height; focusable modules must not become invisible.
     #[test]
     fn a_pinned_row_never_takes_more_than_a_ratio_could_when_the_window_shrinks() {
         let tall = Frame::new(Size { w: 1920, h: 1041 }, HANDLE);

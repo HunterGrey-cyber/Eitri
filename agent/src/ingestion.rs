@@ -1290,11 +1290,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// Checks the `record_written` gate while the session id is known but no record is on disk.
-    /// Adoption sets the id under the lock and writes the record after releasing it. A history
-    /// file written during that gap would have no session record, making it unreachable from
-    /// the picker and subject to cleanup by the next new session. The test sets this state
-    /// directly so it can check the gate without relying on a timing race.
+    /// The `record_written` gate, which `provider_session_id` alone does NOT cover.
+    ///
+    /// There is a real window in which the id is visible and the record is not yet on disk:
+    /// adoption sets the id under the lock and writes the record after releasing it. That window is
+    /// what lost 20 titles out of 20 in a reproduction. A history file written in it would
+    /// belong to a session with no record -- an orphan from birth, unreachable from the picker and
+    /// swept by the next new session. Driven directly rather than raced, because a test that had to
+    /// hit that window would be a flaky test of a deterministic rule.
     #[test]
     fn nothing_is_stored_while_the_session_id_is_known_but_the_record_is_not_written() {
         crate::state_dirs::redirect_state_to_a_test_root();

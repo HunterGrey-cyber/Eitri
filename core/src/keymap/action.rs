@@ -1373,8 +1373,8 @@ mod tests {
         assert!(err.contains("module.nope") && err.contains("Lua panel"), "{err}");
     }
 
-    /// The `?` overlay says killing the last module closes the window.
-    /// Hiding still refuses the last module.
+    /// The `?` overlay once said the kill refused the last module on screen; since
+    /// 2026-09-26 that kill closes the window instead. The hide still refuses it.
     #[test]
     fn the_kill_row_says_the_last_module_closes_eitri() {
         let kill = Action::ModuleKill.describe("Ctrl+b", "e / a / t");
@@ -1385,7 +1385,7 @@ mod tests {
             .contains("not the last one on screen"));
     }
 
-    /// `select.last` and `select.next` are tmux's `last-pane` and `select-pane -t :.+`. `parse`'s `select.`
+    /// Bindings added 2026-09-29 for tmux's `last-pane` and `select-pane -t :.+`. `parse`'s `select.`
     /// fallback reads only a direction, so both names need arms of their own -- and the fallback must
     /// keep reading the directions.
     #[test]

@@ -237,13 +237,16 @@ fn main() {
         harness.scale_factor_setting()
     );
 
-    // 6. Verify that the forced redraw changes pixels as well as `grid_scale()`.
-    //    Put 'MMM' on row 0 and add four empty buffer lines so the cursor lands on row 4,
-    //    outside the 320x160 canvas at both scales. This isolates row 0's ink for measurement.
-    //    A single blank line would put the cursor against the enlarged text with no background
-    //    gap. The cursor is redrawn at its current size every frame, so it could hide stale
-    //    cached text. Filling all seven remaining grid rows would instead scroll row 0 off
-    //    the top, since the single-grid embedding reserves one of its eight rows for commands.
+    // 6. The forced redraw actually changes pixels, not just grid_scale()'s number. Put known
+    //    text ('MMM') on row 0, then add four real (but empty) buffer lines below it so the cursor
+    //    lands on row 4 -- far enough that, once it is off this test's undersized-for-the-zoomed-in
+    //    320x160 canvas at both scales this check uses, row 0's own ink is the only thing left to
+    //    measure. Two tempting alternatives give wrong readings: a single blank line
+    //    below (`o<Esc>` once) put the cursor -- which, unlike a line's own picture, is redrawn
+    //    fresh every frame at its live position and size -- flush against a freshly-large row 0
+    //    with no background gap to tell the two apart; filling the grid's other 7 rows (`o<Esc>`
+    //    seven times) instead made nvim scroll row 0 off the top entirely, since the single-grid
+    //    embedding reserves one of those 8 rows for the command line.
     const TEXT_COLUMNS: u32 = 3;
     // Comfortably past row 0's own ink at either scale this check uses, and still well short of
     // row 4 (the cursor's row) at either scale too -- see the comment above.

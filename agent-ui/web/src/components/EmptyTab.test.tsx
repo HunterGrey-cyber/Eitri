@@ -11,7 +11,7 @@ import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "../typing
 
 afterEach(cleanup);
 
-/** #26: the typing guard reads each keydown's timestamp (jsdom: `Date.now()`), so two keys a test fires
+/** The typing guard reads each keydown's timestamp (jsdom: `Date.now()`), so two keys a test fires
  *  back to back are one burst. `keyGap()` moves the clock past the guard window, as a person pausing
  *  would -- with the fake clock's `setSystemTime` (no timer fires) or, under real timers, a `Date.now`
  *  offset undone after each test. */
@@ -155,9 +155,9 @@ describe("EmptyTab (F3)", () => {
     const { container } = renderEmpty();
     expect(container.querySelector("textarea")).not.toBeNull();
     expect(document.activeElement).toBe(container.querySelector("textarea"));
-    // The dashboard shows four actions (`new`, `resume`, `sessions`, `keys`) instead of individual
-    // resume rows. `HELLO` has ten sessions, so this checks that the action count is independent of
-    // the session count.
+    // The eight resume rows are gone, replaced by the dashboard's own
+    // four (`new`, `resume`, `sessions`, `keys`) items -- `HELLO` above has ten records, so this also
+    // pins that the dashboard never draws one row per record the way the old screen did.
     expect(container.querySelectorAll('[data-nav-stop="resume"]').length).toBe(0);
     expect(container.querySelectorAll('[data-nav-stop="dash"]').length).toBe(4);
     expect(container.textContent).not.toContain("about 8");
@@ -170,8 +170,9 @@ describe("EmptyTab (F3)", () => {
     fireEvent.keyDown(box, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("fix the parser");
   });
-  // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab throughout the chat.
-  // App.test.tsx covers that routing.
+  // Shift+Tab used to be claimed by this screen's own `onKeyDown` directly; it is
+  // now caught everywhere in the chat by App.tsx's document-capture router (`modeKey.ts`, tested in
+  // App.test.tsx's "Shift+Tab anywhere in the chat" describe block), so that test moved there.
   it("says it is starting while the session connects, with the box live, queueing", () => {
     const onQueue = vi.fn();
     const { container, getByText } = renderEmpty({ tab: { ...TAB, state: "starting" }, onQueue });
@@ -182,8 +183,9 @@ describe("EmptyTab (F3)", () => {
     fireEvent.keyDown(box, { key: "Enter" });
     expect(onQueue).toHaveBeenCalledWith("queue this");
   });
-  /** A starting tab has no live turn for send-now. Queue Ctrl+Enter as well as Enter so
-   *  `Composer.submit()` cannot clear a draft through a no-op `onSendNow`. */
+  /** A starting tab has no live turn to send-now to, so
+   *  Ctrl+Enter used to fall through to `Composer`'s default no-op `onSendNow` while its `submit()`
+   *  cleared the box anyway -- the typed text vanished with no send, no queue and no restore. */
   it("queues on Ctrl+Enter too, instead of silently discarding the draft", () => {
     const onQueue = vi.fn();
     const { container } = renderEmpty({ tab: { ...TAB, state: "starting" }, onQueue });
@@ -203,13 +205,13 @@ describe("EmptyTab (F3)", () => {
     const { container, getByText, props } = renderEmpty({ tab: { ...TAB, state: "failed" }, failure: "the gate refused 2.1.999" });
     getByText("the gate refused 2.1.999");
     expect(container.querySelector(".dashboard")).toBeNull();
-    // An unrecognised failure: no headline/remedy block, exactly as before this task.
+    // An unrecognised failure has no headline/remedy block.
     expect(container.querySelector(".row-problem")).toBeNull();
     fireEvent.keyDown(container.querySelector(".empty-tab")!, { key: "r" });
     expect(props.onReset).toHaveBeenCalled();
   });
-  // A recognised startup failure shows a headline and remedy above the unchanged raw error text,
-  // preserving the details needed to diagnose it.
+  // A recognised startup failure draws a headline and remedy above the
+  // raw text, which stays -- "never hide the evidence".
   it("classifies a recognised startup failure into a plain headline and remedy above the raw text", () => {
     const { container, getByText } = renderEmpty({
       tab: { ...TAB, state: "failed" },
@@ -223,8 +225,8 @@ describe("EmptyTab (F3)", () => {
       "Install it and make sure claude runs in a terminal, then press r.",
     );
   });
-  /** Show the retry instruction once, whether it comes from a remedy or the failure row. The
-   *  composer must not duplicate it. */
+  /** "Press r…" was on screen twice (the row and the composer), three times under
+   *  a remedy that already says it. Once, whichever way. */
   it("says press r once on a failed tab, with a remedy and without one", () => {
     const withRemedy = renderEmpty({
       tab: { ...TAB, state: "failed" },
@@ -306,7 +308,7 @@ describe("EmptyTab (F3)", () => {
       expect(container.querySelector("textarea")).not.toBeNull();
     });
 
-    /** v1 hardening, codex-release-p1 #7 (C1a): this screen had never grown `o`, the live tab's own
+    /** This screen had never grown `o`, the live tab's own
      *  exact alias of `i` (`keymap.ts:284-292`) -- only `i` opened the composer here. */
     it("o is an exact alias of i (C1a)", () => {
       const rendered = renderEmpty();
@@ -317,7 +319,7 @@ describe("EmptyTab (F3)", () => {
       expect(container.querySelector("textarea")).not.toBeNull();
     });
 
-    /** v1 hardening, codex-release-p1 #7 (C1a): `A` had no branch at all here, so the live tab's
+    /** `A` had no branch at all here, so the live tab's
      *  second frozen alias -- open INPUT with the caret forced to the end -- was silently absent on
      *  the very first screen a new user sees. Round trip mirrors `Composer`'s own suite: `i` leaves
      *  the caret at 3 of "hello world", `Escape` returns to BROWSE, and `A` must move it to 11
@@ -338,7 +340,7 @@ describe("EmptyTab (F3)", () => {
       expect(container.querySelector("textarea")!.selectionStart).toBe("hello world".length);
     });
 
-    /** v1 hardening: `r` still resumes the newest record, regardless of
+    /** `r` still resumes the newest record, regardless of
      *  the cursor -- `TYPING_GUARD_MS` later, like `f` and `H`/`L` on this screen, so typed prose
      *  cannot run it (the next tests). */
     it("r resumes the newest record directly, regardless of the cursor, TYPING_GUARD_MS later", () => {
@@ -453,8 +455,8 @@ describe("EmptyTab (F3)", () => {
       }
     });
 
-    /** Arrivals land the dashboard in BROWSE. Typing "run" immediately must cancel the deferred `r`
-     *  action instead of resuming the newest saved session. */
+    /** An arrival lands this dashboard in BROWSE, and "run
+     *  the tests" typed at once resumed the newest record into this tab on its own `r`. */
     it('"run" at 80 ms a key resumes nothing, and the band names r', () => {
       vi.useFakeTimers();
       try {
@@ -541,8 +543,9 @@ describe("EmptyTab (F3)", () => {
       expect(props.onResume).toHaveBeenCalledWith("id-0-0000000000");
     });
 
-    /** After mounting and arriving in BROWSE, Space must start the leader sequence and show the
-     *  which-key box after its delay when a table is supplied. */
+    /** The leader engine must be
+     *  reachable here at all. Mounting
+     *  an EmptyTab, arriving and firing Space must produce a reachable composer. */
     describe("the leader engine", () => {
       it("shows the which-key box 200ms after Space, once a real table is supplied", () => {
         vi.useFakeTimers();
@@ -562,8 +565,9 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** An input method's Space must not start a sequence, whether marked by `isComposing` or
-       *  WebKit's `keyCode` 229. Use the same `isImeKey` guard as the live conversation. */
+      /** An input method's Space never starts a sequence here, whether it arrives
+       *  with `isComposing` or only as WebKit's `keyCode` 229 -- the same `isImeKey` guard App.tsx
+       *  uses for its own leader engine. */
       it("an IME Space (isComposing, or keyCode 229) starts no sequence", () => {
         vi.useFakeTimers();
         try {
@@ -580,7 +584,7 @@ describe("EmptyTab (F3)", () => {
           fireEvent.keyDown(root, { key: "d" });
           expect(onPanelAction).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tab.close" }));
           // A real Space still does, so the guard is not simply swallowing Space -- on its own, after
-          // a pause: in the middle of typing the leader is refused (the v1-ui GUI pass, below).
+          // a pause: in the middle of typing the leader is refused.
           act(() => vi.advanceTimersByTime(300));
           fireEvent.keyDown(root, { key: " " });
           act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
@@ -590,8 +594,9 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** The leader starts a sequence only for a key pressed alone or at the end of a quick motion.
-       *  A space within typed text must not arm `<leader>m` and change the stored mode to bypass. */
+      /** "set up my" typed onto this dashboard ran `<leader>m` and
+       *  flipped the stored mode to bypass, so removing the bare `m` is insufficient. The leader
+       *  here starts a sequence only on a key that stands alone or ends a quick motion. */
       it("t Space m at 80 ms a key: <leader>m never runs, and the band is told why", () => {
         vi.useFakeTimers();
         try {
@@ -633,7 +638,7 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** v1 hardening, codex-release-p1 #5 (agent-ui/web/src/components/EmptyTab.tsx:478): `f`
+      /** `f`
        *  intercepted every keydown unconditionally, ahead of the pending-sequence check -- so once
        *  `<leader>` (Space) armed a sequence, the very next `f` was stolen by HINT instead of
        *  continuing it, and the advertised `<leader>fn` (new tab) binding could never complete. */
@@ -650,9 +655,12 @@ describe("EmptyTab (F3)", () => {
         expect(onHint).not.toHaveBeenCalled();
       });
 
-      /** A bare Control or Shift keydown must leave the dashboard's pending leader sequence armed,
-       *  just as on a live tab. Otherwise the modifier needed to type a later chord would cancel
-       *  the sequence before that chord arrives. */
+      /** An unbound key after the leader must be swallowed, even when a bare modifier arrives first.
+       *  The dashboard's leader engine mirrors `App.tsx`'s at leader.ts:76-84 (its own doc
+       *  comment says so) and shares the identical unguarded `seqRef.current !== null` branch --
+       *  the same missing `isModifierKey` check that let a bare `Control`/`Shift` keydown cancel a
+       *  pending sequence on the live tab. A bare Shift (as `gT`'s own, just above, and `Ctrl+c`'s
+       *  in App.tsx) must not drop the armed `<leader>` here either. */
       it("a bare Shift keydown keeps a pending leader sequence alive, so Space Shift b d still completes <leader>bd", () => {
         const onPanelAction = vi.fn();
         const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
@@ -665,9 +673,11 @@ describe("EmptyTab (F3)", () => {
         expect(onPanelAction).toHaveBeenCalledWith(expect.objectContaining({ keys: ["<leader>", "b", "d"], action: "tab.close" }));
       });
 
-      /** A bare Control keydown preserves the pending sequence, but the following `d` still carries
-       *  `ctrlKey`. It must not complete `<leader>bd` as plain `d`: Space, b, Ctrl+d must not
-       *  run `tab.close`. */
+      /** Ignoring modifiers keeps a bare Control
+       *  keydown from cancelling the pending sequence, but the REAL character keydown that follows
+       *  it (`d`, carrying `ctrlKey: true`) used to reach `advanceSequence` as plain "d", completing
+       *  `<leader>bd` for a Ctrl+d chord no table entry actually names. Space, b, Ctrl+d (the
+       *  Control keydown included) must not run tab.close. */
       it("Space b Ctrl+d (the Control keydown included) does not run tab.close", () => {
         const onPanelAction = vi.fn();
         const rendered = renderEmpty({ panelTable: TABLE, onPanelAction });
@@ -707,8 +717,8 @@ describe("EmptyTab (F3)", () => {
         expect(container.querySelector(".which-key-box")).toBeNull();
       });
 
-      /** Handle `[b`/`]b` here because `startSequence` leaves `[`/`]` to `resolveKey`, which this
-       *  screen does not run. */
+      /** `[b`/`]b` reached nothing here, since `startSequence`
+       *  leaves `[`/`]` to `resolveKey`, which this screen does not run. */
       it("[ b and ] b run the table's tab.prev / tab.next, and a stray [ is dropped", () => {
         const onPanelAction = vi.fn();
         const table = {
@@ -741,9 +751,10 @@ describe("EmptyTab (F3)", () => {
         fireEvent.keyDown(root, { key: "i" });
         expect(rendered.container.querySelector("textarea")).not.toBeNull();
       });
-      /* Shift+Tab, overlays and tab switches can cancel keys without reaching this handler.
-         `dropKeysRequest` clears the waiting prefix and leader sequence so a later `i` is not
-         swallowed by an old `g`. */
+      /* A cancel route this screen never sees as a key -- Shift+Tab, which the
+         window's document-capture router stops before this handler, an overlay, a tab switch --
+         left its prefix and leader waiting, so `g`, Shift+Tab, `i` swallowed the `i`. The window
+         now says so through `dropKeysRequest`. */
       it("K01: dropKeysRequest drops a waiting prefix and a leader sequence", () => {
         vi.useFakeTimers();
         try {
@@ -821,7 +832,7 @@ describe("EmptyTab (F3)", () => {
         expect(onPanelAction).toHaveBeenCalledTimes(2);
       });
 
-      /** Losing pane focus cancels a pending sequence. */
+      /** The keys leaving this pane end a pending sequence here too. */
       it("losing pane focus cancels a pending sequence", () => {
         vi.useFakeTimers();
         try {
@@ -843,8 +854,11 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** Defer `f` for `TYPING_GUARD_MS` before asking for a HINT, matching the live conversation. A
-       *  following key can then cancel an accidental `f` typed as part of a word. */
+      /** A hint request must wait for the typing guard on the empty screen too.
+       *  `f` used to intercept every keydown unconditionally (moving the pending-sequence check
+       *  ahead of it did not defer its action), so a lone `f` asked for a HINT at
+       *  once. It now defers the same `TYPING_GUARD_MS` the live conversation's own `f` does
+       *  (`App.test.tsx`'s "f in BROWSE asks shell for a HINT..."). */
       it("f asks for a HINT TYPING_GUARD_MS later, not at once", () => {
         vi.useFakeTimers();
         try {
@@ -861,8 +875,10 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** Typing "fix" in BROWSE must not request a HINT. The `i` within `TYPING_GUARD_MS` cancels the
-       *  deferred `f` and flashes the reason. */
+      /** A typed first letter must not open hints.
+       *  "fix the dashboard layout⏎" typed on a fresh window's own first screen used to start a HINT
+       *  on its own `f`. The `i` that follows within `TYPING_GUARD_MS` cancels the deferred `f`
+       *  before it ever asks, and flashes the reason. */
       it('"fix this" at 80 ms a key asks for no HINT, and flashes', () => {
         vi.useFakeTimers();
         try {
@@ -877,7 +893,8 @@ describe("EmptyTab (F3)", () => {
           }
           act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
           expect(onHint).not.toHaveBeenCalled();
-          // Display the cancelled `f`'s own flash returned by the typing guard's `onKey`.
+          // The cancelled `f` says so in its own words (this screen used to
+          // drop what the guard's `onKey` returned, so it said nothing at all).
           expect(onFlash).toHaveBeenCalledWith(hintTypingFlash());
         } finally {
           vi.useRealTimers();
@@ -905,8 +922,9 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** `f` still requests a HINT on a failed tab after the guard delay. Its mode can read "input",
-       *  but there is no live composer to disturb. */
+      /** `f` must still work on a `failed` tab (there is no live composer to disturb
+       *  once the tab has failed, this file's own `onKeyDown` doc comment) even though `mode` reads
+       *  "input" there -- `modeRef`/`failedRef`'s own reasoning. */
       it("f still asks for a HINT on a failed tab, TYPING_GUARD_MS later", () => {
         vi.useFakeTimers();
         try {
@@ -922,8 +940,11 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** Defer the direct `H` binding for `TYPING_GUARD_MS`, matching the live conversation. A lone
-       *  `H` still runs, while subsequent typing can cancel it. */
+      /** A tab switch must wait for the typing guard on the empty screen too.
+       *  `H` used to run at once, ahead of the dashboard's own fixed keys; this test used
+       *  to pin exactly that ("runs immediately"). It now defers the same `TYPING_GUARD_MS` the live
+       *  conversation's own `H`/`L` do (`App.test.tsx`'s "H posts tab_verb prev..."), so a lone `H`
+       *  still runs, just that much later. */
       it("a direct table binding (H) runs TYPING_GUARD_MS later, ahead of the dashboard's own fixed keys", () => {
         vi.useFakeTimers();
         try {
@@ -940,9 +961,13 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** A deferred `H` closes over the binding present at keydown. Replacing `panelTable` must
-       *  cancel the typing guard's deferred single-key callback as well as any multi-key sequence;
-       *  otherwise the old action still runs when `TYPING_GUARD_MS` elapses. */
+      /** The deferred `H` above closes over the OLD table's
+       *  `binding` at keydown time -- replacing `panelTable` mid-wait used to leave that stale
+       *  callback armed (`useEffect(() => { clearSequence(); }, [panelTable])` cancels only a
+       *  pending multi-key sequence, never this screen's own `typingGuard`'s deferred single-key
+       *  wait), so it still ran once `TYPING_GUARD_MS` elapsed. The same cancellation is needed
+       *  on `App.tsx`'s copy: replacing the table must prevent a delayed single-key callback
+       *  from running a stale binding. */
       it("replacing the table mid-guard-window drops the deferred H binding entirely (P2-A6)", () => {
         vi.useFakeTimers();
         try {
@@ -964,8 +989,10 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** Typing "Looks good" in BROWSE must not switch tabs. The `o` within `TYPING_GUARD_MS` cancels
-       *  the deferred `L` before it posts. */
+      /** "Looks good, now
+       *  add tests⏎" typed on a fresh window's own first screen used to switch tabs on its own `L` --
+       *  this screen lacked the live conversation's deferral. The `o` that follows within
+       *  `TYPING_GUARD_MS` cancels the deferred `L` before it ever posts. */
       it('"Looks good" at 80 ms a key posts no tab_verb', () => {
         vi.useFakeTimers();
         try {
@@ -1005,7 +1032,7 @@ describe("EmptyTab (F3)", () => {
         }
       });
 
-      /** `i` is one of the reserved fixed BROWSE keys (Global Constraint #4), so it can never START
+      /** `i` is one of the reserved fixed BROWSE keys, so it can never START
        *  a sequence -- but a sequence already pending, mid-typing, swallows any key that does not
        *  continue it, `i` included.
        *  This is the exact same rule `App.tsx`'s own describe block pins with `armThenCancel(() =>
@@ -1032,8 +1059,10 @@ describe("EmptyTab (F3)", () => {
     });
   });
 
-  /** Mode changes go through `App.tsx`'s document-capture Shift+Tab router and the guarded bypass
-   *  prompt. The dashboard never dispatches a mode change from bare `m`, regardless of timing. */
+  /** The dashboard used to cycle the mode straight off
+   *  a bare `m`, with none of the typed-text guard the rest of the panel now has around a move
+   *  into bypass. `App.tsx`'s document-capture Shift+Tab router is the only way in now; this screen
+   *  never dispatches on the letter at all any more, at any timing. */
   describe("v1 mode: S2 via the prompt", () => {
     it("m in the menu posts nothing", () => {
       const rendered = renderEmpty();
@@ -1092,8 +1121,9 @@ describe("EmptyTab (F3)", () => {
     expect(props.onChooseSessions).toBeUndefined();
   });
 
-  /** `arrive` must move focus off the textarea before `setMode("browse")`. Then `onBlur` reports
-   *  BROWSE with the root as `relatedTarget`, and focus never gets stranded on `document.body`. */
+  /** `arrive` must never leave the keys stranded on `document.body`.
+   *  Focusing the root happens BEFORE `setMode("browse")`, so the
+   *  textarea's `onBlur` reports BROWSE with `relatedTarget` already the root rather than nothing. */
   describe("keysRequest / overlayOpen", () => {
     it("arrive with the textarea focused lands the keys on the root, not body", () => {
       const rendered = renderEmpty();
@@ -1282,9 +1312,10 @@ describe("the starting screen's checkout hint is delayed 10s", () => {
   });
 });
 
-/* `App.tsx` forwards `navKeyRequest` only after checking its overlays. This screen reports
-   `onNavFallthrough` for starting or failed tabs, or when its menu/composer mode does not match
-   the direction, instead of transitioning. */
+/* `App.tsx` bumps `navKeyRequest` only for a `nav_key` it
+   has not already answered with `nav_fallthrough` itself (an overlay it alone knows about, `?`, a
+   y/n) -- this screen decides the rest: a starting/failed tab, or its own menu/composer mode not
+   matching the direction, both report back through `onNavFallthrough` rather than transitioning. */
 describe("EmptyTab: navKeyRequest", () => {
   it("menu nav_key down opens the composer", () => {
     const rendered = renderEmpty();
@@ -1307,7 +1338,7 @@ describe("EmptyTab: navKeyRequest", () => {
     const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onNavFallthrough });
     rendered.rerender(<EmptyTab {...rendered.props} navKeyRequest={{ seq: 1, direction: "down" }} />);
     expect(onNavFallthrough).toHaveBeenCalledWith("down");
-    // The starting tab's own box stays live regardless (C1: it queues behind the connect) --
+    // The starting tab's own box stays live regardless (it queues a message behind the connect) --
     // falling through changes nothing about it either way.
     expect(rendered.container.querySelector("textarea")).not.toBeNull();
   });
@@ -1319,8 +1350,10 @@ describe("EmptyTab: navKeyRequest", () => {
     expect(onNavFallthrough).toHaveBeenCalledWith("down");
   });
 
-  // A starting tab's composer queues behind the connection. Leaving its open INPUT via `Ctrl+k`
-  // must return to BROWSE like Esc, keeping focus on this screen instead of falling through.
+  // A starting tab's composer is live (it queues behind the
+  // connect", this file's own `onKeyDown` comment), so leaving an already-open INPUT via `Ctrl+k`
+  // must behave the same way `Esc` already does there -- not fall through and hand the keys off this
+  // screen entirely, contradicting `Escape`'s own handling two tests up.
   it("a starting tab already in INPUT leaves it on nav_key up, like Esc -- the composer stays live", () => {
     const onNavFallthrough = vi.fn();
     const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onNavFallthrough });
@@ -1373,8 +1406,9 @@ describe("EmptyTab: navKeyRequest", () => {
   });
 });
 
-/* If a tab fails while its composer has focus, focus this screen's root in BROWSE. Leaving focus in
-   a disabled textarea would let WebKit move it to body. */
+/* A tab failing while its composer holds the keys hands them to this screen's own
+   root, in BROWSE, rather than leaving them in a disabled textarea for WebKit's focus fix-up to drop
+   on <body>. */
 describe("EmptyTab: K04, a failure while the composer has the keys", () => {
   it("focuses the root and reports BROWSE when the tab turns failed", () => {
     const onModeChange = vi.fn();
@@ -1399,10 +1433,10 @@ describe("EmptyTab: K04, a failure while the composer has the keys", () => {
   });
 });
 
-/* The dashboard's own `i`/`o`/`A` enter INPUT only on a key that stands alone (or ends a quick
-   motion run), and any key within `TYPING_GUARD_MS` of a `y` that copied the handoff command is
-   typing. Otherwise "expla" typed on the empty tab would lose its first letters to the `i` inside
-   "explain". Time is vitest's fake clock. */
+/* The dashboard's own `i`/`o`/`A` enter INPUT only on a key that
+   stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a `y` that
+   copied the handoff command is typing. This happened right here: "expla" typed on the empty tab lost
+   its first letters to the `i` inside "explain". Time is vitest's fake clock. */
 describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
   const HINT = "i or Ctrl+j to type";
   const at = (ms: number) => act(() => vi.advanceTimersByTime(ms));
@@ -1447,8 +1481,8 @@ describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
     }
   });
 
-  // Do not exempt motions before `i`/`o`/`A`: `l`, `h` or `G` can start a word. Typing "look at"
-  // must not open the composer on its `o`.
+  // No motion exception for `i`/`o`/`A` -- a lone `l`, `h`
+  // or `G` is a word's first letter, so "look at" walked and opened the composer with its `o`.
   it.each(["look at the diff", "how do I", "Good", "hi", "like", "join"])(
     "%s at 80 ms a key never opens the composer, even though its first letter is a motion key",
     (text) => {
@@ -1496,8 +1530,8 @@ describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
     }
   });
 
-  // A dashboard `y` opens the typing guard window even without a handoff command. Enter or `j`
-  // immediately afterward must not run the selected action or move the cursor.
+  // The window opened only when a handoff command existed, so on an
+  // ordinary dashboard `y` then Enter ran the selected action and `j` moved the cursor.
   it("y on a dashboard with no handoff still opens the window: Enter right after it runs nothing", () => {
     vi.useFakeTimers();
     try {

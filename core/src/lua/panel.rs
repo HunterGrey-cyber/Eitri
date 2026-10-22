@@ -281,8 +281,8 @@ mod tests {
         assert_eq!(parsed.key, None);
     }
 
-    /// `key` is optional and kept as written. `ModuleKeys::build` validates it once every
-    /// panel has registered.
+    /// `key` is optional and kept as written; whether it can be one is
+    /// `ModuleKeys::build`'s question, asked once every panel has registered.
     #[test]
     fn a_key_is_kept_as_written() {
         let lua = Lua::new();
@@ -419,8 +419,8 @@ mod tests {
 
     #[test]
     fn resolve_panel_url_passes_through_data_uris() {
-        // `data:` URIs have no `//` authority component (unlike `file://`/`http://`), so they
-        // need their own scheme-aware check -- found broken via sandbox verification (task 8).
+        // `data:` URIs lack the `//` authority used by `file://` and `http://`, so validation
+        // must check the scheme itself rather than rely on an authority component.
         let dir = std::path::Path::new("/home/example/.config/eitri");
         let raw = "data:text/html,<h1>plugin panel</h1>";
         assert_eq!(resolve_panel_url(dir, raw), raw);

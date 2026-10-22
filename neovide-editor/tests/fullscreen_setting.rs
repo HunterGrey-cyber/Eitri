@@ -1,20 +1,22 @@
-//! Checks `g:neovide_fullscreen` propagation between the host and a real nvim.
+//! `g:neovide_fullscreen` reaches the host, and the host's write reaches nvim -- against a real nvim.
 //!
-//! `shell` follows the variable with the window and writes it back when the window changes
-//! for a reason nvim did not see. One launch checks three paths:
+//! `shell` follows this variable with the real window and writes it back when the window changes
+//! for a reason nvim did not see. Three paths, one launch:
 //!
-//! 1. A value set before `ui_attach` with `--cmd` is read by `settings.read_initial_values`
-//!    and becomes the getter's initial value.
-//! 2. A runtime `:let` reaches the getter through the variable watcher, as `init.lua` and
-//!    mappings do.
-//! 3. `set_fullscreen_setting` assigns the variable in nvim. Only the watcher moves the
-//!    getter, so observing the new value confirms that the write arrived.
+//! 1. a value set before `ui_attach` (`--cmd`, read by `settings.read_initial_values`) is what the
+//!    getter starts at;
+//! 2. a runtime `:let` reaches the getter through Neovide's variable watcher -- the path `init.lua`
+//!    and a mapping take;
+//! 3. `set_fullscreen_setting` really assigns the variable in nvim: nothing but that watcher moves
+//!    the getter, so the getter following the write is the proof the write landed.
 //!
-//! Ignored unless requested: it spawns `nvim` (>= 0.10 on `PATH`) and starts its own `Xvfb`
-//! for the clipboard without creating a window. `shell/tests/support/own_x_server.rs`
-//! starts the display before winit connects and removes inherited `WAYLAND_DISPLAY` and
-//! `DISPLAY`. A plain `main` (`harness = false`) keeps winit's event loop on the main
-//! thread; libtest runs each test on a separate thread. Run without a display wrapper:
+//! Ignored unless asked for: it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to a display
+//! for the clipboard (no window) -- **its own `Xvfb`** since 2026-09-29
+//! (`shell/tests/support/own_x_server.rs`), started and pointed to before winit connects, with any
+//! inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took the session's display, the
+//! desktop's from any agent shell. A plain `main` (`harness = false`) because winit builds its event
+//! loop on the main thread only, and libtest runs each test on a thread of its own. Run with, and no
+//! wrapper is needed:
 //!
 //!     cargo test -p neovide-editor --test fullscreen_setting -- --ignored
 use std::time::{Duration, Instant};

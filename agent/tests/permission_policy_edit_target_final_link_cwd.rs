@@ -48,7 +48,7 @@ fn a_kernel_tree_link_as_the_edit_targets_own_last_component_cards() {
     std::os::unix::fs::symlink("/proc/self/cwd/../escaped.ipynb", root.join("nb.ipynb")).unwrap();
     std::os::unix::fs::symlink("/dev/fd/0", root.join("stdin.txt")).unwrap();
 
-    // `cd <root>/src && Eitri <root>`, the review's own shape.
+    // `cd <root>/src && Eitri <root>` gives the host a different cwd from the CLI.
     let started_in = std::env::current_dir().unwrap();
     std::env::set_current_dir(root.join("src")).unwrap();
     assert_eq!(

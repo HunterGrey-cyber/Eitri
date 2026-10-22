@@ -443,8 +443,8 @@ mod tests {
         assert_eq!(state_dir(Some(OsStr::new("relative")), None), None);
     }
 
-    /// Saves and reloads `Auto`, the only mode `save_mode` writes. Bypass refusal is checked by
-    /// `bypass_is_never_written_in_any_build`.
+    /// `save_mode` refuses bypass (`bypass_is_never_written_in_any_build`), so this roundtrip
+    /// covers Auto, the only mode it writes.
     #[test]
     fn a_saved_mode_is_read_back_and_nothing_else_is_written() {
         let dir = scratch("roundtrip");
@@ -465,8 +465,8 @@ mod tests {
         assert_eq!(names.len(), 1, "no .tmp left behind: {names:?}");
     }
 
-    /// Refusing bypass writes nothing in every build and leaves any saved `auto` value
-    /// untouched.
+    /// Refusing to save bypass must work in release builds too: nothing is written, and an existing
+    /// `auto` file is left unchanged.
     #[test]
     fn bypass_is_never_written_in_any_build() {
         let dir = scratch("never-bypass");
@@ -482,8 +482,8 @@ mod tests {
         );
     }
 
-    /// A file remembering bypass starts in auto with an explanatory note. The file is neither
-    /// rewritten nor renamed to `.unusable`.
+    /// An older file remembering bypass loads as auto with an explanation. The original file stays
+    /// untouched: no rewrite and no `.unusable` rename.
     #[test]
     fn a_remembered_bypass_starts_in_auto_with_a_note_and_the_file_is_untouched() {
         let dir = scratch("remembered-bypass");

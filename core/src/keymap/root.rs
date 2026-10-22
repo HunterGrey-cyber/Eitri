@@ -342,12 +342,10 @@ mod tests {
         );
     }
 
-    /// A design decision (2026-09-30): in the agent panel's INPUT, `Ctrl+y` approves the oldest
-    /// waiting card. The page handles it, the way it handles `Ctrl+Enter`: nothing in `shell`
-    /// claims either chord, so the WebView's own key event decides. A root chord (an accelerator or
-    /// a capture-phase navigation key) or the default prefix on `Ctrl+y` would take it before the
-    /// page ever saw it, and the band would advertise a key that does nothing. A user's own
-    /// `eitri.keymap` can still take it; that is theirs to choose.
+    /// In panel INPUT, Ctrl+y approves the oldest waiting card through the page, like Ctrl+Enter.
+    /// Default root accelerators, capture navigation and prefix bindings must leave both chords
+    /// to the WebView; otherwise the advertised key would do nothing. Explicit user bindings
+    /// may still claim the chord.
     #[test]
     fn ctrl_y_stays_the_agent_panels() {
         let ctrl_y = Chord::of(&super::super::key::KeySpec::parse("C-y").expect("C-y parses"));

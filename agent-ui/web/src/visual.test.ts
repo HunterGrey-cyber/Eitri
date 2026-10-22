@@ -20,10 +20,11 @@ import {
   type VisualModel,
 } from "./visual";
 
-/** A `SelectionLike` whose `modify()` follows a supplied caret path, one step per call,
- *  clamped at the last position, while recording calls. It does not implement word movement.
- *  It checks the steps requested by `visual.ts` and supplies DOM positions for exercising
- *  `stepOnce`/`repeatMotion` boundary, chrome and no-progress handling. */
+/** A `SelectionLike` whose `modify()` walks a fixed, caller-supplied path of carets (one step per
+ *  call, clamped at the last), and records every call it saw. It has no idea what "forward word"
+ *  actually means; it verifies which motion `visual.ts` ASKS the selection to do
+ *  and gives `stepOnce`/`repeatMotion` a real sequence of DOM positions to walk so their
+ *  boundary/chrome/no-progress logic can be exercised against a real small DOM tree. */
 function fakeSelection(path: Caret[]): SelectionLike & { calls: string[] } {
   let index = 0;
   let anchorNode: Node = path[0].node;
@@ -121,8 +122,8 @@ describe("visual.ts: motion modify() calls", () => {
     const j = fakeSelection(path);
     const result = runMotion(j, cursor, "j", null);
     expect(j.calls).toEqual(["move forward line"]);
-    // jsdom has no layout, so goal-column snapping does nothing and `goalX` falls back to null.
-    // Real goal-column snapping is verified only by the browser harness.
+    // jsdom has no layout, so the goal-column snap is a no-op and goalX falls back to null here --
+    // real-browser goal-column snapping needs layout, verified only in the real-WebKit harness.
     expect(result.goalX).toBeNull();
 
     const h = fakeSelection(path);
@@ -314,10 +315,12 @@ describe("visual.ts: copySelectionText hides chrome for one synchronous read", (
     expect(row3.hasAttribute("data-visual-copying")).toBe(false);
   });
 
-  /* `.message-list` contains the history notice above its rows, including a `Copy path` button.
-     `k` from the first row can extend the selection into that notice, so the notice needs the
-     copying attribute too. jsdom's `toString()` ignores CSS; this test checks the attribute
-     at read time, where `[data-visual-copying] button` in `index.css` hides the controls. */
+  /* The event shield covered rows only, but `.message-list` also
+     holds the history notice -- not a row, above the first one, with its own `Copy path` button --
+     and `k` from the first row can put an end of the selection in the notice's text. Its button
+     reached `toString()` unshielded. jsdom's `toString()` ignores CSS, so what is asserted is the
+     mark itself, at the moment of the read: the rule that hides the button keys on it (`index.css`,
+     `[data-visual-copying] button`). */
   it("also marks a block of the list that is not a row -- the history notice -- when the selection crosses it", () => {
     const root = document.createElement("div");
     root.className = "agent-ui-conversation";
@@ -437,8 +440,8 @@ const _allMotionsCovered: CharMotion[] = ["h", "l", "j", "k", "w", "e", "b", "0"
 void _allMotionsCovered;
 
 describe("visual.ts: gg/G and CARET's dual-end motion", () => {
-  // G lands on the last character. One past it would extend the inclusive caret block outside
-  // the list, causing the containment check to refuse `y`/`>`.
+  // G lands ON the last character, never one past it -- past it, the
+  // caret's inclusive one-character block reached out of the list and copying or quoting refused y/>.
   it("lastSelectableCaret skips chrome and lands ON the last real character, not past it", () => {
     const row = document.createElement("div");
     row.innerHTML = '<div class="row-body">hello</div><span class="row-sign" aria-hidden="true">›</span>';
@@ -472,7 +475,7 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
     const pastEnd = stepOnce(fakeSelection([textCaret(last, 3), textCaret(last, 4)]), onT, "$", root);
     expect(pastEnd.model.cursor).toEqual(textCaret(last, 3));
     expect(pastEnd.moved).toBe(false);
-    // A text-node end with more text after it in the list is left unchanged by `$`.
+    // The same end of a text node with more text after it in the list is left alone (`$`).
     const first = root.querySelector(".row-body")?.firstChild as Text;
     const onFirst: VisualModel = { anchor: textCaret(first, 0), cursor: textCaret(first, 0), kind: "caret", goalX: null };
     const endOfFirst = stepOnce(fakeSelection([textCaret(first, 0), textCaret(first, 5)]), onFirst, "$", root);
@@ -480,8 +483,8 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
     expect(endOfFirst.moved).toBe(true);
   });
 
-  // Centring the caret's parent after each `j`/`k` step makes the view jump on every key.
-  // A step must not call `scrollIntoView`.
+  // Re-centering the caret's parent after every j/k step was
+  // jumping the view on every key; nothing in a step may call scrollIntoView now.
   it("stepOnce's j/k never call scrollIntoView", () => {
     const root = document.createElement("div");
     root.innerHTML = '<div class="row-body">one</div><div class="row-body">two</div>';
@@ -558,8 +561,8 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
     expect(charResult.model.cursor.offset).toBe(1);
   });
 
-  // In a table, V-LINE's hard line is the whole row. `paragraphboundary` alone stops at a cell
-  // and can omit the neighbouring cells from the copy.
+  // In a table, V-LINE's hard line is the row -- paragraphboundary alone stopped at the
+  // cell, and the real-WebKit check copied the last row as "3" without the "4" beside it.
   it("V-LINE inside a table spans whole rows: the first row's first cell to the last row's last cell", () => {
     const table = document.createElement("table");
     table.innerHTML = "<tbody>\n<tr><td>a</td><td>b</td></tr>\n<tr><td>1</td><td>2 </td></tr>\n</tbody>";
@@ -589,13 +592,19 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
   });
 });
 
-// A wrapped neighbouring cell can make a `<tr>` taller than `MAX_LINE_PROBE_PX`, leaving
-// `stepByLinePoint` unable to reach the next row. `stepToAdjacentTableRow` uses DOM position
-// so `j`/`k` can continue. The fake `SelectionLike.modify("line")` stays in the current text
-// node and lands at its start/end, mimicking a browser that cannot cross the cell boundary.
-// That makes `advancedVisually` false and exercises the fallback chain. jsdom lacks
-// `getClientRects` and `caretRangeFromPoint`, so the pixel probe returns `null` here.
-// This tests the boundary failure and DOM fallback, not the rendered height of a tall row.
+// A `<tr>` made TALL by a wrapped neighbouring cell can
+// put the next row further away than `stepByLinePoint`'s `MAX_LINE_PROBE_PX` pixel budget, so a real
+// engine's own probe never finds it and `j`/`k` (and a counted `9999j`) stop inside the table even
+// though it plainly has more rows. `runMotion`'s new DOM-position fallback (`stepToAdjacentTableRow`)
+// is exercised here through a `SelectionLike` whose `modify("line")` mimics a real engine's own
+// refusal to cross a `<table>` row boundary (the same shape `App.test.tsx`'s `stubSelectionModify`
+// uses for jsdom's real `Selection`): it stays within the caret's own text node, landing at that
+// node's start/end -- exactly the "nothing left to do locally" state that makes `advancedVisually`
+// false and hands off to the fallback chain. jsdom has neither `getClientRects` nor
+// `caretRangeFromPoint`, so `stepByLinePoint` is already a guaranteed `null` here, and this
+// fallback is what a real engine would additionally need once ITS pixel probe also came up empty for
+// the same tall-row reason -- this test cannot reproduce "tall" as a pixel measurement, only the
+// modify()-can't-cross-cells shape both engines share.
 describe("visual.ts: stepToAdjacentTableRow -- j/k cross a table row the pixel probe cannot reach", () => {
   /** `alter: "move"` only -- every `CharMotion` case in `runMotion` uses it, never `"extend"`. Line
    *  granularity collapses to the caret's OWN node's start (backward) or end (forward), the same as
@@ -706,11 +715,14 @@ describe("visual.ts: stepToAdjacentTableRow -- j/k cross a table row the pixel p
     }
   });
 
-  // Chained `repeatMotion`/`9999j` across multiple rows needs real layout. After this fallback
-  // lands at cell offset 0, jsdom cannot distinguish the next offset-0-to-length move from a new
-  // visual line. A browser checks `landedRect.top >= startRect.bottom` and invokes the fallback again
-  // if still on the same row. The multi-row composition is covered by the browser harness in
-  // `shell/tests/panel_visual_mode.rs`.
+  // A chained `repeatMotion`/`9999j` across MULTIPLE rows is deliberately not exercised here: once
+  // this fallback lands at a cell's offset 0, jsdom's own "no real layout, trust modify's own result"
+  // heuristic (the comment on `advancedVisually` above) cannot tell that cell's own offset 0 ->
+  // length move (what the NEXT `j` immediately does) apart from a genuine move to a new visual line --
+  // a real engine's geometry check (`landedRect.top >= startRect.bottom`) correctly says "no, still
+  // the same row" and this fallback fires again; jsdom has no such check to fall back on. That
+  // composition is exactly what real geometry is needed to arbitrate, so it belongs in the real-WebKit
+  // harness (`shell/tests/panel_visual_mode.rs`), not here -- see its own new table-row case.
 });
 
 describe("visual.ts: revealCaret, least scroll", () => {
@@ -785,7 +797,7 @@ describe("visual.ts: revealCaret, least scroll", () => {
   });
 });
 
-/* CARET/VISUAL `w`/`e`/`b` follow vim's own word rules over the DOM text. A failure occurred
+/* CARET/VISUAL `w`/`e`/`b` follow vim's own word rules over the DOM text. Previously,
    on the real panel, in a code block showing the line below: the first `w` landed before `has`,
    the second did not move -- WebKit's `Selection.modify(..., "word")` steps, composed, returned to
    their start. Every expected sequence here is nvim's own, measured headless (`nvim --headless

@@ -78,13 +78,13 @@ describe("KeymapOverlay", () => {
       expect(text).toContain(row.what);
     }
     // Typing carries four rows of its own on top of INPUT_KEYS: the pane-switch chord and the
-    // prefix (C6), plus V1 C1's `Ctrl+k`/`Ctrl+j` -- all four of which Eitri (or Rust's mirror)
+    // prefix, plus the mirror's `Ctrl+k`/`Ctrl+j`; all four Eitri (or Rust's mirror)
     // keeps for itself rather than handing to the composer. "This panel" carries one of its own on
-    // top of BROWSE_KEYS (V1 C1): `Ctrl+j`, Rust's mirror claiming the chord ahead of `resolveKey`.
+    // top of BROWSE_KEYS: `Ctrl+j`, Rust's mirror claiming the chord ahead of `resolveKey`.
     // Neither GTK-decided pair can live in `BROWSE_KEYS`/`INPUT_KEYS` themselves -- both are tied to
     // `resolveKey`/`COMPOSER_CHORDS` both ways (`keymap.test.ts`, `composerKeys.test.ts`). The leader
-    // section adds none of its own -- `EMPTY_PANEL_TABLE` has no bindings. "Selecting" (visual-mode
-    // spec, revised for 3a) adds `CARET_KEYS.length + VISUAL_KEYS.length` rows of its own -- no
+    // section adds none of its own; `EMPTY_PANEL_TABLE` has no bindings. "Selecting"
+    // adds `CARET_KEYS.length + VISUAL_KEYS.length` rows of its own with no
     // GTK-decided extra, since the region never reaches `shell`. "Review (c)" adds `REVIEW_KEYS.length`.
     expect(container.querySelectorAll("tr").length).toBe(
       BROWSE_KEYS.length + 1 + CARET_KEYS.length + VISUAL_KEYS.length + REVIEW_KEYS.length + INPUT_KEYS.length + 4 + WINDOW.length + PREFIX.length,
@@ -96,17 +96,17 @@ describe("KeymapOverlay", () => {
       <KeymapOverlay onClose={() => {}} windowKeys={[]} prefixKeys={[]} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} />,
     );
     const typing = Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Typing"))!;
-    // The pane row claims only h/l. The two rows below claim j/k, so listing them here too would
-    // give conflicting meanings.
+    // Narrowed to h/l -- j/k are claimed by the two rows below
+    // instead, so the pane row no longer claims them too.
     expect(typing.textContent).toContain("Ctrl+h / l");
     expect(typing.textContent).toContain("Move between panes (Eitri keeps these)");
     expect(typing.textContent).toContain("Ctrl+b");
-    // V1 C1: the mirror's own Ctrl+k/Ctrl+j, spliced in the same way.
+    // The mirror's own Ctrl+k/Ctrl+j, spliced in the same way.
     expect(typing.textContent).toContain("Back to browsing (as Esc)");
     expect(typing.textContent).toContain("The module below");
   });
 
-  // V1 C1: the mirror's own `Ctrl+j` in "This panel" is spliced in the same way, since
+  // The mirror's own `Ctrl+j` in "This panel" is spliced in the same way, since
   // `resolveKey` never claims it either -- checked against a real panel `<Section>`, not just the
   // whole-container row count above.
   it("names the mirror's Ctrl+j in This panel too", () => {
@@ -181,10 +181,12 @@ describe("KeymapOverlay", () => {
     });
   });
 
-  // Editor context accompanies Enter through `Composer`; `resolveKey` never sees a separate key.
-  // Describe it in the note under "Typing", not as a row of `INPUT_KEYS`.
-  // The selection caps are `MAX_SELECTION_LINES = 400` and `CONTENT_LIMIT = 2000`.
-  // `core/src/editor_context/feed.rs` drops the cursor line, and file text is never sent.
+  // What rides with a sent message is one sentence about
+  // Enter, not a key of its own -- `Composer` sends it and `resolveKey` never sees it, so it cannot be a
+  // row of `INPUT_KEYS` (tied to `COMPOSER_CHORDS` both ways) -- and it is the note under "Typing", the
+  // same shape as the Escape-alias note under "This panel". The figures are the nvim snippet's own caps
+  // (`MAX_SELECTION_LINES = 400`, `CONTENT_LIMIT = 2000`); "not its text or cursor" is because
+  // `core/src/editor_context/feed.rs` drops the cursor line and the file's text is never sent.
   describe("the note under Typing (R13)", () => {
     it("says what Enter also sends from the editor, in a <p> after the table, and adds no row", () => {
       const section = sectionTitled(overlay().container, "Typing");
@@ -215,7 +217,7 @@ describe("KeymapOverlay", () => {
       return Array.from(container.querySelectorAll("section")).find((s) => s.textContent?.startsWith("Slash commands"))!;
     }
 
-    // A bare /model is sent too, so list it without an argument placeholder.
+    // A bare /model sends too now, so it is listed plainly.
     it("lists the works rows Enter would send, in the table's own order -- no /config, and /model plain", () => {
       const section = slashSection(overlay().container);
       const items = Array.from(section.querySelectorAll("li")).map((li) => li.textContent);
@@ -300,17 +302,20 @@ describe("KeymapOverlay", () => {
         expect(section.textContent).toContain(row.keys);
         expect(section.textContent).toContain(row.what);
       }
-      // Ctrl+e/Ctrl+y scroll the region without leaving it, so the note must name this exception
-      // to "any other key leaves".
+      // Ctrl+e/Ctrl+y now scroll the region instead of ending
+      // it, so "any other key leaves" is no longer literally true -- the note names the exception.
       expect(section.textContent).toContain(
         "Any other key leaves (Ctrl+e/Ctrl+y scroll instead). The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.",
       );
     });
 
-    // Keep CARET_KEYS and VISUAL_KEYS in separate tables with mode headings. Shared keys such as
-    // `gg` and `Esc` otherwise have indistinguishable or conflicting rows. Assert each table's
-    // exact row order against its source array; text-presence checks cannot distinguish
-    // descriptions shared by both modes.
+    // CARET_KEYS and VISUAL_KEYS used to render as one table
+    // with no sub-heading -- 21 rows, duplicates (a key both modes bind, e.g. `gg`) indistinguishable,
+    // and two conflicting `Esc` rows with nothing saying which mode either belongs to. Assert the
+    // grouping itself -- each table's own rows, in order, exactly match its own source array -- not
+    // just that every row's text is present somewhere in the section (`toContain` alone cannot tell
+    // CARET's rows apart from VISUAL's, since several `what` strings are shared verbatim between the
+    // two, e.g. "Previous / next character").
     it("renders CARET's table then VISUAL's, each under its own sub-heading, never merged", () => {
       const section = selectingSection(overlay(() => {}, TABLE).container);
       const headings = Array.from(section.querySelectorAll("h3")).map((h) => h.textContent);
@@ -335,8 +340,8 @@ describe("KeymapOverlay", () => {
       expect(section.textContent).toContain("v is your leader: V selects lines, Esc there gives the caret");
     });
 
-    // A plain panel binding on `v` must be described as bound elsewhere. Only an actual leader
-    // should be called the leader.
+    // A plain panel binding on `v` is not a leader -- the
+    // note used to say "v is your leader" for it anyway, naming a leader the user does not have.
     it("says v is bound elsewhere (not that it is the leader) when a plain binding takes v", () => {
       const panel: PanelTable = { ...TABLE, bindings: [binding(["v"], "tab.prev")] };
       const section = selectingSection(overlay(() => {}, panel).container);

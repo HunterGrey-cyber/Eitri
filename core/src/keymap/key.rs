@@ -337,7 +337,7 @@ impl Chord {
 mod tests {
     use super::*;
 
-    /// Every tmux key name the default table and parsing probes use.
+    /// Every tmux key name the default table, the shipped keymap snippet and the stock probe use.
     const NAMES: &[&str] = &[
         "C-b", "C-a", "%", "\"", "\\", "z", "C-Up", "C-Down", "C-Left", "C-Right", "M-Up", "M-Down", "M-Left",
         "M-Right", "Up", "Down", "Left", "Right", "{", "}", "M-1", "M-2", "x", "c", "n", "p", "l", "1", "9", ",", "&",

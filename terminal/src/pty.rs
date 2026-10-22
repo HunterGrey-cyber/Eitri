@@ -657,8 +657,8 @@ mod tests {
             ("TMUX_PANE", "%3"),
             ("TERM", "tmux-256color"),
             ("WAYLAND_DISPLAY", "wayland-0"),
-            // The editor pane's `NEOVIM_BIN` choice must not reach a `neovide` or script
-            // run inside this terminal.
+            // The host's choice of `nvim` for the editor pane must never reach a `neovide` or
+            // script run inside this terminal.
             ("NEOVIM_BIN", "/home/x/.local/share/eitri/nvim/0.11.4/bin/nvim"),
         ]);
         let mut env = child_environment(host);
@@ -753,8 +753,8 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ENOTTY));
     }
 
-    /// `from_metrics` rounds cell dimensions to whole device pixels and copies the grid
-    /// dimensions unchanged.
+    /// `from_metrics` rounds the cell size to whole device pixels and carries the grid through
+    /// unchanged; checking the constructor directly catches lost grid dimensions.
     #[test]
     fn from_metrics_rounds_the_cell_size_and_copies_the_grid() {
         let metrics = TerminalMetrics::new(1000.0, 500.0, 1.0);

@@ -2222,14 +2222,13 @@ pub(crate) fn test_claude_projects_root() -> PathBuf {
 mod tests {
     use agent::SidecarAvailability::{self, BuildsNamedCheckout, Missing, Runnable};
 
-    /// Every result of `agent::sidecar_availability`. Availability selects the startup line
-    /// without changing which backend is chosen.
+    /// Every answer `agent::sidecar_availability` can give affects only the startup line,
+    /// never which backend is chosen.
     const ALL_AVAILABILITIES: [SidecarAvailability; 3] = [Runnable, BuildsNamedCheckout, Missing];
 
-    /// The explicit variable wins over what is installed, whatever is installed -- and now that
-    /// legacy is the gated backend, it wins only where this
-    /// build compiled legacy in at all. Someone who names a backend is testing that backend, and
-    /// an installation that happens to carry a sidecar artifact must not quietly overrule them.
+    /// An explicit backend selection wins over installed artifacts whenever that backend is compiled
+    /// in. Someone selecting a backend is testing it; an installed sidecar must not overrule them.
+    /// Selecting legacy without compiling it in must fail rather than silently select another backend.
     #[test]
     fn an_explicit_choice_beats_what_is_installed() {
         for available in ALL_AVAILABILITIES {
@@ -2278,8 +2277,8 @@ mod tests {
         }
     }
 
-    /// An unrecognized backend value selects the sidecar with a warning in every build.
-    /// Compiling in legacy must not make it the fallback for a typo.
+    /// A typo selects the sidecar with a warning in every build. Falling back to the compile-gated
+    /// legacy backend would silently run a different backend from the default.
     #[test]
     fn an_unrecognized_value_selects_the_sidecar_in_every_build() {
         for legacy_compiled in [true, false] {
@@ -2375,10 +2374,12 @@ mod tests {
         }
     }
 
-    /// Checks that every offered string maps to a permission mode. Both modes require the
-    /// interactive gate: bypass is implemented by answering `allow` locally. The gate and
-    /// `bypass_permission_mode` capabilities are asserted at compile time beside
-    /// `LEGACY_CAPABILITIES`.
+    /// Ties the offered list to the capability struct it claims to describe, so adding a mode to one
+    /// without the other fails here rather than producing a button whose mode is never honored.
+    ///
+    /// Every offered mode needs the backend's interactive gate. Both modes run the CLI gated;
+    /// bypass means Eitri answers `allow`. The backend's `bypass_permission_mode` is a constant
+    /// asserted beside `LEGACY_CAPABILITIES`; this test pins that every offered string is a mode.
     #[test]
     fn every_offered_mode_is_one_the_legacy_capabilities_actually_claim() {
         for mode in CLIENT_IMPLEMENTED_PERMISSION_MODES {
@@ -2413,10 +2414,11 @@ mod tests {
         // were renamed or dropped -- which is exactly how the previous version of this line survived
         // the rename that made it meaningless.
         assert_eq!(hello["resumableSessions"], serde_json::json!([]));
-        // The resume and fork capabilities are asserted at compile time beside the constant.
-        // The greeting still offers bypass because the client answers `allow` through the
-        // interactive gate; legacy needs no CLI bypass mode. Those capabilities are also
-        // asserted beside the constant.
+        // resume/fork being false is enforced at compile time beside the constant; asserting it
+        // again here would be a constant assertion, which is what the previous version of this
+        // test was.
+        // The greeting offers bypass through the interactive gate: Eitri answers `allow`, while the
+        // CLI stays gated. Both capabilities are asserted at compile time beside the constant.
         let modes: Vec<&str> = greeting.permission_modes.to_vec();
         assert_eq!(modes, vec!["manual", "auto", "bypass"]);
     }
@@ -2539,7 +2541,7 @@ mod tests {
         );
     }
 
-    // ---- The picker's title ladder ---------------------------------------------------------
+    // ---- The picker's title ladder: the CLI's title only when present, nothing of it persisted --
 
     fn a_claude_projects_root() -> PathBuf {
         super::test_claude_projects_root()
@@ -2588,8 +2590,8 @@ mod tests {
         greeting.resumable.into_iter().next().expect("checked just above")
     }
 
-    /// The CLI's title takes precedence over the persisted title at display time.
-    /// Both titles exist here, so the row must show the CLI's title.
+    /// The CLI's own title takes precedence over Eitri's title at display time. Existing sessions
+    /// may already have a CLI title even when Eitri never stored one for them.
     #[test]
     fn the_clis_own_title_is_what_a_row_shows_when_the_transcript_has_one() {
         let row = the_only_row(a_workspace_with(
@@ -2599,8 +2601,9 @@ mod tests {
         assert_eq!(row.title.as_deref(), Some("what the CLI recorded"));
     }
 
-    /// **The negative control, and the whole promise of the fallback** (invariant 17). The same
-    /// record with no transcript beside it must read EXACTLY as it did before this change: the
+    /// **The negative control, and the whole promise of the fallback**: a record with no CLI title
+    /// reads as it always has. The same record with no transcript beside it must read EXACTLY as a
+    /// record did before the picker read transcripts at all: the
     /// title Eitri recorded, then the bare id. Without this pair, "it degrades back to today's
     /// behaviour" would only be a sentence -- and the degradation is silent, so nothing else would
     /// notice the day the CLI stops writing that line.
@@ -2637,7 +2640,7 @@ mod tests {
         assert_eq!(row.title.as_deref(), Some("what eitri recorded"));
     }
 
-    /// **Invariant 16: nothing read from a transcript is ever persisted.** The record on disk is
+    /// **Nothing read from a transcript is ever persisted.** The record on disk is
     /// byte-identical before and after the picker is built, so the CLI's title cannot collide with
     /// `title`'s own first-one-wins rule and cannot move `updated_at`.
     #[test]
@@ -2675,9 +2678,9 @@ mod tests {
         );
     }
 
-    /// Every file under `dir`, path and bytes, sorted. The bytes, not a parsed record: invariant 16
-    /// is about what is written, and a comparison of parsed values would pass over a rewrite that
-    /// only changed formatting or a field this crate does not read.
+    /// Every file under `dir`, path and bytes, sorted. The bytes, not a parsed record: "nothing read
+    /// from a transcript is persisted" is about what is written, and a comparison of parsed values
+    /// would pass over a rewrite that only changed formatting or a field this crate does not read.
     fn every_file_under(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
         let mut found: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(dir)
             .into_iter()
@@ -2764,7 +2767,7 @@ mod tests {
         assert!(!text.contains("/p/src/main.rs"));
     }
 
-    // ---- A rejected send still leaves the prompt recorded ----
+    // A rejected send still leaves the prompt recorded.
 
     /// A minimal `agent::AgentProvider` built only to make `AgentConversation::create` succeed and
     /// its `send_turn` genuinely fail -- the public equivalent of `agent::conversation`'s own
@@ -2884,8 +2887,8 @@ mod tests {
         assert_eq!(record.title.as_deref(), Some("fix the picker"));
     }
 
-    /// A rename before the session exists is included in the record written during adoption.
-    /// A later rename is written into the record by the ingestion thread.
+    /// A rename before session creation is included when adoption writes the record.
+    /// A later rename is persisted by the ingestion thread.
     #[test]
     fn a_rename_reaches_the_record_before_and_after_adoption() {
         agent::state_dirs::redirect_state_to_a_test_root();
@@ -2973,9 +2976,8 @@ mod tests {
         }
     }
 
-    /// A `Read` of a file inside the project produced a
-    /// card. It must now produce no card at all, and the request must really have been answered --
-    /// not merely hidden, which would leave the model waiting forever.
+    /// An in-project Read must produce no card and actually be answered. Merely hiding its
+    /// request would leave the model waiting forever.
     #[test]
     fn a_read_inside_the_project_is_answered_here_and_never_becomes_a_card() {
         let dir = a_workspace_holding_one_file();
@@ -3092,8 +3094,8 @@ mod tests {
         backend.shutdown();
     }
 
-    /// A saved rule is applied at the shared backend permission handler. A compound command
-    /// still reaches the user even when its first command matches the rule.
+    /// A saved rule reaches the common backend answer path, while a compound command with a
+    /// matching first word still reaches the user.
     #[test]
     fn a_project_rule_answers_a_bash_call_and_never_a_compound_one() {
         let dir = a_workspace_holding_one_file();
@@ -3140,10 +3142,10 @@ mod tests {
         backend.shutdown();
     }
 
-    /// A hidden chat still answers requests that need no human and counts the card it holds.
-    /// The panel's 33 ms pump timer ignores visibility, so the tracker uses `on_screen = false`.
-    /// The projection holds both pending requests until the provider's resolution arrives, including
-    /// the automatically answered `Read`. The tracker counts only the card delivered to the panel.
+    /// A hidden conversation still answers auto-allowed requests and counts its one waiting card.
+    /// Hiding the chat does not stop its 33ms pump, so the tracker is told `on_screen = false`.
+    /// The projection holds both requests, including the answered `Read`, until the provider's
+    /// resolution returns; attention counts the one card delivered to the panel.
     #[test]
     fn a_hidden_chat_counts_the_card_it_holds_and_still_answers_what_needs_no_human() {
         let dir = a_workspace_holding_one_file();
@@ -3208,7 +3210,7 @@ mod tests {
         assert!(!fatal.benign, "a dead process ends the session");
     }
 
-    // ---- No automatic answers after the CLI reports an ungated mode -----------------------
+    // Nothing is answered for a CLI that reported an ungated mode.
 
     /// A `Read` inside the project is what the classifier answers `allow` on its own (the test above).
     /// Once the CLI has reported an ungated mode, not even that: the session is about to be closed,
@@ -3277,9 +3279,8 @@ mod tests {
         backend.shutdown();
     }
 
-    /// An ungated-mode tripwire prevents approvals even when bypass is reported in the same
-    /// batch. It blocks both gate requests and CLI prompts, which bypass would otherwise
-    /// answer regardless of their reason.
+    /// An ungated-mode report in the same batch as a bypass choice stops automatic approval.
+    /// That applies to both gate requests and CLI prompts, even though bypass otherwise approves both.
     #[test]
     fn a_tripwire_in_bypass_answers_nothing_either() {
         let dir = a_workspace_holding_one_file();
@@ -3447,12 +3448,10 @@ mod tests {
         backend.shutdown();
     }
 
-    // ---- Bypass answers requests locally; `approve_pending` handles pending requests --------
+    // Bypass answers every request through `approve_pending`.
 
-    /// Bypass in one assertion: nothing reaches the panel as a
-    /// card, and both requests really were answered -- the in-root write and the out-of-root read
-    /// alike, since bypass never consults the classifier's path boundary at all. The tool call
-    /// itself is still owed to the transcript.
+    /// Bypass answers in-root writes and out-of-root reads without a card or classifier path
+    /// checks. The tool call itself must still reach the transcript.
     #[test]
     fn in_bypass_every_request_is_answered_and_never_delivered() {
         let dir = a_workspace_holding_one_file();
@@ -3744,9 +3743,8 @@ mod tests {
         assert_eq!(approved.ids, vec!["p1".to_string(), "p3".to_string()]);
     }
 
-    /// `TabSet::confirm_bypass` calls `approve_pending` between 33ms pumps. The function must
-    /// check for an `UngatedCliMode` already folded by background ingestion, before the next
-    /// pump marks the tab `Failed`.
+    /// `TabSet::confirm_bypass` calls `approve_pending` outside the 33ms pump. It must refuse answers
+    /// once ingestion has folded an `UngatedCliMode`, even before a pump marks the tab failed.
     #[test]
     fn approve_pending_answers_nothing_once_the_cli_reported_an_ungated_mode() {
         let dir = a_workspace_holding_one_file();
@@ -3854,7 +3852,7 @@ mod tests {
         serde_json::json!({ "file_path": ".git/probe", "content": "o3" })
     }
 
-    /// One delivery through the O3 entry point, with the tab's human approvals; returns what was
+    /// One delivery through the CLI-prompt entry point, with the tab's human approvals; returns what was
     /// delivered and the CLI prompts answered without a card (for the row notes).
     fn deliver(
         backend: &mut AgentBackend,
@@ -3910,9 +3908,8 @@ mod tests {
             .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { permission_id, .. } if permission_id == id))
     }
 
-    /// The classifier allows an in-project `Read` gate request without a card.
-    /// The CLI's own prompt for the same call bypasses classification and becomes a card in `Auto`
-    /// when there is no human approval for that call.
+    /// The classifier allows an in-project `Read` at the gate. The CLI's prompt for the same call
+    /// bypasses the classifier and remains a card in Auto without a human approval.
     #[test]
     fn the_classifier_never_answers_the_clis_own_prompt() {
         let dir = a_workspace_holding_one_file();
@@ -3939,8 +3936,7 @@ mod tests {
         backend.shutdown();
     }
 
-    /// A saved prefix rule can allow `npm ci` at the gate.
-    /// It cannot answer the CLI's own prompt for the same command.
+    /// A prefix rule that answers `npm ci` at the gate cannot answer the CLI's prompt for that command.
     #[test]
     fn a_saved_rule_never_answers_the_clis_own_prompt() {
         let dir = a_workspace_holding_one_file();
@@ -3966,8 +3962,8 @@ mod tests {
         backend.shutdown();
     }
 
-    /// Bypass allows the CLI's own prompt without a card.
-    /// The answer enters `host_answered` and returns the note shown on the call's row.
+    /// Bypass allows the CLI's prompt without a card, records the answer in `host_answered`, and
+    /// returns the note displayed on its row, just as for other bypass answers.
     #[test]
     fn bypass_allows_the_clis_own_prompt_without_a_card() {
         let dir = a_workspace_holding_one_file();
@@ -4137,11 +4133,13 @@ mod tests {
         }
     }
 
-    /// The acceptEdits fast path allows only the gate's request for an in-project `Write`.
-    /// A later CLI prompt for that same call is still a card in `Auto`, whether a user's
-    /// `permissions.ask` rule (`Edit(notes.txt)`) forced it or no rule is behind it: the fast-path
-    /// allow is not a human approval, so `HumanApprovals` stays empty. This keeps an ask rule for
-    /// an edit from being answered silently in `Auto`. Bypass allows the prompt.
+    /// The acceptEdits fast path answers only the gate's request for an in-project `Write`.
+    /// A user's `permissions.ask` rule (`Edit(notes.txt)`) can still make the CLI prompt afterward:
+    /// CLI 2.1.283 runs its ask-rule check after a hook allow. That prompt remains a card in Auto,
+    /// as does a CLI prompt with no rule behind it: an automatic allow is not a human approval
+    /// (`HumanApprovals` stays empty). This preserves explicit ask rules even when edits normally
+    /// need no card. Bypass answers that prompt like every other request
+    /// (`bypass_allows_every_kind_of_the_clis_own_prompt`).
     #[test]
     fn a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed() {
         let dir = a_workspace_holding_one_file();
@@ -4190,9 +4188,9 @@ mod tests {
         backend.shutdown();
     }
 
-    /// In `Auto`, a human approval answers one CLI prompt for the exact call approved on the card:
-    /// the same non-empty tool-use id, tool and input. A different id, tool or input, a missing id,
-    /// or another prompt after the approval is consumed requires a card.
+    /// In Auto, human approval answers the CLI's prompt only once for the same call: the same
+    /// non-empty tool-use id, tool and input shown on the card. Another call, changed tool or input,
+    /// no id, or a second prompt after consuming the approval must produce a card.
     #[test]
     fn in_auto_an_approval_answers_one_prompt_for_exactly_the_call_it_approved() {
         let dir = a_workspace_holding_one_file();
@@ -4394,8 +4392,9 @@ mod tests {
         backend.shutdown();
     }
 
-    /// A trip folded by ingestion while the first answer is being sent stops later answers in
-    /// the same `approve_pending` batch, matching `answer_what_needs_no_human`.
+    /// An ungated-mode report folded while the first answer is being sent stops later answers in
+    /// that `approve_pending` batch, as in `answer_what_needs_no_human`
+    /// (`a_trip_folded_mid_batch_stops_answering_the_next_request`).
     #[test]
     fn approve_pending_stops_at_a_trip_folded_mid_batch() {
         let dir = a_workspace_holding_one_file();

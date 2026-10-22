@@ -1,32 +1,21 @@
-//! Checks that `LiveHarness::set_os_scale_factor` re-rasterizes an embedded editor with
-//! real nvim. `os_scale_factor` is the display scale read from `Widget::scale_factor()`;
-//! `g:neovide_scale_factor` supplies user zoom. Updating the display scale is needed when
-//! the window moves between monitors or GTK emits `notify::scale-factor`.
+//! Test `LiveHarness::set_os_scale_factor` against a real embedded nvim.
+//! `os_scale_factor` is the display scale read from `Widget::scale_factor()`; it multiplies
+//! the user zoom in `g:neovide_scale_factor`. Display-scale changes must update cell sizes
+//! and rasterized glyphs after construction, including when moving between monitors.
 //!
-//! One launch checks six properties, using `Frames`, `ink_row_height` and `assert_ratio`:
+//! Use one launch to check that setting 2.0 doubles cell width and row-0 ink height without
+//! `resize_grid`. `os_scale_redraw_pending` must contribute to `scale_factor_changed` so
+//! the glyph picture is recorded again at the new size.
+//! Reassigning 2.0 returns `false` and leaves cell width and `os_scale_factor_resyncs()`
+//! unchanged across 30 idle frames. User zoom 1.5 at display scale 2.0 gives about 3x the
+//! baseline size; restoring zoom 1.0 gives about 2x without changing the display scale.
+//! Zero, negative and NaN display scales return `false` without changing state.
+//! Setting display scale back to 1.0 restores the baseline cell width.
 //!
-//! 1. `set_os_scale_factor(2.0)` returns `true`, `os_scale_factor()` reads back `2.0`, and
-//!    cell width is about twice its scale-1 baseline after one frame.
-//! 5. In check 1's transition, the ink height of row 0's 'MMM' grows by about the same ratio.
-//!    No `resize_grid` call is made: the integer grid stays fixed while cell size changes.
-//!    This detects a missing redraw when `LiveHarness::render_frame` combines
-//!    `os_scale_redraw_pending` with `scale_factor_changed`. Using only
-//!    `apply_scale_factor_setting()` leaves the glyph image unchanged at a ratio near 1.0;
-//!    including the pending redraw produces a ratio near 2.0.
-//! 2. Repeating `set_os_scale_factor(2.0)` returns `false`. Cell width and
-//!    `os_scale_factor_resyncs()` remain unchanged across 30 idle frames.
-//! 3. At display scale 2.0, `:let g:neovide_scale_factor = 1.5` gives about 3x the baseline
-//!    cell width; setting zoom back to 1.0 returns to about 2x. `sync_scale_factor` multiplies
-//!    the two scales and leaves the host's `os_scale_factor` unchanged.
-//! 4. `set_os_scale_factor(0.0)`, `(-1.0)` and `(f64::NAN)` return `false` without changing
-//!    the stored display scale or cell width.
-//! 6. `set_os_scale_factor(1.0)` returns `true` and restores the original cell width.
-//!
-//! Ignored unless requested: it spawns `nvim` (>= 0.10 on `PATH`) and starts its own `Xvfb`
-//! for the clipboard without creating a window. `shell/tests/support/own_x_server.rs`
-//! starts the display before winit connects and removes inherited `WAYLAND_DISPLAY` and
-//! `DISPLAY`. A plain `main` (`harness = false`) keeps winit's event loop on the main
-//! thread; libtest runs each test on a separate thread. Run without a display wrapper:
+//! Ignored unless requested: requires nvim >= 0.10 on `PATH`. Start a separate `Xvfb`
+//! for the clipboard before winit connects, clearing inherited `WAYLAND_DISPLAY` and `DISPLAY`.
+//! Use a plain `main` (`harness = false`) because winit requires the event loop on the main
+//! thread, while libtest runs tests on separate threads. Run without a wrapper:
 //!
 //!     cargo test -p neovide-editor --test os_scale_factor -- --ignored
 use std::time::{Duration, Instant};

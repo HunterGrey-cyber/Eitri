@@ -13,9 +13,12 @@ beforeAll(() => {
 
 const BACKENDS: BackendKind[] = ["legacy", "sidecar"];
 
-/** Keep backend names out of the chooser and the empty tab's dashboard on both backends.
- *  `DetailPopover`, opened through `prefix i` or `<leader>i`, displays the backend name.
- *  These tests prevent other rows from adding it back. */
+/** The backend belongs in session details rather than the chooser or dashboard.
+ *  The session list identifies sessions and their modes, without repeating backend names.
+ *  The model and backend live in `prefix i`; this guard pins that the chooser and dashboard
+ *  never draw the backend's own name, on either backend, and that `DetailPopover` (`prefix i` /
+ *  `<leader>i`) is the one place that still does -- so a future row cannot silently reintroduce the
+ *  word without a test failing here first. */
 describe("the backend name is drawn only in the detail popover, never the chooser or the dashboard", () => {
   it.each(BACKENDS)("does not appear in a rendered chooser (%s)", (backend) => {
     const tabs: TabInfo[] = [

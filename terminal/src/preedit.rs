@@ -266,9 +266,10 @@ mod tests {
         assert_eq!(layout.caret_col, 5, "after one wide character: two cells in");
     }
 
-    /// Near the right edge, a composition moves left to stay on the row.
-    /// An end caret needs one more cell so the beam sits after the text,
-    /// rather than on the composition's last character.
+    /// Near the right edge a composition moves left to fit, as foot does. With the caret at
+    /// the end, leave one more cell: its beam belongs after the text, not over the composition's
+    /// last character. For example, `ni hao` at 14..19 must not put the end caret in column 19
+    /// between `a` and `o`.
     #[test]
     fn a_preedit_that_would_run_off_the_right_edge_moves_left() {
         let layout = layout_preedit("ni hao", 6, at(1, 18), 20, 5, &colors()).unwrap();
@@ -289,12 +290,14 @@ mod tests {
         assert_eq!(row_wide.caret_col, 4);
     }
 
-    /// The fill must hide the terminal's block cursor wherever the preedit caret sits. With the
-    /// cursor in the last column and the caret at the end, the text shifts left and ends one
-    /// column before the cursor. The fill must cover that extra column so the beam appears on
-    /// the background. Sweep all anchor columns, including positions beyond a resized grid, and
-    /// all caret positions to check that the fill covers the cursor and text while staying
-    /// within the row.
+    /// The fill is the only thing that hides the terminal's own block cursor, so it must reach the
+    /// cursor's cell wherever the caret is. The failing case has the
+    /// cursor in the LAST column and the caret at the end, so the composition shifts one cell
+    /// further left than the cursor and its text ends one column short of it -- the fill used to
+    /// stop with the text, at 13..18, and the frame's block cursor stayed drawn in 19 with the beam
+    /// inside it. Swept over every anchor column (and past the grid, a frame and a resize crossing)
+    /// and every kind of caret, the fill covers the cursor's cell, stays on the row, and holds every
+    /// character it draws.
     #[test]
     fn the_fill_covers_the_terminals_cursor_cell_wherever_the_caret_is() {
         let end = layout_preedit("ni hao", 6, at(1, 19), 20, 5, &colors()).unwrap();
@@ -364,10 +367,13 @@ mod tests {
         assert_eq!(layout.caret_col, 0, "a caret at the start is before the first cell");
     }
 
-    /// `Term::input` and preedit layout both use `UnicodeWidthChar::width` from the same locked
-    /// version of `unicode-width`. Compare composition width with terminal cursor movement directly
-    /// for CJK, combining marks, emoji with VS16, regional-indicator pairs, and the East Asian
-    /// ambiguous characters `°` and U+2026 (ellipsis), where width rules can differ.
+    /// The composition layout must use the same width rule as the terminal. That agreement
+    /// holds because alacritty's `Term::input` and this module both ask `unicode-width`'s
+    /// `UnicodeWidthChar::width`, one version in the lockfile. Nothing else ties them, so this
+    /// compares the two directly: the cells a composition takes against how far the terminal's own
+    /// cursor moves for the same text, on the characters where width rules part -- CJK, a combining
+    /// mark, an emoji with VS16, a regional-indicator pair, and the East Asian ambiguous `°` and `…`
+    /// (checked red against a layout that uses `width_cjk`).
     #[test]
     fn a_composition_takes_the_cells_the_terminal_gives_the_same_text() {
         use crate::pty::PtySize;

@@ -379,7 +379,7 @@ mod tests {
         assert_ne!(ModuleId::lua("terminal"), ModuleId::terminal());
     }
 
-    /// Decision a: the set is closed, and anything else is refused by name, not as a typo.
+    /// The set is closed, and anything else is refused by name, not as a typo.
     #[test]
     fn anything_unknown_is_refused() {
         for bad in ["", "Editor", "Terminal", "lua:", "plugin:x", "chat"] {

@@ -8,9 +8,10 @@ afterEach(cleanup);
 
 type Overrides = Partial<Parameters<typeof ContinueInTerminal>[0]>;
 
-/** `open` defaults to `true` here to test what `ContinueInTerminal` draws after `<leader>t`
- *  or the detail popover requests it. A separate block below tests `open: false`, which draws
- *  nothing. */
+/** `ContinueInTerminal` is controlled now -- `open`
+ *  defaults to `true` here, since every test below is about what it draws once something (`<leader>t`,
+ *  the detail popover's trailing row) has already asked to open it; the "closed" state (`open`
+ *  `false`, drawing nothing) is its own small describe block below. */
 function renderControl(overrides: Overrides = {}) {
   const onHandoff = vi.fn();
   const onClose = vi.fn();
@@ -155,7 +156,7 @@ describe("ContinueInTerminal once a handoff is in flight", () => {
 });
 
 describe("ContinueInTerminal confirmation and a changing world", () => {
-  /* Correction from the pre-Task-10 version of this test: with a `confirming` state of its own,
+  /* With a `confirming` state of its own,
      this component used to remember a dismissed-by-blocking confirmation and NOT bring it back once
      the block cleared -- the bug that guarded against was a stale re-open with no new click behind
      it. Now `open` is the host's own explicit fact (only `<leader>t`/the popover row set it, and
@@ -198,8 +199,11 @@ describe("HandoffCommandCard", () => {
     expect(container.querySelector("pre")!.textContent).toBe(HANDOFF.command);
   });
 
-  /* This manual command path holds no session lock, so show a concurrency warning.
-     Another process can resume the same session and write to the same transcript; do not imply exclusivity. */
+  /* Handing the user a command to run is not
+     the strongly-exclusive handoff, and must be shown as the raw/manual path with a concurrency
+     warning. Nothing here may read as a guarantee: two CLIs resuming one session interleave their
+     messages in one transcript, and with no lock both honour even a held lease cannot stop another
+     writer -- and this path holds none. */
   it("says plainly that nothing is holding the session", () => {
     const { container } = render(<HandoffCommandCard handoff={HANDOFF} />);
     const text = container.textContent ?? "";

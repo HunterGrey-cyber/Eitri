@@ -1736,8 +1736,10 @@ mod tests {
         assert_eq!(titled_record(&conversation).as_deref(), Some("later prompt"));
     }
 
-    /// The session id can be visible under the adoption lock before the session entry is persisted.
-    /// Submit the title as soon as the id appears to exercise that gap; the title must still be saved.
+    /// The gap the first version fell into: the session id is visible (adoption has set it under
+    /// the lock) but the record is not written yet. A title handed over there was dropped, 20 runs
+    /// out of 20 in a reproduction. Noting it the moment the id shows is as close to that
+    /// gap as a test can aim; the title must still arrive.
     #[test]
     fn a_title_noted_the_moment_the_session_id_appears_is_not_lost() {
         let fake = Arc::new(FakeProvider::new());
@@ -1791,7 +1793,7 @@ mod tests {
         crate::history::store::history_path(conversation.conversation_id(), "claude-uuid-abc").unwrap()
     }
 
-    /// The whole of task 3's wiring, driven through the real `AgentConversation::resume`.
+    /// Resuming must load history into the projection the panel reads.
     ///
     /// The unit tests in `history::load` prove the loader; this proves the loader is REACHED and
     /// that what it produces is the projection the panel reads. Without it, `resume` could hand
@@ -1800,7 +1802,7 @@ mod tests {
     ///
     /// The transcript (B) cannot exist for a fresh uuid, so this exercises the fallback to Eitri's
     /// own copy, which is also the only half a test can set up without writing under
-    /// `$CLAUDE_CONFIG_DIR` -- something this feature never does (invariant 11).
+    /// `$CLAUDE_CONFIG_DIR` -- something this feature never does because that directory belongs to the CLI.
     #[test]
     fn a_resumed_conversation_opens_carrying_what_it_already_said() {
         let dir = unique_dir();
@@ -2583,10 +2585,13 @@ mod tests {
         );
     }
 
-    /// If `close_session` fails, `shutdown` keeps the lease in `self.ingest` so another client cannot
-    /// resume the same transcript while the provider is still tearing down. Teardown may take up
-    /// to `SIDECAR_EXIT_GRACE` before the child is killed. `provider` precedes `ingest` in
-    /// [`AgentConversation`], so dropping it tears down the provider before releasing the lease.
+    /// Releasing the lease when `close_session` fails would risk
+    /// another client resuming the same provider session, over the same transcript, while this
+    /// one might still be tearing down (a wedged or crashed provider, closing over up to
+    /// `SIDECAR_EXIT_GRACE` before the child is even killed). `shutdown` skips the release on a failed
+    /// close and leaves the lease inside `self.ingest`; `provider` is declared before `ingest` on
+    /// [`AgentConversation`], so dropping the conversation tears the provider down first and only
+    /// then drops the lease with it.
     #[test]
     fn a_failed_close_session_keeps_the_lease_held_until_the_conversation_is_dropped() {
         let fake = Arc::new(FakeProvider::new());

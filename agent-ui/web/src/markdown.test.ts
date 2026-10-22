@@ -55,8 +55,9 @@ describe("renderMarkdown", () => {
   });
 });
 
-// Rendered model content is untrusted. Keep it inert so it cannot impersonate controls,
-// overlay the panel or load remote content without a click.
+// Rendered model content is untrusted. These cases exercise navigation spoofing,
+// remote-loading attributes and styles, and code-block content,
+// so sanitized replies cannot impersonate controls or load hidden remote resources.
 describe("renderMarkdown keeps model content inert (panel-content findings 1-3)", () => {
   it("strips id/name/role/aria/data-*, and keeps class to what this module itself emits (finding 1 adjacent)", () => {
     const fakeCard =
@@ -158,8 +159,10 @@ describe("renderMarkdown keeps model content inert (panel-content findings 1-3)"
   });
 });
 
-// Block remote loads through legacy `background=` attributes while preserving GFM checkboxes,
-// image alt text, badge links and highlight.js's `class_`/`function_` modifiers.
+// The sanitizer must also preserve safe markup while refusing remote-loading
+// attributes (a legacy `background=` vector FORBID_ATTR missed), GFM checkboxes
+// must survive, image alt text must not be double-escaped, a badge-style `[![img](url)](url)` keeps its
+// real link, and the class allowlist keeps highlight.js's own `class_`/`function_` modifiers.
 describe("renderMarkdown: legacy background= attributes and the markup it keeps", () => {
   it("drops a legacy background= attribute -- WebKitGTK loads it as a background-image with no click", () => {
     const vectors = [
@@ -239,13 +242,17 @@ function parse(html: string): HTMLDivElement {
   return div;
 }
 
-// Open dialogs can overlay the panel through browser styles without a style attribute.
-// Also check consistent entity handling in image links and preserve links with mixed image/text content.
+// The sanitizer must refuse overlays with no inline style, such as
+// `<dialog open>` positioned by the UA stylesheet. Image
+// links must resolve HTML entities like ordinary links, and badge handling must cover more than a
+// link whose whole content is one image.
 describe("renderMarkdown: dialogs, entities in image links, and mixed image/text links", () => {
   it("drops <dialog>: the UA stylesheet positions an open one absolutely, an overlay with no style=", () => {
-    // WebKitGTK's UA stylesheet positions an open dialog absolutely without a style attribute.
-    // Since `.row` and `.message-list` are not positioned, the dialog uses `.agent-ui-scroller` and
-    // can paint over later rows, including the real permission card.
+    // WebKitGTK's own UA sheet: `dialog { position: absolute; inset-inline: 0; margin: auto;
+    // background-color: Canvas; ... } dialog[open] { display: block; }`. `.row`/`.message-list`
+    // are not positioned, so it lays out against `.agent-ui-scroller` and paints over the rows
+    // after it -- the real permission card included (the styled overlay the sanitizer already refused,
+    // rebuilt without style).
     const html = renderMarkdown("x\n\n<dialog open><p>Bash: ls</p><button>Approve</button></dialog>");
     const div = parse(html);
     expect(div.querySelector("dialog"), html).toBeNull();
@@ -286,7 +293,7 @@ describe("renderMarkdown: dialogs, entities in image links, and mixed image/text
       expect(ordinary, dest).not.toBeNull();
       const image = parse(renderMarkdown(`![d](${dest})`)).querySelector("a")!;
       expect(image.getAttribute("href"), dest).toBe(ordinary);
-      // The link shows the full URL, exactly the string it opens after decoding.
+      // The link shows the full URL -- the SAME string it goes to, not a differently-decoded one.
       expect(image.textContent, dest).toBe(`d: ${ordinary}`);
       const badge = parse(renderMarkdown(`[![b](https://i.example/i.svg)](${dest})`)).querySelectorAll("a");
       expect(badge.length, dest).toBe(1);

@@ -66,9 +66,10 @@ describe("PermissionCard decisions", () => {
 });
 
 describe("PermissionCard when the panel withdraws its answer", () => {
-  /** If Rust refuses an answer because an Always allow rule cannot be saved, the card stays pending.
-   *  When `alreadyAnswered` changes from true to false, clear the local click guard too,
-   *  so the user can answer again instead of leaving the buttons disabled. */
+  /** Rust refused a click's answer (an "Always allow" whose rule could
+   *  not be saved) and left the card waiting, but the card's own `clicked` kept its buttons disabled
+   *  for good. The panel takes its answer back (`alreadyAnswered` true -> false) and the click goes
+   *  with it. */
   it("a click the panel took back leaves the buttons live again", () => {
     const onAnswer = vi.fn();
     const { container, rerender } = render(
@@ -88,7 +89,7 @@ describe("PermissionCard when the panel withdraws its answer", () => {
    anything on its own. The id is what ties the card to the exact call above it in the transcript --
    the same id `MessageList` keys that call's block on. */
 describe("PermissionCard and the tool call it gates", () => {
-  /** The tool call id is in a tooltip on the card's tool line, never as visible text. */
+  /** In a tooltip on the card's tool line, never as visible text. */
   it("names the tool call the request belongs to, in a tooltip only", () => {
     const { container } = render(
       <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />,
@@ -208,6 +209,7 @@ describe("Permission denial with a reason", () => {
     expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "not the whole disk");
   });
 
+  /** An input method's Enter commits a reason without denying. */
   it("enter_in_the_reason_box_while_composing_does_not_deny", () => {
     const onAnswer = vi.fn();
     const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
@@ -279,9 +281,10 @@ describe("PermissionCard for an Edit with hidden characters", () => {
   });
 });
 
-/** A CLI prompt raised after the gate answered appears in the same permission card.
- *  Show the CLI's sentence and label it as a safety check or a prompt forced by the user's ask rule.
- *  Use the same buttons, keys and permission id as any other card. */
+/** The CLI's own prompt (it asked after the gate had answered) is drawn in the same
+ *  card, showing the CLI's own sentence and a small label saying whose question it is -- Claude
+ *  Code's safety check, or the user's own ask rule when one forced it -- and it answers through the
+ *  same buttons, keys and permission id as any card. */
 describe("PermissionCard for the CLI's own prompt", () => {
   const REASON = "Claude requested permissions to edit /p/.git/probe which is a sensitive file.";
   const prompt: PermissionRequestRecord = {

@@ -1,6 +1,6 @@
 //! Real, `#[ignore]`d, real API cost -- the sidecar-provider analog of
 //! `agent/tests/backend_conformance.rs`, exercising the same real behaviors that file pins for the
-//! legacy backend, so the two are directly comparable (Phase 5's own future A/B job). Mirrors that
+//! legacy backend, so the two are directly comparable (the ground for an A/B of the two backends). Mirrors that
 //! file's own polling style (`pump()` inside a deadline loop) deliberately, not a different idiom.
 
 use agent::{
@@ -245,11 +245,14 @@ fn real_close_session_fail_closes_a_pending_permission() {
         .any(|e| matches!(e, AgentDomainEvent::SessionClosed { .. })));
 }
 
-/// Checks edit permission requests and approved writes through the sidecar path.
-/// The legacy twin is in `backend_conformance.rs`. Legacy passes `--disallowedTools` on
-/// the command line; the sidecar sends `ClaudeHostPolicy.tool_policy` over gRPC.
-/// Both use `disallowed_tools()`, but each transport needs its own coverage because one
-/// can break while the other keeps working.
+/// The MVP sentence's CLI-settleable clauses on the SIDECAR path.
+///
+/// The legacy twin is `backend_conformance.rs::real_edit_under_the_auto_gate_…`. This one matters
+/// separately because the two backends express the same policy through different mechanisms: legacy
+/// passes `--disallowedTools` on the command line, the sidecar sends `ClaudeHostPolicy.tool_policy`
+/// over gRPC, and since 2026-09-18 both are built from `disallowed_tools_for(mode)` -- one
+/// `disallowed_tools()` under the shared gate. A change that kept one working and broke the other
+/// would be invisible in the other file.
 #[test]
 #[ignore]
 fn real_edit_under_the_auto_gate_on_the_sidecar_path() {

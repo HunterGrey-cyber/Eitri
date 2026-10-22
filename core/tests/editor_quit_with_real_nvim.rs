@@ -1,13 +1,18 @@
-//! Drive `editor_quit_lua` through real nvim over msgpack-RPC, using the same `nvim_exec_lua`
-//! request as `shell`. Two older tests are ignored; the remaining tests require `nvim` on PATH.
-//! They need no display or network and do not spend tokens.
+//! `editor_quit_lua` is driven by real nvim over msgpack-RPC and delivered as the shell sends
+//! it: an `nvim_exec_lua` request, never typed keys.
 //!
-//! A headless nvim without an attached UI answers `:confirm qall` with its default, so it
-//! cannot exercise cancellation reliably. Use `nvim --embed` and `nvim_ui_attach` to make
-//! the dialog block in mode `r?`. A small `rmpv` client supplies the msgpack-RPC connection.
+//! Two older tests remain `#[ignore]`d. The others need only nvim on PATH, so ordinary
+//! `cargo test -p eitri-core` runs them. None spends tokens, uses the network, opens a window
+//! or needs a display.
 //!
-//! Include the ignored tests with:
-//! `cargo test --test editor_quit_with_real_nvim -- --include-ignored`
+//! Every other real-nvim test in this crate drives `nvim --headless` with no UI attached and reads
+//! whatever the Lua side pushes to a socket -- that is not enough here, because **headless without a
+//! UI answers `:confirm qall`'s dialog with its own default** (measured: typing `c` still wrote the
+//! buffer and quit). Only with a UI attached (`nvim --embed` plus `nvim_ui_attach`) does the dialog
+//! actually block, in mode `r?`, so this talks real msgpack-RPC instead: a small client over `rmpv`,
+//! since nothing else in this crate needs one.
+//!
+//! Run the ignored ones too: `cargo test -p eitri-core --test editor_quit_with_real_nvim -- --include-ignored`
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -351,11 +356,11 @@ fn a_confirm_qall_that_quits_sends_nothing() {
     }
 }
 
-/// Window close runs `editor_quit_lua` through `shell`'s `ask_nvim_to_quit` and
-/// `kill_pane::EditorQuit::Window`. Cancelling nvim's prompt keeps the unsaved buffer and its
-/// swap file and writes nothing. Finally run `:qa!` as a control: it deletes the swap file,
-/// showing that the check can detect deletion. This test runs normally and needs only
-/// `nvim` on PATH, with no display.
+/// Window close runs this Lua through `ask_nvim_to_quit` and `kill_pane::EditorQuit::Window`.
+/// Cancelling nvim's prompt must preserve the unsaved buffer and swap file without writing.
+/// The control uses `:qa!`, which deletes the swap file, to show the swap check detects deletion.
+///
+/// This test runs normally because it needs only nvim on PATH, without a desktop display.
 #[test]
 fn a_cancelled_window_close_keeps_the_unsaved_buffer_and_its_swap_file() {
     let scratch = scratch_dir("close-swap");
@@ -475,13 +480,14 @@ fn buffer_text(client: &mut Client) -> String {
         .unwrap_or_default()
 }
 
-/// A window close while nvim waits for a key must not type into the user's buffer.
-/// Here it waits for `f`'s character; `t`, `r`, `m`, `q`, `Ctrl-W`, `getchar()` and insert-mode
-/// `Ctrl-V` have the same concern. The control types `<Cmd>lua ...<CR>` through `nvim_input`:
-/// `<Cmd>` supplies `f`'s character, then the rest runs as Normal commands, so `u` undoes the
-/// edit and `a` inserts Lua. An `nvim_exec_lua` request instead waits for the pending key;
-/// `nvim_get_mode` remains responsive and reports blocking mode `n`. The request then asks
-/// to quit, and cancellation keeps the edit and sends the generation back.
+/// Closing while nvim waits for a key must not type into the buffer. The pending character
+/// of `f` stands in for similar waits in `t`, `r`, `m`, `q`, `Ctrl-W`, `getchar()` and insert
+/// mode's `Ctrl-V`.
+///
+/// The control types the Lua as `<Cmd>lua …<CR>` through `nvim_input`: `<Cmd>` becomes the
+/// character for `f`, then Normal-mode commands undo the edit and insert Lua. `nvim_exec_lua`
+/// instead waits for the missing key while `nvim_get_mode` still reports blocking `n`, then
+/// asks to quit. Cancelling preserves the edit and returns the generation.
 #[test]
 fn a_quit_while_nvim_waits_for_a_key_types_nothing_into_the_buffer() {
     // --- the control: typed, it destroys the edit ------------------------------------------------

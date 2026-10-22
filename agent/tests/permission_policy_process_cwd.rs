@@ -1,15 +1,18 @@
-//! The permission policy resolves paths in the application process. The CLI child runs with the
-//! project root as its cwd (`agent::process` sets `current_dir`), while the application keeps its cwd.
-//! With the application in `~/proj/src` and the CLI in `~/proj`, `/proc/self/cwd` differs between them.
+//! The permission policy judges a path in Eitri's own process; the CLI child that then writes or
+//! reads it runs with the project root as its cwd (`agent::process` sets `current_dir`), and Eitri
+//! itself never changes directory. So `/proc/self/cwd` names a different directory in each: started
+//! as `cd ~/proj/src && eitri ~/proj`, Eitri's is `~/proj/src` and the CLI's `~/proj`.
 //!
-//! A repository link `d -> /proc/self/cwd/..` makes `d/.config/autostart/evil.desktop` resolve to
-//! `~/proj/.config/autostart/evil.desktop` in the application but `~/.config/autostart/evil.desktop`
-//! in the CLI. Allowing the first path would permit a write outside the project in the CLI.
-//! The same resolver judges `Read`, so reads need the same protection.
+//! A reproduction on 2026-09-28 used a cloned repository holding
+//! `d -> /proc/self/cwd/..` made `Write d/.config/autostart/evil.desktop` resolve, in Eitri, to
+//! `~/proj/.config/autostart/evil.desktop` -- inside the project, allowed with no card -- while the
+//! CLI wrote `~/.config/autostart/evil.desktop`. The same resolver judges `Read`, so a read escaped
+//! the same way.
 //!
-//! This file must contain exactly one test because it moves the process's cwd, shared by every
-//! test in the binary. `/proc/self/fd`, `/dev/fd`, and `/proc/self/root` need no cwd change;
-//! their tests are in `agent/src/permission_policy.rs`.
+//! **This file holds exactly one test, and must keep holding only one**: it moves the process's cwd,
+//! which every other test running in the same binary would share. The other per-process shapes
+//! (`/proc/self/fd`, `/dev/fd`, `/proc/self/root`) need no cwd moved and are unit tests in
+//! `agent/src/permission_policy.rs`.
 
 #[cfg(target_os = "linux")]
 #[test]

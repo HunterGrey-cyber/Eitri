@@ -260,7 +260,7 @@ describe("hintTargets", () => {
   });
 
   it("judges a start-screen choice by its own scrolling list, not by the root", () => {
-    // `.chooser-list` scrolls its own content (index.css): a choice
+    // `.chooser-list` (the launch chooser) scrolls its own content (index.css): a choice
     // scrolled out of it is still inside the root, and must not get a label drawn over the controls
     // below the list. `.session-choice`, the old resumable-session picker's own list, is gone.
     document.body.innerHTML = `
@@ -297,7 +297,8 @@ describe("hintTargets", () => {
   });
 });
 
-/* Reply HTML sits inside its row. Any nested element claiming to be a stop is row content. */
+/* A reply's own
+   HTML sits inside its row, so anything in it that claims to be a stop is the row's content. */
 describe("a stop inside another stop is content, not a stop", () => {
   /** Rows r0-r3 as the list's own children; r1 is a reply whose HTML carries two hidden "rows", a
    *  "notice" with a button, a link, and a HINT composer marker; r2 is a card. */
@@ -369,10 +370,11 @@ describe("a stop inside another stop is content, not a stop", () => {
   });
 });
 
-/* Web links reached by `gx` and global HINT use `new URL` without a base: http(s), no userinfo,
-   and a plain host other than the panel's own. Picks display the normalized `href`, and
-   `open_url` sends that address. Fixtures use `setAttribute` and `String.raw` for backslashes
-   so the parser receives exactly the strings written here. */
+/* The web links `gx` and the global HINT reach. An href counts only as the
+   WHATWG parser (`new URL`, no base) reads it -- http(s), no userinfo, a plain host that is not the
+   panel's own `eitri.invalid` -- and the NORMALIZED `href` is what a pick shows and `open_url` sends,
+   never the spelling the reply wrote. Fixtures are built with `setAttribute` (and `String.raw` for a
+   backslash), so what reaches the parser is exactly the string written here. */
 describe("webUrl and webLinks", () => {
   /** A row holding one anchor per href (an entry of `null` is an anchor with no `href` at all). */
   function rowWithLinks(hrefs: (string | null)[]): HTMLElement {
@@ -761,9 +763,10 @@ describe("hintTargets: web links", () => {
   });
 });
 
-/* Place HINT labels on the visible part of each target. `clipBox` intersects the root with every
-   clipping ancestor; `visibleBox` intersects the target with that area. `hintVisible` is exactly
-   whether `visibleBox` is non-null, keeping label eligibility and placement consistent. */
+/* What a HINT label is placed on -- the part of its target that shows. `clipBox` is
+   the intersection of the root and every clipping ancestor between them; `visibleBox` is the target's
+   own box inside it; `hintVisible` is exactly "`visibleBox` is not null", so what gets a label and
+   where it goes cannot disagree. */
 describe("clipBox and visibleBox", () => {
   const edges = (b: { top: number; bottom: number; left: number; right: number } | null) =>
     b === null ? null : { top: b.top, bottom: b.bottom, left: b.left, right: b.right };

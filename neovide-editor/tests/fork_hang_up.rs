@@ -1,7 +1,8 @@
-//! Exercise `HangUp` through the fork's `NeovimSession` against real processes without a display
-//! or `LiveHarness`. Closing stdin ends nvim while its `Neovim` handle remains alive.
-//! A launcher with a failed handshake is released, and hanging up a `--listen` connection
-//! shuts the socket so the server sees the client leave.
+//! The pinned fork's `HangUp` (its `bridge/session.rs`), driven
+//! through the fork's own `NeovimSession` against real processes -- no display, no `LiveHarness`:
+//! closing nvim's stdin ends it while the session's `Neovim` handle still lives; a launcher that
+//! fails the handshake is let go; and a session on a `--listen` server gets its
+//! socket shut, so the server sees the client leave.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -45,8 +46,8 @@ fn embedded(program: &Path, args: &[&str], dir: &Path) -> NeovimInstance {
     NeovimInstance::Embedded(command)
 }
 
-/// The session's `Neovim` handle stays alive, as it does in the fork's handler.
-/// Hanging up the session must still end nvim.
+/// End to end through the fork: the session's `Neovim` handle stays alive
+/// (as the fork's handler keeps one), and the hang-up alone ends nvim.
 #[test]
 fn a_hang_up_ends_nvim_while_the_connection_lives() {
     let dir = scratch("pipe");
@@ -70,9 +71,11 @@ fn a_hang_up_ends_nvim_while_the_connection_lives() {
     assert!(exited.is_ok(), "nvim exited on the hang-up alone");
 }
 
-/// The launcher closes stdout before the handshake, then waits for EOF on stdin.
-/// After the handshake fails, startup waits for stderr to close. Release the session's stdin
-/// writer first so the launcher can exit and startup can report the error.
+/// A launcher that closes its stdout before the handshake and then waits
+/// for EOF on its stdin. The handshake fails; the fork then waits for the launcher's stderr to end,
+/// which it does only once the launcher sees EOF -- so the stdin writer the session owns must be let
+/// go first, or startup never reports its error. Keeping the writer alive after a failed
+/// handshake would leave both sides waiting.
 #[test]
 fn a_launcher_that_fails_the_handshake_is_let_go() {
     use std::os::unix::fs::PermissionsExt;
@@ -97,9 +100,9 @@ fn a_launcher_that_fails_the_handshake_is_let_go() {
     );
 }
 
-/// A `NEOVIDE_SERVER` connection splits a socket into read and write halves.
-/// Dropping the write half alone leaves the socket open. Hanging up shuts its write side
-/// so the server sees the client leave and removes its channel.
+/// `NEOVIDE_SERVER`'s connection is a socket split into a read half
+/// and a write half; dropping the write half alone leaves the socket open. The hang-up shuts its
+/// write side, so the server sees the client leave: its channel is gone.
 #[test]
 fn a_hang_up_on_a_server_session_closes_the_servers_channel() {
     use nvim_rs::rpc::handler::Dummy;

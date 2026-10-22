@@ -510,8 +510,8 @@ mod tests {
         )
     }
 
-    /// Stored prompts, replies, and tool calls use a `0600` file in `0700` directories so other
-    /// users cannot read them, regardless of the umask.
+    /// Stored history contains prompts, replies and tool calls, so its files must be 0600
+    /// in 0700 directories even when the umask would otherwise produce 0644 files in 0755 directories.
     #[test]
     fn a_saved_history_is_private() {
         use std::os::unix::fs::PermissionsExt;

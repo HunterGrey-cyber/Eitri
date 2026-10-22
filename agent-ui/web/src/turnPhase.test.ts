@@ -48,7 +48,7 @@ describe("phaseOf", () => {
     expect(phaseOf(state)).toEqual({ kind: "replying" });
   });
 
-  /* --- the amended rule 2 ------------------------------------
+  /* An unfinished call stays current when a later sibling finishes
      Rule 2 used to require `openTool.seq === lastItemSeq`. The four tests below are the four cases
      that settle the amendment; the first three were each reproduced RED against that qualifier
      before it was replaced, and the fourth is the regression guard that the replacement did not
@@ -120,7 +120,7 @@ describe("phaseOf", () => {
     expect(phaseOf(state).kind).not.toBe("tool");
   });
 
-  /* --- a new PROMPT displaces an unfinished call -----------------------
+  /* A new PROMPT displaces the previous turn's tool call
      The first amendment dropped `lastItemSeq` outright, which left a call that never completed --
      an interrupt or a denial, both of which leave `result: null` FOREVER -- as "the newest
      unfinished call" into the following turn. `toolCalls` is never cleared between turns, and a
@@ -129,7 +129,7 @@ describe("phaseOf", () => {
      reporting `{kind: "tool", toolName: ...}` where it now reports `sent`. */
 
   it("an INTERRUPTED call does not claim 'running <Tool>' into the next turn", () => {
-    // After an interrupt the model emits nothing further, so
+    // After an interrupt the model may emit nothing further, so
     // no text ever lands after the call inside its own turn -- `lastMessageSeq` stays below it for
     // good, and only the new prompt can displace it. `ActivityLine` renders `running` from the
     // instant `turn_started` lands, so without this the meter animates "running NotebookEdit" for
@@ -210,7 +210,7 @@ describe("phaseOf", () => {
     state = applyEvent(state, { type: "user_prompt_submitted", text: "never mind, do X" });
     state = applyEvent(state, { type: "turn_started", turn_id: "t2" });
 
-    // `assistantMessageOpen` stays on `wire`, as Rust now sends it (sw-panel-render-2): `turn_started`
+    // `assistantMessageOpen` stays on `wire`, as Rust now sends it: `turn_started`
     // just above already closed it on `state` itself, so this is the wire's true value, not a
     // stripped one -- `phaseOf` does not read this field regardless.
     const { nextSeq: _n, turnThinking: _t, ...wire } = state;

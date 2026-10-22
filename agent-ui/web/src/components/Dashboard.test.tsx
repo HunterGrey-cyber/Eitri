@@ -120,8 +120,9 @@ describe("MODE_CONSEQUENCE", () => {
 });
 
 describe("Dashboard", () => {
-  /** The where-line does not name the backend: the name is the same in every release build, so
-   *  it carries nothing. The backend stays reachable in `prefix i`. */
+  /** The
+   *  where-line no longer names the backend -- it reads "sidecar"/"legacy" in every release build
+   *  and carries nothing; the backend stays reachable in `prefix i` (the session-detail route). */
   it("draws the centred question and the where-line with no backend, account omitted when null", () => {
     const { getByText, container } = renderDash();
     // 2026-10-16: no brand line above the question; the question and the where-line are the whole head.

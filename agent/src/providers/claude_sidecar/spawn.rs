@@ -1617,14 +1617,14 @@ mod tests {
             .expect_err("a named artifact that is absent must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains("EITRI_SIDECAR_BINARY"), "{err}");
-        // Keep the shared `sidecar_missing_message` opening sentence and the searched path in the
-        // error, so edits to the error path or message cannot silently remove either.
+        // `sidecar_missing_message` builds this error text. Pin the searched path here so changes
+        // to either the error path or its wording cannot silently omit it.
         assert!(err.to_string().contains("The agent sidecar is not installed."), "{err}");
         assert!(err.to_string().contains("/no/such/sidecar/binary"), "{err}");
     }
 
-    /// The missing-sidecar message names every searched path and the package that supplies it.
-    /// The UI splits the text after the shared opening sentence into the displayed remedy.
+    /// The missing-sidecar message names every searched path and the package that ships it.
+    /// `agent-ui/web/src/problems.ts::classify` splits that package hint off as the remedy.
     #[test]
     fn sidecar_missing_message_names_every_searched_path_and_the_package() {
         let searched = [PathBuf::from("/a/b/sidecar"), PathBuf::from("/c/d/sidecar")];
@@ -1738,10 +1738,13 @@ mod tests {
 
     use super::*;
 
-    /// Spawns the compiled sidecar, checks that its socket accepts connections, and confirms
-    /// that closing the held-open stdin makes it exit. No CLI turn is sent.
-    /// Requires a prebuilt artifact, a per-user build, or an explicit checkout override that may
-    /// build on demand. An unbuilt default checkout fails with `NO_SIDECAR_HINT`.
+    /// Spawn the actual compiled sidecar and confirm it binds its socket and exits when the
+    /// held-open stdin closes. No CLI turn is sent, so this incurs no API cost.
+    ///
+    /// The default checkout must already be runnable: a bare default checkout fails with
+    /// `NO_SIDECAR_HINT` instead of building on demand. A prebuilt artifact or user-path build
+    /// is runnable; only an explicit `EITRI_VERDANDI_CHECKOUT` can select an unbuilt checkout
+    /// and build it through the explicit branch.
     #[test]
     #[ignore]
     fn spawn_binds_the_socket_and_stdin_close_shuts_it_down_cleanly() {
@@ -1767,9 +1770,18 @@ mod tests {
         assert!(exited, "sidecar did not exit within 5s of its stdin being closed");
     }
 
-    /// Checks that every default checkout named by the scripts matches the path computed here.
-    /// Inspecting literal script text catches disagreements even when neither path exists locally.
-    /// The launcher and root installer are excluded because they no longer supply checkout defaults.
+    /// Packaging scripts that name a default checkout must agree with the resolver. A detached
+    /// `~/src/verdandi-old-checkout` default once differed from this file's
+    /// `~/src/verdandi`; with both directories present a launcher guard could pass
+    /// against one while the binary read the other. Compare literal text so this works even
+    /// where neither directory exists.
+    ///
+    /// `packaging/eitri.launcher.sh` names no default checkout: it finds an explicit override,
+    /// a packaged sibling or a revision-keyed user install, or prints a setup hint.
+    /// The root `install.sh` is a wrapper over `packaging/install.sh --from-source --checkout`
+    /// and passes `--verdandi-checkout` only when `EITRI_VERDANDI_CHECKOUT` is set. Neither script
+    /// has a guessed default to compare. Without an override the installer uses pinned public
+    /// Verdandi source rather than a path specific to one machine.
     #[test]
     fn packaging_scripts_default_to_the_same_checkout_this_code_does() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1820,12 +1832,10 @@ mod tests {
         );
     }
 
-    /// The root `install.sh`'s own half of the same change: it is a thin
-    /// wrapper over `packaging/install.sh --from-source --checkout`, passing `--verdandi-checkout`
-    /// only `if` the variable is set -- never defaulted to a guessed path (a stranger's checkout has
-    /// no `~/src/verdandi`) the way the old script's own default silently disagreed with
-    /// this file. `${EITRI_VERDANDI_CHECKOUT:-}` (an empty-string default, just to test whether it
-    /// is set) is not the thing being ruled out here and is expected to appear.
+    /// The root `install.sh` wraps `packaging/install.sh --from-source --checkout`, passing
+    /// `--verdandi-checkout` only if `EITRI_VERDANDI_CHECKOUT` is set. A guessed default such as
+    /// `~/src/verdandi` would fail on other machines and could disagree with this
+    /// resolver. `${EITRI_VERDANDI_CHECKOUT:-}` is an empty-string presence check and is allowed.
     #[test]
     fn the_root_install_sh_no_longer_defaults_the_verdandi_checkout() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2149,9 +2159,9 @@ mod tests {
         );
     }
 
-    // The per-user sidecar is keyed by the pinned revision.
+    // -- The per-user sidecar is keyed by the pinned revision so builds do not share artifacts. --
 
-    /// An absolute `$XDG_DATA_HOME` takes precedence over the home-directory fallback.
+    /// An absolute `$XDG_DATA_HOME` wins outright when locating the user install.
     #[test]
     fn user_sidecar_path_prefers_an_absolute_xdg_data_home() {
         let path = user_sidecar_path(Some(OsStr::new("/data")), Some(OsStr::new("/home/x")), "abc1234")
@@ -2197,8 +2207,8 @@ mod tests {
         );
     }
 
-    /// Paths are keyed by revision, so different builds live in different directories.
-    /// A client cannot mistake a build for another revision for its own.
+    /// Revision-keyed directories keep different builds apart so a newer client cannot mistake
+    /// another revision's artifact for its own.
     #[test]
     fn user_sidecar_path_is_keyed_by_rev() {
         let a = user_sidecar_path(Some(OsStr::new("/data")), None, "aaaaaaa").unwrap();
@@ -2260,9 +2270,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The default checkout is usable only when it already contains a prebuilt artifact.
-    /// An unbuilt default checkout returns `NO_SIDECAR_HINT` instead of triggering a build.
-    /// `resolve_sidecar_program` performs no builds, so this check does not depend on timing.
+    /// The default checkout counts only when it already holds a prebuilt
+    /// artifact. One present but unbuilt must not be picked up as a build opportunity -- resolution
+    /// ends in the shared `NO_SIDECAR_HINT` rather than reaching for `npm`. `resolve_sidecar_program`
+    /// itself calls neither `ensure_sidecar_built` nor `Command::new("npm")` in any of its branches
+    /// (see its own doc comment), so this is a structural guarantee this test pins, not a timing one
+    /// that could flake.
     #[test]
     fn the_default_checkout_never_builds_when_it_is_present_but_unbuilt() {
         let home = fake_home_with_default_checkout(&[]);
@@ -2272,8 +2285,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// When both a sibling artifact and a per-user build for the expected revision exist,
-    /// the sibling wins. Providing both candidates makes the test check their relative precedence.
+    /// A packaged sibling beats a per-user build for this exact revision when both exist.
+    /// Testing both candidates together catches a swapped priority that isolated candidates miss.
     #[test]
     fn a_sibling_artifact_beats_a_user_build_for_the_same_revision() {
         let dir = std::env::temp_dir().join(format!("nv-sidecar-dir-{}", uuid::Uuid::new_v4()));
@@ -2323,9 +2336,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A default checkout with a prebuilt artifact resolves to that artifact without building.
-    /// Availability and resolution must agree: otherwise startup reports a runnable sidecar
-    /// but spawning fails for the same checkout.
+    /// A default checkout with a prebuilt artifact and no higher-priority candidate resolves
+    /// and runs without building. Testing only an unbuilt checkout would miss deletion of this
+    /// branch. Availability must also report it runnable, or startup would advertise a sidecar
+    /// that spawning refuses; the same mismatch could select a backend that cannot start.
     #[test]
     fn a_default_checkout_with_a_prebuilt_artifact_runs_it_without_building() {
         let suffix = node_platform_suffix().expect("this test target has a known Node platform name");
@@ -2367,13 +2381,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The other half of the guarantee above: the test just
-    /// above pins that `resolve_sidecar_program` never *returns* a buildable `Checkout` for the
-    /// default-checkout case, but nothing had pinned the wiring on the other side -- that a
-    /// `Checkout{prebuilt: None}` `spawn()` DOES receive (only possible from the explicit
-    /// `EITRI_VERDANDI_CHECKOUT` branch, step 2) actually reaches the build step. `invocation_for`
-    /// exists so that wiring is this directly testable, with a fake `build` closure standing in for
-    /// `ensure_sidecar_built` -- no real `npm`/`node`, no process-env mutation.
+    /// The default checkout must never return a buildable `Checkout`, but an explicit
+    /// `EITRI_VERDANDI_CHECKOUT` can. Pin the other side of that wiring: a `Checkout{prebuilt: None}`
+    /// that reaches `spawn` must actually build. `invocation_for` allows a fake build closure to
+    /// stand in for `ensure_sidecar_built`, without real npm or Node or process-environment mutation.
     #[test]
     fn invocation_for_builds_an_explicit_checkout_that_has_nothing_prebuilt() {
         let root = fake_checkout(&[]);
@@ -2454,9 +2465,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// `sidecar_availability_in` must count the per-user build, just as resolution does.
-    /// Otherwise `BackendKind::choose` reports no installed sidecar even though the session
-    /// can start successfully from that path.
+    /// `sidecar_availability_in` must count the user path too, or a machine that has run `eitri
+    /// setup` reports no sidecar above a session that starts fine from that path. Availability
+    /// and spawning must agree, just as they must for a runnable default checkout.
     #[test]
     fn sidecar_availability_counts_the_user_path() {
         let xdg_data_home = std::env::temp_dir().join(format!("nv-xdg-avail-{}", uuid::Uuid::new_v4()));
@@ -2569,7 +2580,8 @@ mod tests {
         assert!(!is_exe_sibling_artifact(&sibling, None));
     }
 
-    /// A sibling artifact without a `.rev` file gives no warning, allowing older installations.
+    /// A sibling with no `.rev` file gives no warning -- the common case for an install
+    /// predating this file's existence.
     #[test]
     fn sibling_rev_skew_warning_is_empty_when_the_rev_file_is_absent() {
         let dir = std::env::temp_dir().join(format!("nv-sibling-rev-absent-{}", uuid::Uuid::new_v4()));
@@ -2597,8 +2609,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `.rev` value with no prefix match in either direction yields exactly one warning
-    /// that names both the actual and expected revisions.
+    /// A `.rev` file that does not start with `EXPECTED_VERDANDI_REVISION`, nor vice versa,
+    /// produces exactly one warning naming both revisions so the mismatch can be diagnosed.
     #[test]
     fn sibling_rev_skew_warning_names_both_revs_on_a_mismatch() {
         let dir = std::env::temp_dir().join(format!("nv-sibling-rev-mismatch-{}", uuid::Uuid::new_v4()));
@@ -2615,8 +2627,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A full 40-character revision beginning with the expected abbreviated revision gives
-    /// no warning. This checks the longer-file-value direction of the prefix comparison.
+    /// Installed packages write the public twin's full 40-character revision while this client
+    /// can compare a 7-character `EXPECTED_VERDANDI_REVISION`. Equal-length inputs cannot prove
+    /// that `sibling_rev_skew_warning` accepts a full hash starting with the expected prefix;
+    /// this pins that direction of the bidirectional `starts_with` comparison.
     #[test]
     fn sibling_rev_skew_warning_is_empty_when_the_rev_file_is_a_longer_sha_starting_with_the_expected_prefix() {
         let dir = std::env::temp_dir().join(format!("nv-sibling-rev-long-{}", uuid::Uuid::new_v4()));
@@ -2644,12 +2658,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Pins the cross-plan seam: `NO_SIDECAR_HINT` must start
-    /// with `sidecar_missing_message`'s own opening sentence, or
-    /// `agent-ui/web/src/problems.ts::classifySidecarMissing` stops recognising the step-5
-    /// fallthrough and a fresh public-release user sees unrecognised raw text with no headline or
-    /// remedy. `problems.test.ts` pins the same literal from this file's source independently; this
-    /// test is the Rust-side half of that agreement.
+    /// `NO_SIDECAR_HINT` must start with `sidecar_missing_message`'s opening sentence so
+    /// `agent-ui/web/src/problems.ts::classifySidecarMissing` recognizes the resolver fallthrough.
+    /// Otherwise a fresh install gets raw text without a headline or remedy. `problems.test.ts`
+    /// independently pins the same literal; this is the Rust half of that agreement.
     #[test]
     fn no_sidecar_hint_starts_with_the_panels_sidecar_missing_headline() {
         const SIDECAR_MISSING_HEADLINE: &str = "The agent sidecar is not installed.";

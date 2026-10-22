@@ -204,8 +204,8 @@ mod tests {
         );
     }
 
-    /// A `keymap.set("panel", ...)` call is recorded like a prefix table call,
-    /// and `Keymap::apply_user` accepts it.
+    /// `eitri.keymap.set("panel", ...)` is recorded like the prefix table and accepted by
+    /// `Keymap::apply_user`.
     #[test]
     fn a_panel_table_set_is_recorded_and_accepted() {
         let ops = run(r#"eitri.keymap.set("panel", "<leader>tn", "tab.new")"#);
@@ -247,15 +247,15 @@ mod tests {
         assert!(matches!(err, KeymapError::UnknownTable { .. }), "{err:?}");
     }
 
-    /// The snippet runs through Lua and produces the expected prefix and action bindings.
+    /// The shipped keymap snippet must load through real Lua and apply its advertised bindings.
     #[test]
     fn the_owners_snippet_applies_cleanly_and_reproduces_his_tmux() {
         let map = Keymap::apply_user(&run(SNIPPET), &[]).unwrap_or_else(|e| panic!("{e}"));
         reproduces_his_tmux(&map);
     }
 
-    /// What `~/.config/tmux/base.conf` binds, as Eitri has it: the snippet's result, and since
-    /// the import, also what reading the tmux config itself gives.
+    /// What the fixture user's `~/.config/tmux/base.conf` binds, as Eitri has it: the snippet's result,
+    /// and since the import, also what reading that tmux config itself gives.
     fn reproduces_his_tmux(map: &Keymap) {
         let k = |s: &str| KeySpec::parse(s).unwrap();
         let action = |s: &str| map.lookup(&k(s)).map(|b| (b.action.clone(), b.repeatable));
@@ -331,9 +331,9 @@ mod tests {
         );
     }
 
-    /// A scratch home holding copies of the two tmux files at their expected paths
+    /// A scratch home holding copies of a real user's two tmux files where that user keeps them
     /// (`~/.config/tmux/tmux.conf`, which sources `~/.config/tmux/base.conf`). The copies in
-    /// `core/tests/fixtures/tmux/` have every comment emptied and one script name changed,
+    /// `core/tests/fixtures/tmux/` are those files with every comment emptied and one script name changed,
     /// line for line, so the snippet's `base.conf:NN` references still point at the right lines.
     fn his_tmux_home() -> crate::test_scratch_dir::ScratchDir {
         let home = crate::test_scratch_dir::ScratchDir::new("eitri-tmux", "owner");
@@ -377,7 +377,7 @@ mod tests {
             "every row, not only the ones asserted above"
         );
         assert_eq!(import.files, vec![home.join(".config/tmux/tmux.conf")]);
-        // What did not come across, and why: run/if-shell lines, copy-mode and root keys,
+        // What did not come across, and why: its run/if-shell lines, its copy-mode and root keys,
         // the commands Eitri has no equivalent of.
         let at = |file: &str, line: usize| {
             import
@@ -497,7 +497,7 @@ mod tests {
         }
     }
 
-    /// Lua does not specify the iteration order of the snippet's `pairs` loops.
+    /// The snippet's `pairs` loops run in an order Lua does not specify.
     #[test]
     fn the_snippet_applies_the_same_whatever_order_pairs_runs_in() {
         let ops = run(SNIPPET);

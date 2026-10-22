@@ -1,14 +1,13 @@
-//! Two real sidecar sessions in one process, as two session tabs.
+//! Two real sidecar sessions in one process behave as separate session tabs.
 //! `#[ignore]`d: it spawns two real Verdandi sidecars and two real `claude` processes and bills the
 //! account they run as.
 //!
-//! **Run it only on a dedicated test account, through the resolved binary, never a bundled one, and
-//! only with a scratch `XDG_STATE_HOME`.** `AgentConversation`'s ingestion thread persists a
-//! `ConversationRecord` the moment either backend's first `SessionOpened` folds
-//! (`agent::ingestion::persist_record`, `agent::state_dirs::conversations_dir`), which this test
-//! drives twice, on purpose. Without `XDG_STATE_HOME` set, `conversations_dir()` falls back to
-//! `$HOME/.local/state/eitri/conversations/`, and two real records land there and are never
-//! cleaned up:
+//! Run only on the TEST profile through the resolved production binary, never a bundled one,
+//! and with scratch `XDG_STATE_HOME`. Ingestion persists a `ConversationRecord` as soon as each
+//! backend's first `SessionOpened` folds (`agent::ingestion::persist_record`,
+//! `agent::state_dirs::conversations_dir`). This test opens two real sessions; without that
+//! state override they leave records in the user's `$HOME/.local/state/eitri/conversations/`.
+//! The test-account wrapper leaves `XDG_STATE_HOME` as inherited, so the caller must set it:
 //!
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
@@ -16,9 +15,10 @@
 //!     cargo test -p eitri-core --test session_tabs_real_cli -- --ignored --nocapture
 //! ```
 //!
-//! The sidecar runs the CLI named by `VERDANDI_CLAUDE_CLI_PATH`; `PATH` alone does not select it.
+//! The test-account wrapper sets `VERDANDI_CLAUDE_CLI_PATH` to the `claude-wrapper` launcher, which
+//! selects the sidecar's CLI. PATH alone does not select it.
 //!
-//! **Where the card comes from.** An in-project `Write` in an Auto tab raises no card: Eitri's
+//! **Where the card comes from.** An in-project `Write` in an Auto tab raises no card any more: Eitri's
 //! own policy allows it, and a CLI that runs its own auto mode lets its classifier decide a deferred
 //! call. The project therefore ships `.claude/settings.json` with `permissions.ask: ["Write"]` (the
 //! sessions start `Trusted`, so the project tier loads, and the CLI applies an ask rule whatever its

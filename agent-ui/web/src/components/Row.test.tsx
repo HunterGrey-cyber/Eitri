@@ -8,9 +8,15 @@ import { Row } from "./Row";
 afterEach(cleanup);
 
 describe("Row", () => {
-  /* Derive `data-sign` and the visible `.row-sign` from one `sign` argument.
-     Tests read the data attribute while users read the span, so separate values could drift
-     without failing tests. Check both the div and button shapes to preserve the shared source. */
+  /* THE PROPERTY THIS COMPONENT EXISTS FOR. The two-cell shape was written six times -- once here
+     and five times by hand (`App.tsx`'s two session-ended rows, `TerminalHandoff`'s command card,
+     `ModeSelector`'s two choice rows -- `ModeSelector` itself is gone now,
+     replaced by `EmptyTab`'s own choice rows) -- and each hand-written copy spelled its glyph out TWICE,
+     once in `data-sign` and once in the visible `.row-sign` span. Tests read `data-sign`; users
+     read the span; nothing compared them, so editing one and not the other drifted straight past a
+     green suite. With one `sign` argument feeding both, that is not a thing a test has to catch --
+     it is unrepresentable. This asserts it anyway for the shape, because the derivation is what a
+     future edit could undo. */
   it("derives data-sign and the visible glyph from the same argument, on both shapes", () => {
     const { container } = render(
       <>
@@ -63,8 +69,10 @@ describe("Row", () => {
     expect(row.getAttribute("aria-current")).toBe("true");
   });
 
-  /* A `problem` from `classify()` adds a headline and remedy above the row's unchanged children.
-   *  When `problem` is omitted, draw neither so unrecognized failures retain their raw text alone. */
+  /* A `problem` (a `classify()` result) draws a headline and remedy ABOVE the
+   *  row's own children, which stay exactly as they were -- "never hide the evidence". An error row
+   *  with nothing recognised (`problem` omitted, the common case) draws neither and is unchanged
+   *  from before this prop existed. */
   it("draws a problem's headline and remedy above the row's own raw text, when given one", () => {
     const { container } = render(
       <Row kind="error" sign="✗" problem={{ headline: "Claude Code (claude) was not found.", remedy: "Install it." }}>

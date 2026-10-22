@@ -127,9 +127,9 @@ fn events_from_payload(payload: Option<&str>) -> Vec<serde_json::Value> {
     }
 }
 
-/// Sends `prompt` and pumps the real 33 ms loop until the turn starts and ends, collecting
-/// every event sent to the panel. Any delivered card is denied immediately and retained in the
-/// returned list. An ungated-mode tripwire failure is reported with its reason.
+/// Sends `prompt` and pumps the real 33ms loop until the turn starts and ends, collecting
+/// all delivered events. Every delivered card is denied and retained in the result, so nothing
+/// asking for permission runs on this test's approval. An ungated-mode trip fails with its reason.
 fn drive_turn(set: &mut TabSet, dir: &Path, tab: TabId, prompt: &str, label: &str) -> Vec<serde_json::Value> {
     set.get_mut(tab)
         .unwrap()

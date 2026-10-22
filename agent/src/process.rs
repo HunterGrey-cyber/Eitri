@@ -1160,10 +1160,16 @@ impl Drop for AgentProcess {
 #[cfg(test)]
 mod deny_list_tests {
 
-    /// Checks that the shared deny list is empty so every session offers every tool.
-    /// Both modes run the CLI in `default` under the `PreToolUse` gate. `Auto` routes calls
-    /// through the permission policy; bypass answers `allow` through that same gate.
-    /// The empty list omits `--disallowedTools` on legacy and uses `unrestricted` on the sidecar.
+    /// Every session uses one CLI mode and one empty deny list. Tools such as `Edit` and `Bash`
+    /// must reach the `PreToolUse` gate so Auto can allow read-only commands or ask for a decision,
+    /// and so approved edits can reach a live buffer. Denying tools before the gate would make
+    /// those permission cards unreachable.
+    ///
+    /// An ungated bypass with an empty deny list could rewrite files without any decision; using
+    /// a narrower list instead would make bypass less capable than Auto. Bypass therefore answers
+    /// `allow` under the same gate rather than starting a CLI without one. Since both modes share
+    /// the gated CLI posture, `disallowed_tools()` supplies the same empty list for every session.
+    /// Saved prefix rules and the card's always-allow answer also need `Bash` to reach the gate.
     #[test]
     fn every_session_offers_every_tool_because_the_gate_covers_them_and_bypass_denies_nothing() {
         let list = disallowed_tools();
@@ -1183,9 +1189,9 @@ mod deny_list_tests {
         );
     }
 
-    /// Checks CLI mode classification: `default` is requested, `plan` and `dontAsk` still deny
-    /// without an answer, and empty means unreported. Every other value, including unknown values,
-    /// stops the session.
+    /// Classify every reported CLI mode: `default` is requested, `plan` and `dontAsk` still deny
+    /// an unanswered call, an empty value is unreported, and everything else stops the session,
+    /// including values this build has never seen.
     #[test]
     fn a_reported_cli_mode_is_classified_toward_stopping() {
         assert_eq!(classify_cli_mode("default"), CliModeReport::Default);
@@ -1197,9 +1203,10 @@ mod deny_list_tests {
         }
     }
 
-    /// A session that requests CLI auto mode accepts `auto` or the CLI's `default` fallback.
-    /// All other reports stop it, including `plan`, `dontAsk` and an empty report, which a default-mode
-    /// session tolerates. `classify_cli_mode` still rejects `auto` when it was not requested.
+    /// A session requesting CLI auto accepts `auto` and its `default` fallback. Everything else
+    /// stops it, including `plan`, `dontAsk` and an empty report, which a default session tolerates.
+    /// Only an explicit auto request makes `auto` acceptable: the default classifier above still
+    /// trips on it.
     #[test]
     fn a_session_that_asked_for_auto_accepts_only_auto_or_the_default_fallback() {
         let auto = RequestedCliMode::Auto;
@@ -1449,17 +1456,17 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// The regression test for the second, narrower deadlock a review found in the same code
-    /// path: `listener.set_nonblocking(true)` only affects the *listening* socket, not sockets it
-    /// accepts -- an accepted `UnixStream` comes back blocking by default (confirmed real via a
-    /// standalone `fcntl(fd, F_GETFL)` check), so without `HOOK_CONNECTION_READ_TIMEOUT`, a
-    /// connection that starts but never completes its line (a real `agent-hook` process
-    /// killed/orphaned mid-write) would park this thread in `read_line` forever, never
-    /// re-checking `stop` -- functionally the same class of hang as the accept()-side one above,
-    /// just triggered by "a connection starts but never finishes" instead of "nothing connects."
-    /// Connects a real client, writes a partial line with no trailing newline, then never sends
-    /// anything else (holding the connection open, simulating exactly that failure mode), and
-    /// confirms the listener thread still stops promptly once asked to.
+    /// An accepted connection must not prevent the listener from stopping:
+    /// `listener.set_nonblocking(true)` only affects the *listening* socket, not sockets it accepts
+    /// -- an accepted `UnixStream` comes back blocking by default (confirmed real via a standalone
+    /// `fcntl(fd, F_GETFL)` check), so without `HOOK_CONNECTION_READ_TIMEOUT`, a connection that
+    /// starts but never completes its line (a real `agent-hook` process killed/orphaned mid-write)
+    /// would park this thread in `read_line` forever, never re-checking `stop` -- functionally the
+    /// same class of hang as the accept()-side one above, just triggered by "a connection starts
+    /// but never finishes" instead of "nothing connects." Connects a real client, writes a partial
+    /// line with no trailing newline, then never sends anything else (holding the connection open,
+    /// simulating exactly that failure mode), and confirms the listener thread still stops promptly
+    /// once asked to.
     #[test]
     fn hook_listener_does_not_hang_when_a_connection_stalls_without_completing_its_line() {
         let socket_path = temp_socket_path();
@@ -1556,7 +1563,7 @@ mod tests {
 
     /// The listener's happy path, exercised without a real `claude` process: a real client
     /// connects over a real `UnixStream` and writes the exact real captured `PreToolUse` stdin
-    /// JSON that `agent-hook` would relay verbatim -- confirms the thread
+    /// JSON from the captured fixture that `agent-hook` would relay verbatim -- confirms the thread
     /// parses it and emits a matching `AgentEvent::PermissionRequest` with `PermissionSource::
     /// HookRelay`, that the connection is stashed in `pending` under the real `tool_use_id`
     /// (which `respond_permission`/`write_hook_decision` depend on to find it again), and that
@@ -1714,12 +1721,16 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty());
     }
 
-    /// Checks that shutdown releases pending hook connections. Killing the CLI alone leaves
-    /// `agent-hook` blocked on a connection that no public API can answer after shutdown.
-    /// The test uses `spawn_hook_listener` with a captured `PreToolUse` payload to create a real pending
-    /// connection. It checks that the blocked peer receives an explicit `deny` followed immediately
-    /// by EOF when the shutdown drain runs. This releases the helper without treating shutdown as
-    /// approval.
+    /// `shutdown()` must drain `pending_hook_connections`: otherwise an `agent-hook` process blocked
+    /// on a stashed connection stays blocked once `claude` is killed (reparented to init, waiting out
+    /// the full 600s hook timeout for a decision that could never come -- nothing in the public
+    /// API can answer a request after shutdown). Uses the REAL listener path (a real
+    /// `spawn_hook_listener`, a real client connection relaying the real captured `PreToolUse`
+    /// fixture) so the stranded connection in the map is a genuinely accepted one, then confirms
+    /// the peer -- genuinely blocked, verified before the drain -- is released once `shutdown()`'s
+    /// drain runs: it receives an explicit fail-closed `deny` (so the still-alive-for-now CLI can
+    /// never read the release as a silent allow) immediately followed by a real EOF (`read_line`
+    /// returning `Ok(0)`, exactly what `agent-hook` itself would then see and exit on).
     #[test]
     fn releasing_pending_hook_connections_denies_and_then_eofs_a_blocked_peer() {
         let fixture = std::fs::read_to_string(format!(
@@ -1850,9 +1861,10 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// A legacy hook payload reporting a mode less restrictive than `default` is denied on its
-    /// connection and emits `UngatedCliMode` so the host closes the session. It is never stored as a
-    /// pending request or shown as a card because an unanswered hook in that mode could run the tool.
+    /// A legacy hook payload reporting a CLI mode less restrictive than `default` means project
+    /// settings may have outranked `--permission-mode default`. Deny that connection, name the mode
+    /// and emit `UngatedCliMode` so the host closes the session. Never file a permission request:
+    /// in such a mode an unanswered request could run without a card anyone approved.
     #[test]
     fn a_hook_call_reporting_an_ungated_mode_is_denied_and_asks_for_the_session_to_close() {
         for mode in ["bypassPermissions", "acceptEdits"] {
@@ -2225,9 +2237,9 @@ exit 0"#,
         );
     }
 
-    /// Exercises the fake launcher through `spawn_with_binary`, which installs a gate on every
-    /// spawn. Checks that the real spawn path runs the preflight before binding the socket, so a
-    /// launcher that rejects the hook settings leaves nothing to clean up.
+    /// Exercise the fake launcher through `spawn_with_binary`, which always installs a gate,
+    /// rather than invoking preflight alone. Preflight must run before the socket is bound so a
+    /// doomed spawn leaves nothing behind to clean up.
     #[test]
     fn spawn_with_binary_fails_fast_via_preflight_and_binds_no_socket_when_the_resolved_binary_refuses_settings() {
         let _socket_guard = hook_socket_guard();
@@ -2269,12 +2281,13 @@ exit 0"#,
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Checks the arguments passed by the real legacy spawn path.
-    /// The child gets the `PreToolUse` gate through `--settings` and no `--disallowedTools`,
-    /// so `Bash` is offered and every call reaches the hook. Passing `--disallowedTools Bash`
-    /// could escape the deny-list test above but fails this spawn check.
-    /// The CLI runs in `default`, and no flags select `auto` or an ungated mode.
-    /// In CLI `auto`, an unanswered hook request falls through to a model classifier.
+    /// Read the actual spawn argv so a correct deny-list helper cannot hide an incorrectly wired
+    /// launcher: the child gets the `PreToolUse` gate (`--settings`) and no `--disallowedTools`.
+    /// `Bash` is offered and every call reaches the hook.
+    ///
+    /// The CLI runs in `default`, whose unanswered requests stay denied, rather than a mode whose
+    /// non-answer falls to a model classifier or skips the gate. None of the flags selecting an
+    /// ungated mode may appear.
     #[test]
     fn every_spawn_runs_default_under_the_gate_and_passes_no_deny_list() {
         let _socket_guard = hook_socket_guard();

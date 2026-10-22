@@ -34,8 +34,9 @@ function labels(s: AgentUiState): string[] {
       case "thinking":
         return `thinking:${item.block.text}${item.open ? "…" : ""}`;
       case "run":
-        // Only `display.ts`'s `buildDisplay` produces runs from `buildTimeline`'s output.
-        // `TimelineItem` includes them, so this switch must handle the kind even though it cannot occur here.
+        // `buildTimeline` itself never produces this kind -- only `display.ts`'s `buildDisplay`
+        // does, over `buildTimeline`'s own output, but `TimelineItem`'s union includes it,
+        // so this switch has to name it too.
         throw new Error("buildTimeline never produces a run item");
     }
   });
@@ -302,11 +303,11 @@ describe("promptIndex (R4's [[ / ]])", () => {
   });
 });
 
-/* `]p` / `[p` find the next or previous card waiting for an answer in this tab, wrapping at the ends.
-   Prompt navigation (`[[`/`]]`) does not wrap. Answered cards are skipped even while still visible
-   until the provider resolves them. */
+/* `]p` / `[p`, the next / previous card waiting for an answer in this tab. Wraps as
+   nvim's `]d` does (`vim.diagnostic.jump`'s default) where `[[`/`]]` (`promptIndex` above) never do; a card
+   this panel has already answered is not waiting, though it stays on screen until the provider resolves it. */
 describe("waitingCardIndex (R7's ]p / [p)", () => {
-  /** prompt 0, card p1 1, a message 2, card p2 3. */
+  /** Prompt 0, card p1 1, a message 2, card p2 3. */
   const fixture = () =>
     buildTimeline(
       state({
@@ -397,7 +398,7 @@ describe("waitingCardIndex (R7's ]p / [p)", () => {
 /* `{N}]p` / `{N}[p`: a count repeats the jump. It is the single step taken N times, but costs one lap of the
    waiting cards at most, however large N is (the panel caps a count at 9999). */
 describe("waitingCardAfter (a count before ]p / [p)", () => {
-  /** prompt 0, card p1 1, a message 2, card p2 3. */
+  /** Prompt 0, card p1 1, a message 2, card p2 3. */
   const fixture = () =>
     buildTimeline(
       state({

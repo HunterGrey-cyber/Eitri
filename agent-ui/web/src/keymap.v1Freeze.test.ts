@@ -1,18 +1,30 @@
 /// <reference types="vite/client" />
-/** Freeze existing key meanings while allowing new bindings.
- *  `resolveKey` cases cover the fixed BROWSE/INPUT table and state-dependent actions.
- *  Events are hand-picked; only expected actions are snapshots, so help-text edits cannot
- *  silently change coverage.
+/** The keyboard table is frozen: existing keys keep their meaning, while new keys may be added.
+ *  A snapshot records actions so a description-only edit cannot silently change bindings.
+ *  Both the fixed table and the leader table are covered,
+ *  matching the same two halves in
+ *  `core/tests/keymap_v1_freeze.rs` on the Rust side:
  *
- *  The leader table shares `docs/keymap/v1-frozen-panel-keys.json` with the Rust test.
- *  It is exercised through `startSequence`/`advanceSequence`, or through `resolveKey`
- *  for reserved-prefix sequences [b, ]b, gt and gT.
+ *  1. `resolveKey` (`./keymap`) -- the panel's fixed single/two-key BROWSE and INPUT table. The
+ *     candidate keyboard events below are hand-picked, one per semantically distinct row of
+ *     `BROWSE_KEYS`/`INPUT_KEYS` (plus the session/turn-state branches that change what a row does),
+ *     and are themselves part of the test, not generated data -- only the *expected action* each one
+ *     resolves to is a frozen snapshot, so a text-only edit to `BROWSE_KEYS`'s descriptions can never
+ *     silently change what this file checks.
+ *  2. The panel's leader/which-key table -- `core::keymap::panel::default_bindings()`, shared with
+ *     the Rust test via ONE fixture, `docs/keymap/v1-frozen-panel-keys.json` (its `keys: string[]`
+ *     shape already matches `PanelBinding.keys` on the wire), walked through `./leader`'s
+ *     `startSequence`/`advanceSequence` (or, for the four sequences that start with one of
+ *     `resolveKey`'s own reserved two-key prefixes -- `[b`, `]b`, `gt`, `gT` -- through `resolveKey`
+ *     itself, the same two-step a real keypress takes).
  *
- *  Regenerate only the resolve-key fixture here with
- *  `REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 npx vitest run -u src/keymap.v1Freeze.test.ts`.
- *  The variable selects regeneration and -u allows the fixture to be written.
- *  The Rust test regenerates the panel fixture. Inspect changes by hand because snapshots
- *  cannot distinguish intended changes from regressions. */
+ *  Regenerate fixture 1 only (fixture 2 is Rust's to regenerate, see `keymap_v1_freeze.rs`'s own
+ *  header -- this file only reads it): `REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 npx vitest run -u
+ *  src/keymap.v1Freeze.test.ts` (both are needed: the variable selects the regenerating case, `-u` lets
+ *  vitest write the file), then read the diff by hand to ensure existing keys
+ *  keep their meaning; this test cannot tell an
+ *  intended change from a regression it should have caught.
+ */
 import { describe, expect, it } from "vitest";
 // Read through Vite's `?raw` like the other tests here, not `node:fs`: the panel's `tsc -b` has no
 // Node types, and shell/build.rs runs that build.
@@ -32,10 +44,11 @@ const key = (k: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> =
   ...over,
 });
 
-/** Convert `CARET_KEYS`/`VISUAL_KEYS` display tokens to `KeyLike`, matching `parseVisualToken`.
- *  `Esc` maps to `Escape`, `1-9` to a representative digit, and `gg` to its first keypress;
- *  a separate case covers the second. `Ctrl+x` holds Ctrl with `x`, and uppercase letters
- *  and `?` carry Shift. */
+/** `CARET_KEYS`/`VISUAL_KEYS`' own token spelling -> a `KeyLike`, the same rule `keymap.test.ts`'s
+ *  `parseVisualToken` uses: `"Esc"` is the display spelling of the real `key: "Escape"`, `"1-9"` a
+ *  representative digit, `"gg"` (added for 3a) the FIRST of its two presses (a non-`pending` case
+ *  below covers the second), `"Ctrl+x"` -> Ctrl held with `x` (needed by
+ *  the "Ctrl+e / Ctrl+y" row), and every bare uppercase letter or `?` carries Shift. */
 function visualToken(token: string): KeyLike {
   if (token === "Esc") return key("Escape");
   if (token === "1-9") return key("3");
@@ -100,7 +113,8 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   { label: "Escape, browse, idle", mode: "browse", event: key("Escape"), ctx: { sessionEnded: false, turnRunning: false } },
   { label: "Escape, browse, a turn is running", mode: "browse", event: key("Escape"), ctx: { sessionEnded: false, turnRunning: true } },
   { label: "Escape, input", mode: "input", event: key("Escape"), ctx: { sessionEnded: false } },
-  // Append new binding cases so regenerated fixture diffs show only additions.
+  // New bindings are additive under the freeze ("keys are only ever added"), appended
+  // rather than inserted so the regenerated fixture diffs as additions only.
   { label: "Ctrl+e", mode: "browse", event: key("e", { ctrlKey: true }), ctx: { sessionEnded: false } },
   { label: "Ctrl+y", mode: "browse", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
   // Turn review: `c` opens the overlay -- an added key, so the cases are appended and the regenerated
@@ -108,8 +122,10 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   { label: "c, a live session", mode: "browse", event: key("c"), ctx: { sessionEnded: false } },
   { label: "c, a session that ended", mode: "browse", event: key("c"), ctx: { sessionEnded: true } },
   { label: "c, input", mode: "input", event: key("c"), ctx: { sessionEnded: false } },
-  // Add cases for BROWSE's visual entry keys, the gv reservation, and each VISUAL_KEYS row
-  // in VISUAL and V-LINE. Also pin keys that must never answer a card and Ctrl+c's interrupt.
+  // Region-mode cases are additions to the frozen table:
+  // only: BROWSE's own entry keys, the reservation `gv` makes, one case per VISUAL_KEYS row in each
+  // of VISUAL and V-LINE, and three "never an answer" cases plus the
+  // one Ctrl chord VISUAL keeps a BROWSE meaning for.
   { label: "v", mode: "browse", event: key("v"), ctx: { sessionEnded: false } },
   { label: "Shift+V", mode: "browse", event: key("V", { shiftKey: true }), ctx: { sessionEnded: false } },
   { label: "gv", mode: "browse", event: key("v"), ctx: { sessionEnded: false, pending: "g" } },
@@ -127,8 +143,9 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   { label: "visual: a", mode: "visual", event: key("a"), ctx: { sessionEnded: false } },
   { label: "visual: Shift+D", mode: "visual", event: key("D", { shiftKey: true }), ctx: { sessionEnded: false } },
   { label: "visual: Ctrl+c, a turn is running", mode: "visual", event: key("c", { ctrlKey: true }), ctx: { sessionEnded: false, turnRunning: true } },
-  // Cover every CARET_KEYS row, three keys that must never answer, and running/idle Ctrl+c.
-  // Idle Ctrl+c is claimed in CARET, unlike the VISUAL case above.
+  // One case per CARET_KEYS row, plus three "never an
+  // answer" pins and the Ctrl+c pair, this time for CARET -- where idle Ctrl+c is CLAIMED, the
+  // opposite of VISUAL's own pin just above.
   ...CARET_KEYS.flatMap(({ keys }) =>
     keys.split(" / ").map((token) => ({
       label: `caret: ${token}`,
@@ -148,7 +165,7 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
     event: key("c", { ctrlKey: true }),
     ctx: { sessionEnded: false, turnRunning: true },
   },
-  // A design decision (2026-09-30): INPUT's Ctrl+y, an ADDED key under F10, appended so the
+  // INPUT's Ctrl+y, an ADDED key under the freeze, appended so the
   // regenerated fixture diffs as additions only. BROWSE's own "Ctrl+y" row above is unchanged; the
   // Shift pin says only the exact chord approves.
   { label: "Ctrl+y, input", mode: "input", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },

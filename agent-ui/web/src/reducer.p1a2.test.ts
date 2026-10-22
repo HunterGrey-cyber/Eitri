@@ -3,14 +3,24 @@ import { applyEvent, applySnapshot, initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiSnapshot } from "./types";
 import fixture from "./fixtures/p1a2-mid-stream.json";
 
-/** Text already included in a tab-switch or reload snapshot must not arrive again in the next
- * pump. Queued events carry their projection revision; `AgentBackend::note_ui_snapshot` saves
- * the snapshot revision, and `TabSet::pump` excludes events at or below it. The fixture comes
- * from a Rust test in `core/src/tab_set.rs` and contains both filtered and unfiltered events.
- * `midStream` covers text folded without an intervening tick; `foldAfterADrain` covers text
- * folded after a drain but before the snapshot read. Each case holds the actual snapshot,
- * `nextEvents`, and `nextEventsUnfiltered`, allowing the reducer test to detect duplicate text
- * across the language boundary. */
+/**
+ * On the sidecar backend, text already inside a tab-switch or
+ * reload snapshot could be delivered again by the very next pump, so the reply text rendered
+ * twice. The fix is Rust-side and this reducer is unchanged: every queued event carries the
+ * projection revision its fold produced, the snapshot's own revision is noted on the backend
+ * (`AgentBackend::note_ui_snapshot`), and `TabSet::pump` leaves every event at or below it out of
+ * the next `events` payload (`core/src/tab_set.rs`).
+ *
+ * The fixture is not hand-typed. It is written by the Rust test
+ * `core/src/tab_set.rs`, `tests::with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both`
+ * (its own `writtenBy` field says so too), which compares it on every run and rewrites it only
+ * under `EITRI_WRITE_FIXTURES=1` when it differs. For each of the two shapes -- `midStream`, the
+ * text folded with no tick since the last one, and `foldAfterADrain`, text
+ * folded right after a tick's drain but before the snapshot read, it holds the real snapshot that
+ * `TabSet::active_state_payloads` sent, the real `events` of the tick after it (`nextEvents`), and
+ * what that same tick sends without the revision filter
+ * (`nextEventsUnfiltered`).
+ */
 interface P1a2Case {
   text: string;
   snapshot: AgentUiSnapshot;
@@ -49,18 +59,21 @@ describe("P1-A2: a mid-stream snapshot is never followed by a repeat of its own 
       expect(renderedCount(testCase, testCase.nextEvents)).toBe(1);
     });
 
-    // Without the Rust filter, the same tick renders the text twice because the reducer does not
-    // deduplicate. If this reads 1, the fixture no longer captures the race or the reducer hides
-    // it, so the preceding test no longer proves the filter works.
+    // What makes the case above a test of anything: the reducer itself does not deduplicate, so the
+    // tick without the Rust filter renders the text twice. If this ever reads 1, the fixture no
+    // longer records the race (or the reducer began hiding it), and the case above proves nothing.
     it(`${name}: the same tick without the Rust filter renders the text twice`, () => {
       expect(renderedCount(testCase, testCase.nextEventsUnfiltered)).toBe(2);
     });
   }
 
-  /** Keep this case hand-built so it remains useful independently of the fixture. New text folded
-   * after a mid-stream snapshot must append to the snapshot's open message without duplicating
-   * it or creating a second bubble. This must match `AgentSessionProjection::apply`, like the
-   * `content_delta` case in `reducer.ts`. */
+  /**
+   * The counterexample stays hand-built so it remains meaningful whatever the fixture
+   * holds: a mid-stream snapshot can legitimately be followed by real queued events -- text folded
+   * after the switch/reload snapshot was read -- and the reducer must append that as a continuation
+   * of the still-open message, never as a duplicate or a second bubble (the same rule `MUST stay
+   * identical to AgentSessionProjection::apply` documents in `reducer.ts`'s own `content_delta` case).
+   */
   it("appends a genuinely new delta to the snapshot's own open message, not a second one", () => {
     const snapshot: AgentUiSnapshot = {
       ...initialState(),

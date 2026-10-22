@@ -4,8 +4,8 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-// Used only by the Linux-only `no_orphan_survives_the_host_being_killed` test.
-// Conditional imports avoid unused-import warnings on macOS.
+// Used only by `no_orphan_survives_the_host_being_killed`, which is Linux-only: on macOS (this
+// crate's second host, `Cargo.toml`) these would otherwise be unused-import warnings.
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStringExt;
@@ -77,9 +77,12 @@ fn the_child_gets_exactly_the_hosts_environment_minus_tmux_plus_three() {
     assert_eq!(got, want);
     assert_eq!(got.get(&OsString::from("TERM_PROGRAM")), Some(&OsString::from("eitri")));
     assert!(!got.contains_key(&OsString::from("TMUX")) && !got.contains_key(&OsString::from("TMUX_PANE")));
-    // The owned spawn does not add `ALACRITTY_WINDOW_ID`. If the host already has it,
-    // `child_environment` passes it through. Compare against the host's value so running
-    // this test inside Alacritty also works.
+    // The owned spawn injects nothing of its own -- unlike `alacritty_terminal::tty`, which sets
+    // `ALACRITTY_WINDOW_ID` unconditionally. A host that happens to run this test *inside*
+    // Alacritty legitimately has that variable already, and `child_environment` passes it through
+    // like any other host variable, so the assertion is against the host's own value, not against
+    // absence. An unconditional-absence assertion panics with
+    // `ALACRITTY_WINDOW_ID=12345 cargo test ...`, blaming the spawn for inherited host state.
     assert_eq!(
         got.get(&OsString::from("ALACRITTY_WINDOW_ID")),
         std::env::var_os("ALACRITTY_WINDOW_ID").as_ref(),
@@ -94,8 +97,9 @@ fn the_child_gets_exactly_the_hosts_environment_minus_tmux_plus_three() {
 
 #[test]
 fn the_child_runs_in_the_requested_directory_on_a_tty_of_the_requested_size() {
-    // `stty -a | grep -o '[-]*iutf8'` isolates the flag `PtyChild::spawn` sets explicitly. When
-    // set, `stty -a` prints the bare name; when unset, it adds a leading `-`.
+    // `stty -a | grep -o '[-]*iutf8'` isolates the one flag `PtyChild::spawn` sets explicitly
+    // so the test checks that IUTF8 was actually applied. Set,
+    // `stty -a` prints the bare name; unset, a leading `-`.
     let mut child = PtyChild::spawn(
         &spec("/bin/sh", &["-c", "pwd; stty size; tty; stty -a | grep -o '[-]*iutf8'"]),
         size(100, 30),

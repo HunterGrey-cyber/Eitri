@@ -3,8 +3,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent } from "@testing-library/react";
 import { installCtrlBracketAsEscape, isCtrlBracket } from "./ctrlBracket";
 
-/* WebKitGTK 2.52.6 delivers `Ctrl+[` as `key "["`, `code BracketLeft`, with `ctrlKey` set.
-   The panel must treat this shape as Esc. */
+/* WebKitGTK 2.52.6 delivers `Ctrl+[` as
+   `key "["`, `code BracketLeft`, `ctrlKey` -- and nothing in the panel read that as Esc, which vim,
+   nvim and every terminal do. */
 function ctrlBracket(init: KeyboardEventInit = {}): KeyboardEvent {
   return new KeyboardEvent("keydown", { key: "[", code: "BracketLeft", ctrlKey: true, ...init });
 }

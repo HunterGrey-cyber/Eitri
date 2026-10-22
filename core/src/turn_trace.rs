@@ -451,9 +451,9 @@ mod tests {
         assert!(trace.is_emitted());
     }
 
-    /// A turn whose start or first text reached the panel in a snapshot must complete its trace
-    /// without waiting for a paint report. The panel measures only text received as events. A
-    /// batch seen only through a snapshot must still mark the turn's end.
+    /// A turn whose start or first text reached the panel inside a snapshot gets no
+    /// paint report (the panel measures only text it received as events), so its line must not wait
+    /// for one -- and a batch seen only through a snapshot still marks the turn's end.
     #[test]
     fn a_turn_the_panel_got_inside_a_snapshot_is_complete_without_a_paint() {
         let mut trace = trace();
@@ -499,9 +499,8 @@ mod tests {
         trace.emit(); // no panic, no second line
     }
 
-    /// When the stream cadence releases first text between ticks, stamp its actual dispatch
-    /// instant for the turn that held it. A later paint report is measured from that instant,
-    /// and the stamp must never be applied to another turn.
+    /// First text released by the cadence between ticks is stamped at release for the turn
+    /// that held it, never a later turn. The following paint report measures from that moment.
     #[test]
     fn a_late_stamp_counts_from_when_the_text_went_and_only_for_its_own_turn() {
         let mut trace = trace();

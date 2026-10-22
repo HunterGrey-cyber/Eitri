@@ -3,12 +3,13 @@ import { FIXED_PAIRS } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence } from "./leader";
 import { binding as b, TABLE } from "./testFixtures";
 
-/* Keep `FIXED_PAIRS` and `FIXED_PENDING_ENTRIES` in sync so every working pair is listed
-   in the which-key box and every listed pair completes. */
+/* `resolveKey` completes a prefix from `FIXED_PAIRS`, and the which-key
+   box drawn after the prefix lists `FIXED_PENDING_ENTRIES` -- two lists nothing tied together, so a
+   pair added to one alone would work unlisted, or be listed and cancel. */
 describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
   it("lists exactly the keys FIXED_PAIRS completes each prefix with, each with a label", () => {
     expect(Object.keys(FIXED_PENDING_ENTRIES).sort()).toEqual(Object.keys(FIXED_PAIRS).sort());
-    // Ctrl+w, stored as "C-w", is the fifth reserved prefix.
+    // `Ctrl+w` (`"C-w"`) is the fifth reserved prefix.
     for (const prefix of ["g", "z", "[", "]", "C-w"] as const) {
       const listed = FIXED_PENDING_ENTRIES[prefix].map((e) => e.key);
       expect(listed.slice().sort(), prefix).toEqual(Object.keys(FIXED_PAIRS[prefix]).sort());
@@ -17,7 +18,7 @@ describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
     }
   });
 
-  /* The which-key box labels the six z pairs for row scrolling and folding, beyond zh/zl. */
+  /* What the box says after `z` for the six pairs beyond `zh`/`zl`. */
   it("names the six z pairs the fold and row-scroll keys add", () => {
     const labels = Object.fromEntries(FIXED_PENDING_ENTRIES.z.map((e) => [e.key, e.label]));
     expect(labels).toMatchObject({
@@ -30,7 +31,8 @@ describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
     });
   });
 
-  /* The box lists gg, gf and gx in that order because prefix entries follow table order. */
+  /* What the box says after `g` -- its two older pairs, then `gx`. Listed in this
+     order: the box shows a prefix's pairs in table order. */
   it("names gx after gg and gf", () => {
     expect(FIXED_PENDING_ENTRIES.g.map((e) => [e.key, e.label])).toEqual([
       ["g", "first row"],
@@ -39,7 +41,8 @@ describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
     ]);
   });
 
-  /* Bracket entries list the prompt pair before the waiting-card pair, matching table order. */
+  /* What the box says after a bracket -- the prompt pair it always had, then the
+     card pair `]p` / `[p` adds. Listed in this order: the box shows a prefix's pairs in table order. */
   it("names the ]p and [p pairs after the prompt pairs", () => {
     expect(FIXED_PENDING_ENTRIES["]"].map((e) => [e.key, e.label])).toEqual([
       ["]", "next prompt"],
@@ -51,7 +54,7 @@ describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
     ]);
   });
 
-  /* The box labels all four Ctrl+w directions; `App.tsx` displays its title as Ctrl+w. */
+  /* What the box says after `Ctrl+w`, its title being App.tsx's `Ctrl+w`. */
   it("names the four Ctrl+w pairs by the module they move the keys to", () => {
     expect(FIXED_PENDING_ENTRIES["C-w"].map((e) => [e.key, e.label])).toEqual([
       ["h", "module left"],
@@ -102,8 +105,8 @@ describe("the sequence engine (which-key's state.lua)", () => {
     expect(sequenceTitle(TABLE, ["<leader>", "b"])).toBe("Space b");
   });
   it("a new table cancels nothing by itself but a stale typed prefix advances to cancel", () => {
-    // App drops pending sequences when the table changes. A racing key resolved against the
-    // new table must not run a binding that was removed.
+    // App drops the pending sequence on a new table; if a key races in, the engine
+    // over the NEW table must not run an old binding.
     const fresh = { ...TABLE, bindings: TABLE.bindings.filter((x) => x.action !== "tab.close") };
     expect(advanceSequence(fresh, ["<leader>", "b"], "d").kind).toBe("cancel");
   });

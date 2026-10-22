@@ -18,7 +18,7 @@ function notice(overrides: Partial<HistoryNotice> = {}): HistoryNotice {
 }
 
 describe("historyNoticeText", () => {
-  /* One example for each history notice form. */
+  /* The four wordings of the restored-history table, one example each. */
 
   it("says where a complete history came from", () => {
     expect(historyNoticeText(notice())).toBe("Earlier messages in this session, read from Claude's own transcript.");
@@ -52,8 +52,10 @@ describe("historyNoticeText", () => {
     );
   });
 
-  /* A fallback copy can also be truncated. Announce both the fallback and the omitted history,
-     in that order, so neither condition is hidden. */
+  /* A truncated fallback is both of those things at once. The restored-history table lists four cases and this is
+     not one of them, but two invariants each demand one of the two sentences -- 14 ("falling back
+     to A always says so on screen") and 9 ("truncation is always said on screen") -- so the only
+     honest answer is both, in that order. Choosing one would break the other invariant silently. */
   it("says both when the fallback copy was also truncated", () => {
     const text = historyNoticeText(
       notice({ source: "eitri_copy", fallbackReason: "unknown history format version 2", omittedItems: 7 }),
@@ -68,8 +70,8 @@ describe("historyNoticeText", () => {
   });
 
   /* **The count is this restore's own, never a build-wide cap.** This sentence used to print
-     `HISTORY_MAX_ITEMS` -- the 400-item ceiling -- on every truncated restore, and the whole-branch
-     review measured a real session restoring 32 items that would have read "The last 400 records".
+     `HISTORY_MAX_ITEMS` -- the 400-item ceiling -- on every truncated restore, and a
+     real session that restored 32 items would have read "The last 400 records".
      Two notices differing only in `restoredItems` have to produce two different sentences; a
      constant, in either language, cannot do that. The second assertion is what stops the first
      from being satisfied by a literal that happens to equal this fixture's 42: no multi-digit

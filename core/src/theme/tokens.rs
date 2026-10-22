@@ -794,8 +794,8 @@ mod tests {
         assert_eq!(moved, vec!["--nv-font-size"]);
     }
 
-    /// Without an editor row height, the panel uses the `24px` fallback in `index.css`. The
-    /// shell sets the variable when `connect_cell_size_changed` reports a cell height.
+    /// Without a reported cell height the panel keeps `index.css`'s 24px fallback. The shell sets
+    /// it as soon as `neovide-editor`'s `connect_cell_size_changed` reports one.
     #[test]
     fn the_editor_row_is_a_css_var_only_once_the_editor_reported_it() {
         let mut t = ThemeTokens::fallback();
@@ -1617,7 +1617,7 @@ mod tests {
         );
     }
 
-    /// sw-theme-2's own probe: the shipped `zaibatsu` colorscheme's real highlight data (measured
+    /// The shipped `zaibatsu` colorscheme's real highlight data (measured
     /// via headless nvim: `Normal` fg=#ffffff/bg=#0e0024, `NormalFloat` linking through `Pmenu` to
     /// fg=#0e0024/bg=#ffffff). `surface` picks up the floating background but nothing ever guards a
     /// foreground for text drawn on it, so a tool/permission card painted `--nv-surface` under
@@ -1650,7 +1650,7 @@ mod tests {
         );
     }
 
-    /// sw-theme-3's own probe: the shipped `pablo` colorscheme's real highlight data (`Comment`
+    /// The shipped `pablo` colorscheme's real highlight data (`Comment`
     /// fg=#808080, `Visual` bg=#a9a9a9 not-reverse, `Normal` fg=#ffffff/bg=#000000). `cursorline` is
     /// guarded only against `fg` and `muted` only against `bg` -- never against each other, though
     /// `index.css` paints `muted` text directly on a `cursorline` fill (the detail popover's current
@@ -1674,11 +1674,10 @@ mod tests {
         );
     }
 
-    /// Moving `muted` toward `fg` to improve contrast against `cursorline` can reduce its contrast
-    /// against `bg` when it starts on the opposite side of `bg` from `fg`. Here black Comment text
-    /// already passes on mid-grey `bg` at 4.62:1. Mixing toward white can produce `#e6e6e6`, passing
-    /// on `cursorline` at 4.60:1 but failing on `bg` at 3.64:1. Muted text appears on both surfaces,
-    /// so it must meet the contrast threshold on both at once.
+    /// Moving `muted` toward `fg` to clear `cursorline` can reduce its contrast against `bg`
+    /// when `muted` and `fg` lie on opposite sides of `bg`. A black Comment on mid-grey passes
+    /// the first guard at 4.62:1, but mixing toward white can yield `#e6e6e6`: 4.60:1 against
+    /// `cursorline`, only 3.64:1 against `bg`. Muted text is painted on both and must read on both.
     #[test]
     fn muted_reads_on_bg_and_cursorline_at_once_when_the_comment_sits_across_bg() {
         let t = ThemeTokens::derive(&payload(
@@ -1700,7 +1699,7 @@ mod tests {
         );
     }
 
-    /// sw-theme-4's own probe: the real payload the verifier fed through `ThemeTokens::derive`
+    /// A real payload fed through `ThemeTokens::derive`
     /// (rose-pine dawn's `Normal` fg=#575279/bg=#faf4ed, `StatusLine` fg=#faf4ed/bg=#d7827e).
     /// Neither of Normal's own colours reaches 4.5:1 against this `chrome`, and `ensure_contrast`'s
     /// own doc says it "returns toward when no step does" -- so without a pole fallback, `chrome_fg`

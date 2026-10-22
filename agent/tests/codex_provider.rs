@@ -1194,7 +1194,7 @@ fn a_child_that_exits_is_a_session_unavailable_notice() {
 
 // ---------------------------------------------------------------- how a turn ends
 
-/// A `codexErrorInfo` value as Codex writes it, with the expected turn outcome.
+/// A row of the error table: the `codexErrorInfo` as Codex writes it, and what the turn becomes.
 struct Row {
     info: Value,
     outcome: TurnOutcome,

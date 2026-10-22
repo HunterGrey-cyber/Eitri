@@ -93,7 +93,7 @@ mod tests {
     }
 
     /// `vim.cmd` inside a libuv callback is a fast event and fails with E5560 at RUNTIME -- never at
-    /// load, and never in a way a `--cmd` reports. The hop is the fix and it is easy to drop while
+    /// load, and never in a way a `--cmd` reports. The hop is what avoids that, and it is easy to drop while
     /// "simplifying" this line.
     #[test]
     fn the_timer_callback_hops_to_the_main_loop_before_running_a_command() {

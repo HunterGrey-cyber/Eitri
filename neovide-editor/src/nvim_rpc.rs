@@ -509,9 +509,10 @@ mod tests {
         assert_eq!(watch.last_alive(), watch.sent_at);
     }
 
-    /// Nvim's answer reaches the worker through a oneshot before the worker publishes it.
-    /// `settled` waits up to its bound for publication so a caller at nvim's exit can read the result.
-    /// A request still outstanding at the bound remains outstanding.
+    /// Nvim's answer reaches the worker through a oneshot, and the worker
+    /// publishes it a moment later. `settled` waits (bounded) for that, so a caller deciding at
+    /// nvim's exit reads how the request really ended; one still outstanding at the bound reads as
+    /// outstanding.
     #[test]
     fn settled_waits_for_the_worker_to_publish() {
         let call = async {
@@ -531,8 +532,8 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(100), "it waited the bound");
     }
 
-    /// A request ended by nvim exiting without an answer is `done` but not `returned`.
-    /// The host must distinguish that exit from a cancelled quit.
+    /// A request that ended without nvim's answer (nvim went away) is
+    /// `done` and NOT `returned`, so a host never takes an exit for a cancel.
     #[test]
     fn a_call_that_ends_without_an_answer_is_done_but_not_returned() {
         let call = async { false };
@@ -793,8 +794,8 @@ mod tests {
 
         #[test]
         fn a_watched_quit_is_held_behind_a_pending_key_and_a_stopped_nvim_stops_answering() {
-            // `nvim_child` tests examine every child of this process. Hold their spawn lock so this test's
-            // `nvim --embed` cannot appear during another test's child search.
+            // `nvim_child`'s tests look at every child this process has, so this
+            // test's own `nvim --embed` must not appear while one of them runs.
             let _serial = crate::nvim_child::SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)

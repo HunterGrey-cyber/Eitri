@@ -83,8 +83,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             AgentDomainEvent::ResumeOutcome { .. } => "ResumeOutcome",
             AgentDomainEvent::SessionUnavailable { .. } => "SessionUnavailable",
             AgentDomainEvent::SessionClosed { .. } => "SessionClosed",
-            // The crate never issues `SetPermissionMode`, so this event is unsolicited.
-            // Matched for exhaustiveness.
+            // Unsolicited under the shared gate (this crate never issues SetPermissionMode): matched for
+            // exhaustiveness.
             AgentDomainEvent::PermissionModeChanged { .. } => "PermissionModeChanged",
             AgentDomainEvent::UngatedCliMode { .. } => "UngatedCliMode",
             AgentDomainEvent::CliPermissionMode { .. } => "CliPermissionMode",

@@ -312,8 +312,9 @@ mod tests {
         );
     }
 
-    /// A bare `/model` or `/effort` gets no appended context, even with a file open.
-    /// The CLI would read that block as an argument and omit the reply the picker expects.
+    /// A bare `/model` or `/effort` must stay bare even with a file open. Appending an editor context
+    /// block makes the CLI's local-command router treat it as an argument, preventing the reply
+    /// this panel's picker parses.
     #[test]
     fn a_bare_model_or_effort_command_gets_no_context_appended() {
         assert_eq!(
@@ -331,9 +332,10 @@ mod tests {
         );
     }
 
-    /// Local commands with arguments also get no appended context, including picker choices
-    /// such as `/model haiku` and `/effort low`. The CLI treats the trimmed text after the command
-    /// name as its argument, so context would corrupt the model name or effort level.
+    /// Picker-generated `/model <choice>` and `/effort <level>` must not receive editor context.
+    /// The CLI treats everything after the command name, trimmed, as its argument (`ZEe` in
+    /// 2.1.283). Appending context would turn `haiku` into `haiku\n\nThe user opened the file ...`
+    /// and make an effort level such as `low` invalid.
     #[test]
     fn a_local_command_with_an_argument_gets_no_context_either() {
         let selection = Some(Selection {
@@ -382,9 +384,9 @@ mod tests {
         assert!(CLI_LOCAL_COMMANDS.contains(&"model") && CLI_LOCAL_COMMANDS.contains(&"effort"));
     }
 
-    /// Local command definitions can put `name` before `type` or hold the name in a variable.
-    /// The fixed names include `keybindings`, `rewind` with `checkpoint` and `undo`,
-    /// `low-priority` and `claim-credit`; all must be sent without appended context.
+    /// Matching only `{type:"local",name:"…"` misses definitions whose name precedes their type
+    /// (`keybindings`, `rewind` with `checkpoint`/`undo`) or whose name is in a variable
+    /// (`Sae` is `low-priority`, `MOt` is `claim-credit`). All four are built in and fixed by name.
     #[test]
     fn local_commands_defined_name_first_or_by_variable_are_sent_as_typed() {
         for typed in [
@@ -457,8 +459,8 @@ mod tests {
         assert_eq!(out.matches('Z').count(), CONTENT_LIMIT);
     }
 
-    /// `&s[..2000]` panics mid-codepoint. Chinese text is valid editor input; a selection of
-    /// it is not an exotic case here.
+    /// `&s[..2000]` panics mid-codepoint. Users type Chinese and other multibyte text into this
+    /// editor; a selection of it is not an exotic case here.
     #[test]
     fn truncation_counts_characters_not_bytes_so_multibyte_text_cannot_panic() {
         let long = "字".repeat(CONTENT_LIMIT + 10);
@@ -503,11 +505,19 @@ mod tests {
         assert!(out.starts_with("The user opened"), "{out}");
     }
 
-    /// Checks that stripping a composed turn recovers exactly the typed text, beside the
-    /// forward composition cases. Transcripts store wire text, which can include appended
-    /// editor context. Feeding it directly into `AgentDomainEvent::UserPromptSubmitted` would
-    /// display paths and selections as user-authored text. `strip_composed_block` lives in
-    /// `agent` so its transcript reader can use it without a dependency cycle.
+    /// The round trip a restored history needs (the composed block stripped back off the stored
+    /// prompt), kept beside the forward cases so
+    /// the two directions cannot be changed independently.
+    ///
+    /// It matters because the prompt text a transcript stores is the WIRE turn, not what the user
+    /// typed: measured 2026-09-20, 2 of the 6 SDK-driven sessions on this machine end with a block
+    /// this function appended. Rendering that as
+    /// `AgentDomainEvent::UserPromptSubmitted` -- whose own doc says `text` is "the text the user
+    /// typed, deliberately NOT the text that went on the wire" -- would show a file path and a
+    /// selection nobody wrote.
+    ///
+    /// `strip_composed_block` lives in `agent`, not in this file, because `eitri-core` depends on
+    /// `agent`; see this module's re-export for the full reason.
     #[test]
     fn stripping_the_composed_block_recovers_exactly_what_the_user_typed() {
         let selections = [

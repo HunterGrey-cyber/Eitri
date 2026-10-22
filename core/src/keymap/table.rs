@@ -871,8 +871,8 @@ mod tests {
         KeySpec::parse(name).unwrap()
     }
 
-    /// Expected defaults, row by row, as `(key, action with its options, -r)`.
-    /// This literal fixture checks the table's bindings, options and repeat flags.
+    /// Pin default keys row by row as `(key, action with its options, -r)`. An independent
+    /// expected table catches changed actions, options or repeatability in the defaults.
     const DEFAULTS_FIXTURE: &[(&str, &str, bool)] = &[
         ("C-b", "send-prefix", false),
         ("M-H", "move.left", true),
@@ -949,7 +949,7 @@ mod tests {
         ("f", "hint", false),
         ("r", "panel.reload", false),
         ("?", "panel.keymap", false),
-        // tmux's `command-prompt`, here the panel's `:` line, which runs nothing.
+        // tmux's `command-prompt` opens the panel's `:` line without running anything.
         (":", "panel.command-line", false),
         ("C-l", "send-keys keys=C-l", false),
         ("C-h", "send-keys keys=C-h", false),
@@ -1071,9 +1071,9 @@ mod tests {
         assert!(map.bindings().iter().all(|b| b.source == Source::Default));
     }
 
-    /// `prefix :` opens the panel's `:` line. Leaving it unbound would make the armed prefix swallow
-    /// it and let subsequent letters run as panel keys. The binding is not repeatable, matching tmux's
-    /// `command-prompt`, and the `?` overlay describes it in the prefix section.
+    /// `prefix :` must open the panel command line, matching tmux command-prompt. An unbound
+    /// colon would be swallowed by the prefix table and leave subsequent letters running as panel
+    /// keys. The binding is non-repeatable like stock tmux, and the prefix help lists its action.
     #[test]
     fn prefix_colon_opens_the_panels_command_line() {
         let map = Keymap::defaults();
@@ -1085,7 +1085,7 @@ mod tests {
         assert_eq!(map.keys_for(&bound.action), vec![k(":")]);
     }
 
-    /// Every default key is stock tmux's, with stock's `-r`, unless the spec marks it eitri-only.
+    /// Every default key matches stock tmux and its `-r`, except explicitly listed Eitri-only actions.
     #[test]
     fn every_default_is_a_stock_tmux_key_or_marked_eitri_only() {
         // `[` and `PPage` are stock tmux's own keys too (both non-repeatable, like our `copy-mode`
@@ -1135,7 +1135,7 @@ mod tests {
         }
     }
 
-    /// Setting an already-bound default key fails with a message naming both bindings.
+    /// A collision reports both the occupied key and the action already using it.
     #[test]
     fn set_on_a_default_key_fails_naming_both_bindings() {
         let err = Keymap::apply_user(&[set("l", "resize.right")], &[]).unwrap_err();
@@ -1325,7 +1325,7 @@ mod tests {
         );
     }
 
-    /// `;` and `o` sit right after the arrows, whose row means something else
+    /// Bindings added 2026-09-29: `;` and `o` sit right after the arrows, whose row means something else
     /// ("that way"); each says what it does and neither joins it.
     #[test]
     fn help_gives_the_last_and_next_module_keys_rows_of_their_own() {
@@ -1349,7 +1349,7 @@ mod tests {
         );
     }
 
-    /// A user `set` on either key now fails naming the default, until
+    /// Those two keys are frozen defaults: a user `set` on either key now fails naming the default, until
     /// the user frees the key with `del`, as for every other default.
     #[test]
     fn set_on_semicolon_or_o_names_the_default_it_would_shadow() {
@@ -1520,9 +1520,9 @@ mod tests {
         assert!(err(&[set("gt", "tab.rename")]).contains("tab.rename"));
         assert!(err(&[set("<C-x>", "tab.new")]).contains("<C-x>"));
         assert!(err(&[del("zz")]).contains("nothing binds"));
-        // `gt` is a default, so rebinding it is refused until it is deleted.
+        // `gt` is a default binding, so rebinding it is refused until it is deleted.
         assert!(err(&[set("gt", "tab.new")]).contains("tab.next (default)"));
-        // `zq`, not `zb`: `zb` is reserved for BROWSE in panel.rs's TAKEN_PAIRS.
+        // `zq`, not `zb`: `zb` is reserved for BROWSE (panel.rs's TAKEN_PAIRS).
         let ok = Keymap::apply_user(&[del("H"), set("H", "tab.next"), set("zq", "tab.new")], &[]).unwrap();
         assert_eq!(ok.panel_user().sets.len(), 2);
         assert_eq!(ok.panel_user().dels.len(), 1);

@@ -173,8 +173,8 @@ mod tests {
         ModuleId::terminal()
     }
 
-    /// The initial layout with the terminal below the editor's own leaf,
-    /// before anything is hidden.
+    /// The first launch with the terminal in it (the default since 2026-09-28: below the editor's own
+    /// leaf), before anything is hidden.
     fn with_terminal() -> Layout {
         Layout::initial(&[ModuleDecl {
             id: term(),
@@ -211,8 +211,9 @@ mod tests {
         assert_eq!((rect.w, rect.h), (541, 240));
     }
 
-    /// The initial layout with a Lua `side` panel: `[[editor / term] | agent] | side`.
-    /// The terminal goes below the editor's own leaf only.
+    /// The first launch with a Lua `side` panel too, terminal below the editor before it (the
+    /// equivalence check for that below-the-editor default): `[[editor / term] | agent] | side`, terminal below the
+    /// editor's own leaf only.
     fn with_terminal_and_side() -> Layout {
         Layout::initial(&[
             ModuleDecl {
@@ -363,7 +364,7 @@ mod tests {
             kill(&mut layout, &editor(), Reopen::Never, &frame()),
             Err(LayoutError::Gone(editor()))
         );
-        // Still a hidden leaf -- and the state file writes it shown, as it was before (T6-5).
+        // Still a hidden leaf -- and the state file writes it shown, as it was before.
         assert!(layout.contains(&editor()));
         assert!(layout.hidden().contains(&editor()));
         assert!(!layout.saved_hidden().contains(&editor()));

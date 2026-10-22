@@ -584,8 +584,9 @@ mod tests {
             provider_session_id: "claude-uuid-not-the-sidecars".into(),
             model: "claude-sonnet-5".into(),
             cwd: "/tmp".into(),
-            // The sidecar reports the CLI permission mode actually in force.
-            // An empty value means unreported and does not trigger session closure here.
+            // The sidecar reports the permission mode actually in force, so the host can detect a
+            // mode that differs from its request. Empty here means unreported: noted without tripping
+            // the mode guard, leaving exactly one event for this test.
             permission_mode: String::new(),
             // `account_identity` and `init_fingerprint` are not read by this test.
             ..Default::default()
@@ -619,8 +620,7 @@ mod tests {
         let event = wrap(ProtoEvent::TextDelta(TextDelta {
             turn_id: "turn-1".into(),
             text: "hi".into(),
-            // `message_id` belongs to the `text_delta_message_id` capability and is not used by this
-            // translator yet.
+            // `text_delta_message_id` carries the message identity used to split text runs.
             ..Default::default()
         }));
         assert_eq!(
@@ -1254,8 +1254,9 @@ mod tests {
         }))
     }
 
-    /// A `SessionReady` reporting a mode less restrictive than `default` opens the session
-    /// and then signals that it must close. Unknown modes also trigger closure.
+    /// A `SessionReady` whose CLI reports a mode less restrictive than `default` -- a project's
+    /// own `permissions.defaultMode`, most likely -- opened a session that must be closed. Both are
+    /// said, the opening first. An unknown value resolves toward stopping.
     #[test]
     fn a_session_ready_reporting_a_less_restrictive_mode_opens_and_trips() {
         for reported in ["bypassPermissions", "acceptEdits", "auto", "weird"] {
@@ -1284,9 +1285,9 @@ mod tests {
         }
     }
 
-    /// The client never requests a mode switch, so `PermissionModeChanged` is unsolicited.
-    /// `default` is a no-op. A less restrictive mode, reported by name or by the BYPASS enum
-    /// alone, signals that the session must close.
+    /// This client never requests a mode switch, so `PermissionModeChanged` is unsolicited.
+    /// `default` folds to a no-op; a less restrictive mode, named explicitly or through the
+    /// BYPASS enum alone, closes the session.
     #[test]
     fn a_permission_mode_change_trips_unless_it_reports_default() {
         assert_eq!(
@@ -1403,10 +1404,9 @@ mod tests {
             .is_some_and(|l| l.contains("PermissionModeChanged")));
     }
 
-    /// For a session requesting auto mode, `auto` and the `default` fallback open the session
-    /// and emit `CliPermissionMode` for the answer path. Any other report opens the session
-    /// and signals closure, including stricter modes and an empty report.
-    /// A session requesting `default` would only note those stricter or unreported values.
+    /// A session requesting CLI auto accepts `auto` and its `default` fallback and reports
+    /// which was selected through `CliPermissionMode` for the answer path. Everything else
+    /// opens and trips, including stricter modes and empty reports that default sessions only note.
     #[test]
     fn a_session_that_asked_for_auto_accepts_auto_or_default_and_trips_on_anything_else() {
         let auto = RequestedCliMode::Auto;

@@ -107,13 +107,9 @@ mod tests {
         emit(&lua, &bus, "nothing_here", Value::Nil);
     }
 
-    /// Regression test for the reentrancy panic the final review reproduced: a handler for
-    /// `"test_event"` that itself calls `eitri.on("test_event", ...)` -- subscribing another
-    /// handler to the very event currently being emitted -- must not panic with `BorrowMutError`.
-    /// Before the fix, `emit` held `bus.borrow()` for the entire loop (including while each
-    /// handler ran), so `EventBus::subscribe`'s `bus.borrow_mut()` from inside the handler would
-    /// panic; the fix clones the handler list out and drops the borrow before calling any of
-    /// them.
+    /// An event handler may subscribe another handler to the event being emitted without
+    /// `BorrowMutError`. Holding `bus.borrow()` through callbacks would conflict with subscribe's
+    /// mutable borrow, so emit must clone the handler list and release its borrow first.
     #[test]
     fn handler_that_subscribes_another_handler_to_the_same_event_does_not_panic() {
         let lua = Lua::new();

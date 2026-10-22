@@ -1,20 +1,27 @@
-//! Checks that core, agent and terminal crates have no GUI toolkit dependencies.
-//! Runs `cargo tree -p <crate> -e normal --offline --locked --prefix none` separately
-//! for each of the seven target crates. Package names are checked for gtk, gdk, glib,
-//! gio, gobject, webkit, javascriptcore, gsk, pango and cairo, ignoring case.
-//! Substring matching also catches their `*-sys` packages without listing each one.
-//! `-e normal` follows only normal dependency edges. Offline mode uses cached packages;
-//! locked mode fails rather than updating `Cargo.lock`.
+//! The normal dependency graphs of the toolkit-free crates must contain no GTK, GDK, GLib or
+//! WebKit packages. This checks `eitri-core`, `eitri-panel`, `eitri-mac`, `agent`,
+//! `eitri-terminal`, `terminal-render`, `terminal-frame`, `terminal-sync` and `terminal-input`.
 //!
-//! Per-crate `cargo tree -p` resolves only the named package's dependency closure.
-//! Whole-workspace `cargo metadata` also reads dependencies reachable from shell,
-//! including `gtk4` and `webkit6`. With a cache populated only by a core build, it can
-//! fail on an uncached package before the toolkit check runs.
+//! Each crate gets its own `cargo tree -p <crate> -e normal --offline --locked --prefix none`.
+//! A package name containing gtk, gdk, glib, gio, gobject, webkit, javascriptcore, gsk, pango or
+//! cairo fails, case-insensitively. Substring matching catches the corresponding `*-sys`
+//! packages without listing each. Normal edges exclude build and dev dependencies; offline
+//! uses cached sources, and locked refuses lockfile changes.
 //!
-//! Uses the build-time cargo executable from `env!("CARGO")` so a restricted runtime
-//! `PATH` cannot cause a false pass. Skips only if that executable cannot be launched.
-//! Toolkit violations and cargo errors, including stale lock files or missing target
-//! crates, fail the test.
+//! Per-crate queries also work with a cache populated only for a toolkit-free target, as on
+//! macOS. Whole-workspace `cargo metadata` has no `-p` filter and must read dependencies of
+//! all workspace members before its graph can be filtered, including shell's GTK and WebKit.
+//! With only core's dependencies cached, it can fail on an unrelated missing package such as
+//! `ab_glyph` before checking toolkit isolation. `cargo tree -p` needs only the selected
+//! package's dependency closure. Reproduced 2026-09-28 with an isolated `CARGO_HOME` fetched only
+//! through `cargo build -p eitri-core`: whole-workspace `cargo metadata --offline --locked` failed
+//! that way against it, while `cargo tree -p eitri-core -e normal --offline --locked` against the
+//! same limited cache succeeded.
+//!
+//! The test skips only if the exact Cargo binary that built it (`env!("CARGO")`) cannot run.
+//! Embedding that path avoids silently skipping a violation when a runner restricts PATH.
+//! If Cargo runs and reports a violation or an error, such as a stale lockfile or missing
+//! target crate, the test fails.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

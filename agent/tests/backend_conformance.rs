@@ -103,11 +103,17 @@ fn real_pretooluse_hook_allow_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Checks that the real CLI honors a denial relayed through the full hook path.
-/// A tool call fires `PreToolUse`; `agent-hook` relays it over the socket, and an
-/// `allow=false` response blocks the tool and returns the exact reason in `tool_result`.
-/// Every permission request is denied because the model may retry with a different command.
-/// Each retry fires another hook that needs an answer or the turn stalls until the 600s timeout.
+/// The deny half of the same real round trip -- the single most safety-critical behavior in this
+/// crate, and (until this test) the one thing the hook mechanism existed for that was never
+/// actually exercised end-to-end against the real CLI. Fixture-based tests only proved
+/// the wire-level JSON *shape* of a deny; this proves the real CLI genuinely honors one relayed
+/// through the whole stack: real tool call -> real `PreToolUse` hook fires -> relayed by the real
+/// `agent-hook` binary over the real socket -> answered `allow=false` with a real reason -> the
+/// CLI actually blocks the tool and surfaces that exact reason back in the `tool_result`.
+///
+/// Denies EVERY permission request it sees (not just the first): a denied model commonly retries
+/// with a different command, and each retry is its own real hook firing that must also be answered
+/// or the turn stalls until the CLI's 600s hook timeout.
 #[test]
 #[ignore]
 fn real_pretooluse_hook_deny_end_to_end() {
@@ -172,8 +178,8 @@ fn real_pretooluse_hook_deny_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Was a Phase 0 baseline pinning the cross-session collision this refactor exists to fix; it now
-/// pins the FIX, in the same shape, so a regression is a failure rather than a silence.
+/// Was a baseline pinning the cross-session collision before it was fixed; it now pins the FIX, in
+/// the same shape, so a regression is a failure rather than a silence.
 ///
 /// The collision it used to pin: `HookSettings::generate` wrote a directory-scoped
 /// `<project_dir>/.claude/settings.local.json`, so two `AgentSession`s in one directory shared one
@@ -244,8 +250,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
     }
 
     // Confirm A really did trigger a real tool call this run, so a run where no hook fired at all
-    // cannot be mistaken for evidence of isolation (kept from the Phase 0 version -- its own final
-    // review raised exactly this).
+    // cannot be mistaken for evidence of isolation.
     assert!(
         !session_a.projection.tool_calls.is_empty(),
         "session A never issued a real tool call this run -- re-run, this is not evidence of anything"
@@ -278,7 +283,7 @@ fn real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Phase 0 baseline: pins that `AgentSession::interrupt()` (a) denies and clears every pending
+/// Baseline: pins that `AgentSession::interrupt()` (a) denies and clears every pending
 /// permission request immediately, (b) still lets the interrupted turn's own real `TurnCompleted`
 /// arrive afterward without flipping the session's `ProjectionStatus` to `Closed`, and (c) leaves
 /// the conversation genuinely usable for a further turn on the same process -- distinguishing
@@ -361,13 +366,15 @@ fn drain_until_finished(session: &mut agent::AgentSession) -> String {
     panic!("no TurnCompleted within 60s");
 }
 
-/// Checks that a real CLI can request an edit, stop at the permission gate, and write the
-/// file after approval. The request must carry the fields needed to render a diff.
-/// Diff rendering is covered by `agent-ui/web`; buffer reloading has separate coverage.
+/// Exercise the edit-and-approve flow as far as the agent crate can: the model reaches for
+/// `Edit`, its gate stops the write, the request contains the fields needed for a diff, and
+/// approval actually writes the file. Diff rendering belongs to the web tests; buffer reload
+/// belongs to `eitri-core::buffer_reload`.
 ///
-/// Uses the real `disallowed_tools()` policy so changes to the product's deny list reach
-/// this test, even while that list is empty. Every session uses that list and runs the CLI
-/// with `--permission-mode default` under the gate.
+/// Use the real `disallowed_tools()` helper even though its list is empty: a hard-coded
+/// empty list only proves the CLI can edit and would miss a product policy denying `Edit`
+/// before it could reach a card. The same gated `--permission-mode default` posture applies
+/// to every session, with `Bash` offered too.
 #[test]
 #[ignore]
 fn real_edit_under_the_auto_gate_carries_a_reviewable_request_and_then_writes_the_file() {

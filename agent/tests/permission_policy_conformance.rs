@@ -1,28 +1,104 @@
-//! Tests that the permission policy is never more permissive than the real Claude CLI.
-//! The headless CLI provides an observable permission result: under `default`, with no hook,
-//! `Read` ran and `Write` was denied without creating a file. Under `auto`, a classifier
-//! approved `Bash`, `Read` and `Write`, so that mode cannot serve as the same comparison.
+//! The permission policy, checked against the real Claude CLI instead of against a table copied
+//! out of documentation.
 //!
-//! A CLI denial that the policy would auto-allow fails the test. A CLI allowance that the
-//! policy sends for approval is printed and counted, but passes. The policy requires approval
-//! for compound shell syntax, `WebFetch` and unknown tool names, so equality is not required.
-//! Each probe must call its expected tool to avoid passing without exercising it.
-//! Reads outside the root, including paths containing `..`, exercise path-based classification.
+//! # The oracle, and why one exists at all
 //!
-//! These ignored tests make real, billed CLI calls. Use an isolated profile and state directory.
+//! `agent::permission_policy` reproduces the CLI's *interactive* `default`-mode rules: which tool
+//! calls it would put in front of a human. An interactive prompt is not something a test can read
+//! -- but on 2026-09-19, on CLI 2.1.272, the headless CLI was measured doing the same
+//! classification with a different ending:
+//!
+//! - `claude --print` with **no** `--permission-mode` flag (`init.permissionMode` reports
+//!   `default`) ran `Read` and **denied** `Write` -- `is_error: true`, "Claude requested permissions
+//!   to write to ..., but you haven't granted it yet", and the file was really not created.
+//! - `claude --print --permission-mode auto` ran `Bash`, `Read` **and** `Write` with no prompt,
+//!   because `auto` means "a classifier model approves in your place".
+//!
+//! So under `default`, with no hook installed, **what the CLI allows is what needs no human, and
+//! what it denies is what does**. That is a real oracle, and it is why this file exists: a table
+//! transcribed from docs drifts silently when a release changes the rules, and a test against the
+//! binary does not.
+//!
+//! # What this asserts, exactly
+//!
+//! Not equality. The policy is deliberately **stricter** than the CLI in several places (it refuses
+//! to parse compound shell syntax, it always cards `WebFetch`, it cards any tool name it has never
+//! heard of), and each of those is a documented decision rather than a defect. So the assertion is
+//! one-sided:
+//!
+//! > the policy is never MORE PERMISSIVE than the CLI.
+//!
+//! A call the CLI denied and the policy would have auto-allowed is a security defect and fails the
+//! test, naming the call. A call the CLI allowed and the policy cards is printed, counted, and
+//! passes -- that is the cost side of rule (c), and seeing it listed is the point.
+//!
+//! # Running it
+//!
+//! Real turns, real money, on the TEST Claude profile -- never a personal login:
+//!
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
 //! cargo test -p agent --test permission_policy_conformance -- --ignored --nocapture
 //! ```
 //!
-//! `Write`, `Edit` and `NotebookEdit` are compared under `acceptEdits`; other tools use `default`.
-//! The edit probes check that ordinary in-project edits run while protected paths need approval.
-//! `Edit` must follow `Read` in the same session so validation reaches the permission check.
-//! `file_must_contain` checks the actual result, since a validation error can still satisfy
-//! `expects_tool` without matching `REFUSAL_PHRASES`. Matching "refusing to" also catches
-//! edit denials for symlink leaves and paths whose disk location cannot be determined.
-//! A separate ignored test checks that a user's `Edit(...)` ask rule overrides the gate's allow.
-//! These edit checks have not yet been run against the real CLI.
+//! **First run: 2026-09-19, CLI 2.1.272 on the TEST profile, passed** with four probes: the CLI and
+//! the policy agreed on four calls, and the policy was stricter on one (`pwd; readlink -f /tmp; ls
+//! -la`, which the CLI ran and the policy cards because it contains `;`). Nothing was more
+//! permissive. That run could not have noticed a probe that produced no call at all -- the only
+//! vacuity check was global -- and no probe reached a path outside the project, which is the one
+//! place the policy allows by *reasoning about a path* rather than by name. Both were fixed the same
+//! day: every probe now names the tool it exists to exercise and fails if that tool was never
+//! called, and two probes were added (a `Read` of an absolute path outside the root, and one that
+//! climbs out with `..`).
+//!
+//! **2026-09-28 (indirect reads), CLI 2.1.283 on the TEST profile: passed** with twelve probes, four of
+//! them new for the cards added then (`find -files0-from`, `wc --files0-from`, `diff` of two
+//! directories, read-only git in a project inside a larger repository). Nothing was more permissive;
+//! five calls were stricter -- the four new ones, all of which the CLI ran, and the old piped
+//! `grep`. Run with `XDG_STATE_HOME=$HOME/.cache/nv-policy/state` so test state stays separate.
+//!
+//! **2026-09-28 (config reads and option-shaped paths), CLI 2.1.283 on the TEST profile: passed** with fourteen probes,
+//! two more covering indirect reads -- `git blame` in a repo whose config reads an outside file
+//! and `cat -- -n` through an option-shaped symlink. The CLI ran both and
+//! the policy cards both, so nothing was more permissive and both are counted stricter.
+//!
+//! **2026-09-28 (repository back-links), CLI 2.1.283 on the TEST profile: passed** with fifteen probes, one
+//! more for the repository boundary: `git show HEAD:outside.txt` in a project whose `.git` is a
+//! gitfile naming another repository. The CLI ran it without refusing (the same command, run for real,
+//! prints the other repository's file); the policy cards it. Nothing was more permissive; seven calls
+//! were stricter (the previous six and this one).
+//!
+//! **2026-09-28 (the acceptEdits fast path): NOT YET RUN.** `Write`, `Edit` and
+//! `NotebookEdit` stopped reproducing `default` (which denies every one of them) and started
+//! reproducing `acceptEdits` instead (module doc on `permission_policy`, "The acceptEdits fast
+//! path"). Three probes were changed accordingly: the one plain in-project `Write` probe is now run
+//! under `--permission-mode acceptEdits` rather than no flag, its expected side effect flipped from
+//! "must not exist" to "no longer checked" (the CLI is now expected to create it, same as the
+//! policy), and two probes were added alongside it -- an `Edit` of an existing in-project file, and
+//! a `Write` under a protected directory (`.vscode/settings.json`), both also under `acceptEdits`,
+//! to state the parity claim for BOTH halves of the fast path: an ordinary in-project edit runs, and
+//! a protected path still cards, on both sides. Seventeen probes now, up from fifteen. Not run here
+//! (the real CLI was not invoked); left for the next the test-account wrapper pass.
+//!
+//! **The `Edit` probe above was found likely vacuous before it
+//! ever ran once.** `Edit`'s own `validateInput` refuses a file the session has not `Read` yet,
+//! ahead of hooks and permissions in the CLI's own phase order -- so the original prompt's bare
+//! `Edit` call would have failed validation, never reached a permission decision, and still counted
+//! as "the CLI allowed it" (a validation error is not a [`REFUSAL_PHRASES`] match) while satisfying
+//! `expects_tool: "Edit"` regardless. The prompt now tells the model to `Read` first, and
+//! `file_must_contain` (`Probe`'s own doc) asserts the edit was actually applied -- still not run
+//! here, so this is a claim about what the next the test-account wrapper pass will actually exercise, not a
+//! new passing result.
+//!
+//! **Edit verification, still NOT RUN as of 2026-09-28.** Two ways this oracle could miscount an edit the CLI
+//! refused as one it allowed are closed: [`REFUSAL_PHRASES`] gains "refusing to" (the CLI's own
+//! `Write`/`Edit`/`NotebookEdit` denials for a symlink leaf and an undeterminable path read "Refusing
+//! to write X: ..." -- a case exists today where the policy allows and the CLI refuses: a write to an
+//! in-root symlink leaf, harmless because the CLI's re-check after the hook denies it anyway), and
+//! the in-project `Write` probe now checks `probe.txt` really holds "hello". A second `#[ignore]`d
+//! test, [`a_users_own_ask_rule_still_stops_an_edit_the_gate_allowed`], checks the one CLI behaviour
+//! the edit fast path relies on -- a user's `Edit(...)` ask rule beating the gate's `allow` -- and is owed
+//! to the same pass.
 
 //! **2026-10-08, CLI 2.1.292 on the TEST profile: passed**, 19 probes made calls, nothing more permissive, seven stricter.
 //! The eight `Grep`/`Glob` arms added that day were skipped: 2.1.292 lists neither tool (`TOOLS_THE_CLI_MAY_LACK`), so a
@@ -75,10 +151,12 @@ const REFUSAL_PHRASES: &[&str] = &[
     "needs approval",
     "permission denied by",
     "user doesn't want",
-    // The CLI's edit tools can deny a write with "Refusing to write" when the target is
-    // a symlink or its disk location cannot be determined. Match this wording so a denied
-    // edit is not counted as allowed when the policy allows it. Other safety refusals can
-    // also match, causing a conservative failure rather than hiding an unsafe allowance.
+    // CLI 2.1.283's bundle contains edit-tool denials not yet observed in a run:
+    // "Refusing to write X: it is a symbolic link. ..." (`Zlt`, from the tools' checkPermissions)
+    // and "Refusing to write X: where it leads on disk could not be determined ..." (`xl`).
+    // Without matching these, a policy-allowed but CLI-refused edit counts as agreement.
+    // The bundle has about thirty other safety refusals, including changed links and clone
+    // URLs; matching those can only report a spurious PERMISSIVE failure, the safe direction.
     "refusing to",
 ];
 
@@ -235,17 +313,24 @@ fn the_policy_is_never_more_permissive_than_the_real_cli() {
 /// The tools the Auto policy judges by Claude Code's acceptEdits fast path, and Manual always cards.
 const EDIT_TOOLS: &[&str] = &["Write", "Edit", "NotebookEdit"];
 
-/// Checks that a user's `permissions.ask` rule stops an edit even when the gate's hook allows it.
-/// This probe has not yet been run. An in-project `Write` can receive the hook's `allow`
-/// without a card, so the CLI must re-check the user's `Edit(...)` ask rule before writing.
-/// Under `--print` with no permission prompt tool, the expected result is a refusal.
+/// **NOT YET RUN: owed to the next the test-account wrapper pass.** A user's own `permissions.ask`
+/// rule for an edit must still stop a write the hook allowed. In-project writes can pass the
+/// hook without a card, so the CLI's own re-check must preserve the user's rule.
 ///
-/// The probe uses `--permission-mode default`, `--setting-sources project,local`, and a
-/// `PreToolUse` hook with matcher `*` that answers `allow`. This selection excludes machine-specific
-/// user settings so the probe is independent of them. `Bash` is withheld so the model
-/// cannot create the file through a tool the rule does not cover. The project's
-/// `.claude/settings.json` asks for `Edit(probe-asked.txt)`. The requested file must not exist
-/// afterwards.
+/// Read from CLI 2.1.283's bundle, not yet observed: after hook allow, `EQn` runs `DR`
+/// (checkRuleBasedPermissions), then the tool's `checkPermissions`. Its `Lb` asks when
+/// `Ca(<spelling>, ..., "edit", "ask")` finds an `Edit(...)` rule; `DR` returns a rule-forced
+/// ask (`Pve`), and `EQn` calls `canUseTool` instead of taking the hook's allow. Under print
+/// mode without a permission prompt tool this is a refusal; on the sidecar it carries
+/// `matched_ask_rule`, which core cards in every mode
+/// (`agent_backend::tests::a_users_own_ask_rule_still_cards_an_edit_the_fast_path_allowed`).
+/// This checks the edit case with a real CLI rather than assuming the bundle's branch runs.
+///
+/// Use `--permission-mode default`, `--setting-sources project,local` to avoid dependence on
+/// machine user settings, and a `PreToolUse` hook with matcher `*` answering allow, as the
+/// policy does for this Write (asserted below). Withhold Bash so the model cannot create the
+/// file through another tool. Project settings ask for `Edit(probe-asked.txt)`; after asking
+/// the model to create it, the file must not exist.
 #[test]
 #[ignore]
 fn a_users_own_ask_rule_still_stops_an_edit_the_gate_allowed() {
@@ -329,24 +414,37 @@ struct Probe {
     /// A path that must NOT exist afterwards, for a probe whose whole point is that the CLI refused
     /// to create it. Confirms the refusal by its absence rather than only by what was reported.
     file_that_must_not_exist: Option<&'static str>,
-    /// `(path, substring)` that must exist and contain `substring` after the probe.
-    /// This confirms that the CLI executed the edit, beyond emitting a `tool_use` block.
+    /// `(path, substring)` that must BOTH exist AND contain `substring` afterwards, for a probe
+    /// whose whole point is that the CLI actually reached and executed the edit -- not merely that
+    /// it emitted a `tool_use` block for the right tool name.
     ///
-    /// `Edit` validation rejects a file not yet `Read` in the session before permissions run.
-    /// That validation error does not match [`REFUSAL_PHRASES`], so `parse_calls` can mark it
-    /// `allowed_by_the_cli: true` and satisfy `expects_tool` without a permission decision.
-    /// The prompt requests `Read` first; this check also fails if the expected edit never happens.
+    /// The `Edit` probe must not pass when the CLI never reached a permission decision at all.
+    /// `Edit`'s own `validateInput` refuses a file that
+    /// has not been `Read` in the same session first ("File has not been read yet."), BEFORE hooks
+    /// or permissions run at all (`YSt`'s own phase order: validate, then permission). That refusal
+    /// is a real tool error, not a permission denial -- its wording matches none of
+    /// [`REFUSAL_PHRASES`] on purpose, since this test's whole `allowed_by_the_cli` bookkeeping
+    /// exists to separate "the CLI let this run" from "the CLI denied it for permission reasons" --
+    /// so `parse_calls` counts it `allowed_by_the_cli: true` and `expects_tool` is satisfied by the
+    /// failed call, and the probe passed without ever exercising a real acceptEdits decision. The
+    /// probe's prompt now tells the model to `Read` first; this field is the belt to that prompt's
+    /// suspenders, so a future model that skips the `Read` anyway (or a future CLI that relaxes the
+    /// validation) still fails loudly here rather than passing on a call nothing decided.
     file_must_contain: Option<(&'static str, &'static str)>,
     /// Where the CLI runs, given the fresh workspace -- the workspace itself for every probe but one,
     /// which needs a project inside a larger repository. Also the root the policy judges against.
     run_in: fn(&Path) -> PathBuf,
-    /// `--permission-mode <this>` for the CLI, or no flag (`default`) when `None`.
+    /// `--permission-mode <this>` for the CLI, or no flag at all (`default`) when `None`.
     ///
-    /// `permission_policy` reproduces `acceptEdits` for `Write`, `Edit`, and `NotebookEdit`,
-    /// and `default` for other tools. The CLI denies writes under `default` regardless of path,
-    /// so parity probes for those edit tools use `Some("acceptEdits")` to test the matching mode.
-    /// Other probes use `default`. The Manual-mode edit probe also uses `default` and compares only
-    /// against the Manual policy.
+    /// Every probe here was `None` (`default`) until 2026-09-28 (the acceptEdits fast
+    /// path): `permission_policy` reproduces `default` for every tool EXCEPT `Write`/`Edit`/
+    /// `NotebookEdit`, which now reproduce `acceptEdits` instead (module doc). Comparing one of
+    /// those three against a `default`-mode CLI run would not test what the policy claims to
+    /// reproduce -- the CLI denies every write under `default`, on purpose, regardless of path -- so
+    /// a probe whose `expects_tool` is one of those three must set this to `Some("acceptEdits")`.
+    /// Every other probe stays compared against `default`, unchanged. The one exception is Manual
+    /// mode's own probe (2026-10-14): an edit under `default`, where only the Manual policy is
+    /// compared.
     permission_mode: Option<&'static str>,
 }
 
@@ -354,7 +452,7 @@ fn in_the_workspace(workspace: &Path) -> PathBuf {
     workspace.to_path_buf()
 }
 
-/// `<workspace>/project`, with the enclosing git repository rooted at `<workspace>`.
+/// `<workspace>/project`, with the git repository at `<workspace>` -- a project nested inside another repository.
 fn inside_a_larger_repository(workspace: &Path) -> PathBuf {
     let project = workspace.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -370,9 +468,10 @@ fn inside_a_larger_repository(workspace: &Path) -> PathBuf {
     project
 }
 
-/// The workspace as a committed git repository whose `blame.ignoreRevsFile` points outside it.
-/// `git blame` reads that file, so the policy cards every git call with this non-inert config key.
-/// The probe uses `/etc/os-release`; it only needs the CLI to attempt the read.
+/// The workspace as a committed git repository whose `blame.ignoreRevsFile` points at a file
+/// OUTSIDE it. `git blame` then reads that outside file; the policy
+/// cards every git call in a repo with a non-inert config key. `/etc/os-release` is a public file --
+/// the probe only needs the CLI to attempt the read, not a real secret.
 fn with_a_config_key_reading_an_outside_file(workspace: &Path) -> PathBuf {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -390,9 +489,10 @@ fn with_a_config_key_reading_an_outside_file(workspace: &Path) -> PathBuf {
     workspace.to_path_buf()
 }
 
-/// `<workspace>/project`, whose `.git` file names `<workspace>/victim` without a back-link.
-/// `git show HEAD:outside.txt` prints that repository's committed file; the policy cards every
-/// git call here. The file holds a probe string so the test can detect the read.
+/// `<workspace>/project`, whose `.git` is a gitfile naming ANOTHER repository, `<workspace>/victim`,
+/// which names nothing back. `git show HEAD:outside.txt`
+/// then prints the other repository's committed file; the policy cards every git call here. The
+/// file holds a probe string, not a secret -- the probe only needs the CLI to attempt the read.
 fn with_a_gitfile_naming_a_repository_outside(workspace: &Path) -> PathBuf {
     let victim = workspace.join("victim");
     std::fs::create_dir_all(&victim).unwrap();
@@ -420,9 +520,9 @@ fn with_a_gitfile_naming_a_repository_outside(workspace: &Path) -> PathBuf {
     project
 }
 
-/// A workspace holding a symlink named `-n` that points outside it.
-/// After `--`, every argument is an operand, so `cat -- -n` follows the symlink.
-/// The policy checks `-n` as a path and cards it; the CLI reads `/etc/hostname` through the link.
+/// A workspace holding a symlink named `-n` that points OUTSIDE it:
+/// after `--` every argument is an operand, so `cat -- -n` follows the symlink. The policy checks the
+/// literal `-n` as a path and cards it; the CLI runs `cat`, reading `/etc/hostname` through the link.
 fn with_an_option_shaped_symlink(workspace: &Path) -> PathBuf {
     #[cfg(unix)]
     std::os::unix::fs::symlink("/etc/hostname", workspace.join("-n")).unwrap();
@@ -454,16 +554,18 @@ fn probes() -> Vec<Probe> {
             run_in: in_the_workspace,
             permission_mode: None,
         },
-        // Compare an in-project `Write` against `acceptEdits`, where the CLI's fast path also applies.
-        // `default` denies every write, so it would report the policy as more permissive without
-        // exercising the edit behavior this probe tests.
+        // The acceptEdits fast path: a plain in-project `Write` is no longer compared
+        // against `default` -- `default` denies every write on purpose, which would report this as
+        // "more permissive than the CLI" for a divergence the module doc explains, not a defect.
+        // Compared against `acceptEdits` instead, where the CLI's own fast path applies too, so this
+        // probe is now a real acceptEdits-parity check rather than a `default`-mode one.
         Probe {
             label: "an in-project write, under acceptEdits",
             prompt: "Create a file called probe.txt in the current directory containing the word hello.",
             expects_tool: "Write",
             file_that_must_not_exist: None,
-            // The write must really have happened. A refusal worded outside `REFUSAL_PHRASES`
-            // would otherwise count as the CLI allowing it.
+            // The write must really have happened. A refusal worded
+            // outside `REFUSAL_PHRASES` would otherwise count as the CLI allowing it.
             file_must_contain: Some(("probe.txt", "hello")),
             run_in: in_the_workspace,
             permission_mode: Some("acceptEdits"),
@@ -485,9 +587,11 @@ fn probes() -> Vec<Probe> {
         // an existing file, where `Write` above created a new one.
         Probe {
             label: "an in-project edit of an existing file, under acceptEdits",
-            // `Edit` validation rejects a file not yet `Read` in the session before permissions run.
-            // The prompt requests `Read` first so `Edit` reaches a permission decision.
-            // `file_must_contain` checks that the edit was applied.
+            // `Edit`'s own `validateInput` refuses a file that
+            // has not been `Read` in the same session yet, before hooks or permissions ever run
+            // (`file_must_contain`'s own doc). The prompt now tells the model to `Read` first so the
+            // `Edit` call actually reaches a permission decision, and `file_must_contain` below
+            // checks the edit was really applied rather than merely attempted.
             prompt: "First use the Read tool to read main.rs in the current directory. Then, using \
                      the Edit tool, change the text \"probe\" to \"edited\" in it. Use only the Read \
                      and Edit tools.",
@@ -627,8 +731,8 @@ fn probes() -> Vec<Probe> {
             run_in: inside_a_larger_repository,
             permission_mode: None,
         },
-        // A non-inert repo config key makes `git blame` read an outside file.
-        // The CLI runs it; the policy cards it. This stricter result passes.
+        // A repo config key that reads an outside file. The CLI runs
+        // `git blame`; the policy cards it (non-inert config key). Stricter, which passes.
         Probe {
             label: "git blame in a repo whose config reads an outside file",
             prompt: "Using the Bash tool, run exactly `git blame main.rs` in the current directory \
@@ -639,8 +743,8 @@ fn probes() -> Vec<Probe> {
             run_in: with_a_config_key_reading_an_outside_file,
             permission_mode: None,
         },
-        // After `--`, `-n` is a filename. The CLI runs `cat` and follows the symlink outside the workspace.
-        // The policy cards it. This stricter result passes.
+        // An option-shaped filename after `--`. The CLI runs `cat`,
+        // following the `-n` symlink out of the workspace; the policy cards it. Stricter, passes.
         Probe {
             label: "cat of an option-shaped symlink after --",
             prompt: "Using the Bash tool, run exactly `cat -- -n` in the current directory and tell \
@@ -651,8 +755,8 @@ fn probes() -> Vec<Probe> {
             run_in: with_an_option_shaped_symlink,
             permission_mode: None,
         },
-        // A gitfile names another repository without a back-link. The CLI runs `git show` and prints its file.
-        // The policy cards it. This stricter result passes.
+        // A gitfile naming another repository. The CLI runs `git show`,
+        // printing that repository's file; the policy cards it (no back-link). Stricter, passes.
         Probe {
             label: "git show through a gitfile naming another repository",
             prompt: "Using the Bash tool, run exactly `git show HEAD:outside.txt` in the current \
@@ -836,8 +940,8 @@ fn a_fresh_workspace() -> PathBuf {
     // For the piped-grep probe: a file with a line the command can find, so a `grep` that prints
     // nothing cannot be mistaken for a refusal.
     std::fs::write(dir.join("a.txt"), "alpha\nbeta\n").unwrap();
-    // NUL-terminated lists name only workspace entries, and two directories let `diff` compare files.
-    // Nothing named by these fixtures is outside the workspace.
+    // For the indirect-read probes: NUL-terminated lists naming only what is already here, and two
+    // directories for `diff` to compare. Nothing any of them names is outside the workspace.
     std::fs::write(dir.join("paths"), "main.rs\0").unwrap();
     std::fs::write(dir.join("dirs"), ".\0").unwrap();
     for side in ["a", "b"] {

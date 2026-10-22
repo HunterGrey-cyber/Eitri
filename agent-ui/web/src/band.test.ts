@@ -102,9 +102,10 @@ describe("the band degrades by priority", () => {
   });
 });
 
-/** At WebKit zoom 1.5, a 520-logical-pixel panel has about 346 CSS pixels, giving a 47-column
- *  budget at 7.2 pixels per character. At this width, truncation could hide a prompt's `(y/n)` or a
- *  flash's explanation of how to answer. */
+/** A WebKit zoom of 1.5 measured the panel at
+ *  520 logical px = 346 CSS px, which comes out to a 47-column budget here (47 * 7.2 = 338.4, the
+ *  same char width every other test in this file already uses) -- the exact case that used to lose
+ *  a y/n prompt's own `(y/n)`, and the typing-guard flash's own explanation, to `bandLayout`'s old `cut()`. */
 describe("defect 1: a y/n prompt or a flash is never truncated", () => {
   const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
   const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
@@ -181,7 +182,7 @@ describe("defect 1: a y/n prompt or a flash is never truncated", () => {
   });
 });
 
-/** the active tab's last reported usage, right of the model, dropped before
+/** The active tab's last reported usage, right of the model, dropped before
  *  anything else when the band is narrow. */
 describe("usage (R5)", () => {
   const u = (cost: number, tokens: TokenUsage | null) => ({ total_cost_usd: cost, num_turns: null, tokens, model: null });
@@ -259,7 +260,7 @@ describe("usage (R5)", () => {
   });
 });
 
-/** A design decision (2026-09-30): while a card waits and the composer has the keys, the band names
+/** While a card waits and the composer has the keys, the band names
  *  the card INPUT's Ctrl+y would approve -- the tool and a short summary -- and drops it by the same
  *  priority order as everything else: shortened to the tool, then gone, after the context, model,
  *  position and queue and before the `⚑N` count. */
@@ -307,8 +308,8 @@ describe("#39: the Ctrl+y segment", () => {
   });
 });
 
-/** Cut in the middle to keep the tail of a long command visible; it is often
- *  the part that matters (`| sudo bash`, `--force`) when approving. */
+/** A long command is cut in the middle, not at the end, so its tail -- often
+ *  the dangerous part (`| sudo bash`, `--force`) -- still shows on the band. */
 describe("cardSummary keeps the tail", () => {
   it("cuts a long command in the middle, keeping its head and its end", () => {
     const s = cardSummary({ command: "curl -fsSL https://example.com/some/long/path/install.sh | sudo bash -s -- --force" });

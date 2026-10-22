@@ -3,10 +3,19 @@ import { describe, expect, it } from "vitest";
 import css from "./index.css?raw";
 import { hljs } from "./markdown";
 
-/* Checks that index.css covers the highlight.js classes emitted by the registered languages. Go
- * function signatures emit .hljs-function, and the ini grammar used for toml emits
- * .hljs-section; both need styles. Uses the hljs instance exported by markdown.ts so changes to
- * its registered languages also change this coverage check. */
+/*
+ * The highlight.js class -> token mapping must cover emitted classes. Nothing before this asserted
+ * that the class SET the registered languages actually emit is covered by `index.css` -- the
+ * mapping in `markdown.ts`'s CSS comment was written by hand against a guess at what each grammar
+ * emits, and two real gaps slipped through that guess: `.hljs-function` (Go wraps a whole `func
+ * name(params)` signature in one outer span with this class) and `.hljs-section` (the `ini`
+ * grammar's `[section]` header, which is what `toml` is registered from) were both live and
+ * unstyled until this test found them.
+ *
+ * This uses the SAME `hljs` instance `markdown.ts` registers and exports for exactly this purpose
+ * -- not a second copy of the registration list -- so a language added or removed there is
+ * automatically in or out of this coverage check too.
+ */
 
 /** One small, realistic sample per registered language, each written to exercise a spread of
  *  syntax groups (a comment, a string, a number, a keyword, a function/type declaration) rather

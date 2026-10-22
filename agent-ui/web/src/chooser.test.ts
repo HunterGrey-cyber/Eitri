@@ -46,8 +46,9 @@ describe("chooserRows", () => {
     expect(chooserRows(ENVELOPE, TABS, "fix").map((r) => r.kind)).toEqual(["tab", "record"]);
   });
   it("/ filters a record with both name and title by either field, not just the leading name", () => {
-    // Search both `name` and `title` when both are present. Using `recordLead` would search only
-    // `name`, hiding matches in the title shown by the row.
+    // `recordLead`'s `name ?? title` short-circuit meant a
+    // record with both fields set was searchable only by `name`, even though the placeholder
+    // ("filter by name or title") and the row itself both show the title too.
     const named: ChooserEnvelope = {
       open: [],
       records: [{ providerSessionId: "renamed-0000", name: "notes", title: "fix the parser bug", createdAt: "1", updatedAt: "2", heldElsewhere: false }],
@@ -105,8 +106,8 @@ describe("resumeMode", () => {
   });
 });
 
-/** The four list-motion keys are shared by the chooser, its filter box, and the `/model` and
- *  `/effort` pickers. */
+/** The one place the four list-motion keys of a picker are named, shared by the chooser
+ *  (its list and its filter box) and the `/model`/`/effort` pickers. */
 describe("pickerStep", () => {
   it("names ↓ and Ctrl+n as a step down, ↑ and Ctrl+p as a step up", () => {
     expect(pickerStep({ key: "ArrowDown", ctrlKey: false })).toBe(1);

@@ -275,10 +275,9 @@ mod tests {
     /// Test-only, written immediately before the open. It exists because the guard it pins cannot
     /// be observed from the function's RETURN value: a directory declines a second time inside
     /// `File::open` (`EISDIR`, swallowed by the `.ok()?`), so a test that only checked for `None`
-    /// stays green with the guard deleted -- a blind spot that hides attempted opens and
-    /// is the whole reason this probe exists. A FIFO, the case the guard is really for, cannot be
-    /// used as the stand-in instead: without the guard the test would hang in `open(2)` forever
-    /// rather than fail.
+    /// stayed green with the guard deleted, so this probe records the attempt itself. A FIFO, the
+    /// case the guard is really for, cannot be used as the stand-in instead: without the guard the
+    /// test would hang in `open(2)` forever rather than fail.
     ///
     /// A set of paths rather than a counter, so that tests running in parallel cannot disturb each
     /// other: each test asks only whether its OWN path is in here.
@@ -338,9 +337,9 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_underscores_and_non_ascii_characters_too() {
-        // These are the two classes the earlier "replace `/` and `.` only" rule missed -- see
-        // this plan's own real, disk-verified comparison against all 111 real buckets under
-        // `~/.claude/projects/` (module doc above). Values confirmed by running this exact
+        // These are the two classes the earlier "replace `/` and `.` only" rule missed -- see the
+        // real, disk-verified comparison against all 111 real buckets under `~/.claude/projects/`
+        // in `sanitize_cwd_for_claude_projects`'s doc. Values confirmed by running this exact
         // function, not by hand-counting.
         assert_eq!(sanitize_cwd_for_claude_projects("/tmp/a_b"), "-tmp-a-b");
         assert_eq!(sanitize_cwd_for_claude_projects("/home/x/あいう"), "-home-x----");
@@ -356,8 +355,8 @@ mod tests {
 
     #[test]
     fn transcript_path_joins_projects_dir_sanitized_cwd_and_session_id() {
-        // Propagate poisoning of this shared test lock with `unwrap()`.
-        // A previous panic while holding it should fail this test too.
+        // Propagate poisoning from the shared test-only environment lock: a failed mutation
+        // must not silently affect another test.
         let _guard = CLAUDE_CONFIG_DIR_TEST_LOCK.lock().unwrap();
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/fake-claude-config") };
         let path = transcript_path("/tmp/project", "prov-1").unwrap();
@@ -431,7 +430,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- newest_ai_title -------------------------------------------------------------------
+    // ---- newest_ai_title ---------------------------------------------------------------------
 
     /// A transcript to read a title out of, in its own temp directory. Returns the file's path.
     fn a_transcript(lines: &str) -> (PathBuf, PathBuf) {
@@ -442,8 +441,9 @@ mod tests {
         (dir, path)
     }
 
-    /// The last `ai-title` line in the window wins.
-    /// Repeated title entries must not make the scan return an older value.
+    /// The NEWEST title wins, not the first one the scan meets. Measured on real transcripts: a real
+    /// session rewrites the same title a median of 24 times and up to 808, so "which one" is a
+    /// question every read answers, even though this machine has never seen the value change.
     #[test]
     fn the_last_ai_title_line_in_the_window_is_the_one_taken() {
         let (dir, path) = a_transcript(concat!(
@@ -458,9 +458,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A transcript without an `ai-title` returns `None`, allowing the next title fallback.
-    /// This is also the result when the title is outside the read window;
-    /// see `a_title_outside_the_window_is_not_chased`.
+    /// A transcript with no `ai-title` at all reads as `None` -- the ladder's whole fallback
+    /// promise: a row without a title drops to the next level down, never to an error.
+    /// Indistinguishable, on purpose, from a window that
+    /// simply did not reach far enough back; see `a_title_outside_the_window_is_not_chased`.
     #[test]
     fn a_transcript_with_no_ai_title_reads_as_none() {
         let (dir, path) = a_transcript(concat!(
@@ -509,12 +510,11 @@ mod tests {
     /// FIFO would be a test that hangs forever when the guard is removed, which is the one shape
     /// a regression test must not have.
     ///
-    /// **The assertion is that no open was ATTEMPTED, not that the result was `None`** (since
-    /// 2026-09-20). The first version of this test asserted `None` and could not fail: with the
-    /// guard deleted a directory still declines, because `File::open` returns `EISDIR` and the
-    /// `.ok()?` swallows it. The reviewer deleted the guard and the whole module stayed green. A
-    /// FIFO would not have declined -- it would have hung -- and that difference is exactly what
-    /// `None` cannot see and `OPEN_ATTEMPTS` can.
+    /// **The assertion is that no open was ATTEMPTED, not that the result was `None`**. The first
+    /// version of this test asserted `None` and could not fail: with the guard deleted a directory
+    /// still declines, because `File::open` returns `EISDIR` and the `.ok()?` swallows it. Deleting
+    /// the guard left the whole module green. A FIFO would not have declined -- it would have hung
+    /// -- and that difference is exactly what `None` cannot see and `OPEN_ATTEMPTS` can.
     ///
     /// The second half is the positive control, and it is what stops this test from passing
     /// because the probe itself stopped recording: a real transcript in the same run must appear
@@ -539,8 +539,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Reads the tail rather than the head so initial attachment data cannot hide a recent title.
-    /// The fixture puts a title near EOF and fills the head window with attachment lines.
+    /// **The head-vs-tail choice, as a test rather than a comment.** Measured over this machine's
+    /// 37 titled sessions: reading the file's HEAD finds the title
+    /// 0 times out of 37, because a session opens with `attachment` lines and the first `ai-title`
+    /// already sits past 117 KB; reading its TAIL finds it 37 times out of 37. This pins the
+    /// direction with a file shaped like that: a title near the end, and a head window full of
+    /// something else.
     #[test]
     fn the_window_reads_the_tail_and_a_head_window_would_have_missed_it() {
         let filler = format!(
@@ -565,9 +569,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A title outside the window is not found, and the read never expands to the whole file.
-    /// That miss looks like an absent title, so the picker uses the next title fallback.
-    /// Keeping the read bounded prevents an arbitrarily large transcript from blocking the GTK main loop.
+    /// A title further back than the window is **deliberately** not found, and the read does not
+    /// fall back to scanning the whole file. This miss is undetectable and accepted: the row drops
+    /// one level down the ladder and nothing else happens. Without this test the bound reads like
+    /// an oversight somebody should "fix", which would put an unbounded read of someone else's file
+    /// on the GTK main loop.
     #[test]
     fn a_title_outside_the_window_is_not_chased() {
         let filler = format!(
@@ -608,8 +614,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Reuses the redacted `ai-title` entry in the history fixture as a positive title sample.
-    /// The history fold discards this entry, while `newest_ai_title` extracts its title.
+    /// The real redacted `ai-title` line the history fixtures already carry (see
+    /// `agent/tests/fixtures/transcript_lines.README.md`). It was checked in as a side record to be
+    /// DISCARDED by the fold; the title lookup uses the same line as a positive sample,
+    /// keeping both consumers tied to the same captured format.
     #[test]
     fn the_real_redacted_ai_title_line_reads_as_its_title() {
         let raw = std::fs::read_to_string(concat!(

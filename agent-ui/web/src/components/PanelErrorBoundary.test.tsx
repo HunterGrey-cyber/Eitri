@@ -22,8 +22,8 @@ function Boom({ message = "boom" }: { message?: string }): never {
   throw new Error(message);
 }
 
-/** An uncaught render error empties `#root` and leaves no keyboard handlers.
- *  The boundary catches it so the rest of the panel can remain usable. */
+/** One throw during render unmounted the whole React tree, so `#root` went
+ *  empty and every key went dead. A boundary is the only thing React keeps a tree alive with. */
 describe("PanelErrorBoundary", () => {
   it("draws its children when nothing throws, and never calls onError", () => {
     const onError = vi.fn();

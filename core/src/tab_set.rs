@@ -5219,10 +5219,11 @@ mod tests {
         }
     }
 
-    /// Create a `Write` request that needs a human: `.git/main.rs` is protected, while an ordinary
-    /// in-project write can be allowed by the acceptEdits fast path without a card. The queueing,
-    /// attention and confirmation tests need a request that reliably produces a card.
-    /// The fast path has separate tests in `agent::permission_policy`.
+    /// `.git/main.rs` is a protected `Write` target that reliably produces a card. An ordinary
+    /// in-project write would be answered by the acceptEdits fast path, leaving queueing, attention
+    /// and confirmation tests waiting for a nonexistent card. Those mechanisms need an asking
+    /// request; the fast path has separate tests in `agent::permission_policy`. Using `.git/`
+    /// keeps this fixture recognizably a write.
     fn write(id: &str) -> AgentDomainEvent {
         AgentDomainEvent::PermissionRequested {
             permission_id: id.into(),
@@ -5461,8 +5462,8 @@ mod tests {
         );
     }
 
-    /// The pump calls `take_revised_ui_delivery` on every tab, so the policy can answer a
-    /// background tab's `Read` even when that tab sends no UI payload.
+    /// Pumping every tab through `take_revised_ui_delivery` answers a background tab's Read
+    /// without dispatching that tab's events to the page.
     #[test]
     fn the_pump_answers_what_needs_no_human_in_a_background_tab() {
         let dir = workspace("tabs-background-pump");
@@ -5497,9 +5498,9 @@ mod tests {
         let snapshot: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert_eq!(snapshot["kind"], "snapshot");
         assert_eq!(snapshot["tab"], background.0);
-        // The projection holds both requests until the Read's resolution returns.
-        // `host_answered` hides the already answered Read from the snapshot and tray, so only
-        // the Write that is still waiting is shown.
+        // The projection retains both requests until the Read's resolution returns, but
+        // `host_answered` hides the already answered Read from snapshots and attention.
+        // Only the Write still waiting for a human is shown.
         assert_eq!(
             snapshot["state"]["pendingPermissions"].as_array().unwrap().len(),
             1,
@@ -5580,17 +5581,18 @@ mod tests {
         }));
     }
 
-    /// The snapshot sent by a switch or reload (`active_state_payloads`), followed by the
-    /// active payload of each of the next two ticks.
+    /// One run of the double-delivery race: the snapshot a switch or a reload sent (`active_state_payloads`), then the
+    /// active payload of each of the two ticks after it.
     struct P1a2Run {
         snapshot: String,
         next: Option<String>,
         after: Option<String>,
     }
 
-    /// The ingestion thread folds a turn's text without an intervening tick. A switch or reload
-    /// snapshot carries that text while it is still queued. `redeliver` disables the snapshot
-    /// coverage filter (`TabSet::redeliver_covered`).
+    /// The race as it first showed: the sidecar's ingestion thread folds on
+    /// its own thread, so a turn's text folds with NO tick in between -- the real gap between a tick
+    /// and a switch or reload -- and the switch/reload snapshot carries it while the tab's queue
+    /// still holds it. `redeliver` turns the `covered` filter off (`TabSet::redeliver_covered`).
     fn p1a2_mid_stream(redeliver: bool) -> P1a2Run {
         let dir = workspace("tabs-p1a2-mid-stream");
         let mut set = set();
@@ -5610,9 +5612,9 @@ mod tests {
         run
     }
 
-    /// A tick delivers the turn's first text. The seam folds `<between>` just after the next
-    /// drain, the switch or reload snapshot carries it, and `<after>` folds after that
-    /// snapshot. `redeliver` disables the snapshot coverage filter.
+    /// The fold-after-a-drain shape, driven by the seam: a tick has delivered the turn's first text, `<between>`
+    /// folds right after the next tick's drain, the switch/reload snapshot carries it, and `<after>`
+    /// folds after that snapshot. `redeliver` as for [`p1a2_mid_stream`].
     fn p1a2_fold_after_a_drain(redeliver: bool) -> P1a2Run {
         let dir = workspace("tabs-p1a2-fold-after-drain");
         let mut set = set();
@@ -5644,9 +5646,9 @@ mod tests {
         run
     }
 
-    /// A switch or reload snapshot carries the text folded mid-stream. Subsequent ticks send
-    /// nothing when the snapshot already covered the whole batch, preventing duplicate reply
-    /// text in the panel.
+    /// A switch or reload taken mid-stream must not be followed by a tick
+    /// delivering the snapshot's own text again, or the panel renders the reply twice. The
+    /// snapshot carries the text; the ticks after it send nothing, the whole batch having been in it.
     #[test]
     fn a_mid_stream_snapshots_text_is_never_delivered_again() {
         let run = p1a2_mid_stream(false);
@@ -5662,9 +5664,10 @@ mod tests {
         assert_eq!(run.after, None);
     }
 
-    /// The drain and snapshot read acquire the lock separately. An event folded between them is
-    /// both in the snapshot and still queued, so the next tick must filter it out. The seam
-    /// also checks that an event folded after the snapshot reaches the panel exactly once.
+    /// A drain and a later snapshot read are separate lock
+    /// acquisitions, and an event folded between them is in the snapshot AND still queued, so the
+    /// next tick would deliver it again. Driven by the seam, not by timing. Also the no-loss direction:
+    /// what folds after the snapshot reaches the panel on the next tick, once, and nothing is left.
     #[test]
     fn a_fold_between_a_ticks_drain_and_a_switchs_snapshot_is_never_delivered_again() {
         let run = p1a2_fold_after_a_drain(false);
@@ -5685,14 +5688,16 @@ mod tests {
         assert_eq!(events_text(run.after.as_deref()), "");
     }
 
-    /// Disabling the snapshot coverage filter makes both cases repeat the snapshot's text on
-    /// the next tick. The reducer fixture replays the actual snapshots and following `events`
-    /// payloads with and without filtering through `reducer.ts`.
+    /// Both shapes with the `covered` filter off -- the semantics before it -- repeat the snapshot's
+    /// text on the next tick: the filter, and nothing else, keeps it out. And the fixture
+    /// `agent-ui/web/src/reducer.p1a2.test.ts` replays through the real `reducer.ts`: each shape's
+    /// real snapshot and the real `events` of the tick after it, with the filter and without --
+    /// never a hand-typed guess at their shape.
     ///
-    /// The fixture is compared on every run and rewritten only when explicit fixture writing is
-    /// enabled and its contents differ. Automatic writes on failure dirty a tracked file, and
-    /// changes under `agent-ui/web/src` trigger the npm rebuild in `shell/build.rs`. Checkouts
-    /// without the web tree skip the comparison.
+    /// Compared on every run, rewritten only under `EITRI_WRITE_FIXTURES=1` and only when it
+    /// differs: a test in this crate writing into `../agent-ui/web/src` dirtied a tracked file
+    /// whenever it went red, and a newer file under `src` sets off `shell/build.rs`'s npm rebuild. A
+    /// checkout without the web tree skips the comparison, having no reducer test to feed.
     #[test]
     fn with_the_filter_off_the_tick_repeats_the_snapshot_and_the_reducer_fixture_records_both() {
         let events_of = |payload: Option<&str>| -> serde_json::Value {
@@ -5757,10 +5762,13 @@ mod tests {
         }
     }
 
-    /// A `TurnCompleted` carried by a switch or reload snapshot must still reach
-    /// `PumpOutput::turn_ended` exactly once when the next tick drains it, even though the
-    /// payload filters it out. That signal triggers the panel's queue flush; losing it leaves
-    /// the next message waiting. The completion folds without an intervening tick.
+    /// An earlier catch-up drain at a switch or reload lost turn ends:
+    /// a `TurnCompleted` a switch or reload took off the queue never reached
+    /// `PumpOutput::turn_ended` -- the only trigger `eitri_panel::agent_panel`'s queue flush has -- so
+    /// a message queued behind the turn sat there until something else poked the tab. That drain is
+    /// gone; what this holds now is that a `TurnCompleted` the snapshot carried,
+    /// and the next tick therefore leaves out of its payload, is still folded by that tick into
+    /// `turn_ended`, exactly once. The completion folds with NO tick in between, as in the real race.
     #[test]
     fn a_turn_end_a_switch_snapshot_carried_still_flushes_the_queue() {
         let dir = workspace("tabs-p1a2-round1-turn-end");
@@ -5865,10 +5873,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// In `pump`'s `Resync` arm, the snapshot is read after further lock acquisitions and a
-    /// bypass sweep. A delta folded after the drain is both in that snapshot and still queued,
-    /// so the next tick must filter it out. The seam folds a unique delta just after an
-    /// overflow drain.
+    /// `pump`'s own `Resync` arm has the same shape -- the drain returns
+    /// `Resync`, and the snapshot it sends is read after further lock cycles (and a bypass sweep) --
+    /// so a fold in between would be in that snapshot and queued for the next tick. Driven the same way:
+    /// an overflow owes the tab a resync, and the seam folds a unique delta right after that drain.
     #[test]
     fn a_fold_between_a_resyncs_drain_and_its_snapshot_read_is_never_delivered_again() {
         let dir = workspace("tabs-p1a2-round2-resync");
@@ -5915,11 +5923,14 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// The `Resync` payload must carry the start time of the turn in its own `SnapshotView::of`
-    /// read. Reading the clock just after the drain can pair an old turn's start time with a
-    /// new turn's snapshot if the turn changes during later lock acquisitions and the bypass
-    /// sweep. This seam runs immediately before the snapshot read, beyond the reach of
-    /// `after_drain`.
+    /// The `Resync` arm's own early turn-clock read -- taken right after the
+    /// drain, before this arm's further lock cycles (its one read of the projection and
+    /// `approve_pending`'s bypass sweep) -- was used to stamp the payload this arm actually sends,
+    /// which is read only afterward, from a fresh `SnapshotView::of`. If a turn ends and the next
+    /// starts in that gap, the snapshot names the new turn while the payload still carries the old
+    /// one's start time, and the panel takes that stamp as exact. Driven by a seam positioned exactly
+    /// where `after_drain` (fired right after the drain, before any of this arm's own lock cycles)
+    /// cannot reach: right before this arm's own snapshot read.
     #[test]
     fn a_resyncs_snapshot_names_the_start_of_the_turn_it_carries_even_when_the_race_ends_it_first() {
         let dir = workspace("tabs-p1a2-round4-resync-clock");
@@ -5975,10 +5986,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A snapshot's revision belongs to its session. Replacing the session immediately after a
-    /// snapshot must not filter the new session's events against the old snapshot, since
-    /// revision numbers restart from the new session's seed. This test installs the replacement
-    /// through `collect_starts`.
+    /// A snapshot's revision belongs to its session. A tab whose session is replaced
+    /// right after a snapshot, with no pump in between, must not measure the new session's events
+    /// -- whose revisions start again from its own seed -- against the old one's snapshot. Here
+    /// through `collect_starts`; the next test replaces it the way `shell` does.
     #[test]
     fn a_new_sessions_events_are_never_measured_against_the_old_sessions_snapshot() {
         let dir = workspace("tabs-p1a2-round2-install");
@@ -6019,9 +6030,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Replacing a backend must discard its snapshot watermark. Fatal-command and never-opened
-    /// paths can install `Failed` without `collect_starts` or a pump. This test installs the
-    /// next session immediately afterward, with no intervening tick.
+    /// A snapshot's watermark belongs to the session it was read
+    /// from and goes with it, whatever replaces the backend. `shell`'s fatal-command and
+    /// never-opened paths swap in `Failed` themselves, passing through neither `collect_starts` nor
+    /// the pump; here the next session is installed straight after, with no tick in between either.
     #[test]
     fn a_replaced_backend_takes_its_snapshot_watermark_with_it() {
         let dir = workspace("tabs-p1a2-watermark-replaced");
@@ -6065,10 +6077,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// The shell reports tray attention around ticks and switches, but not panel reloads
-    /// (`InboundMessage::Ready`). Reading the active state must leave attention unchanged. The
-    /// snapshot draws a newly folded card, and the next pump counts it without sending the
-    /// request again.
+    /// `shell` reports the tray's attention around the tick and a
+    /// switch, never around a panel reload (`InboundMessage::Ready`) -- so reading the active tab's
+    /// state must not move it. A card folded since the last tick is drawn by the snapshot and
+    /// counted by the next pump, which the tick reports; the pump does not send its request again.
     #[test]
     fn reading_the_active_tabs_state_leaves_the_windows_attention_alone() {
         let dir = workspace("tabs-p1a2-attention");
@@ -6122,8 +6134,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A connect that finishes after its tab was closed is never
-    /// installed anywhere; the closed tab's receiver hands the backend back for shutdown.
+    /// A connect finishing after its tab closes is never installed elsewhere; the closed tab's
+    /// receiver returns the backend for shutdown.
     #[test]
     fn a_late_start_for_a_closed_tab_is_returned_for_shutdown() {
         let dir = workspace("tabs-late-start");
@@ -6168,9 +6180,8 @@ mod tests {
 
     type StartResult = Result<AgentBackend, BackendError>;
 
-    /// A resumed session with both a rename and a title uses the rename as the tab's label and
-    /// `name`, including in the detail popover (`prefix ,`). A rename made while connecting is newer
-    /// and takes precedence.
+    /// A resumed record's rename wins over its title and becomes the tab's own `name`, also used
+    /// in the `prefix ,` detail popover. A rename made while connecting is newer and wins over both.
     #[test]
     fn a_resume_installs_the_records_rename_as_the_tabs_name_unless_renamed_meanwhile() {
         let dir = workspace("tabs-resume-name");
@@ -6193,9 +6204,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// `react` responds only when `arrived` increases. The window total must not decrease when
-    /// a tab installs a session, resets, or closes, or a card arriving in another tab in the same tick
-    /// could go unnoticed.
+    /// `react` acts only when `arrived` grows. The window total must not decrease on session install,
+    /// reset or tab close, or a simultaneous card in another tab could fail to raise it.
     #[test]
     fn the_windows_arrived_count_never_goes_down() {
         let dir = workspace("tabs-arrived");
@@ -6459,8 +6469,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// An active Auto tab asks for confirmation before entering bypass both before and after
-    /// its session starts. Leaving bypass is immediate in either state.
+    /// Entering bypass asks for confirmation both before and after a session starts. A live active
+    /// Auto tab receives `Confirm`, just like an empty tab; leaving bypass is immediate in either state.
     #[test]
     fn a_rename_is_normalized_and_the_mode_can_still_be_switched_after_the_session_starts() {
         let dir = workspace("tabs-rename-mode");
@@ -6472,8 +6482,8 @@ mod tests {
         assert_eq!(set.get(tab).unwrap().name, None);
         assert!(!set.rename(TabId(99), "x"));
 
-        // Before a session starts in `NotStarted`/auto, entering bypass requires confirmation.
-        // Confirming also updates the window default, so a new tab inherits it without another prompt.
+        // Before the session starts (NotStarted, auto), entering bypass asks and confirming also
+        // moves the window default, so a fresh tab inherits bypass without another question.
         let first_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(first_plan.scope, BypassScope::Tab(tab));
         assert_eq!(
@@ -6490,7 +6500,8 @@ mod tests {
 
         let (_provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        // Leaving bypass works while `next` is on screen: the tab being changed need not be active.
+        // Leaving bypass works even when `next`, rather than `tab`, is on screen.
+        // Only entering bypass requires the tab to be active.
         assert_eq!(
             set.cycle_mode(tab, ViewId::BASE),
             Ok(ModeCycle::Changed(SessionModeChoice::Manual)),
@@ -6501,8 +6512,7 @@ mod tests {
             set.cycle_mode(tab, ViewId::BASE),
             Ok(ModeCycle::Changed(SessionModeChoice::Auto))
         );
-        // Entering bypass again still requires confirmation once `tab` is back on screen,
-        // just as it did before the session started.
+        // Entering bypass again asks just as before the session existed, once `tab` is active again.
         set.select(tab);
         let second_plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(second_plan.scope, BypassScope::Tab(tab));
@@ -6561,7 +6571,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    // Entering bypass asks first; once entered, the host answers every request.
+    // Entering bypass asks first, then Eitri answers every request in it.
 
     #[test]
     fn entering_bypass_on_a_live_tab_asks_and_changes_nothing_until_confirmed() {
@@ -6615,8 +6625,8 @@ mod tests {
                 && set.get(second).unwrap().attention.attention().pending == 1
         });
 
-        // `open()` left `second` active. Entering bypass is refused for a tab that is not on screen,
-        // so select `first` before requesting the switch.
+        // `open()` above left `second` active, and entering bypass on a tab that is not on screen
+        // is refused -- select back to `first` first.
         set.select(first);
         let plan = plan(set.cycle_mode(first, ViewId::BASE));
         assert_eq!(plan.approve, vec!["p1".to_string()]);
@@ -6858,8 +6868,8 @@ mod tests {
             shut_down_all(&mut set);
         }
 
-        // A `Starting` tab asks like a live one: `Confirm`, `LiveTab` text and no cards.
-        // After starting fails, the `Failed` bypass tab can still leave bypass immediately.
+        // A STARTING tab asks like a live one: `Confirm`, LiveTab text, zero cards. If starting
+        // fails, the FAILED bypass tab still leaves bypass immediately.
         {
             let mut set = set();
             let starting_tab = set.active();
@@ -6924,8 +6934,7 @@ mod tests {
             shut_down_all(&mut set);
         }
 
-        // ...and `reset` on a still-bypass ended tab keeps bypass and leaves the default untouched
-        //.
+        // `reset` on an ended bypass tab keeps its mode and leaves the window default untouched.
         {
             let mut set = set();
             let ended_bypass = set.active();
@@ -7093,9 +7102,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// `Tab::mode` remains authoritative regardless of a provider's mode report.
-    /// A real provider reports an unrestricted mode as `UngatedCliMode`, rather than the raw
-    /// `PermissionModeChanged` event used here.
+    /// `Tab::mode` remains the authority regardless of provider reports. A real provider turns an
+    /// unrestricted mode report into `UngatedCliMode` rather than a raw `PermissionModeChanged`;
+    /// even a raw event must not move the tab's mode.
     #[test]
     fn a_provider_mode_report_moves_nothing() {
         let dir = workspace("mode-report-is-inert");
@@ -7254,9 +7263,9 @@ mod tests {
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
 
-        // The request stays pending in the projection until its resolution is queued.
-        // `RecordingProvider` emits no resolution on its own, so the classifier's answer
-        // remains unresolved here.
+        // Stays pending in the projection until its resolution is queued (`RecordingProvider` never
+        // emits one on its own) -- this holds the classifier's own answer back, so a prompt the
+        // classifier answered sits pending in the projection yet never becomes a card.
         provider.queue(read("classifier-answered"));
         provider.queue(write("real-card"));
         until("only the real card is a card", || {
@@ -7374,9 +7383,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A live-tab bypass prompt does not ask about new sessions. If a terminal handoff changes
-    /// the tab to `NotStarted` before `y` arrives, ask again without entering bypass or changing
-    /// the window default. The saved prompt scope must still describe the tab when answered.
+    /// A live-tab bypass prompt says nothing about new sessions. If a terminal handoff changes the
+    /// tab to `NotStarted` while that prompt waits, accepting it must not silently change the window
+    /// default and put later new tabs into bypass. Confirmation remembers the question shown and
+    /// asks again when it no longer describes the tab.
     #[test]
     fn a_live_tab_prompt_answered_after_the_tab_became_empty_reprompts_and_moves_nothing() {
         let dir = workspace("bypass-prompt-kind-changed");
@@ -7393,7 +7403,7 @@ mod tests {
         );
 
         // What `agent_panel`'s `HandoffToTerminal` arm does to the tab (its own drop of the prompt
-        // is the other half of this fix; this is the half that holds even without it).
+        // is the other half of the protection; this is the half that holds even without it).
         if let TabBackend::Live(mut backend) =
             std::mem::replace(&mut set.get_mut(tab).unwrap().backend, TabBackend::NotStarted)
         {
@@ -7473,8 +7483,8 @@ mod tests {
         assert_eq!(set.default_mode(), SessionModeChoice::Auto);
     }
 
-    /// A window starts in Auto even if its constructor receives Bypass.
-    /// The constructor enforces this independently of `agent_prefs::startup_mode`.
+    /// A launch must never start in bypass, even if a caller bypasses `agent_prefs::startup_mode`.
+    /// The tab set enforces this independently of the caller's startup-mode normalization.
     #[test]
     fn a_window_never_starts_in_bypass_whatever_it_is_handed() {
         let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Bypass);
@@ -7728,7 +7738,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Like `:bd` with unsaved changes, `<leader>bd` asks only when something would be lost.
+    /// Like vim's `:bd` (E89), `<leader>bd` asks only when closing would lose something.
     #[test]
     fn closing_asks_only_for_a_running_turn_a_connect_or_a_queue() {
         let dir = workspace("tabs-close-needs-confirm");
@@ -7763,7 +7773,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// The phase-3 GUI pass (2026-09-25): the elapsed clock read `0s+` after a tab switch, because
+    /// Seen in a GUI pass on 2026-09-25: the elapsed clock read `0s+` after a tab switch, because
     /// the panel holds only the active tab's state and restarted the clock at the snapshot. The tab
     /// now keeps when its running turn started, from the first tick that delivered it, and the
     /// snapshot a switch (or a reload) sends carries it.
@@ -8036,8 +8046,7 @@ mod tests {
         assert_eq!(times[0].anchor_seq, Some(4));
     }
 
-    /// A flush the backend refuses stays in the queue with a line saying
-    /// why, and is not retried on every tick.
+    /// A refused queue flush stays queued with the refusal reason and is not retried every tick.
     #[test]
     fn a_refused_flush_keeps_the_queue_and_is_not_retried_every_tick() {
         let dir = workspace("tabs-queue-refused");
@@ -8066,7 +8075,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A pending card holds the queue.
+    /// A pending card holds the queue: a queued message waits until the card is answered.
     #[test]
     fn the_queue_waits_while_a_card_is_pending() {
         let dir = workspace("tabs-queue-card");
@@ -8087,7 +8096,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// After an interrupt, the queue still goes out with the message added by `Ctrl+Enter`.
+    /// After an interrupt the queue still goes out, including what `Ctrl+Enter` added.
     #[test]
     fn send_now_interrupts_and_the_queue_goes_out_when_the_turn_ends() {
         let dir = workspace("tabs-send-now");
@@ -8144,7 +8153,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Queueing requires a session that is starting or alive.
+    /// Queueing requires a starting or live session; empty and failed tabs refuse it.
     #[test]
     fn queueing_needs_a_session_that_is_starting_or_alive() {
         let mut set = set();
@@ -8171,7 +8180,7 @@ mod tests {
         assert!(set.queue_message(tab, "y", "y".into(), 2, true).is_err());
     }
 
-    /// `r` on an ended tab puts its queue back into the draft.
+    /// `r` on an ended tab restores its queue to the draft.
     #[test]
     fn reset_folds_the_queue_and_the_old_draft_into_the_draft() {
         let mut set = set();
@@ -8211,7 +8220,7 @@ mod tests {
         assert_eq!(set.queued_count(), 0);
     }
 
-    /// Rules answer a background tab's call, and a card that a rule could answer offers that rule.
+    /// Saved rules answer background tabs too, and a card eligible for a rule offers one.
     #[test]
     fn rules_answer_a_background_call_and_a_card_is_offered_the_rule_that_would() {
         let dir = workspace("tabs-rules");
@@ -8318,9 +8327,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// An in-project `Write` answered without a card by the acceptEdits fast path is marked
-    /// "allowed by auto" in events and subsequent snapshots. A `Write` to a protected path such
-    /// as `.git/` keeps its pending card and has no such note.
+    /// An in-project `Write` the acceptEdits fast path answers with no card is
+    /// named "allowed by auto" -- on the events envelope as it happens, and on the snapshot after --
+    /// while a `Write` into a protected path (`.git/`, still carded, `write()`'s own reason for
+    /// existing) carries no such note and stays a pending card.
     #[test]
     fn an_edit_the_fast_path_allowed_is_named_auto_in_events_and_snapshots() {
         let dir = workspace("tabs-auto-notes");
@@ -8452,11 +8462,11 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A `Write` allowed by the acceptEdits fast path still marks its completed row as creating
-    /// a file when the target was absent. `note_new_files` cannot see this call because
-    /// `answer_what_needs_no_human` removes its `PermissionRequested` before delivery.
-    /// The absence check runs there just before sending `allow`, so the row does not show an
-    /// overwrite warning for a new file.
+    /// A `Write` answered by the acceptEdits fast path still marks its completed row as creating a
+    /// file when the target did not exist. `note_new_files` runs from delivered permission requests,
+    /// which automatic answering suppresses. The existence check must therefore run where
+    /// `answer_what_needs_no_human` sends its allow, so a newly created file never gets an overwrite
+    /// warning. Inferring creation from `ToolCallStarted` in Auto would miss other answering modes.
     #[test]
     fn an_auto_allowed_write_over_no_file_is_marked_as_creating_one() {
         let dir = workspace("tabs-auto-new-file");
@@ -8471,8 +8481,8 @@ mod tests {
             name: "Write".into(),
             input: serde_json::json!({ "file_path": "brand_new.rs", "content": "fn x() {}" }),
         });
-        // Queue the gate request the fast path will answer. The note is recorded at that answer;
-        // without a gate, there is nothing to note, as with a call that fails validation first.
+        // The fast-path note is recorded at the gate answer. Without a gate request this fixture
+        // would model a call rejected before permission checking, leaving no answer to annotate.
         provider.queue(AgentDomainEvent::PermissionRequested {
             permission_id: "perm-new".into(),
             tool_use_id: Some("toolu_new".into()),
@@ -8511,13 +8521,15 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Queue overflow can drop a follow-up card's `PermissionRequested` while the projection
-    /// still shows it pending and `Resync` displays the card. The pending sweep must remove the
-    /// fast-path candidate so a later human approval cannot leave an "allowed by auto" note.
+    /// A queue overflow may drop a follow-up card's `PermissionRequested`, which normally removes
+    /// a fast-path note candidate. The complete projection still has that permission pending,
+    /// so `Resync` must draw the card and sweep its candidate. Otherwise human approval could
+    /// complete the call with a false "allowed by auto" note.
     ///
-    /// Use an in-project edit the fast path actually answers, then overflow the CLI's follow-up
-    /// prompt for that call. A protected `.git/probe` edit would produce a card immediately and
-    /// never create the candidate this test needs to remove.
+    /// The fixture must first edit an ordinary in-project file the fast path actually answers.
+    /// A protected `.git/probe` write cards immediately and creates no candidate, so it cannot
+    /// detect a broken sweep. Overflowing the CLI's follow-up prompt for the same allowed call
+    /// leaves a real candidate for the sweep to remove.
     #[test]
     fn a_resync_drops_a_fast_path_candidate_whose_further_card_survived_the_overflow() {
         let dir = workspace("tabs-resync-drops-candidate");
@@ -8548,7 +8560,7 @@ mod tests {
             .note_ledger
             .has("toolu_edit", NoteKind::AutoEdit));
 
-        // The CLI's own follow-up prompt for the same call (O3), plus filler enough to overflow the
+        // The CLI's own follow-up prompt for the same call, plus filler enough to overflow the
         // queue so the whole batch -- the prompt's `PermissionRequested` included -- is dropped and
         // this tick's drain is a `Resync`. Queued as one batch (`queue_all`'s doc): a `queue` call
         // per event would let the ingestion thread fold the follow-up card alone, well before the
@@ -8605,7 +8617,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Builds a tool-call start event for the permission tests below.
+    /// Helpers for exercising gate answers, follow-up prompts and completion independently.
     fn call_started(id: &str, name: &str, input: serde_json::Value) -> AgentDomainEvent {
         AgentDomainEvent::ToolCallStarted {
             turn_id: "t1".into(),
@@ -8655,9 +8667,9 @@ mod tests {
             .collect()
     }
 
-    /// The CLI runs `validateInput` before `PreToolUse` hooks. An `Edit` of an unread file or one
-    /// without `old_string` can finish with `is_error` before any gate exists.
-    /// The absence of a card therefore cannot justify an "allowed by auto" note.
+    /// The CLI validates input before `PreToolUse`. An Edit of a file not read yet or lacking
+    /// `old_string` can finish with `is_error` without asking the gate. It must not claim
+    /// "allowed by auto": no card does not imply an automatic answer.
     #[test]
     fn an_edit_that_failed_validation_before_the_gate_is_never_named_auto() {
         let dir = workspace("tabs-auto-validation-failed");
@@ -8686,8 +8698,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A request with no tool-use id maps the wire's empty id to `None`.
-    /// Its card must still prevent an "allowed by auto" note when a human approves the write.
+    /// A card without a tool-use id maps to `None` and still removes a matching note candidate.
+    /// Human approval of an out-of-project Write must not complete it as "allowed by auto" merely
+    /// because id matching cannot connect the card to its call.
     #[test]
     fn a_carded_edit_whose_request_names_no_tool_use_id_is_never_named_auto() {
         let dir = workspace("tabs-auto-card-without-id");
@@ -8721,8 +8734,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Switching to bypass between a call's start and its gate makes bypass answer the request
-    /// through `answer_what_needs_no_human`. The completed call must not receive an Auto fast-path note.
+    /// A switch to bypass between call start and gate makes bypass answer the call, never the
+    /// fast path. An Auto candidate must not survive into a note when the fast path answered nothing.
     #[test]
     fn an_edit_bypass_answered_after_a_switch_is_never_named_auto() {
         let dir = workspace("tabs-auto-then-bypass");
@@ -8758,9 +8771,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Bypass answers a `Write` gate and removes its request before `note_new_files` can see it.
-    /// Check whether the target is absent where the answer is given, before sending it, in both
-    /// Auto and bypass. A new file gets the creation note; an existing file does not.
+    /// Bypass answers a Write's gate and suppresses its permission request, so `note_new_files`
+    /// cannot rely on delivered requests. Checking file existence where the answer is sent in
+    /// both Auto and bypass marks newly created files correctly; an existing file gets no creation
+    /// note. Otherwise a new bypass-written file would keep a misleading overwrite warning.
     #[test]
     fn a_bypass_write_over_no_file_is_marked_as_creating_one() {
         let dir = workspace("tabs-bypass-new-file");
@@ -8793,9 +8807,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A created-file note must reach the panel through events as well as snapshots. Answering
-    /// and dropping a gate request can leave its batch empty (`RevisedDelivery::Nothing`), so
-    /// the note is held for the next events payload instead of being lost with that batch.
+    /// The created-file note must reach the panel on the events path too, not only in a later snapshot.
+    /// A gate usually arrives in a batch of its own, after its call's start; answered and dropped, it
+    /// leaves that batch empty (`RevisedDelivery::Nothing`), so a note made from the answer is held
+    /// for the next events payload rather than lost with the batch.
     #[test]
     fn a_created_file_note_answered_in_a_batch_of_its_own_reaches_the_next_events_payload() {
         let dir = workspace("tabs-creates-file-alone");
@@ -8834,11 +8849,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A fast-path answer stays a candidate until its call completes. If queue overflow drops
-    /// the completion event, `Resync` must still turn the finished candidate into its note.
-    /// The call finishes before resync here, so the finished sweep consumes the candidate first.
-    /// `a_resync_before_the_call_finishes_keeps_its_fast_path_answer` checks the pending sweep's
-    /// `host_answered` filter separately.
+    /// A fast-path answer remains a candidate until its call completes. If queue overflow drops
+    /// the completion, `Resync` must still turn it into a note. Finishing before the resync makes
+    /// the finished sweep consume the candidate before the still-pending `host_answered` filter;
+    /// `a_resync_before_the_call_finishes_keeps_its_fast_path_answer` pins that filter separately.
     #[test]
     fn a_resync_turns_a_fast_path_answer_whose_call_finished_into_its_note() {
         let dir = workspace("tabs-resync-keeps-auto-answer");
@@ -8897,10 +8911,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A `Resync` can arrive after the fast path answers an edit's gate but before the call ends.
-    /// Until the provider reports resolution, the projection still lists the request as pending.
-    /// The pending sweep must exclude `host_answered` requests and keep this candidate so the
-    /// completed call retains its "allowed by auto" note.
+    /// A `Resync` after the fast path answers an edit's gate but before completion must keep its
+    /// note candidate. The projection may still list the unresolved request as pending;
+    /// `host_answered` must exclude it from the still-pending sweep, or an early resync would
+    /// remove the finished call's "allowed by auto" note.
     #[test]
     fn a_resync_before_the_call_finishes_keeps_its_fast_path_answer() {
         let dir = workspace("tabs-resync-before-completion");
@@ -8956,9 +8970,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// After the fast path allows a gate, the CLI can raise its own sensitive-file prompt for
-    /// the same call. If a human approves that card, completion must not say "allowed by auto".
-    /// The `PermissionRequested` arm of `NoteLedger::fold` removes the candidate.
+    /// When the fast path allows the gate and a human then approves the CLI's follow-up prompt
+    /// for that call, the completed row must not say "allowed by auto".
+    /// `NoteLedger::fold` removes the candidate when `PermissionRequested` arrives.
     #[test]
     fn the_clis_own_prompt_after_the_fast_path_drops_the_auto_note() {
         let dir = workspace("tabs-cli-prompt-drops-auto");
@@ -9005,10 +9019,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Only fast-path answers for `Write`, `Edit` and `NotebookEdit` (`ACCEPT_EDITS_TOOLS`) create
-    /// Auto candidates. A classifier-allowed `Read` uses the same `answer_what_needs_no_human`
-    /// function but must not say "allowed by auto": that note identifies the acceptEdits fast path,
-    /// not the read-only rules shared by every mode.
+    /// Only fast-path answers for `Write`/`Edit`/`NotebookEdit` (`ACCEPT_EDITS_TOOLS`) become auto-note
+    /// candidates. A `Read` allowed by `answer_what_needs_no_human` must not say "allowed by auto":
+    /// that note identifies the acceptEdits fast path rather than the read-only rules shared by modes.
     #[test]
     fn a_classifier_allowed_read_is_never_named_auto() {
         let dir = workspace("tabs-read-not-auto");
@@ -9043,13 +9056,14 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Queue overflow can drop a follow-up card's `PermissionRequested` while the projection
-    /// still shows it pending and `Resync` displays the card. The pending sweep must remove the
-    /// rule candidate so a later human approval cannot leave an "allowed by rule" note.
+    /// A queue overflow may drop the CLI follow-up prompt's `PermissionRequested`, which would
+    /// normally remove a saved-rule note candidate. The complete projection still lists the prompt
+    /// pending, so `Resync` draws its card and must sweep the candidate. Otherwise the human's later
+    /// approval could produce a false "allowed by rule" note.
     ///
-    /// First let the rule answer the gate to create a real candidate, then overflow the CLI's
-    /// follow-up prompt for that call. `ToolCallStarted` alone cannot create a candidate; it must
-    /// come from an answer `AgentBackend::answer_what_needs_no_human` actually gave.
+    /// The fixture must answer an actual gate request through the rule before overflowing the
+    /// follow-up prompt for the same call. A bare `ToolCallStarted` cannot establish a candidate:
+    /// notes are recorded only from answers `AgentBackend::answer_what_needs_no_human` actually gave.
     #[test]
     fn a_resync_drops_a_rule_candidate_whose_further_card_survived_the_overflow() {
         let dir = workspace("tabs-resync-drops-rule-candidate");
@@ -9078,7 +9092,7 @@ mod tests {
                 .has("toolu_npm", NoteKind::Rule)
         });
 
-        // The CLI's own follow-up prompt for the same call (O3), plus filler enough to overflow the
+        // The CLI's own follow-up prompt for the same call, plus filler enough to overflow the
         // queue so the whole batch -- the prompt's `PermissionRequested` included -- is dropped and
         // this tick's drain is a `Resync`. Queued as one batch (`queue_all`'s doc): a `queue` call
         // per event would let the ingestion thread fold the follow-up card alone, well before the
@@ -9135,11 +9149,11 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// When a snapshot covers every event in the next drain, the payload filters them all out.
-    /// Notes produced when the tab processes those events still need delivery because the
-    /// snapshot predates those notes. An empty `events` envelope carries them to
-    /// `applyCallNotes`. The seam folds completion between the drain and the switch's snapshot
-    /// read.
+    /// When a snapshot already carried every event of the next drain, the payload
+    /// leaves them all out -- but a note those events produce was not in that snapshot (it was read
+    /// before this tab folded them), so it still goes to the panel, on an `events` envelope with no
+    /// events, which the panel applies to what it already holds (`applyCallNotes`). The completion
+    /// folds through the seam, right after a tick's drain and before the switch's snapshot read.
     #[test]
     fn a_note_from_events_a_snapshot_carried_still_reaches_the_panel() {
         let dir = workspace("tabs-p1a2-round2-notes");
@@ -9219,9 +9233,9 @@ mod tests {
     /// existing file does not, nor does its file appearing later change what the card said.
     #[test]
     fn a_write_card_over_no_file_is_marked_as_creating_one() {
-        // Both targets are under `.git/` so their writes still produce cards. Ordinary top-level
-        // writes can be allowed by the acceptEdits fast path without a card, but this test needs
-        // cards to check their `createsFile` flags.
+        // Both targets use `.git/` so they card regardless of whether the file exists. Ordinary
+        // `new.txt` and `old.txt` would take the acceptEdits fast path; this test needs real cards
+        // to pin their `createsFile` flags.
         let dir = workspace("tabs-new-file");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/old.txt"), "there").unwrap();
@@ -9278,9 +9292,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Only a not-found result marks a path as a new file. An inaccessible parent or a path
-    /// through a regular file leaves the overwrite warning in place because the lookup cannot
-    /// establish what the write replaces. A dangling symlink also keeps the warning.
+    /// Only "not found" is no file. A path this process cannot
+    /// look at (a parent it may not search) or one through a regular file says nothing about what
+    /// the write replaces, so its card keeps the overwrite warning. A dangling symlink is something.
     #[test]
     fn only_a_path_that_is_not_found_counts_as_a_new_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -9461,10 +9475,10 @@ mod tests {
         );
     }
 
-    /// The CLI runs `validateInput` before `PreToolUse` hooks. A Bash call can fail with `is_error`
-    /// without a `PermissionRequested` or any gate for a saved rule to answer.
-    /// Matching its started arguments to a rule and seeing no card cannot justify an
-    /// "allowed by rule" note.
+    /// A saved-rule note must come from an actual gate answer, never from reclassifying a started
+    /// call's arguments and seeing no card. The CLI validates input before `PreToolUse`, so a Bash
+    /// call can finish with `is_error` without ever requesting permission. Such a call must not
+    /// claim "allowed by rule npm ci *" when the rule answered nothing.
     #[test]
     fn a_bash_call_that_failed_validation_before_the_gate_is_never_named_by_rule() {
         let dir = workspace("tabs-rule-validation-failed");
@@ -9491,9 +9505,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Switching to bypass between a call's start and its gate makes bypass answer the request.
-    /// The bypass branch of `answer_what_needs_no_human` does not classify it against saved rules,
-    /// so the completed call must not receive an "allowed by rule" note.
+    /// Switching to bypass between call start and its gate makes bypass answer the call without
+    /// classification. A speculative rule candidate from the started call's arguments must not
+    /// survive as a rule note when no rule answered the gate.
     #[test]
     fn a_bash_call_bypass_answered_after_a_switch_is_never_named_by_rule() {
         let dir = workspace("tabs-rule-then-bypass");
@@ -9537,9 +9551,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// The CLI's follow-up prompt for a call already answered by a rule can have an empty tool-use
-    /// id, which `translate.rs` maps to `None`. Match this card to its candidate by content through
-    /// `NoteLedger::dropped_by_card`, so human approval cannot leave an "allowed by rule" note.
+    /// The CLI's follow-up prompt for a rule-answered call can omit its tool-use id: Verdandi sends
+    /// `toolUseId: ''`, and `translate.rs` maps it to `None`. Id matching alone cannot remove that
+    /// call's note candidate. `NoteLedger::dropped_by_card` matches content instead, so human
+    /// approval of an id-less card cannot leave a false "allowed by rule" note on completion.
     #[test]
     fn an_id_less_follow_up_card_a_human_answers_drops_the_rule_candidate_by_content() {
         let dir = workspace("tabs-rule-id-less-follow-up");
@@ -9568,10 +9583,9 @@ mod tests {
                 .has("toolu_idless", NoteKind::Rule)
         });
 
-        // The CLI's follow-up prompt has no tool-use id. `needs_its_own_card()` is false
-        // because there is no ask rule or unrecognized origin and a reason is given. In Auto,
-        // `HumanApprovals::matches` cannot match an id-less prompt, so this becomes a card
-        // instead of being answered by the rule again.
+        // The CLI follow-up prompt omits its tool-use id. `needs_its_own_card()` is false because
+        // it has a reason, no ask rule and a known origin. Even so, `HumanApprovals::matches` never
+        // matches an id-less prompt, so Auto draws a card rather than re-answering it through a rule.
         provider.queue(resolved("perm-gate"));
         provider.queue(AgentDomainEvent::PermissionRequested {
             permission_id: "perm-follow-up".into(),
@@ -9614,10 +9628,10 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A rule-eligible request stays a card if the provider refuses the auto-answer. No
-    /// `by_rule` candidate is recorded because candidates are added only on success. With an
-    /// empty tool-use id, the content match in `NoteLedger::dropped_by_card` must find nothing
-    /// to drop. A later human approval must never be labeled "allowed by rule".
+    /// A rule-eligible call whose automatic answer the provider refuses stays a card. `by_rule`
+    /// records candidates only after a successful answer, so this refusal creates none. An empty
+    /// tool-use id also exercises content matching in `NoteLedger::dropped_by_card`: it must find
+    /// nothing to drop, and human approval must not yield an "allowed by rule" note.
     #[test]
     fn a_carded_rule_request_a_human_approves_is_never_named_by_rule() {
         let dir = workspace("tabs-rule-refused-answer");
@@ -9661,9 +9675,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// If queue overflow drops a rule-answered call's completion, the `Resync` finished sweep
-    /// must turn its candidate into a note. Otherwise the candidate lingers indefinitely and
-    /// the completed call never shows which rule answered it.
+    /// A rule-answered call whose completion was dropped by queue overflow must become a note
+    /// through `Resync`'s finished sweep, just like prompt and fast-path candidates.
+    /// Without sweeping rule candidates too, they remain live indefinitely and never display a note.
     #[test]
     fn a_resync_turns_a_rule_answer_whose_call_finished_into_its_note() {
         let dir = workspace("tabs-resync-keeps-rule-answer");
@@ -9725,14 +9739,11 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Item (b) of this task's own review: the still-pending sweep's `host_answered` filter, pinned
-    /// for fast-path candidates by `a_resync_before_the_call_finishes_keeps_its_fast_path_answer`,
-    /// had no rule counterpart either. A `Resync` that lands after the rule answered a call's gate
-    /// but BEFORE its call completes: the provider has not reported the request resolved, so the
-    /// projection still lists it pending; the still-pending sweep must leave it out (`host_answered`)
-    /// and keep the candidate, or the finished call would lose its "allowed by rule" note to a
-    /// `Resync` that merely came early. Fails, exactly like its auto sibling, if the filter is
-    /// removed (verified by mutation in this task).
+    /// A resync after a rule answers the gate but before call completion must keep the rule
+    /// candidate even if the projection still lists the unresolved request as pending. The
+    /// `host_answered` filter excludes that request from the still-pending sweep, preserving the
+    /// finished call's "allowed by rule" note. This complements the corresponding fast-path test
+    /// and detects removal of that filter.
     #[test]
     fn a_resync_before_the_call_finishes_keeps_its_rule_answer() {
         let dir = workspace("tabs-resync-before-rule-completion");
@@ -9791,7 +9802,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Defect 8 (phase 2's sandbox pass): a background tab's turn trace was never observed.
+    /// Turn traces must be observed for background tabs as well as the active tab.
     #[test]
     fn a_background_tabs_trace_is_observed_marked_and_emitted() {
         let dir = workspace("tabs-bg-trace");
@@ -9828,11 +9839,13 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A turn folded entirely before the first tick can reach the active panel wholly through
-    /// `active_state_payloads`, with no `events` dispatch. No paint report will arrive, so
-    /// `observe_in_snapshot` completes its trace with `first_paint_frame=snapshot`. Emission
-    /// must use `!dispatched`: gating on inactivity would leave this active tab's trace
-    /// unprinted.
+    /// Nothing previously pinned how `pump` feeds a drained batch into the turn trace. A turn that
+    /// folds entirely before the very first tick sees it (the double-delivery race's shape) is delivered to the
+    /// active tab wholly `in_snapshot`, via `active_state_payloads`, and never reaches the panel as
+    /// `events` at all -- so no paint report is ever coming for it, and `observe_in_snapshot` (not
+    /// plain `observe`) is what lets the trace complete anyway (`first_paint_frame=snapshot`).
+    /// `emit`'s own gate is `!dispatched`, not `!is_active`: this tab IS active and never dispatches
+    /// (the whole batch was already shown), so a gate keyed on `is_active` would never print it.
     #[test]
     fn a_turn_folded_entirely_inside_a_snapshot_still_completes_and_prints_its_trace() {
         let dir = workspace("tabs-trace-in-snapshot");
@@ -9842,14 +9855,15 @@ mod tests {
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
         set.get_mut(tab).unwrap().session.turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
 
-        // The ingestion thread folds the whole turn independently, without a tick draining it.
+        // The whole turn folds with no tick draining it -- the ingestion thread folds on its own,
+        // exactly as in the double-delivery races.
         provider.queue(started("t1"));
         provider.queue(text_delta("t1", "hi"));
         provider.queue(completed("t1", agent::TurnOutcome::Completed));
         wait_for_fold(&set, tab, "hi");
 
-        // Reads the snapshot and stores its revision on the backend as the watermark for the
-        // next pump's `covered` filter.
+        // Reads the snapshot and notes its revision on the backend -- the watermark the next
+        // pump's `covered` filter reads.
         let snapshot = the_snapshot(set.active_state_payloads());
         assert!(snapshot_text(&snapshot).contains("hi"), "{snapshot}");
 
@@ -9909,8 +9923,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Sending the first message from an empty tab clears its mirrored draft, so state payloads
-    /// sent after the connect finishes cannot restore the sent text to the new composer.
+    /// Sending the first message from an empty tab clears its mirrored draft, so state delivered
+    /// after connection does not put the sent text back into the new conversation's composer.
     #[test]
     fn a_sent_prompt_is_no_longer_the_tabs_draft() {
         let mut set = set();
@@ -9926,7 +9940,7 @@ mod tests {
         assert_eq!(draft["text"], "");
     }
 
-    /// A draft edited in nvim returns to the tab it came from, after a switch too.
+    /// A draft edited in nvim returns to its originating tab even after a tab switch.
     #[test]
     fn a_scratch_edit_returns_to_its_own_tab() {
         let mut set = set();
@@ -10014,9 +10028,9 @@ mod tests {
 
     // A CLI reporting an ungated mode closes the session.
 
-    /// An `UngatedCliMode` fails the tab with a reason naming the setting and mode, and returns
-    /// the backend for shutdown. No events from that batch are delivered, so the queued `Write`
-    /// never becomes an approvable card and shutdown denies it.
+    /// `UngatedCliMode` fails the tab with a reason naming the setting and mode, returns its backend
+    /// for shutdown, and delivers none of that batch. A queued Write cannot become an approvable
+    /// card; shutdown denies it instead.
     #[test]
     fn a_cli_reporting_an_ungated_mode_closes_the_session() {
         let dir = workspace("tabs-ungated-cli-mode");
@@ -10267,8 +10281,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// `Tab::mode` is the only authority: a `PermissionModeChanged` that reached the
-    /// pump -- which only one naming `default` can -- moves nothing.
+    /// `Tab::mode` is the only authority: a `PermissionModeChanged` reaching the pump, which only
+    /// a report naming `default` can do, must not change it.
     #[test]
     fn a_reported_mode_change_moves_nothing() {
         let dir = workspace("tabs-mode-report-moves-nothing");
@@ -10292,7 +10306,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    // ---- O3: the CLI's own permission prompts through the tab set ---------------------------------
+    // ---- The CLI's own permission prompts through the tab set -------------------------------------
 
     fn gate_write(permission_id: &str, tool_use_id: &str) -> AgentDomainEvent {
         AgentDomainEvent::PermissionRequested {
@@ -10338,9 +10352,9 @@ mod tests {
         }
     }
 
-    /// In Auto, a human approves the gate's card with `answer_card`, the gate resolves, and the
-    /// CLI asks about the same call under a new permission id. The follow-up request is
-    /// accepted and answered `allow` without drawing another card.
+    /// The gate card, human approval through `answer_card`, and gate resolution can be followed by
+    /// the CLI's prompt for the same call under a new permission id. That request is accepted and
+    /// answered `allow` using the prior human approval, producing exactly one card for the call.
     #[test]
     fn approving_the_card_for_a_call_answers_the_clis_own_prompt_that_follows() {
         let dir = workspace("o3-auto-one-card");
@@ -10463,7 +10477,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// In bypass, the CLI's own prompt is answered and never drawn.
+    /// In bypass the CLI's prompt is answered without being drawn as a card.
     #[test]
     fn in_bypass_the_clis_own_prompt_is_answered_and_never_delivered() {
         let dir = workspace("o3-bypass");
@@ -10522,8 +10536,8 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A saved rule cannot silence the CLI's own prompt, so its card never offers "Always allow".
-    /// The gate's card for the same command can still offer it.
+    /// A saved rule cannot silence the CLI's prompt, so that card never offers "Always allow".
+    /// The gate card for the same command still offers a rule.
     #[test]
     fn the_clis_own_prompt_is_never_offered_a_rule() {
         let dir = workspace("o3-no-offer");
@@ -10550,10 +10564,11 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// Entering bypass counts and approves every waiting card in `seq` order, including CLI
-    /// prompts forced by user ask rules and prompts with unknown kinds, missing reasons, descriptions,
-    /// paths, or stated reasons. The confirmation has one line because no card stays waiting. A call
-    /// whose CLI prompt was approved on entry gets a row note when it completes.
+    /// Entering bypass counts and approves every waiting card: the gate's request and CLI prompts
+    /// forced by an ask rule, of unknown kind, without a reason, describing only a subject or path,
+    /// or carrying a reason. They are listed in `seq` order and approved by `y`.
+    /// The prompt needs only one line because no card remains waiting. Completed calls whose CLI
+    /// prompt the entry approved carry the same bypass note as calls answered in a bypass tab.
     #[test]
     fn entering_bypass_approves_every_waiting_card_the_clis_own_prompts_included() {
         let dir = workspace("bypass-entry-every-prompt");
@@ -10649,9 +10664,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A card arriving while the bypass prompt is open was not counted by that prompt, even if
-    /// a user ask rule forced it. Confirmation asks again with the new count, and only that
-    /// second `y` approves it.
+    /// A card arriving while the bypass prompt is open, even one forced by an ask rule, cannot be
+    /// approved by a `y` to a question that omitted it. Confirmation asks again with the new count;
+    /// only the second `y` approves it.
     #[test]
     fn a_cli_prompt_arriving_under_an_open_bypass_prompt_asks_again() {
         let dir = workspace("bypass-entry-late-ask");
@@ -10709,7 +10724,7 @@ mod tests {
             .is_err());
     }
 
-    /// Codex's finding: a `Resync` can swallow a turn boundary (T1's `TurnCompleted` and T2's
+    /// A `Resync` can swallow a turn boundary (T1's `TurnCompleted` and T2's
     /// `TurnStarted` both dropped with the overflow), so the turn-end clear never runs. Every Resync
     /// forgets the tab's approvals, so a T2 prompt reusing T1's id -- same tool, same input -- is a
     /// card, not answered on T1's approval.
@@ -10778,7 +10793,7 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// `r` forgets the approvals at once, before any pump (review #4, C2).
+    /// `r` forgets the approvals at once, before any pump.
     #[test]
     fn reset_forgets_the_approvals() {
         let mut set = set();
@@ -10792,7 +10807,7 @@ mod tests {
         assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
     }
 
-    /// A tab with no backend holds no approvals: the pump's non-live arm forgets them (review #4, C3).
+    /// A tab with no backend holds no approvals: the pump's non-live arm forgets them.
     #[test]
     fn a_tab_without_a_backend_holds_no_approvals() {
         let dir = workspace("o3-no-backend");
@@ -10807,7 +10822,7 @@ mod tests {
         assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
     }
 
-    /// An Approve the provider refused approved nothing, so nothing is recorded (review #4, C4).
+    /// An Approve the provider refused approved nothing, so nothing is recorded.
     #[test]
     fn a_refused_approve_records_no_approval() {
         let dir = workspace("o3-refused-approve");
@@ -10828,9 +10843,9 @@ mod tests {
         shut_down_all(&mut set);
     }
 
-    /// A call whose CLI prompt was answered without a card gets a muted note on its row. The
-    /// note is carried in the completion's events payload and every later snapshot, as with a
-    /// call answered by a saved rule.
+    /// A call whose CLI prompt was answered without a card says
+    /// so, muted, on its row -- in the events payload when the call completes, and in every later
+    /// snapshot -- as a call a saved rule answered does.
     #[test]
     fn a_call_answered_without_a_card_says_so_on_its_row() {
         let dir = workspace("o3-row-note");

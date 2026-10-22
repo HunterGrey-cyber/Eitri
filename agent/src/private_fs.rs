@@ -422,7 +422,7 @@ mod tests {
         dir
     }
 
-    /// Umask 002 is the case the review measured (`0775`/`0664`); the modes here are set
+    /// Umask 002 otherwise permits group writes (`0775`/`0664`); the modes here are set
     /// explicitly, so the process umask cannot widen them. The umask is process-wide, so the body
     /// runs in a child copy of the test binary (`test_umask`).
     #[test]

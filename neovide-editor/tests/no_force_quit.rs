@@ -1,12 +1,14 @@
-//! Check that editor shutdown never sends a force-quit command to nvim.
-//! Shutdown uses `:confirm qall`, stdin EOF, or SIGTERM before escalating to SIGKILL by the
-//! held pid after the patience window in `nvim_child::end`. EOF and SIGTERM preserve swap
-//! files for modified buffers.
+//! Eitri must preserve modified buffers and their swap files when ending nvim.
+//! Ending an editor is only: nvim's own `:confirm qall` (it asks the user); closing its stdin and
+//! waiting (on EOF nvim exits keeping the swap files of modified buffers); SIGTERM, which nvim's
+//! own deadly-signal handler answers the same way; and SIGKILL by the pid Eitri holds, only when
+//! those did not end it within the patience window (`neovide_editor`'s `nvim_child::end`).
 //!
-//! `:qa!` discards unsaved buffers and deletes their swap files. Scan string literals in
-//! non-test Rust, product Lua files, and the pinned fork's lifecycle code for commands that
-//! could do this. Locate the fork with `cargo metadata` to inspect the revision being built.
-//! `nvim_child`'s real-nvim tests cover shutdown behavior.
+//! `:qa!` discards unsaved buffers AND deletes their swap files, and the pinned fork's own shutdown
+//! used to send it (`ParallelCommand::Quit` with `confirm_quit` forced off). This scans what could
+//! send one: every string literal in the product crates' non-test Rust, every product Lua file, and
+//! the pinned fork's lifecycle code, located through `cargo metadata` so it is the revision this
+//! workspace actually builds. The behaviour half is `nvim_child`'s real-nvim tests.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,10 +52,12 @@ fn force_quits(text: &str) -> Vec<String> {
     found
 }
 
-/// String literal contents and start offsets from Rust source, including plain, raw, byte and
-/// C strings. [`unescape`] decodes escapes in non-raw strings. Comments, nested block comments,
-/// literals and char literals are blanked out byte for byte in the code copy so offsets agree.
-/// Closing quotes distinguish char literals from lifetimes.
+/// Rust source read as the compiler reads it (splitting on `"` misses a
+/// raw string holding quotes and an escaped quote): the contents of every string literal -- plain,
+/// raw (`r#"…"#`), byte and C strings, the escapes of all but raw ones decoded ([`unescape`]) --
+/// with where each starts, and the code with every comment
+/// (nested block comments too), literal and char literal blanked out, byte for byte, so offsets
+/// agree. Lifetimes are told from char literals by the closing quote.
 struct Lexed {
     literals: Vec<(usize, String)>,
     code: String,
@@ -155,11 +159,12 @@ fn lex_rust(text: &str) -> Lexed {
     }
 }
 
-/// Decode a plain, byte or C string literal's body so the matcher sees what nvim receives.
-/// Handle `\n`, `\r`, `\t`, `\\`, `\0`, `\'`, `\"`, two-digit `\x` escapes, and `\u{...}`
-/// with hex digits and optional underscores. A backslash ending a line drops the line break
-/// and following whitespace. Keep anything else as written. Raw strings have no escapes
-/// and never reach this function.
+/// A plain, byte or C string literal's body as the compiler decodes it (`"qa\x21"` is `qa!`
+/// to nvim, and the matcher used to see the
+/// source spelling). `\n` `\r` `\t` `\\` `\0` `\'` `\"`, `\x` with two hex digits, `\u{…}` (hex,
+/// underscores allowed), and a backslash ending a line, which drops the line break and the
+/// whitespace after it. Anything else is kept as written. Raw strings never reach this: they have
+/// no escapes.
 fn unescape(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
@@ -293,8 +298,9 @@ fn rust_offences(text: &str) -> Vec<String> {
     hits
 }
 
-/// Find commands in raw strings with quotes, escaped quotes and byte strings, including after
-/// char literals and lifetimes. Ignore comments, nested block comments and the test module.
+/// Every literal Rust can spell, found as the compiler reads it -- a raw
+/// string holding quotes, an escaped quote, a byte string, a `'"'` char before a string, lifetimes
+/// -- and nothing in a comment, a nested block comment or the test module.
 #[test]
 fn every_rust_literal_is_read_as_the_compiler_reads_it() {
     let found = |src: &str| rust_offences(src);
@@ -359,9 +365,10 @@ mod tests { const X: &str = \"qa!\"; }"
     );
 }
 
-/// Decode force-quit commands spelled with `\x`, `\u{...}` or line continuations in plain,
-/// byte and C strings, including escapes in the bang or command name. Raw strings and escaped
-/// backslashes preserve the backslash that nvim receives and do not form those commands.
+/// A force-quit spelt with escapes is the
+/// force-quit Rust hands nvim -- `\x`, `\u{…}` (in the bang or in the command name), a line
+/// continuation, in plain, byte and C strings -- while a raw string, or an escaped backslash, keeps
+/// the backslash nvim then sees, which is no force-quit at all.
 #[test]
 fn an_escaped_force_quit_is_read_as_the_compiler_decodes_it() {
     let found = |src: &str| rust_offences(src);

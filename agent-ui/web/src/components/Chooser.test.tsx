@@ -47,7 +47,7 @@ function renderChooser(over: Record<string, unknown> = {}) {
     onCycleMode: vi.fn(),
     onCycleTabMode: vi.fn(),
     onLeave: vi.fn(),
-    // v1: claims nothing by default, so every existing test below exercises the
+    // Claims nothing by default, so every existing test below exercises the
     // chooser's own keys exactly as before; the dedicated describe further down overrides this to
     // prove the opposite -- a claiming `answerConfirm` swallows the chooser's keys whole.
     answerConfirm: vi.fn(() => false),
@@ -59,7 +59,7 @@ function renderChooser(over: Record<string, unknown> = {}) {
 }
 
 describe("Chooser", () => {
-  /** A tab with waiting cards must read `⚑N waiting` so it cannot appear idle. */
+  /** A tab holding cards read `⚑ · idle`. */
   it("an open tab with waiting cards reads ⚑N waiting, not idle", () => {
     const waiting = { ...TAB1, marker: "needs_input" as const, pending: 2 };
     const { container } = renderChooser({
@@ -99,8 +99,9 @@ describe("Chooser", () => {
     expect(props.onCloseTab).toHaveBeenCalledWith(1);
   });
   it("x on New session or a record row does nothing -- it is only bound on an open tab", () => {
-    // `x` closes only an open tab. On New session or a saved-session row it must leave the chooser
-    // open, matching the keys line.
+    // `x` used to fall into the catch-all `onLeave` branch for
+    // any row that is not a tab, silently closing the whole chooser even though the keys line
+    // advertises `x close tab` only on an open tab's row.
     const { root, props } = renderChooser(); // cursor starts on "New session" (active: null)
     fireEvent.keyDown(root, { key: "x" });
     expect(props.onLeave).not.toHaveBeenCalled();
@@ -132,6 +133,7 @@ describe("Chooser", () => {
     fireEvent.keyDown(filter, { key: "Enter" });
     expect(document.activeElement).not.toBe(filter);
   });
+  /** An input method's Enter or Escape must neither choose nor close. */
   it("the_filter_ignores_enter_while_composing", () => {
     const { root, container, props } = renderChooser();
     fireEvent.keyDown(root, { key: "/" });
@@ -173,7 +175,9 @@ describe("Chooser", () => {
     expect(props.onNewSession).toHaveBeenCalled();
   });
 
-  /** A record row shows the short id without the backend name, so untitled sessions can be told apart. */
+  /** The backend
+   *  name is no longer part of a record row -- only the short id, which is how an untitled record
+   *  is told apart from another. */
   it("a record row's line 2 keeps only the short id, never the backend, and is untitled with neither name nor title", () => {
     const { container } = renderChooser({
       envelope: {
@@ -211,8 +215,8 @@ describe("Chooser", () => {
     expect(mark.textContent!.toLowerCase()).toBe("fix");
   });
 
-  /** An open tab's mode can change, so the hint describes the available Shift+Tab action and calls
-   *  the auto/bypass switch a toggle. */
+  /** An open tab's mode is switchable, so the line no longer says "fixed": it
+   *  says what Shift+Tab does from here, and "toggle" rather than "cycle". */
   it("the mode line reads Start/Resume on New session and a record, and what Shift+Tab does on an open tab", () => {
     const { root, container } = renderChooser({ defaultMode: "auto" });
     const line = () => container.querySelector(".chooser-mode-line")!.textContent;
@@ -316,8 +320,9 @@ describe("Chooser", () => {
     expect(container.querySelector(".chooser-keys")!.textContent).toBe("enter switch · / filter · ctrl+r rename · x close tab · shift+tab mode · esc");
   });
 
-  /** An open tab's second line omits the backend name, which adds no distinction in release builds,
-   *  and the default auto mode. It shows a title or bypass notice when present. */
+  /** An open tab's line 2 used to read `⏵⏵ <mode> · <backend>[ · <title>]`
+   *  unconditionally -- the backend name (which reads "sidecar" in every release build) carried
+   *  nothing, and the mode was shown even for the default, auto. */
   describe("an open tab's line 2 (v1 trial item 1)", () => {
     it("is absent in auto mode with no title -- no mode, no backend", () => {
       const { container } = renderChooser(); // TAB1: auto, title null
@@ -350,7 +355,8 @@ describe("Chooser", () => {
     });
   });
 
-  /** A not-started tab's label already says new, so its state word must not repeat it. */
+  /** A not-started tab's row used to read "new" twice -- once as its default
+   *  label, once as its state word on the right. */
   it("a not-started tab has no state word on the right", () => {
     const notStarted: TabInfo = { ...TAB1, state: "not_started" };
     const { container } = renderChooser({
@@ -371,8 +377,8 @@ describe("Chooser", () => {
     expect(props.onCycleMode).not.toHaveBeenCalled();
   });
 
-  /** `App` bumps `focusRequest` on `pane_focus`/`arrive` so a chooser that lost DOM focus
-   *  gets it back without selecting a half-typed filter or rename value again. */
+  /** `App` bumps `focusRequest` on `pane_focus`/`arrive` so a chooser that lost DOM
+   *  focus (a GTK round trip) gets it back, without re-selecting a half-typed filter/rename value. */
   describe("focusRequest", () => {
     it("re-focuses the root after focus moved elsewhere", () => {
       const outside = document.createElement("button");
@@ -399,8 +405,8 @@ describe("Chooser", () => {
       document.body.removeChild(outside);
     });
   });
-  /** `gg`/`G` move to the first/last row and are consumed here so they cannot move
-   *  the conversation underneath the chooser. */
+  /** `gg`/`G` must go to the ends. Neither was originally bound,
+   *  and the `g`s went on to the conversation under the chooser. */
   it("gg goes to the first row and G to the last, and neither reaches the panel under it", () => {
     // The panel under it is a React `onKeyDown` on an ancestor (`App.tsx`'s root), so the check is
     // one too.
@@ -419,8 +425,8 @@ describe("Chooser", () => {
     fireEvent.keyDown(el(), { key: "g" });
     fireEvent.keyDown(el(), { key: "g" });
     expect(current()).toContain("New session");
-    // After a lone `g`, a non-modifier key other than `g` is consumed to cancel the wait. The
-    // following `j` must not also move the cursor.
+    // A lone `g` then another key is not `gg` -- and under the pending-prefix guard that key is swallowed, not run: the `j`
+    // after the `g` moves nothing, and only the wait is over.
     fireEvent.keyDown(el(), { key: "j" });
     fireEvent.keyDown(el(), { key: "g" });
     fireEvent.keyDown(el(), { key: "j" });
@@ -430,7 +436,7 @@ describe("Chooser", () => {
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "g" }));
     expect(outer).not.toHaveBeenCalledWith(expect.objectContaining({ key: "G" }));
   });
-  /** rc.3 minors review: a `g` held with Ctrl, Alt or Meta is a chord meant for something else; it must
+  /** A `g` held with Ctrl, Alt or Meta is a chord meant for something else; it must
    *  not arm the chooser's `gg` wait and so swallow the next plain key. */
   it("a modified g does not arm gg, so the next j still moves", () => {
     const { root } = renderChooser();
@@ -447,7 +453,8 @@ describe("Chooser", () => {
       expect(current()).toContain("1 fix-parser");
     }
   });
-  /** The current row's sign cell draws a solid cursor holding `›`, alongside the row fill. */
+  /** The current row's sign cell must be the panel's solid cursor holding `›`,
+   *  rather than only the cursorline fill. */
   it("draws the current row's sign as › and no other row's", () => {
     const { root } = renderChooser();
     const signs = Array.from(root.querySelectorAll(".chooser-row .chooser-sign")).map((el) => el.textContent);
@@ -455,7 +462,7 @@ describe("Chooser", () => {
     expect(root.querySelector(".chooser-row.current .chooser-sign")!.textContent).toBe("›");
   });
 
-  /** v1: a bypass (or window-close) confirm owns every key ahead of everything else in
+  /** A bypass (or window-close) confirm owns every key ahead of everything else in
    *  the panel, the chooser included -- `answerConfirm` is tried first in `onKeyDown`, and when it
    *  claims the key nothing below (the row cursor, Enter's `choose`, `x`, `q`/`Esc`, this
    *  component's own Shift+Tab) may also react to the same keydown. */
@@ -483,9 +490,9 @@ describe("Chooser", () => {
   });
 });
 
-/** A filter with no matches leaves no current row; `modeLine` must handle `undefined`
- *  without throwing and unmounting the panel. Exercise `↓`, `↑`, `Ctrl+n`, `Ctrl+p` and `g`
- *  with an empty list as well as with selectable rows. */
+/** A filter that matched nothing left no
+ *  row under the cursor, `modeLine` read `row.kind` on `undefined`, and the throw took the whole panel
+ *  with it. The list keys are `↓` `↑` `Ctrl+n` `Ctrl+p`; the chooser swallows an unmatched key after `g`. */
 describe("Chooser: the list keys", () => {
   const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
   /** ↓ ↑ Ctrl+n Ctrl+p, as the four keydowns a real keyboard sends. */
@@ -680,9 +687,11 @@ describe("Chooser: the list keys", () => {
   });
 });
 
-/** A lone `g` waits without a timeout, so window cancellation must clear it too. Shift+Tab cancels
- *  directly; focus changes, arrival, HINT, tab switches, and overlays cancel through
- *  `dropKeysRequest`. Otherwise the next `j` would be swallowed by an obsolete wait. */
+/** A lone `g` waits for its next key with
+ *  no timeout, so any route that ends a pending key elsewhere in the window has to end this one too --
+ *  Shift+Tab (the chooser sees it as a key of its own) and the window's cancel routes that reach it as
+ *  `dropKeysRequest` (a focus round trip, `arrive`, a HINT, a tab switch, an overlay). Left waiting, the
+ *  next `j` after either was swallowed as the cancel of a `g` nobody meant any more. */
 describe("Chooser: a waiting g ends on the window's cancel routes (K01)", () => {
   const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
 

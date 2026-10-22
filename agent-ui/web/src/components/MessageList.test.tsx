@@ -25,14 +25,18 @@ function texts(...values: string[]) {
   return values.map((text, i) => ({ seq: i, text }));
 }
 
-/* Tests that do not exercise the cursor pass `cursor={-1}`, outside the timeline, so no row gets
-   `.row-current` or `aria-current`. The cursor-highlight cases have their own describe block at
-   the bottom. */
+/* `cursor` is a prop because the cursor must be
+   visible, `.row-current`/`aria-current`). Every test above this line predates it and is not
+   testing the cursor -- `cursor={-1}` is passed throughout them (never a real timeline index) so
+   none of their rows render as current, preserving exactly the rendering these tests already
+   assert on. The cursor-highlight behaviour itself is its own describe block, at the bottom. */
 
-/* Conversation items share a sign-column grid (`.row.row-<kind>`, `.row-sign`, `.row-body`).
-   State is shown by the `data-sign` glyph as well as colour; this test checks the glyphs
-   themselves. Keep the two finished calls separated by other items, since adjacent finished
-   calls collapse into one `run` row with only one glyph. */
+/* Every conversation item is now a row on one sign-column
+   grid (`.row.row-<kind>`, `.row-sign`, `.row-body`), and the row's state is never colour alone --
+   the glyph in `data-sign` differs too. This is the one test asserting the glyphs themselves.
+   The two finished calls sit apart, each with something else between them: two
+   ADJACENT finished calls collapse into one `run` row now, which would leave only one glyph on
+   screen for both -- exactly the wrong fixture for a test about telling states apart by glyph. */
 describe("MessageList row structure", () => {
   it("gives every row a sign column, and distinguishes state by glyph not only colour", () => {
     render(
@@ -189,7 +193,7 @@ describe("MessageList interleaves the conversation in its real order", () => {
   });
 });
 
-/* The Critical finding this sanitization closed: model output is rendered with
+/* Sanitization must keep model output from impersonating navigation controls. Model output is rendered with
    `dangerouslySetInnerHTML`, and model output is attacker-influenceable (a repository file, a web
    page the model fetched, a tool result). Script execution inside THIS document is not a contained
    XSS -- the panel holds `window.webkit.messageHandlers.eitriAgent`, the same bridge that relays
@@ -262,7 +266,7 @@ describe("MessageList tool calls and permissions", () => {
         sessionEnded={false}
         // t-0 is still running, which always renders regardless of `expanded` -- see
         // `renderToolCall`. t-1 is finished, and this test is about tool_use_id keying, not about
-        // the fold added in this task, so it is expanded here to keep asserting the state it always
+        // the result fold, so it is expanded here to keep asserting the state it always
         // asserted rather than the folded placeholder.
         expanded={{ "t-1": true }}
         cursor={-1}
@@ -275,9 +279,11 @@ describe("MessageList tool calls and permissions", () => {
     expect(calls[1].querySelector(".tool-result")!.getAttribute("data-state")).toBe("done");
   });
 
-  /* A finished call absent from `expanded` must show the folded placeholder rather than its
-     result. Running calls and explicitly expanded calls do not exercise this default, so this
-     test catches an ignored `showResult` or a reversed expansion check. */
+  /* A FINISHED call with no entry in `expanded` shows the folded placeholder,
+     not its result. This once had zero coverage -- every other test here either
+     leaves a call running (which always shows, folded or not) or opts out of the fold via
+     `expanded`, so a regression that ignored `showResult` entirely, or a flipped `=== true` /
+     `!== false` comparison at the call site, would pass all 206 tests unnoticed. */
   it("folds a finished call's result by default, per the empty `expanded` map", () => {
     const { container } = render(
       <MessageList
@@ -316,7 +322,8 @@ describe("MessageList tool calls and permissions", () => {
     );
     const awaiting = Array.from(container.querySelectorAll(".row-tool [data-awaiting-permission='true']"));
     expect(awaiting).toHaveLength(1);
-    // A gated call says it is waiting because the permission card already shows the command.
+    // A gated call says it is waiting rather than repeating the command a card below
+    // it already shows.
     expect(awaiting[0].textContent).toContain("waiting for approval");
     expect(awaiting[0].textContent).not.toContain("rm -rf /");
   });
@@ -426,7 +433,7 @@ describe("MessageList tool calls and permissions", () => {
   });
 });
 
-/* sw-panel-render-6: a `null` result used to mean "still running" unconditionally, so a tool call
+/* A `null` result used to mean "still running" unconditionally, so a tool call
    abandoned by session end or a resume that restored a call from before its own history boundary
    rendered a permanent spinner. `MessageList` is what has both the call's `seq` and `state.history`
    /`sessionEnded` in scope, so it is where the "can this ever complete?" verdict is actually made
@@ -481,10 +488,11 @@ describe("MessageList: an abandoned tool result never spins forever (sw-panel-re
     expect(result.getAttribute("data-state")).toBe("none");
   });
 
-  /* An interrupted turn can leave `activeTurnId` null while `status` is running and `history` is
-     null. A tool result can arrive only in its own turn, so its spinner must stop once that turn
-     is inactive and stay stopped when another turn starts. Exercise this through the real
-     reducer. */
+  /* An INTERRUPTED turn in a fresh session -- `tool_call_started`, then
+     `turn_completed` with no result -- left `activeTurnId` null but `status` running and `history`
+     null, so the call kept its `◐` and `Running…` forever. A call's result only ever arrives inside
+     its own turn; once that turn is not the active one, it never will, and that must hold after
+     the next turn starts too. Folded through the real reducer, not a hand-built state. */
   it("stops spinning once the call's own turn has ended, and stays stopped when the next turn starts", () => {
     const events: AgentDomainEvent[] = [
       { type: "session_opened", session_id: "s1", provider_session_id: "c1", model: "m", cwd: "/p" },
@@ -554,9 +562,10 @@ function setScroll(list: HTMLElement, dims: { scrollHeight: number; clientHeight
   Object.defineProperty(list, "scrollTop", { value: dims.scrollTop, configurable: true, writable: true });
 }
 
-/* Following snaps to the end for new rows and growing rows. A smooth scroll leaves a new row
-   below the edge while it animates, so these tests assert the final list position instead of
-   checking for a `scrollIntoView` call. */
+/* Correction (the GUI pass, 2026-09-24): the tests in this block asserted that a new
+   row was followed by a call to `scrollIntoView` -- the smooth scroll a new row used to get. That scroll
+   left the row below the edge for the frame or two its animation took, so following is a snap to the
+   end now, new row or not, and these tests assert where the list ends up instead. */
 describe("MessageList auto-follow", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
@@ -572,9 +581,10 @@ describe("MessageList auto-follow", () => {
     expect(list.scrollTop).toBe(1680);
   });
 
-  /* Measuring after a new row mounts can make a reader at the bottom look scrolled away when the
-     row exceeds the 24px threshold. Grow the list by 600px without a scroll event to check that
-     content growth keeps following active. */
+  /* The first guard measured AFTER the new row was in the DOM, so a row taller
+     than the 24px threshold made a user sitting exactly at the bottom look scrolled away. Here the
+     user is at the very bottom, and the new row grows the list by 600px with no scroll event -- which
+     is what real content growth does. Checked against the old guard: it fails this test. */
   it("still follows when the new row alone is taller than the threshold", () => {
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("first") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
@@ -693,7 +703,8 @@ describe("MessageList follows a reply growing while it streams", () => {
   });
 });
 
-/* Clamp `scrollTop` as a browser does so follow snaps land at realistic positions. */
+/* A list whose `scrollTop` clamps the way a
+   browser's does, so the snap lands where a real one would. */
 function clampedList(list: HTMLElement, clientHeight: number, start: { scrollHeight: number; scrollTop: number }) {
   let height = start.scrollHeight;
   let top = start.scrollTop;
@@ -819,8 +830,8 @@ describe("MessageList follows by intent, not by the direction of a scroll", () =
     expect(list.scrollTop).toBe(1680);
   });
 
-  // Stop following for any upward wheel scroll the list can take. Gestures that move nothing are
-  // covered separately below.
+  // "any wheel up" that the list itself can take -- one that moves nothing is its own
+  // block below.
   it("stops following on any wheel up the list can take, however small (deliberately, since 2026-09-24)", () => {
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
@@ -1411,8 +1422,8 @@ describe("MessageList cursor highlight", () => {
   });
 });
 
-/* The restored-history notice belongs at the head of the list because it describes the
-   conversation below it. */
+/* The restored-history notice lives at the head of the list rather than above
+   it, because it describes the conversation below it. */
 describe("the restored-history notice", () => {
   const notice = {
     source: "claude_transcript" as const,
@@ -1663,9 +1674,10 @@ describe("MessageList keeps a following view at its end when the list or a row c
   });
 });
 
-/** Read the last `(label, jump, afterSeq)` triple passed to `onUnreadChange`. The band in
- *  `App.tsx` holds this value for the unread indicator. `afterSeq` is the sequence threshold for
- *  unread items. */
+/** The last `(label, jump, afterSeq)` triple `onUnreadChange` was called with.
+ *  The pill no longer floats itself (`NewPill`, deleted); it reports upward instead, and the
+ *  band (`App.tsx`) holds the latest value the way this reads it back for a test. `afterSeq`
+ *  is the `seq` threshold itself; see `MessageList`'s own doc comment on the prop. */
 function lastUnread(mock: ReturnType<typeof vi.fn>): { label: string | null; jump: () => void; afterSeq: number | null } {
   const call = mock.mock.calls[mock.mock.calls.length - 1] as [string | null, () => void, number | null];
   return { label: call[0], jump: call[1], afterSeq: call[2] };
@@ -1757,14 +1769,16 @@ describe("MessageList: the unread pill (reported upward)", () => {
   });
 });
 
-/* Use a `seq` threshold for unread items. `buildTimeline` can insert a card after an older tool
-   call, before a saved array-length cutoff, even though the card arrived later. Unread status
-   depends on arrival sequence rather than where the item is drawn. */
+/* The old threshold was a timeline INDEX (the length at the moment following
+   stopped), sliced off the CURRENT timeline. `buildTimeline` does not keep the array in `seq` order
+   -- a card anchored to an older tool call is spliced in right after that call, which can land it
+   BEFORE the old length cutoff even though it arrived (its own `seq`) long after. A `seq` threshold
+   fixes that: what matters is when an item happened, never where `buildTimeline` chose to draw it. */
 describe("MessageList: the unread threshold is a seq, not an index", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
-  /** Scroll away from the bottom so `MessageList` stops following and latches
-   *  `unseenAfterSeqRef` from `state`'s timeline. */
+  /** Parks the view (scrolled up and away from the bottom), the same way the unread-pill tests above do,
+   *  so `unseenAfterSeqRef` in `MessageList` latches its threshold from `state`'s timeline. */
   function park(list: HTMLElement) {
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
     fireEvent.scroll(list);
@@ -1828,7 +1842,7 @@ describe("MessageList: the unread threshold is a seq, not an index", () => {
       <MessageList state={state({ transcript: texts("a", "b", "c") })} {...props} onUnreadChange={onUnreadChange} />,
     );
     const list = container.querySelector(".message-list") as HTMLElement;
-    // `MessageList` is not remounted across a tab switch (that is the whole reason this task exists),
+    // `MessageList` is not remounted across a tab switch, so its unread threshold must track that switch,
     // so it carries whatever `followingRef` it already had. A tab switch's restore is only ever
     // seeded for a tab that was left PARKED (`App.tsx`'s `saveView` never saves a threshold for one
     // left `atBottom`) -- parking it here first is what stops the `[state]` effect's own `follow()`
@@ -1867,7 +1881,7 @@ describe("MessageList: the unread threshold is a seq, not an index", () => {
 describe("turn ending rows", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: vi.fn() };
   const none = { reason: null, api_error_status: null, message: null };
-  /** prompt, a partial reply, the turn's end, then (optionally) a later prompt, folded by the real reducer. */
+  /** Prompt, a partial reply, the turn's end, then (optionally) a later prompt, folded by the real reducer. */
   const conversation = (end: AgentDomainEvent, later = false): AgentUiState => {
     const events: AgentDomainEvent[] = [
       { type: "turn_started", turn_id: "t1" },

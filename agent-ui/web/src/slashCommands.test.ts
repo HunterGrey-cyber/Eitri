@@ -58,8 +58,11 @@ describe("SLASH_COMMANDS", () => {
     ]);
   });
 
-  // Check each command's classification against its table cell to catch transcription errors.
-  // Some cells have trailing annotations, so read the class from the leading words.
+  // Cross-checks the table against the doc's own classification row by row, so a hand-transcription
+  // slip fails here rather than only being caught by someone re-reading both files side by side.
+  // Four rows (`/model`, `/config`, `/resume`, `/login`) carry an extra "— and are held
+  // back regardless (named ...)" annotation after the class word in the doc's own cell; only the
+  // leading word(s) are the class, so this matches the whole cell and reads its prefix.
   it("classifies every command exactly as the doc's table row says", () => {
     for (const entry of SLASH_COMMANDS) {
       const rowRe = new RegExp(`\\| \`/${entry.name}\` \\| ([^|]+) \\|`);
@@ -83,8 +86,8 @@ describe("heldBackSlashCommand", () => {
     expect(heldBackSlashCommand("/resume yesterday")).toBe("resume");
   });
 
-  /* Send a bare `/model`: its headless reply is parseable text that the panel turns into a
-   *  picker. */
+  /* A bare /model now sends -- its reply is real, parseable text
+   *  headless, and the panel opens a picker from it instead of refusing to send at all. */
   it("no longer holds back a bare /model -- it sends, same as /model <name>", () => {
     expect(heldBackSlashCommand("/model")).toBeNull();
     expect(heldBackSlashCommand("/model  ")).toBeNull();
@@ -143,11 +146,11 @@ describe("worksSlashCommands (the ? overlay's list)", () => {
   });
 });
 
-/* The v1-ui GUI pass (2026-09-27): `/config` typed and refused said "? lists the ones that do", and `?`
+/* `/config` typed and refused said "? lists the ones that do", and `?`
    listed `/config`. The overlay lists only what Enter sends. */
 describe("listedSlashCommands (the ? overlay's list, what Enter would send)", () => {
-  /* List `/model` as "model", like other sendable commands. It needs no "<name>" suffix because
-   *  the bare command also sends and opens a picker. */
+  /* /model is plain "model" now, like every other sendable row --
+   *  it no longer needs its own "<name>" form, since a bare /model sends too (and opens a picker). */
   it("leaves out /config and lists /model plainly", () => {
     expect(listedSlashCommands()).toEqual([
       "clear",

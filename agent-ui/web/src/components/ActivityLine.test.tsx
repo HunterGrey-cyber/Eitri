@@ -54,7 +54,8 @@ it("counts the queue, names the interrupt key, and names a card that waits (P1)"
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={2} pendingTool={null} />,
   );
-  // The lowercase interrupt hint is the Stop button's label, so the hint itself is clickable.
+  // The interrupt words ARE the Stop button now, lowercase
+  // like Claude Code's own bin string -- not a separate span beside a "Stop" button.
   expect(container.querySelector(".activity-line")!.textContent).toContain("2 queued · ctrl+c interrupt");
   expect(container.querySelector("button.stop")!.textContent).toBe("ctrl+c interrupt");
   rerender(
@@ -64,8 +65,9 @@ it("counts the queue, names the interrupt key, and names a card that waits (P1)"
   expect(container.textContent).not.toContain("queued");
 });
 
-/** The card hint names `a`/`d` in BROWSE. In INPUT it says Escape first because keys go to the
- *  composer. Callers that omit the mode get BROWSE wording. */
+/** The card row reads differently by mode -- BROWSE can
+ *  answer `a`/`d` directly, INPUT's keys go to the composer so it says `Esc` first. Defaults to
+ *  BROWSE for every caller that predates this (`mode?`'s own doc comment). */
 it("the card row says a / d alone in BROWSE, and defaults to it", () => {
   const onInterrupt = vi.fn();
   const { container } = render(
@@ -74,8 +76,10 @@ it("the card row says a / d alone in BROWSE, and defaults to it", () => {
   expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — j to it, a / d alone");
 });
 
-/** A waiting card gets the activity line without a phase word beside it.
- *  At 520px, showing both truncated the card's answer keys. */
+/** With a card waiting the activity line must keep the approval keys visible. The old
+ *  wording drew the phase word and the card side by side, and at
+ *  520px both were cut to `waiti… ⚑ Write needs …` -- the keys that answer the card were the part
+ *  lost. */
 it("with a card waiting, the card is the line: no phase word or clock beside it", () => {
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Write" />,
@@ -85,9 +89,11 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
   expect(container.querySelector("button.stop")).not.toBeNull();
 });
 
-/** The hint must explain both card targeting and the typing guard: move onto the card before
- *  `a`/`d`, then wait `TYPING_GUARD_MS` after the last key. Otherwise moving away with `k` or
- *  answering too soon after Escape produces a refusal the shorter hint did not explain. */
+/** The old "a / d" /
+ *  "Esc, then a / d" said neither that the cursor check narrows `a`/`d` to the card under the cursor (never
+ *  "the only card, from any row") nor that the typing guard makes them wait `TYPING_GUARD_MS` since the last key.
+ *  A user who moved off the card with `k`, or pressed `a` a beat after `Esc`, followed a hint that
+ *  did not explain either refusal. */
 it("codex-release-p1 #9: the hint names both S4's navigation and S1's pause, in both modes", () => {
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,

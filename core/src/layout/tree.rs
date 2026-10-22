@@ -1330,8 +1330,8 @@ mod tests {
         assert!(!layout.is_shown(&ModuleId::editor()));
     }
 
-    /// The default split leaves 760px for the editor out of the 1279px remaining
-    /// after the default window's 1px divider, matching `main`'s `GtkPaned`.
+    /// The first tiled window must look like the old one: the default split puts the divider where `main`'s
+    /// `GtkPaned` did, 760px of the 1279 the default window's 1px divider leaves.
     #[test]
     fn the_default_is_editor_then_agent_where_main_put_the_divider() {
         assert_eq!((1279.0 * DEFAULT_EDITOR_SHARE).round(), 760.0);
@@ -1351,8 +1351,8 @@ mod tests {
         assert_eq!(layout.zoomed(), None);
     }
 
-    /// `side` goes right of the whole root and `bottom` below it, in registration order.
-    /// A side panel preserves the agent.
+    /// `side` goes right of the whole root and `bottom` below it, in registration order; the agent
+    /// is no longer replaced by a side panel.
     #[test]
     fn lua_positions_become_placements_in_registration_order() {
         let layout = Layout::initial(&[
@@ -1382,8 +1382,8 @@ mod tests {
         );
     }
 
-    /// `main` takes the editor's leaf and hides the editor, which remains in the tree
-    /// so it can be shown again. Focus starts on the panel.
+    /// `main` keeps its visual meaning: the panel takes the editor's leaf and the editor is hidden,
+    /// not gone -- it is still a leaf, so it can be shown again, and focus starts on the panel.
     #[test]
     fn main_takes_the_editors_leaf_and_hides_the_editor() {
         let layout = Layout::initial(&[decl("m", Placement::InPlaceOfEditor)]).unwrap();
@@ -1393,8 +1393,9 @@ mod tests {
         assert_eq!(layout.focus(), &lua("m"));
     }
 
-    /// `Placement::BelowEditor` wraps only the editor's own leaf, even with the agent on its right
-    /// and a side panel around the root. Neither the agent nor the side panel moves or loses height.
+    /// `Placement::BelowEditor` (the terminal's default since 2026-09-28): with the agent right of the editor and
+    /// a side panel wrapping the whole root, a module placed this way wraps the editor's own leaf
+    /// only -- neither the agent nor the side panel move or lose any height.
     #[test]
     fn below_editor_wraps_only_the_editors_own_leaf() {
         let root = Node::split(
@@ -1432,8 +1433,9 @@ mod tests {
         );
     }
 
-    /// In the default `[editor | agent]` window, the module goes below the editor's own leaf.
-    /// The agent keeps its full height, unlike placement below the whole root.
+    /// The default window, `[editor | agent]`: the module goes below the editor's own leaf, and the
+    /// agent keeps the whole column's height -- not the tree `Placement::BelowRoot` would build,
+    /// which is exactly the shape the terminal was moved away from on 2026-09-28.
     #[test]
     fn below_editor_keeps_the_agent_at_full_height_in_the_default_window() {
         let root = Node::split(
@@ -1527,7 +1529,7 @@ mod tests {
         );
     }
 
-    /// Invariant 2: only a leaf can be hidden, and showing an unknown module is an error rather
+    /// Only a leaf can be hidden, and showing an unknown module is an error rather
     /// than a silent insert.
     #[test]
     fn invariant_2_only_leaves_are_hidden() {
@@ -1540,8 +1542,8 @@ mod tests {
         assert!(layout.hidden().is_empty());
     }
 
-    /// `LastVisible` describes the last module on screen rather than saying it cannot be hidden.
-    /// The message also reaches callers of `kill()` through its inner `hide`.
+    /// `LastVisible` must describe both hiding and killing: `kill()` also calls `hide()` internally,
+    /// including when a module exits unexpectedly, so its error text must fit either operation.
     #[test]
     fn last_visible_reads_the_last_module_on_screen_not_cannot_be_hidden() {
         assert_eq!(
@@ -1562,8 +1564,8 @@ mod tests {
         assert_eq!(layout.hide_unfocused(&ModuleId::agent()), Ok(false), "already hidden");
     }
 
-    /// Invariant 4, and the defect it exists for: today's `unzoom` shows every child, so a zoom
-    /// ending would resurrect a module the user closed.
+    /// A zoom never touches the hidden set, and the defect that guards against: an `unzoom` that
+    /// showed every child would, as a zoom ended, resurrect a module the user closed.
     #[test]
     fn invariant_4_a_zoom_never_touches_the_hidden_set() {
         let mut layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
@@ -1633,8 +1635,8 @@ mod tests {
         assert_eq!(layout.focus(), &ModuleId::agent());
     }
 
-    /// A hidden module cannot take focus through `set_focus`, which receives GTK focus changes.
-    /// `hide` moves focus away first; this checks that a later focus update cannot give it back.
+    /// A hidden module must never hold focus. `hide` moves the keys first, as tested in
+    /// `geometry.rs`; this pins the other entry point, where the shell records GTK's focus report.
     #[test]
     fn a_hidden_module_never_takes_the_keys() {
         let mut layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
@@ -1710,9 +1712,9 @@ mod tests {
         );
     }
 
-    /// A module placed below the root keeps its height. Until the pin has a length, the split
-    /// uses `BELOW_ROOT_SHARE`. A module placed right of the root or in the editor's leaf
-    /// is not pinned.
+    /// A module placed below the root keeps its height (this file's doc). The pin has no
+    /// length yet -- the split divides by `BELOW_ROOT_SHARE` until it has been on screen -- and a
+    /// module placed right of the root, or in the editor's leaf, is not pinned.
     #[test]
     fn a_module_placed_below_the_root_is_pinned_on_its_own_side_and_nothing_else_is() {
         let layout = Layout::initial(&[decl("below", Placement::BelowRoot)]).unwrap();
@@ -1754,8 +1756,8 @@ mod tests {
         assert_eq!(arrange(&layout, &frame).rect_of(&lua("below")).unwrap().h, 360);
     }
 
-    /// Rebuilding from a state file applies every `Layout::new` check
-    /// and rejects invalid `hidden` sets.
+    /// Loading saved state must enforce every `Layout::new` invariant plus the three additional
+    /// checks for hidden modules.
     #[test]
     fn from_parts_rebuilds_a_layout_and_refuses_what_breaks_an_invariant() {
         let root = || {

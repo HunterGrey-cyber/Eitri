@@ -1,12 +1,10 @@
-//! `fd_watch::add_local`'s `!Send` closure must never run or drop off the thread that registered it
-//!. Two ways a safe caller could reach that:
-//!
-//! - it registers while owning the default context, releases it, and another thread iterates;
-//! - it sends the (`Send`) `SourceId` to another thread, which removes it (the destroy notify runs there).
-//!
-//! Either must fail loudly (the guard's panic, an abort from a C callback) rather than run. Each
-//! scenario runs in a child copy of this test binary, because the expected outcome ends the
-//! process. No display is needed.
+//! `fd_watch::add_local`'s `!Send` closure must run and drop on its registering thread.
+//! Two safe caller actions can otherwise move those operations to another thread:
+//! - release the default context after registration and let another thread iterate it;
+//! - send the `Send` SourceId to another thread and remove it there, invoking destroy notify.
+//! Both must fail loudly through the guard panic or callback abort rather than execute.
+//! Each scenario uses a child copy of this test binary because it ends the process.
+//! No display is needed.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;

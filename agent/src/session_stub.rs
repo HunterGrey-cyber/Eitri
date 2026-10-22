@@ -106,8 +106,8 @@ impl AgentSession {
 mod tests {
     use super::*;
 
-    /// The gate itself: in a build without the feature the legacy backend cannot
-    /// start, and says why in words a developer can act on.
+    /// Without the feature the legacy backend cannot start and must explain why in words
+    /// a developer can act on.
     #[test]
     fn start_is_unsupported_and_names_the_feature_that_brings_legacy_back() {
         let error = match AgentSession::start(Path::new("."), &[], ProjectTrust::Untrusted) {

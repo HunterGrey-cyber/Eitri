@@ -190,9 +190,9 @@ fn the_sender_marks_only_selections_longer_than_2000_unicode_characters() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// The 400-line cap can truncate a selection below `CONTENT_LIMIT` of 2000 characters.
-/// For 401 one-character lines, the retained 400 lines contain only 799 characters.
-/// Mark that truncation so the model cannot mistake a partial selection for a complete one.
+/// The 400-line cap can truncate well below `CONTENT_LIMIT` (2000 characters): 401 one-character
+/// lines leave only 799 characters. The result must carry a truncation marker so the model
+/// cannot mistake a partial selection for the complete selection.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_selection_past_the_line_cap_marks_truncation_even_under_the_character_limit() {
@@ -240,10 +240,9 @@ fn a_selection_past_the_line_cap_marks_truncation_even_under_the_character_limit
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// When the line cap truncates a blockwise selection, keep the cursor's endpoint column.
-/// Using `i32::MAX` widens every retained line to its full width and sends unselected text
-/// to the model. The test selects two columns across 500 lines of `abcdefgh` and checks
-/// both the column boundary and the truncation marker.
+/// Capping a blockwise selection must retain the endpoint's selected column. Forcing
+/// `i32::MAX` widens every retained line to its full width, sending unselected text to the
+/// model without a truncation marker. Two columns across 500 lines of `abcdefgh` expose it.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_capped_block_selection_sends_only_the_selected_columns() {
@@ -251,9 +250,9 @@ fn a_capped_block_selection_sends_only_the_selected_columns() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("wide_lines.txt");
 
-    // Use 300 lines and columns 1-2 as the uncapped control, so the test also catches regressions
-    // in ordinary block selections. `\u{16}` is a literal Ctrl-V byte that `:normal!` reads as
-    // the key for entering blockwise visual mode, just as it would a real keypress.
+    // The control uses 300 lines and columns 1-2, below the cap, to catch regressions in the
+    // ordinary uncapped block path too. `\u{16}` is a literal Ctrl-V byte: `:normal!` reads it
+    // as the key entering blockwise Visual, just as a real keypress would.
     std::fs::write(&file, "abcdefgh\n".repeat(300)).unwrap();
     let mut feed = EditorContextFeed::new().expect("the feed must bind");
     let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
@@ -265,7 +264,7 @@ fn a_capped_block_selection_sends_only_the_selected_columns() {
     assert!(!selection.text.contains(TRUNCATION_MARKER));
     feed.cleanup();
 
-    // Above the cap: 500 lines, columns 1-2. Before the fix this sent 8-column "abcdefgh" lines,
+    // Above the cap: 500 lines, columns 1-2. An earlier version sent 8-column "abcdefgh" lines,
     // capped to 224 lines by the character limit the wide text hit early, with no marker.
     std::fs::write(&file, "abcdefgh\n".repeat(500)).unwrap();
     let mut feed = EditorContextFeed::new().expect("the feed must bind");
@@ -288,14 +287,15 @@ fn a_capped_block_selection_sends_only_the_selected_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A capped block must keep the selected display columns when the cap line contains a tab. This
-/// case selects columns 1-2 across 500 lines, with `\tXYZ` on line 400. Reusing byte column 2
-/// there would select through display column 9 and send `abcdefghi` instead of `ab`.
+/// A capped block keeps the user's display columns rather than moving the lower corner's byte
+/// column to the cap line. For columns 1-2 of `abcdefghijklmnop` over 500 lines, a cap line
+/// containing `\tXYZ` puts byte 2 (`X`) at display column 9. Using that byte corner would
+/// incorrectly send `abcdefghi` for a selection of `ab`.
 ///
-/// The same nvim writes `getregion` for the whole uncapped selection as the oracle. Each
-/// returned snippet line must match that line of the oracle exactly; truncation may remove
-/// lines but cannot change columns. `--clean` excludes user configuration so each case controls
-/// `virtualedit` and `selection`.
+/// Nvim supplies the oracle: its own `getregion` returns the whole uncapped block. Every sent
+/// line must exactly match the corresponding oracle line; fewer lines with a truncation marker
+/// are allowed, different columns are not. `--clean` excludes user configuration so each case
+/// alone sets 'virtualedit' and 'selection'.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_capped_block_selection_keeps_its_display_columns_across_a_tab() {

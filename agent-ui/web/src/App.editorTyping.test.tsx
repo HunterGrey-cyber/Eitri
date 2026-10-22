@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * A design decision (revised 2026-09-29), the page's half: Rust's `editor_typing` envelope slows the
+ * Rust's `editor_typing` envelope slows the
  * turn meter while the user types in the editor (`typingCadence.ts`). The attribute and the meter
  * step are Rust's word alone -- nothing else in the page sets or clears them -- so a tab switch, a
  * focus change or a snapshot must leave them exactly as Rust last said, and a page that goes away

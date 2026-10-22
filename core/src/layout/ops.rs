@@ -410,9 +410,8 @@ mod tests {
         layout
     }
 
-    /// The chat can move below or left of the editor: `Ctrl+a " a` from the editor,
-    /// or `Ctrl+a \ e` from the agent. Modules are moved without duplication,
-    /// and the moved module receives the keys.
+    /// Chat can move below or left of the editor through `Ctrl+a " a` from the editor or
+    /// `Ctrl+a \ e` from the agent. A move must not duplicate the module and must give it focus.
     #[test]
     fn the_chat_goes_below_or_left_of_the_editor() {
         let mut layout = Layout::initial(&[]).unwrap();
@@ -452,8 +451,8 @@ mod tests {
         assert_eq!(layout.focus(), &term());
     }
 
-    /// A previously unplaced module joins both the tree and the MRU list,
-    /// so `neighbor()` can rank it.
+    /// A canvas module is placed the first time it draws: a module the tree has never held joins it,
+    /// and the MRU list, so `neighbor()` can rank it.
     #[test]
     fn a_module_never_placed_joins_the_tree() {
         let mut layout = Layout::initial(&[]).unwrap();
@@ -561,9 +560,10 @@ mod tests {
         assert_eq!(a.rect_of(&term()).map(|r| (r.x, r.w, r.h)), Some((0, 1280, 240)));
     }
 
-    /// `Ctrl+a |` with the terminal hidden makes the editor and chat equal while preserving the
-    /// terminal's bottom row and stored height. A later `Ctrl+a t` restores that row, and `F11`
-    /// does not grow it. A terminal that is shown when evened joins the row and loses its pin.
+    /// Evening the default window with its terminal hidden makes the editor and chat equal.
+    /// The hidden terminal stays below with its previous height, so reopening it preserves a bottom
+    /// row through `F11` rather than creating a right-hand column. A visible terminal instead joins
+    /// the even row and loses its height pin.
     #[test]
     fn a_hidden_bottom_row_keeps_its_place_and_its_height_through_even() {
         let mut layout = window();
@@ -585,10 +585,10 @@ mod tests {
         assert_eq!(widths, [426, 426, 426]);
     }
 
-    /// A hidden module outside a bottom row stays in the tree when `even` rebuilds it.
-    /// The hidden editor goes at the chain's end and takes no space. `Ctrl+a e` then shows
-    /// it beside the chat. Omitting it would make showing it create a new split in release
-    /// builds, where `replace_root` checks the invariant only with `debug_assert`.
+    /// Evening after hiding the editor keeps that hidden non-bottom module in the tree, at the
+    /// chain's end where it takes no space. Showing it later restores it beside the chat.
+    /// Dropping it from the chain would escape a release build's `replace_root` debug assertion
+    /// and cause the editor to be placed as a new split instead.
     #[test]
     fn a_hidden_module_that_is_not_a_bottom_row_stays_hidden_at_the_end_of_the_chain() {
         let mut layout = window();
@@ -749,7 +749,7 @@ mod swap_adjacent_tests {
         layout.leaves().iter().position(|m| m == id).unwrap()
     }
 
-    /// Like tmux's `swap-pane -U/-D`, adjacent swaps wrap, over the modules on screen in tree order.
+    /// tmux's `swap-pane -U/-D` wrap over visible modules in tree order.
     #[test]
     fn swap_adjacent_wraps_over_the_modules_on_screen_and_skips_a_hidden_one() {
         let frame = Frame::new(Size { w: 1280, h: 721 }, 1);

@@ -1,5 +1,5 @@
-//! Real-CLI probes of the gated bypass. `#[ignore]`d: it spawns real Claude sessions and bills the
-//! account they run as.
+//! Real-CLI probes of host-answered bypass. Ignored by default because these spawn real
+//! Claude sessions and bill the account they run as.
 //!
 //! **Run only on a dedicated test account, through the resolved binary, with a scratch state home:**
 //!
@@ -19,14 +19,12 @@
 //!
 //! The sidecar runs the CLI named by `VERDANDI_CLAUDE_CLI_PATH`; `PATH` alone does not select it.
 //!
-//! **What these prove, and what they only record.** Bypass is Eitri's own `allow` under a CLI
-//! that always runs gated, never `bypassPermissions` on the wire. Tests 1/1b/2/6 assert that: no
-//! `PermissionRequested` a bypass tab answers itself is ever delivered to the panel, the resolution
-//! still arrives (sidecar) or is silently dropped with the request (legacy, a documented gap), and
-//! the effect lands on disk. Tests 3, 4 and 5 probe whether the real CLI's own `default` mode plus a
-//! hook that always allows behaves exactly like `bypassPermissions` would. **A refusal there is not
-//! this test suite's bug to fix**: it is recorded verbatim (the tool result text, the CLI build) and
-//! reported, never loosened or skipped around.
+//! Bypass means the host answers `allow` while the CLI stays gated, never `bypassPermissions`
+//! on the wire. Tests 1/1b/2/6 require answered requests to stay out of panel delivery, their
+//! resolution to arrive on sidecar (legacy drops it with the request), and effects to land
+//! on disk. Tests 3/4/5 measure whether CLI `default` plus an allowing hook behaves like
+//! `bypassPermissions`. Refusals must be recorded with their tool result and CLI build and
+//! reported as limitations, never hidden by loosening or skipping the probe.
 //!
 //! **Auto tabs answer differently depending on the CLI.** On a sidecar that offers `cli_auto_mode` and
 //! `permission_defer` the CLI runs its own `auto` and the host answers every gate request `defer`:
@@ -52,10 +50,10 @@
 //! Test 8 is Manual mode on a sidecar whose CLI runs its own `auto`: a real in-project `Write` must be
 //! the gate's own card, neither answered by the host nor deferred. Passed on CLI 2.1.293.
 //!
-//! **A run that did not exercise what a test is about fails as INCONCLUSIVE**: test 1b needs exactly
-//! five Reads each paired with its own resolution by id; test 3 needs an `Agent`/`Task` call and, for
-//! a `Write` card, proof from the CLI's own transcript that a subagent made it; test 5 counts a trip
-//! after the card as a trip. Read the raw lines each prints before recording any figure or branch.
+//! A run that misses the behavior being measured fails as INCONCLUSIVE. Test 1b needs exactly
+//! five Reads paired with their resolutions by id; test 3 requires an `Agent`/`Task` call and
+//! CLI transcript evidence that a subagent made any counted Write; test 5 counts a trip even
+//! after a card. Read the raw output before recording any measurement or outcome.
 
 use agent::{AgentDomainEvent, PermissionDecision, PermissionMode, PermissionOutcome, PrefixRules};
 use eitri_core::agent_backend::{AgentBackend, AnsweredForYou, BackendKind, GateOrigin, HumanApprovals};
@@ -66,8 +64,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// `$HOME/.cache/nv-v1mode-t5/<pid>/` -- never `/tmp`, and namespaced by this
-/// process's own pid so two runs (or two lanes) never collide on the same scratch tree.
+/// Scratch lives at `$HOME/.cache/nv-v1mode-t5/<pid>/`, with this process's pid preventing
+/// concurrent runs from colliding on one scratch tree.
 fn scratch_root() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME must be set");
     PathBuf::from(home)
@@ -103,9 +101,10 @@ fn shut_down(set: &mut TabSet) {
     }
 }
 
-/// Owns a `TabSet` and shuts down its backends even when an assertion panics.
-/// Rust runs `Drop` while unwinding, so a failed test cannot skip cleanup and leave
-/// real `claude` or sidecar processes running.
+/// Owns a `TabSet` and shuts down everything it holds even when an assertion panics mid-test --
+/// Rust still runs `Drop` while unwinding, which a `shut_down` call written only at a test's last
+/// line does not cover, and a leaked real `claude`/sidecar process from a failed assertion is
+/// exactly the accident a guard that shuts every tab down on failure too exists to prevent.
 struct LiveSet(TabSet);
 
 impl std::ops::Deref for LiveSet {
@@ -150,9 +149,8 @@ impl Drop for LiveBackend {
     }
 }
 
-/// Creates a tab confirmed into bypass before it has a backend. Confirming an empty tab
-/// also updates the window default, matching a launch where the user accepts the
-/// dashboard's bypass offer before the first turn.
+/// Confirming bypass on an empty tab also changes the window default. This models accepting
+/// the dashboard's bypass offer before the first turn, when the tab has no backend yet.
 fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     let mut set = TabSet::new(kind, SessionModeChoice::Auto);
     let tab = set.active();
@@ -569,13 +567,15 @@ impl GateTrace {
     }
 }
 
-/// Sends `prompt` and pumps the real 33 ms loop until the turn starts and ends, passing each
-/// delivered batch to `on_events`. `turn_running()` reads the live projection, but
-/// `active_turn_id` becomes `Some` only after the ingestion thread folds `TurnStarted`. A false
-/// value immediately after sending does not mean completion.
+/// Sends `prompt` and pumps the real 33ms loop until the turn has both started and ended, handing
+/// every newly delivered event to `on_events` along the way. `turn_running()` reads the backend's
+/// own live projection directly (not a locally cached flag), but the sidecar's `active_turn_id` only
+/// becomes `Some` once the provider's real `TurnStarted` folds -- asynchronously, on the ingestion
+/// thread -- so "wait for it to become true" is a real phase here, not a formality: reading `false`
+/// straight after `send_turn` must never be mistaken for "the turn already ended".
 ///
-/// A tab failed by the ungated-mode tripwire is shut down and reported immediately, so its
-/// failure is not hidden behind a start or end timeout.
+/// An ungated-mode trip shuts down the failed tab and reports its reason immediately rather
+/// than waiting until the deadline and misreporting a turn that never started or ended.
 fn drive_turn(
     set: &mut TabSet,
     dir: &std::path::Path,
@@ -652,10 +652,9 @@ fn assert_no_permission_requested(events: &[serde_json::Value], label: &str) {
     );
 }
 
-/// Prints every `tool_name` call the turn made -- its input, and its result text with `is_error` --
-/// BEFORE the caller asserts on the effect, so a run that fails an effect assertion (an `rm -rf` that
-/// left the directory behind) has already said what the tool was really given and what it answered
-///.
+/// Print each `tool_name` call's input and result, including `is_error`, before asserting
+/// its effect. If `rm -rf` leaves a directory behind, the output must already explain what
+/// the tool received and answered.
 fn print_tool_io(events: &[serde_json::Value], tool_name: &str, label: &str) {
     let calls: Vec<&serde_json::Value> = events
         .iter()
@@ -680,10 +679,11 @@ fn print_tool_io(events: &[serde_json::Value], tool_name: &str, label: &str) {
     }
 }
 
-/// Exercises a `Write` outside the project, `Bash rm -rf` on an external scratch directory, and
-/// a `Read` of an external file while the CLI remains gated. Each call draws no card, completes
-/// without error, and produces the expected disk effect. The sidecar's `PermissionResolved`
-/// confirms that the host answered a request.
+/// Test 1: `Write` outside the project, `Bash rm -rf` of a scratch dir outside the project, `Read` of a
+/// file outside the project -- three calls a real `bypassPermissions` session would run without asking,
+/// on a session that always stays gated. Every call: no card drawn, the tool
+/// completes without error, the effect is really on disk, and the sidecar's own `PermissionResolved`
+/// still shows up (evidence the host really answered it, not that nothing was asked at all).
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn sidecar_bypass_answers_every_call_and_the_cli_runs_them() {
@@ -785,18 +785,20 @@ fn sidecar_bypass_answers_every_call_and_the_cli_runs_them() {
     );
 }
 
-/// Measures bypass answer latency by driving `take_revised_ui_delivery` every 1 ms,
-/// bypassing the 33 ms pump. Reads five in-project files, one call per file.
+/// Test 1b measures host answer latency by driving `take_revised_ui_delivery` every 1ms,
+/// bypassing the 33ms pump so its tick cannot dominate the measurement.
+/// Five in-project Reads each target their own file.
 ///
-/// Pairs each resolution's `permission_id` with its request's `tool_use_id`. Other tools
-/// also receive resolutions, so pairing by arrival order can give false latency results.
-/// Read pending requests from the projection before and after answering on every pass:
-/// bypass removes requests from UI delivery. Require exactly five pairs, reject negative
-/// latencies, and print every raw measurement.
+/// Pair by id, never arrival order. Pairing the i-th Read start with the i-th resolution
+/// of any tool is invalid: bypass also answers ToolSearch, Glob and other hooked calls.
+/// An extra resolution can create negative latencies and a false pass. Map each resolution's
+/// `permission_id` to its request's `tool_use_id`, using the projection before and after
+/// answering because bypass hides requests from delivery. Require exactly five Read pairs,
+/// non-negative latency for each, and print every raw figure first.
 ///
-/// Measure from request-seen to resolution-seen for each permission id. The CLI starts a
-/// tool after the host answers, so `ToolCallStarted` can arrive after its own resolution
-/// and cannot mark the beginning of the host's answer latency.
+/// Use the request as the start marker, not `ToolCallStarted`. Reads' resolutions can arrive
+/// before their tool starts (measured 0-264ms earlier) because the CLI starts the tool only
+/// after the host answers. Answer latency is request-seen to resolution-seen per permission id.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn host_answer_latency_in_bypass() {
@@ -980,10 +982,10 @@ fn host_answer_latency_in_bypass() {
     );
 }
 
-/// Exercises the same three calls on `BackendKind::Legacy` with `--permission-mode default` and
-/// the hook returning `allow`. Checks that no card appears, tools finish without error, and
-/// disk effects land. Legacy drops the synchronous resolution with the request, so this does
-/// not expect a `PermissionResolved`. Requires a build with `--features legacy-backend`.
+/// Test 2 repeats the three calls on `BackendKind::Legacy`, verifying that `--permission-mode
+/// default` plus the hook's allow grants them. Legacy returns resolution synchronously and
+/// drops it with the request, so this checks no card, no tool error and disk effects without
+/// requiring a delivered `PermissionResolved`. Available only with `--features legacy-backend`.
 #[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
@@ -1231,16 +1233,20 @@ fn is_subagent_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
 }
 
-/// Probes whether `PreToolUse` sees a subagent's tool call in `auto` on both backends.
-/// A card or a host answer proves the gate saw the call. Host answers include a fast-path
-/// `allow` noted on the call's row and a `defer`. With neither a card nor a host answer,
-/// no file indicates a CLI refusal and is printed; a written file is ungated and fails.
+/// Test 3: `auto`, both backends: does the `PreToolUse` gate see a SUBAGENT's own tool call, or does it
+/// slip through unasked? Card + file: the gate sees subagents (bypass will answer them too). The
+/// host answering the call itself (a fast-path `allow` noted on its row, or a `defer`) + file: the same
+/// evidence, since the host's answer is the gate seeing the call. No card, no answer of the host +
+/// no file: the CLI refused an unhooked call, a functional limitation to record. No card or
+/// host answer with a file means a gate bypass and must fail.
 ///
-/// The Write must come from a subagent: a parent writing `sub.txt` would not exercise that
-/// path. Allow the `Agent`/`Task` card and require the call to start. Count a Write card only
-/// while that call is open and when the CLI transcript places its `tool_use` id on a
-/// sidechain line with an `agentId`. Neither backend's wire carries the parent tool-use id
-/// or agent id. Missing proof fails as inconclusive. Deny all other cards.
+/// A counted Write must come from a subagent. If the model ignores the instruction and writes
+/// `sub.txt` itself, a card plus that file would falsely imply a subagent path was exercised.
+/// The probe therefore allows the `Agent`/`Task` card, requires that call to start, and counts a
+/// Write as the subagent's only when it arrives while that call is open and the CLI transcript
+/// records its `tool_use` id on a sidechain line with an `agentId`. Neither backend's wire has
+/// a parent tool-use id or agent id, so a run lacking transcript evidence is inconclusive and
+/// fails instead of recording a result. Other cards are denied so nothing else runs.
 fn a_subagent_tool_call_reaches_the_host_on(kind: BackendKind, label: &str) {
     let dir = project(label);
     let (mut set, tab) = auto_tab(kind, &dir);
@@ -1507,7 +1513,7 @@ fn a_subagent_tool_call_reaches_the_host_on_sidecar() {
     a_subagent_tool_call_reaches_the_host_on(BackendKind::Sidecar, "subagent-sidecar");
 }
 
-/// Requires a build with `--features legacy-backend`.
+/// Available only in builds with `--features legacy-backend`.
 #[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
@@ -1616,7 +1622,7 @@ fn protected_paths_under_default_with_hook_allow() {
         bypass_trace.assert_target_writes_were_gated(rel, ran, rel);
     }
 
-    // Leaving bypass moves this session to Manual immediately; the next press moves it to Auto.
+    // Auto, same session: leaving bypass immediately selects manual; the next press selects auto.
     match set.cycle_mode(tab, eitri_core::tab_set::ViewId::BASE).unwrap() {
         ModeCycle::Changed(SessionModeChoice::Manual) => {}
         other => panic!("leaving bypass moves at once, to manual, got {other:?}"),
@@ -1736,12 +1742,15 @@ fn protected_paths_under_default_with_hook_allow() {
     );
 }
 
-/// A project's `permissions.defaultMode` must not leave the session ungated. Each combination
-/// must be `Gated` (deny the card, write nothing), `Tripped` (close the session, write
-/// nothing), or `AnsweredByHost` (no card because the host deferred to CLI auto mode or allowed
-/// an edit). Any write to `inside.txt` must correspond to a gate request answered by a card or
-/// the host. The CLI must report `auto` or `default`. On legacy, `--permission-mode default`
-/// must override the project setting, so the branch cannot be `Tripped`.
+/// Test 5 checks that project `permissions.defaultMode` never leaves the session ungated.
+/// Each combination is `Gated` (deny its card, nothing written), `Tripped` (close the session,
+/// nothing written), or `AnsweredByHost` (no card,
+/// because the host answered the gate request itself: a `defer` to the CLI's own auto mode, or an
+/// `allow` from its edit fast path). `inside.txt` existing without the gate having seen the call --
+/// a card answered `Allow`, or an answer of the host -- is never acceptable in any branch, and is
+/// asserted as such regardless of which one this run took. The CLI must also report a mode the host
+/// accepts (`auto` or `default`, never what the project asked for). On legacy the explicit
+/// `--permission-mode default` must always win: the branch there must not be `Tripped`.
 enum DefaultModeBranch {
     Gated,
     AnsweredByHost,
@@ -1901,9 +1910,8 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
                         for t in out.tripped {
                             t.retired.into_backend().shutdown();
                         }
-                        // A trip after answering the card must still set `found` to `Tripped`.
-                        // Leaving it at `Gated` skips the trip checks and reports the wrong
-                        // branch after the CLI announces an ungated mode.
+                        // A trip after the card still changes the outcome to Tripped. Leaving `found` at Gated
+                        // would skip the trip checks and falsely report gated despite an ungated-mode report.
                         println!("[v1-mode] test5 {label}: the tripwire fired AFTER the card was answered");
                         found = DefaultModeBranch::Tripped;
                         break;
@@ -2026,7 +2034,7 @@ fn default_mode_bypass_permissions_gates_the_sidecar() {
     run_default_mode_probe(BackendKind::Sidecar, "bypassPermissions", "default-mode-bypass-sidecar");
 }
 
-/// Requires a build with `--features legacy-backend`.
+/// Available only in builds with `--features legacy-backend`.
 #[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
@@ -2040,7 +2048,7 @@ fn default_mode_accept_edits_gates_the_sidecar() {
     run_default_mode_probe(BackendKind::Sidecar, "acceptEdits", "default-mode-accept-edits-sidecar");
 }
 
-/// Requires a build with `--features legacy-backend`.
+/// Available only in builds with `--features legacy-backend`.
 #[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
@@ -2338,13 +2346,13 @@ fn a_bypass_tab_answers_a_content_scoped_ask_rule_prompt() {
     assert!(dir.join("first.txt").exists(), "the Write the ask rule asked about ran");
 }
 
-/// Entering bypass lists and approves the waiting card, allowing the write. Leaving bypass is
-/// immediate, and the next call produces a card on the Auto tab and is denied. Supplied
-/// `ask_rules` are loaded from the trusted project's settings.
+/// A waiting card is counted and approved on entering bypass, and its write lands. Leaving
+/// bypass is immediate; a second such call must card in the now-Auto tab and is denied.
+/// When given, `ask_rules` are loaded from the trusted project's settings.
 ///
-/// Only legacy offers a host-policy card here. When the sidecar CLI runs `auto`, the host
-/// defers every gate request and produces no card of its own. The sidecar case instead uses a
-/// CLI card forced by an ask rule.
+/// Only legacy has a waiting card of the host's own policy to offer in a test: on a sidecar whose CLI
+/// runs `auto` the host defers every gate request, so no card of the host's exists there, and the
+/// sidecar's entry is test 6a, with a card the CLI raised for an ask rule.
 #[cfg(feature = "legacy-backend")]
 fn bypass_approves_the_waiting_card(
     kind: BackendKind,

@@ -882,10 +882,12 @@ mod tests {
 
     #[test]
     fn osc52_may_copy_and_may_not_paste() {
-        // Assert `term_config().osc52` directly to verify that `Term` refuses clipboard reads
-        // under `Osc52::OnlyCopy`. An empty reply alone cannot distinguish that refusal from
-        // the listener's unconditional `Event::ClipboardLoad(..) => {}`. The `screen.feed` and
-        // `take_replies` checks also exercise the client path end to end.
+        // `assert_eq!(term_config().osc52, ...)` is the load-bearing
+        // check. `Term` itself (`Osc52::OnlyCopy`) refuses a read before it ever reaches an
+        // `Event`, so the two `screen.feed`/`take_replies` lines below observe an empty reply
+        // either way and cannot distinguish "Term refused it" from "the listener would have
+        // dropped it too" (`Event::ClipboardLoad(..) => {}` in listener.rs is unconditional).
+        // They still exercise the real client path end to end and are kept for that.
         assert_eq!(term_config().osc52, Osc52::OnlyCopy);
         let mut screen = Screen::new(SIZE, TerminalColors::default());
         screen.feed(b"\x1b]52;c;?\x07");
@@ -896,10 +898,12 @@ mod tests {
         assert_eq!(screen.take_events().clipboard.as_deref(), Some("hi"));
     }
 
-    /// Check that `Term` itself refuses clipboard reads under `Osc52::OnlyCopy`. With
-    /// `Osc52::CopyPaste` as a control, `clipboard_load` emits `Event::ClipboardLoad`, which
-    /// the listener separately discards unconditionally. This verifies both layers of
-    /// clipboard-read protection.
+    /// `Term` really is the layer that refuses a
+    /// read, not merely `Screen`'s listener happening to agree. Under `Osc52::CopyPaste` (the
+    /// negative control -- never Eitri's own config), alacritty's `clipboard_load` (verified
+    /// against `alacritty_terminal-0.26.0/src/term/mod.rs`) DOES emit `Event::ClipboardLoad`; only
+    /// our listener's own, separate, unconditional no-op then drops it. So the refusal is real and
+    /// double-layered, as the module doc claims -- neither layer alone is a coincidence.
     #[test]
     fn a_clipboard_read_is_refused_by_term_itself_under_only_copy() {
         use std::sync::{Arc, Mutex};
@@ -926,9 +930,8 @@ mod tests {
             received
         };
 
-        // `c` is the clipboard; `p` and `s` are the selection phase 2 puts on the primary
-        //: `Term::clipboard_load` checks the
-        // policy before it looks at the target, and this pins that for the selection too.
+        // `c` is the clipboard; `p` and `s` are the primary selection. `Term::clipboard_load`
+        // checks policy before the target, so selection reads must obey the same refusal.
         for read in [&b"\x1b]52;c;?\x07"[..], b"\x1b]52;p;?\x07", b"\x1b]52;s;?\x07"] {
             let name = String::from_utf8_lossy(read).escape_debug().to_string();
             assert_eq!(
@@ -945,10 +948,9 @@ mod tests {
         }
     }
 
-    /// Bottom-terminal phase 2: OSC 52 names its target, and `Term` reports `c` as the clipboard and
-    /// both `p` and `s` as the selection (`alacritty_terminal-0.26.0` `clipboard_store`). nvim's own
-    /// OSC 52 provider copies `"*` with `s`. Before phase 2 the listener dropped the target, so a
-    /// `"*y` inside the terminal overwrote the CLIPBOARD used for `Ctrl+V`.
+    /// OSC 52 names its target: `Term` reports `c` as the clipboard and both `p` and `s` as the
+    /// selection (`alacritty_terminal-0.26.0` `clipboard_store`). nvim copies `"*` with `s`;
+    /// dropping that target would let `"*y` overwrite the clipboard pasted by `Ctrl+V`.
     #[test]
     fn osc52_to_the_selection_is_kept_apart_from_the_clipboard() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -962,7 +964,7 @@ mod tests {
         assert_eq!(events.clipboard.as_deref(), Some("clip"));
     }
 
-    /// Bottom-terminal phase 2: where typing lands, which is where the input method's preedit is
+    /// Where typing lands, which is where the input method's preedit is
     /// drawn and its candidate window placed. The `PaintList` carries the cursor only while it is
     /// visible (`terminal-render`'s contract); this is the same cell, reported either way, and
     /// always the cell of the frame `render` just produced.
@@ -999,9 +1001,12 @@ mod tests {
         assert_eq!((screen.cursor_cell().row, screen.cursor_cell().col), (4, 19));
     }
 
-    /// While a synchronized update is open, the cursor must come from the snapshot that `render`
-    /// uses. Reading the live `Term` instead would place preedit and the input method's candidate
-    /// window at the cursor of a partially drawn update.
+    /// The cursor must belong to the frame `render` just
+    /// produced, especially while a synchronized update is open, when that frame is the
+    /// snapshot taken as the update opened. The session renders then (a focus change, a resize, a
+    /// title inside nvim's `DECSET 2026` redraw), and a cursor read off the live `Term` would put the
+    /// preedit and the candidate window at the half-drawn update's cursor. Checked red against a
+    /// `cursor_cell` that reads `self.term`.
     #[test]
     fn inside_an_open_update_the_cursor_cell_is_the_snapshots_not_the_half_drawn_ones() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -1146,9 +1151,9 @@ mod tests {
         assert_eq!(screen.render(true).surface_background, RgbColor::new(0x12, 0x34, 0x56));
     }
 
-    /// GUI pass 2026-09-23, defect 3, at the `Screen`: with no fixed cursor colour the cursor takes
-    /// the covered cell's colours swapped; a fixed one (and `set_colors` switching between the two)
-    /// is honoured; and an OSC 12 query still gets an answer -- the foreground.
+    /// With no fixed cursor colour the screen uses the covered cell's colours swapped.
+    /// A fixed colour is honoured, including when `set_colors` switches between these modes,
+    /// and an OSC 12 query still gets the foreground as its answer.
     #[test]
     fn with_no_fixed_cursor_colour_the_cursor_follows_the_cell_and_a_query_gets_the_foreground() {
         let cursor_color = |screen: &mut Screen| match screen.render(true).cursor() {
@@ -1266,8 +1271,9 @@ mod tests {
         assert_eq!(screen.open_update(), None, "aborting with nothing open is a no-op");
     }
 
-    /// A nested BSU is idempotent in `SyncBarrier` and only resets the parser timeout. It must
-    /// preserve the ordinal because the same update remains open and unpublished.
+    /// A nested BSU inside an already-open update (`SyncBarrier`
+    /// treats it as idempotent, matching vte's own "just reset the timeout" handling) must not
+    /// perturb the ordinal: it is still the same update, still open, still unpublished.
     #[test]
     fn a_nested_bsu_does_not_rename_the_still_open_update() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -1281,8 +1287,9 @@ mod tests {
         assert_eq!(screen.open_update(), None, "the ESU that actually ends it still works");
     }
 
-    /// Aborting an open update retires its ordinal just as ESU does, so the next update gets a
-    /// different ordinal from the aborted one.
+    /// Aborting an open update must retire its
+    /// ordinal exactly like an ESU would, so the update that opens next gets a genuinely new name
+    /// -- not one that collides with the aborted one's.
     #[test]
     fn aborting_an_update_retires_its_ordinal_like_an_esu_would() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -1311,10 +1318,10 @@ mod tests {
         assert_eq!(screen.take_replies(), b"\x1b[8;1;1t\x1b[4;18;9t");
     }
 
-    /// `CSI 14 t` uses `alacritty_terminal::Term::text_area_size_pixels`, which multiplies
-    /// `num_lines * cell_height` and `num_cols * cell_width` in `u16`. Products above 65535
-    /// panic in debug builds and wrap in release builds. `saturate_cell_px` must keep both
-    /// products at or below that limit.
+    /// `CSI 14 t`'s formatter (`alacritty_terminal::Term::text_area_size_pixels`) multiplies
+    /// `num_lines * cell_height` and `num_cols * cell_width` in plain `u16`: a debug build panics
+    /// past 65535 and a release build wraps. `saturate_cell_px` must cap these products as well
+    /// as the dimensions passed to `PtySize::to_winsize`.
     #[test]
     fn a_wide_high_res_terminal_does_not_overflow_csi_14_t() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -1330,9 +1337,10 @@ mod tests {
         assert_eq!(screen.take_replies(), b"\x1b[4;64000;64000t");
     }
 
-    /// One read contains a published frame ("frame" and "plus1") followed by a still-open
-    /// update that has written only "HEL". `render()` must show the last published frame while
-    /// the second update remains incomplete.
+    /// One read carries a complete, published frame ("frame"/
+    /// "plus1") followed immediately by a second, still-open update that has only written "HEL"
+    /// so far. `render()` must keep showing the last PUBLISHED frame, never the live `Term`'s
+    /// current, torn content -- that is the whole point of the publication barrier.
     #[test]
     fn render_never_shows_a_frame_torn_by_a_later_update_in_the_same_read() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -1367,10 +1375,12 @@ mod tests {
         assert_eq!(screen.render(true).row_text(0), "first");
     }
 
-    /// A resize inside an update must reach `render()` even if the update dispatches no
-    /// content. `Term::resize` does not set the publication barrier's dirty flag. Both ESU and
-    /// abort clear `in_sync` regardless of that flag, so the next render projects the live
-    /// `term` with the new grid size.
+    /// A resize during an empty synchronized update must not leave `render` at the old grid
+    /// size. `Term::resize` is not a parser dispatch, so it never sets `frame_ready`; with no
+    /// dispatch inside the update, `SyncBarrier::dirty` also stays clear and neither feed's
+    /// transition capture nor abort has dirty content to publish. Rendering must reproject the
+    /// live term whenever no update is open: both `end_sync` and `abort_sync` clear `in_sync`
+    /// even when clean, so the next render reads the resized term.
     #[test]
     fn a_resize_inside_an_update_that_publishes_nothing_still_reaches_render() {
         for end_with_esu in [true, false] {
@@ -1400,11 +1410,14 @@ mod tests {
         }
     }
 
-    /// Feeding plain output must not pay for a full screen projection on each PTY read.
-    /// This feeds 50,000 small 64-byte chunks without BSU or ESU. Projection belongs in `render`;
-    /// `feed` should do only parsing and bookkeeping for this stream.
-    /// The test is ignored because it is timing-sensitive and can take seconds on a regression.
-    /// Run with `cargo test --lib -- --ignored` from this crate's directory.
+    /// Snapshotting a full O(rows x cols) projection on every `FrameComplete` or end-of-read
+    /// `Wakeup` makes a plain flood pay one projection per PTY read even without synchronized
+    /// updates. Measured overhead was 2.6-7.6x. Feed 50,000 small (64-byte) chunks to mimic a
+    /// fast PTY reader's small reads (16-17 bytes per real read): `feed` must only do per-byte
+    /// bookkeeping, leaving projection to rendering instead of producing 50,000 full screens.
+    /// Ignored like `delta_equals_full` because a timing-sensitive test that takes several
+    /// seconds when broken costs too much in every debug workspace run. Run with
+    /// `cargo test -p eitri-terminal --lib -- --ignored`.
     #[test]
     #[ignore = "timing-sensitive; run with --ignored to confirm no per-read projection cost"]
     fn feeding_a_plain_flood_pays_no_per_read_projection_cost() {
@@ -1487,8 +1500,9 @@ mod tests {
         assert!(screen.scrolled());
     }
 
-    /// Output arriving while scrolled back keeps the pinned view on the same content.
-    /// The indicator's `N` grows by the number of new lines below the window.
+    /// (b) Output arriving while scrolled back must not move the pinned view -- the
+    /// anchor holds the same content -- but the indicator's `N` grows by however many new lines
+    /// arrived below it.
     #[test]
     fn output_while_pinned_does_not_move_the_view_only_the_indicator_grows() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
@@ -1505,11 +1519,14 @@ mod tests {
         );
     }
 
-    /// The first scroll into `Pinned` must render a correct history window even while a
-    /// synchronized update is open. Falling back to `self.frame` when `self.pinned_frame` is
-    /// `None` would use screen-local `RowUpdate::line` values instead of absolute grid lines.
-    /// Subtracting a negative `window_top_line` from those values would leave top rows empty
-    /// and shift live-screen content into the wrong rows.
+    /// The first scroll into `Pinned` while a synchronized update is
+    /// already open used to leave `self.pinned_frame` at `None`, and `render`'s
+    /// `unwrap_or(&self.frame)` fell back to the live-screen snapshot -- whose `RowUpdate::line`
+    /// values are screen-local (`0..rows-1`, see `terminal_frame::project::full_rows`), not absolute
+    /// grid lines like `project_window`'s. `build_paint_list`'s `to_row` then subtracted a negative
+    /// `window_top_line` from those screen-local numbers, so the window's top rows drew nothing and
+    /// the rest showed the live screen's own rows shifted into the wrong window rows. `render` must
+    /// still produce a correct pinned window the very first time it is asked for one, even mid-update.
     #[test]
     fn scrolling_for_the_first_time_during_an_open_update_still_renders_the_pinned_window() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
@@ -1591,8 +1608,8 @@ mod tests {
         assert_eq!(screen.top_line(), 0);
     }
 
-    /// `HalfPages(n)` moves `rows / 2` lines, with a minimum of one line, per step.
-    /// Copy mode uses this for `Ctrl+u` and `Ctrl+d`.
+    /// `HalfPages(n)` moves half a screen (`rows / 2` lines, at least one) at a time -- the
+    /// `Ctrl+u`/`Ctrl+d` keys in copy mode.
     #[test]
     fn half_pages_move_half_a_screen_at_a_time() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
@@ -1603,8 +1620,8 @@ mod tests {
         assert!(!screen.scrolled(), "back down by the same half screen unpins");
     }
 
-    /// The alternate screen keeps no history (`max_scrollback == 0`), so scrollback requests
-    /// have no effect there. Wheel handling can send arrow keys to the program instead.
+    /// (e) The alternate screen keeps no history (`max_scrollback == 0`): every scroll request is a
+    /// no-op there. The input handler turns the wheel into arrow keys for a program running in it instead.
     #[test]
     fn scrolling_in_the_alternate_screen_is_a_no_op() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
@@ -1644,10 +1661,11 @@ mod tests {
 
     // ---- copy mode ----
 
-    /// Entering copy mode shows `[0/M]` at the live bottom, where `ScrollView::indicator` alone
-    /// reports nothing because the view is unpinned. Scrolling updates the indicator as usual.
-    /// Leaving copy mode returns to the live bottom and removes the indicator,
-    /// whether or not the view was scrolled back.
+    /// Entering copy mode shows the indicator at once, `[0/M]` at the live bottom where
+    /// `ScrollView::indicator` alone reports nothing because nothing is pinned there; scrolling
+    /// inside copy mode counts exactly as plain scrollback keys already do; and leaving
+    /// always snaps back to the bottom and removes the indicator, whether or not the view had been
+    /// scrolled up in between.
     #[test]
     fn copy_mode_shows_0_of_m_at_the_bottom_and_leaving_removes_it() {
         fn indicator_text(frame: &PaintList) -> Option<&str> {
@@ -1799,8 +1817,9 @@ mod tests {
         );
     }
 
-    /// Typing clears the selection through `note_input`, which also returns a scrolled-back
-    /// view to the live bottom. A bare modifier leaves the selection unchanged.
+    /// (e) Typing (never a bare modifier) clears the selection, the
+    /// same `on_terminal_input_start` rule that snaps a scrolled-back view to the bottom
+    /// (`note_input`'s own doc).
     #[test]
     fn typing_clears_the_selection_but_a_bare_modifier_does_not() {
         use terminal_input::keys::{Key, KeyEvent, ModifiersState, NamedKey};
@@ -1834,9 +1853,10 @@ mod tests {
         assert!(screen.term.selection.is_none(), "a real key clears the selection");
     }
 
-    /// `Self::selection_spans`, passed by `render` to `RenderInput::selection`, contains exactly
-    /// the selected cells. `Lines(3)` pins the window three lines into history, so a selection
-    /// on its top row must report that negative absolute grid line rather than `0`.
+    /// (f) `Self::selection_spans` -- what `render` hands `RenderInput::selection` -- carries
+    /// exactly the selected cells, including while scrolled back: `Lines(3)` pins the
+    /// window 3 lines into history, and a selection made on the window's own top row (now the
+    /// absolute line the pin reports, negative) reports that same negative line, not `0`.
     #[test]
     fn selection_spans_cover_exactly_the_selected_cells_including_while_scrolled_back() {
         let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());

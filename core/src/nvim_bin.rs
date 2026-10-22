@@ -652,9 +652,8 @@ mod tests {
         );
     }
 
-    /// A `PATH` nvim whose probe fails or times out is not "none": the private copy still wins (it
-    /// cannot be shown to be new enough), but the line must not tell the user their `PATH` has no
-    /// nvim when it does.
+    /// A PATH nvim whose probe fails or times out cannot be shown new enough, so the private copy
+    /// wins. The diagnostic must still acknowledge that PATH contains nvim, rather than say none exists.
     #[test]
     fn a_path_nvim_whose_probe_fails_is_unreadable_not_absent() {
         let chosen = decide(
@@ -676,9 +675,9 @@ mod tests {
         );
     }
 
-    /// Both the override and an inherited `NEOVIM_BIN` must be absolute paths.
-    /// Relative values could be checked against `shell`'s cwd but run from the project directory.
-    /// They are rejected even when `is_file` accepts every path, as a same-named local file would.
+    /// `EITRI_NVIM` and inherited `NEOVIM_BIN` must be absolute. A relative path could be checked
+    /// in the shell's cwd but executed from the project directory, selecting a different file.
+    /// Reject it before `is_file`, even when a same-named file exists in the shell's cwd.
     #[test]
     fn a_relative_eitri_nvim_or_neovim_bin_is_an_error_naming_the_variable() {
         for relative in ["bin/nvim", "./nvim", "nvim"] {
@@ -781,9 +780,12 @@ mod tests {
 
     #[test]
     fn which_nvim_skips_a_relative_or_empty_path_entry() {
-        // The `NEOVIM_BIN` spawn uses `current_dir(project)`, which may differ from this test's cwd.
-        // Skip relative and empty `PATH` entries even if they find an executable here: returning
-        // such a path could name a different file when the editor is spawned.
+        // The fork resolves `NEOVIM_BIN` with `current_dir(project)` (this module's top-level
+        // doc, and fork `src/bridge/command.rs:79-89`), a directory that has nothing to do with
+        // wherever this test process's own cwd happens to be -- so a relative (or PATH's-own-
+        // empty-means-"." convention) entry that resolves to a real executable here, against this
+        // process's cwd, must never be joined and returned: it would name a different file from
+        // the one the fork would actually run.
         let cwd = std::env::current_dir().unwrap();
         let relative_name = format!("nvim-bin-test-cwd-relative-{}-{}", std::process::id(), line!());
         let relative_dir = PathBuf::from(&relative_name);
@@ -896,9 +898,11 @@ mod tests {
 
     #[test]
     fn version_of_binary_caps_output_and_kills_a_binary_that_never_stops_printing() {
-        // An endlessly printing `nvim` must hit the output cap and be reaped well before
-        // `VERSION_PROBE_TIMEOUT`. This checks the output bound separately from the timeout for
-        // a child that prints nothing; an unbounded `Command::output()` would keep growing.
+        // An uncapped `Command::output()` here would let a PATH `nvim` that never stops printing
+        // grow that buffer without bound (this probe once worked that way). The capped reader must finish
+        // (and the child must be reaped) well inside `VERSION_PROBE_TIMEOUT`, not by hitting it --
+        // proving the cap actually bounds this case rather than merely bounding the separate
+        // "prints nothing at all" hang below.
         let scratch = std::env::temp_dir().join(format!(
             "nvim-bin-test-version-infinite-{}-{}",
             std::process::id(),

@@ -232,8 +232,8 @@ describe("installDispatch", () => {
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
-  /* A `y` answer must echo a nonce received from Rust. Reject an envelope without one, just like
-     invalid JSON or an unrecognized kind. */
+  /* A `y` can only ever echo a real nonce back -- one this side never made up itself -- so
+     an envelope with none is rejected up front, the same as invalid JSON or an unrecognized kind. */
   it("rejects a confirm_bypass envelope with no nonce, like other malformed envelopes", () => {
     const handler = vi.fn();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -345,8 +345,9 @@ describe("installDispatch", () => {
   });
 });
 
-/* Pins the exact wire strings for `panel_keys` and `nav_fallthrough`, including field order.
-   The core tests use the same five strings so field order and spelling stay aligned. */
+/* The exact wire strings `panel_keys`/`nav_fallthrough`
+   serialise to, byte for byte -- a core test pins the same five, so the two sides can
+   never silently drift apart on field order or spelling. */
 describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly (Interfaces block)", () => {
   it.each<[OutboundMessage, string]>([
     [{ type: "panel_keys", request_id: "req-7", mode: "browse" }, '{"type":"panel_keys","request_id":"req-7","mode":"browse"}'],
@@ -359,9 +360,10 @@ describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly (Int
   });
 });
 
-/* Pins `pane_nav`'s exact wire strings for all four directions, including field order. The core
-   test `parses_pane_nav_in_all_four_directions_as_a_window_level_message` parses the same strings.
-   Directions use side names rather than the keys `h`/`j`/`k`/`l`. */
+/* `pane_nav`'s exact wire strings, all four sides, field order included -- the core
+   test `parses_pane_nav_in_all_four_directions_as_a_window_level_message` parses these same four
+   strings, so the two sides cannot drift apart on spelling (the words are the sides' names, never the
+   letters `h`/`j`/`k`/`l`). */
 describe("OutboundMessage: pane_nav serialises exactly", () => {
   it.each<[OutboundMessage, string]>([
     [{ type: "pane_nav", request_id: "req-1", direction: "left" }, '{"type":"pane_nav","request_id":"req-1","direction":"left"}'],
@@ -373,10 +375,10 @@ describe("OutboundMessage: pane_nav serialises exactly", () => {
   });
 });
 
-/* Pins `open_url`'s exact wire string, including field order. The core test
-   `parses_open_url_as_a_window_level_message` parses the same string to keep spelling aligned.
-   The page sends the normalized `href` from `nav.ts#webUrl`; Rust validates it in
-   `panel/src/links.rs#web_url` before it reaches `UriLauncher`. */
+/* `open_url`'s exact wire string, field order included -- the core test
+   `parses_open_url_as_a_window_level_message` parses this same string, so the two sides cannot drift apart
+   on spelling. The page sends the WHATWG-normalized `href` (`nav.ts#webUrl`), and Rust re-checks it
+   (`panel/src/links.rs#web_url`) before it reaches `UriLauncher`. */
 describe("OutboundMessage: open_url serialises exactly", () => {
   it("names the type, the request id and the url, in that order", () => {
     const message: OutboundMessage = { type: "open_url", request_id: "req-1", url: "https://example.com/a" };

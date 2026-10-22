@@ -52,8 +52,8 @@ describe("applyEvent", () => {
   });
 
   it("turn_started sets activeTurnId, and a subsequent turn_completed clears it regardless of outcome", () => {
-    // Covers all four TurnOutcome values: `turn_completed` always clears the active turn,
-    // regardless of how it ended.
+    // Parametrized over all four TurnOutcome values, matching the Rust test of the same
+    // property (turn_completed always clears the active turn, no matter how it ended).
     const outcomes: TurnOutcome[] = ["completed", "interrupted", "failed", "limit_reached"];
     for (const outcome of outcomes) {
       let state = applyEvent(initialState(), { type: "turn_started", turn_id: "t1" });
@@ -76,7 +76,7 @@ describe("applyEvent", () => {
     expect(state.status).toEqual({ kind: "running" });
   });
 
-  /* the tab's last reported usage. Each report REPLACES the figure whole
+  /* The tab's last reported usage. Each report REPLACES the figure whole
      (the SDK reports a running total and `/clear` resets it, so a lower later figure is the truth),
      and a turn that reports none -- interrupted, synthesized -- leaves the last figure standing:
      silence is not a measurement, and the band must never show an invented zero. Mirrors
@@ -160,7 +160,7 @@ describe("applyEvent", () => {
       let state = applyEvent(initialState(), done(usage));
       state = applyEvent(state, { type: "session_unavailable", reason: "provider process exited unexpectedly" });
       expect(state.usage).toEqual(usage);
-      // The lost-session view also keeps usage after the sidecar stops.
+      // And the lost-session view a stopped sidecar leaves behind (with its recovery note).
       const said = applyEvent(applyEvent(initialState(), done(usage)), { type: "content_delta", turn_id: "t2", kind: "text", text: "hi" });
       expect(keepAfterFailure(said, "the sidecar stopped")?.usage).toEqual(usage);
     });
@@ -204,9 +204,9 @@ describe("applyEvent", () => {
     expect(state.activeTurnId).toBeNull();
   });
 
-  // The mode lives on the tab in the `tabs` envelope, outside this per-session projection. This
-  // known event advances `nextSeq` without changing other state and must not trigger the
-  // exhaustiveness warning.
+  // The mode lives on the tab (`tabs` envelope), not this per-session projection, so the
+  // reducer folds nothing here -- unlike a genuinely unrecognized shape, this is a KNOWN event, so
+  // it must not reach the exhaustiveness guard's console.warn either.
   it("permission_mode_changed changes nothing but nextSeq and does not warn", () => {
     const consoleWarn = console.warn;
     let warned = false;
@@ -267,7 +267,7 @@ describe("applyEvent", () => {
     expect(state.pendingPermissions[0].toolUseId).toBe("toolu_01ABC");
   });
 
-  /* O3: the CLI's own prompt for a call arrives as a SECOND request carrying the same tool_use_id
+  /* The CLI's own prompt for a call arrives as a SECOND request carrying the same tool_use_id
      as the gate's (already answered) one, under a new permission id, with the CLI's own words in
      `provider_prompt` (Rust's snake_case event). The reducer keeps it as a card of its own and
      carries the words in the snapshot's camelCase shape, so an events-built card and a
@@ -304,7 +304,7 @@ describe("applyEvent", () => {
       matchedAskRule: { source: "projectSettings", toolName: "Write", ruleContent: null },
       unrecognizedOrigin: null,
     });
-    // O3 review #3: an origin this build does not know is carried, so the card calls it neutrally.
+    // An origin this build does not know is carried, so the card calls it neutrally.
     state = applyEvent(state, {
       type: "permission_requested",
       permission_id: "perm-new",
@@ -408,10 +408,11 @@ describe("applyEvent", () => {
     console.warn = consoleWarn;
   });
 
-  /* Restored history reaches the panel only in a snapshot. Rust folds it before the event
-   * ingestion thread starts, so there is no corresponding event. A resync or reload must
-   * preserve both the messages and their restored-history notice, or old messages would appear
-   * without an explanation. */
+  /* A restored history (from the host) reaches this side only inside a snapshot -- there is no
+   * event for it, because it is folded in Rust before the ingestion thread that produces events
+   * even starts. So a resync or a panel reload is the ONLY path it travels, and it has to survive
+   * one intact: a notice lost on a resync would leave a panel showing last session's messages with
+   * nothing saying they are old. */
   it("a resync keeps the restored-history notice and the items it describes", () => {
     const restored = {
       ...initialState(),
@@ -558,7 +559,7 @@ describe("partial assistant streaming", () => {
     state = applyEvent(state, delta("streaming"));
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "tu1", name: "Bash", input: {} });
     expect(state.assistantMessageOpen).toBe(false);
-    // Built as the WIRE now genuinely carries it (sw-panel-render-2's fix): `assistantMessageOpen`
+    // Built as the WIRE now genuinely carries it: `assistantMessageOpen`
     // is on `AgentUiSnapshot`, and here it is truthfully `false` -- the tool call closed the
     // message before this snapshot was ever taken, on both sides.
     const { nextSeq: _seq, turnThinking: _think, ...wire } = { ...state, transcript: [{ seq: 0, text: "an earlier reply" }] };
@@ -590,9 +591,10 @@ describe("partial assistant streaming", () => {
   });
 });
 
-/* `turnThinking` is the ephemeral bit read by `turnPhase.ts` beyond the four collections. A
-   resync may clear it but must never invent it. `turnPhase.test.ts` checks the same degradation
-   in the phase derived from it. */
+/* `turnThinking` is the one ephemeral bit `turnPhase.ts`
+   reads that is not already sitting in the four collections. Invariant under test throughout: it
+   can only ever be LOST, never invented -- see `turnPhase.test.ts`'s "resync degradation" test for
+   the same invariant one layer up, on the phase it feeds. */
 describe("turnThinking", () => {
   it("is set by a content_delta with kind thinking", () => {
     const state = applyEvent(initialState(), { type: "content_delta", turn_id: "t1", kind: "thinking", text: "hmm" });
@@ -617,11 +619,17 @@ describe("turnThinking", () => {
   });
 
   it("a content_delta of an UNKNOWN kind is a no-op, not a transcript entry with no text", () => {
-    // An unknown delta such as `redacted_thinking` must not enter the text path and append
-    // `{seq: 1, text: undefined}`. `MessageList` passes that text to `renderMarkdown`, where
-    // `marked` throws. Without an error boundary, the whole panel unmounts.
-    // Rust currently emits only Text and Thinking, so the cast simulates future variant drift
-    // and verifies the runtime guard even though the TypeScript union excludes this input.
+    // This arm used to open with `if (event.kind !== "text")
+    // return state;` and the in-flight motion change replaced it with `if (event.kind ===
+    // "thinking")`, so every other kind fell into the TEXT path. Reproduced there: folding a
+    // `redacted_thinking` delta appended `{seq: 1, text: undefined}`, which `MessageList` hands to
+    // `renderMarkdown`, which throws inside `marked` -- and this app has no error boundary, so the
+    // panel unmounts whole.
+    //
+    // Unreachable against today's Rust (`ContentKind` is `{Text, Thinking}` and `projection.rs`
+    // matches per variant), which is exactly the point: this is the same defence-against-drift the
+    // `default:` arm at the bottom of that switch exists for, and the cast is needed because TS has
+    // already narrowed the union by this line.
     const drifted = { type: "content_delta", turn_id: "t1", kind: "redacted_thinking" } as unknown as AgentDomainEvent;
     const state = applyEvent(initialState(), drifted);
     expect(state.transcript).toEqual([]);
@@ -1045,8 +1053,8 @@ describe("applyCallNotes", () => {
     expect(applyCallNotes(state, { promptNotes: [] })).toBe(state);
   });
 
-  /** Apply acceptEdits fast-path notes to named calls only, like the rule notes above. Ignore
-   *  unknown call ids and preserve the state object when no notes arrive. */
+  /** The acceptEdits fast path's own note, applied the same way as the rule note
+   *  above -- named calls only, ignoring a note for no call, a no-op when nothing arrived. */
   it("marks the calls the acceptEdits fast path allowed, leaves the rest", () => {
     let state = initialState();
     for (const id of ["toolu_1", "toolu_2"]) {
@@ -1071,8 +1079,9 @@ describe("applyCallNotes", () => {
     expect(next.toolCalls[0].createsFile).toBe(true);
   });
 
-  /** A fast-path-allowed `Write` raises no `PermissionRequested`, so `createsFile` never learns
-   *  about it. `autoCreatesFile` carries the same new-file signal for a call answered without a card. */
+  /** A fast-path-allowed `Write` never raises a `PermissionRequested`, so
+   *  `createsFile` above never learns of it (the creation note is driven entirely by that event) --
+   *  `autoCreatesFile` carries the identical signal for a call answered with no card at all. */
   it("marks a fast-path-allowed Write over no file as creating one, with no card ever raised", () => {
     let state = initialState();
     state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_w", name: "Write", input: { file_path: "/p/new.rs" } });

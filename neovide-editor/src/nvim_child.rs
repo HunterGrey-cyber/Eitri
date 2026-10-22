@@ -543,8 +543,8 @@ pub(crate) static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    //! Real `nvim` processes (on `PATH`), no display: not `#[ignore]`d (the v1-hardening plan's rule
-    //! -- ignore only what needs a display). Serialised by [`SPAWNING`], because
+    //! Real `nvim` processes (on `PATH`), no display: not `#[ignore]`d (only a test that needs a
+    //! display is ignored). Serialised by [`SPAWNING`], because
     //! [`NvimChild::find_new`] looks at every child this test process has.
     use super::*;
     use std::path::{Path, PathBuf};
@@ -681,9 +681,10 @@ mod tests {
         true
     }
 
-    /// A launcher can be the harness's direct child and carry `--embed` in its arguments while
-    /// running nvim without `exec`. `end` must watch and signal nvim itself, since killing the launcher
-    /// can leave a hung nvim running.
+    /// A `nvim` that is a launcher running nvim
+    /// without `exec` is the fork's direct child, with `--embed` in its argv. What `end` watches and
+    /// signals must be nvim itself, not the launcher -- a killed launcher leaves the hung nvim
+    /// running.
     #[test]
     fn a_launcher_that_does_not_exec_nvim_is_not_what_an_end_reaches() {
         let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -820,9 +821,10 @@ mod tests {
         assert!(nvim_gone, "nvim itself is gone");
     }
 
-    /// Killing a launcher that did not `exec` leaves nvim alive, re-parented and holding the pipes,
-    /// even though the harness reports an exit. Both the pid reported by nvim and the child found
-    /// beneath the launcher must show nvim alive until it is ended, then show it gone.
+    /// A launcher that does not `exec` nvim exits (here: is killed) and nvim
+    /// lives on, re-parented, still holding the pipes -- which is when the fork reports nvim exited.
+    /// What the pane holds says nvim is alive; after nvim is ended, that it is gone. Found both by
+    /// nvim's own answer and, before it answers, by the nvim found under the launcher at launch.
     #[test]
     fn nvim_outliving_its_launcher_is_seen_alive() {
         use nvim_rs::rpc::handler::Dummy;
@@ -893,13 +895,16 @@ mod tests {
         );
     }
 
-    /// Checks ending nvim with an unsaved, unsynced edit after closing stdin.
-    /// Idle nvim exits on EOF. In a `:confirm` dialog, nvim 0.12.5 needs SIGTERM, whose handler writes
-    /// the edit to the swap file. A stopped process needs SIGKILL, which cannot flush the edit.
-    /// The original file is never written and the swap file remains in every case.
+    /// Measures endings on the nvim on `PATH`: nvim with an unsaved, unsynced
+    /// edit, its stdin closed, then [`end`]'s schedule. Idle, it exits on the hang-up alone; with a
+    /// `:confirm` dialog up the hang-up does nothing (nvim 0.12.5 stays in the dialog), and SIGTERM
+    /// ends it -- nvim's own deadly-signal handler keeps the swap file AND writes the edit into it,
+    /// which SIGKILL does not; a stopped nvim answers neither and is killed at the patience. The file
+    /// itself is never written, and the swap file always stays.
     ///
-    /// This test UI answers no requests and installs no `VimLeavePre` hook, so SIGTERM after EOF ends
-    /// the dialog here. [`fork_nvim`] checks the ending order with the harness's own UI.
+    /// **This UI is not the fork's**: it answers nothing and installs no
+    /// `VimLeavePre`, so a SIGTERM after the hang-up ends the dialog here and did not under the
+    /// fork. [`fork_nvim`] is the fork's UI, and the ending order is tested there.
     fn ending(case: &str, dialog: bool, stop: bool) -> (Ended, bool, bool, bool) {
         use std::io::Write;
         let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1294,10 +1299,12 @@ mod tests {
         }
     }
 
-    /// Under the harness's UI, nvim in its `:confirm qall` dialog exits on SIGTERM while stdin is
-    /// still open. The edit made 0.5 s earlier reaches its swap file even with `updatetime` at 10 s.
-    /// Closing stdin first makes the UI exit request fail on the closed channel; nvim then waits
-    /// for a key in the dialog until SIGKILL at 5 s.
+    /// Nvim in its own `:confirm qall` dialog -- the quit the pane sent is
+    /// outstanding -- under the fork's UI ends on SIGTERM sent while its stdin is still open, within
+    /// milliseconds, the edit made half a second before in its swap file even at an `updatetime` of
+    /// 10 s. With stdin closed first and SIGTERM at 1 s the fork's exit request fails
+    /// on the closed channel, nvim then waits for a key inside the dialog, and only the SIGKILL at
+    /// 5 s ends it (measured twice in the GUI; `ending_orders_in_a_quit_dialog` measures both).
     #[test]
     fn an_nvim_in_its_quit_dialog_exits_on_sigterm_sent_first() {
         let outcome = end_fork_nvim("fork-dialog", 10_000, true, schedule(true));
@@ -1309,8 +1316,8 @@ mod tests {
         assert!(outcome.kept && outcome.preserved, "{outcome:?}");
     }
 
-    /// Without a known prompt, idle nvim under the harness's UI exits on EOF alone.
-    /// Its edit is preserved in the swap file and no signal is sent.
+    /// With no prompt known, stdin closes first -- idle nvim under the fork's
+    /// UI exits on the hang-up alone, the edit in its swap file, no signal sent.
     #[test]
     fn an_idle_nvim_under_the_forks_ui_exits_on_the_hang_up() {
         let outcome = end_fork_nvim("fork-idle", 10_000, false, schedule(false));
@@ -1329,7 +1336,7 @@ mod tests {
     /// | EOF only | SIGKILL at 5 s | yes (nvim synced it idle, at 4 s) | **no** |
     /// | SIGTERM only | SIGTERM, ms | yes | yes |
     /// | EOF, SIGTERM from 1 s | SIGKILL at 5 s | yes (SIGTERM's `preserve_exit`) | yes |
-    /// | SIGTERM, EOF at 1 s | SIGTERM, ms | yes | yes |
+    /// | SIGTERM, EOF at 1 s (used here) | SIGTERM, ms | yes | yes |
     ///
     /// When idle, closing stdin first exits on EOF; signalling first exits on SIGTERM.
     #[test]

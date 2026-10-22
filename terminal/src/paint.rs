@@ -437,9 +437,9 @@ mod tests {
         palette
     }
 
-    /// Right-aligned in the top row, and in the palette's `CURSOR`/`BACKGROUND` colours reversed
-    ///: the fill takes `CURSOR`, the text `BACKGROUND` -- the opposite pairing a
-    /// filled cursor itself uses.
+    /// The scroll indicator sits right-aligned in the top row, in the palette's `CURSOR`/`BACKGROUND`
+    /// colours reversed: the fill takes `CURSOR`, the text `BACKGROUND` -- the opposite pairing a
+    /// filled cursor itself uses, so the indicator never reads as a cursor.
     #[test]
     fn the_indicator_is_right_aligned_at_row_0_in_reversed_cursor_colours() {
         let palette = themed_palette();

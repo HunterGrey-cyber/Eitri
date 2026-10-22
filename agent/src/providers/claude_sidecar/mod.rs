@@ -1681,10 +1681,11 @@ fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64)
 mod tests {
     use super::*;
 
-    /// Every fresh, resumed and forked request uses `INTERACTIVE`, disables permission switching,
-    /// and sends an empty deny list as `unrestricted`, regardless of the tab's mode.
-    /// `INTERACTIVE` installs the sidecar's `PreToolUse` gate. `unrestricted` prevents its conservative
-    /// default deny list from being added, so every tool can reach the gate.
+    /// Fresh, resumed and forked sidecar requests all use `INTERACTIVE`, are never switchable,
+    /// and state an empty deny list as `unrestricted`, regardless of the tab's mode. The request
+    /// carries no tab mode. Verdandi installs its `PreToolUse` broker for `INTERACTIVE`
+    /// (`permissions !== 'bypass'` in `packages/claude-runtime/src/session.ts`), and `unrestricted`
+    /// keeps its `CONSERVATIVE_BYPASS_DENY` floor off, leaving the gate present with no tool denied.
     #[test]
     fn every_request_is_gated_never_switchable_and_restricts_no_tool() {
         let shapes = [crate::RequestedCliMode::Default, crate::RequestedCliMode::Auto].map(|cli_mode| {
@@ -1750,10 +1751,11 @@ mod tests {
         }
     }
 
-    /// Every session created here is gated and requests the CLI's own prompts exactly when
-    /// the handshake advertises support. Only the prompt flag changes; the remaining policy
-    /// stays the same, including the absent `allow` list. The sidecar rejects an allow list
-    /// naming the three prompt tools enabled by this flag.
+    /// The CLI's own permission prompts are asked for on every session this client
+    /// creates -- all of them gated -- exactly when the handshake advertised the capability, and the
+    /// flag is the ONLY thing that moves: the policy is otherwise the one `every_request_is_gated_...`
+    /// pins, `allow` still absent (Verdandi refuses an allow list naming the three prompt tools the
+    /// flag would add, and Eitri has none).
     #[test]
     fn the_clis_own_prompts_are_asked_for_exactly_when_the_sidecar_offers_them() {
         assert!(provider_prompts_from_handshake(&real_handshake_today()));
@@ -2055,8 +2057,8 @@ mod tests {
                 "account_identity",
                 "init_fingerprint",
                 "tool_allow_list",
-                // The pinned sidecar still advertises this command, but this client never calls it.
-                // No client capability is derived from it.
+                // Still advertised by the pinned sidecar, but this client never switches the CLI's
+                // permission mode, so no capability is derived from it.
                 "set_permission_mode",
                 // Capability 'text_delta_message_id' -- see CAP_TEXT_DELTA_MESSAGE_ID.
                 "text_delta_message_id",
@@ -2142,8 +2144,8 @@ mod tests {
         );
     }
 
-    /// Refuses a sidecar without the gated policy and names the missing and advertised policies.
-    /// Never starts the session under BYPASS instead.
+    /// A sidecar without the gated policy is refused at session creation, naming what is missing
+    /// and what it does offer -- never started under BYPASS instead.
     #[test]
     fn a_sidecar_without_the_gated_policy_is_refused_loudly() {
         let today = real_handshake_today();

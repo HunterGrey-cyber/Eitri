@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 
-// Reply text from CLI 2.1.283 for the model and effort parser tests.
+// Verbatim probe text from CLI 2.1.283 under a test-account wrapper,
+// so the parser is checked against actual command output.
 const MODEL_REPLY =
   "Current model: `Haiku 4.5` (effort: high)\n" +
   "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], " +

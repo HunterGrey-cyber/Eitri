@@ -52,7 +52,7 @@ describe("SlashPicker", () => {
     expect(container.querySelector(".slash-picker-row.current")!.textContent).toContain("sonnet");
   });
 
-  /** The picker uses the chooser's arrow and Ctrl+n/Ctrl+p navigation keys. */
+  /** The picker shares its four list-motion keys with the chooser. */
   it("↑ ↓ Ctrl+p Ctrl+n move the cursor, and Enter chooses where they landed (R12)", () => {
     const { root, props } = renderPicker(); // current: haiku (row 2)
     fireEvent.keyDown(root, { key: "ArrowUp" }); // -> opus
@@ -147,8 +147,9 @@ describe("SlashPicker", () => {
     expect(mock).toHaveBeenCalled();
   });
 
-  /** A GTK focus cycle, `arrive` or a HINT landing must return focus to an open picker.
-   *  Exercise `focusRequest` as in `Chooser.test.tsx` so navigation keys keep reaching the picker. */
+  /** A GTK focus round trip, `arrive` or a HINT landing used to
+   *  hand the keys to the container root instead of an open picker, since `App.tsx`'s `takeKeys`
+   *  had no branch for it -- mirrors `Chooser.test.tsx`'s identical `focusRequest` coverage. */
   describe("focusRequest", () => {
     it("re-focuses the root after focus moved elsewhere", () => {
       const outside = document.createElement("button");

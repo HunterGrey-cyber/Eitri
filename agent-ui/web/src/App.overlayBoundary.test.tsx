@@ -1,11 +1,16 @@
 // @vitest-environment jsdom
-/** A throw while an overlay rendered used to unmount the whole panel, leaving `#root` empty
- * and every key dead. Each overlay in `App.tsx` has its own `PanelErrorBoundary`, so a throw
- * closes only that overlay through its leave path, reports it in the band, and leaves the panel
- * drawn and the keys working. This includes the chooser, the `/model`/`/effort` picker, the `?`
- * overlay, session details, `gf`'s path picker, `gx`'s link picker, `/` search and `:` commands.
- * The wrappers let each overlay throw on demand (`broken`). Otherwise they render the real
- * component, so nothing else about `App` changes under test. */
+/**
+ * One throw while an overlay rendered used to unmount the whole panel --
+ * `#root` empty, every key dead, nothing logged. Every overlay `App` draws (the chooser, the
+ * `/model`/`/effort` picker, the `?` overlay, the session details popover) now sits inside its own
+ * `PanelErrorBoundary` in `App.tsx`, so a throw closes just that overlay through its own leave path,
+ * says so in the band, and leaves the panel drawn and the keys working. The rc.3 minors round adds the
+ * four the first pass left out: `gf`'s path picker, `gx`'s link picker, the `/` search line and the `:`
+ * command line.
+ *
+ * The overlays are wrapped here so that each can be made to throw on demand (`broken`); they draw the
+ * real component otherwise, so nothing else about `App` changes under test.
+ */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { ComponentProps, ComponentPropsWithoutRef } from "react";
@@ -271,7 +276,7 @@ const SITES: Site[] = [
   { name: "the ? overlay over a conversation", layout: "conversation", flag: "keymap", overlay: ".keymap-overlay", flash: "the keys overlay failed and closed", open: () => dispatch({ kind: "open_keymap" }) },
   { name: "the ? overlay over an empty tab", layout: "empty", flag: "keymap", overlay: ".keymap-overlay", flash: "the keys overlay failed and closed", open: () => dispatch({ kind: "open_keymap" }) },
   { name: "the session details popover", layout: "conversation", flag: "detail", overlay: ".detail-popover", flash: "the session details failed and closed", open: () => dispatch(DETAIL) },
-  // The path picker, link picker, search line and command line each need their own error boundary.
+  // All four overlays need their own boundary so a throw cannot unmount the panel.
   { name: "gf's path picker", layout: "conversation", flag: "pathPick", overlay: ".path-pick", flash: "the path picker failed and closed", open: (c, round) => { withReply(round); keys(c, "g", "f"); } },
   { name: "gx's link picker", layout: "conversation", flag: "linkPick", overlay: ".link-pick", flash: "the link picker failed and closed", open: (c, round) => { withReply(round); boxLinks(c); keys(c, "g", "x"); } },
   { name: "the / search line", layout: "conversation", flag: "search", overlay: ".search-bar", flash: "the search line failed and closed", open: (c) => keys(c, "/") },
@@ -311,8 +316,8 @@ describe("an overlay that throws closes itself and leaves the panel drawn (K03)"
     expect(container.querySelector(".chooser")).toBeNull();
   });
 
-  /** The overlay held focus and then threw on a later render, after a filter matched nothing.
-   *  Focus must return to the panel so the keys keep working. */
+  /** The overlay drew fine, held the keys, and threw on a later render (a filter that
+   *  matched nothing). Focus was inside it when it went, so it must be handed back or the keys die. */
   describe("an overlay that held the keys and threw on a later render hands them back", () => {
     it("the chooser", () => {
       const { container } = start("conversation");
@@ -375,7 +380,7 @@ describe("an overlay that throws closes itself and leaves the panel drawn (K03)"
   });
 });
 
-/** Exercises a chooser filter that matches nothing through `App`, with the real chooser and no forced throw. */
+/** A chooser filter with no matches must remain usable, end to end through `App`, without a forced throw. */
 describe("K03 itself: a chooser filter that matches nothing", () => {
   it("leaves the whole panel drawn, shows 'nothing matches', and Esc still leaves the chooser", () => {
     const { container } = start("conversation");

@@ -1527,6 +1527,48 @@ class VerdandiPublicRevision(unittest.TestCase):
         self.assertEqual(self.fetch("file://" + os.path.join(self.scratch, "nowhere"), self.published), 2)
 
 
+class HostScans(unittest.TestCase):
+    """host_scans, with the real publish/scan.sh, over a fixture of every view it builds. The asset install.sh is
+    packaging/install.sh copied to the release's top level, where scan.sh's citation rule would read it under the root
+    install.sh's path and allowance; that rule belongs to the source view alone, which holds the same file at its own
+    path, so the asset views pass and a citing comment added to the source view still fails."""
+
+    def run_scans(self, extra_source_line=""):
+        scan = os.path.join(_PACKAGING, "..", "publish", "scan.sh")
+        if not os.path.isfile(scan):
+            self.skipTest("publish/scan.sh is not in this checkout")
+        scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        work, rel, logs = (os.path.join(scratch, d) for d in ("work", "rel", "logs"))
+        os.makedirs(logs)
+        with open(os.path.join(_PACKAGING, "install.sh"), encoding="utf-8") as f:
+            installer = f.read()
+        _write(os.path.join(rel, "install.sh"), installer)
+        _write(os.path.join(rel, "RELEASE"), "version 1.0.0-rc.1\n")
+        for name in ("tarball", "deb", "rpm"):
+            _write(os.path.join(work, "check", "x", name, "README"), "Eitri\n")
+        # Verdandi's tree has its own Cargo.toml at the top, where the repo's is, with more citing lines than the
+        # repo's own may keep.
+        citing = "# " + "Task 5 pins this\n"
+        _write(os.path.join(work, "check", "x", "verdandi", "Cargo.toml"), citing * 6 + "[workspace]\n")
+        source = os.path.join(work, "check", "x", "source", "eitri-1.0.0-rc.1-source")
+        _write(os.path.join(source, "packaging", "install.sh"), installer + extra_source_line)
+        env = dict(os.environ, RS_SOURCE=os.path.join(_PACKAGING, ".."), RS_WORK=work, RS_REL=rel, RS_LOGS=logs,
+                   RS_VERSION="1.0.0-rc.1", RS_NO_LEAK_SCAN="0", RS_SCAN=scan)
+        return _bash("host_scans", env, scratch)
+
+    def test_the_asset_views_pass_with_the_shipped_installer_at_the_top(self):
+        proc = self.run_scans()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("[citation]", proc.stdout + proc.stderr)
+
+    def test_a_citing_comment_added_to_the_source_view_still_fails(self):
+        proc = self.run_scans(extra_source_line="# " + "spec \u00a74.2 says so\n")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("packaging/install.sh:", proc.stdout + proc.stderr)
+        self.assertIn("[citation]", proc.stdout + proc.stderr)
+
+
 class ReleaseNotes(unittest.TestCase):
     """fill_notes, over the real release-notes.md.in, with the real publish/scan.sh:
     the Verify section must describe what THIS build's shipped install.sh

@@ -10,7 +10,7 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
 
-/** V3: the deterministic half of "measure first". A `j` press re-renders the whole
+/** A `j` press re-renders the whole
  *  panel; before the memo, every message was re-parsed (marked + highlight.js + DOMPurify) on every
  *  press. Counted, not timed: jsdom's timing is not WebKitGTK's, and a count cannot be flaky. */
 it("parses no message again when j moves the cursor through 500 of them", () => {

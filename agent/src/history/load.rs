@@ -760,11 +760,14 @@ mod tests {
     // The transcript failing over to the stored copy, and the transcript winning
     // -------------------------------------------------------------------------------------
 
-    /// A nonempty transcript with no parsed conversational items falls back to the stored copy.
-    /// The file has no schema version, so this can indicate an unsupported format. It can also
-    /// happen with valid attachment-only files, slash-command echoes or `isMeta` user lines.
-    /// The notice must describe what was observed without claiming the file is broken.
-    /// The test checks the full reason sentence because it is embedded in the panel's notice.
+    /// A nonempty transcript with no conversational items falls back because the file has no
+    /// schema version and nothing parsed is the only available signal of a format change.
+    /// The notice names the CLI that wrote it so the format can be dated.
+    ///
+    /// The reason must describe the observation rather than assume a format change: attachment-only
+    /// files read perfectly, and real sessions with only slash-command echoes or `isMeta` lines can
+    /// reach the same branch. Pin the whole sentence because the panel embeds it; wording that
+    /// drifts can send a user to inspect a healthy file.
     #[test]
     fn a_transcript_that_parses_nothing_falls_back_to_the_stored_copy() {
         let conversation_id = setup();
@@ -998,7 +1001,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------
-    // What the notice's count MEANS
+    // What the notice's count means
     // -------------------------------------------------------------------------------------
 
     /// **`restored_items` is what the panel draws, not what the parser kept.**
@@ -1118,11 +1121,12 @@ mod tests {
         );
     }
 
-    /// Folds real top-level transcripts and checks each notice against the resulting projection.
-    /// This complements the hand-built case above. The test reports how many files produced
-    /// history so equality is not mistaken for useful coverage when none did.
-    /// Assertions and diagnostics use shapes and counts, without printing or comparing
-    /// conversation content.
+    /// Fold every real top-level transcript on this machine and compare the notice with the
+    /// projection it produced. The hermetic case above pins one constructed input; this checks
+    /// that the property survives a real corpus, including the 45 files that exposed a mismatch.
+    /// Print how many files fold so an empty corpus cannot masquerade as meaningful equality.
+    ///
+    /// Shapes and counts only: nothing reads, prints or compares conversation content.
     #[test]
     #[ignore = "needs this machine's real $CLAUDE_CONFIG_DIR/projects corpus"]
     fn every_real_transcript_reports_the_count_its_projection_holds() {

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The first key after a keyboard arrival. On an installed 0.2.0: after `Ctrl+l` from the
+ * The first key after a keyboard arrival must act. After `Ctrl+l` from the
  * editor the first `v` did not enter CARET and a second `v` did.
  *
  * `arrive` and `focus_permission` do their landing in an effect, which runs only after React has

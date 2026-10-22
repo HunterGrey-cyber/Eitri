@@ -18,7 +18,8 @@ use agent::{
 };
 use std::time::{Duration, Instant};
 
-/// The commands probed, in a fixed order so results can be compared row for row.
+/// The commands probed: a fixed list in a fixed order, so every run probes the same commands and
+/// its printed results compare row for row with an earlier run's.
 const COMMANDS: &[&str] = &[
     "/help",
     "/clear",
@@ -50,19 +51,18 @@ const COMMANDS: &[&str] = &[
     "/output-style",
 ];
 
-/// `/compact` and `/clear` need prior history to make their effects observable:
-/// shrinking the next turn's input and starting a fresh context, respectively.
+/// `/compact` and `/clear` need a history before their own effect (shrinking the next turn's input,
+/// starting a fresh context) is even observable.
 const NEEDS_WARMUP: &[&str] = &["/compact", "/clear"];
 
 const TURN_DEADLINE: Duration = Duration::from_secs(60);
 const INTERRUPT_DEADLINE: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A scratch cwd under `$HOME/.cache`, never `/tmp` (a small shared tmpfs, per the plan's global
-/// constraints) and never this repository -- a command that gets treated as a real instruction (a
-/// bare `/init` reads as "initialize this project" to a model that has seen real Claude Code
-/// transcripts, and could reach for `Write`/`Bash`) lands here, not in a checkout or a shared scratch
-/// space.
+/// A scratch cwd under `$HOME/.cache`, never `/tmp` (a small shared tmpfs) and never this
+/// repository -- a command that gets treated as a real instruction (a bare `/init` reads as
+/// "initialize this project" to a model that has seen real Claude Code transcripts, and could reach
+/// for `Write`/`Bash`) lands here, not in a checkout or a shared scratch space.
 fn scratch_cwd() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
@@ -72,8 +72,8 @@ fn scratch_cwd() -> std::path::PathBuf {
     dir
 }
 
-/// Data for classifying one command by hand: the events seen, any assistant text,
-/// the turn's token usage, and the final status.
+/// Everything a human needs to classify one command by hand: the events seen, whether
+/// any assistant text came back, the turn's token usage, and the final status.
 struct TurnResult {
     /// `Debug`-formatted, in arrival order -- deliberately not reduced to a type name, since
     /// `ToolCallStarted`'s `name`/`input` and `TurnCompleted`'s `outcome` are exactly what tells a
@@ -116,8 +116,8 @@ fn run_probe_turn(provider: &ClaudeSidecarProvider, session_id: &str, text: &str
             {
                 result.assistant_text.push_str(text);
             }
-            // Answer permission requests so a command that calls a tool can finish
-            // and be measured without stalling on a card.
+            // Answer each gated tool request so a command
+            // whose turn calls a tool is measured rather than stalling on a card.
             if let AgentDomainEvent::PermissionRequested { permission_id, .. } = &event {
                 let _ = provider.resolve_permission(ResolvePermissionRequest {
                     session_id: session_id.to_string(),
@@ -167,8 +167,8 @@ fn probe_which_slash_commands_do_something_through_the_sidecar() {
         // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         let session_id = match provider.create_session(CreateSessionRequest {
             cwd: cwd.clone(),
-            // Every session is gated. `run_probe_turn` answers each request `Allow`
-            // so commands can complete their tool calls.
+            // Every session is gated since v1: this probe used to ask for BYPASS so a
+            // command's tool calls ran unasked; now `run_probe_turn` answers each request `Allow`.
             streaming: StreamingPreference::Complete,
             project: agent::setting_sources::ProjectTrust::Trusted,
         }) {

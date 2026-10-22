@@ -302,7 +302,7 @@ mod tests {
         assert!(!feed.dir.exists());
     }
 
-    /// sw-theme-1's own probe: four connections that never write anything used to cost this feed's
+    /// Four connections that never write anything used to cost this feed's
     /// old accept loop the full per-syscall `READ_TIMEOUT` (100ms) each, one after another, because
     /// it put every accepted stream back into BLOCKING mode and `read_line`'d it in turn -- ~400ms
     /// total for four, and unboundedly more for a writer that trickles bytes slower than the
@@ -335,7 +335,7 @@ mod tests {
         feed.cleanup();
     }
 
-    /// sw-theme-1's other half: there used to be no cap at all on an unterminated line's size, so a
+    /// The same reader's size bound: there used to be no cap at all on an unterminated line's size, so a
     /// contiguous multi-megabyte line with no newline was read and parsed in full. `NewestLineReader`
     /// closes an oversized connection instead, without discarding an earlier good payload or blocking
     /// a later good connection.
@@ -362,7 +362,7 @@ mod tests {
         feed.cleanup();
     }
 
-    /// The trap L2 T5's rename set: the sweep finds candidates **by prefix**, so a directory
+    /// The trap a prefix rename sets: the sweep finds candidates **by prefix**, so a directory
     /// written under the old prefix stops being a candidate the moment the prefix changes -- it
     /// would sit under `TMPDIR` forever with nothing left in the code that names it. Sweeping
     /// [`SWEPT_NAMES`] rather than one pair is what closes that.
@@ -373,7 +373,7 @@ mod tests {
         // pid 0 is rejected before any syscall by `pid_is_alive`, and `std::process::id()` never
         // returns it, so it is always a safe "definitely dead" pid to plant a fixture at.
         let current = root.join(format!("{DIR_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
-        // Exactly what a pre-L2-T5 build wrote: the old prefix and a hyphenated uuid.
+        // Exactly what a build before the prefix rename wrote: the old prefix and a hyphenated uuid.
         let legacy = root.join(format!("neovibe-theme-0-{}", uuid::Uuid::new_v4()));
         for dir in [&current, &legacy] {
             std::fs::create_dir_all(dir).expect("build the fixture");
@@ -388,10 +388,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Asserts the socket path is exactly 100 bytes with the longest macOS temporary-directory
-    /// and pid shapes, so changes cannot silently consume the remaining path-length margin.
-    /// An assertion against `MAX_SOCKET_PATH_BYTES` alone would let a change from 100 to 103 pass
-    /// with no headroom left. Update the expected length deliberately; do not relax the assertion.
+    /// The socket path at macOS's worst-case temporary directory is exactly 100 bytes.
+    ///
+    /// An inequality against `MAX_SOCKET_PATH_BYTES` would let growth from 100 to 103 bytes pass
+    /// while silently consuming the remaining headroom. Pinning the exact length forces any
+    /// increase to be deliberate, with a shorter directory or socket name if more margin is needed.
     #[test]
     fn the_theme_socket_path_is_exactly_100_bytes_at_the_macos_worst_case() {
         // `/var/folders/<2>/<28>/T/` -- this project's Mac mini, measured 2026-09-17. Every macOS
@@ -451,12 +452,11 @@ mod tests {
     #[test]
     #[ignore = "spawns a real nvim; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn a_busy_nvim_main_loop_does_not_lose_a_payload() {
-        // Our VimEnter handler is registered first through `--cmd`. A later user handler can block
-        // nvim's loop for 400ms, so the theme sender writes synchronously before that handler starts.
-        // An asynchronous write can miss the read timeout. `NewestLineReader` may keep only the
-        // last of the ColorScheme and VimEnter snapshots sent before the first poll; both carry
-        // the same colours here. Check that a payload arrives despite the busy loop, rather than
-        // requiring a count of both startup payloads.
+        // A user's VimEnter handler can keep nvim busy after ours, registered first by `--cmd`.
+        // The synchronous send must finish before that handler's 400ms sleep; an asynchronous write
+        // could lose the payload. `NewestLineReader` may collapse ColorScheme and VimEnter sends
+        // before the first poll, dropping the older payload. Both carry the same colors, so this
+        // asserts delivery despite the busy loop rather than counting arrivals.
         let mut feed = ThemeFeed::new().expect("feed");
         let mut reader = reader_for(&mut feed);
         let mut child = std::process::Command::new("nvim")
@@ -489,13 +489,10 @@ mod tests {
         assert!(seen.is_some(), "the busy main loop must not lose the payload entirely");
     }
 
-    /// nvim has no "a highlight group changed" event, so a bare
-    /// `nvim_set_hl` from an autocmd registered after this loader's own -- reachable from the
-    /// LazyVim distribution, where plugins commonly tweak highlight groups post-colorscheme --
-    /// never triggered a re-snapshot. Reproduced against a real nvim: `colorscheme retrobox`, then a
-    /// SECOND `++once VimEnter` handler (registered after `--cmd`'s own, so it fires after the first
-    /// snapshot already went out) overrides `Normal.fg`. The periodic re-snapshot must catch it
-    /// within a bounded window rather than leaving the panel on `retrobox`'s real colour forever.
+    /// Nvim has no general highlight-change event. A plugin autocmd registered after the loader
+    /// can override a highlight after the initial snapshot. Here a second `++once VimEnter`
+    /// handler changes `Normal.fg` after `colorscheme retrobox`; periodic snapshots must detect it
+    /// within a bounded window instead of leaving the panel with the original color indefinitely.
     #[test]
     #[ignore = "spawns a real nvim, and sleeps past the resnapshot interval; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn a_late_highlight_override_is_eventually_caught_by_the_periodic_resnapshot() {
@@ -534,11 +531,11 @@ mod tests {
             "a highlight group changed after startup was never re-sent to the panel"
         );
     }
-    /// The periodic snapshot must not resend unchanged theme data. Each received payload
-    /// restyles the window, rethemes the WebView and queues editor and terminal renders on the
-    /// GTK thread; the shell does not deduplicate. An unconditional timer repeats that work
-    /// every three seconds in idle windows. With no changes after startup, no later connection
-    /// should arrive.
+    /// Periodic snapshots must not resend unchanged theme data. Every received payload restyles
+    /// the window, rethemes the WebView and queues editor and terminal renders on the GTK thread;
+    /// the shell does not deduplicate. An unconditional timer did that every 3s in an idle window
+    /// (connections at 0.01/3.01/6.01/9.01s, one distinct payload), so no new connection may arrive
+    /// after startup when the theme stays unchanged.
     #[test]
     #[ignore = "spawns a real nvim, and waits past two resnapshot intervals; run with: cargo test -p eitri-core theme::feed -- --ignored"]
     fn an_unchanged_theme_is_not_resent_by_the_periodic_resnapshot() {

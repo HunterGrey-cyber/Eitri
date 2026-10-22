@@ -649,24 +649,20 @@ mod tests {
         assert_eq!(letter_direction('X'), None);
     }
 
-    /// For a test asserting that **one** poll handles several connections.
+    /// A generous budget isolates whether one poll handles several connections from scheduler stalls.
     /// [`MAX_POLL_DURATION`] is a wall-clock backstop, so under it such an assertion depends on the
     /// scheduler: a stall of 5ms between two reads legitimately leaves the rest for the next poll.
     /// The budget's own behaviour is pinned separately, at zero, by
     /// `a_poll_past_its_time_budget_still_delivers_its_front_message_and_keeps_the_rest_in_order`.
     const UNHURRIED: Duration = Duration::from_secs(60);
 
-    /// Test-only safety net: if a regression ever drops the explicit
-    /// `set_nonblocking(true)` [`PaneSwitchReader::poll`] depends on, the "must never block" family
-    /// of tests below would call a `poll()` that can block forever on a real syscall -- turning a
-    /// clean, fast test failure into a hung test *process* (mutation-checked: setting an accepted
-    /// stream back to blocking makes several of these tests run past 60s rather than fail). Running
-    /// the call on its own thread and giving up after `timeout` keeps the failure immediate: on the
-    /// fast path the reader (and its result) come back through the channel and the caller keeps
-    /// using it exactly as before; on a timeout the spawned thread -- still parked in the blocked
-    /// syscall, holding the reader -- is abandoned rather than joined. That leaked thread is
-    /// harmless here: it dies with the test binary's own process exit, and it touches nothing beyond
-    /// this one test's own socket and directory.
+    /// A hang guard keeps a regression in `set_nonblocking(true)` from hanging the test process:
+    /// without it, setting an accepted stream back to blocking makes several of the "must never
+    /// block" tests below run past 60s rather than fail (checked by making that very change).
+    /// Run `poll` on its own thread and receive its reader and result through a channel. If a syscall
+    /// blocks, the timeout abandons that thread rather than joining it; the thread touches only
+    /// this test's socket and directory and dies when the test binary exits. The timeout guards
+    /// against a hang, while the returned messages establish the poll's behavior.
     fn poll_within(
         mut reader: PaneSwitchReader,
         timeout: Duration,
@@ -723,7 +719,7 @@ mod tests {
         let tmp = std::env::temp_dir();
         let a = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
         let b = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
-        // The whole point of A5: two channels built in one process get two directories, so neither
+        // The point of a directory per channel: two channels built in one process get two directories, so neither
         // can bind the other's socket path or delete the other's symlink.
         assert_ne!(a, b);
 
@@ -848,8 +844,9 @@ mod tests {
         assert!(!nav.exists());
     }
 
-    /// The instance directory and `bin/`, which comes first on nvim's `PATH`, have mode 0700.
-    /// The `dofile`d snippet has mode 0600, regardless of the umask.
+    /// The instance directory and `bin/`, first on nvim's PATH, must be 0700 and the `dofile`d
+    /// snippet 0600, independently of umask. Defaults such as 0775/0664 or 0755/0644 would expose
+    /// code nvim executes to other users.
     #[test]
     fn the_shim_directory_and_the_nav_snippet_are_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -929,11 +926,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The time budget must still allow a poll to try its front connection. Previously, accepts
-    /// or a preemption could exhaust the budget before the first read even when a complete message
-    /// waited. The read budget now starts after acceptance.
-    /// A zero budget makes this deterministic: each poll must deliver its front message and retain
-    /// the rest for later polls in accept order.
+    /// A poll must make progress even if accepts or preemption have exhausted its time budget
+    /// before the first read. Checking the deadline first could return no message despite a ready
+    /// front connection, and under parallel load that made this module's own suite fail `left: []`
+    /// in about one run in ten. A zero budget reproduces that deterministically: each poll still delivers
+    /// one front message and keeps the remaining connections in accept order.
     #[test]
     fn a_poll_past_its_time_budget_still_delivers_its_front_message_and_keeps_the_rest_in_order() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
@@ -956,10 +953,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A per-read `SO_RCVTIMEO` cannot bound a blocking `read_line`: successful partial reads
-    /// reset the timeout, so a trickling sender can hold the caller and its main loop for the whole
-    /// trickle. `PaneSwitchReader::poll` must return promptly on each call while retaining incomplete
-    /// connections, then deliver the complete message once enough polls have run.
+    /// A blocking `read_line` with `SO_RCVTIMEO` can hold the GTK loop for a whole trickled line:
+    /// each successful partial read resets the timeout. An approximately 80ms trickle held the
+    /// caller for 81ms despite a 30ms budget.
+    ///
+    /// `PaneSwitchReader::poll` instead uses nonblocking reads and retains incomplete connections.
+    /// Slow sends must not hold a poll waiting for more bytes, and enough polls must eventually
+    /// deliver the complete message.
     #[test]
     fn p3_a1_a_trickled_message_never_holds_one_poll_past_its_budget() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
@@ -972,7 +972,7 @@ mod tests {
         let mut stream = UnixStream::connect(&socket_path).expect("connect");
         let writer = std::thread::spawn(move || {
             // Leading spaces are trimmed by `parse_message`, so this still parses as `Direction('R')`
-            // -- same shape as the verdict's own probe, enough bytes to make a stalled read measurable.
+            // -- one byte every 10ms, enough bytes to make a stalled read measurable.
             for byte in b"      R\n" {
                 std::thread::sleep(Duration::from_millis(10));
                 stream.write_all(&[*byte]).unwrap();
@@ -1001,10 +1001,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Each accepted stream must be explicitly made non-blocking. Linux does not copy the
-    /// listener's non-blocking flag onto accepted sockets, so omitting `set_nonblocking(true)` in
-    /// [`PaneSwitchReader::poll`] would leave them blocking. An accepted connection with nothing
-    /// written yet must not block `poll`.
+    /// Every accepted stream must explicitly become nonblocking. Linux does not inherit the
+    /// listener's nonblocking flag on `accept`, unlike macOS (`rust-lang/rust#67027`). Omitting
+    /// `set_nonblocking(true)` would therefore hang a Linux poll on an accepted connection that
+    /// has not written anything. This test exercises exactly that empty connection.
     #[test]
     fn a_connection_with_nothing_written_yet_never_blocks_a_poll() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
@@ -1034,8 +1034,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An older incomplete connection must block a newer complete one from overtaking it.
-    /// Otherwise consecutive keys could reach the host out of order and move focus incorrectly.
+    /// An older incomplete connection must not let a newer message overtake it; completion
+    /// preserves connection order without blocking on the older sender. Reordered keystrokes
+    /// could otherwise move focus somewhere the user did not intend.
     #[test]
     fn an_older_incomplete_connection_blocks_a_newer_complete_one_from_overtaking_it() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
@@ -1101,9 +1102,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stale silent connection and a complete one accepted in the same poll share an
-    /// `accepted_at`, but must not both be discarded. Read the new front after evicting the silent
-    /// connection so its already-complete message is delivered despite its age.
+    /// A silent connection and a complete connection accepted in the same poll share `accepted_at`.
+    /// Aging out the silent front must not discard its ready sibling by applying the same cutoff
+    /// before reading it. The complete message must survive even though it waited behind a
+    /// connection that never sent anything. A `poll_at` that re-checked the new front against the
+    /// cutoff unread lost the ready sibling's `D`, and its log line said "never completed a message"
+    /// although it had.
     #[test]
     fn a_stale_connection_never_drops_a_ready_sibling_accepted_with_it() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
@@ -1116,16 +1120,17 @@ mod tests {
         // `UNHURRIED` for why that assertion needs the wall-clock backstop out of the way.
         reader.read_time_budget = UNHURRIED;
 
-        // Both accepted in the same poll, so both get the same `accepted_at` -- the shape the
-        // finding needs: a silent connection ahead of one whose whole message is already written.
+        // Accept both connections in one poll so they share `accepted_at`: the silent connection
+        // must precede the one whose complete message is already written.
         let _silent = UnixStream::connect(&socket_path).expect("connect (silent)");
         let mut ready = UnixStream::connect(&socket_path).expect("connect (ready)");
         ready.write_all(b"D\n").unwrap();
 
         let now = Instant::now();
-        // The first poll stops at the silent, non-stale `Pending` connection without reading its sibling.
-        // Both polls use `poll_within` because they read a connection that never writes; a blocking-read
-        // regression must fail within a bound instead of hanging the test binary.
+        // First poll: the silent front is `Pending` and not yet stale, so the loop stops there --
+        // the ready sibling is never looked at yet, by design (never skip ahead of a young front).
+        // Both polls read a connection that never writes, so both go through `poll_within`: under
+        // a blocking-read regression they would otherwise hang the test binary.
         let (reader, empty) = poll_within(reader, Duration::from_secs(2), Some(now));
         assert!(empty.is_empty());
 
@@ -1150,14 +1155,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [`MAX_PENDING_CONNECTIONS`] bounds retained descriptors behind a stuck front, even when
-    /// senders connect without writing and no connection has yet reached its age limit.
-    ///
-    /// Connect `MAX_PENDING_CONNECTIONS + MAX_ACCEPTS_PER_POLL` clients, one batch per poll, to
-    /// exceed the cap without filling the kernel backlog all at once. On Linux, a blocking `AF_UNIX`
-    /// `connect()` waits for backlog space without a std-socket timeout, so a larger simultaneous
-    /// flood could hang the test. Assert the queue reaches the cap as well as staying within it;
-    /// an upper-bound assertion alone would pass if nothing were accepted.
+    /// `MAX_PENDING_CONNECTIONS` bounds descriptors queued behind a stuck sender before its age
+    /// eviction. Connect one batch per poll, totaling `MAX_PENDING_CONNECTIONS + MAX_ACCEPTS_PER_POLL`
+    /// clients: that exceeds the cap while limiting the kernel listen backlog to one batch.
+    /// Linux blocking Unix-socket connect waits for backlog space without a std-socket timeout,
+    /// so connecting a whole flood first could hang on a host with a smaller `somaxconn`.
+    /// Assert actual accepted occupancy, since an upper-bound-only check also passes an empty queue.
     #[test]
     fn pending_connections_are_capped_so_a_silent_flood_cannot_grow_without_bound() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
@@ -1194,7 +1197,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The trap L2 T5's rename set: [`sweep_stale_instance_dirs`] finds candidates **by prefix**,
+    /// The trap a prefix rename sets: [`sweep_stale_instance_dirs`] finds candidates **by prefix**,
     /// so a directory written under the old prefix stops being a candidate the moment the prefix
     /// changes -- it would sit under `TMPDIR` forever, holding a dead socket and a dead symlink,
     /// with nothing left in the code that names it. Sweeping [`SWEPT_NAMES`] rather than one pair
@@ -1209,7 +1212,7 @@ mod tests {
         // pid 0 is rejected before any syscall by `pid_is_alive`, and `std::process::id()` never
         // returns it, so it is always a safe "definitely dead" pid to plant a fixture at.
         let current = root.join(format!("{DIR_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
-        // Exactly what a pre-L2-T5 build wrote: the old prefix and a hyphenated uuid.
+        // Exactly what a build before the prefix rename wrote: the old prefix and a hyphenated uuid.
         let legacy = root.join(format!("neovibe-pane-switch-0-{}", uuid::Uuid::new_v4()));
         for dir in [&current, &legacy] {
             std::fs::create_dir_all(dir.join("bin")).expect("build the fixture");
@@ -1224,10 +1227,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Asserts the socket path is exactly 100 bytes with the longest macOS temporary-directory
-    /// and pid shapes, so changes cannot silently consume the remaining path-length margin.
-    /// An assertion against `MAX_SOCKET_PATH_BYTES` alone would let a change from 100 to 103 pass
-    /// with no headroom left. Update the expected length deliberately; do not relax the assertion.
+    /// The socket path at macOS's worst-case temporary directory is exactly 100 bytes.
+    ///
+    /// An inequality against `MAX_SOCKET_PATH_BYTES` would let growth from 100 to 103 bytes pass
+    /// while silently consuming the remaining headroom. Pinning the exact length forces any
+    /// increase to be deliberate, with a shorter directory or socket name if more margin is needed.
+    /// Update the number deliberately; do not relax the assertion.
     #[test]
     fn the_switch_socket_path_is_exactly_100_bytes_at_the_macos_worst_case() {
         // `/var/folders/<2>/<28>/T/` -- this project's Mac mini, measured 2026-09-17. Every macOS

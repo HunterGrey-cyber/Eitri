@@ -58,12 +58,12 @@ pub struct Harness {
     pub session: TerminalSession,
     woken: mpsc::Receiver<()>,
     pub frame: Option<PaintList>,
-    /// The cursor cell the session reported with the latest frame (bottom-terminal phase 2).
+    /// The cursor cell the session reported with the latest frame.
     pub cursor: Option<CursorCell>,
     pub events: HostEvents,
     pub exited: Option<ExitInfo>,
     pub wakes: usize,
-    /// The live mouse-mode summary (bottom-terminal phase 3c), latest-wins.
+    /// The live mouse-mode summary the session last reported, latest-wins.
     pub mouse: Option<MouseModes>,
 }
 
@@ -218,7 +218,7 @@ fn painted(list: &PaintList, metrics: &TerminalMetrics) -> Surface {
 }
 
 /// `list` painted by `paint`, then `overlay` by `paint_ops` on top of it, as the host paints an
-/// input method's preedit (bottom-terminal phase 2).
+/// input method's preedit.
 fn painted_with(list: &PaintList, overlay: &[PaintOp], metrics: &TerminalMetrics) -> Surface {
     let width = ((list.cols as f32 * metrics.cell_width()).ceil() as i32).max(1);
     let height = ((list.rows as f32 * metrics.cell_height()).ceil() as i32).max(1);

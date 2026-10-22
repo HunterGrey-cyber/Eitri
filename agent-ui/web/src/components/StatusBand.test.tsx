@@ -159,7 +159,7 @@ it("a narrow band drops the usage segment first, keeping the model and the posit
   expect(container.querySelector(".band-position")).not.toBeNull();
 });
 
-/** C1c: the band stops being a `j`/`k` stop -- its own details stay reachable on
+/** The band stops being a `j`/`k` stop -- its own details stay reachable on
  *  `<leader>i`, `prefix i` and a click (`onOpenDetail`, exercised above), none of which go through
  *  `nav.ts`'s `data-nav-stop` list. */
 it("carries no data-nav-stop -- j/k never land here, only click/leader/prefix reach its details", () => {
@@ -167,7 +167,7 @@ it("carries no data-nav-stop -- j/k never land here, only click/leader/prefix re
   expect(container.querySelector(".status-band")!.hasAttribute("data-nav-stop")).toBe(false);
 });
 
-/** At WebKit zoom 1.5, a panel measured at
+/** A WebKit zoom of 1.5 measured the panel at
  *  520 logical px = 346 CSS px -- a 47-column budget at this suite's own 7.2px character width
  *  (47 * 7.2 = 338.4). `bandLayout` no longer truncates a prompt/flash that does not fit there; this
  *  is the render-level half of that fix: `StatusBand` must add `.status-band--wrap` exactly when

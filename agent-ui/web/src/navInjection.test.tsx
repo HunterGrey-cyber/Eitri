@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 /**
- * Reply elements marked `data-nav-stop="row"` must not change which conversation row a key acts on.
- * Rows are found by structure: a stop cannot be inside another stop. `a`/`d` answer the card under
- * the cursor by `permissionId`, without clicking a button found by a DOM query.
+ * A model reply that carries navigation markers must never impersonate the panel's rows.
+ * Elements marked `data-nav-stop="row"` must not move which
+ * row a key acts on. The rows are found by structure -- a stop is never inside another stop -- and
+ * `a`/`d` answer the card under the cursor by its `permissionId`, never by clicking a button that a
+ * DOM query found.
  *
- * Each case runs with `renderMarkdown` and with raw reply HTML to verify that navigation remains
- * safe even when the sanitizer is bypassed.
+ * Every case runs twice: once through the real sanitizer (`renderMarkdown`), and once with it
+ * bypassed, rendering the reply's raw HTML, so the structural fix is shown to stand on its own
+ * whatever the sanitizer does or does not strip.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
@@ -58,7 +61,7 @@ const LIVE_TAB = {
 function snapshotState(overrides: Partial<AgentUiState> = {}): AgentUiState {
   return { ...initialState(), status: { kind: "running" }, ...overrides };
 }
-/** Advance past the 250 ms typing guard so a lone key can act. */
+/** Past the 250ms typing guard, so a lone key is what acts. */
 const wait = (ms = 300) => act(() => vi.advanceTimersByTime(ms));
 const press = (key: string, init: Record<string, unknown> = {}) =>
   fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
@@ -179,8 +182,8 @@ describe.each([
     expect(isEchoCard(cursorRow(container))).toBe(true);
     press("k");
     wait();
-    // The echo call is the fifth conversation row. Gated tool rows omit their commands, so row text
-    // cannot distinguish the two calls.
+    // The echo call's own row: the fifth of the conversation's rows (a gated call's row does not
+    // repeat its command, so its text cannot tell the two calls apart).
     const rows = Array.from(container.querySelectorAll('.message-list > [data-nav-stop="row"]'));
     expect(rows.indexOf(cursorRow(container)!)).toBe(4);
     expect(cursorRow(container)!.classList.contains("row-tool")).toBe(true);

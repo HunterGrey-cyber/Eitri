@@ -42,8 +42,10 @@ describe("HistoryNotice", () => {
     expect(el.textContent).toContain("read from Claude's own transcript");
   });
 
-  /* Show the notice whenever history was restored, including complete history, so users can
-     distinguish earlier conversation from new messages. Truncation is not required for this. */
+  /* The row appears whenever history was restored, not only when it was truncated. A user
+     has to be able to tell "this is what we said last time" from "this is what we said just now",
+     and after the 400-item cap only 8 of this machine's 44 sessions truncate at all -- so a
+     truncation-only row would be absent almost every time it is needed. */
   it("is drawn for a complete history too, not only a truncated one", () => {
     const { el } = renderInPanel(notice({ omittedItems: 0 }));
     expect(el).not.toBeNull();
@@ -76,8 +78,8 @@ describe("HistoryNotice", () => {
     fireEvent.click(button);
     expect(writeText).toHaveBeenCalledWith("/home/user/.claude/projects/-home-user-p/7432932d.jsonl");
     expect(button.getAttribute("title")).toBe("/home/user/.claude/projects/-home-user-p/7432932d.jsonl");
-    // Keep the absolute path on the button, outside the prose, because it can wrap a narrow panel
-    // several times.
+    // The path itself is NOT in the line of prose: it is absolute, and it would wrap a narrow panel
+    // several times (keeping the full list on the button).
     expect(el.querySelector("span")!.textContent).not.toContain(".jsonl");
   });
 

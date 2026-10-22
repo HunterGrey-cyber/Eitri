@@ -3522,10 +3522,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A real directory is needed so path resolution distinguishes an unresolvable path from
-    /// one outside the root. A minimal `.git` from [`fabricate_git_dir`] also lets read-only
-    /// git calls pass and stops repository discovery at the root, so repositories above
-    /// `$TMPDIR` cannot change the result.
+    /// A real directory on disk, because every path branch here canonicalizes for real -- a
+    /// fabricated root would make the "unresolvable path" and "outside the root" branches
+    /// indistinguishable.
+    ///
+    /// It is a git repository of its own (a minimal `.git`, see [`fabricate_git_dir`]) because
+    /// git is judged against the repository git would really use, so a
+    /// test that expects a read-only git call allowed needs a repository at the root -- and one
+    /// there stops the walk, so no directory above `$TMPDIR` can change the answer.
     struct Workspace {
         root: PathBuf,
     }
@@ -3661,9 +3665,10 @@ mod tests {
         }
     }
 
-    /// CLI 2.1.283 names the subagent tool `Agent`; older versions use `Task`.
-    /// A call with `subagent_type` and `prompt` must get the same verdict under either name,
-    /// so the rename does not cause an unknown-tool card for every subagent launch.
+    /// CLI 2.1.283 spells the subagent tool `Agent`, not
+    /// `Task`, and a policy that only knew `Task` carded every subagent launch in Auto
+    /// (`[permission] asking the user: Agent (this tool is not in the policy's table)`). A shaped
+    /// `Agent` call (`subagent_type`/`prompt`, its own schema) must be answered exactly like `Task`.
     #[test]
     fn a_subagent_launch_is_never_a_card_under_either_of_its_two_names() {
         let ws = Workspace::new();
@@ -3696,11 +3701,15 @@ mod tests {
         );
     }
 
-    /// Every CLI tool outside `decided_elsewhere` still reaches the user. Use the actual
-    /// `system/init` tool list so the test covers names a session can produce.
+    /// The other side of that change, and the reason it is one name rather than a category: every
+    /// remaining tool this CLI offers still reaches the user. Written as the real list off
+    /// `system/init` rather than an invented name, because the names that matter are the ones a real
+    /// session can actually produce -- five of these reach outside this machine or change the tree.
     ///
-    /// `Write`, `Edit` and `NotebookEdit` have separate acceptEdits fast path tests: an
-    /// ordinary in-project target is allowed without asking by their own classifier.
+    /// `Write`, `Edit` and `NotebookEdit` belong in `decided_elsewhere` because of the
+    /// acceptEdits fast path: with `file_path: "src/main.rs"`, an in-project path, all three are
+    /// now allowed without asking rather than carding -- their own coverage is the "acceptEdits fast
+    /// path" test group below, which is what a change to their behaviour should be read against.
     #[test]
     fn every_other_tool_this_cli_offers_still_reaches_the_user() {
         let ws = Workspace::new();
@@ -3789,9 +3798,9 @@ mod tests {
                 "{path}"
             );
         }
-        // Use the canonical root, matching the CLI's cwd. A path through a system link
-        // outside the root, such as macOS's `$TMPDIR` under `/var -> private/var`, cards
-        // because links outside the root are not followed.
+        // Spelled from the canonical root, as the CLI spells it (its cwd is that root). Through a
+        // system link outside the root -- macOS's `$TMPDIR` under `/var -> private/var` -- it cards
+        // because a link that sits outside the root is not followed.
         let absolute = ws.path().canonicalize().unwrap().join("src/main.rs");
         assert_eq!(
             verdict("Read", json!({ "file_path": absolute }), ws.path()),
@@ -3847,11 +3856,13 @@ mod tests {
         );
     }
 
-    /// The session root is already canonical and must keep resolving to itself.
-    /// Renaming it and replacing its path with a link must not silently make another
-    /// directory the project while the CLI child remains in the renamed directory.
-    /// A hook `allow` overrides the CLI's working-directory prompt, so every call whose
-    /// paths are checked must card when the root no longer resolves to itself.
+    /// The root the session was started in must remain a
+    /// canonical path, and `boundary` used to canonicalize it again on every call -- so once a process
+    /// able to write the root's parent renamed the project and put a link to another directory in its
+    /// place, that other directory silently became "the project", and an absolute `Write` or `Read`
+    /// into it passed as inside. The CLI child still sits in the original directory (renamed); its
+    /// own post-hook re-check would have asked, but a hook `allow` overrides a working-directory ask.
+    /// A root that no longer resolves to itself is no boundary now, for every path-judged call.
     #[cfg(unix)]
     #[test]
     fn a_project_root_replaced_by_a_link_is_no_boundary() {
@@ -3948,10 +3959,15 @@ mod tests {
         }
     }
 
-    // The acceptEdits fast path tests cover new and existing files, nested directories,
-    // NotebookEdit, protected names at any depth, symlink and `..` escapes, hard links, saved
-    // rules and malformed input. The `$HOME` boundary case is covered by
-    // `a_project_root_at_or_above_home_is_no_boundary`, which supplies explicit `Surroundings`.
+    // ---- the acceptEdits fast path -------------------------------------------------------------
+    //
+    // The edit fast path covers ordinary writes and every boundary that must still ask:
+    // allow cases (a new file, an existing file, a nested dir, NotebookEdit), every protected dir
+    // and file (at root and nested), symlink escape, `..` escape, a symlinked dir inside the root
+    // pointing out, a hard link, $HOME as root (covered by extending
+    // `a_project_root_at_or_above_home_is_no_boundary` above, since that is the one place the
+    // boundary check itself is exercised with an explicit `Surroundings`), a saved rule beating the
+    // fast path, and malformed input.
 
     #[test]
     fn an_edit_or_write_inside_the_project_root_needs_no_human() {
@@ -4026,7 +4042,7 @@ mod tests {
     }
 
     /// [`DANGEROUS_RELATIVE_PATH`] (`.config/git`), the one two-segment sequence beside the
-    /// single-directory names -- extra fidelity beyond the module doc's written list, cited in the
+    /// single-directory names -- extra fidelity beyond the plain list of single-directory names, explained in the
     /// const's own doc.
     #[test]
     fn an_edit_or_write_under_config_slash_git_still_cards() {
@@ -4126,10 +4142,12 @@ mod tests {
         );
     }
 
-    /// A raw edit path containing `..` after a missing component must card.
-    /// Applying the missing tail lexically can cancel `nx` and reach the real `escape`
-    /// symlink without resolving it. Here `nx` is absent and `escape` points outside
-    /// the root, so accepting the lexical result could allow a write outside it.
+    /// A raw edit-tool
+    /// path carrying `..` past a component that does not exist on disk used to reach an EXISTING,
+    /// in-root symlink named `escape` -- pointing outside the root -- without ever resolving it,
+    /// because `resolve_missing_edit_target`'s "apply the missing tail lexically" fallback only
+    /// pushes/pops path components, it never calls back into [`resolve`]. The fixture makes this
+    /// concrete: `nx` never exists, `escape` is a real symlink out of the root.
     #[test]
     fn a_dotdot_past_a_missing_component_cannot_reach_a_real_symlink_lexically() {
         let ws = Workspace::new();
@@ -4146,7 +4164,7 @@ mod tests {
                 "{path}: must not reach the real outside symlink through a lexical `..`"
             );
         }
-        // The absolute-path form the review also found allowed.
+        // The absolute-path form must reject the same unresolved escape.
         let absolute = ws.path().join("nx/../escape/pwned.txt");
         assert_eq!(
             verdict("Write", json!({ "file_path": absolute.to_str().unwrap() }), ws.path()),
@@ -4227,10 +4245,10 @@ mod tests {
         );
     }
 
-    /// [codex], "important": the CLI's own `Ki` folds a handful of confusable characters before
+    /// The CLI's own `Ki` folds a handful of confusable characters before
     /// matching a protected name, so a lookalike cannot rename its way past the check. Narrower than
     /// `Ki` (see `fold_confusables`'s own doc), but covers the two characters and the invisible-run
-    /// the review actually reproduced.
+    /// covered by the fixture.
     #[test]
     fn a_confusable_spelling_of_a_protected_name_still_cards() {
         let ws = Workspace::new();
@@ -4248,9 +4266,12 @@ mod tests {
         }
     }
 
-    /// Both edit-target resolvers must require a card for `Resolution::Refused` instead of
-    /// falling through to allow. A dangling symlink is `Refused`, not `Missing`: a final link
-    /// whose target does not exist is unresolvable, rather than an absent edit target.
+    /// The `Resolution::Refused` branches of both edit-target resolvers card rather than fall
+    /// through to an allow -- pinned directly because other tests can pass even if either does
+    /// (`Refused => None`/`return None` mutated to fall through or `continue`). A dangling symlink
+    /// -- one whose target does not exist -- is `Refused`, not `Missing`, because [`resolve`]'s own
+    /// contract treats "the last component is a link that leads nowhere" as unresolvable rather
+    /// than absent.
     #[test]
     fn a_dangling_symlink_as_the_edit_target_itself_cards() {
         let ws = Workspace::new();
@@ -4276,10 +4297,13 @@ mod tests {
         );
     }
 
-    /// An edit spelled outside the root cards even when it resolves inside.
-    /// An outside `x` linked to the root makes `<outside>/x/new.txt` resolve inside,
-    /// but retargeting `x` before the write could redirect it elsewhere. Both requested
-    /// and resolved spellings must therefore be inside the root.
+    /// A path SPELLED outside the root cards even when it
+    /// resolves inside it today. An outside `x` linked to the root, then `Write
+    /// <outside>/x/.ssh/authorized_keys` -- allowed before, because only the resolved path was
+    /// contained, so the verdict hung on the state of a link outside the project that the user may
+    /// not control (retarget it between the verdict and the write and the write lands elsewhere).
+    /// Claude Code 2.1.283's own fast path refuses the same request: `zy` requires EVERY spelling,
+    /// requested and resolved, to be inside a working directory.
     #[test]
     fn an_edit_spelled_outside_the_root_cards_even_when_it_resolves_inside() {
         let ws = Workspace::new();
@@ -4320,9 +4344,11 @@ mod tests {
         }
     }
 
-    /// Only the resolved path is protected here; the requested spelling hides it behind
-    /// a link. This tests the resolved-path check independently of the requested-path
-    /// check, so the requested-path check cannot mask a missing resolved-path check.
+    /// The check of the RESOLVED path against the protected
+    /// names had no test of its own -- every protected case above names the protected segment in
+    /// the requested spelling too, so deleting the resolved-path check passed the whole suite. Here
+    /// only the resolved path is protected. (The CLI's own re-check after a hook `allow` would
+    /// still prompt for these, so this was a regression-safety gap, not a live hole.)
     #[test]
     fn a_protected_path_reached_only_through_a_link_still_cards() {
         let ws = Workspace::new();
@@ -4350,10 +4376,11 @@ mod tests {
         );
     }
 
-    /// [`MAX_RESOLUTION_STEPS`] bounds `resolve_missing_edit_target` before any search.
-    /// Without the cap, a missing first component causes an O(n^2) prefix search on the
-    /// GTK thread before the tail is joined to the root. An excessive component count
-    /// must card, while shorter missing paths can still use the new-file fast path.
+    /// `resolve_missing_edit_target`'s component cap
+    /// ([`MAX_RESOLUTION_STEPS`]) bounds the search. Without it, a path whose first component
+    /// does not exist is searched one prefix at a time down to the root, which resolves, and the
+    /// whole tail is then joined on -- an allow, after an O(n^2) search on the GTK thread. With it,
+    /// a path of more components than one resolution may look up cards before any search.
     #[test]
     fn an_edit_target_of_more_components_than_one_resolution_looks_up_cards() {
         let ws = Workspace::new();
@@ -4383,12 +4410,16 @@ mod tests {
         }
     }
 
-    /// Only "not found" and "not a directory" count as [`Resolution::Missing`].
-    /// Other lookup failures yield [`Resolution::Unexaminable`] and card for edits,
-    /// so the missing-target fallback cannot allow a write through an unexamined link.
-    /// Here `locked` lacks search permission and contains `inner` pointing outside.
-    /// Bash arguments treat the failure as missing because the command runs as the same
-    /// user and cannot perform the lookup either.
+    /// [`resolve`] must not call ANY failed lookup "nothing is
+    /// there" ([`Resolution::Missing`]) -- permission denied and a name too long included, not only
+    /// "not found" -- and the edit path's nearest-existing-ancestor fallback then allowed the write.
+    /// For example, `locked/` (mode 0600, so nothing under it can be examined) holding `inner
+    /// -> <outside>`; `Write locked/inner/new.txt` was allowed, the link out never examined. Claude
+    /// Code refuses the same request (`xl`: "where it leads on disk could not be determined (a link
+    /// or directory on the way could not be examined…)"). Now only "not found" and "not a
+    /// directory" are missing; any other failed lookup is [`Resolution::Unexaminable`], which the
+    /// edit path cards. (`Bash`'s argument check keeps treating it as nothing there, on purpose: the
+    /// command runs as this same user and is refused the same lookup -- see the variant's doc.)
     #[test]
     fn a_component_that_cannot_be_examined_cards_rather_than_counting_as_missing() {
         use std::os::unix::fs::PermissionsExt;
@@ -4470,12 +4501,14 @@ mod tests {
             .collect()
     }
 
-    /// Links through `/proc` or `/dev` can resolve differently here and in the CLI child.
-    /// `/proc/self/fd/<n>` uses each process's own descriptor; `/dev/fd` links to it.
-    /// `/proc/self/root` and `/proc/thread-self/root` use the process's own root.
-    /// Even if these links lead inside the project here, they must card for every path tool.
-    /// The `/proc/self/cwd` case changes this process's cwd and therefore runs separately
-    /// in `agent/tests/permission_policy_process_cwd.rs`.
+    /// The policy resolves a path in EITRI's process, but the
+    /// write (or read) happens in the CLI child's, and a link through `/proc` or `/dev` names a
+    /// different place in each. `/proc/self/fd/<n>` is this process's descriptor `<n>` -- in the CLI
+    /// it is the CLI's own `<n>`, or nothing; `/dev/fd` is a link to it; `/proc/self/root` and
+    /// `/proc/thread-self/root` are the process's own root. Here every link below leads back into the
+    /// project, so each call was allowed, while the CLI would have gone wherever its own descriptor,
+    /// or root, led. The `/proc/self/cwd` shape needs this process's cwd moved,
+    /// so it is in its own test binary, `agent/tests/permission_policy_process_cwd.rs`.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_link_through_proc_or_dev_cards_for_every_path_tool() {
@@ -4518,9 +4551,11 @@ mod tests {
         }
     }
 
-    /// A link that leaves the root and returns must card even if its final target is inside.
-    /// Outside path components can differ by process or change before use. Only links
-    /// whose resolution stays within the root are allowed; the controls below cover those.
+    /// A link that leaves the root and comes back in cards, even though
+    /// where it ends is inside. What the path passes through on the way is the part that may differ
+    /// by process or change under the verdict: an outside directory that is itself a link, a
+    /// sibling, a link sitting outside the project. Only links that stay inside the root at every
+    /// step are followed; the controls below are the ones that do.
     #[cfg(unix)]
     #[test]
     fn a_link_out_of_the_root_and_back_in_cards() {
@@ -4535,7 +4570,7 @@ mod tests {
         std::os::unix::fs::symlink(&root, outside_dir.join("back")).unwrap();
         let mut leaks = Vec::new();
         for (name, target) in [
-            // The review's shape: out to an outside directory, `..`, and back in by name.
+            // Out to an outside directory, `..`, and back in by name.
             ("out-and-back", format!("{}/../{root_name}/docs", outside_dir.display())),
             // The same, relative, through a sibling of the root.
             ("via-sibling", format!("../{outside_name}/../{root_name}/docs")),
@@ -4582,13 +4617,19 @@ mod tests {
         assert!(carded.is_empty(), "carded:\n{}", carded.join("\n"));
     }
 
-    /// CLI 2.1.283 passes raw `Grep` and `Glob` paths to the hook, then searches using
-    /// `expandPath`: whitespace is trimmed, home paths are expanded and `..` is resolved
-    /// lexically against the cwd. Physical resolution here can therefore disagree:
-    /// `d/../..` can stay inside physically but escape lexically, `~` can name a local
-    /// directory here but the home directory in the CLI, and trimming can expose a link out.
-    /// These spellings must card whenever the tools are offered. This launch does not
-    /// offer them unless `--tools` or `--allowedTools` names them.
+    /// CLI 2.1.283 gives `Grep` and `Glob` no
+    /// `backfillObservableInput` (only `Write`, `Read`, `Edit` and `NotebookEdit` have one), so the
+    /// hook hands this policy their `path` exactly as the model wrote it -- while the tool searches
+    /// `expandPath(path)` (`Ye` in the bundle): trimmed, a leading `~/` taken from the home
+    /// directory, and `path.resolve`d LEXICALLY against the cwd. Each spelling below names an
+    /// in-project directory when resolved physically here (allowed before) and something else in
+    /// the CLI: `d/../..` is the root physically (`d` leads two levels down) and the root's parent
+    /// lexically; `~/.ssh` and `~` are directories in the project named `~`, and `$HOME/.ssh` and
+    /// `$HOME` to the CLI; a real ` sub2` (or `sub3 `, or one led by a tab, an ideographic space or
+    /// U+FEFF, all of which JavaScript's `trim` removes) is `sub2`/`sub3` to the CLI, an in-project
+    /// link out. Not reachable on 2.1.283 as launched here -- it offers neither tool unless
+    /// `--tools`/`--allowedTools` names it -- but a build or a launch that offers them must not
+    /// inherit a silent read outside the root.
     #[cfg(unix)]
     #[test]
     fn a_search_path_the_cli_spells_differently_cards() {
@@ -5020,7 +5061,7 @@ mod tests {
         }
     }
 
-    // ---- the review of 2026-09-19 (later): every finding that the policy failed open ------------
+    // ---- commands and paths that must fail toward a card -------------------------------------
 
     #[test]
     fn a_git_option_that_writes_a_file_gets_a_card_in_both_spellings() {
@@ -5089,8 +5130,9 @@ mod tests {
         ] {
             assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
         }
-        // A link staying inside is allowed. Use a canonical target: passing through a system
-        // link outside the root, such as macOS's `/var`, leaves the root on the way and cards.
+        // A path through a link that stays inside is still fine. Its target is canonical: spelled
+        // through a system link outside the root (macOS's `/var`), it leaves the root on the way
+        // and must card because links outside the root are not followed.
         std::os::unix::fs::symlink(ws.path().canonicalize().unwrap().join("src"), ws.path().join("inner")).unwrap();
         assert_eq!(
             bash("cat inner/main.rs", ws.path()),
@@ -5188,8 +5230,8 @@ mod tests {
             classify("Bash", json!({ "command": "ls" }), ws.path(), ws.path()),
             PermissionVerdict::AskTheUser
         );
-        // The acceptEdits fast path uses the same boundary check: a target that otherwise
-        // passes still requires a card when the root is `$HOME` or an ancestor of it.
+        // The acceptEdits fast path is gated by the same boundary check for $HOME as root: a target
+        // that would otherwise fast-path-allow still cards when the root itself is no boundary.
         assert_eq!(
             classify("Write", json!({ "file_path": "new.txt" }), ws.path(), ws.path()),
             PermissionVerdict::AskTheUser
@@ -5217,9 +5259,9 @@ mod tests {
         );
     }
 
-    /// A root under `/proc`, `/sys` or `/dev` cannot serve as a project boundary.
-    /// Links there can depend on the process, so resolving a path here cannot establish
-    /// where the CLI child will open it.
+    /// A root in `/proc`, `/sys` or `/dev` is no boundary either. Every path
+    /// under it passes through a tree whose links (`/dev/stdin`, `/proc/self`, ...) resolve
+    /// differently in each process, so nothing there can be judged in this one for the CLI's.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_project_root_in_proc_sys_or_dev_is_no_boundary() {
@@ -5245,7 +5287,7 @@ mod tests {
         assert!(leaks.is_empty(), "allowed:\n{}", leaks.join("\n"));
     }
 
-    // prefix rules
+    // ---- prefix rules --------------------------------------------------------------------------
 
     use crate::permission_rules::{PrefixRule, PrefixRules};
 
@@ -5262,9 +5304,9 @@ mod tests {
         rules
     }
 
-    /// Matching prefix rules must not allow `Bash` inputs refused for syntax or paths.
-    /// The corpus repeats every card-producing `Bash` input from this module's tests,
-    /// using a workspace with the same links.
+    /// Every syntax or path refusal must still card with a matching rule present.
+    /// The corpus is every card-producing `Bash` input this module's
+    /// tests use, copied here verbatim, against a workspace with the same links those tests make.
     #[test]
     fn no_rule_ever_turns_a_card_the_classifier_refused_on_syntax_or_paths_into_an_allow() {
         let ws = Workspace::new();
@@ -5392,10 +5434,13 @@ mod tests {
             rule_that_allows("Bash", &json!({ "command": "ls" }), ws.path(), &ls),
             None
         );
-        // A Bash prefix rule cannot answer another tool's card. Use `WebFetch`, which always
-        // requires a card, to test this. An in-project `Write` is already allowed by
-        // `classify_edit_target` and would not test rule isolation. The edit fast path has
-        // separate coverage in `no_rule_can_touch_the_edit_tools_at_all`.
+        // No rule ever reaches another tool, even one the classifier cards.
+        //
+        // `Write` on an in-project path is deliberately NOT the probe here because of
+        // the acceptEdits fast path: it is now allowed on its own, by `classify_edit_target`, not
+        // by any rule, so it would no longer demonstrate this rule's actual point. `WebFetch` still
+        // cards unconditionally (`ALWAYS_ASK_TOOLS`) and is untouched by that change; the fast
+        // path's own rule-immunity has its own dedicated test, `no_rule_can_touch_the_edit_tools_at_all`.
         let all = PrefixRules::default().with(PrefixRule::parse("Bash(src *)").unwrap());
         assert!(
             classify_with_rules("WebFetch", &json!({ "url": "https://example.com" }), ws.path(), &all).needs_a_human()
@@ -5519,10 +5564,10 @@ mod tests {
         );
     }
 
-    // ---- reads the path checks never saw ---------------------------------------------------------
+    // ---- reads beyond the paths named in command arguments -----------------------------------
     //
-    // Each of these was allowed without a card before the fix, and each was reproduced by running the
-    // real command in a scratch fixture before being fixed.
+    // Each command can read outside the root indirectly, even when its arguments look contained.
+    // Running the real commands in scratch fixtures confirmed these reads, so each needs a card.
 
     /// A list file inside the project names what the command then reads, so the path checks, which
     /// look only at argv, never see the path. `wc`/`du --files0-from` print an outside file's size,
@@ -5719,10 +5764,11 @@ mod tests {
         assert_eq!(bash("git log", bare.path()), PermissionVerdict::AskTheUser);
     }
 
-    /// A repository's `.git/config` can make read-only commands run programs through
-    /// `diff.external`, `core.fsmonitor` or `hook.<name>.event = post-index-change`.
-    /// `core.worktree` can make `git diff` read outside the project. A directory or archive
-    /// can arrive with this metadata even though writing it through the tools needs a card.
+    /// A repository's own `.git/config` can run a program under a read-only command: measured
+    /// 2026-09-28, `diff.external` ran under plain `git diff`, `core.fsmonitor` twice under `git
+    /// status`, a `hook.<name>.event = post-index-change` under `git status`, and `core.worktree`
+    /// made `git diff` print a file outside the project. The model cannot write that config without a
+    /// card, but a directory or archive that arrives with its own `.git` can.
     #[test]
     fn a_repository_whose_own_config_can_run_a_program_cards_every_git_call() {
         for config in [
@@ -5869,13 +5915,13 @@ mod tests {
         );
     }
 
-    /// A linked worktree (a `.git` file naming a git directory elsewhere, which names its common
+    /// A linked worktree (`.git` a file naming a git directory elsewhere, which names its common
     /// directory) is the project's own repository: its toplevel is the root. What its config says is
     /// read from the common directory, where git reads it.
     ///
-    /// The git directory also holds the `gitdir` back-link naming this worktree's `.git`, as every
-    /// `git worktree add` writes it. Without one, a repository outside the root is not the
-    /// project's, and it cards (see
+    /// The git directory must also hold the `gitdir` back-link naming this worktree's
+    /// `.git`, as every `git worktree add` writes it (git 2.55.0, measured) -- without one, a
+    /// repository outside the root is not the project's, and it cards (see
     /// `a_dot_git_naming_a_repository_outside_the_root_cards_unless_that_repository_names_the_root`).
     #[test]
     fn a_linked_worktree_is_judged_by_its_common_directory() {
@@ -5909,8 +5955,9 @@ mod tests {
         );
     }
 
-    /// With the repository toplevel at the root, `<rev>:<path>` names a path relative
-    /// to that root. Paths containing `..` or an absolute escape must still card.
+    /// With the repository's toplevel at the root, a `<rev>:<path>` names
+    /// a path relative to the root, and the only ways out of it -- `..` and an absolute path -- were
+    /// already cards. Pinned here so the argument is a test, not a comment.
     #[test]
     fn a_rev_path_argument_stays_inside_when_the_toplevel_is_the_root() {
         let ws = Workspace::new();
@@ -5996,9 +6043,10 @@ mod tests {
         assert!(classify_in("Bash", &status, ws.path(), &surroundings).needs_a_human());
     }
 
-    /// A git include through `/proc/self/cwd` can be missing here but present for git.
-    /// Git starts in the project root, where the included file can set `core.fsmonitor`.
-    /// Such an include must card rather than be skipped as missing.
+    /// Per-process links must card in a path git reads as well as one the
+    /// call names. `include.path = /proc/self/cwd/<name>` is looked up in THIS process's cwd, where
+    /// nothing has that name, so the include was skipped as missing and `git status` allowed -- while
+    /// git, started in the project root, reads `<root>/<name>` and runs its `core.fsmonitor`.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_git_include_through_proc_self_cwd_cards() {
@@ -6095,11 +6143,15 @@ mod tests {
         }
     }
 
+    // ---- repository configuration and indirect reads ----------------------------------------
 
-    /// A promisor remote can make a read-only git command execute a helper during lazy fetch.
-    /// With `promisor`, `partialclonefilter`, an `ext::` URL and `protocol.ext.allow=always`,
-    /// `git show <missing-oid>` can run the configured program. The promisor/filter keys are
-    /// outside the inert allowlist, and the URL check also rejects the helper transport.
+    /// A repository config can make a read-only git command run a program without any
+    /// dangerous *executable* key: `remote.<n>.promisor=true` + `partialclonefilter` + a
+    /// `remote.<n>.url` on a program transport (`ext::`) + `protocol.ext.allow=always` makes `git
+    /// show <missing-oid>` lazy-fetch through the `ext::` helper, which runs the program (reproduced
+    /// on this host, 2026-09-28: the helper's marker file appeared). An executable-key denylist
+    /// held none of these, so it allowed the call. The allowlist inversion cards it two ways -- the
+    /// promisor/filter keys are not inert, and the `ext::` URL is a program transport.
     #[test]
     fn a_promisor_remote_with_a_program_transport_url_cards_every_git_call() {
         let ws = Workspace::new();
@@ -6139,9 +6191,12 @@ mod tests {
         );
     }
 
-    /// `blame.ignoreRevsFile` can make `git blame` read an outside file and include its first
-    /// line in an error. Config keys outside the inert allowlist require cards even when they
-    /// run no program.
+    /// A repository config key that reads an EXTERNAL FILE -- `blame.ignoreRevsFile`,
+    /// pointing at a file outside the project -- is enough on its own: `git blame` reads it and its
+    /// first line leaks in git's error (reproduced 2026-09-28: `fatal: invalid object name: <first
+    /// line of the outside file>`). An executable-key denylist checked only executable keys, so it allowed
+    /// this. Under the allowlist any key not proven inert cards, so a file-reading key cards even
+    /// though it runs no program.
     #[cfg(unix)]
     #[test]
     fn a_config_key_that_reads_an_external_file_or_is_simply_unknown_cards_every_git_call() {
@@ -6165,9 +6220,11 @@ mod tests {
         }
     }
 
-    /// An option-shaped argument can be a filename: `cat -- -n` follows a symlink named `-n`
-    /// even when no entry named `n` exists. Check the literal spelling as a path so removing
-    /// the leading dash cannot bypass containment.
+    /// After `--` every argument is an operand, and more generally an option-shaped
+    /// argument may be treated as one: a symlink named `-n` (with no plain entry `n`) is followed by
+    /// `cat -- -n` (reproduced 2026-09-28: it printed the outside file). The path check dropped the
+    /// leading dash and looked for `n`, which does not exist, so it passed. The literal spelling `-n`
+    /// must be checked as a path.
     #[cfg(unix)]
     #[test]
     fn a_complete_option_shaped_filename_is_checked_as_a_path() {
@@ -6188,9 +6245,11 @@ mod tests {
         );
     }
 
-    /// A symlink at `.git/objects` or another git read path can expose another repository's
-    /// objects without `objects/info/alternates`. Discovery follows links when testing
-    /// searchability, so containment must be checked separately.
+    /// `.git/objects` (or another path git reads from the git directory) may be a symlink
+    /// to ANOTHER repository's object store, with no `objects/info/alternates` file at all: `git show
+    /// <oid>` then prints the foreign blob (reproduced 2026-09-28). Discovery followed the symlink
+    /// when it tested searchability, and nothing checked that git's reads stay inside the git
+    /// directory.
     #[cfg(unix)]
     #[test]
     fn a_git_read_path_that_escapes_the_git_directory_cards() {
@@ -6209,9 +6268,11 @@ mod tests {
         }
     }
 
-    /// A submodule's `commondir` can select a different common directory whose config runs
-    /// `core.fsmonitor` during the superproject's `git status`. Check that common config as
-    /// well as the submodule's own git directory.
+    /// A submodule's git directory (`.git/modules/<name>`) can point its `commondir` at
+    /// another common directory whose config runs a program (`core.fsmonitor`); the superproject's
+    /// `git status` enters the submodule and reads that foreign common config (reproduced 2026-09-28:
+    /// the fsmonitor marker appeared). The scan read the submodule's own directory but never followed
+    /// its `commondir`, so the foreign config was invisible.
     #[cfg(unix)]
     #[test]
     fn a_submodule_commondir_pointing_at_a_foreign_common_config_cards() {
@@ -6296,6 +6357,7 @@ mod tests {
         assert_eq!(bash("git status", rel.path()), PermissionVerdict::AllowWithoutAsking);
     }
 
+    // ---- linked worktree and submodule repository boundaries ---------------------------------
 
     /// A linked worktree's git directory as `git worktree add` lays it out (git 2.55.0, measured):
     /// `<common>/worktrees/<name>` holding `HEAD`, `commondir` = `../..` and, when given, the
@@ -6323,9 +6385,13 @@ mod tests {
         git_dir
     }
 
-    /// A `.git` gitfile or symlink can select any repository on disk and expose its committed
-    /// files. An outside repository belongs to this root only when it contains a back-link
-    /// naming the root: a linked worktree's `gitdir` file or a submodule's `core.worktree`.
+    /// A `.git` gitfile or symlink may name ANY repository on disk. Without checking that
+    /// it is this project's own repository: with a gitfile `gitdir:
+    /// <victim>/.git`, `git show HEAD:private.txt` printed the other repository's committed file
+    /// (reproduced 2026-09-28 on git 2.55.0 in the first, second, third, fourth and seventh shapes
+    /// below). A repository outside the root is this project's only when it says so itself, in a
+    /// back-link git writes there and a project cannot: a linked worktree's `gitdir` file, a
+    /// submodule's `core.worktree`.
     #[cfg(unix)]
     #[test]
     fn a_dot_git_naming_a_repository_outside_the_root_cards_unless_that_repository_names_the_root() {
@@ -6453,9 +6519,10 @@ mod tests {
         );
     }
 
-    /// A linked worktree reads without a card when its `gitdir` back-link names this root's
-    /// `.git`, absolutely or relative to its git directory. A submodule reads without a card
-    /// when its `core.worktree` resolves to this root.
+    /// A linked worktree whose `gitdir` back-link names this root's
+    /// `.git` -- absolute, as `git worktree add` writes it, or relative to the worktree's git
+    /// directory, as `--relative-paths` does -- and a submodule whose `core.worktree` resolves to
+    /// this root read without a card.
     #[cfg(unix)]
     #[test]
     fn a_linked_worktree_or_submodule_that_names_the_root_back_reads_without_a_card() {
@@ -6617,10 +6684,13 @@ mod tests {
         assert!(leaks.is_empty(), "a separate git dir: {leaks:#?}");
     }
 
-    /// Nested symlinks can expose another repository's objects even when top-level git entries
-    /// stay inside. Links at `.git/objects/pack/pack-*.{idx,pack}` or `.git/objects/<xx>` can
-    /// redirect `git show HEAD:<file>` to those objects. Every symlink in the git directory
-    /// must resolve inside it or inside the project.
+    /// Containing only the top-level `objects`, `refs`, `packed-refs`, `info` and `logs` entries of
+    /// the git directory lets a symlink one level down read another repository.
+    /// `.git/objects/pack/pack-*.{idx,pack}` linked to another repository's packs, or
+    /// `.git/objects/<xx>` to its loose-object directories, with `HEAD` holding that repository's
+    /// commit id, made `git show HEAD:<file>` print its file (reproduced 2026-09-28, both). Every
+    /// symbolic link anywhere in the git directory must now resolve inside it or inside the
+    /// project.
     #[cfg(unix)]
     #[test]
     fn a_symlink_anywhere_in_the_git_directory_that_leaves_it_and_the_project_cards() {
@@ -6669,9 +6739,12 @@ mod tests {
         assert_eq!(bash("git status", ws.path()), PermissionVerdict::AllowWithoutAsking);
     }
 
-    /// Ordinary pull, rerere, branch and submodule settings are inert for the permitted
-    /// read-only subcommands and should not require cards. Submodule update accepts only git's
-    /// four named strategies; `!command` and other values still require cards.
+    /// Config keys ordinary use leaves in a repository, each inert for the nine
+    /// read-only subcommands, must not card git calls (reproduced 2026-09-28).
+    /// `pull.*` and `branch.<n>.rebase` are read only by `git pull`, `rerere.*` only by merge-like
+    /// commands, `branch.<n>.description` only by `format-patch`/`request-pull`/`branch`,
+    /// `submodule.<n>.update`/`.branch` only by `git submodule update`. A `!command` update strategy
+    /// still cards, as does anything but git's four named ones.
     #[test]
     fn benign_keys_pull_rerere_branch_and_submodule_use_leave_stay_card_free() {
         let reads = ["git status", "git log", "git diff", "git show HEAD"];
@@ -6701,7 +6774,7 @@ mod tests {
             // could not be read off it: `filter.lfs.*` keeps carding, whatever its values.
             "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\
              \tprocess = git-lfs filter-process\n\trequired = true\n",
-            // Partial-clone config requires a card.
+            // A partial clone keeps carding because reading a missing object can fetch from a remote.
             "[remote \"origin\"]\n\tpromisor = true\n\tpartialclonefilter = blob:none\n",
             "[extensions]\n\tpartialClone = origin\n",
         ] {
@@ -6712,9 +6785,11 @@ mod tests {
         }
     }
 
-    /// Exact `--no-pager` and `-P` global options only disable the pager, so read-only
-    /// subcommands following them need no card. Abbreviations, combined forms and other global
-    /// options still require cards.
+    /// `git --no-pager <read-only subcommand>` must not card merely because the first word
+    /// after `git` was taken as the subcommand. `--no-pager` and `-P` (its short spelling) only stop
+    /// git starting a pager; git accepts them exactly as spelled (`--no-pag`, `-Pp` were measured
+    /// rejected, 2026-09-28). Every other global option still cards: each reconfigures or relocates
+    /// git, or runs a pager.
     #[test]
     fn git_no_pager_before_a_read_only_subcommand_needs_no_card_and_other_global_options_still_card() {
         let ws = Workspace::new();
@@ -6753,13 +6828,15 @@ mod tests {
             assert_eq!(bash(command, ws.path()), PermissionVerdict::AskTheUser, "`{command}`");
         }
     }
+    // ---- bounded path resolution ------------------------------------------------------------
 
-    /// Creates `n` symlinks named `<prefix><i>` in `dir`. Each target is padded with `d/../` up
-    /// to about `pad` bytes, and the last names `last`. The padding preserves the destination
-    /// while increasing resolution work.
+    /// `n` symbolic links named `<prefix><i>` in `dir`, each hop's target padded with `d/../`
+    /// (resolving back to `dir`) up to about `pad` bytes, the last naming `last`. In this shape,
+    /// every hop resolves where it points, so nothing about it is refused except what it costs.
     ///
-    /// Linux-only: callers use symlink targets of about 4 KB, within Linux's 4096-byte
-    /// `PATH_MAX`. macOS's 1024-byte limit makes `symlink(2)` reject the fixture.
+    /// Linux-only: every caller here pads to ~4 KB, which fits Linux's 4096-byte `PATH_MAX` but
+    /// not macOS's 1024-byte one -- `symlink(2)` itself refuses a target that long on macOS, so
+    /// the fixture cannot even be built there.
     #[cfg(target_os = "linux")]
     fn padded_chain(dir: &Path, prefix: &str, n: usize, pad: usize, last: &str) {
         std::fs::create_dir_all(dir.join("d")).unwrap();
@@ -6774,20 +6851,23 @@ mod tests {
         }
     }
 
-    /// Project-controlled paths and `.git` links must have bounded resolution costs because
-    /// classification runs on the GTK thread. Padded link chains can resolve inside the project
-    /// yet make repeated `canonicalize` calls block the UI.
+    /// Every resolution of a path the project (or its `.git`) shapes previously
+    /// ran `canonicalize` -- glibc's `realpath`, one system call per component -- with nothing
+    /// bounding how many. A 39-hop chain padded with `d/../` to ~4 KB a hop cost 21 ms per
+    /// resolution here (the kernel's own `stat` of it, 0.57 ms), so a hostile repository held the
+    /// GTK thread, which classifies every request: 1000 links in `.git`, 25-30 s;
+    /// 200 `core.worktree` values, 5.3 s; `cat c0 c0 ...` over 2400 arguments, 107 s (release
+    /// build, measured 2026-09-28). Each of those resolved INSIDE the project and was allowed.
+    /// Paths are now resolved by a bounded resolver that reads each link before following it: a
+    /// long target, one with many components or `..`, too many hops or steps, or a git directory
+    /// holding more links than the policy checks -- each cards.
     ///
-    /// The resolver reads each link before following it and requires a card for excessive
-    /// target length, components, `..`, hops or steps. A git directory with more links than the
-    /// policy checks also requires a card.
-    ///
-    /// Linux-only: callers use symlink targets of about 4 KB, within Linux's 4096-byte
-    /// `PATH_MAX`. macOS's 1024-byte limit makes `symlink(2)` reject the fixture.
+    /// Linux-only: see [`padded_chain`] -- every case here needs a ~4 KB symlink target, which
+    /// macOS's `symlink(2)` refuses outright (its `PATH_MAX` is 1024, not Linux's 4096).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_path_whose_links_would_take_long_to_resolve_cards_instead() {
-        // The review's shape, scaled down: links in `.git` whose every hop resolves inside it.
+        // Links in `.git` whose every hop resolves inside it still need a resolution budget.
         let ws = Workspace::new();
         padded_chain(&ws.path().join(".git/links"), "h", 39, 4000, "../HEAD");
         let started = std::time::Instant::now();
@@ -7018,8 +7098,9 @@ mod tests {
             PermissionVerdict::AllowWithoutAsking,
             "the control"
         );
-        // Judge the git directory by its resolved location. A gitfile naming an in-project link
-        // to an outside repository still needs the outside repository's back-link check.
+        // The git directory must be judged where it IS: a gitfile naming a link in the project
+        // that leads to an outside repository is outside, whatever its spelling says -- read
+        // lexically, the repository back-link check would never run.
         let victim = Workspace::new();
         victim.write("secret", "private text\n");
         ws.link("x", victim.path().join(".git"));
@@ -7060,7 +7141,7 @@ mod tests {
     }
 
     /// The work one classification may do is bounded, and running out always cards -- whatever
-    /// the check that ran out would have answered. The review's other bound (entries walked) did
+    /// the check that ran out would have answered. Bounding entries walked alone did
     /// not bound time; nor did a config's `include.path` fan-out, followed without limit: four
     /// levels of 30 includes each cost 810,000 file reads, 1.27 s in a release build before it
     /// ALLOWED (measured 2026-09-28), and git's depth limit of 10 lets it reach 30^10.
@@ -7105,11 +7186,13 @@ mod tests {
         );
     }
 
-    /// Leading git global options such as `-C`, `--git-dir`, `--work-tree` and `--namespace`
-    /// can select a repository the root's repository check never inspected. Their
-    /// separate-argument forms carry no `=`. They require a card with a reason no saved rule
-    /// replaces, so `Bash(git -C *)` cannot authorize outside reads. A subcommand such as `git
-    /// push` keeps its replaceable reason.
+    /// `git -C x <sub>` (and `--git-dir`, `--work-tree`,
+    /// `--namespace`, whose separate-argument forms carry no `=`) carded with the reason a saved
+    /// rule may replace, so a hand-written `Bash(git -C *)` answered it -- and the repository
+    /// check had judged only the project root's repository, never the `-C` target. Reproduced:
+    /// with that rule, `git -C sub2 show HEAD:secret` through a gitfile into an outside
+    /// repository was allowed and printed its file. A leading global option now cards with a
+    /// reason no rule replaces; a genuine subcommand (`git push`) keeps the replaceable one.
     #[cfg(unix)]
     #[test]
     fn a_saved_rule_never_answers_a_git_global_option() {

@@ -552,8 +552,7 @@ mod tests {
         assert!(r.notes.is_empty(), "{:?}", r.notes);
     }
 
-    /// Removes modules this window does not have, including unregistered Lua panels.
-    /// Their siblings take the space, and their `hidden` entries are removed.
+    /// An unregistered Lua panel is dropped along with its hidden entry; its sibling takes the space.
     #[test]
     fn a_module_this_window_does_not_have_is_left_out_and_its_sibling_takes_the_space() {
         let with_gone = Node::split(
@@ -628,8 +627,9 @@ mod tests {
         );
     }
 
-    /// A state file or Lua default tree without a terminal receives one below the editor's own
-    /// leaf, hidden until `Ctrl+a t`, leaving the agent untouched.
+    /// A file written before the terminal existed, or `init.lua`'s default tree without one: it goes
+    /// where a first launch puts it, hidden until `Ctrl+a t` -- below the editor's own leaf only
+    /// (the default since 2026-09-28), leaving the agent untouched.
     #[test]
     fn a_missing_terminal_is_placed_below_the_editor_and_hidden() {
         let r = reconcile(row(leaf(editor()), leaf(agent())), &BTreeSet::new(), None, &[], &[]).unwrap();
@@ -678,9 +678,10 @@ mod tests {
         );
     }
 
-    /// A default layout with a terminal below a row is a plain `Column` split.
-    /// Pinning the terminal here keeps its height through `F11`.
-    /// An editor placed under the agent keeps its ratio instead.
+    /// `eitri.layout.default{ 'column', {'row', {'editor'}, {'agent'}, share = 0.7}, {'terminal'} }`
+    /// is a plain `Column` split. Its bottom terminal must keep its height through `F11`, just
+    /// like the first-launch layout. An editor below the agent is not a default bottom module,
+    /// so that split keeps its ratio.
     #[test]
     fn a_bottom_row_from_outside_is_pinned_as_a_first_launch_pins_it() {
         let upper = || Node::split(Axis::Row, 0.6, leaf(editor()), leaf(agent()));
@@ -891,9 +892,8 @@ mod tests {
         assert_eq!(tabbed.focus, 1, "the terminal is still the drawn tab");
     }
 
-    /// A saved file keeps the arrangement the window left. `Ctrl+a _` with the terminal shown
-    /// builds `Column(editor, Column(agent, terminal))` and removes its pin,
-    /// so reopening must not pin it again.
+    /// Restoring a saved `Column(editor, Column(agent, terminal))` created by `Ctrl+a _` with the
+    /// terminal visible must preserve its deliberately unpinned size rather than pinning it again.
     #[test]
     fn a_file_is_never_pinned_by_reconcile() {
         let evened = Node::split(
@@ -910,10 +910,9 @@ mod tests {
         same_as(&r, two_level);
     }
 
-    /// A layout saved with a Lua `main` panel -- `Row(lua:main, editor)`, the editor hidden -- and
-    /// reopened after the panel left `init.lua`: the editor is shown where the panel was, rather than
-    /// the window opening with no nvim. An editor hidden beside
-    /// a module that is still there stays hidden.
+    /// Reopening `Row(lua:main, editor)` with the editor hidden after removing the Lua panel from
+    /// `init.lua` shows the editor where that panel was, so the window still has nvim.
+    /// An editor hidden beside a module that remains present stays hidden.
     #[test]
     fn an_editor_hidden_by_a_panel_that_is_gone_is_shown() {
         let main = ModuleId::lua("main");
@@ -990,10 +989,9 @@ mod tests {
         );
     }
 
-    /// A Lua default tree with the chat on the left carries no focus. The keys go to the editor,
-    /// as on first launch, rather than to the first leaf. A focus absent from the tree uses the
-    /// same fallback. With the editor hidden, a Lua `main` panel in its place takes focus before
-    /// a module earlier in the tree.
+    /// A default `Row(agent at 0.4, editor)` has no focus field. It must give keys to the editor,
+    /// not the first leaf. An invalid focus id falls back the same way. With the editor hidden,
+    /// a Lua `main` panel in its place wins over a module earlier in tree order.
     #[test]
     fn without_a_usable_focus_the_keys_go_where_a_first_launch_gives_them() {
         let chat_left = Node::split(Axis::Row, 0.4, leaf(agent()), leaf(editor()));

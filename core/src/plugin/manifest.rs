@@ -1314,7 +1314,7 @@ mod tests {
         assert!(err.contains("handoff"), "{err}");
     }
 
-    /// The preview plugin's manifest as its design gives it, comments included.
+    /// The preview plugin's manifest as it ships, comments included.
     #[test]
     fn a_follow_plugin_manifest_parses() {
         let text = r#"id = "markdown"

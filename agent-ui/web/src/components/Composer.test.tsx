@@ -95,9 +95,10 @@ describe("Composer sending", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  /* `disabled` prevents sending a second turn while one runs. The backend rejects it too,
-     but the UI must not offer it. There is no Send button; Enter is the remaining send path,
-     so this checks that Enter cannot send while disabled. */
+  /* `disabled` is the whole guard against a second turn being sent while one is running -- the
+     backend rejects it, but the UI must not offer it. There is no Send button any more to also
+     check as disabled -- Enter is the only
+     path left, so it is the only one this pins. */
   it("cannot send while disabled, even via Enter", () => {
     const { textarea, onSend } = renderComposer({ disabled: true });
     expect(textarea.disabled).toBe(true);
@@ -107,9 +108,12 @@ describe("Composer sending", () => {
   });
 });
 
-// The composer sends on Enter and inserts a newline on Shift+Enter. The mouse Stop button lives
-// in `ActivityLine`, gated by the provider's `interrupt` capability. Its behavior is tested in
-// `ActivityLine.test.tsx`.
+// Send and Stop buttons are absent from the composer. Keyboard sending stays available:
+// Enter still sends and Shift+Enter still inserts a newline (both pinned
+// above), and Stop lives only in `ActivityLine` (formerly
+// `StatusLine`), for mouse users -- see `ActivityLine.test.tsx`'s own "shows the turn's motion and
+// Stop..." test for that half, gated the same way this one used to be, on the provider's
+// advertised `interrupt` capability rather than the backend's name.
 
 describe("Composer on a session that has ended", () => {
   it("says the session ended rather than inviting a turn that cannot be taken", () => {
@@ -127,9 +131,9 @@ describe("Composer on a session that has ended", () => {
 
 /* The two halves of not eating a typed message: the box refuses while the conversation is closing
    and says so, and a send the host refused comes back. */
-/* A held-back slash command is never sent: keep the draft and show a local flash naming it.
- *  `slashCommands.test.ts` covers classification; this checks that Enter calls
- *  `heldBackSlashCommand` and renders the flash where `submit` puts it. */
+/* A held-back slash command is never sent, the draft stays, and a local flash
+ *  names it. `slashCommands.test.ts` covers the classification itself; this only pins the wiring:
+ *  Enter goes through `heldBackSlashCommand`, and the flash renders where `submit` puts it. */
 describe("Composer and slash commands (P10)", () => {
   it("does not send a held-back command (/login), keeps the draft, and flashes", () => {
     const { container, textarea, onSend } = renderComposer();
@@ -164,8 +168,8 @@ describe("Composer and slash commands (P10)", () => {
     }
   });
 
-  /* Bare `/model` can be sent because `App.tsx` parses its reply into a picker. This component
-   *  only sends the command. */
+  /* /model is no longer interactive-only even bare -- its reply
+   *  parses into a picker (`App.tsx`'s own wiring; not this component's concern). */
   it("sends /model bare or with an argument alike", () => {
     for (const command of ["/model", "/model sonnet"]) {
       const { textarea, onSend } = renderComposer();
@@ -261,8 +265,10 @@ describe("Composer's BROWSE/INPUT split", () => {
   it("shows an empty-looking box instead of a textarea in BROWSE, with the C1b/S3 hint after it", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector("textarea")).toBeNull();
-    // The stand-in shows the placeholder with the key at its right end (`.composer-key`). `i`, a
-    // click and Tab still enter INPUT.
+    // The BROWSE box has a dim reminder of the way into INPUT, because an arrival
+    // lands in BROWSE. The reminder tests below pin its appearance and behavior;
+    // `i`, a click and Tab still reach INPUT from the box.
+    // Since 2026-10-15 the reminder is the key alone at the box's right end (`.composer-key`).
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...i");
   });
 
@@ -304,10 +310,10 @@ describe("Composer's BROWSE/INPUT split", () => {
   });
 });
 
-/** C1b/S3: the dim `i or Ctrl+j to type` that follows the placeholder or the draft in
+/** The BROWSE reminder: the dim `i or Ctrl+j to type` that follows the placeholder or the draft in
  *  BROWSE, restoring what 2026-09-19 removed once that removal's own premise (`Ctrl+l` opening the
  *  composer directly) ended. */
-/* C1b/S3 restored a reminder of the way in; since 2026-10-15 it is the key alone at the box's right end, as
+/* The box shows a reminder of the way in; since 2026-10-15 it is the key alone at the box's right end, as
    the start screen's menu shows its keys, not the sentence "i or Ctrl+j to type" after the placeholder. */
 describe("Composer's BROWSE hint (C1b/S3)", () => {
   it("shows the key at the right end, with nothing typed, and no sentence", () => {
@@ -336,7 +342,7 @@ describe("Composer's BROWSE hint (C1b/S3)", () => {
   it("is not shown on a session that has ended -- that row says r instead", () => {
     const { container } = renderComposer({ mode: "browse", sessionEnded: true });
     expect(container.querySelector(".composer-key")).toBeNull();
-    // The row above says "Press r..."; the composer does not repeat it.
+    // The row above says "Press r…"; the composer does not repeat it.
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("This session has ended.");
   });
 
@@ -346,9 +352,9 @@ describe("Composer's BROWSE hint (C1b/S3)", () => {
   });
 });
 
-/** C1a: where the caret goes on entering INPUT, now that `Composer`'s own
+/** Where the caret goes on entering INPUT, now that `Composer`'s own
  *  `[focusRequest, mode]` effect runs `focusAtCaret` on every transition into "input" rather than
- *  only when `focusRequest` had separately been bumped past 0 (the fix at F12's actual cause: a
+ *  only when `focusRequest` had separately been bumped past 0 (the focus bug was a
  *  fresh `autoFocus` mount of a non-empty box is not reliable on its own, in this project's own
  *  measured GUI pass). */
 describe("Composer's caret on entering INPUT (C1a)", () => {
@@ -375,7 +381,7 @@ describe("Composer's caret on entering INPUT (C1a)", () => {
     expect(container.querySelector("textarea")!.selectionStart).toBe(11);
   });
 
-  /** F12's own start-of-draft case: a box that mounts already carrying a draft (never one the user
+  /** Start-of-draft case: a box that mounts already carrying a draft (never one the user
    *  typed into THIS instance first) must not land the caret at 0. */
   it("a fresh mount with a draft puts the caret at the end, not the start", () => {
     const { textarea } = renderComposer({ mode: "input", restoredDraft: { text: "existing words", seq: 1 } });
@@ -401,8 +407,9 @@ describe("Composer in BROWSE (C2)", () => {
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("Ask the agent...i");
   });
 
-  // App.tsx's document-capture router (`modeKey.ts`) handles Shift+Tab in every mode before this
-  // component. The behavior is tested in App.test.tsx.
+  // `onShiftTab` is gone -- App.tsx's document-capture router (`modeKey.ts`) now
+  // claims Shift+Tab ahead of this component entirely, in every mode,
+  // as exercised in App.test.tsx's "Shift+Tab anywhere in the chat" describe block.
 });
 
 describe("Composer during a turn (C1, F1)", () => {
@@ -560,8 +567,8 @@ describe("Composer keys", () => {
     expect(textarea.placeholder).toBe("editing in nvim — :wq to return");
   });
 
-  /** Defect 1 (phase 1's sandbox pass): a landing put the caret before the existing text. A box the
-   *  user never placed the caret in takes it at the end; one they left mid-text gets it back (C2). */
+  /** A landing put the caret before the existing text. A box the
+   *  user never placed the caret in takes it at the end; one they left mid-text gets it back (with a saved caret). */
   it("puts the caret at the end of existing text, or back where the user left it", () => {
     const text = { text: "existing words", seq: 1 };
     const { container, rerender } = renderComposerWithRerender({ mode: "browse", restoredDraft: text });
@@ -585,10 +592,12 @@ describe("Composer keys", () => {
   });
 });
 
-/* Checking `INPUT_KEYS` against a separately maintained `COMPOSER_CHORDS` list alone cannot detect
-   a missing handler. This table exercises every chord on `Composer`, or on `resolveKey("input", ...)`
-   for the two chords that bubble to `App`. Its keys must equal `COMPOSER_CHORDS`, tying
-   `INPUT_KEYS` to behavior that actually runs. */
+/* `composerKeys.test.ts` tied `INPUT_KEYS` only to `COMPOSER_CHORDS`, a
+   hand-kept list nothing derived from the handler, so deleting `Ctrl+w` from `onKeyDown` left it
+   green. This table exercises every `COMPOSER_CHORDS` entry against the real `Composer` (or, for the
+   two chords `Composer` leaves to bubble, against `resolveKey("input", …)`, which is what `App`'s
+   INPUT branch runs), and its keys must equal `COMPOSER_CHORDS` -- so the chain is
+   `INPUT_KEYS` = `COMPOSER_CHORDS` = the chords that really do something. */
 describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
   const typed = (textarea: HTMLTextAreaElement, value: string) => {
     fireEvent.change(textarea, { target: { value } });
@@ -619,7 +628,7 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       expect(onQueue).not.toHaveBeenCalled();
     },
     "Alt+Enter / \\ Enter": () => {
-      // A design decision: Claude Code's own two newline keys. Nothing is sent.
+      // Claude Code's own two newline keys. Nothing is sent.
       const { textarea, onSend } = renderComposer();
       typed(textarea, "line");
       expect(fireEvent.keyDown(textarea, { key: "Enter", altKey: true })).toBe(false);
@@ -710,8 +719,9 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       });
     },
     "Shift+Tab": () => {
-      // Leave Shift+Tab unclaimed here. App.tsx's document-capture router (`modeKey.ts`) handles it
-      // before React handlers in every mode; App.test.tsx covers that routing.
+      // `Composer` must leave it to bubble -- App.tsx's document-capture router
+      // (`modeKey.ts`) now claims it ahead of every React handler, in every mode, not just here
+      // (see App.test.tsx's "Shift+Tab anywhere in the chat" describe block).
       const { textarea } = renderComposer();
       expect(fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true })).toBe(true);
     },
@@ -727,7 +737,7 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       expect(onOpenKeymap).toHaveBeenCalledTimes(1);
     },
     "Ctrl+y": () => {
-      // A design decision: `Composer` must leave it to bubble (its text untouched), and `App`'s
+      // `Composer` must leave it to bubble (its text untouched), and `App`'s
       // INPUT branch approves the oldest waiting card on it (`App.inputCtrlY.test.tsx`).
       const { textarea } = renderComposer();
       typed(textarea, "keep");
@@ -756,9 +766,10 @@ function keyLike(key: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolea
   return { key, ctrlKey: false, shiftKey: false, isComposing: false, ...over };
 }
 
-/* Alt+Enter and a backslash followed by Enter insert a newline, as Claude Code documents both,
-   instead of sending the half-written draft. Plain Enter and Ctrl+Enter send; Shift+Enter uses
-   the textarea's native newline. */
+/* `Alt+Enter` and a trailing backslash then Enter send
+   the half-written draft today; Claude Code documents both as a newline, so both insert one (ruled a
+   bug fix). Plain Enter still sends, Shift+Enter is the textarea's own newline, Ctrl+Enter still sends
+   now. */
 describe("Alt+Enter and backslash+Enter insert a newline (#27, K14)", () => {
   const place = (textarea: HTMLTextAreaElement, value: string, caret: number = value.length) => {
     fireEvent.change(textarea, { target: { value } });
@@ -842,9 +853,9 @@ describe("Alt+Enter and backslash+Enter insert a newline (#27, K14)", () => {
     expect(onSend).toHaveBeenCalledWith("a\\bc");
   });
 
-  // `readOnly` stops typing but does not stop keydown handlers. While `editingInNvim` is true,
-  // newline keys must leave the draft alone because the editor's write would overwrite those
-  // changes.
+  // `readOnly` stops typing but not a keydown handler, so both newline
+  // keys edited a draft nvim owned for the length of a scratch round trip -- text nvim's own write would
+  // then replace, losing the newline.
   it("while nvim owns the draft (editingInNvim), neither newline key touches it and nothing is sent", () => {
     const { textarea, onSend } = renderComposer({ editingInNvim: true });
     place(textarea, "abcd", 2);

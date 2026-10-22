@@ -1,8 +1,11 @@
-//! Ignored end-to-end test of handoff to the CLI using a real sidecar, `claude` CLI and
-//! handoff helper process. It costs one API turn to create conversation content to resume.
-//! The test confirms the helper starts the correct process holding the session lease.
-//! It does not drive the resumed `claude --resume` interactive session or test returning
-//! the conversation to the application.
+//! Real, `#[ignore]`d: proves the Eitri->CLI handoff mechanism actually works
+//! end to end against a real sidecar, a real `claude` CLI, and a real spawned
+//! `eitri-claude-handoff` process. Real API cost: 1 real turn (to give the session real content
+//! worth resuming). Does NOT drive the resumed `claude --resume` process's own interactive
+//! session -- the handoff's own scope stops at "the handoff genuinely started the right real
+//! process holding the right real lease"; asserting what that process does next needs the
+//! CLI->Eitri return direction, which does not exist yet (it is blocked on Verdandi's
+//! `ResumeSession` RPC).
 
 use agent::handoff::prepare_eitri_to_cli_handoff;
 use agent::lease::{LeaseError, SessionLease};
@@ -28,10 +31,10 @@ fn drain_until<F: Fn(&[AgentDomainEvent]) -> bool>(
 #[test]
 #[ignore]
 fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() {
-    // Require Linux before spawning processes or incurring API usage. The check below reads
-    // `/proc/<pid>/comm` to confirm the child has exec'd into `claude`. macOS has no `/proc`,
-    // and its process-name checks have not been verified for a symlinked CLI installation.
-    // Without a verified check, `AlreadyHeld` could pass while the wrapper still holds the lease.
+    // Linux-only and refused before spawning or billing: `/proc/<pid>/comm` below proves the
+    // handoff child exec'd into `claude`. macOS has no `/proc`; its `proc_name`/`p_comm` behavior
+    // with a symlinked CLI has not been observed. Guessing that check could let `AlreadyHeld`
+    // pass while the wrapper still holds the lock rather than proving inheritance by the CLI.
     assert!(
         cfg!(target_os = "linux"),
         "this conformance test's exec check is Linux-only (/proc/<pid>/comm) and has no verified macOS port"
@@ -45,8 +48,9 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     // and what send_turn/close_session's own `session_id` field expects -- the sidecar's
     // SessionRegistry is keyed by this value, NOT by the real Claude CLI session UUID). This is
     // genuinely a different value from `provider_session_id` below -- conflating them is exactly
-    // the kind of real bug this plan's own "Verified facts" point 1 exists to prevent; do not
-    // "simplify" this test by using one value for both.
+    // the kind of real bug that once dropped `provider_session_id` on the sidecar path while the
+    // sidecar's own id looked like a usable stand-in; do not "simplify" this test by using one
+    // value for both.
     let session_id = provider
         // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
         .create_session(CreateSessionRequest {
@@ -101,11 +105,12 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
     let outcome = prepare_eitri_to_cli_handoff("claude", &cwd, &provider_session_id).unwrap();
     assert!(outcome.child_pid > 0);
 
-    // Read `/proc/<pid>/comm` to confirm the child has exec'd into `claude` before checking
-    // `AlreadyHeld`. The handoff helper uses `exec`, so the CLI must retain the inherited
-    // file descriptor for the lease to survive. Checking the lease first could pass while
-    // the wrapper is still starting. Confirming the process first makes the lease assertion
-    // test that the lock survived into the CLI.
+    // Confirm the spawned process is actually `claude` or its exec target through
+    // `/proc/<pid>/comm`, before asserting `AlreadyHeld`. `eitri-claude-handoff` execs rather
+    // than supervising a child, so lease survival depends on the CLI retaining the inherited fd.
+    // Checking the lock first would only prove some process at `outcome.child_pid` holds it,
+    // possibly the wrapper before exec. Checking comm first makes the lock assertion prove it
+    // survived into the real CLI.
     let comm_path = format!("/proc/{}/comm", outcome.child_pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut comm = String::new();
@@ -143,8 +148,9 @@ fn a_real_session_hands_off_to_a_real_claude_resume_process_holding_the_lease() 
         .status();
     let _ = std::fs::remove_dir_all(&project_dir);
 
-    // After killing the child, the lease must become acquirable again. This checks flock's
-    // automatic release on process death through the full spawn, exec and kill sequence.
+    // After killing the handoff process the lease must become acquirable again. This pins
+    // flock's automatic release on death through the actual spawn, exec and kill sequence,
+    // rather than only the isolated lease primitive.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut released = false;
     while std::time::Instant::now() < deadline {

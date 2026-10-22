@@ -66,9 +66,10 @@ mod tests {
     use super::*;
     use crate::transcript::CLAUDE_CONFIG_DIR_TEST_LOCK;
 
-    // Every test below acquires `CLAUDE_CONFIG_DIR_TEST_LOCK`, defined in `transcript.rs`,
-    // before touching `CLAUDE_CONFIG_DIR`. Tests in both modules share a test binary and would
-    // otherwise race under Cargo's parallel test runner. Unwrapping the lock propagates poisoning.
+    // Every test below acquires `CLAUDE_CONFIG_DIR_TEST_LOCK` (defined in `transcript.rs`)
+    // before touching `CLAUDE_CONFIG_DIR`: both files' tests share a binary and would otherwise
+    // race under cargo's parallel test runner, just as mutations of `XDG_STATE_HOME` can race.
+    // Unwrapping the lock propagates poisoning so a failed mutation cannot silently affect another test.
 
     #[test]
     fn check_reports_unchanged_when_the_poll_interval_has_not_elapsed() {

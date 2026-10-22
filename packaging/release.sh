@@ -689,8 +689,12 @@ proof() {
 # host_scans runs publish/scan.sh over each extracted asset's scan view.
 # Exclude vendor/, skia/ and proto/, which are checked by hash. Rename shipped dist/
 # contents and the source asset's top-level fork checkout so the scanner reads them.
+# Only the source view uses the citation rule because its allowances depend on repo paths.
+# Other views can put different bytes at the same path: an asset's root install.sh
+# comes from packaging/install.sh. The source view scans each file at its actual repo path.
 host_scans() {
 	local view name
+	local -a flags
 	if [ "$RS_NO_LEAK_SCAN" = 1 ]; then
 		warn "--no-leak-scan: the host leak scan is skipped"
 		return 0
@@ -705,7 +709,9 @@ host_scans() {
 	mkdir -p -- "$RS_WORK/scan/assets"
 	cp -- "$RS_REL/install.sh" "$RS_REL/RELEASE" "$RS_WORK/scan/assets/"
 	for view in "$RS_WORK/scan"/*; do
-		"$RS_SCAN" "$view" 2>&1 | tee -a "$RS_LOGS/scan.log" || die "publish/scan.sh found leaks in $view (above, and $RS_LOGS/scan.log)"
+		flags=()
+		[ "${view##*/}" = source ] || flags=(--no-citation)
+		"$RS_SCAN" "$view" "${flags[@]}" 2>&1 | tee -a "$RS_LOGS/scan.log" || die "publish/scan.sh found leaks in $view (above, and $RS_LOGS/scan.log)"
 	done
 }
 

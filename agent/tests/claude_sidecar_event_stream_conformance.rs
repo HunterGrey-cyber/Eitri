@@ -1,6 +1,7 @@
-//! Ignored end-to-end test of the plain-text event pipeline against a real sidecar and
-//! `claude` CLI. It incurs API usage and checks create_session -> start_watching -> send_turn
-//! through TextDelta and TurnCompleted events arriving via pump().
+//! Exercise the full event pipeline against the real sidecar and Claude CLI: create a
+//! session, start watching, send a turn and receive its TextDelta and TurnCompleted through
+//! `pump`. Permission, interrupt and fail-closed shutdown cases have separate coverage in
+//! `claude_sidecar_conformance.rs`; this file pins the plain-text happy path.
 
 use agent::{AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CreateSessionRequest, TurnOutcome};
 

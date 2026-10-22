@@ -36,8 +36,8 @@ fn typed_keys_are_echoed_by_the_shell() {
     });
 }
 
-/// `Ctrl+a Ctrl+a` hands the program a literal Ctrl+a (spec, keys): 0x01 through the encoder, not a
-/// raw byte, and it arrives -- `cat -v` shows it.
+/// `Ctrl+a Ctrl+a` hands the program a literal Ctrl+a, as a doubled tmux prefix does: 0x01 through
+/// the encoder, not a raw byte, and it arrives -- `cat -v` shows it.
 #[test]
 fn ctrl_a_arrives_as_0x01() {
     assert_eq!(terminal_input::encode(&ctrl('a'), Default::default()), vec![0x01]);
@@ -112,7 +112,7 @@ fn osc52_copy_reaches_the_host_and_osc52_paste_is_refused() {
     assert!(h.has_line("load=[]"), "{:?}", h.text());
 }
 
-/// Bottom-terminal phase 2: an OSC 52 copy to the selection (`s`, nvim's `"*`) reaches the host as
+/// An OSC 52 copy to the selection (`s`, nvim's `"*`) reaches the host as
 /// the primary selection, apart from a copy to the clipboard in the same stream.
 #[test]
 fn an_osc52_selection_copy_reaches_the_host_apart_from_the_clipboard() {
@@ -124,9 +124,8 @@ fn an_osc52_selection_copy_reaches_the_host_apart_from_the_clipboard() {
 }
 
 /// A copy is the one event a hidden terminal rings the host for (the pump puts it on the desktop's
-/// clipboard at once, hidden or not). Bottom-terminal phase 2: a copy to the selection too. Before
-/// it, `publish_events` rang only for `clipboard`, and a hidden terminal's `"*y` waited, unseen, for
-/// the next show.
+/// clipboard at once, hidden or not). Selection copies must ring it too: if `publish_events`
+/// rings only for `clipboard`, a hidden terminal's `"*y` waits unseen until the next show.
 #[test]
 fn a_hidden_selection_copy_rings_the_host_like_a_clipboard_copy() {
     let script = r#"stty -echo; printf ready; read _; printf '\033]52;s;aGk=\007'; exec sleep 5"#;
@@ -146,7 +145,7 @@ fn a_hidden_selection_copy_rings_the_host_like_a_clipboard_copy() {
     assert_eq!(h.events.primary.as_deref(), Some("hi"));
 }
 
-/// Bottom-terminal phase 2: every frame comes with the cell the cursor is in, even when the program
+/// Every frame comes with the cell the cursor is in, even when the program
 /// hid it and the frame paints no cursor -- the host draws an input method's preedit there.
 #[test]
 fn every_frame_says_where_the_cursor_is_even_when_it_is_hidden() {
@@ -187,14 +186,15 @@ fn idle_renders_nothing() {
     let mut h = Harness::start(spec("/bin/sh", &["-c", "printf ready; exec sleep 5"]), size(80, 5));
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l == "ready"));
     std::thread::sleep(Duration::from_millis(100));
-    // Drain wake-ups received on the way to "ready" so the idle count starts at zero.
-    // `Harness::wakes` only grows inside `wait_for`, so comparing that field without
-    // receiving more wake-ups would miss notifications sent during the idle interval.
+    // Drain wake-ups received on the way to ready so the count starts at zero. `Harness::wakes`
+    // only grows inside `wait_for`, which is not called during the measurement: comparing that
+    // stale field to its saved value would compare a value to itself without reading any wakes.
     h.pending_wakes();
-    // Reopen the wake-pending gate as well as draining the channel. A closed gate would hide
-    // repeated publication during the idle interval and let `pending_wakes() == 0` pass.
-    // `wait_for` with an always-true predicate calls `take_update` once without blocking,
-    // so the gate starts open.
+    // Also reopen the wake-pending gate, which draining the channel alone does not do.
+    // Otherwise a regression publishing every tick rings only once while settling and finds
+    // the gate shut for the idle second, letting `pending_wakes() == 0` pass incorrectly.
+    // `wait_for` with an always-true predicate absorbs once through `take_update` without
+    // blocking, so the measurement starts with the gate open.
     h.wait_for(WAIT, |_| true);
     let (renders, turns) = (h.session.renders(), h.session.thread_wakeups());
     std::thread::sleep(Duration::from_secs(1));
@@ -254,8 +254,9 @@ fn a_bell_flood_is_coalesced_to_about_one_host_wake_per_frame() {
     assert!(h.events.bell, "the bell itself must still be reported");
 }
 
-/// A hidden terminal must not wake the host for bells. Hidden events should cause no host work,
-/// just like hidden frames.
+/// A hidden bell must not wake the host: hidden terminals suppress frame and event wakes.
+/// An unconditional bell notification measured 719 hidden host wakes/s even though the pump
+/// has nothing to do with a bell.
 #[test]
 fn a_hidden_bell_flood_rings_the_host_not_at_all() {
     let mut h = Harness::start(
@@ -279,8 +280,8 @@ fn an_exited_shell_keeps_its_screen_and_says_how_it_ended() {
     assert!(text.iter().any(|l| l == "last words"), "{text:?}");
     let notice = "[process exited 3 \u{2014} Enter restarts]";
     let row = text.iter().position(|l| l == notice).expect("the notice");
-    // The final frame carries the cursor placed by `show_end` just after the exit notice,
-    // so the host has cursor coordinates for that frame.
+    // The final frame carries its own cursor, just after the notice where `show_end` left it,
+    // rather than omitting it or keeping the previous render's cursor.
     assert_eq!(
         h.cursor,
         Some(CursorCell {
@@ -339,13 +340,15 @@ fn a_shell_that_ignores_sighup_is_killed_after_the_grace_period() {
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 }
 
-/// A paste larger than the tty buffer must wait in the outbox for POLLOUT without blocking
-/// output reads or losing bytes. Send it after the child enters raw mode, since cooked mode's
-/// line discipline discards input past 4095 bytes.
+/// Input larger than the tty's buffer (a big paste) must neither block the session thread nor lose
+/// bytes: it waits in the outbox for POLLOUT while output keeps being read. The
+/// paste goes only after the program has switched the tty to raw mode -- in cooked mode the line
+/// discipline itself discards past 4095 bytes, which is the tty's behaviour, not the session's.
 ///
-/// The child prints "mid" before reading the paste. Receiving "mid" while the paste is still
-/// queued proves that reading and rendering continue during a pending write. Checking only
-/// the final byte count would also pass if `write` blocked until the child began reading.
+/// The child prints "mid" before it starts reading the paste. Proving only that no bytes were
+/// lost would let a session blocked in `write` until `head` starts draining pass. "mid" reaching
+/// the screen while the paste is still queued proves reading and rendering stayed live while
+/// a write was pending.
 #[test]
 fn a_large_input_is_delivered_whole_without_stalling() {
     let script = "stty raw -echo; printf ready; sleep 0.5; printf mid; sleep 0.5; head -c 200000 | wc -c; stty sane";
@@ -362,9 +365,8 @@ fn a_large_input_is_delivered_whole_without_stalling() {
     assert!(h.text().iter().any(|l| l.contains("200000")), "{:?}", h.text());
 }
 
-/// Keys, resizes and colours sent after the shell has exited -- the pane can race the exit -- are
-/// dropped without a panic, and a zero-sized resize is clamped to one cell rather than passed on
-///.
+/// Keys, resizes and colours sent after shell exit must be dropped without panic because
+/// the pane can race the exit. A zero-sized resize is clamped to one cell before forwarding.
 #[test]
 fn commands_after_exit_and_a_zero_resize_are_harmless() {
     let mut h = Harness::start(plain_sh(), size(80, 24));
@@ -383,8 +385,8 @@ fn commands_after_exit_and_a_zero_resize_are_harmless() {
     assert_eq!(h.session.shutdown_and_wait().and_then(|e| e.code), Some(0));
 }
 
-/// An unterminated synchronized update holds publication only until its deadline. This covers a
-/// program killed mid-frame, `printf '\e[?2026h'`, or replayed output lacking an end marker.
+/// A synchronized update that never ends -- nvim killed mid-frame, `printf '\e[?2026h'`, `cat` of a
+/// recording -- holds publication back only until the deadline, not forever.
 #[test]
 fn an_unterminated_synchronized_update_is_published_after_the_deadline() {
     let mut h = Harness::start(
@@ -418,10 +420,12 @@ fn a_reset_inside_an_open_update_is_published_after_the_deadline() {
     h.wait_for(Duration::from_secs(2), |h| h.has_line("after"));
 }
 
-/// A child exiting during a synchronized update must publish both its content and the exit
-/// notice. `Screen::render` uses the snapshot from the update's start while `open_update()` is
-/// `Some`, so the exit path must close the update before rendering. Otherwise the pane remains
-/// on the pre-update frame even after `exited` is set.
+/// A child that exits while a synchronized update is still open must not freeze the pane on the
+/// stale pre-update frame: its own content and the exit notice must both reach the screen.
+/// `Screen::render` returns the snapshot taken at the moment the update opened for as long as
+/// `open_update()` is `Some`, and the exit path used to feed the notice and render without ever
+/// closing the update first -- so neither "inside" nor the notice ever appeared; the pane stayed on
+/// `["before", "", ...]` forever, even though `exited` was set.
 #[test]
 fn an_exit_inside_an_open_synchronized_update_still_shows_its_content_and_the_notice() {
     let mut h = Harness::start(
@@ -438,9 +442,9 @@ fn an_exit_inside_an_open_synchronized_update_still_shows_its_content_and_the_no
     );
 }
 
-/// A program that closes its terminal while still running has detached rather than exited.
-/// Waiting for it would prevent the thread from receiving `Shutdown`. Report the detachment to
-/// the pane and still hang up the child on shutdown.
+/// A program that closes the terminal and keeps running (`exec nohup cmd` does this) is not an
+/// exit: waiting for it would stop the thread hearing `Shutdown`. The pane is told it left and
+/// still runs, and shutting down still hangs it up.
 #[test]
 fn a_child_that_leaves_the_terminal_is_reported_and_still_shut_down() {
     let mut h = Harness::start(
@@ -485,9 +489,9 @@ fn a_child_that_left_the_terminal_is_reaped_when_it_exits() {
 #[test]
 fn a_detached_childs_own_exit_reaches_the_host() {
     let mut h = Harness::start(
-        // Keep the child alive for 0.6s after closing its terminal. A 0.3s delay leaves only about
-        // 100ms beyond `EXIT_AFTER_EOF` (200ms); late scheduling could then report the real exit
-        // before `detached`, causing the first `wait_for` to time out.
+        // 0.6s matches the sibling test: 0.3s leaves only about 100ms over `EXIT_AFTER_EOF`
+        // (200ms). A session thread scheduled late after EOF would see the real exit immediately,
+        // never report `detached`, and leave the first `wait_for` timing out.
         spec("/bin/sh", &["-c", "exec </dev/null >/dev/null 2>&1; sleep 0.6; exit 4"]),
         size(80, 5),
     );
@@ -504,9 +508,10 @@ fn a_detached_childs_own_exit_reaches_the_host() {
     );
 }
 
-/// A session-thread panic must notify the host through `exited` so Enter can restart the pane.
-/// `PtyChild`'s `Drop` must kill and reap the child even if it ignores SIGHUP. With
-/// `--nocapture`, the test's panic message is expected.
+/// A panic on the session thread -- here a host's tap; in life the emulator on hostile input -- must
+/// neither wedge the pane nor leave the child behind: the host hears `exited` (so Enter restarts),
+/// and the child, which ignores SIGHUP, is killed and reaped by `PtyChild`'s `Drop`.
+/// Run with `--nocapture`, the panic's own message is printed; that is expected.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_panic_on_the_session_thread_ends_the_session_and_reaps_the_child() {
@@ -531,8 +536,8 @@ fn a_panic_on_the_session_thread_ends_the_session_and_reaps_the_child() {
     }
 }
 
-/// A program that asks questions without reading replies (`yes $'\e[6n'`) must not grow session
-/// memory at its output rate. Drop replies beyond `REPLY_CAP`.
+/// A program that asks questions and never reads the answers (`yes $'\e[6n'`) must not grow the
+/// session's memory at its output rate: answers past `REPLY_CAP` are dropped.
 #[test]
 fn answers_to_a_program_that_never_reads_them_are_capped() {
     let script = r#"stty raw -echo; yes "$(printf '\033[6n')" | head -c 600000; printf done; exec sleep 30"#;
@@ -549,8 +554,8 @@ fn answers_to_a_program_that_never_reads_them_are_capped() {
     );
 }
 
-/// A hidden terminal renders nothing while its program prints. When shown again, it renders the
-/// latest screen immediately.
+/// A hidden terminal whose program keeps printing renders nothing; shown again, it renders the
+/// latest screen at once.
 #[test]
 fn a_hidden_terminal_renders_nothing_until_it_is_shown() {
     let script = "stty -echo; printf ready; read _; seq 1 2000; exec sleep 30";
@@ -607,11 +612,10 @@ fn titles_and_bells_reach_the_host_without_a_frame() {
 }
 
 /// A mouse report reaches the program only while its own mode asks for it, and a dropped report
-/// (the mode having just gone off) never gets read as something else's byte (bottom-terminal phase
-/// 3c). `ready` proves the enabling escape sequence was parsed before anything is sent; `off` proves
-/// the disabling one was too, before the second (dropped) report is sent; `next=x` proves the
-/// dropped report did not leave a stray byte for the child's next read to pick up instead of the key
-/// that follows it.
+/// (the mode having just gone off) never gets read as something else's byte. `ready` proves the
+/// enabling escape sequence was parsed before anything is sent; `off` proves the disabling one was
+/// too, before the second (dropped) report is sent; `next=x` proves the dropped report did not leave
+/// a stray byte for the child's next read to pick up instead of the key that follows it.
 #[test]
 fn mouse_reports_reach_the_program_only_while_it_asks() {
     let script = r#"stty raw -echo; printf '\033[?1000;1006hready'; r=$(dd bs=1 count=9 2>/dev/null); printf '\033[?1000lgot=%s off' "$(printf %s "$r" | od -An -c | tr -s ' ')"; r=$(dd bs=1 count=1 2>/dev/null); printf ' next=%s' "$r""#;

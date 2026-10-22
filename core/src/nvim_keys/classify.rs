@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(classify(&map(" bd", None, Some("Delete Buffer"))), Some(Close));
         assert_eq!(classify(&map("x", None, Some("next buffer"))), Some(Next));
         assert_eq!(classify(&map("x", None, Some("Previous Buffer"))), Some(Prev));
-        // Recognised, not dropped (LazyVim keymaps.lua:43-45)
+        // Recognize these stock LazyVim keymaps rather than silently dropping them.
         assert_eq!(
             classify(&map("x", None, Some("Delete Other Buffers"))),
             Some(CloseOthers)

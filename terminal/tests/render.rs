@@ -11,7 +11,7 @@ const BG: RgbColor = RgbColor::new(0xfa, 0xf4, 0xed); // rose-pine dawn's base, 
 const FG: RgbColor = RgbColor::new(0x57, 0x52, 0x79);
 
 /// What `shell`'s `colors_from` hands over: the theme's background and foreground, and no fixed
-/// cursor colour (GUI pass 2026-09-23, defect 3).
+/// cursor colour.
 fn themed() -> TerminalColors {
     TerminalColors {
         background: BG,
@@ -85,7 +85,7 @@ fn bold_default_text_stays_readable_on_a_light_background() {
     assert_eq!(colors, Some(FG));
 }
 
-/// GUI pass 2026-09-23, defect 3: the cursor was drawn in the theme's foreground whatever the cell
+/// The cursor was drawn in the theme's foreground whatever the cell
 /// under it, so on a cell a program painted in its own light colours under a DARK theme -- nvim
 /// with LazyVim's light scheme, inside -- it was a pale block on a pale cell. Painted here, pixels
 /// read back: the block is the covered cell's own ink colour, and the character inside it is the
@@ -125,7 +125,7 @@ fn a_block_cursor_on_a_cell_a_program_painted_takes_that_cells_colours_swapped()
     assert!(glyph > 0, "the X under the block must stay readable");
 }
 
-/// Bottom-terminal phase 2: the host paints an input method's preedit over a finished frame with
+/// The host paints an input method's preedit over a finished frame with
 /// `paint_ops`, which must not clear the canvas first as `paint` does. On a CPU raster, pixels read
 /// back: the printed text is untouched, the preedit's cells gain ink where they had none, the block
 /// cursor under the preedit is covered (one caret on screen, not two), the caret beam follows it,
@@ -165,10 +165,13 @@ fn a_preedit_is_painted_over_the_frame_without_clearing_it() {
     );
 }
 
-/// At the right edge, an end caret needs its own cell, so the composition shifts left one cell
-/// further than the text alone requires. The fill must cover the frame's block cursor in that
-/// last column. Compare against the same preedit painted over an empty frame: the cell should
-/// contain only a beam on the background.
+/// The same promise at the right edge, with the caret at the composition's END (GTK's simple
+/// context; rime with `PreeditCursorPositionAtBeginning` off): the cursor is in the last column, so
+/// the composition shifts left one cell further than its text needs, to give the end caret a cell
+/// of its own -- and that cell is the one the frame's block cursor is in. A measurement on
+/// 2026-09-24 showed it with the block still fully drawn there (189 px, exactly the bare
+/// block's) and the beam invisible inside it. The oracle is the same layout painted over an EMPTY
+/// frame: the cell must hold exactly what the preedit alone puts there, a beam on the background.
 #[test]
 fn a_composition_shifted_in_from_the_last_column_still_covers_the_block_cursor() {
     let mut screen = Screen::new(size(40, 6), themed());

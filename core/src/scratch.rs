@@ -472,8 +472,8 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// Only `[0-9a-f]` from the request travels through `nvim_input`, so a path cannot close
-    /// `<Cmd>` or introduce its own key notation.
+    /// Only `[0-9a-f]` travels through `nvim_input`, so a path cannot close `<Cmd>` or introduce
+    /// its own key notation.
     #[test]
     fn a_request_crosses_nvim_input_as_hex_only() {
         let hostile = Path::new("/tmp/a<CR>:!rm -rf ~<CR>|b'.md");
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(value["line"], 42);
     }
 
-    /// The phase-3 GUI pass (2026-09-25): with a `Ctrl+g` split focused, the V1 context line named
+    /// Seen in a GUI pass on 2026-09-25: with a `Ctrl+g` split focused, the context line named
     /// the draft's scratch file. A buffer in this directory is Eitri's own, never the user's file.
     #[test]
     fn only_files_inside_the_scratch_directory_are_scratch_buffers() {

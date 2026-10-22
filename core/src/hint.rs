@@ -357,8 +357,8 @@ mod tests {
         }
     }
 
-    /// Visible targets follow top bar, main slot, panel, bottom slot order.
-    /// Labels and landings stay the same when editor and bottom slots are represented as modules.
+    /// Hints follow visible top-bar items, the main slot, the panel, then the bottom slot,
+    /// preserving both labels and focus destinations as slots become module-based.
     #[test]
     fn targets_are_ordered_top_bar_then_main_then_panel_then_bottom() {
         let order = order_targets(&layout());

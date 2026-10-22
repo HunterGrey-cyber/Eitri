@@ -292,10 +292,17 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
 
-    /// The navigation-mode mirror starts at `Other` and resets to `Other` on every `ready`.
-    /// Test reset_nav_mode_for_ready directly because the Ready handler needs a real WebView.
-    /// A stale `Input` value after reload would make `claims(PanelKeys::Input, Direction::Down)`
-    /// return false, sending Ctrl+j to move_focus instead of opening the composer.
+    /// The nav-mode mirror starts `Other` and returns to `Other` on every ready (a reload).
+    /// A round trip through `handle_inbound_message`'s `Ready` arm needs a real `WebView`
+    /// (`dispatch_all`/`ok` both take one), so this pins the one-line mutation the arm calls,
+    /// `reset_nav_mode_for_ready`, directly -- the same shape as
+    /// `nav_fallthrough_refuses_with_no_hook_and_calls_the_installed_hook_with_the_mapped_direction`
+    /// pinning `run_nav_fallthrough` apart from the WebView it is also called from.
+    ///
+    /// Without resetting `nav_mode` on `ready`, a reload while `mode == Input` would leave
+    /// the mirror at `Input` even though the fresh document starts in BROWSE, so `main.rs`'s
+    /// `claims(PanelKeys::Input, Direction::Down)` was `false` and a `Ctrl+j` meant to open the
+    /// composer fell through to `move_focus` instead.
     #[test]
     fn ready_resets_the_nav_mode_mirror_to_other() {
         let state = state_for_hooks(TabSet::new(

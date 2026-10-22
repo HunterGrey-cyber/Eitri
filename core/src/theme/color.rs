@@ -233,7 +233,7 @@ mod tests {
         );
     }
 
-    /// sw-theme-4's own scenario in miniature: `ensure_contrast` toward a colour that itself never
+    /// The rose-pine dawn status-line case in miniature: `ensure_contrast` toward a colour that itself never
     /// reaches `min` against `against` returns that failing colour unchanged; the pole variant must
     /// fall through to black or white instead.
     #[test]

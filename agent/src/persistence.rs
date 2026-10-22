@@ -695,9 +695,8 @@ mod tests {
         assert_eq!(load_conversation_record(&conv, "prov-1").unwrap(), saved);
     }
 
-    /// A saved record includes the session's first prompt line as its title. Use mode `0600`
-    /// for the file and `0700` for directories from the state root down so the default umask
-    /// cannot expose it.
+    /// A record's title contains the first prompt line, so records must be 0600 files in 0700
+    /// directories from the state root down, even when the umask would produce 0644 files in 0755 directories.
     #[test]
     fn a_saved_record_is_private() {
         use std::os::unix::fs::PermissionsExt;
@@ -914,8 +913,8 @@ mod tests {
         }
     }
 
-    /// A long-lived tab can rank oldest while newer tabs write records.
-    /// Pruning must preserve its record while its session lease is held.
+    /// A long-lived tab ranks oldest while newer tabs write records, and the
+    /// prune must not take its record out from under it.
     #[test]
     fn prune_spares_a_record_whose_lease_is_held() {
         let conversation_id = unique_conversation_id("prune-lease");

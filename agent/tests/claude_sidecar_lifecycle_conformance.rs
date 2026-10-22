@@ -1,15 +1,25 @@
-//! Exercises long-lived sessions against a real sidecar and a real Claude CLI.
+//! The long-lived session lifecycle, proven against a real sidecar and a real Claude CLI.
 //!
-//! Tests are ignored by default and spend real tokens. Run with
+//! `#[ignore]`d and billed: every test here spends real tokens. Run with
 //! `cargo test -p agent --test claude_sidecar_lifecycle_conformance -- --ignored --test-threads=1`.
 //!
-//! Multiple turns must work in one session; single-turn tests cannot establish continuity.
-//! The legacy counterpart is `backend_conformance.rs::real_multi_turn_conversation_in_one_process`.
-//! Permission-policy coverage is in `claude_sidecar_conformance.rs`.
+//! Why this file exists at all. The legacy CLI backend has pinned multi-turn continuity from the
+//! start (`backend_conformance.rs::real_multi_turn_conversation_in_one_process`); the sidecar provider
+//! never had an equivalent. Every sidecar test written before this file sends exactly one turn, so the
+//! whole "long-lived session" premise of this migration rested on reading Verdandi's kernel source
+//! and observing that `turnInProgress` is cleared when a `result` message arrives. Reading is not
+//! evidence -- this project has repeatedly shipped defects that only running could find. These
+//! tests are the evidence.
 //!
-//! Every session here is gated with INTERACTIVE and the CLI in `default`.
-//! Tool calls raise `PermissionRequested`, and `run_turn` answers each with `Allow` to
-//! exercise host-level bypass through the gate.
+//! Every test used `PermissionMode::Bypass`, which was deliberate and not laziness: BYPASS was the
+//! only permission policy that milestone shipped, so the lifecycle had to be proven on the path
+//! that would really run. (The Auto/`interactive` permission path has its own coverage in
+//! `claude_sidecar_conformance.rs`.)
+//!
+//! **Every session here uses the shared gate** -- `INTERACTIVE`, the CLI in `default`,
+//! which is again the path that really runs: the client can no longer ask for anything else, and
+//! the product's bypass is Eitri answering `allow`. So a turn that uses a tool raises a
+//! `PermissionRequested`, and `run_turn` answers each one `Allow`, standing in for that answer.
 
 use agent::{
     AgentDomainEvent, AgentProvider, ClaudeSidecarProvider, CloseSessionRequest, CreateSessionRequest,
@@ -162,8 +172,8 @@ fn run_turn(
     events
 }
 
-/// Answers every `PermissionRequested` in `events` with `Allow` to exercise host-level bypass.
-/// These tests drive the provider directly, so permission answers are sent at the provider level.
+/// Answer each `PermissionRequested` with `Allow`, as Eitri's bypass does under the gate.
+/// These tests drive the provider directly, so the harness supplies the host's answer.
 fn allow_every_request(provider: &ClaudeSidecarProvider, session_id: &str, events: &[AgentDomainEvent]) {
     for event in events {
         if let AgentDomainEvent::PermissionRequested { permission_id, .. } = event {
@@ -379,9 +389,13 @@ fn real_interrupt_cancels_the_turn_and_the_session_still_accepts_another() {
     provider.close_session(CloseSessionRequest { session_id }).unwrap();
 }
 
-/// Checks that a gated tool call runs after the host answers `Allow` through `run_turn`.
-/// The call must raise a permission request, execute the tool, and return its real output
-/// to the model. This verifies execution as well as passage through the gate.
+/// T2.3 -- BYPASS must genuinely bypass, and must be honest about it.
+///
+/// That was: no permission request raised, AND the tool actually ran. **With the shared gate
+/// the first half is inverted by design**: the session is gated, so the request IS raised, and the
+/// bypass is the host's `Allow` (`run_turn` answers it). What stays is the half that gave the old
+/// test its meaning -- the tool really ran and its real output reached the model -- plus the new
+/// fact that makes it safe: the call went through the gate first.
 #[test]
 #[ignore]
 fn real_gated_session_runs_a_tool_once_the_host_allows_it() {

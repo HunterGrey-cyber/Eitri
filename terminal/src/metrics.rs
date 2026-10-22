@@ -447,7 +447,7 @@ mod tests {
         }
     }
 
-    /// GUI pass 2026-09-23, defect 4: lualine's clock (U+F43A, nf-oct-clock) came out as another
+    /// Lualine's clock (U+F43A, nf-oct-clock) came out as another
     /// pictogram, because the unnamed fallback lookup answered DejaVu Sans, which maps that
     /// codepoint too. The face drawn must be the one the terminal's own family would fall back to.
     ///

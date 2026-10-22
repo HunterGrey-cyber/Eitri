@@ -612,8 +612,9 @@ mod tests {
 
     #[test]
     fn unnameable_keys_are_dropped_rather_than_guessed_at() {
-        // Bare modifier presses produce no text: forwarding them would inject junk on every chord.
-        // A lone Shift can switch the fcitx5 input method and must remain unconsumed.
+        // Bare modifier presses must produce nothing: forwarding them injects junk into the
+        // buffer on every chord. A lone Shift is also an fcitx5 input-method-switch gesture
+        // and must stay unconsumed.
         assert_eq!(format_key_event(Key::Control_L, ModifierType::empty()), None);
         assert_eq!(format_key_event(Key::Shift_L, ModifierType::empty()), None);
         assert_eq!(format_key_event(Key::Alt_L, ModifierType::empty()), None);

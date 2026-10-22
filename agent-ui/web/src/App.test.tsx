@@ -9,8 +9,9 @@ import { WHICH_KEY_DELAY_MS } from "./leader";
 import { REFUSED_ECHO_MS } from "./tabs";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import type { PanelTable } from "./keymap";
-// A namespace import lets the test spy on the real `isPlainAnswerKey` export and check that the
-// bypass-y handler calls it.
+// A namespace import so `h3b` below can spy on
+// the real `isPlainAnswerKey` export and prove the bypass-y handler actually calls it, rather than
+// a same-shaped hand-written copy -- see that test's own comment for what this can and cannot catch.
 import * as keymapModule from "./keymap";
 import { binding, TABLE } from "./testFixtures";
 import { modeFixedMessage } from "./modeKey";
@@ -94,18 +95,18 @@ function lastOfType(type: string): Record<string, unknown> | undefined {
   return matching[matching.length - 1];
 }
 
-/** The panel now opens in BROWSE, where the composer renders a hint line rather than a textarea
- *. Every test below that types into the box goes through the same `i` the real keyboard
+/** The panel opens in BROWSE, where the composer renders a hint line rather than a textarea.
+ *  Every test below that types into the box goes through the same `i` the real keyboard
  *  table (`./keymap`) offers, rather than reaching for the textarea directly -- which is also what
  *  proves the wiring in `App.tsx`'s `onKeyDown` actually works, not just `resolveKey` in isolation. */
 function enterInputMode(container: HTMLElement) {
-  // A person's `i` stands alone (#26): whatever key the test pressed a moment ago is not in its burst.
+  // A person's `i` stands alone (after the typing guard): whatever key the test pressed a moment ago is not in its burst.
   if (vi.isFakeTimers()) vi.setSystemTime(Date.now() + TYPING_GUARD_MS + 50);
   else keyGap();
   fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "i" });
 }
 
-/** #26: the typing guard reads each keydown's timestamp, which jsdom takes from `Date.now()`, so two keys a
+/** The typing guard reads each keydown's timestamp, which jsdom takes from `Date.now()`, so two keys a
  *  test fires back to back are one burst -- `i` right after `g`, or any key right after `y`, is swallowed.
  *  `keyGap()` moves that clock forward past the guard window, as a person pausing would, without fake timers
  *  (the test's own timers keep running real). Undone after every test. */
@@ -162,10 +163,14 @@ function buttonLabelled(container: HTMLElement, label: string): HTMLButtonElemen
   return Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes(label));
 }
 
-/** Stubs `ResizeObserver` so the band can grow beyond its mode-and-pill floor before measurement.
- *  Call before mounting `StatusBand`: its `useLayoutEffect` creates an observer only at mount time.
- *  Call the returned function with the rendered `container` to report a wide band and mono character width.
- *  Call `vi.unstubAllGlobals()` afterwards so later `MessageList` tests do not inherit the stub. */
+/** Stubs `ResizeObserver` so the band can be widened past `band.ts`'s own pre-measurement floor
+ *  (mode and pill only, until a real width is known).
+ *  Must be called BEFORE the render that mounts a `StatusBand`: its `useLayoutEffect` only creates a
+ *  real observer if one exists at mount time, the same requirement `MessageList.test.tsx`'s own
+ *  `stubResizeObserver` documents. Call the returned function with the rendered `container` once,
+ *  any time after render, to report a wide band and a plausible mono character width; call
+ *  `vi.unstubAllGlobals()` afterwards so the stub does not leak into `MessageList`'s own unrelated
+ *  use of the same global in a later test. */
 function stubBandWidth(): (container: HTMLElement) => void {
   type Rec = { callback: ResizeObserverCallback; observed: Element[] };
   const observers: Rec[] = [];
@@ -194,10 +199,14 @@ function stubBandWidth(): (container: HTMLElement) => void {
   };
 }
 
-/** Opens `ContinueInTerminal`'s confirmation through the detail popover.
- *  Clicking the band opens the popover, `tab_detail` fills it, and its trailing row opens the confirmation.
- *  The band button survives at any width, so this needs no `stubBandWidth`.
- *  `rows` supplies popover facts; an empty list suffices when only the trailing row matters. */
+/** Opens `ContinueInTerminal`'s confirmation through the session's detail popover:
+ *  a click on the band opens the popover, `tab_detail` answers it, and a click on
+ *  its trailing row opens the confirmation -- there is no permanently visible button to click
+ *  directly any more (`<leader>t` is the other entry point, exercised by its own leader tests
+ *  elsewhere). The band click works at any width (mode/pill's own floor, `band.ts`'s
+ *  pre-measurement rule, never drops that button, so this needs no `stubBandWidth`). `rows` lets a
+ *  caller shape the popover's own facts when a test cares; empty is fine when only the trailing row
+ *  matters. */
 function openHandoffConfirm(container: HTMLElement, tab = 1, rows: { label: string; value: string }[] = []) {
   fireEvent.click(container.querySelector(".band-open")!);
   dispatch({ kind: "tab_detail", tab, rows });
@@ -222,12 +231,12 @@ describe("pane focus", () => {
     dispatch({ kind: "pane_focus", focused: false });
     expect(modeBlock(container).dataset.focused).toBe("false");
     // The mode itself is untouched (focus is a separate fact from which mode the panel is in), but
-    // the band names it only while the panel holds the keys.
+    // the band names it only while the panel holds the keys (it is blank without keyboard focus).
     expect(modeBlock(container).dataset.mode).toBe("browse");
     expect(modeBlock(container).textContent).toBe("");
   });
 
-  /** The empty tab starts in INPUT at launch while the editor holds the keys; do not let its
+  /** The empty tab starts in INPUT at launch while the editor holds the keys; its
    *  band read `INPUT`. It names a mode only once the panel has the keys, as the live tab's does. */
   it("the empty tab's band names no mode while the keys are elsewhere", () => {
     const { container } = render(<App />);
@@ -280,15 +289,19 @@ describe("pane focus", () => {
   });
 });
 
-/** Keyboard arrivals land in BROWSE, except a brand-new tab's `enter_input` arrival.
- *  A waiting permission card still receives the cursor when the keys arrive. */
+/** Keyboard arrivals land in BROWSE while a brand-new tab enters INPUT
+ *  through `enter_input` (see the "pane focus" describe above). A waiting card takes
+ *  the cursor on arrival; the card-arrival cases below exercise that half separately
+ *  from ordinary arrivals. */
 describe("arrive", () => {
   function modeBlock(container: HTMLElement): HTMLElement {
     return container.querySelector<HTMLElement>("[data-testid=mode-block]")!;
   }
 
-  /* With no waiting card, an arrival on the last row resumes following there.
-     A cursor placed elsewhere stays there, preserving the reader's position. */
+  /* An earlier test moved the cursor away
+     with `gg` and asserted the arrival landed on the last row anyway. Split: a reader on the last row
+     (following) still lands there, following resumed; one who put the cursor elsewhere keeps it. The
+     park-and-restore cases are the "#22: coming back restores where you were" describe below. */
   it("with no card, from INPUT on the last row: BROWSE on the last row, following resumed, no textarea focused", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -344,7 +357,7 @@ describe("arrive", () => {
     expect(container.querySelector("textarea")).toBeNull();
   });
 
-  /** GUI pass (2026-09-26, r2-gui): the empty tab's band read `INPUT` whatever the tab was in --
+  /** The empty tab's band must reflect its actual mode. It used to read `INPUT` in every mode --
    *  its facts hard-coded `mode: "input"`, so an arrival that put the dashboard in BROWSE still
    *  said INPUT under it. */
   it("on an empty tab, the band shows the tab's own mode", () => {
@@ -356,9 +369,10 @@ describe("arrive", () => {
     expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
-  /** `EmptyTab` must ignore `arrive` counts reached before it mounted. Reading a stale count
-   *  as a new request made tabs created from a live tab drop straight to BROWSE with nothing
-   *  focused, leaving the keys dead. */
+  /** `EmptyTab` read the window's `arrive` counter as a new
+   *  request whenever it MOUNTED, so once any keyboard arrival had happened, every new tab made from
+   *  a live one (`prefix c`, `<leader>fn`, the chooser's New session) mounted, saw a stale count and
+   *  dropped straight to BROWSE -- with nothing focused, so the keys were dead. */
   it("a new tab made from a live tab after an earlier arrival still lands INPUT (R7)", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -377,7 +391,8 @@ describe("arrive", () => {
     expect(modeBlock(container).dataset.mode).toBe("input");
   });
 
-  /** A tab switch lands BROWSE, including on an empty tab, where the dashboard receives focus. */
+  /** A tab switch lands BROWSE, onto an empty tab too, where the dashboard
+   *  puts the cursor on its New session item. */
   it("a switch to an existing empty tab lands BROWSE, not a composer nobody asked for", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -389,8 +404,9 @@ describe("arrive", () => {
     expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
-  /** The empty tab ignores request counts reached before it mounted. Switching from a live tab
-   *  unmounts that tab's root and loses its focus, so the dashboard itself must receive focus. */
+  /** The empty tab ignores
+   *  request counts reached before it mounted, so a switch onto it from a live tab (whose root just
+   *  unmounted, taking focus with it) must land the keys on the dashboard itself. */
   it("a switch from a live tab onto an empty tab leaves the keys on the dashboard", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -402,8 +418,10 @@ describe("arrive", () => {
     expect(document.activeElement).toBe(container.querySelector(".empty-tab"));
   });
 
-  /** A tab switch lands in BROWSE while restoring that tab's cursor and scroll position.
-   *  This reset is driven by `tabs`/`snapshot`, independently of the `arrive` envelope. */
+  /** A tab switch itself (not `arrive`) also lands BROWSE, keeping the tab's
+   *  cursor/scroll restore exactly -- this is the switch's own reset (`tabs`/`snapshot`), not the
+   *  `arrive` envelope. The cursor-restoration and streaming-scroll tests below
+   *  also exercise the tab's saved position. */
   it("a tabs envelope switching the active tab while in INPUT lands BROWSE", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -456,7 +474,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
       expect(modeBlock(container).dataset.mode).toBe("input");
       dispatch({ kind: "focus_permission", tab: 1 });
       expect(modeBlock(container).dataset.mode).toBe("browse");
-      // The `i` above counts as a key, so pause before pressing a lone `a`.
+      // The `i` above is a key: a lone `a` is one nothing came near.
       act(() => vi.advanceTimersByTime(300));
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
       act(() => vi.advanceTimersByTime(250));
@@ -475,9 +493,11 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(modeBlock(container).dataset.mode).toBe("input");
   });
 
-  // The no-card fallback keeps the caret, like `i`/`o`. An earlier `A` sets `composerCaret` to the
-  // end through `composerFocusRequest`, so that state must not leak into this arrival through
-  // `inputRequest`.
+  // The "no card to land on, treat as an ordinary arrival" fallback
+  // above carries the same caret rule `i`/`o` do -- "kept" -- rather than whatever `composerCaret`
+  // was last left at by an earlier `A` press (that press bumps `composerFocusRequest` directly,
+  // never `inputRequest`, so nothing about it should leak into a later arrival here). Reproduced
+  // without this fix: the caret below landed at the end of the draft, not at 3.
   it("takes the composer with the caret kept, not wherever an earlier A left composerCaret", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -497,9 +517,10 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(box2.selectionEnd).toBe(3);
   });
 
-  /* Landing on a card moves the cursor, and the `[cursor]` effect reveals its row.
-     This must be announced as a user scroll, like a HINT landing. Otherwise `MessageList` keeps
-     following, and the next delta or resize can snap an older card out of view. */
+  /* Landing on the card moves the
+     cursor, and the `[cursor]` effect reveals its row -- a scroll the user asked for, like a HINT
+     landing's. Unannounced, `MessageList` takes it for nobody's and keeps following, and the next
+     delta or resize snaps an older card straight back out of view. */
   it("announces the landing to the message list, so revealing an older card is the user's scroll", () => {
     const { container } = withTwoCards();
     const list = container.querySelector(".message-list")!;
@@ -550,13 +571,14 @@ describe("literal_key C-a (send-prefix from shell's prefix)", () => {
 describe("App handshake", () => {
   it("announces itself with a `ready` carrying a request id, before anything else", () => {
     render(<App />);
-    // V1 C1: `panel_keys` now follows on mount too (the mirror's own "once after ready"),
+    // `panel_keys` now follows on mount too (the mirror's own "once after ready"),
     // so this no longer asserts the whole post list is length 1 -- only that `ready` leads it. See
     // "the composer mirror" describe block below for what that second post actually says.
     expect(posted[0].type).toBe("ready");
     expect(typeof posted[0].request_id).toBe("string");
-    // Before `hello`/`tabs`, `activeTab` is `null` and no composer exists, so the first `panel_keys`
-    // mirror reports `other`.
+    // Pin what the second post actually is, rather than leaving the
+    // comment above as the only thing saying so -- before `hello`/`tabs`, `activeTab` is `null` and
+    // there is no box of any kind, so the mirror's first value is `other`.
     expect(posted[1]).toMatchObject({ type: "panel_keys", mode: "other" });
   });
 
@@ -564,7 +586,7 @@ describe("App handshake", () => {
     const { container } = render(<App />);
     expect(container.textContent).toContain("Connecting to the shell");
     dispatch({ kind: "hello", ...HELLO });
-    // `hello` alone names no tab yet -- the empty tab (F3) needs `activeTab`, from `tabs`.
+    // `hello` alone names no tab yet -- the empty tab (the dashboard) needs `activeTab`, from `tabs`.
     expect(container.textContent).toContain("Connecting to the shell");
     dispatchEmptyTab();
     expect(container.querySelector("textarea")).not.toBeNull();
@@ -588,7 +610,7 @@ describe("App handshake", () => {
   it("shows the tab's own permission mode in the band's mode pill once it is live", () => {
     // AgentUiState carries no field for this: the mode lives on the TAB now, not
     // remembered here from a click -- there is no button to click any more. The winbar is gone
-    //; the pill is the band's now, always
+    // with its separate session display; the pill is the band's now, always
     // in its short form (`⏵⏵ <mode>`, no "on"/cycle hint -- those moved to `prefix i`), and
     // `started: true` here since this is the session-started render.
     const { container } = render(<App />);
@@ -722,7 +744,7 @@ describe("App rehydration from a snapshot", () => {
     expect(container.querySelector(".empty-tab")).toBeNull();
   });
 
-  /* V3's other half: the WebView holds only the active tab's state, so a switch never
+  /* The WebView holds only the active tab's state, so a switch never
    * renders a stale conversation underneath the new one. */
   it("renders only the active tab's conversation (V3)", () => {
     const { container } = render(<App />);
@@ -825,12 +847,13 @@ describe("App event folding", () => {
        at all and the composer says which key does work. */
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector(".composer-browse-hint")!.textContent).toBe("This session has ended.");
-    // The row alone says to press `r`, so the instruction appears once.
+    // Said once, by the row.
     expect(container.textContent!.match(/press r/gi)).toHaveLength(1);
   });
 
-  /* A normal session close has its own row class and non-error sign, with no error border.
-     These assertions keep it distinct from `row-error` and its error sign. */
+  /* A session that ends normally is not an error, and must not read as one -- distinct row class,
+     distinct (non-✗) sign, no error border. An earlier version had unified the two onto
+     `row-error`/`✗`; this pins them apart. */
   it("announces an ordinary session close without the lost-session treatment", () => {
     const { container } = startedApp();
     events({ type: "session_closed", reason: "provider exited" });
@@ -842,7 +865,7 @@ describe("App event folding", () => {
   });
 });
 
-/* the band shows the ACTIVE tab's last reported usage -- every token and the
+/* The band shows the ACTIVE tab's last reported usage -- every token and the
  *  cost, right of the model. Absent until a turn reports one and never `0 tok $0.00` for unknown; each
  *  report replaces the figure whole; and it is per tab, carried by the snapshot on a switch. The
  *  formatting itself is `band.test.ts`'s; this pins the wiring from events and snapshots to the band. */
@@ -942,9 +965,10 @@ describe("the band's usage segment", () => {
   });
 });
 
-/* A bare /model or /effort sends as a turn, and the panel opens a picker from its reply.
- *  `../slashPicker` tests cover parsing. These tests check which reply opens the picker
- *  and what Enter/Esc do to a real send through `App`. */
+/* A bare
+ *  /model or /effort now sends as a turn (never held back), and the panel opens a picker from its
+ *  reply -- `../slashPicker`'s own unit tests cover the parsing itself; this only pins the App-level
+ *  wiring (which reply arms it, what Enter/Esc do to a real send). */
 describe("slash command pickers", () => {
   function startedApp() {
     const rendered = render(<App />);
@@ -1075,9 +1099,10 @@ describe("slash command pickers", () => {
     expect(container.querySelector(".slash-picker")).toBeNull();
   });
 
-  /** A picker reply must not open over the chooser, `?`, or the `/` prompt.
-   *  Stacked overlays can send Enter to the underlying chooser after focus returns.
-   *  Closing the picker must return focus to the conversation rather than `<body>`. */
+  /** A reply that landed while the chooser
+   *  (or `?`, or the `/` prompt) was open opened the picker on top of it. `takeKeys` then gave the
+   *  keys to the chooser underneath after a focus round trip, so Enter answered the chooser instead
+   *  of choosing a model; and closing the picker left the keys on `<body>`. */
   describe("the picker and the other overlays", () => {
     const REPLY = (): AgentDomainEvent[] => [
       { type: "turn_started", turn_id: "t1" },
@@ -1146,9 +1171,11 @@ describe("slash command pickers", () => {
     }
   });
 
-  /** Opening the picker clears the pending prefix, count, and leader sequence with `dropPendingKeys`.
-   *  Picker keys return before the normal sequence reset, so stale state could otherwise consume
-   *  the first key after the picker closes or turn `f` into `gf`. */
+  /** The picker is a cancel route as the chooser is. Its keys return from
+   *  `onKeyDown` ahead of the read-and-reset of a waiting prefix and count, and opening it dropped
+   *  nothing, so a `g`/`z`/`[`/`]` typed while the reply was on its way took the first key after the
+   *  picker: `i` opened no composer, and `f` could have been `gf`. A count and the leader outlived it
+   *  the same way. Opening the picker now drops all three (`dropPendingKeys`). */
   describe("the picker drops a waiting prefix, count or leader sequence", () => {
     const REPLY = (): AgentDomainEvent[] => [
       { type: "turn_started", turn_id: "t1" },
@@ -1228,8 +1255,9 @@ describe("slash command pickers", () => {
     });
   });
 
-  /** `pendingSlashPickerRef` is shared across tabs, so a tab switch must clear it.
-   *  The switch also closes `slashPicker` to prevent targeting the wrong tab. */
+  /** `pendingSlashPickerRef` is a single flag, not scoped to a
+   *  tab, and `slashPicker` itself used to survive a tab switch -- both closed at the tab-switch
+   *  reset block in `App.tsx`. */
   describe("tab switch", () => {
     const TAB2 = { ...LIVE_TAB, id: 2, number: 2, label: "2 new" };
 
@@ -1271,9 +1299,11 @@ describe("slash command pickers", () => {
   });
 });
 
-/* `App.tsx` sees the raw envelope and can tell whether `turnClock` came from a real
-   `turn_started` event or a turn id first seen in a snapshot. Test the elapsed clock here,
-   where that distinction is available. */
+/* The in-flight motion indicator's elapsed clock must reset with the session.
+   `turnClock`'s PROVENANCE (a real `turn_started` event vs a turn id first seen inside a snapshot)
+   is exactly the distinction `App.tsx` -- not the reducer, and not `ActivityLine`/`TurnActivity`
+   (formerly `StatusLine`) -- is positioned to know, since only the raw
+   envelope carries it. Tested here, at the layer that actually decides it. */
 describe("the in-flight motion indicator's elapsed clock", () => {
   function events(...list: AgentDomainEvent[]) {
     dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
@@ -1327,9 +1357,15 @@ describe("the in-flight motion indicator's elapsed clock", () => {
     expect(container.querySelector(".turn-elapsed")?.textContent).toBe("0s");
   });
 
-  /* A terminal handoff and a fatal error must clear `TurnClock`, just as `returnToStartScreen` does.
-     A later snapshot with the same `activeTurnId` would otherwise retain the old `since` and
-     `exact: true`, inflating elapsed time without a `+`. Both reset paths are tested with a repeated id. */
+  /* There are THREE whole-state resets in App.tsx, and only
+     `returnToStartScreen` cleared the clock. The other two -- a terminal handoff and a fatal error
+     -- left a stale `TurnClock` behind. Normally the next snapshot clears it incidentally via its
+     `activeTurnId === null` branch, which is why this was invisible; the exposure is a snapshot
+     arriving with an `activeTurnId` EQUAL to the stale one, which keeps both the old `since` and
+     the old `exact: true` and shows an inflated elapsed time with no `+`. Whether a turn id can
+     repeat across sessions is a question about ids this repo does not own (legacy mints uuid v4,
+     the sidecar's arrive from Verdandi over the wire), so the resets clear it rather than rely on
+     an answer. Both paths, driven end to end, with the repeated id as the probe. */
   for (const reset of ["a fatal error", "a terminal handoff"] as const) {
     it(`${reset} leaves no stale clock behind, even for a turn id that comes back`, () => {
       vi.useFakeTimers();
@@ -1447,7 +1483,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector(".composer-browse-hint")).not.toBeNull();
   });
 
-  /** rc.3 minors 6: a chord (Alt+g, Meta+z) is not the `g`/`z` prefix, so it must not swallow the plain key
+  /** A chord (Alt+g, Meta+z) is not the `g`/`z` prefix, so it must not swallow the plain key
    *  after it -- `i` here, which the armed prefix used to cancel. */
   it.each([["g", { altKey: true }], ["g", { metaKey: true }], ["z", { altKey: true }], ["z", { metaKey: true }]])(
     "enters INPUT on i right after %s with %j held: the chord armed no prefix",
@@ -1472,8 +1508,8 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     const clipboard = stubClipboard();
     events({ type: "user_prompt_submitted", text: "first prompt" });
     events({ type: "user_prompt_submitted", text: "second prompt" });
-    // The cursor lands on "second prompt" when it arrives; `gg` returns to the top so the
-    // `j`/`k` walk starts from a known row.
+    // The arrival lands the cursor on "second prompt" the moment it arrives; `gg` returns to the top so the
+    // `j`/`k` walk below still starts from a known row.
     fireEvent.keyDown(conversationRoot(container), { key: "g" });
     fireEvent.keyDown(conversationRoot(container), { key: "g" });
 
@@ -1481,7 +1517,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("second prompt");
 
-    // Any key within `TYPING_GUARD_MS` of a `y` is typing, so the walk pauses after it.
+    // Any key within `TYPING_GUARD_MS` of a `y` is typing (inside the copy burst): the walk pauses after it.
     keyGap();
     fireEvent.keyDown(conversationRoot(container), { key: "k" });
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
@@ -1509,8 +1545,8 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(container.querySelector('[data-folded="true"]')).not.toBeNull();
   });
 
-  /* `za` toggles the fold under the cursor as Enter does; `zo` opens it and `zc` closes it.
-     Opening an open fold or closing a closed fold leaves it unchanged. */
+  /* `za` flips the fold under the cursor exactly as Enter
+     does, `zo` opens it and `zc` closes it, and neither moves a fold that is already the way it asks. */
   it("za toggles the folded tool result as Enter does; zo opens it and zc closes it, each idempotent", () => {
     const { container } = startedApp();
     events(
@@ -1590,10 +1626,10 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     expect(notes()).toEqual(["allowed by rule Bash(git log *)"]);
   });
 
-  /** An in-project edit allowed by the acceptEdits fast path gets its own row and diff,
-   *  rather than folding into a count-only run with nearby reads. Its "allowed by auto" note
-   *  comes from an events envelope's `autoNotes` or a snapshot's `allowedByAuto`.
-   *  `toolRegistry.test` covers a call without the note. */
+  /** An in-project edit the acceptEdits fast path allowed renders its own row --
+   *  never folded into a count-only run with the reads around it -- says "allowed by auto", from
+   *  the events envelope's `autoNotes` and from a snapshot's `allowedByAuto` (a call without one:
+   *  toolRegistry.test). */
   it("shows an edit the fast path allowed as its own row, diffed, and named auto -- from events and from a snapshot", () => {
     const { container } = startedApp();
     dispatch({
@@ -1642,16 +1678,18 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     fireEvent.keyDown(conversationRoot(container), { key: "r" });
     expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
 
-    // Rust resets the tab in place and sends a fresh `tabs` envelope. No local reset or new `ready` is
-    // needed; Rust re-sends `hello` when the set of open sessions changes.
+    // Rust resets the tab in place and says so with a fresh `tabs` envelope -- there is
+    // no local start-screen reset here, and no `ready` is asked for: Rust
+    // re-sends `hello` on its own whenever the set of open sessions changes.
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
     expect(container.querySelector(".agent-ui-conversation")).toBeNull();
     expect(container.querySelector(".empty-tab")).not.toBeNull();
   });
 
-  /* GTK handles Ctrl+Shift+R (panel reload) in the capture phase, so this handler must leave
-     that unclaimed chord alone. Shift+R has `event.key` equal to "R", which keeps it out of
-     the lowercase `r` binding without an explicit modifier check. */
+  /* GTK owns Ctrl+Shift+R (panel reload) in the capture phase, and
+     this handler must not fight it for a chord it does not claim. `event.key` for Shift+R is the
+     shifted character "R", which is why this is safe by construction rather than by an explicit
+     modifier check -- this test pins that property so it stays true if the table ever changes. */
   it("does not preventDefault an unclaimed chord like Ctrl+Shift+R", () => {
     const { container } = startedApp();
     const notCancelled = fireEvent.keyDown(conversationRoot(container), { key: "R", ctrlKey: true, shiftKey: true });
@@ -1664,7 +1702,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       { type: "user_prompt_submitted", text: "first" },
       { type: "user_prompt_submitted", text: "second" },
     );
-    // The cursor lands on "second" when it arrives; `gg` returns to the top.
+    // The arrival lands the cursor on "second" the moment it arrives; `gg` returns to the top.
     fireEvent.keyDown(conversationRoot(container), { key: "g" });
     fireEvent.keyDown(conversationRoot(container), { key: "g" });
     expect(container.querySelectorAll(".row-current")).toHaveLength(1);
@@ -1684,7 +1722,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       { type: "user_prompt_submitted", text: "first" },
       { type: "user_prompt_submitted", text: "second" },
     );
-    // The cursor lands on "second" when it arrives; `gg` returns to the top.
+    // The arrival lands the cursor on "second" the moment it arrives; `gg` returns to the top.
     fireEvent.keyDown(conversationRoot(container), { key: "g" });
     fireEvent.keyDown(conversationRoot(container), { key: "g" });
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -1709,8 +1747,8 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
         { type: "user_prompt_submitted", text: "after" },
       );
       const root = conversationRoot(rendered.container);
-      // The cursor lands on "after" when it arrives; `gg` returns to the top so the `j` below
-      // lands on the tool row.
+      // The arrival lands the cursor on "after" the moment it arrives; `gg` returns to the top so the `j`
+      // below still lands on the tool row, as it always did.
       fireEvent.keyDown(root, { key: "g" });
       fireEvent.keyDown(root, { key: "g" });
       fireEvent.keyDown(root, { key: "j" }); // cursor: prompt "before" -> the tool row
@@ -1763,11 +1801,12 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(container.querySelector(".row-current")!.textContent).toContain("after");
     });
 
-    /* With the box scrolled off screen, `j` must bring its row back into view first.
-       Scrolling the hidden box would change nothing visible. `jkScroll.ts` computes the list
-       scroll instead of using `scrollIntoView`, which top-aligns tall rows in WebKitGTK 2.52.6.
-       The list is scrolled to 2500px and the row is at 500px in the content. The press moves
-       the list to the row while leaving the box alone. */
+    /* With the box scrolled off screen (the user mouse-scrolled the list away), `j`
+       used to scroll the hidden box and change nothing visible. Now the first press brings the row
+       back into view instead. The list is computed to the row (`jkScroll.ts`), not handed to the
+       engine's `scrollIntoView` (which top-aligns a row taller than the view in WebKitGTK 2.52.6):
+       the list stands 2500px down, the row (mocked 2000px above its top) at 500 in the content, and
+       the press moves the list up to it, leaving the box alone. */
     it("brings the row back into view, rather than scrolling a box that is off screen", () => {
       const { container } = startedAppWithExpandedResult();
       const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
@@ -1798,10 +1837,11 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(box.scrollTop).toBeLessThan(100);
     });
 
-    /* Ctrl+e uses `scrollCursorRowBox` to scroll a capped tool result first, just like j/k.
-       Unlike `j`, Ctrl+e does not advance to the next row when the box is exhausted.
-       The remaining count scrolls the conversation under the cursor. The cursor moves
-       only if its row leaves the view, which is checked elsewhere. */
+    /* "Inside a long tool result's capped box, scroll that box first, the way j/k
+       do" -- the same `scrollCursorRowBox` j/k already call, reused as-is. Unlike `j` (which moves
+       the cursor to the NEXT row once the box is exhausted), Ctrl+e never advances the cursor row by
+       itself: once the box has nothing left, the rest of the count scrolls the conversation under an
+       unmoved cursor, and only leaving the view (checked elsewhere) would re-home it. */
     it("Ctrl+e scrolls the box first, the same way j does", () => {
       const { container } = startedAppWithExpandedResult();
       const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
@@ -1840,9 +1880,12 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(box.scrollTop).toBeLessThan(100);
     });
 
-    /* A tall command row can span both viewport edges while its `.tool-result-body` is off screen.
-       `scrollIntoView({block:"nearest"})` cannot move that row, so claiming the key would trap scrolling.
-       `Ctrl+e` must fall through to the conversation when the box cannot be reached this way. */
+    /* A multi-line command taller than the view,
+       scrolled into so the ROW spans both viewport edges, with its `.tool-result-body` further down
+       still off screen. `scrollCursorRowBox` saw the box off screen and called
+       `row.scrollIntoView({block:"nearest"})`, but "nearest" moves nothing once the row already
+       spans the viewport it would be aligned against -- so the press was still claimed (returning
+       `true`), and `Ctrl+e` never fell through to scroll the conversation itself. */
     it("Ctrl+e falls through to the conversation when the row already spans the view and its box is still off screen", () => {
       const { container } = startedAppWithExpandedResult();
       const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
@@ -1852,7 +1895,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       Object.defineProperty(box, "clientHeight", { value: 260, configurable: true });
       Object.defineProperty(box, "scrollTop", { value: 0, configurable: true, writable: true });
       // The row spans both edges of the 800px viewport; its result box sits further down, entirely
-      // below the bottom edge -- exactly the geometry the review's own repro describes.
+      // below the bottom edge, so revealing the result must move the view.
       row.getBoundingClientRect = () => ({ top: -50, bottom: 850 }) as DOMRect;
       box.getBoundingClientRect = () => ({ top: 820, bottom: 1080 }) as DOMRect;
       list.getBoundingClientRect = () => ({ top: 0, bottom: 800 }) as DOMRect;
@@ -1864,9 +1907,13 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(list.scrollTop).toBeGreaterThan(0); // the press fell through to the conversation instead
     });
 
-    /* `Ctrl+y` then `Ctrl+e` can scroll only the nested result box while the list remains at its bottom.
-       Nested scroll events do not bubble, and `noteUserScroll("down")` only arms the steering window.
-       A scroll event on `.message-list` is still needed to let `MessageList` resume following. */
+    /* At the true bottom already, `Ctrl+y` then
+       `Ctrl+e` -- both entirely absorbed by the row's own `.tool-result-body`, back to where it
+       started -- never touch the OUTER list at all. `noteUserScroll("down")` alone only arms
+       `MessageList`'s steering window; only a real `scroll` event lets its own "did this reach the
+       bottom" rule re-arm following, and a box-only scroll never fires one on `.message-list` (a
+       `scroll` event does not bubble from a nested scrollable). Before the fix, following stayed off
+       for good even though the box round-tripped back to exactly where it began. */
     it("Ctrl+e dispatches a scroll event on the list even when the whole press stayed inside the box", () => {
       const { container } = startedAppWithExpandedResult();
       const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
@@ -1889,10 +1936,13 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(scrollEvents.length).toBeGreaterThan(0);
     });
 
-    /* Line scrolling must not pull the view back toward an off-screen cursor row.
-       `Ctrl+e`/`Ctrl+y` scroll the result box only while it overlaps the viewport and can move that way.
-       Otherwise the list scrolls, avoiding jumps back to the same row on every held key.
-       Geometry here: list 0-800, row 760-1080, box 800-1060, list scrolled to 400. */
+    /* Ctrl+e/Ctrl+y reused `scrollCursorRowBox`,
+       j/k's own helper, whose off-screen branch brings the cursor row back into view and claims the
+       unit. vim's CTRL-E/CTRL-Y never move the view toward the cursor, so held Ctrl+y with the row's
+       box just below the view jumped back down to the row every time it scrolled it off (it never got
+       past the row), and Ctrl+e jumped a whole box height. For a line scroll the box now takes a unit
+       only while at least part of it is on screen and it can still move that way. The reviewers'
+       geometry: list 0-800, row 760-1080, box 800-1060, the list scrolled to 400. */
     function placeBoxBelowTheView(container: HTMLElement) {
       const box = container.querySelector(".row-current .tool-result-body") as HTMLElement;
       const row = container.querySelector(".row-current") as HTMLElement;
@@ -1951,7 +2001,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
       expect(list.scrollTop).toBe(400);
     });
 
-    /* Codex, the same finding: with the row's top exactly on the list's top (a tall row, scrolled to),
+    /* With the row's top exactly on the list's top (a tall row, scrolled to),
        the "row spans the view" check was strict, missed the equality, and every unit of a counted
        Ctrl+e went to a `scrollIntoView` that moved nothing. `j` had the same equality hole. */
     function alignRowTopWithTheList(container: HTMLElement) {
@@ -2010,13 +2060,14 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     events({ type: "permission_resolved", permission_id: "perm-2", outcome: "allowed" }); // timeline shrinks to 1
 
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
-    // A cursor left at the old index 1 would find nothing.
+    // A cursor left at the old index 1 would find nothing (or, with the old handler, silently write "").
     // Clamped to the new last row, it copies the one item that is still there.
     expect(clipboard.writeText).toHaveBeenCalledWith(JSON.stringify({ a: 1 }, null, 2));
   });
 
-  /* Panel shortcuts must leave keystrokes in editable fields alone.
-     The permission card's deny-reason box must keep both its text input and its focus. */
+  /* This panel does not own every keystroke inside its own subtree -- only
+     the ones outside a text field someone is actually typing into. A permission card's deny-reason
+     box is the one that exists today. Both halves of the bug the reviewer reproduced in jsdom. */
   describe("does not fight a permission card's reason box for keystrokes", () => {
     function withAPermissionRequest() {
       const rendered = startedApp();
@@ -2056,9 +2107,12 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     });
   });
 
-  /* `fireEvent` can dispatch to the conversation root even when it has no real focus.
-     Asserting on and dispatching at `document.activeElement` makes this test depend on the
-     refocus effect, catching keys left on `document.body` after Escape. */
+  /* Keep the event aimed at the actual focused element to check what the refocus effect is
+     for. `fireEvent` bypasses real focus entirely, which is exactly why a test that always
+     dispatches at a hand-picked `conversationRoot(container)` cannot catch a regression here -- it
+     would keep passing even if the refocus effect stopped firing and real focus were left on
+     `document.body`. Asserting on, and dispatching at, `document.activeElement` itself is what
+     makes this test depend on the effect actually running. */
   it("returns real DOM focus to the panel root after Escape, and j/y keep working from there", () => {
     const { container } = startedApp();
     events(
@@ -2098,9 +2152,10 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     /* Every control a keyboard user can Tab to inside the conversation, by the label they read.
        Approve and Deny are the two that were reported; the rest share the one handler and would
        have failed the same way. */
-    /* Enter is left to a card's own buttons, but Space is claimed and does nothing.
-       Pause before Enter so the typing guard does not refuse it. Typing protection is
-       tested separately. */
+    /* Enter is still left to a card's own
+       buttons -- the regression this block pins -- but Space on them is now claimed and does
+       nothing. Enter is pressed with no key just before it, since the typing guard refuses one right
+       after typing; that half is `v1: typing never answers a card`'s. */
     it("claims Enter and Space on the card's own buttons, and an Enter nothing landed presses nothing (K02, v1 S5)", () => {
       vi.useFakeTimers();
       const widen = stubBandWidth();
@@ -2160,7 +2215,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     });
   });
 
-  /* F2: INPUT was a one-way trap on an ended session while the banner kept promising `r`. */
+  /* INPUT must not trap the user on an ended session while the banner promises `r`. */
   describe("a dead session leaves no mode that drops the key its own hints promise", () => {
     it("refuses i, and says so instead of promising it", () => {
       const { container } = startedApp();
@@ -2194,9 +2249,9 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 });
 
 /** The per-row which-key STRIP (`.which-key`) is gone: the band leaves no
- *  room for it, and Claude Code itself only ever kept a bare `? for shortcuts`, which this panel
- *  leaves out too. The which-key BOX (`.which-key-box`,
- *  the leader/g-prefix popup) is a different feature and stays -- see the nested describe below. */
+ *  room for it, and Claude Code itself only ever kept a bare `? for shortcuts`, which was left out
+ *  too. The which-key BOX (`.which-key-box`, the leader/g-prefix popup) is a different feature and
+ *  stays -- see the nested describe below. */
 describe("App: the which-key box", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
@@ -2217,8 +2272,9 @@ describe("App: the which-key box", () => {
   });
 
   describe("the g prefix box (200ms)", () => {
-    // Pending `g`/`z`/`[`/`]` prefixes appear in the which-key box after `WHICH_KEY_DELAY_MS` (200ms).
-    // They do not draw a separate strip line.
+    // The `g`/`z`/`[`/`]` prefixes no longer draw their own line in the
+    // which-key STRIP -- every pending prefix now shows in the which-key BOX instead, after
+    // `WHICH_KEY_DELAY_MS` (200ms, widened from the strip's old `g`-only 400ms).
     it("shows nothing before the delay, `first row` once it elapses, and clears on the next key", () => {
       vi.useFakeTimers();
       try {
@@ -2255,9 +2311,11 @@ describe("App: the which-key box", () => {
   });
 });
 
-/* In BROWSE, `Ctrl+w` waits without a timeout for h/j/k/l and posts `pane_nav` to shell.
-   These pairs move focus like `Ctrl+h/j/k/l`; any other continuation is swallowed.
-   Neither the pairs nor an invalid continuation answer a permission card. */
+/* Vim's `CTRL-W h/j/k/l` -- the keys to the module that way, from the live
+   conversation's BROWSE. `Ctrl+w` is a reserved prefix: it waits for its next key with no
+   timeout, and that key completes one of the four pairs -- posted to shell as `pane_nav`, which runs
+   the move `Ctrl+h/j/k/l` do -- or is swallowed. Nothing here reaches a card: the answer side of it (a
+   pause, then `a`/`d`; a landing, then Enter) is in "v1: typing never answers a card" below. */
 describe("Ctrl+w h/j/k/l in BROWSE: the keys to the module that way", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
@@ -2540,9 +2598,11 @@ describe("the leader", () => {
     }
   });
 
-  /** `H`/`L`, like `f`, can start typed text, so they wait `TYPING_GUARD_MS`, like `a`/`d`.
-   *  A lone `H` still runs after the wait. `[ b` and `[ [` complete a reserved two-key
-   *  prefix in `resolveKey` and still run at once on the second key. */
+  /** `H`/`L` (like `f`, below) are always the first key of whatever typed them,
+   *  so they defer the same `TYPING_GUARD_MS` `a`/`d` do rather than running at once -- a lone `H`
+   *  still runs, just `TYPING_GUARD_MS` later. `[ b`/`[ [` are a different path entirely (the
+   *  reserved two-key prefix `resolveKey` itself owns, completed on the SECOND key), so they are
+   *  untouched and still run at once. */
   it("H posts tab_verb prev TYPING_GUARD_MS later, [ b posts prev via the table at once, [ [ is still a prompt jump", () => {
     vi.useFakeTimers();
     try {
@@ -2566,9 +2626,13 @@ describe("the leader", () => {
     }
   });
 
-  /** A sentence starting with `L` in BROWSE must not switch tabs before the next letter arrives.
-   *  `o` within `TYPING_GUARD_MS` cancels the deferred `L`; `mayActAfterMotion` cannot guard the first key.
-   *  `TypingGuard.defer`'s `cancelledFlash` must name `L`, even when no card is waiting. */
+  /** Two or more tabs open, on tab 2, `Ctrl+l` back to BROWSE
+   *  and then "Looks good, now add tests⏎" typed at typing speed used to switch to tab 1 on the very
+   *  first `L` (`mayActAfterMotion` cannot catch this: `L` is always the first key). Here the `o`
+   *  that follows within `TYPING_GUARD_MS` cancels the deferred `L` before it ever posts, and the
+   *  band says what did not happen in `L`'s own words. A shared cancellation flash used to show
+   *  the `a`/`d` text for every cancelled key, card or no card (`TypingGuard.defer`'s
+   *  `cancelledFlash`). */
   it('"Looks good" at 80 ms a key posts no tab_verb, and the band names L, not a / d', () => {
     vi.useFakeTimers();
     const widen = stubBandWidth();
@@ -2578,7 +2642,7 @@ describe("the leader", () => {
       sendTable();
       act(() => root(container).focus());
       // The band says what did not happen right when the `o` cancelled the `L`. The second `o` is
-      // then swallowed by #26's guard (`i`/`o`/`A` mid-word), whose hint is what the band ends on.
+      // then swallowed by the input-entry guard (`i`/`o`/`A` mid-word), whose hint is what the band ends on.
       let afterCancel: string | undefined;
       for (const [n, key] of ["L", "o", "o", "k", "s"].entries()) {
         press(key);
@@ -2635,10 +2699,13 @@ describe("the leader", () => {
     }
   });
 
-  /** `L`'s single-key binding waits `TYPING_GUARD_MS`. Replacing the `keymap` during that
-   *  window must cancel the deferred callback, which otherwise retains the old `binding`
-   *  and runs it after the wait. Cancelling only the pending multi-key sequence with
-   *  `clearSequence` leaves that stale callback armed. */
+  /** `L`'s single-key binding defers `TYPING_GUARD_MS` (the test above); a `keymap`
+   *  envelope arriving inside that window used to leave the deferred callback armed, closed over the
+   *  OLD table's `binding` -- so replacing the table did not merely fail to run the NEW binding, it
+   *  still ran the STALE one once the wait elapsed. `clearSequence` only ever
+   *  cancelled a pending multi-key sequence, leaving a delayed single-key callback armed.
+   *  Replacing the table must cancel both so neither can execute a stale binding
+   *  after the wait. */
   it("a table replaced mid-guard-window drops the deferred L binding entirely (P2-A6)", () => {
     vi.useFakeTimers();
     try {
@@ -2659,8 +2726,8 @@ describe("the leader", () => {
   });
 
   /** `H`/`L` use `defer` (both directions), not `mayActAfterMotion`: unlike the leader, a preceding
-   *  run of motion keys does not exempt them -- the review's own reason not to reuse
-   *  `mayActAfterMotion` here (there is no motion run behind the FIRST key of anything). */
+   *  run of motion keys does not exempt them. `mayActAfterMotion` cannot protect a first key
+   *  because no motion run precedes it. */
   it("k k then H at 80 ms a key still defers (no motion-run exception, unlike the leader)", () => {
     vi.useFakeTimers();
     try {
@@ -2700,10 +2767,13 @@ describe("the leader", () => {
     expect(tabVerbsPosted()).toEqual([]);
   });
 
-  /** Bare modifier keydowns must leave a pending leader sequence intact. Without an
-   *  `isModifierKey` guard, `Control` in Ctrl+c cancelled the sequence as an unmatched key.
-   *  The following `c` then reached `resolveKey` with `seqRef.current === null` and
-   *  interrupted a running turn instead of being swallowed as an unbound continuation. */
+  /** An unbound chord after the leader is swallowed, including its initial bare modifier.
+   *  A pending sequence's own keydown handler had no `isModifierKey` guard, unlike
+   *  `pendingRef`'s `g`/`z`/`[`/`]` prefix (the test just above) and `TypingGuard.onKey`. The bare
+   *  `Control` keydown of a `Ctrl+c` combo found no match, `advanceSequence` returned `cancel`, and
+   *  the FOLLOWING keydown (`c`, `ctrlKey: true`) then saw `seqRef.current === null`, fell out of the
+   *  leader block and reached `resolveKey`'s own `ctrlKey && event.key === "c"` arm -- interrupting a
+   *  running turn instead of being swallowed as an unbound continuation. */
   it("a bare Ctrl keydown keeps a pending leader sequence alive, so Ctrl+c is swallowed rather than interrupting", () => {
     const { container } = started({ activeTurnId: "t1", capabilities: { ...initialState().capabilities, interrupt: true } });
     sendTable();
@@ -2714,9 +2784,10 @@ describe("the leader", () => {
     expect(posted.some((m) => m.type === "interrupt")).toBe(false);
   });
 
-  /** A bare Control keydown keeps a pending leader sequence alive, but the following character
-   *  must retain its modifiers. Ctrl+d must not reach `advanceSequence` as plain `d` and complete
-   *  `<leader>bd` (`tab.close`) when the table has no Ctrl+d binding. */
+  /** Ignoring modifiers keeps a bare Control
+   *  keydown from cancelling the pending sequence, but the REAL character keydown that follows it
+   *  (`d`, carrying `ctrlKey: true`) used to reach `advanceSequence` as plain "d", completing
+   *  `<leader>bd` (tab.close) for a Ctrl+d chord no table entry actually names. */
   it("Space b Ctrl+d (the Control keydown included) does not run tab.close", () => {
     const { container } = started();
     sendTable();
@@ -2752,8 +2823,9 @@ describe("the leader", () => {
       posted.length = 0;
       const approve = buttonLabelled(container, "Approve")!;
       approve.focus();
-      // `fireEvent` returns false when the handler calls `preventDefault`. Space on a card's
-      // answer button is claimed and neither activates the button nor starts a leader sequence.
+      // `fireEvent` returns false only when the handler called `preventDefault` (the same convention
+      // the Approve-unreachable regression's own tests use). The button rule: Space on a
+      // card's answer button is claimed and does nothing -- not the button, not the leader.
       expect(fireEvent.keyDown(approve, { key: " " })).toBe(false);
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
       expect(container.querySelector(".which-key-box")).toBeNull();
@@ -2863,8 +2935,8 @@ describe("the leader", () => {
     armThenCancel(() => press("i"));
   });
 
-  /** An envelope opening an overlay that takes the keys cancels a pending sequence.
-   *  A key bubbling from that overlay must not advance stale sequence state. */
+  /** An envelope that opens an overlay taking
+   *  the keys ends a pending sequence, so a key the overlay lets bubble cannot advance a stale one. */
   it.each([
     ["chooser", { kind: "chooser", open: [], records: [] }],
     ["begin_rename", { kind: "begin_rename", tab: 1, current: null }],
@@ -2916,7 +2988,7 @@ describe("the leader", () => {
       ],
     };
     // Fake time, and a pause before each leader: the leader starts a sequence only on a key that
-    // stands alone (the v1-ui GUI pass, `TypingGuard.mayActAfterMotion`), and three sequences fired
+    // stands alone (`TypingGuard.mayActAfterMotion`), and three sequences fired
     // back to back in real time would read as typing.
     vi.useFakeTimers();
     try {
@@ -2976,14 +3048,16 @@ describe("the leader", () => {
   });
 });
 
-/* An arrival lands in BROWSE on a waiting card, so immediate typing arrives as shortcut keys.
-   `a`/`d`/`D` answer only in isolation through `./typingGuard` and only target the cursor's card.
-   Space on a card button does nothing. Vitest's fake clock controls the gap between keydowns,
-   which jsdom stamps with `Date.now()`. */
+/* An
+   arrival lands BROWSE with the cursor on a waiting card, and a Claude Code user types at
+   once, so the first letters of a sentence arrive as BROWSE keys. `a`/`d`/`D` answer only when they
+   stand alone (`./typingGuard`), only the cursor's card, and Space on a card button does
+   nothing. Time is vitest's fake clock: jsdom stamps each keydown with `Date.now()`, so a gap
+   here is exactly the gap between two keys. */
 describe("v1: typing never answers a card", () => {
   const TYPING = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
   const NO_CARD = "no card here — i, o, A or Ctrl+j to type";
-  /** When a card waits on another row, the refusal message tells how to move onto it. */
+  /** The same refusal while the card waits elsewhere points back to it. */
   const ELSEWHERE = "a / d answer the card under the cursor — j / k onto it, then a / d";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
@@ -3037,7 +3111,7 @@ describe("v1: typing never answers a card", () => {
   it("arrive, then a l s o at 80 ms a key: nothing is answered, and the band says how to type", () => {
     const { container } = arrivedOnACard();
     // The band says how a card is answered right when the `l` cancels the `a`; the `o` after it is
-    // then swallowed by #26's guard, whose hint is what the band ends on.
+    // then swallowed by the input-entry guard, whose hint is what the band ends on.
     let afterCancel: string | null = null;
     for (const [n, key] of ["a", "l", "s", "o"].entries()) {
       press(key);
@@ -3061,8 +3135,9 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(NO_CARD);
   });
 
-  /** A refused permission response leaves the card waiting, so the panel must clear its answered id.
-   *  This lets `a`/`d` and the card buttons answer again, including when an allow rule cannot be saved. */
+  /** Rust refused the answer ("Always allow" with its rule unsavable)
+   *  and left the card waiting, but this panel kept the id as answered for good -- `a`/`d` and the
+   *  buttons stayed dead until a reset. A refusal now gives the card back. */
   it("a refused permission_response gives the card back: a and its buttons answer again", () => {
     const { container } = arrivedOnACard();
     press("a");
@@ -3103,9 +3178,12 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "deny" })]);
   });
 
-  /* Alt or Meta with `a` must never authorize a tool call through `resolveKey`.
-     Each modifier gets a fresh card: reusing one would let the second key cancel the first deferred
-     answer through `TypingGuard.onKey`, masking a missing modifier check. */
+  /* Before `KeyLike` gained `altKey`/`metaKey`, an Alt or Meta held
+     alongside `a` reached `resolveKey`'s `case "a":` unchecked -- a common OS chord (Cmd/Ctrl+A
+     "select all" muscle memory) that must never authorize a real tool call. Each modifier gets its
+     own fresh card: two presses in the same test would have the second cancel the first's deferred
+     answer regardless of this fix (`TypingGuard.onKey` cancels on every keydown), which would pass
+     even with the bug still there. */
   it.each([{ altKey: true }, { metaKey: true }])(
     "a modified a is not permission approval: %j (v1 audit P2-A1)",
     (modifier) => {
@@ -3116,9 +3194,13 @@ describe("v1: typing never answers a card", () => {
     },
   );
 
-  /* `altKey`/`metaKey` alone do not cover Super or Hyper; check `getModifierState` too.
-     jsdom honours `modifierSuper`, and `fireEvent.keyDown` forwards it to `KeyboardEvent`.
-     This cannot detect a physical modifier that WebKitGTK never exposes to the DOM. */
+  /* Super is also a modifier that must refuse an answer, and
+     the fix that landed for Alt/Meta only ever checked `event.altKey`/`event.metaKey` -- a real
+     `KeyboardEvent`'s `getModifierState("Super")` (jsdom honours `KeyboardEventInit`'s
+     `modifierSuper`, and `fireEvent.keyDown` forwards it through) is the only signal this layer has
+     for a physical Super/Hyper press; see `keymap.ts`'s own `KeyLike` doc comment for the honest
+     caveat that this may still be a no-op on real WebKitGTK if it never surfaces Super as any DOM
+     modifier at all. */
   it("a modified a is not permission approval: Super", () => {
     arrivedOnACard();
     press("a", { modifierSuper: true });
@@ -3126,7 +3208,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  /* The sandbox pass found the case above passing in jsdom and failing on real
+  /* The case above passes in jsdom but fails on real
      WebKitGTK 2.52.6, which never sets a modifier on `a` while Super is held: only Super's own
      keydown (`key: "Super"`, `code: "OSLeft"`) and keyup arrive. This is that shape. */
   it("a is not permission approval while Super is held, as WebKitGTK reports it (sandbox pass, 2026-09-28)", () => {
@@ -3142,8 +3224,8 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toHaveLength(1);
   });
 
-  /* `shell/src/panel_super.rs` drops `Super+x` before the page, so after a waiting `a`
-     the page sees only Super go down. That keydown must cancel the answer. */
+  /* `shell/src/panel_super.rs` drops `Super+x` before the page, so
+     after a waiting `a` the page sees only Super go down; that must cancel the answer. */
   it("a, then Super within the guard window: nothing is answered (the shell withholds the chord)", () => {
     arrivedOnACard();
     press("a");
@@ -3154,8 +3236,10 @@ describe("v1: typing never answers a card", () => {
     fireEvent.keyUp(document.activeElement ?? document.body, { key: "Super", code: "OSLeft" });
   });
 
-  /* AltGr is a level-3 shift used to type ordinary characters, so it must not approve a card.
-     jsdom honours `KeyboardEventInit.modifierAltGraph` just as it honours `modifierSuper`. */
+  /* AltGr is a level-3 shift some layouts use
+     to type an ordinary character, not one of the four modifiers that refuse an answer
+     (Alt, Meta, Super, Hyper) -- jsdom
+     honours `KeyboardEventInit`'s `modifierAltGraph` the same way it honours `modifierSuper`. */
   it("a modified a is not permission approval: AltGraph (v1 audit fixes, finding 1)", () => {
     arrivedOnACard();
     press("a", { modifierAltGraph: true });
@@ -3163,25 +3247,34 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  /* Document-capture `onModeKey` claims Shift+Tab and stops propagation on the `cycle` route.
-     The bubble-phase handler cannot feed it to `typingGuard.onKey`, so capture must do that itself.
-     Otherwise an earlier deferred card answer remains armed and fires after the mode key. */
+  /* Shift+Tab is claimed by `App.tsx`'s document-capture `onModeKey`
+     ahead of the bubble-phase `onKeyDown` that would otherwise feed it to `typingGuard.onKey` --
+     and `onModeKey` calls `event.stopPropagation()` on the very route (`cycle`) this reproduces, so
+     that bubble handler never runs at all. Until the mode cycle cancelled a waiting answer on that path
+     itself, a card answer deferred moments earlier stayed armed and still fired `TYPING_GUARD_MS`
+     later even though the user had moved on. */
   it("Shift+Tab cancels a card answer deferred moments earlier (v1 audit P2-A2)", () => {
     const { container } = arrivedOnACard();
     press("a");
     wait(100);
     press("Tab", { code: "Tab", shiftKey: true });
     expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
-    // Cancelling a deferred `a`/`d` shows its flash. A bare `typingGuard.cancel()` drops the answer
-    // without telling the user that it was discarded.
+    // The cancelled wait's own flash now shows, the same as any other
+    // key cancelling a deferred `a`/`d` (`onModeKey` used to call a bare `typingGuard.cancel()`,
+    // which drops the pending answer but discards its flash -- nothing told the user their `a` had
+    // been discarded).
     expect(band(container)).toBe(TYPING);
     wait(TYPING_GUARD_MS);
     expect(answered()).toEqual([]);
   });
 
-  /* A bare `typingGuard.cancel()` drops a pending answer without recording Shift+Tab as typing.
-     `typingGuard.onKey("Tab", ...)` also protects the next key: `a` shortly after Shift+Tab must
-     be refused even when no earlier answer was pending. */
+  /* With the old handler, `onModeKey` cancelled a pending
+     answer with a bare `typingGuard.cancel()`, which never records Shift+Tab as a key the guard has
+     seen -- so a `a` pressed shortly AFTER a Shift+Tab (with nothing pending to cancel) skipped the
+     guard's "before" half entirely and answered at once, unlike every other key (see "a key just
+     before a refuses it at once" below, which is the same scenario with `x` in place of Shift+Tab).
+     `typingGuard.onKey("Tab", ...)` closes it: Shift+Tab now counts as typing for the key that comes
+     after it too. */
   it("Shift+Tab counts as typing for the guard's before-half too", () => {
     const { container } = arrivedOnACard();
     press("Tab", { code: "Tab", shiftKey: true });
@@ -3267,8 +3360,8 @@ describe("v1: typing never answers a card", () => {
     expect(document.activeElement?.textContent).toBe("Approve");
   });
 
-  /* Enter on a card's button is claimed, and the panel presses it `TYPING_GUARD_MS` later,
-     like `a`/`d`. These tests read the answer after that wait. */
+  /* Enter on a card's own button is claimed, and the panel presses the button itself
+     TYPING_GUARD_MS later (`a`/`d`'s own wait) -- so these three read the answer after it. */
   it("Enter on a focused Approve after 300 ms idle approves", () => {
     arrivedOnACard();
     press("l");
@@ -3300,8 +3393,10 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(TYPING);
   });
 
-  /* A sentence ending in `l` can focus Approve, so that last walk alone must not allow Enter.
-     Every key in the unbroken run before Enter must be a walk (`./typingGuard`). */
+  /* A sentence ending in `l` walks onto Approve (the card's first control), and the
+     walk exception once let its Enter through. Every key of the unbroken run before Enter must now be
+     a walk (`./typingGuard`), so a sentence ending "…al⏎", once expected to land safely on Deny,
+     is refused instead. */
   it.each([["cancel"], ["al"], ["deal"]])("arrive, then %s and Enter at 80 ms a key: Approve is focused and nothing is answered", (word) => {
     const { container } = arrivedOnACard();
     for (const key of word) {
@@ -3352,14 +3447,14 @@ describe("v1: typing never answers a card", () => {
     press("x");
     const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
     act(() => stop.focus());
-    // A key on its own (the v1-ui GUI pass: Stop no longer acts in the middle of typing, below).
+    // A key on its own: Stop must not act in the middle of typing.
     wait(300);
     expect(fireEvent.keyDown(stop, { key: "Enter" })).toBe(true);
     wait(300);
     expect(fireEvent.keyDown(stop, { key: " " })).toBe(true);
   });
 
-  /* The v1-ui GUI pass (2026-09-27): `j` from the last row lands on Stop, so "just do it" typed after
+  /* `j` from the last row lands on Stop, so "just do it" typed after
      an arrival interrupted the turn with its first Space (the card was denied with it), and "jl⏎"
      the same with its Enter. Stop now acts only on a key that stands alone or ends a quick motion. */
   it.each([[" "], ["Enter"]])("t then %j on Stop at 80 ms interrupts nothing, and says so", (key) => {
@@ -3443,7 +3538,7 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(TYPING);
   });
 
-  /* A pending prefix still consumes an answer key after a pause past every timer. */
+  /* A prefix, a pause past every timer, then an answer key. */
   it.each([["g", "d"], ["g", "a"], ["]", "d"], ["[", "d"], ["z", "d"], ["g", "D"]])("K01: %s, a pause, then %s answers nothing", (first, second) => {
     const { container } = arrivedOnACard();
     wait(1000);
@@ -3484,9 +3579,10 @@ describe("v1: typing never answers a card", () => {
     wait(1000); press("g"); wait(1000); press("d", { isComposing: true }); press("d", { keyCode: 229 }); wait(1000);
     expect(answered()).toEqual([]);
   });
-  /* `za` completes the `z` prefix by toggling a fold, so its `a` never answers a card, even after a pause.
-     It consumes the prefix; a later lone `a` still answers after 250 ms.
-     The cursor is on the card itself here, which has no fold. */
+  /* `za` is a pair `z` completes now (toggle a fold, as Enter does), so the `a` after
+     a `z` is never the card's answer -- typed at once or after a pause -- and it spends the prefix: a
+     lone `a` afterwards still answers, 250 ms later. The cursor's row here is the card itself, which
+     folds nothing. */
   it.each([[80], [5000]])("z, %i ms, then a toggles a fold and answers nothing; a lone a after it still answers", (gap) => {
     const { container } = arrivedOnACard();
     wait(1000); press("z"); wait(gap); press("a"); wait(5000);
@@ -3495,8 +3591,8 @@ describe("v1: typing never answers a card", () => {
     press("a"); wait(1000);
     expect(answered()).toHaveLength(1);
   });
-  /* After `za` completes, held-key repeats of `a` reach the card-answer handler.
-     Repeated keydowns must never answer a card. */
+  /* `za` completes, so the `a` a held key repeats afterwards
+     arrives as the card-answer key -- and a held key's repeat never answers. */
   it("z then a held a toggles a fold once and never answers", () => {
     arrivedOnACard();
     wait(1000); press("z"); wait(1000); press("a");
@@ -3513,8 +3609,9 @@ describe("v1: typing never answers a card", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
     expect(container.querySelector(".permission-card")).not.toBeNull();
   });
-  /* Ctrl+f, PageDown, PageUp, and arrow keys only scroll or move the cursor, even on a waiting card.
-     They leave it waiting and cancel a previously deferred answer like any other key. */
+  /* A page (Ctrl+f, PageDown, PageUp) and the arrow keys only scroll or move the
+     cursor -- pressed on a waiting card, at once or after a pause, they answer nothing and leave it
+     waiting; and, as keys, they cancel an answer deferred just before them like any other key. */
   const PAGE_AND_ARROW_KEYS: Array<[string, string, Record<string, unknown>]> = [
     ["Ctrl+f", "f", { ctrlKey: true }],
     ["PageDown", "PageDown", {}],
@@ -3536,16 +3633,17 @@ describe("v1: typing never answers a card", () => {
     wait(5000);
     expect(answered()).toEqual([]);
   });
-  /* An arrow key just before `a` makes it part of a typing run, so it answers nothing.
-     Only a lone `a` answers. */
+  /* The other order: a key just BEFORE `a` -- an arrow the reader used to look around -- makes the `a`
+     one of a run, so it answers nothing either (no key may come just before it). Only a lone `a` answers. */
   it.each(PAGE_AND_ARROW_KEYS)("%s, then a within the guard window answers nothing", (_name, k, init) => {
     arrivedOnACard();
     wait(1000); press(k, init); wait(80); press("a"); wait(5000);
     expect(answered()).toEqual([]);
   });
-  /* Enter requires the immediately preceding key to land focus on its button.
-     A page key leaves focus on Approve here because the list has no layout, while an arrow
-     moves focus off it. Either key breaks the landing, so Enter presses nothing after any wait. */
+  /* And Enter on a button `l` put focus on (the button-landing guard): the landing has to be the key right before the
+     Enter. A page leaves focus on Approve while the card's row stays in view (this list has no layout,
+     so nothing scrolls it away), and an arrow moves it off; either is a key in between, so the Enter
+     presses nothing however long it waits. */
   it.each(PAGE_AND_ARROW_KEYS)("l onto Approve, then %s, then Enter answers nothing", (_name, k, init) => {
     arrivedOnACard();
     press("l"); wait(400);
@@ -3554,9 +3652,10 @@ describe("v1: typing never answers a card", () => {
     pressOnButton("Enter"); wait(5000);
     expect(answered()).toEqual([]);
   });
-  /* While a prefix waits, Enter/Space on any focused control is swallowed, including Stop.
-     Stop would interrupt the turn and deny its waiting card. A count before Enter/Space on a card
-     button also cancels and shows why. */
+  /* The rest of the pending-prefix Enter/Space rule. While a prefix waits, Enter/Space
+     on ANY focused control is swallowed -- Stop included, whose press interrupts the turn and
+     denies the waiting card with it; a count before Enter/Space on a card's own button cancels, and
+     says why. */
   it.each([["Enter"], [" "]])("K01: g, a pause, then %j on Stop interrupts nothing", (key) => {
     arrivedOnACard();
     const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
@@ -3577,8 +3676,8 @@ describe("v1: typing never answers a card", () => {
     wait(1000);
     expect(answered()).toEqual([]);
   });
-  /* A prefix's second key cannot start a leader sequence: `g`, a pause, then Space cancels `g`.
-     The following `m` is plain `m`, never `<leader>m`. */
+  /* A prefix's second key never starts a leader sequence, so `g`, a
+     pause, Space is a cancelled `g`, and the `m` after it is a plain `m` -- never `<leader>m`. */
   it("K01: g, a pause, then Space starts no leader sequence: g Space m never reaches <leader>m", () => {
     const { container } = arrivedOnACard();
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
@@ -3589,8 +3688,9 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  /* `Ctrl+w` is a reserved prefix: its next key completes h/j/k/l or is swallowed, even after a pause.
-     Neither a continuation nor the resulting focus move answers a card. */
+  /* `Ctrl+w` is a reserved prefix, so the pending-prefix rule holds for it as for `g`: the
+     key after it completes h/j/k/l or is swallowed -- never the card's answer, at once or after a
+     pause. Its own pairs move focus to another module and answer nothing either. */
   it.each([["a", {}], ["d", {}], ["D", { shiftKey: true }]])("Ctrl+w, a pause, then %s answers nothing", (second, init) => {
     const { container } = arrivedOnACard();
     wait(1000);
@@ -3621,9 +3721,9 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(posted.filter((m) => m.type === "pane_nav")).toEqual([]);
   });
-  /* A pane move on a waiting card posts only `pane_nav`. Its keys count toward the typing
-     guard, so an `a` immediately before or after the move answers nothing.
-     A lone `a` after a pause still answers. */
+  /* The pairs themselves: a pane move on a waiting card posts `pane_nav` and nothing else, and (as
+     keys) they are neighbours to the guard like any other -- an `a` right before or after one is one of
+     a run and answers nothing, while a lone `a` after a pause still does. */
   it("Ctrl+w l on a waiting card moves the keys away and answers nothing", () => {
     const { container } = arrivedOnACard();
     wait(1000); press("w", { ctrlKey: true }); press("l"); wait(5000);
@@ -3645,8 +3745,8 @@ describe("v1: typing never answers a card", () => {
     wait(1000); press("w", { ctrlKey: true }); press("j"); wait(80); press("a"); wait(5000);
     expect(answered()).toEqual([]);
   });
-  /* The key immediately before Enter must land focus on the button. After `l` onto Approve,
-     a complete Ctrl+w pair or a still-pending Ctrl+w makes Enter press nothing after any wait. */
+  /* `l` onto Approve, then a whole Ctrl+w pair, then
+     Enter presses nothing, however long it waits -- and so does a Ctrl+w left waiting before the Enter. */
   it.each([["j"], ["h"]])("l onto Approve, then Ctrl+w %s, then Enter answers nothing", (second) => {
     arrivedOnACard();
     press("l"); wait(400);
@@ -3664,11 +3764,12 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  /* Enter on a card's button is claimed and defers the press by `TYPING_GUARD_MS`.
-     It requires the typing guard's preceding pause, no held modifier, and focus placed on that
-     button by the immediately preceding key (`h`/`l` or Tab), or by a HINT with no key since.
-     `pressOnButton` models browser activation. If it returns false, any later answer comes
-     from the panel's deferred press. */
+  /* A card's own button
+     decides only the way `a`/`d` do. Enter there is claimed, and the panel presses the button itself
+     `TYPING_GUARD_MS` later, only when no modifier is held and focus was put on that very button by
+     the key right before Enter (`h`/`l` moving it, a Tab; no other key may come just before it) or by
+     a HINT landing with no key since. `pressOnButton` models the browser's own activation, so an
+     answer read after it returned false is the panel's own deferred press. */
   const ENTER_LANDING = "Enter answers a card right after l, h or Tab onto its button";
   it("K02: l, s, Enter at 400 ms a key approves nothing (the walk did not land the Enter)", () => {
     const { container } = arrivedOnACard();
@@ -3803,10 +3904,13 @@ describe("v1: typing never answers a card", () => {
     wait(1000);
     expect(answered()).toEqual([]);
   });
-  /* A tab switch and snapshot in one React commit can reuse the connected, enabled card button
-     at the same `p-<seq>` key, so `isConnected` alone cannot stop a deferred press.
-     Switching cancels the typing guard, checks the tab at fire time, and focuses the root.
-     `activeTabRef` changes in the same `tabs` branch that cancels the wait. */
+  /* The switch above is caught by the button leaving the page. Here the new
+     tab's card sits at the same `p-<seq>` key and the switch and its snapshot land in one commit, as
+     one batch from Rust can, so React keeps the very button element -- connected and enabled, now
+     drawing the NEW tab's card -- and `isConnected` cannot stop the press. Three guards do: the
+     switch's own `typingGuard.cancel()`, the fire-time tab check behind it, and the switch landing the
+     keys on the root (focus leaves the button). The tab check is never the only one: `activeTabRef`
+     changes only in the `tabs` arm, which cancels the wait in the same branch. */
   it("K02: l, Enter on Approve, then a switch to a tab whose card keeps the very same button: nothing is pressed", () => {
     const { container } = arrivedOnACard();
     press("l"); wait(300);
@@ -3883,8 +3987,10 @@ describe("v1: typing never answers a card", () => {
     expect(line()).toBeNull();
   });
 
-  /* A deferred press rechecks focus when it fires; a click away from Approve cancels its effect.
-     A Tab landing is consumed by the first focus after Tab, so a later non-keyboard focus is no landing. */
+  /* Two guards no test above reached. The press is checked again when it
+     fires, so focus moved off Approve by no key (a click elsewhere) within the wait presses nothing;
+     and a Tab's landing is used up by the first focus after it, so a second focus no key made is no
+     landing. */
   it("K02: l, Enter, then focus moved off Approve by no key before 250 ms: nothing is pressed", () => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
@@ -3912,9 +4018,11 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(ENTER_LANDING);
   });
 
-  /* The chooser and /model picker return from `onKeyDown` before the card-button rules.
-     Both are modal, so they must claim Enter and Space on card buttons still focused underneath.
-     Those keys must not trigger native activation through the overlay. */
+  /* The chooser and the /model picker return from
+     `onKeyDown` ahead of the card-button rules, so Enter or Space on a card button that still had
+     focus under either -- a mouse pressed on Approve and dragged off it, so no click -- was the
+     browser's own activation. Both overlays are modal: those keys on a card's own buttons are
+     claimed there too now, and do nothing. */
   const MODEL_REPLY =
     "Current model: `Haiku 4.5` (effort: high)\nUsage: /model <name>. Available: sonnet, opus, haiku, or a full model ID.";
   /** A live tab where a bare `/model` was sent and its reply opened the picker, with a card waiting. */
@@ -3957,8 +4065,9 @@ describe("v1: typing never answers a card", () => {
     expect(container.querySelector(selector)).not.toBeNull();
   });
 
-  /* The `/` prompt and `:` line share one command line: opening either closes the other.
-     A keyboard arrival through `takeKeys` focuses the line on screen. */
+  /* The `/` prompt and the `:` line are one command line, as vim's are --
+     opening either closes the other, so no second box is ever drawn without the keys, and a keyboard
+     arrival (`takeKeys`) hands the keys to the one on screen. */
   it.each([
     ["/", ":", "Command line"],
     [":", "/", "Search the conversation"],
@@ -3993,9 +4102,11 @@ describe("v1: typing never answers a card", () => {
     expect(lines[0].querySelector("input")!.getAttribute("aria-label")).toBe("Search the conversation");
   });
 
-  /* Opening the chooser or tab rename closes an open `:` or `/` line as the overlay takes focus.
-     Otherwise Escape leaves the line visible while keys act on the conversation, allowing `l` and
-     Enter typed as a command to focus and press Approve. */
+  /* `:` (or `/`), then `prefix w` and Esc out of the chooser --
+     or `prefix ,` and Esc out of a tab rename -- left the line drawn while that overlay's own exit
+     gave the keys to the conversation under it, so going on with "the command", `l` then Enter,
+     walked onto Approve and pressed it. Either overlay closes an open line as it takes the keys now,
+     as a pane switch, a HINT and a tab switch already did: nothing is drawn that the keys are not in. */
   it.each([
     [":", "the chooser", () => dispatch({ kind: "chooser", open: [], records: [] }), ".chooser"],
     ["/", "the chooser", () => dispatch({ kind: "chooser", open: [], records: [] }), ".chooser"],
@@ -4017,9 +4128,12 @@ describe("v1: typing never answers a card", () => {
     expect(container.querySelector(".search-bar")).toBeNull();
   });
 
-  /* The `/` and `:` lines claim Tab so focus cannot leave a visible line for the conversation.
-     Reopening an already visible line also returns focus to it after a click moved focus away.
-     Otherwise command text could reach BROWSE shortcuts and answer a card. */
+  /* Tab in the `/` or `:` line was the browser's own focus move, onto the
+     band's `.band-open` right after it, so the line stayed drawn while BROWSE had the keys: `:`, Tab,
+     `l`, Enter walked onto Approve and pressed it, and a lone `a` answered. A line claims every Tab
+     now, as vim's command line never leaves on one. And `:` or `/` again on a line already open (the
+     keys moved off it by a click) only wiped it, so `l`, Enter went on to the card: it hands that
+     line the keys back now. */
   /** Tab as a browser does it: the keydown, then -- only if its default survived -- focus onto the
    *  next focusable element in document order (jsdom does neither itself). Returns whether it did. */
   const tabOut = () => {
@@ -4159,9 +4273,10 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(ENTER_LANDING);
   });
 
-  /* A Tab swallowed by a pending prefix or an unbound leader continuation cannot move focus.
-     Judge Tab's default after all handlers run so it cannot arm a landing for a later mouse focus
-     on Approve and allow an unrelated Enter to press it. */
+  /* Judge Tab's default only after all handlers run. A pending `g`/`z`/`[`/`]` prefix
+     or an unbound leader continuation can swallow Tab without moving focus.
+     Arming a landing before that cancellation could treat later mouse focus as Tab's landing
+     and let Enter press Approve. */
   it.each([["g"], ["z"], ["["], ["]"]])(
     "K02: %s, then Tab (a cancelled pair: no focus move), then Approve focused by no key: Enter presses nothing",
     (prefix) => {
@@ -4201,9 +4316,11 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(ENTER_LANDING);
   });
 
-  /* A card button may answer only the cursor's card or the card gating its current tool call.
-     Tab and `l`/`h` can move button focus to another card while the row cursor stays put.
-     Check `permissionTarget` so Enter cannot answer a card that `a`/`d` would not target. */
+  /* A card's button decides only the card `a`/`d` would from the cursor --
+     the cursor's own, or the one gating the tool call it is on (`permissionTarget`). A Tab walks
+     on from one card's buttons into the next card's, and `l`/`h` then walk that card's (`currentStop`
+     follows focus), while the row cursor stays where it was: Enter there answered a card the cursor
+     was not on, one `a` in the same state would not have answered. */
   const ENTER_ELSEWHERE = "Enter answers the card under the cursor — j / k onto it first";
   /** Two cards waiting: `perm-1` (`rm build`, gating `toolu_1`) and, below it, `perm-2`
    *  (`rm -rf important`, gating `toolu_2`), the keys arrived on the oldest. Rows: the prompt 0,
@@ -4297,10 +4414,11 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
   });
 
-  /* `]p` / `[p` move the cursor to the next / previous waiting card in this tab, wrapping at the ends.
-     They post no `permission_response` and press no button. The typing guard still applies:
-     a lone `a` after 250 ms answers the destination card; `a` immediately after the jump does not.
-     Rows in `arrivedOnTheFirstOfTwoCards`: prompt 0, toolu_1 1, perm-1 2, toolu_2 3, perm-2 4. */
+  /* `]p` / `[p` move the CURSOR to the next / previous card that waits for
+     an answer in this tab, wrapping as nvim's `]d` does. They answer nothing, ever: no `permission_response`
+     is posted, no button is pressed, and the typing guard is untouched -- a lone `a`, 250 ms later, answers the
+     card the cursor landed on (`permissionTarget`), and `a` typed hard on the heels of the jump answers
+     nothing. Rows in `arrivedOnTheFirstOfTwoCards`: prompt 0, toolu_1 1, perm-1 2, toolu_2 3, perm-2 4. */
   describe("]p / [p: the cursor to the next / previous waiting card", () => {
     const NO_WAITING = "no card waiting here";
     const COUNT_ANSWER = "a / d / D take no count — press it on its own";
@@ -4434,8 +4552,8 @@ describe("v1: typing never answers a card", () => {
       expect(cardAt(container, [first, second])).toBe(1);
     });
 
-    /* The jump counts as a key, so an `a` immediately after it in `]pa` is refused
-       with the typing flash, whichever card the cursor has reached. */
+    /* The typing guard still applies: the jump is a key like any other, so an `a` right behind it -- `]pa`, typed as prose
+       or a slip -- is refused with the typing flash, whichever card the cursor is on now. */
     it("an a typed hard on the heels of the jump answers nothing and says why", () => {
       const { container } = arrivedOnTheFirstOfTwoCards();
       top();
@@ -4462,9 +4580,9 @@ describe("v1: typing never answers a card", () => {
       expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
     });
 
-    /* Enter on a card's button needs the immediately preceding key to land focus on that button.
-       A jump returns focus to the row, so Enter only folds or unfolds the card.
-       It does not press the button that held focus before the jump. */
+    /* Enter on a card's button needs a landing on that very button by the key right before it: the jump
+       is neither, so an Enter after it -- on the row now, as the keys came back -- only folds or unfolds the
+       card, and the button that had the keys before it is not pressed. */
     it("Enter right after a jump answers nothing: the keys are the row's, and the button they left is not pressed", () => {
       const { container, first, second } = arrivedOnTheFirstOfTwoCards();
       press("l");
@@ -4680,7 +4798,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     return rendered;
   }
 
-  // `a`/`d` answer after the typing guard's wait, only when no other key is near them.
+  // `a`/`d` answer after the typing guard's wait, and only when nothing came near them.
   it("a on the tool call answers the card that gates it, without moving onto the card", () => {
     vi.useFakeTimers();
     try {
@@ -4856,7 +4974,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
       withACardAndStop();
       press("j");
       press("j");
-      // Wait long enough that the typing guard does not cause the refusal.
+      // Long enough that the typing guard is not what refuses it.
       act(() => vi.advanceTimersByTime(300));
       press("a");
       act(() => vi.advanceTimersByTime(1000));
@@ -4878,9 +4996,9 @@ describe("App keyboard: every control is reachable with hjkl", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
-  // "walks the start screen's buttons with j and k" was removed here: the
+  // The start screen's boxed mode buttons no longer provide a `j`/`k` route: the
   // two boxed Auto/Bypass mode buttons this test walked are gone with the mode-selector start
-  // screen, and the empty tab (F3) that replaced it owns its own `j`/`k` handling entirely --
+  // screen, and the empty tab (the dashboard) that replaced it owns its own `j`/`k` handling entirely --
   // separate from this describe block's `root`/`press`, which only reach the CONVERSATION's
   // `onKeyDown` once a session is live. The empty tab's own resume-row walking is unit-tested
   // directly in `components/EmptyTab.test.tsx`.
@@ -4946,16 +5064,20 @@ describe("App global HINT: the panel's half", () => {
   function show(sessionId: number, count: number) {
     dispatch({ kind: "hint_show", sessionId, labels: LETTERS.slice(0, count) });
   }
-  /** Indices sent by `shell` follow document order: each row, its code blocks, then its
-   *  controls. Card controls follow `data-nav-order` (Approve, Deny, reason), followed by
-   *  the activity line's Stop. The band has no `data-nav-stop` attribute, so it appears in
-   *  neither `j`/`k` stops nor `hintTargets`, which both use `stopsIn`.
-   *  Its details remain reachable through `<leader>i`, `prefix i` or a click. */
+  /** Where each target of `conversation()` sits in the frozen list, i.e. the index `shell` sends:
+   *  rows in document order, each followed by its code blocks and then its controls, the card's in
+   *  `data-nav-order` (Approve, Deny, reason), then the activity line's Stop. The band
+   *  used to be one more target past `stop` (its `.band-open`, `data-nav-stop=
+   *  "status-band"`'s own only child that matched `controlsOf`'s selector) -- dropping that attribute
+   *  so the band stops being a `j`/`k` stop also drops it out of `hintTargets` (`nav.ts` builds both
+   *  lists from the same `stopsIn`), so HINT no longer reaches it either; its details are still
+   *  reachable on `<leader>i`, `prefix i` and a click, none of which go through this list. */
   const AT = { prompt: 0, reply: 1, code: 2, tool: 3, card: 4, approve: 5, deny: 6, reason: 7, stop: 8 };
 
   it("f in BROWSE asks shell for a HINT TYPING_GUARD_MS later, and f in INPUT is just a letter", () => {
-    // `f` can start typed text, so it waits `TYPING_GUARD_MS`, like `a`/`d`, before asking
-    // `shell` for a HINT. A lone `f` still asks after that wait.
+    // `f` is always the first key of whatever typed it, so it defers the same
+    // `TYPING_GUARD_MS` `a`/`d` do rather than asking `shell` at once -- a lone `f` still asks, just
+    // that much later.
     vi.useFakeTimers();
     try {
       const { container } = conversation();
@@ -4976,10 +5098,11 @@ describe("App global HINT: the panel's half", () => {
     }
   });
 
-  /** Typing "fix this" in BROWSE must not start a HINT on its first `f`.
-   *  The `i` within `TYPING_GUARD_MS` cancels the deferred `f` before it posts.
-   *  The band names `f` in the cancellation message rather than showing `a`/`d` text
-   *  when there is no card. */
+  /** "fix the dashboard layout⏎" typed at typing speed used to
+   *  start a HINT on its own `f` (`mayActAfterMotion` cannot catch this: `f` is always the first
+   *  key). Here the `i` that follows within `TYPING_GUARD_MS` cancels the deferred `f` before it
+   *  ever posts, and the band says so in `f`'s own words, not the `a`/`d` text it used to show with
+   *  no card anywhere. */
   it('"fix this" at 80 ms a key asks shell for no HINT, and the band names f, not a / d', () => {
     vi.useFakeTimers();
     const widen = stubBandWidth();
@@ -4987,7 +5110,7 @@ describe("App global HINT: the panel's half", () => {
       const { container } = conversation();
       act(() => widen(container));
       // Right when the `i` cancels the `f` the band names `f`; the second `i` is then swallowed by
-      // #26's guard, whose hint is what the band ends on.
+      // the input-entry guard, whose hint is what the band ends on.
       let afterCancel: string | undefined;
       for (const [n, key] of ["f", "i", "x", " ", "t", "h", "i", "s"].entries()) {
         press(key);
@@ -5025,8 +5148,9 @@ describe("App global HINT: the panel's half", () => {
     }
   });
 
-  /* After `f` posts `hint_request`, shell attaches its window key controller asynchronously.
-     Panel shortcuts must stop immediately so label keys in that gap cannot act on the conversation. */
+  /* Between `f` posting `hint_request` and shell attaching its window key
+     controller (which happens only once it handles that script message), keys still reached this
+     panel's own table. */
   describe("between f and shell's HINT taking the keys, no key acts in the panel", () => {
     /** The conversation, with the row cursor on the pending permission card. */
     function onTheCard() {
@@ -5051,8 +5175,8 @@ describe("App global HINT: the panel's half", () => {
       vi.useFakeTimers();
       try {
         const { container } = onTheCard();
-        // Let the first, lone `f` run after `TYPING_GUARD_MS` before testing the gap while
-        // the HINT request waits for a reply.
+        // The first `f` stands alone and is left to run after its typing guard
+        // (`TYPING_GUARD_MS`) before the round-trip gap this test is about begins.
         press("f");
         act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
         press("i");
@@ -5073,7 +5197,7 @@ describe("App global HINT: the panel's half", () => {
         press("f");
         collect(2);
         dispatch({ kind: "hint_end", sessionId: 2 });
-        // The `f` above counts as a key, so pause before pressing a lone `a`.
+        // The `f` was a key: a lone `a` waits for nothing near it (after the typing guard).
         act(() => vi.advanceTimersByTime(300));
         press("a");
         act(() => vi.advanceTimersByTime(250));
@@ -5089,8 +5213,8 @@ describe("App global HINT: the panel's half", () => {
       try {
         const { container } = onTheCard();
         press("f");
-        // Let the lone `f` run after `TYPING_GUARD_MS` before counting the interval
-        // when keys are blocked while waiting for a HINT reply.
+        // The lone `f` runs after its typing guard before the dead-key window
+        // this test is actually about starts counting.
         act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
         act(() => vi.advanceTimersByTime(HINT_PENDING_TIMEOUT_MS - 1));
         press("i");
@@ -5122,7 +5246,7 @@ describe("App global HINT: the panel's half", () => {
 
   it("labels the composer and landing there enters INPUT with the caret in the box", () => {
     const { container } = idle();
-    // The prompt row, then the composer (C1c: the band is no longer a target -- see AT's own doc
+    // The prompt row, then the composer (the navigation rule: the band is no longer a target -- see AT's own doc
     // comment).
     expect(collect(1)).toBe(2);
     show(1, 2);
@@ -5134,9 +5258,11 @@ describe("App global HINT: the panel's half", () => {
     expect(lastOfType("send_message")).toBeUndefined();
   });
 
-  // `landOnHint`'s composer branch keeps the caret, like `i`/`o`. An earlier `A` sets `composerCaret`
-  // to the end through `composerFocusRequest`, so that state must not leak into a HINT landing
-  // through `inputRequest`.
+  // `landOnHint`'s "composer" branch carries the same caret rule
+  // `i`/`o` do -- "kept" -- rather than whatever `composerCaret` was last left at by an earlier `A`
+  // press (that press bumps `composerFocusRequest` directly, never `inputRequest`, so nothing about
+  // it should leak into a later HINT landing). Reproduced without this fix: the caret below landed
+  // at the end of the draft, not at 3.
   it("landing on the composer via HINT keeps the caret where it was, not wherever an earlier A left composerCaret", () => {
     const { container } = idle();
     fireEvent.keyDown(root(container), { key: "A", shiftKey: true }); // composerCaret -> "end", once.
@@ -5154,8 +5280,11 @@ describe("App global HINT: the panel's half", () => {
     expect(box2.selectionEnd).toBe(3);
   });
 
-  /** A HINT closes an open `/model` picker and clears a pending one, just as `prefix w` does.
-   *  A reply during HINT must not open `SlashPicker` under the labels or take focus from its landing. */
+  /** A bare `/model`'s reply that arrived while a HINT was up opened
+   *  `SlashPicker` under the labels -- `hint_collect` closed the chooser and `?` but left the pending
+   *  picker armed, and `slashReply`'s overlay check did not count a HINT. Landing on the composer then
+   *  left the keys on the picker, while GTK went on taking the label keys. A HINT is a route away from
+   *  the picker the way `prefix w` is (as another focus route): it closes an open one and drops a pending one. */
   describe("and the /model picker", () => {
     const MODEL_REPLY =
       "Current model: `Haiku 4.5` (effort: high)\n" +
@@ -5210,7 +5339,7 @@ describe("App global HINT: the panel's half", () => {
   });
 
   it("offers no composer label only once the session has ended (C1: a running turn no longer disables it)", () => {
-    // A running turn no longer disables the composer (C1: it queues a follow-up instead), so it is
+    // A running turn no longer disables the composer (the composer stays live: it queues a follow-up instead), so it is
     // a HINT target through the turn too -- one more than `AT`'s own count.
     const running = conversation();
     box(running.container.querySelector(".composer")!, 900);
@@ -5270,7 +5399,7 @@ describe("App global HINT: the panel's half", () => {
   it("hint_collect reports how many targets are on screen, and leaves off-screen ones out", () => {
     const { container } = conversation();
     // 4 rows (prompt, reply, tool call, card) + the reply's code block + Approve + Deny + the
-    // reason box + Stop (C1c: the band no longer counts -- see AT's own doc comment).
+    // reason box + Stop (the navigation rule: the band no longer counts -- see AT's own doc comment).
     const count = collect(1);
     expect(count).toBe(Object.keys(AT).length);
     // Push the card row (and everything in it) below the list's viewport: it is no longer counted.
@@ -5332,8 +5461,8 @@ describe("App global HINT: the panel's half", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
-  /* Enter immediately after a HINT landing on a button presses it `TYPING_GUARD_MS` later,
-     just like `l` then Enter. Any intervening key invalidates the landing. */
+  /* A HINT landing is a landing -- the Enter right after it presses the button,
+     `TYPING_GUARD_MS` later, as `l` then Enter does. A key in between makes it none. */
   it("K02: a HINT landing on Approve, then Enter, approves after S1's wait", () => {
     vi.useFakeTimers();
     try {
@@ -5385,9 +5514,9 @@ describe("App global HINT: the panel's half", () => {
     expect(document.activeElement!.closest(".row-permission")).not.toBeNull();
   });
 
-  /* A reply's web links are HINT targets after its code blocks and before its controls.
-     Landing focuses the anchor and makes its row current in BROWSE without clicking it.
-     Enter keeps native activation through `LinkClicked`; the panel does not claim the key. */
+  /* A web link in a reply is a HINT target, after its row's code blocks and before
+     its controls. Landing FOCUSES the anchor (never clicks it) with the reply's row current in BROWSE, and
+     Enter on it is the browser's own activation -- the native `LinkClicked` path -- not a key this panel claims. */
   describe("web links", () => {
     const REPLY = "then look at https://example.com/a.";
     /** `conversation()` with the link in the reply, its anchor on screen. Returns the anchor and where it sits in the list. */
@@ -5480,8 +5609,8 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("labels a wrapped link on a line that is on screen: the first line scrolled above the list is not where it goes", () => {
-      // `hintVisible` uses the link's whole box, so a wrapped link remains a target when only its last
-      // line is visible. Its label must sit on that visible line.
+      // `hintVisible` takes the link's whole box, so a link whose first line has left
+      // the list but whose last line is in it is a target -- its label must sit on the visible line.
       const { container, anchor, at } = withLink();
       const first = { top: -30, left: 40, bottom: -10, right: 300, width: 260, height: 20, x: 40, y: -30 } as DOMRect;
       const second = { top: 0, left: 0, bottom: 20, right: 90, width: 90, height: 20, x: 0, y: 0 } as DOMRect;
@@ -5494,8 +5623,8 @@ describe("App global HINT: the panel's half", () => {
       const origin = root(container).getBoundingClientRect();
       const label = labels(container)[at];
       expect(label.classList.contains("hint-link")).toBe(true);
-      // The chosen line's label is clamped into the list at x 0, y 0, rather than hanging 6px outside.
-      // The first line's label would be at x 34.
+      // The chosen line's label is clamped into the list (x 0, y 0 here), so it no
+      // longer hangs 6px outside it; the first line's would be at x 34.
       expect(label.style.top).toBe(`${Math.max(second.top - 6, 0) - origin.top}px`);
       expect(label.style.left).toBe(`${Math.max(second.left - 6, 0) - origin.left}px`);
     });
@@ -5522,7 +5651,7 @@ describe("App global HINT: the panel's half", () => {
     press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith("ls -la");
     // Only the next y: the one after copies the whole message again (a pause later: any key within
-    // `TYPING_GUARD_MS` of a `y` is typing, #26).
+    // `TYPING_GUARD_MS` of a `y` is typing).
     keyGap();
     press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
@@ -5624,10 +5753,14 @@ describe("App global HINT: the panel's half", () => {
     );
   });
 
-  /** The dashboard items are not `nav.ts` stops: `controlsOf` has no `[role="button"]`
-   *  branch, so a `dash` stop with no other control drops out of `stopsIn`.
-   *  The composer is a HINT target via `hintTarget`, but jsdom gives it zero size unless
-   *  `layOut` boxes it. The layout helper omits `textarea`, so `f` has no target in this harness. */
+  /** The empty tab's dashboard replaced the eight resume rows this test used to label. The
+   *  dashboard's own items replace them, and they are deliberately not `nav.ts` stops (`Dashboard`'s
+   *  own doc comment: `controlsOf`'s selector has no `[role="button"]` branch, so a `dash` stop
+   *  with no other control inside it drops out of `stopsIn`). The empty tab's composer is marked a
+   *  HINT target too (`Composer`'s `hintTarget` prop), but jsdom reports it as zero-size unless
+   *  `layOut` boxes it, and `layOut`'s own selector list (this describe block's own, above) has no
+   *  `textarea` in it -- so this screen now offers `f` no target at all in this harness, which is
+   *  the real, if narrow, thing left to pin down here. */
   it("offers no HINT targets on the empty tab's dashboard, where there is no conversation yet", () => {
     const { container } = render(<App />);
     dispatch({
@@ -5647,10 +5780,11 @@ describe("App global HINT: the panel's half", () => {
     expect(labels(container)).toHaveLength(0);
   });
 
-  /* Labels stay on the visible part of each target, with their top clamped to the clipping
-     box, even if a code block's top is scrolled out or only a sliver is visible.
-     A code-block landing outlines the block and leaves the row sign hollow until the next key.
-     `layOut` gives both the list and root the range 0..1000, so a label's `top` is its y in the list. */
+  /* (a) a label is placed on the VISIBLE part of its target, its top clamped into the
+     clipping box, so a code block whose top is scrolled out (or a sliver at either edge) keeps its label
+     on screen; (b) a landing on a code block is drawn -- the block outlined, the row's sign hollow --
+     until the next key, as the one-solid-mark rule draws a control inside the current row. The list
+     is 0..1000 here (`layOut`), the root too, so a label's `top` is also its y in the list. */
   describe("K07: code block labels and landings", () => {
     const codeLabel = (c: HTMLElement) => c.querySelector<HTMLElement>(".hint-label.hint-code")!;
     const topOf = (el: HTMLElement) => parseFloat(el.style.top);
@@ -5691,9 +5825,10 @@ describe("App global HINT: the panel's half", () => {
       expect(rowLabels.length).toBeGreaterThan(0);
       for (const label of rowLabels) expect(topOf(label)).toBeGreaterThanOrEqual(0);
     });
-    /* A prose row's sign cell has no width. Using the row's box as the label's size made
-       `prefix f` cover the visible row with an opaque label. A scrolled-away sign cell had
-       the same problem. Use a normal small label at the row's visible top-left instead. */
+    /* `prefix f` drew an opaque label the size
+       of the row's whole visible part over every assistant-prose row -- a prose row's sign cell has no width,
+       so `place()` fell back to the row's own box for the label's size and position -- and over any row whose
+       sign cell had scrolled away. Such a row's label is a normal small one at the row's visible top-left. */
     const rowLabel = (c: HTMLElement, at: number) => {
       const label = labels(c)[at];
       expect(label.classList.contains("hint-row")).toBe(true);
@@ -5748,9 +5883,10 @@ describe("App global HINT: the panel's half", () => {
       expect(label.style.width).toBe("100px");
       expect(label.style.height).toBe("18px");
     });
-    /* jsdom lays nothing out, so stub a `.hint-label`'s `offsetWidth`/`offsetHeight`
-       without setting an inline size. A prose-only conversation has only row labels, so their measured
-       size must supply the fallback label's size. */
+    /* jsdom lays nothing out, so a label's measured
+       size is stubbed the way a browser would report it: `offsetWidth`/`offsetHeight` of a `.hint-label` whose
+       box no inline size has set. A conversation of prose only has no code block, link or card, so the only
+       labels drawn are rows' -- which is where a fallback label's size has to come from. */
     function proseOnly() {
       const rendered = started();
       events(
@@ -6035,10 +6171,11 @@ describe("App global HINT: the panel's half", () => {
   });
 });
 
-/* `j`/`k` must scroll through tall replies before moving on, including the last row.
-   jsdom has no layout, so `fakeLayout` stacks rows in a viewport at y = 0 and derives their rects
-   from a clamped `scrollTop`. Each row's line height is 20px, making a three-line step 60px.
-   This checks scroll logic; it does not establish what WebKit draws. */
+/* Moving only between rows skips text in replies taller than the viewport and leaves
+   the end of a long last reply unreachable. These tests check scrolling within the current row.
+   jsdom has no layout, so `fakeLayout` stacks rows at the given heights in a viewport at y = 0.
+   Rects follow `scrollTop`, clamped to [0, scrollHeight - clientHeight]. With 20px line height,
+   one step is 3 x 20 = 60px. This does not prove what a real WebKit draws. */
 describe("App keyboard: scrolling through the conversation", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
@@ -6078,9 +6215,10 @@ describe("App keyboard: scrolling through the conversation", () => {
       const top = y;
       y += heights[i];
       row.getBoundingClientRect = () => ({ top: top - scrollTop, bottom: top + heights[i] - scrollTop }) as DOMRect;
-      // The `.row` wrapper sets neither `font-size` nor `line-height`; `.row-body` sets them.
-      // Deliberately different line heights make measuring the wrapper fail instead of matching the
-      // text cell by coincidence.
+      // The real `.row` wrapper (`index.css`)
+      // sets neither `font-size` nor `line-height` -- only `.row-body` (`Row.tsx`'s own text cell)
+      // does (`--fs-prose` / `1.65`). Deliberately mismatched from the row's own 20px, so a
+      // regression back to measuring the wrapper fails loudly rather than by coincidence agreeing.
       row.style.lineHeight = "999px";
       const body = row.querySelector<HTMLElement>(".row-body")!;
       body.style.lineHeight = "20px";
@@ -6093,14 +6231,14 @@ describe("App keyboard: scrolling through the conversation", () => {
     const { container } = started();
     prompts("a", "b", "c");
     const list = fakeLayout(container, [100, 990, 100]);
-    // The cursor lands on "c" when it arrives; `gg` returns to the top.
+    // The arrival lands the cursor on "c" the moment it arrives; `gg` returns to the top.
     press("g");
     press("g");
 
     press("j");
     expect(current(container)).toBe("b");
     // The tall row's top was already on screen (at 100): landing moves NOTHING, so the tail of "a"
-    // just read stays in view (review: aligning it jumped the view by a quarter of it here).
+    // just read stays in view; aligning the row would jump the view by a quarter of it here.
     expect(list.scrollTop).toBe(0);
 
     // 730px of it is below the view's bottom margin line (a margin of two 20px lines since the j/k
@@ -6156,8 +6294,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("j");
     expect(current(container)).toBe("r1");
   });
-  /* Shift+Tab never reaches `onKeyDown` because `onModeKey` stops it, so it drops
-     a waiting prefix and count itself while still cycling the mode. */
+  /* Shift+Tab never reaches `onKeyDown` (`onModeKey` stops it), so it drops a
+     waiting prefix and a count itself -- the mode still cycles. */
   it("K01: Shift+Tab drops a waiting prefix: g, Shift+Tab, g is no gg", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
@@ -6179,8 +6317,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("j");
     expect(current(container)).toBe("r1");
   });
-  /* A count survives its prefix: `case "pending"` keeps it for the second key,
-     and `prompt-jump` repeats it, so `3[[` jumps three prompts. */
+  /* A count survives its prefix -- `case "pending"` keeps it for the second
+     key, and `prompt-jump` repeats (once, `3[[` jumped one prompt). */
   it("K01 (R2): a count survives its prefix: 3[[ goes three prompts back, 2]] two forward", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4", "r5");
@@ -6190,8 +6328,9 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("2"); press("]"); press("]");
     expect(current(container)).toBe("r4");
   });
-  /* `[`/`]` arm with Alt or Meta held, so the second key accepts the same modifiers.
-     This lets `[[`/`]]` work on layouts that type brackets with Option held on both keys. */
+  /* `[`/`]` arm with Alt or Meta held, so the second key accepts the same modifiers and
+     `[[`/`]]` still jump. Layouts that type brackets with Option need the modifier on both
+     keys. */
   it("K01: [[ and ]] typed with Alt or Meta held on both keys still jump", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
@@ -6208,8 +6347,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(current(container)).toBe("r3");
   });
 
-  /* A count before `G`/`gg` selects row N; before `gt` it selects tab N,
-     and before `gT` it moves N tabs back. `[[`/`]]` repeat the count; other pairs ignore it. */
+  /* A count before `G`/`gg` selects row N. Before `gt` it selects tab N; before `gT` it moves N
+     tabs back. Other pairs ignore it, except `[[`/`]]`, which repeat the prompt jump. */
   it("counts: 3G and 3gg go to row 3, 2]] two prompts on (R2)", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6324,7 +6463,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     const { container } = started();
     prompts("a", "b", "c");
     const list = fakeLayout(container, [100, 990, 100]);
-    // The cursor lands on "c" when it arrives; `gg` returns to the top.
+    // The arrival lands the cursor on "c" the moment it arrives; `gg` returns to the top.
     press("g");
     press("g");
     // one move onto "b", thirteen steps through it, one move onto "c"
@@ -6354,7 +6493,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     const { container } = started();
     prompts("a", "b", "c");
     const list = fakeLayout(container, [360, 990, 400]);
-    // The cursor lands on "c" when it arrives; `gg` returns to the top.
+    // The arrival lands the cursor on "c" the moment it arrives; `gg` returns to the top.
     press("g");
     press("g");
 
@@ -6394,7 +6533,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
     const list = fakeLayout(container, [300, 300, 300, 300, 300]);
-    // The cursor lands on "r4" when it arrives; `gg` returns to the top.
+    // The arrival lands the cursor on "r4" the moment it arrives; `gg` returns to the top.
     press("g");
     press("g");
     const scrollIntoView = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -6442,7 +6581,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     );
     prompts("r1", "r2", "r3");
     const list = fakeLayout(container, [300, 300, 300, 300]);
-    // The cursor lands on "r3" when it arrives; `gg` returns to the permission card at row 0.
+    // The arrival lands the cursor on "r3" the moment it arrives; `gg` returns to the permission card at row 0.
     press("g");
     press("g");
     const rows = list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]');
@@ -6469,8 +6608,9 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(lastOfType("permission_response")).toBeUndefined();
   });
 
-  /* In BROWSE, `Ctrl+e`/`Ctrl+y` scroll by one text line, not half a viewport.
-     `fakeLayout` uses 20px per line, the same unit used by `rowScrollStep`'s three-line tall-row step. */
+  /* Scroll by one text line, as vim's `:help CTRL-E`/
+     `:help CTRL-Y`): one text line -- `fakeLayout`'s own 20px, the same line `rowScrollStep`'s
+     three-line tall-row step is built from -- not half a view. */
   it("Ctrl+e and Ctrl+y scroll by one text line, and the cursor stays while its row is on screen", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6491,9 +6631,12 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(0);
   });
 
-  /* A one-line scroll measures `.row-body`'s computed line height, where the text is drawn.
-     `.row` has no font-size or line-height of its own in `index.css` and inherits ambient values.
-     `fakeLayout` deliberately uses 999px for the wrapper and 20px for the body to expose a wrong measurement. */
+  /* The one-line step must measure the text the
+     reader actually sees (`.row-body`'s own computed line height), not the sign-column grid wrapper
+     around it (`.row`, which `index.css` never gives a font-size or line-height of its own -- it
+     inherits whatever is ambient, `line-height: normal`, well under `.row-body`'s real 15px x 1.65 =
+     24.75px). `fakeLayout` now pins this directly: the row's own line-height (999px) would make one
+     press jump nearly to the list's end; `.row-body`'s (20px) is what every other test here expects. */
   it("Ctrl+e steps by the row's TEXT line height, not the sign-column wrapper's own", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6525,9 +6668,11 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(0); // clamped at the top, exactly like an ordinary scrollTop write
   });
 
-  /* A physical `Ctrl+e` produces a bare `Control` keydown before `e` with `ctrlKey: true`.
-     Sending only the combined `e` event cannot catch `countRef` being cleared by that first event.
-     Include both keydowns so the count must survive until `e` reads it. */
+  /* A real `Ctrl+e` arrives as two keydowns --
+     `Control` on its own (with `ctrlKey: true` already set on that very event, as every browser
+     reports it), THEN `e` -- not one keydown carrying both. `press("e", { ctrlKey: true })` alone
+     (the test above) never dispatches the first one, so it could not have caught the guard clearing
+     `countRef` on that bare `Control` keydown before `e` ever reads it back. */
   it("a bare Control keydown between the count and Ctrl+e does not clear the count", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6568,8 +6713,9 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(current(container)).toBe("r3"); // the LAST row still on screen
   });
 
-  /* Page scrolling keeps two text lines of overlap and repeats for a count.
-     With a 400px viewport and 20px lines, one page is 400 - 2 x 20 = 360px. */
+  /* A whole view down or up with two
+     text lines of the old one kept, counted. Rows of 300 in a 400px view and 20px lines, so one page is
+     400 - 2 x 20 = 360px. */
   it("Ctrl+f, PageDown and PageUp scroll a view keeping two lines; a count repeats them", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6615,7 +6761,7 @@ describe("App keyboard: scrolling through the conversation", () => {
 
   /* Two lines of what the reader READS: the cursor row's text (`.row-body`, which `fakeLayout` gives
      20px), never the list's own line height -- `.message-list` sets none in `index.css`, so it reads
-     `normal`, well under the prose line (the finding Ctrl+e's own text-line test records). The list's
+     `normal`, well under the prose line (as Ctrl+e's own text-line test records). The list's
      mismatched 999px here would leave one pixel of a page. */
   it("a page keeps two lines of the row's TEXT, not of the list's own line height", () => {
     const { container } = started();
@@ -6796,8 +6942,9 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(690);
   });
 
-  /* `zt`/`zz`/`zb` position the cursor's row at the top, middle or bottom of the view.
-     A count first selects row N. Rows are 300px in a 400px view, so r2 (600-900) needs real movement. */
+  /* The ROW goes to an edge of the view -- not a text
+     line -- and with a count, row N first (`3zt`: row 3 at the top, and the cursor on it). Rows of 300
+     in a 400px view, so r2 (600-900) is never on an edge by luck. */
   it("zt / zb / zz put the cursor's row at the top / bottom / middle; 3zt row 3 at the top", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6853,8 +7000,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(current(container)).toBe("c");
   });
 
-  /* A count is a row number starting at 1, clamped to the available rows. The cursor lands on
-     that row whichever edge it is placed at. */
+  /* A count is a row number (1-based), clamped to the rows there are, and the cursor lands on it
+     whichever edge it is put at. */
   it("a count before zt / zz / zb names the row: 9zt clamps to the last, 2zz and 4zb land on theirs", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
@@ -6940,8 +7087,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     prompts("a", "b", "c");
     const list = fakeLayout(container, [100, 100, 100]);
     list.scrollTop = 0;
-    // The cursor lands on "c" when it arrives. Move back to "a" with `k` because this test
-    // checks `gg` itself.
+    // The arrival lands the cursor on "c" the moment it arrives; move back to "a" with `k`, not `gg`, since
+    // `gg` is the very mechanism this test is about.
     press("k");
     press("k");
     expect(current(container)).toBe("a");
@@ -6949,8 +7096,8 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("g");
     expect(current(container)).toBe("a");
 
-    // The key that cancels a lone `g` is swallowed with it. Letting it run as a bare key could
-    // move the cursor with `j` or deny a card with `d`.
+    // The key that cancels a lone `g` is swallowed with it. This used to pin the leak
+    // -- that first `j` moved as a bare `j` -- which is how `g`, a pause, `d` denied a card.
     press("j");
     expect(current(container)).toBe("a");
     press("j");
@@ -7076,9 +7223,13 @@ describe("App handoff to a terminal", () => {
     expect(container.querySelector("pre.handoff-command")!.textContent).toContain("--resume 1857dcd5-973b-46a2");
   });
 
-  /* The handoff card renders only on the start screen and is not a cursor-addressable `TimelineItem`.
-     Its `y` shortcut goes through `handleStartScreenKeyDown`, separate from conversation keys.
-     The handlers do not run together: `handoff` clears before a snapshot starts the session. */
+  /* `TerminalHandoff.tsx`'s "Press y to copy." promise was broken -- this
+     card only ever renders on the start screen (`sessionStarted === false`), a render branch with
+     no key handling of its own at the time, and `resolveKey` gates `y` on nothing while the
+     handoff card is not a `TimelineItem` a cursor could ever sit on anyway. `y` here goes through
+     `App.tsx`'s own `handleStartScreenKeyDown`, a separate small handler rather than a branch in
+     the conversation's `onKeyDown` -- the two never run at once, since `handoff` is always cleared
+     by the time a real `snapshot` flips `sessionStarted` back to true. */
   it("copies the handoff command on y, once the session has been closed for it", () => {
     const { container } = conversation({ providerSessionId: "1857dcd5-973b-46a2" });
     dispatch({
@@ -7089,7 +7240,7 @@ describe("App handoff to a terminal", () => {
     });
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
     const clipboard = stubClipboard();
-    // F3's own composer autofocuses first; blur it (as a click elsewhere would) to reach the
+    // The empty tab's composer autofocuses first; blur it (as a click elsewhere would) to reach the
     // handoff card's own promise, "Press y to copy.", the same way `y` in the composer would
     // otherwise just type the letter.
     fireEvent.blur(container.querySelector("textarea")!);
@@ -7119,9 +7270,9 @@ describe("App handoff to a terminal", () => {
     expect(container.querySelector("pre.handoff-command")).toBeNull();
   });
 
-  /** A resumed session whose sidecar stops before any new turn keeps its transcript on screen
-   *  as a lost session naming the sidecar, even across a switch away and back.
-   *  `r` releases that transcript once the tab is no longer failed. */
+  /** A resumed session whose sidecar stops before any new turn keeps its
+   *  transcript on screen, as a lost session naming the sidecar, across a switch away and back;
+   *  `r` (the tab no longer failed) lets it go. */
   it("keeps a conversation on screen when its sidecar stops, and says so", () => {
     const inner =
       "the connection to the provider ended before this session did, so anything after this point never arrived and the reply above may be incomplete (the provider closed the event stream)";
@@ -7171,9 +7322,11 @@ describe("App handoff to a terminal", () => {
       providerSessionId: "1857dcd5-973b-46a2",
     });
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "not_started" }] });
-    // The dashboard has one "Resume last" item and shows no session id.
-    // Check that this item resumes the unrelated session's id rather than the handed-off one.
-    // A session title would be shown if present; this session has none.
+    // The empty tab's one-row-per-record picker has been replaced by the
+    // dashboard's single "Resume last" item (`dashItems`), so the assertion this test
+    // exists for is now that the item resumes the unrelated session's own id, not the handed-off
+    // one, rather than that a row bearing its id text survives on screen (the dashboard shows no
+    // record's id at all; `session()`'s title is what would show, and this record has none).
     const items = Array.from(container.querySelectorAll<HTMLElement>('[data-nav-stop="dash"]'));
     const resumeItem = items.find((el) => el.textContent?.includes("Resume last"));
     expect(resumeItem).toBeDefined();
@@ -7187,8 +7340,8 @@ describe("App handoff to a terminal", () => {
    holds no session and refuses every command. The frontend has to reflect that. */
 describe("App while a handoff is closing the conversation", () => {
   /** Ends in BROWSE, not INPUT: `openHandoffConfirm` opens the detail popover on its way to the
-   *  trailing row, and `tab_detail` forces BROWSE the same way `prefix i` does (pre-existing,
-   *  unrelated to this task). A test that needs the composer back calls `enterInputMode` again. */
+   *  trailing row, and `tab_detail` forces BROWSE the same way `prefix i` does.
+   *  A test that needs the composer back calls `enterInputMode` again. */
   function closing() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -7198,10 +7351,14 @@ describe("App while a handoff is closing the conversation", () => {
     return rendered;
   }
 
-  /* Text typed before closing must remain in the box, with nothing sent and an explanation
-     of why input stopped. `openHandoffConfirm` opens `tab_detail`, which forces BROWSE,
-     so type before opening it. The composer's `text` state survives its conditional rendering;
-     returning to INPUT checks that the same component kept the text. */
+  /* The outcome that is not acceptable is the message disappearing with no trace. It is still in
+     the box, nothing was sent, and the box says why it stopped accepting input.
+     Typed BEFORE `closing()`, not after -- `tab_detail` (the
+     detail popover `openHandoffConfirm` opens on its way to the trailing row) forces BROWSE the
+     same way `prefix i` does, so INPUT is gone by the time `closing()` returns. The composer's own
+     `text` state survives that, unmounted branch and all (React keeps a component's state across
+     its own conditional rendering), so `enterInputMode` afterwards is what proves it -- the same
+     control, not a fresh one. */
   it("does not swallow a message typed before the conversation started closing", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -7228,7 +7385,7 @@ describe("App while a handoff is closing the conversation", () => {
     expect(container.querySelector(".handoff-blocked")!.textContent).toContain("being closed");
   });
 
-  /* The closing state belongs to the tab being handed off: switching to
+  /* The closing state belongs to the tab being handed off (also across a tab switch): switching to
      another live tab while tab 1's close is still running must leave that tab's composer usable,
      and tab 1's own `command_result` -- answered while tab 2 is on screen -- ends tab 1's state. */
   it("keeps the closing state on the tab being handed off, not on whichever tab is shown", () => {
@@ -7307,9 +7464,11 @@ describe("App refused commands", () => {
     }
   });
 
-  /* When nothing was typed after the optimistic clear, a refused send restores only its text.
-     The restored text must also reach Rust through the normal `draft` envelope so a later tab
-     switch can bring it back from `shell::tabs::set_draft`. */
+  /* The composer is unchanged since the optimistic clear (nothing was
+     typed while the reply was in flight), so the refused text is restored alone -- and it is
+     mirrored back to Rust in the same `draft` envelope ordinary typing sends, which is what this
+     panel needs before a later tab switch can bring it back (`shell::tabs::set_draft` keeps
+     whatever it is told regardless of how the send that produced it was refused). */
   it("mirrors a restored refused send back to Rust when the box was left untouched", () => {
     vi.useFakeTimers();
     try {
@@ -7328,8 +7487,9 @@ describe("App refused commands", () => {
     }
   });
 
-  /* Text typed while a send is in flight must survive a refusal. Restore the refused text
-     before the newer draft, separated by a newline, and mirror the combined text to Rust. */
+  /* Text typed into the box while the send was still in flight must not be
+     destroyed by the refused text coming back -- the refused text goes BEFORE what was typed,
+     separated by a newline, and the combined text is what reaches Rust. */
   it("keeps text typed while a send was refused, with the refused text placed before it", () => {
     vi.useFakeTimers();
     try {
@@ -7489,10 +7649,14 @@ describe("App refused commands", () => {
     }
   });
 
-  /* Mirroring recovered text to Rust lets a tab switch restore it like any other draft.
-     Switch within the refusal's 300ms debounce, before advancing timers, so `flushDraft`
-     in the `tabs` handler must deliver the text. Waiting out the debounce first would
-     miss the race this test checks. */
+  /* The point of mirroring the recovered text to Rust at all: a later tab switch brings it back,
+     the same way any other draft does (`"takes each tab's draft from Rust, never from the tab it
+     left"` in the tabs describe block, exercised here starting from a refusal instead of plain
+     typing). Switches INSIDE the refusal's own 300ms debounce, before advancing any timer: an
+     earlier version of this test advanced the debounce first, so it
+     only ever pinned a hand-dispatched `draft` echo (already covered by the tabs block's "takes
+     each tab's draft from Rust" test), never the actual race where `flushDraft` in the `tabs`
+     handler is what has to deliver the recovered text on a switch nobody waited out. */
   it("shows the recovered text again after switching tabs and back", () => {
     vi.useFakeTimers();
     try {
@@ -7514,7 +7678,7 @@ describe("App refused commands", () => {
       dispatch({ kind: "snapshot", tab: 2, throughRevision: 1, state: snapshotState() });
       dispatch({ kind: "tabs", active: 1, tabs: two });
       dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState() });
-      // Rust echoing back exactly what the switch mirrored to it -- the contract this task closes.
+      // Rust echoes back exactly what the switch mirrored to it, including the pending draft.
       dispatch({ kind: "draft", tab: 1, text: mirrored!.text as string });
       enterInputMode(container);
       expect(container.querySelector("textarea")!.value).toBe("first prompt");
@@ -7523,9 +7687,14 @@ describe("App refused commands", () => {
     }
   });
 
-  /* `reset_tab` joins `tab.queue` and `tab.draft`, which may lag the panel's 300ms draft debounce.
-     Flush the pending recovery mirror before reset, as on a tab switch. Otherwise a stale `draft`
-     echo can erase the composer and clear `pendingDraftRef` before the debounce sends its text. */
+  /* `reset_tab` (the `r` restart on an ended tab) used to read
+     Rust's own, possibly stale `tab.draft` (`TabSet::reset` joins `tab.queue` and `tab.draft` --
+     see core/src/tab_set.rs) without first delivering whatever recovery mirror was still sitting in
+     the 300ms debounce this panel just armed. Pressing `r` inside that window sent `reset_tab`
+     first, and the `draft` echo that came back (Rust's stale copy) both wiped the composer AND
+     nulled `pendingDraftRef`, so the debounce's own later firing posted nothing -- the recovered
+     text reached neither the box nor Rust. Fixed by flushing the pending mirror before `reset_tab`,
+     the same way a real tab switch already does. */
   it("flushes a still-pending recovered draft before reset_tab, so a restart cannot erase it", () => {
     vi.useFakeTimers();
     try {
@@ -7534,7 +7703,7 @@ describe("App refused commands", () => {
       fireEvent.change(box, { target: { value: "first prompt" } });
       fireEvent.keyDown(box, { key: "Enter" });
       const requestId = lastOfType("send_message")!.request_id;
-      // Typed after the optimistic clear, before Rust's refusal arrives.
+      // Typed after the optimistic clear, before Rust's refusal arrives -- keeping both versions.
       fireEvent.change(box, { target: { value: "second unsent draft" } });
       dispatch({ kind: "command_result", requestId, ok: false, error: "no active session" });
       expect(box.value).toBe("first prompt\nsecond unsent draft");
@@ -7618,9 +7787,9 @@ describe("App refused commands", () => {
     return rendered;
   }
 
-  /* A queue request can reach Rust after the session ends or a handoff starts, while the
-     panel still shows a running turn. Restore refused text to the box: `remember_prompts`
-     runs only on `Ok`, so history cannot recover it. */
+  /* A queue the panel believed could take a message (a turn still showing
+     as running) but Rust refused -- the session ended, or a handoff is pending -- used to clear the
+     box and keep the text nowhere, not even in history (`remember_prompts` runs only on `Ok`). */
   it("puts a refused queue_message back in the box", () => {
     const { container } = runningApp();
     const box = container.querySelector("textarea")!;
@@ -7639,9 +7808,9 @@ describe("App refused commands", () => {
     expect(container.querySelector(".command-notice")!.textContent).toContain("session has ended");
   });
 
-  /* `send_now` can be refused after its text is queued because the interrupt failed and the queue stays.
-     Restoring the text would duplicate it. Rust saves it to history before the result either way,
-     keeping a refused `send_now` recoverable. */
+  /* `send_now`'s refusal can arrive AFTER its text was queued (the interrupt was refused:
+     "the queue stays"), so putting it back would show it twice. Rust saves it to history before the
+     result either way, which is what keeps a refused `send_now` recoverable. */
   it("does not put a refused send_now back in the box", () => {
     const { container } = runningApp();
     const box = container.querySelector("textarea")!;
@@ -7653,12 +7822,11 @@ describe("App refused commands", () => {
     expect(container.querySelector(".command-notice")!.textContent).toContain("interrupt refused");
   });
 
-  // "does not double-report a failed start, which already has its own banner" was removed here
-  //: it guarded `record?.kind === "start"`, a distinction that existed only
+  // "does not double-report a failed start, which already has its own banner" was removed here:
+  // it guarded `record?.kind === "start"`, a distinction that existed only
   // because `start_session` was its own wire message with its own `command_result`. There is no
   // such message any more -- a fresh tab's first `send_message` IS the start, and a
-  // refusal of it is refused the same way any other send is, with no separate suppression rule
-  // specified for it by the plan.
+  // refusal of it is refused the same way any other send is, with no separate suppression rule.
 });
 
 describe("App: a live session's ending classified", () => {
@@ -7740,7 +7908,7 @@ describe("App fatal errors", () => {
   });
 
   // "asks for a fresh hello when a fatal error drops it back to the start screen" and "re-asks once
-  // per error rather than compounding" were removed here: `error`
+  // per error rather than compounding" were removed because `error`
   // no longer re-requests `hello` itself. Rust re-sends `hello`, recomputed, whenever the set of
   // open provider sessions changes -- a tab failing is exactly such a change -- so there is no
   // client-side re-ask left to test; asserting "no extra `ready` is posted" would just restate that
@@ -7791,8 +7959,9 @@ describe("App: the ? keymap overlay", () => {
     const el = overlay(container);
     expect(el).not.toBeNull();
     const titles = Array.from(el!.querySelectorAll("h2")).map((h) => h.textContent);
-    // "Selecting" follows "This panel", then "Review (c)", "Leader and tab keys", and "Typing".
-    // "Slash commands" sits between "Typing" and "Anywhere".
+    // "Selecting" sits right after "This panel", "Review (c)" after it; "Leader and
+    // tab keys" after that, then "Typing"; "Slash commands"
+    // sits between "Typing" and "Anywhere".
     expect(titles).toEqual([
       "This panel",
       "Selecting (v)",
@@ -7874,8 +8043,10 @@ describe("App: the ? keymap overlay", () => {
     expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("browse");
   });
 
-  /** The start screen renders and closes the keymap overlay opened by `? Keys` or an empty draft's `?`.
-   *  It must not leave a hidden overlay armed to appear when a session starts. */
+  /** The empty tab has a `? Keys` item and `?` on an empty draft, so the
+   *  start screen draws the overlay too. It previously drew
+   *  none, and the dashboard's `?` armed one anyway: nothing showed, and the overlay popped up over
+   *  the conversation the moment a session started, so overlay entry needs its own guard. */
   it("opens on the start screen too, and closes there, so it never pops up once a session starts", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -7946,11 +8117,12 @@ describe("App: the ? keymap overlay", () => {
   });
 });
 
-/* `Ctrl+[` acts as Escape throughout the panel. The browser delivers it as key "[", code
-   BracketLeft, with ctrlKey set. The document-capture listener in `./ctrlBracket`, installed by
-   `App`'s first effect, re-dispatches a plain Escape keydown on the same target. These tests
-   exercise the existing Escape routes through the real `App`; CARET/VISUAL routes are tested
-   under "BROWSE visual mode" below. */
+/* `Ctrl+[` is Esc, as in vim, nvim and every
+   terminal. WebKitGTK 2.52.6 delivers it as `key "["`, `code BracketLeft`, `ctrlKey`, and nothing
+   here read that as Esc. One document-capture listener (`./ctrlBracket`, installed by `App`'s first
+   effect) re-dispatches it as a plain Escape keydown on the same target, so every place below is a
+   place the panel already reads Escape -- each test drives the real `App` with `Ctrl+[` where its
+   Escape tests drive it with `Escape`. The CARET/VISUAL half is in "BROWSE visual mode" further down. */
 describe("Ctrl+[ is Esc everywhere in the panel (R9, kbux P15)", () => {
   const CTRL_BRACKET = { key: "[", code: "BracketLeft", ctrlKey: true };
   const CHOOSER = {
@@ -7965,7 +8137,7 @@ describe("Ctrl+[ is Esc everywhere in the panel (R9, kbux P15)", () => {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 0);
-    // The band names the mode only while this pane holds the keys.
+    // The band names the mode only while this pane holds the keys (it is blank without keyboard focus).
     dispatch({ kind: "pane_focus", focused: true });
     return rendered;
   }
@@ -8085,8 +8257,8 @@ describe("the activity line, the bottom band, and the detail popover", () => {
       expect(order[i - 1]!.compareDocumentPosition(order[i]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     }
     expect(container.querySelector(".winbar")).toBeNull();
-    // `StatusRow`, `Footer`, `NewPill`, `ContextLine` and the per-row which-key strip
-    // are replaced by the single band above.
+    // `StatusRow`, `Footer`, `NewPill`, `ContextLine` and the
+    // per-row which-key strip are all gone, replaced by the one band above.
     expect(container.querySelector(".status-row")).toBeNull();
     expect(container.querySelector(".panel-footer")).toBeNull();
     expect(container.querySelector(".new-pill")).toBeNull();
@@ -8106,7 +8278,9 @@ describe("the activity line, the bottom band, and the detail popover", () => {
     expect(container.querySelector(".detail-popover")).toBeNull();
   });
 
-  /** The detail popover's trailing row opens `ContinueInTerminal`'s confirmation. */
+  /** The detail popover's trailing row, not `Enter` on
+   *  nothing, opens `ContinueInTerminal`'s confirmation through the detail popover.
+   *  The popover row is the visible entry point. */
   it("the popover's trailing row opens ContinueInTerminal's confirmation, above the composer", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -8160,9 +8334,9 @@ describe("the panel's own scroll keys announce themselves to the message list", 
       { key: "G", shiftKey: true },
       { key: "g" }, // the first half of `gg` moves nothing, and says nothing
       { key: "g" },
-      // `Ctrl+e` follows the down rule of `j`/`Ctrl+d`/`G`: following re-arms only when
-      // the scroll reaches the bottom. `Ctrl+y` follows the up rule of `k`/`Ctrl+u`/`gg`:
-      // following stops before the scroll.
+      // `Ctrl+e` follows the same "down" rule as `j`/`Ctrl+d`/`G` (the scroll
+      // decides whether following re-arms, once it actually reaches the bottom); `Ctrl+y` follows
+      // the same "up" rule as `k`/`Ctrl+u`/`gg` (following stops outright, before the scroll).
       { key: "e", ctrlKey: true },
       { key: "y", ctrlKey: true },
     ]) {
@@ -8171,8 +8345,8 @@ describe("the panel's own scroll keys announce themselves to the message list", 
     expect(seen).toEqual(["down", "up", "down", "up", "down", "up", "down", "up"]);
   });
 
-  /* `{N}G` and `{N}gg` go to row N, so their announced direction is relative
-     to the current cursor, regardless of which end the bare command names. */
+  /* `{N}G` / `{N}gg` go to row N, so the direction they announce is where that
+     row sits against the cursor -- not the end a bare `G`/`gg` names whatever the cursor is (above). */
   it("says which way a counted jump goes: up to an earlier row, down to a later one", () => {
     const { container } = startedApp();
     const list = container.querySelector(".message-list")!;
@@ -8323,8 +8497,8 @@ describe("the tab bar", () => {
   });
 
   it("takes each tab's draft from Rust, never from the tab it left", () => {
-    // A tab switch lands BROWSE, including on an empty tab, so the draft appears in the
-    // composer preview rather than a textarea's value.
+    // A switch lands BROWSE, onto an empty tab too, where the
+    // draft is the stand-in's preview rather than a textarea's value.
     const draft = (c: HTMLElement) =>
       c.querySelector("textarea")?.value ?? c.querySelector(".composer-draft")?.textContent ?? "";
     const { container } = render(<App />);
@@ -8365,8 +8539,11 @@ describe("the tab bar", () => {
     expect(lastOfType("close_tab")).toMatchObject({ tab: 1 });
   });
 
-  /** `<leader>bo` uses `confirm_close_others` to show a prompt in `.band-prompt`.
-   *  Accepting with `y` posts `close_others`; there is no single tab for a `close_tab` message. */
+  /** `<leader>bo` must reach the right confirmation: Rust's
+   *  `confirm_close_others` had no handler at all, and no `close_others` message was ever posted
+   *  back. The prompt is the band's own `prompt` fact (`.band-prompt`,
+   *  taking the whole band right of the mode section), but `y` must post `close_others`,
+   *  never `close_tab` -- there is no single tab to name. */
   it("<leader>bo prompts, and y sends close_others rather than close_tab", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -8390,8 +8567,9 @@ describe("the tab bar", () => {
     vi.unstubAllGlobals();
   });
 
-  /** A rename field stays open across a tab switch because switching does not move its focus.
-   *  Committing must name the tab where the field opened, even if another tab is now active. */
+  /** A rename field opened on one tab stays open across a switch: n/p/digits/l move without
+   *  moving focus, so renaming and switching can coexist.
+   *  Committing must still name the tab the field is open on, never whichever tab is active by then. */
   it("commits a rename to the tab it was opened on, even after the active tab has changed", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -8426,9 +8604,14 @@ describe("the session chooser", () => {
     expect(container.querySelector(".chooser")).toBeNull();
   });
 
-  /** Esc or `q` from the chooser over an empty tab returns focus to the dashboard in BROWSE.
-   *  Returning it to `.agent-ui-root` would leave the keys on an element that handles no key.
-   *  The chooser closes locally and reuses the `arrive` path without waiting for Rust. */
+  /** GUI pass, 2026-09-25: `prefix w` over an empty tab, then `Esc`, left the keys on
+   *  `.agent-ui-root` -- the empty layout's anchor, which handles no key. Typing went nowhere and
+   *  not even `i` recovered it; only a click did. The launch chooser is gone, so `Esc`
+   *  here always returns the keys this way, entirely locally -- there is no round trip to Rust for
+   *  it any more. The empty tab's live control used to be its
+   *  composer, landing INPUT; over an empty tab `Esc`/`q` now returns to the dashboard menu in
+   *  BROWSE instead (`Esc` never lands INPUT anywhere else in this panel either), reusing the same
+   *  `arrive` pair used for every other keyboard arrival. */
   it("Esc from prefix w over an empty tab returns to the dashboard menu, in BROWSE", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -8436,7 +8619,7 @@ describe("the session chooser", () => {
     dispatch(ENV);
     const postsBefore = posted.length;
     fireEvent.keyDown(container.querySelector(".chooser")!, { key: "Escape" });
-    // V1 C1: the chooser's own close is still local -- no round trip to Rust for IT --
+    // The chooser's own close is still local -- no round trip to Rust for IT --
     // and the mirror posts once, BROWSE: this landing keeps BROWSE throughout (unlike the old
     // INPUT-landing behaviour this test used to pin), so there is no second, mode-changing post.
     expect(posted.slice(postsBefore)).toEqual([{ type: "panel_keys", request_id: expect.any(String), mode: "browse" }]);
@@ -8447,8 +8630,9 @@ describe("the session chooser", () => {
 });
 
 describe("the mode, queue and context lines, and the band's message/prompt", () => {
-  /** A live tab cycles its mode. An ended tab outside bypass flashes instead of posting,
-   *  since it cannot enter bypass. An ended tab already in bypass can still leave it. */
+  /** A live tab always cycles now (see "Shift+Tab anywhere in the chat" below) -- the one
+   *  case that still flashes rather than posting is a tab that has already ENDED and is not already
+   *  in bypass, which can never be asked to ENTER bypass, only leave it. */
   it("flashes that the mode is fixed once a session has ended, and never offers a cycle into bypass", () => {
     vi.useFakeTimers();
     const widen = stubBandWidth();
@@ -8471,8 +8655,11 @@ describe("the mode, queue and context lines, and the band's message/prompt", () 
     }
   });
 
-  /** A fresh document given the reload's `ready` batch must display the tab's mode.
-   *  The mode comes from the `tabs` envelope and survives a panel reload. */
+  /** After `prefix r` the footer could lose the mode. A fresh
+   *  document given the `ready` batch must show the tab's own mode.
+   *  The mode belongs to the tab, so reloading the page
+   *  must reconstruct its display from the host's ready batch
+   *  without a local mode change. */
   it("shows the tab's mode after a reload's ready batch", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -8485,7 +8672,7 @@ describe("the mode, queue and context lines, and the band's message/prompt", () 
     expect(container.querySelector(".status-band .mode-pill")!.textContent).toBe("⏵⏵ bypass permissions on");
   });
 
-  /** The INPUT hints (F4) are gone -- nothing replaces `.footer-hint`; the queue and the
+  /** The INPUT hints (the old footer reminder) are gone -- nothing replaces `.footer-hint`; the queue and the
    *  editor context both still show, the second now in the band's own `context` fact rather than a
    *  separate `ContextLine` between the queue and the composer. */
   it("draws the queue around the composer, and the editor context in the band", () => {
@@ -8505,7 +8692,7 @@ describe("the mode, queue and context lines, and the band's message/prompt", () 
     vi.unstubAllGlobals();
   });
 
-  /** Defect 6 (phase 2's sandbox pass): the empty tab drew `prefix &`'s prompt as a bare span. */
+  /** The empty tab drew `prefix &`'s prompt as a bare span. */
   it("draws the empty tab's close prompt in its own band, like the conversation's", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -8534,8 +8721,8 @@ describe("P1: the keys land on a card that waits", () => {
     return rendered;
   }
 
-  /** `Ctrl+l` into the chat sends `arrive` rather than `enter_input`.
-   *  When a card is waiting, the cursor still lands on that card in BROWSE. */
+  /** `Ctrl+l` into the chat now sends `arrive`, not
+   *  `enter_input`; a waiting card still takes the cursor on arrival. */
   it("Ctrl+l (arrive) with a card waiting lands in BROWSE on it, not in the composer", () => {
     const { container } = oneCard();
     dispatch({ kind: "arrive" });
@@ -8543,8 +8730,9 @@ describe("P1: the keys land on a card that waits", () => {
     expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
   });
 
-  /* `a` acts only on the cursor's card. On another row it shows a flash instead of answering.
-     The pause is long enough that the typing guard does not cause the refusal. */
+  /* `a` answers only the card under the cursor:
+     `a` acts on the cursor's card only. The flash it shows instead is `v1: typing never answers a
+     card`'s. The wait is long enough that the typing guard is not what refuses it. */
   it("a from another row does not answer the only card (v1 S4)", () => {
     vi.useFakeTimers();
     try {
@@ -8726,9 +8914,9 @@ describe("a switch back to a tab whose reply streams (the small-defects GUI pass
   });
 
   it("a cursor move in the same render as a streamed delta is not undone", () => {
-    // A cursor clamp and a streamed delta in one render used to confuse key reconciliation
-    // when runs folded. It restored the previous cursor, whose reveal scrolled the list up.
-    // The cursor move must survive that reconciliation.
+    // The mechanism behind the first test's parked view: the visibility clamp moved the cursor while a delta
+    // landed in the same render, the key reconciliation (for a run folding) read that as the row
+    // having moved and put the cursor back, and its reveal scrolled the list up.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "tabs", active: 1, tabs: two });
@@ -8747,9 +8935,9 @@ describe("a switch back to a tab whose reply streams (the small-defects GUI pass
   });
 });
 
-/** A digit prefix must stay bounded and must not require `O(count)` work.
- *  These pure tests check accumulation without the DOM; keyboard wiring and DOM scans
- *  are checked by the counted-motion tests below. */
+/** A digit prefix must not cost `O(count)` work, and must not simply keep
+ *  growing forever either. Pure, DOM-free -- the accumulation function itself, not the keyboard
+ *  wiring around it (that's the boundary-scan tests inside "BROWSE: counts…" below). */
 describe("accumulateMotionCount (v1 audit R4)", () => {
   function typeCount(digits: string): number {
     let count: number | null = null;
@@ -8770,8 +8958,8 @@ describe("accumulateMotionCount (v1 audit R4)", () => {
   });
 });
 
-/** Pure tests for where bare and counted `gg`/`G` land.
- *  The scrolling tests cover the keyboard wiring. */
+/** Where `gg`/`G` land, bare and counted. Pure -- the keyboard wiring around
+ *  it is "counts: ..." in the scrolling describe. */
 describe("jumpTarget (vim {N}G / {N}gg)", () => {
   it("is the first or the last row when bare", () => {
     expect(jumpTarget("first", null, 5)).toBe(0);
@@ -8820,10 +9008,13 @@ describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
     expect(current()).toContain("first ask");
   });
 
-  /** `nextStop`/`clampStep` clamp at a boundary instead of returning `null`, so a loop
-   *  that stops only on `null` repeats all `times` iterations without moving.
-   *  Stop when a repeat returns the same stop. Count `querySelectorAll` calls to measure
-   *  the scans made by `stopsIn`/`conversationRows` through `nextStop`/`rowIndexOf`. */
+  /** An earlier probe measured 3,004 DOM scans for `1000j` sitting at a one-row
+   *  boundary (`nextStop`/`clampStep` clamp rather than returning `null` there, so the old loop's
+   *  only early-exit condition never fired and it ran all `times` iterations). Fixed by "no
+   *  progress = stop": once a repeat lands back on the stop the previous repeat already reached,
+   *  the walk is over regardless of how many repeats are left. `querySelectorAll` is the DOM
+   *  operation `stopsIn`/`conversationRows` (both walked by `nextStop`/`rowIndexOf`) actually run,
+   *  same technique the saved audit probe used. */
   it("a large count at a one-row boundary does O(1) DOM scans, not O(count)", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -8854,10 +9045,11 @@ describe("BROWSE: counts, prompt jumps and Ctrl+c", () => {
     scans.mockRestore();
   });
 
-  /** Boundary tests only show that a count which cannot move is cheap. Walking a count
-   *  also needs bounded DOM scans: the old loop queried `conversationRows` through both
-   *  `nextStop` and `rowIndexOf` on every step, making 2,001 queries for `1000j` across
-   *  1,001 rows. `countedStop` reads the tree once per motion. */
+  /** The boundary tests above only
+   *  prove a count that CANNOT move is cheap. A count that really walks was still `O(count)`: every
+   *  step called `nextStop` -> `currentStop` -> `conversationRows` and then `rowIndexOf` ->
+   *  `conversationRows`, so `1000j` from the first of 1,001 rows made 2,001 full-tree queries
+   *  (about 2.3 s in jsdom). `countedStop` reads the tree once per motion. */
   it("1000j from the first of 1,001 rows reads the tree a bounded number of times and lands on the last", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9011,7 +9203,7 @@ describe("R4: / and n / N", () => {
   });
 
   it("n takes the keys back from a control that was refocused after a search", () => {
-    // Found in review: `search-next` moved the row cursor via `setCursor` without ever calling
+    // `search-next` moved the row cursor via `setCursor` without ever calling
     // `root.focus()`, unlike every other cursor-moving action in this switch (`move`, `jump`,
     // `prompt-jump`, the Ctrl+d/Ctrl+u re-home). A stale `document.activeElement` on a permission
     // card's Approve button would then still answer a later Enter/Space, even though the visible
@@ -9078,10 +9270,10 @@ describe("P2 runs and R3 the detailed view", () => {
     expect(container.querySelectorAll('[data-folded="true"]'), "the detailed view is the tab's own").toHaveLength(0);
   });
 
-  /* `zo`/`zc` open and close the fold that Enter toggles on a collapsed run.
-     `zc` closes the innermost open fold: a call's result before its containing run.
-     `indexOfKey` finds a call inside its run, so the cursor follows the collapsed run.
-     The fixture has two finished `Read` calls followed by a message. */
+  /* The fold Enter flips on a collapsed run, opened and closed by
+     name. `zc` closes the INNERMOST open fold -- a call's own open result before the run it sits in --
+     and from any of the run's calls, the cursor following the run back (`indexOfKey` finds a call at
+     its run). Two finished `Read`s, then a message, exactly as the Enter test above. */
   function twoReadsThenAMessage() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9234,7 +9426,7 @@ describe("N3 and P5 in the conversation", () => {
   });
 
   it("D puts the keys in the card's reason box; Enter there denies with the reason", () => {
-    // `D` acts only on the cursor's card, after the typing guard's wait.
+    // `D` acts on the cursor's card only, after the wait.
     vi.useFakeTimers();
     try {
       const { container } = withBash();
@@ -9295,9 +9487,12 @@ describe("N2 and R3: the editor round trips", () => {
     expect(posted.filter((m) => m.type === "open_path")).toHaveLength(1);
   });
 
-  /** Switching tabs must clear `pathPick`. Otherwise a `gf` picker from the old conversation
-   *  stays open and the next letter on the new tab can open one of the old tab's paths.
-   *  Resetting other conversation state alone leaves that stale picker active. */
+  /** A `gf` picker left open over tab 1's conversation named paths that meant
+   *  nothing once the panel switched to tab 2 -- the very next letter typed there still opened one
+   *  of the old tab's paths, because the tab-switch reset cleared a long, explicit list of
+   *  per-conversation UI state and `pathPick` was not on it. Switching tabs with the picker
+   *  open must close it before any letter can choose a stale path
+   *  from the previous tab. */
   it("switching tabs while gf's picker is open drops it: no open_path on the new tab (P2-A5)", () => {
     const { container } = withPaths("compare a.rs and b.rs");
     const root = container.querySelector(".agent-ui-conversation")!;
@@ -9381,10 +9576,12 @@ describe("N2 and R3: the editor round trips", () => {
   });
 });
 
-/* `gx` opens web links on the cursor row. A single visible link whose text is its address
-   opens immediately. Multiple, titled or hidden links show full addresses and wait for a letter
-   so the reader can see the destination. `open_url` carries the WHATWG-normalized `href`,
-   which Rust checks again. `boxLinks` supplies layout boxes for jsdom's visibility checks. */
+/* `gx` opens the web link of the row under the cursor. One link whose
+   visible text IS its address opens at once; several, or a titled one, or one nobody can see, wait for a
+   letter with each full address shown (a link in a model's reply is never opened without
+   the reader having seen where it goes). The page posts `open_url` with the WHATWG-normalized `href`;
+   Rust re-checks it (`agent_panel.rs#web_url`). jsdom lays nothing out, so `boxLinks` gives the
+   conversation, the list and each visible anchor a box -- what `hintVisible` reads as "on screen". */
 describe("gx: web links on a row", () => {
   function withReply(text: string) {
     const rendered = render(<App />);
@@ -9501,9 +9698,9 @@ describe("gx: web links on a row", () => {
   });
 
   it("shows a link whose visible text is only part of its address: hidden markup inside the text is not what the reader sees", () => {
-    // DOMPurify keeps `hidden` spans inside link text, and `textContent` includes them. A link can
-    // therefore display `https://good.example/` while its text equals the different destination
-    // `https://good.example.evil.example/`.
+    // DOMPurify keeps `hidden` and inline HTML inside link text, and
+    // `textContent` counts a hidden span -- so a reply could show `https://good.example/`, carry the real
+    // address `https://good.example.evil.example/` in the text too, and pass a text-equals-href test.
     for (const reply of [
       '<a href="https://good.example.evil.example/">https://good.example<span hidden>.evil.example</span>/</a>',
       "[https://good.example<span hidden>.evil.example</span>/](https://good.example.evil.example/)",
@@ -9618,8 +9815,9 @@ describe("gx: web links on a row", () => {
     }
   });
 
-  /* Only a plain letter chooses a link. A chord or composing key cancels and opens nothing.
-     Auto-repeat leaves the pick waiting: the `x` of `gx` still being held is not a second choice. */
+  /* Only a plain letter chooses. A chord, an input method's key, or
+     a held `x`'s auto-repeat is not a choice -- the first two end the pick and open nothing, the repeat
+     leaves it waiting (it is the `x` of `gx` still held, not a second key). */
   describe("the pick's keys", () => {
     function openTwo() {
       const rendered = withReply("see https://example.com/a and [docs](https://example.com/b)");
@@ -9715,8 +9913,8 @@ describe("gx: web links on a row", () => {
       later(container);
     });
 
-    /* The link pick handles keys before the key table, so another control taking the keys must end it.
-       Otherwise the next letter intended for a text field could open a link. */
+    /* The pick owns every key ahead of the key table, so anything else that takes the
+       keys must end it -- or the next letter typed there would open a link instead of being typed. */
     it("the composer taking the keys (a click into it): its letters are typed, and open nothing", () => {
       const { container } = openTwo();
       act(() => container.querySelector<HTMLElement>(".composer-browse-hint")!.focus());
@@ -9912,9 +10110,13 @@ describe("statusWarning", () => {
   });
 });
 
-/** Overlays keep focus across `pane_focus` and `arrive`; empty-tab arrivals land on a focusable item.
- *  jsdom does not lose DOM focus by itself, so the test sends `pane_focus false`, blurs the element,
- *  then sends `pane_focus true` to simulate a WebView focus loss across GTK. */
+/** The panel never
+ *  strands the keys. An overlay -- the chooser, a tab rename -- keeps them (`pane_focus`/`arrive`
+ *  re-focus it rather than falling through to the conversation or a composer under it), and a
+ *  keyboard arrival on the empty tab always lands *somewhere* focusable even when Rust
+ *  cannot hand the keys to the editor. jsdom never drops DOM focus on its own, so a
+ *  `pane_focus false` -> a real blur -> `pane_focus true` sequence simulates the WebView losing DOM
+ *  focus across a GTK round trip -- without the blur these would pass today and prove nothing. */
 describe("takes the keys", () => {
   function modeBlock(container: HTMLElement): HTMLElement {
     return container.querySelector<HTMLElement>("[data-testid=mode-block]")!;
@@ -9949,9 +10151,9 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
   });
 
-  /** The chooser's lone `g` is a pending key. Losing and regaining focus cancels it through
-   *  `dropPendingKeys`, so the next `j` moves the cursor instead of cancelling an old prefix.
-   *  Shift+Tab cancels it too. */
+  /** The chooser's own lone-`g` wait is a pending key too. A focus round trip is one of the
+   *  window's cancel routes (`dropPendingKeys`), so the `j` after it moves the cursor instead of being
+   *  swallowed as the cancel of a `g` typed before the panel lost the keys; Shift+Tab ends it the same way. */
   it("a2. chooser open: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9979,8 +10181,9 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
   });
 
-  /** App renders the chooser over both a live conversation and an empty tab.
-   *  Exercise both cancel routes on the empty layout too, so its `dropKeysRequest` is covered. */
+  /** `App.tsx` renders the chooser at two sites -- over a live conversation (a2/a3
+   *  above) and over an empty tab -- and only the first was covered, so the second one's `dropKeysRequest`
+   *  could have been deleted with every test green. Same two routes, on the empty-tab layout. */
   it("a2e. chooser open over an empty tab: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10062,9 +10265,10 @@ describe("takes the keys", () => {
     expect(container.querySelector(".row-current")!.textContent).toContain("first");
   });
 
-  /** Esc from the chooser returns focus locally without waiting for Rust.
-   *  There is no launch chooser that hands focus to the editor and needs a later `arrive`
-   *  if the editor refuses focus. */
+  /** The launch chooser (and its flagged handoff to the editor on Esc) is gone, so the
+   *  scenario "e" used to cover here -- Esc at launch, then Rust's `arrive` because the editor
+   *  refused the keys -- can no longer happen: `Esc` always returns the keys locally now (see the
+   *  "session chooser" describe block above), with no round trip to Rust at all. */
   it("f. empty tab, composer focused: arrive lands the keys on the empty tab root, not body", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10109,9 +10313,15 @@ describe("takes the keys", () => {
   });
 });
 
-/* `MessageList` is reused across tabs, so a timeline-index unread threshold cannot survive a restore.
-   Save the sequence threshold per tab in `TabViewState.unseenAfterSeq` and restore it as `unseenSeed`
-   before content and the `[state]` effect run, so rows arriving while parked remain counted. */
+/* `MessageList`'s unread threshold used to be a timeline INDEX, latched at the
+   moment following stopped and sliced off whatever the CURRENT timeline held. `MessageList` is not
+   remounted across a tab switch (`App.tsx` reuses the one instance for every tab), so on a restore
+   that index was recomputed against the just-restored tab's OWN (short) timeline -- every row that
+   had actually arrived while the tab was away sat past that fresh cutoff and was silently never
+   counted ("↓3" read "↓0", or showed nothing at all). The fix threads the threshold through as a
+   `seq` instead: `App.tsx` saves it per tab (`TabViewState.unseenAfterSeq`) and hands it back to
+   `MessageList` as `unseenSeed` on a restore, which seeds it in before the tab's real content -- and
+   `MessageList`'s own `[state]` effect -- ever runs against it. */
 describe("A parked tab's unread count includes what arrived while it was away", () => {
   const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
 
@@ -10136,8 +10346,9 @@ describe("A parked tab's unread count includes what arrived while it was away", 
     });
     act(() => widen(container));
     const list = container.querySelector(".message-list") as HTMLElement;
-    // Scrolling up away from the bottom makes `MessageList` latch the current maximum `seq`
-    // of 3 as its unseen-message threshold.
+    // Park it: scrolled up and away from the bottom, the max `seq` on screen (3) becomes the
+    // threshold `MessageList` latches -- the same gesture the unread-pill tests in
+    // `MessageList.test.tsx` use.
     setListScroll(list, { scrollHeight: 2000, clientHeight: 400, scrollTop: 1600 });
     fireEvent.scroll(list);
     fireEvent.wheel(list, { deltaY: -100 });
@@ -10239,9 +10450,13 @@ describe("A parked tab's unread count includes what arrived while it was away", 
   });
 });
 
-/** Shift+Tab is handled anywhere in the panel by the document-capture `onModeKey` listener.
- *  It runs `modeKeyRoute` before React handlers and WebKit's default backward-focus navigation.
- *  These tests dispatch bubbling `KeyboardEvent`s so gaps in routing can be observed. */
+/** Shift+Tab must cycle permission mode everywhere in the panel.
+ *  Its capture listener must precede both local handlers and default focus navigation.
+ *  A document-capture `keydown` listener (`App.tsx`'s `onModeKey`, `modeKey.ts`'s `modeKeyRoute`) now
+ *  claims Shift+Tab ahead of every React handler and of WebKit's own default backward-focus
+ *  navigation, wherever in the panel it lands -- these tests dispatch a real, bubbling `KeyboardEvent`
+ *  the way a real keypress would arrive, not `fireEvent.keyDown` on a React element directly, so a
+ *  gap in the router (rather than in a component's own handler) would actually show up here. */
 describe("Shift+Tab anywhere in the chat", () => {
   /** Dispatches a real, bubbling, cancelable Shift+Tab on `target` and returns the event so a test
    *  can read `defaultPrevented` off it -- `fireEvent`'s own return value is the inverse of that,
@@ -10254,8 +10469,8 @@ describe("Shift+Tab anywhere in the chat", () => {
     return event;
   }
 
-  /** A `live` tab cycles its mode on any backend without a `SetPermissionMode` capability.
-   *  Entering bypass gets a separate `confirm_bypass` y/n prompt from Rust. */
+  /** A live tab cycles on any backend. Entering bypass gets a separate `confirm_bypass` y/n
+   *  prompt from Rust. */
   it("a. live tab, BROWSE, focus on the conversation root: cycle_mode posted, no flash, focus unchanged", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -10361,7 +10576,8 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(lastOfType("cycle_default_mode")).toBeDefined();
   });
 
-  /** A starting tab cycles like `not_started`/`live`, without a separate starting flash. */
+  /** "a starting tab can switch" -- no separate "starting" flash any more, it simply
+   *  cycles like `not_started`/`live`. */
   it("g. a starting tab: posts too, no flash", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -10393,8 +10609,8 @@ describe("Shift+Tab anywhere in the chat", () => {
     vi.unstubAllGlobals();
   });
 
-  /** A live tab's `<leader>` `mode.cycle` posts like Shift+Tab.
-   *  No capability check disables its entry in the which-key box. */
+  /** A live tab's `<leader>` `mode.cycle` always posts now too, the same as its Shift+Tab
+   *  (test a/b above) -- there is no capability left to grey the box entry out for. */
   it("i. <leader> mode.cycle on a live tab posts, and the box does not grey it out", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -10420,9 +10636,12 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
-  /** Shift+Tab and `<leader>` `mode.cycle` both use `modeKeyRoute`.
-   *  A failed tab in auto mode flashes rather than posting `cycle_mode`.
-   *  The message names `r`, the fixed reset key, rather than `newTabChord`. */
+  /** Shift+Tab and `<leader>` `mode.cycle` follow one rule, but on a
+   *  `starting` or `failed` tab `EmptyTab` returned before its leader engine, so `<leader>m` did
+   *  nothing at all; and `runPanelAction` gated on `live || ended`, so reaching it there would have
+   *  posted a `cycle_mode` Rust only refuses. Both now follow `modeKeyRoute`; `failed` in
+   *  auto (not already bypass) is still the one state this flashes rather than posts -- and the text
+   *  now names `r` (the fixed reset key), not `newTabChord` (there is no rebindable "leave" chord). */
   it("j. <leader> mode.cycle on a failed tab flashes 'the session has ended — r to start again', no post", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -10440,7 +10659,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     vi.unstubAllGlobals();
   });
 
-  /** On a starting tab, `<leader>` `mode.cycle` posts like Shift+Tab, without a starting flash. */
+  /** On a starting tab, `<leader>` `mode.cycle` posts the request just as Shift+Tab does. */
   it("j2. <leader> mode.cycle on a starting tab posts too, no flash", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -10458,9 +10677,10 @@ describe("Shift+Tab anywhere in the chat", () => {
     vi.unstubAllGlobals();
   });
 
-  /** An ended tab cannot enter bypass but may leave it if already in bypass.
-   *  Shift+Tab and the leader's `mode.cycle` share `modeKeyRoute`, so this checks both routes.
-   *  `modeKey.test.ts` covers every `tabState`/`tabMode` pair. */
+  /** The one case that still refuses to enter bypass -- an already-ended tab that is not
+   *  already in bypass -- but that same tab, already in bypass, may still leave it. Both the plain
+   *  Shift+Tab route and the leader's `mode.cycle` share `modeKeyRoute`, so one check here stands in
+   *  for both call sites; the pure cases (every `tabState`/`tabMode` pair) are `modeKey.test.ts`'s. */
   it("k. an ended tab already in bypass still cycles (to leave it)", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
@@ -10477,9 +10697,11 @@ describe("Shift+Tab anywhere in the chat", () => {
   });
 });
 
-/* The empty tab keeps its own waiting prefix and leader sequence.
-   Cancel routes such as Shift+Tab, the chooser, a tab switch and a bypass prompt must clear them
-   even when no key reaches the dashboard, or the next key can complete a stale sequence. */
+/* The
+   empty tab keeps its own waiting prefix and leader sequence, which `dropPendingKeys()` did not
+   reach. A cancel route the dashboard never sees as a key of its own -- Shift+Tab (stopped by
+   `onModeKey`), the chooser, a switch to another empty tab, a bypass prompt -- left them armed, so
+   the next key was swallowed (`g`, Shift+Tab, `i` opened no composer) or completed the sequence. */
 describe("K01 on the empty tab: every cancel route drops its waiting prefix and leader", () => {
   function emptyInBrowse() {
     const rendered = render(<App />);
@@ -10569,9 +10791,11 @@ describe("K01 on the empty tab: every cancel route drops its waiting prefix and 
   });
 });
 
-/** Entering bypass asks for y/n confirmation. Only an isolated `y`/`Y` after the initial delay accepts.
- *  `modeKey.test.ts` covers `bypassYesCounts` timing combinations; these tests exercise the route
- *  through an `App` render, a `confirm_bypass` envelope, and keydowns. */
+/** Entering bypass
+ *  asks a y/n first, and only a LONE `y`/`Y` -- not one that lands as part of typed text, or too
+ *  soon after the prompt appeared -- may answer it. `bypassYesCounts`'s own arithmetic (every
+ *  `now`/`openedAt`/`lastKeyAt` combination) is `modeKey.test.ts`'s; this file wires it through a
+ *  real `App` render, a real `confirm_bypass` envelope and real keydowns. */
 describe("v1 mode: entering bypass asks first", () => {
   /** Fakes `performance.now()` alongside the timer functions -- plain `vi.useFakeTimers()` leaves
    *  `performance.now()` real (confirmed empirically), and `App.tsx`'s guard reads the clock through
@@ -10744,9 +10968,9 @@ describe("v1 mode: entering bypass asks first", () => {
     vi.unstubAllGlobals();
   });
 
-  /** Typed text must not confirm bypass, even when the keys opening the prompt
-   *  (`Space m` here) immediately precede `y`. This checks a live tab in BROWSE
-   *  with a permission card already waiting. */
+  /** Typed text can never answer the prompt, even when the very keys that triggered it (here,
+   *  the leader's own `Space m`) are what land right before the `y`. A live tab in BROWSE with a
+   *  card already waiting, so a confirmation can approve real pending work. */
   it("g. Space, m, y at 100ms with the envelope arriving between m and y: no confirm_bypass, no permission_response, the band names why", () => {
     fakeClock();
     try {
@@ -10781,12 +11005,15 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  /** These tests check both `bypassYesCounts` guards through `App.tsx`: time since the prompt
-   *  opened and time since the previous key. `modeKey.test.ts` covers raw timestamp
-   *  combinations and boundaries. A key other than a counted y/Y cancels an open prompt.
-   *  Any earlier non-cancelling key close enough to the answer to fail the lone-key guard
-   *  is also close enough to the prompt opening to fail the display-time guard.
-   *  The later test therefore exercises both guards failing together. */
+  /** The two halves of `bypassYesCounts`, exercised end to end (every raw `now`/`openedAt`/
+   *  `lastKeyAt` combination, including the boundary, is `modeKey.test.ts`'s own `bypassYesCounts`
+   *  describe block -- these two just prove `App.tsx` actually wires the guard through). A key that
+   *  lands WHILE the prompt is already open cancels it outright via the prompt's own "any key but a counted
+   *  y/Y" rule (test b3) before the guard's stand-alone half would even matter -- and a key close
+   *  enough before the ANSWER to trip the stand-alone half is necessarily close enough to when the
+   *  prompt opened to also trip the on-screen half (the prompt cannot have been open for the guard's
+   *  own duration AND have a non-cancelling key land within the guard's duration of it, at once).
+   *  So test h2 below reproduces both halves failing together, the same shape as test g. */
   it.each(["y", "Y"])("h. %s cancelled: too soon after the prompt opened, no other key at all (on-screen rule)", (key) => {
     fakeClock();
     try {
@@ -10818,11 +11045,25 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  /** A `y` with Ctrl/Alt/Meta held, or one being composed by an input method, cancels
-   *  the bypass prompt even after the timing guard expires. Shift alone is allowed: `Y` counts.
-   *  Super, Hyper and AltGraph must also be checked. jsdom exposes `modifierSuper`, `modifierHyper`
-   *  and `modifierAltGraph` independently, so each case isolates one modifier.
-   *  This does not prove WebKitGTK exposes each as a DOM modifier. */
+  /** A `y` with Ctrl/Alt/Meta held, or one an input method
+   *  is composing, is an editing keystroke, not a "y pressed on its own" -- the timing guard
+   *  alone let `Ctrl+y` (or the first letter of a pinyin syllable) enter bypass and approve the
+   *  waiting cards once the prompt had been up for the guard's duration. Each cancels, like any key
+   *  but a counted y. Shift is not in the list: `Y` is a counted answer (test b2).
+   *
+   *  Super and Hyper must also refuse an answer. The previous check missed
+   *  `getModifierState("Super"/"Hyper")`; `keymap.ts`'s `isPlainAnswerKey` rejects Alt,
+   *  Meta and Super alike. `jsdom`
+   *  honours `KeyboardEventInit`'s `modifierSuper` and `modifierHyper` as two independent booleans
+   *  (`EventModifierMixin-impl.js`'s `getModifierState` reads `this.modifier${keyArg}` for either),
+   *  so `Super+y` and `Hyper+y` below each isolate one without implying the other, the way a
+   *  physical keypress would report it (see keymap.ts's `KeyLike` doc comment on the honest caveat
+   *  about whether WebKitGTK ever surfaces either as a DOM modifier at all).
+   *
+   *  AltGraph: a level-3 shift some layouts
+   *  use to type an ordinary character. `isPlainAnswerKey` must check it too;
+   *  `jsdom` honours `modifierAltGraph` the same way it
+   *  honours `modifierSuper`. */
   it.each([
     ["Ctrl+y", { key: "y", ctrlKey: true }],
     ["Alt+y", { key: "y", altKey: true }],
@@ -10848,10 +11089,27 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  /** Spy on the exported `isPlainAnswerKey` to check that the bypass handler uses the shared rule.
-   *  Behavioral cases alone also pass with an equivalent local copy. The namespace spy intercepts
-   *  App's imported binding, but cannot intercept direct calls within `keymap.ts`.
-   *  The keymap matrix checks those callers; direct predicate tests check the rule itself. */
+  /** Spy on the shared predicate so a copied modifier list cannot pass unnoticed.
+   *  h3 above pins every modifier/composing case behaviourally, but a same-shaped hand-written copy
+   *  substituted for the `isPlainAnswerKey` call in the bypass-y handler would pass every one of
+   *  them too: it only proves the RESULT, not that both surfaces share one rule.
+   *  This spies on the real, exported
+   *  `keymap.ts#isPlainAnswerKey` (imported as a namespace, so the spy replaces the same binding
+   *  `App.tsx`'s own `import { isPlainAnswerKey }` resolves through -- confirmed in a throwaway
+   *  cross-module spike before writing this) and catches the one mutation at this call site h3
+   *  cannot: `App.tsx` reverting to a same-shaped hand-written modifier list (the spy sees zero
+   *  calls; all h3 rows still pass while this test fails).
+   *  Hardcoding `plain = true` is a DIFFERENT mutation and not
+   *  that gap: confirmed by mutation, it fails every h3 row (all nine) as well as this one -- h3's
+   *  own behavioural assertions already catch it, so this test is merely redundant on that
+   *  particular case, not the reason it exists. It cannot reach `keymap.ts`'s OWN two internal call
+   *  sites (the `a`/`d` case, the `Shift+D` arm) -- those are intra-module references the bundler
+   *  compiles to a direct local call, not a property read through the spied namespace object,
+   *  confirmed the same way. `keymap.test.ts`'s own matrix test (including all modifier combinations) is what
+   *  pins those two now, not behavioural tests alone -- though even that matrix cannot reach a bug
+   *  inside `isPlainAnswerKey` itself, since it derives its own expectation by calling the same
+   *  function under test; a direct `isPlainAnswerKey` unit test (and this file's own Hyper-alone h3
+   *  row) covers that instead. */
   it("h3b. the bypass-y handler calls the real, exported isPlainAnswerKey, not a look-alike copy", () => {
     const spy = vi.spyOn(keymapModule, "isPlainAnswerKey");
     fakeClock();
@@ -10870,7 +11128,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  /* The sandbox pass (2026-09-28, the bypass follow-up): WebKitGTK names the Super key "Super",
+  /* WebKitGTK names the Super key "Super",
      which the prompt's old four-name modifier list did not know, so holding Super closed the prompt
      by itself and the y after it copied a row instead. Super's own keydown is a modifier now, and a
      y while it is held is refused like any other modified y. */
@@ -10901,8 +11159,9 @@ describe("v1 mode: entering bypass asks first", () => {
       ["focus_permission", () => dispatch({ kind: "focus_permission", tab: 1 })],
       ["enter_input", () => dispatch({ kind: "enter_input" })],
       ["chooser", () => dispatch({ kind: "chooser", open: [], records: [] })],
-      // GTK claims these keys before the WebView sees keydown, so they bypass `answerConfirm`. They must
-      // cancel the bypass prompt before a copy key or a rename beginning with `y` can answer it.
+      // GTK claims these keys before the WebView sees
+      // a keydown, so none of them passes through `answerConfirm` -- and "HINT then y" (copy a code
+      // block) or a rename starting with y answered the prompt.
       ["hint_collect (prefix f)", () => dispatch({ kind: "hint_collect", sessionId: 1 })],
       ["begin_rename (prefix ,)", () => dispatch({ kind: "begin_rename", tab: 1, current: null })],
       ["tab_detail (prefix i), whose own y copies a row", () => dispatch({ kind: "tab_detail", tab: 1, rows: [{ label: "cwd", value: "/p" }] })],
@@ -11043,9 +11302,10 @@ describe("v1 mode: entering bypass asks first", () => {
   });
 });
 
-/** The prompt and chooser take the keys before controls underneath them.
- *  Prompt answers must reach the typing guard, held `y` must not count, and the chooser must
- *  handle `y` only once. Enter/Escape must reach the prompt even from the chooser's inputs. */
+/** A chooser must swallow keys it does not handle before they reach the card
+ *  under it. The failures below also included a typing guard that never saw the key that
+ *  answered a prompt, a held `y` counted, the chooser's `y` was handled twice, and the chooser's own
+ *  inputs kept Enter/Escape from the prompt. */
 describe("the prompt and the chooser take the keys whole", () => {
   function fakeClock() {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
@@ -11114,7 +11374,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     press("y");
     expect(confirms().map((m) => m.nonce)).toEqual([1]);
     wait(20);
-    // A card arrived while the prompt was open, so Rust responds with a fresh prompt.
+    // A card arrived while the prompt was up, so Rust answers with a fresh prompt.
     dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 2, lines: ["Switch to bypass and approve the 2 waiting cards? (y/n)"] });
     wait(280);
     press("y", { repeat: true });
@@ -11122,9 +11382,12 @@ describe("the prompt and the chooser take the keys whole", () => {
     expect(container.querySelector(".band-prompt")).toBeNull();
   });
 
-  /** A `y` pressed too soon after the prompt opens cancels it and leaves `confirm` null while
-   *  the key is still held. Its auto-repeats must be swallowed: falling through to BROWSE's `y`
-   *  calls `copied()` and replaces the cancellation flash with "copied N chars". */
+  /** Distinct from the test just above, which holds `y`
+   *  across a REPROMPT. Here nothing reprompts -- the FIRST `y` (too soon after the prompt
+   *  opened, so it fails the guard's on-screen half) just cancels, leaving `confirm` null, and the
+   *  physical key is still held. Before the fix, each auto-repeat after that fell through to
+   *  BROWSE's own `y` (copy the row under the cursor), which calls `copied()` and overwrites the
+   *  typing-guard flash with "copied N chars" within about one repeat interval. */
   it("defect 2: after a held y cancels the prompt, its autorepeats do not fall through as BROWSE's copy", () => {
     fakeClock();
     const { container } = arrivedOnACard();
@@ -11298,9 +11561,10 @@ describe("the prompt and the chooser take the keys whole", () => {
   });
 });
 
-/* These tests cover the page's `panel_keys` mirror and the `nav_key`/`nav_fallthrough` exchange
-   for `Ctrl+j`/`Ctrl+k`. They post and dispatch wire envelopes without running Rust's
-   `install_module_nav`. */
+/* The page's composer-focus mirror -- the `panel_keys`
+   mirror this page posts, and the `nav_key`/`nav_fallthrough` round trip a claimed `Ctrl+j`/`Ctrl+k`
+   takes. The Rust side has tests of its own; this file only ever posts/dispatches the wire envelopes
+   both sides agree on, never anything from `install_module_nav` itself. */
 describe("the composer mirror", () => {
   function startedApp() {
     const rendered = render(<App />);
@@ -11329,8 +11593,10 @@ describe("the composer mirror", () => {
     expect(lastOfType("panel_keys")).toMatchObject({ mode: "input" });
   });
 
-  // `before` already includes the initial BROWSE state, so only the four subsequent mode transitions
-  // post new mirrors.
+  // The title used to say "five mirrors" while the assertion below
+  // checks four -- `before` is captured already sitting in the first (BROWSE) of the five states, so
+  // only the four transitions AWAY from it post; the title now says what the assertion actually
+  // checks.
   it("posts only on change: BROWSE -> INPUT -> BROWSE -> INPUT -> BROWSE is four new mirrors, not five", () => {
     const { container } = startedApp();
     const before = posted.filter((m) => m.type === "panel_keys").length;
@@ -11380,9 +11646,10 @@ describe("the composer mirror", () => {
     expect(lastOfType("panel_keys")).toMatchObject({ mode: "other" });
   });
 
-  // Before the first `tabs` envelope, `activeTab` is `null` and no `EmptyTab` composer is mounted.
-  // The mirror must not report `emptyMode`'s default `input` and claim `Ctrl+k` for a nonexistent
-  // box.
+  // Before the first `tabs` envelope, `activeTab` is `null` and the
+  // render shows only "Connecting to the shell…" -- there is no `EmptyTab`, so no box of any kind.
+  // `emptyMode`'s "input" default must not leak into the mirror here (it used to, claiming `Ctrl+k`
+  // for a composer that had never mounted).
   it("posts other before the first tabs envelope (no box exists yet)", () => {
     render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -11410,7 +11677,8 @@ describe("nav_key and its fallthrough", () => {
   });
 
   it("nav_key up in INPUT leaves it, cursor unchanged, draft kept, no fallthrough", () => {
-    // Two transcript rows make it possible to check that the cursor stays on the same row.
+    // A transcript with two rows, so "cursor unchanged" is actually
+    // checkable -- the earlier version of this test had nothing to assert it against.
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 0);
@@ -11425,13 +11693,17 @@ describe("nav_key and its fallthrough", () => {
     expect(container.querySelector(".composer-draft")!.textContent).toBe("half a thought");
     expect(posted.slice(before).some((m) => m.type === "nav_fallthrough")).toBe(false);
     expect(container.querySelector(".row-current")!.textContent).toBe(cursorRowBefore);
-    // Leaving INPUT must return DOM focus to the panel root so it receives subsequent keys.
+    // The panel root, not `document.body`, must hold real DOM focus
+    // afterwards -- the same regression class "returns real DOM focus to the panel root after
+    // Escape" above guards against, but this chord had no assertion of its own.
     expect(document.activeElement).toBe(root);
   });
 
-  // `nav_key down` keeps the caret, like `i`/`o`. A bare `setMode("input")` would reuse an earlier
-  // `A`'s stale `composerCaret`: Composer's effect runs on a mode change without needing a fresh
-  // `composerFocusRequest`.
+  // `nav_key down` must carry the same caret rule `i`/`o` do --
+  // "kept" for this chord, rather than whatever `composerCaret` was last
+  // left at by an unrelated `A` press (a bare `setMode("input")` reads that stale state, since
+  // `Composer`'s own effect keys on `mode` alone and does not require a fresh `composerFocusRequest`
+  // to run). Reproduced without this fix: the caret below landed at the end of the draft, not at 3.
   it("nav_key down places the caret where it was left, not wherever an earlier A left composerCaret", () => {
     const { container } = startedApp();
     const root = conversationRoot(container);
@@ -11452,9 +11724,10 @@ describe("nav_key and its fallthrough", () => {
     expect(box2.selectionEnd).toBe(3);
   });
 
-  // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees keydown. A claimed `nav_key` must cancel
-  // pending prefixes and leader sequences, or a later key can complete a stale sequence after
-  // returning from INPUT.
+  // GTK takes `Ctrl+j`/`Ctrl+k` before the WebView sees a keydown, so
+  // a claimed `nav_key` is a key pressed in between -- exactly why `pane_focus`/`arrive` cancel a
+  // pending `g`/`z`/`[`/`]` prefix or leader sequence. Without that here, `g`, Ctrl+j, a draft,
+  // Ctrl+k left the box drawn over the composer and one later `g` completed the stale `gg`.
   it("a claimed nav_key cancels a pending g prefix and hides its box", () => {
     vi.useFakeTimers();
     try {
@@ -11532,8 +11805,10 @@ describe("nav_key and its fallthrough", () => {
     expect(container.querySelector(".keymap-overlay")).not.toBeNull();
   });
 
-  // Before the first `tabs` envelope, `EmptyTab` is not mounted. Queuing `nav_key` in `emptyNavKey`
-  // would seed `navKeySeenRef` at mount and silently discard the key.
+  // Before the first `tabs` envelope, `EmptyTab` is not mounted yet
+  // (only "Connecting to the shell…" is on screen) -- a `nav_key` here used to be queued into
+  // `emptyNavKey` and then silently dropped the moment `EmptyTab` DID mount, because its
+  // `navKeySeenRef` seeds itself from that already-stale prop at mount and never fires for it.
   it("nav_key before the first tabs envelope falls through, not silently dropped once EmptyTab later mounts", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -11586,9 +11861,13 @@ describe("nav_key over the empty tab", () => {
   });
 });
 
-/* Exercise o/A caret placement, j on the last stop, and Esc during a running turn through keydowns.
-   This checks that `resolveKey` actions reach `Composer` and the band, beyond the pure keymap tests.
-   The BROWSE hint is covered in Composer.test.tsx; chooser Escape here covers the live-tab landing. */
+/* `o`/`A` and the caret (the BROWSE placeholder hint itself
+   is unit-tested in Composer.test.tsx and not repeated here), j on the last stop, and Esc while a
+   turn runs -- each exercised through a real keydown on the
+   conversation root, confirming `resolveKey`'s action actually reaches `Composer`/the band and not
+   only that the pure table returns the right shape (`keymap.test.ts` already pins that). The
+   chooser's own Esc-over-an-empty-tab landing is pinned in "the session chooser" above; this
+   adds only its live-tab counterpart, for symmetry. */
 describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
   function startedApp() {
     const rendered = render(<App />);
@@ -11662,7 +11941,7 @@ describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
     vi.unstubAllGlobals();
   });
 
-  /* The v1-ui GUI pass (2026-09-27): holding `j` to the bottom never flashed -- every step after the
+  /* Holding `j` to the bottom never flashed -- every step after the
      first is a repeat. The first repeat that stops after moving now flashes; the ones after it do not. */
   it("a held j that reaches the last stop by repeat flashes once", () => {
     vi.useFakeTimers();
@@ -11726,7 +12005,8 @@ describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
     vi.unstubAllGlobals();
   });
 
-  /** Esc from the chooser over a live tab returns focus to the conversation root. */
+  /** The live-tab counterpart of the empty-tab landing pinned in "the session chooser":
+   *  the chooser's Esc must return the conversation its own root. */
   it("Esc from the chooser over a live tab returns to the conversation root, unchanged", () => {
     const { container } = startedApp();
     const root = conversationRoot(container);
@@ -11786,10 +12066,13 @@ describe("every panel y/n accepts Y too", () => {
   });
 });
 
-/* jsdom implements `Selection` but not `modify()`. This stub moves the live selection's focus
-   by characters or words over its text content, so tests can check that motions move the caret
-   and `y` copies the live DOM selection. Exact word and line movement is tested with the native
-   implementation in `shell/tests/panel_visual_mode.rs`. */
+/* BROWSE visual mode.
+   jsdom implements `Selection` but not WebKit's own `modify()` -- this
+   stub moves the live selection's focus by whole characters/words over its own text content, good
+   enough to prove the WIRING end to end (a motion really moves the caret, `y` really copies
+   something real off the live DOM selection). It is not a vim-exact word/line implementation and
+   is not meant to be one: the real `Selection.modify` behaviour is verified only in the real
+   WebKit harness, `shell/tests/panel_visual_mode.rs`. */
 function stubSelectionModify(): () => void {
   const proto = Selection.prototype as unknown as { modify?: (alter: string, direction: string, granularity: string) => void };
   const original = proto.modify;
@@ -11802,9 +12085,12 @@ function stubSelectionModify(): () => void {
     const startAnchorOffset = this.anchorOffset;
     if (granularity === "character") {
       offset = direction === "forward" ? Math.min(text.length, offset + 1) : Math.max(0, offset - 1);
-      // WebKit draws a block caret at the final text position, but jsdom has no layout to model it. When
-      // a collapsed selection at `text.length` cannot extend forward, pull its anchor back one
-      // character so the stub still yields a one-character selection.
+      // The line-end caret quirk: at a line end WebKit draws the line-break box, which
+      // reads like vim's cursor past the end. A real engine still shows a one-character block caret
+      // at the very last position, which needs real layout jsdom does not have. A block caret
+      // (anchor === focus, both already at `text.length`) extending forward has nowhere left to move
+      // within this text node -- pull the ANCHOR back by one instead, so the stub still produces the
+      // one-character selection the caret needs, without claiming jsdom modelled WebKit's own rendering.
       if (
         alter === "extend" &&
         direction === "forward" &&
@@ -11829,8 +12115,8 @@ function stubSelectionModify(): () => void {
         offset = i;
       }
     } else {
-      // For "line" and "paragraphboundary", each stub row is one text node, so both move to
-      // that node's start or end. `0`/`$` and V-LINE use the same boundaries.
+      // "line" / "paragraphboundary": this stub's rows are each one text node, so both collapse to
+      // that node's own start/end -- the same unit `0`/`$` and V-LINE share.
       offset = direction === "forward" ? text.length : 0;
     }
     if (alter === "move") this.collapse(node, offset);
@@ -11859,7 +12145,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(visualFixture(), 3);
-    // The band's mode block draws only while this pane holds the keys -- every
+    // The band's mode block draws only while this pane holds the keys (it is blank without keyboard focus) -- every
     // test below reads it, so this pane needs focus, the same as a real launch's `pane_focus` gives
     // the panel once it is clicked or `Ctrl+l`'d into.
     dispatch({ kind: "pane_focus", focused: true });
@@ -11889,7 +12175,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "v" });
     expect(modeBlock()?.getAttribute("data-mode")).toBe("visual");
     expect(modeBlock()?.textContent).toBe("VISUAL");
-    // Escape from VISUAL returns to CARET, keeping the region active.
+    // VISUAL's own Esc goes back to CARET, not all the way to BROWSE -- the region stays on.
     fireEvent.keyDown(root, { key: "Escape" });
     expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
     // CARET's own Esc ends the whole region.
@@ -11898,14 +12184,14 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "V", shiftKey: true });
     expect(modeBlock()?.getAttribute("data-mode")).toBe("vline");
     expect(modeBlock()?.textContent).toBe("V-LINE");
-    // Escape from V-LINE also returns to CARET.
+    // V-LINE's own Esc also goes back to CARET.
     fireEvent.keyDown(root, { key: "Escape" });
     expect(modeBlock()?.getAttribute("data-mode")).toBe("caret");
   });
 
-  /** `Ctrl+[` is Esc in the region too. Until then the region
+  /** `Ctrl+[` is Esc in the region too. Before it was, the region
    *  read it as a modified key its table does not claim (`vswallow`: swallowed, nothing else), so a
-   *  vim user reaching for it saw CARET/VISUAL stay on -- the one region change of that plan. It
+   *  vim user reaching for it saw CARET/VISUAL stay on. It
    *  reaches `resolveKey` as the plain Escape `./ctrlBracket` turns it into, `repeat` and all. */
   it("R9: Ctrl+[ is Esc in the region -- VISUAL and V-LINE back to CARET, CARET to BROWSE, and a held one steps back once", () => {
     const { container, root } = startedOnPromptRow();
@@ -11918,8 +12204,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(mode()).toBe("visual");
     expect(fireEvent.keyDown(root, ctrlBracket), "claimed, not left to the browser").toBe(false);
     expect(mode()).toBe("caret");
-    // The key that steps back swallows its own repeats. The translated Escape preserves
-    // `repeat`, so holding Ctrl+[ does not also end the region.
+    // The key that stepped back swallows its own repeats. The Escape this becomes carries the
+    // original's `repeat`, so a held Ctrl+[ does not go on to end the whole region.
     fireEvent.keyDown(root, { ...ctrlBracket, repeat: true });
     expect(mode()).toBe("caret");
     // A fresh press is a new key and ends it, as a fresh Esc does.
@@ -11951,15 +12237,20 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     vi.useFakeTimers();
     try {
       const { root } = startedOnPromptRow();
-      // Move onto the permission row so this test checks the region's suppression of `a`/`d`/`D`. On the
-      // prompt row, `permissionTarget` finds no card and BROWSE already answers nothing, so the
-      // test could pass without suppression.
+      // The cursor must be ON the card for this test to prove anything:
+      // `startedOnPromptRow` lands `gg` on the PROMPT
+      // row, where BROWSE's own `a`/`d`/`D` already answer nothing (`permissionTarget` finds no
+      // card there) -- so the original version of this test passed even with the region's own
+      // card-answer suppression deleted outright, proving nothing about it. `j` moves onto the permission
+      // row.
       fireEvent.keyDown(root, { key: "j" });
       expect(root.querySelector(".row-current")?.className).toContain("row-permission");
-      // Enter CARET with `v` before each answer key. The unbound `a`/`d`/`D` keys end the
-      // region, while `landCursorOnRowKey` keeps the row cursor on the card. A single `v`
-      // before the whole sequence would test later keys in BROWSE and could pass without
-      // testing their suppression in CARET.
+      // `v` (CARET) before EACH key, not once before all three: `a`/`d`/`D` are themselves
+      // unbound CARET keys, and an unbound key ENDS the region (`landCursorOnRowKey` keeps the row cursor on the
+      // card throughout), so a chained `v, a, d, Shift+D` tests `a` in CARET but `d`/`Shift+D` in
+      // plain BROWSE on the same row -- which answer nothing there either, but for a different,
+      // untested reason. Found while building the first version of this fix: the chained form
+      // silently posted nothing for the wrong cause.
       for (const key of [{ key: "a" }, { key: "d" }, { key: "D", shiftKey: true }]) {
         fireEvent.keyDown(root, { key: "v" });
         expect(document.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
@@ -11986,8 +12277,9 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       const { root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "j" });
       expect(root.querySelector(".row-current")?.className).toContain("row-permission");
-      // `a` must stand alone: right after `j`, within the guard window, it is refused as
-      // typing. Wait so this control checks that the row answers a lone `a`.
+      // `a` must stand alone: right after `j`, within the same guard window, it is refused as
+      // typing (the same rule the test above's own comment explains) -- this control is about
+      // whether the ROW answers a properly-alone `a`, not about the typing guard itself.
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
       fireEvent.keyDown(root, { key: "a" });
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
@@ -12064,8 +12356,9 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "Escape" });
     expect(clipboard.writeText).not.toHaveBeenCalled();
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
-    // CARET selects one character at the moving end, which `l` advanced to "e". Check the text
-    // as well as the length: selecting the anchor "h" would also pass a length-only check.
+    // CARET's own selection is one character, at the MOVING end ("cursor", which `l` just
+    // advanced to "e") -- never the anchor ("h"), which a mutation landing CARET on the anchor
+    // instead would still pass a bare length-1 check with (it would read "h").
     expect(window.getSelection()?.toString()).toBe("e");
     fireEvent.keyDown(root, { key: "Escape" });
     expect(clipboard.writeText).not.toHaveBeenCalled();
@@ -12173,8 +12466,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       fireEvent.keyDown(root, { key: "v" });
       // The leader claimed it: no VISUAL, no flash naming it as unbound.
       expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
-      // Check that `v` starts the leader: its which-key box appears and `<leader>d` runs `tab.close`.
-      // Merely staying out of VISUAL would also pass if `v` were swallowed.
+      // The first version asserted only that negative half, which a
+      // `v` swallowed by anything at all would satisfy. The positive half: `v` really STARTED the
+      // leader -- its which-key box draws, and the sequence it began completes (`<leader>d` runs
+      // `tab.close`).
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
       expect(container.querySelector(".which-key-box"), "v, the leader, draws the leader's which-key box").not.toBeNull();
       posted.length = 0;
@@ -12206,18 +12501,20 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
         newTabChord: "Ctrl+b c",
         panel: { ...EMPTY_PANEL_TABLE, bindings: [binding(["V"], "tab.close")] },
       });
-      // Wait past the typing guard's window after `startedOnPromptRow`'s `gg`. An immediate
-      // single-key table binding is refused as typing, so seeing "browse" alone would not prove
-      // the binding ran.
+      // Past the typing guard's window: right after `startedOnPromptRow`'s own `gg`, a single-key
+      // table binding is refused as typing ("k then L at 80 ms"), which is why the first
+      // version of this test, pressing `V` at once, saw "browse" without the binding ever running.
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
       posted.length = 0;
       fireEvent.keyDown(root, { key: "V", shiftKey: true });
-      // A lone single-key table binding runs after `TYPING_GUARD_MS`, like the default `L`
-      // binding. If `resolveKey`'s `V` entry ran instead of the table binding, the mode would
-      // be "vline" rather than "browse".
+      // A single-key table binding runs `TYPING_GUARD_MS` later, standing alone, the same as `L`'s
+      // own single-key default does -- the contrapositive of what this assertion proves: had
+      // the table lookup NOT beaten `resolveKey`'s own `V` -> VISUAL row, this would read "vline"
+      // instead of "browse", deferred or not.
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
       expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
-      // Check that `V` runs the binding. Staying in BROWSE alone would also pass if the key did nothing.
+      // And the positive half: "V runs it". Without
+      // this, a `V` that did nothing at all passed as well as one that ran the binding.
       expect(posted.filter((m) => m.type === "tab_verb"), "the init.lua row on V ran: tab.close").toEqual([
         expect.objectContaining({ type: "tab_verb", verb: "close" }),
       ]);
@@ -12226,8 +12523,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     }
   });
 
-  // Each of these routes must call `exitVisual` and clear the region's selection. Test them
-  // separately so omitting any one call is caught.
+  // Every route that exits the region must restore the live list.
+  // Each calls `exitVisual` explicitly; the routes just above this
+  // describe's own tests never had a test proving it. Mutation testing found removing any one of
+  // these calls still passed the suite.
   it.each([
     ["hint_collect", { kind: "hint_collect", sessionId: 1 }],
     ["begin_rename", { kind: "begin_rename", tab: 1, current: null }],
@@ -12283,9 +12582,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "j" }); // onto the permission card row
     fireEvent.keyDown(root, { key: "v" });
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
-    // A click ends the region before keydown. Dispatch directly to the controls to check the
-    // separate keydown guard: a key targeted at anything other than the root itself ends the region and is swallowed
-    // before a descendant can handle it.
+    // A real click already ends the region before its own keydown -- this asserts the
+    // OTHER half of the focus rule directly: "a key whose target is not the root ends the region
+    // and is swallowed, so no descendant sees it." Dispatched straight onto the controls, bypassing
+    // the pointer-down exit, so a stray focus change (not a click) is what is under test.
     const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
     const approve = container.querySelector<HTMLButtonElement>('button[data-nav-action="allow"]')!;
     fireEvent.keyDown(reasonBox, { key: "a" });
@@ -12393,9 +12693,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
 
   const modeOf = (container: HTMLElement) => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
 
-  /* `handoff` and `error` reset to `initialState()`, whose status is `starting`.
-     That reset alone does not end VISUAL or release the frozen conversation; each route needs `exitVisual`.
-     Each case includes a control without `v` to check the setup. */
+  /* The `handoff` and `error` arms reset the whole state
+     to `initialState()` -- status `starting`, so not an ended session, and `mode` untouched -- and
+     neither ever called `exitVisual`. VISUAL, and the conversation it froze, outlived the
+     conversation. Each case below has a control run without `v`, so the setup is proven real. */
   /** `between` runs after the `handoff` envelope and before the `tabs` one that follows it, so a
    *  test can look at the arm's own effect before the `[sessionStarted]` backstop gets a turn. */
   function handOffTab1(between: () => void = () => {}) {
@@ -12499,9 +12800,11 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(modeOf(container)).toBe("browse");
   });
 
-  /* App's `timeline` stays live while `MessageList` draws the frozen list, so join them by key.
-     A linked card can change live `[tool, reply]` to `[tool, card, reply]` while the frozen list
-     still has two rows. Live index 2 names no frozen row; the key identifies the reply in both. */
+  /* App's `timeline` stays live while `MessageList` draws the
+     frozen one, so the two are joined by key. A card linked to an EARLIER tool call arrives while
+     VISUAL is on: live `[tool, reply]` becomes `[tool, card, reply]` (`timeline.ts`'s anchoring), the
+     frozen list still has two rows. Handing `MessageList` the live index (2) would name no frozen row;
+     the key names the reply in both. */
   function linkedFixture() {
     return snapshotState({
       activeTurnId: "t1",
@@ -12576,8 +12879,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(modeOf(container)).toBe("browse");
   });
 
-  // A click into the reason box triggers both pointer press and focus. Test each event alone so
-  // neither can hide a missing region exit in the other handler.
+  // Tests the two exits together (a click into the reason box is both a
+  // pointer press and a focus); each alone must end VISUAL too, or removing either passes the suite.
   it("a pointer press alone (on text that takes no focus) ends CARET", () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" });
@@ -12603,18 +12906,20 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.keyDown(root, { key: "v" });
     expect(modeOf(container)).toBe("caret");
     const reasonBox = container.querySelector<HTMLInputElement>(".permission-card input")!;
-    // `l` would move the caret and keep CARET active on the root. On a foreign target it must
-    // end the region and be swallowed.
+    // `l` is a motion: taken as a CARET key it would move the caret and leave CARET on. A key on a
+    // foreign target must end the region and be swallowed instead.
     const notPrevented = fireEvent.keyDown(reasonBox, { key: "l" });
     expect(notPrevented).toBe(false);
     expect(modeOf(container)).toBe("browse");
     expect(window.getSelection()?.toString()).toBe("");
   });
 
-  /* VISUAL keys must reach `typingGuard.onKey` in the capture handler.
-     Capture stops propagation, so `onKeyDown` cannot report those keys. Without this, a BROWSE `d`
-     typed just after leaving VISUAL can appear isolated and deny a card while the reader types prose.
-     Typing `ver` then `d` checks that the earlier keys still suppress the answer. */
+  /* The rule "VISUAL keys count as typing for what follows"
+     had no test -- the capture handler's `typingGuard.onKey` replaced by a no-op passed the suite.
+     Without it the guard never hears a key VISUAL takes (the capture handler stops their
+     propagation, so `onKeyDown`'s own call never runs for them), and a BROWSE `d` typed right after
+     the key that ENDED VISUAL looks alone: "ver" then `d` -- prose after a stray `v`, the
+     "verify" example -- denied the card. The reviewer's probe, kept as the test. */
   it("the keys VISUAL takes count as typing -- a d right after the key that ended VISUAL answers no card", () => {
     vi.useFakeTimers();
     try {
@@ -12641,8 +12946,9 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     }
   });
 
-  /* Modified keys are swallowed: their default is prevented, VISUAL stays active,
-     and the selection does not move. Alt+j must not act as j. */
+  /* Modified region keys, end to end -- `keymap.test.ts` pins
+     `vswallow`; this pins what swallowing means on the page: the key's default is prevented, VISUAL
+     stays, and the selection does not move (Alt+j is not j). */
   it("Ctrl+o and Alt+j in VISUAL are swallowed -- prevented, VISUAL stays, the selection unchanged", () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" }); // CARET
@@ -12657,10 +12963,13 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(window.getSelection()!.toString()).toBe(before);
   });
 
-  /* While VISUAL is active, live cursor indices must not address the frozen DOM.
-     A queued prompt can move the live cursor to index 3 while frozen row 3 is an unrelated tool row.
-     The cursor effect, current-row fallback and scroll clamp must not use that index to scroll,
-     highlight a frozen row or write a frozen index back into the live cursor. */
+  /* Nothing indexes the DOM by the live cursor
+     while VISUAL is on. Three things did, all reached by the reviewer's probe: a queued prompt sent at
+     a turn's end (`landOnPromptRef`) moves the LIVE cursor to a row the frozen list does not have --
+     here live index 3, while the frozen list's row 3 is an unrelated tool row -- and then the
+     `[cursor]` effect scrolled that frozen row into view, `MessageList`'s `?? cursor` fallback drew it
+     as the current row, and the scroll clamp read the frozen rows by the live index and wrote a
+     frozen index back as the live cursor. */
   function queuedPromptFixture() {
     const tool = (seq: number) => ({ seq, toolUseId: `tu${seq}`, name: "Read", input: { file_path: `/x/f${seq}.rs` }, result: { content: `file ${seq}`, isError: false }, turnId: "t1" });
     return snapshotState({
@@ -12710,9 +13019,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(scrollIntoView, "no frozen row is revealed for the live cursor").not.toHaveBeenCalled();
     expect(root.querySelector(".row-current"), "the live cursor's row is not in the frozen list: no current row at all").toBeNull();
 
-    // The frozen row at the live cursor index (3) is off screen, while the first row is
-    // visible. Running the scroll clamp against these frozen rows would incorrectly write 0
-    // back to the live cursor.
+    // The frozen row at the live index (3) is
+    // off screen above, the first row visible. A clamp reading the frozen rows would write 0 back.
     const list = root.querySelector<HTMLElement>(".message-list")!;
     const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
     list.getBoundingClientRect = () => rect(0, 100);
@@ -12720,7 +13028,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     fireEvent.scroll(list);
     expect(root.querySelector(".row-current"), "the clamp wrote no frozen index back as the live cursor").toBeNull();
 
-    // Escape restores the live list, including the queued prompt, with the cursor on the row the region was on.
+    // Esc: the live list, with the queued prompt, and the cursor back on the row the region was on.
     fireEvent.keyDown(root, { key: "Escape" });
     expect(modeOf(container)).toBe("browse");
     expect(root.textContent).toContain("a queued prompt");
@@ -12770,10 +13078,14 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(root.querySelector(".row-current")?.textContent).toContain("rm build");
   });
 
-  /* `exitVisual` requests a live render; it does not repaint synchronously.
-     `hint_collect` must wait for that render before reading `containerRef.current`, or controls
-     on newly arrived cards are absent from the collected targets. Nonzero layout stubs are needed
-     in jsdom so zero-sized targets do not hide the difference between frozen and live collections. */
+  /* `hint_collect`'s dispatch arm had the exact gap `focus_permission`'s reveal had
+     before the `focus_permission` test above fixed it -- `exitVisual` only ASKS `MessageList` to draw the live list;
+     it does not repaint synchronously, so reading `containerRef.current` right there, before that
+     repaint, could still be the frozen VISUAL one. A row that arrived during VISUAL (a linked
+     permission card, with its own Approve/Deny/reason controls) would then get no HINT label at all.
+     A probe with `getBoundingClientRect` stubbed nonzero (jsdom lays out nothing, so without this
+     stub every target -- old or new -- measures zero-size and is filtered out regardless of the bug)
+     found 3 targets collected while VISUAL still framed the collect, 7 once thawed. */
   it("hint_collect right after VISUAL counts the thawed list, not the frozen one it interrupts", () => {
     const originalRect = Element.prototype.getBoundingClientRect;
     Element.prototype.getBoundingClientRect = function () {
@@ -12796,8 +13108,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       expect(root.querySelector(".row-current")?.className).toContain("row-tool");
       fireEvent.keyDown(root, { key: "v" });
       expect(modeOf(container)).toBe("caret");
-      // A card linked to the same call arrives during CARET. It is absent from the frozen list
-      // captured by `v`, as in the `focus_permission` test above.
+      // A card linked to that same call arrives while CARET is on -- not in the frozen list `v`
+      // captured, same fixture shape as the frozen-list `focus_permission` test just above.
       dispatch({
         kind: "events",
         tab: 1,
@@ -12824,10 +13136,15 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     }
   });
 
-  /* Finished results start folded, and `/` matches their text without unfolding them.
-     Press Enter before entering selection mode to make `.tool-result-body` available.
-     From the invocation line, 40 `j` presses reach "build line 040".
-     The `modify` stub moves by hard line, matching the fixture's one screen line per output line. */
+  /* The real-WebKit check (`shell/tests/panel_visual_mode.rs`)
+     could not pass. A finished result is folded by default (`MessageList` renders
+     `renderToolCall(call, expanded[key] === true)`, `expanded` starts `{}`), and `/` matches folded
+     text without unfolding it -- so `V` started on the invocation line and the first `j` left the row
+     with no `.tool-result-body` to be in. The route that works is `Enter` (drawing the folded
+     result) before `v`. And from the
+     invocation line, 40 `j` end on "build line 040", not 041. Proved here with a `modify` stub that
+     moves by hard line (each `pre` line is one screen line in W6's fixture, and the invocation is one
+     line): the same keys W6 sends, in the replay's own row order. */
   function stubLineModify(): () => void {
     const proto = Selection.prototype as unknown as { modify?: (alter: string, direction: string, granularity: string) => void };
     const original = proto.modify;
@@ -12884,8 +13201,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     const out = Array.from({ length: 80 }, (_, i) => `build line ${String(i + 1).padStart(3, "0")}: ok`).join("\n");
-    // Place the waiting card before the tool call, matching `replay_main`, so a row follows the card
-    // and selection can cross its controls.
+    // `replay_main`'s own order: the waiting card BEFORE the tool call, so a row
+    // follows the card and the selection crosses its controls.
     dispatchLiveTab(
       snapshotState({
         userPrompts: [{ seq: 1, text: "The quick brown fox jumps over the lazy dog" }],
@@ -12923,17 +13240,18 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(text, "V-LINE ends at the cursor's own line").not.toContain("build line 041");
   });
 
-  // `gg`/`G` place the caret, or extend the selection, at the list's first or last selectable
-  // character without calling `Selection.modify`. Check CARET's one-character selection at the
-  // fixture's endpoints; a call through the stub would appear in `sel.calls`.
+  // `gg`/`G` place the caret (or extend the selection to) the list's first/
+  // last selectable character -- never through Selection.modify (the fake stubbed by beforeEach
+  // would show it in `sel.calls` if it were), so this is proved from CARET's OWN one-character
+  // selection landing on the very first/last character of the fixture's two rows.
   it("gg/G place the caret at the conversation's first/last selectable character", () => {
     const { container, root } = startedOnPromptRow();
     expect(container.querySelector(".row-current")?.className).toContain("row-prompt");
     fireEvent.keyDown(root, { key: "v" }); // CARET, starting on the prompt row
     fireEvent.keyDown(root, { key: "G", shiftKey: true });
     expect(window.getSelection()!.toString().length).toBe(1);
-    // The row cursor stays put until the region ends. Escape then lands it where the caret
-    // moved.
+    // The row cursor does not move until the region ends -- Esc lands it where the caret
+    // walked to.
     fireEvent.keyDown(root, { key: "Escape" });
     expect(container.querySelector(".row-current")?.className).toContain("row-permission");
     fireEvent.keyDown(root, { key: "v" }); // CARET again, now starting on the permission row
@@ -12981,10 +13299,16 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     }
   });
 
-  // `>` must move the row cursor to the selection's start row, as `y` does. Start on the permission
-  // row and extend backward with `gg` to the prompt row. This works without `Selection.modify` or
-  // layout in jsdom. Nothing else moves the BROWSE cursor during the region, so leaving
-  // `landCursorOnRowKey` out of `vquote` would leave `.row-current` on the wrong row.
+  // `>` must move the row cursor to the
+  // SELECTION'S START row, the same "earlier" rule `y` uses -- not leave it wherever BROWSE
+  // happened to be when the region was entered. Starts on the PERMISSION row (the list's last row,
+  // BROWSE's own `j` moving it there before any region exists) and extends backward with `gg` (the boundary rule:
+  // "gg/G place the caret... at the list's first/last selectable character", exercised without
+  // `Selection.modify`/layout, so it works in jsdom) to the PROMPT row -- the selection's start is
+  // now the prompt row, the opposite end from where BROWSE's cursor sat going in. A mutation that
+  // makes `landCursorOnRowKey` a no-op in the `vquote` arm would leave `.row-current` on the
+  // permission row (nothing else moves the BROWSE cursor during the region); the fix must move it to
+  // the prompt row instead.
   it("> moves the row cursor to the selection's start row, not wherever BROWSE was when the region started", () => {
     vi.useFakeTimers();
     try {
@@ -13025,8 +13349,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       throughRevision: 4,
       events: [{ type: "session_closed", reason: "provider exited" }],
     });
-    // The `[sessionEnded]` effect already ended the region. Re-enter on the ended session so
-    // the refusal below tests `>` with an active region.
+    // The region already ended with the session (the `[sessionEnded]` backstop). Region mode allows entry on
+    // an ended session, so re-enter: the refusal below is `>`'s own, not "there is no region".
     expect(modeOf()).toBe("browse");
     fireEvent.keyDown(root, { key: "v" });
     fireEvent.keyDown(root, { key: "v" });
@@ -13049,9 +13373,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
     expect(document.activeElement).toBe(textarea);
     const afterFirstQuote = textarea.value;
-    // Send the repeat to the focused textarea, where a real repeat lands. jsdom does not type keydown
-    // events into textareas, so an unchanged value alone proves nothing. Preventing the keydown's
-    // default action is what stops `>` from being typed.
+    // The repeat lands where a real one would: on the focused box. jsdom never types a keydown into
+    // a textarea, so the value alone proves nothing; what keeps the engine from typing `>` is the
+    // keydown being default-prevented. Removing that guard once left
+    // this test passing because it fired on `root` and read only the value.
     const typed = fireEvent.keyDown(textarea, { key: ">", shiftKey: true, repeat: true });
     expect(typed).toBe(false);
     expect(textarea.value).toBe(afterFirstQuote);
@@ -13060,8 +13385,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(fireEvent.keyDown(textarea, { key: ">", shiftKey: true })).toBe(true);
   });
 
-  // The snapshot must stay frozen from CARET through VISUAL and back to CARET. Deltas arriving at
-  // each stage must leave the reply DOM untouched until the region ends.
+  // The freeze must hold from CARET through VISUAL and back: a delta in
+  // between leaves the reply's DOM untouched until the region ends. A
+  // change that thawed on vtoggle/vback passed every test, since the frozen-list test above only does
+  // `v` then Esc.
   it("the freeze holds from CARET through VISUAL and back to CARET, a delta arriving at each stage", () => {
     const { container, root } = startedOnPromptRow();
     const modeOf = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
@@ -13090,8 +13417,8 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector(".row-assistant")!.textContent).toContain("one two three");
   });
 
-  // Idle `Ctrl+c` in CARET must prevent the default action and show why nothing was copied. Check the
-  // flash here as well as the key handling.
+  // Idle Ctrl+c in CARET must be default-prevented and flash its status. The
+  // missing flash was previously caught only by keymap-level tests.
   it("idle Ctrl+c in CARET is claimed and says why; in VISUAL it stays the engine's own copy", () => {
     const clipboard = stubClipboard();
     const { container, root } = startedOnPromptRow();
@@ -13102,13 +13429,14 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(modeOf()).toBe("caret");
     expect(clipboard.writeText).not.toHaveBeenCalled();
     fireEvent.keyDown(root, { key: "v" });
-    // O6's default: VISUAL leaves idle Ctrl+c unclaimed, so the engine's native copy runs.
+    // By default VISUAL leaves idle Ctrl+c unclaimed, so the engine's native copy runs.
     expect(fireEvent.keyDown(root, { key: "c", ctrlKey: true })).toBe(true);
     expect(modeOf()).toBe("visual");
   });
 
-  // A held Escape steps VISUAL back to CARET and swallows its repeats until keyup. Only a fresh press
-  // may end the region.
+  // "A repeated ... Esc does nothing, and the key that leaves a mode swallows its own repeats
+  // until keyup". A held Esc used to step VISUAL back to CARET, then
+  // its first auto-repeat ended the whole region.
   it("a held Esc in VISUAL stops at CARET; only a fresh Esc ends the region", () => {
     const { container, root } = startedOnPromptRow();
     const modeOf = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
@@ -13126,7 +13454,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(modeOf()).toBe("browse");
   });
 
-  // The observer's flash must name CARET when a change ends CARET.
+  // The observer's flash named VISUAL while CARET was on.
   it("D13's observer ends CARET on a change under the caret, and names CARET", async () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" });
@@ -13140,9 +13468,10 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
   });
 
-  // A region key must announce all list scrolling it causes, including movement during a snap or
-  // probe before `scrollCaretIntoView`. Otherwise `follow.ts` can miss an upward scroll and snap
-  // the thawed list back to the bottom.
+  // A region key announces ANY scroll of the list it caused, not only
+  // the last nudge `scrollCaretIntoView` makes itself -- a j/k whose snap or probe revealed the line it
+  // measured has already moved the list by then, and went unannounced, so `follow.ts` never learned a
+  // `k` had scrolled up and the thawed list snapped back to the bottom when the region ended.
   it("a motion that scrolled the list during the key announces it -- up when it went up", () => {
     const { container, root } = startedOnPromptRow();
     const list = container.querySelector<HTMLElement>(".message-list")!;
@@ -13176,11 +13505,18 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
   });
 
+  /* These cases check delayed slash replies, refused commands, scrolling chords and region status;
+     the refused commands' own case is in the "App refused commands" describe below. */
 
-  /** The `slashReply` effect treats CARET/VISUAL/V-LINE as covered through
-   *  `isRegionMode(modeRef.current)`. A bare `/model` or `/effort` reply stays plain transcript
-   *  text. Opening `SlashPicker` would focus it, trigger the root's `onFocus` exit, and discard
-   *  the region before the next key. */
+  /** `slashReply`'s own effect (`App.tsx`'s `covered` check) listed every OTHER overlay
+   *  a bare /model or /effort reply must not open a picker over -- the chooser, `?`, the `/` prompt
+   *  -- but not the region. A reply landing during CARET/VISUAL/V-LINE opened `SlashPicker`, which
+   *  focuses itself (`slashPickerFocusRequest`), and the root's own `onFocus` (the focus backstop:
+   *  "focus landing on anything but the root ends the region") then called `exitRegion()` -- so the
+   *  very next `y` copied nothing and the very next `Enter` sent "/model haiku" into the picker
+   *  instead of doing whatever the user meant inside the region. Fixed the same way the chooser/`?`/
+   *  `/`-prompt cases already were: `isRegionMode(modeRef.current)` joins the `covered` disjunction,
+   *  so the reply stays plain transcript text and neither the picker nor the focus effect ever run. */
   it("finding 1: a bare /model's reply landing during VISUAL neither opens the picker nor ends the region", () => {
     const MODEL_REPLY =
       "Current model: `Haiku 4.5` (effort: high)\n" +
@@ -13220,11 +13556,17 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(clipboard.writeText).toHaveBeenLastCalledWith("he");
   });
 
-  /** `chooseSlashOption` sends directly through `sendMessage`; its text bypasses the
-   *  composer entirely. Ordinary send refusals restore sent text into the draft, so picker choices use a
-   *  separate "picker-send" in-flight kind. Refusing one must only flash in the footer and
-   *  preserve the draft. This test quotes "hello world" into an empty draft with `V >`, then
-   *  opens the picker from the earlier `/model` reply and refuses its choice. */
+  /** `chooseSlashOption` sends the picker's choice through the same `sendMessage` an
+   *  ordinary composer send uses, which records `{kind: "send", text}` -- so a refusal restores
+   *  `${record.text}\n${typedSince}` into the box, on the theory that `record.text` really did
+   *  leave it (the draft still matches the sent text). A picker choice never went through the
+   *  box at all: `chooseSlashOption` calls `sendMessage` directly. Reproduced exactly as found --
+   *  quote "hello world" into an EMPTY draft first (`V >`), so the box holds `"> hello
+   *  world\n\n"` and nothing else has touched it; only THEN does the earlier bare `/model`'s reply
+   *  open the picker (the picker only reaches BROWSE-blocking focus once `mode` is back to "input",
+   *  which the quote's exit already restored) and only THEN is a picker choice refused.
+   *  Fixed: a dedicated in-flight kind (`"picker-send"`) whose refusal is a footer flash alone --
+   *  the draft (whatever it holds) is left exactly as the user last set it. */
   it("finding 2: a refused picker choice flashes and leaves an already-quoted draft untouched", () => {
     vi.useFakeTimers();
     try {
@@ -13241,7 +13583,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
       fireEvent.keyDown(firstBox, { key: "Enter" });
       expect(lastOfType("send_message")!.text).toBe("/model");
       fireEvent.keyDown(firstBox, { key: "Escape" }); // back to BROWSE, box now empty
-      // V > : quote "hello world" into the empty draft.
+      // V > : quote "hello world" into the (empty) draft.
       fireEvent.keyDown(root, { key: "V", shiftKey: true }); // V-LINE directly (O8)
       fireEvent.keyDown(root, { key: ">", shiftKey: true });
       expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("input");
@@ -13283,10 +13625,13 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     }
   });
 
-  /** `resolveRegionModifierKey` handles Ctrl+e/Ctrl+y in CARET and VISUAL/V-LINE using BROWSE's
-   *  one-line `scroll-line` action. This checks that the region handler scrolls the list
-   *  without moving the caret or selection or changing the mode; `keymap.test.ts` checks the
-   *  low-level mapping. */
+  /** `resolveRegionModifierKey` (shared by CARET and VISUAL/V-LINE) used to swallow every
+   *  Ctrl chord, Ctrl+e/Ctrl+y included, with no feedback at all -- even though the `?` overlay and
+   *  CARET_KEYS' own `?` row both claimed "any other key leaves"/"ends the caret too". vim scrolls
+   *  on these keys in Visual mode; fixed the same way, reusing BROWSE's own one-line `scroll-line`
+   *  step (`keymap.test.ts` pins the low-level `resolveKey` mapping; this is the DOM-level proof that
+   *  `App.tsx`'s region switch actually scrolls the list and leaves the caret/selection and the mode
+   *  alone). */
   it("finding 3: Ctrl+e/Ctrl+y scroll the frozen list one line in CARET, without moving the caret or ending the region", () => {
     const { container, root } = startedOnPromptRow();
     const list = container.querySelector<HTMLElement>(".message-list")!;
@@ -13354,21 +13699,24 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(visualFlash).toContain("Enter");
     expect(visualFlash, "names BROWSE's Enter-then-v route").toContain("BROWSE");
     expect(visualFlash).toContain("v");
-    // An unbound `d` ends CARET and explains why.
+    // The unchanged case (`d`) still reads exactly as it did with the old handler.
     fireEvent.keyDown(root, { key: "v" });
     fireEvent.keyDown(root, { key: "d" });
     expect(container.querySelector(".band-message")?.textContent).toBe("CARET ended: d is not a CARET key (v selects)");
   });
 });
 
-/* When a tab fails with its composer focused, the disabled textarea loses focus to <body> in
-   WebKit. Replaying keys on `.agent-ui-root`, the empty tab's parent, misses the empty tab's
-   handler and leaves `r` unable to retry. jsdom keeps a disabled textarea focused, so these
-   tests explicitly blur it to exercise replay after focus is lost. */
+/* A failed-start tab's `r` was dead -- not on arrival (an `r` right
+   after a `Ctrl+l` worked), but after the tab failed while its composer had
+   the keys. The textarea went disabled, WebKit's focus fix-up moved focus to <body>, and the document
+   replay re-dispatched the key on `.agent-ui-root`, the empty tab's PARENT, whose only handler is the
+   `?`/confirm capture; the replay also focused that root, so every later key was dead too. jsdom does
+   not apply WebKit's fix-up (a disabled focused textarea stays `activeElement`), so these tests blur
+   explicitly where WebKit would. */
 describe("K04: r on a failed empty tab", () => {
   const FAILED = { ...LIVE_TAB, state: "failed", failure: "claude: not logged in -- run claude /login" } as const;
 
-  /** A starting tab whose composer holds the keys (C1: it is live while starting), then failing. */
+  /** A starting tab whose composer holds the keys (the composer is live while starting), then failing. */
   function failWhileTyping() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -13549,11 +13897,13 @@ describe("K04: r on a failed empty tab", () => {
   });
 });
 
-/* Returning to the panel restores the cursor row and scroll position unless it was following
-   the bottom. In that case it lands on the last row and keeps following. A waiting card takes priority,
-   and a new tab lands in INPUT. Fake layout stacks rows and clamps `scrollTop` as a browser would.
-   The mocked `scrollIntoView` does not move a fitting row; the tests set `scrollTop` directly.
-   This does not prove what a real WebKit draws. */
+/* Leaving the panel and coming back keeps a reader's place: coming back
+   to the panel (`Ctrl+h/l`, `prefix a`, a tray chip) restores a reader's cursor row and scroll unless they
+   were following the bottom, who land on the last row and keep following; a waiting card still wins,
+   and a new tab still lands INPUT. The geometry below is a fake layout: rows stacked at given heights in a
+   list `viewport` px tall at y = 0, `scrollTop` clamped as a browser's is, every rect following it.
+   `scrollIntoView` is this file's mock, so a reveal of a row that fits moves nothing; the view is set by
+   writing `scrollTop`. None of this proves what a real WebKit draws. */
 describe("#22: coming back restores where you were", () => {
   let revision = 0;
   const row = (n: number) => ({ seq: n, text: `row ${n}` });
@@ -13623,10 +13973,11 @@ describe("#22: coming back restores where you were", () => {
   const FIVE = [300, 300, 300, 300, 300];
   const SEVEN = [300, 300, 300, 300, 300, 300, 300];
 
-  /** Park on row 3: start at the bottom with the cursor on row 5, then scroll to 560. The
-   *  scroll clamp moves the cursor to row 4; `k` moves to row 3 and stops following. At 560,
-   *  row 3 fits within the two-line margins without scrolling. At 600, its top would touch the
-   *  view's edge and the landing would scroll up 40px for the margin. */
+  /** "Parked on row 3": at the bottom (the arrival has the cursor on row 5), the reader scrolls up to 560 (the
+   *  clamp moves the cursor to row 4, the nearest visible), then `k` (row 3 fits and sits inside the
+   *  view's two-line margins at 560, so the landing moves nothing, and `k` stops following). 560 rather
+   *  than 600 since the margin rule: at 600 row 3's top is on the view's edge and the landing would
+   *  scroll up 40px to give it its margin. */
   function parkOnRow3(c: HTMLElement) {
     const list = layOut(c, FIVE, 1100);
     act(() => rootOf(c).focus());
@@ -13933,7 +14284,7 @@ describe("#22: coming back restores where you were", () => {
     fireEvent.scroll(list);
     come();
     expect(current(container)).toBe("row 4");
-    // The next streamed row must leave the restored view and cursor in place.
+    // The next streamed row must not carry the view (and, through the visibility clamp, the cursor) away.
     stream("row 6");
     layOut(container, [300, 300, 300, 300, 300], list.scrollTop);
     stream("row 7");
@@ -13954,8 +14305,9 @@ describe("#22: coming back restores where you were", () => {
     expect(seen).toEqual(["resume"]);
   });
 
-  /* After the saved position is dropped or consumed, a scroll moves the cursor through the
-     scroll clamp. Arrival must leave it there rather than restore row 3. */
+  /* Every way the park is dropped or consumed, each made observable the same way: after it, a scroll
+     the reader did not make moves the cursor (the scroll clamp), and the arrival must leave it there rather
+     than restore row 3. */
   function driftAway(c: HTMLElement): string {
     const list = listOf(c);
     list.scrollTop = 1100;
@@ -14030,10 +14382,10 @@ describe("#22: coming back restores where you were", () => {
   });
 });
 
-/* BROWSE's `i`/`o`/`A` enter INPUT only on a key that stands alone (or ends a quick motion run), and
-   any key within `TYPING_GUARD_MS` of a BROWSE `y` is typing, not a command. Otherwise a word typed
-   into BROWSE runs its first letters as keys and enters INPUT partway through it. Time is vitest's
-   fake clock. */
+/* BROWSE's `i`/`o`/`A` enter INPUT only on a
+   key that stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a
+   BROWSE `y` is typing, not a command. "explain" lost "expla", "follow-up" sent "llow-up one",
+   `yiw` typed the `w`. Time is vitest's fake clock, as in `v1: typing never answers a card` above. */
 describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
   const HINT = "i or Ctrl+j to type";
   let widen: (container: HTMLElement) => void;
@@ -14113,8 +14465,9 @@ describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
     }
   });
 
-  // `i`/`o`/`A` have no motion exception in the typing guard. A motion can also be a word's first
-  // letter: typing "look at" must not move with `l` and enter INPUT with `o`.
+  // Unlike the leader, `i`/`o`/`A` have NO motion
+  // exception. A lone motion key is a word's first letter as much as a motion: "look at" walked with
+  // `l` and opened INPUT with `o` ("ok at"), and so did "how", "hi", "like", "join", "Good".
   it.each([
     ["look at the diff", [..."look at the diff"]],
     ["how do I", [..."how do I"]],
@@ -14188,8 +14541,8 @@ describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
     expect(modeOf(container)).toBe("input");
   });
 
-  // The post-`y` typing window must also cover the document-capture Shift+Tab router and the
-  // focused-control early return.
+  // The post-`y` window has to hold ahead of the handlers that used
+  // to run before it -- the document-capture Shift+Tab router and the focused-control early return.
   it("y then Shift+Tab within 250 ms cycles nothing and says how to type; after a pause it cycles", () => {
     stubClipboard();
     const { container } = startedWithRows();
@@ -14237,9 +14590,11 @@ describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
   });
 });
 
-/* `prefix :` opens the same command line as BROWSE's `:` through `open_command_line`.
-   Leaving it to an armed prefix lets subsequent text run as panel commands and can send a partial word.
-   The command line executes nothing; Enter explains that, and Esc closes it. */
+/* `prefix :` (tmux `command-prompt`) was swallowed by the armed prefix, and the
+   letters typed after it ran as panel keys -- "kill-window -a" moved the cursor, entered INPUT and sent
+   "ll-window -a" as a turn. Rust binds it now (`panel.command-line`) and tells the panel with an
+   `open_command_line` envelope, which opens the same `:` line BROWSE's own `:` opens: it runs
+   nothing, Enter says so, Esc closes it. */
 describe("#28: prefix : opens the panel's command line", () => {
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
@@ -14279,7 +14634,7 @@ describe("#28: prefix : opens the panel's command line", () => {
     expect(line(container)?.getAttribute("aria-label")).toBe("Command line");
     expect(container.querySelector(".search-bar")!.textContent).toBe(":");
     expect(document.activeElement).toBe(line(container));
-    // Each character goes into the command line as text and must not run a panel key binding.
+    // Every letter here is text of the command line, never a panel key.
     for (const ch of "kill-window -a") {
       const input = line(container)!;
       if (fireEvent.keyDown(input, { key: ch })) fireEvent.change(input, { target: { value: input.value + ch } });
@@ -14480,10 +14835,11 @@ describe("#28: prefix : opens the panel's command line", () => {
   });
 });
 
-/* Routes that hand focus to another control must cancel every pending y/n prompt and the `gf`
-   picker. `cancelBypassConfirm` alone leaves `close`/`close_others` prompts open. A stale
-   prompt or picker could consume text intended for a rename field, chooser filter, composer, or
-   card reason box and close a tab or open a file. */
+/* `open_command_line` was not the only route that hands
+   the keys to something else. `cancelBypassConfirm` -- what every other such route called -- leaves a `close` /
+   `close_others` prompt alone, and a `gf` letter picker was ended only by the tab switch, so a `y` typed into what the
+   route opened (a rename field, the chooser's filter, the composer, a card's reason box) answered "close this tab?",
+   and a letter opened a file. Each route below is pinned to end both: every pending y/n prompt and the picker. */
 describe("a route that hands the keys elsewhere ends every pending y/n prompt and a gf picker", () => {
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {

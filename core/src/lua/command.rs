@@ -176,12 +176,9 @@ mod tests {
         assert!(registry.borrow().get("no-key").unwrap().keybinding.is_none());
     }
 
-    /// Regression test for the reentrancy panic the final review reproduced: a command action
-    /// that itself calls `eitri.command.register(...)` -- registering another command from
-    /// inside a command's own action -- must not panic with `BorrowMutError`. This mirrors
-    /// `Kernel::invoke_command`'s own borrow/call sequence rather than going through
-    /// `LuaEngine` directly, since this module (unlike `LuaEngine`) needs no display and is
-    /// fully unit-testable on its own.
+    /// A command action may register another command without `BorrowMutError`. Mirror
+    /// `Kernel::invoke_command`'s borrow and call sequence without `LuaEngine` so the reentrant
+    /// registration is exercised without needing a display.
     #[test]
     fn action_that_registers_another_command_does_not_panic() {
         let lua = Lua::new();
@@ -209,7 +206,7 @@ mod tests {
         .unwrap();
 
         // Mirror `Kernel::invoke_command`'s clone-out-then-call pattern: resolve the action
-        // under a scoped borrow, drop the borrow, then call it. Before the fix (a bare
+        // under a scoped borrow, drop the borrow, then call it. Without it (a bare
         // `RegistryKey` resolved and called while still holding `registry.borrow()`), the
         // action's own `eitri.command.register` call would panic with `BorrowMutError`.
         let action = {
@@ -223,10 +220,10 @@ mod tests {
         assert!(registry.borrow().get("second").is_some());
     }
 
-    /// Registration refuses ids containing spaces, parentheses or `::` before they reach
-    /// `set_accels_for_action("app.cmd-{id}", ...)`. Spaces and parentheses can abort the process
-    /// with a GTK assertion; `x::y` silently targets action `x` with target `y`.
-    /// The error must name the invalid id.
+    /// GTK accelerator registration aborts the process when an action id contains spaces or
+    /// parentheses. `::` silently binds a different action (`x::y` means action `x`, target `y`).
+    /// `register` must reject these ids before they reach `set_accels_for_action("app.cmd-{id}", ...)`
+    /// in `main.rs`, naming the invalid id instead of crashing the shell at startup.
     #[test]
     fn register_rejects_an_id_containing_a_space() {
         let lua = Lua::new();
@@ -297,9 +294,9 @@ mod tests {
         assert!(registry.borrow().get("my-command.v2").is_some());
     }
 
-    /// A Lua chunk run with `.exec()` stops at its first uncaught error. An invalid command id
-    /// therefore prevents all later statements in that chunk from running. Exercise the
-    /// registration closure from `install` directly, so the check needs no `LuaEngine`.
+    /// An uncaught invalid-id error stops the rest of its Lua chunk. `Kernel::load_init_file`
+    /// executes init.lua as one chunk, so statements after the failed registration must not run.
+    /// This exercises `install`'s `register_fn` directly without needing `LuaEngine`.
     #[test]
     fn an_invalid_id_stops_the_rest_of_the_chunk_not_just_that_call() {
         let lua = Lua::new();
@@ -328,10 +325,10 @@ mod tests {
              it does not keep loading"
         );
     }
-    /// A refused command id is remembered even if `init.lua` catches the Lua error with `pcall`.
-    /// `Kernel::load_init_file` can then fail startup and name the id. A Lua error alone can skip
-    /// the rest of `init.lua` while allowing startup, with only stderr output that an app-menu launch
-    /// may not show.
+    /// A refused command id must be remembered even if init.lua catches the Lua error with `pcall`.
+    /// Otherwise initialization may skip keymaps, panels or account selection while the shell starts
+    /// with only a stderr line hidden on app-menu launches. Remembering the refusal makes startup
+    /// fail visibly instead of continuing with incomplete configuration.
     #[test]
     fn a_refused_id_is_remembered_even_when_init_lua_catches_the_error() {
         let lua = Lua::new();

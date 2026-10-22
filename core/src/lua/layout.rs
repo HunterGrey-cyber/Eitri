@@ -1777,7 +1777,7 @@ mod tests {
         Node::Leaf(id)
     }
 
-    /// The editor takes a 0.6 share beside a column with the agent above the canvas.
+    /// The editor takes share 0.6 beside a column with the agent above the canvas.
     #[test]
     fn the_specs_example_is_a_tree() {
         let tree = default_of("eitri.layout.default{ 'row', {'editor', 0.6}, {'column', {'agent'}, {'canvas', 0.5}} }")
@@ -1798,9 +1798,8 @@ mod tests {
         );
     }
 
-    /// A bottom row keeps its height, spelled the n-ary way: the terminal ending a root
-    /// `column` of three is pinned once the default is reconciled, as the two-level spelling's is
-    ///.
+    /// A bottom terminal in an n-ary root `column` is pinned when defaults are reconciled, just
+    /// like the two-level spelling, so it retains its height when the window grows.
     #[test]
     fn an_n_ary_columns_bottom_terminal_is_pinned_as_a_first_launch_pins_it() {
         let pinned = |source: &str| {
@@ -1854,7 +1853,7 @@ mod tests {
         );
     }
 
-    /// A malformed layout table produces an error naming the call and the problem.
+    /// Malformed layout tables must fail startup with a message naming the call and the error.
     #[test]
     fn a_malformed_tree_is_an_error_naming_the_call_and_the_problem() {
         let cases = [

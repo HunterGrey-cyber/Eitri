@@ -22,8 +22,8 @@ describe("R4 search", () => {
     expect(rowSearchText(rows[3])).toContain("src/parser.rs");
   });
 
-  /* A collapsed run shows a summary rather than individual call inputs. Search each folded
-     call's name and input so `/` can still find it. */
+  /* A collapsed run's own row shows a summary, not any one call's input -- so `/`
+     still finds it by what a folded call would show, each name and input. */
   it("reads a collapsed run by its calls, not just its summary", () => {
     const run: TimelineItem = {
       kind: "run",

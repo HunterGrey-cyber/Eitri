@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(t.attention().pending, 0, "a session that ended owes nothing");
         t.resync(["p4".to_string()]);
         assert_eq!(t.attention().pending, 1);
-        // SessionUnavailable clears pending cards, just as SessionClosed does.
+        // Ending a session through the explicit session-end path also preserves the unread sign.
         t.observe(
             &[AgentDomainEvent::SessionUnavailable {
                 reason: "the sidecar exited".into(),
@@ -293,9 +293,8 @@ mod tests {
         assert_eq!(t.attention().pending, 0, "a session that died owes nothing either");
     }
 
-    /// A hidden chat whose session ends keeps a sign: `agent ⚑1` becomes `agent •`, not a bare
-    /// `agent` -- by the event, and by the panel taking the session
-    /// itself.
+    /// A hidden chat whose session ends keeps an unread sign: `agent ⚑1` becomes `agent •`, not
+    /// bare `agent`. Both an end event and the panel taking a failed or unopened session preserve it.
     #[test]
     fn a_session_that_ends_off_screen_leaves_the_chat_unread() {
         let mut t = AttentionTracker::default();
@@ -343,8 +342,7 @@ mod tests {
         assert_eq!((t.attention().pending, t.attention().arrived), (0, 3));
     }
 
-    /// A turn completed off screen sets the unread bit.
-    /// Returning to the chat clears it.
+    /// A turn completing while the module is off screen sets unread; returning clears it.
     #[test]
     fn a_turn_that_finishes_off_screen_is_unread_until_the_chat_is_seen() {
         let mut t = AttentionTracker::default();
@@ -368,9 +366,8 @@ mod tests {
         );
     }
 
-    /// New cards off screen raise a toast by default. `reveal` shows the chat unless
-    /// something is zoomed. Cards arriving in view and changes without a new arrival need no
-    /// reaction.
+    /// The chat stays quiet unless asked: nothing reveals itself by default; `reveal` does, unless something is
+    /// zoomed; a card that arrives in view needs nothing; only a NEW card reacts.
     #[test]
     fn a_new_card_off_screen_raises_a_toast_or_with_reveal_the_chat() {
         let none = Attention::default();
@@ -407,7 +404,6 @@ mod tests {
             "a card answered"
         );
         // One answered card and one new card in the same pump leave `pending` at 1.
-        // The arrival count still increases, so the new card must trigger a notification.
         let replaced = Attention { arrived: 2, ..one };
         assert_eq!(
             react(Badge, one, replaced, Hidden),
@@ -421,9 +417,9 @@ mod tests {
         );
     }
 
-    /// A card that arrives and is answered or ends with its session in the same pump still
-    /// counts as an arrival. With no card waiting, it raises no toast and does not reveal the
-    /// chat.
+    /// A card arriving and disappearing in one pump counts as arrived but not waiting. Whether
+    /// answered or ended with its session, it must not trigger a toast about zero waiting cards
+    /// or reveal a chat with nothing to answer.
     #[test]
     fn a_card_gone_in_the_same_pump_raises_nothing() {
         let mut tracker = AttentionTracker::default();
@@ -450,8 +446,8 @@ mod tests {
         }
     }
 
-    /// Entering bypass approves delivered cards in arrival order. `BTreeMap::keys()` would
-    /// sort ids alphabetically instead, regardless of arrival order.
+    /// Bypass entry approves delivered cards in arrival order, not alphabetical order:
+    /// a plain `BTreeMap::keys()` would put `"a"` before `"b"` regardless of arrival.
     #[test]
     fn card_ids_are_oldest_first_not_alphabetical() {
         let mut t = AttentionTracker::default();
@@ -460,7 +456,7 @@ mod tests {
         assert_eq!(t.card_ids(), vec!["b".to_string(), "a".to_string()]);
     }
 
-    /// Every tab's tracker shares one clock so card arrival order can be compared across tabs.
+    /// Every tab's tracker shares one clock so the oldest card is comparable across tabs.
     #[test]
     fn cards_carry_one_arrival_clock_across_trackers() {
         let mut first = AttentionTracker::default();

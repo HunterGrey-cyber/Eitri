@@ -692,9 +692,8 @@ mod snap_tests {
         }
     }
 
-    /// The grid's rows fill the snapped region, whose bottom matches the framebuffer's bottom.
-    /// Checks two cell heights to cover a zoom, with the sub-cell remainder placed above the
-    /// grid.
+    /// The grid's rows exactly fill the snapped region, with unused space above rather than
+    /// below: the region's bottom is the framebuffer's bottom, for two cell heights as after a zoom.
     #[test]
     fn the_grid_fills_the_snapped_region_and_ends_at_the_bottom() {
         for cell in [(20.0_f32, 44.0_f32), (22.0, 49.0)] {
@@ -752,10 +751,11 @@ mod snap_tests {
         assert_eq!((hit.min.y, hit.max.y), (14.0, 1598.0));
     }
 
-    /// Applying a scale change with its matching framebuffer resize preserves the nvim grid
-    /// size. `sync_os_scale` runs before grid computation in both `connect_resize` and the
-    /// render callback. This checks two framebuffer sizes with a cell of 11.238282 by 22 pixels
-    /// and both dimensions doubled together.
+    /// A display-free check: a scale change applied TOGETHER with the framebuffer
+    /// resize that always accompanies it -- exactly what `lib.rs`'s `sync_os_scale` guarantees by
+    /// running before any grid is computed, in both `connect_resize` and the render callback --
+    /// resizes nothing in nvim. The measured cell (11.238282x22, `s1.log`, 2026-09-27 sandbox
+    /// investigation) and both sandbox framebuffers from that same run.
     #[test]
     fn a_scale_change_applied_with_its_framebuffer_resizes_nothing() {
         let cell = GridScale::new(PixelSize::new(11.238282, 22.0));
@@ -770,10 +770,10 @@ mod snap_tests {
         }
     }
 
-    /// Applying the new cell size before its matching framebuffer resize changes the grid:
-    /// `760x480` yields `33x10` instead of `67x21`. This transient mismatch lasts until GTK
-    /// resizes the framebuffer, so `set_os_scale_factor` must not run directly from
-    /// `connect_scale_factor_notify`.
+    /// Applying a new cell size without its matching framebuffer resize produces a different
+    /// grid: `33x10` for `760x480`, rather than `67x21` at the matching cell size. Applying the
+    /// scale in a notify callback creates this transient grid before GTK's resize catches up.
+    /// `set_os_scale_factor` must therefore wait for the resize or render callback.
     #[test]
     fn applying_the_new_cell_before_the_framebuffer_resize_is_a_different_grid() {
         let cell = GridScale::new(PixelSize::new(11.238282, 22.0));

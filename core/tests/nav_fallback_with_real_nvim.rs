@@ -1,15 +1,18 @@
-//! The nav fallback (`core/src/nav_fallback.lua`), driven by a real `nvim` over msgpack-RPC.
+//! The nav fallback (`core/src/nav_fallback.lua`),
+//! driven by a real `nvim` over msgpack-RPC.
 //!
-//! Ignored because it needs `nvim` on PATH. `nvim --embed --headless` needs no network,
-//! display, or window.
+//! `#[ignore]`d: it needs `nvim` on PATH. It spends no tokens, touches no network, opens no window
+//! and needs no display -- `nvim --embed --headless` is the whole harness.
 //!
-//! RPC preserves unfinished Visual selections: `:normal` and `feedkeys(..., 'x')` end them,
-//! while `nvim_input` behaves like a typed key. The real `PaneSwitchChannel` supplies
-//! arguments, child environment, and the listener used by the editor pane.
+//! RPC rather than `-c` commands preserves unfinished Visual selections: `:normal` and
+//! `feedkeys(…, 'x')` end an unfinished Visual selection, while `nvim_input` leaves it exactly as a
+//! typed key would. The channel is the real [`PaneSwitchChannel`] (its `nvim_args()`, its
+//! `child_env()`, its bound listener), so what this drives is what `shell` hands the editor pane.
 //!
-//! A sentinel checks that a move which stays inside nvim writes nothing: the next key must
-//! leave, and its letter must arrive first. The fallback connects from inside the mapping, so
-//! a stray letter from the first key would already be queued on the listener ahead of it.
+//! "Writes nothing" is proven with a sentinel rather than a sleep: after a move that must not leave,
+//! a second key that must leave is pressed, and the first letter to arrive has to be the second
+//! key's. The fallback's connect() is issued inside the mapping, so a stray letter from the first
+//! key would be queued on the listener ahead of it.
 //!
 //! Run: `cargo test -p eitri-core --test nav_fallback_with_real_nvim -- --ignored`
 
@@ -26,7 +29,7 @@ use rmpv::Value;
 const DEADLINE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(25);
 
-/// The fallback's `desc` for each direction.
+/// The fallback's `desc` identifies its mappings in each direction.
 const KEYS: [(&str, &str, &str); 4] = [
     ("<C-h>", "left", "L"),
     ("<C-j>", "down", "D"),
@@ -95,7 +98,7 @@ impl Client {
 enum Loader {
     /// `channel.child_env()` whole: the product shape.
     Installed,
-    /// `EITRI_NAV_LUA` absent from the env (spec step (g)).
+    /// `EITRI_NAV_LUA` absent from the environment.
     NavLuaUnset,
     /// `EITRI_NAV_LUA` present but empty.
     NavLuaEmpty,
@@ -312,7 +315,7 @@ impl Nvim {
     }
 }
 
-/// (a) No mapping of the user's: after `VimEnter`, all four keys carry the fallback in Normal and
+/// No mapping of the user's: after `VimEnter`, all four keys carry the fallback in Normal and
 /// Visual mode. `--clean` leaves nvim's own default `<C-L>` (`:h CTRL-L-default`) in Normal mode,
 /// which counts as an empty slot -- otherwise a plain nvim could never leave by `Ctrl+l`.
 #[test]
@@ -334,9 +337,9 @@ fn with_no_mapping_all_four_keys_get_the_fallback_in_normal_and_visual() {
     nvim.quit();
 }
 
-/// Plain window move mappings, including `map("n", "<C-h>", "<C-w>h", { remap = true })`,
-/// are replaced whether installed before the snippet loads or reset by an autocommand
-/// registered after the snippet's own autocommand on `User VeryLazy`.
+/// Plain window moves in supported spellings, including stock LazyVim's
+/// `map("n", "<C-h>", "<C-w>h", { remap = true })`, are replaced whether present before loading
+/// or set again by a later `User VeryLazy` autocommand, as LazyVim's keymaps.lua does.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn plain_window_moves_are_replaced_at_vimenter_and_after_verylazy() {
@@ -373,7 +376,7 @@ fn plain_window_moves_are_replaced_at_vimenter_and_after_verylazy() {
     nvim.quit();
 }
 
-/// (c) vim-tmux-navigator's own mapping, a Lua-callback mapping (a lazy.nvim key stub and
+/// vim-tmux-navigator's own mapping, a Lua-callback mapping (a lazy.nvim key stub and
 /// smart-splits both have this shape), and `<C-W>K` -- which moves the *window*, not the cursor, so
 /// it is not a plain move even though only the letter's case differs -- are left alone in Normal
 /// mode, across a later `User LazyLoad` too. Visual mode, which none of them maps, gets the fallback.
@@ -415,7 +418,7 @@ fn a_users_own_mappings_are_left_alone_and_visual_mode_still_gets_the_fallback()
     nvim.quit();
 }
 
-/// (c, buffer-local) A buffer-local `<C-l>` (netrw has one) is never touched and keeps winning in
+/// A buffer-local `<C-l>` (netrw has one) is never touched and keeps winning in
 /// its buffer; the global slot beneath it -- here nvim's default -- still gets the fallback.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
@@ -434,7 +437,7 @@ fn a_buffer_local_mapping_is_left_alone() {
     nvim.quit();
 }
 
-/// (d) One window: each key in Normal mode is at nvim's edge, so it writes its letter.
+/// One window: each key in Normal mode is at nvim's edge, so it writes its letter.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn in_one_window_each_key_writes_its_letter() {
@@ -448,7 +451,7 @@ fn in_one_window_each_key_writes_its_letter() {
     nvim.quit();
 }
 
-/// (e) With a split, `<C-l>` from the left window moves to the right one and writes nothing; the
+/// With a split, `<C-l>` from the left window moves to the right one and writes nothing; the
 /// sentinel `<C-k>` (the top edge) is then the first letter to arrive.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
@@ -465,9 +468,9 @@ fn a_move_between_windows_writes_nothing() {
     nvim.quit();
 }
 
-/// At nvim's edge, Visual mode writes the direction letter while preserving both charwise and
-/// linewise selections. Away from the edge, the key leaves Visual mode and moves within nvim
-/// without writing a letter.
+/// Visual mode at nvim's edge writes the letter and stays in Visual mode with the
+/// selection intact (charwise and linewise); not at the edge, it leaves Visual mode and moves,
+/// writing nothing.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn visual_mode_leaves_at_the_edge_and_keeps_its_selection() {
@@ -503,7 +506,7 @@ fn visual_mode_leaves_at_the_edge_and_keeps_its_selection() {
     nvim.quit();
 }
 
-/// (g) The loader is a no-op without `EITRI_NAV_LUA` (absent or empty), and the snippet itself
+/// The loader is a no-op without `EITRI_NAV_LUA` (absent or empty), and the snippet itself
 /// stands down without `EITRI_PANE_SWITCH_SOCKET`: no augroup, no mapping, nvim's default `<C-L>`
 /// still in place -- even after a `User VeryLazy` and a scheduled round trip.
 #[test]
@@ -535,9 +538,9 @@ fn without_its_environment_the_loader_installs_nothing() {
     }
 }
 
-/// In Insert mode, only `<C-l>` gets the fallback: leave Insert, then move right. `<C-h>`,
-/// `<C-j>`, and `<C-k>` keep their backspace, newline, and digraph meanings and receive no
-/// Insert mapping.
+/// Insert mode: only `<C-l>` gets the fallback (leave Insert, then move right); `<C-h>`,
+/// `<C-j>` and `<C-k>` keep vim's own Insert meanings (backspace, newline, digraph), so nothing is
+/// mapped on them in Insert mode.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn insert_mode_gets_only_ctrl_l() {
@@ -557,7 +560,7 @@ fn insert_mode_gets_only_ctrl_l() {
     nvim.quit();
 }
 
-/// (h, edge) In Insert mode at nvim's edge, `<C-l>` writes its letter and leaves Insert mode: the
+/// In Insert mode at nvim's edge, `<C-l>` writes its letter and leaves Insert mode: the
 /// keys are about to go to another pane, so the editor must not be left typing.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
@@ -572,7 +575,7 @@ fn insert_ctrl_l_at_the_edge_writes_its_letter_and_leaves_insert() {
     nvim.quit();
 }
 
-/// (h, split) With a split, Insert `<C-l>` from the left window leaves Insert, moves to the right
+/// With a split, Insert `<C-l>` from the left window leaves Insert, moves to the right
 /// window and writes nothing; the sentinel `<C-k>` (Normal mode, the top edge) is then the first
 /// letter to arrive.
 #[test]
@@ -593,10 +596,10 @@ fn insert_ctrl_l_between_windows_moves_and_writes_nothing() {
     nvim.quit();
 }
 
-/// `:stopinsert` takes effect after the mapping callback returns. Moving windows inside
-/// that callback ends Insert mode in the destination, shifts its cursor left and fires
-/// `InsertLeave` in its buffer, leaving the source cursor unchanged. End Insert mode in
-/// the source window before moving so both buffers keep the correct cursor positions.
+/// `:stopinsert` takes effect after the mapping callback returns. Moving windows inside that
+/// callback would end Insert mode in the destination, shift its cursor left and fire its
+/// `InsertLeave`, while leaving the source cursor unchanged. End Insert in the source before
+/// moving focus.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn insert_ctrl_l_ends_insert_in_the_source_window_and_leaves_the_destination_cursor_alone() {
@@ -653,7 +656,7 @@ fn insert_ctrl_l_ends_insert_in_the_source_window_and_leaves_the_destination_cur
     nvim.quit();
 }
 
-/// (h, the user's own) An Insert `<C-l>` of the user's -- a plain mapping, a Lua callback, or a
+/// An Insert `<C-l>` of the user's -- a plain mapping, a Lua callback, or a
 /// buffer-local one -- is never replaced, across a later `User LazyLoad` too.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
@@ -695,14 +698,16 @@ fn a_users_own_insert_ctrl_l_is_left_alone() {
     nvim.quit();
 }
 
-/// Checks that the direction letter is on the wire before the mapping returns. Asynchronous
-/// `pipe:connect` schedules its write for a later event-loop turn. `PaneSwitchReader` can
-/// retain an empty accepted connection across polls, but that alone cannot guarantee delivery
-/// before the sender dies.
+/// Asynchronous `pipe:connect` queues its write for a later nvim event-loop turn. The reader
+/// already retains accepted-but-empty connections, so eventual delivery from a busy-then-idle
+/// nvim does not prove that the sender finishes before returning.
 ///
-/// The mapping callback writes a marker after sending. Killing nvim as soon as the marker
-/// appears cuts off later event-loop turns. A synchronous `chansend` has already put the bytes
-/// in the kernel socket buffer, where the sender's death cannot remove them.
+/// This test requires bytes on the wire before the mapping returns. The callback writes a
+/// marker after issuing the key and send, then the nvim process is SIGKILLed (by its pid) as soon
+/// as the marker appears: SIGKILL gives nvim no further event-loop turn after that point, though
+/// every turn before it has run. An asynchronous write has not happened yet;
+/// a synchronous `chansend` has put its bytes in the kernel socket buffer, where they survive
+/// the sender's death.
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_right_after() {

@@ -1,11 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isModifierKey, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 
-/* Each test drives the guard like `App.tsx`'s `onKeyDown`: every keydown goes through `onKey`
-   first; `a`/`d`/`D` then ask `defer`, and Enter on a card button asks `mayAnswerNow`.
-   Enter also needs a deferred wait and a focus landing, which these cases do not model;
-   separate cases below and `App.test.tsx` cover those checks. `answers` stores what would
-   have been answered and when. The fake clock makes each test gap the gap between keys. */
+/* Every keydown reaches `onKey` first. `a`/`d`/`D` ask `defer`; Enter on a card button asks
+   `mayAnswerNow`, then waits in `defer` and requires a focus landing. These rows model only the guard;
+   button landing is covered by the key-count tests below and `App.test.tsx`.
+   `answers` records the answer and its time. Fake timers make test gaps match the time between keys. */
 
 let guard: TypingGuard;
 let answers: Array<{ key: string; at: number }>;
@@ -108,8 +107,8 @@ describe("TypingGuard: typed prose never answers", () => {
     expect(answers).toEqual([]);
   });
 
-  /* The shell withholds keys pressed with Super or Hyper. For `a` then `Super+x`, the page sees
-     only Super's keydown, which must cancel the waiting action as the hidden `x` would. */
+  /* The shell withholds a key pressed with Super or Hyper, so for
+     `a` then `Super+x` the page sees only Super's own keydown -- which must cancel as the x would. */
   it("a then Super at 100 ms: Super's own keydown cancels the waiting a (the chord after it never arrives)", () => {
     key("a");
     vi.advanceTimersByTime(100);
@@ -183,9 +182,10 @@ describe("TypingGuard: Enter on a card button", () => {
     expect(answers).toEqual([]);
   });
 
-  /* Every key in the unbroken run before Enter must be a walk. Checking only the last key
-     would let a sentence ending in `l` walk onto Approve, the first control in
-     `PermissionCard.tsx`'s `data-nav-order`, and let Enter approve it. */
+  /* The walk exception once asked only about the key right before Enter, so a sentence
+     ending in `l` walked onto Approve (the first control, `PermissionCard.tsx`'s `data-nav-order`)
+     and its Enter approved. The expectation that "…al⏎" lands on Deny was false against the code. Now every
+     key of the unbroken run before Enter must be a walk. */
   it('"cancel" then Enter at 80 ms a key does not answer: the l walked onto Approve, but the run began with typing', () => {
     type("cancel\n", 80, { enterOnButton: true });
     expect(answers).toEqual([]);
@@ -256,8 +256,8 @@ describe("TypingGuard: cancel", () => {
     expect(guard.onKey("j", Date.now())).toBeNull();
   });
 
-  /** Deferred keys share one waiting slot. Return the cancelled wait's own flash text so
-   *  the caller shows the message for that key rather than the `a`/`d` message for every key. */
+  /** Every deferred key shared one slot and the caller flashed the
+   *  `a`/`d` text for all of them. The flash that comes back is the cancelled wait's own. */
   it("onKey hands back the flash the cancelled wait named, not another's", () => {
     guard.onKey("f", 1000);
     expect(guard.defer(1000, false, () => {}, "f starts HINT only on its own")).toBe(true);
@@ -296,7 +296,7 @@ describe("isModifierKey", () => {
   });
 });
 
-/* The v1-ui GUI pass (2026-09-27): "set up my" ran `<leader>m` and "the boy" `<leader>bo` (its `y`
+/* "set up my" ran `<leader>m` and "the boy" `<leader>bo` (its `y`
    then answered the y/n), and "just do it" reached Stop with its `j` and interrupted the turn with
    its first Space. The leader and Enter/Space on Stop now ask `mayActAfterMotion`. */
 describe("TypingGuard.mayActAfterMotion: the leader and Stop", () => {
@@ -347,9 +347,10 @@ describe("TypingGuard.mayActAfterMotion: the leader and Stop", () => {
   });
 });
 
-/* Enter on a card button is deferred like `a`/`d` and requires `App.tsx` to have seen the preceding
-   key focus that exact button. The guard counts keys so the caller can match a landing to its key;
-   it does not infer focus from key names. */
+/* Enter on a card's own button now
+   answers the way `a`/`d` do -- deferred through `defer`, and only when `App.tsx` saw focus put on
+   that very button by the key right before it. The guard itself decides no landing: it counts the
+   keys it recorded, so `App.tsx` can tie the landing it saw to the key that made it. */
 describe("K02: keyCount", () => {
   it("counts every recorded key, a cancelling Super included, and no bare Shift", () => {
     const g = new TypingGuard();
@@ -378,8 +379,8 @@ describe("K02: keyCount", () => {
   });
 });
 
-/* A BROWSE `y` opens a burst in which subsequent keys count as typing.
-   `noteCopy` records the copy; `afterCopy` checks the key most recently recorded by `onKey`. */
+/* A BROWSE `y` opens a burst in which any other key is typing,
+   not a command. `noteCopy` records the `y`; `afterCopy` asks about the key `onKey` just recorded. */
 describe("TypingGuard: the burst after a copy (#26, K15)", () => {
   it("is false before any copy", () => {
     expect(guard.afterCopy(Date.now())).toBe(false);
@@ -407,9 +408,9 @@ describe("TypingGuard: the burst after a copy (#26, K15)", () => {
   });
 });
 
-/* `i`/`o`/`A` enter INPUT only after a pause, with no motion exception. A lone `l`, `h` or `G`
-   can begin a word as well as a motion; otherwise "look at" walks with `l` and opens INPUT
-   with `o`. */
+/* `i`/`o`/`A` enter INPUT on a pure pause, with NO motion
+   exception -- a lone `l`, `h` or `G` is a word's first letter as much as a motion, so "look at" walked
+   with `l` and opened INPUT with `o`. */
 describe("TypingGuard.mayStartInput: i/o/A need a pause, never a motion run", () => {
   function lastMayStart(text: string, gap: number, repeat = false): boolean {
     const keys = [...text];

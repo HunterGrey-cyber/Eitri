@@ -44,10 +44,13 @@ fn run_init_in(cwd: &Path, config_dir: &Path, init_lua: &str, keys: &[&str]) -> 
     outcome.unwrap()
 }
 
-/// The default `Lua::new()` search path includes `./?.lua;./?/init.lua`, which lets modules in
-/// an opened project shadow `init.lua` modules from the user's configuration. Checks that
-/// `require` resolves the same name from `<config_dir>/lua/` instead of the working directory,
-/// and that `package.cpath` is empty.
+/// Before the sandbox, `Lua::new()`'s default `package.path` included `./?.lua;./?/init.lua`, so
+/// `require` searched the process's current working directory -- which for a window is
+/// normally the project the user opened, never the user's own config directory. A module
+/// planted in an opened project could therefore shadow, or simply run as, one of the user's
+/// own `init.lua` modules. This reproduces that failure (a module resolving from the cwd) and
+/// checks the sandbox (the same name resolving from `<config_dir>/lua/` instead, and `package.cpath`
+/// empty).
 #[test]
 fn require_resolves_only_against_the_config_directory_never_the_launch_cwd() {
     let project_dir = unique_dir("project");

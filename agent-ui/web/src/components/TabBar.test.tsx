@@ -71,8 +71,8 @@ describe("TabBar", () => {
     expect(props.onRenameCancel).not.toHaveBeenCalled();
   });
 
-  /** `App` increments `focusRequest` when `pane_focus` regains focus so a rename field recovers
-   *  DOM focus after a GTK focus cycle without reselecting the typed text. */
+  /** `App` bumps `focusRequest` on `pane_focus` regaining focus so a rename field
+   *  that lost DOM focus (a GTK round trip) gets it back, without re-selecting the typed text. */
   it("focusRequest re-focuses the rename input after focus moved elsewhere", () => {
     const { container, props, rerender } = renderBar({ renaming: { tab: 2, initial: "docs" } });
     expect(document.activeElement).toBe(container.querySelector<HTMLInputElement>(".tab-rename"));

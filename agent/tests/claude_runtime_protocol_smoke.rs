@@ -1,6 +1,7 @@
-//! Confirms that Cargo resolves the `claude-runtime-protocol` package from a git dependency
-//! without a root `Cargo.toml` or workspace. The test constructs its generated types and
-//! checks that their fields carry the expected values.
+//! Cargo must resolve `claude-runtime-protocol` by package name from Verdandi's git repository
+//! even though it has no root Cargo.toml or workspace. No subtree or path override is used.
+//! Importing the generated types confirms they are usable from this crate's tests and catches
+//! missing build inputs as well as an incompatible wire API.
 
 use claude_runtime_protocol::v1::{ClaudeHostPolicy, ConfigurationProfile, CreateSessionRequest, PermissionMode};
 

@@ -1,12 +1,12 @@
-//! The protocol dependency's `rev` in `agent/Cargo.toml` and the compiled runtime revision
-//! constant must identify the same commit. Compare by prefix in either direction because Cargo
-//! accepts both full and abbreviated revisions. The runtime checkout check in
-//! `providers::claude_sidecar::spawn::describe_checkout` uses the same comparison.
+//! `agent/Cargo.toml`'s `claude-runtime-protocol` revision and
+//! `agent::EXPECTED_VERDANDI_REVISION` must name the same commit. Either can be a full hash
+//! or a short prefix, so compare prefixes in either direction, as Cargo accepts both forms.
+//! `providers::claude_sidecar::spawn::describe_checkout` uses the same comparison for runtime drift.
 //!
-//! This test reads the manifest as text and compares it with the compiled constant, offline.
-//! It catches changes to one pin without the other. The runtime check compares the constant
-//! with the running checkout's `git rev-parse` and cannot detect manifest drift.
-//! Update both pins together; nothing here needs regeneration.
+//! This static, offline check reads the manifest and compares it with the compiled constant.
+//! The runtime drift warning compares that constant with a running checkout and never reads
+//! the manifest, so it cannot catch a manifest-only bump. Updating both pins together keeps
+//! this check passing; there is no generated file to regenerate.
 
 use std::fs;
 use std::path::PathBuf;
@@ -85,10 +85,10 @@ fn manifest_pin_and_expected_revision_name_the_same_commit() {
     );
 }
 
-/// Checks that the active dependency line wins over a commented-out stale pin above it.
-/// A first-match search that ignores a leading `#` can select the stale pin instead.
-/// The test uses synthetic manifest text because an unresolvable revision in the real
-/// manifest would fail dependency resolution before any assertion runs.
+/// A stale commented pin above the dependency must not win: `.lines().find()` otherwise
+/// returns the first matching line even if it starts with `#`. Use synthetic manifest text
+/// rather than mutating the real manifest, because an unresolvable revision would fail Cargo
+/// before the pin-agreement test's assertion could run.
 #[test]
 fn the_active_line_wins_over_a_commented_one_above_it() {
     let manifest = "[dependencies]\n\

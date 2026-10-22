@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { applyEditorTyping, NATURAL_METER_STEP_MS, typingMeterStepMs } from "./typingCadence";
 
 /**
- * A design decision (revised 2026-09-29): while the user types in the editor, the panel's stream
+ * While the user types in the editor, the panel's stream
  * reaches the page on an even cadence (`core/src/panel_cadence.rs`), and the page's own motion --
  * the turn meter -- must not repaint faster than that, or it adds the frame-clock cycles the pacing
  * removes. It is slowed, never paused: the meter keeps moving.

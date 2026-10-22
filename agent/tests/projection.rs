@@ -188,9 +188,10 @@ fn the_legacy_hook_relay_shape_where_both_ids_are_one_string_is_stored_intact() 
     assert_eq!(record.tool_use_id.as_deref(), Some("toolu_01CtdezhmhUCrBaswxW5HYmC"));
 }
 
-/// A CLI prompt for a call whose gate request was already resolved is a separate request.
-/// It may share the `tool_use_id`, but has its own permission id and prompt text.
-/// It must become pending and resolve independently rather than being treated as a duplicate.
+/// The CLI's own prompt for a call is a SECOND request for a `tool_use_id` whose gate
+/// request was already answered and resolved (measured: same id, new permission id, 15-140 ms after
+/// the gate's allow). It must land as a pending request of its own, carrying the CLI's words, and
+/// resolve independently -- never be taken for a duplicate of the first.
 #[test]
 fn a_second_request_for_a_call_already_answered_is_a_new_pending_request() {
     let mut projection = AgentSessionProjection::default();
@@ -615,7 +616,7 @@ fn a_turn_reporting_no_usage_neither_invents_a_zero_nor_erases_a_real_figure() {
     );
 }
 
-/// The SDK reports a running total and `/clear` resets it, so the latest figure applies even when lower.
+/// The SDK reports a running total and `/clear` resets it, so a smaller later figure is the truth.
 #[test]
 fn a_later_report_replaces_usage_whole_even_when_it_is_lower() {
     let report = |cost: f64| AgentDomainEvent::TurnCompleted {

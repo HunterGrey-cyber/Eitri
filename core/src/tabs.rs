@@ -909,8 +909,9 @@ mod tests {
         );
     }
 
-    /// Checks the four English bypass prompts byte for byte, including singular and plural card
-    /// counts. Every character must be ASCII.
+    /// The four bypass prompts use the band's English wording byte for byte: one card is
+    /// "the 1 waiting card", two are "the 2 waiting cards", and none contains non-ASCII characters
+    /// such as a full-width question mark.
     #[test]
     fn the_bypass_prompts_are_english_and_pluralize_the_card_count() {
         assert_eq!(bypass_prompt(PromptScope::LiveTab, 0), "Switch to bypass? (y/n)");
@@ -939,10 +940,11 @@ mod tests {
         }
     }
 
-    /// The web tests copy bypass prompts into `confirm_bypass` envelopes and narrow-width fixtures.
-    /// Every double-quoted string in a `*.test.ts(x)` file that mentions bypass and ends in `(y/n)`
-    /// must match a string `bypass_prompt` produces. Scan the source text so stale wording or a
-    /// paraphrase fails instead of passing for a real prompt.
+    /// Web tests hand-copy bypass prompts in `confirm_bypass` lines and narrow-band fixtures.
+    /// Every double-quoted test string mentioning bypass and ending in `(y/n)` must match a real
+    /// `bypass_prompt` string. Fixtures may omit other lines but must not paraphrase a prompt,
+    /// so copied wording cannot drift between the Rust producer and the page tests.
+    /// Read the files as text, like the socket-path scanners.
     #[test]
     fn the_web_tests_use_only_the_bypass_prompts_this_file_produces() {
         let mut real: Vec<String> = vec![

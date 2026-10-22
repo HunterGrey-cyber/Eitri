@@ -74,9 +74,10 @@ describe("editPreview", () => {
     expect(editPreview("mcp__x__y", { anything: 1 })).toBeNull();
   });
 
-  /** `NotebookEdit` supplies `notebook_path` and `new_source`, but no previous cell content.
-   *  Treat it as a whole-cell write, like `Write` for a whole file. The note must say "cell"
-   *  rather than "file" to describe the scope correctly. */
+  /** `NotebookEdit`'s own schema (`notebook_path`, `new_source`) carries no
+   *  "before" -- the tool never reports what a cell held, unlike `Edit`'s `old_string` -- so this
+   *  is a whole-content write for one cell, the same shape as `Write` is for a whole file, and it
+   *  must say "cell" rather than "file" so the note is not misleading. */
   it("reads a NotebookEdit as a whole-cell write, filed under notebook_path", () => {
     const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", cell_id: "c1", new_source: "one\ntwo\n" })!;
     expect(preview.filePath).toBe("/p/a.ipynb");
@@ -90,8 +91,10 @@ describe("editPreview", () => {
     expect(editPreview("NotebookEdit", {})).toBeNull();
   });
 
-  /** `NotebookEdit` with `edit_mode: "delete"` has no `new_source` to diff.
-   *  Name the deletion instead of showing an empty diff and the misleading "Writes the whole cell" note. */
+  /** `edit_mode: "delete"` carries no `new_source` at all -- there is nothing
+   *  to write -- so diffing it like every other `NotebookEdit` produced an empty diff, "+0 −0" and
+   *  the misleading "Writes the whole cell" note, true of nothing and silent about the deletion
+   *  that actually happened. */
   it("names a deleted cell instead of drawing an empty whole-cell write for it", () => {
     const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", cell_id: "c1", edit_mode: "delete" })!;
     expect(preview.filePath).toBe("/p/a.ipynb");

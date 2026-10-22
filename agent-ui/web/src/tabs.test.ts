@@ -93,8 +93,9 @@ describe("the per-tab view store", () => {
     expect(takeView(store, 1)).toBeUndefined();
     expect(takeView(store, 2)?.cursor).toBe(7);
   });
-  // Save and restore the unread pill's `seq` threshold so `MessageList` can seed it with `unseenSeed`.
-  // Preserve `null` too, for a tab left following or never parked.
+  // The unread pill's threshold is a `seq`, saved and handed back across a switch so
+  // `MessageList`'s `unseenSeed` can seed it in -- round-tripped here the same way every other field
+  // already is above; `null` (a tab left following, or never parked) round-trips too.
   it("round-trips the unread threshold (unseenAfterSeq)", () => {
     const store = new Map<number, TabViewState>();
     saveView(store, 1, view(3, 42));
@@ -114,8 +115,8 @@ describe("withoutHandoff", () => {
   });
 });
 
-/* Counted `gt` selects a tab by number; `gT` moves backward by the count and wraps.
-   Tab ids deliberately differ from their numbers: id 5 is third, so returning 3 would fail. */
+/* Vim's `{N}gt` / `{N}gT` (`:help gt`). The ids are deliberately not the
+   numbers -- tab 5 is the bar's third -- so a target that returned the number would fail here. */
 describe("countedTabTarget (vim {N}gt / {N}gT)", () => {
   const env: TabsEnvelope = { active: 2, tabs: [tab(1), tab(2), tab(5, { number: 3 })], defaultMode: "auto" };
   it("gt goes to the tab numbered N, or nowhere", () => {

@@ -36,7 +36,7 @@ it("draws a trailing Continue in a terminal row only when onHandoff is given, an
 });
 
 it("keeps the current row in view as j/k move it (the phase-3 GUI pass, 2026-09-25)", () => {
-  // Seen in the sandbox: with phase 3's rows the table outgrew a short panel, and `j` walked the
+  // When the table outgrows a short panel, `j` must keep the selected row visible rather than walking the
   // highlight off the bottom with nothing scrolling after it.
   const calls: Element[] = [];
   const original = Element.prototype.scrollIntoView;

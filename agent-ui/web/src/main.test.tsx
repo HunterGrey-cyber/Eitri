@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { waitFor } from "@testing-library/react";
 
-/** Make `App` throw on its first render to exercise the entry point's error boundary. */
+/** `App` throws on its first render, matching a chooser crash on a filter with no matches. */
 vi.mock("./App", () => ({
   default: () => {
     throw new Error("render exploded");
@@ -21,8 +21,9 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-/** A render failure can leave `#root` empty and every key inactive until reload.
- *  Test the error boundary at the entry point, since `App` tests do not render `main.tsx`. */
+/** `#root` went empty -- no chrome, every key dead, nothing logged -- until `prefix r`.
+ *  The entry point is the one place a boundary must exist for that to be impossible, so it is pinned here
+ *  rather than in `App`'s own tests, which never render `main.tsx`. */
 it(
   "draws a crash notice, not an empty #root, when the panel itself throws",
   async () => {

@@ -1417,10 +1417,12 @@ impl Worker<'_> {
 mod tests {
     use super::*;
 
-    /// A panic can replace a rendered frame that the host has not taken yet.
-    /// The failure frame must not retain the previous frame's cursor, which would place preedit
-    /// and the input method on a screen that is gone. Calling `contain_panic` with a render still
-    /// pending exercises this case deterministically.
+    /// A frame the session rendered,
+    /// rang the host for and the host has not taken yet, followed by a panic on the thread. The
+    /// failure frame replaces it in the pending update, and must not go out beside that frame's
+    /// cursor: the pane would draw a composition, and point the input method, at a cell of a screen
+    /// that is gone. Deterministic by construction -- the panic is `contain_panic` itself, called
+    /// with the render still pending, which a live session reaches only by losing a race.
     #[test]
     fn a_contained_panic_does_not_leave_the_previous_frames_cursor_beside_its_own() {
         let size = PtySize {

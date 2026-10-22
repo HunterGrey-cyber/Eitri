@@ -1,23 +1,30 @@
-//! Pins the two default key tables to checked-in fixtures. Existing (context, key)
-//! mappings must retain their actions; new keys are allowed without fixture updates.
+//! Existing default keys keep their meanings; new keys may be added. Checked-in fixtures pin
+//! the two Rust default key tables, and changing or removing a pinned (context, key) mapping
+//! fails. A new key absent from the fixture needs no fixture update.
 //!
-//! The prefix table pins both `Keymap::defaults().prefix()`, the `Ctrl+b` trigger,
-//! and `Keymap::defaults().bindings()`, the bindings used after the trigger fires.
-//! The `C-b` binding sends the literal prefix to the pane. Changing the trigger
-//! does not change that binding, so pinning bindings alone would miss the change.
-//! The Rust prefix fixture is `tests/fixtures/v1-frozen-prefix-keys.json`.
+//! Two tables:
+//! - The prefix (tmux-style) table: both `Keymap::defaults().prefix()` -- the trigger chord that
+//!   *enters* prefix mode (default `Ctrl+b`) -- and `Keymap::defaults().bindings()`
+//!   (the within-prefix-mode key table, looked up only once that chord has already fired). These are
+//!   two different things that happen to share a spelling by design: `bindings()` also has its own
+//!   row keyed `"C-b"` (`send-prefix`, stock tmux's `prefix C-b` -> send the literal prefix to the
+//!   pane), but changing the *trigger* in `prefix()` would not touch that row's key at all, so pinning
+//!   `bindings()` alone cannot catch a changed trigger. Rust/shell-only, fixture at
+//!   `tests/fixtures/v1-frozen-prefix-keys.json`.
+//! - The panel (leader/which-key) table, `eitri_core::keymap::default_bindings()` -- shared with
+//!   `agent-ui/web`'s `keymap.v1Freeze.test.ts` via one fixture, `docs/keymap/v1-frozen-panel-keys.json`,
+//!   because `PanelSeq::wire()` already produces the exact `keys: string[]` shape the frontend's
+//!   `PanelBinding` uses on the wire (`serialize_keymap_for_js`), so one JSON file is the freeze for
+//!   both languages instead of two fixtures that could quietly drift apart.
 //!
-//! The panel table comes from `keymap::default_bindings()`. It shares
-//! `docs/keymap/v1-frozen-panel-keys.json` with the frontend's `keymap.v1Freeze.test.ts`.
-//! `PanelSeq::wire()` produces the `keys: string[]` shape used by `PanelBinding`
-//! through `serialize_keymap_for_js`, so both languages can use the same fixture.
+//! Each action is pinned by its full shape (`Action::name()` plus every `Action::options()` value,
+//! sorted), not just its name, so a binding that keeps its name but changes an option (`cells: 1` ->
+//! `cells: 5`, `up: false` -> `up: true`) still counts as a changed meaning.
 //!
-//! Each action includes `Action::name()` and all sorted `Action::options()` values.
-//! Changing an option changes the binding's meaning even if its action name stays the same.
-//!
-//! Run the ignored `regenerate_fixtures` test only for deliberate additions, then
-//! inspect the diff before committing. Regeneration must not hide changed or removed
-//! mappings; the test detects changes but cannot tell an intended change from a bug.
+//! Regenerate only for a deliberate addition, never to silence a regression:
+//! `cargo test -p eitri-core --test keymap_v1_freeze -- --ignored regenerate_fixtures`.
+//! Inspect the diff before accepting it: this test detects a change but cannot tell whether
+//! it was intended.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -32,8 +39,8 @@ struct PrefixFixtureRow {
     action: String,
 }
 
-/// The prefix fixture includes the trigger chord and every binding within prefix mode. An
-/// object holds both `prefix` and the bindings array so the trigger itself can be checked.
+/// The frozen prefix shape includes both its trigger chord and every within-prefix binding.
+/// An object wrapper, rather than a bare array, lets the fixture pin the trigger independently.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct PrefixFixture {
     prefix: String,
@@ -199,9 +206,9 @@ fn panel_table_keeps_every_pinned_binding() {
     );
 }
 
-/// Ignored because it overwrites the checked-in fixtures with the current binding tables. Run
-/// after an intentional binding change and inspect the diff before committing: the test cannot
-/// distinguish an intended change from a regression.
+/// `--ignored`, by design: this writes today's tables over the checked-in fixtures. Run it only after
+/// a deliberate, approved change to the default bindings, then review the diff by hand before committing --
+/// this test has no way to tell an intended change from a regression it should have caught.
 #[test]
 #[ignore]
 fn regenerate_fixtures() {

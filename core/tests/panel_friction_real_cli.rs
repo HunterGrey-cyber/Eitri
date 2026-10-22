@@ -1,5 +1,5 @@
-//! Phase 3 against a real sidecar and a real `claude`. `#[ignore]`d: it
-//! spawns real Claude sessions and bills the account they run as.
+//! Panel interactions against a real sidecar and real `claude`. Ignored by default because
+//! these tests spawn real sessions and bill the account they run as.
 //!
 //! **Run only on the TEST profile, through the resolved binary, with a scratch state home:**
 //!
@@ -93,7 +93,7 @@ fn shut_down(set: &mut TabSet) {
     }
 }
 
-/// A message queued during a turn goes out after `Ctrl+Enter` interrupts it.
+/// A queued message goes out after `Ctrl+Enter` interrupts the running turn.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn a_queued_message_goes_out_after_an_interrupt() {
@@ -138,10 +138,11 @@ fn a_queued_message_goes_out_after_an_interrupt() {
     shut_down(&mut set);
 }
 
-/// A project rule answers a matching Bash call with no card; a writing option still needs a card.
-/// `git log` is already on the classifier's read-only list and would pass without a rule.
-/// `uname` is refused because it is not on that list, so allowing it tests the rule itself.
-/// `git log --output=` checks that writing still needs a card despite the matching rule.
+/// A project rule answers matching Bash without a card; an option that writes still cards.
+///
+/// A `git log *` probe would pass even without a rule because the classifier already allows
+/// read-only `git log`. `uname` is refused for the replaceable not-on-the-read-only-list reason,
+/// so only a rule answers it. `git log --output=` checks that a writing option still cards.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn a_rule_answers_its_command_and_git_log_output_still_cards() {
@@ -170,7 +171,7 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
         );
         !set.get(tab).unwrap().turn_running() && transcript(set, tab).contains("Linux")
     });
-    // Not vacuous (the phase-3 GUI pass, 2026-09-25): the first run of this test passed its first
+    // Not vacuous (seen in a GUI pass, 2026-09-25): the first run of this test passed its first
     // half with NO Bash call at all -- `disallowed_tools_for(Auto)` removes `Bash` from the model's
     // tools, so it answered "Linux" from its environment info and nothing reached the gate. A rule
     // can only be shown to answer a call that was made.
@@ -183,7 +184,7 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
         .tool_calls
         .iter()
         .any(|call| call.name == "Bash" && call.input["command"].as_str().is_some_and(|c| c.contains("uname")));
-    // Auto offers Bash, so this assertion fails if the model chose not to call it.
+    // Auto offers Bash, so an inconclusive probe here means the model chose not to call it.
     assert!(
         ran_bash,
         "no Bash call reached the gate, so a rule was not shown answering anything \
@@ -253,16 +254,16 @@ fn deny_the_next_card(
     permission
 }
 
-/// With no rules, Auto offers Bash on the real CLI. A read-only command inside the
-/// project runs with no card, and a command that writes needs a card.
+/// With no saved rules, Auto offers Bash: a read-only in-project command runs without a card,
+/// while a writing command must card.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn auto_offers_bash_runs_a_read_only_command_and_cards_a_write() {
     auto_offers_bash_on(BackendKind::Sidecar, "auto-bash");
 }
 
-/// Checks the same behavior on the legacy backend, which passes no `--disallowedTools` in Auto.
-/// Requires a build with `--features legacy-backend`.
+/// The same behavior on legacy, whose Auto CLI gets no `--disallowedTools`.
+/// Available only in builds with `--features legacy-backend`.
 #[cfg(feature = "legacy-backend")]
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]

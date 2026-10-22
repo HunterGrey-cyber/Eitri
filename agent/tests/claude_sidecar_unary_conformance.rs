@@ -1,9 +1,14 @@
-//! Ignored tests of unary RPC round trips against a freshly spawned `claude-sidecar`.
-//! Session and turn ids, handshakes and provider errors confirm response shapes without
-//! model queries or Claude API usage. These tests do not check conversation content.
+//! Real, `#[ignore]`d tests against a real, freshly-spawned `claude-sidecar` process -- but no real
+//! Claude API cost: every test here only exercises unary RPC round trips whose *shape* the sidecar
+//! itself can confirm without ever issuing a query (a session_id/turn_id coming back, a handshake,
+//! or a well-formed provider error). Real conversation content is covered in
+//! `claude_sidecar_event_stream_conformance.rs` and `claude_sidecar_conformance.rs`.
 //!
-//! The sidecar runs `claude --version` at startup to check CLI compatibility, so `claude`
-//! must be installed. This version probe sends no messages and costs no tokens.
+//! "No query", not "no `claude` process": the sidecar shells out to `claude --version` once at
+//! startup for its own CLI-compatibility check (`runtimeServiceImpl.ts::getActualClaudeCodeVersion`),
+//! so the binary does run. A version probe sends no messages and costs no tokens. `claude` must
+//! therefore be installed for these to pass -- the cost claim is about billing, not about
+//! dependencies.
 
 use agent::{AgentProvider, ClaudeSidecarProvider, CreateSessionRequest};
 
@@ -87,7 +92,7 @@ fn close_session_on_an_unknown_id_surfaces_a_typed_provider_error() {
 ///
 /// `real_handshake_today()` in `agent/src/providers/claude_sidecar/mod.rs` is a hand-written literal
 /// whose doc comment claims it is "the exact shape today's real sidecar returns". Nothing verified
-/// that. On 2026-09-15 a cross-repository review found it still saying `protocol_major: 1` with
+/// that. On 2026-09-15 it still said `protocol_major: 1` with
 /// seven capabilities, while `CLIENT_PROTOCOL_MAJOR` was 2 and the pinned sidecar advertised nine --
 /// it described a peer `connect()` would have REFUSED outright, and every unit test around it stayed
 /// green throughout, because they all read that same literal.

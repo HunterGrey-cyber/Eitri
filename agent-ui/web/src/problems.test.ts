@@ -95,9 +95,9 @@ describe("classify", () => {
     expect(classify("/login isn't available in this environment.")).toBeNull();
   });
 
-  // The in-range-but-untested diagnostic stays in the header as `⚠`. It is not a startup failure
-  // and must not gain a headline or remedy here. Its text contains neither "refusing to start"
-  // nor "outside", so the failure recognizers must leave it unmatched.
+  // This diagnostic stays the header's own `⚠` and must NOT gain a
+  // headline/remedy block here -- it is not a startup failure at all, and nothing above may match
+  // it by accident (the real text has neither "refusing to start" nor "outside").
   it("returns null for the in-range-but-untested compatibility diagnostic", () => {
     const text =
       "claude CLI version 2.1.283 is inside this sidecar's supported range (>=2.1.252 <3.0.0) but " +

@@ -85,7 +85,7 @@ describe("TurnActivity", () => {
   });
 });
 
-// A design decision (revised 2026-09-29): while the user types in the editor the page slows the
+// While the user types in the editor the page slows the
 // activity line's star to the panel's cadence, but it never pauses the motion the turn is showing, and
 // the elapsed clock (one repaint a second, never faster than the slowest cadence Rust accepts) is left
 // alone.

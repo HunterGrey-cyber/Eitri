@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(keys.lua_keys(), ['N', 'g']);
     }
 
-    /// A Lua panel keyed `f`, `w` or `c` fails with a message naming the existing binding.
+    /// A Lua panel cannot claim reserved `f`, `w` or `c`; failure must name the conflicting binding.
     #[test]
     fn a_lua_panel_keyed_f_w_or_c_fails_naming_the_binding() {
         for (key, action) in [('f', "hint"), ('w', "tab.choose"), ('c', "tab.new")] {
@@ -458,9 +458,9 @@ mod tests {
         assert!(matches!(build_one("e", &keymap), Err(KeyError::Taken { by, .. }) if by == "editor"));
     }
 
-    /// A panel keyed `A` would intercept `Ctrl+a " a` with Shift still held from `"`,
-    /// which should open the chat below. Capitals of built-in keys are refused,
-    /// including `V` for the reserved canvas key `v`.
+    /// A panel keyed `A` must not take `Ctrl+a " a` with Shift still held from `"`, which opens
+    /// chat below everywhere else. `V` is likewise reserved for the canvas's `v`, so a later canvas
+    /// cannot take a key already assigned to a Lua panel.
     #[test]
     fn the_capital_of_a_built_in_key_is_refused_naming_the_key() {
         // `E` is also a built-in capital, but it is bound itself now (`layout.spread`), and a bound key is refused as
@@ -490,8 +490,7 @@ mod tests {
         );
     }
 
-    /// `v` is unbound by default but still reserved for the canvas,
-    /// so a Lua panel cannot take it.
+    /// `v` is unbound by default but reserved for the canvas, so a Lua panel cannot claim it.
     #[test]
     fn a_lua_panel_keyed_v_is_refused_reserved_for_the_canvas() {
         let keymap = Keymap::defaults();
@@ -541,7 +540,7 @@ mod tests {
         );
     }
 
-    /// A module key shows, places, focuses or hides its module according to its current state.
+    /// A module key shows a hidden module, places an absent one, focuses a visible one, or hides the focused one.
     #[test]
     fn a_module_key_shows_places_focuses_or_hides() {
         let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
@@ -597,8 +596,8 @@ mod tests {
         assert_eq!(armed, after_split);
     }
 
-    /// A built-in whose direct key is `del`ed or moved is listed, armed, under the key that really
-    /// reaches it, or not at all -- while its after-a-split key stays.
+    /// Deleting or moving a built-in direct key changes its listed, armed key to the one that
+    /// actually reaches it, or removes it from the list; its after-a-split key stays available.
     #[test]
     fn the_armed_strip_follows_a_deleted_or_rebound_module_key() {
         let layout = Layout::initial(&[ModuleDecl {

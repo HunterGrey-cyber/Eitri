@@ -12,14 +12,18 @@ const key = (
     keyCode: number;
     altKey: boolean;
     metaKey: boolean;
-    /** Creates a KeyLike whose getModifierState reports Super and Hyper held, matching the
-     *  modifier-query interface of KeyboardEvent. */
+    /** Shorthand for a `KeyLike` whose
+     *  `getModifierState` reports Super/Hyper held, the only shape a real `KeyboardEvent` can put it
+     *  in (see `keymap.ts`'s own `KeyLike` doc comment). */
     superKey: boolean;
-    /** `superKey` reports Super and Hyper together, so it cannot isolate a Hyper-only failure.
-     *  This reports Hyper alone, as a Hyper-only keypress would. */
+    /** `superKey` above
+     *  reports BOTH Super and Hyper at once (that is what `hasSuperOrHyper` checks), which cannot
+     *  tell a Super-only regression from a Hyper-only one -- this isolates Hyper alone, the way a
+     *  real Hyper-only keypress would actually report it. */
     hyperKey: boolean;
-    /** Creates a KeyLike whose getModifierState reports AltGraph held. This is the level-3
-     *  shift some layouts use to type ordinary characters such as @ and €. */
+    /** Shorthand for a `KeyLike` whose
+     *  `getModifierState` reports AltGraph held -- the level-3 shift some layouts use to type an
+     *  ordinary character (`@`, `€`), the same shape a real `KeyboardEvent` reports it in. */
     altGraphKey: boolean;
   }> = {},
 ) => {
@@ -37,22 +41,26 @@ const key = (
 };
 const ctx = { sessionEnded: false };
 
-/** Parses one BROWSE_KEYS[i].keys token after splitting on " / ". A two-key sequence such as
- *  gg, [[, ]] or Ctrl+w h uses its second key with the first stored as pending. Ctrl+x carries
- *  Ctrl, G and ? carry Shift, and 1-9 uses a representative digit. Other tokens are keys on
- *  their own. Both directions of the table-to-resolveKey checks share this parser. */
+/** Turns one `BROWSE_KEYS[i].keys` TOKEN (after splitting on " / ") into what a person actually
+ *  pressed, as a sequence: a two-key sequence (`gg`, `[[`, `]]`, and the `Ctrl+w` prefix's `Ctrl+w h`)
+ *  is its second key with the first held as `pending`; `Ctrl+x` -> Ctrl held with `x`; `G`/`?` ->
+ *  Shift held (that is how both arrive on a real keyboard); `1-9` -> a single representative digit;
+ *  anything else is the key on its own.
+ *  Shared by both directions of the table <-> `resolveKey` correspondence below, so the two can
+ *  never silently parse a token two different ways. */
 function parseKeyToken(token: string): { ev: KeyLike; pending?: PendingPrefix } {
-  // Ctrl+w h means h with the Ctrl+w prefix pending. Handle it before the Ctrl+ branch, which
-  // would otherwise parse it as Ctrl held with a key named "w h".
+  // `Ctrl+w h` is `h` with the `Ctrl+w` prefix waiting -- this must come ahead of the
+  // `Ctrl+` branch below, which would otherwise read it as Ctrl held with a key named "w h".
   const cw = /^Ctrl\+w ([hjkl])$/.exec(token);
   if (cw) return { ev: key(cw[1]), pending: "C-w" };
   if (/^[gz\[\]].$/.test(token)) return { ev: key(token[1]), pending: token[0] as PendingPrefix };
   if (token === "1-9") return { ev: key("3") };
-  // The help row uses arrow glyphs (↓ / ↑), while keyboard events report ArrowDown and ArrowUp.
+  // The help row spells the arrow keys as their glyphs (`↓ / ↑`), the keyboard
+  // reports them as `ArrowDown`/`ArrowUp`.
   if (token === "↓") return { ev: key("ArrowDown") };
   if (token === "↑") return { ev: key("ArrowUp") };
   if (token.startsWith("Ctrl+")) return { ev: key(token.slice("Ctrl+".length), { ctrlKey: true }) };
-  // `:` also carries Shift on most layouts, where it is typed as Shift+;.
+  // `:` too: Shift+; on most layouts (a shifted punctuation key).
   if (/^[A-Z?:]$/.test(token)) return { ev: key(token, { shiftKey: true }) };
   return { ev: key(token) };
 }
@@ -63,7 +71,7 @@ describe("resolveKey", () => {
     expect(resolveKey("input", key("Escape"), ctx)).toEqual({ kind: "mode", to: "browse" });
   });
 
-  /* C1a: `o` is an exact alias of `i` -- same caret, same refusal -- and `A` is `i`'s
+  /* `o` is an exact alias of `i` -- same caret, same refusal -- and `A` is `i`'s
      shifted sibling with the caret forced to the end (`:h A`). Neither reaches `O`/`I`, which stay
      unbound (additive later): the blanket Shift refusal still catches them. */
   it("adds o as an exact alias of i, and A at the end of the draft (C1a)", () => {
@@ -97,9 +105,13 @@ describe("resolveKey", () => {
     expect(resolveKey("input", key("a"), ctx)).toBeNull();
   });
 
-  /* Alt or Meta held with a card-answer key must not authorize or deny a card: OS shortcuts
-     such as Meta+A must not trigger permission answers. Bare a/d must still work. Super is a
-     separate GDK modifier and needs its own check. */
+  /* Alt/Meta held alongside a card-answer key must never authorize or
+     deny a card -- Alt+A and Cmd/Meta+A are common OS-level chords (e.g. "select all" muscle
+     memory), and `KeyLike` once had no `altKey`/`metaKey` fields at all, so neither the
+     blanket ctrl/shift-only refusal nor this switch's own `case "a":` ever looked at them. Bare
+     `a`/`d` (the control) must keep working. Super is its own, separate case just below: it is a
+     THIRD GDK modifier, not a spelling of Meta (an earlier version of this comment wrongly said
+     "Linux's Super arrives as `metaKey` too"). */
   it("refuses Alt or Meta on a/d, but bare a/d still answer (R2)", () => {
     expect(resolveKey("browse", key("a", { altKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("a", { metaKey: true }), ctx)).toBeNull();
@@ -109,9 +121,12 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
   });
 
-  /* Checking altKey and metaKey alone misses Super and Hyper. This pure layer queries
-     getModifierState("Super"/"Hyper") to refuse modified card-answer keys. Whether WebKitGTK
-     supplies that state on another key's event must be checked separately. */
+  /* Super must refuse a card answer too
+     ("refuse any Alt, Meta or Super"), and the code above it checked only `altKey`/`metaKey` --
+     confirmed missing, before Super was added, by reading `resolveKey`'s `case "a":`.
+     `getModifierState("Super"/"Hyper")` is the only signal this pure layer can read it
+     through (see `keymap.ts`'s `KeyLike` doc comment for the caveat on whether WebKitGTK ever
+     actually sets it). */
   it("refuses Super (or Hyper) on a/d, but bare a/d still answer", () => {
     expect(resolveKey("browse", key("a", { superKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("d", { superKey: true }), ctx)).toBeNull();
@@ -119,7 +134,7 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("d"), ctx)).toEqual({ kind: "answer", decision: "deny" });
   });
 
-  /* The sandbox pass: WebKitGTK 2.52.6 sets no modifier on `a` while Super is
+  /* WebKitGTK 2.52.6 sets no modifier on `a` while Super is
      held -- only Super's own keydown/keyup arrive, which `heldSuper.ts` tracks. */
   it("refuses a/d while Super is held by its own keydown, with no modifier on the key itself", () => {
     noteKey("keydown", { key: "Super", code: "OSLeft" });
@@ -156,8 +171,9 @@ describe("resolveKey", () => {
     expect(resolveKey("input", key("y"), ctx)).toBeNull();
   });
 
-  /* A held Ctrl or Shift must prevent a match unless the binding names that modifier. Checking
-     every row ensures an unnamed modifier cannot silently trigger an ordinary key action. */
+  /* `KeyLike` has always declared `ctrlKey`/`shiftKey`; nothing read them,
+     which is indistinguishable from a modifier check that silently does not exist. A held Ctrl or
+     Shift now means "not this table's key" across every row, not just the ones it happens to name. */
   it("does not claim a key carrying a modifier this table does not name", () => {
     expect(resolveKey("browse", key("i", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("j", { ctrlKey: true }), ctx)).toBeNull();
@@ -168,18 +184,23 @@ describe("resolveKey", () => {
     // named exactly: every other modifier set on the same letters, and every other Ctrl/Shift
     // letter a vim user might reach for, is still refused.
     expect(resolveKey("browse", key("d", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
-    // Ctrl+a reaches the blanket modifier refusal before `isPlainAnswerKey` is consulted.
-    // This checks Ctrl separately from the Alt, Meta and Super cases above.
+    // `a`/`d` name no Ctrl chord of their own (unlike `d`'s Ctrl+d/
+    // half-page just below), so Ctrl+a already falls to the blanket refusal above the switch before
+    // `isPlainAnswerKey` is ever consulted -- recorded directly rather than left implicit, since
+    // `resolveKey("browse", key("a", { altKey: true }), ...)` above tests the same card only for
+    // Alt/Meta/Super, never Ctrl.
     expect(resolveKey("browse", key("a", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("U", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("G", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
-    // Ctrl+f scrolls a page; Ctrl+Shift+f stays unclaimed.
-    // Ctrl+b is the tmux prefix and stays unclaimed too.
+    // Ctrl+f was pinned unclaimed here; it is a page now (its own
+    // test below), so what stays refused is the same letter with any other modifier set. `Ctrl+b` is
+    // the tmux prefix, and stays unclaimed with it.
     expect(resolveKey("browse", key("f", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("b", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("p", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("J", { shiftKey: true }), ctx)).toBeNull();
-    // Ctrl+Shift+e/y are refused, like Ctrl+Shift+d above; only the unshifted Ctrl+e/y chords scroll.
+    // Ctrl+e/Ctrl+y take Shift too, the same way Ctrl+d/Ctrl+u's own Ctrl+Shift+d
+    // check above does: Ctrl+Shift+e/y are refused, unlike the bare chords their own test names.
     expect(resolveKey("browse", key("e", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("y", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     // And the named ones belong to BROWSE only: in the composer they are the text box's own.
@@ -199,24 +220,27 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("d", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "half-page", delta: 1 });
   });
 
-  /* Check Ctrl+e/Ctrl+y before the plain-key switch. A browser reports `key === "y"` for both
-     Ctrl+y and bare `y`, so letting Ctrl+y reach the switch would copy the current row. */
+  /* Checked ahead of the plain-key switch
+     for the same reason Ctrl+d/Ctrl+u are -- a browser reports `key === "y"` for Ctrl+y the same as
+     bare `y`, and bare `y` (below) copies the current row. */
   it("names Ctrl+e and Ctrl+y as one-line scrolls, and a Ctrl+y is never a copy", () => {
     expect(resolveKey("browse", key("e", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: 1 });
     expect(resolveKey("browse", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: -1 });
     expect(resolveKey("browse", key("y"), ctx)).toEqual({ kind: "copy" });
     // Scrolling a dead session's transcript is still reading it, the same as Ctrl+d/Ctrl+u.
     expect(resolveKey("browse", key("e", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "scroll-line", delta: 1 });
-    // These scrolls belong to BROWSE. In INPUT, Ctrl+e belongs to the composer and Ctrl+y
-    // approves the oldest waiting card instead of scrolling.
+    // BROWSE only: INPUT's own Ctrl+e (end of line) is the composer's. INPUT's Ctrl+y was unclaimed
+    // until it gained "approve the oldest waiting card",
+    // -- never a scroll (its own describe block below).
     expect(resolveKey("input", key("e", { ctrlKey: true }), ctx)).toBeNull();
     expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).not.toEqual({ kind: "scroll-line", delta: -1 });
   });
 
-  /* An added key: in INPUT a single Ctrl+y approves the active tab's oldest waiting card (`App.tsx`
-     picks the card and runs the typing guard; this table only says which chord it is). Exactly
-     Ctrl+y: with Shift, Alt, AltGraph, Meta, Super/Hyper held, or an input method composing, it is
-     nothing. BROWSE's Ctrl+y stays the one-line scroll above. There is no deny chord in INPUT. */
+  /* An ADDED key -- in INPUT a
+     single Ctrl+y approves the active tab's oldest waiting card (`App.tsx` picks the card and runs
+     the typing guard; this table only says which chord it is). Exactly Ctrl+y: Shift, Alt, AltGraph,
+     Meta, Super/Hyper, or an input method composing, and it is nothing. BROWSE's Ctrl+y stays the
+     one-line scroll above. There is no deny chord in INPUT. */
   describe("#39: INPUT Ctrl+y", () => {
     it("is approve-oldest in INPUT, and still the one-line scroll in BROWSE", () => {
       expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
@@ -248,8 +272,8 @@ describe("resolveKey", () => {
       expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
     });
 
-    /* Under Caps Lock, GTK/WebKitGTK report Ctrl+y as key "Y" with Shift not held.
-       INPUT accepts that spelling while still rejecting Ctrl+Shift+Y. */
+    /* Under Caps Lock GTK/WebKitGTK report Ctrl+y as key "Y" with Shift not
+       held. BROWSE's own Ctrl+y is left as it was on this branch. */
     it("accepts Caps Lock's Ctrl+Y (no Shift) in INPUT, and still refuses Ctrl+Shift+Y", () => {
       expect(resolveKey("input", key("Y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
       expect(resolveKey("input", key("Y", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
@@ -262,9 +286,10 @@ describe("resolveKey", () => {
     });
   });
 
-  /* Ctrl+f and PageDown/PageUp scroll a view; the arrow keys act as j/k.
-     Ctrl+f must be checked before the plain-key switch because its `key` is "f", like the
-     bare key that starts HINT. Ctrl+b is the tmux prefix, so PageUp scrolls back a page. */
+  /* Vim's `Ctrl+f` and the keyboard's own PageDown/PageUp
+     scroll a view, and the arrow keys are `j`/`k`. `Ctrl+f` is checked ahead of the plain-key switch for
+     the reason Ctrl+d/Ctrl+e are -- a browser reports `key === "f"` for it as for the bare `f`, and a
+     bare `f` starts a HINT. `Ctrl+b` is the tmux prefix, so PageUp is the only way back a page. */
   it("names Ctrl+f and PageDown as a page down, PageUp as a page up, and the arrows as j and k", () => {
     const cases: Array<[string, KeyLike, unknown]> = [
       ["Ctrl+f", key("f", { ctrlKey: true }), { kind: "page", delta: 1 }],
@@ -279,7 +304,7 @@ describe("resolveKey", () => {
       expect(resolveKey("browse", ev, { sessionEnded: true }), `${name}, session ended`).toEqual(want);
       // BROWSE only: in the composer they are the text box's own (a caret line, a history walk).
       expect(resolveKey("input", ev, ctx), `${name} in INPUT`).toBeNull();
-      // An input method composing owns the key (C4): its candidate list pages with these very keys.
+      // An input method composing owns the key: its candidate list pages with these very keys.
       expect(resolveKey("browse", { ...ev, isComposing: true }, ctx), `${name} composing`).toBeNull();
       expect(resolveKey("browse", { ...ev, keyCode: 229 }, ctx), `${name} keyCode 229`).toBeNull();
     }
@@ -309,22 +334,29 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("D", { shiftKey: true }), { sessionEnded: true })).toBeNull();
   });
 
-  /* Shift+D is checked before the blanket modifier refusal, so Alt and Meta need their
-     own guard on this chord. */
+  /* Shift+D is checked ahead of the blanket modifier refusal (the test
+     above), which is exactly why Alt or Meta held alongside it needs its own guard here -- that
+     refusal never runs for this chord at all. */
   it("refuses Alt or Meta on Shift+D (R2)", () => {
     expect(resolveKey("browse", key("D", { shiftKey: true, altKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("D", { shiftKey: true, metaKey: true }), ctx)).toBeNull();
   });
 
-  /* Shift+D needs its own Super/Hyper guard because it bypasses the blanket modifier refusal. */
+  /* Same gap as the a/d test above, on the
+     Shift+D chord's own separate guard. */
   it("refuses Super (or Hyper) on Shift+D", () => {
     expect(resolveKey("browse", key("D", { shiftKey: true, superKey: true }), ctx)).toBeNull();
   });
 
-  /* Card answers and bypass confirmation share `isPlainAnswerKey`. The a/d/D paths also reject
-     composing input at the start of `resolveKey`, before any chord or switch is checked.
-     Both `isComposing` and legacy WebKit's `keyCode === 229` must block answers, matching
-     `composerKeys.ts`'s `isImeKey`. */
+  /* The card-answer checks and App.tsx's bypass-confirm `y` (fixed separately for the same class of
+     bug) share one modifier predicate, `isPlainAnswerKey`. Checking this side of that: a/d/D already
+     refused a composing key before the two were joined, by way of `resolveKey`'s own top-of-function
+     composing check (the `if (event.isComposing || event.keyCode === 229) return null;` guarded ahead
+     of every chord and switch below it; no line number is given for it, since one given earlier had
+     already drifted) rather than anything specific to the answer switch -- this pins that so the
+     claim is proven, not merely believed, now that both
+     paths are read as making one promise. `keyCode === 229` is the same legacy-WebKit signal
+     `composerKeys.ts`'s `isImeKey` treats as composing too. */
   it("refuses a/d/D while an input method is composing (C4, reconciled with the bypass y fix)", () => {
     expect(resolveKey("browse", key("a", { isComposing: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("d", { isComposing: true }), ctx)).toBeNull();
@@ -339,8 +371,8 @@ describe("resolveKey", () => {
     expect(resolveKey("browse", key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
     expect(resolveKey("browse", key("g"), { ...ctx, pending: null })).toEqual({ kind: "pending", prefix: "g" });
     expect(resolveKey("browse", key("g"), { ...ctx, pending: "g" })).toEqual({ kind: "jump", to: "first" });
-    // After a pending `g`, the next key completes a pair or cancels the prefix.
-    // A non-pair key such as `j` must not run its bare-key action.
+    // This used to pin the prefix leak (`g`, then `j` moved as a bare `j`); a pending
+    // g's next key now completes one of its pairs or cancels, as vim's `nv_g_cmd` does.
     expect(resolveKey("browse", key("j"), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("input", key("g"), { ...ctx, pending: "g" })).toBeNull();
   });
@@ -348,8 +380,9 @@ describe("resolveKey", () => {
   it("starts a global HINT on f in BROWSE, and does not in INPUT", () => {
     expect(resolveKey("browse", key("f"), ctx)).toEqual({ kind: "hint" });
     expect(resolveKey("input", key("f"), ctx)).toBeNull();
-    // Ctrl+Shift+F is the shell's app accelerator, handled first by GTK. If it reaches the page,
-    // it stays unclaimed, as does Shift+F. Plain Ctrl+f scrolls a page and never starts HINT.
+    // Ctrl+Shift+F is shell's app-level accelerator (GTK takes it first); a Ctrl+Shift+f that does
+    // reach the page is not claimed here, and neither is a Shift+F.
+    // A plain Ctrl+f is vim's page down and never a HINT.
     expect(resolveKey("browse", key("f", { ctrlKey: true, shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("f", { ctrlKey: true }), ctx)).toEqual({ kind: "page", delta: 1 });
     expect(resolveKey("browse", key("F", { shiftKey: true }), ctx)).toBeNull();
@@ -381,7 +414,7 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("browse", key("["), { ...ctx, pending: "[" })).toEqual({ kind: "prompt-jump", delta: -1 });
     expect(resolveKey("browse", key("]"), { ...ctx, pending: "]" })).toEqual({ kind: "prompt-jump", delta: 1 });
     expect(resolveKey("browse", key("]"), { ...ctx, pending: "[" }), "a mismatched pair is nothing").toBeNull();
-    // After `[`, a non-pair key such as `j` cancels the prefix and is swallowed.
+    // This used to pin the leak (`[` then `j` moved); any other key now cancels, swallowed.
     expect(resolveKey("browse", key("j"), { ...ctx, pending: "[" }), "any other key cancels the prefix").toEqual({ kind: "cancel", why: "unbound" });
   });
 
@@ -410,10 +443,10 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("input", key("/"), ctx)).toBeNull();
   });
 
-  /* `:` opens a command line that runs only `:trust` and `:untrust`, so `:ls`, `:l` and `:d`
-     cannot answer a card. Match `key` with or without Shift; AZERTY types it unshifted.
-     Ctrl, Alt or Meta exclude it. After a pending prefix it cancels; INPUT types it,
-     and CARET/VISUAL end on it. */
+  /* `:` opens a vim-style command line that runs only `:trust` and `:untrust`, so `:ls⏎`,
+     `:l⏎` and `:d⏎` can never reach a card. Matched on `key`, with or without Shift (AZERTY types it
+     unshifted); held with Ctrl, Alt or Meta it is not `:`. After a pending prefix it cancels,
+     INPUT types it, and CARET/VISUAL still end on it. */
   it("opens the : command line in BROWSE with or without Shift, and nowhere else (K02)", () => {
     expect(resolveKey("browse", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "ex-line" });
     expect(resolveKey("browse", key(":"), ctx)).toEqual({ kind: "ex-line" });
@@ -423,7 +456,7 @@ describe("resolveKey, phase 3", () => {
     }
     expect(resolveKey("input", key(":", { shiftKey: true }), ctx)).toBeNull();
     expect(resolveKey("input", key(":"), ctx)).toBeNull();
-    // An input method's own key is never a command (C4), by either signal.
+    // An input method's own key is never a command, by either signal.
     expect(resolveKey("browse", key(":", { shiftKey: true, isComposing: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key(":", { shiftKey: true, keyCode: 229 }), ctx)).toBeNull();
     expect(resolveKey("browse", key(":", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "cancel", why: "unbound" });
@@ -443,9 +476,10 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("browse", key("l"), { ...ctx, pending: "z" })).toEqual({ kind: "table-scroll", delta: 1 });
   });
 
-  /* Each of zt/zz/zb and za/zo/zc is a row of `FIXED_PAIRS`.
-     After z, the next key completes a pair or cancels; it never runs its bare-key action.
-     In particular, za cannot answer a card and zo cannot start a session. */
+  /* Six more pairs `z` completes,
+     each one row of `FIXED_PAIRS` -- so the reserved-prefix rule holds for them without a line of its own: after
+     `z` the key completes a pair or cancels, and none of these ever falls through to its own
+     meaning (`za`/`zo` are not an answer key and a new session, `zc`/`zb` not a copy or a move). */
   it("zt / zz / zb put the cursor's row at the top / middle / bottom, and za / zo / zc fold", () => {
     const z = { ...ctx, pending: "z" as const };
     expect(resolveKey("browse", key("t"), z)).toEqual({ kind: "scroll-row", where: "top" });
@@ -456,13 +490,15 @@ describe("resolveKey, phase 3", () => {
     expect(resolveKey("browse", key("c"), z)).toEqual({ kind: "fold", open: false });
   });
 
-  /* Ctrl and Shift do not complete fixed z pairs; recursive zA/zO/zC are not supported.
-     Alt and Meta complete pairs as bare keys do, matching how z itself arms the prefix. */
+  /* A pair's key completes it bare, never under Ctrl or Shift (vim's `zA`/`zO`/`zC` are the recursive
+     variants, not built), so those cancel the `z` instead of running the pair -- and Shift+`a` is never
+     `za`. Alt and Meta are read as `z` itself is read, which arms with them held, so
+     they complete the pair as the bare key does (the "reads Alt and Meta" tests). */
   it("does not complete zt / zz / zb / za / zo / zc with Ctrl or Shift held: it cancels; Alt or Meta complete them", () => {
     const z = { ...ctx, pending: "z" as const };
     for (const k of ["t", "z", "b", "a", "o", "c"]) {
       for (const over of [{ ctrlKey: true }, { shiftKey: true }]) {
-        // Ctrl+c remains unclaimed after a prefix while idle.
+        // Ctrl+c alone keeps its interrupt meaning after a prefix (idle: unclaimed), as the prefix tests pin.
         const idleCtrlC = k === "c" && over.ctrlKey === true;
         expect(resolveKey("browse", key(k, over), z), `z ${k} with ${JSON.stringify(over)}`).toEqual(
           idleCtrlC ? null : { kind: "cancel", why: "unbound" },
@@ -516,28 +552,30 @@ describe("resolveKey with a panel table", () => {
     const gT: PanelBinding = { keys: ["g", "T"], action: "tab.prev", desc: "previous tab", source: "default" };
     const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, gT] };
     expect(resolveKey("browse", key("T", { shiftKey: true }), { ...ctx, pending: "g", table })).toEqual({ kind: "panel", binding: gT });
-    // A Ctrl chord cannot complete a pair. It cancels the pending `g` and is claimed so it
-    // cannot reach another handler as an unrelated command.
+    // This used to pin the leak as `null` (unclaimed, so the chord reached whatever took it
+    // next); a Ctrl chord still never completes a pair, and now cancels the pending `g` instead.
     expect(resolveKey("browse", key("T", { ctrlKey: true, shiftKey: true }), { ...ctx, pending: "g", table })).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("input", key("T", { shiftKey: true }), { ...ctx, pending: "g", table })).toBeNull();
   });
-  /* Without a table binding for `[b`, `b` cancels the prefix and is swallowed, like other
-     non-pair keys. */
+  /* This used to pin the leak -- `[b` with no table resolved to `null`, unclaimed. With no pair
+     for `b` under `[`, the key now cancels the prefix, swallowed, like any other non-pair key. */
   it("cancels [b without a table (pinned the K01 leak until X-A-11)", () => {
     expect(resolveKey("browse", key("b"), { ...ctx, pending: "[" })).toEqual({ kind: "cancel", why: "unbound" });
   });
 });
 
-/* A prefix waits for its second key without a timeout. That key completes a known pair or
-   cancels the prefix; it never falls through to its own action. In particular, `g` followed
-   after a pause by `d` must not deny the card under the cursor. */
+/* `g`, a pause, then `d` denied the card under the cursor -- a
+   reserved prefix's second key fell through to its own meaning whenever it completed no pair. vim
+   waits for a prefix's second key with no timeout and ends the command on a key it does not know
+   (`nv_g_cmd`, `nv_zet`, `nv_brackets`: `clearopbeep`); so does this table now. */
 describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs or cancels", () => {
-  // A prefix's next key never runs its bare-key action, including page and arrow keys.
-  // gp, zp and Ctrl+w p cancel; [p and ]p complete pairs.
-  // zx, [x, ]x and Ctrl+w x cancel; gx completes a pair.
+  // The page and arrow keys are keys of their own now, and a prefix's next key
+  // never runs as itself -- `g`, a pause, PageDown pages nothing.
+  // `p` too -- `gp`, `zp` and `Ctrl+w p` cancel, while `[p`/`]p` are pairs (skipped below).
+  // And `x` -- `zx`, `[x`, `]x` and `Ctrl+w x` cancel, while `gx` is a pair.
   const OTHER = ["a", "d", "j", "k", "i", "o", "y", "r", "n", "p", "x", "Enter", " ", "Escape", "3", "0", "/", "ArrowDown", "ArrowUp", "PageDown", "PageUp"];
   it("never falls through to the key's own meaning", () => {
-    // Ctrl+w is the fifth reserved prefix and follows the same cancellation rule.
+    // `Ctrl+w` is the fifth reserved prefix, and follows the same rule.
     for (const prefix of ["g", "z", "[", "]", "C-w"] as const)
       for (const k of OTHER) {
         if (FIXED_PAIRS[prefix][k] !== undefined) continue;
@@ -562,12 +600,12 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
       expect(resolveKey("browse", ev, { ...ctx, count: 3 })).toEqual({ kind: "cancel", why: "count-on-answer" });
     expect(resolveKey("browse", key("j"), { ...ctx, count: 3 })).toEqual({ kind: "move", delta: 1 });
   });
-  /* Resolve pending prefixes before Ctrl+o so g then Ctrl+o cannot toggle the view.
-     Every chord except Ctrl+c cancels a waiting prefix. INPUT ignores pending prefixes,
-     so its Ctrl+o still toggles the detailed view. */
+  /* `Ctrl+o` was matched ahead of the pending-prefix check, so `g` then
+     Ctrl+o toggled the detailed view. Every chord but Ctrl+c cancels a waiting prefix; INPUT
+     never reads one, so its own Ctrl+o is untouched. */
   it("cancels every chord but Ctrl+c: g Ctrl+o never toggles the detailed view", () => {
-    // Ctrl+w cancels a pending prefix without arming another one.
-    // This also makes Ctrl+w Ctrl+w and Ctrl+w Ctrl+o cancel.
+    // `Ctrl+w` is a chord now (so `g Ctrl+w` cancels the `g` and arms nothing), and
+    // a prefix of its own (`Ctrl+w Ctrl+w` cancels, as `Ctrl+w Ctrl+o` does).
     for (const prefix of ["g", "z", "[", "]", "C-w"] as const)
       for (const k of ["o", "d", "u", "e", "y", "g", "f", "w"])
         expect(resolveKey("browse", key(k, { ctrlKey: true }), { ...ctx, pending: prefix }), `${prefix} Ctrl+${k}`).toEqual({
@@ -577,20 +615,23 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
     expect(resolveKey("browse", key("o", { ctrlKey: true }), ctx)).toEqual({ kind: "detailed" });
     expect(resolveKey("input", key("o", { ctrlKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "detailed" });
   });
-  /* Brackets can arm a prefix with Alt or Meta held so [[ and ]] work on layouts that
-     type brackets with Option. Once a prefix is pending, Alt and Meta do not block a pair's
-     second key. A key that completes no pair still cancels; Ctrl and Shift never complete
-     a fixed pair. */
+  /* The
+     first key armed a prefix with Alt or Meta held (the blanket refusal
+     reads only Ctrl and Shift), but the second key completed a pair only with neither held. So a
+     pair typed with either on both keys cancelled where it had always completed. On a layout that
+     types a bracket with Option (macOS German, French, Swiss), that is how `[[` and `]]` are typed.
+     The two halves now read Alt and Meta the same way: not at all. A key that completes no pair
+     still cancels, whatever it holds, and Ctrl or Shift still never complete a fixed pair. */
   it("reads Alt and Meta on a pair's second key as its first key does: [[ typed with Option still jumps", () => {
     for (const over of [{ altKey: true }, { metaKey: true }]) {
       const held = JSON.stringify(over);
       for (const prefix of ["g", "z", "[", "]"] as const) {
-        // rc.3 minors 6: only a bracket arms with Alt or Meta held (the next test); a pair typed
+        // Only a bracket arms with Alt or Meta held (the next test); a pair typed
         // after a prefix that armed plainly still completes with either held, as here.
         for (const [k, pair] of Object.entries(FIXED_PAIRS[prefix]))
           expect(resolveKey("browse", key(k, over), { ...ctx, pending: prefix }), `${prefix} then ${held} ${k}`).toEqual(pair);
       }
-      // Reserved `gv` and mismatched bracket pairs remain unclaimed.
+      // gv's reservation and a mismatched bracket pair stay nothing, as they were with the old prefix routing.
       expect(resolveKey("browse", key("v", over), { ...ctx, pending: "g" }), `g then ${held} v`).toBeNull();
       expect(resolveKey("browse", key("]", over), { ...ctx, pending: "[" }), `[ then ${held} ]`).toBeNull();
       expect(resolveKey("browse", key("[", over), { ...ctx, pending: "]" }), `] then ${held} [`).toBeNull();
@@ -603,7 +644,7 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
     for (const over of [{ ctrlKey: true }, { shiftKey: true }])
       expect(resolveKey("browse", key("[", over), { ...ctx, pending: "[" }), JSON.stringify(over)).toEqual({ kind: "cancel", why: "unbound" });
   });
-  /* rc.3 minors 6: the FIRST key. `g` and `z` are letters no layout types with Alt or Meta held, so a
+  /* The FIRST key. `g` and `z` are letters no layout types with Alt or Meta held, so a
      modified one is a chord meant for something else (the window manager, GTK, a future binding) and
      arming a prefix from it swallowed the next plain key -- Alt+g, then `i`, never opened the
      composer. BROWSE reads them as the region modes and `v`/`:`/`Ctrl+w` already do. A bracket is
@@ -628,11 +669,12 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
   });
 });
 
-/* In BROWSE, Ctrl+w h/j/k/l selects the module in that direction.
-   Ctrl+w waits for its next key without a timeout; the key completes a pair or cancels,
-   so Ctrl+w followed by d cannot deny a card. `resolveKey` returns a `pane` direction,
-   which `App.tsx` posts to the shell as `pane_nav`. INPUT keeps the composer's word deletion,
-   and CARET/VISUAL swallow the chord. */
+/* Vim's `CTRL-W h/j/k/l` -- the window that way -- as the module that way.
+   `Ctrl+w` is a reserved prefix like `g`/`z`/`[`/`]`: it waits for its next key with no timeout, and
+   that key completes one of the four pairs or cancels, so `Ctrl+w`, a pause, `d` can
+   never deny a card. A pair is one action, `pane`, which `App.tsx` posts to shell as `pane_nav`;
+   `resolveKey` only names the direction. BROWSE only: the composer's `Ctrl+w` (delete a word) and
+   CARET/VISUAL's swallowing of every chord are untouched. */
 describe("Ctrl+w h/j/k/l: the module that way", () => {
   const ctrlW = key("w", { ctrlKey: true });
   const PAIRS = [
@@ -678,9 +720,9 @@ describe("Ctrl+w h/j/k/l: the module that way", () => {
     expect(Object.keys(FIXED_PAIRS["C-w"]).sort()).toEqual(["h", "j", "k", "l"]);
   });
 
-  /* After Ctrl+w, a non-pair key is swallowed so it cannot answer a card or run its own action.
-     Holding Ctrl on the second key also cancels. The shell claims Ctrl+l before the page through
-     `nav_key` and drops the prefix. */
+  /* Any other key -- the card-answer keys above all -- is swallowed, and runs
+     nothing as itself. Ctrl held on the second key (Ctrl+w Ctrl+l) is a chord, which cancels as every
+     chord does: shell claims Ctrl+l itself, before the page (`nav_key`), and drops the prefix. */
   it("cancels every other key, so Ctrl+w then d is never a deny", () => {
     for (const k of ["a", "d", "i", "o", "y", "r", "n", "f", "g", "w", "Enter", " ", "Escape", "3", "/", "ArrowDown", "PageDown"])
       expect(resolveKey("browse", key(k), { ...ctx, pending: "C-w" }), `Ctrl+w ${JSON.stringify(k)}`).toEqual({ kind: "cancel", why: "unbound" });
@@ -728,10 +770,11 @@ describe("Ctrl+w h/j/k/l: the module that way", () => {
   });
 });
 
-/* ]p and [p move to the next or previous card waiting for an answer, wrapping at the ends.
-   `resolveKey` returns only `{ kind: "card-jump", delta }`; `App.tsx` selects the card from
-   the timeline and session state. The jump answers nothing. A later bare a answers the
-   selected card only if it can still be answered. */
+/* `]p` / `[p` -- vim's bracket pairs for "next / previous", here the next /
+   previous card waiting for an answer (nvim's own `]d` / `[d` are the model: they wrap). `resolveKey` only
+   names the motion, `{ kind: "card-jump", delta }`; which cards wait, and where the cursor goes, is
+   `App.tsx`'s (it knows the timeline, the answered ones and whether the session ended). It moves the
+   cursor and answers nothing: a lone `a` afterwards answers the card it landed on, the typing guard unchanged. */
 describe("]p / [p: the next / previous waiting card", () => {
   it("completes ] p to a forward jump and [ p to a backward one", () => {
     expect(resolveKey("browse", key("p"), { ...ctx, pending: "]" })).toEqual({ kind: "card-jump", delta: 1 });
@@ -794,9 +837,10 @@ describe("]p / [p: the next / previous waiting card", () => {
   });
 });
 
-/* gx opens the web links in the cursor's row. `resolveKey` returns `{ kind: "open-link" }`;
-   `App.tsx` reads the DOM and either opens a single link or waits for a choice.
-   Like gf, gx completes the g prefix rather than running x as a bare key. */
+/* `gx` -- vim's "open the link under the cursor", here the web link(s) of the
+   row under the cursor. `resolveKey` only names the action, `{ kind: "open-link" }`; which links the row
+   holds, and whether one opens at once or waits for a letter, is `App.tsx`'s (it has the DOM). It is a
+   pair of the `g` prefix like `gf`, so the reserved-prefix rule holds for it without a line of its own. */
 describe("gx: open this row's web link", () => {
   it("completes g x to the open-link action, whatever the session or a count", () => {
     expect(resolveKey("browse", key("x"), { ...ctx, pending: "g" })).toEqual({ kind: "open-link" });
@@ -845,8 +889,9 @@ describe("gx: open this row's web link", () => {
   });
 });
 
-/* `BROWSE_KEYS` must list every key `resolveKey` handles and no key it ignores.
-   Separate tests identify which direction of the check failed. */
+/* `BROWSE_KEYS` may neither promise a key `resolveKey` does
+   nothing with, nor leave out a key that does something. Each half is its own `it` so a failure
+   names which direction broke. */
 describe("BROWSE_KEYS <-> resolveKey", () => {
   it("every key BROWSE_KEYS lists actually does something in resolveKey", () => {
     for (const { keys } of BROWSE_KEYS) {
@@ -857,8 +902,8 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
         const localCtx: KeyContext = { sessionEnded: token === "r", pending, turnRunning: true };
         const result = resolveKey("browse", ev, localCtx);
         expect(result, `"${token}" (from "${keys}")`).not.toBeNull();
-        // A key after a pending prefix that completes no pair resolves to `cancel`: claimed,
-        // not `null`, but it does nothing. A help row for that key would promise an unavailable action.
+        // A key after a pending prefix that completes no pair resolves to `cancel` -- claimed, so
+        // not `null`, yet it does nothing. A row for such a key would promise what the table refuses.
         expect(result?.kind, `"${token}" (from "${keys}") only cancels the prefix`).not.toBe("cancel");
       }
     }
@@ -867,8 +912,8 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
   /* Every candidate a person could plausibly press, checked under both endings of a session (some
      rows, like `a`/`d`/`i`, only resolve on one side of that flag). A lone `g`/digit is excluded on
      purpose: it is the first half of `gg`, or the start of a count the table spells `1-9`/`gg`, not
-     as itself -- see `PanelAction`'s `pending`/`count` cases. Deleting the `y` row (spec's own red
-     check for this test) makes "y" resolve to `{kind:"copy"}` here with no row to match it against. */
+     as itself -- see `PanelAction`'s `pending`/`count` cases. Deleting the `y` row (the way to see
+     this test fail) makes "y" resolve to `{kind:"copy"}` here with no row to match it against. */
   it("every key that does something in resolveKey is listed somewhere in BROWSE_KEYS", () => {
     const known = new Set(BROWSE_KEYS.flatMap((row) => row.keys.split(" / ")));
     const candidates: { token: string; ev: KeyLike; pending?: PendingPrefix; table?: PanelTable }[] = [
@@ -884,7 +929,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "Ctrl+u", ev: key("u", { ctrlKey: true }) },
       { token: "Ctrl+e", ev: key("e", { ctrlKey: true }) },
       { token: "Ctrl+y", ev: key("y", { ctrlKey: true }) },
-      // Page scrolls and arrow-key j/k motions must each appear in the help table.
+      // A page, and the arrow keys as `j`/`k` -- each must be spelled by a row.
       { token: "Ctrl+f", ev: key("f", { ctrlKey: true }) },
       { token: "PageDown", ev: key("PageDown") },
       { token: "PageUp", ev: key("PageUp") },
@@ -894,7 +939,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "1-9", ev: key("3") },
       { token: "[[", ev: key("["), pending: "[" },
       { token: "]]", ev: key("]"), pending: "]" },
-      // Next and previous waiting cards share one help row with two tokens.
+      // The next / previous waiting card -- one row, two tokens.
       { token: "]p", ev: key("p"), pending: "]" },
       { token: "[p", ev: key("p"), pending: "[" },
       { token: "Ctrl+c", ev: key("c", { ctrlKey: true }) },
@@ -904,7 +949,8 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "Ctrl+o", ev: key("o", { ctrlKey: true }) },
       { token: "zh", ev: key("h"), pending: "z" },
       { token: "zl", ev: key("l"), pending: "z" },
-      // Each zt/zz/zb and za/zo/zc pair in `FIXED_PAIRS` must appear in `BROWSE_KEYS`.
+      // The six pairs beyond `zh`/`zl` -- each a row of `FIXED_PAIRS`, so each must
+      // be spelled by a BROWSE_KEYS row (`zt / zz / zb`, `za / zo / zc`).
       { token: "zt", ev: key("t"), pending: "z" },
       { token: "zz", ev: key("z"), pending: "z" },
       { token: "zb", ev: key("b"), pending: "z" },
@@ -912,9 +958,9 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
       { token: "zo", ev: key("o"), pending: "z" },
       { token: "zc", ev: key("c"), pending: "z" },
       { token: "gf", ev: key("f"), pending: "g" },
-      // gx opens this row's web link and needs a `BROWSE_KEYS` row beside gf.
+      // Open this row's web link -- a row of `BROWSE_KEYS`, beside `gf`'s.
       { token: "gx", ev: key("x"), pending: "g" },
-      // All four Ctrl+w pairs must appear as tokens in their shared help row.
+      // The four pairs `Ctrl+w` completes -- each spelled by the one row's tokens.
       { token: "Ctrl+w h", ev: key("h"), pending: "C-w" },
       { token: "Ctrl+w j", ev: key("j"), pending: "C-w" },
       { token: "Ctrl+w k", ev: key("k"), pending: "C-w" },
@@ -935,8 +981,9 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
         if ((result.kind === "pending" || result.kind === "count") && !known.has(token)) continue;
         // A table-resolved key is listed by the overlay's own panel section, never here.
         if (result.kind === "panel") continue;
-        // Esc only flashes a reminder while a reply is running; it performs no action to list in
-        // the `?` overlay. `turnRunning: true` is what makes this result reachable here.
+        // `Esc` while a turn runs is a transient reminder, not a discoverable key -- the ?
+        // overlay promises "these keys do this", and Esc genuinely does nothing except flash
+        // while a reply is in flight (`turnRunning: true` here is what surfaces it at all).
         if (result.kind === "esc-blocked") continue;
         expect(known.has(token), `"${token}" (sessionEnded=${sessionEnded}) resolves to ${JSON.stringify(result)} but no BROWSE_KEYS row spells it`).toBe(true);
       }
@@ -944,14 +991,18 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
   });
 });
 
-/** Parses `VISUAL_KEYS` tokens into events for VISUAL/V-LINE tests. `1-9` uses a representative
- *  digit, `Esc` becomes `Escape`, and `Ctrl+x` sets Ctrl with `x`. Uppercase letters and `?`
- *  carry Shift, as in `parseKeyToken`. The `gg` branch supplies only its first key. */
+/** VISUAL/V-LINE's own token parser, mirroring `parseKeyToken` above but for the shape `VISUAL_KEYS`
+ *  rows actually take: no two-key sequences, `"1-9"` a representative digit, `"Esc"` the display
+ *  spelling of the real `key: "Escape"`, `"Ctrl+x"` -> Ctrl held with `x` (the
+ *  CARET_KEYS/VISUAL_KEYS "Ctrl+e / Ctrl+y" row needs the modifier, unlike the
+ *  plain-letter rows), and every bare uppercase letter or `?` carries Shift, the same reason
+ *  `parseKeyToken` does. */
 function parseVisualToken(token: string): KeyLike {
   if (token === "Esc") return key("Escape");
   if (token === "1-9") return key("3");
-  // For `gg`, the table tests only need the first press, which arms a pending marker.
-  // Separate tests check the complete sequence alongside `G`.
+  // `gg` is a two-key sequence (two presses); the round-trip tests below only need the FIRST
+  // press here (which arms the region-local pending marker, a non-null result) -- `gg`'s own full
+  // resolution is checked directly, by name, alongside `G`.
   if (token === "gg") return key("g");
   if (token.startsWith("Ctrl+")) return key(token.slice("Ctrl+".length), { ctrlKey: true });
   if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
@@ -969,10 +1020,14 @@ describe("VISUAL_KEYS <-> resolveKey", () => {
     }
   });
 
-  /* An unbound plain letter in VISUAL ends the region as `vend`, so check that every letter
-     absent from `VISUAL_KEYS` does that rather than a named action. Listed keys must resolve to
-     something else. Exclude `g`: only `gg` is listed, and a lone `g` arms the region's pending
-     marker instead of ending it. That case is checked separately below. */
+  /* Every candidate a person could plausibly press in VISUAL. Unlike BROWSE, an unbound plain key
+     is not "nothing" here -- `resolveVisualKey`'s own `default` branch claims it as `vend` (since
+     ANY key not in this table's own set ends the region) -- so this direction is checked
+     differently: every letter that VISUAL_KEYS does NOT list must still come back as `vend`, never
+     as one of the table's own named actions, and every key the table DOES list must come back as
+     something else. `g` is excluded from the loop: it is not itself a VISUAL_KEYS row (only `gg`,
+     the two-key sequence, is), and a lone `g` arms the region-local pending marker (`{kind:
+     "pending", prefix: "g"}`) rather than ending the region -- checked on its own, below. */
   it("every other plain letter ends VISUAL (vend) rather than doing one of VISUAL_KEYS's own things", () => {
     const known = new Set(VISUAL_KEYS.flatMap((row) => row.keys.split(" / ")));
     for (const letter of "abcdefhijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")) {
@@ -1053,9 +1108,9 @@ describe("CARET_KEYS <-> resolveKey", () => {
   });
 });
 
-/* Ctrl+e/Ctrl+y scroll one line in CARET, VISUAL and V-LINE, just as in BROWSE.
-   Handle them in the region resolvers before the generic modifier catch-all swallows them.
-   These modes return before reaching `resolveKey`'s non-INPUT scrolling branch. */
+/* CARET/VISUAL/V-LINE handle Ctrl+e/Ctrl+y through `resolveRegionModifierKey`.
+   These keys scroll by one line using BROWSE's `scroll-line` action. Region modes return
+   before BROWSE's chord handling, so they need their own path to that action. */
 describe("v1 trial seam review finding 3: Ctrl+e/Ctrl+y scroll the region instead of vswallow", () => {
   it.each([
     ["caret", "e", 1],
@@ -1090,10 +1145,12 @@ describe("v1 trial seam review finding 3: Ctrl+e/Ctrl+y scroll the region instea
   });
 });
 
-/* Keys with Ctrl, Alt, Meta, Super, Hyper or AltGraph return `vswallow` in VISUAL and
-   V-LINE so browser defaults cannot run.
-   Alt+j must not move the caret, and Ctrl+o must not re-render rows under the selection.
-   Ctrl+c is handled separately and is covered by the freeze fixture. */
+/* The rule "a key with Ctrl/Alt/Meta/Super/AltGraph is swallowed
+   and VISUAL stays" had no test -- `vswallow` replaced by `null` passed the whole suite, and `null`
+   lets the key through unprevented to whatever the engine does with it by default. Each chord comes
+   back as `vswallow` in both modes, never a motion (`Alt+j` must not move the caret as `j` would)
+   and never its BROWSE meaning (`Ctrl+o` must not toggle the detailed view, which re-renders rows
+   under the selection). `Ctrl+c` is the one exception and is pinned in the freeze fixture. */
 describe("a modified key in VISUAL is swallowed, VISUAL stays", () => {
   it.each([
     ["Ctrl+o", key("o", { ctrlKey: true })],
@@ -1126,8 +1183,9 @@ describe("v / V entry reads isPlainAnswerKey", () => {
     expect(resolveKey("browse", key("V", { shiftKey: true }), ctx)).toEqual({ kind: "visual", line: true });
   });
 
-  /* Mode entry must reject Ctrl, Alt, Meta, Super, Hyper and AltGraph. Checking only `ctrlKey`
-     lets modified `v` or Shift+V start a mode; these chords must remain unclaimed. */
+  /* The entry rows checked only `ctrlKey`, so Alt+v (reproduced: data-mode
+     "visual") and every other modified chord started a mode. Each must come back exactly as it did
+     before VISUAL existed: unclaimed. */
   it.each([
     ["Alt", { altKey: true }],
     ["Meta", { metaKey: true }],
@@ -1150,9 +1208,11 @@ describe("the ? keymap tables", () => {
   });
 });
 
-/* The a/d/D cases and `App.tsx`'s bypass-confirm y share `isPlainAnswerKey`.
-   Test it directly so callers can rely on its modifier and composition checks independently
-   of the routing in `resolveKey`. */
+/* `isPlainAnswerKey` is the one predicate this switch's a/d/D cases and
+   `App.tsx`'s bypass-confirm `y` now both call, so the card-answer modifier rule and App.tsx's own
+   fix for the same class of bug on the bypass `y` read one definition. Tested directly, not just
+   through `resolveKey`, so a future caller of either
+   side can trust the contract without re-deriving it from the switch statements above. */
 describe("panelEntryKey: the key that brings the keyboard into the panel, from the window keys the ? sheet lists", () => {
   const FULL_WINDOW = [
     { keys: "Ctrl+h / Ctrl+l", what: "Module left / right" },
@@ -1188,17 +1248,24 @@ describe("isPlainAnswerKey", () => {
     expect(isPlainAnswerKey(key("a", { superKey: true }))).toBe(false);
   });
 
-  /* `superKey` reports Super and Hyper together, which cannot catch a check narrowed to Super
-     alone. Test Hyper alone directly through `isPlainAnswerKey`; routing the expected result
-     through `resolveKey` could reuse the same broken `hasSuperOrHyper` and agree with the bug. */
+  /* `superKey` above reports Super and Hyper together (that is what
+     `hasSuperOrHyper` itself checks for), so it alone cannot catch `hasSuperOrHyper` narrowing to
+     "Super only" -- confirmed by mutation: that exact change leaves the test above green. This is a
+     direct, independent oracle on `isPlainAnswerKey` (not routed through `resolveKey`, which would
+     just call the same broken `hasSuperOrHyper` to compute its own "expected" value and agree with
+     the bug), for Hyper alone. */
   it("is false with Hyper held alone, not only together with Super (v1 audit fixes, finding 1)", () => {
     expect(isPlainAnswerKey(key("a", { hyperKey: true }))).toBe(false);
   });
 
-  /* AltGr is a level-3 shift key and needs its own `getModifierState("AltGraph")` check.
-     A key typed while AltGr is held must not answer a card or confirm bypass as a bare key.
-     `typingGuard.ts` separately treats a bare AltGraph press as a modifier.
-     These modifier-state reads have not been verified against real WebKitGTK. */
+  /* AltGr is a level-3 shift key, not one of
+     the four modifiers that refuse an answer (Alt, Meta, Super, Hyper) -- `getModifierState("Super"/
+     "Hyper")` is the only signal read for Super/Hyper, and AltGraph once had no analogous check at
+     all, so a key typed while
+     holding AltGr (rather than composed by it -- see `typingGuard.ts`'s own `MODIFIER_KEYS`, which
+     already treats a BARE AltGraph press as a modifier, not a typed key) answered a card or
+     confirmed bypass like a bare key. Not verified against real WebKitGTK, the same caveat every
+     other `getModifierState` read here carries. */
   it("is false with AltGraph held", () => {
     expect(isPlainAnswerKey(key("a", { altGraphKey: true }))).toBe(false);
   });

@@ -611,7 +611,7 @@ mod tests {
             "content": [{"type": "text", "text": text}]}})
     }
 
-    /// The phase-3 GUI pass (2026-09-25): two assistant messages with no tool call between them
+    /// In a GUI pass (2026-09-25), two assistant messages with no tool call between them
     /// rendered as one, `After the table.TURN-1-DONE`. The CLI emits one `assistant` line per
     /// content block, and the blocks of ONE message share its `message.id`; a different id is a
     /// different message and must be its own transcript entry.

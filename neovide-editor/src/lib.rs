@@ -2494,9 +2494,10 @@ mod tests {
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    /// A map requests one delayed render, never in the same main-loop turn; a burst of maps requests
-    /// only one. This test covers scheduling without a display. Real `connect_map` wiring and restored
-    /// content after editing while hidden require a display to check.
+    /// A display-free check: a map asks for exactly one
+    /// render, never in the same main-loop turn, and a burst of maps asks for one. What it cannot
+    /// hold is the wiring (`connect_map` on a real `GLArea`) and the pixels; the GUI checklist's
+    /// "edit while hidden, then show" item does.
     #[test]
     fn a_map_asks_for_one_render_after_the_delay_and_never_in_the_same_turn() {
         assert_eq!(
@@ -2554,9 +2555,9 @@ mod tests {
         assert_eq!(nvim_args(false, &[]), vec!["--cmd", hide]);
     }
 
-    /// A scale-factor change must queue a render even without animation, new nvim content or a
-    /// pending resize or keypress. With all other inputs false, only `scale_factor_changed_now`
-    /// can make `tick_should_render` true.
+    /// A scale-factor change alone, with no animation, content, resize or keypress, must queue
+    /// a render. With every other input false, only the scale term makes `tick_should_render`
+    /// true. Removing `|| scale_factor_changed_now` was checked to make this assertion fail.
     #[test]
     fn a_scale_factor_change_alone_still_queues_a_render() {
         assert!(tick_should_render(false, false, false, true));
@@ -2572,7 +2573,7 @@ mod tests {
         assert!(tick_should_render(false, false, true, false));
     }
 
-    // Cell-size notifications fire on the first value and on changes only.
+    // --- cell_size_changed fires only when the cell size changes. ---
 
     #[test]
     fn the_first_report_is_always_a_change() {
@@ -2668,10 +2669,10 @@ mod tests {
         assert_eq!(watch.take_pending_for_ready(), Some(1.6));
     }
 
-    // `os_scale_to_apply` tests the integer scale and skips an already matching harness scale.
-    // It is the pure part of `sync_os_scale`, which needs a live `&mut LiveHarness`.
+    // --- os_scale_to_apply follows GTK's integer scale only when it differs. This is the pure
+    // half of `sync_os_scale`, whose real `LiveHarness` cannot be constructed in a unit test. ---
 
-    /// GTK's `scale_factor()` supplies the target; an already matching harness needs no update.
+    /// GTK's `scale_factor()` is the source of truth; a harness already there needs nothing.
     #[test]
     fn os_scale_to_apply_follows_gtks_integer_factor() {
         assert_eq!(os_scale_to_apply(1.0, 2), Some(2.0));
@@ -2683,16 +2684,16 @@ mod tests {
         assert_eq!(os_scale_to_apply(f64::NAN, 1), Some(1.0));
     }
 
-    // `build_start_failure_message` includes the failure, required version and installation link.
-    // Use the two raw error shapes from `bridge/mod.rs` as fixtures because a unit test here cannot
-    // construct a real `LiveHarness::with_options` error.
+    // --- build_start_failure_message names what failed, the version floor and where to get nvim.
+    // It uses the raw `anyhow` chain from `LiveHarness::with_options`. A real harness cannot be
+    // constructed here, so fixtures use the two error shapes the pinned fork's bridge produces. ---
 
     /// The too-old shape: the fork's own sentence names the found version; the built message must
     /// name it too, plus Eitri's own floor and where to get a newer nvim.
     #[test]
     fn a_too_old_nvim_names_the_version_that_was_found() {
-        // The error's `{found}` contains `:version`'s full first line, "NVIM v0.9.5".
-        // Strip the prefix so the message does not repeat the nvim name.
+        // The real shape: the fork puts `:version`'s whole first line, "NVIM v0.9.5", into {found}
+        // (measured in the GUI on 2026-09-27: the message read "nvim NVIM v0.9.5 is older").
         let raw = "Neovide requires nvim version 0.10.0 or higher, but NVIM v0.9.5 was detected. Download \
                     the latest version here https://github.com/neovim/neovim/wiki/Installing-Neovim";
         let message = build_start_failure_message(raw);
@@ -2715,8 +2716,8 @@ mod tests {
         assert!(message.contains(raw), "message: {message}");
     }
 
-    // `failed_tick_should_render` requests one frame to show the failure, then reports idle.
-    // The decision is separate so it can be tested without a real GLArea tick callback.
+    // --- failed_tick_should_render renders the failure once and stops. The pure decision for
+    // LiveState::Failed is split out because a unit test cannot construct a real GLArea tick. ---
 
     #[test]
     fn the_tick_still_renders_once_more_right_after_a_start_failure() {
@@ -2728,9 +2729,10 @@ mod tests {
         assert!(!failed_tick_should_render(true));
     }
 
-    /// Report an exit only after nvim's own process is gone, and only once across repeated ticks.
-    /// If the harness reports an exit while the process lives, report unreachable once instead.
-    /// When no nvim process is known, use the harness report.
+    /// An exit is reported only once nvim's own
+    /// process is gone, exactly once however often the tick asks; while the fork says exited and
+    /// the process lives, the host is told once that nvim is out of reach; with no process known,
+    /// the fork's report is all there is.
     #[test]
     fn an_exit_is_reported_once_nvims_process_is_gone_and_only_once() {
         let nothing = ExitEvents::default();
@@ -2759,8 +2761,10 @@ mod tests {
         );
     }
 
-    /// If thread creation fails with `EAGAIN`, run the job inline so nvim's termination is not lost.
-    /// Otherwise later closes could see it marked as ending and wait forever.
+    /// A thread that cannot be started (`EAGAIN` under a process limit,
+    /// reproduced under that limit) must not leave nvim's ending unscheduled -- the pane had marked
+    /// it hung up, so every later close returned early and the window waited forever. The job then
+    /// runs here, inline.
     #[test]
     fn a_job_whose_thread_cannot_start_runs_inline() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2787,8 +2791,9 @@ mod tests {
         }
     }
 
-    /// Check the dispatch used by the tick for states without a live session.
-    /// After a start failure, it requests the frame that shows the message and then reports idle.
+    /// The tick's own decision for every state without a live session, so
+    /// the `Failed` arm is pinned where the tick reads it -- after a start failure the render loop
+    /// asks for the one frame that paints the message, then reports idle.
     #[test]
     fn after_a_start_failure_the_render_loop_goes_idle() {
         let failed = LiveState::Failed("nvim could not start".into());

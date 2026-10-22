@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { installHeldSuperTracking, noteKey, reset, superHeld } from "./heldSuper";
 
-/* The shape WebKitGTK 2.52.6 actually delivers: the Super key's
+/* WebKitGTK 2.52.6 delivers the Super key's
    own keydown/keyup, `key: "Super"`, `code: "OSLeft"`, and no modifier flag on any other key. */
 describe("heldSuper", () => {
   afterEach(() => reset());
@@ -28,7 +28,7 @@ describe("heldSuper", () => {
     expect(superHeld()).toBe(false);
   });
 
-  /* Track both Super keys separately so releasing one cannot clear the other while it is held. */
+  /* One boolean let releasing right Super clear a left Super still down. */
   it("stays held while either Super key is down", () => {
     noteKey("keydown", { key: "Super", code: "OSLeft" });
     noteKey("keydown", { key: "Super", code: "OSRight" });
@@ -38,8 +38,8 @@ describe("heldSuper", () => {
     expect(superHeld()).toBe(false);
   });
 
-  /* HINT stops key propagation at window capture while a request is pending. Install tracking
-     before that listener so it sees Super go down. A document listener would miss it. */
+  /* HINT's own window-capture listener stops a key's propagation while a
+     request is pending; a tracker installed after it, or on the document, never saw Super go down. */
   it("sees Super's keydown even when a later window-capture listener stops it", () => {
     const remove = installHeldSuperTracking(document, window);
     const stopper = (event: Event) => event.stopImmediatePropagation();

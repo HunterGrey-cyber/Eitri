@@ -1,5 +1,5 @@
 //! Byte streams replayed into a [`Screen`] and painted on a CPU raster: the headless half of the
-//! "daily corpus" check (the risk: everyday programs misbehave, because this is not foot).
+//! "daily corpus" check, against the risk that everyday programs misbehave because this is not foot.
 //! The foot comparison of the same streams is the GUI pass's half.
 //!
 //! Two parts:

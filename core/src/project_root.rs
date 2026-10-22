@@ -379,8 +379,8 @@ mod tests {
 
     #[test]
     fn version_is_a_known_flag_and_never_a_project_directory() {
-        // `main()` handles `--version` and exits before `resolve()` runs, but this module must
-        // still classify it like `--clean`: a known flag, never a project directory named "--version".
+        // `main()` intercepts `--version` before `resolve()`, but this module must still treat it
+        // as a known flag like `--clean`, never a project directory named "--version".
         assert_eq!(select(["--version"], None), Ok(RootSource::Cwd));
         // `shell --version /x` is not an error for the resolver -- the flag is skipped and the
         // real positional argument after it is still found, the same shape as `--clean` above.
@@ -389,11 +389,9 @@ mod tests {
 
     #[test]
     fn legacy_is_a_known_flag_in_every_build_and_never_a_project_directory() {
-        // `main()` intercepts `--legacy` too -- on a build that
-        // did not compile the legacy backend in, it exits before `resolve()` is ever called, the
-        // same shape `--version` uses. This module lists it regardless of that cargo feature, so a
-        // release still reports `LEGACY_NOT_IN_BUILD`'s real reason rather than this module's own
-        // "unrecognized option --legacy".
+        // `main()` intercepts `--legacy` before `resolve()` when legacy was not compiled in.
+        // Listing it here regardless of that feature preserves the real `LEGACY_NOT_IN_BUILD`
+        // diagnostic instead of reporting an unrecognized option.
         assert_eq!(select(["--legacy"], None), Ok(RootSource::Cwd));
         assert_eq!(select(["--legacy", "/x"], None), Ok(argument("/x")));
     }

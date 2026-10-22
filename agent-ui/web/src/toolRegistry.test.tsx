@@ -43,8 +43,9 @@ describe("renderToolCall", () => {
     expect(plain.container.querySelector(".tool-rule-note")).toBeNull();
   });
 
-  /** A `Write`/`Edit`/`NotebookEdit` allowed by the acceptEdits fast path shows a muted note.
-   *  Calls without the note show no such text, including calls answered by a card or saved rule. */
+  /** A `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path allowed with no
+   *  card says so, muted, the same way a rule-answered row does -- and a call without the note says
+   *  nothing of the kind, the carded/rule-answered case included. */
   it("names an edit the acceptEdits fast path allowed, and says nothing of the kind otherwise", () => {
     const { container } = render(<>{renderToolCall(call({ name: "Edit", allowedByAuto: true }))}</>);
     expect(container.querySelector(".tool-rule-note")?.textContent).toBe("allowed by auto");
@@ -197,8 +198,8 @@ describe("renderToolCall", () => {
     expect(plain.querySelector(".tool-result-preview-line")!.textContent!.endsWith("…")).toBe(true);
   });
 
-  /** A call whose CLI prompt was answered without a card shows a muted note, like a call answered
-   *  by a saved rule. Calls without that note show no such text. */
+  /** A call whose CLI prompt Eitri answered without a card says so, muted, the
+   *  way a call a saved rule answered does; a call without one says nothing of the kind. */
   it("says when the CLI's own prompt for a call was answered without a card", () => {
     const { container } = render(<>{renderToolCall(call({ name: "Write", promptNote: "Claude Code asked — allowed in bypass" }))}</>);
     const note = container.querySelector(".tool-prompt-note");
@@ -464,10 +465,12 @@ describe("a tool named after an Object.prototype member", () => {
   });
 });
 
-/* Name every real tool, render ToolSearch as one muted line and collapse finished runs.
-   Fold edit diffs to a one-line path and counts summary outside detailed or expanded rows.
-   Write, Edit and NotebookEdit keep individual rows, so their default view must stay compact.
-   Gated rows show that they wait without repeating the call. The detailed view uses wider cuts. */
+/* Named tools, a muted ToolSearch line and collapsed finished runs also share checks with
+   an edit's diff (folded to a one-line path+counts summary anywhere except the detailed view
+   or an expanded row -- this replaced the original 6-line fold once Write/
+   Edit/NotebookEdit stopped folding into count-only runs and every one of them needed to be this
+   compact by default), a gated row (it says it waits rather than repeating the call) and the
+   detailed view's wider cuts. */
 describe("P2, P3, P4, R3 in the registry", () => {
   const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
 
@@ -521,8 +524,9 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect((full.match(/class="diff-line/g) ?? []).length).toBe(20);
   });
 
-  /** `opts.detailed` (`Ctrl+o`) expands the edit diff as well as `ToolResult`'s head/tail cut.
-   *  A folded row must show the full diff in detailed view even without per-row expansion. */
+  /** `opts.detailed` (`Ctrl+o`) used to reach only `ToolResult`'s own
+   *  head/tail cut, never `editConfig`'s `maxLines` -- a folded row stayed folded in the detailed
+   *  view too, so `Ctrl+o` alone never showed the diff `editConfig`'s own doc promised it would. */
   it("Ctrl+o (opts.detailed) widens a folded edit's diff too, not only Enter", () => {
     const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
     const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
@@ -536,8 +540,9 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect((neither.match(/class="diff-line/g) ?? []).length).toBe(0);
   });
 
-  /** A `Write` that creates a file says so instead of warning about an unseen overwrite.
-   *  The note stays visible when collapsed because it sits outside the diff's line budget. */
+  /** A `Write` over a path with nothing there says so instead of warning about an
+   *  overwrite it cannot see -- collapsed or not, since the note sits beside the diff body rather
+   *  than inside its line budget. */
   it("says a Write creates a new file even collapsed, and NotebookEdit gets the same real diff view", () => {
     const created = html(
       renderToolCall({ seq: 1, toolUseId: "t", name: "Write", input: { file_path: "/p/new.rs", content: "fn new() {}" }, result: null, createsFile: true }, false, { expanded: false }),
@@ -558,8 +563,9 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect((notebook.match(/class="diff-line/g) ?? []).length).toBe(2);
   });
 
-  /** A deleted notebook cell renders as a deletion. `PermissionCard` and completed rows share
-   *  `EditDiff`, so `editPreview` must supply the deletion description for both. */
+  /** A deleted cell reads as a deletion, not a
+   *  content-free "Writes the whole cell" note (`PermissionCard` and a completed row share this
+   *  same `EditDiff` view, so the fix at `editPreview` reaches both). */
   it("names a deleted notebook cell instead of drawing an empty diff for it", () => {
     const out = html(
       renderToolCall(

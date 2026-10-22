@@ -2688,8 +2688,8 @@ mod tests {
         );
     }
 
-    /// An unrecognized tab verb parses as `None`, like any other unrecognized wire value.
-    /// `parse_inbound_message` returns `Option<InboundMessage>`, so the test checks `is_none()`.
+    /// An unknown verb returns `None`, matching other unrecognized wire values and malformed
+    /// messages in the `Option<InboundMessage>` parser.
     #[test]
     fn arrive_tab_verb_and_cycle_default_mode() {
         assert_eq!(serialize_arrive_for_js(), r#"{"kind":"arrive"}"#);
@@ -2872,8 +2872,8 @@ mod tests {
         assert_eq!(v, serde_json::json!({ "kind": "nav_key", "direction": "up" }));
     }
 
-    /// Checks the five page-to-Rust wire strings so the page's `bridge.test.ts` can serialize
-    /// the same message shapes.
+    /// The five page-to-Rust wire strings are pinned so `bridge.test.ts` can serialize the same
+    /// messages on the page side.
     #[test]
     fn parses_the_five_panel_keys_and_nav_fallthrough_wire_strings() {
         let msg = parse_inbound_message(r#"{"type":"panel_keys","request_id":"req-7","mode":"browse"}"#).unwrap();
@@ -2942,8 +2942,8 @@ mod tests {
         );
     }
 
-    /// `Ctrl+w h/j/k/l` in BROWSE sends window-level pane navigation with the request id.
-    /// All four directions are supported; the message names no session tab.
+    /// `Ctrl+w h/j/k/l` in BROWSE sends a window-level move without a tab id. All four directions
+    /// carry the request id through, whichever tab the panel shows.
     #[test]
     fn parses_pane_nav_in_all_four_directions_as_a_window_level_message() {
         let msg = parse_inbound_message(r#"{"type":"pane_nav","request_id":"r","direction":"left"}"#).unwrap();
@@ -2989,10 +2989,9 @@ mod tests {
         }
     }
 
-    /// The same one-directional reasoning as `DecisionChoice`'s: a direction Rust does not know is a
-    /// parse failure, never a move some later `match` chose for it. `"sideways"` is the plan's own
-    /// example; `"Left"` and `"north"` are the near misses (case, and a compass instead of vim's keys),
-    /// and a message with no direction or no request id is malformed like any other.
+    /// Unknown directions fail parsing rather than becoming a default move in a later match.
+    /// `sideways`, `Left` and `north` check unsupported words and case; missing directions or
+    /// request ids are malformed too.
     #[test]
     fn an_unknown_missing_or_misspelled_pane_nav_direction_fails_to_parse() {
         for direction in ["sideways", "Left", "north", "", "h"] {
@@ -3004,9 +3003,8 @@ mod tests {
         assert!(parse_inbound_message(r#"{"type":"pane_nav","request_id":"r","direction":null}"#).is_none());
     }
 
-    /// `gx` sends a window-level `open_url` message with the request id and chosen address.
-    /// The link belongs to the current row, so no session tab is named. The JSON string matches
-    /// what `agent-ui/web/src/bridge.test.ts` serializes.
+    /// `gx` opens a web link through window-level `open_url`, without a tab id. The request id and
+    /// chosen address match the exact JSON string pinned by `agent-ui/web/src/bridge.test.ts`.
     #[test]
     fn parses_open_url_as_a_window_level_message() {
         let json = r#"{"type":"open_url","request_id":"req-1","url":"https://example.com/a"}"#;
@@ -3110,7 +3108,7 @@ mod tests {
         }
     }
 
-    /// Every line of the phase 2 protocol, as the panel sends it.
+    /// Every revert, undo, comment and send message for turn review, as the panel sends it.
     const REVIEW_PHASE2_LINES: [&str; 9] = [
         r#"{"type":"review_revert","request_id":"r9","tab":3,"turn":7,"scope":"turn","path":"core/src/x.rs","target":{"hunk":2,"header":"@@ -830,6 +830,12 @@"}}"#,
         r#"{"type":"review_revert","request_id":"r9","tab":3,"turn":7,"scope":"turn","path":"core/src/x.rs","target":"file"}"#,
@@ -4916,11 +4914,10 @@ mod tests {
         assert_eq!(held[0]["change"]["fields"]["command"], "b");
     }
 
-    /// a tab's last usage figure rides its snapshot, so a tab switch or a
-    /// panel reload shows it at once instead of waiting for the next turn to report one. `null` --
-    /// present as a key, never a zeroed object -- until a provider has reported something, and
-    /// replaced whole by each later report. Inside, snake_case: the same shape the `turn_completed`
-    /// event carries (`agent::UsageInfo`'s own derive), where the rest of `state` is camelCase.
+    /// A tab's last usage figure rides its snapshot so a tab switch or panel reload shows it
+    /// immediately. It is a present `null` key until a provider reports usage, then replaced whole
+    /// by each report. Its snake_case fields match `turn_completed` and `agent::UsageInfo`, even
+    /// though the surrounding state uses camelCase.
     #[test]
     fn a_snapshot_carries_the_last_reported_usage_and_null_before_any() {
         let usage_in_snapshot = |projection: &AgentSessionProjection| -> Value {
@@ -5375,7 +5372,7 @@ mod tests {
         );
     }
 
-    /// O3: a reload or a tab switch rebuilds the panel from this snapshot, so the CLI's own prompt
+    /// A reload or a tab switch rebuilds the panel from this snapshot, so the CLI's own prompt
     /// must arrive here with its words (`providerPrompt`, camelCase like the rest of the snapshot)
     /// or its card would lose the reason it was drawn for. A gate request carries no such key.
     #[test]
@@ -5475,9 +5472,9 @@ mod tests {
         );
     }
 
-    /// Checks every key in the restored-history notice. The panel's four wordings read
-    /// different keys; a missing key renders as `undefined`, which the TS type does not
-    /// allow.
+    /// The notice a restored history puts on the wire. Every key is checked, because
+    /// the panel's four wordings each read a different one and a missing key renders as
+    /// `undefined` -- which is not a state the TS type admits.
     #[test]
     fn a_restored_history_reaches_the_frontend_as_one_notice_object() {
         let mut projection = AgentSessionProjection::default();
@@ -5522,8 +5519,8 @@ mod tests {
         assert_eq!(history["attemptedTranscriptPath"], "/claude/projects/p/sess.jsonl");
         assert_eq!(history["fallbackReason"], "transcript file not found");
         assert!(history["writerVersion"].is_null());
-        // Every restored item sits below `uptoSeq`, letting the panel distinguish historical
-        // tool calls that cannot complete from live calls still running.
+        // Every restored item sits below `uptoSeq`, which is what lets the panel tell a historical
+        // tool call that can never complete from a live one that is still running.
         assert!(parsed["state"]["userPrompts"][0]["seq"].as_u64().unwrap() < history["uptoSeq"].as_u64().unwrap());
     }
 
@@ -5774,8 +5771,8 @@ mod tests {
     }
 
     /// `hidden_pending` (`Tab::host_answered`) removes exactly the named ids from
-    /// `pendingPermissions`. Tool calls and transcript entries are unaffected; this test
-    /// constructs neither, so their absence does not test that behavior.
+    /// `pendingPermissions`. This test builds no tool calls or transcript, so their absence
+    /// cannot demonstrate whether they were preserved.
     #[test]
     fn a_snapshot_hides_the_ids_it_is_given() {
         let mut projection = AgentSessionProjection::default();
@@ -5813,14 +5810,14 @@ mod tests {
         assert_eq!(ids, vec!["shown"], "{ids:?}");
     }
 
-    /// The wire contract at the top of the v1-mode plan, both directions.
+    /// The bypass-confirmation wire contract must agree in both directions.
     #[test]
     fn the_confirm_bypass_envelope_matches_the_wire_contract() {
         let tab_plan = crate::tab_set::BypassPlan {
             scope: crate::tab_set::BypassScope::Tab(TabId(3)),
             nonce: 17,
             approve: vec!["p1".to_string(), "p2".to_string()],
-            // Use the strings `TabSet` sends so this assertion cannot drift from the actual prompt text.
+            // The strings `TabSet` really sends, not a paraphrase that can drift from them.
             lines: vec![crate::tabs::bypass_prompt(crate::tabs::PromptScope::LiveTab, 2)],
             prompt: crate::tabs::PromptScope::LiveTab,
             page: crate::tabs::ViewId::BASE,
@@ -5870,8 +5867,8 @@ mod tests {
             other => panic!("expected ConfirmBypass, got {other:?}"),
         }
 
-        // A missing nonce fails to parse. An answer must identify the exact prompt shown,
-        // rather than whichever prompt is current.
+        // A missing nonce fails to parse: an answer must identify the exact prompt shown,
+        // never whichever prompt happens to be current.
         assert!(
             parse_inbound_message(r#"{"type":"confirm_bypass","request_id":"r7","tab":3,"scope":"tab"}"#).is_none()
         );
@@ -5902,11 +5899,9 @@ mod tests {
         assert!(BypassScopeWire::Default.scope(Some(3)).is_err());
     }
 
-    /// The panel's half of what the user asked: a snapshot
-    /// must carry `user_prompts` too, or a reload/resync loses every prompt the live event stream
-    /// already showed. There is no shared `view_of`/`SnapshotView` builder in this module -- every
-    /// neighbouring test constructs one inline with the fields it needs and defaults for the rest,
-    /// so this follows that pattern rather than inventing a helper.
+    /// A snapshot carries `user_prompts` so a reload or resync preserves prompts already delivered
+    /// by the live event stream. Like neighboring tests, this constructs its own `SnapshotView`
+    /// with the needed fields and defaults for the rest; there is no shared builder here.
     #[test]
     fn a_snapshot_carries_the_user_prompts_and_their_seqs() {
         let mut projection = AgentSessionProjection::default();
@@ -6174,7 +6169,7 @@ mod tests {
     fn a_tab_command_parses_and_says_which_tab_it_names() {
         let named = parse_inbound_message(r#"{"type":"send_message","request_id":"r1","tab":3,"text":"hi"}"#).unwrap();
         assert!(matches!(named.tab_ref(), TabRef::Named(TabId(3))));
-        // Parse the request so its requestId can be answered, then refuse it for naming no tab.
+        // Parsing preserves requestId so a request naming no tab can receive a refusal.
         let missing = parse_inbound_message(r#"{"type":"interrupt","request_id":"r2"}"#).unwrap();
         assert_eq!(missing.request_id(), "r2");
         assert!(matches!(missing.tab_ref(), TabRef::Missing));
@@ -6641,9 +6636,8 @@ mod tests {
         assert_eq!(context_summary(None, root), None);
     }
 
-    /// the snapshot no longer carries `modeSwitch` -- no session's CLI mode is ever
-    /// switched, so there is no capability for the panel to gate on. Absent, not `false`: a panel
-    /// still reading it must see nothing, never a "no" it could mistake for a live answer.
+    /// The snapshot omits `modeSwitch` because the CLI mode never switches. Absence keeps a panel
+    /// from mistaking a false capability value for a live response about mode switching.
     #[test]
     fn a_snapshot_carries_no_mode_switch_capability() {
         let projection = AgentSessionProjection::default();

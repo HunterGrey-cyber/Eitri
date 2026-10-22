@@ -117,8 +117,8 @@ const textarea = (c: HTMLElement) => c.querySelector<HTMLTextAreaElement>(".comp
 const bandText = (c: HTMLElement) => c.querySelector(".status-band")?.textContent ?? "";
 const bandMessage = (c: HTMLElement) => c.querySelector(".band-message")?.textContent ?? null;
 
-/** Tab 1 live with `cards` cards, the pane focused, the keys arrived on a waiting card if present,
- *  the band widened. Stays in BROWSE. */
+/** Tab 1 live with `cards` cards, the pane focused, the keys arrived (a card landing when one
+ *  waits), the band widened. Stays in BROWSE. */
 function started(
   cards: 0 | 1 | 2,
   tabs: readonly Record<string, unknown>[] = [TAB1],
@@ -389,6 +389,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
     });
   });
 
+  /* Cases where a delayed approval must refuse a changed target or preserve a yank. */
   describe("Ctrl+y guards against changed cards and recent yanks", () => {
     const TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, then press again";
     const YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
@@ -489,7 +490,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       expect(bandMessage(container)).toBe(TYPING_FLASH);
     });
 
-    /** Codex important: focus can move to the search field with a click, which is no key. */
+    /** Focus can move to the search field with a click, which is no key. */
     it("the approval waits for a box that still has the keys: a click into the Ctrl+r search inside the window cancels it", () => {
       const { container, box } = inInput(1);
       fireEvent.keyDown(box, { key: "r", ctrlKey: true });
@@ -503,7 +504,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       expect(answered()).toEqual([]);
     });
 
-    /** The band hides Ctrl+y while the search has the keys, because approval is inactive there. */
+    /** The band names a Ctrl+y that does nothing while the search has the keys. */
     it("the band does not advertise Ctrl+y while the Ctrl+r search has the keys", () => {
       const { container, box } = inInput(1);
       expect(bandText(container)).toContain("Ctrl+y approves");
@@ -515,7 +516,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       expect(bandText(container)).toContain("Ctrl+y approves");
     });
 
-    /** "yank never approves" must not depend on typing fast. */
+    /** "Yank never approves" must not depend on typing fast. */
     it.each(["u", "w", "k"])("Ctrl+%s, a 300 ms pause, then Ctrl+y is a yank: nothing approved; a second Ctrl+y approves", (letter) => {
       const { container, box } = inInput(1);
       fireEvent.change(box, { target: { value: "some words here" } });
@@ -550,7 +551,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       expect(answered().map((m) => m.permission_id)).toEqual(["perm-1"]);
     });
 
-    /** Permission eligibility is checked again when the approval timer fires. */
+    /** Re-check the target and context when the deferred answer fires. */
     it("the session closing inside the window approves nothing", () => {
       const { box } = inInput(1);
       ctrlY(box);
