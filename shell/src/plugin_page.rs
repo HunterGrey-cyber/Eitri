@@ -1,17 +1,21 @@
 //! A plugin's page in WebKitGTK: a web context of its own serving the plugin's scheme, a content security
 //! policy floor the page cannot loosen, an ephemeral network session whose proxy lets through only the
-//! origins the manifest declares, a navigation lock, and the bridge script. What a page may do is decided in
-//! `eitri_core::plugin`; this file builds the view and carries text both ways. Its `PagePort` is the only
+//! origins the manifest declares (and `https`, for a page that shows remote images), a navigation lock, and
+//! the bridge script. What a page may do is decided in `eitri_core::plugin`; this file builds the view and
+//! carries text both ways. Its `PagePort` is the only
 //! place a script is run in the page, and `apply_theme` the only place the window's theme reaches the view.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use eitri_core::plugin::doc_route::{self, DocSlot};
 use eitri_core::plugin::host::PagePort;
 use eitri_core::plugin::manifest::Origin;
 use eitri_core::plugin::page_policy::{self, Navigation, SiteRefusal};
 use eitri_core::plugin::protocol::BRIDGE_JS;
 use eitri_core::plugin::theme::PageTheme;
+use eitri_core::plugin::trace;
 use gtk4::gio;
 use gtk4::gio::prelude::*;
 use gtk4::glib;
@@ -37,6 +41,14 @@ pub(crate) struct PageSpec {
     pub(crate) origins: Vec<Origin>,
     /// Where a file the page saves (its own `blob:`) goes.
     pub(crate) downloads: PathBuf,
+    /// Some only for a plugin that declares `editor.follow`: the document's project directory its pages' images
+    /// come from, set by the host.
+    pub(crate) doc_slot: Option<Rc<RefCell<DocSlot>>>,
+    /// The plugin shows remote `https` images: `img-src` gains `https:` and the session's proxy lets them out.
+    pub(crate) remote_images: bool,
+    /// A probe build with the plugin trace on: the page's console messages go to stdout, where a GUI pass reads
+    /// them.
+    pub(crate) console_to_stdout: bool,
 }
 
 pub(crate) struct PageHooks {
@@ -50,30 +62,86 @@ pub(crate) struct PageHooks {
     pub(crate) open_outside: Rc<dyn Fn(&str)>,
 }
 
+/// What a request of the plugin's scheme asks for.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// The keyboard kit, answered from memory.
+    Kit,
+    /// A file of the followed document's project, in the slot's current generation.
+    Doc { dir: PathBuf, rel: String },
+    /// A document-route path that names no current file: another generation, a path that is not clean, or no
+    /// project known yet.
+    NoDoc,
+    /// A file of the plugin's own site.
+    Site,
+}
+
+/// Which kind of path `uri` asks for: the kit, a document file of the slot's current generation, a document path
+/// that names no current file (another generation, or no project yet), or a site file. Without a slot (a plugin
+/// that does not follow a document) a document-route path is a site path like any other.
+fn route(id: &str, uri: &str, doc_slot: Option<&DocSlot>) -> Route {
+    if page_policy::kit_request(id, uri) {
+        return Route::Kit;
+    }
+    let Some(slot) = doc_slot else {
+        return Route::Site;
+    };
+    if !page_policy::decoded_path(id, uri).is_some_and(|p| p.starts_with(doc_route::DOC_PREFIX)) {
+        return Route::Site;
+    }
+    match (doc_route::doc_request(id, uri), &slot.dir) {
+        (Some((generation, rel)), Some(dir)) if generation == slot.generation => Route::Doc { dir: dir.clone(), rel },
+        _ => Route::NoDoc,
+    }
+}
+
 /// Serves one request of the plugin's scheme. Checking the path touches the disk (`canonicalize`, `metadata`),
 /// which can stall on a slow or hung filesystem, so it runs on a worker thread; the request is answered back on
 /// the main context, and the file itself is read without blocking this thread.
-fn serve(request: &URISchemeRequest, site_root: &Path, id: &str, entry: &str) {
+fn serve(request: &URISchemeRequest, site_root: &Path, id: &str, entry: &str, doc_slot: Option<&Rc<RefCell<DocSlot>>>) {
     let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
-    // The kit is part of the host, not of the plugin's site: it is answered from memory, ahead of the site
-    // lookup, so a site file of the same name can neither replace it nor be asked for through it.
-    if page_policy::kit_request(id, &uri) {
-        let bytes = glib::Bytes::from_static(KIT_JS.as_bytes());
-        let stream = gio::MemoryInputStream::from_bytes(&bytes);
-        request.finish(&stream, bytes.len() as i64, Some("text/javascript"));
-        return;
+    if trace::enabled() {
+        trace::line(id, "serve", &page_policy::decoded_path(id, &uri).unwrap_or_default());
     }
-    let request = request.clone();
-    let (site_root, id, entry) = (site_root.to_path_buf(), id.to_owned(), entry.to_owned());
-    glib::spawn_future_local(async move {
-        let checked = {
-            let (site_root, id, entry, uri) = (site_root, id.clone(), entry.clone(), uri.clone());
-            gio::spawn_blocking(move || page_policy::site_file(&site_root, &id, &entry, &uri)).await
-        };
-        // A worker that panicked is answered like a missing file rather than leaving the request hanging.
-        let checked = checked.unwrap_or(Err(SiteRefusal::NotFound));
-        answer(&request, checked, &id, &entry, &uri);
-    });
+    // The kit is part of the host, not of the plugin's site: it is answered from memory, ahead of the site
+    // lookup, so a site file of the same name can neither replace it nor be asked for through it. The
+    // document route comes next, so a site file can never stand in for a document's image either.
+    let route = match doc_slot.map(|slot| slot.try_borrow()) {
+        None => route(id, &uri, None),
+        Some(Ok(slot)) => route(id, &uri, Some(&slot)),
+        // The slot is being written while this request arrives: no project is known for this request, so a
+        // document path is a 404 rather than a panic inside the scheme handler.
+        Some(Err(_)) => route(id, &uri, Some(&DocSlot::default())),
+    };
+    match route {
+        Route::Kit => respond_static(request, KIT_JS, "text/javascript"),
+        Route::NoDoc => not_found(request),
+        Route::Doc { dir, rel } => {
+            let request = request.clone();
+            glib::spawn_future_local(async move {
+                let checked = gio::spawn_blocking(move || doc_route::doc_file(&dir, &rel)).await;
+                match checked {
+                    Ok(Ok(file)) => read_file(&request, file),
+                    // Every refusal reads as a missing file, so a page learns nothing about what lies outside
+                    // its document's project, and a stale image never shows the "not built" page.
+                    _ => not_found(&request),
+                }
+            });
+        }
+        Route::Site => {
+            let request = request.clone();
+            let (site_root, id, entry) = (site_root.to_path_buf(), id.to_owned(), entry.to_owned());
+            glib::spawn_future_local(async move {
+                let checked = {
+                    let (site_root, id, entry, uri) = (site_root, id.clone(), entry.clone(), uri.clone());
+                    gio::spawn_blocking(move || page_policy::site_file(&site_root, &id, &entry, &uri)).await
+                };
+                // A worker that panicked is answered like a missing file rather than leaving the request hanging.
+                let checked = checked.unwrap_or(Err(SiteRefusal::NotFound));
+                answer(&request, checked, &id, &entry, &uri);
+            });
+        }
+    }
 }
 
 fn answer(
@@ -84,22 +152,9 @@ fn answer(
     uri: &str,
 ) {
     match checked {
-        Ok(file) => {
-            let request = request.clone();
-            let (mime, len) = (file.mime, i64::try_from(file.len).unwrap_or(-1));
-            gio::File::for_path(&file.path).read_async(
-                glib::Priority::DEFAULT,
-                None::<&gio::Cancellable>,
-                move |opened| match opened {
-                    Ok(stream) => request.finish(&stream, len, Some(mime)),
-                    Err(mut e) => request.finish_error(&mut e),
-                },
-            );
-        }
+        Ok(file) => read_file(request, file),
         Err(SiteRefusal::NotFound) if page_policy::is_entry(id, entry, uri) => {
-            let bytes = glib::Bytes::from_static(page_policy::NOT_BUILT_HTML.as_bytes());
-            let stream = gio::MemoryInputStream::from_bytes(&bytes);
-            request.finish(&stream, bytes.len() as i64, Some("text/html"));
+            respond_static(request, page_policy::NOT_BUILT_HTML, "text/html")
         }
         Err(refusal) => {
             let kind = match refusal {
@@ -110,6 +165,46 @@ fn answer(
             request.finish_error(&mut error);
         }
     }
+}
+
+/// Answers with a checked file, read without blocking this thread.
+fn read_file(request: &URISchemeRequest, file: page_policy::SiteFile) {
+    let request = request.clone();
+    let (mime, len) = (file.mime, i64::try_from(file.len).unwrap_or(-1));
+    gio::File::for_path(&file.path).read_async(glib::Priority::DEFAULT, None::<&gio::Cancellable>, move |opened| {
+        match opened {
+            Ok(stream) => respond(&request, &stream, len, mime),
+            Err(mut e) => request.finish_error(&mut e),
+        }
+    });
+}
+
+/// Answers with text the host holds in memory.
+fn respond_static(request: &URISchemeRequest, text: &'static str, mime: &str) {
+    let bytes = glib::Bytes::from_static(text.as_bytes());
+    let stream = gio::MemoryInputStream::from_bytes(&bytes);
+    respond(request, &stream, bytes.len() as i64, mime);
+}
+
+/// Every answer of the scheme goes out with its type and `X-Content-Type-Options: nosniff`. The origin serves
+/// the plugin's site and, for a page that follows a document, image files of that document's project, which
+/// anyone who wrote to the project chose the bytes of: the type the host decided is final, so an image can
+/// never be taken for a script or a style sheet, even by a tag that the page's own policy would let load.
+fn respond(request: &URISchemeRequest, stream: &impl IsA<gio::InputStream>, len: i64, mime: &str) {
+    let response = webkit6::URISchemeResponse::new(stream, len);
+    response.set_status(200, None);
+    response.set_content_type(mime);
+    // Headers given to the response replace the ones WebKit would derive, so the type goes in them too.
+    let headers = webkit6::soup::MessageHeaders::new(webkit6::soup::MessageHeadersType::Response);
+    headers.append("Content-Type", mime);
+    headers.append("X-Content-Type-Options", "nosniff");
+    response.set_http_headers(headers);
+    request.finish_with_response(&response);
+}
+
+fn not_found(request: &URISchemeRequest) {
+    let mut error = glib::Error::new(gio::IOErrorEnum::NotFound, SiteRefusal::NotFound.message());
+    request.finish_error(&mut error);
 }
 
 /// The window's theme on the view: its background, which shows before the web process paints and while a
@@ -145,8 +240,9 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
     }
     {
         let (site_root, id, entry) = (spec.site_root.clone(), spec.id.clone(), spec.entry.clone());
+        let doc_slot = spec.doc_slot.clone();
         context.register_uri_scheme(page_policy::SCHEME, move |request| {
-            serve(request, &site_root, &id, &entry)
+            serve(request, &site_root, &id, &entry, doc_slot.as_ref())
         });
     }
 
@@ -161,14 +257,20 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
     content.register_script_message_handler(HANDLER, None);
 
     // The CSP is the boundary; the proxy is a backstop behind it: anything that gets past the policy dies at
-    // a closed port, except the declared origins' hosts.
+    // a closed port, except the declared origins' hosts and, for a page that shows remote images, `https`.
     let session = NetworkSession::new_ephemeral();
-    let ignore = page_policy::proxy_ignore_hosts(&spec.origins);
-    let ignore: Vec<&str> = ignore.iter().map(String::as_str).collect();
-    session.set_proxy_settings(
-        NetworkProxyMode::Custom,
-        Some(&NetworkProxySettings::new(Some(page_policy::PROXY_BACKSTOP), &ignore)),
-    );
+    let plan = page_policy::proxy_plan(&spec.origins, spec.remote_images);
+    if plan.backstop {
+        let ignore: Vec<&str> = plan.ignore_hosts.iter().map(String::as_str).collect();
+        let mut proxy = NetworkProxySettings::new(Some(page_policy::PROXY_BACKSTOP), &ignore);
+        if plan.https_direct {
+            proxy.add_proxy_for_scheme("https", "direct://");
+        }
+        session.set_proxy_settings(NetworkProxyMode::Custom, Some(&proxy));
+    } else {
+        session.set_proxy_settings(NetworkProxyMode::NoProxy, None);
+    }
+    println!("[plugin {}] proxy: {}", spec.id, plan.summary());
     // The downloads are the page's own `blob:` files, plus a same-origin `<a download>` (WebKit turns those into
     // downloads after the navigation lock has let them through). Whichever starts one, only site files or the
     // page's own data can be saved, and each goes under a safe name in the download directory, never over an
@@ -209,15 +311,20 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
         });
     }
 
+    let csp = page_policy::csp_floor(&spec.origins, spec.remote_images);
+    println!("[plugin {}] csp: {}", spec.id, csp);
     let webview = WebView::builder()
         .web_context(&context)
         .user_content_manager(&content)
         .network_session(&session)
-        .default_content_security_policy(page_policy::csp_floor(&spec.origins))
+        .default_content_security_policy(csp)
         .build();
     if let Some(settings) = WebViewExt::settings(&webview) {
         settings.set_javascript_can_open_windows_automatically(false);
         settings.set_enable_developer_extras(false);
+        if spec.console_to_stdout {
+            settings.set_enable_write_console_messages_to_stdout(true);
+        }
     }
     webview.set_hexpand(true);
     webview.set_vexpand(true);
@@ -270,6 +377,7 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
                         // into one), which no script can make.
                         let by_user = action.is_user_gesture() && action.mouse_button() != 0;
                         if page_policy::opens_outside(link_clicked, by_user) {
+                            trace::line(&id, "outside", &url);
                             open_outside(&url);
                         }
                         decision.ignore();
@@ -362,6 +470,54 @@ mod tests {
         // code it adapts must be inside it, not only in the release's licence collection.
         assert!(KIT_JS.contains("Copyright (c) 2010 Phil Crosby, Ilya Sukhar."));
         assert!(KIT_JS.contains("The above copyright notice and this permission notice shall be included in"));
+    }
+
+    #[test]
+    fn the_kit_the_document_route_and_the_site_are_told_apart() {
+        // Named inside the test for the same reason as above.
+        use super::{route, Route};
+        use eitri_core::plugin::doc_route::DocSlot;
+        use std::path::PathBuf;
+
+        let at = |path: &str| format!("eitri-plugin://demo/{path}");
+        let slot = DocSlot {
+            generation: 2,
+            dir: Some(PathBuf::from("/p")),
+        };
+        let with = |path: &str| route("demo", &at(path), Some(&slot));
+        assert_eq!(with(".eitri/keys.js"), Route::Kit);
+        assert_eq!(
+            with(".eitri/doc/2/a.png"),
+            Route::Doc {
+                dir: PathBuf::from("/p"),
+                rel: "a.png".into()
+            }
+        );
+        assert_eq!(
+            with("%2Eeitri/doc/2/img/a%20b.png?v=1"),
+            Route::Doc {
+                dir: PathBuf::from("/p"),
+                rel: "img/a b.png".into()
+            }
+        );
+        assert_eq!(with(".eitri/doc/1/a.png"), Route::NoDoc);
+        assert_eq!(with(".eitri/doc/3/a.png"), Route::NoDoc);
+        assert_eq!(with(".eitri/doc/2/../a.png"), Route::NoDoc);
+        assert_eq!(with(".eitri/doc/2/"), Route::NoDoc);
+        assert_eq!(with("index.html"), Route::Site);
+        assert_eq!(with("eitri/doc/2/a.png"), Route::Site);
+        assert_eq!(
+            route("demo", "eitri-plugin://other/.eitri/doc/2/a.png", Some(&slot)),
+            Route::Site,
+            "another origin is the site lookup's to refuse"
+        );
+        let empty = DocSlot {
+            generation: 2,
+            dir: None,
+        };
+        assert_eq!(route("demo", &at(".eitri/doc/2/a.png"), Some(&empty)), Route::NoDoc);
+        assert_eq!(route("demo", &at(".eitri/doc/2/a.png"), None), Route::Site);
+        assert_eq!(route("demo", &at(".eitri/keys.js"), None), Route::Kit);
     }
 
     /// The `(` at `open` to its matching `)`, as a byte range of `code`.

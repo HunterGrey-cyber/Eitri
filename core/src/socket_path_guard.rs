@@ -52,6 +52,8 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     ("src/editor_context/feed.rs", "const SOCKET_NAME: &str = \"e.sock\""),
     ("src/editor_context/feed.rs", "const SWEPT_NAMES:"),
     ("src/nvim_keys/feed.rs", "const SOCKET_NAME: &str = \"k.sock\""),
+    ("src/plugin/follow_feed.rs", "const SOCKET_NAME: &str = \"f.sock\""),
+    ("src/plugin/follow_feed.rs", "const SWEPT_NAMES:"),
 ];
 
 #[test]

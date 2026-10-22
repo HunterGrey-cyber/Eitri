@@ -3,16 +3,19 @@ title = "Demo"
 protocol = 1
 site = "build/site"
 entry = "index.html"
-capabilities = ["tasks", "editor.open", "editor.assist", "layout.focus", "state", "net"]
+capabilities = ["tasks", "editor.open", "editor.assist", "layout.focus", "state", "net", "editor.follow", "editor.commands"]
 
 [settings]
 work = { default = "~/demo-work", kind = "dir" }
+auto = { default = false, kind = "bool" }
+images = { default = "https", kind = "choice", values = ["https", "off"] }
 
 [roots]
 work = "${work}"
 
 [net]
 origins = ["https://learn.example.org"]
+images = "${images}"
 
 [vars.course]
 chars = "lower-digit-dash"
@@ -36,3 +39,19 @@ timeout_secs = 0
 argv = ["${plugin}/bin/learn", "reset", "${course}", "${exercise}", "--work", "${work}", "--json"]
 cwd = "${work}"
 timeout_secs = 60
+
+[module]
+start = "hidden"
+at = "right"
+size = 0.4
+focus = false
+
+[follow]
+filetypes = ["markdown", "rst"]
+auto_show = "auto"
+
+[commands.DemoShow]
+does = "show"
+
+[commands.DemoToggle]
+does = "toggle"

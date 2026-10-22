@@ -464,6 +464,9 @@ KNOWN_EITRI_SOURCE_ADDITIONS = (
     # The plugin keyboard kit's bundle and fingerprint, shipped for the same reason.
     "plugin-kit/keys/dist/keys.js",
     "plugin-kit/keys/dist/.inputs-sha256",
+    # The Markdown preview plugin's built site (several files, so its whole dist/) and its fingerprint, shipped for
+    # the same reason.
+    "plugins/markdown/web/dist/",
     "THIRD-PARTY-LICENSES",
     "SOURCE",
 )
@@ -879,6 +882,66 @@ def deb_roles() -> dict[str, str]:
     return {**_PACKAGE_ROLES, **_DEB_ONLY_ROLES}
 
 
+# The plugin directories a release ships (plugins/<name> in the tree), each with its tracked manifest. A plugin
+# directory is one tree, not a role per file: its site's files (fonts, the lazily loaded diagram code) are whatever
+# the build made. The tarball holds it at lib/eitri/plugins/<name>/ (install.sh copies lib/eitri whole), the packages
+# at usr/share/eitri/plugins/<name>/; plugin_tree_problems holds the three to one another.
+PLUGIN_TREES = (("markdown", "plugins/markdown/eitri-plugin.toml"),)
+
+
+def tarball_plugin_dir(name: str) -> str:
+    """A plugin directory's path under the tarball's top directory."""
+    return f"lib/eitri/plugins/{name}"
+
+
+def package_plugin_dir(name: str) -> str:
+    """A plugin directory's path in the .deb and the .rpm, from /."""
+    return f"usr/share/eitri/plugins/{name}"
+
+
+def plugin_tree_problems(tarball_root: str, deb_root: str, rpm_root: str, repo_root: str) -> list[str]:
+    """Every plugin tree of PLUGIN_TREES, in the extracted tarball (`tarball_root`, its top directory), the .deb and
+    the .rpm (their roots): the same relative paths with the same bytes in all three, an `eitri-plugin.toml` equal to
+    the tracked one under `repo_root`, a `web/dist/index.html` (a release with an empty site would load a page that
+    is not there), and no `.inputs-sha256` (the build's fingerprint is for the source asset alone). Each problem
+    names the plugin and the artifact."""
+    problems = []
+    for name, manifest in PLUGIN_TREES:
+        trees: dict[str, dict[str, str]] = {}
+        for label, root, rel_dir in (("tarball", tarball_root, tarball_plugin_dir(name)),
+                                     (".deb", deb_root, package_plugin_dir(name)),
+                                     (".rpm", rpm_root, package_plugin_dir(name))):
+            tree_root = os.path.join(root, *rel_dir.split("/"))
+            if not os.path.isdir(tree_root):
+                problems.append(f"plugin tree {name}: the {label} has no {rel_dir}/")
+                continue
+            trees[label] = {rel: _sha256_file(path) for rel, path in iter_files(tree_root)}
+        for label, tree in trees.items():
+            if "eitri-plugin.toml" not in tree:
+                problems.append(f"plugin tree {name}: the {label} has no eitri-plugin.toml")
+            if "web/dist/index.html" not in tree:
+                problems.append(f"plugin tree {name}: the {label} has no web/dist/index.html")
+            for rel in sorted(tree):
+                if rel.rsplit("/", 1)[-1] == ".inputs-sha256":
+                    problems.append(f"plugin tree {name}: the {label} ships {rel}")
+        for rel in sorted(set().union(*trees.values())):
+            missing = [label for label, tree in trees.items() if rel not in tree]
+            if missing:
+                problems.append(f"plugin tree {name}: {rel} is missing from: {', '.join(missing)}")
+            elif len({tree[rel] for tree in trees.values()}) > 1:
+                problems.append(f"plugin tree {name}: {rel} differs: "
+                                + ", ".join(f"{label}={tree[rel][:12]}" for label, tree in trees.items()))
+        tracked = os.path.join(repo_root, *manifest.split("/"))
+        if not os.path.isfile(tracked):
+            problems.append(f"plugin tree {name}: {manifest} is not in {repo_root}")
+            continue
+        want = _sha256_file(tracked)
+        for label, tree in trees.items():
+            if "eitri-plugin.toml" in tree and tree["eitri-plugin.toml"] != want:
+                problems.append(f"plugin tree {name}: the {label}'s eitri-plugin.toml is not the tracked {manifest}")
+    return problems
+
+
 def _content_problems(label: str, files: list[tuple[str, str]], sdk_allowed: Callable[[str], bool]) -> list[str]:
     problems = []
     for name, hits in (
@@ -897,12 +960,14 @@ def _content_problems(label: str, files: list[tuple[str, str]], sdk_allowed: Cal
     return problems
 
 
-def check_binary_asset(label: str, root: str, roles: dict[str, str]) -> list[str]:
+def check_binary_asset(label: str, root: str, roles: dict[str, str], trees: Sequence[str] = ()) -> list[str]:
     """One extracted tarball/.deb/.rpm: exactly the files `roles` names (M6's layout; anything else
-    -- an agent-hook, a sidecar, a stray build product -- is a problem), and the content rules. The
+    -- an agent-hook, a sidecar, a stray build product -- is a problem), apart from the files under one of `trees`
+    (plugin directories, which plugin_tree_problems checks as wholes), and the content rules over every file. The
     SDK's name is allowed only in eitri-setup (the installer, which prints the SDK line)."""
     files = iter_files(root)
-    present = {rel for rel, _ in files}
+    prefixes = tuple(tree.rstrip("/") + "/" for tree in trees)
+    present = {rel for rel, _ in files if not rel.startswith(prefixes)} if prefixes else {rel for rel, _ in files}
     expected = set(roles.values())
     problems = []
     if present - expected:
@@ -928,9 +993,11 @@ def check_same_bytes(named_paths: dict[str, str]) -> list[str]:
     return problems
 
 
-# The npm projects shell/build.rs builds into a file the binary embeds, each with the bundle it leaves
-# behind: the source asset ships both beside a fingerprint so its offline rebuild reaches no npm.
-WEB_BUNDLES = (("agent-ui/web", "dist/index.html"), ("plugin-kit/keys", "dist/keys.js"))
+# The npm projects shell/build.rs builds, each with the file it leaves behind: the agent panel's page and the plugin
+# keyboard kit, which the binary embeds, and the Markdown preview plugin's site, which ships as a plugin directory.
+# The source asset ships each beside a fingerprint so its offline rebuild reaches no npm.
+WEB_BUNDLES = (("agent-ui/web", "dist/index.html"), ("plugin-kit/keys", "dist/keys.js"),
+               ("plugins/markdown/web", "dist/index.html"))
 
 
 def _check_web_bundle(root: str, web_rel: str, output: str) -> list[str]:
@@ -1088,9 +1155,12 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
     extract_tar_gz(os.path.join(out_dir, verdandi), x["verdandi"])
 
     troles, proles = tarball_roles(version), package_roles()
-    problems += check_binary_asset(tarball, x["tarball"], troles)
-    problems += check_binary_asset(deb, x["deb"], deb_roles())
-    problems += check_binary_asset(rpm, x["rpm"], proles)
+    ttop = tarball_top(version)
+    package_trees = [package_plugin_dir(name) for name, _ in PLUGIN_TREES]
+    problems += check_binary_asset(tarball, x["tarball"], troles,
+                                   [f"{ttop}/{tarball_plugin_dir(name)}" for name, _ in PLUGIN_TREES])
+    problems += check_binary_asset(deb, x["deb"], deb_roles(), package_trees)
+    problems += check_binary_asset(rpm, x["rpm"], proles, package_trees)
     for role in troles:
         if role not in proles:
             continue  # a tarball-only role (0.2.0's desktop entry): no package carries it
@@ -1099,6 +1169,8 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
             f"{deb}:{proles[role]}": os.path.join(x["deb"], proles[role]),
             f"{rpm}:{proles[role]}": os.path.join(x["rpm"], proles[role]),
         })
+    # Each plugin directory as one tree: the same files and bytes in all three, the manifest the tracked one.
+    problems += plugin_tree_problems(os.path.join(x["tarball"], ttop), x["deb"], x["rpm"], src_repo)
     src_root = os.path.join(x["source"], source_top(version))
     top_level = sorted(os.listdir(x["source"]))
     if top_level != [source_top(version)]:

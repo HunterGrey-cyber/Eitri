@@ -976,6 +976,115 @@ def _fake_elf(text=b""):
     return b"\x7fELF" + b"\0" * 12 + text
 
 
+# A shipped plugin directory as the release lays it out: the tracked manifest plus the built site, without the
+# build's fingerprint.
+PLUGIN_MANIFEST = b'id = "markdown"\ntitle = "Markdown preview"\n'
+PLUGIN_SITE = {
+    "eitri-plugin.toml": PLUGIN_MANIFEST,
+    "web/dist/index.html": b"<!doctype html>\n",
+    "web/dist/preview.js": b"export {};\n",
+    "web/dist/katex/fonts/KaTeX_Main-Regular.woff2": b"wOF2",
+}
+
+
+class PluginTreeTests(unittest.TestCase):
+    """plugin_tree_problems: the plugin directory is one tree in each of the tarball, the .deb and the .rpm (not a
+    role per file); the three must hold the same relative paths with the same bytes, the manifest must be the
+    tracked one, the page must be there, and the build's fingerprint must not."""
+
+    def setUp(self):
+        self.root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.tarball = os.path.join(self.root, "tarball", "eitri-1.0.0-x86_64-linux")
+        self.deb = os.path.join(self.root, "deb")
+        self.rpm = os.path.join(self.root, "rpm")
+        self.repo = os.path.join(self.root, "repo")
+        _plant(self.repo, {"plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST})
+        for base, rel_dir in self.places():
+            _plant(os.path.join(base, rel_dir), PLUGIN_SITE)
+
+    def places(self):
+        return ((self.tarball, rc.tarball_plugin_dir("markdown")),
+                (self.deb, rc.package_plugin_dir("markdown")),
+                (self.rpm, rc.package_plugin_dir("markdown")))
+
+    def path(self, which, rel):
+        base, rel_dir = dict(zip(("tarball", "deb", "rpm"), self.places()))[which]
+        return os.path.join(base, rel_dir, rel)
+
+    def problems(self):
+        return rc.plugin_tree_problems(self.tarball, self.deb, self.rpm, self.repo)
+
+    def test_the_places_and_the_shipped_plugins(self):
+        self.assertEqual(rc.PLUGIN_TREES, (("markdown", "plugins/markdown/eitri-plugin.toml"),))
+        self.assertEqual(rc.tarball_plugin_dir("markdown"), "lib/eitri/plugins/markdown")
+        self.assertEqual(rc.package_plugin_dir("markdown"), "usr/share/eitri/plugins/markdown")
+
+    def test_three_equal_trees_with_the_tracked_manifest_pass(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_a_file_missing_from_one_artifact_fails(self):
+        os.remove(self.path("rpm", "web/dist/preview.js"))
+        self.assertEqual(self.problems(), ["plugin tree markdown: web/dist/preview.js is missing from: .rpm"])
+
+    def test_an_extra_file_in_one_artifact_fails(self):
+        _plant(os.path.dirname(self.path("deb", "web/dist/x")), {"stray.js": b"s\n"})
+        self.assertEqual(self.problems(), ["plugin tree markdown: web/dist/stray.js is missing from: tarball, .rpm"])
+
+    def test_a_changed_file_in_one_artifact_fails(self):
+        with open(self.path("tarball", "web/dist/preview.js"), "wb") as f:
+            f.write(b"other\n")
+        problems = self.problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("plugin tree markdown: web/dist/preview.js differs: tarball="), problems)
+        self.assertIn(", .deb=", problems[0])
+        self.assertIn(", .rpm=", problems[0])
+
+    def test_a_manifest_that_is_not_the_tracked_one_fails(self):
+        for which in ("tarball", "deb", "rpm"):
+            with open(self.path(which, "eitri-plugin.toml"), "wb") as f:
+                f.write(PLUGIN_MANIFEST + b"# changed\n")
+        self.assertEqual(self.problems(), [
+            f"plugin tree markdown: the {label}'s eitri-plugin.toml is not the tracked "
+            "plugins/markdown/eitri-plugin.toml"
+            for label in ("tarball", ".deb", ".rpm")
+        ])
+
+    def test_a_tree_without_its_page_fails(self):
+        for which in ("tarball", "deb", "rpm"):
+            os.remove(self.path(which, "web/dist/index.html"))
+        self.assertEqual(self.problems(), [
+            f"plugin tree markdown: the {label} has no web/dist/index.html" for label in ("tarball", ".deb", ".rpm")
+        ])
+
+    def test_a_tree_without_its_manifest_fails(self):
+        for which in ("tarball", "deb", "rpm"):
+            os.remove(self.path(which, "eitri-plugin.toml"))
+        self.assertEqual(self.problems(), [
+            f"plugin tree markdown: the {label} has no eitri-plugin.toml" for label in ("tarball", ".deb", ".rpm")
+        ])
+
+    def test_the_builds_fingerprint_in_an_artifact_fails(self):
+        _plant(os.path.dirname(self.path("deb", "web/dist/x")), {".inputs-sha256": b"0" * 64})
+        problems = self.problems()
+        self.assertIn("plugin tree markdown: the .deb ships web/dist/.inputs-sha256", problems)
+        self.assertIn("plugin tree markdown: web/dist/.inputs-sha256 is missing from: tarball, .rpm", problems)
+
+    def test_a_missing_tree_is_named_with_its_place(self):
+        shutil.rmtree(os.path.join(self.rpm, "usr"))
+        self.assertEqual(self.problems(), ["plugin tree markdown: the .rpm has no usr/share/eitri/plugins/markdown/"])
+        shutil.rmtree(os.path.join(self.tarball, "lib"))
+        self.assertEqual(self.problems(), [
+            "plugin tree markdown: the tarball has no lib/eitri/plugins/markdown/",
+            "plugin tree markdown: the .rpm has no usr/share/eitri/plugins/markdown/",
+        ])
+
+    def test_a_repository_without_the_tracked_manifest_fails(self):
+        os.remove(os.path.join(self.repo, "plugins", "markdown", "eitri-plugin.toml"))
+        self.assertEqual(self.problems(),
+                         [f"plugin tree markdown: plugins/markdown/eitri-plugin.toml is not in {self.repo}"])
+
+
 class BinaryAssetTreeTests(unittest.TestCase):
     def tree(self, roles, extra=None, overrides=None):
         root = _scratch_dir()
@@ -991,6 +1100,18 @@ class BinaryAssetTreeTests(unittest.TestCase):
     def test_the_tarball_and_package_layouts_pass(self):
         for roles in (rc.tarball_roles("1.0.0-rc.1"), rc.package_roles(), rc.deb_roles()):
             self.assertEqual(rc.check_binary_asset("x", self.tree(roles), roles), [])
+
+    def test_a_plugin_tree_is_left_to_the_tree_check_but_not_to_the_content_rules(self):
+        roles = rc.package_roles()
+        tree = rc.package_plugin_dir("markdown")
+        extra = {f"{tree}/{rel}": data for rel, data in PLUGIN_SITE.items()}
+        root = self.tree(roles, extra)
+        self.assertEqual(rc.check_binary_asset("x", root, roles, [tree]), [])
+        problems = rc.check_binary_asset("x", root, roles)
+        self.assertTrue(any("files no release ships" in p and f"{tree}/web/dist/index.html" in p for p in problems),
+                        problems)
+        root = self.tree(roles, {**extra, f"{tree}/web/dist/node_modules/x/index.js": b"x\n"})
+        self.assertTrue(any("node_modules" in p for p in rc.check_binary_asset("x", root, roles, [tree])))
 
     def test_the_desktop_entry_and_the_icons_are_named_by_the_application_id(self):
         """The compositor matches a window to `<application id>.desktop`, and the theme finds the icon
@@ -1214,7 +1335,9 @@ class EitriSourceTreeTests(unittest.TestCase):
                                                     "package.json": b"{}\n"})
         self.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
                                       "plugin-kit/keys/src/a.ts": b"k\n", "plugin-kit/keys/build.mjs": b"b\n",
-                                      "packaging/install.sh": b"# names claude-agent-sdk\n"})
+                                      "packaging/install.sh": b"# names claude-agent-sdk\n",
+                                      "plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST,
+                                      "plugins/markdown/web/src/main.ts": b"m\n"})
         fork, _ = _init_git_repo({"Cargo.toml": b"[package]\n"})
         shutil.copytree(fork, os.path.join(self.src, "neovide"))
         for d in (self.verdandi, self.src, fork):
@@ -1240,6 +1363,13 @@ class EitriSourceTreeTests(unittest.TestCase):
         self.kit_dir = os.path.join(self.root, "plugin-kit/keys")
         _plant(self.root, {"plugin-kit/keys/dist/keys.js": b"(() => {})();\n"})
         _plant(self.root, {"plugin-kit/keys/dist/.inputs-sha256": rc.web_bundle_fingerprint(self.kit_dir).encode()})
+        # The Markdown preview plugin's site is shipped the same way: the whole dist/ and the fingerprint of its
+        # sources.
+        self.plugin_web = os.path.join(self.root, "plugins/markdown/web")
+        _plant(self.root, {"plugins/markdown/web/dist/index.html": b"<!doctype html>\n",
+                           "plugins/markdown/web/dist/preview.js": b"export {};\n"})
+        _plant(self.root, {"plugins/markdown/web/dist/.inputs-sha256":
+                           rc.web_bundle_fingerprint(self.plugin_web).encode()})
 
     def check(self):
         sha = hashlib.sha256(self.SKIA_BYTES).hexdigest()
@@ -1281,6 +1411,17 @@ class EitriSourceTreeTests(unittest.TestCase):
         self.assertIn("plugin-kit/keys/dist/.inputs-sha256 does not match a fresh fingerprint", problems[0])
         os.remove(os.path.join(self.root, "plugin-kit/keys/dist/keys.js"))
         self.assertTrue(any("no plugin-kit/keys/dist/keys.js" in p for p in self.check()))
+
+    def test_the_plugin_bundle_and_its_fingerprint_are_required_and_checked(self):
+        self.assertIn(("plugins/markdown/web", "dist/index.html"), rc.WEB_BUNDLES)
+        os.remove(os.path.join(self.root, "plugins/markdown/web/dist/.inputs-sha256"))
+        self.assertTrue(any("no plugins/markdown/web/dist/.inputs-sha256" in p for p in self.check()))
+        _plant(self.root, {"plugins/markdown/web/dist/.inputs-sha256": b"0" * 64})
+        problems = self.check()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("plugins/markdown/web/dist/.inputs-sha256 does not match a fresh fingerprint", problems[0])
+        os.remove(os.path.join(self.root, "plugins/markdown/web/dist/index.html"))
+        self.assertTrue(any("no plugins/markdown/web/dist/index.html" in p for p in self.check()))
 
     def test_a_changed_kit_build_script_makes_the_shipped_fingerprint_stale(self):
         _plant(self.root, {"plugin-kit/keys/build.mjs": b"changed\n"})
@@ -1345,6 +1486,8 @@ class ReleaseAssetsTests(unittest.TestCase):
         })
         cls.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
                                      "plugin-kit/keys/src/a.ts": b"k\n",
+                                     "plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST,
+                                     "plugins/markdown/web/src/main.ts": b"m\n",
                                      "packaging/install.sh": cls.INSTALL, "LICENSE": b"MIT\n",
                                      "packaging/apparmor/eitri": cls.APPARMOR,
                                      # The tracked desktop entry and icons the release ships unmodified
@@ -1375,6 +1518,7 @@ class ReleaseAssetsTests(unittest.TestCase):
         # because that tree is clean (nothing planted here changes agent-ui/web).
         fingerprint = rc.web_bundle_fingerprint(os.path.join(self.src, "agent-ui/web"))
         kit_fingerprint = rc.web_bundle_fingerprint(os.path.join(self.src, "plugin-kit/keys"))
+        plugin_fingerprint = rc.web_bundle_fingerprint(os.path.join(self.src, "plugins/markdown/web"))
         source.update({top + rel: data for rel, data in {
             "vendor/nvim-rs/src/lib.rs": b"pub fn f() {}\n",
             ".cargo/config.toml": b'[source.vendored-sources]\ndirectory = "vendor"\n',
@@ -1383,13 +1527,20 @@ class ReleaseAssetsTests(unittest.TestCase):
             "agent-ui/web/dist/.inputs-sha256": fingerprint.encode(),
             "plugin-kit/keys/dist/keys.js": b"(() => {})();\n",
             "plugin-kit/keys/dist/.inputs-sha256": kit_fingerprint.encode(),
+            "plugins/markdown/web/dist/index.html": PLUGIN_SITE["web/dist/index.html"],
+            "plugins/markdown/web/dist/preview.js": PLUGIN_SITE["web/dist/preview.js"],
+            "plugins/markdown/web/dist/.inputs-sha256": plugin_fingerprint.encode(),
             **self.NOTICES,
         }.items()})
         return {
-            "tarball": {troles[r]: b for r, b in role_bytes.items()},
+            "tarball": {**{troles[r]: b for r, b in role_bytes.items()},
+                        **{f"{rc.tarball_top(v)}/{rc.tarball_plugin_dir('markdown')}/{rel}": data
+                           for rel, data in PLUGIN_SITE.items()}},
             "deb": {**{proles[r]: b for r, b in role_bytes.items() if r in proles},
-                    rc.deb_roles()["apparmor"]: self.APPARMOR},
-            "rpm": {proles[r]: b for r, b in role_bytes.items() if r in proles},
+                    rc.deb_roles()["apparmor"]: self.APPARMOR,
+                    **{f"{rc.package_plugin_dir('markdown')}/{rel}": data for rel, data in PLUGIN_SITE.items()}},
+            "rpm": {**{proles[r]: b for r, b in role_bytes.items() if r in proles},
+                    **{f"{rc.package_plugin_dir('markdown')}/{rel}": data for rel, data in PLUGIN_SITE.items()}},
             "source": source,
             "verdandi": _archive_files(self.verdandi, self.vrev),
             "install.sh": self.INSTALL,
@@ -1430,6 +1581,17 @@ class ReleaseAssetsTests(unittest.TestCase):
         contents["tarball"][rc.tarball_roles(self.VERSION)[role]] = data
         for key in ("deb", "rpm"):
             contents[key][rc.package_roles()[role]] = data
+
+    def set_plugin_file(self, contents, rel, data):
+        """Replace (or add) one file of the plugin tree in the tarball, the .deb and the .rpm alike."""
+        contents["tarball"][f"{rc.tarball_top(self.VERSION)}/{rc.tarball_plugin_dir('markdown')}/{rel}"] = data
+        for key in ("deb", "rpm"):
+            contents[key][f"{rc.package_plugin_dir('markdown')}/{rel}"] = data
+
+    def drop_plugin_file(self, contents, rel):
+        contents["tarball"].pop(f"{rc.tarball_top(self.VERSION)}/{rc.tarball_plugin_dir('markdown')}/{rel}")
+        for key in ("deb", "rpm"):
+            contents[key].pop(f"{rc.package_plugin_dir('markdown')}/{rel}")
 
     def test_the_unbroken_release_passes(self):
         self.assertEqual(self.check(), [f"extracted and checked: {', '.join(self.names().values())}"])
@@ -1491,6 +1653,28 @@ class ReleaseAssetsTests(unittest.TestCase):
              ["not byte-identical", "install.sh="]),
             ("RELEASE", replace("RELEASE", b"EITRI_VERSION=1.0.0\n"), ["not byte-identical", "{tarball}:RELEASE"]),
             ("missing", replace("verdandi", None), ["asset missing: {verdandi}"]),
+            ("a plugin file missing from the rpm",
+             lambda c: c["rpm"].pop(rc.package_plugin_dir("markdown") + "/web/dist/preview.js"),
+             ["plugin tree markdown: web/dist/preview.js is missing from: .rpm"]),
+            ("an extra plugin file in the deb",
+             plant("deb", rc.package_plugin_dir("markdown") + "/web/dist/stray.js", b"s\n"),
+             ["plugin tree markdown: web/dist/stray.js is missing from: tarball, .rpm"]),
+            ("a changed plugin file in the tarball",
+             plant("tarball", f"{rc.tarball_top(self.VERSION)}/{rc.tarball_plugin_dir('markdown')}/web/dist/preview.js",
+                   b"other\n"),
+             ["plugin tree markdown: web/dist/preview.js differs"]),
+            ("a plugin manifest that is not the tracked one",
+             lambda c: self.set_plugin_file(c, "eitri-plugin.toml", PLUGIN_MANIFEST + b"# changed\n"),
+             ["plugin tree markdown: the tarball's eitri-plugin.toml is not the tracked "
+              "plugins/markdown/eitri-plugin.toml"]),
+            ("a plugin tree without its page", lambda c: self.drop_plugin_file(c, "web/dist/index.html"),
+             ["plugin tree markdown: the tarball has no web/dist/index.html"]),
+            ("the build's fingerprint in every artifact",
+             lambda c: self.set_plugin_file(c, "web/dist/.inputs-sha256", b"0" * 64),
+             ["plugin tree markdown: the tarball ships web/dist/.inputs-sha256"]),
+            ("a source asset without the plugin's site",
+             lambda c: c["source"].pop(top + "plugins/markdown/web/dist/index.html"),
+             ["source asset has no plugins/markdown/web/dist/index.html"]),
         ]
         names = {k: v for k, v in self.names().items() if "." not in k and k != "RELEASE"}
         for label, mutate, expected in cases:

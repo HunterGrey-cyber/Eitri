@@ -1,6 +1,6 @@
 //! A plugin page's rules that need no toolkit: its scheme and origin, the content security policy floor
-//! the page cannot loosen, where a navigation may go, which hosts pass the proxy backstop, and which file
-//! under the site a request names. `shell` applies them to a `WebView`.
+//! the page cannot loosen, where a navigation may go, how its session is proxied (which hosts and schemes pass
+//! the backstop), and which file under the site a request names. `shell` applies them to a `WebView`.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +30,8 @@ const MIME: &[(&str, &str)] = &[
     ("jpeg", "image/jpeg"),
     ("gif", "image/gif"),
     ("webp", "image/webp"),
+    ("avif", "image/avif"),
+    ("bmp", "image/bmp"),
     ("ico", "image/x-icon"),
     ("woff", "font/woff"),
     ("woff2", "font/woff2"),
@@ -51,25 +53,38 @@ pub fn host_page_base(id: &str) -> String {
 /// The entry's address, each byte outside the unreserved set percent-encoded so a name holding `#`, `?` or
 /// `%` reaches `site_file` as the file it names and not as a fragment, a query or an escape.
 pub fn entry_uri(id: &str, entry: &str) -> String {
-    let mut path = String::with_capacity(entry.len());
-    for b in entry.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
-            path.push(char::from(b));
-        } else {
-            path.push_str(&format!("%{b:02X}"));
-        }
-    }
-    format!("{SCHEME}://{id}/{path}")
+    format!("{SCHEME}://{id}/{}", encode_path(entry))
 }
 
-pub fn csp_floor(origins: &[Origin]) -> String {
+/// A relative path as it goes into one of this scheme's addresses: every byte outside `A-Za-z0-9-._~/`
+/// percent-encoded, so the strict decoder gives back exactly the path.
+pub(crate) fn encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The page's default policy. `remote_images` adds `https:` to `img-src` and nothing else: a page that shows
+/// a document's remote pictures still runs only its own scripts and reaches only its declared origins.
+pub fn csp_floor(origins: &[Origin], remote_images: bool) -> String {
     let mut connect = String::from("'self'");
     for o in origins {
         connect.push(' ');
         connect.push_str(&o.as_str());
     }
+    let img = if remote_images {
+        "'self' data: https:"
+    } else {
+        "'self' data:"
+    };
     format!(
-        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src {img}; \
          font-src 'self'; connect-src {connect}; frame-src 'none'; base-uri 'none'; form-action 'none'"
     )
 }
@@ -93,6 +108,48 @@ pub fn proxy_ignore_hosts(origins: &[Origin]) -> Vec<String> {
     hosts
 }
 
+/// How a page's ephemeral session is proxied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyPlan {
+    /// Every request goes to [`PROXY_BACKSTOP`] unless a rule below says otherwise; without it the CSP alone guards.
+    pub backstop: bool,
+    /// The `host:port` entries that skip the backstop: the declared origins' ([`proxy_ignore_hosts`]).
+    pub ignore_hosts: Vec<String>,
+    /// `https` requests go out directly, while `http` and every other scheme stay on the backstop; the CSP decides
+    /// which https requests the page may make.
+    pub https_direct: bool,
+}
+
+impl ProxyPlan {
+    /// One line for the log, naming what gets past the backstop.
+    pub fn summary(&self) -> String {
+        if !self.backstop {
+            return "no backstop: the CSP alone".to_owned();
+        }
+        let hosts = if self.ignore_hosts.is_empty() {
+            "no host".to_owned()
+        } else {
+            self.ignore_hosts.join(" ")
+        };
+        let mut line = format!("backstop {PROXY_BACKSTOP} except {hosts}");
+        if self.https_direct {
+            line.push_str("; https direct");
+        }
+        line
+    }
+}
+
+/// The backstop always stays. With remote images, `https` gets a direct route of its own: WebKit's resolver
+/// keeps a per-scheme entry apart from the default proxy, so `http` and every other scheme still die at the
+/// closed port, and only the CSP's `img-src https:` lets a page use the direct route.
+pub fn proxy_plan(origins: &[Origin], remote_images: bool) -> ProxyPlan {
+    ProxyPlan {
+        backstop: true,
+        ignore_hosts: proxy_ignore_hosts(origins),
+        https_direct: remote_images,
+    }
+}
+
 /// Whether an outside address a navigation names is handed to the desktop: only for a link the user clicked.
 /// `user_gesture` is the user's own press, not a script acting in a gesture's name. A script's `click()` on a
 /// link is a link click too, and passing it would let a page send data out in a URL, or open tabs and mail
@@ -113,6 +170,12 @@ pub enum Navigation {
 pub fn navigation(id: &str, uri: &str) -> Navigation {
     let home = origin(id);
     if uri == home || uri.strip_prefix(&home).is_some_and(|rest| rest.starts_with('/')) {
+        // The host answers `/.eitri/` itself (the keyboard kit, a followed document's images): a script or an
+        // image there is never a page. An SVG a document links to would otherwise run as the page, with the
+        // bridge.
+        if decoded_path(id, uri).is_some_and(|p| p.starts_with(".eitri/")) {
+            return Navigation::Refuse;
+        }
         return Navigation::Stay;
     }
     // A `blob:` the page made itself is how it saves a file (an export): WebKit turns it into a download.
@@ -217,7 +280,7 @@ pub fn mime_for(name: &str) -> Option<&'static str> {
 
 /// `%XX` decoded, strictly: a `%` without two hex digits, bytes that are not UTF-8, or a control character
 /// refuse the path.
-fn decoded(text: &str) -> Option<String> {
+pub(crate) fn decoded(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -239,11 +302,17 @@ fn decoded(text: &str) -> Option<String> {
 
 /// The path part of a request for this plugin's origin, with the query and fragment cut; `None` for another
 /// origin.
-fn request_path<'a>(id: &str, uri: &'a str) -> Option<&'a str> {
+pub(crate) fn request_path<'a>(id: &str, uri: &'a str) -> Option<&'a str> {
     let rest = uri.strip_prefix(&origin(id))?;
     let rest = if rest.is_empty() { "/" } else { rest };
     let rest = rest.strip_prefix('/')?;
     Some(rest.split(['?', '#']).next().unwrap_or(""))
+}
+
+/// The decoded path a request for this plugin's origin names (query and fragment cut), for the trace; `None` for
+/// another origin or a path that does not decode.
+pub fn decoded_path(id: &str, uri: &str) -> Option<String> {
+    decoded(request_path(id, uri)?)
 }
 
 /// Where every plugin's origin serves the keyboard kit, a path no site file is read for.
@@ -297,12 +366,12 @@ mod tests {
     fn the_csp_floor_names_only_declared_origins() {
         let origins = [Origin::parse("https://learn.example.org").unwrap()];
         assert_eq!(
-            csp_floor(&origins),
+            csp_floor(&origins, false),
             "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
              font-src 'self'; connect-src 'self' https://learn.example.org; frame-src 'none'; base-uri 'none'; \
              form-action 'none'"
         );
-        let none = csp_floor(&[]);
+        let none = csp_floor(&[], false);
         assert!(none.contains("connect-src 'self';"));
         let script = none
             .split(';')
@@ -333,6 +402,74 @@ mod tests {
         assert!(!opens_outside(true, false), "a script's click() on a link");
         assert!(!opens_outside(false, true), "a gesture that is not a link click");
         assert!(!opens_outside(false, false));
+    }
+
+    #[test]
+    fn remote_images_add_https_to_img_src_and_nothing_else() {
+        let origins = [Origin::parse("https://learn.example.org").unwrap()];
+        let off = csp_floor(&origins, false);
+        let on = csp_floor(&origins, true);
+        assert_eq!(on, off.replace("img-src 'self' data:;", "img-src 'self' data: https:;"));
+        for directive in on.split(';').map(str::trim) {
+            if !directive.starts_with("img-src") {
+                assert!(
+                    !directive.contains("https:") || directive.starts_with("connect-src"),
+                    "{directive}"
+                );
+            }
+        }
+        assert!(
+            on.contains("connect-src 'self' https://learn.example.org;"),
+            "connect-src unchanged"
+        );
+        assert!(on.contains("script-src 'self';") && on.contains("frame-src 'none';"));
+    }
+
+    #[test]
+    fn the_proxy_plan_for_each_images_value() {
+        let origins = [Origin::parse("https://learn.example.org").unwrap()];
+        let off = proxy_plan(&origins, false);
+        assert_eq!(
+            off,
+            ProxyPlan {
+                backstop: true,
+                ignore_hosts: vec!["learn.example.org:443".to_owned()],
+                https_direct: false,
+            }
+        );
+        assert_eq!(
+            off.summary(),
+            "backstop http://127.0.0.1:9 except learn.example.org:443"
+        );
+        let bare = proxy_plan(&[], false);
+        assert_eq!(
+            bare,
+            ProxyPlan {
+                backstop: true,
+                ignore_hosts: vec![],
+                https_direct: false,
+            }
+        );
+        assert_eq!(bare.summary(), "backstop http://127.0.0.1:9 except no host");
+        let on = proxy_plan(&origins, true);
+        assert_eq!(
+            on,
+            ProxyPlan {
+                backstop: true,
+                ignore_hosts: vec!["learn.example.org:443".to_owned()],
+                https_direct: true,
+            }
+        );
+        assert_eq!(
+            on.summary(),
+            "backstop http://127.0.0.1:9 except learn.example.org:443; https direct"
+        );
+        let open = ProxyPlan {
+            backstop: false,
+            ignore_hosts: vec![],
+            https_direct: false,
+        };
+        assert_eq!(open.summary(), "no backstop: the CSP alone");
     }
 
     #[test]
@@ -376,6 +513,16 @@ mod tests {
             assert_eq!(navigation("demo", refused), Navigation::Refuse, "{refused}");
         }
         assert_eq!(navigation("demo", &host_page_base("demo")), Navigation::Stay);
+        for refused in [
+            "eitri-plugin://demo/.eitri/doc/1/x.svg",
+            "eitri-plugin://demo/%2Eeitri/doc/1/x.svg",
+            "eitri-plugin://demo/.eitri/keys.js",
+        ] {
+            assert_eq!(navigation("demo", refused), Navigation::Refuse, "{refused}");
+        }
+        assert_eq!(navigation("demo", "eitri-plugin://demo/eitri/x.html"), Navigation::Stay);
+        assert_eq!(mime_for("x.avif"), Some("image/avif"));
+        assert_eq!(mime_for("x.BMP"), Some("image/bmp"));
     }
 
     #[test]

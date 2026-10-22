@@ -123,6 +123,9 @@ DEFAULT_SOURCE_URL = "https://github.com/HunterGrey-cyber/eitri"
 PERMISSIVE = {
     "MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unlicense",
     "0BSD", "CC0-1.0", "Unicode-3.0", "Unicode-DFS-2016", "BSL-1.0", "BlueOak-1.0.0",
+    # Python-2.0: argparse, the command-line parser of markdown-it's own CLI, which the Markdown preview's bundle
+    # never includes but npm's tree lists; a permissive licence, so printing its notice is the safe direction.
+    "Python-2.0",
 }
 EXCEPTIONS = {"LLVM-exception"}
 # Known, classifiable, and NOT acceptable without a per-package acknowledgement below.
@@ -168,6 +171,10 @@ ALLOWLIST = {
         "Verdandi's own sidecar, same owner as Eitri; no licence stated yet (to be MIT)."),
     ("npm", "@verdandi/claude-runtime"): (
         "Verdandi's own runtime package, same owner as Eitri; no licence stated yet (to be MIT)."),
+    ("npm", "khroma"): (
+        "Mermaid's colour library (the Markdown preview plugin's page). Its package.json declares no licence "
+        "field, but it ships an MIT LICENSE file (Fabio Spampinato), which is reproduced. Re-check when it "
+        "declares one."),
     ("npm", "@anthropic-ai/claude-agent-sdk"): (
         "NOT open source. Bundled into the sidecar knowingly. "
         "Its own LICENSE.md is reproduced verbatim; Eitri's MIT licence does not and cannot "
@@ -240,6 +247,9 @@ NOT_SHIPPED = {
 # Provenance for each file: packaging/license-texts/README.md.
 TEXT_OVERRIDES = {
     ("npm", "standardwebhooks", "1.1.1"): ["standard-webhooks.LICENSE"],
+    ("npm", "@hedgedoc/markdown-it-task-lists", "2.0.1"): ["hedgedoc-markdown-it-task-lists.LICENSE"],
+    ("npm", "fastdom", "1.0.12"): ["fastdom.LICENSE"],
+    ("npm", "strictdom", "1.0.1"): ["strictdom.LICENSE"],
     ("cargo", "gl", "0.14.0"): ["gl-rs.LICENSE"],
     ("cargo", "webkit6", "0.6.1"): ["webkit6-rs.LICENSE"],
     ("cargo", "webkit6-sys", "0.6.0"): ["webkit6-rs.LICENSE"],
@@ -1295,6 +1305,53 @@ def kit_entries(shipped, counts):
              "files": [("vimium-LICENSE", text)]}]
 
 
+MARKDOWN_PLUGIN_WEB = os.path.join("plugins", "markdown", "web")
+# The first line of the plugin's src/style/markdown.css, a `/*!` comment esbuild keeps (`legalComments: "eof"`).
+MARKDOWN_NOTICE_MARKER = b"Adapted from Visual Studio Code's Markdown preview"
+MARKDOWN_NOTICE_TEXT = "vscode-markdown-preview.txt"
+
+
+def refuse_markdown_layout_engines(pkgs):
+    """Mermaid 12 depends on elkjs, which is EPL-2.0 OR GPL-3.0-or-later; so is the ELK layout package. The preview
+    ships Mermaid 11 and neither, and a dependency bump that brings one in fails here, by name."""
+    for p in pkgs:
+        if p["name"] == "elkjs" or p["name"].startswith("@mermaid-js/layout-elk"):
+            raise Fail(f"{p['name']} {p['version']} is in the Markdown preview's tree: EPL-2.0 OR GPL-3.0-or-later")
+        if p["name"] == "mermaid" and int(p["version"].split(".")[0]) >= 12:
+            raise Fail(f"mermaid {p['version']} is in the Markdown preview's tree: 12 and later pull in elkjs "
+                       "(EPL-2.0 OR GPL-3.0-or-later); the preview ships Mermaid 11")
+
+
+def markdown_plugin_packages(repo=REPO):
+    """The npm packages of the Markdown preview plugin's page, which ships as a plugin directory, not in `shell`."""
+    pkgs = npm_packages(os.path.join(repo, MARKDOWN_PLUGIN_WEB))
+    refuse_markdown_layout_engines(pkgs)
+    return pkgs
+
+
+def markdown_notice_entries(counts, repo=REPO):
+    """VS Code's MIT notice, for the preview's stylesheet and scroll sync adapted from VS Code's Markdown preview: not
+    an npm package, so no tree lists it. Printed when the plugin's build output carries the marker."""
+    dist = os.path.join(repo, MARKDOWN_PLUGIN_WEB, "dist")
+    found = False
+    for name in ("preview.css", "preview.js"):
+        path = os.path.join(dist, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                found = found or MARKDOWN_NOTICE_MARKER in f.read()
+    if not found:
+        return []
+    text = read_text(os.path.join(TEXTS, MARKDOWN_NOTICE_TEXT))
+    if "MIT License" not in text or "Microsoft Corporation" not in text:
+        raise Fail(f"license-texts/{MARKDOWN_NOTICE_TEXT} is no longer VS Code's MIT notice; re-check it")
+    counts["MIT"] = counts.get("MIT", 0) + 1
+    return [{"title": "Visual Studio Code's Markdown preview (stylesheet and scroll sync adapted into the Markdown "
+                      "preview plugin)", "name": "vscode-markdown-preview", "version": "", "license": "MIT",
+             "status": None, "copyleft": False,
+             "note": "adapted source, not an npm dependency; in the plugin's preview.css and preview.js",
+             "files": [(MARKDOWN_NOTICE_TEXT, text)]}]
+
+
 def artwork_entries(repo=REPO):
     """The one entry for Eitri's own artwork (ARTWORK_DIR under `repo`), or a Fail: the directory must
     hold exactly ARTWORK_FILES, its LICENSE must be the notice (ARTWORK_NOTICE) word for word,
@@ -1335,13 +1392,15 @@ def nvim_rs_lgpl_notice(version):
 
 
 def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web_count, sc, sc_pkgs_count,
-                  counts_rust, counts_web, counts_sc, skia_archive_count=0, artwork_count=0):
+                  counts_rust, counts_web, counts_sc, skia_archive_count=0, artwork_count=0, plugin_count=0,
+                  counts_plugin=None):
     """The prose block before PART 1, as its own function so a unit test can check the two profiles'
     shapes without a real build. `sc` is the sidecar_facts()
     dict, or None when no_sidecar. `skia_archive_count` (no_sidecar only) is the number of entries
     skia_archive_notice_entries() found, for the "Contents:" list below; that list
     used to stop at part 3/4 and never mentioned the archive-contents section at all. `artwork_count`
-    is the number of entries artwork_entries() found (Eitri's own icon, under its own licence)."""
+    is the number of entries artwork_entries() found (Eitri's own icon, under its own licence). `plugin_count` and
+    `counts_plugin` describe part 5, the Markdown preview plugin's page, which ships as a plugin directory."""
     nvim_rs = next((e for e in copyleft if e["name"] == "nvim-rs"), None)
     if nvim_rs is None:
         raise Fail("no nvim-rs entry in copyleft: the LGPL-3.0 sec 4(a) notice has no version to name")
@@ -1390,6 +1449,8 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     ]
     if not no_sidecar:
         L.append(f"  part 4  the sidecar: Node.js {sc['node']} and its npm packages              ({sc_pkgs_count})")
+    if plugin_count:
+        L.append(f"  part 5  npm packages in the Markdown preview plugin's page, a plugin directory  ({plugin_count})")
     if no_sidecar:
         L.append(f"  also    components inside the Skia prebuilt archive in the source asset      ({skia_archive_count})")
     if artwork_count:
@@ -1398,6 +1459,8 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
     parts = [("part 1", counts_rust), ("part 3", counts_web)]
     if not no_sidecar:
         parts.append(("part 4", counts_sc))
+    if counts_plugin:
+        parts.append(("part 5", counts_plugin))
     for title, counts in parts:
         L.append(f"Licence expressions, {title}:")
         for k in sorted(counts, key=lambda k: (-counts[k], k)):
@@ -1430,13 +1493,15 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
                    "source asset ships the whole Skia prebuilt archive, and its own components need "
                    "a notice regardless of what the shipped binaries link")
 
-    counts_rust, counts_web, counts_sc = {}, {}, {}
+    counts_rust, counts_web, counts_sc, counts_plugin = {}, {}, {}, {}
     crates, by_nv = cargo_packages(repo)
     rust = [resolve(p, by_nv, counts_rust) for p in crates]
     native = native_components(by_nv, shipped, binaries_dir, skia_license_dir)
     web = [resolve(p, by_nv, counts_web) for p in npm_packages(os.path.join(repo, "agent-ui", "web"))]
     web += vite_runtime(shipped, counts_web, repo)
     web += kit_entries(shipped, counts_web)
+    plugin = [resolve(p, by_nv, counts_plugin) for p in markdown_plugin_packages(repo)]
+    plugin += markdown_notice_entries(counts_plugin, repo)
 
     sc, sc_pkgs, excluded, archive_entries = None, [], [], []
     if not no_sidecar:
@@ -1468,7 +1533,8 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
 
     artwork = artwork_entries(repo)
     L = build_header(no_sidecar, source_url, copyleft, len(rust), len(native), len(web), sc,
-                      len(sc_pkgs), counts_rust, counts_web, counts_sc, len(archive_entries), len(artwork))
+                      len(sc_pkgs), counts_rust, counts_web, counts_sc, len(archive_entries), len(artwork),
+                      plugin_count=len(plugin), counts_plugin=counts_plugin)
 
     printed = {}
     L += [RULE, "PART 1 -- Rust crates linked into the shipped binaries", RULE, ""]
@@ -1495,6 +1561,8 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
               "this build linked, not just the parts the binaries above actually reference -- so every",
               "component it contains needs a notice, whether or not it appears in PART 2.", ""]
         render_entries(archive_entries, printed, L)
+    L += ["", RULE, "PART 5 -- the Markdown preview plugin's web bundle (a plugin directory, not in shell)", RULE, ""]
+    render_entries(plugin, printed, L)
     # Last in both profiles, so publish.sh's byte-equality of parts 1-3 is not touched by it.
     L += ["", RULE, "Eitri's own artwork -- the icon files this package installs", RULE, ""]
     L += ["The application icon (hicolor/<size>/apps/cn.huntergrey.eitri.png and the scalable .svg) is not",
@@ -1505,7 +1573,7 @@ def collect(repo, binaries_dir, no_sidecar, source_url, sidecar_artifact=None, v
         raise Fail("no nvim-rs entry in the resolved copyleft crates: the LGPL-3.0 sec 4(a) notice "
                    "has no version to name")
     return "\n".join(L).rstrip("\n") + "\n", {"rust": counts_rust, "native": [c["title"] for c in native],
-                                               "web": counts_web, "sidecar": counts_sc,
+                                               "web": counts_web, "sidecar": counts_sc, "plugin": counts_plugin,
                                                "excluded": [p["name"] for p in excluded],
                                                "skia_archive": [c["title"] for c in archive_entries],
                                                "artwork": [e["title"] for e in artwork],

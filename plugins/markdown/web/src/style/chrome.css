@@ -1,0 +1,103 @@
+/* The page's own furniture around the document: notices, boxes for what was not shown, the markers beside blocks.
+   Text is drawn in --nv-fg, --nv-muted or a surface's own text colour; signal colours only on borders, fills and
+   decorations. */
+.mdp-notice {
+  margin: 0 0 1em;
+  padding: 8px 12px;
+  border-left: 3px solid var(--nv-border);
+  background-color: var(--nv-surface);
+  color: var(--nv-surface-fg);
+}
+
+.mdp-notice:empty {
+  display: none;
+}
+
+/* An image or diagram that was not shown: its alt text and the reason, in place. */
+.mdp-box {
+  display: inline-flex;
+  gap: 0.5em;
+  align-items: baseline;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px dashed var(--nv-border);
+  border-radius: 3px;
+  color: var(--nv-muted);
+  font-size: 0.9em;
+}
+
+div.mdp-box {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 16px;
+}
+
+.mdp-box-reason {
+  font-family: var(--nv-font-mono);
+}
+
+.mdp-error-badge {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--nv-error);
+  border-radius: 3px;
+  font-size: 0.85em;
+  color: var(--nv-fg);
+}
+
+.mdp-math-error {
+  font-family: var(--nv-font-mono);
+  text-decoration: underline wavy var(--nv-error);
+  text-underline-offset: 3px;
+}
+
+/* A diagram is drawn at its natural size, scaled down to the column when wider; a tall one is read by scrolling. */
+.mdp-diagram {
+  margin: 0 0 16px;
+  overflow-x: auto;
+}
+
+.mdp-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.mdp-diagram-pending {
+  min-height: 2em;
+  padding: 8px;
+  border: 1px dashed var(--nv-border);
+  color: var(--nv-muted);
+  font-family: var(--nv-font-mono);
+  white-space: pre-wrap;
+}
+
+/* A block that scrolls sideways (zh / zl): a wide code block, table, formula or diagram. */
+.mdp-wide {
+  overflow-x: auto;
+}
+
+/* The bars in the left margin: nvim's cursor line while nvim leads, the reading position's block while the preview
+   has the keys. Placed by the page in document coordinates. */
+.mdp-cursor-bar, .mdp-current-bar {
+  position: absolute;
+  width: 3px;
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+.mdp-cursor-bar {
+  background-color: var(--nv-chrome-accent);
+}
+
+.mdp-current-bar {
+  background-color: var(--nv-focus-ring);
+}
+
+.mdp-cursor-bar[hidden], .mdp-current-bar[hidden] {
+  display: none;
+}
+
+/* The end sentinel closes the last gap of the line index, which leaves out zero-height elements: it keeps one pixel. */
+.mdp-root > div.code-line:last-child:empty {
+  min-height: 1px;
+}

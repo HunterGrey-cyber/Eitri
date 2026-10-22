@@ -62,7 +62,7 @@ use eitri_core::keymap::action::{FloatRule, SelectionRule, SplitCwd};
 use eitri_core::keymap::keys_return::{AtClose, KeysReturn, Opened as KeysOpened};
 use eitri_core::keymap::prefix::WorkspacePick;
 use eitri_core::keymap::{Action, SwapTarget, TabAction};
-use eitri_core::layout::rules::{OpenPoint, RuleSize};
+use eitri_core::layout::rules::{without_keys, At, OpenPoint, RuleSize};
 use eitri_core::layout::workspace::MAIN;
 use eitri_core::layout::{
     declared_placement, Axis, ConLayout, Direction, KeyAction, KillScope, Layout, LayoutError, ModuleDecl, ModuleId,
@@ -272,6 +272,12 @@ fn build_ui(
     // Initialize `gtk-xft-dpi` before building any agent or Lua panel WebView,
     // so it is set when the WebView reads it.
     xft_dpi::ensure_xft_dpi();
+    // The plugin trace lines a GUI pass reads exist only in a probe build, switched on from its environment before
+    // any plugin page is made (a page built with the trace on also writes its console to stdout).
+    #[cfg(feature = "probe")]
+    if std::env::var_os("EITRI_PLUGIN_TRACE").is_some_and(|v| v == "1") {
+        eitri_core::plugin::trace::set_enabled(true);
+    }
     // The application id is also the icon's name in the icon theme (`packaging/icons` installs it as
     // `cn.huntergrey.eitri`). On Wayland the compositor takes a window's icon from the desktop entry of
     // the same id (`packaging/cn.huntergrey.eitri.desktop`) and ignores this; an X11 session, and the
@@ -376,6 +382,18 @@ fn build_ui(
             std::process::exit(1);
         }
     };
+    plugin_panels.set_window_root(project_root);
+    // The socket nvim reports followed buffers and plugin commands to, bound only when a loaded plugin follows the
+    // editor or defines nvim commands: a window without one has no such socket at all. Bound now, before any page
+    // exists, so the commands work before the module is first shown.
+    let mut follow_socket = if plugin_panels.wants_follow_feed() {
+        eitri_core::plugin::follow_feed::FollowSocket::bind()
+    } else {
+        None
+    };
+    if let Some(socket) = &follow_socket {
+        plugin_panels.set_follow_feed(socket.socket_path(), scratch_path.as_deref());
+    }
 
     // The bottom terminal starts hidden on first launch. Its shell starts when it is first shown
     // through any route, via the change hook below. A terminal that is never shown starts no
@@ -445,14 +463,34 @@ fn build_ui(
             })
             .collect(),
     );
-    // The Lua panels as `init.lua` registered them, each at its own `position`. Where the window
-    // places modules by itself (`decls`, below) is these with the open rules applied.
+    // The plugin modules that start hidden: the window never places them by itself. Each has its host, its
+    // page entry and its module key from startup; its page is built the first time it is shown, and its
+    // first show opens it by its own rule (`open_plugin_module`).
+    let deferred: Vec<ModuleId> = lua_panels
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .filter(|id| plugin_panels.starts_hidden(id))
+        .collect();
+    // The Lua panels as `init.lua` registered them, each at its own `position` (a plugin's at its own
+    // rule's place when the rule says where), the deferred ones left out. Where the window places
+    // modules by itself (`decls`, below) is these with the open rules applied.
     let panel_decls: Vec<ModuleDecl> = lua_panels
         .iter()
+        .filter(|(id, _, _)| !deferred.contains(id))
         .map(|(id, slot, _)| ModuleDecl {
             id: id.clone(),
-            placement: slot.placement(),
+            placement: plugin_panels
+                .own_rule(id)
+                .and_then(|rule| rule.at)
+                .map_or(slot.placement(), |at| without_keys(at).0),
         })
+        .collect();
+    // The whole declared rule of each plugin that starts shown: a first launch applies its `size` (and a float's
+    // `focus`) as well as its place, as the open rules would.
+    let own_rules: Vec<(ModuleId, OpenRule)> = lua_panels
+        .iter()
+        .filter(|(id, _, _)| !deferred.contains(id))
+        .filter_map(|(id, _, _)| plugin_panels.own_rule(id).map(|rule| (id.clone(), rule)))
         .collect();
     // Each Lua panel's module key after `Ctrl+a`. A key that is reserved,
     // taken twice or not one character is a startup failure naming it, as `agent.font_size` is:
@@ -490,6 +528,8 @@ fn build_ui(
             // A page's multi-key sequences wait as long as the editor's do.
             plugin_panels.set_timeoutlen(report.timeoutlen);
             keys_help.nvim_report(report);
+            // The feed reports at nvim's VimEnter: a new editor session may be ready for the plugins' snippets.
+            plugin_panels.editor_session();
         });
     }
     // The layout this window opens with: this project's state file if
@@ -528,7 +568,7 @@ fn build_ui(
     );
     let loaded = state_dir
         .as_deref()
-        .map(|dir| eitri_core::layout::persist::load(dir, project_root, &decls));
+        .map(|dir| eitri_core::layout::persist::load_with(dir, project_root, &decls, &deferred));
     // The key that shows the editor, as the keymap binds it: named by the note a layout that hides
     // the editor prints, the way the toast names its own way back.
     let show_editor: Option<String> = keymap
@@ -538,24 +578,30 @@ fn build_ui(
     // `module_layout` is the current workspace's layout, the one every reader of the live layout holds;
     // `workspaces` holds the window's other workspaces beside it, and what a later build keeps in the
     // file.
-    let (workspaces, module_layout, keep_copy) =
-        match layout_state::choose_startup_layout(lua_default.as_ref(), loaded, &decls, &rules, show_editor.as_deref())
-        {
-            Ok((workspaces, layout, notes, keep_copy)) => {
-                for note in notes {
-                    println!("[layout] {note}");
-                }
-                (
-                    Rc::new(RefCell::new(workspaces)),
-                    Rc::new(RefCell::new(layout)),
-                    keep_copy,
-                )
+    let (workspaces, module_layout, keep_copy) = match layout_state::choose_startup_layout(
+        lua_default.as_ref(),
+        loaded,
+        &decls,
+        &rules,
+        show_editor.as_deref(),
+        &deferred,
+        &own_rules,
+    ) {
+        Ok((workspaces, layout, notes, keep_copy)) => {
+            for note in notes {
+                println!("[layout] {note}");
             }
-            Err(message) => {
-                eprintln!("eitri: {message}");
-                std::process::exit(1);
-            }
-        };
+            (
+                Rc::new(RefCell::new(workspaces)),
+                Rc::new(RefCell::new(layout)),
+                keep_copy,
+            )
+        }
+        Err(message) => {
+            eprintln!("eitri: {message}");
+            std::process::exit(1);
+        }
+    };
     let defined = lua_engine
         .layout
         .borrow()
@@ -575,6 +621,7 @@ fn build_ui(
         &mut module_layout.borrow_mut(),
         &defined,
         &decls,
+        &deferred,
     ) {
         Ok(notes) => {
             for note in notes {
@@ -594,6 +641,7 @@ fn build_ui(
         decls.clone(),
         keep_copy,
     );
+    layout_saver.set_deferred(deferred.clone());
     // Every module's host, added once and never reparented (`module_grid`'s module doc).
     let grid = ModuleGrid::new(module_layout.clone());
     // Wrap the editor in an overlay with a hidden failure-message label before adding it to the
@@ -678,6 +726,16 @@ fn build_ui(
         }
         grid.add(id.clone(), &WebHost::new(widget), widget, web_host);
     }
+    // A plugin that starts hidden costs no web process until its module is first shown. A layout that
+    // reopens one shown builds its page now; every later first show, by any route, builds it in the
+    // change hook below.
+    let shown_at_start: Vec<ModuleId> = {
+        let layout = module_layout.borrow();
+        deferred.iter().filter(|id| layout.is_shown(id)).cloned().collect()
+    };
+    for id in &shown_at_start {
+        plugin_panels.build_page(id, &plugin_panels.theme());
+    }
     // A terminal's shell starts the first time it is shown, however it got there -- `Ctrl+a t`,
     // `Ctrl+a \ t`, a new instance, its tray chip, `eitri.layout.show`, a saved layout -- rather than
     // only on the `Ctrl+a t` path. Every live pane that is shown and has no shell running is started;
@@ -711,6 +769,50 @@ fn build_ui(
             }
         });
     }
+    // A plugin that starts hidden gets its page the first time its module is shown, however it got there:
+    // its key, `module.<id>`, a split key, a tray chip, a workspace switch, `eitri.layout.show`.
+    {
+        let module_layout = module_layout.clone();
+        let plugin_panels = plugin_panels.clone();
+        let deferred = deferred.clone();
+        grid.connect_changed(move || {
+            // Bound before any build: a build adds a widget, and nothing may hold the layout across it.
+            let building: Vec<ModuleId> = {
+                let Ok(layout) = module_layout.try_borrow() else {
+                    eprintln!("[plugin] BUG: the layout was borrowed when it changed; no page was built");
+                    return;
+                };
+                deferred
+                    .iter()
+                    .filter(|id| layout.is_shown(id) && !plugin_panels.is_built(id))
+                    .cloned()
+                    .collect()
+            };
+            for id in building {
+                plugin_panels.build_page(&id, &plugin_panels.theme());
+            }
+        });
+    }
+    // Each plugin host hears whether its module is drawn: nvim follows a buffer for a page only while it is. Hooked
+    // before the startup `apply`, which runs it once for the layout the window opens with.
+    {
+        let module_layout = module_layout.clone();
+        let plugin_panels = plugin_panels.clone();
+        let modules = plugin_panels.modules();
+        grid.connect_changed(move || {
+            // Read and released before any host is told: nothing may hold the layout across a host call.
+            let visible: Vec<ModuleId> = {
+                let Ok(layout) = module_layout.try_borrow() else {
+                    eprintln!("[plugin] BUG: the layout was borrowed when it changed; no plugin was told it is drawn");
+                    return;
+                };
+                layout.visible_modules()
+            };
+            for id in &modules {
+                plugin_panels.set_on_screen(id, visible.contains(id));
+            }
+        });
+    }
     grid.apply();
     // Every change of the arrangement is written to this project's state file, 500ms after the last
     // one, and once more when the window closes if it is still unwritten; a change of the
@@ -740,6 +842,7 @@ fn build_ui(
         let pane = pane.clone();
         let grid = grid.clone();
         let module_layout = module_layout.clone();
+        let plugin_panels = plugin_panels.clone();
         Rc::new(move |id| {
             match module_layout.try_borrow() {
                 Ok(layout) if !layout.is_shown(id) => {
@@ -750,6 +853,12 @@ fn build_ui(
                 // No caller holds the layout for writing while it moves focus (`ModuleGrid::apply`,
                 // `hide_module`); this line is how a new one would show up.
                 Err(_) => eprintln!("[focus] BUG: the layout was borrowed for writing when {id} was given the keys"),
+            }
+            // A start-hidden plugin's slot holds no view until its page is built, and an empty slot refuses the
+            // grab. A workspace switch and an open give the keys before the change hooks that build it run, so
+            // the page is built here first, with no layout borrow held.
+            if plugin_panels.starts_hidden(id) && !plugin_panels.is_built(id) {
+                plugin_panels.build_page(id, &plugin_panels.theme());
             }
             if id.kind() == ModuleKind::Editor {
                 pane.grab_focus();
@@ -956,6 +1065,8 @@ fn build_ui(
             // The derived tokens, not the panel's sized ones: a page's set carries no size, so a size-only
             // change leaves it equal and sends the pages nothing.
             plugin_panels.set_theme(&tokens);
+            // The feed reports at nvim's VimEnter: a new editor session may be ready for the plugins' snippets.
+            plugin_panels.editor_session();
         });
     }
 
@@ -1503,10 +1614,32 @@ fn build_ui(
     // `show_on_screen` restores `id` where it was hidden and leaves keyboard focus
     // where it is. Lua show calls and module keys for hidden modules use this path.
     // End a zoom first if it would hide `id`, so a successful show puts it on screen.
+    // A plugin that starts hidden and is absent from this workspace opens through
+    // its own rule (`open_plugin_module`), leaving keyboard focus where it is.
     let show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
+        let rules = rules.clone();
+        let workspaces = workspaces.clone();
+        let plugin_panels = plugin_panels.clone();
+        let give_keys = give_keys.clone();
         Rc::new(move |id| {
+            let (held, keys) = {
+                let layout = module_layout.borrow();
+                (layout.contains(id), layout.focus().clone())
+            };
+            if !held && plugin_panels.starts_hidden(id) {
+                return open_plugin_module(
+                    &grid,
+                    &rules,
+                    &workspaces,
+                    &plugin_panels,
+                    id,
+                    Some(&keys),
+                    Some(false),
+                    &*give_keys,
+                );
+            }
             let zoom_hides = {
                 let layout = module_layout.borrow();
                 if !layout.contains(id) {
@@ -1528,6 +1661,20 @@ fn build_ui(
             show_on_screen(id).map_err(|e| e.to_string())?;
             focus_and_arrive(id).map_err(|e| e.to_string())
         }));
+    }
+    // The follow socket's lines: views and gone buffers to their plugins, and the plugins' nvim commands applied to
+    // their modules in the order they were typed, the keys left where they are.
+    if let Some(socket) = follow_socket.as_mut() {
+        let window = GridFollowWindow {
+            module_layout: module_layout.clone(),
+            grid: grid.downgrade(),
+            show_on_screen: show_on_screen.clone(),
+            focus_module: focus_module.clone(),
+        };
+        let plugin_panels = plugin_panels.clone();
+        feed_pump.listen_follow(socket, move |batch| {
+            plugin_panels::apply_follow_commands(&window, plugin_panels.route_follow(batch, std::time::Instant::now()));
+        });
     }
     // The scratch round trips (`Ctrl+g`, `gf`): the editor is shown and given the keys before nvim
     // is handed the request, and an edit that came back returns the keys to the chat.
@@ -1597,12 +1744,16 @@ fn build_ui(
     }
     // `place_and_arrive`: `id` into a new split after the module with the keys, along `axis`, moved
     // there if it is elsewhere, and the keys to it (`Ctrl+a \`/`"` + a key, `Ctrl+a <key>` for a
-    // module never placed, `eitri.layout.split`).
+    // module never placed, `eitri.layout.split`). A start-hidden plugin module placed this way is then
+    // held, hidden, by every other workspace that lacks it, as one opened by its rule is.
     let place_and_arrive: Rc<dyn Fn(&ModuleId, Axis) -> Result<(), LayoutError>> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
         let terminals = terminals.clone();
         let chat_views = chat_views.clone();
+        let rules = rules.clone();
+        let workspaces = workspaces.clone();
+        let plugin_panels = plugin_panels.clone();
         let give_keys = give_keys.clone();
         let arrive = arrive.clone();
         Rc::new(move |id, axis| {
@@ -1613,6 +1764,10 @@ fn build_ui(
             placeable_by_id(id, live)?;
             let target = module_layout.borrow().focus().clone();
             grid.place_module(id, &target, axis)?;
+            if plugin_panels.starts_hidden(id) {
+                let placement = plugin_hidden_placement(&rules, plugin_panels.own_rule(id).as_ref(), id);
+                workspaces.borrow_mut().add_everywhere_at(id, placement);
+            }
             if give_keys(id) {
                 arrive(id);
             }
@@ -1622,8 +1777,15 @@ fn build_ui(
 
     // `Ctrl+a <key>`'s four cases for a module,
     // for the prefix and the tray's chips; a refusal flashes the app name.
+    // A plugin module that starts hidden is opened by its own rule rather than split beside the keys, and
+    // its key gives it the keys as every module key does (`open_plugin_module`).
     let open_module: Rc<dyn Fn(&ModuleId, KeyAction)> = {
         let grid = grid.clone();
+        let module_layout = module_layout.clone();
+        let rules = rules.clone();
+        let workspaces = workspaces.clone();
+        let plugin_panels = plugin_panels.clone();
+        let give_keys = give_keys.clone();
         let focus_module = focus_module.clone();
         let focus_and_arrive = focus_and_arrive.clone();
         let show_on_screen = show_on_screen.clone();
@@ -1633,6 +1795,19 @@ fn build_ui(
         Rc::new(move |id, action| {
             println!("[modules] {id}: {action:?}");
             let result = match action {
+                KeyAction::Place | KeyAction::ShowAndFocus if plugin_panels.starts_hidden(id) => {
+                    let keys = module_layout.borrow().focus().clone();
+                    open_plugin_module(
+                        &grid,
+                        &rules,
+                        &workspaces,
+                        &plugin_panels,
+                        id,
+                        Some(&keys),
+                        Some(true),
+                        &*give_keys,
+                    )
+                }
                 KeyAction::ShowAndFocus => show_on_screen(id).and_then(|()| focus_and_arrive(id)),
                 KeyAction::Focus => focus_and_arrive(id),
                 KeyAction::Place => place_and_arrive(id, Axis::Row),
@@ -1662,9 +1837,12 @@ fn build_ui(
         let focus_module = focus_module.clone();
         let workspaces = workspaces.clone();
         let released = Rc::downgrade(&pane);
+        let plugin_panels = plugin_panels.clone();
         Rc::new(move || {
             let Some(grid) = grid.upgrade() else { return Ok(()) };
             grid.kill_module(&ModuleId::editor(), Reopen::Never, &*focus_module)?;
+            // No editor is coming back to this window: a page following one says so.
+            plugin_panels.editor_closed();
             grid.with_current_frame(|frame| workspaces.borrow_mut().retire_everywhere(&ModuleId::editor(), frame));
             println!("[modules] editor: nvim quit; the editor is closed for this window");
             let released = released.clone();
@@ -1865,7 +2043,12 @@ fn build_ui(
                     // A no-op for a Lua panel that is not a plugin.
                     plugin_panels.stop(id);
                     if let Some((_, widget, _, _)) = lua_pages.iter().find(|(m, _, _, _)| m == id) {
-                        if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
+                        // A plugin page built after startup sits inside its module's slot; one never built
+                        // has no web process to end.
+                        let webview = plugin_panels
+                            .webview(id)
+                            .or_else(|| widget.downcast_ref::<webkit6::WebView>().cloned());
+                        if let Some(webview) = webview {
                             use webkit6::prelude::*;
                             webview.terminate_web_process();
                         }
@@ -1909,6 +2092,7 @@ fn build_ui(
         let killed = killed.clone();
         let agent = agent_panel_handle.clone();
         let lua_pages = lua_pages.clone();
+        let plugin_panels = plugin_panels.clone();
         grid.connect_changed(move || {
             let revived: Vec<ModuleId> = {
                 let Ok(layout) = module_layout.try_borrow() else {
@@ -1929,7 +2113,10 @@ fn build_ui(
                     ModuleKind::Agent => agent.open_chooser(ViewId::of_module(&id).expect("a chat module")),
                     ModuleKind::LuaWebview => {
                         if let Some((_, widget, url, crash_guard)) = lua_pages.iter().find(|(m, _, _, _)| *m == id) {
-                            if let Some(webview) = widget.downcast_ref::<webkit6::WebView>() {
+                            let webview = plugin_panels
+                                .webview(&id)
+                                .or_else(|| widget.downcast_ref::<webkit6::WebView>().cloned());
+                            if let Some(webview) = webview {
                                 use webkit6::prelude::*;
                                 webview.load_uri(url);
                             }
@@ -2913,6 +3100,7 @@ fn build_ui(
         let module_layout = module_layout.clone();
         let lua_engine = lua_engine.clone();
         let decls = decls.clone();
+        let deferred = deferred.clone();
         let switch_workspace = switch_workspace.clone();
         Rc::new(move |name| {
             let exists = workspaces.borrow().order().iter().any(|existing| existing == name);
@@ -2925,11 +3113,18 @@ fn build_ui(
                     .iter()
                     .find(|(defined, _)| defined == name)
                     .map(|(_, tree)| tree.clone());
-                let (layout, notes, gone) = {
+                let (layout, notes, gone, spread) = {
                     let live = module_layout.borrow();
-                    let (layout, notes) = new_workspace_layout(template, &live, &decls)?;
+                    let (layout, notes) = new_workspace_layout(template, &live, &decls, &deferred)?;
                     let gone: Vec<ModuleId> = live.modules().into_iter().filter(|id| live.is_gone(id)).collect();
-                    (layout, notes, gone)
+                    // A start-hidden plugin module the definition names and the window holds nowhere yet: once
+                    // this workspace holds it, every other one holds it hidden, as at startup.
+                    let spread: Vec<ModuleId> = deferred
+                        .iter()
+                        .filter(|id| layout.contains(id) && !live.contains(id))
+                        .cloned()
+                        .collect();
+                    (layout, notes, gone, spread)
                 };
                 for note in notes {
                     println!("[layout] workspace '{name}': {note}");
@@ -2942,6 +3137,17 @@ fn build_ui(
                 // in a workspace made after it.
                 for id in gone {
                     grid.with_current_frame(|frame| workspaces.borrow_mut().retire_everywhere(&id, frame));
+                }
+                for id in spread {
+                    let mut live = module_layout.borrow_mut();
+                    let mut modules = live.modules();
+                    modules.push(id.clone());
+                    for note in eitri_core::layout::fit_to_with(&mut live, &modules, &decls) {
+                        println!("[layout] workspace '{}': {note}", workspaces.borrow().current());
+                    }
+                    workspaces
+                        .borrow_mut()
+                        .add_everywhere_at(&id, declared_placement(&decls, &id, Placement::BelowEditor));
                 }
                 println!("[workspace] made {name}");
             }
@@ -4080,8 +4286,11 @@ fn build_ui(
     {
         let editor_quitting_for_exit = editor_quitting.clone();
         let review_for_exit = agent_panel_handle.clone();
+        let plugin_panels = plugin_panels.clone();
         pane.on_exited_unrequested(move || {
             review_for_exit.review_editor_lost();
+            // Before the exit is acted on, which may close the window: a page following the editor hears it ended.
+            plugin_panels.editor_closed();
             editor_quitting_for_exit.nvim_exited();
         });
         let editor_quitting = editor_quitting.clone();
@@ -4135,6 +4344,10 @@ fn build_ui(
         let focus_and_arrive = focus_and_arrive.clone();
         let show_on_screen = show_on_screen.clone();
         let place_and_arrive = place_and_arrive.clone();
+        let rules = rules.clone();
+        let workspaces = workspaces.clone();
+        let plugin_panels = plugin_panels.clone();
+        let give_keys = give_keys.clone();
         let run_action = run_action.clone();
         let refresh_mark = refresh_mark.clone();
         let refresh_selection = refresh_selection.clone();
@@ -4179,6 +4392,23 @@ fn build_ui(
                             eprintln!("[lua] layout: {request:?} refused: {text}");
                         }
                         Ok(())
+                    }
+                    // A plugin module that starts hidden, which this workspace does not hold yet: its own
+                    // rule's `focus` decides whether it takes the keys.
+                    LayoutRequest::Show(id)
+                        if plugin_panels.starts_hidden(id) && !module_layout.borrow().contains(id) =>
+                    {
+                        let keys = module_layout.borrow().focus().clone();
+                        open_plugin_module(
+                            &grid,
+                            &rules,
+                            &workspaces,
+                            &plugin_panels,
+                            id,
+                            Some(&keys),
+                            None,
+                            &*give_keys,
+                        )
                     }
                     LayoutRequest::Show(id) => show_on_screen(id),
                     LayoutRequest::Hide(id) => grid.hide_module(id, &*focus_module),
@@ -4395,6 +4625,10 @@ fn build_ui(
         if let Some(feed) = &nvim_keys_feed {
             feed.cleanup();
         }
+        // The plugins' follow socket, for the same two reasons.
+        if let Some(socket) = &follow_socket {
+            socket.cleanup();
+        }
         // Shut down any `AgentSession` started by the panel. If the mode-selector screen
         // was never left, this is a no-op. The session's `Rc<RefCell<AgentPanelState>>`
         // is otherwise held by internal closures that do not run on window close, so
@@ -4443,6 +4677,52 @@ fn flash(app_name: &gtk4::Label) {
     });
     if let Some(earlier) = REFUSAL_ENDS.with(|slot| slot.borrow_mut().replace(ends)) {
         earlier.remove();
+    }
+}
+
+/// What a plugin's nvim commands do to its module in this window: a show puts it on screen (opening a start-hidden
+/// one by its rule the first time) with the keys where they are, a hide sends the keys where any hide sends them.
+struct GridFollowWindow {
+    module_layout: Rc<RefCell<eitri_core::layout::Layout>>,
+    grid: glib::WeakRef<ModuleGrid>,
+    show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>>,
+    focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
+}
+
+impl plugin_panels::FollowWindow for GridFollowWindow {
+    fn is_shown(&self, module: &ModuleId) -> bool {
+        self.module_layout.borrow().is_shown(module)
+    }
+
+    fn is_on_screen(&self, module: &ModuleId) -> bool {
+        self.module_layout.borrow().is_visible(module)
+    }
+
+    fn show(&self, module: &ModuleId) {
+        if let Err(err) = (self.show_on_screen)(module) {
+            println!("[modules] {module}: the editor asked to show it, refused: {err}");
+            return;
+        }
+        // Showing ends a zoom that hides it, but a tab its container does not draw stays behind; its tab is drawn
+        // unless that would hide the module with the keys.
+        let brought = {
+            let mut layout = self.module_layout.borrow_mut();
+            layout.is_tabbed_away(module) && layout.bring_forward(module)
+        };
+        if brought {
+            if let Some(grid) = self.grid.upgrade() {
+                grid.apply();
+            }
+        } else if self.module_layout.borrow().is_tabbed_away(module) {
+            println!("[modules] {module}: shown, but its tab stays behind the one with the keys");
+        }
+    }
+
+    fn hide(&self, module: &ModuleId) {
+        let Some(grid) = self.grid.upgrade() else { return };
+        if let Err(err) = grid.hide_module(module, &*self.focus_module) {
+            println!("[modules] {module}: the editor asked to hide it, refused: {err}");
+        }
     }
 }
 
@@ -5030,18 +5310,20 @@ fn resolve_pick(order: &[String], current: &str, pick: WorkspacePick) -> Pick {
 /// The layout a workspace made by name at runtime starts from: `init.lua`'s definition of that name,
 /// reconciled as the window's startup reconciles it and brought to the window's modules (`fit_to_with`:
 /// an instance the window lacks is left out, a module the definition does not place is hidden at its
-/// declared place in `lua`, else below the editor), else a copy of `live`, the current arrangement. The
-/// notes say what was left out or added.
+/// declared place in `lua`, else below the editor), else a copy of `live`, the current arrangement. A
+/// `deferred` module the definition names is kept, as the startup keeps it. The notes say what was left
+/// out or added.
 fn new_workspace_layout(
     template: Option<Result<eitri_core::lua::layout::LuaTree, String>>,
     live: &Layout,
     lua: &[ModuleDecl],
+    deferred: &[ModuleId],
 ) -> Result<(Layout, Vec<String>), String> {
     let Some(template) = template else {
         return Ok((live.fresh_copy(), Vec::new()));
     };
     let tree = template?;
-    let reconciled = eitri_core::layout::reconcile_default_floating(tree.tiled, tree.floats, lua)
+    let reconciled = eitri_core::layout::reconcile_default_floating_with(tree.tiled, tree.floats, lua, deferred)
         .map_err(|err| format!("eitri.layout.workspace: {err}"))?;
     let mut layout = reconciled.layout;
     let mut notes = reconciled.notes;
@@ -5182,6 +5464,73 @@ fn open_instance(
     }
 }
 
+/// The rule [`open_plugin_module`] opens `id` by: the open rules', the plugin's own counted where a Lua panel's
+/// `position` counts, at a new instance's point, with `focus` replaced by `take_keys` when the way it was opened
+/// decides who has the keys (`None`: the rule's own).
+fn plugin_open_rule(rules: &OpenRules, own: Option<&OpenRule>, id: &ModuleId, take_keys: Option<bool>) -> OpenRule {
+    let (mut rule, _) = rules.resolve_own(id, OpenPoint::NewInstance, own);
+    if let Some(take) = take_keys {
+        rule.focus = take;
+    }
+    rule
+}
+
+/// Where a start-hidden plugin's module goes, hidden, in a workspace that lacks it once another holds it: its rule's
+/// place as a tiled one (hidden there, it needs no float).
+fn plugin_hidden_placement(rules: &OpenRules, own: Option<&OpenRule>, id: &ModuleId) -> Placement {
+    let rule = plugin_open_rule(rules, own, id, None);
+    without_keys(rule.at.unwrap_or(At::Beside(Direction::Right))).0
+}
+
+/// Puts a start-hidden plugin's module on screen: shown where it was if the layout holds it; else opened by its
+/// rule ([`plugin_open_rule`]) beside `keys`, and put hidden into every other workspace that lacks it, as a new
+/// instance is. The keys move, through `focus`, only when it takes them. A zoom that would hide it ends first. Its
+/// page is built once the module is on screen (the grid's change hook) or about to take the keys (`focus_module`),
+/// so an open the grid refuses builds no page and starts no web process.
+#[allow(clippy::too_many_arguments)]
+fn open_plugin_module(
+    grid: &ModuleGrid,
+    rules: &OpenRules,
+    workspaces: &RefCell<Workspaces>,
+    panels: &plugin_panels::PluginPanels,
+    id: &ModuleId,
+    keys: Option<&ModuleId>,
+    take_keys: Option<bool>,
+    focus: &dyn Fn(&ModuleId) -> bool,
+) -> Result<(), LayoutError> {
+    let rule = plugin_open_rule(rules, panels.own_rule(id).as_ref(), id, take_keys);
+    let (held, zoom_hides) = {
+        let layout = grid.layout();
+        let layout = layout.borrow();
+        (layout.contains(id), layout.zoom_hides(id))
+    };
+    if held {
+        if zoom_hides {
+            grid.unzoom();
+        }
+        grid.show_module(id)?;
+        if rule.focus {
+            focus(id);
+        }
+        return Ok(());
+    }
+    let opened = grid.open_module(id, &rule, keys, focus)?;
+    for note in &opened.notes {
+        println!("[layout] {note}");
+    }
+    let placement = plugin_hidden_placement(rules, panels.own_rule(id).as_ref(), id);
+    workspaces.borrow_mut().add_everywhere_at(id, placement);
+    println!(
+        "[modules] {id}: opened by its rule{}",
+        if opened.takes_keys {
+            ""
+        } else {
+            ", the keys left where they were"
+        }
+    );
+    Ok(())
+}
+
 /// Logs a refused layout operation and flashes the top bar's app name for `REFUSAL_FLASH`. A
 /// separate CSS class preserves the prefix indicator if it is armed meanwhile. Another refusal
 /// restarts the flash timer. There is one window per process (`NON_UNIQUE`), so one timer per
@@ -5295,7 +5644,7 @@ mod tests {
     #[test]
     fn a_workspace_made_by_name_is_its_definition_fitted_to_the_window_else_a_copy() {
         let live = crate::terminal::initial_layout(&[]).unwrap();
-        let (copy, notes) = new_workspace_layout(None, &live, &[]).unwrap();
+        let (copy, notes) = new_workspace_layout(None, &live, &[], &[]).unwrap();
         assert_eq!(copy.root(), live.root(), "a copy keeps the arrangement");
         assert!(notes.is_empty());
 
@@ -5314,7 +5663,7 @@ mod tests {
             ),
             floats: Vec::new(),
         };
-        let (made, notes) = new_workspace_layout(Some(Ok(template)), &live, &[]).unwrap();
+        let (made, notes) = new_workspace_layout(Some(Ok(template)), &live, &[], &[]).unwrap();
         assert!(
             !made.contains(&two),
             "an instance the window lacks is left out: {notes:?}"
@@ -5324,9 +5673,36 @@ mod tests {
         }
         assert!(made.is_visible(&ModuleId::editor()));
         assert_eq!(
-            new_workspace_layout(Some(Err("bad tree".into())), &live, &[]).map(|_| ()),
+            new_workspace_layout(Some(Err("bad tree".into())), &live, &[], &[]).map(|_| ()),
             Err("bad tree".to_string())
         );
+    }
+
+    /// A definition that names a start-hidden plugin module keeps it, as the startup keeps one a template
+    /// names; without the window's list of them the leaf is left out as a module the window lacks.
+    #[test]
+    fn a_workspace_made_by_name_keeps_a_deferred_module_its_definition_names() {
+        let live = crate::terminal::initial_layout(&[]).unwrap();
+        let preview = ModuleId::lua("markdown");
+        let template = || eitri_core::lua::layout::LuaTree {
+            tiled: eitri_core::layout::Node::split(
+                Axis::Row,
+                0.6,
+                eitri_core::layout::Node::split(
+                    Axis::Row,
+                    0.5,
+                    eitri_core::layout::Node::Leaf(ModuleId::editor()),
+                    eitri_core::layout::Node::Leaf(ModuleId::agent()),
+                ),
+                eitri_core::layout::Node::Leaf(preview.clone()),
+            ),
+            floats: Vec::new(),
+        };
+        let (made, notes) = new_workspace_layout(Some(Ok(template())), &live, &[], &[preview.clone()]).unwrap();
+        assert!(made.is_shown(&preview), "{notes:?}");
+        let (made, notes) = new_workspace_layout(Some(Ok(template())), &live, &[], &[]).unwrap();
+        assert!(!made.contains(&preview));
+        assert!(notes.iter().any(|n| n.contains("left out 'lua:markdown'")), "{notes:?}");
     }
 
     /// A killed numbered terminal, whose host the grid keeps, is not placed again by name; a live one
@@ -5465,6 +5841,56 @@ mod tests {
         };
         assert_eq!(rule_for(&rules, &t3, OpenPoint::NewInstance, Some(&explicit)), explicit);
         assert_eq!(rule_for(&none, &t2, OpenPoint::NewInstance, Some(&explicit)), explicit);
+    }
+
+    /// A start-hidden plugin's module opens by the open rules, its own declared rule where none names it, with the
+    /// keys as the way it was opened asks: a module key gives them, a show from nvim leaves them, and anything
+    /// else follows the rule's own `focus`.
+    #[test]
+    fn a_plugin_module_opens_by_its_own_rule_with_the_keys_as_asked() {
+        use eitri_core::layout::rules::RuleTarget;
+        let id = ModuleId::lua("preview");
+        let own = OpenRule {
+            at: Some(At::Beside(Direction::Right)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let none = OpenRules::default();
+        let rule = plugin_open_rule(&none, Some(&own), &id, Some(true));
+        assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Right)), true));
+        let rule = plugin_open_rule(&none, Some(&own), &id, Some(false));
+        assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Right)), false));
+        assert_eq!(
+            plugin_open_rule(&none, Some(&own), &id, None),
+            own,
+            "the rule's own focus"
+        );
+        // No declared rule: a Lua panel's built-in place, the side.
+        let rule = plugin_open_rule(&none, None, &id, None);
+        assert_eq!(
+            (rule.at, rule.focus),
+            (Some(At::Placement(Placement::RightOfRoot)), true)
+        );
+
+        let mut rules = OpenRules::default();
+        rules
+            .add(
+                RuleTarget::Module(id.clone()),
+                OpenRule {
+                    at: Some(At::Beside(Direction::Down)),
+                    focus: true,
+                    ..OpenRule::default()
+                },
+            )
+            .unwrap();
+        let rule = plugin_open_rule(&rules, Some(&own), &id, None);
+        assert_eq!(
+            (rule.at, rule.focus),
+            (Some(At::Beside(Direction::Down)), true),
+            "a rule for the module wins"
+        );
+        let rule = plugin_open_rule(&rules, Some(&own), &id, Some(false));
+        assert_eq!((rule.at, rule.focus), (Some(At::Beside(Direction::Down)), false));
     }
 
     /// A new chat view takes the lowest `agent#N` from 2 that no workspace holds and no kept data

@@ -350,3 +350,41 @@ fn a_bundling_script_changes_the_fingerprint_to_the_pinned_value_the_python_side
         "cca1e95e0df5fd4af8f591f7d787e118812bba746ccf62fb9b087ca7c77a6abe"
     );
 }
+
+/// `build.rs` builds the Markdown preview plugin's page third, under the rule the other two bundles follow. Nothing of
+/// it is embedded in `shell`: a debug build finds `plugins/markdown/` on the plugin search path, and this keeps the
+/// site it finds current.
+#[test]
+fn the_build_script_builds_the_plugin_page_third_with_its_watch_paths() {
+    let build = include_str!("../build.rs");
+    let panel = build
+        .find("ensure_web_bundle_built(&web_dir, \"dist/index.html\"")
+        .expect("the agent panel");
+    let kit = build
+        .find("ensure_web_bundle_built(&kit_dir, \"dist/keys.js\"")
+        .expect("the kit");
+    let page = build
+        .find("ensure_web_bundle_built(&markdown_dir, \"dist/index.html\"")
+        .expect("the plugin page");
+    assert!(panel < kit && kit < page);
+    assert!(build.contains("join(\"../plugins/markdown/web\")"));
+    assert!(build.contains("web_build_watch_paths(&markdown_dir)"));
+}
+
+/// The real plugin page project: every input its fingerprint reads is watched.
+#[test]
+fn the_plugin_page_project_watches_its_sources_and_build_files() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/markdown/web");
+    let watched = web_build_watch_paths(&dir);
+    for name in [
+        "src",
+        "package.json",
+        "package-lock.json",
+        "index.html",
+        "build.mjs",
+        "tsconfig.json",
+    ] {
+        assert!(watched.contains(&dir.join(name)), "{name} is not watched");
+    }
+    assert!(!watched.contains(&dir.join("vitest.config.ts")));
+}

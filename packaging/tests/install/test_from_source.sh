@@ -60,6 +60,11 @@ fs_scaffold() {
 	cp -R "$PKG/../nvim/eitri.nvim" "$_fs_dir/nvim/eitri.nvim"
 	cp -R "$PKG/../gnome-extension" "$_fs_dir/gnome-extension"
 	cp -R "$PKG/icons" "$_fs_dir/packaging/icons"
+	# The Markdown preview plugin's manifest is tracked; its site is what the build writes (fixtures/cargo-fromsource).
+	mkdir -p "$_fs_dir/plugins/markdown/web/src"
+	printf 'id = "markdown"\ntitle = "Markdown preview"\n' >"$_fs_dir/plugins/markdown/eitri-plugin.toml"
+	printf 'export {};\n' >"$_fs_dir/plugins/markdown/web/src/main.ts"
+	printf 'dist/\n' >"$_fs_dir/plugins/markdown/web/.gitignore"
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
 }

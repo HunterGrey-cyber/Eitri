@@ -125,6 +125,7 @@ impl Kernel {
                 plugins.clone(),
                 crate::plugin::state::PluginStore::eitri_root_from_env(),
                 std::env::var_os("HOME").map(PathBuf::from),
+                crate::plugin::search::SearchEnv::from_process(),
             )?;
         }
         super::command::install(&lua, &eitri, commands.clone())?;

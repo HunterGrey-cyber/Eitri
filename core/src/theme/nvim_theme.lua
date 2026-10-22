@@ -27,6 +27,8 @@ local GROUPS = {
   "DiagnosticInfo", "Function", "String", "@keyword", "Statement", "@function", "@string", "@type", "Type",
   "@comment", "@number", "Number", "@constant", "Constant", "@variable", "Identifier", "@operator",
   "Operator", "@punctuation", "Delimiter", "@property", "@tag", "Tag",
+  -- How a Markdown link's text is drawn in the buffer: a plugin page beside the editor colours its links the same.
+  "@markup.link.label", "@markup.link", "Underlined",
   -- The statusline's mode sections, which the panel's own mode block copies. lualine creates them when it
   -- loads (LazyVim: after VimEnter), so the first payload may lack them and the resnapshot timer below
   -- carries them over a few seconds later.

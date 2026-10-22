@@ -181,7 +181,7 @@ package() {
 	# The panel's own entry (`eitri panel`), and the nvim plugin that adds :EitriPanel.
 	install -Dm0644 "packaging/cn.huntergrey.eitri.Panel.desktop" \
 		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.Panel.desktop"
-	local _icon _plugin _ext
+	local _icon _plugin _ext _pf
 	while IFS= read -r _plugin; do
 		install -Dm0644 "nvim/eitri.nvim/$_plugin" "$pkgdir/usr/share/eitri/nvim/eitri.nvim/$_plugin"
 	done < <(cd nvim/eitri.nvim && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
@@ -193,6 +193,16 @@ package() {
 	while IFS= read -r _icon; do
 		install -Dm0644 "packaging/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
 	done < <(cd packaging/icons && find hicolor -type f | LC_ALL=C sort)
+	# The Markdown preview plugin directory: its manifest and the site build()'s cargo build wrote (shell/build.rs),
+	# at the packages' place for it; the build's fingerprint never ships.
+	if [ ! -f "plugins/markdown/web/dist/index.html" ]; then
+		echo "plugins/markdown/web/dist/index.html was not built" >&2
+		return 1
+	fi
+	install -Dm0644 "plugins/markdown/eitri-plugin.toml" "$pkgdir/usr/share/eitri/plugins/markdown/eitri-plugin.toml"
+	while IFS= read -r _pf; do
+		install -Dm0644 "plugins/markdown/web/dist/$_pf" "$pkgdir/usr/share/eitri/plugins/markdown/web/dist/$_pf"
+	done < <(cd plugins/markdown/web/dist && find . -type f ! -name .inputs-sha256 | sed 's#^\./##' | LC_ALL=C sort)
 
 	# Install this tree's LICENSE plus the SDK and Node licences. This locally built AUR
 	# package omits generated THIRD-PARTY-LICENSES and SOURCE. Unlike from_source_stage,

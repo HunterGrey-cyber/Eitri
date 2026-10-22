@@ -1,0 +1,48 @@
+/* The agent panel's mapping of highlight.js classes onto the editor's syntax colours, copied so code reads the same in
+   both. */
+/* Syntax keeps the editor's language palette. */
+.hljs-keyword, .hljs-selector-tag {
+  color: var(--nv-syn-keyword);
+}
+.hljs-string, .hljs-regexp {
+  color: var(--nv-syn-string);
+}
+.hljs-comment, .hljs-quote {
+  color: var(--nv-syn-comment);
+}
+.hljs-number, .hljs-literal {
+  color: var(--nv-syn-number);
+}
+.hljs-title, .hljs-title.function_ {
+  color: var(--nv-syn-function);
+}
+.hljs-type, .hljs-built_in {
+  color: var(--nv-syn-type);
+}
+.hljs-variable, .hljs-attr, .hljs-attribute {
+  color: var(--nv-syn-variable);
+}
+.hljs-operator {
+  color: var(--nv-syn-operator);
+}
+.hljs-punctuation {
+  color: var(--nv-syn-punctuation);
+}
+.hljs-meta, .hljs-symbol, .hljs-bullet {
+  color: var(--nv-syn-constant);
+}
+.hljs-section {
+  color: var(--nv-syn-function);
+}
+.hljs-addition {
+  color: var(--nv-syn-string);
+}
+.hljs-deletion {
+  color: var(--nv-syn-keyword);
+}
+.hljs-function, .hljs-params {
+  color: var(--nv-syn-variable);
+}
+.hljs-title.class_ {
+  color: var(--nv-syn-type);
+}

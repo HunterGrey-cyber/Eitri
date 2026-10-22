@@ -35,6 +35,14 @@ EXTENSION_ID = "eitri@huntergrey.cn"
 EXTENSION_FILES = ["direction.js", "extension.js", "metadata.json", "policy.js"]
 # What makepkg's msg2 prints for the one line (the test's own stand-in msg2 prints "  -> text").
 SLOW_LINE = "  -> Installing the Claude Agent SDK and building the sidecar (1-3 min)"
+# The Markdown preview plugin's directory as the tarball (lib/eitri/plugins/markdown) and the built source tree
+# (plugins/markdown, its site under web/dist) hold it; the build's fingerprint is never installed.
+MARKDOWN_SITE = {
+    "eitri-plugin.toml": b'id = "markdown"\n',
+    "web/dist/index.html": b"<!doctype html>\n",
+    "web/dist/preview.js": b"export {};\n",
+    "web/dist/katex/fonts/KaTeX_Main-Regular.woff2": b"wOF2",
+}
 
 
 def _icon_files():
@@ -131,7 +139,7 @@ class _PackageCase(unittest.TestCase):
         )
         self.assertEqual(len(_plugin_files()), 3)
         self.assertEqual(
-            [p for p in got if p.startswith("usr/share/eitri/")],
+            [p for p in got if p.startswith("usr/share/eitri/nvim/")],
             [f"usr/share/eitri/nvim/eitri.nvim/{rel}" for rel in _plugin_files()],
         )
         for rel in _plugin_files():
@@ -156,6 +164,16 @@ class _PackageCase(unittest.TestCase):
                 _read(os.path.join(self.pkgdir, "usr/share/icons", rel)), _read(os.path.join(_PACKAGING, "icons", rel)), rel
             )
             self.assertEqual(os.stat(os.path.join(self.pkgdir, "usr/share/icons", rel)).st_mode & 0o777, 0o644, rel)
+
+    def assert_markdown_plugin(self):
+        got = self.installed()
+        root = "usr/share/eitri/plugins/markdown"
+        self.assertEqual(sorted(p for p in got if p.startswith("usr/share/eitri/plugins/")),
+                         sorted(f"{root}/{rel}" for rel in MARKDOWN_SITE))
+        for rel, data in MARKDOWN_SITE.items():
+            path = os.path.join(self.pkgdir, root, rel)
+            self.assertEqual(_read(path), data, rel)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, rel)
 
 
 class EitriBinPackage(_PackageCase):
@@ -184,6 +202,10 @@ class EitriBinPackage(_PackageCase):
         shutil.copytree(os.path.join(_PACKAGING, "icons", "hicolor"), os.path.join(top, "share", "icons", "hicolor"))
         for name in ("LICENSE", "THIRD-PARTY-LICENSES", "SOURCE"):
             _touch(os.path.join(top, "share", "licenses", "eitri", name))
+        for rel, data in MARKDOWN_SITE.items():
+            _touch(os.path.join(top, "lib", "eitri", "plugins", "markdown", rel), data)
+        # A fingerprint never reaches a tarball, but the package must leave one out if it ever did.
+        _touch(os.path.join(top, "lib", "eitri", "plugins", "markdown", "web", "dist", ".inputs-sha256"), b"0" * 64)
 
     def test_it_installs_the_desktop_entry_and_every_icon_from_the_tarball_layout(self):
         proc = self.package()
@@ -209,6 +231,17 @@ class EitriBinPackage(_PackageCase):
         self.assertNotEqual(proc.returncode, 0, "package() must fail, not ship an entry with the old name")
         self.assertNotIn("usr/share/applications/eitri.desktop", self.installed())
 
+    def test_it_installs_the_markdown_plugin_directory_from_the_tarball(self):
+        proc = self.package()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_markdown_plugin()
+
+    def test_a_tarball_without_the_plugin_directory_fails_the_package(self):
+        shutil.rmtree(os.path.join(self.srcdir, "eitri-0.2.0-x86_64-linux", "lib", "eitri", "plugins"))
+        proc = self.package()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("lib/eitri/plugins/markdown/eitri-plugin.toml", proc.stderr)
+
 
 class EitriGitPackage(_PackageCase):
     pkgbuild = os.path.join(_PACKAGING, "aur", "eitri-git", "PKGBUILD")
@@ -228,6 +261,10 @@ class EitriGitPackage(_PackageCase):
         shutil.copytree(os.path.join(_PACKAGING, "icons"), os.path.join(tree, "packaging", "icons"))
         _touch(os.path.join(tree, "LICENSE"), b"MIT\n")
         _touch(os.path.join(self.srcdir, "release-for-sidecar.env"))
+        for rel, data in MARKDOWN_SITE.items():
+            _touch(os.path.join(tree, "plugins", "markdown", rel), data)
+        _touch(os.path.join(tree, "plugins", "markdown", "web", "dist", ".inputs-sha256"), b"0" * 64)
+        _touch(os.path.join(tree, "plugins", "markdown", "web", "src", "main.ts"), b"source\n")
 
     def test_it_installs_the_desktop_entry_and_every_icon_from_the_source_tree(self):
         proc = self.package()
@@ -258,6 +295,17 @@ class EitriGitPackage(_PackageCase):
         self.assertEqual(_read(os.path.join(licences, "LICENSE-icon")), _read(os.path.join(_PACKAGING, "icons", "LICENSE")))
         self.assertIn(b"CC BY 4.0", _read(os.path.join(licences, "LICENSE-icon")))
         self.assertEqual(_read(os.path.join(licences, "LICENSE")), b"MIT\n")
+
+    def test_it_installs_the_markdown_plugin_directory_from_the_built_tree(self):
+        proc = self.package()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_markdown_plugin()
+
+    def test_a_tree_whose_plugin_site_was_not_built_fails_the_package(self):
+        os.remove(os.path.join(self.srcdir, "eitri-git", "plugins", "markdown", "web", "dist", "index.html"))
+        proc = self.package()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("plugins/markdown/web/dist/index.html", proc.stderr)
 
 
 if __name__ == "__main__":

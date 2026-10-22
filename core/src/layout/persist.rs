@@ -763,7 +763,19 @@ fn left_out(label: &str, why: &str, notes: &mut Vec<String>, copy: &mut bool) {
 /// not. Every note and reason comes back with its control characters escaped: names and keys in them
 /// are the file's own text, and each ends up on one log line.
 pub fn decode_v2(text: &str, project_root: &Path, lua: &[ModuleDecl]) -> Result<Opened, String> {
-    decode_by(text, project_root, lua, Reader::ThisBuild)
+    decode_v2_with(text, project_root, lua, &[])
+}
+
+/// [`decode_v2`] for a window some of whose modules are deferred: modules it never places by itself, which a
+/// tiled leaf or a float in any workspace keeps, as it keeps a numbered instance, and which every workspace that
+/// lacks them then holds hidden.
+pub fn decode_v2_with(
+    text: &str,
+    project_root: &Path,
+    lua: &[ModuleDecl],
+    deferred: &[ModuleId],
+) -> Result<Opened, String> {
+    decode_by(text, project_root, lua, deferred, Reader::ThisBuild)
 }
 
 /// [`decode_v2`] as `reader` reads the file: for tests that pin what the build before floats does
@@ -775,11 +787,17 @@ pub(crate) fn decode_v2_as(
     lua: &[ModuleDecl],
     reader: Reader,
 ) -> Result<Opened, String> {
-    decode_by(text, project_root, lua, reader)
+    decode_by(text, project_root, lua, &[], reader)
 }
 
-fn decode_by(text: &str, project_root: &Path, lua: &[ModuleDecl], reader: Reader) -> Result<Opened, String> {
-    match decode_v2_as_written(text, project_root, lua, reader) {
+fn decode_by(
+    text: &str,
+    project_root: &Path,
+    lua: &[ModuleDecl],
+    deferred: &[ModuleId],
+    reader: Reader,
+) -> Result<Opened, String> {
+    match decode_v2_as_written(text, project_root, lua, deferred, reader) {
         Ok(mut opened) => {
             opened.notes = opened.notes.iter().map(|note| printable(note)).collect();
             Ok(opened)
@@ -825,7 +843,13 @@ fn nesting(text: &str) -> usize {
     deepest
 }
 
-fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], reader: Reader) -> Result<Opened, String> {
+fn decode_v2_as_written(
+    text: &str,
+    project_root: &Path,
+    lua: &[ModuleDecl],
+    deferred: &[ModuleId],
+    reader: Reader,
+) -> Result<Opened, String> {
     let deepest = nesting(text);
     if deepest > MAX_NESTING {
         return Err(format!(
@@ -862,13 +886,15 @@ fn decode_v2_as_written(text: &str, project_root: &Path, lua: &[ModuleDecl], rea
 
     // Tiled leaves and floats create instances, in every workspace; names in kept data reserve their
     // numbers instead. The builds before floats had no chat views, so for them only a terminal is an
-    // instance and an `agent#N` stays a module the window does not have.
+    // instance and an `agent#N` stays a module the window does not have. A deferred module is held the
+    // same way: the window never places it, so only a workspace that names it brings it back.
     let makes_instance = |id: &ModuleId| {
-        id.number() >= 2
-            && match reader {
-                Reader::ThisBuild => id.kind().has_instances(),
-                Reader::BeforeFloats => id.kind() == super::module::ModuleKind::Terminal,
-            }
+        deferred.contains(id)
+            || id.number() >= 2
+                && match reader {
+                    Reader::ThisBuild => id.kind().has_instances(),
+                    Reader::BeforeFloats => id.kind() == super::module::ModuleKind::Terminal,
+                }
     };
     fn instances_in(node: &Value, makes_instance: &dyn Fn(&ModuleId) -> bool, found: &mut BTreeSet<ModuleId>) {
         match node.get("type").and_then(Value::as_str) {
@@ -1119,9 +1145,16 @@ pub fn read_v2_text(dir: &Path, project_root: &Path) -> std::io::Result<Option<S
 /// Reads this project's layouts from `dir`: the version 2 file if it can be used, else the version
 /// 1 file migrated into one workspace, else nothing. The version 1 file is only ever read.
 pub fn load(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> Loaded {
+    load_with(dir, project_root, lua, &[])
+}
+
+/// [`load`] for a window some of whose modules are deferred: never placed by the window itself, but kept where
+/// the version 2 file names them, and then put, hidden, into each workspace that lacks them, as a numbered
+/// instance is ([`decode_v2_with`]). The version 1 file predates them and is read as [`load`] reads it.
+pub fn load_with(dir: &Path, project_root: &Path, lua: &[ModuleDecl], deferred: &[ModuleId]) -> Loaded {
     let v2_path = dir.join(file_name_v2(project_root));
     let v2_why = match read_v2_text(dir, project_root) {
-        Ok(Some(text)) => match decode_v2(&text, project_root, lua) {
+        Ok(Some(text)) => match decode_v2_with(&text, project_root, lua, deferred) {
             Ok(opened) => return Loaded::Restored(opened),
             Err(why) => Some(format!("{}: {why}", v2_path.display())),
         },
@@ -1161,12 +1194,18 @@ pub fn load(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> Loaded {
 /// The version 2 file as it is now, read only to know what a write would replace: whether it can be
 /// used, whether part of it would be lost, and the keys it keeps for a later build.
 pub fn v2_state(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> V2State {
+    v2_state_with(dir, project_root, lua, &[])
+}
+
+/// [`v2_state`] read with the window's deferred modules ([`decode_v2_with`]), so one the file holds is not taken
+/// for a module this window cannot carry.
+pub fn v2_state_with(dir: &Path, project_root: &Path, lua: &[ModuleDecl], deferred: &[ModuleId]) -> V2State {
     let text = match read_v2_text(dir, project_root) {
         Ok(None) => return V2State::Missing,
         Ok(Some(text)) => text,
         Err(e) => return V2State::Unusable(e.to_string()),
     };
-    match decode_v2(&text, project_root, lua) {
+    match decode_v2_with(&text, project_root, lua, deferred) {
         Ok(opened) => {
             let mut kept = opened.workspaces.kept().clone();
             for name in opened.workspaces.order() {
@@ -2190,6 +2229,95 @@ mod tests {
         }
         let layout = Layout::from_parts(tree, BTreeSet::new(), ModuleId::editor()).unwrap();
         (layout, lua)
+    }
+
+    /// A deferred module is one the window never places by itself: a file that names it keeps it, in the workspace
+    /// that holds it and hidden in every other, and the save path reads that file as usable.
+    #[test]
+    fn a_file_that_names_a_deferred_module_keeps_it_in_every_workspace() {
+        let preview = ModuleId::lua("markdown");
+        let deferred = [preview.clone()];
+        let dir = a_dir("layout-deferred");
+        let main = Layout::initial(&[
+            terminal_decl(),
+            ModuleDecl {
+                id: preview.clone(),
+                placement: Placement::RightOfRoot,
+            },
+        ])
+        .unwrap();
+        assert!(main.contains(&preview));
+        save(
+            &dir,
+            &root(),
+            &with(&["main", "two"], "main", &[main.clone(), plain()]),
+            &main,
+        )
+        .unwrap();
+
+        let Loaded::Restored(opened) = load_with(&dir, &root(), &[], &deferred) else {
+            panic!("the file is read")
+        };
+        assert_eq!(opened.workspaces.current(), "main");
+        assert_eq!(opened.current.root(), main.root(), "{:?}", opened.notes);
+        assert!(!opened.current.hidden().contains(&preview));
+        let two = opened.workspaces.stored("two").unwrap();
+        assert!(two.contains(&preview) && two.hidden().contains(&preview));
+        assert!(
+            opened
+                .notes
+                .iter()
+                .any(|n| n.contains("placed 'lua:markdown' below the editor, hidden: another workspace has it")),
+            "{:?}",
+            opened.notes
+        );
+        assert_eq!(opened.keep_copy, None, "{:?}", opened.notes);
+
+        let Loaded::Restored(without) = load(&dir, &root(), &[]) else {
+            panic!("the file is read")
+        };
+        assert!(!without.current.contains(&preview));
+        assert!(
+            without
+                .notes
+                .iter()
+                .any(|n| n.contains("left out 'lua:markdown': this window has no such module")),
+            "{:?}",
+            without.notes
+        );
+
+        // A floating one in a workspace of its own.
+        let float_dir = a_dir("layout-deferred-float");
+        let mut floating = plain();
+        floating
+            .add_float(
+                &preview,
+                FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 400,
+                    h: 300,
+                },
+                false,
+            )
+            .unwrap();
+        save(
+            &float_dir,
+            &root(),
+            &with(&["main", "two"], "main", &[main.clone(), floating]),
+            &main,
+        )
+        .unwrap();
+        assert!(
+            matches!(v2_state_with(&float_dir, &root(), &[], &deferred), V2State::Usable(..)),
+            "a file holding a deferred module, tiled and floating, is not taken for one this window cannot carry"
+        );
+        assert!(matches!(v2_state(&float_dir, &root(), &[]), V2State::Partly(..)));
+        let Loaded::Restored(opened) = load_with(&float_dir, &root(), &[], &deferred) else {
+            panic!("the file is read")
+        };
+        let two = opened.workspaces.stored("two").unwrap();
+        assert!(two.floats().iter().any(|f| f.id == preview), "{:?}", opened.notes);
     }
 
     /// A tree deeper than serde_json's default limit of 128 levels -- three per container -- comes

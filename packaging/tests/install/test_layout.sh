@@ -12,6 +12,16 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri/eitri-setup f
 ./.local/lib/eitri/eitri-supervisor f
 ./.local/lib/eitri/eitri-tmux-shim f
+./.local/lib/eitri/plugins d
+./.local/lib/eitri/plugins/markdown d
+./.local/lib/eitri/plugins/markdown/eitri-plugin.toml f
+./.local/lib/eitri/plugins/markdown/web d
+./.local/lib/eitri/plugins/markdown/web/dist d
+./.local/lib/eitri/plugins/markdown/web/dist/index.html f
+./.local/lib/eitri/plugins/markdown/web/dist/katex d
+./.local/lib/eitri/plugins/markdown/web/dist/katex/fonts d
+./.local/lib/eitri/plugins/markdown/web/dist/katex/fonts/KaTeX_Main-Regular.woff2 f
+./.local/lib/eitri/plugins/markdown/web/dist/preview.js f
 ./.local/lib/eitri/shell f
 ./.local/share d
 ./.local/share/applications d

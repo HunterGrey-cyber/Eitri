@@ -291,6 +291,60 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
   rule would float, comes back tiled at its fallback place, hidden, with a note naming the place. A new module is
   added hidden to the other workspaces, at the place its rule or kind gives it.
 
+## Plugins
+
+A plugin is a page of its own in the window, as a module beside the others, given only the powers its own manifest
+lists. Eitri ships one, the [Markdown preview](markdown-preview.md); you may also write or install your own. Each is a
+directory holding an `eitri-plugin.toml`, and nothing of it runs until `init.lua` loads it:
+
+```lua
+eitri.plugin.load("markdown")                          -- by name
+eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- by path
+```
+
+- **By name**, a word of lower-case letters, digits and `-`: Eitri looks in these places, in order, and loads the first
+  directory that holds an `eitri-plugin.toml`:
+  1. `$XDG_DATA_HOME/eitri/plugins/<name>/` (`~/.local/share/eitri/plugins/<name>/` when `XDG_DATA_HOME` is not set),
+     your own plugins and your own copies of shipped ones;
+  2. the copy installed with Eitri by the install script (`~/.local/lib/eitri/plugins/<name>/`);
+  3. `<each folder of $XDG_DATA_DIRS>/eitri/plugins/<name>/` (`/usr/local/share` then `/usr/share` when it is not
+     set), where the packages install theirs (`/usr/share/eitri/plugins/<name>/`).
+
+  An empty directory is skipped with a line saying so. A directory whose `eitri-plugin.toml` has an error is still the
+  plugin: Eitri stops with that error rather than loading another copy. The plugin's `id` must be the name you wrote.
+- **By path**, anything else: an absolute path, or one starting with `~`. A relative path is refused, because it would
+  mean a different directory in every project.
+- Every load prints which directory it used and why, in the terminal you started Eitri from:
+  `[plugin markdown] loaded /usr/share/eitri/plugins/markdown (system data directory)`. A name that is found nowhere
+  stops Eitri at startup with a message listing every directory it looked in.
+- The options are the plugin's own settings, plus `key` (a module key after the prefix) and `position` (`"side"`,
+  `"bottom"` or `"main"`). A plugin opens where [open rules](#where-a-new-module-opens) say, as `lua:<id>`.
+- Loading a plugin trusts it as you trust any program you run: it is your own local directory. Load only plugins you
+  trust. Plugins are not available in the companion window.
+
+### Keys in a plugin page
+
+A plugin page that reads keys (the [Markdown preview](markdown-preview.md#reading-with-the-keyboard) does) uses Vim's
+and Vimium's: `j`/`k` scroll, `/` finds, `f` labels what can be followed, `?` lists the page's keys. Six settings
+shape them in every plugin page at once:
+
+| key | value | default | what it does |
+|---|---|---|---|
+| `plugins.keys.scroll_step` | a whole number from 10 to 400 | `60` | How far one `j` or `k` scrolls, in pixels. |
+| `plugins.keys.smooth` | `true` or `false` | `true` | Whether scrolling glides. `false` makes every scroll key jump, as does the desktop's reduced-motion setting. |
+| `plugins.keys.prefix_wait` | `true` or `false` | `true` | Whether a key that only begins longer keys (the `g` of `gg`) waits for the next key as long as it takes, as Vim's own `g` does. `false` gives up after Neovim's `timeoutlen`. |
+| `plugins.keys.which_key_delay` | a whole number from 0 to 5000, or `false` | `200` | How many milliseconds after such a key the page's status line lists the keys that may follow. `false` never lists them. |
+| `plugins.keys.hint_chars` | 2 to 26 different lowercase letters | `"sadfjklewcmpgh"` | The letters the labels of `f` are made of. |
+| `plugins.keys.find_case` | `"smart"`, `"ignore"` or `"match"` | `"smart"` | How `/` treats case: `"smart"` ignores it unless the search has a capital letter, `"ignore"` always ignores it, `"match"` never does. |
+
+```lua
+eitri.config.set("plugins.keys.scroll_step", 80)
+eitri.config.set("plugins.keys.find_case", "ignore")
+```
+
+They are read once, when the window starts; a value outside these stops Eitri at startup with a message naming the
+key. A page's own keys are changed in its `plugin:<id>` table with `eitri.keymap.set`.
+
 ## How a launch starts
 
 Two settings decide what a new window does with the tabs and the mode of its last session.
@@ -360,4 +414,5 @@ not settings and are not listed.
 | `EITRI_SIDECAR_BINARY` | The path of a sidecar program to run agent sessions with, instead of the one `eitri setup` built or the package installed. A path that is not a file is an error when a session starts. |
 | `EITRI_EDITOR_DMABUF` | How the editor hands its drawing to GTK. `0`, `off`, `false` or `no` use GTK's own texture path; `1`, `on`, `true` or `yes` force Eitri's own buffers even on a GTK older than 4.16; anything else, or unset, uses Eitri's own buffers from GTK 4.16 on. |
 | `XDG_STATE_HOME` | Where Eitri keeps what it remembers: per-project layout, open tabs, prompt history, permission rules, trust answers and turn-review snapshots, under `eitri/` in this directory. Unset, empty or a relative path means `~/.local/state`. Nothing is written into your project. |
+| `XDG_DATA_HOME`, `XDG_DATA_DIRS` | Where `eitri.plugin.load` looks for a plugin by name: `eitri/plugins/<name>/` under `XDG_DATA_HOME` first (`~/.local/share` when unset, empty or a relative path), under each folder of `XDG_DATA_DIRS` last (`/usr/local/share` then `/usr/share` when unset or empty). See [Plugins](#plugins). |
 | `VERDANDI_CLAUDE_ACCOUNT`, `VERDANDI_CLAUDE_CONFIG_DIR` | The account and its configuration directory; see [Accounts](#accounts). |

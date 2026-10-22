@@ -1,8 +1,8 @@
 //! Open rules: where the window puts a module it opens by itself -- at a first launch, a new instance,
 //! a tab broken out, a module placed into a workspace that lacks it, a module back after a kill.
 //! A gesture that says where (a split key, a move, a drag) never reads them. Precedence: a rule for
-//! the module's id, then its kind's (`terminal`, `agent`), then a Lua panel's own `position`, then
-//! the built-in default of the point where it opens.
+//! the module's id, then its kind's (`terminal`, `agent`), then the module's own rule (a Lua panel's
+//! `position`, or a plugin's declared rule), then the built-in default of the point where it opens.
 
 use super::con::Node;
 use super::float::{Float, FloatRect, DEFAULT_FLOAT_SHARE};
@@ -114,6 +114,17 @@ impl OpenRules {
 
     /// `position` is a Lua panel's own, `None` for every other module.
     pub fn resolve(&self, id: &ModuleId, point: OpenPoint, position: Option<Placement>) -> (OpenRule, RuleSource) {
+        let own = position.map(|placement| OpenRule {
+            at: Some(At::Placement(placement)),
+            ..OpenRule::default()
+        });
+        self.resolve_own(id, point, own.as_ref())
+    }
+
+    /// `own` is the module's own rule (a Lua panel's `position`, or a plugin's declared rule), counted where a Lua
+    /// panel's `position` counts: after a module-id or kind rule, before the built-in default. It is returned
+    /// whole, so a declared `focus` or `size` survives.
+    pub fn resolve_own(&self, id: &ModuleId, point: OpenPoint, own: Option<&OpenRule>) -> (OpenRule, RuleSource) {
         if let Some((_, rule)) = self.rules.iter().find(|(t, _)| *t == RuleTarget::Module(id.clone())) {
             return (rule.clone(), RuleSource::Module);
         }
@@ -122,14 +133,8 @@ impl OpenRules {
                 return (rule.clone(), RuleSource::Kind);
             }
         }
-        if let Some(placement) = position {
-            return (
-                OpenRule {
-                    at: Some(At::Placement(placement)),
-                    ..OpenRule::default()
-                },
-                RuleSource::Position,
-            );
+        if let Some(rule) = own {
+            return (rule.clone(), RuleSource::Position);
         }
         (builtin(id, point), RuleSource::BuiltIn)
     }
@@ -507,6 +512,48 @@ mod tests {
             at: Some(a),
             ..OpenRule::default()
         }
+    }
+
+    #[test]
+    fn a_plugins_declared_rule_counts_where_position_counts() {
+        let id = ModuleId::lua("markdown");
+        let own = OpenRule {
+            at: Some(At::Beside(Direction::Right)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let none = OpenRules::default();
+        assert_eq!(
+            none.resolve_own(&id, OpenPoint::NewInstance, Some(&own)),
+            (own.clone(), RuleSource::Position)
+        );
+        assert_eq!(
+            none.resolve_own(&id, OpenPoint::NewInstance, None).1,
+            RuleSource::BuiltIn
+        );
+        let mut rules = OpenRules::default();
+        let users = OpenRule {
+            at: Some(At::Placement(Placement::BelowRoot)),
+            size: Some(RuleSize::Share(0.3)),
+            ..OpenRule::default()
+        };
+        rules.add(RuleTarget::Module(id.clone()), users.clone()).unwrap();
+        assert_eq!(
+            rules.resolve_own(&id, OpenPoint::NewInstance, Some(&own)),
+            (users, RuleSource::Module)
+        );
+        // `resolve` with a position is `resolve_own` with that placement's rule.
+        assert_eq!(
+            none.resolve(&id, OpenPoint::Launch, Some(Placement::BelowRoot)),
+            none.resolve_own(
+                &id,
+                OpenPoint::Launch,
+                Some(&OpenRule {
+                    at: Some(At::Placement(Placement::BelowRoot)),
+                    ..OpenRule::default()
+                })
+            )
+        );
     }
 
     #[test]

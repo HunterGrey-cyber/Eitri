@@ -3,7 +3,8 @@
 //! stopped by a kill of its module, and shut down when the window closes; told when its module holds the keys
 //! and what the editor's `timeoutlen` is; its keys read for `prefix ?` before the chat takes them; and its host
 //! given the Super filter and the edge rule for `Ctrl+h/j/k/l`. Also, from `plugin_page.rs`: the kit's reserved
-//! path is answered before the plugin's site is looked up.
+//! path is answered before the plugin's site is looked up, and a page build applies and logs its policy and
+//! proxy plan, and every answer of the scheme carries `nosniff`.
 
 use eitri_core::source_scan as scan;
 
@@ -214,11 +215,295 @@ fn the_kit_path_is_answered_before_any_site_file_is_looked_up() {
     let serve = scan::functions(&code, "serve");
     assert_eq!(serve.len(), 1, "one scheme handler");
     let serve: String = serve[0].split_whitespace().collect();
-    let kit = serve
-        .find("ifpage_policy::kit_request(id,&uri){")
-        .expect("the kit path is checked in serve");
-    let answered = serve[kit..].find("return;").expect("and answered there") + kit;
+    let routed = serve
+        .find("route(id,&uri,")
+        .expect("serve asks route which kind of path it is");
+    let kit = serve.find("Route::Kit=>").expect("the kit is answered in serve");
+    let doc = serve
+        .find("Route::Doc{dir,rel}=>")
+        .expect("the document route is answered in serve");
     let site = serve.find("page_policy::site_file(").expect("the site lookup");
-    // A plugin's own `.eitri/keys.js` would replace the host's kit if the site were looked up first.
-    assert!(kit < answered && answered < site);
+    // A plugin's own `.eitri/keys.js`, or a site file under `.eitri/doc/`, would stand in for what the host serves
+    // if the site were looked up first.
+    assert!(routed < kit && kit < site && doc < site);
+    // The document's project is resolved on disk, which must never happen on the GTK thread.
+    let worker = serve
+        .find("gio::spawn_blocking(move||doc_route::doc_file(&dir,&rel))")
+        .expect("the document file is checked on a worker");
+    assert!(doc < worker && worker < site);
+
+    let route = scan::functions(&code, "route");
+    assert_eq!(route.len(), 1, "one router");
+    let route: String = route[0].split_whitespace().collect();
+    let kit = route
+        .find("ifpage_policy::kit_request(id,uri){returnRoute::Kit;}")
+        .expect("the router checks the kit first");
+    let doc = route
+        .find("doc_route::doc_request(")
+        .expect("and then the document route");
+    assert!(kit < doc);
+}
+
+/// `code`'s byte offset `at` in `text`: `code_only` keeps one character for each character of the source, so the
+/// two line up by character, not by byte.
+fn source_offset(text: &str, code: &str, at: usize) -> usize {
+    let chars = code[..at].chars().count();
+    text.char_indices().nth(chars).map_or(text.len(), |(byte, _)| byte)
+}
+
+/// The source text (literals kept) of the `code` slice `part`, whitespace removed.
+fn source_of(text: &str, code: &str, part: &str) -> String {
+    let start = part.as_ptr() as usize - code.as_ptr() as usize;
+    let (from, to) = (
+        source_offset(text, code, start),
+        source_offset(text, code, start + part.len()),
+    );
+    text[from..to].split_whitespace().collect()
+}
+
+#[test]
+fn a_page_build_logs_its_policy_and_proxy_and_uses_the_plan() {
+    let source = scan::read_required("shell/src/plugin_page.rs");
+    // Not cut at the tests module: blanking it could change its byte length, and these offsets must line up with
+    // the source by character.
+    let code = scan::code_only(&source.text);
+    let build = scan::functions(&code, "build");
+    assert_eq!(build.len(), 1, "one page build");
+    let plain: String = build[0].split_whitespace().collect();
+    assert!(
+        plain.contains("page_policy::proxy_plan(&spec.origins,spec.remote_images)"),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("page_policy::csp_floor(&spec.origins,spec.remote_images)"),
+        "{plain}"
+    );
+    // The log lines carry literals, which `code_only` blanks: they are read from the source text of the same
+    // function.
+    let text = source_of(&source.text, &code, build[0]);
+    assert!(text.contains("println!(\"[plugin{}]csp:{}\",spec.id,csp)"), "{text}");
+    assert!(
+        text.contains("println!(\"[plugin{}]proxy:{}\",spec.id,plan.summary())"),
+        "{text}"
+    );
+
+    // The direct route for `https` exists only where the plan asks for it.
+    let ends = scan::word_ends(&code, "add_proxy_for_scheme");
+    assert_eq!(ends.len(), 1, "one per-scheme proxy entry in the file");
+    let call = ends[0] - "add_proxy_for_scheme".len();
+    let guard = scan::word_ends(&code, "https_direct")
+        .into_iter()
+        .find(|end| {
+            let before = code[..end - "https_direct".len()].trim_end();
+            before.ends_with("plan.") && before[..before.len() - "plan.".len()].trim_end().ends_with("if")
+        })
+        .expect("an `if plan.https_direct` block");
+    let open = guard + code[guard..].find('{').unwrap();
+    let block = scan::braced(&code, open);
+    assert!(
+        open < call && call < open + block.len(),
+        "the per-scheme entry sits inside `if plan.https_direct`"
+    );
+    let args_end = call + code[call..].find(')').unwrap() + 1;
+    let at = &code[call..args_end];
+    assert_eq!(
+        source_of(&source.text, &code, at),
+        "add_proxy_for_scheme(\"https\",\"direct://\")"
+    );
+}
+
+#[test]
+fn every_answer_of_the_scheme_carries_nosniff() {
+    let source = scan::read_required("shell/src/plugin_page.rs");
+    let code = scan::code_only(&source.text);
+    let code = scan::without(&code, &scan::modules(&code, "tests"));
+    // A file is answered only through `respond`, which sets the type and `nosniff`; errors carry no body.
+    assert_eq!(
+        code.matches("request.finish(").count(),
+        0,
+        "an answer that bypasses respond"
+    );
+    assert_eq!(
+        code.matches(".finish_with_response(").count(),
+        1,
+        "one place answers with a body"
+    );
+    let respond = scan::functions(&code, "respond");
+    assert_eq!(respond.len(), 1, "one respond");
+    assert!(
+        respond[0].contains(".finish_with_response("),
+        "the body is sent from respond"
+    );
+    let text: String = source.text.split_whitespace().collect();
+    assert!(
+        text.contains("headers.append(\"X-Content-Type-Options\",\"nosniff\");response.set_http_headers(headers);"),
+        "respond sets nosniff"
+    );
+}
+
+/// A plugin whose module starts hidden: kept out of what the window places by itself, its page built when its
+/// module is first shown (a check right after startup for a layout that reopens it shown, then a change hook for
+/// every later route), and opened by its own rule through one function from every show path.
+#[test]
+fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
+    let code = main_rs();
+    let hooks: Vec<usize> = code.match_indices("grid.connect_changed(").map(|(at, _)| at).collect();
+    let first_hook = *hooks.first().expect("a change hook");
+    let builds: Vec<usize> = code
+        .match_indices("plugin_panels.build_page(")
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        builds.iter().any(|at| *at < first_hook),
+        "a layout that reopens the module shown builds its page at startup"
+    );
+    let built_in_a_hook = hooks.iter().any(|at| {
+        let after = at + "grid.connect_changed(".len();
+        code[after..].starts_with("move||{") && {
+            let body = scan::braced(&code, after + "move||".len());
+            body.contains("plugin_panels.build_page(")
+        }
+    });
+    assert!(
+        built_in_a_hook,
+        "a change hook builds the page on the module's first show"
+    );
+    assert!(code.contains("eitri_core::layout::persist::load_with(dir,project_root,&decls,&deferred)"));
+    assert!(code.contains("layout_saver.set_deferred(deferred.clone());"));
+    // A switch or an open gives the keys before the change hooks run: the grab builds the page first.
+    let focus = code
+        .find("letfocus_module:Rc<dynFn(&ModuleId)->bool>=")
+        .expect("focus_module");
+    let focus = scan::braced(&code, focus + code[focus..].find('{').unwrap());
+    assert!(
+        focus.contains("plugin_panels.build_page("),
+        "the keys never go to a slot with no page"
+    );
+    assert!(
+        code.contains("new_workspace_layout(template,&live,&decls,&deferred)"),
+        "a workspace made from a definition keeps a start-hidden module it names"
+    );
+
+    let show = code
+        .find("letshow_on_screen:Rc<dynFn(&ModuleId)->Result<(),LayoutError>>=")
+        .expect("show_on_screen");
+    let show = scan::braced(&code, show + code[show..].find('{').unwrap());
+    assert!(
+        show.contains("open_plugin_module("),
+        "show_on_screen opens a hidden plugin by its rule"
+    );
+    let arm = code
+        .find("LayoutRequest::Show(id)if")
+        .expect("eitri.layout.show's own arm");
+    let arm = scan::braced(&code, arm + code[arm..].find('{').unwrap());
+    assert!(
+        arm.contains("open_plugin_module("),
+        "eitri.layout.show opens it by its rule"
+    );
+    let open = code
+        .find("letopen_module:Rc<dynFn(&ModuleId,KeyAction)>=")
+        .expect("open_module");
+    let open = scan::braced(&code, open + code[open..].find('{').unwrap());
+    assert!(
+        open.contains("KeyAction::Place|KeyAction::ShowAndFocusifplugin_panels.starts_hidden(id)=>{"),
+        "its module key opens it by its rule"
+    );
+
+    let source = scan::read_required("shell/src/main.rs");
+    let text = scan::code_only(&source.text);
+    let opener = scan::functions(&text, "open_plugin_module");
+    assert_eq!(opener.len(), 1, "one way to open it");
+    assert!(opener[0].contains("plugin_open_rule(") && opener[0].contains("add_everywhere_at("));
+    assert!(
+        !opener[0].contains("build_page("),
+        "an open the grid refuses builds no page"
+    );
+    let rule = scan::functions(&text, "plugin_open_rule");
+    assert_eq!(rule.len(), 1);
+    assert!(rule[0].contains("resolve_own("));
+
+    // The page is built in one closure, which logs the build after it.
+    let source = scan::read_required("shell/src/plugin_panels.rs");
+    let code = scan::code_only(&source.text);
+    let code = scan::without(&code, &scan::modules(&code, "tests"));
+    let flat: String = code.split_whitespace().collect();
+    assert_eq!(flat.matches("plugin_page::build(").count(), 1, "one page build");
+    let closure = flat.find("letbuild:BuildPage=").expect("the BuildPage closure");
+    let closure = scan::braced(&flat, closure + flat[closure..].find('{').unwrap());
+    let built = closure
+        .find("plugin_page::build(")
+        .expect("the build is inside the closure");
+    let traced = closure.find("trace::line(").expect("the build is traced");
+    assert!(built < traced);
+    let text: String = source.text.split_whitespace().collect();
+    assert!(text.contains("trace::line(&id,\"pagebuilt\",\"\");"));
+}
+
+/// The follow socket exists only for a window whose plugins want it; its lines are routed by owner and its commands
+/// applied by the window; each host hears whether its module is drawn (from a change hook), when the editor's session
+/// may have started (the theme and keys feeds report at VimEnter) and when the editor ended (before its exit is acted
+/// on); and the trace switch is a probe build's alone.
+#[test]
+fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
+    let code = main_rs();
+    assert_eq!(code.matches("FollowSocket::bind()").count(), 1, "one follow socket");
+    let wants = code
+        .find("ifplugin_panels.wants_follow_feed(){")
+        .expect("bound only when a plugin wants it");
+    let block = scan::braced(&code, wants + "ifplugin_panels.wants_follow_feed()".len());
+    assert!(block.contains("FollowSocket::bind()"), "{block}");
+    assert!(code.contains("plugin_panels.set_follow_feed(socket.socket_path(),scratch_path.as_deref());"));
+    assert!(code.contains("plugin_panels.set_window_root(project_root);"));
+
+    let listen = code.find("feed_pump.listen_follow(").expect("the follow listener");
+    let closure = scan::braced(&code, listen + code[listen..].find('{').unwrap());
+    let apply = closure.find("apply_follow_commands(").expect("the commands applied");
+    let route = closure.find("plugin_panels.route_follow(").expect("the lines routed");
+    assert!(apply < route, "the routed commands are what is applied");
+
+    let on_screen = code.match_indices("grid.connect_changed(").any(|(at, _)| {
+        let after = at + "grid.connect_changed(".len();
+        code[after..].starts_with("move||{")
+            && scan::braced(&code, after + "move||".len()).contains("plugin_panels.set_on_screen(")
+    });
+    assert!(on_screen, "a change hook tells each host whether its module is drawn");
+
+    for listener in ["feed_pump.listen_theme(feed,", "feed_pump.listen_keys(feed,"] {
+        let at = code.find(listener).expect(listener);
+        let body = scan::braced(&code, at + code[at..].find('{').unwrap());
+        assert!(body.contains("plugin_panels.editor_session();"), "{listener}");
+    }
+
+    let exit = code.find("pane.on_exited_unrequested(").expect("the editor's own exit");
+    let body = scan::braced(&code, exit + code[exit..].find('{').unwrap());
+    let told = body.find("plugin_panels.editor_closed();").expect("the hosts are told");
+    let acted = body.find(".nvim_exited();").expect("the exit is acted on");
+    assert!(told < acted);
+    let retire = code
+        .find("letretire_editor:Rc<dynFn()->Result<(),LayoutError>>=")
+        .expect("retire_editor");
+    let body = scan::braced(&code, retire + code[retire..].find('{').unwrap());
+    let killed = body.find("grid.kill_module(").expect("the editor is killed");
+    let told = body.find("plugin_panels.editor_closed();").expect("the hosts are told");
+    assert!(killed < told, "told only once the kill succeeded");
+
+    let close = code.find("window.connect_close_request(").unwrap();
+    assert!(code[close..].contains("socket.cleanup();"));
+
+    // The switch's attribute and variable are literals, which the code-only text blanks: read the source.
+    let source = scan::read_required("shell/src/main.rs");
+    let text: String = source.text.split_whitespace().collect();
+    assert_eq!(text.matches("trace::set_enabled(true)").count(), 1);
+    assert!(text.contains(
+        "#[cfg(feature=\"probe\")]ifstd::env::var_os(\"EITRI_PLUGIN_TRACE\").is_some_and(|v|v==\"1\"){eitri_core::plugin::trace::set_enabled(true);}"
+    ));
+
+    // A followed document's project goes into the same slot the page's scheme handler reads.
+    let source = scan::read_required("shell/src/plugin_panels.rs");
+    let code = scan::code_only(&source.text);
+    let code: String = scan::without(&code, &scan::modules(&code, "tests"))
+        .split_whitespace()
+        .collect();
+    assert!(code.contains("doc_slot:doc_slot.clone(),"));
+    assert!(code.contains("ifletSome(slot)=&doc_slot{host.set_doc_slot(slot.clone());}"));
 }

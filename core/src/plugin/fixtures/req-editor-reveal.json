@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "id": 31,
+  "verb": "editor.reveal",
+  "args": {
+    "buf": 3,
+    "line": 120,
+    "token": 7
+  }
+}

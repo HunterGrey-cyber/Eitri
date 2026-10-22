@@ -1125,5 +1125,91 @@ class KitLicence(unittest.TestCase):
             self.assertIn(cl.KIT_MARKER, f.read())
 
 
+class MarkdownPluginLicences(unittest.TestCase):
+    """The Markdown preview plugin's page ships as a plugin directory: its npm tree is walked, and VS Code's notice
+    is printed when its build output carries the adapted stylesheet."""
+
+    def _repo_with_dist(self, files):
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        dist = os.path.join(root, "plugins", "markdown", "web", "dist")
+        os.makedirs(dist)
+        for name, content in files.items():
+            with open(os.path.join(dist, name), "wb") as f:
+                f.write(content)
+        return root
+
+    def test_python_2_0_is_permissive(self):
+        self.assertTrue(cl.acceptable("Python-2.0"))
+
+    def test_khroma_is_allowlisted_for_its_shipped_mit_text(self):
+        self.assertIn("MIT", cl.ALLOWLIST[("npm", "khroma")])
+
+    def test_mermaid_12_and_elk_layouts_fail_and_mermaid_11_passes(self):
+        pkg = lambda name, version: {"eco": "npm", "name": name, "version": version}
+        cl.refuse_markdown_layout_engines([pkg("mermaid", "11.17.2"), pkg("katex", "0.16.47")])
+        for bad in (pkg("mermaid", "12.0.0"), pkg("elkjs", "0.9.3"), pkg("@mermaid-js/layout-elk", "0.1.9")):
+            with self.assertRaises(cl.Fail):
+                cl.refuse_markdown_layout_engines([pkg("katex", "0.16.47"), bad])
+
+    def test_the_notice_is_printed_when_the_built_stylesheet_carries_the_marker(self):
+        repo = self._repo_with_dist({"preview.css": b"x" + cl.MARKDOWN_NOTICE_MARKER + b"y", "preview.js": b""})
+        counts = {}
+        entries = cl.markdown_notice_entries(counts, repo)
+        self.assertEqual([e["name"] for e in entries], ["vscode-markdown-preview"])
+        self.assertEqual([n for n, _ in entries[0]["files"]], ["vscode-markdown-preview.txt"])
+        self.assertEqual(counts, {"MIT": 1})
+        lines = []
+        cl.render_entries(entries, {}, lines)
+        self.assertIn("Microsoft Corporation", "\n".join(lines))
+
+    def test_the_marker_in_the_script_alone_also_counts(self):
+        repo = self._repo_with_dist({"preview.js": cl.MARKDOWN_NOTICE_MARKER})
+        self.assertEqual(len(cl.markdown_notice_entries({}, repo)), 1)
+
+    def test_no_build_output_lists_nothing(self):
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        counts = {}
+        self.assertEqual(cl.markdown_notice_entries(counts, root), [])
+        self.assertEqual(counts, {})
+
+    def test_the_stylesheet_source_opens_with_the_marker(self):
+        path = os.path.join(cl.REPO, "plugins", "markdown", "web", "src", "style", "markdown.css")
+        with open(path, "rb") as f:
+            first = f.readline()
+        self.assertTrue(first.startswith(b"/*!"))
+        self.assertIn(cl.MARKDOWN_NOTICE_MARKER, first)
+
+    def test_the_built_page_carries_the_marker(self):
+        path = os.path.join(cl.REPO, "plugins", "markdown", "web", "dist", "preview.css")
+        if not os.path.isfile(path):
+            self.skipTest("the plugin page has not been built in this checkout")
+        with open(path, "rb") as f:
+            self.assertIn(cl.MARKDOWN_NOTICE_MARKER, f.read())
+
+    def test_the_plugin_tree_passes_the_gate(self):
+        if not os.path.isdir(os.path.join(cl.REPO, "plugins", "markdown", "web", "node_modules")):
+            self.skipTest("plugins/markdown/web has no node_modules in this checkout")
+        pkgs = cl.markdown_plugin_packages(cl.REPO)
+        names = {p["name"] for p in pkgs}
+        self.assertTrue({"markdown-it", "katex", "mermaid", "dompurify", "morphdom"} <= names)
+        self.assertNotIn("elkjs", names)
+        self.assertEqual(len([p for p in pkgs if p["name"] == "katex"]), 1)
+        counts = {}
+        for p in pkgs:
+            cl.resolve(p, {}, counts)
+
+    def test_collect_prints_part_5_after_parts_1_to_4_and_before_the_artwork(self):
+        with open(os.path.join(_HERE, "collect-licenses.py"), encoding="utf-8") as f:
+            src = f.read()
+        body = src[src.index("def collect("):src.index("def neovide_checkout_head")]
+        part5 = body.index("PART 5 -- ")
+        self.assertLess(body.index("PART 3 -- "), part5)
+        self.assertLess(body.index("PART 4 -- "), part5)
+        self.assertLess(body.index("Components inside the Skia prebuilt archive in the source asset"), part5)
+        self.assertLess(part5, body.index("Eitri's own artwork -- the icon files"))
+
+
 if __name__ == "__main__":
     unittest.main()

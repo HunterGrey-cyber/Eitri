@@ -67,6 +67,11 @@ const SYNTAX: [(&str, &str, &str); 12] = [
     ("tag", "@tag", "Tag"),
 ];
 
+/// The groups a Markdown link's text is drawn with in the editor, most specific first. A plugin page that shows
+/// links in body text (the Markdown preview) colours them with the first of these that sets a foreground, so a link
+/// looks as it does in the buffer beside it.
+const LINK_GROUPS: [&str; 3] = ["@markup.link.label", "@markup.link", "Underlined"];
+
 /// Every group [`ThemeTokens::derive`] reads. `nvim_theme.lua` must request each one;
 /// `crate::theme::feed`'s `the_lua_snippet_requests_every_group_derivation_reads` checks that.
 /// **Add a name here in the same edit that makes `derive` read it.**
@@ -121,6 +126,9 @@ pub(crate) const GROUPS_READ: &[&str] = &[
     "@property",
     "@tag",
     "Tag",
+    "@markup.link.label",
+    "@markup.link",
+    "Underlined",
     "lualine_a_normal",
     "lualine_a_insert",
     "lualine_a_visual",
@@ -227,6 +235,11 @@ pub struct ThemeTokens {
     /// starts from `String`'s foreground, the colour `mode_input` already names. A border, outline or
     /// fill only, like `warn`; never text.
     pub focus_ring: Rgb,
+    /// Link text in a page beside the editor: the editor's own Markdown link colour ([`LINK_GROUPS`]), else the
+    /// colour `--nv-syn-function` has. **Not guarded**, for the reason `syntax` is not: it is the colour the editor
+    /// draws the same link with a few pixels to the left, and a guard would make the two differ. It is body text,
+    /// which the signal colours (`warn`, `chrome_accent`, ...) must never be, and `syntax` means code.
+    pub link: Rgb,
     /// `(suffix, colour)` in `SYNTAX` order.
     pub syntax: Vec<(&'static str, Rgb)>,
     /// A CSS `font-family` value.
@@ -437,6 +450,16 @@ impl ThemeTokens {
             UI_CONTRAST,
         );
 
+        let syntax: Vec<(&'static str, Rgb)> = SYNTAX
+            .iter()
+            .map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg)))
+            .collect();
+        let syn_function = syntax
+            .iter()
+            .find(|(name, _)| *name == "function")
+            .map_or(fg, |(_, colour)| *colour);
+        let link = g.fg_of(&LINK_GROUPS).unwrap_or(syn_function);
+
         ThemeTokens {
             bg,
             fg,
@@ -491,10 +514,8 @@ impl ThemeTokens {
             cursor_band,
             cursor_band_inactive,
             focus_ring,
-            syntax: SYNTAX
-                .iter()
-                .map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg)))
-                .collect(),
+            link,
+            syntax,
             font_mono: mono_font_stack(&payload.options.guifont),
             font_size_px: DEFAULT_PANEL_FONT_SIZE_PX,
             color_scheme: if light { "light" } else { "dark" },
@@ -544,6 +565,7 @@ impl ThemeTokens {
             ("cursor-band", self.cursor_band),
             ("cursor-band-inactive", self.cursor_band_inactive),
             ("focus-ring", self.focus_ring),
+            ("link", self.link),
         ];
         let mut vars: Vec<(String, String)> = colours
             .into_iter()
@@ -713,14 +735,14 @@ mod tests {
         assert_eq!(t.fg.hex(), "#e0e2ea");
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
-        // 45, the status band's three mode blocks as a bg and fg each (2026-10-15), and the cursor band's two
-        // fills with the composer's focus ring.
-        assert_eq!(vars.len(), 54);
+        // 45, the status band's three mode blocks as a bg and fg each (2026-10-15), the cursor band's two
+        // fills with the composer's focus ring, and the colour of a Markdown link.
+        assert_eq!(vars.len(), 55);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 54, "no duplicate variable names");
+        assert_eq!(names.len(), 55, "no duplicate variable names");
         // The count alone would be satisfied by any variable at all, and this one carries a UNIT --
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
@@ -879,6 +901,91 @@ mod tests {
         let keyword = |t: &ThemeTokens| t.syntax.iter().find(|(n, _)| *n == "keyword").unwrap().1;
         assert_eq!(keyword(&both).hex(), "#111111");
         assert_eq!(keyword(&legacy_only).hex(), "#222222");
+    }
+
+    /// A Markdown link in a plugin page takes the colour the editor gives a Markdown link: the Treesitter label
+    /// group, then the link group, then the legacy `Underlined`, then whatever `--nv-syn-function` is.
+    #[test]
+    fn the_link_colour_follows_nvims_markdown_link_highlight() {
+        let normal = ("Normal", hl(Some(0xe0e2ea), Some(0x14161b)));
+        let function = ("Function", hl(Some(0x111111), None));
+        let label = ("@markup.link.label", hl(Some(0x222222), None));
+        let link = ("@markup.link", hl(Some(0x333333), None));
+        let underlined = ("Underlined", hl(Some(0x444444), None));
+
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                normal.clone(),
+                function.clone(),
+                label.clone(),
+                link.clone(),
+                underlined.clone(),
+            ],
+        ));
+        assert_eq!(t.link.hex(), "#222222");
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[normal.clone(), function.clone(), link.clone(), underlined.clone()],
+        ));
+        assert_eq!(t.link.hex(), "#333333");
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[normal.clone(), function.clone(), underlined.clone()],
+        ));
+        assert_eq!(t.link.hex(), "#444444");
+
+        // No link group at all: the value --nv-syn-function has, whichever group gave it.
+        let t = ThemeTokens::derive(&payload("dark", &[normal.clone(), function.clone()]));
+        assert_eq!(t.link.hex(), "#111111");
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                normal.clone(),
+                function.clone(),
+                ("@function", hl(Some(0x555555), None)),
+            ],
+        ));
+        assert_eq!(t.link.hex(), "#555555");
+        let t = ThemeTokens::derive(&payload("dark", &[normal.clone()]));
+        assert_eq!(t.link, t.fg);
+
+        // A link group that sets no foreground (nvim's own `Underlined` is only an underline) falls through.
+        let t = ThemeTokens::derive(&payload(
+            "dark",
+            &[normal.clone(), function.clone(), ("Underlined", hl(None, None))],
+        ));
+        assert_eq!(t.link.hex(), "#111111");
+
+        let vars = t.appearance_vars();
+        let syn_function = vars
+            .iter()
+            .find(|(n, _)| n == "--nv-syn-function")
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            vars.iter().find(|(n, _)| n == "--nv-link").map(|(_, v)| v.clone()),
+            syn_function
+        );
+    }
+
+    /// The shared fixtures carry the new name, with the value their palettes give it: neither palette sets a
+    /// link group, so each equals that fixture's own --nv-syn-function.
+    #[test]
+    fn every_theme_fixture_carries_the_link_colour() {
+        let ev: serde_json::Value = serde_json::from_str(include_str!("../plugin/fixtures/ev-theme.json")).unwrap();
+        let hello: serde_json::Value = serde_json::from_str(include_str!("../plugin/fixtures/rep-hello.json")).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(include_str!("../plugin/fixtures/rep-hello-settings.json")).unwrap();
+        for (name, vars) in [
+            ("ev-theme.json", &ev["data"]["vars"]),
+            ("rep-hello.json", &hello["result"]["theme"]["vars"]),
+            ("rep-hello-settings.json", &settings["result"]["theme"]["vars"]),
+        ] {
+            assert!(vars["--nv-link"].is_string(), "{name}: no --nv-link");
+            assert_eq!(vars["--nv-link"], vars["--nv-syn-function"], "{name}");
+        }
+        assert_eq!(hello["result"]["theme"]["vars"]["--nv-link"], "#e0e2ea");
+        assert_eq!(ev["data"]["vars"]["--nv-link"], "#575279");
     }
 
     #[test]
@@ -1604,11 +1711,11 @@ mod tests {
     }
 
     #[test]
-    fn the_appearance_vars_number_53_and_carry_no_size() {
+    fn the_appearance_vars_number_54_and_carry_no_size() {
         let vars = ThemeTokens::fallback().appearance_vars();
-        assert_eq!(vars.len(), 53);
+        assert_eq!(vars.len(), 54);
         let names: std::collections::HashSet<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 53, "no duplicate names");
+        assert_eq!(names.len(), 54, "no duplicate names");
         for name in [
             "--nv-bg",
             "--nv-focus-ring",

@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::layout::rules::{parse_at, At};
+
 /// The bridge protocol this build speaks.
 pub const PROTOCOL: u32 = 1;
 /// The longest a page-supplied variable may be declared.
@@ -17,6 +19,15 @@ const MAX_TITLE_CHARS: usize = 80;
 /// A day: the longest timeout a task may declare. `0` means none.
 const MAX_TIMEOUT_SECS: u64 = 86_400;
 
+/// The most filetypes a `[follow]` table may list.
+pub const MAX_FILETYPES: usize = 16;
+/// The most nvim commands a plugin may define.
+pub const MAX_COMMANDS: usize = 8;
+/// The longest nvim command name a plugin may define.
+pub const MAX_COMMAND_NAME: usize = 40;
+/// The most values a `choice` setting may list.
+pub const MAX_CHOICES: usize = 8;
+
 /// What a page may be given. A closed set: a name outside it refuses the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
@@ -26,16 +37,20 @@ pub enum Capability {
     LayoutFocus,
     State,
     Net,
+    EditorFollow,
+    EditorCommands,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 8] = [
         Capability::Tasks,
         Capability::EditorOpen,
         Capability::EditorAssist,
         Capability::LayoutFocus,
         Capability::State,
         Capability::Net,
+        Capability::EditorFollow,
+        Capability::EditorCommands,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -46,6 +61,8 @@ impl Capability {
             Capability::LayoutFocus => "layout.focus",
             Capability::State => "state",
             Capability::Net => "net",
+            Capability::EditorFollow => "editor.follow",
+            Capability::EditorCommands => "editor.commands",
         }
     }
 
@@ -206,16 +223,95 @@ impl Origin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingKind {
     /// A directory, created 0700 at load when missing.
     Dir,
+    /// `true` or `false`.
+    Bool,
+    /// One of a closed list of words, in the order the manifest lists them.
+    Choice(Vec<String>),
+}
+
+impl SettingKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SettingKind::Dir => "dir",
+            SettingKind::Bool => "bool",
+            SettingKind::Choice(_) => "choice",
+        }
+    }
+}
+
+/// A setting's value: a `dir` or `choice` setting holds text, a `bool` setting a boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingValue {
+    Text(String),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Setting {
-    pub default: String,
+    pub default: SettingValue,
     pub kind: SettingKind,
+}
+
+/// `[follow]`: the filetypes whose buffers the page may follow, and the bool setting that shows the module
+/// by itself when such a buffer becomes current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowDecl {
+    pub filetypes: Vec<String>,
+    pub auto_show: Option<String>,
+}
+
+/// What an nvim command the plugin defines does to the plugin's own module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandDoes {
+    Show,
+    Toggle,
+    Hide,
+}
+
+impl CommandDoes {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandDoes::Show => "show",
+            CommandDoes::Toggle => "toggle",
+            CommandDoes::Hide => "hide",
+        }
+    }
+}
+
+/// `[commands.<Name>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDecl {
+    pub name: String,
+    pub does: CommandDoes,
+}
+
+/// Whether a first launch puts the module on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleStart {
+    Shown,
+    Hidden,
+}
+
+/// `[module]`: how the module starts, and the plugin's own open rule (`at`, `size`, `focus`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleTable {
+    pub start: ModuleStart,
+    pub at: Option<At>,
+    pub size: Option<f32>,
+    pub focus: bool,
+}
+
+/// `[net] images`: whether the page may load `https` images from any host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetImages {
+    Https,
+    Off,
+    /// `"${<setting>}"`: a `choice` setting whose values are `https` and `off`.
+    Setting(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +330,7 @@ pub struct TaskDecl {
     pub timeout: Option<Duration>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     pub id: String,
     pub title: String,
@@ -243,11 +339,16 @@ pub struct Manifest {
     /// In the order the manifest lists them, without repeats.
     pub capabilities: Vec<Capability>,
     pub settings: BTreeMap<String, Setting>,
-    /// Templates over `${plugin}` and settings; made canonical paths at load.
+    /// Templates over `${plugin}` and `dir` settings; made canonical paths at load.
     pub roots: BTreeMap<String, Template>,
     pub origins: Vec<Origin>,
     pub vars: BTreeMap<String, VarRule>,
     pub tasks: BTreeMap<String, TaskDecl>,
+    pub follow: Option<FollowDecl>,
+    /// In name order.
+    pub commands: Vec<CommandDecl>,
+    pub module: Option<ModuleTable>,
+    pub images: Option<NetImages>,
 }
 
 impl Manifest {
@@ -275,19 +376,25 @@ struct RawManifest {
     vars: BTreeMap<String, RawVar>,
     #[serde(default)]
     tasks: BTreeMap<String, RawTask>,
+    follow: Option<RawFollow>,
+    #[serde(default)]
+    commands: BTreeMap<String, RawCommand>,
+    module: Option<RawModule>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSetting {
-    default: String,
+    default: toml::Value,
     kind: String,
+    values: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawNet {
-    origins: Vec<String>,
+    origins: Option<Vec<String>>,
+    images: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +410,28 @@ struct RawTask {
     argv: Vec<String>,
     cwd: String,
     timeout_secs: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFollow {
+    filetypes: Vec<String>,
+    auto_show: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCommand {
+    does: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModule {
+    start: Option<String>,
+    at: Option<String>,
+    size: Option<f64>,
+    focus: Option<bool>,
 }
 
 /// `[a-z0-9_]`, starting with a letter, at most 32: a setting, variable, root or task name.
@@ -326,6 +455,40 @@ fn relative_path_ok(path: &str) -> bool {
 /// A plugin id: `[a-z0-9-]`, at most 40, not starting or ending with `-`.
 pub fn id_ok(id: &str) -> bool {
     CharClass::LowerDigitDash.admits(id) && id.len() <= MAX_ID_LEN
+}
+
+/// A `choice` value or a filetype: lower-case letters, digits and `_` (and `-` for a choice), 1-32 bytes.
+fn word_ok(word: &str, dash: bool) -> bool {
+    !word.is_empty()
+        && word.len() <= MAX_NAME_LEN
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || (dash && b == b'-'))
+}
+
+/// nvim's rule for a user command, `[A-Z][A-Za-z0-9]*`, at most 40.
+fn command_name_ok(name: &str) -> bool {
+    name.len() <= MAX_COMMAND_NAME
+        && name.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// A path or an argument may name only `dir` settings: a boolean or a choice word has no meaning there.
+fn dir_settings_only(template: &Template, settings: &BTreeMap<String, Setting>, key: &str) -> Result<(), String> {
+    for piece in template.pieces() {
+        if let Piece::Setting(name) = piece {
+            if let Some(setting) = settings.get(name) {
+                if setting.kind != SettingKind::Dir {
+                    return Err(format!(
+                        "eitri-plugin.toml: {key}: ${{{name}}} is a {} setting; only a dir setting may be part of a \
+                         path or an argument",
+                        setting.kind.name()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
@@ -390,23 +553,56 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         }
         let kind = match setting.kind.as_str() {
             "dir" => SettingKind::Dir,
+            "bool" => SettingKind::Bool,
+            "choice" => {
+                let key = format!("settings.{name}.values");
+                let Some(values) = &setting.values else {
+                    return fail(&key, "a choice setting lists its values".into());
+                };
+                if values.is_empty() || values.len() > MAX_CHOICES {
+                    return fail(&key, format!("must list 1-{MAX_CHOICES} values"));
+                }
+                for (i, value) in values.iter().enumerate() {
+                    if !word_ok(value, true) {
+                        return fail(&key, format!("{value:?} must be [a-z0-9_-], 1-32"));
+                    }
+                    if values[..i].contains(value) {
+                        return fail(&key, format!("{value:?} is listed twice"));
+                    }
+                }
+                SettingKind::Choice(values.clone())
+            }
             other => {
                 return fail(
                     &format!("settings.{name}.kind"),
-                    format!("{other:?} is not a kind (dir)"),
+                    format!("{other:?} is not a kind (dir, bool, choice)"),
                 );
             }
         };
-        if setting.default.trim().is_empty() {
-            return fail(&format!("settings.{name}.default"), "must not be empty".into());
+        if setting.values.is_some() && !matches!(kind, SettingKind::Choice(_)) {
+            return fail(
+                &format!("settings.{name}.values"),
+                "only a choice setting has values".into(),
+            );
         }
-        settings.insert(
-            name.clone(),
-            Setting {
-                default: setting.default.clone(),
-                kind,
-            },
-        );
+        let key = format!("settings.{name}.default");
+        let default = match (&kind, &setting.default) {
+            (SettingKind::Dir, toml::Value::String(text)) if text.trim().is_empty() => {
+                return fail(&key, "must not be empty".into());
+            }
+            (SettingKind::Dir, toml::Value::String(text)) => SettingValue::Text(text.clone()),
+            (SettingKind::Dir, _) => return fail(&key, "a dir setting's default is a path".into()),
+            (SettingKind::Bool, toml::Value::Boolean(b)) => SettingValue::Bool(*b),
+            (SettingKind::Bool, _) => return fail(&key, "a bool setting's default is true or false".into()),
+            (SettingKind::Choice(values), toml::Value::String(text)) if values.contains(text) => {
+                SettingValue::Text(text.clone())
+            }
+            (SettingKind::Choice(values), _) => {
+                let listed: Vec<String> = values.iter().map(|v| format!("{v:?}")).collect();
+                return fail(&key, format!("must be one of {}", listed.join(", ")));
+            }
+        };
+        settings.insert(name.clone(), Setting { default, kind });
     }
     let setting_names: BTreeSet<String> = settings.keys().cloned().collect();
 
@@ -458,21 +654,62 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         }
         let template = Template::parse(text, &setting_names, &none)
             .map_err(|e| format!("eitri-plugin.toml: roots.{name}: {e}"))?;
+        dir_settings_only(&template, &settings, &format!("roots.{name}"))?;
         roots.insert(name.clone(), template);
     }
 
-    let origins = match (&raw.net, capabilities.contains(&Capability::Net)) {
+    let (origins, images) = match (&raw.net, capabilities.contains(&Capability::Net)) {
         (Some(_), false) => return fail("[net]", "declared without the net capability".into()),
-        (Some(net), true) => net
-            .origins
-            .iter()
-            .map(|o| {
-                Origin::parse(o).ok_or_else(|| {
-                    format!("eitri-plugin.toml: net.origins: {o:?} is not an https origin (no path, no trailing slash)")
+        (Some(net), true) => {
+            if net.origins.is_none() && net.images.is_none() {
+                return fail("[net]", "names neither origins nor images".into());
+            }
+            let origins = net
+                .origins
+                .iter()
+                .flatten()
+                .map(|o| {
+                    Origin::parse(o).ok_or_else(|| {
+                        format!(
+                            "eitri-plugin.toml: net.origins: {o:?} is not an https origin (no path, no trailing slash)"
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        (None, _) => Vec::new(),
+                .collect::<Result<Vec<_>, _>>()?;
+            let images = match net.images.as_deref() {
+                None => None,
+                Some("https") => Some(NetImages::Https),
+                Some("off") => Some(NetImages::Off),
+                Some(text) => {
+                    let named = text
+                        .strip_prefix("${")
+                        .and_then(|rest| rest.strip_suffix('}'))
+                        .and_then(|name| settings.get(name).map(|s| (name, s)));
+                    match named {
+                        Some((
+                            name,
+                            Setting {
+                                kind: SettingKind::Choice(values),
+                                ..
+                            },
+                        )) if values.iter().all(|v| v == "https" || v == "off") => {
+                            Some(NetImages::Setting(name.to_owned()))
+                        }
+                        _ => {
+                            return fail(
+                                "net.images",
+                                format!(
+                                    "{text:?} must be \"https\", \"off\" or \"${{<setting>}}\" naming a choice setting \
+                                     whose values are https and off"
+                                ),
+                            );
+                        }
+                    }
+                }
+            };
+            (origins, images)
+        }
+        (None, _) => (Vec::new(), None),
     };
 
     if !raw.tasks.is_empty() && !capabilities.contains(&Capability::Tasks) {
@@ -486,10 +723,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         }
         let mut argv = Vec::new();
         for (i, arg) in task.argv.iter().enumerate() {
-            argv.push(
-                Template::parse(arg, &setting_names, &var_names)
-                    .map_err(|e| format!("eitri-plugin.toml: {key}.argv[{i}]: {e}"))?,
-            );
+            let template = Template::parse(arg, &setting_names, &var_names)
+                .map_err(|e| format!("eitri-plugin.toml: {key}.argv[{i}]: {e}"))?;
+            dir_settings_only(&template, &settings, &format!("{key}.argv[{i}]"))?;
+            argv.push(template);
         }
         let first_ok = matches!(argv.first().map(Template::pieces), Some([Piece::Plugin, Piece::Text(t), ..]) if t.starts_with('/'))
             && !argv[0].uses_vars();
@@ -501,6 +738,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         }
         let cwd = Template::parse(&task.cwd, &setting_names, &none)
             .map_err(|e| format!("eitri-plugin.toml: {key}.cwd: {e}"))?;
+        dir_settings_only(&cwd, &settings, &format!("{key}.cwd"))?;
         if task.timeout_secs > MAX_TIMEOUT_SECS {
             return fail(
                 &format!("{key}.timeout_secs"),
@@ -522,6 +760,121 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         );
     }
 
+    let follow = match (&raw.follow, capabilities.contains(&Capability::EditorFollow)) {
+        (Some(_), false) => return fail("[follow]", "declared without the editor.follow capability".into()),
+        (None, true) => return fail("[follow]", "editor.follow needs a [follow] table".into()),
+        (None, false) => None,
+        (Some(f), true) => {
+            if f.filetypes.is_empty() || f.filetypes.len() > MAX_FILETYPES {
+                return fail("follow.filetypes", format!("must list 1-{MAX_FILETYPES} filetypes"));
+            }
+            let mut filetypes: Vec<String> = Vec::new();
+            for filetype in &f.filetypes {
+                if !word_ok(filetype, false) {
+                    return fail("follow.filetypes", format!("{filetype:?} must be [a-z0-9_], 1-32"));
+                }
+                if !filetypes.contains(filetype) {
+                    filetypes.push(filetype.clone());
+                }
+            }
+            if let Some(name) = &f.auto_show {
+                if !matches!(
+                    settings.get(name),
+                    Some(Setting {
+                        kind: SettingKind::Bool,
+                        ..
+                    })
+                ) {
+                    return fail("follow.auto_show", format!("{name:?} must name a bool setting"));
+                }
+            }
+            Some(FollowDecl {
+                filetypes,
+                auto_show: f.auto_show.clone(),
+            })
+        }
+    };
+
+    let has_commands = capabilities.contains(&Capability::EditorCommands);
+    if !raw.commands.is_empty() && !has_commands {
+        return fail("[commands]", "declared without the editor.commands capability".into());
+    }
+    if has_commands && raw.commands.is_empty() {
+        return fail(
+            "[commands]",
+            "editor.commands needs at least one [commands.<Name>]".into(),
+        );
+    }
+    if raw.commands.len() > MAX_COMMANDS {
+        return fail("[commands]", format!("at most {MAX_COMMANDS} commands"));
+    }
+    let mut commands = Vec::new();
+    for (name, command) in &raw.commands {
+        if !command_name_ok(name) {
+            return fail(
+                &format!("commands.{name}"),
+                format!("a command name is [A-Z][A-Za-z0-9]*, at most {MAX_COMMAND_NAME}"),
+            );
+        }
+        let does = match command.does.as_str() {
+            "show" => CommandDoes::Show,
+            "toggle" => CommandDoes::Toggle,
+            "hide" => CommandDoes::Hide,
+            other => {
+                return fail(
+                    &format!("commands.{name}.does"),
+                    format!("{other:?} is not show, toggle or hide"),
+                );
+            }
+        };
+        commands.push(CommandDecl {
+            name: name.clone(),
+            does,
+        });
+    }
+
+    let module = match &raw.module {
+        None => None,
+        Some(m) => {
+            let start = match m.start.as_deref() {
+                None | Some("shown") => ModuleStart::Shown,
+                Some("hidden") => ModuleStart::Hidden,
+                Some(other) => return fail("module.start", format!("{other:?} is not shown or hidden")),
+            };
+            let at = match m.at.as_deref() {
+                None => None,
+                Some(name) => match parse_at(name) {
+                    Some(at) => Some(at),
+                    None => {
+                        return fail(
+                            "module.at",
+                            format!(
+                                "{name:?} is not a place (side, bottom, main, below-editor, right, below, left, \
+                                 above, tab)"
+                            ),
+                        );
+                    }
+                },
+            };
+            let size = match m.size {
+                None => None,
+                Some(share) if share > 0.0 && share < 1.0 && (share as f32) < 1.0 => Some(share as f32),
+                Some(share) => {
+                    return fail(
+                        "module.size",
+                        format!("{share} must be a share strictly between 0 and 1"),
+                    );
+                }
+            };
+            Some(ModuleTable {
+                start,
+                at,
+                size,
+                focus: m.focus.unwrap_or(true),
+            })
+        }
+    };
+
     Ok(Manifest {
         id: raw.id,
         title: raw.title,
@@ -533,6 +886,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         origins,
         vars,
         tasks,
+        follow,
+        commands,
+        module,
+        images,
     })
 }
 
@@ -547,7 +904,55 @@ mod tests {
         let m = parse_manifest(EXAMPLE).expect("the example is valid");
         assert_eq!(m.id, "demo");
         assert_eq!(m.capabilities, Capability::ALL.to_vec());
-        assert_eq!(m.settings["work"].default, "~/demo-work");
+        assert_eq!(m.settings["work"].default, SettingValue::Text("~/demo-work".into()));
+        assert_eq!(m.settings["work"].kind, SettingKind::Dir);
+        assert_eq!(
+            m.settings["auto"],
+            Setting {
+                default: SettingValue::Bool(false),
+                kind: SettingKind::Bool
+            }
+        );
+        assert_eq!(
+            m.settings["images"],
+            Setting {
+                default: SettingValue::Text("https".into()),
+                kind: SettingKind::Choice(vec!["https".into(), "off".into()])
+            }
+        );
+        assert_eq!(m.images, Some(NetImages::Setting("images".into())));
+        assert_eq!(
+            m.follow,
+            Some(FollowDecl {
+                filetypes: vec!["markdown".into(), "rst".into()],
+                auto_show: Some("auto".into())
+            })
+        );
+        assert_eq!(
+            m.commands,
+            [
+                CommandDecl {
+                    name: "DemoShow".into(),
+                    does: CommandDoes::Show
+                },
+                CommandDecl {
+                    name: "DemoToggle".into(),
+                    does: CommandDoes::Toggle
+                },
+            ]
+        );
+        assert_eq!(
+            m.module,
+            Some(ModuleTable {
+                start: ModuleStart::Hidden,
+                at: parse_at("right"),
+                size: Some(0.4),
+                focus: false
+            })
+        );
+        assert_eq!(Capability::ALL.len(), 8);
+        assert_eq!(Capability::parse("editor.follow"), Some(Capability::EditorFollow));
+        assert_eq!(Capability::parse("editor.commands"), Some(Capability::EditorCommands));
         assert_eq!(
             m.vars["course"],
             VarRule {
@@ -577,8 +982,12 @@ mod tests {
             ("id = \"demo\"", "id = \"Demo_1\"", "id"),
             ("site = \"build/site\"", "site = \"../site\"", "site"),
             ("entry = \"index.html\"", "entry = \"/index.html\"", "entry"),
-            ("\"state\", \"net\"]", "\"state\", \"net.raw\"]", "net.raw"),
-            ("\"state\", \"net\"]", "\"state\"]", "[net]"),
+            (
+                "\"net\", \"editor.follow\"",
+                "\"net.raw\", \"editor.follow\"",
+                "net.raw",
+            ),
+            ("\"state\", \"net\", ", "\"state\", ", "[net]"),
             (
                 "chars = \"lower-digit-dash\"\nmax_len = 40",
                 "max_len = 40",
@@ -689,5 +1098,321 @@ mod tests {
             ]
         );
         assert_eq!(t.vars(), ["course"]);
+    }
+    /// Each edit of the example breaks one of the new rules and must be refused, naming what was wrong.
+    #[test]
+    fn every_new_rule_is_refused_by_name() {
+        let cases: &[(&str, &str, &str)] = &[
+            // [follow] and editor.follow need each other.
+            (
+                "\"net\", \"editor.follow\", \"editor.commands\"]",
+                "\"net\", \"editor.commands\"]",
+                "[follow]",
+            ),
+            (
+                "[follow]\nfiletypes = [\"markdown\", \"rst\"]\nauto_show = \"auto\"\n",
+                "",
+                "[follow]",
+            ),
+            (
+                "filetypes = [\"markdown\", \"rst\"]",
+                "filetypes = []",
+                "follow.filetypes",
+            ),
+            (
+                "filetypes = [\"markdown\", \"rst\"]",
+                "filetypes = [\"Markdown\"]",
+                "\"Markdown\"",
+            ),
+            (
+                "filetypes = [\"markdown\", \"rst\"]",
+                "filetypes = [\"mark-down\"]",
+                "\"mark-down\"",
+            ),
+            ("auto_show = \"auto\"", "auto_show = \"images\"", "follow.auto_show"),
+            ("auto_show = \"auto\"", "auto_show = \"nope\"", "follow.auto_show"),
+            // [commands] and editor.commands need each other.
+            (
+                "\"net\", \"editor.follow\", \"editor.commands\"]",
+                "\"net\", \"editor.follow\"]",
+                "[commands]",
+            ),
+            (
+                "[commands.DemoShow]\ndoes = \"show\"\n\n[commands.DemoToggle]\ndoes = \"toggle\"",
+                "",
+                "[commands]",
+            ),
+            ("[commands.DemoShow]", "[commands.demoShow]", "commands.demoShow"),
+            ("[commands.DemoShow]", "[commands.Demo_Show]", "commands.Demo_Show"),
+            ("does = \"toggle\"", "does = \"flip\"", "commands.DemoToggle.does"),
+            ("does = \"toggle\"", "does = \"toggle\"\nwhen = \"x\"", "when"),
+            // Setting kinds.
+            (
+                "auto = { default = false, kind = \"bool\" }",
+                "auto = { default = \"no\", kind = \"bool\" }",
+                "settings.auto.default",
+            ),
+            (
+                "auto = { default = false, kind = \"bool\" }",
+                "auto = { default = false, kind = \"flag\" }",
+                "settings.auto.kind",
+            ),
+            ("values = [\"https\", \"off\"]", "values = []", "settings.images.values"),
+            (
+                "values = [\"https\", \"off\"]",
+                "values = [\"https\", \"https\"]",
+                "twice",
+            ),
+            (
+                "values = [\"https\", \"off\"]",
+                "values = [\"https\", \"Off\"]",
+                "\"Off\"",
+            ),
+            (
+                "images = { default = \"https\"",
+                "images = { default = \"ftp\"",
+                "settings.images.default",
+            ),
+            (
+                "images = { default = \"https\", kind = \"choice\", values = [\"https\", \"off\"] }",
+                "images = { default = \"https\", kind = \"choice\" }",
+                "settings.images.values",
+            ),
+            (
+                "work = { default = \"~/demo-work\", kind = \"dir\" }",
+                "work = { default = \"~/demo-work\", kind = \"dir\", values = [\"a\"] }",
+                "settings.work.values",
+            ),
+            (
+                "work = { default = \"~/demo-work\", kind = \"dir\" }",
+                "work = { default = true, kind = \"dir\" }",
+                "settings.work.default",
+            ),
+            // A path or an argument names only dir settings.
+            (
+                "[roots]\nwork = \"${work}\"\n",
+                "[roots]\nwork = \"${work}\"\nflag = \"${auto}\"\n",
+                "${auto}",
+            ),
+            (
+                "cwd = \"${work}\"\ntimeout_secs = 0",
+                "cwd = \"${images}\"\ntimeout_secs = 0",
+                "${images}",
+            ),
+            // [net] images.
+            ("images = \"${images}\"", "images = \"${auto}\"", "net.images"),
+            ("images = \"${images}\"", "images = \"http\"", "net.images"),
+            (
+                "origins = [\"https://learn.example.org\"]\nimages = \"${images}\"\n",
+                "",
+                "[net]",
+            ),
+            // [module].
+            ("start = \"hidden\"", "start = \"later\"", "module.start"),
+            ("at = \"right\"", "at = \"up\"", "module.at"),
+            ("size = 0.4", "size = 1.0", "module.size"),
+            ("size = 0.4", "size = 0.0", "module.size"),
+            ("focus = false", "focus = false\nfloat = true", "float"),
+            ("focus = false", "focus = false\nscratchpad = true", "scratchpad"),
+        ];
+        for (from, to, named) in cases {
+            assert!(EXAMPLE.contains(from), "the example has no {from:?}");
+            let text = EXAMPLE.replacen(from, to, 1);
+            let err = parse_manifest(&text).expect_err(&format!("{to:?} was accepted"));
+            assert!(err.contains(named), "{to:?}: {err:?} does not name {named:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_name_is_at_most_40_and_a_plugin_defines_at_most_8() {
+        let long = format!("[commands.D{}]", "a".repeat(MAX_COMMAND_NAME));
+        let err = parse_manifest(&EXAMPLE.replacen("[commands.DemoShow]", &long, 1)).unwrap_err();
+        assert!(err.contains("commands.Daaa"), "{err}");
+        let fits = format!("[commands.D{}]", "a".repeat(MAX_COMMAND_NAME - 1));
+        assert!(parse_manifest(&EXAMPLE.replacen("[commands.DemoShow]", &fits, 1)).is_ok());
+
+        let mut many = EXAMPLE.to_string();
+        for i in 0..MAX_COMMANDS - 1 {
+            many.push_str(&format!("\n[commands.Extra{i}]\ndoes = \"hide\"\n"));
+        }
+        let err = parse_manifest(&many).unwrap_err();
+        assert!(err.contains("[commands]") && err.contains("at most 8"), "{err}");
+    }
+
+    #[test]
+    fn a_follow_table_folds_repeated_filetypes_and_holds_at_most_16() {
+        let twice = EXAMPLE.replacen(
+            "filetypes = [\"markdown\", \"rst\"]",
+            "filetypes = [\"markdown\", \"markdown\"]",
+            1,
+        );
+        assert_eq!(parse_manifest(&twice).unwrap().follow.unwrap().filetypes, ["markdown"]);
+        let list: Vec<String> = (0..=MAX_FILETYPES).map(|i| format!("\"t{i}\"")).collect();
+        let many = EXAMPLE.replacen(
+            "filetypes = [\"markdown\", \"rst\"]",
+            &format!("filetypes = [{}]", list.join(", ")),
+            1,
+        );
+        assert!(parse_manifest(&many).unwrap_err().contains("follow.filetypes"));
+    }
+
+    #[test]
+    fn module_and_net_tables_are_optional_and_default_as_today() {
+        let no_module = &EXAMPLE[..EXAMPLE.find("\n[module]\n").unwrap() + 1];
+        let no_module = no_module.replacen(", \"editor.follow\", \"editor.commands\"]", "]", 1);
+        let m = parse_manifest(&no_module).unwrap();
+        assert_eq!((m.module, m.follow, m.commands.len()), (None, None, 0));
+        let shown = EXAMPLE.replacen("start = \"hidden\"\nat = \"right\"\nsize = 0.4\nfocus = false", "", 1);
+        assert_eq!(
+            parse_manifest(&shown).unwrap().module,
+            Some(ModuleTable {
+                start: ModuleStart::Shown,
+                at: None,
+                size: None,
+                focus: true
+            })
+        );
+        let origins_only = EXAMPLE.replacen("images = \"${images}\"\n", "", 1);
+        assert_eq!(parse_manifest(&origins_only).unwrap().images, None);
+        let images_only = EXAMPLE.replacen("origins = [\"https://learn.example.org\"]\n", "", 1);
+        let m = parse_manifest(&images_only).unwrap();
+        assert!(m.origins.is_empty());
+        assert_eq!(m.images, Some(NetImages::Setting("images".into())));
+        for (value, want) in [("\"https\"", NetImages::Https), ("\"off\"", NetImages::Off)] {
+            let text = EXAMPLE.replacen("images = \"${images}\"", &format!("images = {value}"), 1);
+            assert_eq!(parse_manifest(&text).unwrap().images, Some(want));
+        }
+    }
+
+    /// The preview plugin's manifest as its design gives it, comments included.
+    #[test]
+    fn a_follow_plugin_manifest_parses() {
+        let text = r#"id = "markdown"
+title = "Markdown preview"
+protocol = 1
+site = "web/dist"                   # the build directory, the same path installed and in the source tree
+entry = "index.html"
+capabilities = ["editor.follow", "editor.commands", "net"]
+
+[module]
+start = "hidden"                    # "shown" (the default) | "hidden": not placed at a first launch
+at = "right"                        # the declared open rule: an `at` value of eitri.layout.rule
+focus = false
+
+[follow]
+filetypes = ["markdown"]            # 1-16 names, each [a-z0-9_]{1,32}
+auto_show = "auto"                  # names a bool setting; optional
+
+[commands.MarkdownPreview]
+does = "show"                       # show | toggle | hide
+[commands.MarkdownPreviewToggle]
+does = "toggle"
+[commands.MarkdownPreviewStop]
+does = "hide"
+
+[settings.auto]
+kind = "bool"
+default = false
+
+[settings.remote_images]
+kind = "choice"
+values = ["https", "off"]
+default = "https"
+
+[settings.sync]
+kind = "choice"
+values = ["both", "editor", "off"]
+default = "both"
+
+[net]
+images = "${remote_images}"         # resolves to "https" or "off"
+"#;
+        let m = parse_manifest(text).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            m.capabilities,
+            [Capability::EditorFollow, Capability::EditorCommands, Capability::Net]
+        );
+        assert!(m.roots.is_empty() && m.origins.is_empty());
+        assert_eq!(m.images, Some(NetImages::Setting("remote_images".into())));
+        let names: Vec<(&str, CommandDoes)> = m.commands.iter().map(|c| (c.name.as_str(), c.does)).collect();
+        assert_eq!(
+            names,
+            [
+                ("MarkdownPreview", CommandDoes::Show),
+                ("MarkdownPreviewStop", CommandDoes::Hide),
+                ("MarkdownPreviewToggle", CommandDoes::Toggle),
+            ]
+        );
+        assert_eq!(
+            m.settings["sync"].kind,
+            SettingKind::Choice(vec!["both".into(), "editor".into(), "off".into()])
+        );
+        let module = m.module.unwrap();
+        assert_eq!(
+            (module.start, module.at, module.size, module.focus),
+            (ModuleStart::Hidden, parse_at("right"), None, false)
+        );
+    }
+
+    /// The Markdown preview's own manifest is an ordinary one: every table it uses is a general one.
+    #[test]
+    fn the_markdown_plugin_manifest_parses() {
+        let text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../plugins/markdown/eitri-plugin.toml"
+        ));
+        let m = parse_manifest(text).expect("the plugin's manifest parses");
+        assert_eq!(
+            (m.id.as_str(), m.site.as_str(), m.entry.as_str()),
+            ("markdown", "web/dist", "index.html")
+        );
+        assert_eq!(
+            m.capabilities,
+            vec![Capability::EditorFollow, Capability::EditorCommands, Capability::Net]
+        );
+        let module = m.module.as_ref().expect("[module]");
+        assert_eq!(module.start, ModuleStart::Hidden);
+        assert_eq!(module.at, crate::layout::rules::parse_at("right"));
+        assert_eq!(module.size, None);
+        assert!(!module.focus);
+        assert_eq!(
+            m.follow,
+            Some(FollowDecl {
+                filetypes: vec!["markdown".into()],
+                auto_show: Some("auto".into())
+            })
+        );
+        let commands: Vec<(&str, CommandDoes)> = m.commands.iter().map(|c| (c.name.as_str(), c.does)).collect();
+        assert_eq!(
+            commands,
+            vec![
+                ("MarkdownPreview", CommandDoes::Show),
+                ("MarkdownPreviewStop", CommandDoes::Hide),
+                ("MarkdownPreviewToggle", CommandDoes::Toggle),
+            ]
+        );
+        assert_eq!(m.images, Some(NetImages::Setting("remote_images".into())));
+        assert_eq!(
+            m.settings["auto"],
+            Setting {
+                default: SettingValue::Bool(false),
+                kind: SettingKind::Bool
+            }
+        );
+        assert_eq!(
+            m.settings["remote_images"],
+            Setting {
+                default: SettingValue::Text("https".into()),
+                kind: SettingKind::Choice(vec!["https".into(), "off".into()]),
+            }
+        );
+        assert_eq!(
+            m.settings["sync"],
+            Setting {
+                default: SettingValue::Text("both".into()),
+                kind: SettingKind::Choice(vec!["both".into(), "editor".into(), "off".into()]),
+            }
+        );
+        assert!(m.origins.is_empty() && m.roots.is_empty() && m.tasks.is_empty());
     }
 }

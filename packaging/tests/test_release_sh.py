@@ -1090,6 +1090,91 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
             self.assertEqual(os.stat(os.path.join(self.tree, rel)).st_mode & 0o777, 0o644, rel)
 
 
+class StagesThePluginDirectories(unittest.TestCase):
+    """Phase B's ctr_stage_plugins and ctr_tarball_plugins, run for real over a stand-in clone: the staging dir holds
+    each shipped plugin's manifest and built site at plugins/<name>/ (where both nfpm profiles name it, one tree entry),
+    the tarball tree holds the same files at lib/eitri/plugins/<name>/ (which install.sh copies with the binaries),
+    and the build's fingerprint is in neither."""
+
+    SITE = {
+        "eitri-plugin.toml": b'id = "markdown"\n',
+        "web/dist/index.html": b"<!doctype html><title>preview</title>\n",
+        "web/dist/preview.js": b"export {};\n",
+        "web/dist/katex/fonts/KaTeX_Main-Regular.woff2": b"wOF2",
+    }
+
+    def setUp(self):
+        self.scratch = _scratch_dir()
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+        self.clone = os.path.join(self.scratch, "clone")
+        for rel, data in self.SITE.items():
+            path = os.path.join(self.clone, "plugins", "markdown", rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        _write(os.path.join(self.clone, "plugins", "markdown", "web", "dist", ".inputs-sha256"), "0" * 64)
+        _write(os.path.join(self.clone, "plugins", "markdown", "web", "src", "main.ts"), "source\n")
+        _write(os.path.join(self.clone, "plugins", "markdown", "web", "package.json"), "{}\n")
+        self.st = os.path.join(self.scratch, "stage")
+        self.tree = os.path.join(self.scratch, "tarball", "top")
+        os.makedirs(self.st)
+
+    @staticmethod
+    def files(root):
+        return {os.path.relpath(os.path.join(d, f), root) for d, _, names in os.walk(root) for f in names}
+
+    def stage(self):
+        return _bash(f'umask 022; ctr_stage_plugins "{self.st}" && ctr_tarball_plugins "{self.st}" "{self.tree}"',
+                     dict(os.environ), self.clone)
+
+    def test_the_staged_and_tarball_trees_hold_the_manifest_and_the_site_only(self):
+        proc = self.stage()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        staged = os.path.join(self.st, "plugins", "markdown")
+        tarball = os.path.join(self.tree, "lib", "eitri", "plugins", "markdown")
+        self.assertEqual(self.files(self.st), {f"plugins/markdown/{rel}" for rel in self.SITE})
+        self.assertEqual(self.files(self.tree), {f"lib/eitri/plugins/markdown/{rel}" for rel in self.SITE})
+        for root in (staged, tarball):
+            for rel, data in self.SITE.items():
+                with open(os.path.join(root, rel), "rb") as f:
+                    self.assertEqual(f.read(), data, rel)
+                self.assertEqual(os.stat(os.path.join(root, rel)).st_mode & 0o777, 0o644, rel)
+            self.assertEqual(os.stat(os.path.join(root, "web", "dist", "katex")).st_mode & 0o777, 0o755)
+
+    def test_a_plugin_without_its_built_site_stops_the_release(self):
+        os.remove(os.path.join(self.clone, "plugins", "markdown", "web", "dist", "index.html"))
+        proc = self.stage()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("plugins/markdown/web/dist/index.html was not built", proc.stderr)
+
+    def test_a_plugin_without_its_manifest_stops_the_release(self):
+        os.remove(os.path.join(self.clone, "plugins", "markdown", "eitri-plugin.toml"))
+        proc = self.stage()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("plugins/markdown has no eitri-plugin.toml", proc.stderr)
+
+    @staticmethod
+    def function_text(name):
+        """The source text of one release.sh function, as written (`declare -f` would reformat it)."""
+        with open(_RELEASE_SH, encoding="utf-8") as f:
+            text = f.read()
+        start = text.index(f"\n{name}() {{\n")
+        return text[start:text.index("\n}\n", start)]
+
+    def test_the_phases_install_the_packages_stage_the_tree_and_ship_the_site_in_the_source_asset(self):
+        proc = _bash('echo "SHIPPED_PLUGINS=$SHIPPED_PLUGINS"', dict(os.environ), self.scratch)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "SHIPPED_PLUGINS=markdown")
+        self.assertIn("(cd plugins/markdown/web && npm ci --no-audit --no-fund)", self.function_text("ctr_phase_f"))
+        body = self.function_text("ctr_phase_b")
+        self.assertIn('ctr_stage_plugins "$st"', body)
+        self.assertIn('ctr_tarball_plugins "$st" "$tb/$tt"', body)
+        # The staging comes after the build and the licence collection, which reads the build output in the tree.
+        self.assertLess(body.index("collect-licenses.py"), body.index('ctr_stage_plugins "$st"'))
+        self.assertLess(body.index('ctr_stage_plugins "$st"'), body.index("nfpm pkg --config nfpm-public.yaml"))
+        self.assertIn("plugins/markdown/web/dist/.inputs-sha256", body)
+
+
 class SignAndVerify(unittest.TestCase):
     """The same sign_sums/verify_sums/write_sums release.sh runs, with a throwaway key."""
 

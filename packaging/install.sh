@@ -56,6 +56,12 @@ NV_PLUGIN_FILES='plugin/eitri.lua lua/eitri/init.lua doc/eitri.txt'
 # list to the committed files.
 NV_EXT_ID='eitri@huntergrey.cn'
 NV_EXT_FILES='metadata.json extension.js direction.js policy.js'
+# The plugin directories the release ships (today the Markdown preview): in the release tarball at
+# lib/eitri/plugins/<name>/ (its eitri-plugin.toml and its built site under web/dist/), so they are installed, upgraded
+# and removed with the binaries and the running binary finds them beside itself; never in the user's data directory,
+# whose own plugins the window looks at first. A from-source install stages them from the tree it built. A test holds
+# this list to the harness's.
+NV_SHIPPED_PLUGINS='markdown'
 # The icon, one file per size under the icon theme's tree: each is in the release tarball at
 # share/icons/<this path> and goes to $XDG_DATA_HOME/icons/<this path> (packaging/release_check.py's
 # role table holds the tarball to exactly this set, and a test holds the two lists equal).
@@ -2705,6 +2711,32 @@ from_source_stage() {
 		mkdir -p -- "$_fss_top/share/icons/${_fss_i%/*}" || die "cannot create $_fss_top/share/icons/${_fss_i%/*}"
 		cp -- "$_fss_src/packaging/icons/$_fss_i" "$_fss_top/share/icons/$_fss_i" || die "cannot stage the icon $_fss_i"
 	done
+	# Each shipped plugin directory: its tracked manifest, and the site the build just wrote (shell/build.rs) without
+	# the build's fingerprint. A release build has no source-tree search step, so this is how a from-source install
+	# finds the plugin by name.
+	# A tree with no plugins/ at all is a release from before the shipped plugins, refused with the way to install
+	# it as a tarball of one is; a tree with plugins/ but no manifest is broken.
+	if [ ! -d "$_fss_src/plugins" ]; then
+		die "$_fss_src has no plugins/: it is a source tree from before Eitri shipped plugins, which this installer does not lay out. Nothing was changed. To install it, use its own installer: packaging/install.sh --from-source in that tree (or that release's install.sh asset with --from-source)."
+	fi
+	for _fss_p in $NV_SHIPPED_PLUGINS; do
+		if [ ! -f "$_fss_src/plugins/$_fss_p/eitri-plugin.toml" ]; then die "$_fss_src has no plugins/$_fss_p/eitri-plugin.toml: report it at $NV_ISSUES"; fi
+		if [ ! -f "$_fss_src/plugins/$_fss_p/web/dist/index.html" ]; then
+			# In a checkout built before, removing web/dist/ by hand does not make cargo rerun the build
+			# script that writes it (it watches the site's inputs, not its output), so the advice comes first.
+			if [ -n "$OPT_CHECKOUT" ]; then
+				die "the build did not produce plugins/$_fss_p/web/dist/index.html. Nothing was changed. If plugins/$_fss_p/web/dist/ was removed from a checkout that was built before, cargo does not know to write it again: run cargo clean -p shell --release --target-dir $_fss_src/target and install again. Otherwise report it at $NV_ISSUES"
+			fi
+			die "the build did not produce plugins/$_fss_p/web/dist/index.html: report it at $NV_ISSUES"
+		fi
+		mkdir -p -- "$_fss_top/lib/eitri/plugins/$_fss_p/web" || die "cannot create $_fss_top/lib/eitri/plugins/$_fss_p"
+		cp -- "$_fss_src/plugins/$_fss_p/eitri-plugin.toml" "$_fss_top/lib/eitri/plugins/$_fss_p/eitri-plugin.toml" ||
+			die "cannot stage plugins/$_fss_p/eitri-plugin.toml"
+		cp -R -- "$_fss_src/plugins/$_fss_p/web/dist" "$_fss_top/lib/eitri/plugins/$_fss_p/web/dist" ||
+			die "cannot stage plugins/$_fss_p/web/dist"
+		rm -f -- "$_fss_top/lib/eitri/plugins/$_fss_p/web/dist/.inputs-sha256" ||
+			die "cannot remove the build's fingerprint from the staged plugins/$_fss_p"
+	done
 	if [ -f "$_fss_src/LICENSE" ]; then
 		cp -- "$_fss_src/LICENSE" "$_fss_top/share/licenses/eitri/LICENSE" || die "cannot stage LICENSE"
 	else
@@ -3120,6 +3152,12 @@ unpack_new() {
 	done
 	for _un_f in $NV_LICENCE_FILES; do
 		if [ ! -f "$_un_top/share/licenses/eitri/$_un_f" ]; then die "$NV_TARBALL_NAME has no share/licenses/eitri/$_un_f: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
+	done
+	if [ ! -d "$_un_top/lib/eitri/plugins" ]; then
+		die "$NV_TARBALL_NAME is from a release before Eitri shipped plugins (it has no lib/eitri/plugins/), which this installer does not lay out. Nothing was changed. To install that release, use its own install.sh (a release asset)."
+	fi
+	for _un_f in $NV_SHIPPED_PLUGINS; do
+		if [ ! -f "$_un_top/lib/eitri/plugins/$_un_f/eitri-plugin.toml" ]; then die "$NV_TARBALL_NAME has no lib/eitri/plugins/$_un_f/eitri-plugin.toml: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	done
 	if [ ! -f "$_un_top/lib/eitri/RELEASE" ]; then die "$NV_TARBALL_NAME has no lib/eitri/RELEASE: it is not a valid Eitri release. Nothing was changed; report it at $NV_ISSUES"; fi
 	parse_release "$_un_top/lib/eitri/RELEASE"

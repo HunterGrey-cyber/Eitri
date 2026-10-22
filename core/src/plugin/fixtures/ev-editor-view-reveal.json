@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "event": "editor.view",
+  "data": {
+    "buf": 3,
+    "name": "/w/notes/docs/README.md",
+    "filetype": "markdown",
+    "tick": 41,
+    "current": true,
+    "line_count": 300,
+    "top": 121,
+    "top_fraction": 0.25,
+    "bottom": 160,
+    "cursor": {
+      "line": 125,
+      "col": 4
+    },
+    "cause": "reveal",
+    "doc": null,
+    "token": 7
+  }
+}

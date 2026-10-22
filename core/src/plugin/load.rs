@@ -7,7 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::manifest::{parse_manifest, Manifest, Piece, SettingKind, Template};
+use super::manifest::{parse_manifest, Manifest, NetImages, Piece, SettingKind, SettingValue, Template};
 use super::roots::{dir_inside, Roots};
 
 #[derive(Debug, Clone)]
@@ -17,8 +17,12 @@ pub struct LoadedPlugin {
     pub dir: PathBuf,
     /// `<dir>/<site>`: canonical when it exists, else as joined (the site may not be built yet).
     pub site_root: PathBuf,
-    /// Every declared setting, `~` expanded.
+    /// Every `dir` setting, `~` expanded: what a template's `${<setting>}` becomes.
     pub settings: BTreeMap<String, String>,
+    /// Every `bool` and `choice` setting's effective value.
+    pub values: BTreeMap<String, SettingValue>,
+    /// `[net] images` resolved to `https`: the page may load `https` images from any host.
+    pub remote_images: bool,
     pub roots: Roots,
 }
 
@@ -76,9 +80,30 @@ pub fn expand(
     Ok(out)
 }
 
+/// A value as a refusal shows it: text quoted, a boolean bare.
+fn shown(value: &SettingValue) -> String {
+    match value {
+        SettingValue::Text(text) => format!("{text:?}"),
+        SettingValue::Bool(b) => b.to_string(),
+    }
+}
+
+/// [`load_plugin_with`] with every option as text, as a `dir` setting takes it.
 pub fn load_plugin(
     raw_dir: &str,
     given: &BTreeMap<String, String>,
+    home: Option<&Path>,
+) -> Result<LoadedPlugin, String> {
+    let given: BTreeMap<String, SettingValue> = given
+        .iter()
+        .map(|(name, value)| (name.clone(), SettingValue::Text(value.clone())))
+        .collect();
+    load_plugin_with(raw_dir, &given, home)
+}
+
+pub fn load_plugin_with(
+    raw_dir: &str,
+    given: &BTreeMap<String, SettingValue>,
     home: Option<&Path>,
 ) -> Result<LoadedPlugin, String> {
     let dir = expand_home(raw_dir, home)?;
@@ -98,32 +123,63 @@ pub fn load_plugin(
         ));
     }
     let mut settings = BTreeMap::new();
+    let mut values = BTreeMap::new();
     for (name, setting) in &manifest.settings {
-        let raw = given.get(name).unwrap_or(&setting.default);
-        let value = expand_home(raw, home)?;
-        match setting.kind {
+        let value = given.get(name).unwrap_or(&setting.default);
+        match &setting.kind {
             SettingKind::Dir => {
-                if !value.is_absolute() {
+                let SettingValue::Text(raw) = value else {
+                    return Err(format!("setting {name} = {}: a dir setting takes a path", shown(value)));
+                };
+                let path = expand_home(raw, home)?;
+                if !path.is_absolute() {
                     return Err(format!("setting {name} = {raw:?} is not an absolute path"));
                 }
-                if value.exists() {
-                    if !value.is_dir() {
+                if path.exists() {
+                    if !path.is_dir() {
                         return Err(format!("setting {name} = {raw:?} exists and is not a directory"));
                     }
                 } else {
                     std::fs::DirBuilder::new()
                         .recursive(true)
                         .mode(0o700)
-                        .create(&value)
-                        .map_err(|e| format!("setting {name}: creating {}: {e}", value.display()))?;
+                        .create(&path)
+                        .map_err(|e| format!("setting {name}: creating {}: {e}", path.display()))?;
                     // The builder's mode passes through the umask; the leaf is made exactly private.
-                    std::fs::set_permissions(&value, std::fs::Permissions::from_mode(0o700))
-                        .map_err(|e| format!("setting {name}: {}: {e}", value.display()))?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|e| format!("setting {name}: {}: {e}", path.display()))?;
                 }
+                settings.insert(name.clone(), path.to_string_lossy().into_owned());
             }
+            SettingKind::Bool => {
+                if !matches!(value, SettingValue::Bool(_)) {
+                    return Err(format!(
+                        "setting {name} = {}: a bool setting takes true or false",
+                        shown(value)
+                    ));
+                }
+                values.insert(name.clone(), value.clone());
+            }
+            SettingKind::Choice(allowed) => match value {
+                SettingValue::Text(text) if allowed.contains(text) => {
+                    values.insert(name.clone(), value.clone());
+                }
+                _ => {
+                    let listed: Vec<String> = allowed.iter().map(|v| format!("{v:?}")).collect();
+                    return Err(format!(
+                        "setting {name} = {}: a choice setting takes one of {}",
+                        shown(value),
+                        listed.join(", ")
+                    ));
+                }
+            },
         }
-        settings.insert(name.clone(), value.to_string_lossy().into_owned());
     }
+    let remote_images = match &manifest.images {
+        Some(NetImages::Https) => true,
+        Some(NetImages::Setting(name)) => values.get(name) == Some(&SettingValue::Text("https".to_string())),
+        Some(NetImages::Off) | None => false,
+    };
 
     let no_vars = BTreeMap::new();
     let mut roots = BTreeMap::new();
@@ -152,11 +208,36 @@ pub fn load_plugin(
         dir,
         site_root,
         settings,
+        values,
+        remote_images,
         roots,
     })
 }
 
 impl LoadedPlugin {
+    /// Every `bool` and `choice` setting as the page reads it in `host.hello`: a bool as a JSON boolean, a
+    /// choice as a JSON string. `dir` settings are not here; a page sees them as roots.
+    pub fn page_settings(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.values
+            .iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    SettingValue::Bool(b) => serde_json::Value::Bool(*b),
+                    SettingValue::Text(text) => serde_json::Value::String(text.clone()),
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    }
+
+    /// A `bool` setting's effective value; `None` for a name that is not a bool setting.
+    pub fn bool_setting(&self, name: &str) -> Option<bool> {
+        match self.values.get(name) {
+            Some(SettingValue::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
     pub fn resolve_task(&self, task: &str, vars: &BTreeMap<String, String>) -> Result<ResolvedTask, TaskRefusal> {
         let decl = self.manifest.tasks.get(task).ok_or(TaskRefusal::NoSuchTask)?;
         for (name, value) in vars {
@@ -353,5 +434,87 @@ mod tests {
         };
         assert!(message.len() < 500, "{}", message.len());
         assert!(message.contains("..."));
+    }
+    #[test]
+    fn bool_and_choice_settings_take_their_defaults_and_a_value_of_their_kind() {
+        let s = Scratch::new("kinds");
+        let (dir, settings) = demo_plugin(&s.0);
+        let p = load_plugin(dir.to_str().unwrap(), &settings, None).unwrap();
+        assert_eq!(p.values["auto"], SettingValue::Bool(false));
+        assert_eq!(p.values["images"], SettingValue::Text("https".into()));
+        assert!(!p.values.contains_key("work"), "a dir setting is not a value");
+        assert!(p.settings.contains_key("work") && !p.settings.contains_key("auto"));
+        assert!(p.remote_images, "the choice's default is https");
+        assert_eq!(p.bool_setting("auto"), Some(false));
+        assert_eq!(p.bool_setting("images"), None);
+        assert_eq!(p.bool_setting("nope"), None);
+        assert_eq!(
+            serde_json::Value::Object(p.page_settings()),
+            serde_json::json!({"auto": false, "images": "https"})
+        );
+
+        let mut given: BTreeMap<String, SettingValue> = settings
+            .iter()
+            .map(|(k, v)| (k.clone(), SettingValue::Text(v.clone())))
+            .collect();
+        given.insert("auto".into(), SettingValue::Bool(true));
+        given.insert("images".into(), SettingValue::Text("off".into()));
+        let p = load_plugin_with(dir.to_str().unwrap(), &given, None).unwrap();
+        assert_eq!(p.bool_setting("auto"), Some(true));
+        assert!(!p.remote_images);
+        assert_eq!(
+            serde_json::Value::Object(p.page_settings()),
+            serde_json::json!({"auto": true, "images": "off"})
+        );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_kind_is_refused_naming_the_setting() {
+        let s = Scratch::new("wrong-kind");
+        let (dir, settings) = demo_plugin(&s.0);
+        let with = |name: &str, value: SettingValue| {
+            let mut given: BTreeMap<String, SettingValue> = settings
+                .iter()
+                .map(|(k, v)| (k.clone(), SettingValue::Text(v.clone())))
+                .collect();
+            given.insert(name.into(), value);
+            load_plugin_with(dir.to_str().unwrap(), &given, None).unwrap_err()
+        };
+        assert_eq!(
+            with("auto", SettingValue::Text("yes".into())),
+            "setting auto = \"yes\": a bool setting takes true or false"
+        );
+        assert_eq!(
+            with("images", SettingValue::Text("http".into())),
+            "setting images = \"http\": a choice setting takes one of \"https\", \"off\""
+        );
+        assert_eq!(
+            with("images", SettingValue::Bool(true)),
+            "setting images = true: a choice setting takes one of \"https\", \"off\""
+        );
+        assert_eq!(
+            with("work", SettingValue::Bool(true)),
+            "setting work = true: a dir setting takes a path"
+        );
+    }
+
+    #[test]
+    fn net_images_resolve_to_remote_images() {
+        let s = Scratch::new("net-images");
+        let (dir, settings) = demo_plugin(&s.0);
+        let manifest = std::fs::read_to_string(dir.join("eitri-plugin.toml")).unwrap();
+        for (images, want) in [("\"https\"", true), ("\"off\"", false)] {
+            let text = manifest.replacen("images = \"${images}\"", &format!("images = {images}"), 1);
+            std::fs::write(dir.join("eitri-plugin.toml"), text).unwrap();
+            let p = load_plugin(dir.to_str().unwrap(), &settings, None).unwrap();
+            assert_eq!(p.remote_images, want, "{images}");
+        }
+        let text = manifest.replacen("images = \"${images}\"\n", "", 1);
+        std::fs::write(dir.join("eitri-plugin.toml"), text).unwrap();
+        assert!(
+            !load_plugin(dir.to_str().unwrap(), &settings, None)
+                .unwrap()
+                .remote_images
+        );
     }
 }

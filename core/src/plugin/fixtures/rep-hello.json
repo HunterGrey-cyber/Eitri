@@ -41,6 +41,7 @@
         }
       }
     ],
+    "settings": {},
     "theme": {
       "vars": {
         "--nv-bg": "#14161b",
@@ -63,6 +64,7 @@
         "--nv-font-prose": "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif",
         "--nv-hint-bg": "#e0e2ea",
         "--nv-hint-fg": "#14161b",
+        "--nv-link": "#e0e2ea",
         "--nv-mode-browse": "#e0e2ea",
         "--nv-mode-input": "#e0e2ea",
         "--nv-muted": "#8e9098",

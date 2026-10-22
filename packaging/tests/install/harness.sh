@@ -295,6 +295,16 @@ mk_verdandi_source() {
 	MVS_SHA256=$(sha256sum <"$2" | cut -d' ' -f1)
 }
 
+# mk_plugin_tree DIR TAG: a stand-in for the Markdown preview plugin directory the release ships (its manifest and its
+# built site), with TAG in the page so a test can tell two releases' copies apart.
+mk_plugin_tree() {
+	mkdir -p "$1/web/dist/katex/fonts"
+	printf 'id = "markdown"\ntitle = "Markdown preview"\n' >"$1/eitri-plugin.toml"
+	printf '<!doctype html><title>preview %s</title>\n' "$2" >"$1/web/dist/index.html"
+	printf 'export {};\n' >"$1/web/dist/preview.js"
+	printf 'wOF2' >"$1/web/dist/katex/fonts/KaTeX_Main-Regular.woff2"
+}
+
 # mk_release VERSION REV creates $S/fix/v$VERSION from stub binaries, the real launcher,
 # desktop file and icons, the installer, a fixture sidecar source asset and shared runtime pins.
 # Each fixture's RELEASE then has the inputs needed to attempt a sidecar build.
@@ -312,6 +322,8 @@ mk_release() {
 		printf '#!/bin/sh\necho "stub %s %s"\n' "$bin" "$v" >"$b/lib/eitri/$bin"
 		chmod 0755 "$b/lib/eitri/$bin"
 	done
+	# The Markdown preview plugin directory, as the tarball lays it out: lib/eitri/plugins/markdown (release.sh).
+	mk_plugin_tree "$b/lib/eitri/plugins/markdown" "$v"
 	# The fixture release's eitri-setup and install.sh are the unkeyed copy, not the real file: the
 	# tests run them (the tarball's eitri-setup after an install, `eitri setup`) and compare the
 	# installed eitri-setup with $INSTALLER, and none of them may depend on the real release key.
@@ -617,6 +629,7 @@ TESTS=
 . "$HERE/test_icon.sh"
 . "$HERE/test_panel.sh"
 . "$HERE/test_extension.sh"
+. "$HERE/test_plugins.sh"
 
 # The scratch must be new: only the fixture server's own files may already be there.
 for e in "$S"/* "$S"/.[!.]*; do

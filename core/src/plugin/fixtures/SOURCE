@@ -1,3 +1,4 @@
 415aefa88dc6e9a6c23987180a579bd3cb13a770  engine/web/src/eitri/fixtures (the page side's copy; change both in one session)
 Every .json here, ev-theme.json and the theme, prefix and module_key members of rep-hello.json and ev-keys-config.json included, matched that copy byte for byte on 2026-10-20 (fixtures_match_the_page_side_byte_for_byte).
-The keys_settings member of rep-hello.json exists only here until the page side's copy is refreshed (2026-10-21).
+The editor.* fixtures (req-, rep-, ev-editor-*, bad-editor-reveal-extra-key.json), rep-hello-settings.json and rep-hello.json's settings member exist only here until the page side's copy is refreshed.
+The keys_settings member of rep-hello.json and rep-hello-settings.json exists only here until the page side's copy is refreshed (2026-10-21).

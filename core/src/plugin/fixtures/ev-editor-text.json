@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "event": "editor.text",
+  "data": {
+    "buf": 3,
+    "tick": 41,
+    "name": "/w/notes/docs/README.md",
+    "text": "# Notes\n\nA paragraph.\n"
+  }
+}

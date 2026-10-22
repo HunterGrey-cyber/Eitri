@@ -1,0 +1,39 @@
+id = "markdown"
+title = "Markdown preview"
+protocol = 1
+site = "web/dist"                   # the build directory, the same path installed and in the source tree
+entry = "index.html"
+capabilities = ["editor.follow", "editor.commands", "net"]
+
+[module]
+start = "hidden"                    # "shown" (the default) | "hidden": not placed at a first launch
+at = "right"                        # the declared open rule: an `at` value of eitri.layout.rule
+focus = false
+
+[follow]
+filetypes = ["markdown"]            # 1-16 names, each [a-z0-9_]{1,32}
+auto_show = "auto"                  # names a bool setting; optional
+
+[commands.MarkdownPreview]
+does = "show"                       # show | toggle | hide
+[commands.MarkdownPreviewToggle]
+does = "toggle"
+[commands.MarkdownPreviewStop]
+does = "hide"
+
+[settings.auto]
+kind = "bool"
+default = false
+
+[settings.remote_images]
+kind = "choice"
+values = ["https", "off"]
+default = "https"
+
+[settings.sync]
+kind = "choice"
+values = ["both", "editor", "off"]
+default = "both"
+
+[net]
+images = "${remote_images}"         # resolves to "https" or "off"

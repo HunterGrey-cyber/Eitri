@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "event": "editor.closed",
+  "data": {
+    "buf": 3,
+    "reason": "wiped"
+  }
+}

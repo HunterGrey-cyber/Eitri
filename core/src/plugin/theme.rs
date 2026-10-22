@@ -280,7 +280,7 @@ mod tests {
         let guifont = vec![family; 40].join(",");
         let tokens = ThemeTokens::derive(&payload("dark", &guifont, &[]));
         let theme = PageTheme::from_tokens(&tokens);
-        assert_eq!(theme.vars().len(), 53);
+        assert_eq!(theme.vars().len(), 54);
         assert!(theme.vars().iter().any(|(n, _)| n == "--nv-font-mono"));
         assert_one_root_rule(&theme.user_style_sheet());
     }

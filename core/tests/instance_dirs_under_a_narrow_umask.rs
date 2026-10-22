@@ -8,6 +8,7 @@
 use eitri_core::editor_context::feed::EditorContextFeed;
 use eitri_core::nvim_keys::feed::NvimKeysFeed;
 use eitri_core::pane_switch::PaneSwitchChannel;
+use eitri_core::plugin::follow_feed::FollowSocket;
 use eitri_core::theme::feed::ThemeFeed;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -57,6 +58,7 @@ fn every_instance_directory_is_exactly_private_under_umask_0277() {
     let editor = EditorContextFeed::new().expect("the editor-context feed starts under umask 0277");
     let keys = NvimKeysFeed::new().expect("the nvim-keys feed starts under umask 0277");
     let theme = ThemeFeed::new().expect("the theme feed starts under umask 0277");
+    let follow = FollowSocket::bind().expect("the plugin follow socket binds under umask 0277");
     // With a shim: its `bin/` directory is made the same way, and the link to the shim goes into it.
     let shim = Path::new("/bin/sh");
     let switch = PaneSwitchChannel::bind(shim).expect("the pane switch binds under umask 0277");
@@ -64,6 +66,7 @@ fn every_instance_directory_is_exactly_private_under_umask_0277() {
     usable("editor context", editor.socket_path());
     usable("nvim keys", keys.socket_path());
     usable("theme", theme.socket_path());
+    usable("plugin follow", follow.socket_path());
     let switch_dir = usable("pane switch", switch.socket_path());
     assert_eq!(mode(&switch_dir.join("bin")), 0o700, "pane switch: bin/");
     assert_eq!(std::fs::read_link(switch_dir.join("bin").join("tmux")).unwrap(), shim);

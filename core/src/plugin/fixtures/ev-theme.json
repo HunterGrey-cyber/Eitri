@@ -21,6 +21,7 @@
       "--nv-font-prose": "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif",
       "--nv-hint-bg": "#d7827e",
       "--nv-hint-fg": "#32312f",
+      "--nv-link": "#575279",
       "--nv-mode-browse": "#575279",
       "--nv-mode-input": "#575279",
       "--nv-muted": "#615c80",

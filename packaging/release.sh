@@ -934,6 +934,11 @@ ctr_phase_f() {
 	# network, because the build below runs offline.
 	step "npm ci (plugin-kit/keys)"
 	(cd plugin-kit/keys && npm ci --no-audit --no-fund)
+	# The Markdown preview plugin's page is a third bundle shell/build.rs builds (into plugins/markdown/web/dist,
+	# which the release ships as a plugin directory, not inside a binary); its packages come in here for the same
+	# reason.
+	step "npm ci (plugins/markdown/web)"
+	(cd plugins/markdown/web && npm ci --no-audit --no-fund)
 
 	step "the Skia archive, checked against its pin"
 	ctr_fetch_pinned "$RS_SKIA_URL_UPSTREAM" "/build/skia/$RS_SKIA_ARCHIVE" "$RS_SKIA_SHA256"
@@ -972,6 +977,39 @@ ctr_tar() {
 # this list, the nfpm entries and install.sh's NV_EXT_FILES to one another.
 GNOME_EXT_ID='eitri@huntergrey.cn'
 GNOME_EXT_FILES='metadata.json extension.js direction.js policy.js'
+
+# The plugins this release ships as plugin directories (plugins/<name> in the tree): each one's manifest and the site
+# shell/build.rs built under web/dist/. Both packages and the tarball take one staged tree per plugin, found rather
+# than listed, so the site's files (fonts, the lazily loaded diagram code) never need a list of their own here;
+# release_check.py holds the three copies to one another and the manifest to the tracked file.
+SHIPPED_PLUGINS='markdown'
+
+# ctr_stage_plugins ST: each shipped plugin's eitri-plugin.toml and every file of its web/dist/ except the build's
+# fingerprint (.inputs-sha256), from the clone (cwd) into ST/plugins/<name>/ at the same relative paths, where both
+# nfpm profiles name the tree. The manifest says `site = "web/dist"`, which holds in the tree and as installed.
+ctr_stage_plugins() {
+	local st="$1" name f
+	for name in $SHIPPED_PLUGINS; do
+		[ -f "plugins/$name/eitri-plugin.toml" ] || ctr_die "plugins/$name has no eitri-plugin.toml"
+		[ -f "plugins/$name/web/dist/index.html" ] || ctr_die "plugins/$name/web/dist/index.html was not built"
+		install -D -m 0644 "plugins/$name/eitri-plugin.toml" "$st/plugins/$name/eitri-plugin.toml"
+		while IFS= read -r f; do
+			install -D -m 0644 "plugins/$name/web/dist/$f" "$st/plugins/$name/web/dist/$f"
+		done < <(cd "plugins/$name/web/dist" && find . -type f ! -name .inputs-sha256 | sed 's#^\./##' | LC_ALL=C sort)
+	done
+}
+
+# ctr_tarball_plugins ST TREE: the staged plugin directories at the tarball's lib/eitri/plugins/<name>/. install.sh
+# copies lib/eitri whole, so a plugin is installed, upgraded and removed with the binaries, and the running binary
+# finds it beside itself.
+ctr_tarball_plugins() {
+	local st="$1" tree="$2" name f
+	for name in $SHIPPED_PLUGINS; do
+		while IFS= read -r f; do
+			install -D -m 0644 "$st/plugins/$name/$f" "$tree/lib/eitri/plugins/$name/$f"
+		done < <(cd "$st/plugins/$name" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+	done
+}
 
 # ctr_stage_art ST: the desktop entries, the nvim plugin, the GNOME Shell extension and the icon tree, copied from the clone (cwd)
 # into the staging dir at the paths nfpm-public.yaml names as their sources. The entry is named by the application id
@@ -1030,7 +1068,7 @@ ctr_phase_b() {
 	# The same value shell/build.rs would read from neovide/'s own checkout here, set explicitly so
 	# collect-licenses.py prints it in SOURCE for a rebuild from the asset, which has no .git.
 	export EITRI_BUILD_FORK_COMMIT="$RS_FORK_COMMIT"
-	local sde skia_url out=/build/out logs=/build/logs b rc7="${RS_VERDANDI_REV:0:7}"
+	local sde skia_url out=/build/out logs=/build/logs b f rc7="${RS_VERDANDI_REV:0:7}"
 	sde="$(git log -1 --format=%ct HEAD)"
 	skia_url="file:///build/skia/$RS_SKIA_ARCHIVE"
 	export SKIA_BINARIES_URL='file:///build/skia/skia-binaries-{key}.tar.gz'
@@ -1040,9 +1078,10 @@ ctr_phase_b() {
 	cargo tree --locked --offline -e features -p shell -p agent -p supervisor -i agent > "$logs/feature-tree.txt"
 	if grep -n 'legacy-backend' "$logs/feature-tree.txt" >&2; then ctr_die "the resolved graph enables legacy-backend"; fi
 
-	# shell/build.rs writes agent-ui/web/dist/index.html and plugin-kit/keys/dist/keys.js
-	# into a fresh source copy while /build/target is retained. Unchanged inputs can make
-	# cargo skip the build script on a retry, leaving bundles absent and include_str! failing.
+	# shell/build.rs writes agent-ui/web/dist/index.html, plugin-kit/keys/dist/keys.js and
+	# the preview site under plugins/markdown/web/dist into a fresh source copy while
+	# /build/target is retained. Unchanged inputs can make cargo skip the build script
+	# on a retry, leaving bundles absent and causing include_str! to fail.
 	# Cleaning shell makes its build script run against the fresh copy every time.
 	step "cargo clean --release -p shell (its build script writes the web bundle into this fresh copy)"
 	cargo clean --release --locked --offline -p shell
@@ -1091,6 +1130,7 @@ ctr_phase_b() {
 	install -m 0755 packaging/install.sh "$st/packaging/install.sh"
 	install -m 0755 packaging/eitri.launcher.sh "$st/packaging/eitri.launcher.sh"
 	ctr_stage_art "$st"
+	ctr_stage_plugins "$st"
 	# The .deb's AppArmor profile (nfpm-public.yaml's `packager: deb` entry).
 	install -D -m 0644 packaging/apparmor/eitri "$st/packaging/apparmor/eitri"
 	install -m 0644 LICENSE "$st/LICENSE"
@@ -1106,6 +1146,7 @@ ctr_phase_b() {
 	install -D -m 0755 "$st/packaging/install.sh" "$tb/$tt/lib/eitri/eitri-setup"
 	install -D -m 0644 "$st/dist/RELEASE" "$tb/$tt/lib/eitri/RELEASE"
 	ctr_tarball_art "$st" "$tb/$tt"
+	ctr_tarball_plugins "$st" "$tb/$tt"
 	install -D -m 0644 "$st/LICENSE" "$tb/$tt/share/licenses/eitri/LICENSE"
 	install -D -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$tb/$tt/share/licenses/eitri/THIRD-PARTY-LICENSES"
 	install -D -m 0644 "$st/dist/SOURCE" "$tb/$tt/share/licenses/eitri/SOURCE"
@@ -1131,6 +1172,13 @@ ctr_phase_b() {
 	# together, so the offline rebuild of the asset skips npm for it too.
 	install -D -m 0644 plugin-kit/keys/dist/keys.js "$sd/$sa/plugin-kit/keys/dist/keys.js"
 	install -D -m 0644 plugin-kit/keys/dist/.inputs-sha256 "$sd/$sa/plugin-kit/keys/dist/.inputs-sha256"
+	# The Markdown preview plugin's site and the fingerprint it was built from, for the same reason: the asset's
+	# offline rebuild then skips npm for the third bundle too.
+	while IFS= read -r f; do
+		install -D -m 0644 "plugins/markdown/web/dist/$f" "$sd/$sa/plugins/markdown/web/dist/$f"
+	done < <(cd plugins/markdown/web/dist && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+	[ -f "$sd/$sa/plugins/markdown/web/dist/.inputs-sha256" ] \
+		|| ctr_die "plugins/markdown/web/dist/.inputs-sha256 is missing: the build wrote no fingerprint"
 	install -D -m 0644 "/build/skia/$RS_SKIA_ARCHIVE" "$sd/$sa/skia/$RS_SKIA_ARCHIVE"
 	install -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$st/dist/SOURCE" "$sd/$sa/"
 	find "$sd/$sa" -exec touch -h -d "@$sde" {} +

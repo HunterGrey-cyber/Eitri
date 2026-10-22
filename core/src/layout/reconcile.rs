@@ -108,12 +108,27 @@ pub fn reconcile_default_floating(
     floats: Vec<Float>,
     lua: &[ModuleDecl],
 ) -> Result<Reconciled, ReconcileError> {
-    let instances: Vec<_> = root
+    reconcile_default_floating_with(root, floats, lua, &[])
+}
+
+/// [`reconcile_default_floating`] for a window some of whose modules are deferred (never placed by the window
+/// itself): one the tree or its floats name is kept as an instance is, and one they do not name is not placed.
+pub fn reconcile_default_floating_with(
+    root: Node,
+    floats: Vec<Float>,
+    lua: &[ModuleDecl],
+    deferred: &[ModuleId],
+) -> Result<Reconciled, ReconcileError> {
+    let mut instances: Vec<ModuleId> = Vec::new();
+    for id in root
         .leaves()
         .into_iter()
         .chain(floats.iter().map(|float| float.id.clone()))
-        .filter(|id| id.kind().has_instances() && id.number() >= 2)
-        .collect();
+    {
+        if (deferred.contains(&id) || id.kind().has_instances() && id.number() >= 2) && !instances.contains(&id) {
+            instances.push(id);
+        }
+    }
     reconcile_with(
         root,
         floats,
@@ -476,6 +491,31 @@ mod tests {
             let layout = reconcile_default_floating(root, Vec::new(), &decls).unwrap().layout;
             assert_eq!(row_pin(&layout.root_node(), &bottom).is_some(), pinned, "{bottom}");
         }
+    }
+
+    #[test]
+    fn a_default_tree_keeps_a_deferred_module_it_names_and_places_none_it_does_not() {
+        let preview = ModuleId::lua("markdown");
+        let deferred = [preview.clone()];
+        let named = row(row(leaf(editor()), leaf(agent())), leaf(preview.clone()));
+        let r = reconcile_default_floating_with(named.clone(), Vec::new(), &[], &deferred).unwrap();
+        assert!(r.layout.contains(&preview), "{:?}", r.notes);
+        assert!(!r.layout.hidden().contains(&preview));
+        assert!(r.notes.iter().all(|n| !n.contains("lua:markdown")), "{:?}", r.notes);
+
+        let unnamed = row(leaf(editor()), leaf(agent()));
+        let r = reconcile_default_floating_with(unnamed, Vec::new(), &[], &deferred).unwrap();
+        assert!(!r.layout.contains(&preview));
+        assert!(r.notes.iter().all(|n| !n.contains("lua:markdown")), "{:?}", r.notes);
+
+        let r = reconcile_default_floating(named, Vec::new(), &[]).unwrap();
+        assert!(!r.layout.contains(&preview));
+        assert!(
+            r.notes
+                .contains(&"left out 'lua:markdown': this window has no such module".to_string()),
+            "{:?}",
+            r.notes
+        );
     }
 
     #[test]

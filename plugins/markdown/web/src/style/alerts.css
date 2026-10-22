@@ -1,0 +1,68 @@
+/* An alert keeps its text in the body colour: its kind shows only in the bar on its left and the glyph before its
+   title, because the signal colours are for borders and glyphs, never for text. */
+.markdown-alert {
+  margin: 0 0 16px;
+  padding: 0.5em 1em;
+  border-left: 0.25em solid var(--mdp-alert);
+  color: var(--nv-fg);
+}
+
+.markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-alert-title {
+  margin: 0 0 8px;
+  font-weight: 600;
+  color: var(--nv-fg);
+}
+
+.markdown-alert-title::before {
+  display: inline-block;
+  width: 1.4em;
+  color: var(--mdp-alert);
+}
+
+details.markdown-alert > summary.markdown-alert-title {
+  cursor: pointer;
+}
+
+.markdown-alert-note {
+  --mdp-alert: var(--nv-chrome-accent);
+}
+
+.markdown-alert-tip {
+  --mdp-alert: var(--nv-ok);
+}
+
+.markdown-alert-important {
+  --mdp-alert: var(--nv-focus-ring);
+}
+
+.markdown-alert-warning {
+  --mdp-alert: var(--nv-warn);
+}
+
+.markdown-alert-caution {
+  --mdp-alert: var(--nv-error);
+}
+
+.markdown-alert-note > .markdown-alert-title::before {
+  content: "\24D8";
+}
+
+.markdown-alert-tip > .markdown-alert-title::before {
+  content: "\2726";
+}
+
+.markdown-alert-important > .markdown-alert-title::before {
+  content: "\2762";
+}
+
+.markdown-alert-warning > .markdown-alert-title::before {
+  content: "\26A0\FE0E";
+}
+
+.markdown-alert-caution > .markdown-alert-title::before {
+  content: "\2298";
+}

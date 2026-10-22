@@ -418,11 +418,15 @@ fn editor_rpc_callers_pass_only_constant_lua() {
     let mut flagged = Vec::new();
     let mut forwarders: Vec<(String, usize)> = Vec::new();
     let mut install_seen = false;
+    let mut follow_seen = false;
     for source in &read {
         let rel = source.path.clone();
         let report = scan(&rel, &source.text);
         if rel == "core/src/companion/driver.rs" && report.constants.iter().any(|c| c == "INSTALL_LUA") {
             install_seen = true;
+        }
+        if rel == "core/src/plugin/editor.rs" && report.constants.iter().any(|c| c == "PLUGIN_FOLLOW_LUA") {
+            follow_seen = true;
         }
         flagged.extend(report.flagged);
         if !report.forwarders.is_empty() {
@@ -432,6 +436,10 @@ fn editor_rpc_callers_pass_only_constant_lua() {
     assert!(
         install_seen,
         "the install's own call (`INSTALL_LUA` in core/src/companion/driver.rs) was not found: the scan reads nothing"
+    );
+    assert!(
+        follow_seen,
+        "the follow snippet's calls (PLUGIN_FOLLOW_LUA in core/src/plugin/editor.rs) were not found"
     );
     assert!(
         flagged.is_empty(),

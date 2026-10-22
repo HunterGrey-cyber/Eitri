@@ -235,7 +235,8 @@ impl ModuleGrid {
         grid
     }
 
-    fn layout(&self) -> Rc<RefCell<Layout>> {
+    /// The layout the grid draws: the same cell the window's readers hold.
+    pub(crate) fn layout(&self) -> Rc<RefCell<Layout>> {
         self.imp()
             .layout
             .borrow()

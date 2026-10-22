@@ -106,7 +106,7 @@ package() {
 	# lays out at share/eitri/eitri.nvim and the packages put at /usr/share/eitri/nvim/eitri.nvim.
 	install -Dm0644 "$top/share/applications/cn.huntergrey.eitri.Panel.desktop" \
 		"$pkgdir/usr/share/applications/cn.huntergrey.eitri.Panel.desktop"
-	local _icon _plugin _ext
+	local _icon _plugin _ext _pf
 	while IFS= read -r _plugin; do
 		install -Dm0644 "$top/share/eitri/eitri.nvim/$_plugin" "$pkgdir/usr/share/eitri/nvim/eitri.nvim/$_plugin"
 	done < <(cd "$top/share/eitri/eitri.nvim" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
@@ -119,6 +119,15 @@ package() {
 	while IFS= read -r _icon; do
 		install -Dm0644 "$top/share/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
 	done < <(cd "$top/share/icons" && find hicolor -type f | LC_ALL=C sort)
+	# The Markdown preview plugin directory: the tarball's lib/eitri/plugins/markdown, at the packages' place for it,
+	# every file found rather than listed (the build's fingerprint never ships).
+	if [ ! -f "$top/lib/eitri/plugins/markdown/eitri-plugin.toml" ]; then
+		echo "the tarball has no lib/eitri/plugins/markdown/eitri-plugin.toml" >&2
+		return 1
+	fi
+	while IFS= read -r _pf; do
+		install -Dm0644 "$top/lib/eitri/plugins/markdown/$_pf" "$pkgdir/usr/share/eitri/plugins/markdown/$_pf"
+	done < <(cd "$top/lib/eitri/plugins/markdown" && find . -type f ! -name .inputs-sha256 | sed 's#^\./##' | LC_ALL=C sort)
 
 	# Install the tarball's licences and SOURCE, plus the SDK's LICENSE.md and Node's licence.
 	# The setup script saves the latter two beside the sidecar when present.

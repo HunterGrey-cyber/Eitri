@@ -1,0 +1,230 @@
+/*! Adapted from Visual Studio Code's Markdown preview (extensions/markdown-language-features), Copyright (c) Microsoft Corporation, MIT License. */
+
+/* Every colour and font comes from the --nv-* set the host keeps on :root, so the preview follows nvim's colourscheme
+   live; light or dark comes from --nv-color-scheme, never from the desktop's preference, which is not Eitri's. The
+   page sets its background and its text together, so neither half is left to the host's defaults. */
+html {
+  color-scheme: var(--nv-color-scheme);
+  background-color: var(--nv-bg);
+  color: var(--nv-fg);
+}
+
+html, body {
+  font-family: var(--nv-font-prose);
+  font-size: 14px;
+  line-height: 22px;
+  word-wrap: break-word;
+}
+
+body {
+  margin: 0;
+  padding: 1em 26px 0;
+}
+
+/* The content root. Room below the last block lets the end of the document come to the top, as nvim's own window
+   can scroll its last line up, so the two stay in step to the end. */
+.mdp-root {
+  position: relative;
+  background-color: var(--nv-bg);
+  color: var(--nv-fg);
+  margin-bottom: calc(100vh - 22px);
+}
+
+h1, h2, h3, h4, h5, h6, p, ol, ul, pre {
+  margin-top: 0;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  margin-top: 24px;
+  margin-bottom: 16px;
+  line-height: 1.25;
+}
+
+h1 {
+  font-size: 2em;
+  margin-top: 0;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--nv-border);
+}
+
+h2 {
+  font-size: 1.5em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--nv-border);
+}
+
+h3 {
+  font-size: 1.25em;
+}
+
+h4 {
+  font-size: 1em;
+}
+
+h5 {
+  font-size: 0.875em;
+}
+
+h6 {
+  font-size: 0.85em;
+}
+
+/* Keep sub and sup from changing a line's height. */
+sub, sup {
+  line-height: 0;
+}
+
+p {
+  margin-bottom: 16px;
+}
+
+li p {
+  margin-bottom: 0.7em;
+}
+
+ul, ol {
+  margin-bottom: 0.7em;
+}
+
+ul ul:first-child, ul ol:first-child, ol ul:first-child, ol ol:first-child {
+  margin-bottom: 0;
+}
+
+img {
+  max-width: 100%;
+  max-height: 100%;
+}
+
+a {
+  color: var(--nv-link);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+a:focus, input:focus, summary:focus {
+  outline: 1px solid var(--nv-focus-ring);
+  outline-offset: -1px;
+}
+
+hr {
+  border: 0;
+  height: 1px;
+  border-bottom: 1px solid var(--nv-border);
+}
+
+/* A wide table scrolls sideways in its own box instead of widening the page. */
+table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin-bottom: 0.7em;
+}
+
+th {
+  text-align: left;
+  border-bottom: 1px solid var(--nv-border);
+  background-color: var(--nv-surface);
+  color: var(--nv-surface-fg);
+}
+
+th, td {
+  padding: 5px 10px;
+}
+
+table > tbody > tr + tr > td {
+  border-top: 1px solid var(--nv-border);
+}
+
+blockquote {
+  margin: 0 0 16px;
+  padding: 0 16px 0 10px;
+  border-left: 5px solid var(--nv-border);
+  border-radius: 2px;
+  color: var(--nv-muted);
+}
+
+code {
+  font-family: var(--nv-font-mono);
+  font-size: 1em;
+  line-height: 1.357em;
+}
+
+:not(pre) > code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background-color: var(--nv-surface);
+  color: var(--nv-surface-fg);
+}
+
+pre {
+  position: relative;
+  padding: 16px;
+  border-radius: 3px;
+  overflow: auto;
+  background-color: var(--nv-surface);
+  border: 1px solid var(--nv-border);
+}
+
+pre code {
+  display: inline-block;
+  color: var(--nv-surface-fg);
+  tab-size: 4;
+  background: none;
+}
+
+kbd {
+  padding: 0 4px;
+  border: 1px solid var(--nv-border);
+  border-radius: 3px;
+  font-family: var(--nv-font-mono);
+  background-color: var(--nv-surface);
+  color: var(--nv-surface-fg);
+}
+
+mark {
+  background-color: var(--nv-search);
+  color: var(--nv-hint-fg);
+}
+
+::selection {
+  background-color: var(--nv-cursor-band);
+}
+
+details > summary {
+  cursor: pointer;
+}
+
+/* Task lists: the checkbox replaces the bullet, and is drawn disabled (the preview edits nothing). */
+.task-list-item {
+  list-style-type: none;
+}
+
+.task-list-item-checkbox {
+  margin: 0 0.35em 0.25em -1.4em;
+  vertical-align: middle;
+}
+
+.footnotes {
+  font-size: 0.875em;
+  color: var(--nv-muted);
+}
+
+.front-matter {
+  margin-bottom: 16px;
+}
+
+.front-matter > summary {
+  color: var(--nv-muted);
+}
+
+/* Display math scrolls sideways in its own box when a formula is wider than the column. */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}

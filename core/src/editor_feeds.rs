@@ -1,4 +1,4 @@
-//! The editor's four push sockets (theme, keys, editor context, pane switch) read from one place.
+//! The editor's push sockets (theme, keys, editor context, pane switch, plugin follow) read from one place.
 //!
 //! Each feed used to be drained by a `glib` timer of its own in `shell`; the reading itself never
 //! needed a toolkit, only a clock. [`EditorFeeds::poll`] takes the time as an argument and decides
@@ -19,6 +19,7 @@ use crate::editor_context::{ContextSource, EditorContext};
 use crate::nvim_keys::feed::NvimKeysReader;
 use crate::nvim_keys::NvimReport;
 use crate::pane_switch::{PaneMessage, PaneSwitchReader};
+use crate::plugin::follow_feed::{FollowBatch, FollowReader};
 use crate::theme::feed::ThemePayloadReader;
 use crate::theme::payload::NvimThemePayload;
 
@@ -30,6 +31,8 @@ pub struct FeedEvents {
     pub pane: Vec<PaneMessage>,
     /// The context source answers something new: a host whose panel reads it only when woken must wake it.
     pub context: bool,
+    /// What the plugin follow socket brought: commands in order, the newest view of each plugin.
+    pub follow: FollowBatch,
 }
 
 /// Whether any of `fds` is readable now, without waiting. An error counts as readable: the caller
@@ -124,6 +127,7 @@ pub struct EditorFeeds {
     keys: Option<Cadenced<NvimKeysReader>>,
     pane: Option<Cadenced<PaneSwitchReader>>,
     context: Option<Cadenced<ContextFeed>>,
+    follow: Option<Cadenced<FollowReader>>,
 }
 
 impl EditorFeeds {
@@ -146,6 +150,12 @@ impl EditorFeeds {
     /// tick is its cadence.
     pub fn add_pane_switch(&mut self, reader: PaneSwitchReader, now: Instant) {
         self.pane = Some(Cadenced::new(reader, Duration::ZERO, now));
+    }
+
+    /// The plugin follow socket is read on every poll too: a command on it is a key press the user is
+    /// waiting on, and a view is the scroll the page should follow at once.
+    pub fn add_follow(&mut self, reader: FollowReader, now: Instant) {
+        self.follow = Some(Cadenced::new(reader, Duration::ZERO, now));
     }
 
     /// The context feed: what it last read, minus scratch buffers, is what the returned source answers;
@@ -195,6 +205,9 @@ impl EditorFeeds {
         if let Some(feed) = &self.pane {
             fds.push(feed.reader.listener_fd());
         }
+        if let Some(feed) = &self.follow {
+            fds.push(feed.reader.listener_fd());
+        }
         fds
     }
 
@@ -213,12 +226,14 @@ impl EditorFeeds {
                 .context
                 .as_ref()
                 .is_some_and(|f| f.reader.reader.borrow().lines().holds_connections())
-            || self.pane.as_ref().is_some_and(|f| f.reader.holds_connections());
+            || self.pane.as_ref().is_some_and(|f| f.reader.holds_connections())
+            || self.follow.as_ref().is_some_and(|f| f.reader.holds_connections());
         !holding && !any_readable(&self.listener_fds())
     }
 
     /// Reads every feed whose interval has passed since its last read (theme, keys and context every
-    /// `POLL_INTERVAL` of theirs, the pane switch on every call), one payload per feed per read.
+    /// `POLL_INTERVAL` of theirs, the pane switch and the plugin follow socket on every call), one payload
+    /// per feed per read.
     pub fn poll(&mut self, now: Instant) -> FeedEvents {
         let mut events = FeedEvents::default();
         if let Some(reader) = self.theme.as_mut().and_then(|feed| feed.due(now)) {
@@ -233,6 +248,9 @@ impl EditorFeeds {
         if let Some(reader) = self.pane.as_mut().and_then(|feed| feed.due(now)) {
             events.pane = reader.poll();
         }
+        if let Some(reader) = self.follow.as_mut().and_then(|feed| feed.due(now)) {
+            events.follow = reader.poll(now);
+        }
         events
     }
 }
@@ -243,6 +261,7 @@ mod tests {
     use crate::editor_context::feed::EditorContextFeed;
     use crate::nvim_keys::feed::NvimKeysFeed;
     use crate::pane_switch::PaneSwitchChannel;
+    use crate::plugin::follow_feed::{FollowCmd, FollowSocket, Ordered};
     use crate::theme::feed::ThemeFeed;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -456,5 +475,61 @@ mod tests {
         let found = feeds.poll(now + Duration::from_secs(10)).theme;
         assert_eq!(found.expect("still there").options.colors_name, "a");
         feed.cleanup();
+    }
+
+    fn follow_feeds() -> (EditorFeeds, FollowSocket, Instant) {
+        let mut socket = FollowSocket::bind().expect("bind");
+        let mut feeds = EditorFeeds::new();
+        let now = Instant::now();
+        feeds.add_follow(FollowReader::new(socket.take_listener().unwrap()), now);
+        (feeds, socket, now)
+    }
+
+    const SHOW: &str = r#"{"v":1,"k":"cmd","owner":"demo","cmd":"show"}"#;
+
+    fn show() -> Ordered {
+        Ordered::Cmd {
+            owner: "demo".to_string(),
+            cmd: FollowCmd::Show,
+            buf: None,
+        }
+    }
+
+    #[test]
+    fn the_follow_feed_is_read_every_poll_and_counts_toward_quiet() {
+        let (mut feeds, socket, now) = follow_feeds();
+        assert_eq!(feeds.listener_fds().len(), 1);
+        assert!(feeds.is_quiet(), "nothing sent");
+
+        send(socket.socket_path(), SHOW);
+        assert!(!feeds.is_quiet(), "a connection waits");
+        assert_eq!(feeds.poll(now).follow.ordered, vec![show()], "read on the first poll");
+        assert!(feeds.is_quiet(), "read");
+        assert!(feeds.poll(now + EditorFeeds::TICK).follow.is_empty());
+
+        // Half a line keeps the feeds from being quiet until it is finished.
+        let mut half = UnixStream::connect(socket.socket_path()).expect("connect");
+        half.write_all(&SHOW.as_bytes()[..10]).expect("write");
+        assert!(feeds.poll(now + EditorFeeds::TICK * 2).follow.is_empty());
+        assert!(!feeds.is_quiet(), "a line is half read");
+        half.write_all(&SHOW.as_bytes()[10..]).expect("write");
+        half.write_all(b"\n").expect("write");
+        assert_eq!(feeds.poll(now + EditorFeeds::TICK * 3).follow.ordered, vec![show()]);
+        assert!(feeds.is_quiet());
+        socket.cleanup();
+    }
+
+    #[test]
+    fn a_follow_feed_not_added_reads_nothing() {
+        let mut socket = FollowSocket::bind().expect("bind");
+        let mut feeds = EditorFeeds::new();
+        let now = Instant::now();
+        send(socket.socket_path(), SHOW);
+
+        assert!(feeds.poll(now).follow.is_empty());
+        // The line is still queued for whoever adds the reader later.
+        feeds.add_follow(FollowReader::new(socket.take_listener().unwrap()), now);
+        assert_eq!(feeds.poll(now).follow.ordered, vec![show()]);
+        socket.cleanup();
     }
 }

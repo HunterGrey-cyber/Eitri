@@ -141,6 +141,13 @@ contents:
     file_info:
       mode: 0644
 
+  # The Markdown preview plugin, a plugin directory `eitri.plugin.load("markdown")` finds under the system data
+  # directories: its manifest and its built site, staged by release.sh as one tree (ctr_stage_plugins), so this
+  # entry never lists the site's files.
+  - src: ./plugins/markdown
+    dst: /usr/share/eitri/plugins/markdown
+    type: tree
+
   # The icon, in every size packaging/icons/hicolor holds, under the icon theme's own tree
   # (packaging/icons/README.md; its notice, CC BY 4.0, is printed in THIRD-PARTY-LICENSES).
   - src: ./packaging/icons/hicolor/16x16/apps/cn.huntergrey.eitri.png

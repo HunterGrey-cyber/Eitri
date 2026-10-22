@@ -149,14 +149,26 @@ pub(crate) fn install_crash_recovery(
     let guard = Rc::new(RefCell::new(
         crate::webview_crash_guard::WebViewCrashGuard::with_defaults(),
     ));
-    let guard_for_signal = guard.clone();
+    install_crash_recovery_into(webview, id, url, give_up_base, guard.clone());
+    guard
+}
+
+/// [`install_crash_recovery`] with a guard made earlier: a view built after its panel was registered answers to
+/// the guard the registry already holds, so the revive path resets the one the signal asks.
+pub(crate) fn install_crash_recovery_into(
+    webview: &webkit6::WebView,
+    id: String,
+    url: String,
+    give_up_base: Option<String>,
+    guard: Rc<RefCell<crate::webview_crash_guard::WebViewCrashGuard>>,
+) {
     webview.connect_web_process_terminated(move |webview, reason| {
         if reason == webkit6::WebProcessTerminationReason::TerminatedByApi {
             return;
         }
         use crate::webview_crash_guard::CrashResponse;
         // Taken before the `match`, so the guard's borrow is not held while the arms act.
-        let response = guard_for_signal.borrow_mut().on_crash();
+        let response = guard.borrow_mut().on_crash();
         match response {
             CrashResponse::Reload => {
                 eprintln!("[lua] panel '{id}': the web process terminated ({reason:?}); reloading it");
@@ -172,7 +184,6 @@ pub(crate) fn install_crash_recovery(
             CrashResponse::AlreadyGivenUp => {}
         }
     });
-    guard
 }
 
 #[cfg(test)]

@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "event": "editor.text",
+  "data": {
+    "buf": 3,
+    "tick": 42,
+    "name": "/w/notes/big.md",
+    "too_large": {
+      "bytes": 5452595,
+      "lines": 61000,
+      "max_bytes": 4194304,
+      "max_lines": 50000
+    }
+  }
+}

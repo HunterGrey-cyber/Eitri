@@ -45,7 +45,8 @@ pub use module::{declared_placement, ModuleDecl, ModuleError, ModuleId, ModuleKi
 pub use number::number_plan;
 pub use ops::{even, place, place_as_tab, place_at, swap, swap_adjacent};
 pub use reconcile::{
-    reconcile, reconcile_default, reconcile_default_floating, reconcile_floating, ReconcileError, Reconciled,
+    reconcile, reconcile_default, reconcile_default_floating, reconcile_default_floating_with, reconcile_floating,
+    ReconcileError, Reconciled,
 };
 pub use rules::{apply_launch_rule, first_launch_decls, open_by_rule, OpenRule, OpenRules, Opened};
 pub use tray::{agent_place, agent_place_covered, chip_label, tray, tray_covered, view_place};

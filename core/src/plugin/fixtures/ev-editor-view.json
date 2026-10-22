@@ -1,0 +1,24 @@
+{
+  "v": 1,
+  "event": "editor.view",
+  "data": {
+    "buf": 3,
+    "name": "/w/notes/docs/README.md",
+    "filetype": "markdown",
+    "tick": 41,
+    "current": true,
+    "line_count": 300,
+    "top": 120,
+    "top_fraction": 0.0,
+    "bottom": 160,
+    "cursor": {
+      "line": 125,
+      "col": 4
+    },
+    "cause": "user",
+    "doc": {
+      "root": "eitri-plugin://markdown/.eitri/doc/4/",
+      "base": "eitri-plugin://markdown/.eitri/doc/4/docs/"
+    }
+  }
+}

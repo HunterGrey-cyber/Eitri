@@ -6,25 +6,32 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::editor::{self, decode_apply, decode_clear};
+use super::doc_route::{self, DocSlot};
+use super::editor::{self, decode_apply, decode_clear, decode_open, read_applied, FollowInstall, PulledText};
+use super::follow::{Done, FollowOp, FollowState, Next, MAX_TEXT_BYTES, MAX_TEXT_LINES};
+use super::follow_feed::ViewLine;
 use super::keys::{self, EffectiveRow, PluginKeyOp};
 use super::kit_settings::KeysSettings;
 use super::load::{LoadedPlugin, ResolvedTask, TaskRefusal};
+use super::manifest::Capability;
+use super::page_policy;
 use super::protocol::{
-    self, ErrorCode, ExitStatus, FocusEvent, FocusTarget, Inbound, KeyRowArg, KeysConfig, OnOff, Reply, StreamName,
-    TaskExit, TaskOutput, Verb,
+    self, ClosedReason, Cursor, DocPrefixes, EditorClosed, EditorJump, EditorOpenLink, EditorReveal, EditorText,
+    EditorView, ErrorCode, ExitStatus, FocusEvent, FocusTarget, Inbound, KeyRowArg, KeysConfig, OnOff, Reply,
+    StreamName, TaskExit, TaskOutput, TooLarge, Verb, EVENT_EDITOR_CLOSED, EVENT_EDITOR_TEXT, EVENT_EDITOR_VIEW,
 };
 use super::roots::{self, PathRefusal};
 use super::state::{PluginStore, StoreError, StoreErrorKind, StoreOp, StoreWorker};
 use super::tasks::{ExitKind, Launch, RunInfo, RunsWaiter, StartError, Stream, TaskEvent, TaskRunner};
 use super::theme::PageTheme;
+use super::trace;
 use crate::editor_rpc::EditorRpc;
 use crate::keymap::{Chord, KeySpec};
 use crate::nvim_rpc::Pending;
@@ -44,6 +51,7 @@ pub const CHECK_DEADLINE: Duration = Duration::from_secs(5);
 pub const DEFAULT_TIMEOUTLEN: u32 = 1000;
 
 const CHECK_TIMEOUT: &str = "the filesystem did not answer within 5 s";
+const EDITOR_BUSY: &str = "the editor did not answer within 5 s; it may be waiting for a key (press Esc and try again)";
 
 /// The page. `send` is asynchronous and never calls back into the host before it returns.
 pub trait PagePort {
@@ -115,11 +123,90 @@ enum CheckJob {
         task: String,
         vars: BTreeMap<String, String>,
     },
+    /// The project of the followed document `doc` (absolute, as nvim names it).
+    Project {
+        doc: PathBuf,
+        window_root: Option<PathBuf>,
+        home: Option<PathBuf>,
+    },
+    /// A link of the followed document `doc`: `path` (relative, decoded) under the document's directory, or
+    /// under its project with `from_root`.
+    Link {
+        doc: PathBuf,
+        window_root: Option<PathBuf>,
+        home: Option<PathBuf>,
+        path: String,
+        from_root: bool,
+    },
 }
 
 enum Checked {
     Path(Result<PathBuf, PathRefusal>),
     Task(Result<ResolvedTask, TaskRefusal>),
+    /// The canonical project directory and the canonical directory of the document, or `None` with no project.
+    Project(Option<(PathBuf, PathBuf)>),
+}
+
+/// A document's project and its own directory, both canonical. Reads the filesystem: the path worker only.
+fn project_of(doc: &Path, window_root: Option<&Path>, home: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
+    let project = doc_route::project_dir(doc, window_root, home)?;
+    let doc_dir = std::fs::canonicalize(doc.parent()?).ok()?;
+    Some((project, doc_dir))
+}
+
+/// Where a document's link leads: a regular file inside the document's project, canonical. A document is
+/// untrusted text, so its links may name anything; only its own project is in reach, by canonical path, so
+/// neither `..` nor a symlink leads out. Reads the filesystem: the path worker only.
+fn link_inside(
+    doc: &Path,
+    window_root: Option<&Path>,
+    home: Option<&Path>,
+    path: &str,
+    from_root: bool,
+) -> Result<PathBuf, PathRefusal> {
+    let (project, doc_dir) = project_of(doc, window_root, home).ok_or(PathRefusal::OutsideRoots)?;
+    let base = if from_root { &project } else { &doc_dir };
+    let canonical = std::fs::canonicalize(base.join(path)).map_err(|_| PathRefusal::Missing)?;
+    // A link inside the project can lead to a file whose own name holds a control character.
+    if roots::has_control(&canonical.to_string_lossy()) {
+        return Err(PathRefusal::ControlCharacter);
+    }
+    if !canonical.starts_with(&project) {
+        return Err(PathRefusal::OutsideRoots);
+    }
+    let meta = std::fs::metadata(&canonical).map_err(|_| PathRefusal::Missing)?;
+    if meta.is_file() {
+        Ok(canonical)
+    } else {
+        Err(PathRefusal::NotRegularFile)
+    }
+}
+
+/// The followed buffer's file, when it names one: nvim names a file's buffer by its absolute path, and anything
+/// else (an unnamed buffer, a `term://` or other plugin buffer) has no file and so no project.
+fn doc_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    (!name.is_empty() && path.is_absolute()).then(|| path.to_path_buf())
+}
+
+/// The line a link's fragment names: `L<n>` or `L<n>-L<m>`, `n` at least 1. Any other fragment is the page's to
+/// act on.
+fn line_fragment(fragment: &str) -> Option<u32> {
+    let number = |text: &str| -> Option<u32> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    };
+    let rest = fragment.strip_prefix('L')?;
+    let (first, end) = match rest.split_once('-') {
+        Some((first, end)) => (first, Some(end)),
+        None => (rest, None),
+    };
+    if let Some(end) = end {
+        number(end.strip_prefix('L')?)?;
+    }
+    number(first).filter(|n| *n >= 1)
 }
 
 /// One worker thread per plugin, started at the first check. Checks run in order; one stalled on the
@@ -143,6 +230,22 @@ impl PathChecker {
                     CheckJob::File(raw) => Checked::Path(roots::file_inside(&plugin.roots, &raw)),
                     CheckJob::Dir(raw) => Checked::Path(roots::dir_inside(&plugin.roots, &raw)),
                     CheckJob::Task { task, vars } => Checked::Task(plugin.resolve_task(&task, &vars)),
+                    CheckJob::Project { doc, window_root, home } => {
+                        Checked::Project(project_of(&doc, window_root.as_deref(), home.as_deref()))
+                    }
+                    CheckJob::Link {
+                        doc,
+                        window_root,
+                        home,
+                        path,
+                        from_root,
+                    } => Checked::Path(link_inside(
+                        &doc,
+                        window_root.as_deref(),
+                        home.as_deref(),
+                        &path,
+                        from_root,
+                    )),
                 };
                 if done.send((ticket, checked)).is_err() {
                     return;
@@ -152,6 +255,19 @@ impl PathChecker {
         })?;
         Ok(PathChecker { tx, rx })
     }
+}
+
+/// The one follow call out to the editor: the host's own (install, follow, text, teardown) or a page's.
+struct FollowCall {
+    op: FollowOp,
+    pending: Pending,
+    deadline: Instant,
+    /// The editor session it was sent to; a call to an earlier session is given up, not waited for.
+    session: Option<u64>,
+    /// The document that was current when it was sent; a text or a reply for another one is dropped.
+    document: u64,
+    /// The page's id for a page's call, until it has been answered (or told the editor is busy).
+    re: Option<u64>,
 }
 
 /// An `editor.open` or `task.start` waiting for its check.
@@ -172,6 +288,13 @@ enum Then {
     Task {
         task: String,
         vars: BTreeMap<String, String>,
+    },
+    /// An `editor.open_link`: the target as the page sent it, the line its fragment names, and the editor
+    /// session it was asked in.
+    Link {
+        target: String,
+        line: Option<u32>,
+        session: Option<u64>,
     },
 }
 
@@ -214,6 +337,44 @@ struct PluginHostState {
     theme: PageTheme,
     /// The current document's declared key table, with the user's overrides applied.
     declared: Option<Vec<EffectiveRow>>,
+    /// What to ask nvim next for a page that follows the editor's buffer.
+    follow: FollowState,
+    follow_call: Option<FollowCall>,
+    /// The window's follow socket: until it is given, nothing of the follow state reaches nvim (an install
+    /// needs somewhere to report to).
+    follow_socket: Option<PathBuf>,
+    /// Eitri's own scratch buffers live here; none is ever followed.
+    scratch_dir: Option<PathBuf>,
+    /// The document that called `editor.follow`.
+    page_follows_document: Option<u64>,
+    /// Whether the plugin's module is drawn, as the window last said.
+    on_screen: bool,
+    /// The newest view of the followed buffer.
+    view: Option<ViewLine>,
+    /// The text (or notice) the page was last sent, for a new document that follows.
+    last_text: Option<EditorText>,
+    /// The followed buffer's end, for a document that was not on screen to hear of it; a new view clears it.
+    closed_notice: Option<EditorClosed>,
+    /// Command names the user already had, each logged once.
+    skipped: Vec<String>,
+    /// The last failure of a follow call, logged once until a call succeeds.
+    follow_error: Option<String>,
+    /// Whether the last `pump` asked for a timer.
+    timer_armed: bool,
+    /// The module was stopped: the snippet is taken down and stays down until the window restarts.
+    follow_stopped: bool,
+    /// What the document route serves, shared with the page's scheme handler; without one no project is looked
+    /// up and views carry no prefixes.
+    doc_slot: Option<Rc<RefCell<DocSlot>>>,
+    /// The window's project root, which a document inside it belongs to.
+    window_root: Option<PathBuf>,
+    /// The user's home, which is never a document's project.
+    home: Option<PathBuf>,
+    /// Each followed buffer name's project and document directory (`None`: no project), as the path worker
+    /// found them.
+    projects: BTreeMap<String, Option<(PathBuf, PathBuf)>>,
+    /// Project lookups out on the path worker: ticket -> buffer name.
+    project_asked: BTreeMap<u64, String>,
 }
 
 pub struct PluginHost {
@@ -231,6 +392,58 @@ fn on_off(on: bool) -> &'static str {
         "on"
     } else {
         "off"
+    }
+}
+
+/// Whether follow events reach the page now: it said hello, called `editor.follow`, and is on screen.
+fn deliverable(st: &PluginHostState) -> bool {
+    st.hello && st.page_follows_document == Some(st.document) && st.on_screen
+}
+
+/// The follow snippet's `{ok = true}`.
+fn answer_ok(value: &rmpv::Value) -> Result<(), String> {
+    let ok = value
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("ok")))
+        .and_then(|(_, v)| v.as_bool());
+    match ok {
+        Some(true) => Ok(()),
+        Some(false) => Err("the editor has no follow snippet installed for this plugin".to_string()),
+        None => Err("the editor's answer has no ok".to_string()),
+    }
+}
+
+/// A view line as the page receives it; the document route's prefixes are not known here.
+fn editor_view(v: &ViewLine) -> EditorView {
+    EditorView {
+        buf: v.buf,
+        name: v.name.clone(),
+        filetype: v.filetype.clone(),
+        tick: v.tick,
+        current: v.current,
+        line_count: v.line_count,
+        top: v.top,
+        top_fraction: v.top_fraction,
+        bottom: v.bottom,
+        cursor: Cursor {
+            line: v.cursor_line,
+            col: v.cursor_col,
+        },
+        cause: v.cause,
+        token: v.token,
+        doc: None,
+    }
+}
+
+/// A link's refusal: as a path's, except that a link's bounds are its document's project.
+fn link_refusal(re: u64, refusal: PathRefusal, target: &str) -> Reply {
+    match refusal {
+        PathRefusal::OutsideRoots => Reply::err(
+            re,
+            ErrorCode::OutsideRoots,
+            &format!("\"{}\" is outside the document's project", target.escape_debug()),
+        ),
+        other => path_refusal(re, other, target),
     }
 }
 
@@ -338,6 +551,24 @@ impl PluginHost {
             keys_settings: KeysSettings::default(),
             theme: PageTheme::fallback(),
             declared: None,
+            follow: FollowState::new(),
+            follow_call: None,
+            follow_socket: None,
+            scratch_dir: None,
+            page_follows_document: None,
+            on_screen: false,
+            view: None,
+            last_text: None,
+            closed_notice: None,
+            skipped: Vec::new(),
+            follow_error: None,
+            timer_armed: false,
+            follow_stopped: false,
+            doc_slot: None,
+            window_root: None,
+            home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
+            projects: BTreeMap::new(),
+            project_asked: BTreeMap::new(),
         };
         PluginHost {
             plugin,
@@ -359,6 +590,17 @@ impl PluginHost {
 
     pub fn set_layout(&self, layout: Rc<dyn LayoutPort>) {
         self.state.borrow_mut().layout = Some(layout);
+    }
+
+    /// The document route's slot, the same one the page's scheme handler reads: from here on the followed
+    /// document's project is looked up, the slot holds it, and views carry the route's prefixes.
+    pub fn set_doc_slot(&self, slot: Rc<RefCell<DocSlot>>) {
+        self.state.borrow_mut().doc_slot = Some(slot);
+    }
+
+    /// The window's project root: a followed document inside it has it as its project.
+    pub fn set_window_root(&self, root: PathBuf) {
+        self.state.borrow_mut().window_root = Some(root);
     }
 
     /// The window's prefix key, which a page's declaration may not hold. Until this is called it is the
@@ -529,12 +771,694 @@ impl PluginHost {
         None
     }
 
-    fn new_document(&self) {
+    /// Whether the window should hand this plugin its follow socket: the manifest lets the page follow the
+    /// editor's buffer, or defines nvim commands (which report through the same socket).
+    pub fn wants_follow_feed(&self) -> bool {
+        let manifest = &self.plugin.manifest;
+        manifest.has(Capability::EditorFollow) || manifest.has(Capability::EditorCommands)
+    }
+
+    /// The window's follow socket, which nvim reports views and commands to, and Eitri's scratch directory,
+    /// whose buffers are never followed. The snippet is installed from the next `pump` on.
+    pub fn set_follow_feed(&self, socket: PathBuf, scratch_dir: Option<PathBuf>) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.follow_socket = Some(socket);
+            st.scratch_dir = scratch_dir;
+        }
+        (self.wake)();
+    }
+
+    /// Whether the plugin's module is drawn. nvim follows only while it is and the document follows; a
+    /// document that comes back on screen is given the newest view, and the text if it moved meanwhile.
+    pub fn set_on_screen(&self, on: bool, _now: Instant) {
+        let back = {
+            let mut st = self.state.borrow_mut();
+            let back = on && !st.on_screen;
+            st.on_screen = on;
+            st.follow.on_screen(on);
+            back
+        };
+        if back {
+            self.follow_catch_up();
+        }
+        self.wake_follow();
+    }
+
+    /// A view line from nvim for this plugin. A scratch buffer's, or one of a filetype the manifest does not
+    /// follow, is dropped.
+    pub fn follow_view(&self, view: ViewLine, _now: Instant) {
+        if view.owner != self.id() || !self.follows_filetype(&view.filetype) {
+            return;
+        }
+        let scratch = {
+            let st = self.state.borrow();
+            st.scratch_dir
+                .as_deref()
+                .is_some_and(|dir| crate::scratch::holds(dir, &view.name))
+        };
+        if scratch {
+            return;
+        }
+        self.track_project(&view.name);
+        let event = self.view_event(&view);
+        let deliver = {
+            let mut st = self.state.borrow_mut();
+            st.follow.view(view.buf, view.tick);
+            st.closed_notice = None;
+            st.view = Some(view);
+            deliverable(&st)
+        };
+        if deliver {
+            self.page.send(&protocol::event_text(EVENT_EDITOR_VIEW, &event));
+        }
+        self.wake_follow();
+    }
+
+    /// A view line as the page receives it, with the document route's prefixes once the document's project is
+    /// known and is what the route serves.
+    fn view_event(&self, view: &ViewLine) -> EditorView {
+        let mut event = editor_view(view);
+        event.doc = self.doc_prefixes(&view.name);
+        event
+    }
+
+    fn doc_prefixes(&self, name: &str) -> Option<DocPrefixes> {
+        let st = self.state.borrow();
+        let slot = st.doc_slot.as_ref()?.borrow();
+        let (project, doc_dir) = st.projects.get(name)?.as_ref()?;
+        // The slot follows the newest view only; prefixes for any other project would not resolve.
+        if slot.dir.as_ref() != Some(project) {
+            return None;
+        }
+        Some(doc_route::doc_prefixes(self.id(), slot.generation, project, doc_dir))
+    }
+
+    /// The newest view names this buffer: the route serves its project when it is known (a change starts a
+    /// new generation, so addresses made for another project stop resolving), and it is looked up on the path
+    /// worker, once per name, when it is not.
+    fn track_project(&self, name: &str) {
+        let job = {
+            let st = self.state.borrow();
+            let Some(slot) = st.doc_slot.clone() else { return };
+            let Some(doc) = doc_path(name) else {
+                slot.borrow_mut().set_dir(None);
+                return;
+            };
+            if let Some(found) = st.projects.get(name) {
+                slot.borrow_mut()
+                    .set_dir(found.as_ref().map(|(project, _)| project.clone()));
+                return;
+            }
+            if st.project_asked.values().any(|asked| asked == name) {
+                return;
+            }
+            CheckJob::Project {
+                doc,
+                window_root: st.window_root.clone(),
+                home: st.home.clone(),
+            }
+        };
+        match self.submit_check(job) {
+            Ok(ticket) => {
+                self.state.borrow_mut().project_asked.insert(ticket, name.to_owned());
+            }
+            Err(why) => eprintln!(
+                "[plugin {}] the document's project could not be looked up: {why}",
+                self.id()
+            ),
+        }
+    }
+
+    /// The path worker found a buffer name's project. For the newest view's name the route moves to it and a
+    /// page that hears views gets the view again, now with the route's prefixes.
+    fn project_found(&self, name: String, found: Option<(PathBuf, PathBuf)>) {
+        let (slot, view, deliver) = {
+            let mut st = self.state.borrow_mut();
+            st.projects.insert(name.clone(), found.clone());
+            let view = st.view.clone().filter(|v| v.name == name);
+            (st.doc_slot.clone(), view, deliverable(&st))
+        };
+        let (Some(slot), Some(view)) = (slot, view) else { return };
+        slot.borrow_mut().set_dir(found.map(|(project, _)| project));
+        let event = self.view_event(&view);
+        if deliver && event.doc.is_some() {
+            self.page.send(&protocol::event_text(EVENT_EDITOR_VIEW, &event));
+        }
+    }
+
+    /// nvim says a buffer was wiped: when it is the followed one, the page is told and it is not pulled again.
+    pub fn follow_gone(&self, buf: u64, _now: Instant) {
+        if self.follows_buffer(buf) {
+            self.buffer_closed(buf, ClosedReason::Wiped);
+        }
+        self.wake_follow();
+    }
+
+    /// Whether the page is viewing this buffer or holds its text: its end is news to the page only then,
+    /// and only once.
+    fn follows_buffer(&self, buf: u64) -> bool {
+        let st = self.state.borrow();
+        st.view.as_ref().is_some_and(|v| v.buf == buf) || st.last_text.as_ref().is_some_and(|t| t.buf == buf)
+    }
+
+    /// The editor quit for good: a following page is told (`editor.closed {reason: "editor"}`).
+    pub fn editor_closed(&self, _now: Instant) {
+        let buf = {
+            let st = self.state.borrow();
+            st.view
+                .as_ref()
+                .map(|v| v.buf)
+                .or_else(|| st.last_text.as_ref().map(|t| t.buf))
+        };
+        // A page that followed no buffer still learns that there is no editor to follow; 0 names no buffer.
+        self.buffer_closed(buf.unwrap_or(0), ClosedReason::Editor);
+    }
+
+    /// The `[follow]` table's `auto_show` setting: whether nvim asks to show the module when a buffer of a
+    /// followed filetype is entered. False without one.
+    pub fn auto_show(&self) -> bool {
+        self.plugin
+            .manifest
+            .follow
+            .as_ref()
+            .and_then(|f| f.auto_show.as_deref())
+            .and_then(|name| self.plugin.bool_setting(name))
+            .unwrap_or(false)
+    }
+
+    /// Looks at the editor's session now: a new one is installed (and followed again when wanted), and an
+    /// install nvim answered early (before VimEnter) is due at once. The window calls it from its theme and
+    /// keys feeds' reports, which come at VimEnter; `pump` makes the same session check without the prompt.
+    pub fn editor_session(&self, now: Instant) {
+        if self.state.borrow().follow_socket.is_none() {
+            return;
+        }
+        self.follow_session(now);
+        self.state.borrow_mut().follow.entered();
+        (self.wake)();
+    }
+
+    /// Command names the user already had when the snippet was installed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn skipped_commands(&self) -> Vec<String> {
+        self.state.borrow().skipped.clone()
+    }
+
+    fn follows_filetype(&self, filetype: &str) -> bool {
+        self.plugin
+            .manifest
+            .follow
+            .as_ref()
+            .is_some_and(|f| f.filetypes.iter().any(|t| t == filetype))
+    }
+
+    /// Asks the window to run `pump`, which sends the follow state's next call.
+    fn wake_follow(&self) {
+        if self.state.borrow().follow_socket.is_some() {
+            (self.wake)();
+        }
+    }
+
+    /// The followed buffer ended: forgotten, and the page told when it can hear it (else when it next can).
+    fn buffer_closed(&self, buf: u64, reason: ClosedReason) {
+        let closed = EditorClosed { buf, reason };
+        let deliver = {
+            let mut st = self.state.borrow_mut();
+            st.follow.gone(buf);
+            if st.view.as_ref().is_some_and(|v| v.buf == buf) || reason == ClosedReason::Editor {
+                st.view = None;
+            }
+            if st.last_text.as_ref().is_some_and(|t| t.buf == buf) || reason == ClosedReason::Editor {
+                st.last_text = None;
+            }
+            st.closed_notice = Some(closed);
+            deliverable(&st)
+        };
+        if deliver {
+            self.page.send(&protocol::event_text(EVENT_EDITOR_CLOSED, &closed));
+        }
+    }
+
+    /// What a document that just started hearing the follow events lacks: the newest view, the text sent
+    /// last when the page does not hold it, or the end of the buffer it followed.
+    fn follow_catch_up(&self) {
+        let (view, text, closed) = {
+            let st = self.state.borrow();
+            if !deliverable(&st) {
+                return;
+            }
+            let text = match (&st.view, &st.last_text) {
+                (Some(v), Some(t)) if t.buf == v.buf && st.follow.page_text() != Some((t.buf, t.tick)) => {
+                    Some(t.clone())
+                }
+                _ => None,
+            };
+            let closed = if st.view.is_none() { st.closed_notice } else { None };
+            (st.view.clone(), text, closed)
+        };
+        if let Some(view) = view {
+            self.page
+                .send(&protocol::event_text(EVENT_EDITOR_VIEW, &self.view_event(&view)));
+        }
+        if let Some(text) = text {
+            self.page.send(&protocol::event_text(EVENT_EDITOR_TEXT, &text));
+            self.state.borrow_mut().follow.page_has(text.buf, text.tick);
+        }
+        if let Some(closed) = closed {
+            self.page.send(&protocol::event_text(EVENT_EDITOR_CLOSED, &closed));
+        }
+    }
+
+    fn editor_follow(&self, re: u64) -> Option<Reply> {
+        let (hello, stopped) = {
+            let st = self.state.borrow();
+            (st.hello, st.follow_stopped)
+        };
+        if !hello {
+            return Some(Reply::err(
+                re,
+                ErrorCode::BadRequest,
+                "editor.follow comes after host.hello",
+            ));
+        }
+        if stopped {
+            return Some(Reply::err(
+                re,
+                ErrorCode::EditorUnavailable,
+                "stopped with prefix x; the plugin comes back when the window restarts",
+            ));
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            st.page_follows_document = Some(st.document);
+            st.follow.page_follows(true);
+        }
+        let filetypes = self
+            .plugin
+            .manifest
+            .follow
+            .as_ref()
+            .map(|f| f.filetypes.clone())
+            .unwrap_or_default();
+        // The reply first, so the page knows it follows before the first event arrives.
+        self.reply(Reply::ok(re, json!({ "filetypes": filetypes })));
+        self.follow_catch_up();
+        self.wake_follow();
+        None
+    }
+
+    /// Notes the editor's session; a call still out to an earlier one is given up rather than waited for,
+    /// since the process it went to is gone.
+    fn follow_session(&self, now: Instant) {
+        let target = {
+            let st = self.state.borrow();
+            st.editor.as_ref().and_then(|e| e.target())
+        };
+        let changed = self.state.borrow_mut().follow.session(target);
+        if !changed {
+            return;
+        }
+        let (stale, waiting, current) = {
+            let mut st = self.state.borrow_mut();
+            // Buffer numbers and ticks belong to one nvim.
+            st.view = None;
+            st.last_text = None;
+            let stale = st.follow_call.take_if(|c| c.session != target);
+            // A reveal, jump or link still in line names the old editor's buffers (or was asked of it): sent to
+            // the next one, it could move another buffer's cursor or open a file the user has moved on from.
+            let waiting = st.follow.drop_page_ops();
+            (stale, waiting, st.document)
+        };
+        if let Some(call) = stale {
+            if let Some(re) = call.re {
+                if call.document == current {
+                    self.reply(Reply::err(re, ErrorCode::EditorUnavailable, "the editor restarted"));
+                } else {
+                    self.log_dropped_reply(re, "the requesting document was replaced");
+                }
+            }
+            self.state.borrow_mut().follow.done(Done::Failed, now);
+        }
+        // Every op in line was asked by the current document: a replaced one's are dropped when it goes.
+        for re in waiting {
+            self.reply(Reply::err(re, ErrorCode::EditorUnavailable, "the editor restarted"));
+        }
+    }
+
+    fn follow_failed(&self, what: &str, why: &str) {
+        let message = format!("{what}: {why}");
+        let fresh = {
+            let mut st = self.state.borrow_mut();
+            let fresh = st.follow_error.as_deref() != Some(message.as_str());
+            st.follow_error = Some(message.clone());
+            fresh
+        };
+        if fresh {
+            eprintln!("[plugin {}] {message}", self.id());
+        }
+    }
+
+    /// Takes the follow call's answer if it has come, tells a page past the deadline that the editor is busy,
+    /// and keeps a late call tracked so nothing overtakes it.
+    fn take_follow_answer(&self, now: Instant, replies: &mut Vec<Reply>) {
+        let taken = {
+            let mut st = self.state.borrow_mut();
+            let current = st.document;
+            let Some(call) = st.follow_call.as_mut() else { return };
+            if call.document != current {
+                if let Some(re) = call.re.take() {
+                    self.log_dropped_reply(re, "the requesting document was replaced");
+                }
+            }
+            match call.pending.try_take() {
+                Some(answer) => st.follow_call.take().map(|call| (call, answer)),
+                None => {
+                    if now >= call.deadline {
+                        if let Some(re) = call.re.take() {
+                            replies.push(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY));
+                        }
+                    }
+                    None
+                }
+            }
+        };
+        let Some((call, answer)) = taken else { return };
+        let current = self.state.borrow().document;
+        let done = match answer {
+            Ok(value) => {
+                let in_time = now < call.deadline;
+                self.follow_answered(&call, &value, call.document == current, in_time, replies)
+            }
+            Err(e) => {
+                if let Some(re) = call.re {
+                    replies.push(Reply::err(
+                        re,
+                        ErrorCode::EditorUnavailable,
+                        &format!("the editor could not be asked: {e}"),
+                    ));
+                }
+                self.follow_failed("a follow call failed", &e.to_string());
+                Done::Failed
+            }
+        };
+        if done != Done::Failed {
+            self.state.borrow_mut().follow_error = None;
+        }
+        self.state.borrow_mut().follow.done(done, now);
+    }
+
+    /// Acts on one follow answer; `current` is whether the document that was current when it was asked
+    /// still is, `in_time` whether the answer was taken before the call's deadline.
+    fn follow_answered(
+        &self,
+        call: &FollowCall,
+        value: &rmpv::Value,
+        current: bool,
+        in_time: bool,
+        replies: &mut Vec<Reply>,
+    ) -> Done {
+        match &call.op {
+            FollowOp::Install => match editor::read_installed(value) {
+                Ok(installed) if installed.early => Done::Early,
+                Ok(installed) => {
+                    for name in installed.skipped {
+                        let fresh = {
+                            let mut st = self.state.borrow_mut();
+                            let fresh = !st.skipped.contains(&name);
+                            if fresh {
+                                st.skipped.push(name.clone());
+                            }
+                            fresh
+                        };
+                        if fresh {
+                            eprintln!("[plugin {}] :{name} is already defined; not replacing it", self.id());
+                        }
+                    }
+                    Done::Installed
+                }
+                Err(why) => {
+                    self.follow_failed("the follow snippet could not be installed", &why);
+                    Done::Failed
+                }
+            },
+            FollowOp::Follow(on) => match answer_ok(value) {
+                Ok(()) => Done::Followed(*on),
+                Err(why) => {
+                    self.follow_failed("the editor could not follow", &why);
+                    Done::Failed
+                }
+            },
+            FollowOp::Text { .. } => match editor::read_text(value) {
+                Ok(PulledText::Gone { buf }) => {
+                    // A wiped line for this buffer may have told the page already.
+                    if self.follows_buffer(buf) {
+                        self.buffer_closed(buf, ClosedReason::Wiped);
+                    }
+                    Done::Gone { buf }
+                }
+                // Pulled for a document that has since been replaced: the new one asks again when it follows.
+                Ok(_) if !current => Done::Other,
+                // The view moved to another buffer, or this one closed, while the pull was out: its text is
+                // no longer what the page shows, and the newest view's buffer is pulled next.
+                Ok(PulledText::Lines { buf, .. } | PulledText::TooLarge { buf, .. })
+                    if self.view_name(buf).is_none() =>
+                {
+                    Done::Other
+                }
+                Ok(PulledText::Lines { buf, tick, lines }) => {
+                    let text = lines.join("\n");
+                    let bytes = text.len() as u64;
+                    trace::line(self.id(), "pull", &format!("buf={buf} tick={tick} bytes={bytes}"));
+                    self.pulled(EditorText {
+                        buf,
+                        tick,
+                        name: self.view_name(buf).unwrap_or_default(),
+                        text: Some(text),
+                        too_large: None,
+                    });
+                    Done::Pulled { buf, tick, bytes }
+                }
+                Ok(PulledText::TooLarge {
+                    buf,
+                    tick,
+                    bytes,
+                    lines,
+                }) => {
+                    trace::line(self.id(), "pull", &format!("buf={buf} tick={tick} bytes={bytes}"));
+                    self.pulled(EditorText {
+                        buf,
+                        tick,
+                        name: self.view_name(buf).unwrap_or_default(),
+                        text: None,
+                        too_large: Some(TooLarge {
+                            bytes,
+                            lines,
+                            max_bytes: MAX_TEXT_BYTES,
+                            max_lines: MAX_TEXT_LINES,
+                        }),
+                    });
+                    // Too many lines makes a buffer as slow to render as too many bytes, whatever its size.
+                    Done::Pulled {
+                        buf,
+                        tick,
+                        bytes: bytes.max(super::follow::LARGE_TEXT_BYTES + 1),
+                    }
+                }
+                Err(why) => {
+                    self.follow_failed("the buffer's text could not be read", &why);
+                    Done::Failed
+                }
+            },
+            FollowOp::Reveal { line, .. } | FollowOp::Jump { line, .. } => {
+                let applied = read_applied(value);
+                let (event, focus) = match &call.op {
+                    FollowOp::Jump { focus, .. } => ("jump", *focus),
+                    _ => ("reveal", false),
+                };
+                if let Ok(applied) = applied {
+                    trace::line(self.id(), event, &format!("line={line} applied={applied}"));
+                }
+                // The keys move only for a page still waiting on this answer, and only before the deadline: one
+                // told the editor was busy, or replaced since, has moved on, and so may the user have while nvim
+                // was slow; the keys jumping under them then would surprise them.
+                if focus && applied == Ok(true) && current && in_time && call.re.is_some() {
+                    let layout = self.state.borrow().layout.clone();
+                    if let Some(layout) = layout {
+                        if let Err(why) = layout.focus(FocusTarget::Editor) {
+                            eprintln!("[plugin {}] the editor could not take the keys: {why}", self.id());
+                        }
+                    }
+                }
+                if let Some(re) = call.re {
+                    replies.push(match applied {
+                        Ok(applied) => Reply::ok(re, json!({ "applied": applied })),
+                        Err(why) => Reply::err(re, ErrorCode::Io, &why),
+                    });
+                }
+                Done::Other
+            }
+            FollowOp::OpenLink { .. } => {
+                if let Some(re) = call.re {
+                    replies.push(match decode_open(value) {
+                        Ok(opened) => Reply::ok(re, json!({ "how": opened.how, "line": opened.line })),
+                        Err(why) => Reply::err(re, ErrorCode::Io, &why),
+                    });
+                }
+                Done::Other
+            }
+            FollowOp::Teardown => Done::Other,
+        }
+    }
+
+    /// The newest view's name for this buffer; `None` when the view has moved to another or the buffer closed.
+    fn view_name(&self, buf: u64) -> Option<String> {
+        let st = self.state.borrow();
+        st.view.as_ref().filter(|v| v.buf == buf).map(|v| v.name.clone())
+    }
+
+    /// A pulled text (or its notice): sent to a document that can hear it, and kept for one that follows later.
+    fn pulled(&self, text: EditorText) {
+        let deliver = {
+            let st = self.state.borrow();
+            deliverable(&st)
+        };
+        if !deliver {
+            return;
+        }
+        self.page.send(&protocol::event_text(EVENT_EDITOR_TEXT, &text));
         let mut st = self.state.borrow_mut();
-        st.hello = false;
-        st.document += 1;
-        // A new document has its own keys, and declares them once it has loaded.
-        st.declared = None;
+        st.follow.page_has(text.buf, text.tick);
+        st.last_text = Some(text);
+    }
+
+    /// Sends the follow state's next call when none is out; returns when to look again, if it is waiting
+    /// for a time.
+    fn send_follow(&self, now: Instant) -> Option<Instant> {
+        let next = {
+            let mut st = self.state.borrow_mut();
+            if st.follow_call.is_some() {
+                return None;
+            }
+            st.follow.next(now)
+        };
+        let op = match next {
+            Next::Idle => return None,
+            Next::At(at) => return Some(at),
+            Next::Send(op) => op,
+        };
+        let Some(editor) = self.editor() else {
+            self.state.borrow_mut().follow.done(Done::Failed, now);
+            return None;
+        };
+        let session = editor.target();
+        let id = self.id();
+        let (pending, re) = match &op {
+            FollowOp::Install => {
+                let (socket, scratch_dir) = {
+                    let st = self.state.borrow();
+                    (st.follow_socket.clone(), st.scratch_dir.clone())
+                };
+                let Some(socket) = socket else {
+                    self.state.borrow_mut().follow.done(Done::Failed, now);
+                    return None;
+                };
+                let manifest = &self.plugin.manifest;
+                let filetypes = manifest
+                    .follow
+                    .as_ref()
+                    .map(|f| f.filetypes.clone())
+                    .unwrap_or_default();
+                let commands: Vec<(String, &'static str)> = manifest
+                    .commands
+                    .iter()
+                    .map(|c| (c.name.clone(), c.does.as_str()))
+                    .collect();
+                let install = FollowInstall {
+                    owner: id,
+                    socket: &socket,
+                    filetypes: &filetypes,
+                    auto: self.auto_show(),
+                    commands: &commands,
+                    scratch_dir: scratch_dir.as_deref(),
+                };
+                (editor::follow_install(&*editor, &install), None)
+            }
+            FollowOp::Follow(on) => {
+                trace::line(id, "follow", on_off(*on));
+                (editor::follow_on(&*editor, id, *on), None)
+            }
+            FollowOp::Text { buf } => (
+                editor::follow_text(&*editor, id, *buf, MAX_TEXT_BYTES, MAX_TEXT_LINES),
+                None,
+            ),
+            FollowOp::Reveal {
+                buf, line, token, re, ..
+            } => (editor::follow_reveal(&*editor, id, *buf, *line, *token), Some(*re)),
+            FollowOp::Jump { buf, line, col, re, .. } => {
+                (editor::follow_jump(&*editor, id, *buf, *line, *col), Some(*re))
+            }
+            FollowOp::OpenLink { path, line, re } => (editor::open(&*editor, path, *line, None), Some(*re)),
+            FollowOp::Teardown => (editor::follow_teardown(&*editor, id), None),
+        };
+        let mut st = self.state.borrow_mut();
+        let document = st.document;
+        st.follow_call = Some(FollowCall {
+            op,
+            pending,
+            deadline: now + EDITOR_DEADLINE,
+            session,
+            document,
+            re,
+        });
+        None
+    }
+
+    /// The follow state's part of `pump`: the session check, the answer, the next call. Returns when to run
+    /// again. Nothing reaches nvim before the window has given the follow socket.
+    fn pump_follow(&self, now: Instant, replies: &mut Vec<Reply>) -> Option<Instant> {
+        let fed = self.state.borrow().follow_socket.is_some();
+        if !fed {
+            return None;
+        }
+        self.follow_session(now);
+        self.take_follow_answer(now, replies);
+        let at = self.send_follow(now);
+        let st = self.state.borrow();
+        match &st.follow_call {
+            Some(call) => Some(
+                now + if now >= call.deadline {
+                    EDITOR_LATE_POLL
+                } else {
+                    EDITOR_POLL
+                },
+            ),
+            None => at,
+        }
+    }
+
+    fn new_document(&self) {
+        let (follows, dropped) = {
+            let mut st = self.state.borrow_mut();
+            st.hello = false;
+            st.document += 1;
+            // A new document has its own keys, and declares them once it has loaded.
+            st.declared = None;
+            // It has not asked to follow, and holds no text.
+            st.page_follows_document = None;
+            st.follow.page_follows(false);
+            st.follow.page_forgot();
+            // What the old one asked of the editor and is still waiting in line is not sent: its answer would
+            // carry an id the new document may be using for something else.
+            let dropped = st.follow.drop_page_ops();
+            (st.follow_socket.is_some(), dropped)
+        };
+        for re in dropped {
+            self.log_dropped_reply(re, "the requesting document was replaced");
+        }
+        if follows {
+            (self.wake)();
+        }
     }
 
     pub fn runs(&self) -> Vec<RunInfo> {
@@ -644,7 +1568,142 @@ impl PluginHost {
                     from: args.from,
                 },
             ),
+            Verb::EditorFollow(_) => self.editor_follow(re),
+            Verb::EditorReveal(args) => self.editor_reveal(re, args),
+            Verb::EditorJump(args) => self.editor_jump(re, args),
+            Verb::EditorOpenLink(args) => self.editor_open_link(re, args, now),
         }
+    }
+
+    /// What every follow verb needs first: the page said hello, its arguments pass their check, and there is an
+    /// editor to ask.
+    fn follow_verb_refusal(&self, re: u64, verb: &str, check: Result<(), String>) -> Option<Reply> {
+        let (hello, stopped) = {
+            let st = self.state.borrow();
+            (st.hello, st.follow_stopped)
+        };
+        if !hello {
+            return Some(Reply::err(
+                re,
+                ErrorCode::BadRequest,
+                &format!("{verb} comes after host.hello"),
+            ));
+        }
+        if let Err(why) = check {
+            return Some(Reply::err(re, ErrorCode::BadRequest, &why));
+        }
+        if stopped {
+            return Some(Reply::err(
+                re,
+                ErrorCode::EditorUnavailable,
+                "stopped with prefix x; the plugin comes back when the window restarts",
+            ));
+        }
+        if self.editor().is_none() {
+            return Some(Reply::err(
+                re,
+                ErrorCode::EditorUnavailable,
+                "this window has no editor running",
+            ));
+        }
+        None
+    }
+
+    /// Whether `buf` is the newest view's buffer: a page acts only on the buffer it is shown.
+    fn is_followed(&self, buf: u64) -> bool {
+        self.state.borrow().view.as_ref().is_some_and(|v| v.buf == buf)
+    }
+
+    fn editor_reveal(&self, re: u64, args: EditorReveal) -> Option<Reply> {
+        if let Some(refused) = self.follow_verb_refusal(re, "editor.reveal", args.check()) {
+            return Some(refused);
+        }
+        if !self.is_followed(args.buf) {
+            return Some(Reply::ok(re, json!({ "applied": false })));
+        }
+        let replaced = self.state.borrow_mut().follow.park(FollowOp::Reveal {
+            buf: args.buf,
+            line: args.line,
+            token: args.token,
+            re,
+        });
+        if let Some(old) = replaced {
+            self.reply(Reply::ok(old, json!({ "applied": false })));
+        }
+        self.wake_follow();
+        None
+    }
+
+    fn editor_jump(&self, re: u64, args: EditorJump) -> Option<Reply> {
+        if let Some(refused) = self.follow_verb_refusal(re, "editor.jump", args.check()) {
+            return Some(refused);
+        }
+        if !self.is_followed(args.buf) {
+            return Some(Reply::ok(re, json!({ "applied": false })));
+        }
+        self.state.borrow_mut().follow.park(FollowOp::Jump {
+            buf: args.buf,
+            line: args.line,
+            col: args.col,
+            focus: args.focus,
+            re,
+        });
+        self.wake_follow();
+        None
+    }
+
+    /// A link of the followed document: resolved against the document (a leading `/` against its project) and
+    /// checked on the path worker to be a regular file of its project before nvim is asked to open it.
+    fn editor_open_link(&self, re: u64, args: EditorOpenLink, now: Instant) -> Option<Reply> {
+        if let Some(refused) = self.follow_verb_refusal(re, "editor.open_link", args.check()) {
+            return Some(refused);
+        }
+        let name = {
+            let st = self.state.borrow();
+            st.view.as_ref().filter(|v| v.buf == args.buf).map(|v| v.name.clone())
+        };
+        let Some(name) = name else {
+            return Some(Reply::err(re, ErrorCode::BadRequest, "buf is not the followed buffer"));
+        };
+        let Some(doc) = doc_path(&name) else {
+            return Some(Reply::err(re, ErrorCode::OutsideRoots, "the document has no file"));
+        };
+        let (path, fragment) = match args.target.split_once('#') {
+            Some((path, fragment)) => (path, Some(fragment)),
+            None => (args.target.as_str(), None),
+        };
+        let line = fragment.and_then(line_fragment);
+        let Some(decoded) = page_policy::decoded(path) else {
+            return Some(Reply::err(
+                re,
+                ErrorCode::BadRequest,
+                &format!("\"{}\" is not a well-formed path", path.escape_debug()),
+            ));
+        };
+        let (rel, from_root) = match decoded.strip_prefix('/') {
+            // Every leading `/`: joined to the project, an absolute rest would replace it.
+            Some(rest) => (rest.trim_start_matches('/'), true),
+            None => (decoded.as_str(), false),
+        };
+        if rel.is_empty() {
+            return Some(Reply::err(re, ErrorCode::BadRequest, "nothing to open"));
+        }
+        let job = {
+            let st = self.state.borrow();
+            CheckJob::Link {
+                doc,
+                window_root: st.window_root.clone(),
+                home: st.home.clone(),
+                path: rel.to_owned(),
+                from_root,
+            }
+        };
+        let then = Then::Link {
+            target: args.target.clone(),
+            line,
+            session: self.state.borrow().follow.current_session(),
+        };
+        self.check_then(re, job, then, now)
     }
 
     fn hello(&self, re: u64) -> Reply {
@@ -683,6 +1742,7 @@ impl PluginHost {
                 "capabilities": capabilities,
                 "roots": roots,
                 "runs": runs,
+                "settings": self.plugin.page_settings(),
                 "keys_kit": 1,
                 "keys_settings": keys_settings,
                 "timeoutlen": timeoutlen,
@@ -1057,6 +2117,9 @@ impl PluginHost {
         }
         self.state.borrow_mut().calls.extend(keep);
         self.send_parked(now, &mut replies);
+        if let Some(at) = self.pump_follow(now, &mut replies) {
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
         {
             let st = self.state.borrow();
             for call in &st.calls {
@@ -1101,6 +2164,16 @@ impl PluginHost {
         for reply in replies {
             self.reply(reply);
         }
+        let changed = {
+            let mut st = self.state.borrow_mut();
+            let armed = next.is_some();
+            let changed = st.timer_armed != armed;
+            st.timer_armed = armed;
+            changed
+        };
+        if changed {
+            trace::line(self.id(), "timer", if next.is_some() { "armed" } else { "idle" });
+        }
         next
     }
 
@@ -1123,6 +2196,13 @@ impl PluginHost {
             "the requesting document was replaced"
         };
         for (ticket, checked) in results {
+            if let Checked::Project(found) = checked {
+                let name = self.state.borrow_mut().project_asked.remove(&ticket);
+                if let Some(name) = name {
+                    self.project_found(name, found);
+                }
+                continue;
+            }
             let waiting = {
                 let mut st = self.state.borrow_mut();
                 let at = st.checking.iter().position(|c| c.ticket == ticket);
@@ -1135,6 +2215,12 @@ impl PluginHost {
                     self.log_dropped_reply(c.re, drop_reason);
                     continue;
                 }
+                // Finished after its deadline but before a pump gave it up: the page is told the filesystem
+                // was too slow, as it would have been a moment earlier, and nothing is opened or started.
+                if now >= c.deadline {
+                    replies.push(Reply::err(c.re, ErrorCode::Io, CHECK_TIMEOUT));
+                    continue;
+                }
                 match (c.then, checked) {
                     (Then::Open { raw, .. }, Checked::Path(Err(refusal))) => {
                         replies.push(path_refusal(c.re, refusal, &raw))
@@ -1144,6 +2230,20 @@ impl PluginHost {
                     }
                     (Then::Task { task, vars }, Checked::Task(resolved)) => {
                         replies.push(self.task_start(c.re, &task, &vars, resolved))
+                    }
+                    (Then::Link { target, .. }, Checked::Path(Err(refusal))) => {
+                        replies.push(link_refusal(c.re, refusal, &target))
+                    }
+                    (Then::Link { line, session, .. }, Checked::Path(Ok(path))) => {
+                        let mut st = self.state.borrow_mut();
+                        if st.follow.current_session() != session {
+                            // The editor the link was clicked against is gone; a new one is not asked to
+                            // open files on its behalf.
+                            replies.push(Reply::err(c.re, ErrorCode::EditorUnavailable, "the editor restarted"));
+                        } else {
+                            // Sent by the follow queue, after the call out and any parked before it.
+                            st.follow.park(FollowOp::OpenLink { path, line, re: c.re });
+                        }
                     }
                     _ => {}
                 }
@@ -1265,8 +2365,9 @@ impl PluginHost {
         }
     }
 
-    /// The plugin's module was closed (prefix `x`): every run is stopped and the assist is put back. The page
-    /// is gone, so nothing is answered and nothing more is sent until a new page says hello.
+    /// The plugin's module was closed (prefix `x`): every run is stopped, the assist is put back and the follow
+    /// snippet is taken down. The page is gone, so nothing is answered and nothing more is sent until a new page
+    /// says hello.
     ///
     /// The clear waits for an assist call still out, so it can never overtake it; the returned time is when
     /// `pump` must run for that, as it does after any other call that leaves an editor answer outstanding.
@@ -1275,6 +2376,9 @@ impl PluginHost {
         let assisted = {
             let mut st = self.state.borrow_mut();
             st.tasks.stop_all();
+            // The snippet's commands go with the module; the window's restart brings them back.
+            st.follow_stopped = true;
+            st.follow.park(FollowOp::Teardown);
             st.assisted
         };
         if assisted {
@@ -1282,7 +2386,8 @@ impl PluginHost {
         }
         let waiting = {
             let st = self.state.borrow();
-            !st.calls.is_empty() || !st.parked.is_empty() || !st.checking.is_empty()
+            let follow = st.follow_socket.is_some() && (st.follow_call.is_some() || !st.follow.stopped());
+            follow || !st.calls.is_empty() || !st.parked.is_empty() || !st.checking.is_empty()
         };
         waiting.then(|| now + EDITOR_POLL)
     }

@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": 33,
+  "verb": "editor.open_link",
+  "args": {
+    "buf": 3,
+    "target": "../docs/setup.md#L10"
+  }
+}

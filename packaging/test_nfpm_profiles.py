@@ -401,6 +401,12 @@ DESKTOP_DSTS = [DESKTOP_DST, PANEL_DESKTOP_DST]
 # The nvim plugin: every file under nvim/eitri.nvim, at the same relative path under this directory.
 NVIM_PLUGIN_DST = "/usr/share/eitri/nvim/eitri.nvim"
 NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/init.lua", "plugin/eitri.lua"]
+# The Markdown preview plugin: one `type: tree` entry per profile, from the tree release.sh stages (its manifest and
+# built site), to the system data directory `eitri.plugin.load("markdown")` searches.
+MARKDOWN_PLUGIN_SRC = "./plugins/markdown"
+MARKDOWN_PLUGIN_DST = "/usr/share/eitri/plugins/markdown"
+# What the stand-in staged tree holds when the packages are built for real below.
+MARKDOWN_PLUGIN_STAND_IN = ("eitri-plugin.toml", "web/dist/index.html", "web/dist/katex/fonts/KaTeX_Main-Regular.woff2")
 # The GNOME Shell extension: the four files the shell loads. testing.js, README.md and test/ are source only.
 GNOME_EXT_DST = "/usr/share/gnome-shell/extensions/eitri@huntergrey.cn"
 GNOME_EXT_FILES = ["metadata.json", "extension.js", "direction.js", "policy.js"]
@@ -497,8 +503,18 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
                 self.assertIsNotNone(entry, (path, rel))
                 self.assertEqual(entry["src"], f"./nvim/eitri.nvim/{rel}", (path, rel))
                 self.assertEqual(entry.get("file_info", {}).get("mode"), 0o644, (path, rel))
-            shipped = {d for d in by_dst if d.startswith("/usr/share/eitri/")}
+            shipped = {d for d in by_dst if d.startswith("/usr/share/eitri/nvim/")}
             self.assertEqual(shipped, {f"{NVIM_PLUGIN_DST}/{rel}" for rel in NVIM_PLUGIN_FILES}, path)
+
+    def test_the_markdown_plugin_is_one_tree_entry_in_both_profiles(self):
+        for path in (PUBLIC_PATH, PRIVATE_PATH):
+            by_dst = _contents_by_dst(_load_yaml(path))
+            entry = by_dst.get(MARKDOWN_PLUGIN_DST)
+            self.assertIsNotNone(entry, path)
+            self.assertEqual(entry["src"], MARKDOWN_PLUGIN_SRC, path)
+            self.assertEqual(entry.get("type"), "tree", path)
+            under = [d for d in by_dst if d.startswith("/usr/share/eitri/plugins/")]
+            self.assertEqual(under, [MARKDOWN_PLUGIN_DST], path)
 
     def test_every_icon_size_is_installed_under_hicolor_in_both(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
@@ -561,6 +577,14 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
         ):
             stage = os.path.join(cls.work, label)
             for entry in _load_yaml(path)["contents"]:
+                if entry.get("type") == "tree":
+                    root = os.path.join(stage, entry["src"])
+                    for rel in MARKDOWN_PLUGIN_STAND_IN:
+                        os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                        with open(os.path.join(root, rel), "w") as f:
+                            f.write(f"stand-in for {rel}\n")
+                        os.chmod(os.path.join(root, rel), 0o644)
+                    continue
                 src = os.path.join(stage, entry["src"])
                 os.makedirs(os.path.dirname(src), exist_ok=True)
                 if entry["src"] == APPARMOR_SRC:
@@ -630,6 +654,22 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
             paths = self._paths(listers[packager](out))
             self.assertLessEqual(want, paths, (label, packager, sorted(want - paths)))
             self.assertNotIn(OLD_DESKTOP_DST.lstrip("/"), paths, (label, packager))
+
+    def test_every_package_carries_the_plugin_tree(self):
+        want = {f"{MARKDOWN_PLUGIN_DST.lstrip('/')}/{rel}" for rel in MARKDOWN_PLUGIN_STAND_IN}
+        listers = {
+            "deb": lambda out: self.sh(["dpkg-deb", "-c", out], text=True).stdout,
+            "rpm": lambda out: self.sh(["rpm", "-qlp", out], text=True).stdout,
+            "archlinux": lambda out: self.sh(["bsdtar", "-tf", out], text=True).stdout,
+        }
+        for (label, packager), out in sorted(self.built.items()):
+            paths = self._paths(listers[packager](out))
+            self.assertLessEqual(want, paths, (label, packager, sorted(want - paths)))
+        for label in ("public", "private"):
+            x, _control = self._deb(label)
+            for rel in MARKDOWN_PLUGIN_STAND_IN:
+                path = os.path.join(x, MARKDOWN_PLUGIN_DST.lstrip("/"), rel)
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, (label, rel))
 
     def test_the_debs_icons_are_the_committed_files_byte_for_byte(self):
         for label in ("public", "private"):

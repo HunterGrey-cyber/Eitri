@@ -60,11 +60,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use eitri_core::layout::persist::{self, Loaded, V2State};
-use eitri_core::layout::rules::{OpenPoint, NOMINAL_GRID};
+use eitri_core::layout::rules::{At, OpenPoint, NOMINAL_GRID};
 use eitri_core::layout::workspace::MAIN;
 use eitri_core::layout::{
-    apply_launch_rule, first_launch_decls, reconcile_default_floating, Con, FloatRect, Layout, ModuleDecl, ModuleId,
-    ModuleKind, Node, OpenRules, Placement, Workspaces,
+    apply_launch_rule, first_launch_decls, reconcile_default_floating_with, Con, FloatRect, Layout, ModuleDecl,
+    ModuleId, ModuleKind, Node, OpenRule, OpenRules, Placement, Workspaces,
 };
 use eitri_core::lua::layout::LuaTree;
 use gtk4::glib;
@@ -95,18 +95,28 @@ use gtk4::glib;
 /// of them with no Lua default, else those the default's tree does not name, sized against
 /// [`NOMINAL_GRID`] since the window has no size yet. A saved layout is never changed by a rule: it is
 /// how the project was left, as it wins over `eitri.layout.default`.
+///
+/// `deferred` are modules the window never places by itself (they are not among `lua`): a first launch leaves
+/// them out, and a Lua default keeps one only where its tree or floats name it. A saved file that names one keeps
+/// it when the caller read it with the same list (`persist::load_with`).
+///
+/// `own` are the own rules of the modules among `lua` that declare a whole rule (a plugin that starts shown): at a
+/// first launch each counts where its `position` would, with its `size` and `focus`, not only its place. A module
+/// without one counts its declared placement alone, as a Lua panel's `position`.
 pub(crate) fn choose_startup_layout(
     default: Option<&LuaTree>,
     loaded: Option<Loaded>,
     lua: &[ModuleDecl],
     rules: &OpenRules,
     show_editor: Option<&str>,
+    deferred: &[ModuleId],
+    own: &[(ModuleId, OpenRule)],
 ) -> Result<(Workspaces, Layout, Vec<String>, Option<String>), String> {
     let mut notes = Vec::new();
     let first_launch = |notes: &mut Vec<String>| -> Result<Layout, String> {
         let (mut layout, named) = match default {
             Some(tree) => {
-                let r = reconcile_default_floating(tree.tiled.clone(), tree.floats.clone(), lua)
+                let r = reconcile_default_floating_with(tree.tiled.clone(), tree.floats.clone(), lua, deferred)
                     .map_err(|e| format!("eitri.layout.default: {e}"))?;
                 notes.extend(r.notes.into_iter().map(|n| format!("eitri.layout.default: {n}")));
                 let named: Vec<ModuleId> = tree
@@ -129,8 +139,21 @@ pub(crate) fn choose_startup_layout(
                 .filter(|d| d.id.kind() == ModuleKind::LuaWebview)
                 .map(|d| (d.id, Some(d.placement))),
         );
-        for (id, position) in placed.into_iter().filter(|(id, _)| !named.contains(id)) {
-            let (rule, _) = rules.resolve(&id, OpenPoint::Launch, position);
+        for (id, position) in placed
+            .into_iter()
+            .filter(|(id, _)| !named.contains(id) && !deferred.contains(id))
+        {
+            let own_rule = own
+                .iter()
+                .find(|(owner, _)| *owner == id)
+                .map(|(_, rule)| rule.clone())
+                .or_else(|| {
+                    position.map(|placement| OpenRule {
+                        at: Some(At::Placement(placement)),
+                        ..OpenRule::default()
+                    })
+                });
+            let (rule, _) = rules.resolve_own(&id, OpenPoint::Launch, own_rule.as_ref());
             match apply_launch_rule(&mut layout, &id, &rule, NOMINAL_GRID) {
                 Ok(applied) => notes.extend(applied),
                 Err(err) => notes.push(format!("open rule for '{id}' not applied at the first launch: {err}")),
@@ -184,12 +207,15 @@ pub(crate) fn choose_startup_layout(
     Ok((workspaces, layout, notes, keep_copy))
 }
 
-/// Appends missing init.lua templates after saved workspaces, then shares every module across them.
+/// Appends missing init.lua templates after saved workspaces, then shares every module across them. A template
+/// keeps a `deferred` module it names (as `choose_startup_layout`'s default tree does), and the fit then puts it,
+/// hidden, into every workspace that lacks it.
 pub(crate) fn add_defined_workspaces(
     workspaces: &mut Workspaces,
     live: &mut Layout,
     defined: &[(String, LuaTree)],
     lua: &[ModuleDecl],
+    deferred: &[ModuleId],
 ) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     for (name, tree) in defined {
@@ -199,7 +225,7 @@ pub(crate) fn add_defined_workspaces(
             ));
             continue;
         }
-        let reconciled = reconcile_default_floating(tree.tiled.clone(), tree.floats.clone(), lua)
+        let reconciled = reconcile_default_floating_with(tree.tiled.clone(), tree.floats.clone(), lua, deferred)
             .map_err(|err| format!("eitri.layout.workspace('{name}'): {err}"))?;
         notes.extend(
             reconciled
@@ -314,6 +340,9 @@ pub(crate) struct LayoutSaver {
     /// The registered Lua panels: the file read again before a write is decoded as `load` decodes
     /// it, so that "unusable" and "partly usable" mean what they meant when the window opened.
     lua: Vec<ModuleDecl>,
+    /// The modules the window never places by itself: the file read again before a write is decoded with
+    /// them, as it was read at startup, so one the file holds is not taken for a module this build cannot carry.
+    deferred: RefCell<Vec<ModuleId>>,
     /// The exact text of a file this window opened only in part, until its first write copies it
     /// aside (or finds the file is no longer those bytes).
     keep_copy: RefCell<Option<String>>,
@@ -351,11 +380,17 @@ impl LayoutSaver {
             layout,
             workspaces,
             lua,
+            deferred: RefCell::new(Vec::new()),
             keep_copy: RefCell::new(keep_copy),
             pending: RefCell::new(None),
             last_change: Cell::new(None),
             base: RefCell::new(base),
         })
+    }
+
+    /// The modules the window never places by itself, as the startup read used them (`persist::load_with`).
+    pub(crate) fn set_deferred(&self, deferred: Vec<ModuleId>) {
+        *self.deferred.borrow_mut() = deferred;
     }
 
     /// The grid's change hook: the layout changed, so it is compared and written 500ms after the
@@ -449,27 +484,30 @@ impl LayoutSaver {
     /// it in two places; the file's text is copied aside instead, as for a partly usable file.
     /// `false` when that could not be done and nothing may be written.
     fn make_way(&self, dir: &Path) -> bool {
-        let (text, mut kept, mut copy) = match persist::v2_state(dir, &self.project_root, &self.lua) {
-            V2State::Missing => return true,
-            V2State::Usable(text, kept) => (text, kept, false),
-            V2State::Partly(text, kept) => (text, kept, true),
-            V2State::Unusable(_) => {
-                return match persist::set_aside_v2(dir, &self.project_root) {
-                    Ok(aside) => {
-                        println!(
-                            "[layout] the file this build could not use is kept as {}",
-                            aside.display()
-                        );
-                        true
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(err) => {
-                        eprintln!("[layout] could not set aside the file this build could not use ({err}); not saved");
-                        false
-                    }
-                };
-            }
-        };
+        let (text, mut kept, mut copy) =
+            match persist::v2_state_with(dir, &self.project_root, &self.lua, &self.deferred.borrow()) {
+                V2State::Missing => return true,
+                V2State::Usable(text, kept) => (text, kept, false),
+                V2State::Partly(text, kept) => (text, kept, true),
+                V2State::Unusable(_) => {
+                    return match persist::set_aside_v2(dir, &self.project_root) {
+                        Ok(aside) => {
+                            println!(
+                                "[layout] the file this build could not use is kept as {}",
+                                aside.display()
+                            );
+                            true
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(err) => {
+                            eprintln!(
+                                "[layout] could not set aside the file this build could not use ({err}); not saved"
+                            );
+                            false
+                        }
+                    };
+                }
+            };
         let placed = match (self.layout.try_borrow(), self.workspaces.try_borrow()) {
             (Ok(layout), Ok(workspaces)) => workspaces.placed(&layout, &self.lua),
             _ => {
@@ -562,11 +600,12 @@ mod tests {
     #[test]
     fn defined_workspaces_open_after_main_on_a_first_launch() {
         let (mut workspaces, mut layout, _, _) =
-            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         let notes = add_defined_workspaces(
             &mut workspaces,
             &mut layout,
             &[("review".to_string(), template(ModuleId::agent(), ModuleId::editor()))],
+            &[],
             &[],
         )
         .unwrap();
@@ -597,7 +636,7 @@ mod tests {
             keep_copy: None,
         });
         let (mut workspaces, mut layout, _, _) =
-            choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         let notes = add_defined_workspaces(
             &mut workspaces,
             &mut layout,
@@ -605,6 +644,7 @@ mod tests {
                 ("study".to_string(), template(ModuleId::agent(), ModuleId::editor())),
                 ("review".to_string(), template(ModuleId::editor(), ModuleId::agent())),
             ],
+            &[],
             &[],
         )
         .unwrap();
@@ -642,12 +682,12 @@ mod tests {
             })
         };
         let (workspaces, layout, notes, keep_copy) =
-            choose_startup_layout(None, Some(loaded()), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(loaded()), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         assert_eq!(workspaces.order(), ["main", "study"]);
         assert_eq!(workspaces.current(), "study");
         assert_eq!(layout, study);
         let (_, first_launch, _, _) =
-            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         assert_eq!(workspaces.stored("main"), Some(&first_launch));
         assert!(
             notes.contains(&"workspace 'main' could not be read; it is the default layout again".to_string()),
@@ -673,8 +713,16 @@ mod tests {
         file["workspaces"][0]["tiled"]["children"][0]["share"] = serde_json::json!(0.99);
         let opened = persist::decode_v2(&file.to_string(), root(), &[]).unwrap();
         assert_eq!(opened.workspaces.order(), ["study"]);
-        let (workspaces, layout, notes, keep_copy) =
-            choose_startup_layout(None, Some(Loaded::Restored(opened)), &[], &OpenRules::default(), None).unwrap();
+        let (workspaces, layout, notes, keep_copy) = choose_startup_layout(
+            None,
+            Some(Loaded::Restored(opened)),
+            &[],
+            &OpenRules::default(),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(workspaces.order(), ["main", "study"]);
         assert_eq!(workspaces.current(), "study");
         assert_eq!(layout, study);
@@ -716,9 +764,17 @@ mod tests {
             keep_copy: None,
         });
         let (workspaces, _, notes, _) =
-            choose_startup_layout(Some(&tree), Some(loaded), &[], &OpenRules::default(), None).unwrap();
-        let (_, lua_default, _, _) =
-            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(Some(&tree), Some(loaded), &[], &OpenRules::default(), None, &[], &[]).unwrap();
+        let (_, lua_default, _, _) = choose_startup_layout(
+            Some(&tree),
+            Some(Loaded::Missing),
+            &[],
+            &OpenRules::default(),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(workspaces.order(), ["main", "study"]);
         assert_eq!(workspaces.stored("main"), Some(&lua_default));
         assert!(
@@ -744,8 +800,15 @@ mod tests {
             scratch: true,
         });
         let (mut workspaces, mut layout, _, _) =
-            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
-        add_defined_workspaces(&mut workspaces, &mut layout, &[("review".to_string(), review)], &[]).unwrap();
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None, &[], &[]).unwrap();
+        add_defined_workspaces(
+            &mut workspaces,
+            &mut layout,
+            &[("review".to_string(), review)],
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(workspaces.stored("review").unwrap().is_floating(&t2));
         assert!(layout.contains(&t2) && layout.hidden().contains(&t2) && !layout.is_floating(&t2));
     }
@@ -753,11 +816,12 @@ mod tests {
     #[test]
     fn a_template_without_the_chat_is_an_error_naming_the_call() {
         let (mut workspaces, mut layout, _, _) =
-            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         let err = add_defined_workspaces(
             &mut workspaces,
             &mut layout,
             &[("x".to_string(), template(ModuleId::editor(), ModuleId::terminal()))],
+            &[],
             &[],
         )
         .unwrap_err();
@@ -800,6 +864,8 @@ mod tests {
             &[],
             &OpenRules::default(),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(layout, left);
@@ -834,6 +900,8 @@ mod tests {
                 &[],
                 &OpenRules::default(),
                 None,
+                &[],
+                &[],
             )
             .unwrap();
             assert_eq!(layout.visible_leaves(), [ModuleId::agent(), ModuleId::editor()]);
@@ -849,8 +917,16 @@ mod tests {
             id: ModuleId::lua("side"),
             placement: Placement::RightOfRoot,
         }];
-        let (_, layout, notes, _) =
-            choose_startup_layout(None, Some(Loaded::Missing), &side, &OpenRules::default(), None).unwrap();
+        let (_, layout, notes, _) = choose_startup_layout(
+            None,
+            Some(Loaded::Missing),
+            &side,
+            &OpenRules::default(),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(layout, crate::terminal::initial_layout(&side).unwrap());
         assert!(notes.is_empty());
     }
@@ -874,6 +950,8 @@ mod tests {
             &[],
             &OpenRules::default(),
             Some("Ctrl+b e"),
+            &[],
+            &[],
         )
         .unwrap();
         assert!(!layout.is_shown(&ModuleId::editor()));
@@ -886,7 +964,7 @@ mod tests {
         );
         // With nothing bound to show the editor, the note names no key rather than a wrong one.
         let (_, _, notes, _) =
-            choose_startup_layout(None, Some(restored(left)), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(restored(left)), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         assert_eq!(
             notes.last().map(String::as_str),
             Some(
@@ -895,7 +973,7 @@ mod tests {
             )
         );
         let (_, _, notes, _) =
-            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None, &[], &[]).unwrap();
         assert!(notes.iter().all(|n| !n.contains("editor is hidden")), "{notes:?}");
     }
 
@@ -1160,6 +1238,8 @@ mod tests {
             &[],
             &OpenRules::default(),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         let layout = Rc::new(RefCell::new(startup));
@@ -1215,6 +1295,8 @@ mod tests {
             &[],
             &OpenRules::default(),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         persist::save(&dir, root(), &Workspaces::single(), &unsettled).unwrap();
@@ -1681,6 +1763,8 @@ mod tests {
             &[],
             &OpenRules::default(),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         assert!(!layout.contains(&ModuleId::lua("gone")));
@@ -1705,7 +1789,7 @@ mod tests {
         fn open(dir: &Path) -> Window {
             let loaded = persist::load(dir, root(), &[]);
             let (workspaces, layout, _, keep_copy) =
-                choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None).unwrap();
+                choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None, &[], &[]).unwrap();
             Window::with(dir, workspaces, layout, keep_copy)
         }
 
@@ -1794,6 +1878,8 @@ mod tests {
             &[],
             &OpenRules::default(),
             None,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(workspaces, Workspaces::single());
@@ -1869,6 +1955,265 @@ mod tests {
         );
         assert_eq!(file_text(&dir), second.written(), "the later writer wins, whole");
         assert_ne!(second.written(), first.written());
+    }
+
+    fn preview() -> ModuleId {
+        ModuleId::lua("markdown")
+    }
+
+    #[test]
+    fn a_deferred_module_is_not_placed_at_a_first_launch() {
+        let (_, layout, notes, _) = choose_startup_layout(
+            None,
+            Some(Loaded::Missing),
+            &[],
+            &OpenRules::default(),
+            None,
+            &[preview()],
+            &[],
+        )
+        .unwrap();
+        assert!(!layout.contains(&preview()), "{layout:?}");
+        assert!(notes.iter().all(|n| !n.contains("lua:markdown")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_file_or_default_without_a_deferred_module_does_not_place_it() {
+        let deferred = [preview()];
+        let dir = agent::state_dirs::test_workspace_dir("layout-deferred-absent");
+        persist::save(
+            &dir,
+            root(),
+            &Workspaces::single(),
+            &crate::terminal::initial_layout(&[]).unwrap(),
+        )
+        .unwrap();
+        let loaded = persist::load_with(&dir, root(), &[], &deferred);
+        assert!(matches!(loaded, Loaded::Restored(_)));
+        let (_, layout, notes, _) =
+            choose_startup_layout(None, Some(loaded), &[], &OpenRules::default(), None, &deferred, &[]).unwrap();
+        assert!(!layout.contains(&preview()));
+        assert!(notes.iter().all(|n| !n.contains("lua:markdown")), "{notes:?}");
+
+        let default = |tiled: Node| {
+            choose_startup_layout(
+                Some(&LuaTree {
+                    tiled,
+                    floats: Vec::new(),
+                }),
+                Some(Loaded::Missing),
+                &[],
+                &OpenRules::default(),
+                None,
+                &deferred,
+                &[],
+            )
+            .unwrap()
+        };
+        let editor_and_agent = || {
+            Node::split(
+                Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            )
+        };
+        let (_, layout, notes, _) = default(editor_and_agent());
+        assert!(!layout.contains(&preview()));
+        assert!(notes.iter().all(|n| !n.contains("lua:markdown")), "{notes:?}");
+
+        let (_, layout, notes, _) = default(Node::split(Axis::Row, 0.6, editor_and_agent(), Node::Leaf(preview())));
+        assert!(layout.contains(&preview()) && layout.is_shown(&preview()), "{notes:?}");
+        assert!(notes.iter().all(|n| !n.contains("lua:markdown")), "{notes:?}");
+    }
+
+    /// An `eitri.layout.workspace` template that names a deferred module keeps it where it says, shown, and the fit
+    /// puts it hidden into the workspaces that lack it; without the list the template's leaf is left out.
+    #[test]
+    fn a_template_keeps_a_deferred_module_it_names_and_the_others_hold_it_hidden() {
+        let deferred = [preview()];
+        let review = || LuaTree {
+            tiled: Node::split(
+                Axis::Row,
+                0.6,
+                Node::split(
+                    Axis::Row,
+                    0.5,
+                    Node::Leaf(ModuleId::editor()),
+                    Node::Leaf(ModuleId::agent()),
+                ),
+                Node::Leaf(preview()),
+            ),
+            floats: Vec::new(),
+        };
+        let (mut workspaces, mut layout, _, _) = choose_startup_layout(
+            None,
+            Some(Loaded::Missing),
+            &[],
+            &OpenRules::default(),
+            None,
+            &deferred,
+            &[],
+        )
+        .unwrap();
+        let notes = add_defined_workspaces(
+            &mut workspaces,
+            &mut layout,
+            &[("review".to_string(), review())],
+            &[],
+            &deferred,
+        )
+        .unwrap();
+        let made = workspaces.stored("review").unwrap();
+        assert!(made.is_shown(&preview()), "{made:?}");
+        assert_eq!(made.visible_leaves().last(), Some(&preview()));
+        assert!(
+            layout.contains(&preview()) && !layout.is_shown(&preview()),
+            "{layout:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("workspace 'main': ") && n.contains("'lua:markdown'") && n.contains("hidden")),
+            "{notes:?}"
+        );
+
+        let (mut workspaces, mut layout, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &[], &OpenRules::default(), None, &[], &[]).unwrap();
+        let notes = add_defined_workspaces(
+            &mut workspaces,
+            &mut layout,
+            &[("review".to_string(), review())],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!workspaces.stored("review").unwrap().contains(&preview()));
+        assert!(!layout.contains(&preview()));
+        assert!(notes.iter().any(|n| n.contains("left out 'lua:markdown'")), "{notes:?}");
+    }
+
+    /// A plugin that starts shown declares a whole rule: at a first launch its `size` applies, not only its place.
+    #[test]
+    fn a_shown_plugins_declared_size_applies_at_a_first_launch() {
+        let notes_panel = ModuleId::lua("notes");
+        let decls = [ModuleDecl {
+            id: notes_panel.clone(),
+            placement: Placement::RightOfRoot,
+        }];
+        let own = OpenRule {
+            at: at("side"),
+            size: Some(eitri_core::layout::rules::RuleSize::Share(0.4)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let width = |own: &[(ModuleId, OpenRule)]| {
+            let (_, layout, notes, _) = choose_startup_layout(
+                None,
+                Some(Loaded::Missing),
+                &decls,
+                &OpenRules::default(),
+                None,
+                &[],
+                own,
+            )
+            .unwrap();
+            let arranged = eitri_core::layout::arrange(&layout, &frame());
+            let rect = arranged
+                .modules
+                .iter()
+                .find(|(id, _)| *id == notes_panel)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{layout:?} {notes:?}"));
+            rect.w as f32 / 1280.0
+        };
+        let declared = width(&[(notes_panel.clone(), own.clone())]);
+        assert!((declared - 0.4).abs() < 0.02, "{declared}");
+        let placed_only = width(&[]);
+        assert!(
+            placed_only < 0.36,
+            "the built-in third, not the declared share: {placed_only}"
+        );
+
+        // A user's rule for the module wins over the declared one, whole.
+        let rules = rules_of(&[(
+            "lua:notes",
+            OpenRule {
+                size: Some(eitri_core::layout::rules::RuleSize::Share(0.25)),
+                ..OpenRule::default()
+            },
+        )]);
+        let (_, layout, _, _) = choose_startup_layout(
+            None,
+            Some(Loaded::Missing),
+            &decls,
+            &rules,
+            None,
+            &[],
+            &[(notes_panel.clone(), own)],
+        )
+        .unwrap();
+        let arranged = eitri_core::layout::arrange(&layout, &frame());
+        let rect = arranged.modules.iter().find(|(id, _)| *id == notes_panel).unwrap().1;
+        let users = rect.w as f32 / 1280.0;
+        assert!((users - 0.25).abs() < 0.02, "{users}");
+    }
+
+    /// The save path reads the file with the window's deferred modules, so a floating one there is not taken for a
+    /// module this build cannot carry, and nothing is copied aside; without them the same file is copied.
+    #[test]
+    fn the_saver_reads_the_file_with_the_deferred_modules() {
+        let deferred = [preview()];
+        let with_float = || {
+            let mut layout = crate::terminal::initial_layout(&[]).unwrap();
+            layout
+                .add_float(
+                    &preview(),
+                    FloatRect {
+                        cx: 0.5,
+                        cy: 0.5,
+                        w: 400,
+                        h: 300,
+                    },
+                    false,
+                )
+                .unwrap();
+            layout
+        };
+        let open = |label: &str| {
+            let dir = agent::state_dirs::test_workspace_dir(label);
+            persist::save(&dir, root(), &Workspaces::single(), &with_float()).unwrap();
+            let (workspaces, layout, _, keep_copy) = choose_startup_layout(
+                None,
+                Some(persist::load_with(&dir, root(), &[], &deferred)),
+                &[],
+                &OpenRules::default(),
+                None,
+                &deferred,
+                &[],
+            )
+            .unwrap();
+            assert!(layout.is_floating(&preview()));
+            assert_eq!(keep_copy, None);
+            let window = Window::with(&dir, workspaces, layout, keep_copy);
+            (dir, window)
+        };
+
+        let (dir, window) = open("layout-saver-deferred");
+        window.saver.set_deferred(deferred.to_vec());
+        window.change();
+        window.saver.save_now();
+        assert!(!partial(&dir).exists(), "the file is read as this window read it");
+        assert_eq!(file_text(&dir), window.written());
+        assert!(file_text(&dir).contains("lua:markdown"));
+
+        let (dir, window) = open("layout-saver-deferred-unset");
+        window.change();
+        window.saver.save_now();
+        assert!(
+            partial(&dir).exists(),
+            "read without the deferred modules, the file holds one this build cannot carry"
+        );
     }
 
     /// A file made partly unusable after this window opened it -- a hand edit, another build -- has its
@@ -2032,8 +2377,16 @@ mod tests {
                 scratch: false,
             }],
         };
-        let (_, layout, notes, copy) =
-            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+        let (_, layout, notes, copy) = choose_startup_layout(
+            Some(&tree),
+            Some(Loaded::Missing),
+            &[],
+            &OpenRules::default(),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(layout.is_floating(&ModuleId::terminal()));
         assert!(!layout.leaves().contains(&ModuleId::terminal()));
         assert!(notes.is_empty(), "{notes:?}");
@@ -2061,8 +2414,16 @@ mod tests {
                 scratch: false,
             }],
         };
-        let (_, layout, notes, copy) =
-            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &[], &OpenRules::default(), None).unwrap();
+        let (_, layout, notes, copy) = choose_startup_layout(
+            Some(&tree),
+            Some(Loaded::Missing),
+            &[],
+            &OpenRules::default(),
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(layout.is_floating(&ModuleId::agent()));
         assert!(!layout.leaves().contains(&ModuleId::agent()));
         assert!(notes.is_empty(), "{notes:?}");
@@ -2202,7 +2563,8 @@ mod tests {
             },
         )]);
         let (decls, _) = rules.launch_decls(&[]);
-        let (_, layout, notes, _) = choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        let (_, layout, notes, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None, &[], &[]).unwrap();
         let terminal = ModuleId::terminal();
         assert!(layout.is_floating(&terminal), "{layout:?}");
         assert!(layout.float_of(&terminal).unwrap().scratch);
@@ -2240,7 +2602,8 @@ mod tests {
         let (decls, _) = rules.launch_decls(&[]);
         assert!(decls.iter().any(|d| d.id == ModuleId::agent()));
         assert!(decls.iter().any(|d| d.id == ModuleId::parse("terminal#3").unwrap()));
-        let (_, layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        let (_, layout, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None, &[], &[]).unwrap();
         let today = crate::terminal::initial_layout(&[]).unwrap();
         assert_eq!(layout.leaves(), today.leaves());
         assert_eq!(layout, today);
@@ -2257,7 +2620,8 @@ mod tests {
             },
         )]);
         let (decls, _) = rules.launch_decls(&[]);
-        let (_, layout, _, _) = choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None).unwrap();
+        let (_, layout, _, _) =
+            choose_startup_layout(None, Some(Loaded::Missing), &decls, &rules, None, &[], &[]).unwrap();
         assert_eq!(
             layout.leaves(),
             [ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()],
@@ -2281,7 +2645,7 @@ mod tests {
         )]);
         let (decls, _) = rules.launch_decls(&[]);
         let (_, layout, notes, _) =
-            choose_startup_layout(None, Some(restored(left.clone())), &decls, &rules, None).unwrap();
+            choose_startup_layout(None, Some(restored(left.clone())), &decls, &rules, None, &[], &[]).unwrap();
         assert_eq!(layout, left);
         assert!(notes.iter().all(|n| !n.starts_with("open rule")), "{notes:?}");
     }
@@ -2328,7 +2692,7 @@ mod tests {
             floats: Vec::new(),
         };
         let (_, layout, notes, _) =
-            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &decls, &rules, None).unwrap();
+            choose_startup_layout(Some(&tree), Some(Loaded::Missing), &decls, &rules, None, &[], &[]).unwrap();
         assert!(layout.leaves().contains(&named) && !layout.is_floating(&named));
         assert!(layout.is_floating(&other) && !layout.leaves().contains(&other));
         assert!(layout.is_floating(&ModuleId::terminal()));

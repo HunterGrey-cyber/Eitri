@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=695f659ca70cd5e026ad2dd12aa0083bff825c91dc44e7931749b5f718b7df6f -->
+<!-- translated-from: configuration.md sha256=20f4c9b1f11a145238516f411b4008ca63515998ac7cd2fffe777ba00ef46e2f -->
 
 # 配置
 
@@ -158,6 +158,48 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- 终端
 - **哪条规则优先。** 先是模块自己 id 的规则，然后是它种类的规则，然后是 Lua 面板自己的 `position`，最后是它打开的那个场合的内置默认：新的终端或聊天视图和拆出来的标签页，开在拿着按键的模块右边（拆出来的标签页是基础视图的右边）；启动时放下的模块，或者关掉之后回来的模块，放在它一直在的地方（终端在编辑器下面，Lua 面板在它的 `position`）。没有任何模块拿着按键时（第一次启动，或者启动时读到的布局文件），`right`、`left` 和 `tab` 变成 `side`，`below` 和 `above` 变成 `bottom`，要求了它们的规则会在日志里留一条提示。
 - **规则永远不决定的事。** 自己说明了放在哪里的操作永远优先：分割键、移动、拖动、`eitri.layout.float`。已保存的布局永远不会被规则改动，来自 `eitri.layout.default` 或 `eitri.layout.workspace` 的布局会放下它点名的模块。已保存的布局或模板里没有、而规则想让它浮动的模块，会以平铺的方式回到它的后备位置，处于隐藏状态，并留下一条提示说明位置。新模块会隐藏着加进其他工作区，放在它的规则或种类给它的位置。
 
+<a id="plugins"></a>
+## 插件
+
+插件是窗口里一个自己的页面，作为模块和其他模块放在一起，只拿到它自己的清单里列出的能力。Eitri 自带一个，[Markdown 预览](markdown-preview.zh-CN.md)；你也可以自己写或安装别的。每个插件都是一个含有 `eitri-plugin.toml` 的目录，在 `init.lua` 加载它之前，它的任何部分都不会运行：
+
+```lua
+eitri.plugin.load("markdown")                          -- 按名字
+eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- 按路径
+```
+
+- **按名字**，即只由小写字母、数字和 `-` 组成的一个词：Eitri 按顺序在这些地方查找，加载第一个含有 `eitri-plugin.toml` 的目录：
+  1. `$XDG_DATA_HOME/eitri/plugins/<name>/`（没有设置 `XDG_DATA_HOME` 时是 `~/.local/share/eitri/plugins/<name>/`），放你自己的插件，以及你对自带插件的副本；
+  2. 安装脚本随 Eitri 一起安装的那份（`~/.local/lib/eitri/plugins/<name>/`）；
+  3. `<$XDG_DATA_DIRS 的每个文件夹>/eitri/plugins/<name>/`（没有设置时依次是 `/usr/local/share` 和 `/usr/share`），软件包把自己的那份装在这里（`/usr/share/eitri/plugins/<name>/`）。
+
+  空目录会被跳过，并打印一行说明。`eitri-plugin.toml` 有错误的目录仍然算作这个插件：Eitri 会带着那个错误停下，而不是去加载另一份。插件的 `id` 必须和你写的名字一致。
+- **按路径**，即其他任何写法：绝对路径，或以 `~` 开头的路径。相对路径会被拒绝，因为它在每个项目里会指向不同的目录。
+- 每次加载都会在你启动 Eitri 的终端里打印它用了哪个目录、为什么：`[plugin markdown] loaded /usr/share/eitri/plugins/markdown (system data directory)`。一个名字在哪里都找不到时，Eitri 会在启动时停下，并列出它找过的每个目录。
+- 选项是插件自己的设置，外加 `key`（前缀之后的模块按键）和 `position`（`"side"`、`"bottom"` 或 `"main"`）。插件按[打开规则](#where-a-new-module-opens)打开，模块名是 `lua:<id>`。
+- 加载一个插件，就像运行任何程序一样信任它：它是你自己的本地目录。只加载你信任的插件。companion 窗口里没有插件。
+
+<a id="keys-in-a-plugin-page"></a>
+### 插件页面里的按键
+
+读取按键的插件页面（[Markdown 预览](markdown-preview.zh-CN.md#reading-with-the-keyboard)就是）用的是 Vim 和 Vimium 的按键：`j`/`k` 滚动，`/` 查找，`f` 给可以跟随的东西标上标签，`?` 列出页面的按键。有六个设置同时作用于所有插件页面里的这些按键：
+
+| 键 | 值 | 默认值 | 作用 |
+|---|---|---|---|
+| `plugins.keys.scroll_step` | 10 到 400 之间的整数 | `60` | 按一次 `j` 或 `k` 滚动多远，单位是像素。 |
+| `plugins.keys.smooth` | `true` 或 `false` | `true` | 滚动是否平滑滑行。`false` 让每个滚动键直接跳到位，桌面的"减少动画"设置也是这样。 |
+| `plugins.keys.prefix_wait` | `true` 或 `false` | `true` | 只是更长按键开头的键（`gg` 里的 `g`）是否一直等下一个键，和 Vim 自己的 `g` 一样。`false` 时超过 Neovim 的 `timeoutlen` 就放弃。 |
+| `plugins.keys.which_key_delay` | 0 到 5000 之间的整数，或 `false` | `200` | 按下这样的键多少毫秒后，页面的状态行列出接下来可以按的键。`false` 时从不列出。 |
+| `plugins.keys.hint_chars` | 2 到 26 个互不相同的小写字母 | `"sadfjklewcmpgh"` | `f` 的标签由哪些字母组成。 |
+| `plugins.keys.find_case` | `"smart"`、`"ignore"` 或 `"match"` | `"smart"` | `/` 怎样处理大小写：`"smart"` 不区分大小写，除非搜索里有大写字母；`"ignore"` 总是不区分；`"match"` 总是区分。 |
+
+```lua
+eitri.config.set("plugins.keys.scroll_step", 80)
+eitri.config.set("plugins.keys.find_case", "ignore")
+```
+
+它们只在窗口启动时读取一次；超出这些范围的值会让 Eitri 在启动时停下，并点出那个键。页面自己的按键在它的 `plugin:<id>` 表里用 `eitri.keymap.set` 修改。
+
 <a id="how-a-launch-starts"></a>
 ## 一次启动怎样开始
 
@@ -202,4 +244,5 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个。不是文件的路径会在会话启动时报错。 |
 | `EITRI_EDITOR_DMABUF` | 编辑器怎样把它的绘制交给 GTK。`0`、`off`、`false` 或 `no` 使用 GTK 自己的纹理路径；`1`、`on`、`true` 或 `yes` 即使在比 4.16 旧的 GTK 上也强制使用 Eitri 自己的缓冲区；其他任何值或不设置，则从 GTK 4.16 起使用 Eitri 自己的缓冲区。 |
 | `XDG_STATE_HOME` | Eitri 保存它所记住的东西的地方：每个项目的布局、打开的标签页、提示历史、权限规则、信任的回答和回合审阅快照，都在这个目录下的 `eitri/` 里。未设置、为空或是相对路径时，表示 `~/.local/state`。不会往你的项目里写任何东西。 |
+| `XDG_DATA_HOME`、`XDG_DATA_DIRS` | `eitri.plugin.load` 按名字查找插件的地方：先找 `XDG_DATA_HOME` 下的 `eitri/plugins/<name>/`（没有设置、为空或是相对路径时用 `~/.local/share`），最后找 `XDG_DATA_DIRS` 每个文件夹下的（没有设置或为空时依次是 `/usr/local/share` 和 `/usr/share`）。见[插件](#plugins)。 |
 | `VERDANDI_CLAUDE_ACCOUNT`、`VERDANDI_CLAUDE_CONFIG_DIR` | 账号和它的配置目录；见[账号](#accounts)。 |

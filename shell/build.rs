@@ -1,8 +1,10 @@
 //! Builds `agent-ui/web` (a standalone npm/Vite project, see agent-ui/web/package.json) into a
 //! single-file `dist/index.html` before `shell` compiles, since `shell/src/agent_panel.rs`
 //! embeds that file's contents at compile time via `include_str!`. Builds `plugin-kit/keys` the same
-//! way into `dist/keys.js`, which `shell/src/plugin_page.rs` embeds. Node.js/npm is a hard
-//! build-time prerequisite for `shell`.
+//! way into `dist/keys.js`, which `shell/src/plugin_page.rs` embeds. Builds the Markdown preview plugin's page
+//! (`plugins/markdown/web`) into its `dist/` the same way; `shell` embeds none of it -- the plugin directory is
+//! served from disk. Node.js/npm is a hard build-time prerequisite for `shell`; each web project's package.json holds its
+//! build-commands section.
 //!
 //! Also bakes `shell --version`'s three build identities into the
 //! binary as compile-time env vars, read back by `shell/src/version.rs` through `env!`.
@@ -60,6 +62,21 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&kit_dir, "dist/keys.js", None, clean_build);
+
+    // The Markdown preview plugin's page: a third bundle under the same rule. `shell` embeds none of it; a debug build
+    // finds `plugins/markdown/` on the plugin search path, so building here keeps the site that path serves current.
+    let markdown_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/markdown/web");
+    if !markdown_dir.is_dir() {
+        panic!(
+            "plugins/markdown/web is not at {} -- the checkout is incomplete, or this build script was \
+             compiled for another one (`cargo clean -p shell` rebuilds it against this one)",
+            markdown_dir.display()
+        );
+    }
+    for path in web_build_watch_paths(&markdown_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    ensure_web_bundle_built(&markdown_dir, "dist/index.html", None, clean_build);
 }
 
 /// Bakes `EITRI_BUILD_COMMIT`, `EITRI_FORK_REV` and `EITRI_VERDANDI_REV` into the binary via

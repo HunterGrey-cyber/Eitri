@@ -7,6 +7,8 @@
 # old shipped binaries before building, so staging fails instead of reusing stale files.
 # Honor --target-dir before CARGO_TARGET_DIR, then default to the workspace's target/.
 # This lets tests check that do_from_source's explicit flag overrides the environment.
+# "no-plugin-site" writes binaries but omits the site from plugins/markdown/web,
+# simulating a build whose shell/build.rs never built that site.
 S=$(cd "$(dirname "$0")/.." && pwd)
 {
 	printf 'cargo'
@@ -39,6 +41,13 @@ build)
 		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
 		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
 	done
+	# shell/build.rs builds the Markdown preview plugin's site into the source tree, beside its fingerprint.
+	if [ "${EITRI_INSTALL_TEST_CARGO_MODE:-ok}" != no-plugin-site ] && [ -f plugins/markdown/eitri-plugin.toml ]; then
+		mkdir -p plugins/markdown/web/dist || exit 1
+		printf '<!doctype html><title>preview built from source</title>\n' >plugins/markdown/web/dist/index.html || exit 1
+		printf 'export {};\n' >plugins/markdown/web/dist/preview.js || exit 1
+		printf '0000000000000000000000000000000000000000000000000000000000000000\n' >plugins/markdown/web/dist/.inputs-sha256 || exit 1
+	fi
 	exit 0
 	;;
 --version)

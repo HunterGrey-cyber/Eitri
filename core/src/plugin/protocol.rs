@@ -136,6 +136,68 @@ pub struct KeysDeclareArgs {
     pub rows: Vec<KeyRowArg>,
 }
 
+/// The longest link target a page may hand to `editor.open_link`.
+pub const MAX_LINK_TARGET: usize = 4096;
+
+/// `editor.reveal`: put a source line of the followed buffer at the top of its window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorReveal {
+    pub buf: u64,
+    pub line: u32,
+    pub token: u64,
+}
+
+/// `editor.jump`: move the followed window's cursor, and with `focus` the keys, to a source line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorJump {
+    pub buf: u64,
+    pub line: u32,
+    pub col: u32,
+    pub focus: bool,
+}
+
+/// `editor.open_link`: a link of the followed document, as written, to open in the editor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorOpenLink {
+    pub buf: u64,
+    pub target: String,
+}
+
+fn line_ok(line: u32) -> Result<(), String> {
+    if line < 1 {
+        Err("line must be at least 1".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+impl EditorReveal {
+    pub fn check(&self) -> Result<(), String> {
+        line_ok(self.line)
+    }
+}
+
+impl EditorJump {
+    pub fn check(&self) -> Result<(), String> {
+        line_ok(self.line)
+    }
+}
+
+impl EditorOpenLink {
+    pub fn check(&self) -> Result<(), String> {
+        if self.target.len() > MAX_LINK_TARGET {
+            return Err(format!("target is over {MAX_LINK_TARGET} bytes"));
+        }
+        if self.target.chars().any(char::is_control) {
+            return Err("target holds a control character".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verb", content = "args")]
 pub enum Verb {
@@ -163,6 +225,14 @@ pub enum Verb {
     LogRead(LogRead),
     #[serde(rename = "keys.declare")]
     KeysDeclare(KeysDeclareArgs),
+    #[serde(rename = "editor.follow")]
+    EditorFollow(NoArgs),
+    #[serde(rename = "editor.reveal")]
+    EditorReveal(EditorReveal),
+    #[serde(rename = "editor.jump")]
+    EditorJump(EditorJump),
+    #[serde(rename = "editor.open_link")]
+    EditorOpenLink(EditorOpenLink),
 }
 
 impl Verb {
@@ -171,6 +241,9 @@ impl Verb {
     pub fn capability(&self) -> Option<Capability> {
         match self {
             Verb::HostHello(_) | Verb::KeysDeclare(_) => None,
+            Verb::EditorFollow(_) | Verb::EditorReveal(_) | Verb::EditorJump(_) | Verb::EditorOpenLink(_) => {
+                Some(Capability::EditorFollow)
+            }
             Verb::TaskStart(_) | Verb::TaskCancel(_) => Some(Capability::Tasks),
             Verb::EditorOpen(_) => Some(Capability::EditorOpen),
             Verb::EditorAssist(_) | Verb::EditorAssistClear(_) => Some(Capability::EditorAssist),
@@ -193,6 +266,10 @@ impl Verb {
             Verb::LogAppend(_) => "log.append",
             Verb::LogRead(_) => "log.read",
             Verb::KeysDeclare(_) => "keys.declare",
+            Verb::EditorFollow(_) => "editor.follow",
+            Verb::EditorReveal(_) => "editor.reveal",
+            Verb::EditorJump(_) => "editor.jump",
+            Verb::EditorOpenLink(_) => "editor.open_link",
         }
     }
 }
@@ -409,6 +486,101 @@ pub struct ThemeEvent {
     pub vars: BTreeMap<String, String>,
 }
 
+pub const EVENT_EDITOR_VIEW: &str = "editor.view";
+pub const EVENT_EDITOR_TEXT: &str = "editor.text";
+pub const EVENT_EDITOR_CLOSED: &str = "editor.closed";
+
+/// nvim's cursor in the followed window: `line` 1-based, `col` nvim's 0-based byte column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cursor {
+    pub line: u64,
+    pub col: u64,
+}
+
+/// Why the followed window's view changed: the user, or the echo of a page's own `editor.reveal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewCause {
+    User,
+    Reveal,
+}
+
+/// The URL prefixes of the document route: the document's project directory and its own directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocPrefixes {
+    pub root: String,
+    pub base: String,
+}
+
+/// `editor.view`: where the followed buffer's window is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorView {
+    pub buf: u64,
+    /// The buffer's absolute path, or `""` for an unnamed buffer.
+    pub name: String,
+    pub filetype: String,
+    pub tick: u64,
+    /// Whether the followed window is nvim's current window.
+    pub current: bool,
+    pub line_count: u64,
+    /// The buffer line at the window's top, 1-based; a closed fold's first line.
+    pub top: u64,
+    /// With a partly hidden wrapped top line, the hidden share of its rows; 0 otherwise.
+    pub top_fraction: f64,
+    pub bottom: u64,
+    pub cursor: Cursor,
+    pub cause: ViewCause,
+    /// The page's own token, on the echo of its reveal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<u64>,
+    /// Required on the wire, `null` for an unnamed buffer or while the project is still being looked up.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub doc: Option<DocPrefixes>,
+}
+
+/// Why a document was not sent: its size and the caps it went over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TooLarge {
+    pub bytes: u64,
+    pub lines: u64,
+    pub max_bytes: u64,
+    pub max_lines: u64,
+}
+
+/// `editor.text`: the followed buffer's whole text at `tick`, or why it is not sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorText {
+    pub buf: u64,
+    pub tick: u64,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub too_large: Option<TooLarge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosedReason {
+    /// The followed buffer was wiped.
+    Wiped,
+    /// The editor quit for good.
+    Editor,
+}
+
+/// `editor.closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorClosed {
+    pub buf: u64,
+    pub reason: ClosedReason,
+}
+
 pub fn event_text<T: Serialize>(event: &str, data: &T) -> String {
     let data = serde_json::to_value(data).unwrap_or(Value::Null);
     serde_json::to_string(&HostEvent {
@@ -500,6 +672,15 @@ mod tests {
                     serde_json::to_value(serde_json::from_value::<KeysConfig>(event.data.clone()).unwrap())
                 }
                 "theme" => serde_json::to_value(serde_json::from_value::<ThemeEvent>(event.data.clone()).unwrap()),
+                "editor.view" => {
+                    serde_json::to_value(serde_json::from_value::<EditorView>(event.data.clone()).unwrap())
+                }
+                "editor.text" => {
+                    serde_json::to_value(serde_json::from_value::<EditorText>(event.data.clone()).unwrap())
+                }
+                "editor.closed" => {
+                    serde_json::to_value(serde_json::from_value::<EditorClosed>(event.data.clone()).unwrap())
+                }
                 other => panic!("{name}: unknown event {other}"),
             }
             .unwrap();
@@ -688,6 +869,14 @@ mod tests {
             cap(r#"{"v":1,"id":1,"verb":"log.read","args":{"stream":"events"}}"#),
             Some(Capability::State)
         );
+        for raw in [
+            r#"{"v":1,"id":1,"verb":"editor.follow","args":{}}"#,
+            r#"{"v":1,"id":1,"verb":"editor.reveal","args":{"buf":1,"line":1,"token":1}}"#,
+            r#"{"v":1,"id":1,"verb":"editor.jump","args":{"buf":1,"line":1,"col":0,"focus":false}}"#,
+            r#"{"v":1,"id":1,"verb":"editor.open_link","args":{"buf":1,"target":"a.md"}}"#,
+        ] {
+            assert_eq!(cap(raw), Some(Capability::EditorFollow), "{raw}");
+        }
     }
 
     #[test]
@@ -718,5 +907,170 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_follow_fixtures_parse_to_their_verbs_and_name_them() {
+        let verb = |name: &str| match parse_request(&fixture_text(name)) {
+            Inbound::Request(r) => r.verb,
+            Inbound::Refused { message, .. } => panic!("{name}: {message}"),
+        };
+        assert_eq!(verb("req-editor-follow.json"), Verb::EditorFollow(NoArgs {}));
+        assert_eq!(
+            verb("req-editor-reveal.json"),
+            Verb::EditorReveal(EditorReveal {
+                buf: 3,
+                line: 120,
+                token: 7
+            })
+        );
+        assert_eq!(
+            verb("req-editor-jump.json"),
+            Verb::EditorJump(EditorJump {
+                buf: 3,
+                line: 42,
+                col: 0,
+                focus: true
+            })
+        );
+        assert_eq!(
+            verb("req-editor-open-link.json"),
+            Verb::EditorOpenLink(EditorOpenLink {
+                buf: 3,
+                target: "../docs/setup.md#L10".into()
+            })
+        );
+        assert_eq!(verb("req-editor-open-link.json").name(), "editor.open_link");
+        assert!(matches!(
+            parse_request(&fixture_text("bad-editor-reveal-extra-key.json")),
+            Inbound::Refused {
+                re: Some(34),
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+
+    fn fixture_text(name: &str) -> String {
+        fixtures()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .1
+    }
+
+    #[test]
+    fn a_line_below_one_or_a_bad_link_target_is_refused_by_its_check() {
+        let reveal = |line| EditorReveal { buf: 1, line, token: 1 };
+        assert_eq!(reveal(0).check(), Err("line must be at least 1".to_string()));
+        assert_eq!(reveal(1).check(), Ok(()));
+        let jump = |line| EditorJump {
+            buf: 1,
+            line,
+            col: 0,
+            focus: true,
+        };
+        assert_eq!(jump(0).check(), Err("line must be at least 1".to_string()));
+        assert_eq!(jump(7).check(), Ok(()));
+        let link = |target: String| EditorOpenLink { buf: 1, target };
+        assert_eq!(link("../x.md#L3".into()).check(), Ok(()));
+        assert_eq!(link("a".repeat(MAX_LINK_TARGET)).check(), Ok(()));
+        assert_eq!(
+            link("a".repeat(MAX_LINK_TARGET + 1)).check(),
+            Err("target is over 4096 bytes".to_string())
+        );
+        for bad in ["a\nb.md", "a\u{7}.md", "a\u{7f}.md", "a\u{85}.md"] {
+            assert_eq!(
+                link(bad.into()).check(),
+                Err("target holds a control character".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_view_must_carry_doc_and_writes_null_and_no_token_when_absent() {
+        let mut data = fixture("ev-editor-view-reveal.json")["data"].clone();
+        let view: EditorView = serde_json::from_value(data.clone()).unwrap();
+        assert_eq!(
+            (view.cause, view.token, view.doc.clone()),
+            (ViewCause::Reveal, Some(7), None)
+        );
+        assert_eq!(view.top_fraction, 0.25);
+        let written = serde_json::to_value(&view).unwrap();
+        assert_eq!(written["doc"], Value::Null, "written as null, never left out");
+        let user = EditorView {
+            cause: ViewCause::User,
+            token: None,
+            ..view
+        };
+        let written = serde_json::to_value(&user).unwrap();
+        assert!(written.get("token").is_none(), "no token on a user view");
+        data.as_object_mut().unwrap().remove("doc");
+        assert!(serde_json::from_value::<EditorView>(data).is_err(), "doc is required");
+        let view: EditorView = serde_json::from_value(fixture("ev-editor-view.json")["data"].clone()).unwrap();
+        assert_eq!(
+            view.doc,
+            Some(DocPrefixes {
+                root: "eitri-plugin://markdown/.eitri/doc/4/".into(),
+                base: "eitri-plugin://markdown/.eitri/doc/4/docs/".into()
+            })
+        );
+        assert_eq!(view.cursor, Cursor { line: 125, col: 4 });
+    }
+
+    #[test]
+    fn editor_text_carries_the_text_or_why_not_and_closed_its_reason() {
+        let text: EditorText = serde_json::from_value(fixture("ev-editor-text.json")["data"].clone()).unwrap();
+        assert_eq!(text.text.as_deref(), Some("# Notes\n\nA paragraph.\n"));
+        assert_eq!(text.too_large, None);
+        let big: EditorText = serde_json::from_value(fixture("ev-editor-text-too-large.json")["data"].clone()).unwrap();
+        assert_eq!(big.text, None);
+        assert_eq!(
+            big.too_large,
+            Some(TooLarge {
+                bytes: 5_452_595,
+                lines: 61_000,
+                max_bytes: 4 * 1024 * 1024,
+                max_lines: 50_000
+            })
+        );
+        let written = serde_json::to_value(&big).unwrap();
+        assert!(written.get("text").is_none());
+        let closed: EditorClosed = serde_json::from_value(fixture("ev-editor-closed.json")["data"].clone()).unwrap();
+        assert_eq!(
+            closed,
+            EditorClosed {
+                buf: 3,
+                reason: ClosedReason::Wiped
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ClosedReason::Editor).unwrap(),
+            Value::String("editor".into())
+        );
+        assert_eq!(
+            event_text(EVENT_EDITOR_CLOSED, &closed),
+            r#"{"v":1,"event":"editor.closed","data":{"buf":3,"reason":"wiped"}}"#
+        );
+    }
+
+    #[test]
+    fn the_settings_hello_fixture_has_the_keys_of_the_plain_one() {
+        let plain = fixture("rep-hello.json");
+        let with = fixture("rep-hello-settings.json");
+        assert_eq!(
+            plain["result"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            with["result"].as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(plain["result"]["settings"], serde_json::json!({}));
+        assert_eq!(
+            with["result"]["settings"],
+            serde_json::json!({"auto": false, "remote_images": "https", "sync": "both"})
+        );
+        assert_eq!(
+            with["result"]["capabilities"],
+            serde_json::json!(["editor.follow", "editor.commands", "net"])
+        );
     }
 }

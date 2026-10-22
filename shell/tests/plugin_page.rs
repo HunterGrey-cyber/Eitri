@@ -1,22 +1,29 @@
-//! A plugin page in the real WebKitGTK, on its own Xvfb (never the desktop): the scheme serves the site and
-//! refuses a path out of it, the CSP blocks inline script, the navigation lock holds, a script's `click()` on
-//! an outside link opens nothing while a real click on it (`xdotool`, aimed at this test's own server) is
-//! handed out, an in-origin load that never commits leaves the running document its hello, and the
-//! bridge round-trips through a real `PluginHost` whose manifest declares only `state`, so an
-//! undeclared verb is refused. A second run, with its own site and host, follows the window's theme: the
-//! first frame and a reload paint from the host's user style sheet, a sheet swapped on a loaded document is
-//! recorded as restyled live or not, the `theme` event delivers the new set, and a document restored by going
-//! back reads the current set without saying hello.
+//! Exercise a plugin page in WebKitGTK on an isolated Xvfb display. The scheme serves only
+//! paths inside the site and sends `nosniff` so image files cannot run as scripts. CSP blocks
+//! inline scripts, navigation stays locked, scripted clicks on external links open nothing, and
+//! real clicks are handed out. An uncommitted same-origin load preserves the running document's
+//! hello. A real `PluginHost` declaring only `state` rejects undeclared verbs.
+//!
+//! Theme checks cover the first frame, reload, a stylesheet swap on a loaded document, delivery
+//! of the `theme` event, and back navigation reading the current theme without another hello.
+//!
+//! Network checks use HTTP and HTTPS listeners on a non-loopback address to avoid loopback
+//! proxy exceptions. Compare a per-scheme `direct://` entry for HTTPS with the dead-proxy
+//! backstop and with no proxy. Repeat without page policy so HTTP blocking can be attributed to
+//! the proxy itself.
 //!
 //!     cargo test -p shell --test plugin_page -- --ignored
 //!
-//! A plain `main` (`harness = false`), because GTK must own the main thread. Under the GUI slot, one at a time.
+//! Uses a plain `main` (`harness = false`) because GTK must own the main thread. Run one at a
+//! time.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eitri_core::plugin::host::{PagePort, PluginHost};
@@ -53,6 +60,15 @@ const APP: &str = r#"(async () => {
   await report({ data: await status("/data.json") });
   await report({ traversal: await status("/a%2f..%2f..%2fsecret.txt") });
   await report({ link: await status("/link.txt") });
+  await report({ nosniff: (await fetch("/data.json")).headers.get("x-content-type-options") });
+  const asScript = await new Promise((done) => {
+    const tag = document.createElement("script");
+    tag.src = "/fake.png";
+    tag.onload = () => done("load");
+    tag.onerror = () => done("error");
+    document.head.append(tag);
+  });
+  await report({ imageScript: asScript, imageRan: window.imageRan === true });
   document.getElementById("ext").click();
   await report({ clicked: true });
   const save = document.createElement("a");
@@ -86,11 +102,15 @@ fn state_only_plugin(root: &Path) -> (PathBuf, BTreeMap<String, String>) {
     let manifest = std::fs::read_to_string(dir.join("eitri-plugin.toml")).unwrap();
     let manifest = manifest
         .replacen(
-            "[\"tasks\", \"editor.open\", \"editor.assist\", \"layout.focus\", \"state\", \"net\"]",
+            "[\"tasks\", \"editor.open\", \"editor.assist\", \"layout.focus\", \"state\", \"net\", \"editor.follow\", \"editor.commands\"]",
             "[\"state\"]",
             1,
         )
-        .replacen("[net]\norigins = [\"https://learn.example.org\"]\n", "", 1);
+        .replacen(
+            "[net]\norigins = [\"https://learn.example.org\"]\nimages = \"${images}\"\n",
+            "",
+            1,
+        );
     let manifest = manifest[..manifest.find("[tasks.prepare]").unwrap()].to_string();
     std::fs::write(dir.join("eitri-plugin.toml"), manifest).unwrap();
     (dir, settings)
@@ -130,6 +150,8 @@ fn run(display: &str) -> Result<Vec<String>, String> {
     std::fs::write(site.join("index.html"), INDEX).unwrap();
     std::fs::write(site.join("app.js"), APP).unwrap();
     std::fs::write(site.join("data.json"), "{\"ok\":true}").unwrap();
+    // Script text under an image's name: served as `image/png`, it must never run as a script.
+    std::fs::write(site.join("fake.png"), "window.imageRan = true;\n").unwrap();
     std::fs::write(site.join("font.woff"), "wOFF").unwrap();
     std::fs::write(root.join("secret.txt"), "secret").unwrap();
     std::os::unix::fs::symlink(root.join("secret.txt"), site.join("link.txt")).unwrap();
@@ -170,6 +192,9 @@ fn run(display: &str) -> Result<Vec<String>, String> {
         entry: "index.html".into(),
         origins: vec![],
         downloads: downloads.clone(),
+        doc_slot: None,
+        remote_images: false,
+        console_to_stdout: false,
     };
     let window = gtk4::Window::new();
     window.set_title(Some(&window_title()));
@@ -232,6 +257,18 @@ fn run(display: &str) -> Result<Vec<String>, String> {
         format!("a symlink out of the site is refused: {}", get("link")),
     );
     all &= check(get("inline").is_null(), "the inline script never ran".into());
+    all &= check(
+        get("nosniff") == "nosniff",
+        format!("a site file is answered with nosniff: {}", get("nosniff")),
+    );
+    all &= check(
+        get("imageScript") == "error" && get("imageRan") == false,
+        format!(
+            "a same-origin image never runs as a script: {} (ran: {})",
+            get("imageScript"),
+            get("imageRan")
+        ),
+    );
     all &= check(
         opened.borrow().is_empty(),
         format!(
@@ -538,6 +575,9 @@ fn run_theme() -> Result<(Vec<String>, bool), String> {
         entry: "index.html".into(),
         origins: vec![],
         downloads,
+        doc_slot: None,
+        remote_images: false,
+        console_to_stdout: false,
     };
     let fallback = PageTheme::fallback();
     let light = light_theme();
@@ -679,6 +719,323 @@ fn run_theme() -> Result<(Vec<String>, bool), String> {
     }
 }
 
+const P4_SCRIPT: &str = r#"(() => {
+  const settle = (img) => new Promise((done) => {
+    if (img.complete) { done(img.naturalWidth > 0 ? "load" : "error"); return; }
+    img.addEventListener("load", () => done("load"), { once: true });
+    img.addEventListener("error", () => done("error"), { once: true });
+  });
+  addEventListener("DOMContentLoaded", async () => {
+    const [https, http] = await Promise.all([settle(document.getElementById("s")), settle(document.getElementById("h"))]);
+    await window.eitriPlugin.call("log.append", { stream: "probe", items: [{ p4: true, https, http }] });
+  });
+})();
+"#;
+
+/// A port that notes every connection and what its first bytes look like (`tls` for a handshake, `plain` for a
+/// request line), then closes it unanswered, so the image fails whichever way it went.
+struct Listener {
+    port: u16,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl Listener {
+    fn start() -> Result<Listener, String> {
+        let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let noted = seen.clone();
+        // Detached: it blocks in `accept` until the process ends.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut head = [0u8; 4];
+                let kind = match stream.read(&mut head) {
+                    Ok(n) if n > 0 && head[0] == 0x16 => "tls",
+                    Ok(n) if n > 0 && head[0].is_ascii_uppercase() => "plain",
+                    Ok(_) => "empty",
+                    Err(_) => "silent",
+                };
+                noted.lock().unwrap().push(kind.to_owned());
+            }
+        });
+        Ok(Listener { port, seen })
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// This host's own non-loopback IPv4 address: the source address the kernel picks for a documentation address.
+/// Nothing is sent.
+fn own_address() -> Result<IpAddr, String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    socket.connect("192.0.2.1:9").map_err(|e| e.to_string())?;
+    let ip = socket.local_addr().map_err(|e| e.to_string())?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err(format!("no non-loopback address to probe with: {ip}"));
+    }
+    Ok(ip)
+}
+
+/// How a probe view's session is set after the page is built, before anything it loads reaches the network.
+#[derive(Clone, Copy)]
+enum ProxyOverride {
+    /// What `build` set from the page's own proxy plan.
+    Keep,
+    /// The backstop for every scheme.
+    Backstop,
+    /// No proxy at all.
+    None,
+}
+
+/// Which listeners one view reached, and what the page saw.
+struct ViewOutcome {
+    https: Vec<String>,
+    http: Vec<String>,
+    page: Value,
+    /// The view's network session, with the proxy the view ran under.
+    session: webkit6::NetworkSession,
+}
+
+impl ViewOutcome {
+    fn reached(&self) -> &'static str {
+        match (self.https.is_empty(), self.http.is_empty()) {
+            (true, true) => "neither",
+            (false, true) => "https only",
+            (true, false) => "http only",
+            (false, false) => "both",
+        }
+    }
+
+    fn detail(&self) -> String {
+        format!(
+            "{} (https listener {:?}, http listener {:?}, page {})",
+            self.reached(),
+            self.https,
+            self.http,
+            self.page
+        )
+    }
+}
+
+/// One view of a state-only plugin whose page holds an `https` and an `http` image on this host's listeners.
+fn p4_view(label: &str, ip: IpAddr, remote_images: bool, proxy: ProxyOverride) -> Result<ViewOutcome, String> {
+    let root = scratch_root(&format!("p4-{label}-"))?;
+    let (dir, settings) = state_only_plugin(&root);
+    let (secure, plain) = (Listener::start()?, Listener::start()?);
+    let site = dir.join("build/site");
+    let index = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>p4</title><script src=\"/p4.js\"></script>\
+         </head><body><img id=\"s\" src=\"https://{ip}:{}/p.png\"><img id=\"h\" src=\"http://{ip}:{}/p.png\">\
+         </body></html>\n",
+        secure.port, plain.port
+    );
+    std::fs::write(site.join("index.html"), index).unwrap();
+    std::fs::write(site.join("p4.js"), P4_SCRIPT).unwrap();
+
+    let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None)?);
+    let store = PluginStore::new(root.join("state"), "demo");
+    let host_cell: Rc<RefCell<Option<Rc<PluginHost>>>> = Rc::default();
+    let hooks = plugin_page::PageHooks {
+        on_message: {
+            let cell = host_cell.clone();
+            Rc::new(move |raw: &str| {
+                let host = cell.borrow().clone();
+                if let Some(host) = host {
+                    host.page_message(raw, Instant::now());
+                }
+            })
+        },
+        on_committed: Rc::new(|| {}),
+        open_outside: Rc::new(|_: &str| {}),
+    };
+    let downloads = root.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    let spec = plugin_page::PageSpec {
+        id: "demo".into(),
+        site_root: plugin.site_root.clone(),
+        entry: "index.html".into(),
+        origins: vec![],
+        downloads,
+        doc_slot: None,
+        remote_images,
+        console_to_stdout: false,
+    };
+    let window = gtk4::Window::new();
+    window.set_default_size(400, 300);
+    let webview = plugin_page::build(&spec, hooks, &PageTheme::fallback());
+    // Set before the main loop runs again: the images are asked for only once the entry has been served and
+    // parsed, which needs the loop.
+    let session = webview.network_session().ok_or("the view has no network session")?;
+    match proxy {
+        ProxyOverride::Keep => {}
+        ProxyOverride::Backstop => session.set_proxy_settings(
+            webkit6::NetworkProxyMode::Custom,
+            Some(&webkit6::NetworkProxySettings::new(
+                Some(eitri_core::plugin::page_policy::PROXY_BACKSTOP),
+                &[],
+            )),
+        ),
+        ProxyOverride::None => session.set_proxy_settings(webkit6::NetworkProxyMode::NoProxy, None),
+    }
+    window.set_child(Some(&webview));
+    window.present();
+    let page: Rc<dyn PagePort> = Rc::new(plugin_page::WebKitPluginPage(webview.downgrade()));
+    let host = Rc::new(PluginHost::new(
+        plugin,
+        page,
+        Arc::new(|| {}),
+        Some(store.clone()),
+        Vec::new(),
+    ));
+    *host_cell.borrow_mut() = Some(host.clone());
+    let probe = Probe {
+        context: gtk4::glib::MainContext::default(),
+        host,
+        store,
+    };
+    let page = probe.wait(0, &format!("P4 {label}"), |v| v.get("p4").is_some())?;
+    // A connection is noted only after its first bytes or a two-second silence; wait out a late one.
+    probe.settle(Duration::from_millis(2500));
+    window.close();
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(ViewOutcome {
+        https: secure.seen(),
+        http: plain.seen(),
+        page,
+        session,
+    })
+}
+
+/// Which listeners an `https` and an `http` image reach over `session` in a view with no content security
+/// policy at all. A plugin page's policy keeps `http` images from ever being asked for, so only here does the
+/// proxy alone decide whether an `http` request leaves.
+fn p4_open_view(label: &str, ip: IpAddr, session: &webkit6::NetworkSession) -> Result<ViewOutcome, String> {
+    let (secure, plain) = (Listener::start()?, Listener::start()?);
+    let html = format!(
+        "<!doctype html><html><body><img src=\"https://{ip}:{}/p.png\"><img src=\"http://{ip}:{}/p.png\">\
+         </body></html>\n",
+        secure.port, plain.port
+    );
+    let webview = webkit6::WebView::builder().network_session(session).build();
+    let finished = Rc::new(std::cell::Cell::new(false));
+    {
+        let finished = finished.clone();
+        webview.connect_load_changed(move |_, event| {
+            if event == webkit6::LoadEvent::Finished {
+                finished.set(true);
+            }
+        });
+    }
+    let window = gtk4::Window::new();
+    window.set_default_size(400, 300);
+    window.set_child(Some(&webview));
+    window.present();
+    webview.load_html(&html, None);
+    let context = gtk4::glib::MainContext::default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !finished.get() {
+        while context.iteration(false) {}
+        if Instant::now() >= deadline {
+            window.close();
+            return Err(format!("P4 {label} without a policy: the page never finished loading"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A connection is noted only after its first bytes or a two-second silence; wait out a late one.
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        while context.iteration(false) {}
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    window.close();
+    Ok(ViewOutcome {
+        https: secure.seen(),
+        http: plain.seen(),
+        page: Value::Null,
+        session: session.clone(),
+    })
+}
+
+/// Check whether a per-scheme `direct://` entry lets HTTPS images through while HTTP stays on
+/// the dead proxy. Compare the default `build` page with a plain backstop and with no proxy.
+/// With remote images disabled, neither listener should be reached.
+fn run_proxy_probe() -> Result<Vec<String>, String> {
+    let ip = own_address()?;
+    let candidate = p4_view("candidate", ip, true, ProxyOverride::Keep)?;
+    let control = p4_view("control", ip, true, ProxyOverride::Backstop)?;
+    let open = p4_view("noproxy", ip, true, ProxyOverride::None)?;
+    let off = p4_view("off", ip, false, ProxyOverride::Keep)?;
+    // The same sessions under no policy: the open session must let an `http` image out, or the probe could not
+    // see one at all; then the candidate's must not, which is the proxy keeping `http` back on its own.
+    let open_bare = p4_open_view("noproxy", ip, &open.session)?;
+    let candidate_bare = p4_open_view("candidate", ip, &candidate.session)?;
+    let control_bare = p4_open_view("control", ip, &control.session)?;
+    let mut lines = vec![
+        format!(
+            "info P4 WebKitGTK {}.{}.{}, probing {ip}",
+            webkit6::functions::major_version(),
+            webkit6::functions::minor_version(),
+            webkit6::functions::micro_version()
+        ),
+        format!("info P4 candidate: {}", candidate.detail()),
+        format!("info P4 control: {}", control.detail()),
+        format!("info P4 no proxy: {}", open.detail()),
+        format!("info P4 remote images off: {}", off.detail()),
+        format!("info P4 no proxy, no policy: {}", open_bare.detail()),
+        format!("info P4 candidate, no policy: {}", candidate_bare.detail()),
+        format!("info P4 control, no policy: {}", control_bare.detail()),
+    ];
+    if open_bare.reached() != "both" {
+        return Err(format!(
+            "P4 inconclusive: with no proxy and no policy the images did not both reach their listeners, so the \
+             probe cannot tell what the proxy holds back: {}\n{}",
+            open_bare.detail(),
+            lines.join("\n")
+        ));
+    }
+    if control.reached() != "neither" || control_bare.reached() != "neither" {
+        return Err(format!(
+            "P4 inconclusive: the plain backstop let a request through: {}; without the policy: {}\n{}",
+            control.detail(),
+            control_bare.detail(),
+            lines.join("\n")
+        ));
+    }
+    if !open.http.is_empty() || open.https.is_empty() {
+        return Err(format!(
+            "P4 stop: with no proxy the policy alone did not keep to https images: {}\n{}",
+            open.detail(),
+            lines.join("\n")
+        ));
+    }
+    let passes = candidate.reached() == "https only" && candidate_bare.reached() == "https only";
+    lines.push(format!("P4 https direct: {}", if passes { "passes" } else { "fails" }));
+    lines.push(format!("P4 control: {}", control.reached()));
+    lines.push(format!("P4 no proxy: {}", open.reached()));
+    lines.push(format!("P4 candidate without the policy: {}", candidate_bare.reached()));
+    if !passes {
+        return Err(format!(
+            "a page with remote images must reach https images and never http ones, and its proxy alone must hold \
+             http back: {}; without the policy: {}\n{}",
+            candidate.detail(),
+            candidate_bare.detail(),
+            lines.join("\n")
+        ));
+    }
+    if off.reached() != "neither" {
+        return Err(format!(
+            "a page with remote images off must reach no remote image: {}\n{}",
+            off.detail(),
+            lines.join("\n")
+        ));
+    }
+    Ok(lines)
+}
+
 fn main() {
     // Mirrors `#[ignore]` under a plain `main`: `cargo test --workspace` needs no display.
     let args: Vec<String> = std::env::args().collect();
@@ -691,6 +1048,7 @@ fn main() {
         let (theme, live) = run_theme()?;
         report.extend(theme);
         report.push(format!("P2 live restyle: {}", if live { "live" } else { "not live" }));
+        report.extend(run_proxy_probe()?);
         Ok(report)
     });
     match outcome {

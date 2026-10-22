@@ -19,6 +19,7 @@ use eitri_core::editor_feeds::EditorFeeds;
 use eitri_core::nvim_keys::feed::{NvimKeysFeed, NvimKeysReader};
 use eitri_core::nvim_keys::NvimReport;
 use eitri_core::pane_switch::{PaneMessage, PaneSwitchChannel, PaneSwitchReader};
+use eitri_core::plugin::follow_feed::{FollowBatch, FollowReader, FollowSocket};
 use eitri_core::theme::feed::{ThemeFeed, ThemePayloadReader};
 use eitri_core::theme::payload::NvimThemePayload;
 
@@ -44,6 +45,7 @@ pub(crate) struct FeedPump {
     keys: RefCell<Option<Handler<NvimReport>>>,
     pane: RefCell<Option<Handler<PaneMessage>>>,
     context: RefCell<Option<Handler<()>>>,
+    follow: RefCell<Option<Handler<FollowBatch>>>,
     wake: RefCell<Wake>,
     /// Each timer and watch holds the pump through this, so it lives as long as something can wake it.
     me: Weak<FeedPump>,
@@ -61,6 +63,7 @@ impl FeedPump {
             keys: RefCell::new(None),
             pane: RefCell::new(None),
             context: RefCell::new(None),
+            follow: RefCell::new(None),
             wake: RefCell::new(Wake::Watches(Vec::new())),
             me: me.clone(),
             #[cfg(test)]
@@ -155,8 +158,8 @@ impl FeedPump {
         Wake::Watches(watches)
     }
 
-    /// One poll, then the handlers: the theme's, the keys', then each pane message in order. The poll's
-    /// borrow of the feeds ends before any handler runs.
+    /// One poll, then the handlers: the theme's, the keys', each pane message in order, then the poll's
+    /// follow lines in one call. The poll's borrow of the feeds ends before any handler runs.
     fn tick(&self) {
         #[cfg(test)]
         self.ticks.set(self.ticks.get() + 1);
@@ -177,6 +180,12 @@ impl FeedPump {
             let handler = self.pane.borrow().clone();
             if let Some(handler) = handler {
                 handler(message);
+            }
+        }
+        if !events.follow.is_empty() {
+            let handler = self.follow.borrow().clone();
+            if let Some(handler) = handler {
+                handler(events.follow);
             }
         }
         if events.context {
@@ -262,6 +271,20 @@ impl FeedPump {
             .add_pane_switch(PaneSwitchReader::new(listener), Instant::now());
         self.rearm();
     }
+
+    /// Calls `on_batch` with each poll's follow lines: the window routes commands to the plugin modules and views to
+    /// their hosts. Takes the socket's listener, so a second call logs and does nothing.
+    pub(crate) fn listen_follow(&self, socket: &mut FollowSocket, on_batch: impl Fn(FollowBatch) + 'static) {
+        let Some(listener) = socket.take_listener() else {
+            eprintln!("[follow] listen() called twice -- ignoring");
+            return;
+        };
+        *self.follow.borrow_mut() = Some(Rc::new(on_batch));
+        self.feeds
+            .borrow_mut()
+            .add_follow(FollowReader::new(listener), Instant::now());
+        self.rearm();
+    }
 }
 
 /// Wakes `panel` each time the context source `pump` handed it answers something new: the panel reads the
@@ -297,9 +320,10 @@ mod tests {
         stream.write_all(format!("{line}\n").as_bytes()).expect("write");
     }
 
-    /// With all four feeds listened to and nothing sent, the pump is not woken at all (it polled 40
-    /// times a second, measured); a pane message and a theme still arrive, the pane message without
-    /// waiting for a tick, and the pump goes quiet again after them.
+    /// With all five feeds listened to and nothing sent, the pump is not woken at all (it polled 40
+    /// times a second, measured); a pane message, a theme, a context and a follow command still arrive,
+    /// the pane message and the command without waiting for a tick, and the pump goes quiet again after
+    /// them.
     #[test]
     fn an_idle_pump_is_not_woken_and_a_message_still_arrives() {
         let _turn = crate::layout_state::DEFAULT_CONTEXT_TURN
@@ -333,6 +357,13 @@ mod tests {
             let panes = panes.clone();
             pump.listen_pane_switch(&mut pane, move |message| panes.borrow_mut().push(message));
         }
+        let mut follow = FollowSocket::bind().unwrap();
+        let follows = Rc::new(RefCell::new(Vec::new()));
+        {
+            let follows = follows.clone();
+            pump.listen_follow(&mut follow, move |batch| follows.borrow_mut().extend(batch.ordered));
+        }
+        assert_eq!(pump.feeds.borrow().listener_fds().len(), 5);
 
         iterate_until(300, || false);
         let before = pump.ticks.get();
@@ -362,6 +393,23 @@ mod tests {
         assert!(iterate_until(2000, || contexts.get() == 1), "the context change");
         assert_eq!(context_source().map(|c| c.file), Some("/p/a.rs".to_string()));
 
+        let sent = Instant::now();
+        send(follow.socket_path(), r#"{"v":1,"k":"cmd","owner":"demo","cmd":"show"}"#);
+        assert!(
+            iterate_until(2000, || !follows.borrow().is_empty()),
+            "the follow command"
+        );
+        let waited = sent.elapsed();
+        assert_eq!(
+            *follows.borrow(),
+            vec![eitri_core::plugin::follow_feed::Ordered::Cmd {
+                owner: "demo".to_string(),
+                cmd: eitri_core::plugin::follow_feed::FollowCmd::Show,
+                buf: None,
+            }]
+        );
+        assert!(waited < Duration::from_millis(500), "took {waited:?}");
+
         iterate_until(300, || false);
         let before = pump.ticks.get();
         iterate_until(500, || false);
@@ -372,6 +420,7 @@ mod tests {
         keys.cleanup();
         context_feed.cleanup();
         pane.cleanup();
+        follow.cleanup();
     }
 
     /// A reader added from inside a handler, while a poll runs: the pump picks it up when that poll

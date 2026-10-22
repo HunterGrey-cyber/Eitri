@@ -182,6 +182,30 @@ registration.
   note and copies the file to `<hash>.v2.json.partial` first, so no view is lost; it ignores `view`, so those tabs come
   back in its single chat.
 
+## Markdown preview (added after 0.2.2)
+
+- **A Markdown preview, as a plugin that ships with Eitri, off until you turn it on.** Add
+  `eitri.plugin.load("markdown")` to `init.lua`; then `:MarkdownPreview`, `:MarkdownPreviewToggle` and
+  `:MarkdownPreviewStop` in Neovim show and hide it to the right of the editor, keys left in Neovim. It renders the
+  buffer as you type (GitHub-flavoured Markdown, highlighted code, KaTeX math, Mermaid diagrams, GitHub alerts and
+  Obsidian callouts, front matter), in your colourscheme's colours, and scrolls in step with Neovim both ways. With the
+  keys in the preview it reads with Vim-style keys (`j`/`k`, `d`/`u`, `]]`/`[[`, `/` with `n`/`N`, `f`, `yy`), and
+  `Enter` moves Neovim's cursor there and gives Neovim the keys. Options: `key`, `auto`, `remote_images`, `sync`.
+  The guide's "Markdown preview" page has the rest.
+- **Remote images and privacy.** As in VS Code, `https` images in a document load and `http` images do not; loading
+  one tells its server your address and the time. `remote_images = "off"` loads none, and the preview then makes no
+  network request at all.
+- **Plugins are found by name.** `eitri.plugin.load("<name>")` looks in `~/.local/share/eitri/plugins/<name>/` (your
+  own, `$XDG_DATA_HOME` if set), then in the copy installed with Eitri, then under the system data directories
+  (`/usr/share/eitri/plugins/<name>/` for the packages), and prints which directory it loaded. A path still works as
+  before.
+
+**What this can break:**
+- **A `:MarkdownPreview` you defined yourself** (another preview plugin, or a lazy-loading stub for one) is left alone,
+  and Eitri prints a line saying so; the other two commands are still defined.
+- **The packages and the tarball gain a plugin directory** (`/usr/share/eitri/plugins/markdown`,
+  `lib/eitri/plugins/markdown`); the install script refuses a tarball without it.
+
 ## Upgrading from 0.2.1
 
 - **Nothing to rebuild.** The agent backend is pinned to the same revision as in 0.2.1, so `install.sh` keeps
