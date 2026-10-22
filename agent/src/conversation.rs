@@ -30,6 +30,7 @@
 use crate::external::{ExternalProvider, ExternalStart, TurnPolicy};
 use crate::ingestion::ConversationIngest;
 use crate::lease::{LeaseError, SessionLease};
+use crate::move_seed::{ChatMoveCore, ConversationHandoff, HandoffRefused, MovedProvider, PendingName};
 use crate::persistence::{save_conversation_record, ConversationRecord};
 use crate::projection::{AgentDomainEvent, PermissionOutcome};
 use crate::provider::{
@@ -1182,6 +1183,185 @@ impl AgentConversation {
     fn require_session(&self) -> Result<String, ConversationError> {
         self.session_id.clone().ok_or(ConversationError::NoSession)
     }
+
+    /// Stops folding at the sequence the ingest reached, runs the caller's last pump, and takes the
+    /// records a move carries: what the destination folds, and the conversation's own state.
+    ///
+    /// `last_pump` is the caller's ordinary pump, run once more: the events folded and not yet
+    /// delivered are where its answers (bypass, a saved rule, auto) and its "answered for you" notes
+    /// are made, and frozen undelivered they would be made in neither window. It returns once the
+    /// answers it sent were taken by the agent, or says why not. The move is refused, and folding
+    /// resumes, when it fails, when it leaves anything undelivered, and when the conversation is
+    /// closing or is idle with a card still waiting.
+    ///
+    /// The conversation stays frozen after a success: folding resumes only through
+    /// [`Self::unfreeze`], when the move does not happen after all. Waits for a batch being folded:
+    /// call it off the GTK thread.
+    pub fn freeze_for_move(
+        &mut self,
+        last_pump: impl FnOnce(&mut AgentConversation) -> Result<(), String>,
+    ) -> Result<(ChatMoveCore, ConversationHandoff), HandoffRefused> {
+        if self.close_failed || self.session_id.is_none() {
+            return Err(HandoffRefused::Closing);
+        }
+        self.ingest.freeze();
+        let taken = last_pump(self).map_err(HandoffRefused::LastPump).and_then(|()| {
+            if self.close_failed || self.session_id.is_none() {
+                return Err(HandoffRefused::Closing);
+            }
+            self.ingest.take_move_record()
+        });
+        let (core, ingest) = match taken {
+            Ok(taken) => taken,
+            Err(refused) => {
+                self.ingest.unfreeze();
+                return Err(refused);
+            }
+        };
+        let (provider_name, provider_advertises_resume) = self.ingest.identity();
+        let AgentConversation {
+            conversation_id,
+            canonical_cwd,
+            // Adopted by the provider's own handoff in the destination.
+            provider: _,
+            external: _,
+            capabilities,
+            info,
+            session_id,
+            // Its state is in `ingest` above; the thread is the source's own.
+            ingest: _,
+            title_noted,
+            // Checked above: a conversation whose close failed does not move.
+            close_failed: _,
+            // Revisions are per projection: the destination notes its own first snapshot's.
+            ui_snapshot_revision: _,
+        } = &*self;
+        let crate::ingestion::IngestHandoff {
+            provider_session_id,
+            resume_outcome,
+            stats,
+            pending_title,
+            pending_name,
+            record_written,
+            history_dirty,
+        } = ingest;
+        let handoff = ConversationHandoff {
+            conversation_id: conversation_id.clone(),
+            canonical_cwd: canonical_cwd.clone(),
+            capabilities: *capabilities,
+            info: info.clone(),
+            session_id: session_id.clone(),
+            title_noted: *title_noted,
+            provider_name: provider_name.to_string(),
+            provider_advertises_resume,
+            provider_session_id,
+            resume_outcome,
+            stats,
+            pending_title,
+            pending_name: pending_name.map(|name| PendingName { name }),
+            record_written,
+            history_dirty,
+        };
+        Ok((core, handoff))
+    }
+
+    /// Folding resumes after a freeze whose move did not happen: from where the provider kept its
+    /// events, so nothing it produced meanwhile is lost.
+    pub fn unfreeze(&mut self) {
+        self.ingest.unfreeze();
+    }
+
+    /// The session lease's descriptor for the window the conversation moves to (a second descriptor
+    /// on the same open file, close-on-exec). `None` when the conversation holds no lease.
+    pub fn lease_descriptor(&self) -> Option<std::io::Result<std::os::fd::OwnedFd>> {
+        self.ingest.lease_descriptor()
+    }
+
+    /// Continues, in this window, a conversation another window froze for a move: the projection
+    /// rebuilt from `core` by folding, the conversation's own state from `handoff`, driven by the
+    /// adopted provider and holding the lease that crossed as a descriptor. Folding starts at once.
+    pub fn adopt_moved(
+        core: ChatMoveCore,
+        handoff: ConversationHandoff,
+        provider: MovedProvider,
+    ) -> Result<AgentConversation, HandoffRefused> {
+        let projection = crate::AgentSessionProjection::adopt(&core).map_err(HandoffRefused::Seed)?;
+        let ConversationHandoff {
+            conversation_id,
+            canonical_cwd,
+            capabilities,
+            info,
+            session_id,
+            title_noted,
+            provider_name,
+            provider_advertises_resume,
+            provider_session_id,
+            resume_outcome,
+            stats,
+            pending_title,
+            pending_name,
+            record_written,
+            history_dirty,
+        } = handoff;
+        let MovedProvider { agent, external, lease } = provider;
+        let name: &'static str = external.as_ref().map_or(PROVIDER_NAME, |external| external.name());
+        if name != provider_name {
+            return Err(HandoffRefused::Mismatch("the provider"));
+        }
+        if conversation_id != conversation_id_for_cwd(&canonical_cwd) {
+            return Err(HandoffRefused::Mismatch("the directory"));
+        }
+        let cwd_string = canonical_cwd.to_string_lossy().to_string();
+        if let Some(lease) = &lease {
+            let for_this = provider_session_id
+                .as_deref()
+                .is_some_and(|id| lease.is_for(name, &cwd_string, id));
+            if !for_this {
+                return Err(HandoffRefused::Mismatch("the session lease"));
+            }
+        }
+        let ingest = ConversationIngest::start_moved(
+            Arc::clone(&agent),
+            name,
+            conversation_id.clone(),
+            cwd_string,
+            provider_advertises_resume,
+            crate::ingestion::MovedIngest {
+                projection,
+                core,
+                state: crate::ingestion::IngestHandoff {
+                    provider_session_id,
+                    resume_outcome,
+                    stats,
+                    pending_title,
+                    pending_name: pending_name.map(|pending| pending.name),
+                    record_written,
+                    history_dirty,
+                },
+                lease,
+            },
+        );
+        Ok(Self {
+            conversation_id,
+            canonical_cwd,
+            provider: agent,
+            external,
+            capabilities,
+            info,
+            session_id,
+            ingest,
+            title_noted,
+            close_failed: false,
+            ui_snapshot_revision: None,
+        })
+    }
+
+    /// The move is committed: the lease file names this process as its owner, so whoever reads it
+    /// (the session chooser's "in window 2") finds the window that drives the session now. Written
+    /// through the descriptor the lease holds; the lock is never let go.
+    pub fn commit_moved(&mut self) -> std::io::Result<()> {
+        self.ingest.rewrite_lease_owner(std::process::id())
+    }
 }
 
 #[cfg(test)]
@@ -1210,6 +1390,10 @@ mod tests {
         queued_total: std::sync::atomic::AtomicU64,
         /// The trust each `create_session` was asked under, in order.
         trusts: Mutex<Vec<ProjectTrust>>,
+        /// The sequence number of the last provider event queued and of the last one pumped, for a
+        /// fake that numbers its events; `None` for one that does not.
+        wire_queued: Mutex<Option<u64>>,
+        wire_pumped: Mutex<Option<u64>>,
     }
 
     impl FakeProvider {
@@ -1230,6 +1414,14 @@ mod tests {
         fn queue(&self, event: AgentDomainEvent) {
             self.queued_events.lock().unwrap().push(event);
             self.queued_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        /// `events`, as what the provider made of its own event number `sequence`.
+        fn queue_wire(&self, sequence: u64, events: Vec<AgentDomainEvent>) {
+            let mut queued = self.queued_events.lock().unwrap();
+            let count = events.len() as u64;
+            queued.extend(events);
+            *self.wire_queued.lock().unwrap() = Some(sequence);
+            self.queued_total.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
         }
         fn queued_total(&self) -> u64 {
             self.queued_total.load(std::sync::atomic::Ordering::Relaxed)
@@ -1288,7 +1480,12 @@ mod tests {
             Ok(())
         }
         fn pump(&self) -> Vec<AgentDomainEvent> {
-            std::mem::take(&mut *self.queued_events.lock().unwrap())
+            let mut queued = self.queued_events.lock().unwrap();
+            *self.wire_pumped.lock().unwrap() = *self.wire_queued.lock().unwrap();
+            std::mem::take(&mut *queued)
+        }
+        fn pumped_through(&self) -> Option<u64> {
+            *self.wire_pumped.lock().unwrap()
         }
     }
 
@@ -1350,6 +1547,9 @@ mod tests {
             }
             fn pump(&self) -> Vec<AgentDomainEvent> {
                 self.0.pump()
+            }
+            fn pumped_through(&self) -> Option<u64> {
+                self.0.pumped_through()
             }
         }
         AgentConversation::create(Arc::new(Shared(fake)), dir, project)
@@ -2566,5 +2766,377 @@ mod tests {
             assert_eq!(*provider.trusts.lock().unwrap(), vec![project]);
             drop(conversation);
         }
+    }
+
+    // ---- moving a conversation to the other window ----
+
+    /// The caller's last pump at its plainest: hands the page everything folded so far.
+    fn deliver(conversation: &mut AgentConversation) -> Result<(), String> {
+        let _ = conversation.take_ui_delivery();
+        Ok(())
+    }
+
+    fn moved_provider(lease: Option<SessionLease>) -> MovedProvider {
+        let agent: Arc<dyn AgentProvider + Send + Sync> = Arc::new(FakeProvider::new());
+        MovedProvider {
+            agent,
+            external: None,
+            lease,
+        }
+    }
+
+    fn json_of(conversation: &AgentConversation) -> serde_json::Value {
+        serde_json::to_value(&*conversation.projection()).unwrap()
+    }
+
+    fn prompt(text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::UserPromptSubmitted { text: text.into() }
+    }
+
+    fn reply(turn_id: &str, text: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ContentDelta {
+            turn_id: turn_id.into(),
+            kind: ContentKind::Text,
+            text: text.into(),
+        }
+    }
+
+    /// A source that opened its session and finished one turn.
+    fn after_one_turn(fake: &Arc<FakeProvider>) -> AgentConversation {
+        let conversation = conversation_with(Arc::clone(fake));
+        fake.queue(session_opened());
+        wait_for_ingest(&conversation, 1);
+        conversation.fold_locally(prompt("first"));
+        fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        fake.queue(reply("t1", "done"));
+        fake.queue(turn_completed("t1"));
+        wait_for_ingest(&conversation, 5);
+        conversation
+    }
+
+    #[test]
+    fn folded_through_is_the_providers_own_sequence_not_a_count_of_events() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = conversation_with(Arc::clone(&fake));
+        // The provider's first event becomes two domain events, its second one.
+        fake.queue_wire(
+            1,
+            vec![
+                session_opened(),
+                AgentDomainEvent::CliPermissionMode {
+                    reported: "auto".into(),
+                },
+            ],
+        );
+        wait_for_ingest(&source, 2);
+        fake.queue_wire(2, vec![AgentDomainEvent::BackgroundCalls { running: 0 }]);
+        wait_for_ingest(&source, 3);
+
+        let (core, _handoff) = source.freeze_for_move(deliver).expect("an idle chat moves");
+        assert_eq!(
+            core.folded_through, 2,
+            "the destination reads on after the provider's second event, not its third"
+        );
+    }
+
+    #[test]
+    fn a_session_lost_before_it_opened_moves_unavailable() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = conversation_with(Arc::clone(&fake));
+        source.fold_locally(prompt("first"));
+        let lost = AgentDomainEvent::SessionUnavailable {
+            reason: "the event stream failed".into(),
+        };
+        fake.queue(lost.clone());
+        wait_for_ingest(&source, 2);
+
+        let (core, handoff) = source.freeze_for_move(deliver).expect("a lost chat still moves");
+        assert_eq!(core.lifecycle, vec![lost]);
+        let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
+        assert_eq!(
+            adopted.projection().status,
+            crate::ProjectionStatus::Unavailable {
+                reason: "the event stream failed".into()
+            }
+        );
+        assert_eq!(json_of(&adopted), json_of(&source));
+    }
+
+    #[test]
+    fn an_idle_chat_moves_with_no_running_turn_events() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        let (core, handoff) = source.freeze_for_move(deliver).expect("an idle chat moves");
+        assert!(core.running_turn.is_empty(), "nothing runs");
+        assert_eq!(core.lifecycle, vec![session_opened()]);
+        assert_eq!(core.seed.through_revision, source.projection().last_revision);
+        assert_eq!(
+            core.folded_through, 0,
+            "a provider that numbers nothing reports no position"
+        );
+        assert_eq!(handoff.provider_session_id.as_deref(), Some("claude-uuid-abc"));
+        assert_eq!(handoff.session_id.as_deref(), Some("verdandi-session-1"));
+
+        let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
+        assert_eq!(json_of(&adopted), json_of(&source));
+        assert_eq!(adopted.projection().status, crate::ProjectionStatus::Running);
+        assert_eq!(adopted.provider_session_id().as_deref(), Some("claude-uuid-abc"));
+    }
+
+    #[test]
+    fn a_running_turn_moves_with_its_events_and_the_sources_seqs() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        source.fold_locally(prompt("second"));
+        fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        fake.queue(session_opened());
+        fake.queue(reply("t2", "working"));
+        fake.queue(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t2".into(),
+            tool_use_id: "call-1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "ls" }),
+        });
+        fake.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-1".into(),
+            tool_use_id: Some("call-1".into()),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "ls" }),
+            provider_prompt: None,
+        });
+        wait_for_ingest(&source, 11);
+
+        let (core, handoff) = source.freeze_for_move(deliver).expect("a running turn moves");
+        assert_eq!(core.lifecycle, vec![session_opened()], "as of the turn's start");
+        assert_eq!(core.running_turn.len(), 6, "the prompt and every event since");
+        assert_eq!(core.running_turn[0], prompt("second"));
+        let wire = serde_json::to_string(&core).unwrap();
+        let core: ChatMoveCore = serde_json::from_str(&wire).unwrap();
+        let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
+        assert_eq!(
+            json_of(&adopted),
+            json_of(&source),
+            "every seq and the revision, the card included"
+        );
+        assert!(adopted.projection().pending_permissions.contains_key("perm-1"));
+        assert_eq!(adopted.projection().active_turn_id.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn the_cli_mode_and_account_limits_survive_an_idle_move() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        fake.queue(AgentDomainEvent::CliPermissionMode {
+            reported: "auto".into(),
+        });
+        fake.queue(AgentDomainEvent::AccountLimits {
+            used_percent: 63.0,
+            window_minutes: Some(300),
+            resets_at: Some(1_800_000_000),
+            plan: None,
+        });
+        fake.queue(AgentDomainEvent::BackgroundCalls { running: 2 });
+        fake.queue(AgentDomainEvent::CommandsAvailable {
+            commands: vec![crate::SlashCommand {
+                name: "compact".into(),
+                description: "compact".into(),
+                hint: None,
+            }],
+        });
+        fake.queue(AgentDomainEvent::PolicyMismatch {
+            requested: "default".into(),
+            reported: "plan".into(),
+        });
+        wait_for_ingest(&source, 10);
+
+        let (core, handoff) = source.freeze_for_move(deliver).unwrap();
+        let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
+        let (moved, kept) = (adopted.projection(), source.projection());
+        assert!(moved.cli_runs_auto(), "the CLI's own auto mode still decides there");
+        assert_eq!(moved.account_limits, kept.account_limits);
+        assert_eq!(moved.background_calls, 2);
+        assert_eq!(moved.background_at_last_turn_end, kept.background_at_last_turn_end);
+        assert_eq!(moved.available_commands, kept.available_commands);
+        assert_eq!(moved.policy_mismatch, kept.policy_mismatch);
+        assert_eq!(moved.export_settled(), kept.export_settled());
+    }
+
+    #[test]
+    fn freeze_refuses_a_conversation_whose_close_failed() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        *fake.close_session_error.lock().unwrap() = Some(ProviderError::Timeout);
+        source.shutdown();
+        assert!(source.close_failed);
+        let refused = source.freeze_for_move(|_| panic!("a closing conversation is not pumped for a move"));
+        assert!(matches!(refused, Err(HandoffRefused::Closing)));
+    }
+
+    #[test]
+    fn freeze_runs_the_last_pump_before_it_takes_the_record() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        let _ = source.take_ui_delivery();
+        source.fold_locally(prompt("second"));
+        fake.queue(AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        fake.queue(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-2".into(),
+            tool_use_id: Some("call-2".into()),
+            tool_name: "Read".into(),
+            input: serde_json::json!({ "file_path": "a.rs" }),
+            provider_prompt: None,
+        });
+        wait_for_ingest(&source, 8);
+
+        let mut seen = Vec::new();
+        let (core, _) = source
+            .freeze_for_move(|conversation| {
+                if let crate::UiDelivery::Events(events) = conversation.take_ui_delivery() {
+                    seen = events;
+                }
+                // What the caller's pump does with a request its mode answers.
+                conversation
+                    .respond_permission("perm-2", crate::PermissionDecision::Allow)
+                    .map_err(|e| e.to_string())
+            })
+            .expect("the pump delivered everything");
+        assert_eq!(
+            seen.len(),
+            3,
+            "the prompt, the turn's start and the request were still undelivered"
+        );
+        assert!(fake
+            .calls()
+            .contains(&"resolve_permission(perm-2, allow=true)".to_string()));
+        assert!(core
+            .running_turn
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PermissionRequested { .. })));
+
+        // Frozen: what the provider produces now waits for the destination.
+        fake.queue(AgentDomainEvent::PermissionResolved {
+            permission_id: "perm-2".into(),
+            outcome: crate::PermissionOutcome::Allowed,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(source.ingest_stats().events_ingested, 8, "nothing folded while frozen");
+        assert_eq!(fake.queued_events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_freeze_leaves_the_conversation_folding() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        // A pump that hands the page nothing leaves the events undelivered.
+        let refused = source.freeze_for_move(|_| Ok(()));
+        assert!(matches!(refused, Err(HandoffRefused::Undelivered)));
+        let refused = source.freeze_for_move(|_| Err("the agent did not take the answers".to_string()));
+        assert!(matches!(refused, Err(HandoffRefused::LastPump(_))));
+
+        fake.queue(AgentDomainEvent::BackgroundCalls { running: 1 });
+        wait_for_ingest(&source, 6);
+        assert_eq!(source.projection().background_calls, 1);
+    }
+
+    #[test]
+    fn a_card_left_waiting_after_its_turn_ended_moves_with_it() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        let _ = source.take_ui_delivery();
+        // A request still waiting when its turn ended: only folding it again rebuilds the card.
+        source.fold_locally(AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-late".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({}),
+            provider_prompt: None,
+        });
+        source.fold_locally(turn_completed("t-late"));
+        let (core, handoff) = source.freeze_for_move(deliver).unwrap();
+        assert_eq!(core.running_turn.len(), 2, "the turn is not over while its card waits");
+        let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
+        assert!(adopted.projection().pending_permissions.contains_key("perm-late"));
+        assert_eq!(json_of(&adopted), json_of(&source));
+    }
+
+    #[test]
+    fn commit_moved_names_this_process_in_the_lease_without_unlocking_it() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        let _ = adopted_record(&source);
+        let cwd = source.canonical_cwd().to_string_lossy().to_string();
+        let held = || {
+            matches!(
+                SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-abc"),
+                Err(LeaseError::AlreadyHeld)
+            )
+        };
+        assert!(held(), "the source holds the session");
+
+        let (core, handoff) = source.freeze_for_move(deliver).unwrap();
+        let descriptor = source.lease_descriptor().expect("the source holds a lease").unwrap();
+        let lease = SessionLease::from_moved(descriptor, PROVIDER_NAME, &cwd, "claude-uuid-abc").unwrap();
+        let path = lease.path().to_path_buf();
+        // As the file reads while the source's process still owns it.
+        std::fs::write(
+            &path,
+            r#"{"owner_pid":4194001,"instance_id":"first","started_at":"then"}"#,
+        )
+        .unwrap();
+
+        let mut adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(Some(lease))).unwrap();
+        assert!(held());
+        drop(source);
+        assert!(
+            held(),
+            "the source letting go of its descriptor does not free the session"
+        );
+
+        adopted.commit_moved().unwrap();
+        let owner: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(owner["owner_pid"], serde_json::json!(std::process::id()));
+        assert_eq!(owner["instance_id"], serde_json::json!("first"));
+        assert!(held(), "rewriting the owner never unlocks");
+
+        drop(adopted);
+        assert!(lease_comes_free(&cwd, "claude-uuid-abc"));
+    }
+
+    #[test]
+    fn a_lease_for_another_session_is_not_adopted() {
+        let fake = Arc::new(FakeProvider::new());
+        let mut source = after_one_turn(&fake);
+        let _ = adopted_record(&source);
+        let cwd = source.canonical_cwd().to_string_lossy().to_string();
+        let (core, handoff) = source.freeze_for_move(deliver).unwrap();
+        let other = SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-other").unwrap();
+        let refused = AgentConversation::adopt_moved(core, handoff, moved_provider(Some(other)));
+        assert!(matches!(refused, Err(HandoffRefused::Mismatch(_))));
+    }
+
+    #[test]
+    fn history_dirty_set_by_a_turn_end_just_before_the_move_is_carried() {
+        let fake = Arc::new(FakeProvider::new());
+        let source = conversation_with(Arc::clone(&fake));
+        fake.queue(session_opened());
+        let _ = adopted_record(&source);
+        let mut source = source;
+        let (core, handoff) = source
+            .freeze_for_move(|conversation| {
+                // A turn ending just before the move: frozen, the source writes no history for it.
+                conversation.fold_locally(turn_completed("t1"));
+                let _ = conversation.take_ui_delivery();
+                Ok(())
+            })
+            .unwrap();
+        assert!(handoff.history_dirty);
+        assert!(handoff.record_written);
+        assert!(!history_path(&source).exists(), "the frozen source wrote nothing");
+        drop(source);
+
+        let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
+        wait_for(&adopted, "the destination writing the turn's history", |c| {
+            history_path(c).exists()
+        });
     }
 }

@@ -22,7 +22,8 @@
 //!
 //! [`revert`] decides what a revert, its undo or a recovery writes, and refuses unless no turn
 //! runs anywhere, the editor holds no unsaved buffer of the file and the disk is still what the
-//! turn left.
+//! turn left. [`write_slot`] keeps those writes one at a time across every window of the project,
+//! and away from a review message being read from the disk.
 
 pub mod attribution;
 pub mod diff;
@@ -36,6 +37,7 @@ pub mod presence;
 pub mod revert;
 pub mod shadow;
 pub mod write;
+pub mod write_slot;
 
 pub use attribution::{named_paths, origin, NamedPaths, Origin};
 
@@ -49,15 +51,20 @@ pub use draft::{
 pub use flow::{saved_to_undo, show_hunk, undo_to_saved, Out, ReviewFlow};
 pub use journal::{Journal, JournalEntry, JournalNote};
 pub use lifecycle::{
-    DiffJob, JobEvent, JobHook, LeftOutSides, Overview, OverviewFile, OverviewJob, ReviewDiff, ReviewError, ReviewHint,
-    ReviewOptions, Scope, Snap, TurnRecord, TurnRef, TurnReview, TurnState, MAX_OVERVIEW_DIFF_LINES,
+    monotonic_ns, DiffJob, HandedRecord, HandedTurn, JobEvent, JobHook, LeftOutEntry, LeftOutSides, MarksWire,
+    MonotonicClock, Overview, OverviewFile, OverviewJob, PathBytes, PrintWire, ReviewDiff, ReviewError, ReviewHandoff,
+    ReviewHint, ReviewOptions, Scope, Snap, TurnRecord, TurnRef, TurnReview, TurnState, Unbound,
+    MAX_OVERVIEW_DIFF_LINES,
 };
 pub use message::{compose, Preview};
-pub use presence::{busy_elsewhere, Blocked, Busy, Presence, PresenceGuard, PresenceHolder};
+pub use presence::{
+    busy_elsewhere, Blocked, Busy, Decision, Held, Partner, Presence, PresenceFallback, PresenceGuard, PresenceHolder,
+    CONFIRM_WAIT,
+};
 pub use revert::{
-    buffer_state_args, parse_buffer_state, AnchorJob, AppliedRevert, BufferState, EditorCheck, EditorClear, ExactHunk,
-    ExactHunks, ExactHunksJob, RecoverAnswer, RecoverJob, Recovered, RecoveriesJob, Refusal, RevertJob, RevertKind,
-    RevertTarget, Saved, UndoJob, BUFFER_STATE_LUA, MAX_CLEAR_AGE,
+    buffer_state_args, parse_buffer_state, AnchorJob, AppliedRevert, BufferAsk, BufferState, EditorCheck, EditorClear,
+    EmbeddedAsk, ExactHunk, ExactHunks, ExactHunksJob, RecoverAnswer, RecoverJob, Recovered, RecoveriesJob, Refusal,
+    RemoteAsk, RevertJob, RevertKind, RevertTarget, Saved, UndoJob, BUFFER_STATE_LUA, MAX_CLEAR_AGE,
 };
 pub use shadow::{
     review_dir_for, Entry, EntryKind, FilePrint, LeftOut, Limits, Shadow, ShadowError, ShadowLock, Snapshot,
@@ -67,3 +74,4 @@ pub use write::{
     decide_mode, read_current, replace, write_mode, Content, Current, FsHooks, InPlaceWhy, ProjectDir, Stage, Target,
     WriteError, WriteMode,
 };
+pub use write_slot::{SlotBusy, SlotHold, WriteSlot};

@@ -18,6 +18,7 @@ use super::config::Echo;
 use super::wire::{reviewer_word, ThreadEcho};
 use crate::external::{DirTrust, TrustPlan};
 use crate::projection::AgentDomainEvent;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
@@ -163,7 +164,7 @@ pub const USER_HOOK_LAYER: &str = "user";
 
 /// What an untrusted session watches for after it started: tool servers and hooks that only the project's
 /// own configuration provides.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrustWatch {
     /// Names of tool servers the project's configuration defines, alone or otherwise than the user's.
     project_only: HashSet<String>,

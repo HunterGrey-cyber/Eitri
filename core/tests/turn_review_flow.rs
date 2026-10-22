@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,15 +19,20 @@ use eitri_core::agent_backend::{AgentBackend, AgentId, BackendKind};
 use eitri_core::agent_bridge::{parse_inbound_message, InboundMessage, SessionModeChoice};
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::nvim_rpc::{Answer, Pending};
-use eitri_core::review_editor::{Owner, CLEAR_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA, SHOW_LUA, TAKE_EVENTS_LUA};
+use eitri_core::review_editor::{
+    editor_event_to_wire, parse_revert_event, EventKind, Owner, RemoteOverlay, CLEAR_LUA, OPEN_AND_SHOW_LUA,
+    REVIEW_LUA, SHOW_LUA, TAKE_EVENTS_LUA,
+};
 use eitri_core::tab_set::{TabBackend, TabSet};
 use eitri_core::tabs::TabId;
 use eitri_core::test_providers::RecordingProvider;
 use eitri_core::turn_review::{
     check_reverts, replace, review_dir_for, saved_to_undo, show_hunk, undo_to_saved, Blocked, Busy, Content, FsHooks,
-    Journal, JournalNote, NewRevert, Out, PresenceGuard, PresenceHolder, ProjectDir, RevertShape, RevertSource,
-    RevertStatus, ReviewFlow, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, UndoState,
+    Journal, JournalNote, NewRevert, Out, PresenceGuard, PresenceHolder, ProjectDir, RemoteAsk, RevertShape,
+    RevertSource, RevertStatus, ReviewFlow, ReviewOptions, Saved, Scope, Shadow, SlotBusy, Snap, Stage, TurnReview,
+    UndoState, WriteSlot,
 };
+use eitri_core::window_link::{Drawn, EditorOp};
 use rmpv::Value;
 use serde_json::{json, Value as Json};
 
@@ -365,6 +371,17 @@ impl Fixture {
 
     /// A tab set with a review and a held presence, and one empty tab.
     fn bare(name: &str) -> Fixture {
+        Fixture::bare_with(name, true)
+    }
+
+    /// [`Fixture::new`] in a window that holds no presence.
+    fn without_presence(name: &str) -> Fixture {
+        let mut f = Fixture::bare_with(name, false);
+        f.give_session();
+        f
+    }
+
+    fn bare_with(name: &str, presence: bool) -> Fixture {
         agent::state_dirs::redirect_state_to_a_test_root();
         let scratch = Scratch::new(name);
         let project = scratch.0.join("project");
@@ -379,9 +396,11 @@ impl Fixture {
         };
         tabs.install_turn_review(TurnReview::with_options(Some(review_dir.clone()), &project, options))
             .unwrap();
-        tabs.hold_presence(PresenceHolder::start(review_dir.clone(), std::process::id()));
-        let guard = tabs.presence_guard().expect("presence is held");
-        until("this window's presence", || guard.check().is_ok());
+        if presence {
+            tabs.hold_presence(PresenceHolder::start(review_dir.clone(), std::process::id()));
+            let guard = tabs.presence_guard().expect("presence is held");
+            until("this window's presence", || guard.check().is_ok());
+        }
         let tab = tabs.active();
         Fixture {
             scratch,
@@ -2236,4 +2255,288 @@ fn review_editor_never_types_keys() {
             assert!(!text.contains(needle.as_str()), "{name} mentions {needle}");
         }
     }
+}
+
+// ---- the project's write slot ----------------------------------------------------------------------
+
+const HOLD_DIR: &str = "EITRI_FLOW_SLOT_HOLD_DIR";
+const HOLD_SIGNALS: &str = "EITRI_FLOW_SLOT_HOLD_SIGNALS";
+
+/// The child that stands for another window writing: it takes the review directory's write slot
+/// exclusively, says so with a `held` file and keeps it until a `release` file appears. Does nothing
+/// unless the parent set its directories.
+#[test]
+#[ignore = "run by the write slot tests"]
+fn write_slot_holder_child() {
+    let (Some(dir), Some(signals)) = (std::env::var_os(HOLD_DIR), std::env::var_os(HOLD_SIGNALS)) else {
+        return;
+    };
+    let signals = PathBuf::from(signals);
+    let slot = WriteSlot::open(Path::new(&dir)).unwrap();
+    let hold = slot.try_exclusive().expect("the slot is free when the holder starts");
+    std::fs::write(signals.join("held"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !signals.join("release").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(hold);
+}
+
+/// Another process holding the slot exclusively until dropped.
+struct SlotHolder {
+    child: std::process::Child,
+    signals: PathBuf,
+}
+
+impl SlotHolder {
+    fn start(f: &Fixture) -> SlotHolder {
+        let signals = f.scratch.0.join("slot-signals");
+        std::fs::create_dir_all(&signals).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "write_slot_holder_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HOLD_DIR, &f.review_dir)
+            .env(HOLD_SIGNALS, &signals)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let holder = SlotHolder { child, signals };
+        until("the other process to hold the slot", || {
+            holder.signals.join("held").exists()
+        });
+        holder
+    }
+}
+
+impl Drop for SlotHolder {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.signals.join("release"), b"");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.child.try_wait().ok().flatten().is_none() {
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+fn every_disk_job_takes_the_slot_and_refuses_with_the_busy_note_while_another_process_holds_it() {
+    let _one = one_crash_at_a_time();
+    let mut f = Fixture::new("slot-busy");
+    f.write("a.txt", BASE, 0o644);
+    f.write("b.txt", BASE, 0o644);
+    let n = f.turn(|f| {
+        f.write("a.txt", CHANGED, 0o644);
+        f.write("b.txt", CHANGED, 0o644);
+    });
+    let editor = FakeEditor::answering(clear_buffer());
+    // A revert to undo, and an interrupted one to recover, made before the other window comes.
+    let outs = f.run(editor.rpc(), "r0", revert_file("r0", f.tab, n, "a.txt"));
+    assert_eq!(result_of(&outs, "r0"), Ok(None));
+    f.write("c.txt", b"the original\n", 0o644);
+    let entry = crash_mid_write(&f, "c.txt");
+    assert_eq!(first_offer(&mut f), vec![entry.clone()]);
+    let half = f.read("c.txt");
+
+    let holder = SlotHolder::start(&f);
+    let note = SlotBusy::Writing.to_string();
+    assert!(
+        note.contains("another Eitri window"),
+        "the note names the other window: {note}"
+    );
+    for (id, message) in [
+        ("r1", revert_file("r1", f.tab, n, "b.txt")),
+        ("u1", undo("u1", f.tab)),
+        ("v1", recover("v1", &entry, "restore")),
+        ("s1", send("s1", f.tab, None)),
+    ] {
+        let outs = f.run(editor.rpc(), id, message);
+        assert_eq!(result_of(&outs, id), Err(note.clone()), "{id}");
+    }
+    assert_eq!(f.read("a.txt"), BASE, "the undo wrote nothing");
+    assert_eq!(f.read("b.txt"), CHANGED, "the revert wrote nothing");
+    assert_eq!(f.read("c.txt"), half, "the recovery wrote nothing");
+    assert_eq!(pending_ids(&f), vec![entry.clone()], "the entry is still pending");
+    assert_eq!(f.draft().reverts().len(), 1);
+    assert!(!f.draft().reverts()[0].undone, "the undo was not recorded");
+
+    // The other window lets go: the same requests go through.
+    drop(holder);
+    let outs = f.run(editor.rpc(), "r2", revert_file("r2", f.tab, n, "b.txt"));
+    assert_eq!(result_of(&outs, "r2"), Ok(None));
+    assert_eq!(f.read("b.txt"), BASE);
+    let outs = f.run(None, "s2", send("s2", f.tab, None));
+    preview_of(&outs);
+    f.shut_down();
+}
+
+#[test]
+fn a_send_in_a_window_without_presence_still_takes_the_slot() {
+    let mut f = Fixture::without_presence("slot-no-presence");
+    assert!(f.tabs.presence_guard().is_none());
+    f.write("a.txt", BASE, 0o644);
+    let n = f.turn(|f| f.write("a.txt", CHANGED, 0o644));
+    f.run(None, "c1", comment("c1", f.tab, n, "a.txt", "why this?"));
+
+    let holder = SlotHolder::start(&f);
+    let outs = f.run(None, "s1", send("s1", f.tab, None));
+    assert_eq!(result_of(&outs, "s1"), Err(SlotBusy::Writing.to_string()));
+    assert_eq!(f.draft().comments().len(), 1, "the draft is kept");
+
+    drop(holder);
+    let outs = f.run(None, "s2", send("s2", f.tab, None));
+    preview_of(&outs);
+    f.shut_down();
+}
+
+// ---- window 2 --------------------------------------------------------------------------------------
+
+/// Makes the fixture's flow window 2's: every operation it sends to window 1 is recorded, and a
+/// buffer question is answered with `buffer` (`None`: not linked).
+fn as_window_2(f: &mut Fixture, buffer: Option<Value>) -> Rc<RefCell<Vec<EditorOp>>> {
+    let sent: Rc<RefCell<Vec<EditorOp>>> = Rc::default();
+    let ops = sent.clone();
+    let overlay = RemoteOverlay::new(
+        &f.project,
+        Box::new(move |op| {
+            ops.borrow_mut().push(op);
+            ops.borrow().len() as u64
+        }),
+    );
+    let asks = sent.clone();
+    let ask = RemoteAsk::new(
+        &f.project,
+        Box::new(move |op| {
+            asks.borrow_mut().push(op);
+            buffer.clone().map(|value| {
+                let (answer, pending) = Pending::pair();
+                answer.send(Ok(value));
+                pending
+            })
+        }),
+    );
+    f.flow.link_to_window_1(overlay, ask);
+    sent
+}
+
+/// Ticks window 2's flow, which has no editor of its own, until `done` holds of what it sent.
+fn tick_until_sent(f: &mut Fixture, sent: &RefCell<Vec<EditorOp>>, what: &str, done: impl Fn(&[EditorOp]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !done(sent.borrow().as_slice()) {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        f.tick(None);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_panel_moving_to_another_turn_of_a_drawn_file_redraws_it_from_window_2() {
+    let mut f = Fixture::new("window-2-redraw");
+    f.write("a.txt", b"one\ntwo\nthree\n", 0o644);
+    let first = f.turn(|f| f.write("a.txt", b"one\nTWO\nthree\n", 0o644));
+    let second = f.turn(|f| f.write("a.txt", b"one\nTWO\nTHREE\n", 0o644));
+    let sent = as_window_2(&mut f, None);
+
+    // The open goes to window 1 as an operation, and is answered when window 1 answers it.
+    let outs = f.handle(None, open_in_editor("o1", f.tab, first, "a.txt"));
+    assert!(!answered(&outs, "o1"), "window 2 has no editor, but window 1 does");
+    tick_until_sent(&mut f, &sent, "the open", |ops| !ops.is_empty());
+    assert!(
+        matches!(&sent.borrow()[0], EditorOp::ReviewOpenAndShow { path, hunks: Some(h), .. } if path == "a.txt" && h.len() == 1),
+        "{:?}",
+        sent.borrow()
+    );
+    f.flow.remote_overlay().unwrap().answered(1, Ok("opened".to_owned()));
+    let outs = f.drive(None, "o1");
+    assert_eq!(result_of(&outs, "o1"), Ok(Some("opened".to_string())));
+
+    // Until window 1 says the file is drawn, the panel moving on redraws nothing.
+    let jobs = f.flow.jobs_started();
+    f.flow.panel_shows(&f.tabs, f.tab, second, Scope::Turn, "a.txt");
+    assert_eq!(
+        f.flow.jobs_started(),
+        jobs,
+        "nothing is known to be drawn, so nothing is read"
+    );
+
+    f.flow.remote_overlay().unwrap().review_drawn("a.txt", Drawn::Drawn);
+    f.flow.panel_shows(&f.tabs, f.tab, second, Scope::Turn, "a.txt");
+    tick_until_sent(&mut f, &sent, "the redraw", |ops| ops.len() > 1);
+    let ops = sent.borrow();
+    let EditorOp::ReviewShow { path, meta, hunks } = &ops[1] else {
+        panic!("a redraw is a show: {:?}", ops[1]);
+    };
+    assert_eq!(path, "a.txt");
+    assert_eq!(meta.turn, second, "the turn the panel moved to");
+    assert_eq!(meta.session, SESSION);
+    assert_eq!(hunks.len(), 1);
+    drop(ops);
+    f.shut_down();
+}
+
+#[test]
+fn a_review_send_asks_unsaved_editor_reverts_through_remote_ask() {
+    let (mut f, n) = changed_once("window-2-send");
+    f.write("e.txt", b"old1\nold2\n", 0o644);
+    f.tabs.review_draft_mut(f.tab).unwrap().record_revert(NewRevert {
+        turn: n,
+        path: "e.txt".into(),
+        hunk: None,
+        shape: RevertShape::Lines { from: 1, to: 2 },
+        source: RevertSource::Editor,
+        at_line: 1,
+        reverted_to: b"alpha\nbeta\n".to_vec(),
+        replaced: b"old1\nold2\n".to_vec(),
+        undo: None,
+    });
+    let sent = as_window_2(&mut f, Some(buffer_with(&["alpha", "beta"], "unix", true, true)));
+    let outs = f.run(None, "s1", send("s1", f.tab, None));
+    let preview = preview_of(&outs);
+    assert_eq!(
+        preview["notOnDisk"][0]["why"], "only in the editor, not saved",
+        "window 1's editor vouched for it: {preview}"
+    );
+    assert_eq!(
+        *sent.borrow(),
+        vec![EditorOp::BufferState {
+            path: "e.txt".to_owned(),
+            lines: Some((1, 2)),
+        }],
+        "asked of window 1, by the path from the project root and the revert's own lines"
+    );
+    f.shut_down();
+}
+
+#[test]
+fn an_editor_revert_from_window_1_finds_its_tab_by_session_not_by_number() {
+    let (mut f, n) = changed_once("window-2-events");
+    let _sent = as_window_2(&mut f, None);
+    // Window 1 numbered the tab otherwise: the number in the event is not this window's.
+    let mut event = parse_revert_event(&revert_event(&f, n, "a.txt", 1, 2, "two", "TWO", "lf")).unwrap();
+    event.meta.tab = f.tab.0 + 40;
+    f.flow
+        .remote_overlay()
+        .unwrap()
+        .review_events(SESSION, vec![editor_event_to_wire(EventKind::Revert, &event)]);
+    let outs = f.tick(None);
+    assert!(
+        shape(&outs).iter().any(|w| w.starts_with("review_draft")),
+        "the draft is pushed: {:?}",
+        shape(&outs)
+    );
+    assert_eq!(
+        f.draft().reverts().len(),
+        1,
+        "recorded in the tab that holds the session"
+    );
+    f.shut_down();
 }

@@ -262,6 +262,93 @@ impl SessionLease {
         std::mem::forget(self);
         Ok(fd)
     }
+
+    /// A second descriptor on this lease's open file, close-on-exec, for the window a conversation
+    /// moves to. `flock` belongs to the open file, not the descriptor, so the lease stays held while
+    /// either descriptor is open: handing it over never lets it go for a moment.
+    pub fn descriptor_for_move(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        // `try_clone` duplicates with `F_DUPFD_CLOEXEC`.
+        Ok(self.file.try_clone()?.into())
+    }
+
+    /// The lease for exactly this provider, directory and session, from a descriptor another window
+    /// handed over. Refused unless the descriptor is the lease file's own open file and holds its lock
+    /// (taking it if nobody does), so a descriptor for another file or session never passes as one.
+    pub fn from_moved(
+        fd: std::os::fd::OwnedFd,
+        provider: &str,
+        canonical_cwd: &str,
+        provider_session_id: &str,
+    ) -> Result<Self, LeaseError> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = leases_dir().map_err(LeaseError::Io)?;
+        let path = dir.join(format!(
+            "{}.lock",
+            lease_key_hash(provider, canonical_cwd, provider_session_id)
+        ));
+        let file = File::from(fd);
+        let raw = file.as_raw_fd();
+        // Close-on-exec whatever the sender set: a lease must never leak into a child.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        if flags == -1 || unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+            return Err(LeaseError::Io(std::io::Error::last_os_error()));
+        }
+        let held = file.metadata().map_err(LeaseError::Io)?;
+        let named = std::fs::metadata(&path).map_err(LeaseError::Io)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(LeaseError::Io(std::io::Error::other(
+                "the descriptor handed over is not this session's lease file",
+            )));
+        }
+        // Succeeds at once on the open file that holds the lock (it already does), and on a lock
+        // nobody holds; fails only when another open file holds it.
+        let rc = unsafe { libc::flock(raw, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(LeaseError::AlreadyHeld);
+            }
+            return Err(LeaseError::Io(err));
+        }
+        Ok(Self { file, path })
+    }
+
+    /// Names `pid` as the lease's owner in its metadata, keeping whatever else the metadata holds (the
+    /// instance id and start time `try_acquire` wrote). Written through the descriptor the lease holds
+    /// and never by reopening it for writing, so the lock is not touched; read through a second,
+    /// read-only open of the same file (a lock belongs to its open file, and closing another one
+    /// releases nothing).
+    ///
+    /// Refused when the path no longer names the file this lease holds: what would be written is
+    /// what nobody reads. Metadata that cannot be read back is replaced by the owner alone; no
+    /// instance id or start time is made up for it.
+    ///
+    /// One write at offset 0, padded with spaces to the file's current length, so the file never
+    /// gets shorter: there is no moment at which it holds the new text cut short or the old text's
+    /// tail. A reader can still meet the empty file `try_acquire` leaves between its truncation and
+    /// its write, so whoever reads this metadata treats text it cannot parse as an owner it does
+    /// not know.
+    pub fn rewrite_owner_pid(&self, pid: u32) -> std::io::Result<()> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let reader = std::fs::File::open(&self.path)?;
+        let held = self.file.metadata()?;
+        let read = reader.metadata()?;
+        if (held.dev(), held.ino()) != (read.dev(), read.ino()) {
+            return Err(std::io::Error::other("the lease file was replaced"));
+        }
+        let mut text = String::new();
+        let mut metadata = std::io::Read::read_to_string(&mut &reader, &mut text)
+            .ok()
+            .and_then(|_| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).ok())
+            .unwrap_or_default();
+        metadata.insert("owner_pid".to_string(), serde_json::Value::from(pid));
+        let mut bytes = serde_json::to_vec(&metadata).map_err(std::io::Error::other)?;
+        let length = usize::try_from(held.len()).unwrap_or(usize::MAX);
+        if bytes.len() < length {
+            bytes.resize(length, b' ');
+        }
+        self.file.write_all_at(&bytes, 0)
+    }
 }
 
 /// Formats a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp for the lease's `started_at` diagnostic.
@@ -299,6 +386,24 @@ mod tests {
     use super::test_override::IsolatedLeasesDir;
     use super::*;
 
+    /// Whether the lease can be taken, asked again for up to five seconds while it looks held. A
+    /// lock just let go can look held for a moment while another test thread starts a child process:
+    /// the child has a copy of every descriptor of this process, and so the lock, until it execs.
+    /// One never let go is still held after the five seconds, so this checks "released within five
+    /// seconds".
+    fn lease_comes_free(provider: &str, cwd: &str, session: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match SessionLease::try_acquire(provider, cwd, session) {
+                Ok(_) => return true,
+                Err(LeaseError::AlreadyHeld) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
     // These were one long test function, because isolating them meant mutating XDG_RUNTIME_DIR and
     // that is process-wide. `IsolatedLeasesDir` is per-thread, so they are separate tests again and
     // each can say in its own name what it pins.
@@ -322,7 +427,7 @@ mod tests {
         let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-1").unwrap();
         assert!(lease.path().exists());
         drop(lease);
-        assert!(SessionLease::try_acquire("claude", "/tmp/project", "prov-1").is_ok());
+        assert!(lease_comes_free("claude", "/tmp/project", "prov-1"));
     }
 
     #[test]
@@ -369,6 +474,99 @@ mod tests {
         assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap());
         let _again = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe")
             .expect("a probe must leave the lease free to take");
+    }
+
+    fn owner_in(path: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()
+    }
+
+    #[test]
+    fn rewriting_the_owner_keeps_the_lock_and_the_rest_of_the_metadata() {
+        let _dir = IsolatedLeasesDir::new();
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-owner").unwrap();
+        let before = owner_in(lease.path());
+        assert_eq!(before["owner_pid"], serde_json::json!(std::process::id()));
+
+        lease.rewrite_owner_pid(4_194_000).unwrap();
+        let after = owner_in(lease.path());
+        assert_eq!(after["owner_pid"], serde_json::json!(4_194_000));
+        assert_eq!(after["instance_id"], before["instance_id"]);
+        assert_eq!(after["started_at"], before["started_at"]);
+        assert!(matches!(
+            SessionLease::try_acquire("claude", "/tmp/project", "prov-owner"),
+            Err(LeaseError::AlreadyHeld)
+        ));
+
+        // A shorter pid leaves no tail of the longer one behind, and the file keeps its length.
+        let length = std::fs::metadata(lease.path()).unwrap().len();
+        lease.rewrite_owner_pid(7).unwrap();
+        assert_eq!(owner_in(lease.path())["owner_pid"], serde_json::json!(7));
+        assert_eq!(std::fs::metadata(lease.path()).unwrap().len(), length);
+    }
+
+    #[test]
+    fn unreadable_metadata_is_replaced_by_the_owner_alone() {
+        let _dir = IsolatedLeasesDir::new();
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-garbled").unwrap();
+        std::fs::write(lease.path(), "{\"owner_pid\":12").unwrap();
+
+        lease.rewrite_owner_pid(4_194_000).unwrap();
+        let after = owner_in(lease.path());
+        assert_eq!(
+            after,
+            serde_json::json!({ "owner_pid": 4_194_000 }),
+            "nothing is made up"
+        );
+    }
+
+    #[test]
+    fn a_lease_file_replaced_under_the_lease_is_not_written() {
+        let _dir = IsolatedLeasesDir::new();
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-replaced").unwrap();
+        std::fs::remove_file(lease.path()).unwrap();
+        std::fs::write(lease.path(), "{}").unwrap();
+
+        assert!(lease.rewrite_owner_pid(4_194_000).is_err());
+        assert_eq!(
+            owner_in(lease.path()),
+            serde_json::json!({}),
+            "the new file is left as it is"
+        );
+    }
+
+    #[test]
+    fn a_moved_descriptor_holds_the_lease_after_the_original_is_dropped() {
+        let _dir = IsolatedLeasesDir::new();
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-move").unwrap();
+        let fd = lease.descriptor_for_move().unwrap();
+        drop(lease);
+        assert!(matches!(
+            SessionLease::try_acquire("claude", "/tmp/project", "prov-move"),
+            Err(LeaseError::AlreadyHeld)
+        ));
+        let moved = SessionLease::from_moved(fd, "claude", "/tmp/project", "prov-move").unwrap();
+        assert!(moved.is_for("claude", "/tmp/project", "prov-move"));
+        let flags = unsafe { libc::fcntl(moved.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "a moved lease never reaches a child");
+        assert!(matches!(
+            SessionLease::try_acquire("claude", "/tmp/project", "prov-move"),
+            Err(LeaseError::AlreadyHeld)
+        ));
+        drop(moved);
+        assert!(
+            lease_comes_free("claude", "/tmp/project", "prov-move"),
+            "dropping the moved lease lets it go"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_for_another_sessions_lease_is_refused() {
+        let _dir = IsolatedLeasesDir::new();
+        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-a").unwrap();
+        let _other = SessionLease::try_acquire("claude", "/tmp/project", "prov-b").unwrap();
+        let fd = lease.descriptor_for_move().unwrap();
+        assert!(SessionLease::from_moved(fd, "claude", "/tmp/project", "prov-b").is_err());
     }
 
     /// A lease handed to a resume must be the one for that very session: the resume would otherwise

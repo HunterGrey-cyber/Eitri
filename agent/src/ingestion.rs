@@ -38,8 +38,10 @@
 //! the distinction this module is for: memory follows semantic state, not raw event count.
 
 use crate::lease::SessionLease;
+use crate::move_seed::{ChatMoveCore, HandoffRefused, MoveSeed};
 use crate::projection::{AgentDomainEvent, AgentSessionProjection};
 use crate::provider::EventSignal;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -104,7 +106,7 @@ impl RevisedDelivery {
 
 /// Counters for what ingestion is costing. Read by the slow-consumer tests, which need to prove
 /// boundedness rather than merely observe that nothing crashed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestStats {
     /// Every provider event folded since this conversation started.
     pub events_ingested: u64,
@@ -123,7 +125,7 @@ pub struct IngestStats {
 /// Recorded here rather than left for the caller to catch on the event stream: the UI delivery queue
 /// is not a place to read one-off facts from, and draining it to look for a verdict would steal
 /// events the UI has not seen yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeOutcomeRecord {
     pub requested: String,
     pub status: crate::ResumeStatus,
@@ -133,6 +135,7 @@ pub struct ResumeOutcomeRecord {
 }
 
 /// Immutable facts the ingestion thread needs in order to adopt a provider session when one appears.
+#[derive(Clone)]
 struct AdoptionContext {
     /// The name the lease and the record are keyed by (`ExternalProvider::name()`, or `claude`).
     provider_name: &'static str,
@@ -169,6 +172,98 @@ struct IngestState {
     /// Whether this conversation has produced something worth storing since its history was last
     /// written. Set by `fold` at a turn boundary and nowhere else -- see `flush_history`.
     history_dirty: bool,
+    /// The last `SessionOpened` folded and every resume verdict, unavailability or close folded after
+    /// it (all of them while none has opened the session), for the conversation's whole life: what
+    /// sets the session's status when another window rebuilds this projection. A handful at most,
+    /// since each `SessionOpened` starts it again.
+    lifecycle_since_open: Vec<AgentDomainEvent>,
+    /// The running turn, from the fold that started it until the projection is settled again: what a
+    /// move of this conversation in the middle of a turn carries. Freed at the turn's end, so it is
+    /// bounded by one turn.
+    running_turn: Option<RunningTurn>,
+    /// The provider's own sequence number of the last event it had taken in by the last pump whose
+    /// events were folded ([`AgentProvider::pumped_through`]); 0 while it has reported none.
+    ///
+    /// [`AgentProvider::pumped_through`]: crate::provider::AgentProvider::pumped_through
+    folded_through: u64,
+}
+
+/// A running turn as another window needs it to rebuild this projection: the settled export and the
+/// lifecycle list as they were just before the turn's first fold, and every event folded since.
+struct RunningTurn {
+    seed: MoveSeed,
+    lifecycle: Vec<AgentDomainEvent>,
+    events: Vec<AgentDomainEvent>,
+}
+
+/// Whether folding `event` into a settled projection may start a turn's worth of live state (a turn,
+/// an open reply or thought, a card) or is the prompt that begins one. No wildcard arm: a new event
+/// has to say which it is, and saying `true` for one that is not only costs a copy.
+fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
+    match event {
+        AgentDomainEvent::UserPromptSubmitted { .. }
+        | AgentDomainEvent::UserMessageDelivered { .. }
+        | AgentDomainEvent::TurnStarted { .. }
+        | AgentDomainEvent::ContentDelta { .. }
+        | AgentDomainEvent::ToolCallStarted { .. }
+        | AgentDomainEvent::PermissionRequested { .. }
+        | AgentDomainEvent::MoveSeeded(_) => true,
+        AgentDomainEvent::SessionOpened { .. }
+        | AgentDomainEvent::UserMessageDropped { .. }
+        | AgentDomainEvent::AssistantMessageBoundary { .. }
+        | AgentDomainEvent::ToolCallCompleted { .. }
+        | AgentDomainEvent::PermissionResolved { .. }
+        | AgentDomainEvent::TurnCompleted { .. }
+        | AgentDomainEvent::SessionUnavailable { .. }
+        | AgentDomainEvent::ResumeOutcome { .. }
+        | AgentDomainEvent::SessionClosed { .. }
+        | AgentDomainEvent::PermissionModeChanged { .. }
+        | AgentDomainEvent::UngatedCliMode { .. }
+        | AgentDomainEvent::CliPermissionMode { .. }
+        | AgentDomainEvent::PermissionDenied { .. }
+        | AgentDomainEvent::PolicyMismatch { .. }
+        | AgentDomainEvent::BackgroundCalls { .. }
+        | AgentDomainEvent::CommandsAvailable { .. }
+        | AgentDomainEvent::AccountLimits { .. }
+        | AgentDomainEvent::ToolInputChanged { .. } => false,
+    }
+}
+
+/// Keeps `lifecycle` as "the last `SessionOpened` and every status change folded after it", or every
+/// status change folded so far while no `SessionOpened` has been.
+fn note_lifecycle(lifecycle: &mut Vec<AgentDomainEvent>, event: &AgentDomainEvent) {
+    match event {
+        AgentDomainEvent::SessionOpened { .. } => {
+            lifecycle.clear();
+            lifecycle.push(event.clone());
+        }
+        // Kept before any `SessionOpened` too: a session lost before it opened is unavailable, and
+        // without its loss another window would rebuild it as still starting.
+        AgentDomainEvent::ResumeOutcome { .. }
+        | AgentDomainEvent::SessionUnavailable { .. }
+        | AgentDomainEvent::SessionClosed { .. } => lifecycle.push(event.clone()),
+        _ => {}
+    }
+}
+
+/// The ingest's state another window continues from, beside the projection's records.
+pub(crate) struct IngestHandoff {
+    pub(crate) provider_session_id: Option<String>,
+    pub(crate) resume_outcome: Option<ResumeOutcomeRecord>,
+    pub(crate) stats: IngestStats,
+    pub(crate) pending_title: Option<String>,
+    pub(crate) pending_name: Option<Option<String>>,
+    pub(crate) record_written: bool,
+    pub(crate) history_dirty: bool,
+}
+
+/// What an adopted conversation's ingest starts from: the rebuilt projection, the move's records it
+/// was rebuilt from, the ingest's own state from the source, and the lease.
+pub(crate) struct MovedIngest {
+    pub(crate) projection: AgentSessionProjection,
+    pub(crate) core: ChatMoveCore,
+    pub(crate) state: IngestHandoff,
+    pub(crate) lease: Option<SessionLease>,
 }
 
 impl IngestState {
@@ -203,8 +298,28 @@ impl IngestState {
                 detail: detail.clone(),
             });
         }
+        // A turn's first fold: the settled export and the lifecycle list as they stand now are what
+        // another window rebuilds this turn on. Taken only from a settled projection, since the export
+        // carries no live declaration; an unsettled one with no record open stays unmovable until it
+        // settles.
+        if self.running_turn.is_none() && may_start_a_turn(&event) && self.projection.is_settled() {
+            self.running_turn = Some(RunningTurn {
+                seed: self.projection.export_settled(),
+                lifecycle: self.lifecycle_since_open.clone(),
+                events: Vec::new(),
+            });
+        }
         self.projection.apply(&event);
         self.stats.events_ingested += 1;
+        note_lifecycle(&mut self.lifecycle_since_open, &event);
+        if let Some(turn) = &mut self.running_turn {
+            turn.events.push(event.clone());
+            // A prompt leaves the projection settled and is still the turn's start.
+            let prompt = matches!(event, AgentDomainEvent::UserPromptSubmitted { .. });
+            if self.projection.is_settled() && !prompt {
+                self.running_turn = None;
+            }
+        }
         // A turn boundary, and only a turn boundary: that is the quiet moment. `apply` has just
         // closed `assistant_message_open`, so nothing half-written can be stored, and one write per
         // turn is three orders of magnitude fewer than one per event -- a partial-streamed reply is
@@ -237,6 +352,115 @@ impl IngestState {
 
     fn take_delivery(&mut self) -> UiDelivery {
         self.take_revised_delivery().without_revisions()
+    }
+
+    /// The records a move carries, taken while folding is stopped. Refused while folded events wait
+    /// for the page, and for an idle conversation holding a live declaration no fold would rebuild.
+    ///
+    /// Destructures `Self` without a rest pattern: a field added to the ingest does not compile here
+    /// until it is placed in the move or named as not moved.
+    fn take_move_record(&self) -> Result<(ChatMoveCore, IngestHandoff), HandoffRefused> {
+        let IngestState {
+            projection,
+            provider_session_id,
+            // Moves as a descriptor beside the record, never inside it.
+            lease: _,
+            pending_ui,
+            resync_pending,
+            resume_outcome,
+            stats,
+            pending_title,
+            pending_name,
+            record_written,
+            history_dirty,
+            lifecycle_since_open,
+            running_turn,
+            folded_through,
+        } = self;
+        // Emptied by the source's last pump; the destination's first delivery is a snapshot.
+        if !pending_ui.is_empty() || *resync_pending {
+            return Err(HandoffRefused::Undelivered);
+        }
+        let core = match running_turn {
+            Some(turn) => ChatMoveCore {
+                lifecycle: turn.lifecycle.clone(),
+                seed: turn.seed.clone(),
+                running_turn: turn.events.clone(),
+                folded_through: *folded_through,
+            },
+            None if projection.is_settled() => ChatMoveCore {
+                lifecycle: lifecycle_since_open.clone(),
+                seed: projection.export_settled(),
+                running_turn: Vec::new(),
+                folded_through: *folded_through,
+            },
+            None => return Err(HandoffRefused::Unsettled),
+        };
+        let handoff = IngestHandoff {
+            provider_session_id: provider_session_id.clone(),
+            resume_outcome: resume_outcome.clone(),
+            stats: *stats,
+            pending_title: pending_title.clone(),
+            pending_name: pending_name.clone(),
+            record_written: *record_written,
+            history_dirty: *history_dirty,
+        };
+        Ok((core, handoff))
+    }
+
+    /// An adopted conversation's state: the source's, with the running turn and the lifecycle list
+    /// rebuilt from the move's records so a later move of it carries them again.
+    fn moved(moved: MovedIngest) -> Self {
+        let MovedIngest {
+            projection,
+            core,
+            state,
+            lease,
+        } = moved;
+        let ChatMoveCore {
+            lifecycle,
+            seed,
+            running_turn,
+            folded_through,
+        } = core;
+        let mut lifecycle_since_open = Vec::new();
+        for event in lifecycle.iter().chain(running_turn.iter()) {
+            note_lifecycle(&mut lifecycle_since_open, event);
+        }
+        let running_turn = (!running_turn.is_empty()).then_some(RunningTurn {
+            seed,
+            lifecycle,
+            events: running_turn,
+        });
+        let IngestHandoff {
+            provider_session_id,
+            resume_outcome,
+            stats,
+            pending_title,
+            pending_name,
+            record_written,
+            history_dirty,
+        } = state;
+        IngestState {
+            projection,
+            provider_session_id,
+            lease,
+            pending_ui: VecDeque::new(),
+            resync_pending: false,
+            resume_outcome,
+            stats: IngestStats {
+                ui_backlog: 0,
+                resync_pending: false,
+                ..stats
+            },
+            pending_title,
+            pending_name,
+            record_written,
+            history_dirty,
+            lifecycle_since_open,
+            running_turn,
+            folded_through,
+        }
     }
 
     fn take_revised_delivery(&mut self) -> RevisedDelivery {
@@ -279,6 +503,17 @@ pub struct ConversationIngest {
     /// Told after every fold, so the UI need not poll for deliveries.
     ui_wake: UiWakeSlot,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set while a move takes this conversation's records: the thread takes nothing from the
+    /// provider and writes nothing until it is cleared.
+    frozen: Arc<AtomicBool>,
+    /// Held by the thread from before it takes a batch from the provider until that batch is folded
+    /// and adopted and the writes after it are done. Taking it is how a freeze knows no batch is in
+    /// hand.
+    pump_gate: Arc<Mutex<()>>,
+    /// What the lease and the record are keyed by, and whether the provider resumes: the ingest's
+    /// fixed identity, which a move hands on.
+    provider_name: &'static str,
+    provider_advertises_resume: bool,
 }
 
 /// Borrowed access to the canonical projection.
@@ -325,7 +560,7 @@ impl ConversationIngest {
         seed: AgentSessionProjection,
     ) -> Self {
         let record_written = initial_provider_session_id.is_some();
-        let state = Arc::new(Mutex::new(IngestState {
+        let state = IngestState {
             projection: seed,
             provider_session_id: initial_provider_session_id,
             lease: initial_lease,
@@ -337,25 +572,65 @@ impl ConversationIngest {
             pending_name: None,
             record_written,
             history_dirty: false,
-        }));
-        let stop = Arc::new(AtomicBool::new(false));
-        let announced = provider.event_signal();
-        let wake = announced.clone().unwrap_or_default();
+            lifecycle_since_open: Vec::new(),
+            running_turn: None,
+            folded_through: 0,
+        };
         let context = AdoptionContext {
             provider_name,
             conversation_id,
             canonical_cwd,
             provider_advertises_resume,
         };
+        Self::spawn(provider, state, context)
+    }
+
+    /// Continues a conversation another window held, from the state its move carried: the rebuilt
+    /// projection, the source ingest's own state and the lease. Folding starts at once, from the
+    /// adopted provider.
+    pub(crate) fn start_moved(
+        provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
+        provider_name: &'static str,
+        conversation_id: String,
+        canonical_cwd: String,
+        provider_advertises_resume: bool,
+        moved: MovedIngest,
+    ) -> Self {
+        let context = AdoptionContext {
+            provider_name,
+            conversation_id,
+            canonical_cwd,
+            provider_advertises_resume,
+        };
+        Self::spawn(provider, IngestState::moved(moved), context)
+    }
+
+    fn spawn(
+        provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
+        state: IngestState,
+        context: AdoptionContext,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(state));
+        let stop = Arc::new(AtomicBool::new(false));
+        let frozen = Arc::new(AtomicBool::new(false));
+        let pump_gate = Arc::new(Mutex::new(()));
+        let announced = provider.event_signal();
+        let wake = announced.clone().unwrap_or_default();
+        let provider_name = context.provider_name;
+        let provider_advertises_resume = context.provider_advertises_resume;
 
         let ui_wake: UiWakeSlot = Arc::new(Mutex::new(None));
         let thread = {
             let state = Arc::clone(&state);
-            let stop = Arc::clone(&stop);
+            let halt = Halt {
+                stop: Arc::clone(&stop),
+                frozen: Arc::clone(&frozen),
+                pump_gate: Arc::clone(&pump_gate),
+            };
             let ui_wake = Arc::clone(&ui_wake);
             std::thread::Builder::new()
                 .name("eitri-agent-ingest".to_string())
-                .spawn(move || ingest_loop(provider, state, stop, announced, context, ui_wake))
+                .spawn(move || ingest_loop(provider, state, halt, announced, context, ui_wake))
                 .expect("spawning the agent ingestion thread")
         };
 
@@ -365,6 +640,60 @@ impl ConversationIngest {
             wake,
             ui_wake,
             thread: Some(thread),
+            frozen,
+            pump_gate,
+            provider_name,
+            provider_advertises_resume,
+        }
+    }
+
+    /// Stops taking events from the provider, and returns once no batch is in hand: every event the
+    /// provider gave up before this returns is folded, and none after it until [`Self::unfreeze`].
+    /// The thread writes nothing while frozen either (no title, name, history or record), so what a
+    /// move carries is all there is. Local folds still happen: they are the caller's own.
+    ///
+    /// Waits for a batch being folded, and the writes after it, to finish: call it off the GTK
+    /// thread.
+    pub(crate) fn freeze(&self) {
+        let _held = self.pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.frozen.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets the thread take events again, from where the provider kept them.
+    pub(crate) fn unfreeze(&self) {
+        self.frozen.store(false, Ordering::SeqCst);
+        self.wake.raise();
+    }
+
+    /// The records a move carries and the ingest's own state, read under one lock (see
+    /// `IngestState::take_move_record`).
+    pub(crate) fn take_move_record(&self) -> Result<(ChatMoveCore, IngestHandoff), HandoffRefused> {
+        self.state.lock().unwrap().take_move_record()
+    }
+
+    /// The ingest's fixed identity: the name the lease and the record are keyed by, and whether the
+    /// provider resumes.
+    pub(crate) fn identity(&self) -> (&'static str, bool) {
+        (self.provider_name, self.provider_advertises_resume)
+    }
+
+    /// A second descriptor on the session lease's open file, for the other window: the lock is the
+    /// open file's, so it stays held while either descriptor is open. `None` without a lease.
+    pub(crate) fn lease_descriptor(&self) -> Option<std::io::Result<std::os::fd::OwnedFd>> {
+        self.state
+            .lock()
+            .unwrap()
+            .lease
+            .as_ref()
+            .map(SessionLease::descriptor_for_move)
+    }
+
+    /// Writes `pid` into the lease file as its owner, through the descriptor the lease holds. Nothing
+    /// to do without a lease.
+    pub(crate) fn rewrite_lease_owner(&self, pid: u32) -> std::io::Result<()> {
+        match &self.state.lock().unwrap().lease {
+            Some(lease) => lease.rewrite_owner_pid(pid),
+            None => Ok(()),
         }
     }
 
@@ -471,10 +800,17 @@ impl Drop for ConversationIngest {
     }
 }
 
+/// What tells the ingestion thread to stop for good, or for a while.
+struct Halt {
+    stop: Arc<AtomicBool>,
+    frozen: Arc<AtomicBool>,
+    pump_gate: Arc<Mutex<()>>,
+}
+
 fn ingest_loop(
     provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
     state: Arc<Mutex<IngestState>>,
-    stop: Arc<AtomicBool>,
+    halt: Halt,
     // The provider's own signal, which `ConversationIngest` also raises; `None` when the provider
     // announces nothing and so has to be asked on a timer.
     announced: Option<Arc<EventSignal>>,
@@ -482,13 +818,43 @@ fn ingest_loop(
     // Told once a batch is folded (and once more after an adoption, which the UI reads too).
     ui_wake: UiWakeSlot,
 ) {
+    let Halt {
+        stop,
+        frozen,
+        pump_gate,
+    } = halt;
+    // The last position the provider reported, so an unchanged one costs no lock.
+    let mut noted_through: Option<u64> = None;
+    // Until the provider or this side raises the signal: an unfreeze raises it too, so a frozen
+    // thread wakes when it is let go.
+    let idle = |seen: Option<u64>| match (&announced, seen) {
+        // The stop is looked at again under the signal's lock: one that landed after the check above
+        // already raised the signal before `seen` was read, so the count alone would not end this
+        // wait.
+        (Some(signal), Some(seen)) => signal.wait_past_unless(seen, || stop.load(Ordering::SeqCst)),
+        _ => std::thread::sleep(INGEST_POLL_INTERVAL),
+    };
     while !stop.load(Ordering::SeqCst) {
         #[cfg(test)]
         idle_wakeups::between_the_check_and_the_look(&context.conversation_id);
         // Read before the pump: an event queued after the pump looked raises the count past this,
         // so the wait below ends at once instead of missing it.
         let seen = announced.as_ref().map(|signal| signal.seen());
+        // Held until this batch is folded, adopted and written: a freeze waits for it, so it never
+        // stops the thread with events taken from the provider and not yet folded.
+        let batch = pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if frozen.load(Ordering::SeqCst) {
+            drop(batch);
+            idle(seen);
+            continue;
+        }
         let events = provider.pump();
+        // Asked under the same gate as the pump: a freeze, which waits for the gate, finds the
+        // position of the last batch folded and of no later one.
+        let through = provider
+            .pumped_through()
+            .filter(|through| Some(*through) != noted_through);
+        noted_through = through.or(noted_through);
         // Before the idle check, so a title noted while the provider is quiet still gets written.
         flush_title(&state, &context);
         flush_name(&state, &context);
@@ -496,13 +862,12 @@ fn ingest_loop(
         // a quiet stretch, so waiting for the next non-empty pump would delay every write.
         flush_history(&state, &context);
         if events.is_empty() {
-            match (&announced, seen) {
-                // The stop is looked at again under the signal's lock: one that landed after the
-                // check above already raised the signal before `seen` was read, so the count alone
-                // would not end this wait.
-                (Some(signal), Some(seen)) => signal.wait_past_unless(seen, || stop.load(Ordering::SeqCst)),
-                _ => std::thread::sleep(INGEST_POLL_INTERVAL),
+            // A provider event can become no domain event, and the position still moves past it.
+            if let Some(through) = through {
+                state.lock().unwrap().folded_through = through;
             }
+            drop(batch);
+            idle(seen);
             continue;
         }
         // Adoption touches the filesystem, so it happens OUTSIDE the state lock -- holding it across
@@ -513,6 +878,9 @@ fn ingest_loop(
         let mut name: Option<Option<String>> = None;
         {
             let mut guard = state.lock().unwrap();
+            if let Some(through) = through {
+                guard.folded_through = through;
+            }
             for event in events {
                 if let AgentDomainEvent::SessionOpened {
                     provider_session_id, ..
@@ -547,6 +915,7 @@ fn ingest_loop(
             }
             wake_ui(&ui_wake);
         }
+        drop(batch);
     }
 }
 
@@ -937,6 +1306,9 @@ pub(crate) mod tests {
             pending_name: None,
             record_written: false,
             history_dirty: false,
+            lifecycle_since_open: Vec::new(),
+            running_turn: None,
+            folded_through: 0,
         }
     }
 

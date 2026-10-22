@@ -6,7 +6,12 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use eitri_core::turn_review::{busy_elsewhere, Blocked, Busy, Presence, PresenceHolder, Shadow};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use eitri_core::turn_review::{
+    busy_elsewhere, Blocked, Busy, Partner, Presence, PresenceGuard, PresenceHolder, Shadow,
+};
 
 /// A directory of the test's own under the target dir, removed when dropped.
 struct Scratch(PathBuf);
@@ -366,13 +371,13 @@ fn trim_leaves_presence_and_journal_alone() {
     me.turn_started(1).unwrap();
     std::fs::create_dir_all(dir.join("journal")).unwrap();
     std::fs::write(dir.join("journal/entry"), b"pending").unwrap();
-    // A lock file a killed run left is swept by the same pass; none of the presence files is a
+    // An index lock a killed run left is swept by the same pass; none of the presence files is a
     // `.lock`, and none of the directories is entered.
-    std::fs::write(dir.join("stale.lock"), b"").unwrap();
+    std::fs::write(dir.join("index-killed.lock"), b"").unwrap();
 
     shadow.trim(0, Duration::ZERO, u64::MAX / 2, "now").unwrap();
 
-    assert!(!dir.join("stale.lock").exists(), "the pass ran");
+    assert!(!dir.join("index-killed.lock").exists(), "the pass ran");
     assert!(dir.join("windows/4242").exists());
     assert!(dir.join("running/4242.1").exists());
     assert_eq!(std::fs::read(dir.join("journal/entry")).unwrap(), b"pending");
@@ -380,4 +385,269 @@ fn trim_leaves_presence_and_journal_alone() {
         busy_elsewhere(&dir, 100).unwrap(),
         Some(Busy::TurnRunning { pid: 4242 })
     );
+}
+
+// ---- a linked pair -------------------------------------------------------------------------------
+
+/// A real process to stand for the linked partner, so its pid has a start time to match; killed by
+/// its own handle when dropped.
+struct PartnerProcess(std::process::Child);
+
+impl PartnerProcess {
+    fn start() -> PartnerProcess {
+        PartnerProcess(
+            Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn partner(&self) -> (Partner, Arc<AtomicBool>) {
+        let counts_as_other = Arc::new(AtomicBool::new(false));
+        let start = eitri_core::split::proc_start_time(self.pid()).expect("the partner has a start time");
+        (
+            Partner {
+                pid: self.pid(),
+                start,
+                counts_as_other: Arc::clone(&counts_as_other),
+            },
+            counts_as_other,
+        )
+    }
+}
+
+impl Drop for PartnerProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// This window's own pid in the pair tests: any number the other files do not use, since a window
+/// skips its own files by name.
+const ME: u32 = 4100;
+
+#[test]
+fn the_partners_windows_file_is_skipped_only_while_linked_and_counted_again_after() {
+    let scratch = Scratch::new("partner-skip");
+    let dir = scratch.review_dir();
+    let partner = PartnerProcess::start();
+    let _mine = Presence::open(&dir, ME).unwrap();
+    let _theirs = Presence::open(&dir, partner.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let unlinked = Err(Blocked::Busy(Busy::OtherWindow { pid: partner.pid() }));
+
+    assert_eq!(
+        guard.check(),
+        unlinked,
+        "before the link the other window is another window"
+    );
+    let (linked, _) = partner.partner();
+    guard.set_partner(Some(linked));
+    assert_eq!(guard.check(), Ok(()), "a linked partner is not another window");
+    let worker_copy = guard.clone();
+    guard.set_partner(None);
+    assert_eq!(guard.check(), unlinked, "once the link ends it counts again");
+    assert_eq!(
+        worker_copy.check(),
+        unlinked,
+        "a guard already handed to a worker sees it too"
+    );
+    assert!(
+        dir.join(format!("windows/{}", partner.pid())).exists(),
+        "the partner's held file is never swept"
+    );
+}
+
+#[test]
+fn a_partner_whose_pid_names_another_process_now_is_another_window() {
+    let scratch = Scratch::new("partner-reused");
+    let dir = scratch.review_dir();
+    let partner = PartnerProcess::start();
+    let _theirs = Presence::open(&dir, partner.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (mut linked, _) = partner.partner();
+    // The same pid, but a process that started at another time: not the window that linked.
+    linked.start += 1;
+    guard.set_partner(Some(linked));
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::OtherWindow { pid: partner.pid() }))
+    );
+}
+
+#[test]
+fn a_partner_that_reported_held_false_counts_as_another_window_until_held_true() {
+    let scratch = Scratch::new("partner-held-false");
+    let dir = scratch.review_dir();
+    let partner = PartnerProcess::start();
+    let _theirs = Presence::open(&dir, partner.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (linked, counts_as_other) = partner.partner();
+    guard.set_partner(Some(linked));
+    assert_eq!(guard.check(), Ok(()));
+
+    // What the link's reader does on `presence{held: false}`, before it answers.
+    counts_as_other.store(true, Ordering::SeqCst);
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::OtherWindow { pid: partner.pid() })),
+        "a partner that cannot mark its turns is another window"
+    );
+    // And on `presence{held: true}`.
+    counts_as_other.store(false, Ordering::SeqCst);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn the_running_check_is_unchanged_and_sees_a_partner_turn() {
+    let scratch = Scratch::new("partner-turn");
+    let dir = scratch.review_dir();
+    let partner = PartnerProcess::start();
+    let mut theirs = Presence::open(&dir, partner.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (linked, _) = partner.partner();
+    guard.set_partner(Some(linked));
+    assert_eq!(guard.check(), Ok(()));
+
+    theirs.turn_started(2).unwrap();
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::TurnRunning { pid: partner.pid() })),
+        "a turn of the partner blocks a revert here"
+    );
+    theirs.turn_ended(2);
+    assert_eq!(guard.check(), Ok(()));
+
+    // This window's own turn still blocks it, linked or not.
+    let busy_here = PresenceGuard::for_tests(&dir, ME, 1);
+    let (linked, _) = partner.partner();
+    busy_here.set_partner(Some(linked));
+    assert_eq!(busy_here.check(), Err(Blocked::TurnRunningHere));
+}
+
+#[test]
+fn an_unrelated_window_still_blocks_the_pair_and_is_blocked() {
+    let scratch = Scratch::new("partner-unrelated");
+    let dir = scratch.review_dir();
+    let partner = PartnerProcess::start();
+    let _mine = Presence::open(&dir, ME).unwrap();
+    let _theirs = Presence::open(&dir, partner.pid()).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (linked, _) = partner.partner();
+    guard.set_partner(Some(linked));
+    assert_eq!(guard.check(), Ok(()));
+
+    let unrelated_pid = 4242;
+    let unrelated = Presence::open(&dir, unrelated_pid).unwrap();
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::OtherWindow { pid: unrelated_pid })),
+        "a window outside the pair blocks it"
+    );
+    let theirs_check = PresenceGuard::for_tests(&dir, unrelated_pid, 0).check();
+    assert!(
+        matches!(theirs_check, Err(Blocked::Busy(Busy::OtherWindow { pid })) if pid == ME || pid == partner.pid()),
+        "the window outside the pair sees the pair: {theirs_check:?}"
+    );
+    drop(unrelated);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
+fn a_linked_windows_prompt_waits_for_its_presence_file() {
+    use eitri_core::turn_review::Held;
+    let scratch = Scratch::new("confirmed");
+    let dir = scratch.review_dir();
+    let holder = PresenceHolder::start(dir.clone(), 4242);
+    let answer = holder.sync_confirmed(&std::collections::BTreeSet::from([3]));
+    // The answer comes once the file is taken, so by then another window sees the turn.
+    assert_eq!(answer.recv_timeout(Duration::from_secs(10)), Ok(Held::Yes));
+    assert_eq!(
+        busy_elsewhere(&dir, 5000).unwrap(),
+        Some(Busy::TurnRunning { pid: 4242 })
+    );
+    // The same set again is answered again: a second prompt waits for its own confirmation.
+    let again = holder.sync_confirmed(&std::collections::BTreeSet::from([3]));
+    assert_eq!(again.recv_timeout(Duration::from_secs(10)), Ok(Held::Yes));
+    // A set without the turn lets its file go.
+    let ended = holder.sync_confirmed(&std::collections::BTreeSet::new());
+    assert_eq!(ended.recv_timeout(Duration::from_secs(10)), Ok(Held::Yes));
+    assert!(!dir.join("running/4242.3").exists());
+}
+
+#[test]
+fn a_holder_that_could_not_open_answers_no_with_why() {
+    use eitri_core::turn_review::Held;
+    let scratch = Scratch::new("confirmed-no");
+    let dir = scratch.review_dir();
+    symlinked_windows(&scratch, &dir);
+    let holder = PresenceHolder::start(dir, 4242);
+    let answer = holder.sync_confirmed(&std::collections::BTreeSet::from([3]));
+    match answer.recv_timeout(Duration::from_secs(10)) {
+        Ok(Held::No(why)) => assert!(!why.is_empty()),
+        other => panic!("a window whose presence cannot be held must say no: {other:?}"),
+    }
+}
+
+#[test]
+fn with_no_ack_the_prompt_is_not_sent_and_says_why() {
+    use eitri_core::turn_review::{Decision, Held, PresenceFallback, CONFIRM_WAIT};
+    let start = Instant::now();
+    let mut wait = PresenceFallback::start(start);
+    assert_eq!(
+        wait.on_confirmed(Held::No("the review directory is read-only".into()), start),
+        Decision::SendPresenceFalse
+    );
+    assert_eq!(
+        wait.tick(start + CONFIRM_WAIT - Duration::from_millis(1)),
+        Decision::Wait
+    );
+    assert_eq!(
+        wait.tick(start + CONFIRM_WAIT),
+        Decision::NotSent(
+            "not sent: turn review could not mark the turn as running (the review directory is read-only)".into()
+        )
+    );
+    // Decided once: a late acknowledgement sends nothing.
+    assert_eq!(wait.on_ack(start + CONFIRM_WAIT * 2), Decision::Wait);
+
+    // A thread that never answers falls back with a reason of its own.
+    let mut silent = PresenceFallback::start(start);
+    assert_eq!(silent.tick(start + CONFIRM_WAIT), Decision::SendPresenceFalse);
+    match silent.tick(start + CONFIRM_WAIT * 2) {
+        Decision::NotSent(note) => assert!(
+            note.starts_with("not sent: turn review could not mark the turn as running (") && note.ends_with(')'),
+            "{note}"
+        ),
+        other => panic!("no acknowledgement must leave the prompt unsent: {other:?}"),
+    }
+}
+
+#[test]
+fn a_link_end_while_waiting_sends_the_prompt() {
+    use eitri_core::turn_review::{Decision, Held, PresenceFallback, CONFIRM_WAIT};
+    let start = Instant::now();
+    // While the thread has not answered.
+    let mut confirming = PresenceFallback::start(start);
+    assert_eq!(confirming.on_link_end(), Decision::SendPrompt);
+    // While the partner's acknowledgement is awaited.
+    let mut awaiting = PresenceFallback::start(start);
+    assert_eq!(
+        awaiting.on_confirmed(Held::No("full".into()), start),
+        Decision::SendPresenceFalse
+    );
+    assert_eq!(awaiting.on_link_end(), Decision::SendPrompt);
+    assert_eq!(awaiting.tick(start + CONFIRM_WAIT * 3), Decision::Wait, "decided once");
+    // A confirmed prompt is not sent twice by a later link end.
+    let mut confirmed = PresenceFallback::start(start);
+    assert_eq!(confirmed.on_confirmed(Held::Yes, start), Decision::SendPrompt);
+    assert_eq!(confirmed.on_link_end(), Decision::Wait);
 }

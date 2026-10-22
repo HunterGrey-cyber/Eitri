@@ -443,10 +443,18 @@ pub(crate) struct MessageSplit {
 
 impl MessageSplit {
     pub(crate) fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            last_text: None,
-        }
+        Self::resuming(enabled, None)
+    }
+
+    /// A split that goes on from another process's: `last_text` is the message id that split had
+    /// translated last, so the first delta of a different message still opens a new one.
+    pub(crate) fn resuming(enabled: bool, last_text: Option<String>) -> Self {
+        Self { enabled, last_text }
+    }
+
+    /// The message id of the last text delta translated, if any since the turn started.
+    pub(crate) fn last_text(&self) -> Option<&str> {
+        self.last_text.as_deref()
     }
 
     pub(crate) fn before(&mut self, event: &ProtoSessionEvent) -> Option<AgentDomainEvent> {
@@ -490,10 +498,17 @@ pub(crate) struct CliModeNote {
 
 impl CliModeNote {
     pub(crate) fn new(requested: RequestedCliMode) -> Self {
-        Self {
-            requested,
-            noted: false,
-        }
+        Self::resuming(requested, false)
+    }
+
+    /// A note that goes on from another process's, which may have printed its one line already.
+    pub(crate) fn resuming(requested: RequestedCliMode, noted: bool) -> Self {
+        Self { requested, noted }
+    }
+
+    /// Whether the session's one line was printed.
+    pub(crate) fn noted(&self) -> bool {
+        self.noted
     }
 
     /// The line to print for this event, the first time one is due.

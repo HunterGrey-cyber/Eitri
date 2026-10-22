@@ -21,6 +21,8 @@
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Rgb;
 use terminal_frame::frame::{ColorOverride, Rgb as FrameRgb, PALETTE_LEN};
@@ -36,6 +38,10 @@ use terminal_sync::SyncDriver;
 use crate::listener::{HostEvents, Listener, Reply};
 use crate::paint::indicator_ops;
 use crate::pty::PtySize;
+use crate::replay::boundary::BoundaryTracker;
+use crate::replay::gate::Gate;
+use crate::replay::screen_replay::{self, ReplayRefused, ScreenReplay};
+use crate::replay::shadow::{Shadowed, Shadows};
 use crate::scroll::{ScrollRequest, ScrollView};
 use crate::select::{self, SelectCommand};
 
@@ -172,6 +178,36 @@ fn saturate_cell_px(cells: u16, cell_px: u16) -> u16 {
     ((u32::from(u16::MAX) / cells).min(u32::from(cell_px))) as u16
 }
 
+/// The most bytes of an unfinished sequence kept for a move: one more than a move may carry, so a
+/// longer one is known to be too long without keeping all of it (a streamed OSC 52 copy can run to
+/// megabytes).
+const UNFINISHED_KEPT: usize = crate::session::RAW_TAIL_MAX + 1;
+
+/// What the user sees of a terminal beside its grid, carried with it when it moves: how far back
+/// the view is, the selection, and copy mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewState {
+    /// Lines of history below the window's bottom (`[N/M]`'s `N`).
+    pub display_offset: usize,
+    pub selection: Option<SelectionRecord>,
+    pub copy_mode: bool,
+    /// Copy mode's search, which the host keeps; this crate carries it untouched.
+    pub copy_search: Option<String>,
+    /// The view is held in history rather than following new output.
+    pub pinned: bool,
+}
+
+/// A selection as it resolves now, in absolute grid lines (negative in history), both ends
+/// included. A word or line selection is carried as the cells it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectionRecord {
+    pub start_line: i32,
+    pub start_column: usize,
+    pub end_line: i32,
+    pub end_column: usize,
+    pub block: bool,
+}
+
 /// One terminal's emulator state. Owned by exactly one thread (the session's); nothing here blocks.
 pub struct Screen {
     term: Term<Listener>,
@@ -222,13 +258,28 @@ pub struct Screen {
     /// live bottom, where nothing is pinned yet and the plain scrollback keys show nothing
     /// until the first scroll actually moves the window. See [`Self::copy_mode_indicator`].
     copy_mode: bool,
+    /// What alacritty keeps without a getter, recorded on the way to `term`: a moving terminal's
+    /// replay needs it.
+    shadows: Shadows,
+    /// Where the parser stands, fed the same bytes: a move cuts the stream only between sequences.
+    boundary: BoundaryTracker,
+    /// The bytes fed since the parser last stood between sequences (at most [`UNFINISHED_KEPT`]),
+    /// how many there were in all, and how many handler calls they caused: what a move carries
+    /// when a sequence is still open, so the new parser can be brought to the same point.
+    unfinished: Vec<u8>,
+    unfinished_len: usize,
+    unfinished_calls: usize,
+    /// Handler calls still to swallow while an unfinished sequence carried by a move is fed again.
+    swallow: usize,
 }
 
 impl Screen {
     pub fn new(size: PtySize, colors: TerminalColors) -> Self {
         let size = size.clamped();
         let listener = Listener::default();
-        let term = Term::new(term_config(), &grid_size(size), listener.clone());
+        let config = term_config();
+        let shadows = Shadows::new(usize::from(size.cols), config.kitty_keyboard);
+        let term = Term::new(config, &grid_size(size), listener.clone());
         let mut projector = Projector::new();
         let frame = projector.full(&term);
         Screen {
@@ -250,7 +301,116 @@ impl Screen {
             pinned_frame: None,
             pending_selection: None,
             copy_mode: false,
+            shadows,
+            boundary: BoundaryTracker::new(),
+            unfinished: Vec::new(),
+            unfinished_len: 0,
+            unfinished_calls: 0,
+            swallow: 0,
         }
+    }
+
+    /// A fresh screen of the replay's grid (cells of `size`'s pixel size) showing what the replay
+    /// read: both screens, the modes, the shadowed state, and the last printed character, which
+    /// only the parser keeps. Nothing the replay sets off is owed to the program: its answers, if
+    /// any, are dropped.
+    pub fn replayed(replay: &ScreenReplay, size: PtySize, colors: TerminalColors) -> Self {
+        let size = PtySize {
+            cols: replay.columns,
+            rows: replay.rows,
+            ..size
+        };
+        let mut screen = Screen::new(size, colors);
+        screen_replay::apply(&mut screen.term, &mut screen.shadows, &mut screen.sync, replay);
+        let _ = screen.take_replies();
+        screen.published_revision = screen.content_revision();
+        screen.published_inert = screen.listener.inert_events();
+        screen.dirty = true;
+        screen.scroll.observe(&screen.term);
+        screen
+    }
+
+    /// Feeds the bytes of a sequence another screen's parser had begun when it was read, with the
+    /// first `calls` handler calls swallowed: those calls already reached the screen the replay
+    /// was read from. The parser ends where that one stood, and nothing is applied twice.
+    pub fn feed_unfinished(&mut self, bytes: &[u8], calls: usize) {
+        self.swallow = calls;
+        self.feed(bytes);
+        self.swallow = 0;
+    }
+
+    /// Whether the parser stands between two sequences, with no partial character.
+    pub fn at_boundary(&self) -> bool {
+        self.boundary.at_boundary()
+    }
+
+    /// The bytes fed since the parser last stood at a boundary (kept up to one more than a move
+    /// carries), their whole count, and the handler calls they caused.
+    pub fn unfinished(&self) -> (&[u8], usize, usize) {
+        (&self.unfinished, self.unfinished_len, self.unfinished_calls)
+    }
+
+    /// The view beside the grid, read before [`Screen::read_for_move`] (which clears the selection).
+    pub fn view_state(&self) -> ViewState {
+        let selection = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&self.term))
+            .map(|range| SelectionRecord {
+                start_line: range.start.line.0,
+                start_column: range.start.column.0,
+                end_line: range.end.line.0,
+                end_column: range.end.column.0,
+                block: range.is_block,
+            });
+        ViewState {
+            display_offset: self.scroll.indicator(&self.term).map_or(0, |(below, _)| below),
+            selection,
+            copy_mode: self.copy_mode,
+            copy_search: None,
+            pinned: self.scroll.scrolled(),
+        }
+    }
+
+    /// Puts a view read by [`Screen::view_state`] on this screen. Applied before any output the
+    /// source had not fed yet, so that output moves the view and the selection as it would have
+    /// moved them there.
+    pub fn apply_view(&mut self, view: &ViewState) {
+        if view.copy_mode {
+            self.set_copy_mode(true);
+        }
+        if view.pinned && view.display_offset > 0 {
+            let lines = i32::try_from(view.display_offset).unwrap_or(i32::MAX);
+            self.scroll(ScrollRequest::Lines(lines));
+        }
+        if let Some(record) = view.selection {
+            let kind = if record.block {
+                SelectionType::Block
+            } else {
+                SelectionType::Simple
+            };
+            let start = Point::new(Line(record.start_line), Column(record.start_column));
+            let end = Point::new(Line(record.end_line), Column(record.end_column));
+            let mut selection = Selection::new(kind, start, Side::Left);
+            selection.update(end, Side::Right);
+            self.term.selection = Some(selection);
+        }
+        self.dirty = true;
+    }
+
+    /// Whether a keyboard-mode stack is too deep for [`Screen::read_for_move`], which refuses it.
+    pub fn too_deep_to_move(&self) -> bool {
+        self.shadows.too_deep()
+    }
+
+    /// Reads the whole screen into a replay for another process. **The `Term` is not usable
+    /// afterwards**: reading the alternate screen swaps to the primary, which cannot be undone, so
+    /// nothing may be rendered from this screen again; a terminal that stays builds a fresh one
+    /// from the same replay ([`Screen::replayed`]). Refused, with nothing read, when a keyboard
+    /// stack is too deep to replay.
+    pub fn read_for_move(&mut self) -> Result<ScreenReplay, ReplayRefused> {
+        screen_replay::build(&mut self.term, &self.shadows)
     }
 
     /// Parse an output chunk and mark the screen dirty when publication is allowed, never
@@ -265,8 +425,25 @@ impl Screen {
         for &byte in bytes {
             let was_in_sync = self.sync.barrier().in_sync();
             let mut published = false;
-            self.sync
-                .feed(&mut self.term, &[byte], |_term, _reason| published = true);
+            let calls = {
+                let mut shadowed = Shadowed::new(&mut self.term, &mut self.shadows);
+                let mut gate = Gate::new(&mut shadowed, self.swallow);
+                self.sync.feed(&mut gate, &[byte], |_term, _reason| published = true);
+                gate.seen()
+            };
+            self.swallow -= calls.min(self.swallow);
+            self.boundary.byte(byte);
+            if self.boundary.at_boundary() {
+                self.unfinished.clear();
+                self.unfinished_len = 0;
+                self.unfinished_calls = 0;
+            } else {
+                if self.unfinished.len() < UNFINISHED_KEPT {
+                    self.unfinished.push(byte);
+                }
+                self.unfinished_len += 1;
+                self.unfinished_calls += calls;
+            }
             // Judged at the byte that published, so what it measures is exactly what was published.
             if published && self.publication_is_visible() {
                 self.dirty = true;
@@ -342,11 +519,20 @@ impl Screen {
     /// could silently show a different line at the same index instead of reporting expiry.
     pub fn resize(&mut self, size: PtySize) {
         let size = size.clamped();
+        // `Term::resize` changes nothing for a size with the same cells (a new cell pixel size).
+        if (size.cols, size.rows) != (self.size.cols, self.size.rows) {
+            self.shadows.resize(usize::from(size.cols));
+        }
         self.size = size;
         self.term.resize(grid_size(size));
         self.resizes += 1;
         self.dirty = true;
         self.scroll.observe(&self.term);
+    }
+
+    /// The grid and cell size the screen has now.
+    pub fn size(&self) -> PtySize {
+        self.size
     }
 
     /// Something outside the byte stream changed what the frame shows (focus).

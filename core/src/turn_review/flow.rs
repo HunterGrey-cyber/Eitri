@@ -13,7 +13,9 @@
 //!   tick, and again when the editor's answer arrives, because that answer may belong to a tab,
 //!   a session or an editor that is no longer the one asked;
 //! - one write is in flight at a time, from the editor question until the worker has returned,
-//!   so two questions cannot each clear a different write;
+//!   so two questions cannot each clear a different write; across windows the project's write
+//!   slot ([`super::write_slot`]) does the same, taken by the write's worker and, shared, by a
+//!   review message's read of the disk;
 //! - nothing here reads review state on a permission or an ordinary send path: the only message
 //!   this file ever sends is the confirmed review, in [`confirmed_send`].
 //!
@@ -21,9 +23,16 @@
 //! it in the user's nvim with the turn's hunks drawn over it, a hunk the user reverts there comes
 //! back as a revert of the draft, and the panel showing another turn for a drawn file redraws it.
 //! The flow never types into the editor: everything it asks is one of the overlay's own calls.
+//!
+//! **Two windows.** Window 1's flow keeps the one driver nvim's review module has; window 2's calls
+//! are queued on it and what it finds for window 2 waits in [`ReviewFlow::take_window_2_events`] for
+//! the link. Window 2's flow drives a [`RemoteOverlay`] instead, and asks window 1's editor about a
+//! buffer through a [`RemoteAsk`]; everything else here is the same in both windows. An editor
+//! event finds its tab by the session it names, since tab numbers are each window's own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,10 +44,12 @@ use crate::agent_bridge::{
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 use crate::review_editor::{
-    overlay_hunks, EditorOverlay, EditorRevertEvent, OffEvent, OverlayCall, OverlayOutcome, Owner, ShowHunk, ShowMeta,
+    overlay_hunks, EditorOverlay, EditorRevertEvent, OffEvent, Overlay, OverlayCall, OverlayOutcome, Owner,
+    RemoteOverlay, Routed, ShowHunk, ShowMeta, Window2Event,
 };
 use crate::tab_set::{Flush, ReviewTicket, Tab, TabBackend, TabSet};
 use crate::tabs::TabId;
+use serde::{Deserialize, Serialize};
 
 use super::draft::{check_reverts, NewRevert, RevertShape, RevertSource, ReviewDraft, UndoData, UndoState};
 use super::journal::JournalEntry;
@@ -46,9 +57,10 @@ use super::lifecycle::{ReviewError, Scope};
 use super::message::{compose, Preview};
 use super::presence::{Blocked, PresenceGuard};
 use super::revert::{
-    buffer_state_args, parse_buffer_state, AppliedRevert, EditorCheck, EditorClear, ExactHunk, ExactHunks,
-    RecoverAnswer, Recovered, Refusal, RevertKind, RevertTarget, Saved, BUFFER_STATE_LUA,
+    parse_buffer_state, AppliedRevert, BufferAsk, EditorCheck, EditorClear, EmbeddedAsk, ExactHunk, ExactHunks,
+    RecoverAnswer, Recovered, Refusal, RemoteAsk, RevertKind, RevertTarget, Saved,
 };
+use super::write_slot::{SlotBusy, WriteSlot};
 
 /// How long the editor has to say what a buffer holds for a message's check. Past it the revert is
 /// treated as not loaded, which keeps it out of the message rather than guessing.
@@ -103,9 +115,14 @@ pub struct ReviewFlow {
     recovery_job: Option<mpsc::Receiver<Vec<JournalEntry>>>,
     recovery_asked: bool,
     jobs_started: usize,
-    /// The window's editor overlay, once the shell has said who owns the module in it.
-    overlay: Option<EditorOverlay>,
+    /// The window's editor overlay, once the shell has said who owns the module in it, or window
+    /// 2's, which reaches window 1's driver.
+    overlay: Option<Overlay>,
     overlay_owner: Option<Owner>,
+    /// Window 2's way to ask window 1's editor about a buffer; `None` in a window with its own.
+    remote_ask: Option<Rc<RemoteAsk>>,
+    /// What window 1's driver found for window 2, until the link takes it.
+    window2_out: Vec<Window2Event>,
     /// Files being read (hunks and path) for an open or for a redraw.
     opens: Vec<OpenWork>,
     redraws: Vec<RedrawWork>,
@@ -115,6 +132,9 @@ pub struct ReviewFlow {
     shown: BTreeMap<PathBuf, Shown>,
     /// Answers decided between two calls (an owner change failing the opens it dropped).
     early: Vec<Out>,
+    /// What a write finished with for a session whose chat moves, or moved, to another window: its
+    /// record belongs in the draft the chat took along.
+    for_holder: BTreeMap<String, VecDeque<serde_json::Value>>,
 }
 
 /// A file prepared on a worker: its resolved absolute path and the turn's hunks over it.
@@ -210,6 +230,8 @@ struct SendWork {
     /// The draft as it was when the request came in: what the message is made from, and what the
     /// tab's draft must still equal when the answer is used.
     draft: ReviewDraft,
+    /// The review directory whose write slot is taken, shared, around the read of the disk.
+    slot_dir: PathBuf,
     stage: SendStage,
 }
 
@@ -222,8 +244,9 @@ enum SendStage {
         root: std::path::PathBuf,
         latest_turn: u32,
     },
-    /// The statuses are being read from the disk and the message composed, on a worker.
-    Composing(mpsc::Receiver<Preview>),
+    /// The statuses are being read from the disk and the message composed, on a worker. An error is
+    /// the slot another window holds.
+    Composing(mpsc::Receiver<Result<Preview, String>>),
 }
 
 impl ReviewFlow {
@@ -240,7 +263,8 @@ impl ReviewFlow {
             && self.opens.is_empty()
             && self.redraws.is_empty()
             && self.early.is_empty()
-            && !self.overlay.as_ref().is_some_and(EditorOverlay::wants_ticks)
+            && self.window2_out.is_empty()
+            && !self.overlay.as_ref().is_some_and(Overlay::wants_ticks)
     }
 
     /// Who owns the review module in this window's editor: the integrated window's own nvim, or the
@@ -248,11 +272,12 @@ impl ReviewFlow {
     /// served the old one is dropped and the opens still waiting on it fail. Called before every
     /// request and tick, because a companion's channel changes with each attach.
     pub fn set_editor_owner(&mut self, owner: Option<Owner>) {
-        if owner == self.overlay_owner {
+        // Window 2 has no editor of its own to change: its overlay is window 1's for its whole life.
+        if owner == self.overlay_owner || matches!(self.overlay, Some(Overlay::Remote(_))) {
             return;
         }
         self.overlay_owner = owner;
-        self.overlay = owner.map(EditorOverlay::new);
+        self.overlay = owner.map(|owner| Overlay::Local(EditorOverlay::new(owner)));
         self.shown.clear();
         self.redraws.clear();
         // A file still being read was asked for the old editor; sending it to the new one would show
@@ -272,6 +297,49 @@ impl ReviewFlow {
         self.fail_opens("the editor went away before the file was ready; nothing was opened");
         self.fail_awaiting("the editor went away before it answered; nothing was opened");
         std::mem::take(&mut self.early)
+    }
+
+    /// Makes this the flow of window 2, which reaches window 1's editor: its overlay calls go to
+    /// window 1's driver through `overlay`, and its questions about a buffer through `ask`.
+    pub fn link_to_window_1(&mut self, overlay: RemoteOverlay, ask: RemoteAsk) {
+        self.overlay_owner = None;
+        self.overlay = Some(Overlay::Remote(overlay));
+        self.remote_ask = Some(Rc::new(ask));
+        self.shown.clear();
+        self.redraws.clear();
+        self.fail_opens("the editor changed before the file was ready; nothing was opened");
+        self.fail_awaiting("the editor changed before it answered; nothing was opened");
+    }
+
+    /// Window 1's driver, through which the shell queues window 2's calls and holds or releases a
+    /// moving session's events; `None` in window 2 and in a window without an editor.
+    pub fn local_overlay(&mut self) -> Option<&mut EditorOverlay> {
+        match self.overlay.as_mut() {
+            Some(Overlay::Local(overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    /// Window 2's driver, which takes what window 1 reports (`review_drawn`, `review_idle`,
+    /// `review_events`, the answers to its opens); `None` in any other window.
+    pub fn remote_overlay(&mut self) -> Option<&mut RemoteOverlay> {
+        match self.overlay.as_mut() {
+            Some(Overlay::Remote(overlay)) => Some(overlay),
+            _ => None,
+        }
+    }
+
+    /// What window 1's driver found for window 2 since this was last asked, in order.
+    pub fn take_window_2_events(&mut self) -> Vec<Window2Event> {
+        std::mem::take(&mut self.window2_out)
+    }
+
+    /// The editor question of a write: through window 1 in window 2, else this window's own editor.
+    fn start_check(&self, rpc: Option<&dyn EditorRpc>, abs_path: &Path, now: Instant) -> EditorCheck {
+        match self.remote_ask.as_deref() {
+            Some(ask) => EditorCheck::start(ask, abs_path, now),
+            None => EditorCheck::start(&EmbeddedAsk(rpc), abs_path, now),
+        }
     }
 
     /// Fails the opens whose file is still being read. Their workers finish into a closed channel.
@@ -395,7 +463,13 @@ impl ReviewFlow {
                 Ok(())
             }),
             InboundMessage::ReviewSend { confirm, .. } => {
-                named(tab).and_then(|tab| self.start_send(tabs, rpc, now, &request_id, tab, confirm))
+                let remote = self.remote_ask.clone();
+                let embedded = EmbeddedAsk(rpc);
+                let ask: &dyn BufferAsk = match remote.as_deref() {
+                    Some(remote) => remote,
+                    None => &embedded,
+                };
+                named(tab).and_then(|tab| self.start_send(tabs, ask, now, &request_id, tab, confirm))
             }
             InboundMessage::ReviewRecover { entry, answer, .. } => {
                 self.start_recover(tabs, rpc, now, &request_id, &entry, answer)
@@ -491,7 +565,7 @@ impl ReviewFlow {
         check_relative(&path)?;
         let guard = may_write(tabs)?;
         let ticket = tabs.review_ticket(tab)?;
-        let check = EditorCheck::start(rpc, &root.join(&path), now);
+        let check = self.start_check(rpc, &root.join(&path), now);
         self.write = Some(WriteWork {
             request_id: request_id.to_string(),
             ticket: Some(ticket),
@@ -534,7 +608,7 @@ impl ReviewFlow {
         check_relative(&path)?;
         let guard = may_write(tabs)?;
         let ticket = tabs.review_ticket(tab)?;
-        let check = EditorCheck::start(rpc, &root.join(&path), now);
+        let check = self.start_check(rpc, &root.join(&path), now);
         self.write = Some(WriteWork {
             request_id: request_id.to_string(),
             ticket: Some(ticket),
@@ -596,7 +670,7 @@ impl ReviewFlow {
                     .to_path_buf();
                 check_relative(&entry.path.to_string_lossy())?;
                 let guard = may_write(tabs)?;
-                let check = EditorCheck::start(rpc, &root.join(&entry.path), now);
+                let check = self.start_check(rpc, &root.join(&entry.path), now);
                 self.write = Some(WriteWork {
                     request_id: request_id.to_string(),
                     ticket: None,
@@ -735,6 +809,32 @@ impl ReviewFlow {
                 .is_some_and(|session| session == ticket.session)
         });
         let tab = work.ticket.as_ref().map(|ticket| ticket.tab);
+        // A session moving to another window took its draft along as it was; a session that moved
+        // has none here. Either way the holder records what the write did.
+        let (moving, moved) = work.ticket.as_ref().map_or((false, false), |ticket| {
+            tabs.turn_review().map_or((false, false), |review| {
+                (review.handing_over(&ticket.session), review.moved_away(&ticket.session))
+            })
+        });
+        if moving || (moved && !same_tab) {
+            if let (Some(ticket), Some(result)) = (work.ticket.as_ref(), WriteResult::of(&work.op, &done)) {
+                if let Ok(value) = serde_json::to_value(result) {
+                    self.for_holder
+                        .entry(ticket.session.clone())
+                        .or_default()
+                        .push_back(value);
+                }
+            }
+        }
+        if moved && !same_tab {
+            match &done {
+                Done::Revert(Ok(_)) | Done::Undo(Ok(())) => {
+                    out.push(ok_with(id, HELD_ELSEWHERE));
+                    return;
+                }
+                _ => {}
+            }
+        }
         match (work.op, done) {
             (Op::Revert { .. }, Done::Revert(Ok(applied))) => match tab {
                 Some(tab) if same_tab => {
@@ -814,6 +914,65 @@ impl ReviewFlow {
         }
     }
 
+    // ---- results for the window a chat moved to -----------------------------------------------
+
+    /// The oldest result of a job this window finished for `session` after its chat started moving
+    /// to another window, for the holder there (a `review_result` on the link): a write's record
+    /// first, then the turn review's snapshots. Taken once the move is done.
+    pub fn job_result_for_holder(&mut self, tabs: &TabSet, session: &str) -> Option<serde_json::Value> {
+        if let Some(queue) = self.for_holder.get_mut(session) {
+            let value = queue.pop_front();
+            if queue.is_empty() {
+                self.for_holder.remove(session);
+            }
+            if value.is_some() {
+                return value;
+            }
+        }
+        tabs.turn_review()?.result_for_holder(session)
+    }
+
+    /// The move of `session` did not happen: nothing kept for another window is sent. This drops
+    /// only the writes' records kept here; the turn review keeps its own (and its own mark that the
+    /// session is being handed over), so [`TurnReview::move_aborted`] is owed as well, or its
+    /// snapshots stay kept for a holder that never comes.
+    ///
+    /// [`TurnReview::move_aborted`]: crate::turn_review::TurnReview::move_aborted
+    pub fn move_aborted(&mut self, session: &str) {
+        self.for_holder.remove(session);
+    }
+
+    /// A result the window `session` came from finished for it: a write is recorded in the draft of
+    /// the tab that holds the session here, a snapshot goes to the turn review.
+    pub fn review_result(
+        &mut self,
+        tabs: &mut TabSet,
+        session: &str,
+        result: serde_json::Value,
+    ) -> Result<Vec<Out>, String> {
+        if result.get("write").is_none() {
+            let review = tabs.turn_review().ok_or_else(|| TURN_REVIEW_UNAVAILABLE.to_string())?;
+            review.accept_result(session, result)?;
+            return Ok(Vec::new());
+        }
+        let result: WriteResult =
+            serde_json::from_value(result).map_err(|e| format!("protocol: not a review result: {e}"))?;
+        let tab = tabs
+            .tabs()
+            .iter()
+            .find(|t| t.provider_session_id().as_deref() == Some(session))
+            .map(|t| t.id)
+            .ok_or_else(|| format!("no tab holds session {session} here"))?;
+        let draft = tabs.review_draft_mut(tab)?;
+        match result.into_record()? {
+            HolderRecord::Revert(record) => {
+                draft.record_revert(record);
+            }
+            HolderRecord::Undone(record) => draft.mark_undone(record),
+        }
+        Ok(draft_envelope(None, tab, tabs).into_iter().collect())
+    }
+
     // ---- the editor overlay --------------------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
@@ -830,7 +989,7 @@ impl ReviewFlow {
     ) -> Result<(), String> {
         let (review, session) = tabs.review_session(tab)?;
         check_openable(&path)?;
-        if self.overlay.is_none() || rpc.is_none() {
+        if !self.overlay.as_ref().is_some_and(|overlay| overlay.reachable(rpc)) {
             return Err(NO_EDITOR_OVERLAY.to_string());
         }
         if self.opens.len() >= MAX_EDITOR_JOBS {
@@ -884,7 +1043,7 @@ impl ReviewFlow {
                 out.push(failed(id, &why));
                 continue;
             }
-            let (Some(rpc), Some(overlay)) = (rpc, self.overlay.as_mut()) else {
+            let Some(overlay) = self.overlay.as_mut().filter(|overlay| overlay.reachable(rpc)) else {
                 out.push(failed(id, NO_EDITOR_OVERLAY));
                 continue;
             };
@@ -943,7 +1102,7 @@ impl ReviewFlow {
             if tab_gone(tabs, work.tab, &work.session, "").is_some() {
                 continue;
             }
-            let (Some(rpc), Some(overlay)) = (rpc, self.overlay.as_mut()) else {
+            let Some(overlay) = self.overlay.as_mut().filter(|overlay| overlay.reachable(rpc)) else {
                 continue;
             };
             if !overlay.active_paths().contains(&abs) {
@@ -982,13 +1141,15 @@ impl ReviewFlow {
     /// What the editor reported since the last tick: the opens it answered, the hunks the user
     /// reverted there, and the buffers that stopped showing a review.
     fn advance_overlay(&mut self, tabs: &mut TabSet, rpc: Option<&dyn EditorRpc>, now: Instant, out: &mut Vec<Out>) {
-        let (Some(overlay), Some(rpc)) = (self.overlay.as_mut(), rpc) else {
+        let Some(overlay) = self.overlay.as_mut() else {
             return;
         };
         if !overlay.wants_ticks() {
             return;
         }
-        for outcome in overlay.tick(rpc, now) {
+        let Routed { mine, window2 } = overlay.tick(rpc, now);
+        self.window2_out.extend(window2);
+        for outcome in mine {
             match outcome {
                 OverlayOutcome::Answered { request_id, result } => {
                     let Some(note) = self.awaiting.remove(&request_id) else {
@@ -1080,10 +1241,17 @@ impl ReviewFlow {
         event: &EditorRevertEvent,
         consequence: &str,
     ) -> Result<(TabId, String, String), String> {
-        let tab = TabId(event.meta.tab);
-        if let Some(why) = tab_gone(tabs, tab, &event.meta.session, consequence) {
-            return Err(why);
-        }
+        // By the session, never by the tab number the overlay was drawn with: numbers are each
+        // window's own, and a chat that moved between the windows took its session along.
+        let held_by = tabs
+            .tabs()
+            .iter()
+            .find(|tab| tab.provider_session_id().as_deref() == Some(event.meta.session.as_str()))
+            .map(|tab| tab.id);
+        let Some(tab) = held_by else {
+            return Err(tab_gone(tabs, TabId(event.meta.tab), &event.meta.session, consequence)
+                .unwrap_or_else(|| format!("no tab holds the session; {consequence}")));
+        };
         let root = tabs.review_session(tab)?.0.project_root().to_path_buf();
         let abs = Path::new(&event.path);
         let rel = abs
@@ -1194,7 +1362,7 @@ impl ReviewFlow {
     fn start_send(
         &mut self,
         tabs: &mut TabSet,
-        rpc: Option<&dyn EditorRpc>,
+        ask: &dyn BufferAsk,
         now: Instant,
         request_id: &str,
         tab: TabId,
@@ -1203,6 +1371,16 @@ impl ReviewFlow {
         let (review, session) = tabs.review_session(tab)?;
         let root = review.project_root().to_path_buf();
         let latest_turn = review.turns(&session).iter().map(|r| r.n).max().unwrap_or(0);
+        // The slot is where this window's writes take it; a window that holds no presence still
+        // reads the disk, so it takes the slot in its review's own store, which is the same
+        // directory. With neither there is no slot to take, and no read goes ahead without one.
+        let slot_dir = tabs
+            .presence_guard()
+            .map(|guard| guard.review_dir().to_path_buf())
+            .or_else(|| review.store_dir().map(Path::to_path_buf))
+            .ok_or_else(|| {
+                SlotBusy::Unavailable("there is no state directory to keep it in".to_string()).to_string()
+            })?;
         // A preview computed while a write is out describes a disk that is about to change.
         if self.write.is_some() {
             return Err(format!("{WRITE_BUSY}; try again in a moment"));
@@ -1223,13 +1401,7 @@ impl ReviewFlow {
                 continue;
             }
             let lines = lines_in(&record.new.reverted_to);
-            let asked = match rpc {
-                Some(rpc) if rpc.target().is_some() => Some(rpc.exec_lua(
-                    BUFFER_STATE_LUA,
-                    buffer_state_args(&root.join(&record.new.path), Some((record.new.at_line, lines))),
-                )),
-                _ => None,
-            };
+            let asked = ask.buffer_state(&root.join(&record.new.path), Some((record.new.at_line, lines)));
             match asked {
                 Some(pending) => waiting.push((record.id, record.new.at_line, pending)),
                 None => {
@@ -1243,6 +1415,7 @@ impl ReviewFlow {
             session,
             confirm,
             draft,
+            slot_dir,
             stage: SendStage::Asking {
                 waiting,
                 known,
@@ -1261,7 +1434,7 @@ impl ReviewFlow {
                 out.push(failed(&work.request_id, &why));
                 continue;
             }
-            let mut composed: Option<Result<Preview, mpsc::TryRecvError>> = None;
+            let mut composed: Option<Result<Result<Preview, String>, mpsc::TryRecvError>> = None;
             match &mut work.stage {
                 SendStage::Asking {
                     waiting,
@@ -1292,9 +1465,15 @@ impl ReviewFlow {
                     if waiting.is_empty() {
                         let (root, draft, known, latest) =
                             (root.clone(), work.draft.clone(), known.clone(), *latest_turn);
-                        match spawn("eitri-review-flow", move || {
+                        let slot_dir = work.slot_dir.clone();
+                        match spawn("eitri-review-flow", move || -> Result<Preview, String> {
+                            // Shared: other reads may run beside it, a write in any window may not.
+                            let slot = WriteSlot::open_or_busy(&slot_dir)
+                                .and_then(|slot| slot.try_shared())
+                                .map_err(|busy| busy.to_string())?;
                             let statuses = check_reverts(&root, &draft, &known);
-                            compose(&draft, &statuses, latest)
+                            drop(slot);
+                            Ok(compose(&draft, &statuses, latest))
                         }) {
                             Ok(rx) => {
                                 self.jobs_started += 1;
@@ -1314,7 +1493,8 @@ impl ReviewFlow {
                 Some(Err(mpsc::TryRecvError::Disconnected)) => {
                     out.push(failed(&work.request_id, "the review message could not be prepared"))
                 }
-                Some(Ok(preview)) => self.finish_send(work, preview, tabs, out),
+                Some(Ok(Err(why))) => out.push(failed(&work.request_id, &why)),
+                Some(Ok(Ok(preview))) => self.finish_send(work, preview, tabs, out),
             }
         }
         self.sends = still;
@@ -1411,6 +1591,149 @@ fn confirmed_send(tabs: &mut TabSet, tab: TabId, text: &str, now_ms: u64) -> Res
 }
 
 const TURN_REVIEW_UNAVAILABLE: &str = "turn review is not available in this window";
+/// A write that finished after its chat moved to another window: the record is that window's.
+const HELD_ELSEWHERE: &str = "written; it is recorded in the other window, where the chat is now";
+
+/// What a write did, for the window that holds its session now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "write", rename_all = "snake_case")]
+enum WriteResult {
+    Revert {
+        turn: u32,
+        path: String,
+        hunk: Option<(u32, String)>,
+        shape: ShapeWire,
+        at_line: u32,
+        /// Hex, as are the next two: the bytes need not be text.
+        reverted_to: String,
+        replaced: String,
+        pre: SavedWire,
+        post: SavedWire,
+    },
+    Undo {
+        record: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "snake_case")]
+enum ShapeWire {
+    Lines { from: u32, to: u32 },
+    Deleted,
+    Restored,
+    WholeFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SavedWire {
+    Regular { blob: String, mode: u32 },
+    Symlink { blob: String },
+    Absent,
+}
+
+/// What a holder records from a [`WriteResult`].
+enum HolderRecord {
+    Revert(NewRevert),
+    Undone(u32),
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    super::shadow::hex_encode(bytes)
+}
+
+fn bytes_of(text: &str) -> Result<Vec<u8>, String> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    super::shadow::hex_decode(text).ok_or_else(|| "protocol: a review result's bytes are not hex".to_string())
+}
+
+impl SavedWire {
+    fn of(saved: &Saved) -> SavedWire {
+        match saved {
+            Saved::Regular { blob, mode } => SavedWire::Regular {
+                blob: blob.clone(),
+                mode: *mode,
+            },
+            Saved::Symlink { blob } => SavedWire::Symlink { blob: blob.clone() },
+            Saved::Absent => SavedWire::Absent,
+        }
+    }
+
+    fn into_undo(self) -> UndoState {
+        match self {
+            SavedWire::Regular { blob, mode } => UndoState::Regular { blob, mode },
+            SavedWire::Symlink { blob } => UndoState::Symlink { blob },
+            SavedWire::Absent => UndoState::Absent,
+        }
+    }
+}
+
+impl WriteResult {
+    /// `None` for a write that wrote nothing: there is nothing to record.
+    fn of(op: &Op, done: &Done) -> Option<WriteResult> {
+        match (op, done) {
+            (Op::Revert { .. }, Done::Revert(Ok(applied))) => Some(WriteResult::Revert {
+                turn: applied.turn,
+                path: applied.path.clone(),
+                hunk: applied.hunk.clone(),
+                shape: match shape_of(applied) {
+                    RevertShape::Lines { from, to } => ShapeWire::Lines { from, to },
+                    RevertShape::Deleted => ShapeWire::Deleted,
+                    RevertShape::Restored => ShapeWire::Restored,
+                    RevertShape::WholeFile => ShapeWire::WholeFile,
+                },
+                at_line: applied.at_line,
+                reverted_to: hex_of(&applied.reverted_to),
+                replaced: hex_of(&applied.replaced),
+                pre: SavedWire::of(&applied.pre),
+                post: SavedWire::of(&applied.post),
+            }),
+            (Op::Undo { record, .. }, Done::Undo(Ok(()))) => Some(WriteResult::Undo { record: *record }),
+            _ => None,
+        }
+    }
+
+    fn into_record(self) -> Result<HolderRecord, String> {
+        match self {
+            WriteResult::Revert {
+                turn,
+                path,
+                hunk,
+                shape,
+                at_line,
+                reverted_to,
+                replaced,
+                pre,
+                post,
+            } => {
+                check_relative(&path)?;
+                Ok(HolderRecord::Revert(NewRevert {
+                    turn,
+                    path,
+                    hunk,
+                    shape: match shape {
+                        ShapeWire::Lines { from, to } => RevertShape::Lines { from, to },
+                        ShapeWire::Deleted => RevertShape::Deleted,
+                        ShapeWire::Restored => RevertShape::Restored,
+                        ShapeWire::WholeFile => RevertShape::WholeFile,
+                    },
+                    source: RevertSource::Panel,
+                    at_line,
+                    reverted_to: bytes_of(&reverted_to)?,
+                    replaced: bytes_of(&replaced)?,
+                    undo: Some(UndoData {
+                        pre: pre.into_undo(),
+                        post: post.into_undo(),
+                    }),
+                }))
+            }
+            WriteResult::Undo { record } => Ok(HolderRecord::Undone(record)),
+        }
+    }
+}
+
 const NOT_RECORDED: &str =
     "reverted, but the tab closed before it was recorded; the replaced bytes are kept in the review store";
 const UNDO_NOT_RECORDED: &str = "undone, but the tab closed before it was recorded";
@@ -1682,4 +2005,97 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied(reverted_to: &[u8], replaced: &[u8]) -> AppliedRevert {
+        AppliedRevert {
+            session: "s1".into(),
+            turn: 3,
+            scope: Scope::Turn,
+            path: "src/a b.rs".into(),
+            kind: RevertKind::Hunk {
+                base: (4, 2),
+                end: (4, 1),
+            },
+            hunk: Some((2, "@@ -4,2 +4,1 @@".into())),
+            reverted_to: reverted_to.to_vec(),
+            replaced: replaced.to_vec(),
+            at_line: 4,
+            pre: Saved::Regular {
+                blob: "aaaa".into(),
+                mode: 0o644,
+            },
+            post: Saved::Symlink { blob: "bbbb".into() },
+            at_ms: 7,
+        }
+    }
+
+    fn revert_op() -> Op {
+        Op::Revert {
+            turn: 3,
+            scope: Scope::Turn,
+            path: "src/a b.rs".into(),
+            target: RevertTarget::File,
+        }
+    }
+
+    #[test]
+    fn a_revert_finished_for_a_moved_chat_is_recorded_by_its_holder_as_written() {
+        // Bytes that are not text, and an empty side, cross the link unchanged.
+        let applied = applied(b"\xff\x00line\r\n", b"");
+        let result = WriteResult::of(&revert_op(), &Done::Revert(Ok(applied.clone()))).unwrap();
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(value.get("write").is_some(), "{value}");
+        let back: WriteResult = serde_json::from_value(value).unwrap();
+        let HolderRecord::Revert(record) = back.into_record().unwrap() else {
+            panic!("a revert came back as something else");
+        };
+        assert_eq!(
+            record,
+            NewRevert {
+                turn: 3,
+                path: "src/a b.rs".into(),
+                hunk: Some((2, "@@ -4,2 +4,1 @@".into())),
+                shape: shape_of(&applied),
+                source: RevertSource::Panel,
+                at_line: 4,
+                reverted_to: b"\xff\x00line\r\n".to_vec(),
+                replaced: Vec::new(),
+                undo: Some(UndoData {
+                    pre: saved_to_undo(applied.pre.clone()),
+                    post: saved_to_undo(applied.post.clone()),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_write_that_wrote_nothing_has_nothing_for_the_holder() {
+        assert!(WriteResult::of(&revert_op(), &Done::Revert(Err(Refusal::Cancelled))).is_none());
+        let undo = Op::Undo {
+            record: 5,
+            path: "a".into(),
+            pre: Saved::Absent,
+            post: Saved::Absent,
+        };
+        assert_eq!(
+            WriteResult::of(&undo, &Done::Undo(Ok(()))),
+            Some(WriteResult::Undo { record: 5 })
+        );
+    }
+
+    #[test]
+    fn a_holder_result_naming_a_path_outside_the_project_is_refused() {
+        let value = serde_json::json!({
+            "write": "revert", "turn": 1, "path": "../outside", "hunk": null,
+            "shape": { "shape": "deleted" }, "at_line": 1, "reverted_to": "", "replaced": "",
+            "pre": { "kind": "absent" }, "post": { "kind": "absent" }
+        });
+        let result: WriteResult = serde_json::from_value(value).unwrap();
+        assert!(result.into_record().is_err());
+    }
 }

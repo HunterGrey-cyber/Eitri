@@ -206,6 +206,12 @@ registration.
 - **The packages and the tarball gain a plugin directory** (`/usr/share/eitri/plugins/markdown`,
   `lib/eitri/plugins/markdown`); the install script refuses a tarball without it.
 
+## The GNOME Shell extension, version 2 (added after 0.2.2)
+
+- Eitri's GNOME Shell extension is now version 2: it adds `MoveOwnToMonitor`, which puts the calling Eitri
+  window, and no other application's, back on the monitor it was on. With version 1 still enabled, Eitri leaves the
+  window where GNOME places it; GNOME loads the new version at your next login.
+
 ## Upgrading from 0.2.1
 
 - **Nothing to rebuild.** The agent backend is pinned to the same revision as in 0.2.1, so `install.sh` keeps

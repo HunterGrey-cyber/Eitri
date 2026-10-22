@@ -278,22 +278,7 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
 /// at a prompt is not one), which closing the window ends, so the window asks about those too. With
 /// no jobs it is exactly `window_close_prompt(running, queued)`.
 pub fn window_close_prompt_with_jobs(running: usize, queued: usize, jobs: usize) -> Option<String> {
-    let mut parts = Vec::new();
-    if running > 0 {
-        parts.push(format!("{running} running"));
-    }
-    if queued > 0 {
-        parts.push(format!("{queued} queued"));
-    }
-    match jobs {
-        0 => {}
-        1 => parts.push("1 terminal job".to_string()),
-        n => parts.push(format!("{n} terminal jobs")),
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(format!("close window? {} (y/n)", parts.join(", ")))
+    counts_text(running, queued, jobs).map(|here| format!("close window? {here} (y/n)"))
 }
 
 /// The window asks only if some tab is running or has a queued message. A message
@@ -311,6 +296,66 @@ pub fn window_close_prompt(running: usize, queued: usize) -> Option<String> {
         return None;
     }
     Some(format!("close window? {} (y/n)", parts.join(", ")))
+}
+
+/// The other window of a linked pair, for this window's close prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtherWindow<'a> {
+    pub name: &'a str,
+    pub running: usize,
+    pub queued: usize,
+    /// Closing this window leaves the other open without the editor (window 1 closing).
+    pub stays_without_editor: bool,
+}
+
+/// The counted part of a close prompt: turns running, messages queued, and terminals running a job in the
+/// foreground. `None` when all three are zero.
+fn counts_text(running: usize, queued: usize, jobs: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if queued > 0 {
+        parts.push(format!("{queued} queued"));
+    }
+    match jobs {
+        0 => {}
+        1 => parts.push("1 terminal job".to_string()),
+        n => parts.push(format!("{n} terminal jobs")),
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// A linked window's close prompt: asked when this window has something running or queued, or a terminal
+/// running a foreground job, as [`window_close_prompt_with_jobs`]; it names the other window's work, and offers `m`
+/// (move this window's running work to the other window, then close) when there is something to move. The other
+/// window's part counts turns only: its summary carries no terminal jobs.
+pub fn linked_window_close_prompt(
+    running: usize,
+    queued: usize,
+    jobs: usize,
+    other: Option<OtherWindow<'_>>,
+    movable: usize,
+) -> Option<String> {
+    let Some(other) = other else {
+        return window_close_prompt_with_jobs(running, queued, jobs);
+    };
+    let here = counts_text(running, queued, jobs)?;
+    let there = counts_text(other.running, other.queued, 0).unwrap_or_else(|| "idle".to_string());
+    let stays = if other.stays_without_editor {
+        " (stays open without the editor)"
+    } else {
+        ""
+    };
+    let keys = if movable > 0 {
+        format!("y/n, m: move {movable} to window {}", other.name)
+    } else {
+        "y/n".to_string()
+    };
+    Some(format!(
+        "close window? {here} here; window {}: {there}{stays} ({keys})",
+        other.name
+    ))
 }
 
 /// For `<leader>bo`, return every tab except `active` and one y/n prompt with the total and
@@ -545,6 +590,60 @@ mod tests {
     use super::*;
     use crate::attention::{AgentPlace, Attention};
     use crate::layout::ModuleKind;
+
+    #[test]
+    fn a_linked_close_prompt_names_the_other_window_and_offers_the_move() {
+        let other = OtherWindow {
+            name: "2",
+            running: 2,
+            queued: 0,
+            stays_without_editor: true,
+        };
+        assert_eq!(
+            linked_window_close_prompt(1, 0, 0, Some(other), 1).as_deref(),
+            Some("close window? 1 running here; window 2: 2 running (stays open without the editor) (y/n, m: move 1 to window 2)")
+        );
+        let idle_one = OtherWindow {
+            name: "1",
+            running: 0,
+            queued: 0,
+            stays_without_editor: false,
+        };
+        assert_eq!(
+            linked_window_close_prompt(0, 2, 0, Some(idle_one), 0).as_deref(),
+            Some("close window? 2 queued here; window 1: idle (y/n)")
+        );
+        assert_eq!(
+            linked_window_close_prompt(0, 0, 0, Some(other), 0),
+            None,
+            "nothing here: no prompt, as today"
+        );
+        assert_eq!(linked_window_close_prompt(1, 1, 0, None, 0), window_close_prompt(1, 1));
+    }
+
+    #[test]
+    fn a_linked_close_prompt_counts_this_windows_terminal_jobs() {
+        let other = OtherWindow {
+            name: "2",
+            running: 0,
+            queued: 1,
+            stays_without_editor: false,
+        };
+        assert_eq!(
+            linked_window_close_prompt(0, 0, 1, Some(other), 1).as_deref(),
+            Some("close window? 1 terminal job here; window 2: 1 queued (y/n, m: move 1 to window 2)"),
+            "a terminal job alone is reason enough to ask"
+        );
+        assert_eq!(
+            linked_window_close_prompt(1, 0, 2, Some(other), 0).as_deref(),
+            Some("close window? 1 running, 2 terminal jobs here; window 2: 1 queued (y/n)")
+        );
+        assert_eq!(
+            linked_window_close_prompt(1, 1, 2, None, 0),
+            window_close_prompt_with_jobs(1, 1, 2),
+            "unlinked, the prompt is the one a single window asks"
+        );
+    }
 
     #[test]
     fn a_view_is_its_chat_modules_instance_number() {

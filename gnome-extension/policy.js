@@ -56,6 +56,21 @@ export const OWN_ACTIVATION_SHADOW_MS = 1000;
 
 export const METHODS = Object.freeze(['FocusDirection', 'FocusSelfIfNeighbour', 'ActivateOwn', 'ActivatePartner']);
 
+// The extension's version: what `Version` answers and metadata.json's "version" states. Version 2 added
+// MoveOwnToMonitor; a caller that finds the method missing is talking to version 1.
+export const EXTENSION_VERSION = 2;
+
+// The longest connector name MoveOwnToMonitor takes. Real ones ("DP-1", "HDMI-A-2", "eDP-1", "Meta-0") are a dozen
+// characters; the cap only bounds what a caller can hand to mutter and the log.
+export const MAX_CONNECTOR_LENGTH = 64;
+
+// Whether `name` could be a connector: letters, digits and `-`, `_`, `.`, at most MAX_CONNECTOR_LENGTH of them. Checked
+// before mutter is asked, so a caller's string reaches neither mutter nor the log unless it looks like one.
+export function isConnectorName(name) {
+    return typeof name === 'string' && name.length > 0 && name.length <= MAX_CONNECTOR_LENGTH &&
+        /^[A-Za-z0-9._-]+$/.test(name);
+}
+
 // The variable in gnome-shell's own environment that lets extension.js load testing.js. Its methods let any process on
 // the session bus type into the focused window, so the file being present is not enough: a developer's symlinked
 // checkout, or a copy left in an install directory, would expose them in a real session. Only the sandbox harness
@@ -317,6 +332,33 @@ export function mayLeavePulledFocusFor({focusGainedByUs, focusGainedFrom, partne
 // and the partner and activation targets use, so the two never disagree about which windows a pid has.
 export function isUserWindow(w) {
     return (w.type === 'normal' || w.type === 'dialog') && w.skipTaskbar === false;
+}
+
+// Which windows MoveOwnToMonitor moves, and where. `monitorIndex` is mutter's index of the monitor whose connector the
+// caller named (-1 when none has it) and `monitorCount` how many monitors there are; `windows` are records as `decide`
+// takes them, plus `transient`: whether the window has a parent window (anything but a plain false counts as one).
+// The windows are the caller's own top-level windows: normal windows with no parent that stand for the caller's pid
+// (`standsFor`: its Wayland windows, or its X11 ones only when it has no Wayland window), so a dialog follows its
+// parent and an X11 window cannot claim a Wayland application's pid. Nothing else is looked at.
+// No fresh input is asked for: a client may already ask the compositor to put its own window on a monitor
+// (fullscreen on an output), and the answer is a boolean that says nothing about any other window. A window already on
+// that monitor is still named; moving it there again changes nothing.
+// Returns {act: true, monitor, targets: [window ids]} or {act: false, reason}.
+export function planMoveOwnToMonitor({callerPid, connector, monitorIndex, monitorCount, windows}) {
+    if (!isPid(callerPid))
+        return refuse('no-caller');
+    if (!isConnectorName(connector))
+        return refuse('bad-connector');
+    if (!Number.isInteger(monitorCount) || !Number.isInteger(monitorIndex) || monitorIndex < 0 ||
+        monitorIndex >= monitorCount)
+        return refuse('no-such-monitor');
+    if (!Array.isArray(windows))
+        return refuse('no-own-window');
+    const all = windows.filter(w => w !== null && typeof w === 'object');
+    const targets = all
+        .filter(w => w.type === 'normal' && w.transient === false && standsFor(all, w, callerPid))
+        .map(w => w.id);
+    return targets.length === 0 ? refuse('no-own-window') : {act: true, monitor: monitorIndex, targets};
 }
 
 function mruPlace(w) {

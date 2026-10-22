@@ -13,15 +13,33 @@
 //!    shutdown signal, not a process_group/signal trick.
 //!
 //! Unlike `supervisor` (a shared, machine-wide, detached daemon `shell` never waits on), each
-//! `ClaudeSidecarProvider` owns exactly one sidecar process for its own lifetime, closer to how
-//! `agent::process::AgentProcess` owns its one `claude` child -- so this module does NOT detach via
-//! `process_group(0)`; the sidecar is meant to die with its owning provider, not outlive it.
+//! `ClaudeSidecarProvider` holds exactly one sidecar process, closer to how
+//! `agent::process::AgentProcess` owns its one `claude` child: the sidecar ends when its holder ends
+//! it or dies (stdin EOF), and through nothing else. So it is started in a process group of its own:
+//! in the spawner's group, a `Ctrl+C` in the terminal that started the window, or that terminal
+//! closing, would end it too, also after the chat was handed to another window that still holds it.
+//!
+//! A sidecar can be handed to another process (a chat moving to the other window): its stdin,
+//! stdout and stderr go as descriptors, the drains stop at the byte they reached and hand over the
+//! line in progress and the stderr tail, and the side that let go ends nothing. The side that took
+//! it over is its holder from the commit on, and ends it as the spawner would, through a pidfd.
+
+// Handing a sidecar to another process is Linux-only (`moving.rs`); elsewhere the pieces it uses
+// here are compiled and unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// How long `SpawnedSidecar::drop` waits after closing stdin before sending SIGKILL.
@@ -78,8 +96,34 @@ impl StderrTail {
     fn snapshot(&self) -> Vec<String> {
         self.lines.iter().cloned().collect()
     }
+
+    /// The lines as bytes, each ended by a newline: the form another process takes the tail up in.
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in &self.lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    /// The tail [`Self::to_bytes`] wrote, as lines again (at most the capacity, newest kept).
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut tail = Self::default();
+        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+            tail.push(String::from_utf8_lossy(line).into_owned());
+        }
+        tail
+    }
 }
 
+/// The longest line in progress a drain keeps before it prints what it has as a line of its own: a
+/// sidecar that writes without newlines must not grow this process's memory.
+const MAX_PARTIAL_LINE: usize = 64 * 1024;
+
+/// A sidecar this process started, or took over from the process that did. Which of them ends it
+/// is `holds`: the spawner holds it from the start, a process taking it over from its commit on, and
+/// a process that handed it on no longer does.
 pub(crate) struct SpawnedSidecar {
     pub(crate) socket_path: PathBuf,
     /// Which Verdandi checkout and revision this sidecar was built and launched from. Descriptive,
@@ -87,9 +131,259 @@ pub(crate) struct SpawnedSidecar {
     pub(crate) build_description: String,
     /// Only things genuinely worth warning about (today: baseline drift). Usually empty.
     pub(crate) build_warnings: Vec<String>,
-    stdin_keepalive: Option<ChildStdin>,
-    child: Child,
+    /// This process's copy of the sidecar's stdin. The sidecar ends on its EOF, so the last copy to
+    /// close, wherever it is, is the sidecar's end.
+    stdin_keepalive: Option<File>,
+    process: SidecarProcess,
+    stdout: Output,
+    stderr: Output,
     stderr_tail: Arc<Mutex<StderrTail>>,
+    /// Whether dropping this ends the sidecar (close stdin, wait, kill, delete the socket file). When
+    /// it does not, dropping it only closes this process's copies of the descriptors.
+    holds: bool,
+}
+
+/// How this process names the sidecar's process.
+enum SidecarProcess {
+    /// Started here: this process is its kernel parent and reaps it.
+    Spawned(Child),
+    /// Taken over from the process that started it, named by a pidfd opened for its pid and checked
+    /// against its start time, so a signal never reaches a process that took a reused pid.
+    #[cfg(target_os = "linux")]
+    Adopted(crate::child::PidFd),
+}
+
+/// One of the sidecar's output pipes, and whether this process is reading it.
+enum Output {
+    Draining(Drain),
+    /// Read by nobody: stopped for a move, or not started yet in the process taking one over. The
+    /// bytes after the last newline read so far wait in `partial`.
+    Parked {
+        pipe: File,
+        partial: Vec<u8>,
+    },
+    /// The sidecar's end of it closed, or this process let go of it.
+    Closed,
+}
+
+/// Wakes a drain blocked in `poll`, for good: the write end is shut down, so the read end stays
+/// readable.
+struct StopSignal {
+    raised: AtomicBool,
+    wake: UnixStream,
+    watch: UnixStream,
+}
+
+impl StopSignal {
+    fn new() -> std::io::Result<Arc<StopSignal>> {
+        let (wake, watch) = UnixStream::pair()?;
+        Ok(Arc::new(StopSignal {
+            raised: AtomicBool::new(false),
+            wake,
+            watch,
+        }))
+    }
+
+    fn raise(&self) {
+        self.raised.store(true, Ordering::SeqCst);
+        let _ = self.wake.shutdown(std::net::Shutdown::Write);
+    }
+
+    /// Waits until `fd` has something to read or hung up (true), or the stop is raised (false, which
+    /// wins when both are ready).
+    fn wait_readable(&self, fd: RawFd) -> bool {
+        let pollin = |fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut fds = [pollin(fd), pollin(self.watch.as_raw_fd())];
+        loop {
+            // SAFETY: `fds` is a valid, writable array of two `pollfd`s for the call.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready >= 0 {
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                // The read that follows reports whatever is wrong with the descriptor.
+                return !self.raised.load(Ordering::SeqCst);
+            }
+        }
+        fds[1].revents == 0 && !self.raised.load(Ordering::SeqCst)
+    }
+}
+
+/// A thread printing one of the sidecar's output pipes line by line (stderr's lines also go to the
+/// tail), until the pipe's end or a stop. It polls the pipe together with a stop descriptor rather
+/// than blocking in `read`, so a sidecar that writes nothing can still be handed on at once.
+struct Drain {
+    stop: Arc<StopSignal>,
+    thread: Option<JoinHandle<Drained>>,
+}
+
+/// Where a drain left its pipe.
+struct Drained {
+    pipe: File,
+    /// The line in progress: bytes read after the last newline.
+    partial: Vec<u8>,
+    /// The sidecar's end closed (or the pipe failed): nothing more will come.
+    ended: bool,
+}
+
+impl Drain {
+    fn start(
+        pipe: File,
+        partial: Vec<u8>,
+        stream_name: &'static str,
+        tail: Option<Arc<Mutex<StderrTail>>>,
+    ) -> std::io::Result<Drain> {
+        let stop = StopSignal::new()?;
+        let signal = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name(format!("sidecar-{stream_name}"))
+            .spawn(move || drain(pipe, partial, stream_name, tail, &signal))?;
+        Ok(Drain {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Stops the drain at the byte it reached. `None` only if its thread panicked, with the pipe.
+    fn stop(mut self) -> Option<Drained> {
+        self.stop.raise();
+        self.thread.take()?.join().ok()
+    }
+}
+
+fn drain(
+    mut pipe: File,
+    mut partial: Vec<u8>,
+    stream_name: &'static str,
+    tail: Option<Arc<Mutex<StderrTail>>>,
+    stop: &StopSignal,
+) -> Drained {
+    let mut buf = [0u8; 8192];
+    loop {
+        if !stop.wait_readable(pipe.as_raw_fd()) {
+            return Drained {
+                pipe,
+                partial,
+                ended: false,
+            };
+        }
+        match pipe.read(&mut buf) {
+            Ok(0) => {
+                if !partial.is_empty() {
+                    print_line(&std::mem::take(&mut partial), stream_name, tail.as_ref());
+                }
+                return Drained {
+                    pipe,
+                    partial,
+                    ended: true,
+                };
+            }
+            Ok(n) => {
+                partial.extend_from_slice(&buf[..n]);
+                while let Some(at) = partial.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = partial.drain(..=at).collect();
+                    print_line(&line[..line.len() - 1], stream_name, tail.as_ref());
+                }
+                if partial.len() > MAX_PARTIAL_LINE {
+                    print_line(&std::mem::take(&mut partial), stream_name, tail.as_ref());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                return Drained {
+                    pipe,
+                    partial,
+                    ended: true,
+                }
+            }
+        }
+    }
+}
+
+fn print_line(line: &[u8], stream_name: &str, tail: Option<&Arc<Mutex<StderrTail>>>) {
+    let line = String::from_utf8_lossy(line).into_owned();
+    log_line(format!("claude-sidecar[{stream_name}]: {line}"));
+    if let Some(tail) = tail {
+        if let Ok(mut tail) = tail.lock() {
+            tail.push(line);
+        }
+    }
+}
+
+/// How many of the sidecar's lines may wait for this process's stderr before further ones are
+/// counted rather than kept.
+const LOG_BACKLOG: usize = 1024;
+
+/// The sidecar's lines on their way to this process's stderr, written by one thread of their own. A
+/// drain never writes there itself: a stderr whose reader stopped (a full pipe, a terminal paused
+/// with Ctrl+S) blocks the write, and a drain blocked in it could not be stopped, so a move would
+/// wait on it for good. `None` when that thread could not be started; the lines are then counted.
+static LOG: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<String>>> = std::sync::OnceLock::new();
+
+/// Lines not printed because the backlog was full or there is no printing thread.
+static LOG_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hands one line to the printing thread without waiting.
+fn log_line(line: String) {
+    let sender = LOG.get_or_init(|| {
+        let (sender, lines) = std::sync::mpsc::sync_channel::<String>(LOG_BACKLOG);
+        std::thread::Builder::new()
+            .name("sidecar-log".to_string())
+            .spawn(move || print_lines(lines))
+            .ok()
+            .map(|_| sender)
+    });
+    let sent = sender.as_ref().is_some_and(|sender| sender.try_send(line).is_ok());
+    if !sent {
+        LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn print_lines(lines: std::sync::mpsc::Receiver<String>) {
+    use std::io::Write;
+    for line in lines {
+        let mut stderr = std::io::stderr().lock();
+        let dropped = LOG_DROPPED.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            let _ = writeln!(
+                stderr,
+                "claude-sidecar: {dropped} line(s) not printed: this process's stderr was not taking them"
+            );
+        }
+        // A stderr that fails (a hung-up terminal) loses the line; it must not end the thread.
+        let _ = writeln!(stderr, "{line}");
+    }
+}
+
+/// The sidecar's three standard descriptors as another process takes them: stdin's write end, and
+/// the read ends of stdout and stderr. Each is a duplicate (close-on-exec) of this process's copy.
+#[derive(Debug)]
+pub struct SidecarFds {
+    pub stdin: OwnedFd,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
+}
+
+impl SidecarFds {
+    /// In the order they travel: stdin, stdout, stderr.
+    pub fn into_array(self) -> [OwnedFd; 3] {
+        [self.stdin, self.stdout, self.stderr]
+    }
+
+    pub fn from_array([stdin, stdout, stderr]: [OwnedFd; 3]) -> Self {
+        SidecarFds { stdin, stdout, stderr }
+    }
+}
+
+/// What a sidecar's output handed on carries besides its descriptors.
+pub(crate) struct HandedOutput {
+    pub(crate) stdout_partial: Vec<u8>,
+    pub(crate) stderr_partial: Vec<u8>,
+    pub(crate) stderr_tail: Vec<u8>,
 }
 
 impl SpawnedSidecar {
@@ -100,10 +394,160 @@ impl SpawnedSidecar {
         self.stderr_tail.lock().map(|tail| tail.snapshot()).unwrap_or_default()
     }
 
-    /// The spawned sidecar's OS pid -- the only safe handle for an orphan check (see
+    /// The sidecar's OS pid -- the only safe handle for an orphan check (see
     /// `ClaudeSidecarProvider::sidecar_pid`).
     pub(crate) fn pid(&self) -> u32 {
-        self.child.id()
+        match &self.process {
+            SidecarProcess::Spawned(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            SidecarProcess::Adopted(pidfd) => pidfd.pid(),
+        }
+    }
+
+    /// Stops both drains where they are, so that nothing here reads the sidecar's output until
+    /// [`Self::restart_output`]. Refused, with the drains running again, when an output has closed:
+    /// the sidecar is ending, and there is nothing to hand on.
+    pub(crate) fn park_output(&mut self) -> std::io::Result<()> {
+        let mut closed = false;
+        for output in [&mut self.stdout, &mut self.stderr] {
+            *output = match std::mem::replace(output, Output::Closed) {
+                Output::Draining(drain) => match drain.stop() {
+                    Some(Drained {
+                        pipe,
+                        partial,
+                        ended: false,
+                    }) => Output::Parked { pipe, partial },
+                    Some(Drained { ended: true, .. }) | None => {
+                        closed = true;
+                        Output::Closed
+                    }
+                },
+                Output::Parked { pipe, partial } => Output::Parked { pipe, partial },
+                Output::Closed => {
+                    closed = true;
+                    Output::Closed
+                }
+            };
+        }
+        if closed {
+            self.restart_output()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the sidecar's output has closed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Starts a drain on each parked output, from the line it had in progress.
+    pub(crate) fn restart_output(&mut self) -> std::io::Result<()> {
+        let tail = Arc::clone(&self.stderr_tail);
+        for (output, name, tail) in [
+            (&mut self.stdout, "stdout", None),
+            (&mut self.stderr, "stderr", Some(tail)),
+        ] {
+            if let Output::Parked { pipe, partial } = std::mem::replace(output, Output::Closed) {
+                *output = Output::Draining(Drain::start(pipe, partial, name, tail)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Duplicates of the three descriptors, for the process taking the sidecar over. Only while the
+    /// output is parked: a running drain would go on reading what the other process now reads.
+    pub(crate) fn duplicate_fds(&self) -> std::io::Result<SidecarFds> {
+        let parked = |output: &Output| match output {
+            Output::Parked { pipe, .. } => pipe.try_clone().map(OwnedFd::from),
+            _ => Err(std::io::Error::other("the sidecar's output is still read here")),
+        };
+        let stdin = self
+            .stdin_keepalive
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("this process no longer holds the sidecar's stdin"))?
+            .try_clone()?;
+        Ok(SidecarFds {
+            stdin: OwnedFd::from(stdin),
+            stdout: parked(&self.stdout)?,
+            stderr: parked(&self.stderr)?,
+        })
+    }
+
+    /// The parked lines in progress and the stderr tail.
+    pub(crate) fn handed_output(&self) -> HandedOutput {
+        let partial = |output: &Output| match output {
+            Output::Parked { partial, .. } => partial.clone(),
+            _ => Vec::new(),
+        };
+        HandedOutput {
+            stdout_partial: partial(&self.stdout),
+            stderr_partial: partial(&self.stderr),
+            stderr_tail: self.stderr_tail.lock().map(|tail| tail.to_bytes()).unwrap_or_default(),
+        }
+    }
+
+    /// Lets go of the sidecar without a side effect: this process stops reading it and closes its
+    /// copies, and ends nothing -- no stdin EOF the other holder's copy does not outlive, no signal, no
+    /// socket file deleted. The kernel parent is still this process, if it was; dropping a `Child`
+    /// neither waits for nor signals it.
+    pub(crate) fn let_go(&mut self) {
+        self.holds = false;
+        self.stdin_keepalive = None;
+        for output in [&mut self.stdout, &mut self.stderr] {
+            if let Output::Draining(drain) = std::mem::replace(output, Output::Closed) {
+                drop(drain.stop());
+            }
+        }
+    }
+
+    /// From here on this process ends the sidecar when it is dropped, and reads its output.
+    /// Holding starts even when a drain cannot be started: the move is committed by then, and the
+    /// sidecar must still end with this process.
+    pub(crate) fn start_holding(&mut self) -> std::io::Result<()> {
+        self.holds = true;
+        self.restart_output()
+    }
+
+    /// A sidecar another process started and hands over, held by nobody here until
+    /// [`Self::start_holding`]: until then dropping it only closes the descriptors received.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn adopted(
+        socket_path: PathBuf,
+        child: &crate::child::ChildRecord,
+        fds: SidecarFds,
+        output: HandedOutput,
+        build_description: String,
+        build_warnings: Vec<String>,
+    ) -> std::io::Result<SpawnedSidecar> {
+        if child.kind != crate::child::ChildKind::Sidecar {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the process handed over is not a sidecar",
+            ));
+        }
+        let pidfd = crate::child::PidFd::open(child.pid, child.start)?;
+        let SidecarFds { stdin, stdout, stderr } = fds;
+        let HandedOutput {
+            stdout_partial,
+            stderr_partial,
+            stderr_tail,
+        } = output;
+        Ok(SpawnedSidecar {
+            socket_path,
+            build_description,
+            build_warnings,
+            stdin_keepalive: Some(File::from(stdin)),
+            process: SidecarProcess::Adopted(pidfd),
+            stdout: Output::Parked {
+                pipe: File::from(stdout),
+                partial: stdout_partial,
+            },
+            stderr: Output::Parked {
+                pipe: File::from(stderr),
+                partial: stderr_partial,
+            },
+            stderr_tail: Arc::new(Mutex::new(StderrTail::from_bytes(&stderr_tail))),
+            holds: false,
+        })
     }
 }
 
@@ -694,6 +1138,10 @@ fn sidecar_command_for(
         // testing is exactly the kind of thing worth seeing.
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // A group of its own: a `Ctrl+C` in, or the hangup of, the terminal that started this window
+        // goes to this window's group and must not reach a sidecar another window may hold by then.
+        // Its end is its stdin's EOF, which every holder's end brings about, a crash included.
+        .process_group(0)
         // The sidecar merges this variable's MCP servers into every session it serves. Eitri states
         // which servers a session gets and states none today, so a value left in the user's shell
         // must not turn into servers (and tools) in an Eitri session.
@@ -831,6 +1279,35 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
     )?;
     let (build_description, build_warnings, program_path, program_args) =
         invocation_for(program, exe_dir.as_deref(), ensure_sidecar_built)?;
+    spawn_resolved(
+        instance_id,
+        build_description,
+        build_warnings,
+        &program_path,
+        &program_args,
+    )
+}
+
+/// Spawns `program` as the sidecar, with no build step and no search: the crate's own tests start
+/// a stand-in this way.
+#[cfg(feature = "test-support")]
+pub(crate) fn spawn_program(instance_id: &str, program: &Path) -> std::io::Result<SpawnedSidecar> {
+    spawn_resolved(
+        instance_id,
+        format!("stand-in sidecar: {}", program.display()),
+        Vec::new(),
+        program,
+        &[],
+    )
+}
+
+fn spawn_resolved(
+    instance_id: &str,
+    build_description: String,
+    build_warnings: Vec<String>,
+    program_path: &Path,
+    program_args: &[PathBuf],
+) -> std::io::Result<SpawnedSidecar> {
     eprintln!("agent: {build_description}");
     for line in &build_warnings {
         eprintln!("agent: {line}");
@@ -853,18 +1330,35 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
             account.config_dir().display()
         );
     }
-    let mut command = sidecar_command(&program_path, &program_args, &socket_path, account);
+    let mut command = sidecar_command(program_path, program_args, &socket_path, account);
 
     let mut child = command.spawn()?;
-    let stdin_keepalive = child.stdin.take();
+    let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("the sidecar's pipes were not created"));
+    };
+    let stdin_keepalive = Some(File::from(OwnedFd::from(stdin)));
 
     let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
-    if let Some(stdout) = child.stdout.take() {
-        spawn_log_drain_thread(stdout, "stdout", None);
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_log_drain_thread(stderr, "stderr", Some(Arc::clone(&stderr_tail)));
-    }
+    let drains = Drain::start(File::from(OwnedFd::from(stdout)), Vec::new(), "stdout", None).and_then(|stdout| {
+        Drain::start(
+            File::from(OwnedFd::from(stderr)),
+            Vec::new(),
+            "stderr",
+            Some(Arc::clone(&stderr_tail)),
+        )
+        .map(|stderr| (stdout, stderr))
+    });
+    let (stdout, stderr) = match drains {
+        Ok(drains) => drains,
+        Err(e) => {
+            drop(stdin_keepalive);
+            let _ = stop_child(&mut child, SIDECAR_EXIT_GRACE);
+            return Err(e);
+        }
+    };
 
     let started_waiting = std::time::Instant::now();
     loop {
@@ -874,8 +1368,11 @@ pub(crate) fn spawn(instance_id: &str) -> std::io::Result<SpawnedSidecar> {
                 build_description,
                 build_warnings,
                 stdin_keepalive,
-                child,
+                process: SidecarProcess::Spawned(child),
+                stdout: Output::Draining(stdout),
+                stderr: Output::Draining(stderr),
                 stderr_tail,
+                holds: true,
             });
         }
         // Check for a dead child BEFORE sleeping again. The sidecar fails closed on a policy
@@ -923,24 +1420,6 @@ fn describe_startup_failure(summary: &str, stderr_tail: &Arc<Mutex<StderrTail>>)
     format!("{summary}; its stderr said:\n{}", lines.join("\n"))
 }
 
-fn spawn_log_drain_thread<R: std::io::Read + Send + 'static>(
-    reader: R,
-    stream_name: &'static str,
-    stderr_tail: Option<Arc<Mutex<StderrTail>>>,
-) {
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(reader).lines().map_while(Result::ok) {
-            eprintln!("claude-sidecar[{stream_name}]: {line}");
-            if let Some(tail) = &stderr_tail {
-                if let Ok(mut tail) = tail.lock() {
-                    tail.push(line);
-                }
-            }
-        }
-    });
-}
-
 /// Polls `child` for up to `grace`, then calls `kill()` and `wait()` if it has not exited.
 /// Keeping this separate from `SpawnedSidecar::drop` lets tests exercise the shutdown sequence
 /// with a real child process without constructing a whole sidecar.
@@ -963,11 +1442,33 @@ impl Drop for SpawnedSidecar {
     /// Closes the held-open stdin to signal shutdown, then waits up to `SIDECAR_EXIT_GRACE`
     /// for the sidecar to reap its CLI and cancel pending permissions before exiting.
     /// If the sidecar is still running after the grace period, kills it and waits for it to exit.
+    /// Only the holder ends the sidecar. An instance that handed it on, or took it over without
+    /// committing, only closes its descriptor copies when its fields drop.
     fn drop(&mut self) {
+        if !self.holds {
+            return;
+        }
         drop(self.stdin_keepalive.take()); // closes the write end -> sidecar sees stdin EOF
-        let _ = stop_child(&mut self.child, SIDECAR_EXIT_GRACE);
+        match &mut self.process {
+            SidecarProcess::Spawned(child) => {
+                let _ = stop_child(child, SIDECAR_EXIT_GRACE);
+            }
+            #[cfg(target_os = "linux")]
+            SidecarProcess::Adopted(pidfd) => end_adopted(pidfd, SIDECAR_EXIT_GRACE),
+        }
         // The directory outlives windows, so a killed sidecar's file would otherwise pile up in it.
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+/// [`stop_child`] for a sidecar this process took over: its stdin is already closed by the caller;
+/// waits up to `grace` on the pidfd, then SIGKILL through it. Nothing is reaped here: the status is
+/// the kernel parent's to read (the window that started the sidecar, or init once it is gone).
+#[cfg(target_os = "linux")]
+pub(crate) fn end_adopted(pidfd: &crate::child::PidFd, grace: Duration) {
+    if !pidfd.wait_exited(grace) {
+        let _ = pidfd.signal(libc::SIGKILL);
+        let _ = pidfd.wait_exited(Duration::from_secs(1));
     }
 }
 
@@ -1136,17 +1637,19 @@ mod tests {
         assert!(std::os::unix::net::UnixStream::connect(&sidecar.socket_path).is_ok());
 
         drop(sidecar.stdin_keepalive.take());
+        let SidecarProcess::Spawned(child) = &mut sidecar.process else {
+            unreachable!("spawn starts the sidecar here");
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut exited = false;
         while std::time::Instant::now() < deadline {
-            if matches!(sidecar.child.try_wait(), Ok(Some(_))) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
                 exited = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(exited, "sidecar did not exit within 5s of its stdin being closed");
-        let _ = std::fs::remove_file(&sidecar.socket_path);
     }
 
     /// Checks that every default checkout named by the scripts matches the path computed here.
@@ -2039,5 +2542,109 @@ mod tests {
             NO_SIDECAR_HINT.starts_with(SIDECAR_MISSING_HEADLINE),
             "{NO_SIDECAR_HINT:?} must start with {SIDECAR_MISSING_HEADLINE:?}"
         );
+    }
+
+    fn wait_for_line(tail: &Arc<Mutex<StderrTail>>, line: &str) {
+        let started = std::time::Instant::now();
+        while !tail.lock().unwrap().snapshot().iter().any(|l| l == line) {
+            assert!(started.elapsed() < Duration::from_secs(30), "never printed {line:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_stopped_drain_hands_over_its_line_in_progress_and_the_next_one_finishes_it() {
+        use std::io::Write;
+        let (read, mut write) = UnixStream::pair().unwrap();
+        let tail = Arc::new(Mutex::new(StderrTail::default()));
+        let drain = Drain::start(
+            File::from(OwnedFd::from(read)),
+            Vec::new(),
+            "stderr",
+            Some(Arc::clone(&tail)),
+        )
+        .unwrap();
+        write.write_all(b"first line\nsecond ha").unwrap();
+        wait_for_line(&tail, "first line");
+        let Drained { pipe, partial, ended } = drain.stop().unwrap();
+        assert!(!ended);
+        assert!(b"second ha".starts_with(&partial), "{partial:?}");
+
+        write.write_all(b"lf\n").unwrap();
+        let drain = Drain::start(pipe, partial, "stderr", Some(Arc::clone(&tail))).unwrap();
+        wait_for_line(&tail, "second half");
+        drop(write);
+        drop(drain.stop());
+        let lines = tail.lock().unwrap().snapshot();
+        assert_eq!(lines, ["first line", "second half"]);
+    }
+
+    /// A stderr nobody reads (here: its lock held, so every write to it waits) must not keep a drain
+    /// from reading on or from stopping, or a move would wait on it for good.
+    #[test]
+    fn a_drain_reads_on_and_stops_while_this_processs_stderr_takes_nothing() {
+        use std::io::Write;
+        let held = std::io::stderr().lock();
+        let (read, mut write) = UnixStream::pair().unwrap();
+        let tail = Arc::new(Mutex::new(StderrTail::default()));
+        let drain = Drain::start(
+            File::from(OwnedFd::from(read)),
+            Vec::new(),
+            "stderr",
+            Some(Arc::clone(&tail)),
+        )
+        .unwrap();
+        let lines = LOG_BACKLOG * 2;
+        let writer = std::thread::spawn(move || {
+            for n in 0..lines {
+                writeln!(write, "line {n}").unwrap();
+            }
+            write
+        });
+        wait_for_line(&tail, &format!("line {}", lines - 1));
+        let _write = writer.join().unwrap();
+        let (stopped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = stopped.send(drain.stop().map(|drained| drained.ended));
+        });
+        let ended = done.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        assert_eq!(ended.expect("the drain stopped"), Some(false));
+    }
+
+    #[test]
+    fn a_drain_stops_at_once_on_a_pipe_nobody_writes_to() {
+        let (read, _write) = UnixStream::pair().unwrap();
+        let drain = Drain::start(File::from(OwnedFd::from(read)), b"half".to_vec(), "stdout", None).unwrap();
+        let Drained { partial, ended, .. } = drain.stop().unwrap();
+        assert!(!ended);
+        assert_eq!(partial, b"half");
+    }
+
+    #[test]
+    fn the_stderr_tail_crosses_as_bytes_and_comes_back_the_same() {
+        let mut tail = StderrTail::default();
+        tail.push("one".into());
+        tail.push("two words".into());
+        let back = StderrTail::from_bytes(&tail.to_bytes());
+        assert_eq!(back.snapshot(), ["one", "two words"]);
+    }
+
+    #[test]
+    fn the_sidecar_leads_a_process_group_of_its_own() {
+        let mut command = sidecar_command_for(
+            Path::new("/bin/sleep"),
+            &[PathBuf::from("30")],
+            Path::new("/never/bound"),
+            None,
+            false,
+        );
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: `getpgid` reads no memory of ours.
+        let group = unsafe { libc::getpgid(pid) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(group, pid);
     }
 }

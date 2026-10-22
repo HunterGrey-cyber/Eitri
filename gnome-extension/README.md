@@ -4,15 +4,17 @@ Developer notes; this file is not installed.
 
 On GNOME an application cannot focus another application's window, so the companion panel cannot move focus to its
 editor (or back) with `Ctrl+h/j/k/l` the way it does on sway, Hyprland and niri. This extension does it for the panel,
-inside GNOME Shell, under rules that let no background application take focus at will.
+inside GNOME Shell, under rules that let no background application take focus at will. Since version 2 it also lets
+an Eitri window put itself back on the monitor it was on (`MoveOwnToMonitor`), which a Wayland client cannot do on
+GNOME either.
 
 ## Files
 
 | file | shipped | what |
 |---|---|---|
-| `metadata.json` | yes | uuid, name, supported shell versions (45-50) |
+| `metadata.json` | yes | uuid, name, supported shell versions (45-50), the extension's `version` (2) |
 | `extension.js` | yes | owns `cn.huntergrey.Eitri.Shell1` on the session bus, exports `/cn/huntergrey/Eitri/Shell1`, snapshots the shell's windows and activates what `policy.js` allows |
-| `policy.js` | yes | every decision: fresh input, the partner list, who may call what. No GNOME imports |
+| `policy.js` | yes | every decision: fresh input, the partner list, who may call what, which windows a monitor move takes. No GNOME imports |
 | `direction.js` | yes | which window lies left/right/above/below the focused one. No GNOME imports |
 | `testing.js` | **no** | test-only methods for a headless shell in a sandbox (`Focused`, `Arrange`, `Activate`, `PressKey`, `Click`). With it loaded, any process on the bus can type into the focused window, so it is loaded only when gnome-shell runs with `EITRI_SHELL_EXTENSION_TESTING=1` |
 | `test/` | no | node tests for `direction.js` and `policy.js` |
@@ -23,13 +25,17 @@ appear in them.
 ## The interface
 
 ```
-Version() -> u                        1
+Version() -> u                        2 (absent from metadata.json, and 1, before MoveOwnToMonitor)
 FocusDirection(s direction) -> b      left | right | up | down
 FocusSelfIfNeighbour(s direction) -> b
 SetPartner(au pids) -> b              the editor's process chain, nearest first; [] clears
 ActivateOwn() -> b
 ActivatePartner() -> b
+MoveOwnToMonitor(s connector) -> b    version 2: the caller's own top-level windows to that monitor
 ```
+
+A caller that gets `org.freedesktop.DBus.Error.UnknownMethod` for `MoveOwnToMonitor` is talking to version 1; Eitri
+then leaves the window where the window manager put it.
 
 Every method answers `false` when it does not act, never an error, and nothing returns a pid, title or geometry.
 
@@ -108,7 +114,19 @@ panel process over its own gio connection, and a `gdbus`/`busctl` child it spawn
   window's own type and flag (a utility window, a menu or a skip-taskbar panel is never one). The same test picks the
   candidates of a direction move. Mutter's most-recently-used list only chooses which of a pid's windows is activated;
   a window not in it comes after those that are.
-- Nothing acts while the shell holds a modal grab (the overview, a system dialog).
+- Nothing acts while the shell holds a modal grab (the overview, a system dialog). `MoveOwnToMonitor` is not a focus
+  move and is not held back by one.
+- **`MoveOwnToMonitor(connector)`** moves only windows whose pid is the caller's: its normal windows that have no
+  parent window and are not hidden from the taskbar (dialogs follow their parent; X11 windows stand for the pid only
+  when it has no Wayland window, as for every other method). `connector` is a connector name as `GdkMonitor` gives it
+  (`DP-2`, `HDMI-A-1`): letters, digits, `-`, `_`, `.`, at most 64; anything else is refused before mutter is asked.
+  The monitor is the one mutter's monitor manager finds for that connector (`get_monitor_for_connector`), and each
+  window goes there with `move_to_monitor`. It answers `true` when every such window was already there or was handed to
+  `move_to_monitor`, `false` for an unknown connector, a caller with no such window, or a move that threw. `true` does
+  not say the window has arrived: a move that resizes a Wayland window completes when the client acks the configure,
+  after the answer. No fresh input is asked
+  for: a Wayland client can already ask for its own window on a given output (fullscreen on an output), and the
+  boolean says nothing about any other window.
 
 ## Tests
 

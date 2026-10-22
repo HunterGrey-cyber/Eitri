@@ -18,10 +18,10 @@ use agent::{AgentDomainEvent, TurnOutcome};
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::nvim_rpc::{Answer, Pending};
 use eitri_core::turn_review::{
-    replace, review_dir_for, AppliedRevert, Blocked, Busy, Content, EditorCheck, EditorClear, ExactHunks, FsHooks,
-    Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir, RecoverAnswer, Recovered, Refusal,
-    RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, WriteError,
-    BUFFER_STATE_LUA, MAX_CLEAR_AGE,
+    replace, review_dir_for, AppliedRevert, Blocked, Busy, Content, EditorCheck, EditorClear, EmbeddedAsk, ExactHunks,
+    FsHooks, Journal, JournalEntry, JournalNote, Limits, Presence, PresenceGuard, ProjectDir, RecoverAnswer, Recovered,
+    Refusal, RevertKind, RevertTarget, ReviewOptions, Saved, Scope, Shadow, Snap, Stage, TurnReview, WriteError,
+    WriteSlot, BUFFER_STATE_LUA, MAX_CLEAR_AGE,
 };
 use rmpv::Value;
 
@@ -1328,7 +1328,7 @@ fn editor_check_refuses_with_no_link_modified_or_silence() {
     let path = Path::new("/project/src/it's 100%.rs");
     let start = Instant::now();
 
-    let why = editor_refusal(EditorCheck::start(None, path, start).poll(start));
+    let why = editor_refusal(EditorCheck::start(&EmbeddedAsk(None), path, start).poll(start));
     assert!(
         why.starts_with("no editor is connected, so Eitri cannot tell whether"),
         "{why}"
@@ -1336,7 +1336,7 @@ fn editor_check_refuses_with_no_link_modified_or_silence() {
     assert!(why.contains("it's 100%.rs"));
     let mut gone = FakeEditor::new(Some(buffer(false, false)));
     gone.connected = false;
-    let why = editor_refusal(EditorCheck::start(Some(&gone), path, start).poll(start));
+    let why = editor_refusal(EditorCheck::start(&EmbeddedAsk(Some(&gone)), path, start).poll(start));
     assert!(why.starts_with("no editor is connected"), "{why}");
     assert!(
         gone.asked.borrow().is_empty(),
@@ -1344,7 +1344,7 @@ fn editor_check_refuses_with_no_link_modified_or_silence() {
     );
 
     let modified = FakeEditor::new(Some(buffer(true, true)));
-    let mut check = EditorCheck::start(Some(&modified), path, start);
+    let mut check = EditorCheck::start(&EmbeddedAsk(Some(&modified)), path, start);
     let why = editor_refusal(check.poll(start));
     assert!(
         why.ends_with("has unsaved changes in the editor; write or discard them first"),
@@ -1363,21 +1363,21 @@ fn editor_check_refuses_with_no_link_modified_or_silence() {
 
     // An answer that says modified without saying found is still a modified buffer.
     let modified_only = FakeEditor::new(Some(Value::Map(vec![(Value::from("modified"), Value::from(true))])));
-    let why = editor_refusal(EditorCheck::start(Some(&modified_only), path, start).poll(start));
+    let why = editor_refusal(EditorCheck::start(&EmbeddedAsk(Some(&modified_only)), path, start).poll(start));
     assert!(
         why.ends_with("has unsaved changes in the editor; write or discard them first"),
         "{why}"
     );
 
     let silent = FakeEditor::new(None);
-    let mut check = EditorCheck::start(Some(&silent), path, start);
+    let mut check = EditorCheck::start(&EmbeddedAsk(Some(&silent)), path, start);
     assert!(check.poll(start + Duration::from_millis(4900)).is_none());
     let why = editor_refusal(check.poll(start + Duration::from_secs(5)));
     assert_eq!(why, "the editor did not answer; is it waiting for a key?");
 
     for answer in [buffer(true, false), buffer(false, false)] {
         let clean = FakeEditor::new(Some(answer));
-        let clear = EditorCheck::start(Some(&clean), path, start)
+        let clear = EditorCheck::start(&EmbeddedAsk(Some(&clean)), path, start)
             .poll(start)
             .unwrap()
             .unwrap();
@@ -1397,7 +1397,7 @@ fn a_late_poll_does_not_make_a_stale_clear_fresh() {
         .checked_sub(MAX_CLEAR_AGE + Duration::from_secs(1))
         .expect("the clock is past the bound");
     let editor = FakeEditor::new(Some(buffer(true, false)));
-    let clear = EditorCheck::start(Some(&editor), &file, asked_at)
+    let clear = EditorCheck::start(&EmbeddedAsk(Some(&editor)), &file, asked_at)
         .poll(Instant::now())
         .expect("the answer is there")
         .expect("a clean buffer");
@@ -1785,4 +1785,119 @@ fn an_older_entry_without_its_intended_mode_is_never_taken_for_finished() {
     assert_eq!(w.recover(&entry), Ok(Recovered::Restored));
     assert_eq!(w.read("a.txt"), b"the original\n");
     assert!(w.pending().is_empty());
+}
+
+// ---- the project's write slot ----------------------------------------------------------------------
+
+const PROBE_DIR: &str = "EITRI_REVERT_SLOT_PROBE_DIR";
+
+/// The child of the slot probe: tries to take the review directory's write slot both ways, as
+/// another window would, and says which it got. Does nothing unless the parent set the directory.
+#[test]
+#[ignore = "run by the write slot tests"]
+fn write_slot_probe_child() {
+    let Some(dir) = std::env::var_os(PROBE_DIR) else {
+        return;
+    };
+    let slot = WriteSlot::open(Path::new(&dir)).unwrap();
+    let exclusive = slot.try_exclusive().is_ok();
+    let shared = slot.try_shared().is_ok();
+    println!("SLOT exclusive={exclusive} shared={shared}");
+}
+
+/// Whether another process could take `review_dir`'s write slot exclusively, and shared.
+fn probe_slot_from_another_process(review_dir: &Path) -> (bool, bool) {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "write_slot_probe_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE_DIR, review_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find_map(|l| l.split_once("SLOT ").map(|(_, said)| said))
+        .unwrap_or_else(|| panic!("the probe said nothing: {stdout}"));
+    (line.contains("exclusive=true"), line.contains("shared=true"))
+}
+
+#[test]
+fn a_revert_parked_after_its_last_check_still_holds_the_slot_until_after_its_replace() {
+    let mut w = World::new("slot-parked");
+    w.write("a.txt", b"one\ntwo\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"one\nTWO\n", 0o644));
+
+    // The write parks once its new content is synced, after every last check and before the
+    // rename that puts it in place.
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (parked_tx, release_rx) = (Mutex::new(parked_tx), Mutex::new(release_rx));
+    let hooks = FsHooks {
+        fault: Some(Arc::new(move |stage| {
+            if stage == Stage::Synced {
+                let _ = parked_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+            Ok(())
+        })),
+        ..FsHooks::default()
+    };
+    let job = w
+        .review
+        .revert_job(
+            w.guard(),
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "a.txt",
+            RevertTarget::File,
+            w.clear("a.txt"),
+        )
+        .with_fs_hooks(hooks);
+    let worker = std::thread::spawn(move || job.run());
+    parked_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the revert reached its write");
+
+    assert_eq!(w.read("a.txt"), b"one\nTWO\n", "nothing is in place yet");
+    assert_eq!(
+        probe_slot_from_another_process(&w.review_dir),
+        (false, false),
+        "another window can neither write nor read the disk for a message while the revert is parked"
+    );
+    release_tx.send(()).unwrap();
+    let applied = worker.join().unwrap().expect("the revert lands once released");
+    assert_eq!(applied.kind, RevertKind::Replace);
+    assert_eq!(w.read("a.txt"), b"one\ntwo\n");
+    assert_eq!(
+        probe_slot_from_another_process(&w.review_dir),
+        (true, true),
+        "the slot is let go once the write has returned"
+    );
+}
+
+#[test]
+fn a_write_job_is_refused_while_another_holder_has_the_slot_and_writes_nothing() {
+    let mut w = World::new("slot-refused");
+    w.write("a.txt", b"one\ntwo\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"one\nTWO\n", 0o644));
+    let slot = WriteSlot::open(&w.review_dir).unwrap();
+    let other_window = slot.try_shared().unwrap();
+    let refused = w.revert_file(n, "a.txt").unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::SlotBusy(_)),
+        "a message being read from the disk elsewhere holds the write back: {refused:?}"
+    );
+    assert!(refused.to_string().contains("another Eitri window"), "{refused}");
+    assert_eq!(w.read("a.txt"), b"one\nTWO\n");
+    drop(other_window);
+    w.revert_file(n, "a.txt").expect("free again");
+    assert_eq!(w.read("a.txt"), b"one\ntwo\n");
 }

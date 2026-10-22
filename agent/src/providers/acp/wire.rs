@@ -13,7 +13,7 @@
 //! details, which are not Eitri's to keep or to log.
 
 use crate::projection::SlashCommand;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// The method names Eitri sends, and the ones it reads.
@@ -202,7 +202,7 @@ pub fn mode_from_options(options: Option<&Value>) -> Option<String> {
 
 /// A tool call as an update or a permission request describes it. Every field but the id is optional,
 /// because an update carries only what changed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallFields {
     pub id: String,
     pub title: Option<String>,

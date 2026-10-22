@@ -173,6 +173,48 @@ pub fn focus_window_argv(wm: Wm, target: &WindowRef) -> Option<Vec<String>> {
     }
 }
 
+/// Output names as compositors give them (`DP-1`, `HDMI-A-2`, `HEADLESS-2`, `eDP-1`): letters, digits, `-`, `_`
+/// and `.`. Anything else never reaches a command line.
+pub fn valid_output_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The command that moves `target`'s window to the output `output` (GDK's connector name, which is the
+/// compositor's own output name). niri needs the window id. Hyprland's `movewindow` acts on the focused window, so
+/// its batch focuses the window by pid first: this runs when a window opens or its monitor appears, never while the
+/// user works in another window.
+pub fn move_to_output_argv(wm: Wm, target: &WindowRef, output: &str) -> Option<Vec<String>> {
+    if !valid_output_name(output) {
+        return None;
+    }
+    match wm {
+        Wm::Sway => Some(vec![
+            "swaymsg".to_string(),
+            format!("[pid={}] move container to output \"{output}\"", target.pid),
+        ]),
+        Wm::Hyprland => Some(vec![
+            "hyprctl".to_string(),
+            "--batch".to_string(),
+            format!(
+                "dispatch focuswindow pid:{} ; dispatch movewindow mon:{output}",
+                target.pid
+            ),
+        ]),
+        Wm::Niri => target.id.map(|id| {
+            ["niri", "msg", "action", "move-window-to-monitor", "--id"]
+                .iter()
+                .map(ToString::to_string)
+                .chain([id.to_string(), output.to_string()])
+                .collect()
+        }),
+        Wm::Gnome | Wm::None => None,
+    }
+}
+
 pub fn parse_windows(wm: Wm, json: &str) -> Result<Vec<WindowRef>, String> {
     match wm {
         Wm::Hyprland => hyprland::parse_windows(json),
@@ -432,6 +474,59 @@ mod tests {
         let no_id = WindowRef { id: None, ..w };
         assert_eq!(focus_window_argv(Wm::Niri, &no_id), None);
         assert!(focus_window_argv(Wm::Sway, &no_id).is_some());
+    }
+
+    #[test]
+    fn moving_a_window_to_an_output_builds_the_documented_argv_per_wm() {
+        let v = |parts: &[&str]| Some(parts.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let w = WindowRef {
+            pid: 42,
+            id: Some(7),
+            focused: false,
+            visible: true,
+            rect: None,
+        };
+        assert_eq!(
+            move_to_output_argv(Wm::Sway, &w, "HEADLESS-2"),
+            v(&["swaymsg", "[pid=42] move container to output \"HEADLESS-2\""])
+        );
+        assert_eq!(
+            move_to_output_argv(Wm::Hyprland, &w, "DP-1"),
+            v(&[
+                "hyprctl",
+                "--batch",
+                "dispatch focuswindow pid:42 ; dispatch movewindow mon:DP-1"
+            ])
+        );
+        assert_eq!(
+            move_to_output_argv(Wm::Niri, &w, "eDP-1"),
+            v(&["niri", "msg", "action", "move-window-to-monitor", "--id", "7", "eDP-1"])
+        );
+        assert_eq!(
+            move_to_output_argv(Wm::Niri, &WindowRef { id: None, ..w }, "eDP-1"),
+            None
+        );
+        assert_eq!(move_to_output_argv(Wm::Gnome, &w, "DP-1"), None);
+        assert_eq!(move_to_output_argv(Wm::None, &w, "DP-1"), None);
+    }
+
+    #[test]
+    fn an_output_name_with_anything_but_a_plain_word_is_never_put_on_a_command_line() {
+        let long = "x".repeat(65);
+        for bad in ["", "DP 1", "DP-1\"; exec x", "a;b", "x\ny", long.as_str()] {
+            assert!(!valid_output_name(bad), "{bad:?}");
+            let w = WindowRef {
+                pid: 1,
+                id: Some(1),
+                focused: false,
+                visible: true,
+                rect: None,
+            };
+            assert_eq!(move_to_output_argv(Wm::Sway, &w, bad), None);
+        }
+        for good in ["DP-1", "HDMI-A-2", "HEADLESS-2", "eDP-1", "Virtual-1", "DVI_I.1"] {
+            assert!(valid_output_name(good), "{good}");
+        }
     }
 
     #[test]

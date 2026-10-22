@@ -1534,6 +1534,7 @@ fn label(event: &AgentDomainEvent) -> &'static str {
         AgentDomainEvent::ToolInputChanged { .. } => "ToolInputChanged",
         AgentDomainEvent::UserMessageDelivered { .. } => "UserMessageDelivered",
         AgentDomainEvent::UserMessageDropped { .. } => "UserMessageDropped",
+        AgentDomainEvent::MoveSeeded(_) => "MoveSeeded",
     }
 }
 

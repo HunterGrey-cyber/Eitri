@@ -31,7 +31,8 @@ pub mod wire;
 
 pub use locate::{decide_codex, locate_codex, LocateError};
 pub use provider::{
-    refuse_codex_home, refuse_relative_codex_home, CodexLaunch, CodexProvider, HIGHEST_TESTED_CODEX, MIN_CODEX,
+    refuse_codex_home, refuse_relative_codex_home, CodexLaunch, CodexProvider, CodexProviderHandoff,
+    HIGHEST_TESTED_CODEX, MIN_CODEX,
 };
 pub use scripted_model::{ScriptedModel, Step};
 pub use self_check::{ensure_checked, BinaryKey, SelfCheckError};

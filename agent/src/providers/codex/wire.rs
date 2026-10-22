@@ -1043,7 +1043,7 @@ impl AutoReviewNotification {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenBreakdown {
     #[serde(default)]
@@ -1060,7 +1060,7 @@ pub struct TokenBreakdown {
     pub reasoning_output_tokens: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     #[serde(default)]

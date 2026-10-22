@@ -112,7 +112,7 @@ pub fn disallowed_tools() -> &'static [&'static str] {
 /// `Manual` is the strictest mode: the host's policy answers every request, and every file write or
 /// edit gets a card ([`crate::classify_in_manual`]). It is never more permissive than `Auto`.
 /// CLI mode reports cannot produce it because they describe the CLI's policy, not the host's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     Manual,

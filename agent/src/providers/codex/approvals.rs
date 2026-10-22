@@ -16,12 +16,13 @@
 //! interrupt a cancel; nothing is remembered for the session.
 
 use super::wire::{
-    CommandApprovalKind, CommandApprovalParams, Decision, DecisionResponse, ElicitationParams, ElicitationResponse,
-    FileChangeApprovalParams, PatchChangeKind, PermissionsApprovalParams, PermissionsGrant, ServerRequest, ThreadItem,
-    UserInputParams, UserInputResponse,
+    CommandApprovalKind, CommandApprovalParams, CommandExecutionItem, Decision, DecisionResponse, ElicitationParams,
+    ElicitationResponse, FileChangeApprovalParams, FileChangeItem, FileUpdateChange, ItemStatus, McpToolCallItem,
+    PatchChangeKind, PermissionsApprovalParams, PermissionsGrant, ServerRequest, ThreadItem, UserInputParams,
+    UserInputResponse,
 };
 use crate::jsonrpc_link::{OverCapReply, REQUEST_TOO_LARGE};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -225,7 +226,7 @@ impl AutoAnswer {
 }
 
 /// How the answer to a card is written: the form depends on which request it came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnswerForm {
     /// A command or file-change approval: `accept`, `decline` or `cancel`.
     Decision,
@@ -415,6 +416,68 @@ impl HeldItems {
         }
     }
 
+    /// The held items as data another process can take up: each item in Codex's own words, read back
+    /// there exactly as Codex's message was read here. Destructured whole, so a field added to the held
+    /// items has to be placed in the record or named as not moving.
+    pub fn into_record(self) -> HeldItemsRecord {
+        let HeldItems {
+            items,
+            order,
+            asked,
+            missed,
+            missed_anywhere,
+        } = self;
+        let mut items: Vec<(String, String, Value)> = items
+            .into_iter()
+            .filter_map(|((thread, id), item)| held_item_words(&item).map(|words| (thread, id, words)))
+            .collect();
+        items.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let mut asked: Vec<HeldKey> = asked.into_iter().collect();
+        asked.sort();
+        let mut missed: Vec<String> = missed.into_iter().collect();
+        missed.sort();
+        HeldItemsRecord {
+            items,
+            order,
+            asked,
+            missed,
+            missed_anywhere,
+        }
+    }
+
+    /// The held items a record describes. An item that does not read back as the kind it was held as
+    /// is refused, since a card drawn from it would show something other than what Codex runs.
+    pub fn from_record(record: HeldItemsRecord) -> Result<HeldItems, String> {
+        let HeldItemsRecord {
+            items,
+            order,
+            asked,
+            missed,
+            missed_anywhere,
+        } = record;
+        let mut held = HeldItems::default();
+        for (thread, id, words) in items {
+            let item: ThreadItem =
+                serde_json::from_value(words).map_err(|e| format!("a held call could not be read: {e}"))?;
+            let kept = matches!(
+                item,
+                ThreadItem::CommandExecution(_) | ThreadItem::FileChange(_) | ThreadItem::McpToolCall(_)
+            );
+            if !kept || item.id() != Some(id.as_str()) {
+                return Err(format!("the held call {id} did not read back as the call it was"));
+            }
+            held.items.insert(key(&thread, &id), item);
+        }
+        if order.iter().any(|k| !held.items.contains_key(k)) || order.len() != held.items.len() {
+            return Err("the held calls' order names calls that are not held".to_string());
+        }
+        held.order = order;
+        held.asked = asked.into_iter().collect();
+        held.missed = missed.into_iter().collect();
+        held.missed_anywhere = missed_anywhere;
+        Ok(held)
+    }
+
     /// The held tool call a tool approval belongs to: on `thread` and `server`, with exactly these
     /// arguments, no card drawn for it yet, and named `tool` when the approval says which. `None` when
     /// there is none, or when the candidates are calls of different tools: the card would then name a tool
@@ -450,6 +513,97 @@ impl HeldItems {
         }
         Some(first)
     }
+}
+
+/// [`HeldItems`] as data: each held call in Codex's own words, the arrival order, and the notes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldItemsRecord {
+    items: Vec<(String, String, Value)>,
+    order: Vec<HeldKey>,
+    asked: Vec<HeldKey>,
+    missed: Vec<String>,
+    missed_anywhere: bool,
+}
+
+/// A status in Codex's word for it.
+fn status_word(status: &ItemStatus) -> String {
+    match status {
+        ItemStatus::InProgress => "inProgress".to_string(),
+        ItemStatus::Completed => "completed".to_string(),
+        ItemStatus::Failed => "failed".to_string(),
+        ItemStatus::Declined => "declined".to_string(),
+        ItemStatus::Unknown(word) => word.clone(),
+    }
+}
+
+/// A file change's kind as Codex writes it.
+fn change_kind_words(kind: &PatchChangeKind) -> Value {
+    match kind {
+        PatchChangeKind::Add => json!({"type": "add"}),
+        PatchChangeKind::Delete => json!({"type": "delete"}),
+        PatchChangeKind::Update { move_path } => json!({"type": "update", "movePath": move_path}),
+        PatchChangeKind::Unknown(word) => json!({"type": word}),
+    }
+}
+
+/// A call that is held, as Codex wrote it: reading the result gives the same call back. `None` for the
+/// kinds that are never held.
+fn held_item_words(item: &ThreadItem) -> Option<Value> {
+    // Each item is taken apart without a rest pattern, so a field Codex's item gains fails to build here
+    // until it is written out too, rather than being lost when the chat moves.
+    Some(match item {
+        ThreadItem::CommandExecution(CommandExecutionItem {
+            id,
+            command,
+            cwd,
+            status,
+            source,
+            aggregated_output,
+            exit_code,
+            duration_ms,
+        }) => json!({
+            "type": "commandExecution",
+            "id": id,
+            "command": command,
+            "cwd": cwd,
+            "status": status_word(status),
+            "source": source,
+            "aggregatedOutput": aggregated_output,
+            "exitCode": exit_code,
+            "durationMs": duration_ms,
+        }),
+        ThreadItem::FileChange(FileChangeItem { id, changes, status }) => json!({
+            "type": "fileChange",
+            "id": id,
+            "changes": changes.iter().map(|FileUpdateChange { path, kind, diff }| json!({
+                "path": path,
+                "kind": change_kind_words(kind),
+                "diff": diff,
+            })).collect::<Vec<_>>(),
+            "status": status_word(status),
+        }),
+        ThreadItem::McpToolCall(McpToolCallItem {
+            id,
+            server,
+            tool,
+            status,
+            arguments,
+            result,
+            error,
+            duration_ms,
+        }) => json!({
+            "type": "mcpToolCall",
+            "id": id,
+            "server": server,
+            "tool": tool,
+            "status": status_word(status),
+            "arguments": arguments,
+            "result": result,
+            "error": error,
+            "durationMs": duration_ms,
+        }),
+        _ => return None,
+    })
 }
 
 /// The tool a tool approval names, when its message is the form Codex writes for a tool server of the
@@ -910,5 +1064,53 @@ mod tests {
             }
             other => panic!("expected no answer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn held_items_cross_as_data_and_read_back_as_the_same_calls() {
+        let mut held = HeldItems::default();
+        held.hold(
+            "parent",
+            &item(
+                json!({"type": "commandExecution", "id": "c1", "command": "ls -l", "cwd": "/w", "status": "inProgress",
+                         "source": "agent", "exitCode": 2, "durationMs": 7}),
+            ),
+        );
+        held.hold(
+            "parent",
+            &item(
+                json!({"type": "fileChange", "id": "f1", "status": "inProgress", "changes": [
+                {"path": "/w/a", "kind": {"type": "add"}, "diff": "+a"},
+                {"path": "/w/b", "kind": {"type": "update", "movePath": "/w/c"}, "diff": "-b"},
+                {"path": "/w/d", "kind": {"type": "delete"}, "diff": ""},
+                {"path": "/w/e", "kind": {"type": "later"}, "diff": ""}]}),
+            ),
+        );
+        held.hold(
+            "child",
+            &item(
+                json!({"type": "mcpToolCall", "id": "m1", "server": "probe", "tool": "drop",
+                         "arguments": {"name": "prod"}, "status": "somethingNew"}),
+            ),
+        );
+        held.mark_asked("child", "m1");
+        held.mark_missed("other");
+        let before: Vec<String> = [("parent", "c1"), ("parent", "f1"), ("child", "m1")]
+            .iter()
+            .map(|(t, i)| format!("{:?}", held.get(t, i).expect("held")))
+            .collect();
+        let wire = serde_json::to_value(held.into_record()).unwrap();
+        let back = HeldItems::from_record(serde_json::from_value(wire).unwrap()).expect("read back");
+        let after: Vec<String> = [("parent", "c1"), ("parent", "f1"), ("child", "m1")]
+            .iter()
+            .map(|(t, i)| format!("{:?}", back.get(t, i).expect("held after the move")))
+            .collect();
+        assert_eq!(before, after, "every held call reads back as the call it was");
+        assert_eq!(
+            back.order,
+            vec![key("parent", "c1"), key("parent", "f1"), key("child", "m1")]
+        );
+        assert!(back.asked.contains(&key("child", "m1")), "a carded call stays carded");
+        assert!(back.missed.contains("other"));
     }
 }

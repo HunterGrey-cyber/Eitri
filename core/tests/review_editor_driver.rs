@@ -217,7 +217,7 @@ fn installs_once_before_the_first_call() {
         vec![REVIEW_LUA],
         "a second call waits behind the same install"
     );
-    assert!(overlay.tick(&rpc, t0).is_empty());
+    assert!(overlay.tick(&rpc, t0).mine.is_empty());
     assert_eq!(
         rpc.codes(),
         vec![REVIEW_LUA],
@@ -226,7 +226,7 @@ fn installs_once_before_the_first_call() {
     assert!(overlay.wants_ticks());
 
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(
         rpc.codes(),
         vec![REVIEW_LUA, CLEAR_LUA],
@@ -237,24 +237,24 @@ fn installs_once_before_the_first_call() {
         vec![Value::Binary(b"/p/a".to_vec())],
         "the first call is the first sent"
     );
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(
         rpc.codes(),
         vec![REVIEW_LUA, CLEAR_LUA],
         "the second waits for the first's answer"
     );
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.codes(), vec![REVIEW_LUA, CLEAR_LUA, CLEAR_LUA]);
     assert_eq!(rpc.sent.borrow()[2].args, vec![Value::Binary(b"/p/b".to_vec())]);
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
 
     overlay.call(&rpc, clear("/p/c"), t0);
     assert_eq!(rpc.count(REVIEW_LUA), 1, "installed once");
     assert_eq!(rpc.codes().last(), Some(&CLEAR_LUA), "and the call goes straight out");
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert!(!overlay.wants_ticks(), "idle with nothing drawn");
 }
 
@@ -266,18 +266,21 @@ fn a_missing_module_is_reinstalled_once() {
 
     overlay.call(&rpc, open("r1", "/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.codes(), vec![REVIEW_LUA, OPEN_AND_SHOW_LUA]);
 
     rpc.answer(OPEN_AND_SHOW_LUA, missing());
-    assert!(overlay.tick(&rpc, t0).is_empty(), "a first missing is not a failure");
+    assert!(
+        overlay.tick(&rpc, t0).mine.is_empty(),
+        "a first missing is not a failure"
+    );
     assert_eq!(
         rpc.codes(),
         vec![REVIEW_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA],
         "it installs again"
     );
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(
         rpc.codes(),
         vec![REVIEW_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA, OPEN_AND_SHOW_LUA],
@@ -286,7 +289,7 @@ fn a_missing_module_is_reinstalled_once() {
 
     // Missing a second time: the call fails, and there is no third install.
     rpc.answer(OPEN_AND_SHOW_LUA, missing());
-    let out = overlay.tick(&rpc, t0);
+    let out = overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(REVIEW_LUA), 2);
     assert_eq!(out.len(), 1);
     match &out[0] {
@@ -306,20 +309,20 @@ fn a_reinstall_keeps_the_calls_in_the_order_they_were_made() {
     let t0 = Instant::now();
     overlay.call(&rpc, clear("/p/seed"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
 
     overlay.call(&rpc, clear("/p/a"), t0);
     overlay.call(&rpc, clear("/p/b"), t0);
     assert_eq!(rpc.count(CLEAR_LUA), 2, "the second call waits behind the first");
     rpc.answer(CLEAR_LUA, missing());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(REVIEW_LUA), 2, "one re-install for both");
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(REVIEW_LUA), 2, "still one re-install");
     let sent = rpc.sent.borrow();
     let resent: Vec<_> = sent[sent.len() - 2..].iter().map(|s| s.args[0].clone()).collect();
@@ -337,9 +340,9 @@ fn a_new_target_forgets_the_install() {
 
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert!(overlay.active_paths().contains(Path::new("/p/a")));
     assert_eq!(rpc.count(REVIEW_LUA), 1);
     let drains = rpc.count(TAKE_EVENTS_LUA);
@@ -347,7 +350,7 @@ fn a_new_target_forgets_the_install() {
 
     // nvim restarted behind the same handle.
     rpc.target.set(Some(2));
-    overlay.tick(&rpc, ms(t0, 10));
+    overlay.tick(&rpc, ms(t0, 10)).mine;
     assert!(
         overlay.active_paths().is_empty(),
         "what was drawn was in the old editor"
@@ -362,7 +365,7 @@ fn a_new_target_forgets_the_install() {
     assert_eq!(rpc.count(REVIEW_LUA), 2, "the module is installed again");
     assert_eq!(rpc.codes().last(), Some(&REVIEW_LUA), "before the call");
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, ms(t0, 20));
+    overlay.tick(&rpc, ms(t0, 20)).mine;
     assert_eq!(rpc.codes().last(), Some(&SHOW_LUA));
 }
 
@@ -375,9 +378,9 @@ fn a_newer_redraw_is_sent_only_after_the_older_one_answered() {
     let t0 = Instant::now();
     overlay.call(&rpc, clear("/p/seed"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
 
     let older = OverlayCall::Show {
         path: PathBuf::from("/p/a"),
@@ -391,10 +394,10 @@ fn a_newer_redraw_is_sent_only_after_the_older_one_answered() {
     };
     overlay.call(&rpc, older, t0);
     overlay.call(&rpc, newer, t0);
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(SHOW_LUA), 1, "the newer redraw waits");
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(SHOW_LUA), 2, "and goes once the older one answered");
     let turns: Vec<Value> = rpc
         .sent
@@ -428,17 +431,17 @@ fn clearing_the_last_overlay_still_takes_the_waiting_events() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 1);
     rpc.answer(TAKE_EVENTS_LUA, events_answer(vec![], 1));
-    overlay.tick(&rpc, ms(t0, 10));
+    overlay.tick(&rpc, ms(t0, 10)).mine;
 
     // Well inside the 500 ms between drains, the user reverts a hunk and the panel clears the file.
     overlay.call(&rpc, clear("/p/a"), ms(t0, 20));
     rpc.answer(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, ms(t0, 30));
+    overlay.tick(&rpc, ms(t0, 30)).mine;
     assert_eq!(
         rpc.count(TAKE_EVENTS_LUA),
         2,
@@ -448,12 +451,12 @@ fn clearing_the_last_overlay_still_takes_the_waiting_events() {
         TAKE_EVENTS_LUA,
         events_answer(vec![revert_event("/p/a", 1, "old", "new")], 0),
     );
-    let out = overlay.tick(&rpc, ms(t0, 40));
+    let out = overlay.tick(&rpc, ms(t0, 40)).mine;
     assert!(
         matches!(out.as_slice(), [OverlayOutcome::Reverts(events)] if events.len() == 1),
         "{out:?}"
     );
-    overlay.tick(&rpc, ms(t0, 5_000));
+    overlay.tick(&rpc, ms(t0, 5_000)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 2, "and then nothing more");
     assert!(!overlay.wants_ticks());
 }
@@ -467,20 +470,20 @@ fn a_drain_in_flight_during_the_clear_does_not_settle_the_owed_one() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 1, "a drain is in flight");
 
     overlay.call(&rpc, clear("/p/a"), ms(t0, 20));
     rpc.answer_oldest_of(CLEAR_LUA, Ok(map(vec![("active", Value::from(0))])));
-    overlay.tick(&rpc, ms(t0, 30));
+    overlay.tick(&rpc, ms(t0, 30)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 1, "never two drains in flight");
     rpc.answer(TAKE_EVENTS_LUA, events_answer(vec![], 0));
-    overlay.tick(&rpc, ms(t0, 40));
+    overlay.tick(&rpc, ms(t0, 40)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 2, "the owed drain follows");
     rpc.answer(TAKE_EVENTS_LUA, events_answer(vec![], 0));
-    overlay.tick(&rpc, ms(t0, 5_000));
+    overlay.tick(&rpc, ms(t0, 5_000)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 2);
     assert!(!overlay.wants_ticks());
 }
@@ -493,9 +496,9 @@ fn drains_every_500ms_only_while_active() {
 
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(
         rpc.count(TAKE_EVENTS_LUA),
         1,
@@ -504,10 +507,10 @@ fn drains_every_500ms_only_while_active() {
     assert!(rpc.sent.borrow().last().unwrap().args.is_empty());
 
     // Unanswered, there is never a second one in flight.
-    overlay.tick(&rpc, ms(t0, 2_000));
+    overlay.tick(&rpc, ms(t0, 2_000)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 1);
     rpc.answer(TAKE_EVENTS_LUA, events_answer(vec![], 1));
-    overlay.tick(&rpc, ms(t0, 2_001));
+    overlay.tick(&rpc, ms(t0, 2_001)).mine;
     assert_eq!(
         rpc.count(TAKE_EVENTS_LUA),
         2,
@@ -516,14 +519,14 @@ fn drains_every_500ms_only_while_active() {
     rpc.answer(TAKE_EVENTS_LUA, events_answer(vec![], 1));
 
     let base = ms(t0, 2_001);
-    overlay.tick(&rpc, ms(base, 499));
+    overlay.tick(&rpc, ms(base, 499)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 2, "not before 500 ms");
-    overlay.tick(&rpc, ms(base, 500));
+    overlay.tick(&rpc, ms(base, 500)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 3, "at 500 ms");
 
     // The last buffer stops showing: nothing more is asked.
     rpc.answer(TAKE_EVENTS_LUA, events_answer(vec![off_event("/p/a", "user")], 0));
-    let out = overlay.tick(&rpc, ms(base, 600));
+    let out = overlay.tick(&rpc, ms(base, 600)).mine;
     assert_eq!(
         out,
         vec![OverlayOutcome::Off(vec![OffEvent {
@@ -532,7 +535,7 @@ fn drains_every_500ms_only_while_active() {
         }])]
     );
     assert!(overlay.active_paths().is_empty());
-    overlay.tick(&rpc, ms(base, 5_000));
+    overlay.tick(&rpc, ms(base, 5_000)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 3, "no drain while nothing is drawn");
     assert!(!overlay.wants_ticks());
 }
@@ -544,9 +547,9 @@ fn events_come_back_in_order() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(2, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
 
     rpc.answer(
         TAKE_EVENTS_LUA,
@@ -560,7 +563,7 @@ fn events_come_back_in_order() {
             1,
         ),
     );
-    let out = overlay.tick(&rpc, ms(t0, 1));
+    let out = overlay.tick(&rpc, ms(t0, 1)).mine;
     assert_eq!(
         out.len(),
         3,
@@ -593,7 +596,7 @@ fn events_come_back_in_order() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(overlay.tick(&rpc, ms(t0, 2)).is_empty(), "taken once");
+    assert!(overlay.tick(&rpc, ms(t0, 2)).mine.is_empty(), "taken once");
 }
 
 fn unrevert_event(path: &str, hunk: u32, old: &str, new: &str) -> Value {
@@ -615,7 +618,7 @@ fn a_file_with_only_reverted_hunks_still_counts_as_shown() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     // Nothing is drawn, but the editor keeps following the hunk reverted in the buffer.
     rpc.answer(
         SHOW_LUA,
@@ -626,7 +629,7 @@ fn a_file_with_only_reverted_hunks_still_counts_as_shown() {
             ("active", Value::from(1)),
         ])),
     );
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert!(overlay.active_paths().contains(Path::new("/p/a")));
     assert!(overlay.wants_ticks(), "its events are still asked for");
 }
@@ -638,9 +641,9 @@ fn a_revert_its_undo_and_the_revert_again_keep_their_order() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
 
     rpc.answer(
         TAKE_EVENTS_LUA,
@@ -656,7 +659,7 @@ fn a_revert_its_undo_and_the_revert_again_keep_their_order() {
             1,
         ),
     );
-    let out = overlay.tick(&rpc, ms(t0, 1));
+    let out = overlay.tick(&rpc, ms(t0, 1)).mine;
     let shape: Vec<(&str, Vec<u32>)> = out
         .iter()
         .map(|o| match o {
@@ -685,9 +688,9 @@ fn a_full_answer_is_followed_at_once_even_with_nothing_drawn() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 1);
 
     // The user reverted and closed the overlay; the module could not fit every event in one answer.
@@ -695,7 +698,7 @@ fn a_full_answer_is_followed_at_once_even_with_nothing_drawn() {
         TAKE_EVENTS_LUA,
         full_events_answer(vec![revert_event("/p/a", 1, "x", "y")], 0),
     );
-    let out = overlay.tick(&rpc, ms(t0, 1));
+    let out = overlay.tick(&rpc, ms(t0, 1)).mine;
     assert!(
         matches!(out.as_slice(), [OverlayOutcome::Reverts(r)] if r[0].hunk.id == 1),
         "{out:?}"
@@ -711,10 +714,10 @@ fn a_full_answer_is_followed_at_once_even_with_nothing_drawn() {
         TAKE_EVENTS_LUA,
         events_answer(vec![revert_event("/p/a", 2, "x", "y"), off_event("/p/a", "user")], 0),
     );
-    let out = overlay.tick(&rpc, ms(t0, 2));
+    let out = overlay.tick(&rpc, ms(t0, 2)).mine;
     assert_eq!(out.len(), 2, "{out:?}");
     assert!(matches!(&out[0], OverlayOutcome::Reverts(r) if r[0].hunk.id == 2));
-    overlay.tick(&rpc, ms(t0, 5_000));
+    overlay.tick(&rpc, ms(t0, 5_000)).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 2, "nothing waits and nothing is drawn");
     assert!(!overlay.wants_ticks());
 }
@@ -749,7 +752,7 @@ fn a_path_that_is_not_utf8_is_never_drawn_over() {
         t0,
     );
     assert!(rpc.codes().is_empty(), "nothing is sent, not even the install");
-    let out = overlay.tick(&rpc, t0);
+    let out = overlay.tick(&rpc, t0).mine;
     match out.as_slice() {
         [OverlayOutcome::Answered {
             request_id,
@@ -783,9 +786,9 @@ fn an_event_it_cannot_read_is_dropped_and_the_rest_still_arrive() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     let mut broken = revert_event("/p/a", 7, "x", "y");
     if let Value::Map(entries) = &mut broken {
         entries.retain(|(k, _)| k.as_str() != Some("new_start"));
@@ -794,7 +797,7 @@ fn an_event_it_cannot_read_is_dropped_and_the_rest_still_arrive() {
         TAKE_EVENTS_LUA,
         events_answer(vec![broken, revert_event("/p/a", 8, "x", "y")], 1),
     );
-    let out = overlay.tick(&rpc, ms(t0, 1));
+    let out = overlay.tick(&rpc, ms(t0, 1)).mine;
     match out.as_slice() {
         [OverlayOutcome::Reverts(reverts)] => assert_eq!(reverts.len(), 1),
         other => panic!("{other:?}"),
@@ -816,7 +819,7 @@ fn an_unavailable_editor_fails_the_call_with_its_reason() {
             "the panel is not attached to an editor".to_owned(),
         )),
     );
-    let out = overlay.tick(&rpc, t0);
+    let out = overlay.tick(&rpc, t0).mine;
     assert_eq!(
         out,
         vec![OverlayOutcome::Answered {
@@ -835,9 +838,9 @@ fn an_unavailable_editor_fails_the_call_with_its_reason() {
 
     // A connection that ends under a sent call.
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(OPEN_AND_SHOW_LUA, Err(RpcError::Closed));
-    let out = overlay.tick(&rpc, t0);
+    let out = overlay.tick(&rpc, t0).mine;
     assert_eq!(
         out,
         vec![OverlayOutcome::Answered {
@@ -849,9 +852,9 @@ fn an_unavailable_editor_fails_the_call_with_its_reason() {
     overlay.call(&rpc, open("r3", "/p/a"), t0);
     assert_eq!(rpc.count(REVIEW_LUA), 3, "a closed connection forgets the install");
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(OPEN_AND_SHOW_LUA, Err(RpcError::Nvim("E5108: boom".to_owned())));
-    let out = overlay.tick(&rpc, t0);
+    let out = overlay.tick(&rpc, t0).mine;
     assert_eq!(
         out,
         vec![OverlayOutcome::Answered {
@@ -870,7 +873,7 @@ fn an_open_answers_with_what_the_editor_said() {
     overlay.call(&rpc, open("b", "/p/b"), t0);
     overlay.call(&rpc, open("c", "/p/c"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     // One open in flight at a time: each answer lets the next go out.
     let mut out = Vec::new();
     rpc.answer_oldest_of(
@@ -883,7 +886,7 @@ fn an_open_answers_with_what_the_editor_said() {
             ("active", Value::from(1)),
         ])),
     );
-    out.extend(overlay.tick(&rpc, t0));
+    out.extend(overlay.tick(&rpc, t0).mine);
     rpc.answer_oldest_of(
         OPEN_AND_SHOW_LUA,
         Ok(map(vec![
@@ -892,12 +895,12 @@ fn an_open_answers_with_what_the_editor_said() {
             ("active", Value::from(1)),
         ])),
     );
-    out.extend(overlay.tick(&rpc, t0));
+    out.extend(overlay.tick(&rpc, t0).mine);
     rpc.answer_oldest_of(
         OPEN_AND_SHOW_LUA,
         Ok(map(vec![("opened", Value::from(true)), ("active", Value::from(1))])),
     );
-    out.extend(overlay.tick(&rpc, t0));
+    out.extend(overlay.tick(&rpc, t0).mine);
     assert_eq!(rpc.count(OPEN_AND_SHOW_LUA), 3);
     let results: Vec<_> = out
         .iter()
@@ -927,9 +930,9 @@ fn editor_lost_drops_everything() {
     let t0 = Instant::now();
     overlay.call(&rpc, show("/p/a"), t0);
     rpc.answer(REVIEW_LUA, installed());
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     rpc.answer(SHOW_LUA, answered_show(1, 1));
-    overlay.tick(&rpc, t0);
+    overlay.tick(&rpc, t0).mine;
     assert_eq!(rpc.count(TAKE_EVENTS_LUA), 1, "a drain is in flight");
     overlay.call(&rpc, open("r1", "/p/b"), t0);
     overlay.call(&rpc, clear("/p/c"), t0);
@@ -945,7 +948,7 @@ fn editor_lost_drops_everything() {
         events_answer(vec![revert_event("/p/a", 1, "x", "y")], 0),
     );
     let sent_before = rpc.sent.borrow().len();
-    assert!(overlay.tick(&rpc, ms(t0, 5_000)).is_empty());
+    assert!(overlay.tick(&rpc, ms(t0, 5_000)).mine.is_empty());
     assert_eq!(rpc.sent.borrow().len(), sent_before, "and nothing more is sent");
 
     overlay.call(&rpc, clear("/p/d"), ms(t0, 6_000));
@@ -974,7 +977,7 @@ fn collect(
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut all = Vec::new();
     loop {
-        all.extend(overlay.tick(rpc, Instant::now()));
+        all.extend(overlay.tick(rpc, Instant::now()).mine);
         if done(&all) {
             return all;
         }
@@ -1063,7 +1066,7 @@ fn round_trip_with_real_nvim() {
     overlay.call(rpc, OverlayCall::ClearAll, Instant::now());
     let cleared_by = Instant::now() + Duration::from_secs(5);
     while !overlay.active_paths().is_empty() {
-        overlay.tick(rpc, Instant::now());
+        overlay.tick(rpc, Instant::now()).mine;
         assert!(Instant::now() < cleared_by, "the clear never answered");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1222,7 +1225,7 @@ fn a_trailing_deletion_reverted_and_drawn_again_without_an_undo_stays_reverted()
     let out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"off"));
     assert_eq!(kinds(&out), vec!["revert", "off"], "{out:?}");
     std::thread::sleep(Duration::from_millis(700));
-    assert!(overlay.tick(rpc, Instant::now()).is_empty());
+    assert!(overlay.tick(rpc, Instant::now()).mine.is_empty());
     drop(nvim);
     let _ = std::fs::remove_dir_all(&dir);
 }

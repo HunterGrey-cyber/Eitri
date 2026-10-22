@@ -5,6 +5,9 @@
 //! There is no resume RPC available here, so `resume_session` returns
 //! `ProviderError::UnsupportedCapability`.
 
+/// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
+#[cfg(target_os = "linux")]
+mod moving;
 mod spawn;
 mod steer;
 mod translate;
@@ -15,6 +18,10 @@ mod watch;
 #[cfg(test)]
 mod runtime_policy_verification;
 
+#[cfg(target_os = "linux")]
+pub use moving::{ClaudeProviderHandoff, MoveRefusedWhy};
+#[cfg(target_os = "linux")]
+pub use spawn::SidecarFds;
 pub use spawn::{
     sidecar_availability, sidecar_missing_message, user_sidecar_path, SidecarAvailability, EXPECTED_VERDANDI_REVISION,
     NO_SIDECAR_HINT, SIDECAR_EXIT_GRACE,
@@ -40,7 +47,7 @@ use claude_runtime_protocol::v1::{
 };
 use hyper_util::rt::TokioIo;
 use spawn::SpawnedSidecar;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -215,7 +222,9 @@ fn startup_diagnostics_from_stderr(lines: &[String]) -> Vec<String> {
 // the same underlying HTTP/2 connection). No `Mutex` is needed to clone it from `&self`; a `Mutex`
 // here would be protecting nothing (`.clone()` never needs exclusive access).
 pub struct ClaudeSidecarProvider {
-    sidecar: SpawnedSidecar,
+    /// Behind a lock because a move hands it on (or takes it up) while the provider is shared with
+    /// its conversation's ingest thread.
+    sidecar: Mutex<SpawnedSidecar>,
     runtime: RuntimeThread,
     client: RuntimeServiceClient<Channel>,
     events: Arc<EventQueue>,
@@ -232,6 +241,199 @@ pub struct ClaudeSidecarProvider {
     /// `provider_prompts_from_handshake`, captured at `connect()`: whether `create_session` and
     /// `resume_session` ask this sidecar for the CLI's own permission prompts.
     provider_prompts: bool,
+    /// The watch task of each session opened, newest last; a move cancels the source's.
+    watches: Mutex<Vec<Watch>>,
+    /// A sidecar taken over from another process and not committed yet: the session whose watch the
+    /// commit opens, and where it goes on from. Nothing is watched, read or answered until then.
+    parked: Mutex<Option<ParkedWatch>>,
+    /// Set once this process handed the sidecar to another: it acts for the session no more.
+    released: AtomicBool,
+}
+
+/// One session's watch task.
+struct Watch {
+    session_id: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The watch a taken-over sidecar opens on its commit.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ParkedWatch {
+    session_id: String,
+    mark: WatchMark,
+}
+
+/// What one session's watch keeps between events, reconnects included.
+struct WatchState {
+    tracker: watch::SequenceTracker,
+    /// One per session, outside the reconnect loop: a reconnect must not forget which message id it
+    /// last saw, and `tracker` already drops `Duplicate` events before they reach it, so a replay after
+    /// a reconnect cannot split a message twice.
+    split: translate::MessageSplit,
+    /// Per session, like `split`: a stricter or unreported CLI permission mode is noted once, not on
+    /// every turn's `SessionReady`.
+    cli_mode_note: translate::CliModeNote,
+    /// Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new event
+    /// resets it, so the budget bounds "getting nowhere", not "reconnecting at all".
+    consecutive_failures: usize,
+}
+
+/// Where a session's watch stood just after one event: the event's sequence, and the state its
+/// translation left behind. Another process's watch of the same session goes on from it, so the
+/// first event it reads after that sequence is translated as this one would have translated it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WatchMark {
+    sequence: u64,
+    /// The message id of the last text delta translated, which decides whether the next delta opens
+    /// a new assistant message.
+    last_text: Option<String>,
+    /// Whether the session's CLI-mode line was printed.
+    cli_mode_noted: bool,
+}
+
+impl WatchState {
+    fn fresh(splits_messages: bool, requested: crate::RequestedCliMode) -> Self {
+        WatchState {
+            tracker: watch::SequenceTracker::new(),
+            split: translate::MessageSplit::new(splits_messages),
+            cli_mode_note: translate::CliModeNote::new(requested),
+            consecutive_failures: 0,
+        }
+    }
+
+    fn resumed(mark: &WatchMark, splits_messages: bool, requested: crate::RequestedCliMode) -> Self {
+        WatchState {
+            tracker: watch::SequenceTracker::after(mark.sequence),
+            split: translate::MessageSplit::resuming(splits_messages, mark.last_text.clone()),
+            cli_mode_note: translate::CliModeNote::resuming(requested, mark.cli_mode_noted),
+            consecutive_failures: 0,
+        }
+    }
+
+    /// The watch's position after the event it delivered last. Destructures the state without a rest
+    /// pattern, so a field added to it has to say whether another process's watch needs it.
+    fn mark(&self) -> WatchMark {
+        let WatchState {
+            tracker,
+            split,
+            cli_mode_note,
+            // Not carried: a watch taken up elsewhere starts with a whole reconnect budget.
+            consecutive_failures: _,
+        } = self;
+        WatchMark {
+            sequence: tracker.after_sequence(),
+            last_text: split.last_text().map(str::to_string),
+            cli_mode_noted: cli_mode_note.noted(),
+        }
+    }
+}
+
+/// What a handshake tells a provider about its sidecar.
+struct Handshaken {
+    client: RuntimeServiceClient<Channel>,
+    capabilities: ProviderCapabilities,
+    info: ProviderInfo,
+    splits_messages: bool,
+    provider_prompts: bool,
+}
+
+/// Connects to the sidecar's socket and runs the real `Handshake`, refusing a socket served by another
+/// user (and, when `expected_pid` is given, by another process than that one) and an incompatible
+/// protocol major.
+fn handshake_with(
+    runtime: &RuntimeThread,
+    sidecar: &SpawnedSidecar,
+    expected_pid: Option<u32>,
+) -> std::io::Result<Handshaken> {
+    let socket_path = sidecar.socket_path.clone();
+    let client = runtime
+        .block_on(
+            async move {
+                let channel = Endpoint::try_from("http://[::]:50051")?
+                    .connect_with_connector(service_fn(move |_: Uri| {
+                        let socket_path = socket_path.clone();
+                        async move {
+                            let stream = UnixStream::connect(socket_path).await?;
+                            let peer = stream.peer_cred()?;
+                            crate::socket_path::require_own_peer(peer.uid())?;
+                            if let Some(expected) = expected_pid {
+                                if peer.pid().map(|pid| pid as u32) != Some(expected) {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "the sidecar socket is served by another process than the one handed over",
+                                    ));
+                                }
+                            }
+                            Ok::<_, std::io::Error>(TokioIo::new(stream))
+                        }
+                    }))
+                    .await?;
+                Ok::<_, tonic::transport::Error>(RuntimeServiceClient::new(channel))
+            },
+            UNARY_RPC_TIMEOUT,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
+    let handshake = runtime
+        .block_on(
+            {
+                let mut client = client.clone();
+                async move {
+                    client
+                        .handshake(HandshakeRequest {
+                            client_protocol_major: CLIENT_PROTOCOL_MAJOR,
+                        })
+                        .await
+                }
+            },
+            UNARY_RPC_TIMEOUT,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(|status| std::io::Error::other(format!("handshake failed: {status}")))?
+        .into_inner();
+
+    // Reject an incompatible protocol major; tolerate minor differences through protobuf's
+    // unknown-field handling. A conforming peer rejects a mismatched client major during the
+    // handshake RPC, so this branch is a backstop for a peer that returns an incompatible major.
+    // That includes a response omitting the scalar field, which proto3 decodes as zero.
+    // Do not issue commands when the returned wire version is incompatible.
+    if handshake.protocol_major != CLIENT_PROTOCOL_MAJOR {
+        return Err(std::io::Error::other(format!(
+            "claude-sidecar speaks protocol major {} but this client speaks {CLIENT_PROTOCOL_MAJOR}; \
+             refusing to continue rather than issuing commands it may silently misread",
+            handshake.protocol_major
+        )));
+    }
+
+    let capabilities = capabilities_from_handshake(&handshake);
+    let splits_messages = handshake.capabilities.iter().any(|c| c == CAP_TEXT_DELTA_MESSAGE_ID);
+    let provider_prompts = provider_prompts_from_handshake(&handshake);
+    if !provider_prompts {
+        // Said once, on stderr only: an older sidecar is not a fault, but a bypass on it is
+        // narrower than the CLI's own bypassPermissions (O3), and this is the line that says why.
+        eprintln!(
+            "agent: ClaudeSidecarProvider: this sidecar does not offer {CAP_PROVIDER_PERMISSION_PROMPTS}; \
+             a call the CLI itself asks about after the gate allowed it (a write under .git/ or \
+             .claude/) is refused with nobody asked"
+        );
+    }
+    // Warnings only. The checkout DESCRIPTION is always present and travels separately as
+    // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
+    // a permanent warning indicator in the UI for every healthy session.
+    let mut diagnostics = sidecar.build_warnings.clone();
+    diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
+    let info = info_from_handshake(&handshake, Some(sidecar.build_description.clone()), diagnostics);
+    for diagnostic in &info.startup_diagnostics {
+        eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
+    }
+
+    Ok(Handshaken {
+        client,
+        capabilities,
+        info,
+        splits_messages,
+        provider_prompts,
+    })
 }
 
 impl ClaudeSidecarProvider {
@@ -239,85 +441,29 @@ impl ClaudeSidecarProvider {
     /// -- a provider that constructs successfully has already proven it can talk to a real,
     /// compatible sidecar, not just that a process happened to start.
     pub fn connect(instance_id: &str) -> std::io::Result<Self> {
-        let sidecar = spawn::spawn(instance_id)?;
+        Self::around(spawn::spawn(instance_id)?)
+    }
+
+    /// [`Self::connect`] with `program` started as the sidecar, found by no search and built by
+    /// nothing: the crate's tests start a stand-in this way.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn connect_to_program(instance_id: &str, program: &std::path::Path) -> std::io::Result<Self> {
+        Self::around(spawn::spawn_program(instance_id, program)?)
+    }
+
+    /// A provider driving `sidecar`, which this process started and holds.
+    fn around(sidecar: SpawnedSidecar) -> std::io::Result<Self> {
         let runtime = RuntimeThread::spawn();
-        let socket_path = sidecar.socket_path.clone();
-
-        let client = runtime
-            .block_on(
-                async move {
-                    let channel = Endpoint::try_from("http://[::]:50051")?
-                        .connect_with_connector(service_fn(move |_: Uri| {
-                            let socket_path = socket_path.clone();
-                            async move {
-                                let stream = UnixStream::connect(socket_path).await?;
-                                crate::socket_path::require_own_peer(stream.peer_cred()?.uid())?;
-                                Ok::<_, std::io::Error>(TokioIo::new(stream))
-                            }
-                        }))
-                        .await?;
-                    Ok::<_, tonic::transport::Error>(RuntimeServiceClient::new(channel))
-                },
-                UNARY_RPC_TIMEOUT,
-            )
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))?;
-
-        let handshake = runtime
-            .block_on(
-                {
-                    let mut client = client.clone();
-                    async move {
-                        client
-                            .handshake(HandshakeRequest {
-                                client_protocol_major: CLIENT_PROTOCOL_MAJOR,
-                            })
-                            .await
-                    }
-                },
-                UNARY_RPC_TIMEOUT,
-            )
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .map_err(|status| std::io::Error::other(format!("handshake failed: {status}")))?
-            .into_inner();
-
-        // Reject an incompatible protocol major; tolerate minor differences through protobuf's
-        // unknown-field handling. A conforming peer rejects a mismatched client major during the
-        // handshake RPC, so this branch is a backstop for a peer that returns an incompatible major.
-        // That includes a response omitting the scalar field, which proto3 decodes as zero.
-        // Do not issue commands when the returned wire version is incompatible.
-        if handshake.protocol_major != CLIENT_PROTOCOL_MAJOR {
-            return Err(std::io::Error::other(format!(
-                "claude-sidecar speaks protocol major {} but this client speaks {CLIENT_PROTOCOL_MAJOR}; \
-                 refusing to continue rather than issuing commands it may silently misread",
-                handshake.protocol_major
-            )));
-        }
-
-        let capabilities = capabilities_from_handshake(&handshake);
-        let splits_messages = handshake.capabilities.iter().any(|c| c == CAP_TEXT_DELTA_MESSAGE_ID);
-        let provider_prompts = provider_prompts_from_handshake(&handshake);
-        if !provider_prompts {
-            // Said once, on stderr only: an older sidecar is not a fault, but a bypass on it is
-            // narrower than the CLI's own bypassPermissions (O3), and this is the line that says why.
-            eprintln!(
-                "agent: ClaudeSidecarProvider: this sidecar does not offer {CAP_PROVIDER_PERMISSION_PROMPTS}; \
-                 a call the CLI itself asks about after the gate allowed it (a write under .git/ or \
-                 .claude/) is refused with nobody asked"
-            );
-        }
-        // Warnings only. The checkout DESCRIPTION is always present and travels separately as
-        // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
-        // a permanent warning indicator in the UI for every healthy session.
-        let mut diagnostics = sidecar.build_warnings.clone();
-        diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
-        let info = info_from_handshake(&handshake, Some(sidecar.build_description.clone()), diagnostics);
-        for diagnostic in &info.startup_diagnostics {
-            eprintln!("agent: ClaudeSidecarProvider: {diagnostic}");
-        }
-
+        let Handshaken {
+            client,
+            capabilities,
+            info,
+            splits_messages,
+            provider_prompts,
+        } = handshake_with(&runtime, &sidecar, None)?;
         Ok(Self {
-            sidecar,
+            sidecar: Mutex::new(sidecar),
             runtime,
             client,
             events: Arc::new(EventQueue::default()),
@@ -326,6 +472,9 @@ impl ClaudeSidecarProvider {
             info,
             splits_messages,
             provider_prompts,
+            watches: Mutex::new(Vec::new()),
+            parked: Mutex::new(None),
+            released: AtomicBool::new(false),
         })
     }
 
@@ -344,7 +493,7 @@ impl ClaudeSidecarProvider {
     /// The sidecar process's recent stderr, for diagnosing a provider that connected but is
     /// misbehaving. `info().startup_diagnostics` is the curated subset worth showing a user.
     pub fn sidecar_stderr_tail(&self) -> Vec<String> {
-        self.sidecar.stderr_tail()
+        lock(&self.sidecar).stderr_tail()
     }
 
     /// The OS pid of the sidecar process this provider spawned and owns.
@@ -354,7 +503,7 @@ impl ClaudeSidecarProvider {
     /// developer machine are themselves processes named `claude`, so a name-matched search sweeps up
     /// the session running the test. Capture this pid, check this pid.
     pub fn sidecar_pid(&self) -> u32 {
-        self.sidecar.pid()
+        lock(&self.sidecar).pid()
     }
 
     fn map_status(&self, status: tonic::Status) -> ProviderError {
@@ -380,6 +529,7 @@ impl ClaudeSidecarProvider {
     /// Both paths must open the watch stream, and forgetting it on one of them would produce a
     /// session that accepts commands and reports nothing.
     fn open_session(&self, request: ProtoCreateSessionRequest) -> Result<String, ProviderError> {
+        self.require_driving()?;
         let mut client = self.client.clone();
         let response = self.run_unary(async move { client.create_session(request).await })?;
         self.start_watching(response.session_id.clone());
@@ -388,6 +538,26 @@ impl ClaudeSidecarProvider {
 
     fn require_interactive(&self) -> Result<(), ProviderError> {
         require_interactive(&self.capabilities, &self.info)
+    }
+
+    /// Refuses a command while another process drives the session: after this one handed the sidecar
+    /// on, and while it has taken one over and not committed. Nothing is sent to the sidecar then.
+    fn require_driving(&self) -> Result<(), ProviderError> {
+        let why = if self.released.load(Ordering::SeqCst) {
+            "this chat moved to the other window"
+        } else if lock(&self.parked).is_some() {
+            "this chat is still moving to this window"
+        } else if self.events.frozen() {
+            // A message steered now would be open on this side only, and the taking side's gate would
+            // drop its delivery.
+            "this chat is moving to another window"
+        } else {
+            return Ok(());
+        };
+        Err(ProviderError::Provider {
+            code: ProviderErrorCode::ProviderUnavailable,
+            message: why.to_string(),
+        })
     }
 
     /// Watches one session's event stream for as long as the session lives, reconnecting across
@@ -399,26 +569,21 @@ impl ClaudeSidecarProvider {
     /// real sidecar killed mid-reply, that produced zero further events, a projection stuck on an
     /// active turn, and a truncated assistant message no UI had any way to flag.
     fn start_watching(&self, session_id: String) {
+        let state = WatchState::fresh(self.splits_messages, requested_cli_mode(&self.capabilities));
+        self.watch_from(session_id, state);
+    }
+
+    /// Opens `session_id`'s watch with `state`: a fresh one, or one going on from where another
+    /// process's watch of the session stood.
+    fn watch_from(&self, session_id: String, mut state: WatchState) {
         let client = self.client.clone();
         let events = Arc::clone(&self.events);
         let backpressure = Arc::clone(&self.backpressure);
-        let splits_messages = self.splits_messages;
         // The mode this session's `CreateSession` asked for, the one its CLI's reports are judged
         // against: every session this provider creates asks for the same one.
         let requested = requested_cli_mode(&self.capabilities);
-        self.runtime.handle().spawn(async move {
-            let mut tracker = watch::SequenceTracker::new();
-            // One per session, outside the reconnect loop below: a reconnect must not forget which
-            // message id it last saw, and `tracker` (just above) already drops `Duplicate` events
-            // before they reach here, so a replay after a reconnect cannot split a message twice.
-            let mut split = translate::MessageSplit::new(splits_messages);
-            // Per session, like `split`: a stricter or unreported CLI permission mode is noted once,
-            // not on every turn's `SessionReady`.
-            let mut cli_mode_note = translate::CliModeNote::new(requested);
-            // Counts only CONSECUTIVE failed attempts: a reconnect that actually delivered a new
-            // event resets it, so the budget bounds "getting nowhere", not "reconnecting at all".
-            let mut consecutive_failures = 0usize;
-
+        let watched = session_id.clone();
+        let task = self.runtime.handle().spawn(async move {
             // The single exit for every abnormal path. Nothing here may return quietly except the
             // one genuinely normal ending: a session that closed on its own terms.
             let report = |reason: String| {
@@ -434,7 +599,7 @@ impl ClaudeSidecarProvider {
                     // both are defined as unable to report a gap, which is the one thing this client
                     // must never accept silently.
                     start: ReplayStart::AfterSequence as i32,
-                    after_sequence: Some(tracker.after_sequence()),
+                    after_sequence: Some(state.tracker.after_sequence()),
                 };
                 let opened = {
                     let mut client = client.clone();
@@ -455,9 +620,9 @@ impl ClaudeSidecarProvider {
                             }
                             watch::OpenFailure::Retry(detail) => detail,
                         };
-                        match watch::WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
+                        match watch::WATCH_RECONNECT_BACKOFF.get(state.consecutive_failures) {
                             Some(delay) => {
-                                consecutive_failures += 1;
+                                state.consecutive_failures += 1;
                                 backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
                                 tokio::time::sleep(*delay).await;
                                 continue;
@@ -477,13 +642,14 @@ impl ClaudeSidecarProvider {
                         Ok(Some(event)) => {
                             let sequence = event.sequence;
                             record_delivery_lag(&backpressure, event.occurred_at);
-                            match tracker.observe(sequence) {
+                            match state.tracker.observe(sequence) {
                                 watch::SequenceVerdict::Deliver => {
                                     delivered_since_open = true;
-                                    if let Some(boundary) = split.before(&event) {
-                                        events.push(boundary);
+                                    let mut translated = Vec::new();
+                                    if let Some(boundary) = state.split.before(&event) {
+                                        translated.push(boundary);
                                     }
-                                    if let Some(line) = cli_mode_note.observe(&event) {
+                                    if let Some(line) = state.cli_mode_note.observe(&event) {
                                         eprintln!("{line}");
                                     }
                                     for domain_event in translate::translate(event, requested) {
@@ -492,8 +658,11 @@ impl ClaudeSidecarProvider {
                                         // terminal event, never inferred from the stream stopping.
                                         closed_by_session |=
                                             matches!(domain_event, AgentDomainEvent::SessionClosed { .. });
-                                        events.push(domain_event);
+                                        translated.push(domain_event);
                                     }
+                                    // Queued with the watch's position after the event, so whoever
+                                    // takes them knows where the watch stood as of the last one.
+                                    events.push_wire(translated, state.mark());
                                 }
                                 // Replay after a reconnect legitimately re-sends what was already
                                 // delivered. Dropping those is the one silent path that is correct.
@@ -525,11 +694,11 @@ impl ClaudeSidecarProvider {
                 // the replay may carry it.
                 events.stream_lost();
                 if delivered_since_open {
-                    consecutive_failures = 0;
+                    state.consecutive_failures = 0;
                 }
-                match watch::WATCH_RECONNECT_BACKOFF.get(consecutive_failures) {
+                match watch::WATCH_RECONNECT_BACKOFF.get(state.consecutive_failures) {
                     Some(delay) => {
-                        consecutive_failures += 1;
+                        state.consecutive_failures += 1;
                         backpressure.watch_reconnects.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(*delay).await;
                     }
@@ -540,7 +709,17 @@ impl ClaudeSidecarProvider {
                 }
             }
         });
+        lock(&self.watches).push(Watch {
+            session_id: watched,
+            task,
+        });
     }
+}
+
+/// Locks `mutex`, going on past a panic elsewhere: every value kept behind these locks stays whole
+/// between statements.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// What a stalled consumer is actually costing, as opposed to whether it is losing anything.
@@ -962,6 +1141,7 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError> {
+        self.require_driving()?;
         let mut client = self.client.clone();
         let proto_request = ProtoSendTurnRequest {
             session_id: request.session_id,
@@ -989,6 +1169,7 @@ impl AgentProvider for ClaudeSidecarProvider {
         if !self.capabilities.steer {
             return Err(ProviderError::UnsupportedCapability("steer"));
         }
+        self.require_driving()?;
         let SteerTurnRequest {
             session_id,
             expected_turn_id,
@@ -1004,16 +1185,20 @@ impl AgentProvider for ClaudeSidecarProvider {
             text,
         };
         if let Some(now) = self.events.open_steer(&client_message_id, as_typed, proto_request)? {
+            // Counted before this returns, so a move asked for right after it sees the send in flight.
+            let steering = Steering::begin(&self.events);
             self.runtime.handle().spawn(send_steers(
                 self.client.clone(),
                 Arc::clone(&self.events),
                 (client_message_id, now),
+                steering,
             ));
         }
         Ok(())
     }
 
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError> {
+        self.require_driving()?;
         let mut client = self.client.clone();
         let proto_request = ProtoInterruptTurnRequest {
             session_id: request.session_id,
@@ -1024,6 +1209,7 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
+        self.require_driving()?;
         let mut client = self.client.clone();
         let proto_request = resolve_request_for(&self.capabilities, request)?;
         self.run_unary(async move { client.resolve_permission(proto_request).await })?;
@@ -1031,6 +1217,7 @@ impl AgentProvider for ClaudeSidecarProvider {
     }
 
     fn close_session(&self, request: CloseSessionRequest) -> Result<(), ProviderError> {
+        self.require_driving()?;
         let mut client = self.client.clone();
         let proto_request = ProtoCloseSessionRequest {
             session_id: request.session_id,
@@ -1042,6 +1229,13 @@ impl AgentProvider for ClaudeSidecarProvider {
 
     fn pump(&self) -> Vec<AgentDomainEvent> {
         self.events.take()
+    }
+
+    /// The sequence of the last wire event whose translation the latest `pump` handed over in full.
+    /// A turn's end held back for a steer's follow-up, and what follows it, are not counted until
+    /// they are handed over.
+    fn pumped_through(&self) -> Option<u64> {
+        self.events.taken_through()
     }
 
     fn event_signal(&self) -> Option<Arc<crate::provider::EventSignal>> {
@@ -1056,6 +1250,12 @@ impl AgentProvider for ClaudeSidecarProvider {
 /// Every event passes the steer gate (`steer::SteerGate`) on its way in, under the same lock as the
 /// ready list, so a turn's end held for its follow-up and the follow-up's start become ready in one
 /// step and one `pump()` returns both.
+/// How far the watch may have read past the last event folded for a move to go ahead. The sidecar's
+/// replay ring keeps the newest 1000 events of a session (see `watch.rs`), and the taking side
+/// replays from the fold; half of it leaves room for what arrives between the freeze and the commit.
+#[cfg(target_os = "linux")]
+const MOVE_UNFOLDED_LIMIT: u64 = 500;
+
 struct EventQueue {
     state: Mutex<QueueState>,
     signal: Arc<crate::provider::EventSignal>,
@@ -1068,6 +1268,38 @@ struct EventQueue {
 struct QueueState {
     ready: Vec<AgentDomainEvent>,
     gate: steer::SteerGate<ProtoSteerTurnRequest>,
+    /// The watch's position after the last wire event queued.
+    latest: Option<WatchMark>,
+    /// The position after the last wire event whose translation is all in `ready` (or was taken):
+    /// `latest`, except while the gate holds a turn's end and what follows it.
+    ready_through: Option<WatchMark>,
+    /// `ready_through` as of the latest `take`: where the watch stood after the last event the
+    /// conversation folded. A move hands this on, not `latest`, since the watch reads ahead of the fold.
+    taken: Option<WatchMark>,
+    /// The steer gate as of the latest `take`, which is what a taking side's gate must start from: the
+    /// events after `taken` are replayed through it there. `Some` when the gate could not be handed
+    /// over then (a message open, a turn's end held).
+    busy_at_take: Option<steer::SteerBusy>,
+    /// The gate's given-up messages as of the latest `take`; meaningful only while `busy_at_take` is
+    /// `None`. A delivery read after the take for one of them removes it from the live gate, and the
+    /// replay over there needs it still there.
+    given_up_at_take: Vec<(String, String)>,
+    /// A message was handed to the gate after the latest `take`. Its delivery or refusal may already
+    /// have passed the gate here, unfolded, and a taking side's gate would have no record of it.
+    opened_since_take: bool,
+    /// Frozen for a move: `take` hands over nothing, so the position taken stays where it is.
+    frozen: bool,
+    /// `send_steers` tasks running.
+    steering: usize,
+}
+
+impl QueueState {
+    /// Brings `ready_through` up to the latest event once nothing is held back.
+    fn settle(&mut self) {
+        if !self.gate.holding() {
+            self.ready_through = self.latest.clone();
+        }
+    }
 }
 
 impl Default for EventQueue {
@@ -1098,18 +1330,104 @@ impl EventQueue {
         self.signal.raise();
     }
 
-    /// One event off this session's stream. Runs on the provider's runtime, the only place the
-    /// stream is read: a hold it begins arms a timer task there, which sleeps rather than blocks.
+    /// One event this provider makes itself (a lost stream), with no position on the wire. Runs on
+    /// the provider's runtime, like `push_wire`.
     fn push(self: &Arc<Self>, event: AgentDomainEvent) {
         let hold_started = {
             let mut state = self.lock();
             let passed = state.gate.pass(event);
             self.deliver(&mut state, passed.ready);
+            state.settle();
             passed.hold_started
         };
         if let Some(generation) = hold_started {
             self.arm_hold(generation);
         }
+    }
+
+    /// The translation of one wire event, in order, and the watch's position after it, together
+    /// under one lock. Runs on the provider's runtime, the only place the stream is read: a hold it
+    /// begins arms a timer task there, which sleeps rather than blocks.
+    fn push_wire(self: &Arc<Self>, events: Vec<AgentDomainEvent>, mark: WatchMark) {
+        let mut holds = Vec::new();
+        {
+            let mut state = self.lock();
+            for event in events {
+                let passed = state.gate.pass(event);
+                self.deliver(&mut state, passed.ready);
+                holds.extend(passed.hold_started);
+            }
+            state.latest = Some(mark);
+            state.settle();
+        }
+        for generation in holds {
+            self.arm_hold(generation);
+        }
+    }
+
+    /// The queue of a session taken over from another process: its watch stood at `mark`, everything
+    /// up to it was folded there, and `given_up` are the messages that process had reported dropped.
+    #[cfg(target_os = "linux")]
+    fn taking_over(mark: WatchMark, given_up: Vec<(String, String)>) -> Self {
+        let queue = Self::default();
+        {
+            let mut state = queue.lock();
+            state.gate = steer::SteerGate::taken_over(given_up);
+            state.given_up_at_take = state.gate.hand_over().unwrap_or_default();
+            state.latest = Some(mark.clone());
+            state.ready_through = Some(mark.clone());
+            state.taken = Some(mark);
+        }
+        queue
+    }
+
+    /// Stops handing events over, for a move, and returns where the watch stood after the last event
+    /// taken, with the steer gate as it stood at that take: the taking side replays the events after
+    /// that position through it. Refused, nothing changed, while a message is being steered into the
+    /// turn, when one was open at the last take or was handed in since (its delivery or refusal may
+    /// have passed the gate here unfolded), and when the watch has read so far past the fold that
+    /// the sidecar's replay ring may no longer reach back to it.
+    #[cfg(target_os = "linux")]
+    fn freeze(&self) -> Result<(WatchMark, Vec<(String, String)>), MoveRefusedWhy> {
+        let busy = |busy| match busy {
+            steer::SteerBusy::Open => MoveRefusedWhy::SteerOpen,
+            steer::SteerBusy::HoldingTurnEnd => MoveRefusedWhy::HoldingTurnEnd,
+        };
+        let mut state = self.lock();
+        state.gate.hand_over().map_err(busy)?;
+        if state.steering > 0 {
+            return Err(MoveRefusedWhy::SteerInFlight);
+        }
+        if let Some(at_take) = state.busy_at_take {
+            return Err(busy(at_take));
+        }
+        if state.opened_since_take {
+            return Err(MoveRefusedWhy::SteerOpen);
+        }
+        let taken = state.taken.clone().unwrap_or_default();
+        let read = state.latest.as_ref().map_or(0, |mark| mark.sequence);
+        if read.saturating_sub(taken.sequence) > MOVE_UNFOLDED_LIMIT {
+            return Err(MoveRefusedWhy::FoldBehind);
+        }
+        state.frozen = true;
+        Ok((taken, state.given_up_at_take.clone()))
+    }
+
+    /// Hands events over again after a freeze whose move did not happen; what came meanwhile is there.
+    #[cfg(target_os = "linux")]
+    fn thaw(&self) {
+        self.lock().frozen = false;
+        self.signal.raise();
+    }
+
+    /// Hands nothing over any more: the session is driven from another process now.
+    #[cfg(target_os = "linux")]
+    fn close_for_good(&self) {
+        self.lock().frozen = true;
+    }
+
+    fn taken_through(&self) -> Option<u64> {
+        self.lock().taken.as_ref().map(|mark| mark.sequence)
     }
 
     /// The watch stream broke. A hold in force stops counting its wait: what it waits for may be in the
@@ -1141,6 +1459,7 @@ impl EventQueue {
         let mut state = self.lock();
         let out = state.gate.expire(generation);
         self.deliver(&mut state, out);
+        state.settle();
     }
 
     fn open_steer(
@@ -1149,7 +1468,10 @@ impl EventQueue {
         as_typed: String,
         request: ProtoSteerTurnRequest,
     ) -> Result<Option<ProtoSteerTurnRequest>, ProviderError> {
-        self.lock().gate.open(client_id, as_typed, request)
+        let mut state = self.lock();
+        let opened = state.gate.open(client_id, as_typed, request)?;
+        state.opened_since_take = true;
+        Ok(opened)
     }
 
     /// Records an accepted message; the next one to send, if one waits.
@@ -1161,16 +1483,41 @@ impl EventQueue {
         let mut state = self.lock();
         let out = state.gate.refused(client_id, reason);
         self.deliver(&mut state, out);
+        state.settle();
     }
 
     fn steer_unknown(&self, client_id: &str) {
         let mut state = self.lock();
         let out = state.gate.unknown(client_id);
         self.deliver(&mut state, out);
+        state.settle();
     }
 
     fn take(&self) -> Vec<AgentDomainEvent> {
-        std::mem::take(&mut self.lock().ready)
+        let mut state = self.lock();
+        if state.frozen {
+            return Vec::new();
+        }
+        state.taken = state.ready_through.clone();
+        // Every gate transition so far is reflected in what this take hands over (a hold keeps
+        // `ready_through` back, and then the gate is busy), so the gate now is the gate as of `taken`.
+        match state.gate.hand_over() {
+            Ok(given_up) => {
+                state.busy_at_take = None;
+                state.given_up_at_take = given_up;
+            }
+            Err(busy) => {
+                state.busy_at_take = Some(busy);
+                state.given_up_at_take.clear();
+            }
+        }
+        state.opened_since_take = false;
+        std::mem::take(&mut state.ready)
+    }
+
+    /// Frozen for a move, or for good once handed on.
+    fn frozen(&self) -> bool {
+        self.lock().frozen
     }
 
     /// Everything received and not yet taken, held events included.
@@ -1187,10 +1534,28 @@ impl EventQueue {
 /// text, and a turn that ends meanwhile is held for its follow-up. An answer that does not come in time,
 /// or a transport failure after the request may have gone, leaves the message open for its outcome:
 /// the CLI may have it, and reporting it dropped would have the host send it again.
+/// One `send_steers` task counted as running, from before it is spawned until it ends or is dropped.
+struct Steering(Arc<EventQueue>);
+
+impl Steering {
+    fn begin(events: &Arc<EventQueue>) -> Self {
+        events.lock().steering += 1;
+        Steering(Arc::clone(events))
+    }
+}
+
+impl Drop for Steering {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.steering = state.steering.saturating_sub(1);
+    }
+}
+
 async fn send_steers(
     client: RuntimeServiceClient<Channel>,
     events: Arc<EventQueue>,
     first: (String, ProtoSteerTurnRequest),
+    _steering: Steering,
 ) {
     let mut next = Some(first);
     while let Some((id, request)) = next.take() {
@@ -2260,5 +2625,273 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "permission_mode_changed");
         assert_eq!(json["mode"], "bypass");
+    }
+
+    fn mark(sequence: u64, last_text: &str) -> WatchMark {
+        WatchMark {
+            sequence,
+            last_text: Some(last_text.to_string()),
+            cli_mode_noted: false,
+        }
+    }
+
+    fn text(words: &str) -> AgentDomainEvent {
+        AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: crate::ContentKind::Text,
+            text: words.into(),
+        }
+    }
+
+    /// The watch reads ahead of the fold, so what a move hands on is where the watch stood after the
+    /// last event a pump took, not after the last one it read.
+    #[test]
+    fn a_pump_records_the_position_of_the_last_event_it_took_not_of_one_read_ahead() {
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        assert_eq!(queue.taken_through(), None, "nothing taken yet");
+        assert_eq!(queue.take(), [text("one")]);
+        assert_eq!(queue.taken_through(), Some(3));
+        let boundary = AgentDomainEvent::AssistantMessageBoundary { turn_id: "t1".into() };
+        queue.push_wire(vec![boundary.clone(), text("two")], mark(4, "m2"));
+        assert_eq!(queue.taken_through(), Some(3), "read, not taken");
+        // An event that translates to nothing still moves the position once it is taken.
+        queue.push_wire(Vec::new(), mark(5, "m2"));
+        assert_eq!(queue.take(), [boundary, text("two")]);
+        assert_eq!(queue.taken_through(), Some(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_frozen_queue_hands_nothing_over_and_a_thawed_one_hands_over_what_came_meanwhile() {
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        queue.take();
+        queue.push_wire(vec![text("two")], mark(4, "m2"));
+        let (at, given_up) = queue.freeze().unwrap();
+        assert_eq!(at, mark(3, "m1"));
+        assert!(given_up.is_empty());
+        assert!(queue.take().is_empty(), "frozen");
+        assert_eq!(queue.taken_through(), Some(3));
+        queue.thaw();
+        assert_eq!(queue.take(), [text("two")]);
+        assert_eq!(queue.taken_through(), Some(4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_turn_end_is_not_taken_and_refuses_a_freeze_until_it_is_released() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        queue.take();
+        queue
+            .open_steer("s1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::SteerOpen)));
+        queue.steer_accepted("s1");
+        runtime.block_on(async {
+            queue.push_wire(vec![turn_completed("t1")], mark(4, "m1"));
+        });
+        assert!(queue.take().is_empty(), "held");
+        assert_eq!(queue.taken_through(), Some(3), "a held end is not counted as taken");
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::HoldingTurnEnd)));
+        runtime.block_on(async {
+            queue.push_wire(
+                vec![
+                    AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                    AgentDomainEvent::UserMessageDelivered {
+                        client_message_id: "s1".into(),
+                        turn_id: "t2".into(),
+                        text: String::new(),
+                    },
+                ],
+                mark(6, "m1"),
+            );
+        });
+        assert_eq!(queue.take().len(), 3);
+        assert_eq!(queue.taken_through(), Some(6));
+        assert_eq!(queue.freeze().unwrap().0, mark(6, "m1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_send_in_flight_refuses_a_freeze_until_its_task_ends() {
+        let queue = Arc::new(EventQueue::default());
+        let steering = Steering::begin(&queue);
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::SteerInFlight)));
+        drop(steering);
+        assert!(queue.freeze().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn delivered(client_message_id: &str, turn_id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::UserMessageDelivered {
+            client_message_id: client_message_id.into(),
+            turn_id: turn_id.into(),
+            text: String::new(),
+        }
+    }
+
+    /// The taking side replays everything after the last take through a gate built as the gate stood
+    /// at that take. One that had the message open there would hand over a gate with no record of it,
+    /// and the replayed delivery would be dropped there, even though the live gate here is clean.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_message_open_at_the_last_take_refuses_a_freeze_after_its_delivery_was_read_unfolded() {
+        let runtime = current_thread_runtime();
+        let queue = Arc::new(EventQueue::default());
+        queue
+            .open_steer("s1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("s1");
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        queue.take();
+        runtime.block_on(async {
+            queue.push_wire(vec![turn_completed("t1")], mark(4, "m1"));
+            queue.push_wire(
+                vec![
+                    AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                    delivered("s1", "t2"),
+                ],
+                mark(6, "m1"),
+            );
+        });
+        assert!(
+            matches!(queue.freeze(), Err(MoveRefusedWhy::SteerOpen)),
+            "the delivery passed the gate here and is not folded"
+        );
+        assert_eq!(queue.take().len(), 3);
+        assert_eq!(queue.freeze().unwrap(), (mark(6, "m1"), Vec::new()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_message_handed_in_after_the_last_take_refuses_a_freeze_until_a_take_follows() {
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        queue.take();
+        queue
+            .open_steer("s1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("s1");
+        queue.push_wire(vec![delivered("s1", "t1")], mark(4, "m1"));
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::SteerOpen)));
+        let taken = queue.take();
+        assert!(
+            matches!(&taken[..], [AgentDomainEvent::UserMessageDelivered { text, .. }] if text == "typed"),
+            "{taken:?}"
+        );
+        assert_eq!(queue.freeze().unwrap(), (mark(4, "m1"), Vec::new()));
+    }
+
+    /// A refusal is made here and never on the wire: a taking side would not see it at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refusal_after_the_last_take_refuses_a_freeze_until_it_is_taken() {
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        queue.take();
+        queue
+            .open_steer("s1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_refused("s1", "no");
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::SteerOpen)));
+        let taken = queue.take();
+        assert!(
+            matches!(&taken[..], [AgentDomainEvent::UserMessageDropped { client_message_id, .. }] if client_message_id == "s1"),
+            "{taken:?}"
+        );
+        assert_eq!(queue.freeze().unwrap(), (mark(3, "m1"), Vec::new()));
+    }
+
+    /// A delivery read after the last take for a message given up removes it from the live gate; the
+    /// taking side replays that delivery and needs the message still on its list.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_freeze_hands_over_the_messages_given_up_as_of_the_last_take() {
+        let runtime = current_thread_runtime();
+        let queue = Arc::new(EventQueue::default());
+        queue
+            .open_steer("s1", "typed".into(), ProtoSteerTurnRequest::default())
+            .unwrap();
+        queue.steer_accepted("s1");
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        runtime.block_on(async {
+            queue.push_wire(vec![turn_completed("t1")], mark(4, "m1"));
+        });
+        // The first hold: its wait runs out without a follow-up.
+        queue.expire_hold(1);
+        assert_eq!(queue.take().len(), 3, "text, the drop, the released end");
+        queue.push_wire(
+            vec![
+                AgentDomainEvent::TurnStarted { turn_id: "t2".into() },
+                delivered("s1", "t2"),
+            ],
+            mark(6, "m1"),
+        );
+        let (at, given_up) = queue.freeze().unwrap();
+        assert_eq!(at, mark(4, "m1"));
+        assert_eq!(given_up, [("s1".to_string(), "typed".to_string())]);
+    }
+
+    /// The taking side replays from the fold, out of a ring that keeps only the newest events.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_freeze_is_refused_while_the_watch_has_read_far_past_the_fold() {
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(1, "m1"));
+        queue.take();
+        queue.push_wire(Vec::new(), mark(1 + MOVE_UNFOLDED_LIMIT, "m1"));
+        assert!(queue.freeze().is_ok(), "within the limit");
+        queue.thaw();
+        queue.push_wire(Vec::new(), mark(2 + MOVE_UNFOLDED_LIMIT, "m1"));
+        assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::FoldBehind)));
+        queue.take();
+        assert_eq!(queue.freeze().unwrap().0, mark(2 + MOVE_UNFOLDED_LIMIT, "m1"));
+    }
+
+    /// A watch taken up elsewhere translates the next event as this one would have: the same split
+    /// and the same note, from the sequence after the mark.
+    #[test]
+    fn a_watch_resumed_from_a_mark_goes_on_as_the_one_that_made_it() {
+        let requested = crate::RequestedCliMode::Default;
+        let mut state = WatchState::fresh(true, requested);
+        assert_eq!(state.mark(), WatchMark::default());
+        state.tracker.observe(1);
+        state.tracker.observe(2);
+        let delta = |id: &str| claude_runtime_protocol::v1::SessionEvent {
+            sequence: 2,
+            event: Some(claude_runtime_protocol::v1::session_event::Event::TextDelta(
+                claude_runtime_protocol::v1::TextDelta {
+                    turn_id: "t1".into(),
+                    text: "x".into(),
+                    message_id: Some(id.into()),
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(state.split.before(&delta("m1")).is_none());
+        let at = state.mark();
+        assert_eq!(at, mark(2, "m1"));
+
+        let mut resumed = WatchState::resumed(&at, true, requested);
+        assert_eq!(resumed.mark(), at);
+        assert!(matches!(resumed.tracker.observe(3), watch::SequenceVerdict::Deliver));
+        assert!(
+            resumed.split.before(&delta("m2")).is_some(),
+            "a different message after the mark opens a message of its own"
+        );
     }
 }

@@ -393,19 +393,20 @@ mod tests {
         );
     }
 
-    /// The connector of `ClaudeSidecarProvider::connect` checks who serves the socket before any byte
+    /// The connector every `ClaudeSidecarProvider` connects through (`handshake_with`: a sidecar it
+    /// started, or one taken over from another window) checks who serves the socket before any byte
     /// goes over it. The check cannot be exercised against another uid without root, so this reads the
-    /// production source: `require_own_peer` must be called in `connect`, after the `UnixStream::connect`
-    /// and before the stream is handed to the channel.
+    /// production source: `require_own_peer` must be called there, after the `UnixStream::connect` and
+    /// before the stream is handed to the channel.
     #[test]
     fn the_sidecar_connector_checks_the_peer_before_using_the_stream() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join("src/providers/claude_sidecar/mod.rs")).unwrap();
         let start = text
-            .find("pub fn connect(instance_id: &str)")
-            .expect("anchor: ClaudeSidecarProvider::connect");
+            .find("fn handshake_with(")
+            .expect("anchor: the sidecar provider's connector");
         let body = &text[start..];
-        let end = body.find("\n    }\n").expect("the end of connect");
+        let end = body.find("\n}\n").expect("the end of handshake_with");
         let body = &body[..end];
         let code: String = body
             .lines()

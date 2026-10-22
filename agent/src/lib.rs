@@ -35,6 +35,8 @@ mod wire;
 mod wire_guard;
 
 pub mod account;
+#[cfg(target_os = "linux")]
+pub mod child;
 pub mod external;
 pub mod external_writer;
 pub mod handoff;
@@ -44,12 +46,14 @@ pub mod hook_protocol;
 pub mod ingestion;
 pub mod jsonrpc_link;
 pub mod lease;
+mod move_seed;
 pub mod permission_policy;
 pub mod permission_rules;
 pub mod persistence;
 pub mod private_fs;
 #[doc(hidden)]
 pub mod process_probe;
+pub mod provider_move;
 pub mod providers;
 pub mod setting_sources;
 #[cfg(feature = "legacy-backend")]
@@ -65,6 +69,9 @@ pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationE
 pub use event::{AgentEvent, PermissionSource};
 pub use external::{DirTrust, ExternalProvider, ExternalStart, Reviewer, TrustPlan, TurnPolicy};
 pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UiWake, UI_EVENT_QUEUE_CAPACITY};
+pub use move_seed::{
+    ChatMoveCore, ConversationHandoff, HandoffRefused, MoveSeed, MovedProvider, PendingName, SeedRefused,
+};
 pub use permission_policy::{
     classify_in_manual, classify_permission_request, classify_with_rules, rule_that_allows, Classification,
     PermissionVerdict,
@@ -77,6 +84,7 @@ pub use process::{
     classify_cli_mode, classify_reported_cli_mode, disallowed_tools, CliModeReport, PermissionMode, RequestedCliMode,
     CONSERVATIVE_DISALLOWED_TOOLS,
 };
+pub use provider_move::MoveRefusedWhy;
 #[cfg(feature = "legacy-backend")]
 pub use session::AgentSession;
 #[cfg(not(feature = "legacy-backend"))]

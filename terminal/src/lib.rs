@@ -17,6 +17,7 @@ mod outbox;
 pub mod paint;
 pub mod preedit;
 pub mod pty;
+pub mod replay;
 pub mod screen;
 pub mod scroll;
 pub mod select;
@@ -29,10 +30,13 @@ pub use outbox::REPLY_CAP;
 pub use paint::{indicator_ops, paint, paint_ops};
 pub use preedit::{layout_preedit, PreeditLayout};
 pub use pty::{child_environment, PtyChild, PtySize, SpawnSpec};
-pub use screen::{CursorCell, Screen, TerminalColors};
+pub use screen::{CursorCell, Screen, SelectionRecord, TerminalColors, ViewState};
 pub use scroll::{ScrollRequest, ScrollView};
 pub use select::{SelectCommand, SelectKind};
-pub use session::{ExitInfo, SessionCommand, SessionConfig, TerminalSession, Update};
+pub use session::{
+    DetachRefused, Detached, ExitInfo, SessionCommand, SessionConfig, Tail, TerminalSession, Update, BOUNDARY_WAIT,
+    RAW_TAIL_MAX,
+};
 
 /// The guard that this crate's manifest never grows a GTK/WebKit dependency.
 #[cfg(test)]

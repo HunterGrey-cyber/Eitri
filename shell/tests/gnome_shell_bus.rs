@@ -57,6 +57,9 @@ const INTERFACE_XML: &str = r#"
   </interface>
 </node>"#;
 
+/// What version 2 of the extension adds to the interface above.
+const VERSION_2_METHODS: &str = r#"<method name="MoveOwnToMonitor"><arg type="s" direction="in" name="connector"/><arg type="b" direction="out" name="moved"/></method>"#;
+
 const BUS_CONFIG: &str = r#"<busconfig>
   <type>session</type>
   <listen>unix:path=SOCKET</listen>
@@ -203,6 +206,16 @@ impl FakeExtension {
     /// As [`start`](Self::start); `as_the_shell` says whether its connection also owns
     /// `org.gnome.Shell`, as the real extension's (gnome-shell's own) does.
     fn start_with(address: &str, as_the_shell: bool) -> FakeExtension {
+        Self::start_version(address, as_the_shell, 1)
+    }
+
+    /// As [`start_with`](Self::start_with), exporting the interface of extension `version` (1 or 2).
+    fn start_version(address: &str, as_the_shell: bool, version: u32) -> FakeExtension {
+        let xml = if version >= 2 {
+            INTERFACE_XML.replace("</interface>", &format!("{VERSION_2_METHODS}</interface>"))
+        } else {
+            INTERFACE_XML.to_string()
+        };
         let calls: Arc<Mutex<Vec<Call>>> = Arc::default();
         let stalled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -218,7 +231,7 @@ impl FakeExtension {
                         gio::Cancellable::NONE,
                     )
                     .expect("the fake connects to the private bus");
-                    let info = DBusNodeInfo::for_xml(INTERFACE_XML).unwrap();
+                    let info = DBusNodeInfo::for_xml(&xml).unwrap();
                     let interface = info.lookup_interface(gnome_shell::INTERFACE).unwrap();
                     connection
                         .register_object(gnome_shell::OBJECT_PATH, &interface)
@@ -228,7 +241,9 @@ impl FakeExtension {
                                 args: format!("{} {}", params.type_(), params),
                             });
                             let answer = match method {
-                                "Version" => (1u32,).to_variant(),
+                                "Version" => (version,).to_variant(),
+                                // Only "DP-2" is a monitor here.
+                                "MoveOwnToMonitor" => (params.child_value(0).str() == Some("DP-2"),).to_variant(),
                                 // Only "left" has something beside the panel, to see both answers.
                                 "FocusDirection" | "FocusSelfIfNeighbour" => {
                                     (params.child_value(0).str() == Some("left"),).to_variant()
@@ -400,6 +415,60 @@ fn each_method_reaches_the_service_by_name_with_the_documented_argument_types() 
     assert_eq!(seen("ActivateOwn"), vec!["() ()"]);
     assert_eq!(seen("ActivatePartner"), vec!["() ()"]);
     assert_eq!(calls.len(), 7, "{calls:?}");
+}
+
+fn move_own_to_monitor_sends_the_connector_and_an_older_extension_reads_as_not_available() {
+    let Some(bus) = PrivateBus::start("monitor") else {
+        return;
+    };
+    let service = FakeExtension::start_version(&bus.address, true, 2);
+    let calls = on_own_context(async {
+        let shell = caller(&bus.address);
+        let (there, done) = answer();
+        shell.move_own_to_monitor("DP-2", done);
+        // The second call waits for the first answer: two calls in flight reach the service in either order.
+        until("the first move", 5000, || there.borrow().is_some()).await;
+        let (elsewhere, done_elsewhere) = answer();
+        shell.move_own_to_monitor("HDMI-A-9", done_elsewhere);
+        until("the second move", 5000, || elsewhere.borrow().is_some()).await;
+        assert_eq!(*there.borrow(), Some(Some(true)));
+        // A connector no monitor has is the extension's `false`, an answer and not a failure.
+        assert_eq!(*elsewhere.borrow(), Some(Some(false)));
+        service.calls()
+    });
+    let moves: Vec<String> = calls
+        .iter()
+        .filter(|c| c.method == "MoveOwnToMonitor")
+        .map(|c| c.args.clone())
+        .collect();
+    assert_eq!(moves, vec!["(s) ('DP-2',)", "(s) ('HDMI-A-9',)"]);
+    drop(service);
+
+    let Some(bus) = PrivateBus::start("monitor-v1") else {
+        return;
+    };
+    let older = FakeExtension::start(&bus.address);
+    on_own_context(async {
+        let shell = caller(&bus.address);
+        let (slot, done) = answer();
+        shell.move_own_to_monitor("DP-2", done);
+        until("the move", 5000, || slot.borrow().is_some()).await;
+        assert_eq!(
+            *slot.borrow(),
+            Some(None),
+            "an extension without the method cannot move the window"
+        );
+        // Still there: an older extension is not a missing one, and its other methods still work.
+        until("the owner check", 5000, || shell.present() == Some(true)).await;
+        let (own, done_own) = answer();
+        shell.activate_own(done_own);
+        until("activate_own", 5000, || own.borrow().is_some()).await;
+        assert_eq!(*own.borrow(), Some(Some(true)));
+    });
+    assert!(
+        older.calls().iter().all(|c| c.method != "MoveOwnToMonitor"),
+        "the bus refuses a method the object does not export before the service sees it"
+    );
 }
 
 fn a_bus_with_no_owner_of_the_name_marks_the_extension_absent_and_fails_the_call() {
@@ -630,10 +699,14 @@ fn main() {
         return;
     }
     let server = own_x_server::isolate("gnome_shell_bus", "640x480x24");
-    let tests: [(&str, fn()); 7] = [
+    let tests: [(&str, fn()); 8] = [
         (
             "each_method_reaches_the_service_by_name_with_the_documented_argument_types",
             each_method_reaches_the_service_by_name_with_the_documented_argument_types,
+        ),
+        (
+            "move_own_to_monitor_sends_the_connector_and_an_older_extension_reads_as_not_available",
+            move_own_to_monitor_sends_the_connector_and_an_older_extension_reads_as_not_available,
         ),
         (
             "a_bus_with_no_owner_of_the_name_marks_the_extension_absent_and_fails_the_call",

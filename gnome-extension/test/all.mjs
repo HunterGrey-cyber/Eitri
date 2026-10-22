@@ -3,6 +3,7 @@
 import './direction.test.mjs';
 import './heldfocus.test.mjs';
 import './modal.test.mjs';
+import './monitor.test.mjs';
 import './policy.test.mjs';
 import './pull.test.mjs';
 import './testing-gate.test.mjs';

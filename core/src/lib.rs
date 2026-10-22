@@ -46,6 +46,7 @@ pub mod theme;
 pub mod transcript_titles;
 pub mod turn_review;
 pub mod turn_trace;
+pub mod window_link;
 pub mod wm;
 
 /// Test doubles shared across this crate's tests, and with `shell`'s through the `test-support`

@@ -85,7 +85,15 @@ pub(crate) struct SequenceTracker {
 
 impl SequenceTracker {
     pub(crate) fn new() -> Self {
-        Self { last_delivered: 0 }
+        Self::after(0)
+    }
+
+    /// A tracker that goes on from `sequence`, the last event another watch of the same session
+    /// delivered and its holder folded: the first event expected is the one after it.
+    pub(crate) fn after(sequence: u64) -> Self {
+        Self {
+            last_delivered: sequence,
+        }
     }
 
     /// The cursor to ask for, on a first open and on every reconnect alike.

@@ -28,10 +28,22 @@
 //! still hung up and killed at shutdown. A panic on this thread is contained: the child is hung up
 //! and reaped (`PtyChild`'s `Drop`), and the host is told the session ended, so Enter restarts
 //! rather than the pane going dead.
+//!
+//! **A terminal can move to another process** with its child, its screen and what it still owes
+//! the child. [`SessionCommand::Detach`] stops this thread at a point where nothing is half done --
+//! no synchronized update open, the parser between sequences where it can be, output not yet
+//! parsed set aside -- and hands over a duplicate of the PTY's controller side, a replay of the
+//! screen, and the unwritten input and answers. From then on this thread reads, writes and renders
+//! nothing until it hears how the move ended: [`SessionCommand::Committed`] (the other process has
+//! the terminal: forget the child, without a hangup) or [`SessionCommand::Resume`] (it does not:
+//! build a fresh screen from the same record, as the other process would have, write what was
+//! owed, read again). The other side is [`TerminalSession::adopt`], which reads and writes nothing
+//! before [`TerminalSession::commit`]: a process that dies before its commit leaves the PTY exactly
+//! as the source left it.
 
 use std::any::Any;
 use std::io::{self, PipeReader, PipeWriter, Read, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitStatus;
@@ -50,7 +62,8 @@ use crate::listener::HostEvents;
 use crate::mouse::{self, MouseModes};
 use crate::outbox::Outbox;
 use crate::pty::{set_nonblocking, PtyChild, PtySize, SpawnSpec, HANGUP_GRACE};
-use crate::screen::{CursorCell, Screen, TerminalColors};
+use crate::replay::screen_replay::{ReplayRefused, ScreenReplay};
+use crate::screen::{CursorCell, Screen, TerminalColors, ViewState};
 use crate::scroll::ScrollRequest;
 use crate::select::SelectCommand;
 
@@ -70,9 +83,65 @@ const EXIT_AFTER_EOF: Duration = Duration::from_millis(200);
 /// How often a child that left the terminal is checked for its own exit, so it is reaped. Only in
 /// that state: an ordinary session has no timer at all.
 const DETACHED_REAP_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a move waits, reading on, for a sequence cut by the last read to finish: a program
+/// writes a sequence in one write almost always, so its rest is either already in the kernel or
+/// about to be.
+pub const BOUNDARY_WAIT: Duration = Duration::from_millis(50);
+/// The most bytes of an unfinished sequence a move carries; past it (a long OSC or DCS being
+/// streamed) the move is refused and the terminal stays.
+pub const RAW_TAIL_MAX: usize = 64 * 1024;
+/// How many times a move lets a synchronized update close when the wait for a boundary opened
+/// one (a read cut `ESC[?2026h` before its `h`). Each round waits at most [`SYNC_UPDATE_TIMEOUT`]
+/// plus the boundary wait; a program cut that way round after round moves with its update open.
+const SETTLE_ROUNDS: usize = 3;
+/// How long an adopted session whose child has exited waits for the spawner's report of how it
+/// ended ([`SessionCommand::ChildExited`]): only the spawner can wait for the child, and its report
+/// crosses to this process after the exit this session saw. Past it, the end is shown as unknown.
+pub const EXIT_REPORT_WAIT: Duration = Duration::from_secs(2);
+
+/// A terminal read for a move: the PTY's controller side (a duplicate; the source keeps its own
+/// until the move is decided), the child, the screen, and what the source owed the child.
+#[derive(Debug)]
+pub struct Detached {
+    pub master: OwnedFd,
+    pub pid: u32,
+    /// The child's start time (`/proc/<pid>/stat` field 22), so the receiver can check that the
+    /// pid still names the same process before it trusts it.
+    pub start: u64,
+    pub replay: ScreenReplay,
+    pub tail: Tail,
+    /// Input and answers not yet written to the PTY, in the order they were to be written.
+    pub outbox: Vec<u8>,
+    pub view: ViewState,
+}
+
+/// Output the source read and the replay does not show.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Tail {
+    /// The parser stood between sequences; these bytes were read after that point and not fed.
+    /// The new holder feeds them before anything new from the PTY.
+    ReadAhead(Vec<u8>),
+    /// No boundary came in time: the bytes of the unfinished sequence, all fed already, and the
+    /// handler calls they caused (control characters inside the sequence, a DCS's hook). The new
+    /// holder feeds them again with that many calls swallowed, so its parser waits where the
+    /// source's did and nothing is applied twice.
+    Raw { bytes: Vec<u8>, calls: usize },
+}
+
+/// Why a terminal does not move. Nothing was read: it goes on as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetachRefused {
+    /// A sequence over [`RAW_TAIL_MAX`] bytes is still open.
+    RawTooLong,
+    /// A keyboard-mode stack is at alacritty's depth limit, where replaying it would drop titles
+    /// in another order than the source did.
+    TooDeep,
+    /// The PTY's controller side could not be duplicated (no descriptors left).
+    NoDescriptor,
+}
 
 /// What the host tells the session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum SessionCommand {
     /// A key or a paste, encoded on the session thread against the live `TermMode`.
     Input(NormalizedInput),
@@ -102,7 +171,23 @@ pub enum SessionCommand {
     /// or a shell exit or restart returns to the live bottom.
     /// See [`crate::screen::Screen::set_copy_mode`].
     CopyMode(bool),
-    /// Hang up the child, reap it (killing it after [`HANGUP_GRACE`]), and end the thread.
+    /// Read the terminal for a move (module doc): the answer is the record, or why it stays.
+    /// After an `Ok`, the session reads, writes and renders nothing (keys and mouse reports are
+    /// dropped: the host refuses them while a module moves) until `Committed` or `Resume`.
+    Detach(Sender<Result<Detached, DetachRefused>>),
+    /// The move did not happen: rebuild the screen from the record `Detach` gave, exactly as the
+    /// new holder would have, write what was owed, and read again.
+    Resume,
+    /// The move is committed. A session that was detached forgets its child without a hangup and
+    /// ends; an adopted one writes what the source owed, takes the host's size, and starts reading.
+    Committed,
+    /// How an adopted child ended, from the process that spawned it: only that process can wait
+    /// for it. Used when it arrives before the session sees the exit, or within
+    /// [`EXIT_REPORT_WAIT`] after; past that, the end is shown as unknown.
+    ChildExited(ExitStatus),
+    /// Hang up the child, reap it (killing it after [`HANGUP_GRACE`]), and end the thread. A
+    /// detached session still holds its child until `Committed`, so this ends the child; an
+    /// adopted session not yet committed lets it go untouched, since the source still holds it.
     Shutdown,
 }
 
@@ -192,9 +277,23 @@ struct Shared {
     thread_wakeups: AtomicU64,
     outbox_high_water: AtomicUsize,
     replies_dropped: AtomicU64,
+    /// [`BOUNDARY_WAIT`] unless the host set another, in microseconds.
+    boundary_wait_us: AtomicU64,
 }
 
 impl Shared {
+    fn new() -> Self {
+        let shared = Shared::default();
+        shared
+            .boundary_wait_us
+            .store(BOUNDARY_WAIT.as_micros() as u64, Ordering::SeqCst);
+        shared
+    }
+
+    fn boundary_wait(&self) -> Duration {
+        Duration::from_micros(self.boundary_wait_us.load(Ordering::SeqCst))
+    }
+
     /// The pending update. A panic on the session thread is contained, and must not reach the host
     /// through a poisoned lock on its next `take_update`: a poisoned `Update` is still a valid one.
     fn update(&self) -> MutexGuard<'_, Update> {
@@ -233,16 +332,86 @@ pub struct TerminalSession {
     thread: Option<JoinHandle<Option<ExitInfo>>>,
 }
 
+/// What a session thread starts from: a child it spawned, or a terminal another process read.
+enum Origin {
+    Spawned,
+    Adopted {
+        replay: ScreenReplay,
+        tail: Tail,
+        outbox: Vec<u8>,
+        view: ViewState,
+    },
+}
+
 impl TerminalSession {
     pub fn spawn(config: SessionConfig, wake: impl Fn() + Send + 'static) -> io::Result<Self> {
         let pty = PtyChild::spawn(&config.spawn, config.size)?;
+        Self::start(pty, config, wake, Origin::Spawned)
+    }
+
+    /// The destination of a move: a session over a terminal another process read with
+    /// [`SessionCommand::Detach`]. `pidfd` names the child; the caller opened it and checked the
+    /// record's start time against it. The screen is rebuilt from the replay on the session thread
+    /// (with the output the source had not fed, and its view), and may be rendered, but nothing is
+    /// written to or read from the PTY until [`TerminalSession::commit`]. Dropped before that, the
+    /// session lets the child go untouched. `config.spawn` is not used; `config.size` is the
+    /// host's size, taken at the commit.
+    #[cfg(target_os = "linux")]
+    pub fn adopt(
+        detached: Detached,
+        pidfd: OwnedFd,
+        config: SessionConfig,
+        wake: impl Fn() + Send + 'static,
+    ) -> io::Result<Self> {
+        let Detached {
+            master,
+            pid,
+            start: _,
+            replay,
+            tail,
+            outbox,
+            view,
+        } = detached;
+        // Uncommitted: if anything fails before the commit -- this start, the rebuild, a panic on
+        // the session thread -- the child is left untouched, still the source's to resume.
+        let pty = PtyChild::adopt_uncommitted(master, pidfd, pid)?;
+        let origin = Origin::Adopted {
+            replay,
+            tail,
+            outbox,
+            view,
+        };
+        Self::start(pty, config, wake, origin)
+    }
+
+    /// The move this session was adopted from is committed: write what the source owed (its
+    /// unwritten input and answers, then the answers the adoption's own feeding produced), take
+    /// the host's size, and start reading. Nothing on a session that was not adopted.
+    pub fn commit(&self) {
+        self.send(SessionCommand::Committed);
+    }
+
+    /// How long a move waits for a cut sequence to finish ([`BOUNDARY_WAIT`] unless set).
+    pub fn set_boundary_wait(&self, wait: Duration) {
+        self.shared
+            .boundary_wait_us
+            .store(wait.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::SeqCst);
+    }
+
+    fn start(
+        pty: PtyChild,
+        config: SessionConfig,
+        wake: impl Fn() + Send + 'static,
+        origin: Origin,
+    ) -> io::Result<Self> {
         let pid = pty.pid();
-        // From here on, an early return drops `pty`, whose `Drop` hangs the child up and reaps it.
+        // From here on, an early return drops `pty`, whose `Drop` hangs a spawned child up and
+        // reaps it. An adopted one is not committed yet, and its `Drop` leaves the child alone.
         let (bell_rx, bell_tx) = std::io::pipe()?;
         set_nonblocking(bell_rx.as_fd())?;
         set_nonblocking(bell_tx.as_fd())?;
         let (commands, receiver) = mpsc::channel();
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new());
         let thread_shared = shared.clone();
         let SessionConfig {
             size,
@@ -254,26 +423,51 @@ impl TerminalSession {
         let thread = std::thread::Builder::new()
             .name(format!("terminal-{pid}"))
             .spawn(move || {
-                let worker = Worker {
-                    screen: Screen::new(size, colors),
-                    pty,
-                    size: size.clamped(),
-                    focused,
-                    visible: true,
-                    detached: false,
-                    commands: receiver,
-                    doorbell: bell_rx,
-                    shared: thread_shared.clone(),
-                    wake: &wake,
-                    tap,
-                    clock: RenderClock::new(FRAME_INTERVAL),
-                    outbox: Outbox::new(),
-                    sync_deadline: None,
-                    events_pending: false,
-                    frame_owed: false,
-                    last_mouse: None,
-                };
-                match panic::catch_unwind(AssertUnwindSafe(move || worker.run())) {
+                // The rebuild runs inside the containment too: a replay that makes the emulator
+                // panic ends this session like any other panic, with the host told.
+                let run = AssertUnwindSafe(|| {
+                    let (screen, phase) = match origin {
+                        Origin::Spawned => (Screen::new(size, colors), Phase::Live),
+                        Origin::Adopted {
+                            replay,
+                            tail,
+                            outbox,
+                            view,
+                        } => {
+                            let (screen, replies) = rebuild(&replay, &tail, &view, size, colors);
+                            let phase = Phase::Adopted {
+                                carried: outbox,
+                                replies,
+                                held: Vec::new(),
+                            };
+                            (screen, phase)
+                        }
+                    };
+                    let worker = Worker {
+                        screen,
+                        pty,
+                        size: size.clamped(),
+                        colors,
+                        focused,
+                        visible: true,
+                        detached: false,
+                        report_due: None,
+                        phase,
+                        commands: receiver,
+                        doorbell: bell_rx,
+                        shared: thread_shared.clone(),
+                        wake: &wake,
+                        tap,
+                        clock: RenderClock::new(FRAME_INTERVAL),
+                        outbox: Outbox::new(),
+                        sync_deadline: None,
+                        events_pending: false,
+                        frame_owed: false,
+                        last_mouse: None,
+                    };
+                    worker.run()
+                });
+                match panic::catch_unwind(run) {
                     Ok(exit) => exit,
                     Err(payload) => {
                         contain_panic(&thread_shared, &wake, size, colors, payload.as_ref());
@@ -346,8 +540,9 @@ impl Drop for TerminalSession {
 }
 
 /// The session thread panicked -- in the emulator on hostile input, in a host's tap -- and the
-/// worker has already unwound: its `PtyChild` hung the child up and handed it to a reaper. What is
-/// left is to say so where the pane looks: a frame with one line, and `exited`, so Enter restarts.
+/// worker has already unwound: its `PtyChild` hung the child up and handed it to a reaper (unless
+/// it was adopted for a move not yet committed, whose child stays the source's). What is left is
+/// to say so where the pane looks: a frame with one line, and `exited`, so Enter restarts.
 fn contain_panic(shared: &Shared, wake: &dyn Fn(), size: PtySize, colors: TerminalColors, payload: &(dyn Any + Send)) {
     let why = payload
         .downcast_ref::<&str>()
@@ -372,15 +567,73 @@ fn contain_panic(shared: &Shared, wake: &dyn Fn(), size: PtySize, colors: Termin
     });
 }
 
+/// A fresh screen from a move's record, as the source read it plus the output it had not fed, and
+/// the answers that output asked for.
+fn rebuild(
+    replay: &ScreenReplay,
+    tail: &Tail,
+    view: &ViewState,
+    size: PtySize,
+    colors: TerminalColors,
+) -> (Screen, Vec<u8>) {
+    let mut screen = Screen::replayed(replay, size, colors);
+    screen.apply_view(view);
+    match tail {
+        Tail::ReadAhead(bytes) => screen.feed(bytes),
+        Tail::Raw { bytes, calls } => screen.feed_unfinished(bytes, *calls),
+    }
+    let replies = screen.take_replies();
+    (screen, replies)
+}
+
+/// Where the session stands with respect to a move.
+enum Phase {
+    /// Reading, writing and rendering.
+    Live,
+    /// Read for a move: the screen's `Term` is spent, and nothing is read, written or rendered.
+    /// Holds this side's copy of the record until the move is decided.
+    Detached(Kept),
+    /// Adopted, not yet committed: the screen is rebuilt and may be rendered, nothing is read or
+    /// written. The source's unwritten bytes, the answers the rebuild produced, and keys typed
+    /// since, written in that order at the commit.
+    Adopted {
+        carried: Vec<u8>,
+        replies: Vec<u8>,
+        held: Vec<u8>,
+    },
+}
+
+/// The source's copy of what it handed over.
+struct Kept {
+    replay: ScreenReplay,
+    tail: Tail,
+    outbox: Vec<u8>,
+    view: ViewState,
+}
+
+/// What the run loop does after the commands.
+enum Next {
+    Continue,
+    ShutDown,
+    /// Let the child go untouched and end.
+    Forget,
+}
+
 struct Worker<'w> {
     pty: PtyChild,
     screen: Screen,
     size: PtySize,
+    /// The colours a rebuilt screen starts with.
+    colors: TerminalColors,
     focused: bool,
     visible: bool,
     /// The child left the terminal and still runs: the master is not polled any more, and the
     /// thread only waits for the child's own exit or for `Shutdown`.
     detached: bool,
+    /// An adopted child has exited before its spawner said how: until this time the thread waits
+    /// for [`SessionCommand::ChildExited`], still hearing commands, with the master not polled.
+    report_due: Option<Instant>,
+    phase: Phase,
     commands: Receiver<SessionCommand>,
     doorbell: PipeReader,
     shared: Arc<Shared>,
@@ -427,8 +680,8 @@ impl Worker<'_> {
             let mut fds = [
                 libc::pollfd {
                     // A negative fd is ignored by poll: a master whose every user is gone would
-                    // report POLLHUP forever.
-                    fd: if self.detached {
+                    // report POLLHUP forever, and one in the middle of a move is not read.
+                    fd: if self.detached || self.report_due.is_some() || !self.live() {
                         -1
                     } else {
                         self.pty.master_fd().as_raw_fd()
@@ -461,11 +714,32 @@ impl Worker<'_> {
             if fds[1].revents != 0 {
                 let mut drain = [0u8; 64];
                 while matches!(self.doorbell.read(&mut drain), Ok(n) if n > 0) {}
-                if self.handle_commands() {
-                    return self.shut_down();
+                match self.handle_commands() {
+                    Next::Continue => {}
+                    Next::ShutDown => return self.shut_down(),
+                    Next::Forget => return self.forget_child(),
                 }
             }
-            if self.detached {
+            if !self.live() {
+                // Mid-move: the screen is spent (detached) or not yet the terminal's (adopted),
+                // so only the commands above can change anything. An adopted screen still
+                // renders, which nothing reads from the PTY for.
+                if matches!(self.phase, Phase::Adopted { .. }) {
+                    self.publish_mouse_modes();
+                    self.render_if_due(Instant::now());
+                }
+                continue;
+            }
+            if let Some(due) = self.report_due {
+                match self.pty.try_wait() {
+                    Ok(Some(status)) => return Some(self.show_end(ExitInfo::from_status(status))),
+                    _ if Instant::now() < due => {}
+                    _ => {
+                        self.show_end(ExitInfo::UNKNOWN);
+                        return None;
+                    }
+                }
+            } else if self.detached {
                 match self.pty.try_wait() {
                     Ok(None) => {}
                     // The host already has `exited: Some(detached)`; it must also hear the real
@@ -473,6 +747,7 @@ impl Worker<'_> {
                     // -- otherwise the pane keeps saying "still
                     // running" about a process that is gone.
                     Ok(Some(status)) => return Some(self.show_end(ExitInfo::from_status(status))),
+                    Err(_) if self.pty.is_adopted() => self.await_report(),
                     Err(_) => return None,
                 }
             } else {
@@ -490,6 +765,7 @@ impl Worker<'_> {
                                 self.detached = true;
                                 self.show_end(ExitInfo::detached());
                             }
+                            Err(_) if self.pty.is_adopted() => self.await_report(),
                             Err(_) => {
                                 self.show_end(ExitInfo::UNKNOWN);
                                 return None;
@@ -506,11 +782,17 @@ impl Worker<'_> {
         }
     }
 
+    fn live(&self) -> bool {
+        matches!(self.phase, Phase::Live)
+    }
+
     fn poll_timeout(&self, now: Instant) -> libc::c_int {
-        let render = if self.visible { self.clock.deadline() } else { None };
-        let sync = self.sync_deadline.map(|(_, due)| due);
-        let reap = self.detached.then(|| now + DETACHED_REAP_INTERVAL);
-        match [render, sync, reap].into_iter().flatten().min() {
+        let renders = self.visible && !matches!(self.phase, Phase::Detached(_));
+        let render = if renders { self.clock.deadline() } else { None };
+        let sync = self.sync_deadline.filter(|_| self.live()).map(|(_, due)| due);
+        let reap = (self.detached && self.live() && self.report_due.is_none()).then(|| now + DETACHED_REAP_INTERVAL);
+        let report = self.report_due.filter(|_| self.live());
+        match [render, sync, reap, report].into_iter().flatten().min() {
             None => -1,
             Some(due) => due
                 .saturating_duration_since(now)
@@ -520,22 +802,53 @@ impl Worker<'_> {
         }
     }
 
-    /// `true`: shut down.
-    fn handle_commands(&mut self) -> bool {
+    fn handle_commands(&mut self) -> Next {
         loop {
-            match self.commands.try_recv() {
-                Ok(SessionCommand::Input(input)) => {
+            let command = match self.commands.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => return Next::Continue,
+                Err(TryRecvError::Disconnected) => return self.on_shutdown(),
+            };
+            if let Phase::Detached(_) = self.phase {
+                match command {
+                    SessionCommand::Resume => self.resume(),
+                    SessionCommand::Committed => return Next::Forget,
+                    SessionCommand::Shutdown => return Next::ShutDown,
+                    SessionCommand::ChildExited(status) => self.pty.set_exit_status(status),
+                    // Applied to the rebuilt screen if the move does not happen.
+                    SessionCommand::Resize(size) => self.size = size.clamped(),
+                    SessionCommand::Focus(focused) => self.focused = focused,
+                    SessionCommand::Visible(visible) => self.visible = visible,
+                    SessionCommand::SetColors(colors) => self.colors = colors,
+                    // Input waits for no one: written after a move that commits, it would reach
+                    // a program the destination already answers for, so the host refuses it
+                    // while the module moves and anything that still arrives is dropped. The
+                    // view gestures have no screen to act on.
+                    SessionCommand::Input(_)
+                    | SessionCommand::Mouse(_)
+                    | SessionCommand::FocusReport(_)
+                    | SessionCommand::Scroll(_)
+                    | SessionCommand::Select(_)
+                    | SessionCommand::CopyMode(_)
+                    | SessionCommand::Detach(_) => {}
+                }
+                continue;
+            }
+            match command {
+                SessionCommand::Input(input) => {
                     // Typing (never a bare modifier) and a paste both snap a scrolled-back view to
                     // the bottom before the byte reaches the program -- alacritty's own
                     // `on_terminal_input_start` (`Screen::note_input`'s own doc).
                     self.screen.note_input(&input);
                     let bytes = terminal_input::encode(&input, self.screen.mode());
-                    self.outbox.push_input(&bytes);
-                    self.flush_outbox();
+                    self.push_input(&bytes);
                 }
-                Ok(SessionCommand::Resize(size)) => {
+                SessionCommand::Resize(size) => {
                     let size = size.clamped();
-                    if size != self.size {
+                    if !self.live() {
+                        // Taken at the commit, with the PTY's size.
+                        self.size = size;
+                    } else if size != self.size {
                         self.size = size;
                         if let Err(e) = self.pty.resize(size) {
                             eprintln!("[terminal] TIOCSWINSZ {}x{} failed: {e}", size.cols, size.rows);
@@ -543,13 +856,13 @@ impl Worker<'_> {
                         self.screen.resize(size);
                     }
                 }
-                Ok(SessionCommand::Focus(focused)) => {
+                SessionCommand::Focus(focused) => {
                     if focused != self.focused {
                         self.focused = focused;
                         self.screen.mark_dirty();
                     }
                 }
-                Ok(SessionCommand::Visible(visible)) => {
+                SessionCommand::Visible(visible) => {
                     if visible != self.visible {
                         self.visible = visible;
                         if visible {
@@ -557,9 +870,12 @@ impl Worker<'_> {
                         }
                     }
                 }
-                Ok(SessionCommand::SetColors(colors)) => self.screen.set_colors(colors),
-                Ok(SessionCommand::Scroll(req)) => self.screen.scroll(req),
-                Ok(SessionCommand::Select(cmd)) => {
+                SessionCommand::SetColors(colors) => {
+                    self.colors = colors;
+                    self.screen.set_colors(colors);
+                }
+                SessionCommand::Scroll(req) => self.screen.scroll(req),
+                SessionCommand::Select(cmd) => {
                     self.screen.select(cmd);
                     // `Finish`'s text has nowhere else to reach the host: unlike a PTY read, a
                     // command never falls through to the run loop's own `publish_events` call, so
@@ -568,7 +884,7 @@ impl Worker<'_> {
                     // next byte of PTY output, which may never come).
                     self.publish_events(Instant::now());
                 }
-                Ok(SessionCommand::Mouse(m)) => {
+                SessionCommand::Mouse(m) => {
                     // No `note_input`: a report is not typing (`mouse`'s own module doc) -- it must
                     // not snap a scrolled-back view to the bottom or clear a selection.
                     let mode = self.screen.mode();
@@ -583,20 +899,277 @@ impl Worker<'_> {
                         _ => mouse::encode_mouse(&m, mode),
                     };
                     if let Some(bytes) = bytes {
-                        self.outbox.push_input(&bytes);
-                        self.flush_outbox();
+                        self.push_input(&bytes);
                     }
                 }
-                Ok(SessionCommand::FocusReport(focused)) => {
+                SessionCommand::FocusReport(focused) => {
                     if let Some(bytes) = mouse::encode_focus(focused, self.screen.mode()) {
-                        self.outbox.push_input(bytes);
-                        self.flush_outbox();
+                        self.push_input(bytes);
                     }
                 }
-                Ok(SessionCommand::CopyMode(active)) => self.screen.set_copy_mode(active),
-                Ok(SessionCommand::Shutdown) | Err(TryRecvError::Disconnected) => return true,
-                Err(TryRecvError::Empty) => return false,
+                SessionCommand::CopyMode(active) => self.screen.set_copy_mode(active),
+                SessionCommand::Detach(reply) => {
+                    if self.live() {
+                        self.detach(reply);
+                    }
+                }
+                SessionCommand::Committed => self.start_after_commit(),
+                // Only a detached session has something to resume.
+                SessionCommand::Resume => {}
+                SessionCommand::ChildExited(status) => self.pty.set_exit_status(status),
+                SessionCommand::Shutdown => return self.on_shutdown(),
             }
+        }
+    }
+
+    /// The host asked to end, or went away.
+    fn on_shutdown(&self) -> Next {
+        match self.phase {
+            // The source still holds the child; leaving it alone is the abort of the move.
+            Phase::Adopted { .. } => Next::Forget,
+            Phase::Live | Phase::Detached(_) => Next::ShutDown,
+        }
+    }
+
+    /// Input for the program: written now, or, on an adopted session not yet committed, after
+    /// what the source owed.
+    fn push_input(&mut self, bytes: &[u8]) {
+        if let Phase::Adopted { held, .. } = &mut self.phase {
+            held.extend_from_slice(bytes);
+            return;
+        }
+        self.outbox.push_input(bytes);
+        self.flush_outbox();
+    }
+
+    /// Steps 1-5 of a move's read (module doc). Refused, the session goes on as if nothing had
+    /// happened: what can be refused without reading is refused first, and output read on the way
+    /// to a boundary and not yet fed is fed before the refusal is answered.
+    fn detach(&mut self, reply: Sender<Result<Detached, DetachRefused>>) {
+        let master = match self.pty.master_fd().try_clone_to_owned() {
+            Ok(master) => master,
+            Err(err) => {
+                eprintln!("[terminal] pid {}: the PTY cannot move: {err}", self.pty.pid());
+                let _ = reply.send(Err(DetachRefused::NoDescriptor));
+                return;
+            }
+        };
+        if self.screen.too_deep_to_move() {
+            let _ = reply.send(Err(DetachRefused::TooDeep));
+            return;
+        }
+        let mut buf = vec![0u8; READ_CHUNK];
+        let refuse = |this: &mut Self, unfed: &[u8], why: DetachRefused| {
+            // These bytes have left the PTY: fed now, they reach the screen (and any question in
+            // them its answer) as they would have with no move asked for.
+            this.feed_output(unfed);
+            this.flush_outbox();
+            let _ = reply.send(Err(why));
+        };
+        let tail = match self.settle_for_move(&mut buf) {
+            Ok(tail) => tail,
+            Err(why) => return refuse(self, &[], why),
+        };
+        let view = self.screen.view_state();
+        let replay = match self.screen.read_for_move() {
+            Ok(replay) => replay,
+            // The bytes that ended the cut sequence can push a keyboard stack to the limit.
+            Err(ReplayRefused::TooDeep) => {
+                let unfed = match &tail {
+                    Tail::ReadAhead(bytes) => bytes.as_slice(),
+                    Tail::Raw { .. } => &[],
+                };
+                return refuse(self, unfed, DetachRefused::TooDeep);
+            }
+        };
+        let outbox = self.outbox.take_unwritten();
+        let pid = self.pty.pid();
+        #[cfg(target_os = "linux")]
+        let start = crate::pty::start_time(pid).unwrap_or(0);
+        #[cfg(not(target_os = "linux"))]
+        let start = 0;
+        self.sync_deadline = None;
+        self.phase = Phase::Detached(Kept {
+            replay: replay.clone(),
+            tail: tail.clone(),
+            outbox: outbox.clone(),
+            view: view.clone(),
+        });
+        let detached = Detached {
+            master,
+            pid,
+            start,
+            replay,
+            tail,
+            outbox,
+            view,
+        };
+        if reply.send(Ok(detached)).is_err() {
+            // Nobody took the record: the move cannot happen.
+            self.resume();
+        }
+    }
+
+    /// Steps 1-3: no synchronized update open, then the parser at a boundary. The byte that
+    /// reaches the boundary can itself open an update (a read cut `ESC[?2026h` before its `h`);
+    /// the record carries no open update, so the bytes read past it are fed and the update is let
+    /// close again, for at most [`SETTLE_ROUNDS`] rounds.
+    fn settle_for_move(&mut self, buf: &mut [u8]) -> Result<Tail, DetachRefused> {
+        let mut round = 1;
+        loop {
+            self.close_sync_for_move(buf);
+            match self.reach_boundary(buf)? {
+                Tail::ReadAhead(unfed) if self.screen.open_update().is_some() && round < SETTLE_ROUNDS => {
+                    self.feed_output(&unfed);
+                    round += 1;
+                }
+                tail => return Ok(tail),
+            }
+        }
+    }
+
+    /// Output read and not fed yet, fed as a read would have fed it; its answers wait in the
+    /// outbox.
+    fn feed_output(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.screen.feed(bytes);
+        let replies = self.screen.take_replies();
+        if !replies.is_empty() {
+            self.outbox.push_reply(replies);
+        }
+        self.publish_events(Instant::now());
+    }
+
+    /// Step 1: an open synchronized update is let close, reading on as usual, for at most the
+    /// time any update gets; then it is ended as the deadline would have ended it.
+    fn close_sync_for_move(&mut self, buf: &mut [u8]) {
+        let Some(open) = self.screen.open_update() else {
+            return;
+        };
+        let due = match self.sync_deadline {
+            Some((armed, due)) if armed == open => due,
+            _ => Instant::now() + SYNC_UPDATE_TIMEOUT,
+        };
+        while self.screen.open_update().is_some() && !self.detached && self.wait_readable(due) {
+            if let Flow::ChildGone = self.read_output(buf) {
+                break;
+            }
+        }
+        if self.screen.open_update().is_some() {
+            self.screen.abort_sync();
+        }
+        self.sync_deadline = None;
+        self.publish_events(Instant::now());
+    }
+
+    /// Steps 2-3: no more reads as usual. A sequence cut by the last read is fed on, a byte at a
+    /// time, from what the PTY has or sends within the boundary wait; whatever is read past the
+    /// boundary is kept unfed. Answers this feeding owes stay in the outbox, which goes along.
+    fn reach_boundary(&mut self, buf: &mut [u8]) -> Result<Tail, DetachRefused> {
+        let mut read_ahead = Vec::new();
+        if !self.screen.at_boundary() && !self.detached {
+            let deadline = Instant::now() + self.shared.boundary_wait();
+            'wait: while self.wait_readable(deadline) {
+                let n = match self.pty.read(buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => continue,
+                    Err(_) => break,
+                };
+                if let Some(tap) = self.tap.as_mut() {
+                    tap(&buf[..n]);
+                }
+                for (at, &byte) in buf[..n].iter().enumerate() {
+                    self.screen.feed(&[byte]);
+                    if self.screen.at_boundary() {
+                        read_ahead.extend_from_slice(&buf[at + 1..n]);
+                        break 'wait;
+                    }
+                }
+            }
+            let replies = self.screen.take_replies();
+            if !replies.is_empty() {
+                self.outbox.push_reply(replies);
+            }
+            self.publish_events(Instant::now());
+        }
+        if self.screen.at_boundary() {
+            return Ok(Tail::ReadAhead(read_ahead));
+        }
+        let (bytes, len, calls) = self.screen.unfinished();
+        if len > RAW_TAIL_MAX {
+            return Err(DetachRefused::RawTooLong);
+        }
+        Ok(Tail::Raw {
+            bytes: bytes.to_vec(),
+            calls,
+        })
+    }
+
+    /// Whether the master has output before `until`.
+    fn wait_readable(&self, until: Instant) -> bool {
+        let now = Instant::now();
+        if now >= until {
+            return false;
+        }
+        let mut fd = libc::pollfd {
+            fd: self.pty.master_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = (until - now).as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: one live pollfd for the duration of the call.
+        let polled = unsafe { libc::poll(&mut fd, 1, ms) };
+        polled > 0 || (polled < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted)
+    }
+
+    /// The move did not happen: a fresh screen from the kept record, exactly as the destination
+    /// would have built it, then what was owed written, at the size the host has now.
+    fn resume(&mut self) {
+        let Phase::Detached(kept) = std::mem::replace(&mut self.phase, Phase::Live) else {
+            return;
+        };
+        let (screen, replies) = rebuild(&kept.replay, &kept.tail, &kept.view, self.size, self.colors);
+        self.screen = screen;
+        self.outbox.push_input(&kept.outbox);
+        self.outbox.push_input(&replies);
+        self.take_size();
+        self.flush_outbox();
+        self.last_mouse = None;
+        self.screen.mark_dirty();
+        self.publish_events(Instant::now());
+    }
+
+    /// An adopted session's commit: the source's unwritten bytes, then the answers the rebuild
+    /// produced, then keys typed since, are written; the host's size is set; reading starts.
+    fn start_after_commit(&mut self) {
+        let Phase::Adopted { carried, replies, held } = std::mem::replace(&mut self.phase, Phase::Live) else {
+            return;
+        };
+        // From here on the child is this session's to end.
+        self.pty.commit_adoption();
+        self.outbox.push_input(&carried);
+        self.outbox.push_input(&replies);
+        self.outbox.push_input(&held);
+        self.take_size();
+        self.flush_outbox();
+        self.screen.mark_dirty();
+    }
+
+    /// The size the host has now, on the PTY and the screen. An unchanged size sends the program
+    /// no `SIGWINCH`.
+    fn take_size(&mut self) {
+        if let Err(e) = self.pty.resize(self.size) {
+            eprintln!(
+                "[terminal] TIOCSWINSZ {}x{} failed: {e}",
+                self.size.cols, self.size.rows
+            );
+        }
+        let now = self.screen.size();
+        if now != self.size {
+            self.screen.resize(self.size);
         }
     }
 
@@ -670,6 +1243,9 @@ impl Worker<'_> {
     }
 
     fn flush_outbox(&mut self) {
+        if !self.live() {
+            return;
+        }
         let pty = &mut self.pty;
         // `Closed`: the child is gone, and the read side will see it.
         let _ = self.outbox.flush(|bytes| pty.write(bytes));
@@ -764,6 +1340,12 @@ impl Worker<'_> {
         self.shared.ring(self.wake);
     }
 
+    /// An adopted child has exited and only its spawner can say how: wait for that report for at
+    /// most [`EXIT_REPORT_WAIT`], hearing commands meanwhile (the run loop).
+    fn await_report(&mut self) {
+        self.report_due = Some(Instant::now() + EXIT_REPORT_WAIT);
+    }
+
     /// EOF on the master: wait briefly for the child to become reapable (see [`EXIT_AFTER_EOF`]).
     /// `Ok(None)`: it still runs, having closed the terminal.
     fn wait_after_eof(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -797,6 +1379,15 @@ impl Worker<'_> {
             update.mouse = Some(modes);
         });
         exit
+    }
+
+    /// The child is someone else's now, or still the source's: no hangup, no wait. The controller
+    /// side this session held is closed; another holder keeps the PTY open.
+    fn forget_child(self) -> Option<ExitInfo> {
+        let Worker { pty, .. } = self;
+        let (master, _pid) = pty.forget();
+        drop(master);
+        None
     }
 
     /// The host asked (or went away): hang up, give the child [`HANGUP_GRACE`], then kill it by
@@ -834,7 +1425,7 @@ mod tests {
             cell_width_px: 9,
             cell_height_px: 18,
         };
-        let shared = Shared::default();
+        let shared = Shared::new();
         let mut screen = Screen::new(size, TerminalColors::default());
         screen.feed(b"abc");
         let rendered = screen.render(true);

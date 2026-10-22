@@ -10,6 +10,7 @@ use super::wire::{
     RateLimitSnapshot, RateLimitWindow, ThreadItem, TokenUsage, TurnError, TurnStatus,
 };
 use crate::projection::{TokenUsage as EitriTokens, TurnEndDetail, TurnOutcome, UsageInfo};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 /// The most bytes of one tool result or one diff that reaches the transcript. A command can print
@@ -202,7 +203,7 @@ pub fn account_limits(snapshot: &RateLimitSnapshot) -> Option<LimitFigure> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LimitFigure {
     pub used_percent: f64,
     pub window_minutes: Option<u32>,

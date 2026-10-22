@@ -10,6 +10,7 @@
 //! returns.
 
 use super::wire::{SubAgentActivityItem, SubAgentKind};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 /// Threads remembered as members at most, so a flood of announcements cannot grow without bound.
@@ -43,7 +44,7 @@ pub enum FamilyEdge {
     Ignored,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Family {
     /// The tab's own thread, the root of the family.
     tab_thread: String,

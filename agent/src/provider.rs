@@ -151,7 +151,7 @@ pub struct CloseSessionRequest {
 /// Each bool has a source in `HandshakeResponse` and represents a choice a caller makes.
 /// `Copy` lets callers pass capabilities freely. Owned lists, versions and diagnostics
 /// belong in `ProviderInfo`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderCapabilities {
     /// The provider can continue an existing provider session by id.
     pub resume: bool,
@@ -193,7 +193,7 @@ pub struct ProviderCapabilities {
 /// Separate from `ProviderCapabilities` because these are for *display and debugging*, never for
 /// deciding whether to send a command. Anything a caller branches on belongs in the capabilities
 /// struct, with a real wire source behind it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderInfo {
     pub sidecar_version: String,
     pub claude_agent_sdk_version: String,
@@ -372,6 +372,16 @@ pub trait AgentProvider {
     /// Drains every `AgentDomainEvent` that has arrived since the last call. Never blocks --
     /// mirrors `AgentSession::pump()`'s existing contract exactly.
     fn pump(&self) -> Vec<AgentDomainEvent>;
+    /// The provider's own sequence number (its wire cursor) of the last event it had taken in when
+    /// the latest [`pump`](Self::pump) returned, including one that translated to no domain event.
+    /// Asked right after each pump, by the same thread. `None` (the default) for a provider that
+    /// numbers nothing. A conversation moved to another process hands this over as
+    /// `ChatMoveCore::folded_through`, and the destination's provider reads on from the event after
+    /// it: a count of domain events cannot stand in for it, since one provider event may become
+    /// none, one or several of them.
+    fn pumped_through(&self) -> Option<u64> {
+        None
+    }
     /// The signal this provider raises whenever it queues something for `pump`, if it raises one
     /// for every such event. With it the reader of `pump` sleeps until there is news; without it
     /// (the default) the reader has to keep asking, because a provider whose `pump` also acts on

@@ -19,9 +19,16 @@ function firstNormalWindowOf(pid) {
         .find(window => window.get_pid() === pid && window.get_window_type() === Meta.WindowType.NORMAL) ?? null;
 }
 
+// The stage's context owns the Clutter backend on newer shells, which no longer have Clutter.get_default_backend;
+// older ones have only the latter.
+function defaultSeat() {
+    const backend = global.stage.context?.get_backend?.() ?? Clutter.get_default_backend();
+    return backend.get_default_seat();
+}
+
 // Adds the methods to the service object and returns a function that removes them again.
 export function install(service) {
-    const seat = Clutter.get_default_backend().get_default_seat();
+    const seat = defaultSeat();
     let keyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
     let pointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
 

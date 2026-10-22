@@ -10,6 +10,12 @@
 //! editor's answer is checked to be recent ([`MAX_CLEAR_AGE`]) and the file is read and compared
 //! once more, so the gap between the last look and the write is as short as it can be. A job cannot be built without a guard and a clear.
 //!
+//! **One write at a time across windows.** Before any of that, as the first thing its worker does,
+//! every revert, undo and recovery takes the project's write slot exclusively
+//! ([`PresenceGuard::hold_slot_for_write`]) and keeps it until its write has returned: the last look
+//! and the write run after the shadow's shared lock is let go, so without it two windows could write
+//! one file at once and the later rename would erase the other's revert.
+//!
 //! **Bytes, never text.** A file's lines come from the snapshots' blobs, split after each `\n`, so
 //! line terminators and bytes that are not UTF-8 are written back exactly; the lossy text a review
 //! shows is never used to decide or to write anything.
@@ -32,6 +38,7 @@ use rmpv::Value;
 use crate::editor_lines::{self, FileFormat};
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::{Pending, RpcError};
+use crate::window_link::EditorOp;
 
 use super::diff::{file_hunks, Side};
 use super::journal::{Journal, JournalClaim, JournalEntry, JournalNote};
@@ -42,6 +49,7 @@ use super::lifecycle::{
 use super::presence::{Blocked, PresenceGuard};
 use super::shadow::{validate_session, Entry, EntryKind, Shadow, ShadowError, READ_TIMEOUT};
 use super::write::{holds_durably, read_current, replace, Content, Current, FsHooks, ProjectDir, Target, WriteError};
+use super::write_slot::SlotBusy;
 
 /// The Lua that asks the editor about one file's buffers. Its arguments are
 /// [`buffer_state_args`]; its answer is read by [`parse_buffer_state`].
@@ -182,6 +190,8 @@ pub enum Refusal {
     Cancelled,
     Write(WriteError),
     Unavailable(String),
+    /// Another window holds the project's write slot.
+    SlotBusy(SlotBusy),
 }
 
 impl fmt::Display for Refusal {
@@ -200,6 +210,7 @@ impl fmt::Display for Refusal {
             Refusal::Cancelled => f.write_str("the tab closed; nothing was written"),
             Refusal::Write(e) => write!(f, "{e}"),
             Refusal::Unavailable(why) => f.write_str(why),
+            Refusal::SlotBusy(busy) => write!(f, "{busy}"),
         }
     }
 }
@@ -346,6 +357,63 @@ pub fn parse_buffer_state(v: &Value) -> Result<BufferState, String> {
     })
 }
 
+/// Who answers the editor's questions about a file's buffers: this window's own editor, or, in
+/// window 2, which has none, window 1's, asked over the link.
+pub trait BufferAsk {
+    /// Asks [`BUFFER_STATE_LUA`]'s question about `abs_path`, and about the range `lines` (first line
+    /// from 1, number of lines) if given. The answer is that Lua's own result, read by
+    /// [`parse_buffer_state`] whoever asked. `None`: there is no editor to ask.
+    fn buffer_state(&self, abs_path: &Path, lines: Option<(u32, u32)>) -> Option<Pending>;
+}
+
+/// The window's own editor, if it has one (window 1, and a window with no partner).
+pub struct EmbeddedAsk<'a>(pub Option<&'a dyn EditorRpc>);
+
+impl BufferAsk for EmbeddedAsk<'_> {
+    fn buffer_state(&self, abs_path: &Path, lines: Option<(u32, u32)>) -> Option<Pending> {
+        match self.0 {
+            Some(rpc) if rpc.target().is_some() => {
+                Some(rpc.exec_lua(BUFFER_STATE_LUA, buffer_state_args(abs_path, lines)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Window 1's editor, from window 2: the question goes as an [`EditorOp::BufferState`] naming the
+/// file relative to the project root, and window 1 runs [`BUFFER_STATE_LUA`] itself after checking
+/// the path again. Its answer is the Lua's own result.
+pub struct RemoteAsk {
+    root: PathBuf,
+    send: Box<dyn Fn(EditorOp) -> Option<Pending>>,
+}
+
+impl RemoteAsk {
+    /// `send` hands an operation to window 1 and returns its answer to come, or `None` while the
+    /// windows are not linked.
+    pub fn new(root: &Path, send: Box<dyn Fn(EditorOp) -> Option<Pending>>) -> RemoteAsk {
+        RemoteAsk {
+            root: root.to_path_buf(),
+            send,
+        }
+    }
+}
+
+impl BufferAsk for RemoteAsk {
+    fn buffer_state(&self, abs_path: &Path, lines: Option<(u32, u32)>) -> Option<Pending> {
+        // Only a file of the project can be named to window 1, and only by a path that is text; any
+        // other has no editor to answer for it here.
+        let rel = abs_path.strip_prefix(&self.root).ok()?.to_str()?;
+        if rel.is_empty() {
+            return None;
+        }
+        (self.send)(EditorOp::BufferState {
+            path: rel.to_owned(),
+            lines,
+        })
+    }
+}
+
 /// Asking the editor whether a file has unsaved changes, polled without waiting.
 pub struct EditorCheck {
     path: PathBuf,
@@ -360,13 +428,12 @@ enum CheckState {
 }
 
 impl EditorCheck {
-    /// Sends the question about `abs_path` to `rpc`. With no editor, the check is already refused.
-    pub fn start(rpc: Option<&dyn EditorRpc>, abs_path: &Path, now: Instant) -> EditorCheck {
-        let state = match rpc {
-            Some(rpc) if rpc.target().is_some() => {
-                CheckState::Asked(rpc.exec_lua(BUFFER_STATE_LUA, buffer_state_args(abs_path, None)))
-            }
-            _ => CheckState::Done(Some(Err(no_editor(abs_path)))),
+    /// Sends the question about `abs_path` through `ask`. With no editor, the check is already
+    /// refused.
+    pub fn start(ask: &dyn BufferAsk, abs_path: &Path, now: Instant) -> EditorCheck {
+        let state = match ask.buffer_state(abs_path, None) {
+            Some(pending) => CheckState::Asked(pending),
+            None => CheckState::Done(Some(Err(no_editor(abs_path)))),
         };
         EditorCheck {
             path: abs_path.to_path_buf(),
@@ -483,6 +550,7 @@ pub struct RevertJob {
     pub(crate) target: RevertTarget,
     pub(crate) clear: EditorClear,
     pub(crate) final_hook: Option<FinalHook>,
+    pub(crate) fs_hooks: FsHooks,
 }
 
 /// The undo of a revert; [`run`](Self::run) on a worker.
@@ -496,6 +564,7 @@ pub struct UndoJob {
     pub(crate) post: Saved,
     pub(crate) clear: EditorClear,
     pub(crate) final_hook: Option<FinalHook>,
+    pub(crate) fs_hooks: FsHooks,
 }
 
 /// A comment's quoted lines; [`run`](Self::run) on a worker.
@@ -522,6 +591,7 @@ pub struct RecoverJob {
     pub(crate) entry: String,
     pub(crate) answer: RecoverAnswer,
     pub(crate) final_hook: Option<FinalHook>,
+    pub(crate) fs_hooks: FsHooks,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -529,6 +599,12 @@ impl RevertJob {
     /// Runs `hook` right before the last checks.
     pub fn on_final_check(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.final_hook = Some(hook);
+        self
+    }
+
+    /// Writes with `hooks` in place of the file system's own.
+    pub fn with_fs_hooks(mut self, hooks: FsHooks) -> Self {
+        self.fs_hooks = hooks;
         self
     }
 }
@@ -540,6 +616,12 @@ impl UndoJob {
         self.final_hook = Some(hook);
         self
     }
+
+    /// Writes with `hooks` in place of the file system's own.
+    pub fn with_fs_hooks(mut self, hooks: FsHooks) -> Self {
+        self.fs_hooks = hooks;
+        self
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -547,6 +629,12 @@ impl RecoverJob {
     /// Runs `hook` right before the last checks.
     pub fn on_final_check(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.final_hook = Some(hook);
+        self
+    }
+
+    /// Writes with `hooks` in place of the file system's own.
+    pub fn with_fs_hooks(mut self, hooks: FsHooks) -> Self {
+        self.fs_hooks = hooks;
         self
     }
 }
@@ -627,6 +715,7 @@ impl ExactHunksJob {
 
 impl RevertJob {
     pub fn run(self) -> Result<AppliedRevert, Refusal> {
+        let _slot = self.guard.hold_slot_for_write().map_err(Refusal::SlotBusy)?;
         let rel = self.path.clone();
         let wanted = Some(self.wanted.as_ref());
         still_wanted(wanted)?;
@@ -686,7 +775,7 @@ impl RevertJob {
             || Refusal::ChangedSinceEnd,
         )?;
         let note = journal_note(&self.session, &rel, &current, &pre, &post);
-        replace(&target, &planned.content, &note, &journal, &shadow, &FsHooks::default()).map_err(Refusal::Write)?;
+        replace(&target, &planned.content, &note, &journal, &shadow, &self.fs_hooks).map_err(Refusal::Write)?;
         Ok(AppliedRevert {
             session: self.session,
             turn: resolved.current,
@@ -706,6 +795,7 @@ impl RevertJob {
 
 impl UndoJob {
     pub fn run(self) -> Result<(), Refusal> {
+        let _slot = self.guard.hold_slot_for_write().map_err(Refusal::SlotBusy)?;
         let rel = self.path.clone();
         let wanted = Some(self.wanted.as_ref());
         still_wanted(wanted)?;
@@ -754,7 +844,7 @@ impl UndoJob {
         )?;
         // The path now holds `post`, and `pre` is what goes in.
         let note = journal_note(&self.session, &rel, &current, &self.post, &self.pre);
-        replace(&target, &content, &note, &journal, &shadow, &FsHooks::default()).map_err(Refusal::Write)
+        replace(&target, &content, &note, &journal, &shadow, &self.fs_hooks).map_err(Refusal::Write)
     }
 }
 
@@ -830,6 +920,9 @@ impl RecoveriesJob {
 
 impl RecoverJob {
     pub fn run(self) -> Result<Recovered, Refusal> {
+        // A dismissal writes no project file, but it removes the entry another window's restore
+        // may be reading: both are writes to the project's review state.
+        let _slot = self.guard.hold_slot_for_write().map_err(Refusal::SlotBusy)?;
         match self.answer {
             RecoverAnswer::Dismiss => {
                 let (shadow, journal) = open_store(&self.spec)?;
@@ -850,6 +943,7 @@ impl RecoverJob {
                     &journal,
                     &entry,
                     self.final_hook.as_ref(),
+                    &self.fs_hooks,
                 )
             }
         }
@@ -861,6 +955,7 @@ impl RecoverJob {
 /// the file already holding the entry's intended bytes with its intended mode: the write finished,
 /// and the entry is only forgotten. An entry that does not say which mode was intended (an older
 /// build's) is never taken for finished.
+#[allow(clippy::too_many_arguments)]
 fn restore_entry(
     spec: &ShadowSpec,
     guard: &PresenceGuard,
@@ -869,6 +964,7 @@ fn restore_entry(
     journal: &Journal,
     entry: &JournalEntry,
     hook: Option<&FinalHook>,
+    fs_hooks: &FsHooks,
 ) -> Result<Recovered, Refusal> {
     let rel = entry.path.clone();
     let (root, target) = locate(clear, &spec.root, &rel, &entry.session)?;
@@ -928,7 +1024,7 @@ fn restore_entry(
         mode: entry.mode,
     };
     let note = journal_note(&entry.session, &rel, &current, &now, &restored);
-    replace(&target, &content, &note, journal, shadow, &FsHooks::default()).map_err(Refusal::Write)?;
+    replace(&target, &content, &note, journal, shadow, fs_hooks).map_err(Refusal::Write)?;
     journal.remove(&entry.id, shadow).map_err(|e| {
         Refusal::Unavailable(format!(
             "{shown} was restored, but its interrupted revert could not be forgotten: {e}"
@@ -1361,6 +1457,9 @@ fn wall_clock_ms() -> u64 {
 mod tests {
     use super::*;
 
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
     fn lines(text: &[&str]) -> Vec<Vec<u8>> {
         text.iter().map(|l| l.as_bytes().to_vec()).collect()
     }
@@ -1521,5 +1620,114 @@ mod tests {
             buffer_state_args(raw, None),
             vec![Value::Binary(b"/p/\xff".to_vec()), Value::Nil]
         );
+    }
+
+    fn answered(value: Value) -> Pending {
+        let (answer, pending) = Pending::pair();
+        answer.send(Ok(value));
+        pending
+    }
+
+    fn buffer(modified: bool) -> Value {
+        Value::Map(vec![
+            (Value::from("found"), Value::from(true)),
+            (Value::from("modified"), Value::from(modified)),
+        ])
+    }
+
+    #[test]
+    fn a_revert_check_through_remote_ask_sends_buffer_state_and_refuses_on_a_modified_buffer() {
+        let root = Path::new("/project");
+        let sent: Rc<RefCell<Vec<EditorOp>>> = Rc::default();
+        let log = sent.clone();
+        let ask = RemoteAsk::new(
+            root,
+            Box::new(move |op| {
+                log.borrow_mut().push(op);
+                Some(answered(buffer(true)))
+            }),
+        );
+        let now = Instant::now();
+        let file = root.join("src/a.rs");
+        let refused = EditorCheck::start(&ask, &file, now).poll(now);
+        let Some(Err(Refusal::Editor(why))) = refused else {
+            panic!("a modified buffer refuses the write: {refused:?}");
+        };
+        assert_eq!(
+            why,
+            "/project/src/a.rs has unsaved changes in the editor; write or discard them first"
+        );
+        assert_eq!(
+            *sent.borrow(),
+            vec![EditorOp::BufferState {
+                path: "src/a.rs".to_owned(),
+                lines: None,
+            }],
+            "the question names the file from the project root"
+        );
+
+        // A file outside the project cannot be named to the other window: there is no editor to ask.
+        let outside = EditorCheck::start(&ask, Path::new("/elsewhere/b.rs"), now).poll(now);
+        assert!(
+            matches!(&outside, Some(Err(Refusal::Editor(why))) if why.starts_with("no editor is connected")),
+            "{outside:?}"
+        );
+        assert_eq!(sent.borrow().len(), 1, "nothing was sent for it");
+
+        // Not linked: refused at once, as with no editor.
+        let unlinked = RemoteAsk::new(root, Box::new(|_| None));
+        let refused = EditorCheck::start(&unlinked, &file, now).poll(now);
+        assert!(
+            matches!(&refused, Some(Err(Refusal::Editor(why))) if why.starts_with("no editor is connected")),
+            "{refused:?}"
+        );
+
+        // A clean buffer clears the file it was asked about.
+        let clean = RemoteAsk::new(root, Box::new(|_| Some(answered(buffer(false)))));
+        let clear = EditorCheck::start(&clean, &file, now).poll(now);
+        assert!(matches!(&clear, Some(Ok(clear)) if clear.path() == file), "{clear:?}");
+    }
+
+    struct Recording {
+        asked: RefCell<Vec<(&'static str, Vec<Value>)>>,
+        target: Cell<Option<u64>>,
+    }
+
+    impl EditorRpc for Recording {
+        fn exec_lua(&self, code: &'static str, args: Vec<Value>) -> Pending {
+            self.asked.borrow_mut().push((code, args));
+            answered(buffer(false))
+        }
+
+        fn target(&self) -> Option<u64> {
+            self.target.get()
+        }
+    }
+
+    #[test]
+    fn with_no_partner_the_embedded_ask_sends_the_same_constant_as_before() {
+        let editor = Recording {
+            asked: RefCell::new(Vec::new()),
+            target: Cell::new(Some(3)),
+        };
+        let file = Path::new("/project/src/a.rs");
+        let now = Instant::now();
+        let clear = EditorCheck::start(&EmbeddedAsk(Some(&editor)), file, now).poll(now);
+        assert!(matches!(clear, Some(Ok(_))), "{clear:?}");
+        assert!(EmbeddedAsk(Some(&editor)).buffer_state(file, Some((4, 2))).is_some());
+        let asked = editor.asked.borrow().clone();
+        assert_eq!(
+            asked,
+            vec![
+                (BUFFER_STATE_LUA, buffer_state_args(file, None)),
+                (BUFFER_STATE_LUA, buffer_state_args(file, Some((4, 2)))),
+            ]
+        );
+
+        // No editor, or one with nothing behind it: nothing is asked.
+        assert!(EmbeddedAsk(None).buffer_state(file, None).is_none());
+        editor.target.set(None);
+        assert!(EmbeddedAsk(Some(&editor)).buffer_state(file, None).is_none());
+        assert_eq!(editor.asked.borrow().len(), 2);
     }
 }

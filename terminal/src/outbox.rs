@@ -123,6 +123,25 @@ impl Outbox {
         }
     }
 
+    /// Everything not yet written, in the order [`Outbox::flush`] would have written it -- a
+    /// started answer's rest, then input, then the other answers -- leaving the outbox empty. What
+    /// a terminal moving to another process takes along, for its new holder to write.
+    pub fn take_unwritten(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len());
+        if self.reply_written != 0 {
+            if let Some(front) = self.replies.pop_front() {
+                out.extend_from_slice(&front[self.reply_written..]);
+            }
+        }
+        out.extend(self.input.drain(..));
+        for reply in self.replies.drain(..) {
+            out.extend_from_slice(&reply);
+        }
+        self.reply_bytes = 0;
+        self.reply_written = 0;
+        out
+    }
+
     fn note_len(&mut self) {
         self.high_water = self.high_water.max(self.len());
     }
@@ -172,6 +191,26 @@ mod tests {
             "input past the cap is kept whole"
         );
         assert_eq!(outbox.high_water(), outbox.len());
+    }
+
+    /// What is taken along is exactly what a flush with endless room would still have written,
+    /// in the same order, and nothing is left behind.
+    #[test]
+    fn the_unwritten_bytes_are_taken_in_the_order_a_flush_would_write_them() {
+        let mut outbox = Outbox::new();
+        outbox.push_reply(b"\x1b[12;40R".to_vec());
+        let mut kernel = Kernel::new(4, usize::MAX);
+        assert_eq!(outbox.flush(|b| kernel.write(b)), Flushed::Blocked);
+        outbox.push_input(b"ls\r");
+        outbox.push_reply(b"\x1b[?6c".to_vec());
+        let mut twin = Outbox::new();
+        twin.push_input(&outbox.take_unwritten());
+        assert!(outbox.is_empty());
+        assert_eq!(outbox.len(), 0);
+        let mut rest = Kernel::new(usize::MAX, usize::MAX);
+        twin.flush(|b| rest.write(b));
+        assert_eq!(kernel.taken, b"\x1b[12");
+        assert_eq!(rest.taken, b";40Rls\r\x1b[?6c");
     }
 
     #[test]

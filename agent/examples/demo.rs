@@ -164,5 +164,7 @@ fn print_event(event: &AgentDomainEvent) {
         }
         // Derived by ingestion, which this demo does not run: nothing to print.
         AgentDomainEvent::ToolInputChanged { .. } => {}
+        // Made only when a conversation moves between windows, which this demo never does.
+        AgentDomainEvent::MoveSeeded(_) => {}
     }
 }

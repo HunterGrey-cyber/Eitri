@@ -497,3 +497,108 @@ fn the_scan_catches_built_lua_a_leak_and_a_bypass() {
     // A leak in a `#[cfg(test)] fn` outside a test module is still product-adjacent code.
     assert_eq!(flagged("#[cfg(test)]\nfn g() { s.leak(); }").len(), 1);
 }
+
+/// Window 2 reaches the editor only through the editor-op dispatcher, so the dispatcher's product code may name
+/// exactly one Lua constant (the buffer-state chunk, sent by its one `exec_lua` call) and the plugin host's three
+/// editor functions, and nothing else that runs in the editor: no install or teardown, no review chunk (the review
+/// ops become calls on window 1's own review driver), no scratch call, no event drain, no navigation fallback,
+/// and no pane kill. Comments and literals are blanked and whitespace is dropped, so formatting changes nothing.
+#[test]
+fn the_editor_op_dispatcher_names_only_its_table() {
+    use eitri_core::source_scan::{code_only, modules, read_required, without};
+    use std::collections::BTreeSet;
+
+    let source = read_required("core/src/window_link/editor_ops.rs");
+    let all = code_only(&source.text);
+    let tests = modules(&all, "tests");
+    assert!(tests.len() <= 1, "more than one `mod tests` in the dispatcher");
+    for body in &tests {
+        let start = body.as_ptr() as usize - all.as_ptr() as usize;
+        let before: String = all[..start].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            before.ends_with("#[cfg(test)]modtests"),
+            "the dispatcher's `mod tests` is not a test module, so it is read as product code"
+        );
+    }
+    let code = without(&all, &tests);
+    let squeezed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squeezed.contains("pubfndispatch("),
+        "`fn dispatch` was not found: the scan reads nothing"
+    );
+
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let words: Vec<&str> = code.split(|c: char| !is_ident(c)).filter(|w| !w.is_empty()).collect();
+    let constants: BTreeSet<&str> = words.iter().copied().filter(|w| w.ends_with("_LUA")).collect();
+    for forbidden in [
+        "INSTALL_LUA",
+        "TEARDOWN_LUA",
+        "SCRATCH_CALL_LUA",
+        "REVIEW_LUA",
+        "TAKE_EVENTS_LUA",
+        "NAV_FALLBACK_LUA",
+        "SHOW_LUA",
+        "OPEN_AND_SHOW_LUA",
+        "CLEAR_LUA",
+        "CLEAR_ALL_LUA",
+        "PLUGIN_OPEN_LUA",
+        "PLUGIN_ASSIST_LUA",
+    ] {
+        assert!(!constants.contains(forbidden), "the dispatcher names {forbidden}");
+    }
+    assert_eq!(
+        constants,
+        BTreeSet::from(["BUFFER_STATE_LUA"]),
+        "the dispatcher names a Lua constant outside its table"
+    );
+
+    // The plugin host's functions are named by their full path at each call, so an alias cannot hide another.
+    let mut plugin_calls = BTreeSet::new();
+    for (at, _) in squeezed.match_indices("editor::") {
+        if squeezed[..at].chars().next_back().is_some_and(is_ident) {
+            continue; // `review_editor::` and the like
+        }
+        let rest = &squeezed[at + "editor::".len()..];
+        let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+        assert!(
+            rest[name.len()..].starts_with('('),
+            "`editor::{name}` is not a call: the plugin functions are named only where they are called"
+        );
+        plugin_calls.insert(name);
+    }
+    assert_eq!(
+        plugin_calls,
+        BTreeSet::from([
+            "assist_apply".to_string(),
+            "assist_clear".to_string(),
+            "open".to_string()
+        ]),
+        "the dispatcher calls a plugin editor function outside its table"
+    );
+    for (at, _) in squeezed.match_indices("plugin::") {
+        let rest = &squeezed[at + "plugin::".len()..];
+        assert!(
+            rest.starts_with("editor::") || rest.starts_with("roots::"),
+            "the dispatcher reaches into the plugin host beyond its editor functions and path checks: {}",
+            &rest[..rest.len().min(40)]
+        );
+    }
+    assert!(
+        !squeezed.contains("kill::") && !words.contains(&"kill"),
+        "the dispatcher names the pane kill"
+    );
+    assert!(
+        !words.contains(&"ClearAll"),
+        "the dispatcher can clear window 1's overlays"
+    );
+
+    assert_eq!(
+        squeezed.matches("exec_lua(").count(),
+        1,
+        "the dispatcher sends Lua other than through its one buffer-state call"
+    );
+    assert!(
+        squeezed.contains("exec_lua(BUFFER_STATE_LUA,"),
+        "the dispatcher's one `exec_lua` call does not send the buffer-state chunk"
+    );
+}

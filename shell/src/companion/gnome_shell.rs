@@ -19,6 +19,7 @@
 //! alone and run it against a private bus.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -38,6 +39,9 @@ pub(crate) const SHELL_NAME: &str = "org.gnome.Shell";
 /// person, so a Shell that stalls must not stall a call for long, and the extension itself answers
 /// in a few milliseconds.
 pub(crate) const CALL_TIMEOUT_MS: i32 = 1000;
+/// The method version 2 of the extension added. A version 1 extension answers it with the bus's
+/// `UnknownMethod` error.
+pub(crate) const MOVE_OWN_TO_MONITOR: &str = "MoveOwnToMonitor";
 
 /// What a call reports: the method's boolean answer, or `None` when the call itself failed (no
 /// service, a timeout, a reply of an unexpected shape). `Some(false)` is the extension saying
@@ -65,6 +69,18 @@ pub(crate) trait GnomeCalls {
     fn set_partner(&self, pids: Vec<u32>, done: Done);
     fn activate_own(&self, done: Done);
     fn activate_partner(&self, done: Done);
+    /// Asks the extension to put this process's own top-level windows on the monitor whose
+    /// connector (`GdkMonitor::connector`, "DP-2") is `connector`. `Some(true)` when it did,
+    /// `Some(false)` when no monitor has that connector or this process has no window, and `None`
+    /// when it cannot be asked, which includes an extension too old to have the method: the window
+    /// manager then places the window. An implementation with no extension behind it has nothing
+    /// to ask, so that is what it answers by default.
+    // The full window restores its monitor through this; the companion never calls it.
+    #[allow(dead_code)]
+    fn move_own_to_monitor(&self, connector: &str, done: Done) {
+        let _ = connector;
+        done(None);
+    }
 }
 
 /// Why a call did not reach the extension.
@@ -103,6 +119,10 @@ struct Inner {
     owner_changes: Cell<u64>,
     /// The owner that was last refused, so its refusal is logged once.
     refused: RefCell<Option<String>>,
+    /// Caches method support for the current D-Bus service: `true` after a successful call,
+    /// `false` after an unknown-method response. Cleared when the service's unique bus name changes,
+    /// since the replacement may implement a different version of the extension.
+    methods: RefCell<HashMap<&'static str, bool>>,
     /// Ends the watch on the name.
     unwatch: RefCell<Option<Box<dyn FnOnce()>>>,
 }
@@ -136,6 +156,7 @@ impl GnomeShell {
                 verified: RefCell::new(None),
                 owner_changes: Cell::new(0),
                 refused: RefCell::new(None),
+                methods: RefCell::new(HashMap::new()),
                 unwatch: RefCell::new(None),
             }),
         })
@@ -202,6 +223,51 @@ impl Inner {
     fn owner_changed(&self) {
         self.owner_changes.set(self.owner_changes.get() + 1);
         *self.verified.borrow_mut() = None;
+        self.methods.borrow_mut().clear();
+    }
+
+    /// Whether the current owner lacks `method`: `Some(true)` once it said it has no such method,
+    /// `Some(false)` once it answered one call of it, `None` before either. Callers hear the same
+    /// through their `Done`; only the tests read it here.
+    #[cfg(test)]
+    fn lacks(&self, method: &str) -> Option<bool> {
+        self.methods.borrow().get(method).map(|has| !has)
+    }
+
+    /// The boolean answer a call of `method` came back with, or `None` when it failed. An owner
+    /// with no such method is an older extension: that is said once per owner, and is not logged
+    /// as a failure.
+    fn answer_of(&self, method: &'static str, result: Result<Variant, CallError>) -> Option<bool> {
+        match result {
+            Ok(reply) => match reply.get::<(bool,)>() {
+                Some((answer,)) => {
+                    self.methods.borrow_mut().insert(method, true);
+                    Some(answer)
+                }
+                None => {
+                    println!("[companion] GNOME Shell extension: {method} answered {reply}, not a boolean");
+                    None
+                }
+            },
+            // A name nobody owns was already said once, when the extension was found absent, and an
+            // owner that is not gnome-shell when it was refused.
+            Err(CallError::NotTheShell) => None,
+            Err(CallError::Bus(err)) if err.matches(gio::DBusError::UnknownMethod) => {
+                if self.methods.borrow_mut().insert(method, false) != Some(false) {
+                    println!(
+                        "[companion] GNOME Shell extension has no {method}: it is an older version, so the window \
+                         manager places this window"
+                    );
+                }
+                None
+            }
+            Err(CallError::Bus(err)) => {
+                if !is_absent(&err) {
+                    println!("[companion] GNOME Shell extension: {method} failed: {err}");
+                }
+                None
+            }
+        }
     }
 
     /// The name has a new owner. It counts as the extension only once it was checked to be
@@ -416,26 +482,15 @@ async fn connection_pid(connection: &gio::DBusConnection, name: &str) -> Option<
 fn call_bool(inner: &Rc<Inner>, method: &'static str, args: Option<Variant>, done: Done) {
     let inner = inner.clone();
     glib::spawn_future_local(async move {
-        let answer = match inner.call(method, args, "(b)").await {
-            Ok(reply) => match reply.get::<(bool,)>() {
-                Some((answer,)) => Some(answer),
-                None => {
-                    println!("[companion] GNOME Shell extension: {method} answered {reply}, not a boolean");
-                    None
-                }
-            },
-            // A name nobody owns was already said once, when the extension was found absent, and an
-            // owner that is not gnome-shell when it was refused.
-            Err(CallError::NotTheShell) => None,
-            Err(CallError::Bus(err)) => {
-                if !is_absent(&err) {
-                    println!("[companion] GNOME Shell extension: {method} failed: {err}");
-                }
-                None
-            }
-        };
-        done(answer);
+        let result = inner.call(method, args, "(b)").await;
+        done(inner.answer_of(method, result));
     });
+}
+
+/// The method and arguments of a [`GnomeCalls::move_own_to_monitor`] call: the connector as the
+/// one string argument.
+fn move_own_to_monitor_call(connector: &str) -> (&'static str, Variant) {
+    (MOVE_OWN_TO_MONITOR, (connector,).to_variant())
 }
 
 impl GnomeCalls for GnomeShell {
@@ -480,6 +535,11 @@ impl GnomeCalls for GnomeShell {
     fn activate_partner(&self, done: Done) {
         call_bool(&self.inner, "ActivatePartner", None, done);
     }
+
+    fn move_own_to_monitor(&self, connector: &str, done: Done) {
+        let (method, args) = move_own_to_monitor_call(connector);
+        call_bool(&self.inner, method, Some(args), done);
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +560,45 @@ mod tests {
         assert!(is_absent(&glib::Error::new(gio::DBusError::NameHasNoOwner, "x")));
         assert!(!is_absent(&glib::Error::new(gio::DBusError::NoReply, "x")));
         assert!(!is_absent(&glib::Error::new(gio::IOErrorEnum::TimedOut, "x")));
+    }
+
+    #[test]
+    fn move_own_to_monitor_calls_the_method_with_the_connector() {
+        let (method, args) = move_own_to_monitor_call("DP-2");
+        assert_eq!(method, "MoveOwnToMonitor");
+        assert_eq!(args.type_().as_str(), "(s)");
+        assert_eq!(args.to_string(), "('DP-2',)");
+    }
+
+    /// A shell whose calls never reach a bus: these tests read only how answers are taken.
+    fn unconnected() -> Rc<GnomeShell> {
+        GnomeShell::with_connector(Box::new(|| {
+            Box::pin(async { Err(glib::Error::new(gio::IOErrorEnum::NotConnected, "no bus here")) })
+        }))
+    }
+
+    #[test]
+    fn a_version_1_extension_reads_as_not_available() {
+        let shell = unconnected();
+        let (method, _) = move_own_to_monitor_call("DP-2");
+        assert_eq!(shell.inner.lacks(method), None, "nothing is known before a call");
+        // An extension that predates the method answers with the bus's own error for a method it does not export.
+        let older = glib::Error::new(gio::DBusError::UnknownMethod, "No such method 'MoveOwnToMonitor'");
+        assert_eq!(shell.inner.answer_of(method, Err(CallError::Bus(older.clone()))), None);
+        assert_eq!(shell.inner.lacks(method), Some(true), "the owner lacks the method");
+        // A second call to the same owner reads the same, and is not logged again.
+        assert_eq!(shell.inner.answer_of(method, Err(CallError::Bus(older))), None);
+        // Other failures say nothing about the method.
+        let other = unconnected();
+        let slow = glib::Error::new(gio::DBusError::NoReply, "timed out");
+        assert_eq!(other.inner.answer_of(method, Err(CallError::Bus(slow))), None);
+        assert_eq!(other.inner.lacks(method), None);
+        // A new owner may be a newer extension, so the verdict is forgotten with the owner.
+        shell.inner.owner_changed();
+        assert_eq!(shell.inner.lacks(method), None);
+        // An owner that answers has it, and its boolean is the answer.
+        assert_eq!(shell.inner.answer_of(method, Ok((false,).to_variant())), Some(false));
+        assert_eq!(shell.inner.lacks(method), Some(false));
+        assert_eq!(shell.inner.answer_of(method, Ok((true,).to_variant())), Some(true));
     }
 }

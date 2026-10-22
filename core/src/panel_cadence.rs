@@ -137,6 +137,8 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         // A message the user put into the running turn reached the agent or came back: its row and
         // the line above the box change together, so neither waits for a slot.
         AgentDomainEvent::UserMessageDelivered { .. } | AgentDomainEvent::UserMessageDropped { .. } => false,
+        // A whole conversation's records arriving with a move: never a stream fragment.
+        AgentDomainEvent::MoveSeeded(_) => false,
     }
 }
 

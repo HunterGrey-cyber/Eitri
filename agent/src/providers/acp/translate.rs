@@ -9,6 +9,7 @@ use crate::projection::{
     AgentDomainEvent, ContentKind, TokenUsage, TurnEndDetail, TurnOutcome, UsageInfo, MAX_TURN_END_MESSAGE_CHARS,
 };
 use crate::providers::codex::translate::{bounded, MAX_RESULT_BYTES};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -167,7 +168,7 @@ fn names_files(kind: Option<&str>) -> bool {
 }
 
 /// The bookkeeping of one turn's stream.
-#[derive(Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Fold {
     /// Calls started and not ended.
     open: HashSet<String>,

@@ -1544,3 +1544,490 @@ fn a_resync_marks_a_turn_by_the_count_it_ended_with() {
     poll_until(&mut review, "s1", "the turn", |t| is_ok(t, "t1"));
     assert!(turn(&review.turns("s1"), "t1").left_running);
 }
+
+// ---- a linked partner's turns, and a session's review moving between windows ---------------------
+
+use eitri_core::turn_review::{HandedTurn, ReviewHandoff, ReviewHint, Unbound};
+use eitri_core::window_link::{EdgeKind, TurnEdge};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A `CLOCK_MONOTONIC` stand-in the test sets, so turn times are the ones it names.
+#[derive(Clone, Default)]
+struct Clock(Arc<AtomicU64>);
+
+impl Clock {
+    fn set(&self, ns: u64) {
+        self.0.store(ns, Ordering::SeqCst);
+    }
+
+    fn review(&self, scratch: &Scratch, jobs: &Jobs) -> TurnReview {
+        let clock = self.0.clone();
+        let options = ReviewOptions {
+            monotonic: Some(Arc::new(move || clock.load(Ordering::SeqCst))),
+            ..jobs.options()
+        };
+        TurnReview::with_options(Some(scratch.review_dir()), &scratch.project(), options)
+    }
+}
+
+fn edge(session: &str, edge: EdgeKind, at_ns: u64) -> TurnEdge {
+    TurnEdge {
+        session: session.into(),
+        edge,
+        at_ns,
+    }
+}
+
+/// Polls until no worker owes an answer, so what was handed to them (marks included) is written.
+fn settle(review: &mut TurnReview) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while review.has_work_in_flight() {
+        assert!(Instant::now() < deadline, "the workers never finished");
+        review.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_late_started_edge_marks_a_turn_of_this_window_that_ended_pumps_before() {
+    let at = Instant::now();
+    let pump = |n: u32| at + turn_review_pump_interval() * n;
+    let scratch = Scratch::new("late-edge");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    clock.set(1_000);
+    review.observe(1, "s1", &started("a0"), now());
+    clock.set(2_000);
+    review.observe(1, "s1", &completed("a0"), now());
+    clock.set(10_000);
+    review.observe(1, "s1", &started("a1"), now());
+    clock.set(20_000);
+    review.observe(1, "s1", &completed("a1"), now());
+    // Many pumps pass before the partner's start reaches this window: by pumps alone, a1 ended too
+    // long ago to have met it.
+    for n in 0..10 {
+        review.poll_at(pump(n));
+    }
+    poll_until(&mut review, "s1", "both turns", |t| is_ok(t, "a0") && is_ok(t, "a1"));
+    review.partner_turn(edge("p1", EdgeKind::Started, 15_000));
+    let turns = review.turns("s1");
+    assert!(
+        turn(&turns, "a1").overlapped_tab,
+        "it ran while the partner's turn had started"
+    );
+    assert!(
+        !turn(&turns, "a0").overlapped_tab,
+        "it ended before the partner's turn started"
+    );
+
+    // The mark reaches the store, so a later run says it too.
+    settle(&mut review);
+    let n = turn(&turns, "a1").n;
+    let later = scratch.review(&Jobs::default());
+    let overview = later
+        .overview_job("s1", TurnRef::N(n), Scope::Turn, NamedPaths::default())
+        .run()
+        .unwrap();
+    assert!(
+        overview
+            .notes
+            .contains(&"this turn overlapped another tab's turn".to_string()),
+        "{:?}",
+        overview.notes
+    );
+}
+
+#[test]
+fn an_ended_edge_marks_only_the_turns_its_interval_met() {
+    const S: u64 = 1_000_000_000;
+    let scratch = Scratch::new("ended-edge");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    clock.set(S);
+    review.observe(1, "s1", &started("a0"), now());
+    clock.set(2 * S);
+    review.observe(1, "s1", &completed("a0"), now());
+    // A partner turn wholly between this window's two turns.
+    review.partner_turn(edge("p1", EdgeKind::Started, 3 * S));
+    review.partner_turn(edge("p1", EdgeKind::Ended, 5 * S));
+    clock.set(10 * S);
+    review.observe(1, "s1", &started("a1"), now());
+    clock.set(20 * S);
+    review.observe(1, "s1", &completed("a1"), now());
+    poll_until(&mut review, "s1", "both turns", |t| is_ok(t, "a0") && is_ok(t, "a1"));
+    // An end whose start was never heard of compares only its own instant.
+    review.partner_turn(edge("p3", EdgeKind::Ended, 30 * S));
+    let turns = review.turns("s1");
+    assert!(!turn(&turns, "a0").overlapped_tab, "it ended before the partner's turn");
+    assert!(
+        !turn(&turns, "a1").overlapped_tab,
+        "it started after the partner's turn ended"
+    );
+    // A partner turn heard of late that spanned both marks both, though both had ended.
+    review.partner_turn(edge("p2", EdgeKind::Started, S + S / 2));
+    review.partner_turn(edge("p2", EdgeKind::Ended, 12 * S));
+    let turns = review.turns("s1");
+    assert!(turn(&turns, "a0").overlapped_tab && turn(&turns, "a1").overlapped_tab);
+}
+
+#[test]
+fn edges_carried_in_hello_mark_turns_already_running() {
+    let (one, two) = (Scratch::new("hello-one"), Scratch::new("hello-two"));
+    let (jobs_one, jobs_two) = (Jobs::default(), Jobs::default());
+    let (clock_one, clock_two) = (Clock::default(), Clock::default());
+    let mut window_one = clock_one.review(&one, &jobs_one);
+    let mut window_two = clock_two.review(&two, &jobs_two);
+    clock_one.set(5_000);
+    window_one.observe(1, "s1", &started("a1"), now());
+    clock_two.set(3_000);
+    window_two.observe(1, "s2", &started("b1"), now());
+    poll_until(&mut window_two, "s2", "b1's base", |t| has_base(t, "b1"));
+
+    // The link comes up: each side's hello carries its running turns with their own times.
+    let hello = window_one.running_turn_edges();
+    assert_eq!(hello, vec![edge("s1", EdgeKind::Started, 5_000)]);
+    for e in hello {
+        window_two.partner_turn(e);
+    }
+    assert!(turn(&window_two.turns("s2"), "b1").overlapped_tab);
+
+    // A turn starting while the partner's runs is marked as it starts.
+    clock_two.set(6_000);
+    window_two.observe(2, "s3", &started("c1"), now());
+    poll_until(&mut window_two, "s3", "c1's base", |t| has_base(t, "c1"));
+    assert!(turn(&window_two.turns("s3"), "c1").overlapped_tab);
+
+    // Window 1's end, announced as an edge, ends it there; a turn long after is not marked.
+    window_one.announce_turn_edges(true);
+    clock_one.set(9_000);
+    window_one.observe(1, "s1", &completed("a1"), now());
+    let edges = window_one.take_turn_edges();
+    assert_eq!(edges, vec![edge("s1", EdgeKind::Ended, 9_000)]);
+    assert!(window_one.take_turn_edges().is_empty(), "taken once");
+    for e in edges {
+        window_two.partner_turn(e);
+    }
+    // Window 2's own turns end too, pumps before the next one starts, so only the partner could mark it.
+    let at = Instant::now();
+    let pump = |n: u32| at + turn_review_pump_interval() * n;
+    window_two.observe(1, "s2", &completed("b1"), now());
+    window_two.observe(2, "s3", &completed("c1"), now());
+    for n in 0..5 {
+        window_two.poll_at(pump(n));
+    }
+    clock_two.set(60_000_000_000);
+    window_two.observe(3, "s4", &started("d1"), now());
+    poll_until(&mut window_two, "s4", "d1's base", |t| has_base(t, "d1"));
+    assert!(!turn(&window_two.turns("s4"), "d1").overlapped_tab);
+
+    // A partner gone with a turn still running counts it as ended from then on.
+    window_two.partner_turn(edge("s9", EdgeKind::Started, 60_000_000_001));
+    clock_two.set(60_000_000_002);
+    window_two.partner_gone();
+    window_two.observe(3, "s4", &completed("d1"), now());
+    for n in 5..10 {
+        window_two.poll_at(pump(n));
+    }
+    clock_two.set(120_000_000_000);
+    window_two.observe(4, "s5", &started("e1"), now());
+    poll_until(&mut window_two, "s5", "e1's base", |t| has_base(t, "e1"));
+    assert!(!turn(&window_two.turns("s5"), "e1").overlapped_tab);
+}
+
+#[test]
+fn a_review_handoff_round_trips_with_ended_pump_reset_and_times_kept() {
+    let at = Instant::now();
+    let pump = |n: u32| at + turn_review_pump_interval() * n;
+    let scratch = Scratch::new("handoff");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut source = clock.review(&scratch, &jobs);
+    source.poll_at(pump(0));
+    clock.set(100);
+    source.observe(1, "s1", &started("a1"), now());
+    clock.set(200);
+    source.observe(1, "s1", &completed("a1"), now());
+    clock.set(300);
+    source.observe(1, "s1", &started("a2"), now());
+    clock.set(400);
+    source.observe(1, "s1", &completed("a2"), now());
+    poll_until(&mut source, "s1", "both turns", |t| is_ok(t, "a1") && is_ok(t, "a2"));
+    let before = source.turns("s1");
+
+    let handoff = source.hand_over_session("s1", 1).unwrap();
+    let text = serde_json::to_string(&handoff).unwrap();
+    let back: ReviewHandoff = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, handoff, "the handoff survives the link");
+    let times: Vec<(u64, Option<u64>)> = handoff.records.iter().map(|r| (r.started_ns, r.ended_ns)).collect();
+    assert_eq!(times, vec![(100, Some(200)), (300, Some(400))]);
+    assert_eq!(handoff.running, None);
+    assert_eq!(handoff.offset, Some(0));
+
+    // The destination has pumped far more than the source.
+    let dest_jobs = Jobs::default();
+    let mut dest = Clock::default().review(&scratch, &dest_jobs);
+    for n in 0..50 {
+        dest.poll_at(pump(n));
+    }
+    dest.adopt_session(back, 7);
+    assert_eq!(dest.turns("s1"), {
+        let mut moved = before.clone();
+        for t in &mut moved {
+            t.tab = 7;
+        }
+        moved
+    });
+
+    // The adopted turn ended in the destination's current pump: a turn another tab starts in this
+    // pump may have run beside it, as for an end observed here.
+    dest.observe(8, "s2", &started("b1"), now());
+    assert!(turn(&dest.turns("s1"), "a2").overlapped_tab, "{:#?}", dest.turns("s1"));
+
+    // Its times moved with it.
+    let again = dest.hand_over_session("s1", 7).unwrap();
+    let times_again: Vec<(u64, Option<u64>)> = again.records.iter().map(|r| (r.started_ns, r.ended_ns)).collect();
+    assert_eq!(times_again, times);
+    assert!(again.records.iter().all(|r| r.tab == 7));
+}
+
+#[test]
+fn a_job_finishing_in_the_source_reaches_the_holder() {
+    let scratch = Scratch::new("holder-result");
+    let jobs = Jobs::default();
+    jobs.hold(SnapshotKind::Base, 1);
+    let mut source = scratch.review(&jobs);
+    // No session event first: the worker reads the numbering only when the base starts, which is
+    // held, so the handoff goes without it.
+    source.observe(1, "s1", &started("t1"), now());
+    jobs.wait_started(SnapshotKind::Base, 1);
+    source.poll();
+    let handoff = source.hand_over_session("s1", 1).unwrap();
+    assert_eq!(handoff.offset, None);
+    assert_eq!(
+        handoff.running,
+        Some(HandedTurn {
+            position: 1,
+            base: None
+        })
+    );
+
+    let dest_jobs = Jobs::default();
+    let mut dest = scratch.review(&dest_jobs);
+    dest.adopt_session(handoff, 9);
+    source.drop_moved(1);
+    // The turn ends in the destination; its end waits for the numbering the source is reading.
+    dest.observe(9, "s1", &completed("t1"), now());
+    dest.poll();
+    assert!(
+        !dest_jobs.finished(SnapshotKind::End, 1),
+        "nothing is numbered before the offset is known"
+    );
+
+    jobs.release(SnapshotKind::Base, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut forwarded = Vec::new();
+    while forwarded.len() < 2 {
+        assert!(Instant::now() < deadline, "the source never finished: {forwarded:?}");
+        source.poll();
+        while let Some(result) = source.result_for_holder("s1") {
+            forwarded.push(result);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for result in forwarded {
+        dest.accept_result("s1", result).unwrap();
+    }
+    let mut hints: Vec<ReviewHint> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !is_ok(&dest.turns("s1"), "t1") {
+        assert!(Instant::now() < deadline, "{:#?}", dest.turns("s1"));
+        hints.extend(dest.poll());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    hints.extend(dest.poll());
+    let t1 = turn(&dest.turns("s1"), "t1").clone();
+    assert_eq!(t1.n, 1, "numbered as the source numbered it");
+    assert_eq!(t1.tab, 9);
+    assert_eq!(
+        hints,
+        vec![ReviewHint {
+            tab: 9,
+            turn: 1,
+            files: 0
+        }]
+    );
+    settle(&mut source);
+    assert!(source.turns("s1").is_empty());
+    assert!(!source.has_work_in_flight());
+}
+
+#[test]
+fn drop_moved_takes_no_end_snapshot_and_keeps_no_presence() {
+    let scratch = Scratch::new("drop-moved");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut source = clock.review(&scratch, &jobs);
+    clock.set(1_000);
+    source.observe(1, "s1", &started("t1"), now());
+    poll_until(&mut source, "s1", "the base", |t| has_base(t, "t1"));
+    source.hand_over_session("s1", 1).unwrap();
+    source.drop_moved(1);
+    settle(&mut source);
+    assert!(
+        !jobs.seen().iter().any(|e| matches!(
+            e,
+            JobEvent::Starting {
+                kind: SnapshotKind::End,
+                ..
+            }
+        )),
+        "the moved turn was ended here: {:?}",
+        jobs.seen()
+    );
+    assert!(source.turns("s1").is_empty());
+    assert!(source.running_turn_edges().is_empty(), "no turn of this window runs");
+
+    // The moved turn still runs, in the other window: a turn starting here meets it.
+    clock.set(2_000);
+    source.observe(2, "s2", &started("u1"), now());
+    poll_until(&mut source, "s2", "u1's base", |t| has_base(t, "u1"));
+    assert!(turn(&source.turns("s2"), "u1").overlapped_tab);
+
+    // The presence: the tab's running file goes with the set that no longer has it.
+    let presence_dir = scratch.review_dir();
+    let holder = eitri_core::turn_review::PresenceHolder::start(presence_dir.clone(), 4242);
+    let held = holder.sync_confirmed(&BTreeSet::from([1]));
+    assert_eq!(
+        held.recv_timeout(Duration::from_secs(5)),
+        Ok(eitri_core::turn_review::Held::Yes)
+    );
+    let dropped = holder.sync_confirmed(&BTreeSet::new());
+    assert_eq!(
+        dropped.recv_timeout(Duration::from_secs(5)),
+        Ok(eitri_core::turn_review::Held::Yes)
+    );
+    assert!(!presence_dir.join("running/4242.1").exists());
+}
+
+#[test]
+fn an_unbound_turn_cannot_be_handed_over() {
+    let scratch = Scratch::new("unbound");
+    let jobs = Jobs::default();
+    let mut review = scratch.review(&jobs);
+    // The tab's backend has not reported its session yet.
+    review.observe(1, "", &started("t1"), now());
+    assert_eq!(review.hand_over_session("s1", 1), Err(Unbound));
+    // Once it has, the turn is filed under it and can move.
+    review.observe(1, "s1", &opened("s1"), now());
+    assert!(review.hand_over_session("s1", 1).is_ok());
+}
+
+#[test]
+fn a_session_back_before_its_first_worker_answered_is_numbered_and_its_turn_ends() {
+    let scratch = Scratch::new("back-again");
+    let jobs = Jobs::default();
+    jobs.hold(SnapshotKind::Base, 1);
+    let mut one = scratch.review(&jobs);
+    // The worker here is parked before it reads the numbering, so neither handoff carries it.
+    one.observe(1, "s1", &started("t1"), now());
+    jobs.wait_started(SnapshotKind::Base, 1);
+    one.poll();
+    let there = one.hand_over_session("s1", 1).unwrap();
+    assert_eq!(there.offset, None);
+    let two_jobs = Jobs::default();
+    let mut two = scratch.review(&two_jobs);
+    two.adopt_session(there, 9);
+    one.drop_moved(1);
+
+    // The chat comes straight back, before the first worker here answered anything.
+    let back = two.hand_over_session("s1", 9).unwrap();
+    assert_eq!(back.offset, None);
+    assert_eq!(back.running.as_ref().map(|t| t.position), Some(1));
+    two.drop_moved(9);
+    one.adopt_session(back, 2);
+    one.observe(2, "s1", &completed("t1"), now());
+
+    // The first worker's numbering and base are the session's here again: the end kept back for
+    // the numbering goes out, and the turn is whole.
+    jobs.release(SnapshotKind::Base, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !is_ok(&one.turns("s1"), "t1") {
+        assert!(
+            Instant::now() < deadline,
+            "the turn never ended: {:#?}",
+            one.turns("s1")
+        );
+        one.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t1 = turn(&one.turns("s1"), "t1").clone();
+    assert_eq!((t1.n, t1.tab), (1, 2));
+    // Each worker's answers settled its own count: nothing is owed once both are done.
+    settle(&mut one);
+    assert!(!one.has_work_in_flight());
+    assert_eq!(
+        one.result_for_holder("s1"),
+        None,
+        "nothing is kept for a window that no longer holds the session"
+    );
+    assert_eq!(two.result_for_holder("s1"), None);
+}
+
+#[test]
+fn a_command_left_running_moves_with_the_session() {
+    let scratch = Scratch::new("background-moves");
+    let jobs = Jobs::default();
+    let mut source = scratch.review(&jobs);
+    source.observe(1, "s1", &started("t1"), now());
+    source.observe(1, "s1", &background(1), now());
+    source.observe(1, "s1", &completed("t1"), now());
+    poll_until(&mut source, "s1", "t1", |t| is_ok(t, "t1"));
+    assert!(turn(&source.turns("s1"), "t1").left_running);
+
+    let handoff = source.hand_over_session("s1", 1).unwrap();
+    assert_eq!(handoff.background, 1);
+    let back: ReviewHandoff = serde_json::from_str(&serde_json::to_string(&handoff).unwrap()).unwrap();
+    assert_eq!(back, handoff);
+    let dest_jobs = Jobs::default();
+    let mut dest = scratch.review(&dest_jobs);
+    dest.adopt_session(back, 9);
+    source.drop_moved(1);
+
+    // The agent says the count again only when it changes: the next turn here still ends with the
+    // command running.
+    dest.observe(9, "s1", &started("t2"), now());
+    dest.observe(9, "s1", &completed("t2"), now());
+    poll_until(&mut dest, "s1", "t2", |t| is_ok(t, "t2"));
+    assert!(turn(&dest.turns("s1"), "t2").left_running);
+}
+
+#[test]
+fn a_partner_turn_whose_edges_arrive_together_marks_only_what_it_met() {
+    const S: u64 = 1_000_000_000;
+    let scratch = Scratch::new("edges-together");
+    let jobs = Jobs::default();
+    let clock = Clock::default();
+    let mut review = clock.review(&scratch, &jobs);
+    clock.set(10 * S);
+    review.observe(1, "s1", &started("a1"), now());
+    clock.set(11 * S);
+    review.observe(1, "s1", &completed("a1"), now());
+    poll_until(&mut review, "s1", "a1", |t| is_ok(t, "a1"));
+
+    // A partner turn long before, its two edges held up on the way and arriving together.
+    review.partner_turns([edge("p1", EdgeKind::Started, S), edge("p1", EdgeKind::Ended, 2 * S)]);
+    assert!(
+        !turn(&review.turns("s1"), "a1").overlapped_tab,
+        "it ended long before this window's turn started"
+    );
+
+    // One that did run beside it, and a start whose end is not among the edges, are still seen.
+    review.partner_turns([
+        edge("p1", EdgeKind::Started, 3 * S),
+        edge("p1", EdgeKind::Ended, 4 * S),
+        edge("p2", EdgeKind::Started, 10 * S + S / 2),
+    ]);
+    assert!(turn(&review.turns("s1"), "a1").overlapped_tab);
+}

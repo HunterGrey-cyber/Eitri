@@ -18,7 +18,7 @@
 //! once with a note on the call's row (`approvals`). Anything else gets "method not found": an unanswered
 //! request would hang the agent. Nothing is ever granted by default, and no answer is remembered.
 
-use super::approvals::{self, AnswerForm, CardAnswer, Handling, HeldItems};
+use super::approvals::{self, AnswerForm, CardAnswer, Handling, HeldItems, HeldItemsRecord};
 use super::config::{expected_echo, session_config};
 use super::family::{Family, FamilyEdge, Full, MEMBERS_MAX, UNREAD_TURN};
 use super::resume;
@@ -32,7 +32,7 @@ use super::wire::{
     TurnStartResponse, TurnStatus, TurnSteerParams,
 };
 use crate::external::{ExternalProvider, ExternalStart, Reviewer, TurnPolicy, ANSWERED_BY_EITRI};
-use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, Pending, Skipped};
+use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkError, LinkHandoff, LinkSpec, Pending, Skipped};
 use crate::projection::{
     thinking_open_after, ContentKind, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome,
 };
@@ -41,11 +41,14 @@ use crate::provider::{
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
     ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
 };
-use crate::{AgentDomainEvent, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT};
-use serde::Serialize;
+use crate::provider_move::{at_offset, forget_unclaimed, handed_ids, offset_ms, MovedAnswer, START_WAIT};
+use crate::{AgentDomainEvent, MoveRefusedWhy, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -193,7 +196,7 @@ const QUIET_ITEM_TYPES: &[&str] = &[
 ];
 
 /// What a call Codex started and has not reported ended is, for deciding what an interrupt left running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Running {
     Command,
     FileChange,
@@ -250,7 +253,8 @@ pub const STOPPED_BACKGROUND: &str =
 struct SentInterrupt {
     thread_id: String,
     turn_id: String,
-    answer: Pending,
+    /// The answer, until it is read: a refusal is read once, and the interrupt is then sent again.
+    answer: Option<Pending>,
     /// Codex refused it: it is sent again then, should the turn still run.
     again_at: Option<Instant>,
     /// How many times this turn's interrupt was sent again before this one.
@@ -279,6 +283,7 @@ impl Drop for SetOnDrop {
 }
 
 /// A card waiting for its answer.
+#[derive(Debug, Serialize, Deserialize)]
 struct WaitingCard {
     /// Codex's id of the request, which the answer goes back under.
     request_id: Value,
@@ -293,6 +298,7 @@ struct WaitingCard {
 
 /// A row Eitri drew for a card whose call had no row of its own (a network request names Codex's own key,
 /// and no item is ever started for it).
+#[derive(Debug, Serialize, Deserialize)]
 struct AddedRow {
     row: String,
     /// The tab turn the row was filed under.
@@ -394,13 +400,18 @@ struct State {
     thought_scanned: usize,
     /// The reasoning item and part the last thought sent came from.
     thought_part: Option<(String, ThoughtPart)>,
+    /// When a chat taken up from another process was adopted, until its move is committed. Codex's
+    /// output is not read before the commit, so nothing is pumped then and no deadline may run out: one
+    /// that did would stop a session whose turn may well have ended in what is still unread, and the
+    /// parked link would be dropped without the child it does not own yet.
+    adopted_at: Option<Instant>,
 }
 
 /// Which part of a reasoning item a thought came from. Codex writes a reasoning item as summary parts
 /// (or raw content parts) and a past turn's item joins them with a blank line; a thought from another
 /// part, or from another item, is given the same blank line live, so the text reads the same live and
 /// resumed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ThoughtPart {
     Summary(Option<i64>),
     Content(Option<i64>),
@@ -420,6 +431,251 @@ struct SentSteer {
     waiting: Option<Value>,
 }
 
+/// A Codex tab's provider state as data, taken when its chat moves to another process: every field of the
+/// provider's state is here, rebuilt there, or named where it is taken as the reason it does not move.
+/// The connection's own state crosses beside it as the link's [`LinkHandoff`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodexProviderHandoff {
+    version: (u32, u32, u32),
+    state_home: PathBuf,
+    codex_home: PathBuf,
+    steer_unsupported: bool,
+    thread_id: Option<String>,
+    family: Option<Family>,
+    model: Option<String>,
+    /// Folded already and not pumped yet when the chat froze.
+    events: VecDeque<AgentDomainEvent>,
+    held: VecDeque<Incoming>,
+    turn: Option<MovedTurn>,
+    items: HashMap<String, usize>,
+    message_text: HashMap<String, String>,
+    open_tools: HashSet<String>,
+    calls: HeldItemsRecord,
+    cards: Vec<(String, WaitingCard)>,
+    next_card: u64,
+    next_answered_row: u64,
+    answered_rows: HashSet<String>,
+    seen_unknown: HashSet<String>,
+    early_turns: HashMap<String, String>,
+    last_limits: Option<translate::LimitFigure>,
+    watch: TrustWatch,
+    blocked: Option<String>,
+    history: Vec<AgentDomainEvent>,
+    /// By thread and item: a list, since a map with a pair for its key has no JSON form.
+    running: Vec<((String, String), Running)>,
+    running_unread: bool,
+    interrupts: Vec<MovedInterrupt>,
+    stopped_whole: bool,
+    background: HashSet<(String, String)>,
+    background_unread: bool,
+    background_reported: u32,
+    start_abandoned: bool,
+    user_reviewed: HashSet<(String, String)>,
+    steers: Vec<MovedSteer>,
+    /// The reason, and the time left to wait for the last of stderr, in milliseconds from the freeze.
+    closing_notice: Option<(String, i64)>,
+    thought_open: bool,
+    thought_scanned: usize,
+    thought_part: Option<(String, ThoughtPart)>,
+}
+
+/// [`ActiveTurn`] as data: its moments as milliseconds from the freeze.
+#[derive(Debug, Serialize, Deserialize)]
+struct MovedTurn {
+    id: Option<String>,
+    interrupt_wanted: bool,
+    interrupted: HashSet<String>,
+    cancelled: HashSet<String>,
+    interrupt_asked: bool,
+    interrupting: bool,
+    own_end: Option<(TurnOutcome, TurnEndDetail)>,
+    settle_until_ms: Option<i64>,
+    told_to_stop_ms: HashMap<String, i64>,
+    settling: bool,
+    last_message: String,
+    usage: Option<wire::TokenUsage>,
+    /// Whether the turn's reviewer is the user (`true`) or the agent (`false`).
+    reviewed_by_user: Option<bool>,
+}
+
+/// [`SentInterrupt`] as data: its answer by request id, or the answer itself if it had come.
+#[derive(Debug, Serialize, Deserialize)]
+struct MovedInterrupt {
+    thread_id: String,
+    turn_id: String,
+    answer: Option<MovedAnswer>,
+    again_at_ms: Option<i64>,
+    resent: u32,
+}
+
+/// [`SentSteer`] as data: its answer by request id, or the answer itself if it had come.
+#[derive(Debug, Serialize, Deserialize)]
+struct MovedSteer {
+    client_id: String,
+    as_typed: String,
+    answer: Option<MovedAnswer>,
+    waiting: Option<Value>,
+}
+
+fn invalid(what: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.into())
+}
+
+impl ActiveTurn {
+    fn into_moved(self, now: Instant) -> MovedTurn {
+        let ActiveTurn {
+            id,
+            interrupt_wanted,
+            interrupted,
+            cancelled,
+            interrupt_asked,
+            interrupting,
+            own_end,
+            settle_until,
+            told_to_stop,
+            settling,
+            last_message,
+            usage,
+            reviewer,
+        } = self;
+        MovedTurn {
+            id,
+            interrupt_wanted,
+            interrupted,
+            cancelled,
+            interrupt_asked,
+            interrupting,
+            own_end,
+            settle_until_ms: settle_until.map(|at| offset_ms(at, now)),
+            told_to_stop_ms: told_to_stop
+                .into_iter()
+                .map(|(turn, at)| (turn, offset_ms(at, now)))
+                .collect(),
+            settling,
+            last_message,
+            usage,
+            // Matched in full, so a reviewer added later fails to build here instead of crossing as the
+            // agent, the side that asks the user less.
+            reviewed_by_user: reviewer.map(|r| match r {
+                Reviewer::User => true,
+                Reviewer::Agent => false,
+            }),
+        }
+    }
+
+    fn from_moved(moved: MovedTurn, now: Instant) -> ActiveTurn {
+        let MovedTurn {
+            id,
+            interrupt_wanted,
+            interrupted,
+            cancelled,
+            interrupt_asked,
+            interrupting,
+            own_end,
+            settle_until_ms,
+            told_to_stop_ms,
+            settling,
+            last_message,
+            usage,
+            reviewed_by_user,
+        } = moved;
+        ActiveTurn {
+            id,
+            interrupt_wanted,
+            interrupted,
+            cancelled,
+            interrupt_asked,
+            interrupting,
+            own_end,
+            settle_until: settle_until_ms.map(|ms| at_offset(ms, now)),
+            told_to_stop: told_to_stop_ms
+                .into_iter()
+                .map(|(turn, ms)| (turn, at_offset(ms, now)))
+                .collect(),
+            settling,
+            last_message,
+            usage,
+            reviewer: reviewed_by_user.map(|user| if user { Reviewer::User } else { Reviewer::Agent }),
+        }
+    }
+}
+
+impl SentInterrupt {
+    fn into_moved(self, now: Instant) -> MovedInterrupt {
+        let SentInterrupt {
+            thread_id,
+            turn_id,
+            mut answer,
+            again_at,
+            resent,
+        } = self;
+        MovedInterrupt {
+            thread_id,
+            turn_id,
+            answer: answer.as_mut().map(MovedAnswer::of),
+            again_at_ms: again_at.map(|at| offset_ms(at, now)),
+            resent,
+        }
+    }
+
+    fn from_moved(moved: MovedInterrupt, link: &JsonRpcLink, now: Instant) -> io::Result<SentInterrupt> {
+        let MovedInterrupt {
+            thread_id,
+            turn_id,
+            answer,
+            again_at_ms,
+            resent,
+        } = moved;
+        Ok(SentInterrupt {
+            thread_id,
+            turn_id,
+            answer: answer.map(|a| a.rebind(link)).transpose()?,
+            again_at: again_at_ms.map(|ms| at_offset(ms, now)),
+            resent,
+        })
+    }
+}
+
+impl SentSteer {
+    fn into_moved(self) -> MovedSteer {
+        let SentSteer {
+            client_id,
+            as_typed,
+            mut answer,
+            waiting,
+        } = self;
+        MovedSteer {
+            client_id,
+            as_typed,
+            answer: answer.as_mut().map(MovedAnswer::of),
+            waiting,
+        }
+    }
+
+    fn from_moved(moved: MovedSteer, link: &JsonRpcLink) -> io::Result<SentSteer> {
+        let MovedSteer {
+            client_id,
+            as_typed,
+            answer,
+            waiting,
+        } = moved;
+        Ok(SentSteer {
+            client_id,
+            as_typed,
+            answer: answer.map(|a| a.rebind(link)).transpose()?,
+            waiting,
+        })
+    }
+}
+
+/// Why a session takes no more turns: Codex runs under another policy than the one asked for, or loaded
+/// what an untrusted session may not.
+const BLOCKED_POLICY: &str = "Codex is not running under the policy Eitri asked for";
+/// Why a session takes no more turns: Codex refused to resume the conversation.
+const BLOCKED_RESUME: &str = "Codex would not resume this conversation";
+/// Every reason a session can be blocked for, so a moved session's reason is read back as the same one.
+const BLOCKED_REASONS: [&str; 2] = [BLOCKED_POLICY, BLOCKED_RESUME];
+
 /// The start of the id Eitri gives a turn whose start it could not read.
 const UNREAD_TURN_PREFIX: &str = "eitri-unread-turn-";
 
@@ -431,6 +687,29 @@ const BEHIND_A_REFUSAL: &str = "an earlier message was not taken, and this one w
 
 /// The most messages sent into one turn and not yet read; a further one waits for the turn's end.
 const MAX_STEERS: usize = 64;
+
+/// Why an adopted chat refuses what needs its link running: its move is not committed yet.
+const NOT_COMMITTED: &str = "this chat's move here is not committed yet";
+
+/// Moves every deadline the state holds on by `by`.
+fn later_deadlines(st: &mut State, by: Duration) {
+    if let Some(turn) = st.turn.as_mut() {
+        if let Some(until) = turn.settle_until.as_mut() {
+            *until += by;
+        }
+        for at in turn.told_to_stop.values_mut() {
+            *at += by;
+        }
+    }
+    for sent in &mut st.interrupts {
+        if let Some(at) = sent.again_at.as_mut() {
+            *at += by;
+        }
+    }
+    if let Some((_, until)) = st.closing_notice.as_mut() {
+        *until += by;
+    }
+}
 
 /// The longest reason a dropped message carries of Codex's own words, in characters.
 const MAX_STEER_REASON_CHARS: usize = 200;
@@ -948,7 +1227,7 @@ impl CodexProvider {
         Some(SentInterrupt {
             thread_id,
             turn_id,
-            answer,
+            answer: Some(answer),
             again_at: None,
             resent,
         })
@@ -972,12 +1251,13 @@ impl CodexProvider {
                 return false;
             }
             if sent.again_at.is_none() {
-                match sent.answer.try_take() {
+                match sent.answer.as_mut().and_then(Pending::try_take) {
                     None => return true,
                     Some(Ok(_)) => return false,
                     Some(Err(e)) if sent.resent < INTERRUPT_RESENDS => {
                         eprintln!("agent: Codex did not take an interrupt ({e}); it is sent again");
                         sent.again_at = Some(now + INTERRUPT_RETRY);
+                        sent.answer = None;
                     }
                     Some(Err(e)) => {
                         eprintln!("agent: Codex did not take an interrupt ({e}); it is not sent again");
@@ -2513,6 +2793,368 @@ fn note_unknown(st: &mut State, what: &str, method: &str) {
     }
 }
 
+// ------------------------------------------------------------ moving the chat to another process
+
+impl CodexProvider {
+    /// Whether a running turn moves with the chat. Codex keeps its turn when its stdio changes hands, so
+    /// a chat moves mid-turn as well as between turns.
+    pub fn live_move(&self) -> bool {
+        true
+    }
+
+    /// Why the provider cannot freeze now, if it cannot.
+    fn move_blocker(&self, st: &State) -> Option<MoveRefusedWhy> {
+        if st.adopted_at.is_some() {
+            Some(MoveRefusedWhy::Link(NOT_COMMITTED.to_string()))
+        } else if st.stopping.is_some() {
+            Some(MoveRefusedWhy::Stopping)
+        } else if st.closed || st.dead {
+            Some(MoveRefusedWhy::Ended)
+        } else if st.history_loading {
+            Some(MoveRefusedWhy::HistoryLoading)
+        } else if st.thread_id.is_none() || st.turn.as_ref().is_some_and(|turn| turn.id.is_none()) {
+            Some(MoveRefusedWhy::Starting)
+        } else if st.turn.is_some() && !self.live_move() {
+            Some(MoveRefusedWhy::TurnRunning)
+        } else {
+            None
+        }
+    }
+
+    /// Stops the provider where it stands so that another process can take the chat up with
+    /// [`adopt`](Self::adopt): the link stops (its reader at once, its writer once what was queued is
+    /// written), and the provider's state comes out as data, every waiting answer by its request id or, if
+    /// it had come, as the answer itself. Nothing is written to Codex and nothing is ended: the child, its
+    /// stdin, stdout and stderr go with the returned descriptors. From here on this provider is closed and
+    /// pumps nothing.
+    ///
+    /// Refused, with the provider left as it was, while the session is being stopped, a resumed
+    /// conversation's history is being read, the session or a turn is still starting 2 s on, an adopted
+    /// chat's own move is not committed yet, or the link cannot stop (a caller waiting on an answer that
+    /// does not come within 2 s, a write Codex does not take).
+    ///
+    /// The provider stays locked while the link stops, so that nothing is pumped from a half-stopped
+    /// link: its other calls wait for up to those 2 s, and a caller on a UI thread freezes from another.
+    pub fn freeze_for_move(&self) -> Result<(CodexProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
+        let deadline = Instant::now() + START_WAIT;
+        let mut st = loop {
+            let st = lock(&self.state);
+            match self.move_blocker(&st) {
+                None => break st,
+                // The start's caller waits outside this lock and takes it again once its answer comes.
+                Some(MoveRefusedWhy::Starting) if Instant::now() < deadline => {
+                    drop(st);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Some(why) => return Err(why),
+            }
+        };
+        let Some(link) = lock(&self.link).take() else {
+            return Err(MoveRefusedWhy::Ended);
+        };
+        let (link_handoff, fds) = match link.stop_for_move() {
+            Ok(stopped) => stopped,
+            Err(refused) => {
+                let why = refused.reason;
+                *lock(&self.link) = Some(*refused.link);
+                return Err(MoveRefusedWhy::Link(why));
+            }
+        };
+        let gone = State {
+            closed: true,
+            dead: true,
+            ..State::default()
+        };
+        let state = std::mem::replace(&mut *st, gone);
+        Ok((self.handoff_of(state, Instant::now()), link_handoff, fds))
+    }
+
+    fn handoff_of(&self, state: State, now: Instant) -> CodexProviderHandoff {
+        let CodexProvider {
+            // Stopped and handed over as the link's own record.
+            link: _,
+            // Taken apart below.
+            state: _,
+            // The link's record carries the child's pid.
+            pid: _,
+            version,
+            state_home,
+            codex_home,
+            steer_unsupported,
+        } = self;
+        let State {
+            thread_id,
+            family,
+            model,
+            events,
+            held,
+            turn,
+            items,
+            message_text,
+            open_tools,
+            calls,
+            cards,
+            next_card,
+            next_answered_row,
+            answered_rows,
+            seen_unknown,
+            early_turns,
+            last_limits,
+            watch,
+            blocked,
+            // A freeze is refused while the history is read, so it is false.
+            history_loading: _,
+            history,
+            running,
+            running_unread,
+            // A freeze is refused while the child is being stopped: the thread doing it stays here.
+            stopping: _,
+            interrupts,
+            stopped_whole,
+            background,
+            background_unread,
+            background_reported,
+            start_abandoned,
+            user_reviewed,
+            steers,
+            closing_notice,
+            // A freeze is refused once the session is closed or its child gone, so both are false.
+            closed: _,
+            dead: _,
+            thought_open,
+            thought_scanned,
+            thought_part,
+            // A freeze is refused until an adopted chat's move is committed, so it is `None`.
+            adopted_at: _,
+        } = state;
+        CodexProviderHandoff {
+            version: *version,
+            state_home: state_home.clone(),
+            codex_home: codex_home.clone(),
+            steer_unsupported: steer_unsupported.load(Ordering::Acquire),
+            thread_id,
+            family,
+            model,
+            events,
+            held,
+            turn: turn.map(|turn| turn.into_moved(now)),
+            items,
+            message_text,
+            open_tools,
+            calls: calls.into_record(),
+            cards,
+            next_card,
+            next_answered_row,
+            answered_rows,
+            seen_unknown,
+            early_turns,
+            last_limits,
+            watch,
+            blocked: blocked.map(str::to_string),
+            history,
+            running: running.into_iter().collect(),
+            running_unread,
+            interrupts: interrupts.into_iter().map(|sent| sent.into_moved(now)).collect(),
+            stopped_whole,
+            background,
+            background_unread,
+            background_reported,
+            start_abandoned,
+            user_reviewed,
+            steers: steers.into_iter().map(SentSteer::into_moved).collect(),
+            closing_notice: closing_notice.map(|(reason, until)| (reason, offset_ms(until, now))),
+            thought_open,
+            thought_scanned,
+            thought_part,
+        }
+    }
+
+    /// Takes up a chat another process froze with [`freeze_for_move`](Self::freeze_for_move). The link is
+    /// adopted parked and every waiting answer is bound again by its request id, so nothing is read from or
+    /// written to Codex until [`commit`](Self::commit); dropping the provider before then only closes this
+    /// process's copies of the descriptors.
+    pub fn adopt(handoff: CodexProviderHandoff, link: LinkHandoff, fds: [OwnedFd; 3]) -> io::Result<CodexProvider> {
+        let pid = link.pid;
+        let handed = handed_ids(&link);
+        let link = JsonRpcLink::adopt(link, fds, approvals::over_cap_reply)?;
+        Self::rebuilt(handoff, link, pid, &handed)
+    }
+
+    /// Starts the adopted link once the move is committed: what was carried is read first, then Codex's
+    /// stdout, and the answers given meanwhile are written. Nothing to do for a running link.
+    ///
+    /// Until then [`pump`](AgentProvider::pump) reports nothing and acts on no deadline. The deadlines
+    /// carried as time remaining start running here: they are moved on by the time the chat waited for its
+    /// commit, while nothing of Codex's could be read.
+    pub fn commit(&self) -> io::Result<()> {
+        let mut st = lock(&self.state);
+        let started = match lock(&self.link).as_mut() {
+            Some(link) => link.start_after_commit(),
+            None => Ok(()),
+        };
+        // Pumping resumes even when the link's threads could not start: the tab then learns that the
+        // session ended, instead of waiting for good.
+        if let Some(adopted_at) = st.adopted_at.take() {
+            later_deadlines(&mut st, adopted_at.elapsed());
+        }
+        started
+    }
+
+    /// The source's way back when a move is given up before its commit: this provider takes its own
+    /// frozen state up again and reads on at once, as it would have without the move.
+    pub fn resume_after_move(
+        &self,
+        handoff: CodexProviderHandoff,
+        link: LinkHandoff,
+        fds: [OwnedFd; 3],
+    ) -> io::Result<()> {
+        let pid = link.pid;
+        let handed = handed_ids(&link);
+        let link = JsonRpcLink::resume_after_move(link, fds, approvals::over_cap_reply)?;
+        let CodexProvider {
+            link,
+            state,
+            // The source's own, unchanged by the move.
+            pid: _,
+            version: _,
+            state_home: _,
+            codex_home: _,
+            steer_unsupported,
+        } = Self::rebuilt(handoff, link, pid, &handed)?;
+        self.steer_unsupported
+            .store(steer_unsupported.load(Ordering::Acquire), Ordering::Release);
+        let mut st = lock(&self.state);
+        *st = state.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The source's link reads on at once, so there is no commit to wait for.
+        st.adopted_at = None;
+        *lock(&self.link) = link.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(())
+    }
+
+    fn rebuilt(
+        handoff: CodexProviderHandoff,
+        link: JsonRpcLink,
+        pid: u32,
+        handed: &[u64],
+    ) -> io::Result<CodexProvider> {
+        let now = Instant::now();
+        let CodexProviderHandoff {
+            version,
+            state_home,
+            codex_home,
+            steer_unsupported,
+            thread_id,
+            family,
+            model,
+            events,
+            held,
+            turn,
+            items,
+            message_text,
+            open_tools,
+            calls,
+            cards,
+            next_card,
+            next_answered_row,
+            answered_rows,
+            seen_unknown,
+            early_turns,
+            last_limits,
+            watch,
+            blocked,
+            history,
+            running,
+            running_unread,
+            interrupts,
+            stopped_whole,
+            background,
+            background_unread,
+            background_reported,
+            start_abandoned,
+            user_reviewed,
+            steers,
+            closing_notice,
+            thought_open,
+            thought_scanned,
+            thought_part,
+        } = handoff;
+        let blocked = match blocked {
+            None => None,
+            Some(why) => Some(
+                BLOCKED_REASONS
+                    .iter()
+                    .copied()
+                    .find(|known| *known == why)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "the session was blocked for a reason this build does not know: {why}"
+                        ))
+                    })?,
+            ),
+        };
+        let calls = HeldItems::from_record(calls).map_err(invalid)?;
+        let interrupts = interrupts
+            .into_iter()
+            .map(|moved| SentInterrupt::from_moved(moved, &link, now))
+            .collect::<io::Result<Vec<_>>>()?;
+        let steers = steers
+            .into_iter()
+            .map(|moved| SentSteer::from_moved(moved, &link))
+            .collect::<io::Result<Vec<_>>>()?;
+        forget_unclaimed(&link, handed);
+        let state = State {
+            thread_id,
+            family,
+            model,
+            events,
+            held,
+            turn: turn.map(|moved| ActiveTurn::from_moved(moved, now)),
+            items,
+            message_text,
+            open_tools,
+            calls,
+            cards,
+            next_card,
+            next_answered_row,
+            answered_rows,
+            seen_unknown,
+            early_turns,
+            last_limits,
+            watch,
+            blocked,
+            history_loading: false,
+            history,
+            running: running.into_iter().collect(),
+            running_unread,
+            stopping: None,
+            interrupts,
+            stopped_whole,
+            background,
+            background_unread,
+            background_reported,
+            start_abandoned,
+            user_reviewed,
+            steers,
+            closing_notice: closing_notice.map(|(reason, ms)| (reason, at_offset(ms, now))),
+            closed: false,
+            dead: false,
+            thought_open,
+            thought_scanned,
+            thought_part,
+            adopted_at: Some(now),
+        };
+        Ok(CodexProvider {
+            link: Mutex::new(Some(link)),
+            state: Mutex::new(state),
+            pid,
+            version,
+            state_home,
+            codex_home,
+            steer_unsupported: AtomicBool::new(steer_unsupported),
+        })
+    }
+}
+
 impl AgentProvider for CodexProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -2739,6 +3381,9 @@ impl AgentProvider for CodexProvider {
 
     fn pump(&self) -> Vec<AgentDomainEvent> {
         let mut st = lock(&self.state);
+        if st.adopted_at.is_some() {
+            return Vec::new();
+        }
         let caught_up = st.closed || self.drain(&mut st);
         self.follow_interrupts(&mut st);
         self.follow_steers(&mut st, true);
@@ -2806,7 +3451,7 @@ impl CodexProvider {
             return;
         }
         eprintln!("agent: {mismatch}");
-        st.blocked = Some("Codex is not running under the policy Eitri asked for");
+        st.blocked = Some(BLOCKED_POLICY);
         // Cancelled, not declined: a cancel ends the asking thread's turn at once, where a decline would let
         // it go on with what needs no request until the host shuts the session down.
         self.drop_cards_with(st, PermissionOutcome::ProviderFailed, CardAnswer::Interrupt);
@@ -2923,7 +3568,7 @@ impl CodexProvider {
     ) -> String {
         let mut st = lock(&self.state);
         st.history_loading = false;
-        st.blocked = Some("Codex would not resume this conversation");
+        st.blocked = Some(BLOCKED_RESUME);
         st.thread_id = Some(requested.to_string());
         st.family = Some(Family::new(requested.to_string()));
         st.events.push_back(AgentDomainEvent::SessionOpened {
@@ -3034,6 +3679,10 @@ impl ExternalProvider for CodexProvider {
             ));
         }
         Self::require_open(&st)?;
+        // Before the commit the link does not hold the child yet, so stopping it here would end nothing.
+        if st.adopted_at.is_some() {
+            return Err(provider_error(ProviderErrorCode::NoActiveTurn, NOT_COMMITTED));
+        }
         if st.turn.is_some() {
             return Err(provider_error(
                 ProviderErrorCode::TurnAlreadyActive,

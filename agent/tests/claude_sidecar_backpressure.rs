@@ -98,6 +98,8 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
             // No Claude provider puts a message into a running turn yet: matched for exhaustiveness.
             AgentDomainEvent::UserMessageDelivered { .. } => "UserMessageDelivered",
             AgentDomainEvent::UserMessageDropped { .. } => "UserMessageDropped",
+            // Made only by a move between windows, never read off the wire: matched for exhaustiveness.
+            AgentDomainEvent::MoveSeeded(_) => "MoveSeeded",
         };
         *counts.entry(kind).or_default() += 1;
     }

@@ -25,7 +25,7 @@ use super::translate::{self, Fold};
 use super::wire::{self, method, ChunkKind, InitializeResponse, OptionKind, PermissionRequest, ToolCallFields, Update};
 use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
 use crate::jsonrpc_link::{
-    resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkSpec, OverCapReply, Pending, Skipped,
+    resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkHandoff, LinkSpec, OverCapReply, Pending, Skipped,
     REQUEST_TOO_LARGE,
 };
 use crate::projection::{AgentDomainEvent, PermissionOutcome, ResumeStatus, SlashCommand, TurnEndDetail, TurnOutcome};
@@ -34,10 +34,15 @@ use crate::provider::{
     ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
     ResumeSessionRequest, SendTurnRequest,
 };
+use crate::provider_move::{forget_unclaimed, handed_ids, MovedAnswer, START_WAIT};
+use crate::MoveRefusedWhy;
 use crate::SIDECAR_EXIT_GRACE;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
+use std::io;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -63,8 +68,17 @@ const CLOSING_NOTICE_WAIT: Duration = Duration::from_millis(100);
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i64 = -32601;
+/// Why an adopted chat refuses to move on before its own move is committed.
+const NOT_COMMITTED: &str = "this chat's move here is not committed yet";
 /// The prefix of the id of a row Eitri adds for a request it answered whose call it could not name.
 const ANSWERED_ROW_PREFIX: &str = "eitri-answered-";
+
+/// Why a session takes no more turns: the agent would not load the saved session.
+const BLOCKED_LOAD: &str = "the agent would not load this conversation";
+/// Why a session takes no more turns: the agent reported a mode other than the one asked for.
+const BLOCKED_MODE: &str = "the agent is not running in the mode Eitri asked for";
+/// Every reason a session can be blocked for, so a moved session's reason is read back as the same one.
+const BLOCKED_REASONS: [&str; 2] = [BLOCKED_LOAD, BLOCKED_MODE];
 
 /// How the link answers a request from the agent too large to read: a permission request `cancelled`, the
 /// one ACP answer that needs none of the request's options, and anything else "invalid request".
@@ -107,6 +121,7 @@ fn interned_name(agent: &str) -> &'static str {
 }
 
 /// A card waiting for its answer.
+#[derive(Debug, Serialize, Deserialize)]
 struct WaitingCard {
     /// The agent's id of the request, which the answer goes back under.
     request_id: Value,
@@ -153,6 +168,9 @@ struct State {
     /// A saved session is being loaded: what arrives meanwhile is left in the link, so the replay is read
     /// in one place.
     loading: bool,
+    /// The session being opened is a saved one, whose replay can take long: set and cleared with
+    /// `loading`.
+    replaying: bool,
     /// The loaded session's history, until the host takes it. Never pumped.
     history: Vec<AgentDomainEvent>,
     /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
@@ -160,6 +178,9 @@ struct State {
     closing_notice: Option<(String, Instant)>,
     closed: bool,
     dead: bool,
+    /// A chat taken up from another process waits for its move's commit, and pumps nothing until then:
+    /// the move can still be given back, and the source then reports what was carried itself.
+    awaiting_commit: bool,
 }
 
 /// What a wait during the start collects: the mode the agent last reported, and the replay.
@@ -499,6 +520,7 @@ impl AcpProvider {
         let history = boot.history.take().map(History::finish).unwrap_or_default();
         let mut st = lock(&self.state);
         st.loading = false;
+        st.replaying = false;
         st.session_id = Some(session_id.clone());
         st.model = setup.current_model.clone();
         st.history = history;
@@ -532,7 +554,8 @@ impl AcpProvider {
         eprintln!("agent: {} would not load a saved session: {message}", self.agent);
         let mut st = lock(&self.state);
         st.loading = false;
-        st.blocked = Some("the agent would not load this conversation");
+        st.replaying = false;
+        st.blocked = Some(BLOCKED_LOAD);
         st.session_id = Some(requested.to_string());
         st.events.push_back(AgentDomainEvent::SessionOpened {
             session_id: requested.to_string(),
@@ -557,7 +580,7 @@ impl AcpProvider {
             return;
         }
         eprintln!("agent: asked for {requested}, {} reported {reported}", self.agent);
-        st.blocked = Some("the agent is not running in the mode Eitri asked for");
+        st.blocked = Some(BLOCKED_MODE);
         self.drop_cards(st, PermissionOutcome::ProviderFailed, true);
         st.events
             .push_back(AgentDomainEvent::PolicyMismatch { requested, reported });
@@ -820,13 +843,10 @@ impl AcpProvider {
         // A call is named only for a request that named this session too: one whose session id came after
         // the bytes read could be another session's call of the same id.
         let call_id = call_id.filter(|_| session_id.is_some());
-        let State {
-            turn,
-            events,
-            next_answered_row,
-            ..
-        } = st;
-        let Some(turn) = turn.as_mut() else { return };
+        // Field by field, so the turn, the queue and the counter are borrowed apart.
+        let events = &mut st.events;
+        let next_answered_row = &mut st.next_answered_row;
+        let Some(turn) = st.turn.as_mut() else { return };
         let turn_id = turn.id.clone();
         let note = format!(
             "{} asked for a decision in a request larger than 16 MiB, which Eitri cannot show; Eitri cancelled it",
@@ -937,6 +957,350 @@ fn link_error(agent: &str, link: &JsonRpcLink, what: &str, e: LinkError) -> Prov
             ProviderErrorCode::ProviderProtocolError,
             format!("{agent} refused {what}: {message}"),
         ),
+    }
+}
+
+// ------------------------------------------------------------ moving the chat to another process
+
+/// An ACP tab's provider state as data, taken when its chat moves to another process: every field of the
+/// provider's state is here, rebuilt there, or named where it is taken as the reason it does not move.
+/// The connection's own state crosses beside it as the link's [`LinkHandoff`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcpProviderHandoff {
+    agent: String,
+    auto_mode: Option<String>,
+    load_session: bool,
+    close_session: bool,
+    label: Option<String>,
+    session_id: Option<String>,
+    model: Option<String>,
+    /// Folded already and not pumped yet when the chat froze.
+    events: VecDeque<AgentDomainEvent>,
+    turn: Option<MovedTurn>,
+    turn_seq: u64,
+    cards: Vec<(String, WaitingCard)>,
+    next_card: u64,
+    next_answered_row: u64,
+    seen_unknown: HashSet<String>,
+    /// The gauge's used and size.
+    context: Option<(u64, u64)>,
+    commands: Vec<SlashCommand>,
+    blocked: Option<String>,
+    history: Vec<AgentDomainEvent>,
+}
+
+/// [`ActiveTurn`] as data: the prompt's answer by its request id, or the answer itself if it had come.
+#[derive(Debug, Serialize, Deserialize)]
+struct MovedTurn {
+    id: String,
+    pending: Option<MovedAnswer>,
+    response: Option<Result<Value, LinkError>>,
+    fold: Fold,
+    interrupting: bool,
+}
+
+fn invalid(what: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.into())
+}
+
+impl ActiveTurn {
+    fn into_moved(self) -> MovedTurn {
+        let ActiveTurn {
+            id,
+            mut pending,
+            response,
+            fold,
+            interrupting,
+        } = self;
+        MovedTurn {
+            id,
+            pending: pending.as_mut().map(MovedAnswer::of),
+            response,
+            fold,
+            interrupting,
+        }
+    }
+
+    fn from_moved(moved: MovedTurn, link: &JsonRpcLink) -> io::Result<ActiveTurn> {
+        let MovedTurn {
+            id,
+            pending,
+            response,
+            fold,
+            interrupting,
+        } = moved;
+        Ok(ActiveTurn {
+            id,
+            pending: pending.map(|answer| answer.rebind(link)).transpose()?,
+            response,
+            fold,
+            interrupting,
+        })
+    }
+}
+
+impl AcpProvider {
+    /// Whether a running turn moves with the chat. An ACP agent keeps its turn when its stdio changes
+    /// hands, so a chat moves mid-turn as well as between turns.
+    pub fn live_move(&self) -> bool {
+        true
+    }
+
+    /// Why the provider cannot freeze now, if it cannot.
+    fn move_blocker(&self, st: &State) -> Option<MoveRefusedWhy> {
+        if st.awaiting_commit {
+            Some(MoveRefusedWhy::Link(NOT_COMMITTED.to_string()))
+        } else if st.closed || st.dead {
+            Some(MoveRefusedWhy::Ended)
+        } else if st.loading && st.replaying {
+            // A replay can run far past the start's short wait, so it is refused at once.
+            Some(MoveRefusedWhy::HistoryLoading)
+        } else if st.loading || st.session_id.is_none() {
+            Some(MoveRefusedWhy::Starting)
+        } else if st.turn.is_some() && !self.live_move() {
+            Some(MoveRefusedWhy::TurnRunning)
+        } else {
+            None
+        }
+    }
+
+    /// Stops the provider where it stands so that another process can take the chat up with
+    /// [`adopt`](Self::adopt): the link stops (its reader at once, its writer once what was queued is
+    /// written), and the provider's state comes out as data, the prompt's answer by its request id or, if it
+    /// had come, as the answer itself. Nothing is written to the agent and nothing is ended: the child, its
+    /// stdin, stdout and stderr go with the returned descriptors. From here on this provider is closed and
+    /// pumps nothing.
+    ///
+    /// Refused, with the provider left as it was, while a new session is still opening 2 s on, at once
+    /// while a saved session's replay is read, once the session has ended, before an adopted chat's own
+    /// move is committed, or when the link cannot stop (a caller waiting on an answer that does not come
+    /// within 2 s, a write the agent does not take).
+    ///
+    /// The provider stays locked while the link stops, so that nothing is pumped from a half-stopped
+    /// link: its other calls wait for up to those 2 s, and a caller on a UI thread freezes from another.
+    pub fn freeze_for_move(&self) -> Result<(AcpProviderHandoff, LinkHandoff, [OwnedFd; 3]), MoveRefusedWhy> {
+        let deadline = Instant::now() + START_WAIT;
+        let mut st = loop {
+            let st = lock(&self.state);
+            match self.move_blocker(&st) {
+                None => break st,
+                // The start's caller waits outside this lock and takes it again once its answer comes.
+                Some(MoveRefusedWhy::Starting) if Instant::now() < deadline => {
+                    drop(st);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Some(why) => return Err(why),
+            }
+        };
+        let Some(link) = lock(&self.link).take() else {
+            return Err(MoveRefusedWhy::Ended);
+        };
+        let (link_handoff, fds) = match link.stop_for_move() {
+            Ok(stopped) => stopped,
+            Err(refused) => {
+                let why = refused.reason;
+                *lock(&self.link) = Some(*refused.link);
+                return Err(MoveRefusedWhy::Link(why));
+            }
+        };
+        let gone = State {
+            closed: true,
+            dead: true,
+            ..State::default()
+        };
+        let state = std::mem::replace(&mut *st, gone);
+        Ok((self.handoff_of(state), link_handoff, fds))
+    }
+
+    fn handoff_of(&self, state: State) -> AcpProviderHandoff {
+        let AcpProvider {
+            // The interned form of `agent`, interned again where the chat is taken up.
+            name: _,
+            agent,
+            auto_mode,
+            // Stopped and handed over as the link's own record.
+            link: _,
+            // Taken apart below.
+            state: _,
+            // The link's record carries the child's pid.
+            pid: _,
+            load_session,
+            close_session,
+            label,
+        } = self;
+        let State {
+            session_id,
+            model,
+            events,
+            turn,
+            turn_seq,
+            cards,
+            next_card,
+            next_answered_row,
+            seen_unknown,
+            context,
+            commands,
+            blocked,
+            // A freeze is refused while the session opens, so both are false.
+            loading: _,
+            replaying: _,
+            history,
+            // A freeze is refused once the session is closed or its child gone, so both are false.
+            closed: _,
+            dead: _,
+            // Set only once the child is gone, which refuses a freeze, so it is `None`.
+            closing_notice: _,
+            // A freeze is refused until an adopted chat's move is committed, so it is false.
+            awaiting_commit: _,
+        } = state;
+        AcpProviderHandoff {
+            agent: agent.clone(),
+            auto_mode: auto_mode.clone(),
+            load_session: *load_session,
+            close_session: *close_session,
+            label: label.clone(),
+            session_id,
+            model,
+            events,
+            turn: turn.map(ActiveTurn::into_moved),
+            turn_seq,
+            cards,
+            next_card,
+            next_answered_row,
+            seen_unknown,
+            context: context.map(|gauge| (gauge.used, gauge.size)),
+            commands,
+            blocked: blocked.map(str::to_string),
+            history,
+        }
+    }
+
+    /// Takes up a chat another process froze with [`freeze_for_move`](Self::freeze_for_move). The link is
+    /// adopted parked and the prompt's answer is bound again by its request id, so nothing is read from or
+    /// written to the agent until [`commit`](Self::commit); dropping the provider before then only closes
+    /// this process's copies of the descriptors.
+    pub fn adopt(handoff: AcpProviderHandoff, link: LinkHandoff, fds: [OwnedFd; 3]) -> io::Result<AcpProvider> {
+        let pid = link.pid;
+        let handed = handed_ids(&link);
+        let link = JsonRpcLink::adopt(link, fds, over_cap_reply)?;
+        Self::rebuilt(handoff, link, pid, &handed)
+    }
+
+    /// Starts the adopted link once the move is committed: what was carried is read first, then the
+    /// agent's stdout, and the answers given meanwhile are written. Nothing to do for a running link.
+    /// Until then [`pump`](AgentProvider::pump) reports nothing.
+    pub fn commit(&self) -> io::Result<()> {
+        let mut st = lock(&self.state);
+        let started = match lock(&self.link).as_mut() {
+            Some(link) => link.start_after_commit(),
+            None => Ok(()),
+        };
+        // Pumping resumes even when the link's threads could not start: the tab then learns that the
+        // session ended, instead of waiting for good.
+        st.awaiting_commit = false;
+        started
+    }
+
+    /// The source's way back when a move is given up before its commit: this provider takes its own
+    /// frozen state up again and reads on at once, as it would have without the move.
+    pub fn resume_after_move(
+        &self,
+        handoff: AcpProviderHandoff,
+        link: LinkHandoff,
+        fds: [OwnedFd; 3],
+    ) -> io::Result<()> {
+        let pid = link.pid;
+        let handed = handed_ids(&link);
+        let link = JsonRpcLink::resume_after_move(link, fds, over_cap_reply)?;
+        let AcpProvider {
+            link,
+            state,
+            // The source's own, unchanged by the move.
+            name: _,
+            agent: _,
+            auto_mode: _,
+            pid: _,
+            load_session: _,
+            close_session: _,
+            label: _,
+        } = Self::rebuilt(handoff, link, pid, &handed)?;
+        let mut st = lock(&self.state);
+        *st = state.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The source's link reads on at once, so there is no commit to wait for.
+        st.awaiting_commit = false;
+        *lock(&self.link) = link.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(())
+    }
+
+    fn rebuilt(handoff: AcpProviderHandoff, link: JsonRpcLink, pid: u32, handed: &[u64]) -> io::Result<AcpProvider> {
+        let AcpProviderHandoff {
+            agent,
+            auto_mode,
+            load_session,
+            close_session,
+            label,
+            session_id,
+            model,
+            events,
+            turn,
+            turn_seq,
+            cards,
+            next_card,
+            next_answered_row,
+            seen_unknown,
+            context,
+            commands,
+            blocked,
+            history,
+        } = handoff;
+        let blocked = match blocked {
+            None => None,
+            Some(why) => Some(
+                BLOCKED_REASONS
+                    .iter()
+                    .copied()
+                    .find(|known| *known == why)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "the session was blocked for a reason this build does not know: {why}"
+                        ))
+                    })?,
+            ),
+        };
+        let turn = turn.map(|moved| ActiveTurn::from_moved(moved, &link)).transpose()?;
+        forget_unclaimed(&link, handed);
+        let state = State {
+            session_id,
+            model,
+            events,
+            turn,
+            turn_seq,
+            cards,
+            next_card,
+            next_answered_row,
+            seen_unknown,
+            context: context.map(|(used, size)| ContextGauge { used, size }),
+            commands,
+            blocked,
+            loading: false,
+            replaying: false,
+            history,
+            closing_notice: None,
+            closed: false,
+            dead: false,
+            awaiting_commit: true,
+        };
+        Ok(AcpProvider {
+            name: interned_name(&agent),
+            agent,
+            auto_mode,
+            link: Mutex::new(Some(link)),
+            state: Mutex::new(state),
+            pid,
+            load_session,
+            close_session,
+            label,
+        })
     }
 }
 
@@ -1064,6 +1428,9 @@ impl AgentProvider for AcpProvider {
 
     fn pump(&self) -> Vec<AgentDomainEvent> {
         let mut st = lock(&self.state);
+        if st.awaiting_commit {
+            return Vec::new();
+        }
         if !st.closed && !st.loading {
             // Take the prompt's answer before reading the queue: everything the agent said ahead of it is
             // in the queue by then, and the turn ends only once the queue has been read to its end.
@@ -1120,13 +1487,16 @@ impl ExternalProvider for AcpProvider {
             // there is one, is in): a pump that read a mode report meanwhile would drop it as one for no
             // session, and the start's own check of the mode would never see it.
             st.loading = true;
+            st.replaying = saved.is_some();
         }
         let result = match saved {
             None => self.open_new(req),
             Some(saved) => self.open_saved(req, saved),
         };
         if result.is_err() {
-            lock(&self.state).loading = false;
+            let mut st = lock(&self.state);
+            st.loading = false;
+            st.replaying = false;
         }
         result
     }

@@ -90,6 +90,15 @@ struct OpenSteer<R> {
     sending: Sending<R>,
 }
 
+/// Why a session's gate cannot be handed to another process now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteerBusy {
+    /// A message is open: waiting to be sent, sent and unanswered, or answered and not yet delivered.
+    Open,
+    /// A turn's end is held for the follow-up turn of an open message.
+    HoldingTurnEnd,
+}
+
 /// What the stream's next event did to the hold.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Passed {
@@ -300,6 +309,46 @@ impl<R> SteerGate<R> {
     /// Events held back, for the queue depth a caller reports.
     pub(crate) fn held_len(&self) -> usize {
         self.held.len()
+    }
+
+    /// Whether a turn's end is held back for its follow-up.
+    pub(crate) fn holding(&self) -> bool {
+        self.holding.is_some()
+    }
+
+    /// What another process needs to carry this gate on for the same session: the messages reported
+    /// dropped whose delivery may still come. Refused while a message is open (sent and not yet
+    /// delivered or dropped, or waiting to be sent) or a turn's end is held for a follow-up: the
+    /// sending, the answer and the hold all live in this process and cannot be handed over.
+    ///
+    /// Destructures the gate without a rest pattern, so a field added to it has to say whether it moves.
+    pub(crate) fn hand_over(&self) -> Result<Vec<(String, String)>, SteerBusy> {
+        let SteerGate {
+            open,
+            held,
+            holding,
+            // Rebuilt: a gate taken over holds nothing, so it starts counting its holds afresh.
+            generations: _,
+            given_up,
+            // Rebuilt: the taking side's watch is not open yet, and opening it is what says it is up.
+            stream_down: _,
+        } = self;
+        if holding.is_some() || !held.is_empty() {
+            return Err(SteerBusy::HoldingTurnEnd);
+        }
+        if !open.is_empty() {
+            return Err(SteerBusy::Open);
+        }
+        Ok(given_up.iter().cloned().collect())
+    }
+
+    /// The gate of a session taken over from another process: nothing open or held, and the messages
+    /// that process had given up on, so a delivery that still comes for one is passed on there too.
+    pub(crate) fn taken_over(given_up: Vec<(String, String)>) -> Self {
+        let mut gate = Self::default();
+        let skip = given_up.len().saturating_sub(MAX_OPEN_STEERS);
+        gate.given_up = given_up.into_iter().skip(skip).collect();
+        gate
     }
 
     /// The first waiting message, once nothing is in flight.
@@ -693,5 +742,37 @@ mod tests {
             gate.accepted(&id);
         }
         assert!(gate.open("one-more", String::new(), "x").is_err());
+    }
+
+    #[test]
+    fn a_gate_with_a_message_open_or_a_held_end_is_not_handed_over() {
+        let mut gate: Gate = SteerGate::default();
+        assert_eq!(gate.hand_over(), Ok(Vec::new()));
+        assert_eq!(gate.open("a", "typed".into(), "req").unwrap(), Some("req"));
+        assert_eq!(gate.hand_over(), Err(SteerBusy::Open), "sent, not answered");
+        gate.accepted("a");
+        assert_eq!(gate.hand_over(), Err(SteerBusy::Open), "answered, not delivered");
+        assert!(gate.pass(completed("t1")).hold_started.is_some());
+        assert_eq!(gate.hand_over(), Err(SteerBusy::HoldingTurnEnd));
+        gate.pass(started("t2"));
+        gate.pass(delivered("a", "t2"));
+        assert_eq!(gate.hand_over(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_message_given_up_on_is_handed_over_and_a_late_delivery_is_honoured_by_the_taker() {
+        let mut gate: Gate = SteerGate::default();
+        gate.open("a", "typed".into(), "req").unwrap();
+        gate.accepted("a");
+        let generation = gate.pass(completed("t1")).hold_started.unwrap();
+        gate.expire(generation);
+        let given_up = gate.hand_over().unwrap();
+        assert_eq!(given_up, [("a".to_string(), "typed".to_string())]);
+
+        let mut taker: Gate = SteerGate::taken_over(given_up);
+        assert_eq!(
+            taker.pass(delivered("a", "t2")).ready,
+            [delivered_as("a", "t2", "typed")]
+        );
     }
 }

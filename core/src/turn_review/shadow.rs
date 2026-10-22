@@ -654,8 +654,13 @@ impl Shadow {
     /// every later run that needs the same lock fails. Only called with the store lock held
     /// exclusively: then no git run of any window is using the store, and every lock file found
     /// is one a killed run left.
+    ///
+    /// In the review directory itself only the indexes' lock files go. The store lock does not
+    /// keep out the project's write slot (`write.lock`, held by a revert in any window): unlinking
+    /// it while held would let the next window lock a new file beside the old one, and two
+    /// writes would run at once.
     fn clear_stale_locks(&self) -> std::io::Result<()> {
-        remove_lock_files(&self.review_dir, false)?;
+        remove_index_locks(&self.review_dir)?;
         remove_lock_files(&self.git_dir, false)?;
         remove_lock_files(&self.git_dir.join("refs"), true)?;
         remove_lock_files(&self.git_dir.join("objects/info"), true)?;
@@ -1587,6 +1592,26 @@ fn lock_file_of(path: &Path) -> PathBuf {
     let mut lock = path.as_os_str().to_owned();
     lock.push(".lock");
     PathBuf::from(lock)
+}
+
+/// Removes every regular file named `index-*.lock` directly in `dir`: the lock git takes on a
+/// session's index, which lives beside the git directory rather than in it. Nothing else of that
+/// directory's is a lock git leaves.
+fn remove_index_locks(dir: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.as_bytes();
+        if entry.file_type()?.is_file() && name.starts_with(b"index-") && name.ends_with(b".lock") {
+            remove_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes every regular file named `*.lock` in `dir`, and in its subdirectories when `recursive`.

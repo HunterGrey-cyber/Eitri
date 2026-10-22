@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
     Text,
@@ -25,7 +25,7 @@ pub enum ContentKind {
 /// `LimitReached` comes only from the sidecar, which maps the SDK's `terminal_reason`
 /// (`max_turns`, `blocking_limit`, `rapid_refill_breaker`, `budget_exhausted`) to it.
 /// The legacy backend's translation never chooses it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcome {
     Completed,
@@ -133,7 +133,7 @@ pub struct TurnEndingRecord {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOutcome {
     Allowed,
@@ -155,7 +155,7 @@ pub enum PermissionOutcome {
 }
 
 /// What the provider said about a resume. Mirrors the wire's `ResumeStatus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResumeStatus {
     /// The provider opened a session; `attached_provider_session_id` says which one. Necessarily the
@@ -196,7 +196,7 @@ pub enum ProjectionStatus {
 
 /// Provider-neutral (per the design doc's own naming) but Claude-only in practice this phase --
 /// see this module's own header doc for what's deliberately not modeled yet.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentDomainEvent {
     SessionOpened {
@@ -428,6 +428,12 @@ pub enum AgentDomainEvent {
         tool_use_id: String,
         change: InputChange,
     },
+    /// A conversation's settled records, carried from the window that held it into this one, with
+    /// their own sequence numbers and the revision they were taken at. **Made only by the move**
+    /// ([`AgentSessionProjection::adopt`]), never by a provider: it is how an adopted projection is
+    /// still built by folding alone. Taken only by a projection that holds no record and was never
+    /// seeded; anywhere else it changes nothing but the revision.
+    MoveSeeded(Box<crate::move_seed::MoveSeed>),
 }
 
 /// The longest string in a [`InputChange`], in characters; longer ones are cut with `…`.
@@ -457,23 +463,40 @@ pub struct InputChange {
 
 /// What the projection remembers of a gate request's input: a digest per top-level field, not the
 /// input, so held inputs stay small whatever a `Write` carried.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GateInput {
     /// Whether the input was a JSON object; an input of any other kind is one field under `""`.
     object: bool,
+    #[serde(with = "held_fields")]
     fields: std::collections::BTreeMap<FieldId, HeldField>,
+}
+
+/// The held fields as a list of pairs: a JSON object's keys are strings, and a field's key is not.
+mod held_fields {
+    use super::{FieldId, HeldField};
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub(super) fn serialize<S: Serializer>(fields: &BTreeMap<FieldId, HeldField>, out: S) -> Result<S::Ok, S::Error> {
+        out.collect_seq(fields.iter())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<BTreeMap<FieldId, HeldField>, D::Error> {
+        let pairs: Vec<(FieldId, HeldField)> = Vec::deserialize(input)?;
+        Ok(pairs.into_iter().collect())
+    }
 }
 
 /// How a field is keyed in the gate memory. A name too long to hold is keyed by the digest of its
 /// bytes in a variant of its own, so no literal name, whatever it spells, can be taken for it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum FieldId {
     Literal(String),
     Hashed([u8; 32]),
 }
 
 /// One remembered field: the digest of its value and, for a long name, the cut name to report it by.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct HeldField {
     digest: [u8; 32],
     /// `Some` only for a [`FieldId::Hashed`] key: the name cut to [`MAX_KEY_CHARS`] with `…`.
@@ -784,7 +807,7 @@ pub struct ToolCallDenial {
 
 /// The first `UngatedCliMode` a session reported, as the projection keeps it. See
 /// `AgentSessionProjection::ungated_cli_mode`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UngatedCliModeRecord {
     pub reported: String,
     pub detail: String,
@@ -792,7 +815,7 @@ pub struct UngatedCliModeRecord {
 
 /// One slash command an agent advertises. **Untrusted text from the agent**: the producer bounds it
 /// (`providers::acp::wire::parse_commands`), and the page draws it as plain text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
     /// The word typed after the `/`, without the slash. Never empty, never holds whitespace.
     pub name: String,
@@ -804,7 +827,7 @@ pub struct SlashCommand {
 }
 
 /// The latest `AgentDomainEvent::AccountLimits` a session reported, as the projection keeps it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountLimitsRecord {
     pub used_percent: f64,
     pub window_minutes: Option<u32>,
@@ -857,7 +880,7 @@ pub struct ThinkingBlock {
 pub const MAX_STEER_OUTCOMES: usize = 256;
 
 /// What became of a message put into the running turn, as the provider reported it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SteerOutcome {
     Delivered,
     Dropped { reason: String },
@@ -1144,6 +1167,9 @@ impl Default for UsageInfo {
 /// sessions that ended -- i.e. a declaration of live state restored from a file. Restoring history
 /// (`history::store`) is refolding data through `apply`, never rehydrating a state declaration, and
 /// leaving this derive off is what makes the difference a compiler error rather than a discipline.
+/// A chat moved to the other window is rebuilt the same way: its lifecycle events, one
+/// [`AgentDomainEvent::MoveSeeded`] with the settled records, then its running turn's events, all
+/// through `apply` ([`AgentSessionProjection::adopt`]).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentSessionProjection {
     pub session_id: Option<String>,
@@ -1225,7 +1251,9 @@ pub struct AgentSessionProjection {
     /// not part of the four collections -- it is one statement ABOUT them: how many of them came
     /// off a disk, which disk, and where the live part starts (`upto_seq`). `apply` leaves it
     /// exactly as it found it, which is what makes "the history notice describes the seed" true for
-    /// the whole life of the projection rather than only at the moment of loading.
+    /// the whole life of the projection rather than only at the moment of loading. The one fold
+    /// that sets it is a move's [`AgentDomainEvent::MoveSeeded`], which carries the same notice the
+    /// projection it was taken from had, about the same records.
     pub history: Option<HistoryNotice>,
     /// The first `UngatedCliMode` this session reported, or `None`.
     ///
@@ -1293,11 +1321,16 @@ pub struct AgentSessionProjection {
     /// delivered ones are also user prompts; nothing else of it is drawn. Not serialized.
     #[serde(skip)]
     pub steer_outcomes: VecDeque<(String, SteerOutcome)>,
+    /// Whether an [`AgentDomainEvent::MoveSeeded`] was taken: a second seed would put records from
+    /// two exports side by side. Not serialized. Public only so a literal with `..Default::default()`
+    /// can still be written outside this crate.
+    #[serde(skip)]
+    pub move_seeded: bool,
 }
 
 /// [`AgentSessionProjection::call_index`]: the position of each tool-use id's first call, valid for
 /// the first `covers` calls. Opaque outside this crate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CallIndex {
     first: HashMap<String, usize>,
     covers: usize,
@@ -1321,7 +1354,7 @@ pub const MAX_HELD_DENIALS: usize = 64;
 /// The CLI's transcript is what `claude --resume` in a terminal shows. The host keeps a separate
 /// copy, and the two can differ. The panel identifies the source so users can tell which history
 /// they are seeing and whether a fallback was used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistorySource {
     /// B: the real Claude CLI's own `<uuid>.jsonl`.
@@ -1333,7 +1366,7 @@ pub enum HistorySource {
 /// The information the panel displays about restored history: the conversation, its source,
 /// any omissions and the reason for using a fallback. This struct is the sole input to the notice
 /// row, which appears whenever history is restored, even if nothing was truncated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryNotice {
     pub source: HistorySource,
     /// Conversational items actually folded in: prompts, assistant messages and tool calls. The
@@ -1881,6 +1914,15 @@ impl AgentSessionProjection {
                     }
                 }
             }
+            // Puts the records in place with their own `seq`s and leaves the revision where the
+            // exporting projection had it after the bump below. Never touches the status or any other
+            // live declaration: those come from the folds around it. A seed that does not fit (records
+            // here already, a second seed, a revision behind this one) changes nothing.
+            AgentDomainEvent::MoveSeeded(seed) => {
+                if self.seed_fits(seed).is_ok() {
+                    self.place_seed(seed);
+                }
+            }
         }
         self.last_revision += 1;
     }
@@ -1929,7 +1971,9 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::ToolInputChanged { .. }
         | AgentDomainEvent::CommandsAvailable { .. }
         // Dropped changes nothing on screen: it only settles a queued message.
-        | AgentDomainEvent::UserMessageDropped { .. } => open,
+        | AgentDomainEvent::UserMessageDropped { .. }
+        // A seed sets records, never whether a block is open.
+        | AgentDomainEvent::MoveSeeded(_) => open,
     }
 }
 

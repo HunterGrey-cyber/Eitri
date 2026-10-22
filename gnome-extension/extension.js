@@ -1,7 +1,8 @@
 // Lets Eitri's panel move keyboard focus between itself and its editor's window on GNOME, where an application cannot
-// focus another application's window by itself. It exports cn.huntergrey.Eitri.Shell1 on the session bus; every
-// method answers a boolean and nothing else, so a caller learns nothing about other windows. Who may move focus, and
-// when, is decided in policy.js.
+// focus another application's window by itself, and lets an Eitri window put itself back on the monitor it was on.
+// It exports cn.huntergrey.Eitri.Shell1 on the session bus; every method answers a boolean and nothing else, so a
+// caller learns nothing about other windows. Who may move focus, and when, and which windows a monitor move takes,
+// are decided in policy.js.
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -10,13 +11,12 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {
-    TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, focusGainOrigin, newHeldFocus, noteHeldFocus,
-    testingMethodsWanted,
+    EXTENSION_VERSION, TESTING_ENV, callerFocusedAt, cleanPartnerList, decide, focusGainOrigin, isConnectorName,
+    newHeldFocus, noteHeldFocus, planMoveOwnToMonitor, testingMethodsWanted,
 } from './policy.js';
 
 const BUS_NAME = 'cn.huntergrey.Eitri.Shell1';
 const OBJECT_PATH = '/cn/huntergrey/Eitri/Shell1';
-const VERSION = 1;
 
 const METHODS_XML = `
     <method name="Version"><arg type="u" direction="out" name="version"/></method>
@@ -24,7 +24,8 @@ const METHODS_XML = `
     <method name="FocusSelfIfNeighbour"><arg type="s" direction="in" name="direction"/><arg type="b" direction="out" name="moved"/></method>
     <method name="SetPartner"><arg type="au" direction="in" name="pids"/><arg type="b" direction="out" name="recorded"/></method>
     <method name="ActivateOwn"><arg type="b" direction="out" name="activated"/></method>
-    <method name="ActivatePartner"><arg type="b" direction="out" name="activated"/></method>`;
+    <method name="ActivatePartner"><arg type="b" direction="out" name="activated"/></method>
+    <method name="MoveOwnToMonitor"><arg type="s" direction="in" name="connector"/><arg type="b" direction="out" name="moved"/></method>`;
 
 function interfaceXml(extraMethods) {
     return `<node><interface name="${BUS_NAME}">${METHODS_XML}${extraMethods}</interface></node>`;
@@ -97,6 +98,16 @@ function handlingUserInput() {
         return event !== null && USER_INPUT_EVENTS.includes(event.type());
     } catch (e) {
         return false;
+    }
+}
+
+// mutter's index of the monitor whose connector is `connector`, or -1 when no monitor has it or it cannot be read.
+function monitorIndexFor(connector) {
+    try {
+        const index = global.backend.get_monitor_manager().get_monitor_for_connector(connector);
+        return Number.isInteger(index) ? index : -1;
+    } catch (e) {
+        return -1;
     }
 }
 
@@ -284,6 +295,8 @@ class EitriShell {
                 skipTaskbar: window.is_skip_taskbar() !== false,
                 onWorkspace: window.located_on_workspace(workspace),
                 monitor: window.get_monitor(),
+                // Read only by MoveOwnToMonitor; anything but a plain false counts as a window with a parent.
+                transient: window.get_transient_for() !== null,
                 stack,
                 mru: mru.has(id) ? mru.get(id) : null,
             };
@@ -386,7 +399,45 @@ class EitriShell {
     }
 
     Version() {
-        return VERSION;
+        return EXTENSION_VERSION;
+    }
+
+    // Puts the caller's own top-level windows on the monitor whose connector it names (policy.js,
+    // `planMoveOwnToMonitor`). Answers whether it asked mutter to move every one of them (or found it there already):
+    // false for a connector no monitor has, for a caller with no such window, and when a move threw. It does not read
+    // the monitor back: a move that changes a Wayland window's size lands only once the client acks the configure,
+    // after this call has answered, so a read-back would call a move that is under way a failure.
+    _moveOwnToMonitor(connector, callerPid) {
+        // A string that cannot be a connector reaches neither mutter nor the log.
+        const monitorIndex = isConnectorName(connector) ? monitorIndexFor(connector) : -1;
+        const snapshot = this._snapshot();
+        const plan = planMoveOwnToMonitor({
+            callerPid, connector, monitorIndex, monitorCount: global.display.get_n_monitors(),
+            windows: snapshot.windows,
+        });
+        if (!plan.act) {
+            debug(`MoveOwnToMonitor from pid ${callerPid}: refused (${plan.reason})`);
+            return false;
+        }
+        let moved = 0;
+        for (const id of plan.targets) {
+            const window = snapshot.byId.get(id);
+            if (!window)
+                continue;
+            try {
+                if (window.get_monitor() !== plan.monitor)
+                    window.move_to_monitor(plan.monitor);
+                moved += 1;
+            } catch (e) {
+                debug(`MoveOwnToMonitor from pid ${callerPid}: window ${id} not moved (${e})`);
+            }
+        }
+        debug(`MoveOwnToMonitor from pid ${callerPid}: ${moved} of ${plan.targets.length} windows on ${connector}`);
+        return moved > 0 && moved === plan.targets.length;
+    }
+
+    MoveOwnToMonitorAsync([connector], invocation) {
+        this._answer('MoveOwnToMonitor', invocation, pid => this._moveOwnToMonitor(connector, pid));
     }
 
     FocusDirectionAsync([direction], invocation) {
