@@ -21,10 +21,11 @@ type Props = {
    *  too (initial value 0 or otherwise -- the effect below always runs on mount, like the old
    *  mount-only effect it replaces). */
   focusRequest: number;
-  /** Bumped by `dropPendingKeys()` for cancellation routes this chooser never receives as keys:
-   *  focus changes, arrival, HINT, tab switches, and other overlays. Clears its lone-g wait along
-   *  with the panel's prefix, count, and leader sequence. Shift+Tab clears the wait in `onKeyDown`.
-   *  Optional for callers that need no external cancellation. */
+  /** Bumped by `App.tsx`'s `dropPendingKeys()` on every cancel route this overlay
+   *  never sees as a key of its own -- a focus round trip (`pane_focus`), `arrive`, a HINT, a tab
+   *  switch, another overlay. It ends the chooser's own lone-`g` wait, as those routes end the
+   *  panel's waiting prefix, count and leader sequence (`Shift+Tab`, which the chooser does see, ends
+   *  it in `onKeyDown`). Optional, so this component's own tests need no stand-in. */
   dropKeysRequest?: number;
   onSwitch: (tab: TabId) => void;
   onResume: (providerSessionId: string) => void;
@@ -115,8 +116,9 @@ function tabNumber(tab: { tab: TabId; label: string }, info: TabInfo | null): nu
  *  chooser's own phrasing names the mode as a noun ("auto mode") before saying it is on, which
  *  reads better in a full sentence than the footer pill's terser form does. */
 function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMode: PermissionModeChoice): ReactNode {
-  // A filter with no matches leaves `row` undefined. Return no mode line instead of reading
-  // `row.kind` and unmounting the panel. `keysLine` handles the same missing row.
+  // A filter matching nothing leaves no row under the cursor, and this read
+  // `row.kind` on `undefined` -- the throw unmounted the whole panel. No row, no line (`keysLine` below
+  // takes the same `undefined`).
   if (row === undefined) return null;
   if (row.kind === "tab") {
     const mode = row.info?.mode ?? "auto";
@@ -297,8 +299,8 @@ export function Chooser({
   // key does, so `gx` asked to close a tab and `gEnter` chose a row. A bare modifier is not "the next
   // key" (the Shift of a `G`).
   const pendingG = useRef(false);
-  // Clear the pending `g` on the window's cancellation routes. This also runs on mount, when
-  // nothing is waiting.
+  // The window's own cancel routes (`dropKeysRequest`'s doc). Also runs on mount,
+  // where there is nothing waiting yet.
   useEffect(() => {
     pendingG.current = false;
   }, [dropKeysRequest]);
@@ -317,15 +319,15 @@ export function Chooser({
     if (isShiftTab(event)) {
       event.preventDefault();
       event.stopPropagation();
-      // Shift+Tab performs an action here, so it ends a pending `g` wait. A bare modifier leaves
-      // the wait intact.
+      // Shift+Tab is a key after a waiting `g`, and (unlike a bare modifier) it does something
+      // here -- so it ends the wait, as it drops the panel's own pending keys (`App.tsx`).
       pendingG.current = false;
       cycleMode(current);
       return;
     }
     if (filtering || renaming !== null) return;
-    // Map Down and Ctrl+n to `j`, and Up and Ctrl+p to `k`, through the full handling below,
-    // including a pending `g` and the allow-list.
+    // `↓` and `Ctrl+n` are `j`, `↑` and `Ctrl+p` are `k`, and take the whole path below -- a pending
+    // `g` and the allow-list included.
     const step = pickerStep(event);
     const key = step === null ? event.key : step > 0 ? "j" : "k";
     if (pendingG.current) {
@@ -337,7 +339,7 @@ export function Chooser({
       return;
     }
     // A `g` held with Ctrl, Alt or Meta is a chord for something else: it arms no `gg` wait, which would
-    // swallow the next plain key (rc.3 minors review, the same rule as the panel's own g/z/[/]).
+    // swallow the next plain key (the same rule as the panel's own g/z/[/]).
     if (key === "g" && (event.ctrlKey || event.altKey || event.metaKey)) return;
     if (key === "g" || key === "G") {
       event.preventDefault();
@@ -392,8 +394,8 @@ export function Chooser({
           }}
           onKeyDown={(event) => {
             if (composing(event)) return;
-            // The four list-motion keys keep focus in the filter box while moving the list. `j`/`k`
-            // remain typed text here, so they cannot navigate while filtering.
+            // The four list keys move the list from the filter box too, and it keeps the keys --
+            // `j`/`k` are typed text in here, so these are the only way to move while filtering.
             const step = pickerStep(event);
             if (step !== null) {
               event.preventDefault();

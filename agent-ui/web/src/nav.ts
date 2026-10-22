@@ -1,26 +1,35 @@
 /**
- * Keyboard navigation follows the panel's document structure. `hjkl` uses known DOM order,
- * avoiding guesses about the nearest control based on pixel positions.
+ * Keyboard reach for every control in the panel, by structure rather than by geometry
+ * (2026-09-19). Every button has to be reachable in a way that is direct and intuitive, and `hjkl` was
+ * chosen over geometric spatial navigation after the trade-off was laid out: the panel is a vertical document,
+ * so its structure is known exactly, whereas "the nearest button in that direction" would have to
+ * be inferred from pixels and would surprise.
  *
- * A stop carries `data-nav-stop`: a conversation row, banner or terminal-handoff area, or a choice
- * row or mode button on the start screen. `j`/`k` walk stops in document order. The bottom band is
- * not a stop: `j` at the last stop stays there. Session details open with `<leader>i`, `prefix i`
- * or a click on the band. Stops without usable controls are skipped except for rows, which hold
- * the conversation cursor for `Enter`/`y` even when they have no button. A stop inside another stop
- * is content (`isOwnStop`), so reply HTML cannot add conversation rows.
+ * The model:
  *
- * `h`/`l` walk enabled buttons, inputs, textareas and radios within a stop. Document order applies
- * unless `data-nav-order` overrides it. Permission cards put Approve before Deny and the reason
- * box so the most frequent action is one keypress away.
- *
- * The focused control is the selected control. `Tab`, clicks and `h`/`l` move the same DOM focus,
- * and `Enter`/`Space` activate it natively, so separate selection state cannot disagree with focus.
+ * - A **stop** is anything carrying `data-nav-stop`: a conversation row (`"row"`), a banner, the
+ *   terminal-handoff area; on the start screen, each choice row and each mode button. The bottom
+ *   band is not one: `j` on the last stop goes nowhere, and the session's
+ *   details are `<leader>i`, `prefix i` or a click on the band. `j`/`k` walk stops in document
+ *   order, top to bottom. A stop with no usable control is
+ *   skipped, except a row: rows carry the conversation cursor and are worth landing on for
+ *   `Enter`/`y` even when they hold no button. **A stop inside another stop is content, not a
+ *   stop** (`isOwnStop` below): that is what keeps a model reply's own HTML from adding rows.
+ * - A stop's **controls** are its enabled buttons, inputs, textareas and radios. `h`/`l` walk them
+ *   left to right. Order is document order unless a control sets `data-nav-order`, which the
+ *   permission card uses to put Approve before Deny before the reason box: the most frequent action
+ *   first, one keypress away.
+ * - The **selected control is simply the focused one.** No parallel selection state that could
+ *   disagree with DOM focus: `Tab`, a click and `h`/`l` all move the same thing, and `Enter`/`Space`
+ *   activate it natively.
  */
 
 export const STOP_ATTR = "data-nav-stop";
 
-/** Label alphabet shared with the window-wide `f` HINT. It excludes `f` because that key starts
- *  HINT. The `gf` path picker and `gx` link picker reuse it for their footer lists. */
+/** The label alphabet `eitri_core::hint` uses for the window-wide `f` HINT (no `f` itself, since
+ *  that key starts the HINT). The `gf` path picker (`components/PathPick.tsx`) reuses it for its
+ *  own letter-per-path footer list, and so does `gx`'s link picker (`components/LinkPick.tsx`) -- the panel has never
+ *  needed its own copy of this until now. */
 export const HINT_ALPHABET = "asdjklghweruio";
 
 /** A web link as `web_url` (`panel/src/links.rs`) will re-check it -- `http(s)`
@@ -44,9 +53,8 @@ export function webUrl(href: string | null): string | null {
   return url.href;
 }
 
-/** Links reachable by `gx` and HINT inside `row`, in document order, once per normalized
- *  address. Keep the first anchor for each address and its `webUrl` result, which the picker
- *  shows and `open_url` sends. */
+/** The links `gx` and HINT reach inside `row`, in document order, once per normalized address (the first
+ *  anchor that names it), each with that address (`webUrl`) -- what the pick shows and `open_url` sends. */
 export function webLinks(row: HTMLElement): { el: HTMLAnchorElement; url: string }[] {
   const seen = new Set<string>();
   const out: { el: HTMLAnchorElement; url: string }[] = [];
@@ -59,16 +67,22 @@ export function webLinks(row: HTMLElement): { el: HTMLAnchorElement; url: string
   return out;
 }
 
-/** `gx` opens without a picker only when a visible link's plain text matches its normalized URL.
- *  Compare with the parsed address: Unicode host names may normalize to a different spelling,
- *  which the picker must show before opening. Allow the trailing slash added to a bare host.
- *  Hidden links, links in closed details and links outside the list's visible area require a pick.
+/** `gx` opens with no pick only a link a reader can see goes exactly where its text says.
+ *  Compared with the NORMALIZED address, not the raw `href`: an anchor whose text and `href` both spell
+ *  `https://apple.com/` with a Cyrillic "a" (U+0430) reads as apple.com and opens `xn--pple-43d.com`, which
+ *  only the pick shows. A bare host's own `/` is allowed for (`https://example.com` opens
+ *  `https://example.com/`); an upper-case host or a `www.` autolink picks, which costs a keypress and never
+ *  opens the wrong page. An anchor nobody can see (a reply's `hidden`, a closed `<details>`, scrolled out of
+ *  the list) never opens with no pick.
  *
- *  Require `childElementCount === 0`: `textContent` includes text in hidden child elements, so
- *  matching it alone could open an address whose full spelling was never visible. Reply classes
- *  and styles are stripped, so plain text nodes cannot hide themselves inside a visible anchor.
- *  Comment nodes render nothing and contribute nothing to `textContent`. Links wrapping elements
- *  such as `b` or `code` require a pick. */
+ *  **And only a link whose contents are plain text**: `textContent` counts
+ *  what an element inside the anchor does not show -- the sanitizer keeps `hidden` and inline HTML in link
+ *  text, so `<a href=".../good.example.evil.example/">https://good.example<span hidden>.evil.example</span>/</a>`
+ *  READS `https://good.example/` and has a `textContent` equal to its real address. Text nodes are always
+ *  drawn when their anchor is (a reply's `class` and `style` are stripped, so nothing it writes hides a text
+ *  node by itself), so `childElementCount === 0` is exactly "what is drawn is `textContent`" -- marked's
+ *  autolink and a bare-URL link both are. A comment node renders nothing and is not in `textContent`. A link
+ *  wrapping `<b>` or `<code>` picks, which costs one keypress and never opens an address unseen. */
 export function linkOpensAtOnce(link: { el: HTMLAnchorElement; url: string }, root: HTMLElement): boolean {
   if (link.el.childElementCount !== 0) return false;
   const text = link.el.textContent?.trim() ?? "";
@@ -130,12 +144,11 @@ export function linkClickNeedsLook(
  *  else -- it silently DELETES the button's activation.
  *
  *  **Observed on an installed build before it was fixed** (2026-09-18: no key could reach Approve).
- *  Tab-to-Approve then Enter is the only keyboard route to a permission
- *  decision today -- the `a`/`d` allow/deny keys belong to a later sub-project and are
- *  deliberately not in this keyboard skeleton -- and this panel's own `onKeyDown` had taken it
+ *  Tab-to-Approve then Enter was then the only keyboard route to a permission
+ *  decision -- the `a`/`d` allow/deny keys did not exist yet -- and this panel's own `onKeyDown` had taken it
  *  away. Before this branch nothing listened for Enter at all, so the route worked; the branch
  *  created the hole and the fix restores exactly what was there, rather than pulling the later
- *  sub-project's keys forward to paper over it.
+ *  keys forward to paper over it.
  *
  *  The same applies to Space on a button and to Enter on `<summary>` (the generic tool card's
  *  disclosure, `toolRegistry.tsx`), which is why this is a selector over activatable controls and
@@ -348,11 +361,23 @@ export interface CountedLanding {
   from: HTMLElement | null;
 }
 
-/** Walk `times` steps of `j` (+1) or `k` (-1), starting each step from the previous landing. Stop
- * early at a non-conversation stop or a boundary where clamping makes no progress. Return `null`
- * if there are no stops. Read the stops, rows and row indices once so each step needs no DOM
- * queries. Consult focus only for the initial position; rereading a focused control on every
- * step would repeatedly restart at its stop and make `3j` move only once. */
+/**
+ * A counted `j` (+1) or `k` (-1): `times` steps of `nextStop`, each from the stop the previous step
+ * landed on. The walk ends early on a stop that is not a conversation row (a banner, Stop while a
+ * turn runs) -- the same place a single `j`/`k` onto it would leave the keys -- and at a boundary,
+ * where a step makes no progress (`clampStep` clamps rather than failing there). `null` when the
+ * region has no stop at all.
+ *
+ * **One scan of the tree, whatever `times` is.** The first version fetched
+ * `stopsIn` once but still called `nextStop` per step, and each step went back to the tree twice:
+ * `nextStop` -> `currentStop` -> `conversationRows`, then `rowIndexOf` -> `conversationRows`.
+ * `1000j` from the first of 1,001 rows was 2,001 full-tree queries and about 2.3 s in jsdom. Here the stops, the rows
+ * and each row's index are read once and the walk moves along the index, so a step costs no DOM work at all.
+ *
+ * Every step after the first starts from where the walk is, never from `document.activeElement`.
+ * Per-step `currentStop` re-read focus each time, so with focus on a control inside a stop (after
+ * `l` onto a card's Approve) every step re-started from that control's stop and `3j` moved once.
+ */
 export function countedStop(
   root: HTMLElement,
   cursor: number | null,
@@ -405,12 +430,21 @@ export type AnswerableItem =
   | { kind: "tool"; toolUseId: string }
   | { kind: "other" };
 
-/** The timeline index of the permission card `a`/`d` should answer from `cursor`, or `null`. The
- * cursor must be on the card or the tool call it gates. From a tool row, choose the matching
- * `toolUseId` among the permission items directly following it. Other rows have no target,
- * preventing a shortcut from approving an unrelated call. This is also the targeting rule for
- * `D`, even when only one card exists. Arrival moves to the oldest card; with no target, the
- * panel shows a message. */
+/**
+ * The timeline index of the permission card `a`/`d` should answer from `cursor`, or `null`.
+ *
+ * The cursor is on the permission request, **or on the tool call it gates**. A
+ * pending card is anchored directly after its tool call (`timeline.ts`), so from a tool row the
+ * card is the first permission item after it that names the same `toolUseId`. Any other row has
+ * no card to answer, and `a`/`d` there do nothing, rather than reaching for the nearest card:
+ * approving the wrong call is exactly what a keyboard shortcut must not make easy.
+ *
+ * This is the ONLY rule `a`/`d`/`D` follow. There is
+ * no "exactly one card anywhere, answered from any row" exception any more -- vim's operators act on
+ * what the cursor is on (`:h operator`), and an arrival already lands on the oldest card, so
+ * the common case still needs no movement. With no target the panel says so with a flash rather
+ * than doing nothing silently.
+ */
 export function permissionTarget(items: AnswerableItem[], cursor: number): number | null {
   const here = items[cursor];
   if (here === undefined) return null;
@@ -447,7 +481,7 @@ export const HINT_COMPOSER_ATTR = "data-hint-composer";
  *  bar (sideways), and the launch chooser's list. Named here as
  *  well as read off the computed style below, because jsdom loads no stylesheet and the tests must
  *  see these three. `.session-choice` is gone -- the old resumable-session picker it named was
- *  replaced by `EmptyTab` (F3) and the launch chooser (`.chooser-list`). */
+ *  replaced by `EmptyTab` and the launch chooser (`.chooser-list`). */
 const SCROLL_CONTAINERS = ".message-list, .tab-bar, .chooser-list";
 
 function clips(el: HTMLElement): boolean {
@@ -473,9 +507,9 @@ function boxOf(r: DOMRect): Box {
   return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.right - r.left, height: r.bottom - r.top };
 }
 
-/** The area where `el` can show inside `root`: intersect the root box with every ancestor
- *  between them that clips overflow, including nested scroll containers. Return `null` when the
- *  intersection is empty. */
+/** Where anything inside `root` can show, for `el`: the root's box, cut down by every ancestor of
+ *  `el` between them that clips its overflow (the list, or a tool result's own capped box inside it).
+ *  `null` when those leave nothing. */
 export function clipBox(el: HTMLElement, root: HTMLElement): Box | null {
   let clip: Box | null = boxOf(root.getBoundingClientRect());
   for (let a = el.parentElement; a !== null && a !== root && clip !== null; a = a.parentElement) {
@@ -484,9 +518,10 @@ export function clipBox(el: HTMLElement, root: HTMLElement): Box | null {
   return clip;
 }
 
-/** The part of `el` visible inside `root`: intersect its box with `clipBox`, or return `null` if
- *  none shows or the element has no box. Place HINT labels on this area so a partially
- *  scrolled-out target keeps its label inside the visible region. */
+/** The part of `el` that shows inside `root` -- its own box inside `clipBox` -- or `null` when none
+ *  does (or it has no box at all, which is how a hidden element measures). A HINT label is placed on
+ *  this, never on the whole box: a code block whose top is scrolled out of the list has its full box's
+ *  top above the list, where a label drawn over the band above it could not be read. */
 export function visibleBox(el: HTMLElement, root: HTMLElement): Box | null {
   const box = el.getBoundingClientRect();
   if (box.width === 0 || box.height === 0) return null;
@@ -494,9 +529,11 @@ export function visibleBox(el: HTMLElement, root: HTMLElement): Box | null {
   return clip === null ? null : overlap(clip, box);
 }
 
-/** Whether `el` has a non-zero box visible inside `root` and every intervening ancestor that
- *  clips overflow. Nested scrollers must all let it through. This is exactly whether
- *  `visibleBox` is non-null, so label eligibility and placement agree. */
+/** Whether `el` shows on screen inside `root`: it has a non-zero box, and that box meets the root and
+ *  every ancestor between them that clips its overflow (visible inside its own scroll
+ *  container). Every ancestor, not only the nearest: a nested scroller's content is only on screen
+ *  where each of them lets it through. Exactly "`visibleBox` is not `null`", so what gets a label
+ *  and where the label goes can never disagree. */
 export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
   return visibleBox(el, root) !== null;
 }
@@ -509,10 +546,12 @@ function boxShows(box: DOMRect, el: HTMLElement, root: HTMLElement): boolean {
   return clip !== null && overlap(clip, box) !== null;
 }
 
-/** Place a wrapped link's HINT label on its first visible line box, using `hintVisible`'s test
- *  on each line. Its first line may be above the list while later lines still show. Fall back to
- *  the bounding box if no line box shows or none is reported, as in jsdom. A partly visible line
- *  counts; `HintLayer` clamps the label into the clip box. */
+/** Where a HINT label for a link that WRAPS belongs: the first of
+ *  its line boxes that is on screen -- `hintVisible`'s own test, line by line -- and not simply its first.
+ *  A link is a target while any part of it shows, and one whose first line has scrolled above the list
+ *  but whose last line has not would otherwise be labelled where nothing is drawn. With no line box on
+ *  screen, or none reported (jsdom lays nothing out), the bounding box, as before. A first line that only
+ *  PARTLY shows is still the first one on screen; `HintLayer` clamps its label into the clip box. */
 export function firstShownLine(el: HTMLElement, root: HTMLElement): DOMRect {
   for (const line of Array.from(el.getClientRects())) {
     if (boxShows(line, el, root)) return line;
@@ -544,8 +583,9 @@ export function hintTargets(root: HTMLElement): HintTarget[] {
       for (const block of stop.querySelectorAll<HTMLElement>("pre.code-block")) {
         if (hintVisible(block, root)) targets.push({ kind: "code", el: block, rowIndex });
       }
-      // Inspect each anchor directly. `webLinks` deduplicates addresses before checking visibility,
-      // so an off-screen first copy could leave a visible copy without a label.
+      // Per anchor, not through `webLinks`, which drops a repeated address before it looks at whether
+      // that copy is on screen -- a reply naming one address twice, the first copy scrolled off, would
+      // leave the visible copy without a label.
       for (const el of stop.querySelectorAll<HTMLAnchorElement>("a[href]")) {
         if (webUrl(el.getAttribute("href")) !== null && hintVisible(el, root)) targets.push({ kind: "link", el, rowIndex });
       }

@@ -48,7 +48,7 @@ export function SlashPicker({ kind, options, current, focusRequest, onChoose, on
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
-    // `pickerStep` maps `↓` and `Ctrl+n` to `j`, and `↑` and `Ctrl+p` to `k`, before the allow-list.
+    // `↓` and `Ctrl+n` are `j`, `↑` and `Ctrl+p` are `k` (`pickerStep`), before the allow-list.
     const step = pickerStep(event);
     const key = step === null ? event.key : step > 0 ? "j" : "k";
     if (!["j", "k", "Enter", "Escape", "q"].includes(key)) return;

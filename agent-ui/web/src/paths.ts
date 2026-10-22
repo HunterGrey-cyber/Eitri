@@ -73,7 +73,7 @@ export function pathsIn(item: TimelineItem): PathRef[] {
   }
 }
 
-/** Full row text and a buffer title for `Ctrl+g` in BROWSE, without display truncation. */
+/** `Ctrl+g` in BROWSE: the row's whole text, never the cut one, and a title for the buffer. */
 function fenced(text: string): string {
   const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
   const fence = "`".repeat(Math.max(3, longest + 1));
@@ -89,7 +89,7 @@ export function viewText(item: TimelineItem): { title: string; text: string } {
     case "tool": {
       const head = item.call.name === "Bash" ? `$ ${primaryText(item)}` : primaryText(item);
       // Fenced: the scratch buffer is markdown (right for a reply), and a bare output's `_`s and `*`s
-      // drew as emphasis there (the phase-3 GUI pass). The fence outgrows any backtick run inside.
+      // drew as emphasis there. The fence outgrows any backtick run inside.
       const body = item.call.result === null ? "" : `\n\n${fenced(formatResultContent(item.call.result.content))}`;
       return { title: `${item.call.name} ${primaryText(item)}`.slice(0, 60), text: head + body };
     }

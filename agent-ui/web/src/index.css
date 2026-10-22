@@ -1761,8 +1761,7 @@ input::placeholder {
    then the right side; tmux's `status-right` for the right-hand facts). One line, the editor's row high,
    mono at the editor's text size (`--fs-base`).
 
-   **Plain fills preserve the theme tokens' contrast guarantees.**
-   A blended fill on the whole band and mode
+   **Why the fills are plain tokens, not a computed mix.** The obvious design gives the whole band, and the mode
    section would use `color-mix(in srgb, var(--nv-cursorline)/var(--nv-mode-*) N%, var(--nv-bg))`,
    with a fallback if it fails 4.5:1. Nothing in this codebase can conditionally swap a fill per
    theme at runtime -- there is no such mechanism, CSS or otherwise -- so "else fall back" has to be
@@ -2003,9 +2002,8 @@ textarea,
    history notice and its button -- for the one synchronous `Selection.toString()` read a `y` performs, and removes it again
    before the next frame paints -- so `user-select: none` above (whether or not WebKit's own
    `toString`/native copy actually honours it) is never what keeps a row sign, a button label, a
-   form control's value or a fold marker's glyph out of the copied text; THIS rule is.
-   Previously the attribute was set and read, but this rule
-   never existed, so what `y` actually copied depended on WebKit's own unverified handling of
+   form control's value or a fold marker's glyph out of the copied text; THIS rule is. Without it, what `y`
+   actually copied would depend on WebKit's own unverified handling of
    `user-select: none` rather than on anything this file asserts. `.row-sign` is included here (it
    is not above, since it is drawn WITH `user-select: none` regardless of VISUAL) for the same reason
    every other member is: `display: none` removes it from `Selection.toString()` outright, which

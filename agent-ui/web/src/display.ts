@@ -49,7 +49,7 @@ const neverFolded = (call: ToolCallRecord): boolean =>
  *  them or a turn that is over -- become one `run` row. Expanded runs and the detailed view keep
  *  every call.
  *
- * A failed call never joins a run (sw-panel-render-5): every run row draws a fixed `✓` sign and
+ * A failed call never joins a run: every run row draws a fixed `✓` sign and
  * `runSummary` names only counts, so a failing call folded in among successes vanished behind a
  * success sign until the reader expanded the row. Excluding it from the loop below ends the run at
  * the failure -- the failing call falls out to the single-item path just below, and its own row

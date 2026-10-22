@@ -84,12 +84,18 @@ function cleanUrl(href: string): string | null {
   }
 }
 
-/* Resolve an image link's destination exactly as an ordinary link would, or return `null` when
-   marked would emit no link. marked puts the cleaned destination into `href` and lets the HTML
-   parser decode entities. Text and attributes decode some entities differently: `&copy=1` stays
-   literal in an attribute but changes in text. Decode once through an inert `<template>`, where
-   nothing loads or runs, then escape the result for both the attribute and label. `encodeURI`
-   escapes quotes and angle brackets in the cleaned destination. */
+/* The URL a click on an image's link goes to, as an ordinary link to the same destination would
+   have it -- or `null` where marked's own renderers would emit no link at all. marked's `link`
+   emits the cleaned destination RAW into `href="..."` and lets the HTML parser decode entity
+   references in it, which is what gives CommonMark's semantics (`&amp;` in a destination is `&` in
+   the URL; `?a=1&amp;b=2` has a parameter `b`, not `amp;b`). This module needs the decoded string
+   itself, because an image's link also SHOWS the URL as text, and text is decoded by different
+   rules than an attribute: a legacy reference with no `;` (`&copy=1`) is left alone in an
+   attribute and decoded to a copyright sign in text, so emitting the raw string in both places
+   would show one URL and go to another. So the decoding is done once, here, by the same HTML parser an
+   ordinary link's `href` goes through (an inert `<template>`: nothing in it loads or runs; the
+   cleaned string holds no `"`, `<` or `>`, which `encodeURI` escapes), and the result is then
+   escaped once for both the attribute and the label. */
 function resolvedHref(href: string): string | null {
   const cleaned = cleanUrl(href);
   if (cleaned === null) return null;
@@ -316,8 +322,8 @@ function escapeHtml(text: string): string {
   );
 }
 
-/** Wrap tables so they scroll sideways in their own boxes while the list stays fixed horizontally.
- *  Wrap before sanitizing so DOMPurify checks and keeps the wrapper. */
+/** A table scrolls sideways in its own box; the list never does. Wrapped BEFORE the
+ *  sanitize, so DOMPurify still sees (and keeps) the wrapper. */
 function wrapTables(html: string): string {
   return html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, "</table></div>");
 }

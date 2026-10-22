@@ -194,7 +194,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       return { ...state, activeTurnId: event.turn_id, assistantMessageOpen: false, thinkingOpen: false, lastTurnEnding: null };
     case "assistant_message_boundary":
       // Two messages with no tool call between them are two entries, as `AgentSessionProjection`
-      // folds them (the phase-3 GUI pass, 2026-09-25).
+      // folds them (2026-09-25).
       return { ...state, assistantMessageOpen: false, thinkingOpen: false };
     case "user_prompt_submitted":
       // `assistantMessageOpen: false` for the same reason `AgentSessionProjection::apply` does it:
@@ -335,7 +335,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
             toolUseId: event.tool_use_id,
             toolName: event.tool_name,
             input: event.input,
-            // O3: the CLI's own prompt, reshaped to the snapshot's camelCase so a card built from
+            // The CLI's own prompt, reshaped to the snapshot's camelCase so a card built from
             // events and one rebuilt from a snapshot read the same. Absent on the gate's request.
             ...(event.provider_prompt ? { providerPrompt: providerPromptFromWire(event.provider_prompt) } : {}),
           },
@@ -348,15 +348,22 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
       // frontend-local guess.
       return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
     case "turn_completed": {
-      // Clear the in-flight turn on `turn_completed`. Finishing a turn does not end the
-      // conversation; `session_closed` and `session_unavailable` do. Match
-      // `AgentSessionProjection::apply` when updating usage: replace the entire figure because the
-      // SDK reports a running total that `/clear` can reset. A lower report is valid. A turn with
-      // no usage report keeps the last figure; missing data must not erase it or become zero. A
-      // failed, limited or interrupted turn also leaves a row with the provider's explanation and
-      // updates the band until the next turn starts. A completed turn adds no ending row. Keep this
-      // behavior identical to `AgentSessionProjection::apply`. Use a fallback for absent `detail`
-      // so an event without it still produces a row.
+      // The one authoritative source for "no turn is in flight" -- replaces the deleted
+      // markTurnStarted's matching clear. v2 semantics unchanged from v1: a finished turn does
+      // NOT end the conversation, only session_closed/session_unavailable do.
+      //
+      // `usage`, mirroring `AgentSessionProjection::apply`: a report REPLACES the figure whole
+      // -- the SDK reports a running total that `/clear` resets, so a lower later figure is the
+      // truth, never summed or maxed -- and a turn that reported none (`null`: interrupted,
+      // synthesized, a sidecar without `TurnUsage`) leaves the last one standing. Silence is not a
+      // measurement, so it must neither erase a real figure nor become a zero.
+      //
+      // A turn that did not complete (failed, hit a limit, was interrupted) leaves a turn-ending row
+      // where it stopped, with the provider's own words, and the band says it until the next turn
+      // starts. A completed one adds nothing: it needs no explaining, and `lastTurnEnding` is already
+      // null (only `turn_started` clears it, and only a non-completed end sets it). MUST stay identical
+      // to `AgentSessionProjection::apply`. `detail` is read defensively: Rust always sends it, but an
+      // event without one must still fold to a row rather than throw inside the reducer.
       const done = {
         ...state,
         activeTurnId: null,
@@ -503,7 +510,7 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
 export type CallNotes = {
   ruleNotes?: readonly { toolUseId: string; rule: string }[];
   createsFile?: readonly { permissionId: string; toolUseId: string | null }[];
-  /** Calls whose CLI prompt was answered without a card, with the note shown on each call's row. */
+  /** Calls whose CLI prompt was answered without a card, with their row's note. */
   promptNotes?: readonly { toolUseId: string; note: string }[];
   /** Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path
    *  answered with no card. No message of its own, unlike `ruleNotes` -- there is only one fast
@@ -512,7 +519,7 @@ export type CallNotes = {
   /** Tool-use ids of a `Write` answered with no card -- by the acceptEdits
    *  fast path, or in bypass -- over a path where nothing existed
    *  just before the answer was sent. `createsFile`'s own signal is keyed by permission id and only
-   *  ever set for a call that raised a card (F22) -- a `Write` answered without one raises none, so
+   *  ever set for a call that raised a card -- a `Write` answered without one raises none, so
    *  without this its row kept `createsFile`'s absence and showed the overwrite warning for a file
    *  that never existed. */
   autoCreatesFile?: readonly string[];
@@ -604,17 +611,36 @@ export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiSt
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
 export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
-  // The snapshot omits `nextSeq`, `turnThinking` and `denialsBeforeTheirCall`, which
-  // `AgentUiSnapshot` excludes as reducer-internal fields. Supply them here. Preserve
-  // `assistantMessageOpen` from the snapshot: Rust continues appending to an open reply, and
-  // resetting it would split that reply into two rows with broken markdown. Reset `turnThinking`
-  // because earlier thinking does not imply current activity. Resync or reload may degrade
-  // `thinking` to `sent` but must not invent activity. Take `usage` from this tab's snapshot so a
-  // tab with no report cannot retain the previous tab's figure. Default an absent key to `null`,
-  // which `usageSegment` treats as unknown; `undefined` would throw. Restore `accountLimits` from
-  // the snapshot, defaulting an absent key to `null` for payloads that predate it. Restore
-  // `turnEndings` and `lastTurnEnding` from the snapshot, defaulting absent keys to `[]` and
-  // `null`, so reload preserves ending rows and the band's status.
+  // The snapshot carries neither `nextSeq` nor `turnThinking` (nor `denialsBeforeTheirCall`, which
+  // Rust keeps in a field of its own that is not serialized) -- all reducer-internal on both
+  // sides and deliberately not on the wire, which is why the parameter is typed `AgentUiSnapshot`
+  // (the `Omit` of exactly those) rather than a full `AgentUiState` that would claim Rust sent
+  // them. Supplying them here is the only reason this function exists.
+  //
+  // `assistantMessageOpen` is NOT forced here (2026-09-27): it comes from the
+  // spread of `snapshot` below like every other field. It used to be force-reset to `false` on the
+  // theory that a snapshot always meant "start fresh" -- but Rust's own `AgentSessionProjection`
+  // keeps appending to the open message underneath a snapshot taken mid-reply, so forcing `false`
+  // here split one streaming reply into two transcript rows, with broken markdown at the seam, on
+  // every snapshot landing mid-reply (a tab switch back to a streaming reply, `prefix r`, a
+  // bounded-queue Resync). See that field's own doc comment on `AgentUiState`.
+  //
+  // Resetting `turnThinking` IS still forced: a thinking delta folded before the snapshot was taken
+  // must not still read as "thinking now"; the invariant is that
+  // this bit can only ever be LOST, and a resync/reload is one more way to lose it, degrading
+  // `thinking` to `sent`. Unlike `assistantMessageOpen`, Rust never sends this one at
+  // all, so there is nothing on `snapshot` to take it from.
+  //
+  // `usage` comes from the snapshot like every other field: it is per tab, so a tab that has
+  // reported nothing must not keep the figure of the one shown before it. `?? null` is the runtime
+  // defence for a payload without the key (Rust always sends it, `null` included): `usageSegment`
+  // reads `null` as unknown and would throw on `undefined`.
+  //
+  // `accountLimits` is read the same way: the snapshot carries the latest report (`null` before any), and
+  // `?? null` covers a payload from a build that predates the key.
+  //
+  // `turnEndings` and `lastTurnEnding` come from the wire like the other collections, with the same
+  // defence for a payload without them (`[]`/`null`), so a reload keeps the rows and the band's word.
   return {
     ...snapshot,
     usage: snapshot.usage ?? null,

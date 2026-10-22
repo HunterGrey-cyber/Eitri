@@ -35,10 +35,11 @@ export type ShownHint = { target: HintTarget; label: string };
  *  longer in view. */
 type Placement = { top: number; left: number; width?: number; height?: number; shift?: boolean } | null;
 
-/** Fallback label size until drawn labels can be measured by `labelSize`.
- *  `.hint-label` uses one `--fs-xs` line plus 3px padding per side at the default 14px font.
- *  Larger fonts or zoom need measured dimensions so clamps do not let labels overhang the clip box.
- *  jsdom supplies no measurements, so tests use this fallback too. */
+/** A label's size for the clamps below until one has been drawn to measure (`index.css`'s
+ *  `.hint-label`: one `--fs-xs` line plus 3px padding each side, at the default 14px font). Only
+ *  a fallback -- the drawn labels are measured (`labelSize`), since `agent.font_size` 32 or a
+ *  `Ctrl+=` zoom makes a label about twice this, and a clamp with 16 would let it overhang the clip box.
+ *  jsdom measures nothing, so the fallback is also what its tests see. */
 export const LABEL_PX = 16;
 
 /** The height a label would have at its own font size, read off the style `index.css` gives every
@@ -79,7 +80,7 @@ function labelSize(layer: HTMLElement | null): { width: number; height: number }
 
 /** A sign cell is a sliver -- too short to carry a label squashed into it -- only when it is clearly shorter
  *  than a label, not when the two merely disagree by the sub-pixel a rounded and a fractional measure of the
- *  same thing can. */
+ *  same thing can (the boundary case that used to flip on every pass). */
 const SLIVER_SLACK_PX = 1;
 
 /** Two placements closer than this are the same one: a fractional rect differs by float noise between
@@ -124,8 +125,11 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
   const placed = hints.map(({ target }, i): Placement => {
     limits[i] = null;
     if (!target.el.isConnected) return null;
-    // Place labels on the visible part of each target and clamp their tops into its clip box.
-    // This keeps partially clipped targets labelled on screen instead of over the surrounding UI.
+    // Everything is placed on the part of the target that shows, and every label's top is clamped
+    // into the box that part shows in, so a target scrolled half out of the list -- or a sliver at
+    // either edge -- keeps its label on screen rather than over the band above the list or past its
+    // end. A label on screen matters more than one flush with its target (Vimium's rule: a hint on the
+    // visible part of its target).
     const vis = visibleBox(target.el, root);
     const clip = vis === null ? null : clipBox(target.el, root);
     if (vis === null || clip === null) return null;
@@ -146,13 +150,17 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
       if (cell !== null && !sliver) {
         return { top: clampTop(cell.top), left: cell.left - origin.left, width: cell.width, height: cell.height };
       }
-      // A missing, zero-width, or offscreen sign cell cannot hold a row label. Use a small label at
-      // the visible top-left, clamped into the clip box, so an opaque label does not cover the whole row.
+      // A row with no usable sign cell -- a prose row's has no width, another's has scrolled out
+      // of the list, a third has none at all -- used to be labelled on the row's OWN box (`?? vis`), an opaque
+      // label the size of the row's whole visible part laid over its text. It gets a normal small label at
+      // the row's visible top-left instead, clamped into the clip box like every other one.
       return { top: clampTop(vis.top), left: clampLeft(vis.left) };
     }
-    // A wrapped link bounding box can start at the row edge and place its label over unrelated text.
-    // Use `firstShownLine` so the label follows the first visible line, even if earlier lines scrolled out.
-    // jsdom reports no line boxes, so the bounding box is the fallback. Clamp either into the clip box.
+    // A link that wraps onto a second line has a bounding box starting at the row's
+    // left edge on its FIRST line, where its label would sit over unrelated text -- perhaps another link's.
+    // The first line box that is on screen is where its label belongs (`firstShownLine`: not simply the first,
+    // which may have scrolled out of the list while the link's last line is still in it). jsdom reports none,
+    // so the bounding box stays the fallback. Either way the label is clamped into the clip box.
     const r = target.el.getBoundingClientRect();
     const at = target.kind === "link" ? firstShownLine(target.el, root) : r;
     return { top: clampTop(at.top - 6), left: clampLeft(at.left - 6) };

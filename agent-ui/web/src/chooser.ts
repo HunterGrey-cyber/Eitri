@@ -45,9 +45,11 @@ export function choosable(row: ChooserRow): boolean {
   return row.kind !== "record" || !row.record.heldElsewhere;
 }
 
-/** Move a picker's list from the list or its filter box: Down and Ctrl+n step down; Up and Ctrl+p
- *  step up. Shared by the chooser and the `/model` and `/effort` pickers. Return null for other
- *  keys so callers retain their own handling of `j`/`k` and Ctrl+j/Ctrl+k. */
+/** The four keys that move a picker's list from anywhere in
+ *  it, its filter box included, where `j`/`k` would be typed into the box -- `↓` and `Ctrl+n` step
+ *  down, `↑` and `Ctrl+p` step up (fzf, telescope and Claude Code's own `/resume`). Shared by the
+ *  chooser and the `/model`/`/effort` pickers, which take "the same keys as the chooser". `null` for
+ *  every other key: `j`/`k` stay each picker's own (and `Ctrl+j`/`Ctrl+k` are untouched). */
 export function pickerStep(event: { key: string; ctrlKey: boolean }): 1 | -1 | null {
   if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "n")) return 1;
   if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "p")) return -1;
@@ -70,10 +72,15 @@ export function chooserRows(env: ChooserEnvelope, tabs: TabInfo[], filter: strin
   return [...openRows, ...recordRows].filter((row) => rowSearchText(row).toLowerCase().includes(needle));
 }
 
-/** The state word on an open tab's first line. Failed, ended, and not-started states take
- *  precedence over the last marker so a stopped session cannot still read running. Markers
- *  distinguish running, waiting, and done with unread output; otherwise show idle. A waiting card
- *  appears as `⚑N waiting`. Missing tab info reads new, like a not-started tab. */
+/** The right-hand word on an open tab's first line: "running | waiting | done, unread |
+ *  idle | ended | failed | new". `state` (failed/ended/not_started) always wins over `marker`, since
+ *  a session that has stopped is no longer "running" no matter what its last marker was; `working`,
+ *  `needs_input` and `unread` are the markers with their own word, and nothing pending reads as
+ *  `idle`. `waiting`: a tab holding a card used to read `⚑ · idle`, when what it is
+ *  doing is waiting on you -- the chooser draws it as `⚑N waiting`, the tray chip's `agent ⚑N` with
+ *  the word the chip leaves out. `null` -- the
+ *  defensive race `ChooserRow`'s own doc comment names -- reads as `new`, the same word a
+ *  `not_started` tab gets, since neither can say anything more specific yet. */
 export function tabStateWord(info: TabInfo | null): string {
   if (info === null || info.state === "not_started") return "new";
   if (info.state === "failed") return "failed";

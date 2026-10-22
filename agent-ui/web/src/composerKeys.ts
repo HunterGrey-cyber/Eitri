@@ -4,7 +4,7 @@ export function isImeKey(e: { isComposing: boolean; keyCode: number }): boolean 
   return e.isComposing || e.keyCode === 229;
 }
 
-/** C6: readline's `Ctrl+w` (a word back, spaces first) and `Ctrl+u` (to the line's start). A
+/** Readline's `Ctrl+w` (a word back, spaces first) and `Ctrl+u` (to the line's start). A
  *  selection is deleted whole, as readline does with a region. `null` when nothing would change. */
 export function readlineEdit(
   value: string,
@@ -53,7 +53,7 @@ export function caretOnLastLine(value: string, caret: number): boolean {
   return !value.slice(caret).includes("\n");
 }
 
-/** The textarea's height: its content, at most 40% of the panel (C3). There is no floor here: an empty box is
+/** The textarea's height: its content, at most 40% of the panel. There is no floor here: an empty box is
  *  one line tall (`rows={1}` and the stylesheet's `min-height`), the height BROWSE's stand-in has inside the
  *  same card, so entering INPUT does not grow the card. */
 export function growHeight(scrollHeight: number, panelHeight: number): number {
@@ -66,12 +66,14 @@ export function mergeTaken(texts: string[], current: string): string {
   return parts.join("\n\n");
 }
 
-/** Chords handled by `Composer`'s `onKeyDown` or `App`'s INPUT branch. `Esc` and `Ctrl+o`
- *  bubble to the root's `resolveKey("input", ...)` because `Composer` leaves them unclaimed.
- *  `composerKeys.test.ts` checks this list against `INPUT_KEYS` in both directions.
- *  `Composer.test.tsx` exercises each entry and requires its behavior table to match this list.
- *  A listed chord without a handler or behavior test fails. A handler added without a list
- *  entry is not caught, since nothing derives this list from the handler's source. */
+/** Every chord `Composer`'s `onKeyDown` (and `App`'s INPUT branch, for `Esc` and
+ *  `Ctrl+o`, which `Composer` leaves unclaimed so it bubbles to the root's `resolveKey("input", …)`)
+ *  implements. Two tests hold the chain: `composerKeys.test.ts` ties `keymap.ts`'s `INPUT_KEYS` to
+ *  this list both ways, and `Composer.test.tsx` ("every chord COMPOSER_CHORDS names …") exercises
+ *  each entry against the real `Composer` (or `resolveKey("input", …)` for `Esc`/`Ctrl+o`) and
+ *  requires its table's keys to equal this list. So a chord listed here with no handler behind it
+ *  fails, and so does a new entry with no behaviour test. A handler added to `onKeyDown` without an
+ *  entry here is NOT caught: nothing derives this list from the handler's source. */
 export const COMPOSER_CHORDS: string[] = [
   "Enter",
   "Ctrl+Enter",

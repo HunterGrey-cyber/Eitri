@@ -32,7 +32,7 @@ export function primaryText(item: TimelineItem): string {
   }
 }
 
-/** Text copied by `Y`: a tool's whole output as it arrived, without the head/tail cut, or `null`. */
+/** `Y`: a tool's whole output as it arrived (never the head/tail cut), or `null`. */
 export function outputText(item: TimelineItem): string | null {
   if (item.kind !== "tool" || item.call.result === null) return null;
   return formatResultContent(item.call.result.content);

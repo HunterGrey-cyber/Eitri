@@ -1,9 +1,11 @@
-/** Treat plain `Ctrl+[` as Esc. WebKitGTK 2.52.6 sends `key "["`, `code BracketLeft`, with
- *  `ctrlKey` set. A capture listener re-dispatches Escape on the same target so existing handlers
- *  can use their normal Escape path.
+/** `Ctrl+[` is Esc, as in vim, nvim and the terminal. WebKitGTK 2.52.6 sends it
+ *  as `key "["`, `code BracketLeft`, `ctrlKey` (observed 2026-09-29). One capture listener
+ *  re-dispatches it as a plain Escape keydown on the same target, so every handler reads the key it
+ *  already reads; an input method's own key is left to it, as Esc is.
  *
- *  Shift, Alt or Meta makes this a different chord. Leave composing keys to the input method,
- *  using both `isComposing` and the legacy keyCode 229 to detect them. */
+ *  Plain means plain: Shift, Alt and Meta make it some other chord (`Ctrl+{` is not Esc), and a key an
+ *  input method is composing with (`isComposing`, or the legacy keyCode 229 some WebKit builds still
+ *  report -- the same pair `composerKeys.ts`'s `isImeKey` tests) belongs to it, exactly as Esc does. */
 export function isCtrlBracket(e: KeyboardEvent): boolean {
   return e.key === "[" && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && !e.isComposing && e.keyCode !== 229;
 }

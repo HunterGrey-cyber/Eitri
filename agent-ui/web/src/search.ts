@@ -2,7 +2,7 @@ import type { TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
 import { formatResultContent } from "./toolRegistry";
 
-/** Text `/` matches in a row, including content the row can show when expanded. */
+/** What `/` matches in a row: what the row shows or can show. */
 export function rowSearchText(item: TimelineItem): string {
   switch (item.kind) {
     case "prompt":
@@ -19,8 +19,8 @@ export function rowSearchText(item: TimelineItem): string {
     case "ending":
       return turnEndingText(item.ending);
     case "run":
-      // Search each folded call's name and input, plus thoughts folded into the run. This lets
-      // `/bash` and thought text find the run while it is collapsed.
+      // A collapsed run has no invocation of its own on screen to search -- each call's name
+      // and input, so `/bash` still finds it even while it is folded, and the thoughts folded with them.
       return [
         ...item.calls.flatMap((call) => [call.name, JSON.stringify(call.input)]),
         ...(item.thoughts ?? []).map((t) => t.text),

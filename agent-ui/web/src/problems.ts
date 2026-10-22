@@ -73,7 +73,7 @@ function classifyNotLoggedIn(text: string, account: string | null): Problem | nu
   return { headline: "Claude Code is not logged in.", remedy };
 }
 
-/** Captured verbatim in `fixtures/problems/not-logged-in.txt` by the v1-ui GUI pass (2026-09-27): a
+/** Captured verbatim in `fixtures/problems/not-logged-in.txt` by a GUI pass (2026-09-27): a
  *  sidecar started for an account whose config directory has no credentials (and no
  *  `ANTHROPIC_API_KEY`) refuses before it binds its socket -- Verdandi's own account check, ahead of
  *  the CLI version check, so no turn is ever sent and "Please run /login" never appears. Names the
@@ -91,10 +91,11 @@ function classifySidecarNotLoggedIn(text: string): Problem | null {
   };
 }
 
-/** The opening of `stream_ended_early_reason` in `agent/src/providers/claude_sidecar/watch.rs`.
- *  It identifies an event stream that ended before the session, because the sidecar stopped or
- *  its connection could not be reopened. This must be distinguished from a missing conversation
- *  so the transcript remains available. */
+/** `stream_ended_early_reason`'s own opening (agent/src/providers/claude_sidecar/watch.rs): the
+ *  sidecar's event stream ended before the session did -- the sidecar process stopped, or the
+ *  connection to it could not be re-opened. A walkthrough
+ *  saw a resumed session whose sidecar died before any new turn read "it most likely no longer
+ *  exists" (`neverOpenedReason` below) and lose its transcript, while the record was fine. */
 const SIDECAR_STOPPED_MARKER = "the connection to the provider ended before this session did";
 
 /** Whether `text` says the sidecar stopped under a session (see `SIDECAR_STOPPED_MARKER`). */
@@ -132,8 +133,9 @@ export function failureEvidence(text: string): string {
   return inner !== null && sidecarStopped(inner) ? inner : text;
 }
 
-/** Whether the remedy already tells the reader to press `r`. The failure row omits its own
- *  restart instruction when the remedy supplies it, avoiding duplicate instructions. */
+/** Whether a problem's remedy already tells the reader to press `r`, so the row it heads leaves out
+ *  its own "Press r to start a new session here." -- a failed tab said it twice
+ *  (three times with the composer's line, which no longer repeats it). */
 export function remedyNamesR(problem: Problem | null): boolean {
   return problem !== null && /\bpress r\b/i.test(problem.remedy);
 }

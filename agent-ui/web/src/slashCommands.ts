@@ -65,10 +65,19 @@ export const SLASH_COMMANDS: readonly SlashCommandEntry[] = [
 
 const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map(SLASH_COMMANDS.map((entry) => [entry.name, entry]));
 
-/** Hold these commands back because their terminal pickers cannot be drawn in a headless turn.
- *  `/model` and `/effort` are allowed: their headless replies contain parseable usage text, and
- *  `parseModelReply` and `parseEffortReply` use it to build the panel's `SlashPicker`. Neither
- *  command belongs in this set. */
+/** Held back regardless of the table's class above, because a real interactive terminal opens a
+ *  picker/wizard for these that a headless turn cannot draw -- all four degraded to a plain-text
+ *  summary instead when they were sent anyway.
+ *
+ *  `/model` used to be held back only WITHOUT an argument (a real interactive terminal opens a menu
+ *  there). A 2026-09-28 probe showed a bare
+ *  `/model`/`/effort` prints real, parseable text headless (`"Current model: ... Usage: /model
+ *  <name>. Available: ..."` / `"Usage: /effort <low|medium|high|xhigh|max|auto>"`), so this panel
+ *  now sends it too and opens a picker built from that reply (`../components/SlashPicker`,
+ *  `./slashPicker`'s `parseModelReply`/`parseEffortReply`) rather than refusing it -- `/model` is
+ *  therefore no longer in this set at all. `/effort` was never in it (it has no row in
+ *  `SLASH_COMMANDS` -- an unknown slash word already falls through `heldBackSlashCommand` unheld,
+ *  the same route `/model` now takes). */
 const INTERACTIVE_ONLY_UNCONDITIONAL: ReadonlySet<string> = new Set(["login", "config", "resume"]);
 
 /** Classes that are always held back, regardless of name (no-op, error, hangs). No row
@@ -137,7 +146,7 @@ export function worksSlashCommands(): string[] {
   return SLASH_COMMANDS.filter((entry) => entry.class === "works").map((entry) => entry.name);
 }
 
-/** What the `?` overlay lists (the v1-ui GUI pass, 2026-09-27): the **works** rows that Enter would
+/** What the `?` overlay lists (a GUI pass, 2026-09-27): the **works** rows that Enter would
  *  actually send. The pass saw `/config` refused with that flash ("does not work in <the product> — ? lists
  *  the ones that do") while `?` listed `/config`, so the two contradicted each other on one screen. A command
  *  held back unconditionally (`/config`, the only one left since a bare `/model` opens a picker instead of being
@@ -165,7 +174,7 @@ export interface CompletionCommand {
 const LISTED_SENT_AS_TEXT: ReadonlySet<string> = new Set(["init", "review", "security-review"]);
 
 /** One line each, shortened from the CLI's own command reference (code.claude.com/docs/en/commands).
- *  `/effort` has no row in `SLASH_COMMANDS` -- it postdates the survey -- but a bare `/effort` is sent and
+ *  `/effort` has no row in `SLASH_COMMANDS` -- it postdates that table -- but a bare `/effort` is sent and
  *  answered with its usage line (`barePickerCommand`), so it is listed beside `/model`. */
 const CLAUDE_DESCRIPTIONS: Readonly<Record<string, string>> = {
   help: "Show Eitri's keys",

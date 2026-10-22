@@ -43,7 +43,7 @@ use crate::provider::{
     ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
 };
 use crate::provider_move::{at_offset, forget_unclaimed, handed_ids, offset_ms, MovedAnswer, START_WAIT};
-use crate::steer_gate::{SteerEntry, SteerGate};
+use crate::steer_gate::{SteerEntry, SteerOrder};
 use crate::{AgentDomainEvent, MoveRefusedWhy, UNARY_RPC_TIMEOUT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -386,7 +386,7 @@ struct State {
     /// first. Each ends as `UserMessageDelivered` (its `userMessage` item came) or `UserMessageDropped`
     /// (refused, or the turn or session ended first: Codex forgets a message it had not read when the turn
     /// is interrupted, measured on 0.162.1).
-    steers: SteerGate<SentSteer>,
+    steers: SteerOrder<SentSteer>,
     /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
     /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
     closing_notice: Option<ClosingNotice>,
@@ -3038,7 +3038,7 @@ impl CodexProvider {
         let steers = steers
             .into_iter()
             .map(|moved| SentSteer::from_moved(moved, &link))
-            .collect::<io::Result<SteerGate<_>>>()?;
+            .collect::<io::Result<SteerOrder<_>>>()?;
         forget_unclaimed(&link, handed);
         let state = State {
             thread_id,

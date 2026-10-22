@@ -27,12 +27,18 @@ type Props = {
   mode?: PanelMode;
 };
 
-/** Show the turn's motion indicator and Stop directly above the composer, only while a turn runs.
- *  Mode, session status, and position live in `Footer`/`StatusRow`. Keep `data-nav-stop="status"`
- *  with the turn controls. The lowercase `ctrl+c interrupt` text is the Stop button itself,
- *  preserving mouse activation. */
+/** The old `StatusLine`'s body that was about the turn --
+ *  the in-flight motion indicator and Stop -- now its own line, only while a turn runs, directly
+ *  above the composer. The mode block, the session status word and the position counter moved to
+ *  `Footer`/`StatusRow`, and `data-nav-stop="status"` moves with the content it used to gate on
+ *  ("the status line, only while Stop shows") rather than staying behind on an element with
+ *  nothing left to answer for.
+ *
+ *  Restyled to one mono line, Claude Code's own
+ *  `✻ Working… 1m 12s · ctrl+c interrupt` -- the interrupt words ARE the Stop button now (the
+ *  mouse route stays), not a separate span beside it. */
 export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, mode = "browse" }: Props) {
-  // Moved out of `SessionHeader.tsx` (panel-as-document task 6): a terminal status wins over
+  // Moved out of `SessionHeader.tsx`: a terminal status wins over
   // activeTurnId. `reducer.ts:177,184` (`session_unavailable`/`session_closed`) DO clear
   // activeTurnId -- an earlier note here argued the opposite, that nothing should clear it because
   // no provider event says "that turn is over", and that was wrong in its consequence: it left a
@@ -54,14 +60,17 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       </span>
       {/* A card waiting IS what the line says: the phase word beside it only said
           "waiting for you" again, and at 520px the two were cut together, losing the keys that
-          answer the card (r2-gui GUI pass, 2026-09-26). */}
+          answer the card (seen in a GUI pass, 2026-09-26). */}
       {pendingTool === null && <TurnActivity phase={phase} clock={turnClock} />}
       {pendingTool !== null ? (
         <span className="activity-card">
-          {/* `a`/`d` answer only the card under the cursor through `permissionTarget`, and only
-              after `TYPING_GUARD_MS` since the last key. The hint says "j to it" to explain
-              navigation onto the card and "alone" to explain the pause, avoiding unexplained
-              refusals when the cursor is elsewhere or `a` follows Escape too soon. */}
+          {/* The old "a / d" / "Esc, then a / d"
+              said neither that `a`/`d` answer only the card under the cursor (`nav.ts`'s
+              `permissionTarget` -- the old "the only card, from any row" fallback is gone) nor
+              that a key answers only on its own, `TYPING_GUARD_MS` after the last one -- so a
+              user who followed it literally, cursor elsewhere, or `a` a beat too soon after `Esc`,
+              got "no card here" or the typing flash with no clue why. "j to it" points at the
+              route back (`j`/`k`/`G` onto the card); "alone" is `TYPING_FLASH`'s own word for that rule. */}
           ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
         </span>
       ) : (

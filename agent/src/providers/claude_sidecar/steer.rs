@@ -124,7 +124,7 @@ pub(crate) struct Passed {
 #[derive(Debug)]
 pub(crate) struct SteerGate<R> {
     /// In the order the host handed them over.
-    open: steer_gate::SteerGate<OpenSteer<R>>,
+    open: steer_gate::SteerOrder<OpenSteer<R>>,
     /// The held `TurnCompleted` and everything after it, while `holding` is set.
     held: Vec<AgentDomainEvent>,
     /// The generation of the hold in force, so a timer armed for an earlier one does nothing.
@@ -141,7 +141,7 @@ pub(crate) struct SteerGate<R> {
 impl<R> Default for SteerGate<R> {
     fn default() -> Self {
         Self {
-            open: steer_gate::SteerGate::default(),
+            open: steer_gate::SteerOrder::default(),
             held: Vec::new(),
             holding: None,
             generations: 0,

@@ -13,14 +13,16 @@
 import type { VisualMotion } from "./keymap";
 import { conversationRows, rowOf } from "./nav";
 
-/** A DOM boundary point before `offset` inside `node`, as used by `Selection.collapse`/`setBaseAndExtent`.
- *  Plain data: the live selection is rebuilt from it on each key instead of retaining a `Range`. */
+/** One boundary point: a DOM position "before" `offset` inside `node`, the same shape
+ *  `Selection.collapse`/`setBaseAndExtent` take. Plain data, not a live `Range` -- the DOM selection is rebuilt FROM this on every key, never carried forward as a `Range`. */
 export type Caret = { node: Node; offset: number };
 
-/** CARET/VISUAL/V-LINE state: selection ends, selection kind and goal column.
- *  The ends are equal in CARET and move together. `kind` is `"caret"` for the block caret,
- *  `"char"` for VISUAL or `"line"` for V-LINE. `goalX` keeps the x coordinate of the first
- *  vertical move until a horizontal move resets it to null. */
+/** CARET/VISUAL/V-LINE's whole state: the two ends of the selection --
+ *  equal to each other in CARET, where `stepOnce`'s caller moves both -- `kind` (`"caret"` a block
+ *  caret; `"char"` VISUAL; `"line"` V-LINE), and the goal column -- the
+ *  x coordinate of the first vertical move, kept until a horizontal one resets it (`null`). `kind`
+ *  replaced a plain `line: boolean` once CARET needed its own third state alongside charwise and
+ *  linewise. */
 export type VisualModel = { anchor: Caret; cursor: Caret; kind: "caret" | "char" | "line"; goalX: number | null };
 
 /** The subset of `Selection` this module needs. A real `Selection` satisfies this structurally;
@@ -38,9 +40,11 @@ export interface SelectionLike {
   toString(): string;
 }
 
-/** Chrome excluded from caret placement and copying. Every selector also has `user-select: none`
- *  in `index.css`; `indexCss.test.ts` keeps the two lists aligned.
- *  `.row-sign` and `[aria-hidden="true"]` cover the diff gutter; `.fold-marker` is the run row's `▸`. */
+/** The chrome: a selection may never rest in, or copy from, any of these. Every member also
+ *  carries `user-select: none` in `index.css`, and `indexCss.test.ts` holds the two equal so they
+ *  cannot drift apart. `.row-sign` and `[aria-hidden="true"]` (the diff gutter, `EditDiff.tsx`)
+ *  already carried it before VISUAL existed; the rest are new. `.fold-marker` is the run row's own `▸`
+ *  (`components/MessageList.tsx`). */
 export const VISUAL_CHROME: string[] = [".row-sign", '[aria-hidden="true"]', "button", "input", "textarea", "[data-nav-action]", ".fold-marker"];
 
 const CHROME_SELECTOR = VISUAL_CHROME.join(", ");
@@ -49,7 +53,7 @@ function elementOf(node: Node): Element | null {
   return node instanceof Element ? node : node.parentElement;
 }
 
-/** Whether `node` is inside a `VISUAL_CHROME` element contained by `root`. */
+/** Whether `node` sits inside one of `VISUAL_CHROME`'s elements, bounded by `root`. */
 export function isChromeNode(node: Node, root: Node): boolean {
   const el = elementOf(node);
   if (el === null) return false;
@@ -92,18 +96,26 @@ export function compareCarets(a: Caret, b: Caret): number {
   return ra.compareBoundaryPoints(Range.START_TO_START, rb);
 }
 
-/* `w`/`e`/`b` walk DOM text using `wordClassOf` instead of `Selection.modify`'s word granularity.
- * Browser word boundaries differ: underscores, punctuation and syntax-highlight spans can cause
- * composed forward/backward word steps to return to their starting position.
- * A word is a maximal run of one character class: keyword characters, other non-blank characters,
- * emoji, ideographs, kana, hangul and other supported classes. Characters are grapheme clusters
- * (`graphemeStarts`), so movement never lands on combining marks or inside emoji sequences,
- * even when highlighting splits a cluster across text nodes.
- * Whitespace and block boundaries separate words, as do `<br>`/`<hr>`/`<img>`, empty blocks and
- * intervening `VISUAL_CHROME` text. `wordTokens` treats these boundaries as line breaks.
- * Highlight spans do not split words, and `isUnrenderedNode` excludes hidden elements and closed `<details>` bodies.
- * Empty lines do not count as words. A `w`/`b` that would land on boundary whitespace instead lands
- * on the nearest non-blank character, since carets never rest on blanks here. */
+/* `w`/`e`/`b` (2026-10-01): vim's own word rules (`:help word`, `nvim: textobject.c`'s `fwd_word`,
+ * `end_word`, `bck_word`), computed over the DOM text rather than through `Selection.modify`'s
+ * `word` granularity. An earlier version composed WebKit word steps (`forward word` twice then
+ * `backward word`), and WebKit's boundaries are not vim's: `has_flag` is one ICU word with its `_`,
+ * `=`/`|` are no word at all, and highlight.js spans split the text -- a user, in a code block
+ * showing `let has_flag = |flag: &str| flag_given(..., flag);`, saw the first `w` land before `has`
+ * and the second not move, the composed steps returning to their start.
+ *
+ * A word is a maximal run of one vim class (`wordClassOf`, nvim's own `charclass()` table): keyword
+ * characters, other non-blank characters, emoji, CJK ideographs, kana, hangul and a few more. A
+ * character is a grapheme cluster (`graphemeStarts`): a caret never lands on a combining mark or
+ * inside an emoji sequence, even when highlight.js puts the mark in the next text node. Whitespace
+ * separates words, and so does the boundary between two blocks (paragraphs, list items, a code
+ * block, table cells, rows), a `<br>`/`<hr>`/`<img>` or an empty block between two pieces of text,
+ * and any `VISUAL_CHROME` text between them, each of which counts as a line break (`wordTokens`).
+ * A highlight.js span inside a word does not split it, and text that is not rendered (a `hidden`
+ * element, a closed `<details>` body: `isUnrenderedNode`) is never walked. Not reproduced: vim's
+ * "an empty line is also a word", and a `w`/`b` that would end on a blank (vim's `w` from the
+ * buffer's last word to its very last character, or `b` to a blank at its start) lands on the
+ * nearest non-blank character instead, since a caret never rests on one here. */
 
 /** vim's class of one character (`charclass()`): 0 blank, 1 punctuation, 2 keyword, 3 emoji, and
  *  vim's own larger numbers for CJK ideographs, hiragana, katakana, hangul syllables, superscripts,
@@ -448,29 +460,35 @@ function readCaret(sel: SelectionLike, fallback: Caret): Caret {
   return sel.focusNode !== null ? { node: sel.focusNode, offset: sel.focusOffset } : fallback;
 }
 
-/** The x coordinate of the caret's rectangle, requiring real layout.
- *  Returns null when layout rectangles are unavailable, so `j`/`k` skip goal-column snapping in jsdom.
- *  Real geometry is covered only by the browser harness. */
+/** The x coordinate of `caret`'s own rect -- real layout only; jsdom's `getClientRects()` returns
+ *  none, so this reads as `null` there and `j`/`k` simply skip the goal-column snap (unverified
+ *  outside the real-WebKit harness, `shell/tests/panel_visual_mode.rs`'s W10/W2 zoom cases). */
 function caretX(caret: Caret): number | null {
   if (typeof document.createRange !== "function") return null;
   const range = document.createRange();
   range.setStart(caret.node, caret.offset);
   range.collapse(true);
-  // jsdom implements `Range` without `getClientRects`, so calling it would throw.
-  // Without real layout, goal-column measurement returns null; the browser harness covers geometry.
+  // jsdom implements `Range` but not layout: `getClientRects` is simply absent there (it throws
+  // "not a function" rather than returning an empty list), so the goal column is a no-op outside a
+  // real engine -- verified only in the real-WebKit harness.
   if (typeof range.getClientRects !== "function") return null;
   const rect = range.getClientRects()[0];
   return rect === undefined ? null : rect.left;
 }
 
-/** After a `j`/`k` step, snap to the character under goal column `x` with `caretRangeFromPoint`.
- *  This is a no-op in jsdom, which lacks that API and passes `caret` through unchanged.
+/** The snap: after a `j`/`k` step, land on the character under the goal column `x`, using
+ *  `caretRangeFromPoint` (WebKit; absent in jsdom, where this is a no-op and `caret` passes through
+ *  unchanged).
  *
- *  Point hit-testing uses the screen. A line reached outside the list's visible box can
- *  resolve to the composer or other page content. Reveal the landed line with `revealCaret`
- *  before snapping, using the least scroll needed. Accept the snap only inside `root` and
- *  on that line; otherwise keep `modify`'s landing. Without `root`, skip revealing the line
- *  and checking containment. */
+ *  `caretRangeFromPoint` hit-tests the SCREEN, so a
+ *  line `Selection.modify` reached below (or above) the list's visible box -- the next line of a
+ *  counted `9999j`, or a plain `j` at the view's bottom edge -- resolved to whatever the page draws
+ *  at that point instead: the composer under the list, which an earlier version saw as "`modify`
+ *  landing outside the list" and papered over by centring the caret after every step. The landed
+ *  line is now revealed first, by the same least nudge `revealCaret` applies, and a snap is taken
+ *  only when it stays inside `root` and on the landed line; anything else keeps `modify`'s own
+ *  landing. `root` absent (the unit tests' direct `runMotion` calls): no reveal, no containment
+ *  check, the earlier behaviour. */
 function snapToGoalX(caret: Caret, x: number | null, root?: Element): Caret {
   if (x === null || typeof document.caretRangeFromPoint !== "function") return caret;
   if (root !== undefined) {
@@ -521,12 +539,14 @@ function isScrollBox(el: Element): { y: boolean; x: boolean } {
   };
 }
 
-/** Keeps `caret` visible through every scrollable box up to `list`, including result bodies and tables.
- *  Each box scrolls only enough to reveal the caret point. Re-measuring before each box accounts for
- *  inner scrolling and prevents outer boxes from overscrolling based on a stale rectangle.
- *  Returns whether any box moved, or false without layout in jsdom. `scrollCaretIntoView` calls it
- *  after region keys; `snapToGoalX`/`stepByLinePoint` call it before hit-testing so counted motions
- *  also use the minimum necessary scroll. */
+/** Keeps `caret` on screen through every scrollable box between it and `list` -- a 260px
+ *  `.tool-result-body`, a `.table-scroll` sideways, then the list itself -- each nudged by the least
+ *  that shows the caret's own point, never a whole element's `scrollIntoView`. The caret is
+ *  re-measured before each box: an inner box's own nudge moves it, and the outer box
+ *  deciding from the stale rect scrolled further than it needed to. Returns whether any box moved;
+ *  `false` without real layout (jsdom), where it does nothing. `App.tsx`'s `scrollCaretIntoView`
+ *  calls this after every region key, and `snapToGoalX`/`stepByLinePoint` before they hit-test the
+ *  screen, so the least-scroll rule holds inside a counted motion too. */
 export function revealCaret(caret: Caret, list: Element): boolean {
   let el: Element | null = elementOf(caret.node);
   if (el === null || !list.contains(el)) return false;
@@ -660,16 +680,20 @@ function stepToAdjacentTableRow(cursor: Caret, direction: "forward" | "backward"
   return firstSelectableCaret(targetCell);
 }
 
-/** The `VisualMotion` values handled by `runMotion`, excluding `gg`/`G`.
- *  `Selection.modify` handles all except `w`/`e`/`b`, which walk DOM text using `wordClassOf`.
- *  `stepOnce` handles `gg`/`G` directly with `firstSelectableCaret`/`lastSelectableCaret`.
- *  Narrowing the type lets its early return enforce exhaustiveness without dead switch cases. */
+/** Every `VisualMotion` but `gg`/`G` -- the ones `runMotion` steps through (`Selection.modify` for
+ *  all but `w`/`e`/`b`, which walk the DOM text by vim's word rules since 2026-10-01).
+ *  `gg`/`G` are handled entirely in `stepOnce` below, which never calls this for them (they use
+ *  `firstSelectableCaret` / `lastSelectableCaret`, not `modify("documentboundary")`)
+ *  -- narrowing the parameter type here, rather than adding two dead cases to the switch below,
+ *  is what lets `stepOnce`'s own early return carry the exhaustiveness check instead of duplicating
+ *  it. */
 export type CharMotion = Exclude<VisualMotion, "gg" | "G">;
 
-/** Runs one motion after collapsing to `cursor`; `w`/`e`/`b` walk DOM text using `wordClassOf`.
- *  `stepOnce` handles boundaries and chrome because it has `root`.
- *  Returns the caret read from the live selection and the goal column to carry forward.
- *  Only `j`/`k` set a goal column; all other motions clear it. */
+/** One motion's own steps (`w`/`e`/`b` by vim's word rules since 2026-10-01, not
+ *  `Selection.modify`'s `word` granularity), collapsed to `cursor` first. No boundary or chrome handling here -- that is `stepOnce`'s job, one level up, since it needs `root` and this
+ *  does not. Returns the new caret (read back from the live selection)
+ *  and the goal column to carry forward (only `j`/`k` set one; every other motion clears it, since
+ *  the next horizontal move resets `curswant` in vim too). */
 export function runMotion(
   sel: SelectionLike,
   cursor: Caret,
@@ -693,7 +717,7 @@ export function runMotion(
       // visible layout, so it is what lets `9999j` keep going past whatever the viewport currently
       // shows all the way to a 300-paragraph transcript's real end. Only when it plainly failed to
       // reach another visual line -- a `<table>` row or a permission card's own structured body,
-      // W5/W7's real-WebKit finding -- does `stepByLinePoint`'s real-geometry probe take over. Both
+      // a case seen in real WebKit -- does `stepByLinePoint`'s real-geometry probe take over. Both
       // the goal-column snap and the probe hit-test the screen, so each reveals what it measures by
       // the least scroll first (`revealCaret`/`visibleBand`), never by centring.
       sel.modify("move", forward ? "forward" : "backward", "line");
@@ -702,7 +726,7 @@ export function runMotion(
       const landedRect = rectOfCaret(byModify);
       const advancedVisually =
         startRect === null || landedRect === null
-          ? !caretsEqual(byModify, cursor) // Without real layout in jsdom, trust `modify`'s result.
+          ? !caretsEqual(byModify, cursor) // no real layout (jsdom): trust `modify`'s own result
           : forward
             ? landedRect.top >= startRect.bottom - 1
             : landedRect.bottom <= startRect.top + 1;
@@ -741,17 +765,21 @@ export function runMotion(
 
 const MAX_CHROME_SKIP = 64;
 
-/** Moves both ends together in CARET; moves only `cursor` in VISUAL/V-LINE, leaving `anchor` fixed.
- *  Every `stepOnce` return uses this helper so a CARET cannot acquire unequal ends and rebuild
- *  as a multi-character selection instead of a one-character block. */
+/** Both ends move together in CARET (there is only one point); only `cursor` moves in
+ *  VISUAL/V-LINE, `anchor` staying put. Shared by every `stepOnce` return path so none of them can
+ *  forget it -- a CARET model whose `anchor` drifted from its `cursor` would rebuild as a
+ *  multi-character selection instead of a one-character block. */
 function landBothEnds(model: VisualModel, cursor: Caret, goalX: number | null): VisualModel {
   return model.kind === "caret" ? { ...model, anchor: cursor, cursor, goalX } : { ...model, cursor, goalX };
 }
 
-/** Runs one motion step. Leaving `root` undoes the step and returns `moved: false` with the model unchanged.
- *  Landing in chrome retries in the same direction up to `MAX_CHROME_SKIP` times before giving up in place.
- *  `gg`/`G` directly choose the first/last selectable character of `root` (`.message-list` for callers),
- *  bypassing `runMotion` and the chrome-skip loop used for `Selection.modify` boundary crossings. */
+/** One motion step, with the boundary rule applied: a step that would leave `root` is undone
+ *  (`moved: false`, model unchanged -- vim stops at a buffer's end); a step that lands in chrome
+ *  takes another step the same way, up to `MAX_CHROME_SKIP` times, before giving up in place.
+ *  `gg`/`G` are not `Selection.modify` steps at all -- `root` (always
+ *  `.message-list`, every caller's own convention) IS the list they place the caret at the first/
+ *  last selectable character of, so this returns directly rather than looping through
+ *  `runMotion`/chrome-skip, which exist only for `Selection.modify`'s own boundary crossings. */
 export function stepOnce(sel: SelectionLike, model: VisualModel, motion: VisualMotion, root: Element): { model: VisualModel; moved: boolean } {
   if (motion === "gg" || motion === "G") {
     const target = motion === "gg" ? firstSelectableCaret(root) : lastSelectableCaret(root);
@@ -777,9 +805,10 @@ export function stepOnce(sel: SelectionLike, model: VisualModel, motion: VisualM
       goalX = result.goalX;
       continue;
     }
-    // A caret with no selectable character at or after it would draw its block or extend VISUAL
-    // past the list, causing `y`/`>` to reject the selection. Clamp to the list's last selectable
-    // character, as `G` does, for `$`/`l` on the last line or `e` in the last word.
+    // A caret with no selectable character at or
+    // after it in the whole list -- `$` or `l` on the list's last line, `e` into its last word --
+    // would draw its block, or extend a VISUAL end, on whatever follows the list, and the copy check
+    // then refuses `y`/`>`. It lands on the list's last selectable character instead, as `G` does.
     let landed = result.caret;
     if (!hasSelectableTextFrom(landed, root)) {
       const last = lastSelectableCaret(root);
@@ -794,9 +823,9 @@ export function stepOnce(sel: SelectionLike, model: VisualModel, motion: VisualM
   return { model, moved: false };
 }
 
-/** Repeats a motion `times`, stopping at the first step that makes no progress.
- *  The caller clamps `times` to `MAX_MOTION_COUNT` through `App.tsx`'s `accumulateMotionCount`,
- *  shared with BROWSE. */
+/** A count repeats the next motion `times`, stopping at the first step that makes no progress
+ *  (`countedStop`'s own rule for rows, applied here to a caret). `times` is already clamped to
+ *  `MAX_MOTION_COUNT` by the caller (`App.tsx`'s `accumulateMotionCount`, shared with BROWSE). */
 export function repeatMotion(sel: SelectionLike, model: VisualModel, motion: VisualMotion, times: number, root: Element): VisualModel {
   let current = model;
   for (let i = 0; i < times; i++) {
@@ -807,22 +836,25 @@ export function repeatMotion(sel: SelectionLike, model: VisualModel, motion: Vis
   return current;
 }
 
-/** `o` swaps which end moves next. It does not call `Selection.modify`;
+/** `o` (`nvim: visual.txt, v_o`): swap which end moves next. No `Selection.modify` involved --
  *  the next key's `stepOnce` rebuilds from the new `cursor`. */
 export function swapEnds(model: VisualModel): VisualModel {
   return { ...model, anchor: model.cursor, cursor: model.anchor, goalX: null };
 }
 
-/** The live endpoints set by `rebuildSelection`, used to detect later native selection changes,
- *  such as a mouse drag, before acting on the selection. */
+/** What `rebuildSelection` actually set on the live selection, so a later check (the check that the live
+ *  selection is still the one VISUAL built) can tell a native selection that changed underneath it
+ *  (a mouse drag) apart from one this module itself just built. */
 export type BuiltSelection = { anchorNode: Node; anchorOffset: number; focusNode: Node; focusOffset: number };
 
-/** Rebuilds an inclusive live selection from `model` after ordering its ends by document position.
- *  Charwise (`"char"` or `"caret"`) selects from the earlier end through the later end's character
- *  using `extend forward character`. Equal ends therefore highlight one character for CARET.
- *  Linewise (`"line"`) extends from the earlier hard-line start through the later hard-line end
- *  using `paragraphboundary`, also used by `0`/`$`. The native selection is oriented so `extend`
- *  always grows the later end, regardless of the original `anchor`/`cursor` order. */
+/** Rebuilds the live selection from `model`, vim's inclusive `'selection'`. Charwise
+ *  (`"char"` or `"caret"` -- the caret's block IS the VISUAL rebuild with
+ *  anchor = cursor): from the earlier end to the later end plus one character (`extend forward
+ *  character`), so both ends' characters are highlighted and a bare caret (anchor === cursor) shows
+ *  exactly one. Linewise (`"line"`, V-LINE): from the earlier end's hard-line start to the later
+ *  end's hard-line end (`paragraphboundary`, the same unit `0`/`$` use). Always reorders by
+ *  document position first -- `anchor`/`cursor` may be in either order, and the native `Selection`
+ *  is set up so `extend` always grows the LATER end. */
 export function rebuildSelection(sel: SelectionLike, model: VisualModel): BuiltSelection {
   const order = compareCarets(model.anchor, model.cursor);
   const earlier = order <= 0 ? model.anchor : model.cursor;
@@ -863,9 +895,10 @@ function tableRowEdge(caret: Caret, edge: "start" | "end"): Caret | null {
   return { node: last.node, offset: text.replace(/\s+$/, "").length };
 }
 
-/** Checks that the live selection still matches `rebuildSelection` and both ends remain attached
- *  inside `root`. If a mouse drag or another change replaced it, `y` copies nothing rather than
- *  copying text the user did not see highlighted. */
+/** The first check: the live selection is still exactly what `rebuildSelection` last built (a
+ *  mouse drag, or anything else, has not replaced it), and both ends are still attached inside
+ *  `root`. `y` copies nothing, rather than something the user never actually saw highlighted, when
+ *  this is false. */
 export function selectionMatchesBuild(sel: SelectionLike, built: BuiltSelection, root: Element): boolean {
   if (sel.anchorNode !== built.anchorNode || sel.anchorOffset !== built.anchorOffset) return false;
   if (sel.focusNode !== built.focusNode || sel.focusOffset !== built.focusOffset) return false;
@@ -873,12 +906,19 @@ export function selectionMatchesBuild(sel: SelectionLike, built: BuiltSelection,
   return root.contains(built.anchorNode) && root.contains(built.focusNode);
 }
 
-/** Reads highlighted rendered text with all `VISUAL_CHROME` hidden for one synchronous read.
- *  `data-visual-copying` is set and removed within the call so no frame paints without chrome.
- *  It marks rows found through `conversationRows`/`rowOf` and every direct child of `.message-list`
- *  intersecting the range. Marking only rows would leave the history notice's `Copy path` button
- *  exposed when a selection reaches the notice, relying on browser handling of `user-select: none`.
- *  Reply HTML is contained within a row and cannot add direct children to the list. */
+/** The rendered text of what is highlighted, with every `VISUAL_CHROME` member hidden for the
+ *  one synchronous read (`data-visual-copying`, set and removed in this same call so no frame ever
+ *  paints without chrome). The attribute goes on every block the selection touches -- the rows,
+ *  found through `conversationRows`/`rowOf` the same way every other cursor-to-row lookup in this
+ *  panel is (`nav.ts`), and every other top-level block of `.message-list` the selected range
+ *  crosses.
+ *
+ *  Only rows used to be marked, but the list holds chrome outside any
+ *  row -- the history notice (`HistoryNotice.tsx`, its `Copy path` button) sits above the first row,
+ *  and `k` from that row can put an end of the selection in the notice's own text. Its button then
+ *  reached `toString()` unshielded, left to WebKit's unverified handling of `user-select: none`.
+ *  Every direct child of the list the range intersects is marked now; a reply's own HTML can
+ *  never add one (it is inside a row), so this cannot be steered from model output. */
 export function copySelectionText(sel: SelectionLike, root: HTMLElement, model: VisualModel): string {
   const rows = conversationRows(root);
   const anchorRow = rowOf(root, elementOf(model.anchor.node) ?? root);
@@ -927,10 +967,12 @@ function hasSelectableText(node: Node): boolean {
   return (node.textContent ?? "").trim().length > 0;
 }
 
-/** The first selectable character inside `container` in document order, excluding chrome.
- *  `container` is the cursor row or a code block reached by HINT through `copyCodeRef`.
- *  The latter starts at the block's first character. `entrySelectableCaret` handles placement
- *  at the list's visible top edge and falls back to this container-first position. */
+/** The entry caret: the first selectable (non-chrome) character inside `container`, in document
+ *  order. `container` is the cursor row, or -- right after a HINT landed on a code block -- that
+ *  block itself (`App.tsx`'s own `copyCodeRef`), so entry lands on the block's first character
+ *  rather than the row's. Real point-based placement (the first one under the list's top
+ *  edge) is `entrySelectableCaret`, below -- this always picks the container's own first
+ *  character, which is what it, and a fully-on-screen row, both fall back to. */
 export function firstSelectableCaret(container: Element): Caret | null {
   const walker = selectableTextWalker(container);
   const first = walker.nextNode();
@@ -972,12 +1014,16 @@ function lastCharOffset(text: string): number {
   }
 }
 
-/** The last selectable non-chrome character in `container`, found in document order.
- *  `TreeWalker` has no reverse entry that applies `acceptNode`, so walk forward through the same
- *  filter as `firstSelectableCaret` and retain the last accepted node.
- *  The caret lands on the character's offset, never one past the text. Otherwise its block and
- *  the inclusive VISUAL end could extend into the activity line and make `y`/`>` reject the selection.
- *  Trailing whitespace, such as a code block's final newline, is skipped. */
+/** `gg`/`G`: the LAST selectable (non-chrome) character inside `container`,
+ *  in document order -- `TreeWalker` has no "start from the end" entry point that still runs
+ *  `acceptNode`'s own chrome filter, so this walks forward the same way `firstSelectableCaret` does
+ *  and simply keeps the last accepted node rather than stopping at the first.
+ *
+ *  The caret is ON that character (its offset, never the
+ *  text's length). The caret is the character after its position; one past the end made CARET's
+ *  block, and a VISUAL end's inclusive `+1`, reach past the list into whatever the page draws next
+ *  (the activity line), so the copy check refused `y`/`>` and the block was drawn where no caret colour
+ *  applies. Trailing whitespace is not a character to land on (a code block's closing newline). */
 export function lastSelectableCaret(container: Element): Caret | null {
   const walker = selectableTextWalker(container);
   let last: Text | null = null;
@@ -1004,12 +1050,21 @@ function hasSelectableTextFrom(caret: Caret, root: Element): boolean {
   return walker.nextNode() !== null;
 }
 
-/** For row entry, use the first character when the row's top is visible; otherwise hit-test
- *  under the list's top edge with `caretRangeFromPoint`. `list` is the `.message-list` scroll boundary.
- *  A HINT-landed code block uses `firstSelectableCaret` directly instead of this row-entry helper.
- *  Point placement needs real layout and `document.caretRangeFromPoint`. jsdom lacks both, so it
- *  falls back to `firstSelectableCaret`; real geometry is covered by the browser harness.
- *  A hit outside `container` also falls back, keeping entry within the caller's requested container. */
+/** The on-screen entry rule: "the row's first
+ *  character when its top is visible, else the first one under the list's top edge
+ *  (`caretRangeFromPoint`)". `container` is the same row-or-code-block `firstSelectableCaret` takes;
+ *  `list` is `.message-list`, the scroll boundary the other helpers already use. Only reached for a ROW entry
+ *  (`container === row`) -- a HINT-landed code block has no such rule and always
+ *  uses `firstSelectableCaret` directly, so callers that just landed on a code block should call
+ *  that, not this.
+ *
+ *  Real point-based placement is real-browser-only: jsdom has neither layout (`getBoundingClientRect`
+ *  reads every rect as all zeros unless a test overrides it, the same convention `scrollCursorRowBox`
+ *  documents) nor `document.caretRangeFromPoint` at all, so both are missing there and this falls
+ *  back to `firstSelectableCaret` -- exercised by `visual.test.ts`'s own fake, the real behaviour
+ *  only by the real-WebKit `panel_visual_mode.rs` (`#[ignore]`d) and a GUI pass. A landing outside
+ *  `container` (imprecise geometry at the list's very edge) also falls back, rather than starting
+ *  the selection somewhere the caller did not ask for. */
 export function entrySelectableCaret(container: Element, list: Element | null): Caret | null {
   if (list === null || typeof document.caretRangeFromPoint !== "function") return firstSelectableCaret(container);
   const containerRect = container.getBoundingClientRect();

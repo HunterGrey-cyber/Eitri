@@ -15,8 +15,9 @@ type Props = {
 
 type State = { error: Error | null };
 
-/** Catch render errors before they unmount the whole panel and its keyboard handlers.
- *  Overlays close through `onError`; the root draws `fallback` instead of going empty. */
+/** One throw during render unmounted the whole React tree -- `#root` went empty,
+ *  every key went dead, nothing was logged. React keeps a tree only where an error boundary catches.
+ *  Overlays close through `onError`; the root draws `fallback` instead of nothing. */
 export class PanelErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 

@@ -25,8 +25,9 @@ type Props = {
   turnDurations?: TurnDurations;
   /** The session is gone. Pending cards stay visible but can no longer submit into it. */
   sessionEnded: boolean;
-  /** Expanded rows, keyed by timeline `key`. `App.tsx` holds this state because Enter acts on
-   *  its cursor through `toggle-expand`. Expanding a run's key reveals its calls (`display.ts`). */
+  /** Which rows are expanded, keyed by the timeline `key`. Owned by `App.tsx` because `Enter` acts
+   *  on the cursor, and the cursor is App's -- see `App.tsx`'s `onKeyDown`, `toggle-expand` arm. A
+   *  run's own key expanding is what un-collapses it (`display.ts`). */
   expanded: Record<string, boolean>;
   /** The index into THIS component's own `timeline` (below) that `Enter`/`y` act on in `App.tsx`.
    *  Safe to compare by position rather than by identity: both here and there, `timeline` is
@@ -39,8 +40,9 @@ type Props = {
    *  the work of every streamed batch: a merge and sort of the whole conversation. Left out, it is
    *  built here from the same three props. */
   timeline?: TimelineItem[];
-  /** `Ctrl+o` shows every result in full, at wider cuts, with no collapsed runs. Stored per tab
-   *  in `TabViewState.detailed`; fresh tabs default to `false`. */
+  /** `Ctrl+o`: every result shown in full, at wider cuts, with no collapsed runs. Per tab
+   *  (`App.tsx`'s `TabViewState.detailed`); defaults to `false`, the state every fresh tab starts
+   *  in. */
   detailed?: boolean;
   /** How thinking is shown (`init.lua`'s `agent.thinking`, the `display` envelope). Defaults to
    *  `collapsed`, its default there; `App.tsx` always passes it. */
@@ -49,11 +51,12 @@ type Props = {
    *  in `index.css` (and the sign-cell cursor's solid and hollow states outside the conversation). Defaults to
    *  `true`, the state with no host to say otherwise; `App.tsx` always passes it explicitly. */
   focused?: boolean;
-  /** Rules offered by Rust for the visible cards, mapped as `permissionId -> "<words> *"`.
-   *  A missing `rule_offers` entry means no rule; the card never invents a suggestion. */
+  /** The third button: `permissionId -> "<words> *"`, exactly the rules Rust offered for the
+   *  cards currently on screen (`rule_offers`). Absent/no entry means no rule -- the card never
+   *  invents its own suggestion. */
   ruleOffers?: Record<string, string>;
-  /** The last yanked row key, used for the `.row-yanked` flash.
-   *  `App.tsx` owns the timer; this component only reads the key. */
+  /** The row just yanked, so it can flash (`.row-yanked`). `App.tsx` owns the timer; this only
+   *  reads the current key. */
   yankedKey?: string | null;
   onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
   /** The cards already answered from this panel, by `permissionId` --
@@ -62,9 +65,9 @@ type Props = {
   answeredPermissions?: ReadonlySet<string>;
   /** Each card's reason box as it is typed into, so `App.tsx`'s `d` can send it as the Deny button would. */
   onPermissionReason?: (permissionId: string, reason: string) => void;
-  /** Open clicked path links and inline code that parses as a path, matching the keyboard's
-   *  `gf` target through `App.tsx`'s `open-path` action. When absent, clicks retain their normal
-   *  control behavior without opening paths. */
+  /** A click on a path link or an inline code span that parses as a path opens it -- the same
+   *  target `gf` reaches from the keyboard (`App.tsx`'s `open-path` action). Absent, clicks inside
+   *  the list do nothing beyond React's own defaults (a permission card's buttons, say). */
   onOpenPath?: (ref: PathRef) => void;
   /** The unread pill, reported upward rather than floated over the last line here (it sits at the
    *  band's right, `↓N` inverted, never over text). `label` is the band's
@@ -82,7 +85,7 @@ type Props = {
   /** Seeds the unread threshold back in on a tab switch: a tab switch reuses this
    *  component, so without this the first `updatePill` after a restore falls back to counting from
    *  the CURRENT timeline length, and a row that arrived while the tab was away is never counted --
-   *  the defect this task fixes. `afterSeq` is the seq threshold to seed (`TabViewState.unseenAfterSeq`
+   *  the defect this prevents. `afterSeq` is the seq threshold to seed (`TabViewState.unseenAfterSeq`
    *  from the tab just switched TO); `tick` distinguishes one seed from the next so a second switch
    *  back to the same `afterSeq` still re-fires the effect. `null` for a tab with no saved threshold
    *  (never parked, or restored at the bottom) -- nothing to seed. */
@@ -98,7 +101,7 @@ type Props = {
  * row's sign glyph carries. A call with no result yet is never "done with nothing to say"; see
  * `ToolResult` in `toolRegistry.tsx`, which draws the matching distinction in the body.
  *
- * `abandoned` (sw-panel-render-6) reuses the `·` glyph `App.tsx` already draws for an ended session
+ * `abandoned` reuses the `·` glyph `App.tsx` already draws for an ended session
  * row (`<Row kind="ended" sign="·" ...>`), rather than inventing a second "this is over" mark. */
 function toolSign(call: ToolCallRecord, abandoned: boolean): string {
   if (call.result === null) return abandoned ? "·" : "◐";
@@ -110,7 +113,7 @@ function toolSign(call: ToolCallRecord, abandoned: boolean): string {
  * cut that has no result now never will), the session itself has ended, or the call's own turn is
  * no longer the active one. Without this, `null`
  * meant only "still running" -- so a tool call abandoned by a killed/interrupted session, or one
- * that outlived the transcript it was restored from, rendered a permanent spinner (sw-panel-render-6).
+ * that outlived the transcript it was restored from, rendered a permanent spinner.
  * A call still genuinely running (an active turn, inside the live span) is untouched: this is never
  * true for it, matching the pre-fix "◐" rendering exactly. */
 function isAbandonedCall(call: ToolCallRecord, state: AgentUiState, sessionEnded: boolean): boolean {
@@ -227,7 +230,7 @@ export function MessageList({
   /** The CURRENT render's `onScroll`, for the observer below, which is made once. Calling the first
    *  render's own `onScroll` from there ran that render's `updatePill`, which slices that render's
    *  timeline: every row that arrived since was invisible to it, so a row settling its size after a
-   *  card landed below a reader rewrote `↓ ⚑ approval` as `↓ Jump to bottom` (the phase-3 GUI pass,
+   *  card landed below a reader rewrote `↓ ⚑ approval` as `↓ Jump to bottom` (seen in a GUI pass,
    *  2026-09-25). Assigned right after `onScroll` is defined, on every render. */
   const onScrollRef = useRef<() => void>(() => {});
   /** The cursor's fill (`../cursorBand`): the element, its animator, and the row it was last put on, by
@@ -237,15 +240,30 @@ export function MessageList({
   const bandRowKeyRef = useRef<string | null>(null);
   const placeBandRef = useRef<(glide: boolean) => void>(() => {});
 
-  /* Watch the list and its rows for size changes. Viewport-based margins supply row widths;
-     no measured width or size query container is needed. A size container on `.row` caused
-     WebKitGTK to reset `scrollTop` when the status line clock ticked during streaming.
+  /* The list and its rows, watched for size (2026-09-24). Until 2026-10-13 this observer also wrote the
+     list's content-box width to `--list-inline-size`, from which every wide-content escape in `index.css`
+     took the row's width -- the replacement for a CSS size query container on `.row`, which in
+     WebKitGTK 2.52.6 made the engine reset this list's `scrollTop` every time the status line's elapsed
+     counter ticked while a reply streamed (`shell/tests/panel_stream_scroll.rs` is the regression test,
+     against the real engine). The chat page's rows fill the panel between margins written against
+     the viewport, so nothing reads a measured width any more and the write is
+     gone; no size container came back with it.
 
-     A resize can hide the tail without a state change: narrower replies grow taller, or the
-     composer, terminal, or key strip makes the list shorter. Rows must be observed too because
-     their size can change without changing the list's box, such as after a margin or font change.
-     While following, snap to the end after layout and before paint. Leave parked readers and
-     pending provisional stops in place. */
+     A GUI pass on 2026-09-24 found that when this observer only wrote the width, the follow
+     snap below ran only on a state change -- so a resize with nothing streaming behind it
+     left a following view short: narrowing the panel reflows the reply taller while `scrollTop` stays
+     put (482px short after a divider drag, 651px after an unzoom, measured in the sandbox), and a
+     shorter list (the bottom terminal shown, the composer growing, the which-key strip appearing as
+     INPUT becomes BROWSE) hides the tail the same way, for as long as a tool call runs, a permission
+     card waits, or the turn is over. The same observer now also watches every child of the list (the
+     rows), because the rows can change size with the list's box unchanged -- a side margin set on the
+     list alone, say, or anything else restyling the conversation alone. (A font push from the theme
+     is caught either way: the status line and the composer grow with the same
+     `--nv-font-size`, so the list's own box gets shorter too -- measured, the real-engine test with the rows left
+     unobserved failed only on its row-only restyle, then `--prose-measure`.) Either way, while following, the
+     callback snaps the view to its end: after layout and before paint, the same frame. Snapping is
+     all it adds; a parked reader, or a pending provisional stop, is left exactly where it is.
+     `shell/tests/panel_stream_scroll.rs` is the real-engine test. */
   useLayoutEffect(() => {
     const list = listRef.current;
     if (list === null) return;
@@ -291,33 +309,44 @@ export function MessageList({
     }
   };
 
-  // Follow new rows and growing replies only while `followingRef` is true. Include `userPrompts`
-  // because submitting a prompt can grow the list before any reply or tool call arrives.
-  // Use scroll position rather than the cursor index so following also works without keyboard navigation.
-  // An unexplained upward scroll is not enough to stop following: WebKitGTK could reset `scrollTop`
-  // on status clock ticks when rows were CSS size query containers, without any list content change.
-  // User intent comes from wheels, touch drags, a pointer held on the list, browser scroll keys,
-  // focus landing inside the list, or panel scroll commands announced through `noteUserScroll`.
-  // An upward scroll while steering stops following. `k`, `Ctrl+u` and `gg` stop it immediately.
-  // Browser keys such as PageUp, Home and Shift+Space must steer too when a control inside the list has focus.
-  // A mostly vertical upward wheel or an upward browser key provisionally stops following only when
-  // `listTakesUpward` says the list can move. This prevents a delta from snapping over a delayed scroll.
-  // Other gestures only steer, so horizontal jitter and scrolling an inner box do not leave following off.
-  // An actual upward scroll confirms the stop. If the list never moves up, take the stop back when
-  // the steering window ends and snap to any content that arrived meanwhile.
-  // `scheduleSettle` handles that timeout even if no later state change arrives; later gestures extend
-  // it, and a held pointer delays settlement until release and the following steering window.
-  // Reaching the true bottom (`AT_BOTTOM_PX`) re-arms following unless a provisional gesture has not moved.
-  // A downward user scroll within `BOTTOM_FOLLOW_THRESHOLD_PX` also re-arms it.
-  // Snap before paint for both new rows and streamed growth so the newest content is visible immediately.
-  // The `ResizeObserver` also snaps while following when the list or its rows change size without a state change.
-  // jsdom has no layout and generates no scroll events itself, so following tests dispatch them explicitly.
+  // Following uses scroll position rather than cursor position so mouse and touch readers can
+  // follow replies without moving the keyboard cursor. New prompts, rows, and streamed growth
+  // must all be followed, but incoming content must leave a reader who scrolled up in place.
+  // Distance measured after new content mounts cannot tell whether the reader was following.
+  // Engine clamps can also move `scrollTop`, so upward movement alone is not evidence of intent.
+  // A size query container on `.row` caused such jumps when the status line clock changed.
+  // Wheel, touch, pointer, focus, and native scroll keys mark a steering window. Panel scrolls
+  // announce intent through `noteUserScroll`; `k`, `Ctrl+u`, and `gg` stop following immediately.
+  // A mostly vertical upward wheel or native key stops provisionally only if `listTakesUpward`
+  // says the list can scroll. Upward movement while steering confirms the stop. If the gesture
+  // ends without moving the list up, take the stop back so an inner box consuming the gesture
+  // does not leave following disabled. `scheduleSettle` handles this even if no more state arrives;
+  // later gestures extend the window, and a held pointer defers settlement until release.
+  // The true bottom re-arms following; a downward user scroll near the bottom does too.
+  // While following, snap before paint for both new rows and growing text. Smooth scrolling
+  // leaves new rows temporarily hidden and would restart on every streamed text update.
+  // The `ResizeObserver` also follows size changes that arrive without a state update.
+  // jsdom has no layout or automatic scroll events, so tests dispatch scroll events explicitly.
 
-  /* `buildTimeline` merges conversation items using the `seq` assigned by Rust's projection
-     and shipped in snapshots, so reloads and `UiDelivery::Resync` preserve live ordering.
-     Memoising the timeline avoids rebuilding and sorting it on unrelated parent renders.
-     `MarkdownBody` renders each reply once per text instead of repeating markdown processing
-     for every list render. Keep `timeline` above `onScroll` because `updatePill` reads it too. */
+  /* One ordered sequence, not three lists one after another.
+
+     Until 2026-09-15 this component mapped `transcript`, then `toolCalls`, then
+     `pendingPermissions`, so every tool card rendered below every assistant message however the
+     turn really went. `buildTimeline` merges them on `seq`, an ordering key Rust's projection
+     assigns and its snapshot ships -- so a reload or a `UiDelivery::Resync`, which rebuild this
+     whole state from that snapshot, produce the same order as the live path did.
+
+     Memoised on `state`, which the reducer replaces wholesale on every folded event -- so this
+     recomputes exactly as often as the conversation changes, and not on a re-render caused by
+     anything else (a `sessionEnded` flip, a parent re-render while the user types). The merge
+     allocates four mapped arrays, a Map and a Set and then sorts the whole conversation, which
+     during streaming would otherwise run on every 33ms pump batch.
+
+     A reply's markdown is rendered by `MarkdownBody` (end of this file), once per text, so a render
+     of this list no longer runs marked, highlight.js and DOMPurify over every reply.
+
+     Declared here, above `onScroll` (moved for the pill): the pill's `updatePill` closure, defined
+     below alongside `onScroll`, reads `timeline` too, and both need the same binding in scope. */
   const timeline = useMemo(
     () =>
       given ??
@@ -330,7 +359,7 @@ export function MessageList({
   const steerUntilRef = useRef(0);
   const pointerSteeringRef = useRef(false);
   /** Where a wheel or key stopped following on a prediction, until the gesture shows whether the list
-   *  really went up; `null` when no such stop is pending. See (3b) above. (Its `missedRow` flag went
+   *  really went up; `null` when no such stop is pending. See the correction on provisional stops above. (Its `missedRow` flag went
    *  with the smooth scroll, the GUI pass: a take-back snaps to the end whatever arrived meanwhile.) */
   const provisionalStopRef = useRef<{ from: number } | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -346,10 +375,18 @@ export function MessageList({
       lastScrollTopRef.current = list.scrollTop;
     }
   };
-  /** The largest timeline `seq` when following last stopped; `null` while following.
-   *  A length cutoff loses unread rows after a tab restore because the component is reused.
-   *  It also misses new permission cards inserted after older calls before that array index.
-   *  A `seq` threshold counts arrival order regardless of where a card is drawn. */
+  /** The largest `seq` on screen when following last stopped; `null` while following.
+   *
+   *  This used to be a timeline INDEX (`unseenFromRef`, the timeline's length at the
+   *  moment following stopped), sliced off the CURRENT timeline with `timeline.slice(from)`. That
+   *  broke two ways. First, a tab switch reuses this component (`App.tsx` never remounts it), so the
+   *  first `updatePill` after a restore reset `from` to the just-restored (short) timeline's own
+   *  length -- every row that had arrived while the tab was away sat BELOW that length and was
+   *  silently never counted. Second, even within one tab, `buildTimeline` does not keep the array in
+   *  `seq` order: a permission card anchored to an older tool call is spliced in right after that
+   *  call (see `timeline.ts`), which can land it BEFORE the old length cutoff even though its own
+   *  `seq` -- when it actually arrived -- is far newer than everything after it. A `seq` threshold
+   *  does not care where an item landed in the array, only when it happened. */
   const unseenAfterSeqRef = useRef<number | null>(null);
   const [pill, setPill] = useState<string | null>(null);
   const updatePill = () => {
@@ -469,7 +506,7 @@ export function MessageList({
     const steer = () => {
       steerUntilRef.current = performance.now() + STEER_WINDOW_MS;
     };
-    // (3b): only a mostly vertical wheel up that the list itself can take stops following, and only
+    // Only a mostly vertical wheel up that the list itself can take stops following, and only
     // provisionally. A sideways swipe's jitter, a wheel an inner box takes and a wheel with nothing
     // above only steer: if the list does move, its scroll event says so.
     const onWheel = (event: WheelEvent) => {
@@ -478,7 +515,7 @@ export function MessageList({
         stopProvisionally(list);
       }
     };
-    // (3a): the browser's own scroll keys, from a control inside the list. In a text box they move the
+    // The browser's own scroll keys, from a control inside the list. In a text box they move the
     // caret, so they only steer there (a caret reveal can scroll the list, either way).
     const onKeyDown = (event: KeyboardEvent) => {
       const direction = nativeScrollKeyDirection(event);
@@ -639,8 +676,10 @@ export function MessageList({
         data-visual={visual ?? undefined}
         ref={listRef}
         onScroll={onScroll}
-        // Open `.path-link` spans or inline code in replies when they parse as paths.
-        // Exclude fenced code (`pre code`): it is a snippet, and HINT provides `y` to copy it.
+        // A click on a path -- the tool registry's own `.path-link` spans, or an inline code
+        // span in an assistant reply that happens to parse as one. Never a fenced code BLOCK
+        // (`pre code`): that is a real snippet, not a path, and HINT's own `y` already owns copying
+        // it.
         onClick={(event) => {
           if (onOpenPath === undefined) return;
           const target = (event.target as HTMLElement).closest<HTMLElement>(".path-link, .row-assistant code:not(pre code)");
@@ -782,8 +821,10 @@ const TimelineRow = memo(function TimelineRow({
       return (
         <Row kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yankedClass} navStop="row">
           <div data-awaiting-permission={gated ? "true" : undefined}>
-            {/* A gated call shows "waiting for approval" because its permission card already shows
-                the invocation. Repeating it here would make a pending call look as if it had run. */}
+            {/* A call a card is waiting on no longer repeats its own invocation below the
+                card too -- the gated line above says "waiting for approval" already, so the
+                two would otherwise say the same thing twice, once as an offer and once as if
+                it had already run. */}
             {renderToolCall(item.call, expanded, {
               gated,
               detailed,
@@ -833,8 +874,8 @@ const TimelineRow = memo(function TimelineRow({
       );
     }
     case "run": {
-      // A run replaces its calls with a summary such as `Read ×3 · Bash ×2`.
-      // Enter uses `toggle-expand` on the run row key to reveal the calls.
+      // A run replaces its calls with one line, `Read ×3 · Bash ×2`; `Enter`
+      // (`toggle-expand`, keyed on this row's OWN key) puts them back.
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
         <Row kind="tool-run" sign="✓" current={current} className={yankedClass} navStop="row">
@@ -849,7 +890,7 @@ const TimelineRow = memo(function TimelineRow({
       // renders as nothing: this component has no pinned return type, a missing case
       // falls through to `undefined`, `undefined` is a valid `ReactNode`, and `tsc -b` stays
       // clean -- exactly how the "prompt" case's own placeholder was allowed to hide for a
-      // whole task (see the git history of this switch). Assigning `item` to `never` turns
+      // long time. Assigning `item` to `never` turns
       // that same mistake into a compile error instead of an invisible blank row.
       const _exhaustive: never = item;
       return _exhaustive;

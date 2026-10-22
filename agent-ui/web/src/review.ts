@@ -346,7 +346,7 @@ export function draftLine(draft: ReviewDraft): string | null {
   return `draft: ${c} ${c === 1 ? "comment" : "comments"}, ${r} ${r === 1 ? "revert" : "reverts"} · s sends them to the agent`;
 }
 
-/** The overlay's key line: what the keys are, in the order the design lists them. */
+/** The overlay's key line: what the keys are. */
 export const REVIEW_KEY_LINE = "j/k move · Enter open · x revert · u undo · i comment · s send · [ ] turn · o editor · q close";
 
 /** What `x` on a hunk of a binary file says: nothing to revert piecemeal. */

@@ -23,11 +23,21 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
   return activeTab !== null && payload.tab === activeTab;
 }
 
-/** The mode pill uses the panel's mode names from `hello.permissionModes`; `auto` differs from the CLI's.
- *  Every tab can attempt to cycle through `modeKeyRoute`. `cycleOffered` only controls the long form's hint.
- *  The bottom band uses `short = true` to omit "on" and the cycle hint when space is tight.
- *  The short bypass pill spells out `⏵⏵ bypass permissions on` so its effect is clear.
- *  Backend, model and the full pill are shown under `prefix i`. `short` defaults to `false` for long-form callers. */
+/** Claude Code's mode pill (docs, permission-modes.md), with Eitri's own word for the mode
+ *  (`hello.permissionModes`): Eitri's `auto` is not the CLI's. `cycleOffered` used to name the
+ *  `SetPermissionMode` capability gate; that capability is gone entirely -- every tab can always attempt to cycle now (`modeKey.ts`'s
+ *  `modeKeyRoute`) -- but the parameter stays for the long form's own shape, below.
+ *
+ *  `short`: the bottom band has no room for "on" or the
+ *  cycle hint, so it always reads `short = true` and gets the bare `⏵⏵ <mode>` -- `cycleOffered` is
+ *  ignored entirely in that case, since there is nowhere left to draw the hint anyway. Backend and
+ *  model, and the full pill with its hint, moved to `prefix i`; nothing left calls this
+ *  with `short` omitted, but the parameter defaults to `false` rather than being required, so a
+ *  future caller that wants the long form back does not have to relearn what it looked like.
+ *
+ *  Bypass's short pill spells out what it means (`⏵⏵ bypass permissions on`) rather than the
+ *  bare mode word every other mode gets -- Eitri's own answer, spent on every waiting card, is not
+ *  something a glance at "bypass" alone says. */
 export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
   if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;
   // The key cycles manual -> auto -> bypass, Claude Code's order and word.

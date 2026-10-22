@@ -118,7 +118,7 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump 
   const left = segs.filter((seg) => seg.side === "left");
   const right = segs.filter((seg) => seg.side === "right");
   const glyphMode = pillGlyphMode(facts.pill);
-  // Defect 1 (2026-09-27 sandbox GUI pass): `bandLayout` marks a `"prompt"`/`"message"` segment
+  // `bandLayout` marks a `"prompt"`/`"message"` segment
   // `wraps` instead of truncating it (its own doc comment, `../band`) exactly when the full text does
   // not fit the one-row budget -- `index.css`'s `.status-band--wrap` is what actually lets the band
   // grow upward and wrap that text onto more rows, for as long as this render still carries one; an
@@ -139,7 +139,7 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump 
       </span>
       {/* A real `<button>` only when there is something for a click to do (`onOpenDetail`) -- the
           start screen passes none, and a focusable control that activates nothing would be a dead
-          stop for `hjkl`/HINT to land on (found while widening this task: the empty tab's own HINT
+          stop for `hjkl`/HINT to land on (the empty tab's own HINT
           count grew by one for exactly that reason). A `<div>` otherwise, same content, same
           classes, no click handling and no place in `controlsOf`'s selector. */}
       {onOpenDetail !== undefined ? (
@@ -166,8 +166,8 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump 
               </span>
             );
           }
-          // The segment shows the short figure; its tooltip gives the token breakdown, exact cost,
-          // and what the figure means, just as `⚠`'s tooltip carries its warning.
+          // The segment is the short figure; its tooltip is the breakdown it has no room for
+          // (each token part, the exact cost, and what the figure is), as `⚠`'s carries its warning.
           if (seg.id === "usage") {
             return (
               <span key="usage" className="band-seg band-usage" title={facts.usage?.title}>

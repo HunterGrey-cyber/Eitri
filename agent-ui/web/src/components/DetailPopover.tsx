@@ -27,8 +27,8 @@ type Props = {
  *  two-column table of `rows`, shaped like `KeymapOverlay`, plus an optional trailing action row
  *  (`onHandoff`). */
 export const DetailPopover = forwardRef<HTMLDivElement, Props>(function DetailPopover({ rows, current, onClose, onHandoff }, ref) {
-  // The row `j`/`k` sit on stays in view: once phase 3's rows made the table taller than a short
-  // panel, the highlight walked off the bottom with nothing following it (the phase-3 GUI pass).
+  // The row `j`/`k` sit on stays in view: once the rows made the table taller than a short
+  // panel, the highlight walked off the bottom with nothing following it.
   const currentRef = useRef<HTMLTableRowElement | null>(null);
   useEffect(() => {
     // `?.()`: jsdom has no `scrollIntoView`.

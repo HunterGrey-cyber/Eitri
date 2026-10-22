@@ -84,7 +84,7 @@ type Props = {
    *  a tab switch can save the unsent draft. Optional so every existing caller (and this component's own tests) needs
    *  no stand-in. */
   onDraftChange?: (text: string) => void;
-  /** Whether this tab has a turn running (phase 3, C1). The box stays live and typable through it --
+  /** Whether this tab has a turn running. The box stays live and typable through it --
    *  Enter puts the message into the running turn, or holds it for the turn's end when the agent cannot
    *  take it (`enterSteers`; Rust decides, `onQueue` carries both), and `Ctrl+Enter` sends now. */
   running: boolean;
@@ -134,7 +134,7 @@ type Props = {
   idleHint?: string;
 };
 
-/** C2: the BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
+/** The BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
  *  than reproducing the whole unsent message. */
 function twoLines(text: string): string {
   const lines = text.split("\n");
@@ -208,7 +208,7 @@ export function Composer({
      message is gone with no trace, which is the one outcome this must never produce. */
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** Where the caret should go the next time the box takes focus: the end, unless the user left it
-   *  somewhere in the same text (defect 1: a landing put it at the start). */
+   *  somewhere in the same text (a landing used to put it at the start). */
   const caretRef = useRef<number | null>(null);
 
   /** The caret `setBox` has decided on and not yet placed in the box. React reports a `select` for a
@@ -257,7 +257,7 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRequest, mode]);
 
-  // F1: a box that becomes enabled while the panel is in INPUT takes the keys back.
+  // A box that becomes enabled while the panel is in INPUT takes the keys back.
   const wasDisabled = useRef(disabled);
   useEffect(() => {
     if (wasDisabled.current && !disabled && mode === "input") focusAtCaret();
@@ -271,7 +271,7 @@ export function Composer({
     // in the box -- it does NOT mirror it back to Rust itself. `restoredDraft` fires on every tab
     // switch too (cleared to "", `App.tsx`'s `tabs` arm) and on every inbound `draft` echo from
     // Rust, and mirroring unconditionally here re-echoed both of those back out as a fresh `draft`
-    // post nobody asked for (found by a regression this task's own fix first introduced: a leader
+    // post nobody asked for (mirroring unconditionally once caused a regression: a leader
     // sequence test with no composer in play at all started posting one). The host mirrors the
     // RECOVERED text itself, once, right where it computes it (`App.tsx`'s send-refusal handler).
     setText(restoredDraft.text);
@@ -289,7 +289,7 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueTaken?.seq]);
 
-  // C3: grow to the content, at most 40% of the panel.
+  // Grow to the content, at most 40% of the panel.
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (el === null) return;
@@ -575,10 +575,16 @@ export function Composer({
           />
         </>
       ) : sessionEnded ? (
-        /* An ended session cannot enter INPUT: its textarea is disabled, `resolveKey` refuses `i`,
-           and `App.tsx` forces BROWSE if the session ends during INPUT. This hint has no focus
-           target or `onFocus`, so Tab cannot enter INPUT either. The lost, ended, or failed row
-           above already names `r`, so only state that the session has ended here. */
+        /* A dead session offers no route into INPUT at all, and says so instead of promising `i`.
+           The textarea above is `disabled` once the session ends, so INPUT there is an empty mode:
+           `autoFocus` cannot take focus, keys keep arriving at the panel root, and `resolveKey`'s
+           "input" branch drops everything but `Escape` -- including `r`, which is the one key the
+           lost/ended rows above genuinely promise. Not focusable and no `onFocus` here, so Tab
+           cannot reach INPUT by the side door either; `resolveKey` refuses `i` on the same
+           condition, and `App.tsx` forces BROWSE for a session that dies while INPUT is already
+           active. The text names only `r`, the key that actually resolves in the mode the user is
+           in. It names no key at all: the lost/ended/failed row just above
+           already says "Press r…", and a failed tab read it twice. */
         <div className="composer-browse-hint">This session has ended.</div>
       ) : (
         // BROWSE's rendering of the same control: not a textarea at all, so there is nothing here

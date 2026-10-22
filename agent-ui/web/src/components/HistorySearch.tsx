@@ -7,9 +7,10 @@ type Props = {
   history: string[];
   onAccept: (text: string) => void;
   onCancel: () => void;
-  /** Report Enter, Tab, and Escape before stopping propagation. They never reach `App`'s
-   *  `onKeyDown`, so its typing guard would otherwise miss them and could let an immediate
-   *  `Ctrl+y` approve a card. This uses `noteLineKey`, like the `/` and `:` lines. */
+  /** The keys this line claims and stops (Enter, Tab,
+   *  Escape) never bubble to `App`'s own `onKeyDown`, so its typing guard never saw them and a
+   *  `Ctrl+y` right after one approved a card. Each is handed over here first, as the `/` and `:`
+   *  lines hand theirs over (`App.tsx`'s `noteLineKey`). */
   onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
 };
 

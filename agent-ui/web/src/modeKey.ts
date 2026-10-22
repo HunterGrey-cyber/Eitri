@@ -19,10 +19,13 @@ export function isModeCycleKey(e: {
   return isShiftTab(e) && !e.ctrlKey && !e.altKey && !e.metaKey;
 }
 
-/** Recognize Shift+Tab when WebKitGTK reports the `ISO_Left_Tab` keysym as `key:
- *  "Unidentified"`, `code: "Tab"`, `keyCode: 9`. Checking `key === "Tab"` alone lets that event
- *  fall through to GTK focus movement. Keep the `key === "Tab"` case for keymaps and tests that
- *  deliver it. */
+/** Shift+Tab as WebKitGTK actually delivers it. A real keyboard's `us` layout (and any xkb layout)
+ *  turns Shift+Tab into the keysym `ISO_Left_Tab`, which WebKitGTK 2.52.6 reports as
+ *  `key: "Unidentified"`, `code: "Tab"`, `keyCode: 9` -- never `key: "Tab"` (seen in a GUI
+ *  pass, 2026-09-26, with a virtual keyboard carrying the real `us` keymap). Checking `key === "Tab"`
+ *  alone therefore never matched on a real keyboard, and the key fell through to GTK's `move-focus`.
+ *  `code` names the physical key, so it is what identifies Tab here; `key === "Tab"` is kept for a
+ *  keymap (or a test) that does deliver it. */
 export function isShiftTab(e: { key: string; code?: string; shiftKey: boolean }): boolean {
   if (!e.shiftKey) return false;
   return e.key === "Tab" || (e.key === "Unidentified" && e.code === "Tab");
@@ -32,9 +35,9 @@ export type ModeKeyState = {
   confirmOpen: boolean;
   chooserOpen: boolean;
   tabState: TabInfo["state"] | null;
-  /** The tab mode (`TabInfo.mode`) distinguishes ended or failed tabs that can leave bypass from
-   *  those that cannot enter it. A tab already in bypass can leave it in every state. `null`
-   *  before a tab exists, like `tabState`. */
+  /** The tab's own mode (`TabInfo.mode`), read only to settle the `ended`/`failed` case: entering bypass there is refused, but a tab that is ALREADY in bypass can still leave it
+   *  in every state, so `ended`/`failed` is not simply "fixed" any more. `null` before any tab
+   *  exists yet, the same as `tabState`. */
   tabMode: PermissionModeChoice | null;
 };
 
@@ -68,15 +71,18 @@ export function modeFixedMessage(resetKey: string): string {
     : `the session has ended — ${resetKey} to start again`;
 }
 
-/** Minimum prompt age and time since the last non-modifier keydown anywhere in the panel before
- *  `y` or `Y` can confirm `confirm_bypass`. Typed text, including keys that opened the prompt,
- *  must not accidentally enable bypass. */
+/** How long a `confirm_bypass` prompt must have been on screen, and how long since the last
+ *  non-modifier keydown ANYWHERE in the panel, before a `y`/`Y` counts as answering it -- typed text
+ *  (even the very keys that triggered the prompt, like `<leader>m`) must never fall through into
+ *  bypass. It IS `typingGuard.ts#TYPING_GUARD_MS`: one number for "typed text is still
+ *  arriving". */
 export const BYPASS_YES_GUARD_MS = TYPING_GUARD_MS;
 
-/** Check both the prompt age and the time since the previous non-modifier keydown. The caller
- *  supplies `performance.now()` rather than `event.timeStamp` so tests control the clock.
- *  `lastKeyAt` excludes this keydown and includes keys handled anywhere in the panel, as
- *  captured by `App.tsx` before routing. */
+/** Both halves of that guard, pure and clock-injected (`performance.now()` at the call site, never
+ *  `event.timeStamp`, so tests can control it). `lastKeyAt` is the last non-modifier keydown
+ *  strictly BEFORE this one -- see `App.tsx`'s document-capture listener, which records it for every
+ *  keydown in the panel before any routing, so a key typed into any handler (the composer, a card's
+ *  reason box, the leader engine) counts, not just ones this module itself sees. */
 export function bypassYesCounts({ now, openedAt, lastKeyAt }: { now: number; openedAt: number; lastKeyAt: number }): boolean {
   return now - openedAt >= BYPASS_YES_GUARD_MS && now - lastKeyAt >= BYPASS_YES_GUARD_MS;
 }

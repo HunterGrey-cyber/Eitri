@@ -5,11 +5,11 @@ import { NO_TEXT_ASSIST } from "../textField";
 type Props = {
   query: string;
   onChange: (q: string) => void;
-  /** Pass Enter and Esc keydown events to the caller so the typing guard sees them even though
-   *  propagation stops here. Otherwise a following `a` could answer a card immediately. */
+  /** Enter and Esc. Each gets its own keydown, which this bar stops here, so the caller can still
+   *  hand it to the typing guard (a key the guard never saw let `a` right after it answer). */
   onAccept: (event: KeyboardEvent<HTMLInputElement>) => void;
   onCancel: (event: KeyboardEvent<HTMLInputElement>) => void;
-  /** What the line starts with: `/` for search, `:` for the command line. */
+  /** What the line starts with: `/` for the search, `:` for the command line. */
   lead?: string;
   /** The box's accessible name. */
   label?: string;
@@ -25,7 +25,8 @@ function isTab(e: KeyboardEvent<HTMLInputElement>): boolean {
   return e.key === "Tab" || (e.key === "Unidentified" && e.code === "Tab");
 }
 
-/** A one-line footer prompt for `/` search or a `:` command line that runs nothing. */
+/** A one-line prompt in the footer, where vim draws its command line: the `/` search, and the
+ *  `:` command line, which runs nothing. */
 export function SearchBar({
   query,
   onChange,

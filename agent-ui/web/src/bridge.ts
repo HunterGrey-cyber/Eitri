@@ -78,14 +78,16 @@ export type OutboundMessage =
    *  add one. `TabVerbWire`'s wire spelling, `core/src/agent_bridge.rs`. `agent` is read by `new`
    *  alone: the word `:tabnew` was typed with (none: the window's default agent). */
   | { type: "tab_verb"; request_id: string; verb: "next" | "prev" | "last" | "new" | "close" | "close_others" | "choose" | "info"; agent?: string }
-  /** `y` to a `confirm_close_others` prompt is window-level, like `TabVerb`.
-   *  Rust recomputes every tab except the active one when answering, so this carries no tab list.
-   *  Maps to `InboundMessage::CloseOthers` in `core/src/agent_bridge.rs`. */
+  /** `y` to a `confirm_close_others` prompt: window-level, like `TabVerb` --
+   *  Rust recomputes "every tab but the active one" fresh rather than trusting the set the prompt
+   *  was shown with, so this carries no tab list of its own. `InboundMessage::CloseOthers`,
+   *  `core/src/agent_bridge.rs`. */
   | { type: "close_others"; request_id: string }
-  /** Answer a `confirm_bypass` prompt with `y`/`Y` after `bypassYesCounts` accepts the key. Echo
-   *  `tab`, `scope`, and `nonce` verbatim. Rust retains the delivered card list and answers only
-   *  cards still pending on that tab at that nonce; this side never chooses the cards. Maps to
-   *  `InboundMessage::ConfirmBypass` in `core/src/agent_bridge.rs`. */
+  /** `y`/`Y` to a `confirm_bypass` prompt, guarded by
+   *  `modeKey.ts#bypassYesCounts` before this is ever sent. `tab`/`scope`/`nonce` echo the envelope's
+   *  own values verbatim -- this side never counts cards or decides which ones a `y` approves; Rust
+   *  keeps that list and answers only the delivered cards still pending, still on `tab`, at `nonce`.
+   *  `InboundMessage::ConfirmBypass`, `core/src/agent_bridge.rs`. */
   | { type: "confirm_bypass"; request_id: string; tab: TabId | null; scope: "tab" | "default"; nonce: number }
   /** `s` on the launch dashboard: bring back the tabs the last window had open, the first into this
    *  empty tab and the rest into new ones. Names the tab it was pressed in. A saved tab that was in
@@ -312,16 +314,19 @@ type InboundHandler = (
      *  rows in place; with no chooser open, nothing happens (it never opens one). */
     | { kind: "chooser_titles"; titles: { providerSessionId: string; title: string }[] }
     | { kind: "confirm_close"; tab: TabId; lines: string[] }
-    /** `<leader>bo` / `tab.close-others` is window-level. `tabs` lists the tabs a `y` would close;
-     *  Rust recomputes the set when answering rather than trusting the displayed list.
-     *  See `serialize_confirm_close_others_for_js` in `core/src/agent_bridge.rs`. */
+    /** `<leader>bo` / `tab.close-others`: window-level, unlike `confirm_close`
+     *  -- `tabs` is every tab the `y` answer would close, recomputed fresh by Rust rather than
+     *  trusted from here. `serialize_confirm_close_others_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "confirm_close_others"; tabs: TabId[]; lines: string[] }
     | { kind: "begin_rename"; tab: TabId; current: string | null }
-    /** A move into bypass asks for y/n first. With tab scope, `tab` identifies the switching tab;
-     *  default scope changes the window default and carries `tab: null`. `lines[0]` already
-     *  includes the waiting-card count, which this side never computes. Echo `nonce` on `y`/`Y` so
-     *  Rust can reject stale answers. A second envelope replaces an open prompt. Serialized by
-     *  `serialize_confirm_bypass_for_js` in `core/src/agent_bridge.rs`. */
+    /** A move into bypass needs a y/n first:
+     *  `scope: "tab"` names the tab switching (`tab` is that id); `scope: "default"` is the window's
+     *  own default (`cycle_default_mode` from the chooser or an empty tab), and carries `tab: null`
+     *  -- there is no single tab to name. `lines[0]` is Rust's own wording, already carrying the
+     *  waiting-card count; this side never counts them itself. `nonce` is echoed back verbatim on
+     *  `y`/`Y` so Rust can tell a stale answer from the current prompt. A second envelope while
+     *  one is already open REPLACES it (Reprompt) -- this is not additive.
+     *  `serialize_confirm_bypass_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "confirm_bypass"; tab: TabId | null; scope: "tab" | "default"; nonce: number; lines: string[] }
     /** A restore found a tab saved in bypass and asks before giving it back: `y` restores as saved,
      *  `n` brings the bypass tabs back in auto. `nonce` is echoed back on either answer, as
@@ -411,9 +416,10 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
-      // Reject a `confirm_bypass` without a numeric `nonce`, warning and dropping it like an
-      // unrecognized envelope. A `y` answer must echo a received nonce; `App.tsx` must never invent
-      // one.
+      // A `confirm_bypass` with no numeric `nonce` can never be answered correctly (there
+      // would be nothing real to echo back on `y`), so it is rejected the same way an unrecognized
+      // envelope is -- warned about and dropped -- rather than reaching `App.tsx` as a confirm this
+      // side would have to guess a nonce for.
       if (obj.kind === "confirm_bypass" && typeof (obj as { nonce?: unknown }).nonce !== "number") {
         console.warn("agent-ui: __eitriDispatch received a malformed confirm_bypass envelope (no nonce)", parsed);
         return;

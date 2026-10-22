@@ -47,9 +47,10 @@ export type TimelineItem =
    *  (the state's `thinkingOpen`, for its last block only). Whether and how it is drawn is
    *  `display.ts`'s and `MessageList`'s to decide, by the panel's `agent.thinking` level. */
   | { kind: "thinking"; seq: Seq; key: string; block: ThinkingBlock; open: boolean }
-  /** A collapsed run of finished tool calls, drawn as one row by `display.ts`.
-   *  `buildTimeline` preserves ordering by `seq`, with cards anchored after their calls.
-   *  Folding is a display layer over that ordering. `key` is `r-<first seq>`. */
+  /** A collapsed run of finished tool calls, drawn as one row. Made by `display.ts`, never by
+   *  `buildTimeline` -- this function's own ordering (by `seq`, cards anchored after their call)
+   *  stays exactly as it was, and folding several rows into one is a DISPLAY decision layered on
+   *  top of it, not a change to what the conversation actually contains. `key` is `r-<first seq>`. */
   | {
       kind: "run";
       seq: Seq;
@@ -236,8 +237,9 @@ export function oldestPendingPermission(timeline: TimelineItem[]): number | null
   return best;
 }
 
-/** `[[`/`]]`: the next `prompt` row before (`-1`) or after (`1`) `from`, or `null` if none exists.
- *  Navigation stops at either end, matching `clampStep` in `nav.ts`. */
+/** `[[`/`]]`: the next `prompt` row before (`-1`) or after (`1`) `from`, or `null` when there is
+ *  none. Never wraps -- `[[` at the first prompt, or `]]` at the last, simply does nothing, the same
+ *  way `clampStep` (`nav.ts`) stops `j`/`k` at either end rather than cycling. */
 export function promptIndex(timeline: TimelineItem[], from: number, delta: 1 | -1): number | null {
   for (let i = from + delta; i >= 0 && i < timeline.length; i += delta) {
     if (timeline[i].kind === "prompt") return i;
@@ -267,10 +269,11 @@ export function oldestWaitingPermission(timeline: TimelineItem[], answered: Read
   return best;
 }
 
-/** `]p` (+1) / `[p` (-1): the next waiting card after or before `from`, wrapping at either end.
- *  Cards already answered by this panel are excluded. A lone waiting card returns its own index,
- *  even when `from` is on it; no waiting cards returns `null`.
- *  `from` may be outside the timeline, so a cursor past a shortened list still finds a row. */
+/** `]p` (+1) / `[p` (-1): the next waiting card after (before) `from`, wrapping as nvim's `]d`
+ *  does (`vim.diagnostic.jump`'s default) -- unlike `[[`/`]]` (`promptIndex`), which stop at either end. A card
+ *  this panel already answered is not waiting. With one card waiting, and `from` on it, the answer is `from`
+ *  itself (a lone diagnostic is its own next); `null` when none waits at all. `from` may lie outside the
+ *  timeline (it counts round the ring), so a cursor left one past a shortened list still finds a real row. */
 export function waitingCardIndex(
   timeline: TimelineItem[],
   from: number,
@@ -285,10 +288,12 @@ export function waitingCardIndex(
   return null;
 }
 
-/** `{N}]p` / `{N}[p`: repeats `waitingCardIndex` from each preceding landing.
- *  After the first step, navigation cycles only through waiting cards. Reducing `times - 1` modulo
- *  that count preserves the landing while limiting work to O(waiting x rows), rather than O(times x rows).
- *  This avoids scanning a long conversation 9999 times for a single keydown. Returns `null` if no card waits. */
+/** `{N}]p` / `{N}[p`: `waitingCardIndex` taken `times` times, each step from the card the last one landed on
+ *  (a count repeats it). The first step reaches a waiting card and every step after it only goes round the
+ *  ring of them, so a count is at most as many steps as there are waiting cards -- `times - 1` modulo that,
+ *  plus the first -- however large it is: it costs O(waiting x rows), where repeating the single step `times`
+ *  times cost O(times x rows), which for the panel's cap of 9999 over a long conversation with one card waiting
+ *  is a whole scan of it 9999 times inside one keydown. The same landing either way. `null` when no card waits. */
 export function waitingCardAfter(
   timeline: TimelineItem[],
   from: number,

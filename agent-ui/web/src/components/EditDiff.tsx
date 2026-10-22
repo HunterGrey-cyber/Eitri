@@ -47,8 +47,8 @@ export function EditDiff({
     <div className="permission-card-edit">
       <div className="permission-card-edit-head">
         {tool !== undefined && <span className="permission-card-edit-tool">{tool}</span>}
-        {/* Show the path after the tool name and before the change so readers can identify the
-            file. A nonempty path is a `gf` and click target; an empty path cannot be opened. */}
+        {/* The path first (after the tool's name, on a transcript row): which file is the question a reader asks before what changed. A real
+            path is also a `gf`/click target; an empty one is not a path to open. */}
         {preview.filePath ? (
           <span className="permission-card-edit-path path-link" data-path={preview.filePath}>
             <Revealed pieces={pathPieces} />
@@ -77,7 +77,7 @@ export function EditDiff({
         ) : (
           /* Said rather than implied. A Write request carries only what the file WILL contain, so a
              patch-shaped rendering would suggest the rest of the file survives. It may not. Also
-             what is shown when nobody looked (a snapshot from before F22, a call no card gated).
+             what is shown when nobody looked (a snapshot from before `createsFile` existed, a call no card gated).
              `preview.wholeFileNote` overrides this wording for a tool whose whole
              content is not a whole file (`NotebookEdit`'s cell) -- `undefined` for `Write` keeps
              this exact pinned sentence. */

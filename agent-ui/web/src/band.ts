@@ -14,9 +14,12 @@ export type Seg = {
   id: SegId;
   text: string;
   side: "left" | "right";
-  /** Set only on a prompt or message whose full text exceeds the band's measured row width.
-   *  `StatusBand` wraps it at auto height so the trailing `(y/n)` or flash explanation stays
-   *  visible. Absent on other segments, which still drop by priority. */
+  /** Set only on `"prompt"`/`"message"`, and only when the FULL text (never truncated any more) does not fit the band's one row at the measured
+   *  width. `StatusBand` reads this to switch the band from its fixed one-editor-row height to a
+   *  wrapping, auto-height one for as long as this text is shown -- a y/n prompt's own trailing
+   *  `(y/n)`, or the flash explaining what `y` does, used to be exactly the part `bandLayout`'s
+   *  old `cut()` truncated away. Absent (not merely `false`) on every other segment, which keeps
+   *  the existing drop-by-priority degrade instead. */
   wraps?: boolean;
 };
 
@@ -37,13 +40,14 @@ export type BandFacts = {
   context: { file: string; lines: [number, number] | null } | null;
   position: string | null;
   model: string | null;
-  /** The active tab's latest usage, formatted by `usageSegment`: `text` is the segment and `title`
-   *  its tooltip. Null until a turn reports usage, and always null on an empty tab. */
+  /** The active tab's last reported usage, already worded (`usageSegment`) -- `text` is the
+   *  segment, `title` its tooltip. `null` until a turn has reported one, and always `null` on the
+   *  empty tab. */
   usage: UsageFact | null;
   /** The card INPUT's `Ctrl+y` would approve -- the active tab's
    *  oldest waiting card -- set by `App.tsx` only while one waits and the composer has the keys, so
    *  the band says which card that one key answers. Optional: absent (or `null`) is "nothing to
-   *  name", which every caller that predates #39 means. */
+   *  name", which every caller that predates this field means. */
   approve?: ApproveFact | null;
   /** Companion mode: where the panel stands with the editor beside it. `null`, or absent, is the
    *  one-window mode, which has no such thing and never sends one. While it is set and not
@@ -85,7 +89,7 @@ export function recoverySegment(path: string, more: number): string {
   return `an interrupted revert left ${path}${more > 0 ? ` and ${more} more` : ""} · c to review`;
 }
 
-/** #39's segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
+/** The `Ctrl+y` segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
 export type ApproveFact = { tool: string; summary: string };
 
 /** How long `cardSummary` lets a card's summary run on the band, the `…` included. */
@@ -136,22 +140,33 @@ export function textWidth(text: string): number {
   return n;
 }
 
-/** Prompts and messages keep their full text so narrow bands cannot hide a trailing `(y/n)` or the
- *  explanation of how to answer. Oversized segments use `wraps: true`; `StatusBand` and
- *  `.status-band--wrap` let the band grow upward until the prompt or flash ends. Other segments
- *  still degrade by priority. */
+/** This module used to have a `cut(text, n)` truncator here, appending `…` to a message/prompt
+ *  that did not fit. **Removed 2026-09-27, after a sandbox GUI pass:** at
+ *  WebKit zoom 1.5 (a 47-column band), it truncated the bypass prompt (then in
+ *  Chinese; English now, `Switch to bypass and approve the 1 waiting card? (y/n)`, which is
+ *  wider than 47 columns too) mid-sentence, losing its own `(y/n)`, and did the same to the
+ *  flash explaining what `y` does -- exactly the two things a y/n prompt/flash must stay legible
+ *  for. Neither a prompt nor a message is ever cut any more; a segment that would have been reads
+ *  `wraps: true` instead (below), and `StatusBand`/`index.css`'s `.status-band--wrap` let the band
+ *  grow upward and wrap it onto more rows for as long as it is shown, returning to the fixed
+ *  one-editor-row height the moment the prompt/flash ends. Ordinary segments (mode, pill, cards,
+ *  queue, context, model, position, unread) are untouched: they still degrade by priority, below. */
 
 const PAD = 2; // one character of padding each side
 /** The mode block's separator arrow, one cell after it (`index.css`, `.band-mode::after`). */
 const MODE_ARROW = 1;
-// CARET, VISUAL, and V-LINE shorten to C, V, and VL when the band is narrow. INPUT displays as
-// INSERT to match the adjacent editor's mode label while typing.
+// CARET / VISUAL / V-LINE (V-LINE's own word from lualine: utils/mode.lua:17,19, what a LazyVim
+// statusline says; CARET has no lualine precedent -- Eitri-only, qutebrowser's own caret mode is the
+// source), narrow C / V / VL.
+// INPUT reads INSERT (2026-10-15): the band's mode block sits beside the editor's and is drawn like it, so
+// the mode where typing lands is called what vim calls it there.
 const MODE_TEXT: Record<PanelMode, string> = { input: "INSERT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
 const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H", caret: "C", visual: "V", vline: "VL" };
 
 /** The bottom band's degrade rule, a pure function of the facts and the measured
  *  width so it is testable without a browser. `widthPx <= 0` (before the first measurement)
- *  or `charPx <= 0` (the hidden measuring span not yet laid out) shows only mode and pill. */
+ *  or `charPx <= 0` (the hidden measuring span not yet laid out) shows only mode
+ *  and pill -- priorities 1 and 2's own floor, never dropped once a real width is known either. */
 export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[] {
   const mode: Seg = { id: "mode", text: MODE_TEXT[f.mode], side: "left" };
   const pill: Seg = { id: "pill", text: f.pill, side: "left" };
@@ -185,8 +200,8 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   ];
   const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
-    // Usage drops before even shortening the context, so a narrow panel keeps the displayed file
-    // name ahead of a token and cost figure.
+    // The usage figure is the least urgent thing on the band -- it goes before even the context
+    // is shortened, so a narrow panel never trades the file it is showing for a running total.
     (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
     (s) => s.filter((x) => x.id !== "review"),
@@ -194,7 +209,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.filter((x) => x.id !== "position"),
     (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),
     (s) => s.filter((x) => x.id !== "queue"),
-    // #39: the Ctrl+y segment keeps the tool it names before it goes, and goes before the card
+    // The Ctrl+y segment keeps the tool it names before it goes, and goes before the card
     // count -- `⚑N` is shorter, and still says a card waits.
     (s) => s.map((x) => (x.id === "approve" && f.approve ? { ...x, text: `Ctrl+y approves ${f.approve.tool}` } : x)),
     (s) => s.filter((x) => x.id !== "approve"),
@@ -221,8 +236,10 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     const shortened = segs.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
     if (!segs.some((x) => x.id === "message") || width(shortened) <= budget) segs = shortened;
   }
-  // If the full message still exceeds the row after every droppable segment is gone, mark it
-  // `wraps`. `StatusBand` grows to keep the flash's explanation visible.
+  // `message` is never cut either (`over > 0` here means every droppable segment is
+  // already gone and the message's own full text is still wider than the row) -- it is marked
+  // `wraps` instead of being shortened, so `StatusBand` grows the band rather than hiding the end
+  // of a flash like the explanation of what `y` does.
   const over = width(segs) - budget;
   if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, wraps: true } : x));
   return segs;
@@ -254,10 +271,12 @@ function dollars(c: number): string {
  *  and this runs on every render of the panel while a reply streams. */
 const GROUPED = new Intl.NumberFormat("en-US");
 
-/** Format the latest reported token counts and cost, without accumulating reports. Return null for
- *  unknown usage or a non-finite reported cost so rendering cannot throw. A legacy cost-only report
- *  shows only its cost. With `cost_reported: false`, show tokens without a cost rather than a
- *  fabricated `$0.00`. */
+/** Every token the provider counted (the prompt's three parts and the output) and the cost -- the
+ *  latest report, never a sum; `null` until one arrives, never `0 tok $0.00` for unknown. A backend that
+ *  reports a cost and no tokens (legacy) shows the cost alone. A cost that is not a finite number is no
+ *  measurement either (Rust drops such a report whole, `usage_from_proto`; this keeps one that slipped
+ *  through from throwing inside a render). A report with `cost_reported: false` shows its tokens and no
+ *  cost, never `$0.00`. */
 export function usageSegment(u: UsageInfo | null): UsageFact | null {
   if (u === null) return null;
   // `cost_reported: false` (Codex): the provider counted tokens and priced nothing, so `total_cost_usd`

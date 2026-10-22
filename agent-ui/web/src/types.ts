@@ -102,7 +102,7 @@ export type PermissionRequestRecord = {
   /** A `Write` whose file did not exist when the card was raised (Rust looked).
    *  Absent when it did, and for every other tool. */
   createsFile?: boolean;
-  /** O3: present when the CLI itself asked about this call, after the gate had already answered it
+  /** Present when the CLI itself asked about this call, after the gate had already answered it
    *  (Verdandi's PERMISSION_ORIGIN_PROVIDER_PROMPT; Rust's `ProviderPrompt`). Absent on the gate's
    *  own request. Answered like any card, with the same permission id. */
   providerPrompt?: ProviderPrompt;
@@ -145,7 +145,7 @@ export type ProviderPrompt = {
   blockedPath: string | null;
   /** The user's own `permissions.ask` rule that forced this prompt, when one did. */
   matchedAskRule: MatchedAskRule | null;
-  /** The raw `origin` a sidecar newer than this build sent (O3 review #3); `null` for a known one.
+  /** The raw `origin` a sidecar newer than this build sent ; `null` for a known one.
    *  Such a prompt is a card in every mode and is called neutrally. */
   unrecognizedOrigin: number | null;
 };
@@ -360,7 +360,7 @@ export type AgentUiState = {
   /** True while the last folded event was assistant text, so the next chunk continues the same
    * message. See `reducer.ts`'s `content_delta` case.
    *
-   * **On the wire since sw-panel-render-2's fix.** It used to be reducer-internal and
+   * **On the wire since the fix of 2026-09-27.** It used to be reducer-internal and
    * `applySnapshot` forced it to `false` regardless of what a snapshot said, on the theory that a
    * snapshot always meant "start fresh" -- but Rust's own `AgentSessionProjection` keeps this bit
    * (`assistant_message_open`) and keeps appending to the open message underneath a snapshot taken
@@ -417,7 +417,7 @@ export type AgentUiState = {
  * thing this area attracts -- would have got `undefined` with the compiler insisting on a number.
  * Subtracting them is the honest shape: what is missing is now missing in the type too.
  *
- * `assistantMessageOpen` is deliberately NOT in this `Omit` (sw-panel-render-2's fix, 2026-09-27):
+ * `assistantMessageOpen` is deliberately NOT in this `Omit` (2026-09-27):
  * it used to be, on the theory that it was reducer-internal like the other two, but Rust's own
  * projection carries the same bit and disagreeing about it split a mid-stream reply across a
  * snapshot -- see that field's own doc comment on `AgentUiState`. */
@@ -579,7 +579,7 @@ export type AgentDomainEvent =
       tool_use_id: string | null;
       tool_name: string;
       input: unknown;
-      /** O3: the CLI's own prompt; omitted by Rust on the gate's own request. */
+      /** The CLI's own prompt; omitted by Rust on the gate's own request. */
       provider_prompt?: WireProviderPrompt;
     }
   | { type: "permission_resolved"; permission_id: string; outcome: "allowed" | "denied" | "cancelled_by_interrupt" | "cancelled_by_session_close" | "provider_failed" | "expired" | "deferred" }

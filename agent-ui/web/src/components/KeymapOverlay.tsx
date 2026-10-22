@@ -148,9 +148,12 @@ function visualKeyClaim(panel: PanelTable, key: string): "leader" | "binding" | 
   return panel.bindings.some((b) => b.keys[0] === key) ? "binding" : null;
 }
 
-/** Explain which selection entry keys remain available when a leader or panel binding claims
- *  `v` or `V`. `v` enters CARET; `V` selects lines directly, and the region can switch with `v`/`V`.
- *  Name a leader conflict only when the key is the leader; other bindings are "bound elsewhere". */
+/** What the "Selecting" section says about how `v`/`V` are
+ *  actually reached, once a configured leader or panel binding may have taken one or both.
+ *  Only `v` gates CARET's own entry now -- `V` still reaches the region directly, so losing it alone costs nothing the region's own `v`/`V` cannot still reach. The
+ *  note names what actually took the key -- "is your leader"
+ *  only when it IS the leader; a plain panel binding on it is "bound elsewhere", never a leader the
+ *  user does not have. */
 function visualEntryNote(panel: PanelTable): string {
   const vClaim = visualKeyClaim(panel, "v");
   const capitalVClaim = visualKeyClaim(panel, "V");
@@ -194,9 +197,12 @@ function KeyTable({ heading, rows }: { heading: string; rows: KeyHelp[] }) {
   );
 }
 
-/** The "Selecting (v)" section shows `CARET_KEYS` and `VISUAL_KEYS` in separate named tables.
- *  Shared keys such as `gg` and differing `Esc` actions would be ambiguous in one table.
- *  These arrays also supply the keymap checks against `resolveKey`'s region branches. */
+/** One section, "Selecting (v)", between "This panel" and
+ *  "Leader and tab keys" -- CARET's table then VISUAL's (CARET_KEYS/VISUAL_KEYS, the same
+ *  source `keymap.test.ts` ties to `resolveKey`'s region branches both ways). These used to be ONE table with no
+ *  sub-heading, so a "gg"/"Esc" pair that looks the same in both modes (or any two rows sharing a key) rendered as 21
+ *  indistinguishable rows with two conflicting `Esc` lines and no way to tell which mode either belonged to. Two
+ *  separate tables, each headed by its own mode name, so CARET's rows and VISUAL's rows are never merged. */
 function Selecting({ panel }: { panel: PanelTable }) {
   return (
     <section>
@@ -295,11 +301,16 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         note="Opened with c in BROWSE. It owns every key while it is open and changes nothing on disk."
       />
       <LeaderAndTabKeys panel={panel} />
-      {/* Describe the context Enter sends in this group's note. `Composer` sends it; it is not
-          an `INPUT_KEYS` binding handled by `resolveKey`. `compose_turn_text` adds the editor's
-          file name or its live Visual selection. `feed.rs` omits the cursor line. Selection
-          limits are `MAX_SELECTION_LINES = 400` and `CONTENT_LIMIT = 2000`.
-          `CLI_LOCAL_COMMANDS`, including bare `/model` and `/effort`, omit the context block. */}
+      {/* What Enter sends beyond the typed text is one sentence
+          about Enter, not a key of its own -- `Composer` sends it and `resolveKey` never sees it, so it
+          is this group's `note`, not a row of `INPUT_KEYS` (tied to `COMPOSER_CHORDS` both ways). It reads
+          off the code: `compose_turn_text` (core/src/editor_context/compose.rs) adds the
+          editor's file name -- or, while a Visual selection is live, those lines -- and `feed.rs` drops
+          nvim's cursor `line`, so "not its text or cursor" is true; the caps are the nvim snippet's own
+          (`MAX_SELECTION_LINES = 400`, `CONTENT_LIMIT = 2000`, nvim_editor_context.lua); and a turn the
+          CLI runs as one of its own local commands goes without the block (`CLI_LOCAL_COMMANDS`, whose
+          `/model` and `/effort` are the two this panel itself sends bare). This is the one place the panel
+          says it. */}
       <Section
         title="Typing"
         note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."

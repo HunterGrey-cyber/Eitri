@@ -23,9 +23,10 @@ type Props = {
   request: PermissionRequestRecord;
   /** The session this request belongs to has ended. */
   sessionEnded: boolean;
-  /** The rule `permission_rules::offer` supplied for this exact tool call, or `null`/absent.
-   *  Show Rust's words unchanged so `remember: true` is offered only for a request Rust can
-   *  answer with that rule. The card never generates its own suggestion. */
+  /** The third button: the rule Rust would apply to this exact tool call
+   *  (`permission_rules::offer`), or `null`/absent when it offered none. The card never invents its
+   *  own suggestion -- the words shown here are Rust's, byte for byte, so `remember: true` can only
+   *  ever be sent for a request Rust itself is prepared to answer with a rule. */
   ruleOffer?: string | null;
   /** The panel already answered this card -- by `a`/`d`, which answer by
    *  the card's id and never press these buttons, or by a click it has already sent. The panel's
@@ -107,7 +108,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
             onReasonChange?.(request.permissionId, e.target.value);
           }}
           onKeyDown={(e) => {
-            // Enter denies with the reason; leave IME Enter to the input method.
+            // Enter here denies with the reason; an IME's Enter is its own.
             if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
             e.preventDefault();
             handleAnswer("deny");
@@ -116,10 +117,13 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         />
       )}
       <div className="permission-card-buttons">
-        {/* `data-nav-order` puts Approve first for `l`, then Deny, then Always allow when offered,
-            then the reason box. `a`/`d` answer through `answerPermission` by `permissionId`, using
-            its shared guard against a second answer. `alreadyAnswered` then makes the card inert.
-            `data-nav-action` lets `App.tsx` identify card buttons for its Enter/Space guard. */}
+        {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the third
+            (Always allow) button when Rust offered one, then the reason box above them.
+            `a`/`d` do NOT press these buttons: they answer this card by
+            its `permissionId` through the panel's `answerPermission`, which holds the one guard
+            against a second answer, and `alreadyAnswered` draws the card inert after them.
+            `data-nav-action` stays: it is how the Enter/Space guard (`App.tsx`'s `onKeyDown`)
+            knows a focused button answers a card. Nothing looks a button up through it any more. */}
         <button
           data-nav-order={1}
           data-nav-action="allow"
@@ -206,8 +210,8 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
   }
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;
   if (toolName === "Bash" && fields && typeof fields.command === "string") {
-    // Show the command as the shell will read it, including newlines.
-    // Draw characters that could reorder or hide text as escapes (`revealHidden`).
+    // Claude Code's `Command:` line -- the command as the shell will read it, newlines and all.
+    // Characters that would reorder or hide part of it are drawn as escapes (`revealHidden`).
     const pieces = revealHidden(fields.command);
     return (
       <>

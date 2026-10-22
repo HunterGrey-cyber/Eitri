@@ -26,7 +26,7 @@ import { historyNoticeText } from "../history";
  * row is always reachable.
  *
  * **No Dismiss**, unlike `.command-notice`: a line that can be closed does not satisfy "whenever
- * history was restored, this is shown" (invariant 11).
+ * history was restored, this is shown".
  */
 export function HistoryNotice({ notice }: { notice: HistoryNoticeData }) {
   return (

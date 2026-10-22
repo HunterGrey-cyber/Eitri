@@ -23,17 +23,16 @@ function records(value: number): string {
  * The one line the notice row says.
  *
  * Built from two independent statements rather than picked from a table of four, because the two
- * things it can report are independent: WHERE the history came from, and WHETHER it was cut. The
- * design's table lists the four combinations that occur in practice and this produces each of them
- * word for word; the fifth -- a fallback copy that was also truncated -- gets both sentences,
- * because invariant 14 requires the fallback always to be announced and invariant 9 requires
- * truncation always to be announced, and dropping either to fit a four-row table would break one of
- * them silently.
+ * things it can report are independent: WHERE the history came from, and WHETHER it was cut. This
+ * produces each of the four combinations that occur in practice word for word; the fifth -- a
+ * fallback copy that was also truncated -- gets both sentences, because the fallback must always be
+ * announced and truncation must always be announced, and dropping either to fit a four-row table
+ * would break one of them silently.
  *
  * **Every number here comes out of this restore, never out of a build-wide constant**.
  * The sentence used to print `HISTORY_MAX_ITEMS`, the 400-item ceiling, as
  * though truncation always stopped there -- but the character budget binds first about as often,
- * and the reviewer measured one real session restoring 32 items while the panel would have said
+ * and one real session was measured restoring 32 items while the panel would have said
  * 400, and another restoring 107 of 300. `restoredItems` is now counted in Rust AFTER the fold, so
  * it is the number of rows this list actually holds; the constant that used to live in this file,
  * and the test that tied it to Rust's own source, went with the sentence that needed it.

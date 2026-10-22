@@ -10,13 +10,20 @@ import { useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
   label: string;
-  /** A tool whose invocation includes its result inline, such as `ToolSearch`'s muted line,
-   *  with no separate result row. */
+  /** A tool whose invocation carries its own result inline (`ToolSearch`'s one muted line) and
+   *  is never followed by a separate result row. */
   quiet?: boolean;
-  /** Renders only the invocation: what the model asked the tool to do.
-   * `ToolResult` renders results on one shared path so running and finished calls are distinguished
-   * consistently across tools. Keep result handling out of unused invocation parameters.
-   * `editConfig` uses `opts.expanded` to show the full diff when true and fold it to 6 lines when false. */
+  /** Renders the INVOCATION only -- what the model asked the tool to do.
+   *
+   * This used to be `(input, result, isError)`, and all eight registered renderers ignored the last
+   * two arguments: a finished Bash call and one still executing produced byte-identical markup, and
+   * only an error was ever printed. The result is now rendered by `ToolResult` below, on one shared
+   * path for every tool, so "still running" and "finished" cannot end up distinguishable for some
+   * tools and not others. A per-tool result view can be added back as a separate optional field the
+   * day one is genuinely wanted -- what must not come back is a declared parameter nothing uses.
+   *
+   * `opts.expanded`: `editConfig` folds a diff to 6 lines when it is `false`
+   * and shows the whole thing when it is `true`, which is the only renderer today that reads it. */
   renderInvocation: (input: unknown, opts: { expanded: boolean; createsFile?: boolean }) => ReactNode;
   /** `false` for a tool whose own row already says what it did (`Edit`/`Write`/`NotebookEdit`: the diff),
    *  so a folded success draws no result preview under it. A failure is previewed whatever this says. */
@@ -36,7 +43,8 @@ export type ToolRenderConfig = {
 export const RESULT_HEAD_CHARS = 2000;
 export const RESULT_TAIL_CHARS = 500;
 
-/** The detailed view (`Ctrl+o`) uses larger head and tail budgets to show more output. */
+/** The detailed view (`Ctrl+o`): the same head+tail scheme, wider, for a reader who asked to see
+ *  more rather than go find the real output elsewhere. */
 export const DETAILED_HEAD_CHARS = 20000;
 export const DETAILED_TAIL_CHARS = 5000;
 
@@ -111,10 +119,12 @@ function tailStart(text: string, budget: number): number {
   return splitsAPair ? start + 1 : start;
 }
 
-/** `hiddenChars` counts code points (`countCodePoints`); head and tail budgets cap UTF-16 code units.
- * The budgets bound rendered size, while the hidden count reports characters to the reader.
- * `head`/`tail` default to the ordinary fold's budgets. The detailed view (`Ctrl+o`) passes
- * `DETAILED_HEAD_CHARS`/`DETAILED_TAIL_CHARS` for the same truncation with larger limits. */
+/** `hiddenChars` is a code-point count (see `countCodePoints`); the head/tail budgets it is derived
+ * from are code-unit caps. The two units are deliberately different and neither is a guess: one
+ * bounds how much is drawn, the other is what gets reported to a human.
+ *
+ * `head`/`tail` default to the ordinary fold's budgets; the detailed view (`Ctrl+o`) passes
+ * `DETAILED_HEAD_CHARS`/`DETAILED_TAIL_CHARS` instead -- same scheme, wider. */
 export function truncateResult(
   text: string,
   head = RESULT_HEAD_CHARS,
@@ -153,9 +163,10 @@ function pathOf(input: unknown, key: string): string {
   return JSON.stringify(input);
 }
 
-/** A path reachable by `gf` or a click (`MessageList`'s `onClick`, `paths.ts`'s `pathsIn`).
- *  `data-path` carries the raw click target separately from the visible label, which is relative
- *  under the project root. This keeps the display transform from changing which path opens. */
+/** A path rendered where `gf`/a click can reach it (`MessageList`'s `onClick`, `paths.ts`'s
+ *  `pathsIn`). `data-path` carries the raw string a click reads back, separately from the visible
+ *  label, which is project-relative under the project root -- the two were kept
+ *  apart on purpose so that transform could not break what a click opens. */
 function PathLink({ path }: { path: string }) {
   return (
     <span className="path-link" data-path={path}>
@@ -164,8 +175,8 @@ function PathLink({ path }: { path: string }) {
   );
 }
 
-/** One line for a tool without a special view: the first useful string field, or compact JSON,
- *  cut to 120 characters. Avoid "Unrecognized", which reads as an error. */
+/** One line for a tool this registry has no special view for: the first telling string field, else
+ *  compact JSON, cut to 120 characters. Never "Unrecognized": it reads as an error. */
 export function summarizeInput(input: unknown): string {
   if (input && typeof input === "object") {
     const fields = input as Record<string, unknown>;
@@ -196,11 +207,16 @@ function oneLine(label: string): ToolRenderConfig {
   return { label, renderInvocation: (input) => <div className="tool-card">{label}: {summarizeInput(input)}</div> };
 }
 
-/** `Edit`/`Write`/`NotebookEdit`: a diff (`EditDiff`), folded to a path and counts (`maxLines: 0`)
- *  except in the detailed view or an expanded row. Each tool has its own row, so the default stays compact.
- *  `toolName` is passed to `editPreview` separately from the display label.
- *  Falls back to a path line when `editPreview` returns `null`: no `old_string` or `new_string`,
- *  a `Write` with neither `content` nor a path, or a `NotebookEdit` with neither `new_source` nor `notebook_path`. */
+/** `Edit`/`Write`/`NotebookEdit`: a real diff (`EditDiff`). Folded to a one-line path+counts
+ *  summary (`maxLines: 0`) everywhere except the detailed view and an expanded row (it was a 6-line
+ *  fold until these three tools stopped ever folding into a
+ *  count-only run -- every one of them now draws its own row, so each has to be this compact by
+ *  default). `toolName` names the real tool this input belongs to (`editPreview`'s own first
+ *  argument), since `Write file` and `NotebookEdit` are display labels, not tool names. Falls back
+ *  to a plain path line when the input carries no reviewable change (neither `old_string` nor
+ *  `new_string`, `Write` with neither `content` nor a path, or `NotebookEdit` with neither
+ *  `new_source` nor `notebook_path`) -- `editPreview` returning `null` is what decides that, not
+ *  this function. */
 function editConfig(label: string, toolName: string, pathField = "file_path"): ToolRenderConfig {
   return {
     label,
@@ -484,7 +500,7 @@ const ToolResult = memo(function ToolResult({
   abandoned?: boolean;
 }) {
   if (result === null) {
-    // sw-panel-render-6: a `null` result the panel knows can never arrive -- the call predates the
+    // A `null` result the panel knows can never arrive -- the call predates the
     // restored-history boundary, or the session has ended -- draws a static notice instead of the
     // spinner below. `data-state="none"` (not "running") and no `aria-busy`: nothing is in flight.
     if (abandoned) {
@@ -652,13 +668,17 @@ function ChangedInputNote({ name, change }: { name: string; change: InputChange 
   );
 }
 
-/** `showResult` controls folding so long output need not push the conversation away.
- *  `ToolResult` owns head/tail truncation; keep that logic on one shared path.
- *  `opts.gated` hides invocation details already shown by the waiting card, avoiding a duplicate
- *  command or diff that could look approved. `opts.detailed` (`Ctrl+o`) widens truncation and never folds.
- *  `opts.expanded` is the per-row `Enter` toggle for diff lines and defaults to `showResult`
- *  to preserve existing callers' behavior. `opts.abandoned` tells `ToolResult` that a null result
- *  will never arrive. `MessageList.tsx`'s `isAbandonedCall` determines this from state held by the caller. */
+/** `showResult` folded by default, so a long result does not push the conversation away. A parameter rather than a
+ *  second exported renderer: `ToolResult` owns the head/tail truncation and nothing else should grow a copy.
+ *
+ * `opts.gated`: a card is waiting on this exact call, so the invocation repeats nothing the
+ * card already shows -- a `Bash` command or an `Edit`'s diff sitting twice on screen, once above a
+ * card asking whether to run it, read as approved already. `opts.detailed` (`Ctrl+o`) widens
+ * the result's own cut and never folds it. `opts.expanded` is `Enter`'s own per-row toggle,
+ * read by `editConfig` to show a folded diff's remaining lines; it defaults to `showResult` so a
+ * caller that only ever passed the old two arguments keeps the old behaviour exactly. `opts.abandoned`
+ * tells `ToolResult` a `null` result is never coming, rather than still running --
+ * `MessageList.tsx`'s `isAbandonedCall` is what decides it, from state this function does not see. */
 export function renderToolCall(
   call: ToolCallRecord,
   showResult = true,
@@ -678,8 +698,8 @@ export function renderToolCall(
       createsFile: call.createsFile,
     })
   ) : (
-    // For tools without a special view, show the name and a one-line input summary.
-    // Avoid "Unrecognized", which reads as a panel error.
+    // Generic fallback for unrecognized tools -- never "Unrecognized": a name and a one-line
+    // summary of its input is honest, where that word reads as an error the panel hit.
     <details className="tool-card tool-card-generic">
       <summary>
         {call.name} {summarizeInput(call.input)}
@@ -697,22 +717,27 @@ export function renderToolCall(
     );
   }
 
-  // A running call (`result === null`) always reaches `ToolResult` to show the running indicator.
-  // Only finished results fold. With the default `showResult = true`, all results stay visible.
-  // The detailed view also keeps results open regardless of the row's expansion state.
-  // A folded result shows its first lines and a remaining-line count through `ToolResultPreview`.
-  // It has no separate marker line; `data-folded` exposes the state to `Enter` and tests,
-  // and the row itself is the expansion handle. Calls answered by saved prefix rules show a muted
-  // note under the invocation so they can be distinguished from calls approved by the user.
-  // The note includes the rule in permission-rule syntax, such as `Bash(git log *)`.
+  // A call still running has no result to fold -- `result === null` always goes through
+  // `ToolResult`, which is what renders the "Running…" indicator. Folding only ever applies to a
+  // FINISHED call, which is also why the default `showResult = true` reproduces the pre-fold
+  // behaviour exactly: `call.result === null || showResult` is then always true. The detailed view
+  // never folds either, whatever the row's own expansion says.
+  // A folded result draws no marker line of its own (it used to be a line holding only `▸`,
+  // under every finished call). It shows its first lines and how many more there are instead
+  // (`ToolResultPreview`), as Claude Code's fold does. `data-folded` says it is folded, for `Enter` and
+  // for tests; the row itself is the handle.
+  // A call a saved prefix rule answered says so, muted, under its invocation -- it
+  // otherwise looked exactly like one the user approved. Claude Code names the rule the same way
+  // (`Bash(git log *)`, its own permission-rule syntax).
   const ruleNote =
     call.allowedByRule === undefined ? null : (
       <div className="tool-rule-note">
         allowed by rule <code>{call.allowedByRule}</code>
       </div>
     );
-  // The CLI prompt was answered without a card, either in bypass or through earlier user approval
-  // of the same call. Rust supplies the text, shown muted beside the saved-rule note.
+  // The CLI's own prompt for this call was answered without
+  // a card -- in bypass, or on the user's earlier approval of the same call. Rust writes the words;
+  // muted like the rule note, which it sits beside.
   const promptNote =
     call.promptNote === undefined ? null : <div className="tool-rule-note tool-prompt-note">{call.promptNote}</div>;
   // A `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered with no

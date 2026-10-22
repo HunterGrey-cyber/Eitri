@@ -104,7 +104,7 @@ export function ContinueInTerminal({ open, onClose, providerSessionId, turnInPro
  * path that does hold a lease cannot promise more. So this says what is true and no more. */
 export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
   return (
-    // Same two-cell shape as the rest of the panel-as-document grid (panel-as-document task 3):
+    // Same two-cell shape as the rest of the panel-as-document grid:
     // a `→` sign beside the body, so this row's sign lines up with every other row's. `handoff-card`
     // stays on the BODY cell rather than being replaced -- it carries its own box (border,
     // background, spacing) that has nothing to do with the sign column, and every child selector

@@ -2,7 +2,7 @@
  *  (modelled on which-key.nvim's `lua/which-key/state.lua`).
  *
  * `resolveKey` (`./keymap`) still owns every fixed single-key row and the four reserved two-key
- * pairs (`gg`/`gf`/`zh`/`zl`/`[[`/`]]`/`[]`/`][`, Global Constraint #4); this module owns the
+ * pairs (`gg`/`gf`/`zh`/`zl`/`[[`/`]]`/`[]`/`][`); this module owns the
  * leader and any longer sequence the table itself defines. `App.tsx` is expected to try
  * `startSequence`/`advanceSequence` first on a key `resolveKey` did not claim (a `{kind:"none"}`
  * result falls through to `resolveKey`, never the other way around), since the table's own
@@ -13,8 +13,8 @@ import type { PanelBinding, PanelTable, PendingPrefix } from "./keymap";
 /** which-key's default `delay` (which-key.nvim lua/which-key/config.lua:13-15). */
 export const WHICH_KEY_DELAY_MS = 200;
 
-/** The two-key prefixes `resolveKey` already reserves for its own fixed pairs (Global Constraint
- *  #4); a table sequence may still start with one of these keys (`[b`), but the bare key itself is
+/** The two-key prefixes `resolveKey` already reserves for its own fixed pairs;
+ *  a table sequence may still start with one of these keys (`[b`), but the bare key itself is
  *  never a sequence start on its own -- `resolveKey`'s `{kind:"pending"}` machinery owns it.
  *  `Ctrl+w`, the fifth prefix, is deliberately not listed: it is a chord, so
  *  `App.tsx` never asks `startSequence` about it (no sequence starts on a Ctrl key), and no table
@@ -95,11 +95,15 @@ function humanKey(table: PanelTable, k: string): string {
   return k === "<leader>" ? table.leaderLabel : k === " " ? "Space" : k;
 }
 
-/** Distinct next keys reachable from `typed`: direct bindings in table order, then groups
- *  in `table.groups` order. A key is a group when another binding continues past it.
- *  Its label comes from `table.groups` when registered, or a synthesized `+<key>`.
- *  `modeFixed` indicates that `mode.cycle` would flash instead of posting. A live tab may
- *  still support cycling; `modeKey.ts`'s `modeKeyRoute` determines that behavior. */
+/** The distinct next keys reachable from `typed`, in the order the box should show them: every
+ *  direct binding first (in table order), then every group (in `table.groups` order), as which-key.nvim sorts them.
+ *  A key is a group when some OTHER binding continues past it; its label comes from `table.groups`
+ *  if that pair is registered there, else a synthesized `+<key>`.
+ *
+ *  `modeFixed` (App.tsx's own const): whether `mode.cycle` would flash rather than post --
+ *  it already means "cycling makes no sense any more", named for what it disables rather than for
+ *  the tab-lifecycle reading `sessionStarted` used to invite (a live, switch-capable tab can still
+ *  cycle; see `modeKey.ts`'s `modeKeyRoute`). */
 export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
   const depth = typed.length;
   const atDepth = table.bindings.filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
