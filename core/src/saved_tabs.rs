@@ -5,14 +5,14 @@
 //! project.
 //!
 //! **What is listed:** only tabs that have a session (an empty tab has nothing to bring back), in
-//! tab-bar order, each with the rename it carries and the permission mode it was in, and the index of
-//! the tab that was active. Claude tabs are in `tabs`; a tab running another agent is in
-//! `external_tabs`, a separate array with the agent named, so that an older build -- which reads
-//! `tabs` only and ignores what it does not know -- never resumes another agent's session as a Claude
-//! one. Such a build drops the array on its next write, which loses only the offer to bring those
-//! tabs back. The format's version stays 1 for that reason. Two windows on one project each write their own set and the
-//! last writer wins; the session leases, not this file, are what stop two windows driving one
-//! session.
+//! tab-bar order, each with its agent, the rename it carries and the permission mode it was in, and
+//! the tab that was active. In memory that is one list, [`SavedTabs`]. In the file Claude tabs are in
+//! `tabs`; a tab running another agent is in `external_tabs`, a separate array with the agent named,
+//! so that an older build -- which reads `tabs` only and ignores what it does not know -- never
+//! resumes another agent's session as a Claude one. Such a build drops the array on its next write,
+//! which loses only the offer to bring those tabs back. The format's version stays 1 for that reason.
+//! Two windows on one project each write their own set and the last writer wins; the session leases,
+//! not this file, are what stop two windows driving one session.
 //!
 //! **When it is written** is [`TabMemory`]'s job, run on its own thread by [`TabWriter`]: whenever the set it is shown differs from the set
 //! it last saw, and never because the window is closing -- closing closes every tab, and recording
@@ -31,38 +31,105 @@ use crate::layout::persist::{create_state_dir, file_name, state_subdir, temporar
 pub const VERSION: u32 = 1;
 
 /// One tab worth bringing back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedTab {
+    /// The agent the tab ran. A session id is only ever one agent's: two agents may use the same one.
+    pub agent: AgentId,
     pub conversation_id: String,
-    /// Claude's own id for the session: the key its record, its lease and its resume all use.
+    /// The agent's own id for the session (Claude's session id, a Codex thread id): the key its record,
+    /// its lease and its resume all use.
     pub provider_session_id: String,
     /// The tab's rename, if it has one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The mode the tab was in. `bypass` is kept here because the person who chose it should see it
     /// again -- and be asked about it, never silently given it back, when the tabs are restored.
     pub mode: SessionModeChoice,
     /// The chat view the tab was shown in, 2 to 9 (`agent#N`); absent for the base view.
-    /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
     pub view: Option<u8>,
 }
 
-/// One tab of an agent other than Claude worth bringing back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SavedExternalTab {
-    /// Which agent, as its records name it (`codex`, `acp:<name>`).
-    pub agent: AgentId,
-    pub conversation_id: String,
-    /// The agent's own id for the session (a Codex thread id): what its record and lease are keyed on.
-    pub provider_session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub mode: SessionModeChoice,
-    /// The chat view the tab was shown in, 2 to 9 (`agent#N`); absent for the base view.
-    /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
-    pub view: Option<u8>,
+/// The tabs of one window: the Claude tabs, then the other agents' tabs, each in tab-bar order.
+///
+/// Which tab comes back on screen follows two rules, one per kind, because an older build reads only
+/// the Claude tabs and must still find one of them active: a Claude tab is active when it was on
+/// screen and otherwise when it was the Claude tab on screen most recently, so the first Claude tab
+/// at least; another agent's tab is active only when it was on screen, and then it wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedTabs {
+    pub tabs: Vec<SavedTab>,
+    /// Index into `tabs` of the tab that comes back on screen; `None` only when no Claude tab is listed
+    /// and none of the other agents' tabs was on screen.
+    pub active: Option<usize>,
+    /// Index into `tabs` of the Claude tab a build that reads only the Claude tabs puts on screen:
+    /// `active` when that is a Claude tab, else the Claude tab on screen most recently. `None` when no
+    /// Claude tab is listed. Kept so the file says to such a build what it always said.
+    pub claude_active: Option<usize>,
+}
+
+impl SavedTabs {
+    /// The set of `claude`'s tabs followed by `others`', with `claude_active` the index among `claude`
+    /// of the Claude tab on screen (or on screen most recently) and `others_active` the index among
+    /// `others` of the tab on screen, if one of them was. An index past its list's end is read as the
+    /// first Claude tab, and as no other agent's tab.
+    pub fn from_parts(
+        claude: Vec<SavedTab>,
+        claude_active: usize,
+        others: Vec<SavedTab>,
+        others_active: Option<usize>,
+    ) -> Self {
+        let claude_count = claude.len();
+        let claude_active = match claude_count {
+            0 => None,
+            count if claude_active < count => Some(claude_active),
+            _ => Some(0),
+        };
+        let others_active = others_active.filter(|i| *i < others.len()).map(|i| claude_count + i);
+        let mut tabs = claude;
+        tabs.extend(others);
+        SavedTabs {
+            tabs,
+            active: others_active.or(claude_active),
+            claude_active,
+        }
+    }
+
+    /// No tab of any agent.
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    /// The tab that comes back on screen.
+    pub fn active_tab(&self) -> Option<&SavedTab> {
+        self.active.and_then(|i| self.tabs.get(i))
+    }
+
+    /// Whether any tab ran an agent other than Claude.
+    pub fn has_other_agents(&self) -> bool {
+        self.tabs.iter().any(|t| t.agent.is_external())
+    }
+
+    /// The Claude tabs, in order.
+    pub fn claude_tabs(&self) -> impl Iterator<Item = &SavedTab> {
+        self.tabs.iter().filter(|t| !t.agent.is_external())
+    }
+
+    /// The other agents' tabs, in order.
+    pub fn other_tabs(&self) -> impl Iterator<Item = &SavedTab> {
+        self.tabs.iter().filter(|t| t.agent.is_external())
+    }
+
+    /// Where the tab at `index` stands among the tabs of its own kind (Claude's, or the other agents'),
+    /// when it is of the kind `external` says.
+    fn rank(&self, index: Option<usize>, external: bool) -> Option<usize> {
+        let index = index?;
+        let tab = self.tabs.get(index)?;
+        (tab.agent.is_external() == external).then(|| {
+            self.tabs[..index]
+                .iter()
+                .filter(|t| t.agent.is_external() == external)
+                .count()
+        })
+    }
 }
 
 fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
@@ -73,37 +140,48 @@ fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D:
         .filter(|n| (2..=crate::layout::module::MAX_INSTANCE).contains(n)))
 }
 
-/// The tabs of one window, in tab-bar order: the Claude tabs, then the other agents' tabs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SavedTabs {
-    pub tabs: Vec<SavedTab>,
-    /// Index into `tabs` of the tab that was on screen, or of the first Claude tab when the tab on
-    /// screen was another agent's (what an older build, which reads only `tabs`, falls back to).
-    pub active: usize,
-    pub external_tabs: Vec<SavedExternalTab>,
-    /// Index into `external_tabs` when the tab on screen was another agent's.
-    pub active_external: Option<usize>,
-}
-
-impl SavedTabs {
-    /// No tab of either kind.
-    pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty() && self.external_tabs.is_empty()
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct TabsFile {
     version: u32,
     project_root: String,
-    tabs: Vec<SavedTab>,
+    tabs: Vec<ClaudeEntry>,
+    /// Index into `tabs`: what a build that reads only the Claude tabs puts on screen.
     active: usize,
     /// Absent from a file with no such tab, so the file of a window that ran only Claude is what it
     /// always was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     external_tabs: Vec<ExternalEntry>,
+    /// Index into `external_tabs` when the tab on screen was another agent's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_external: Option<usize>,
+}
+
+/// One entry of `tabs`: a Claude tab, its agent implied by the array it is in.
+#[derive(Serialize, Deserialize)]
+struct ClaudeEntry {
+    conversation_id: String,
+    provider_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    mode: SessionModeChoice,
+    /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    view: Option<u8>,
+}
+
+/// One entry of `external_tabs`: another agent's tab, the agent named as its records name it
+/// (`codex`, `acp:<name>`).
+#[derive(Serialize, Deserialize)]
+struct OtherEntry {
+    agent: AgentId,
+    conversation_id: String,
+    provider_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    mode: SessionModeChoice,
+    /// A value no chat view can have is read as absent, so a hand edit never makes the file unusable.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_view")]
+    view: Option<u8>,
 }
 
 /// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
@@ -111,7 +189,7 @@ struct TabsFile {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum ExternalEntry {
-    Known(SavedExternalTab),
+    Known(OtherEntry),
     Unknown(serde_json::Value),
 }
 
@@ -125,10 +203,31 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
     let file = TabsFile {
         version: VERSION,
         project_root: project_root.to_string_lossy().into_owned(),
-        tabs: saved.tabs.clone(),
-        active: saved.active,
-        external_tabs: saved.external_tabs.iter().cloned().map(ExternalEntry::Known).collect(),
-        active_external: saved.active_external,
+        tabs: saved
+            .claude_tabs()
+            .map(|t| ClaudeEntry {
+                conversation_id: t.conversation_id.clone(),
+                provider_session_id: t.provider_session_id.clone(),
+                name: t.name.clone(),
+                mode: t.mode,
+                view: t.view,
+            })
+            .collect(),
+        active: saved.rank(saved.claude_active, false).unwrap_or(0),
+        external_tabs: saved
+            .other_tabs()
+            .map(|t| {
+                ExternalEntry::Known(OtherEntry {
+                    agent: t.agent.clone(),
+                    conversation_id: t.conversation_id.clone(),
+                    provider_session_id: t.provider_session_id.clone(),
+                    name: t.name.clone(),
+                    mode: t.mode,
+                    view: t.view,
+                })
+            })
+            .collect(),
+        active_external: saved.rank(saved.active, true),
     };
     serde_json::to_string_pretty(&file).expect("saved tabs always serialize")
 }
@@ -145,54 +244,71 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
     if file.project_root != root {
         return Err(format!("written for {}, not {root}", file.project_root));
     }
-    let mut kept: Vec<SavedTab> = Vec::new();
-    let mut active_id = file.tabs.get(file.active).map(|t| t.provider_session_id.clone());
-    for tab in file.tabs {
-        let usable = !tab.provider_session_id.trim().is_empty() && !tab.conversation_id.trim().is_empty();
-        if usable && !kept.iter().any(|k| k.provider_session_id == tab.provider_session_id) {
-            kept.push(tab);
-        }
-    }
-    // Where the tab that was active ended up, so dropping an earlier entry cannot move it.
-    let active = active_id
-        .take()
-        .and_then(|id| kept.iter().position(|t| t.provider_session_id == id))
-        .unwrap_or(0);
-    // The same rules for the other agents' tabs, a session being one agent's id of it.
-    let read: Vec<Option<SavedExternalTab>> = file
+    let claude: Vec<SavedTab> = file
+        .tabs
+        .into_iter()
+        .map(|t| SavedTab {
+            agent: AgentId::Claude,
+            conversation_id: t.conversation_id,
+            provider_session_id: t.provider_session_id,
+            name: t.name,
+            mode: t.mode,
+            view: t.view,
+        })
+        .collect();
+    // An agent this build does not know stays a hole, so the active index still finds its tab.
+    let others: Vec<Option<SavedTab>> = file
         .external_tabs
         .into_iter()
         .map(|entry| match entry {
-            ExternalEntry::Known(tab) => Some(tab),
+            ExternalEntry::Known(t) => Some(SavedTab {
+                agent: t.agent,
+                conversation_id: t.conversation_id,
+                provider_session_id: t.provider_session_id,
+                name: t.name,
+                mode: t.mode,
+                view: t.view,
+            }),
             ExternalEntry::Unknown(_) => None,
         })
         .collect();
-    let active_external_id = file
+    let claude_active = claude
+        .get(file.active)
+        .map(|t| (t.agent.clone(), t.provider_session_id.clone()));
+    let others_active = file
         .active_external
-        .and_then(|i| read.get(i))
+        .and_then(|i| others.get(i))
         .and_then(Option::as_ref)
         .map(|t| (t.agent.clone(), t.provider_session_id.clone()));
-    let mut external: Vec<SavedExternalTab> = Vec::new();
-    for tab in read.into_iter().flatten() {
-        let usable = !tab.provider_session_id.trim().is_empty() && !tab.conversation_id.trim().is_empty();
-        let listed = external
+    // The same rules for both kinds, a session being one agent's id of it; a Claude tab listed among
+    // the other agents' is not one of them.
+    let claude = usable(claude.into_iter().map(Some), false);
+    let others = usable(others.into_iter(), true);
+    // Where the tab that was active ended up, so dropping an earlier entry cannot move it.
+    let at = |tabs: &[SavedTab], key: Option<(AgentId, String)>| {
+        key.and_then(|(agent, id)| {
+            tabs.iter()
+                .position(|t| t.agent == agent && t.provider_session_id == id)
+        })
+    };
+    let claude_at = at(&claude, claude_active).unwrap_or(0);
+    let others_at = at(&others, others_active);
+    Ok(SavedTabs::from_parts(claude, claude_at, others, others_at))
+}
+
+/// `tabs` without a blank entry, a repeat of an earlier one, or one of the wrong kind.
+fn usable(tabs: impl Iterator<Item = Option<SavedTab>>, external: bool) -> Vec<SavedTab> {
+    let mut kept: Vec<SavedTab> = Vec::new();
+    for tab in tabs.flatten() {
+        let blank = tab.provider_session_id.trim().is_empty() || tab.conversation_id.trim().is_empty();
+        let listed = kept
             .iter()
             .any(|k| k.agent == tab.agent && k.provider_session_id == tab.provider_session_id);
-        if usable && !listed && tab.agent.is_external() {
-            external.push(tab);
+        if !blank && !listed && tab.agent.is_external() == external {
+            kept.push(tab);
         }
     }
-    let active_external = active_external_id.and_then(|(agent, id)| {
-        external
-            .iter()
-            .position(|t| t.agent == agent && t.provider_session_id == id)
-    });
-    Ok(SavedTabs {
-        tabs: kept,
-        active,
-        external_tabs: external,
-        active_external,
-    })
+    kept
 }
 
 /// What [`load`] found.
@@ -561,6 +677,7 @@ mod tests {
 
     fn tab(session: &str, name: Option<&str>, mode: SessionModeChoice) -> SavedTab {
         SavedTab {
+            agent: AgentId::Claude,
             conversation_id: "0123456789abcdef0123456789abcdef".to_string(),
             provider_session_id: session.to_string(),
             name: name.map(str::to_string),
@@ -570,24 +687,35 @@ mod tests {
     }
 
     fn two() -> SavedTabs {
-        SavedTabs {
-            tabs: vec![
+        SavedTabs::from_parts(
+            vec![
                 tab("s-one", Some("api"), SessionModeChoice::Auto),
                 tab("s-two", None, SessionModeChoice::Bypass),
             ],
-            active: 1,
-            ..SavedTabs::default()
-        }
+            1,
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// `base`, a set of Claude tabs only, with `others` after them.
+    fn and_others(base: SavedTabs, others: Vec<SavedTab>, others_active: Option<usize>) -> SavedTabs {
+        let claude_active = base.rank(base.claude_active, false).unwrap_or(0);
+        SavedTabs::from_parts(base.tabs, claude_active, others, others_active)
     }
 
     #[test]
     fn a_tab_in_a_chat_view_keeps_its_view_and_a_build_before_views_still_reads_the_file() {
-        let mut saved = two();
-        saved.tabs[1].view = Some(3);
-        saved.external_tabs = vec![SavedExternalTab {
-            view: Some(2),
-            ..codex("thread-a", SessionModeChoice::Auto)
-        }];
+        let mut base = two();
+        base.tabs[1].view = Some(3);
+        let saved = and_others(
+            base,
+            vec![SavedTab {
+                view: Some(2),
+                ..codex("thread-a", SessionModeChoice::Auto)
+            }],
+            None,
+        );
         let text = encode(&saved, &root());
         assert_eq!(decode(&text, &root()), Ok(saved.clone()));
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -633,7 +761,7 @@ mod tests {
             );
             let read = decode(&text, &root()).unwrap_or_else(|e| panic!("{bad}: {e}"));
             assert_eq!(read.tabs[0].view, None, "{bad}");
-            assert_eq!(read.external_tabs[0].view, None, "{bad}");
+            assert_eq!(read.other_tabs().next().unwrap().view, None, "{bad}");
         }
         for good in 2..=9u8 {
             let text = format!(
@@ -674,10 +802,10 @@ mod tests {
     /// A tab saved in manual is written as the word `manual` and read back as manual.
     #[test]
     fn a_manual_tab_is_saved_as_manual_and_read_back() {
-        let saved = SavedTabs {
-            tabs: vec![tab("m", None, SessionModeChoice::Manual)],
-            active: 0,
-            external_tabs: vec![SavedExternalTab {
+        let saved = SavedTabs::from_parts(
+            vec![tab("m", None, SessionModeChoice::Manual)],
+            0,
+            vec![SavedTab {
                 agent: AgentId::Codex,
                 conversation_id: "c".to_string(),
                 provider_session_id: "x".to_string(),
@@ -685,8 +813,8 @@ mod tests {
                 mode: SessionModeChoice::Manual,
                 view: None,
             }],
-            active_external: None,
-        };
+            None,
+        );
         let text = encode(&saved, &root());
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["tabs"][0]["mode"], "manual");
@@ -730,12 +858,13 @@ mod tests {
             "the first listing of a repeated session wins"
         );
         assert_eq!(
-            saved.active, 1,
+            saved.active,
+            Some(1),
             "the tab that was active is still the one, whatever was dropped before it"
         );
 
         let past_the_end = text.replace("\"active\":2", "\"active\":9");
-        assert_eq!(decode(&past_the_end, &root()).unwrap().active, 0);
+        assert_eq!(decode(&past_the_end, &root()).unwrap().active, Some(0));
     }
 
     #[test]
@@ -809,13 +938,14 @@ mod tests {
     }
 
     fn numbered(n: usize) -> SavedTabs {
-        SavedTabs {
-            tabs: (0..=n % 7)
+        SavedTabs::from_parts(
+            (0..=n % 7)
                 .map(|i| tab(&format!("s-{n}-{i}"), None, SessionModeChoice::Auto))
                 .collect(),
-            active: 0,
-            ..SavedTabs::default()
-        }
+            0,
+            Vec::new(),
+            None,
+        )
     }
 
     /// The window's thread never waits for the disk: with the writer held inside a write, a hundred changes
@@ -1022,11 +1152,7 @@ mod tests {
     fn it_writes_each_change_once_and_only_a_change() {
         let dir = ScratchDir::new("nv-saved-tabs", "changes");
         let mut memory = memory(&dir);
-        let first = SavedTabs {
-            tabs: vec![tab("s-one", None, SessionModeChoice::Auto)],
-            active: 0,
-            ..SavedTabs::default()
-        };
+        let first = SavedTabs::from_parts(vec![tab("s-one", None, SessionModeChoice::Auto)], 0, Vec::new(), None);
         assert!(matches!(memory.observe(Some(first.clone())), Some(Ok(_))));
         assert_eq!(load(&dir, &root()), Loaded::Saved(first.clone()));
         assert!(
@@ -1042,7 +1168,7 @@ mod tests {
         assert!(matches!(memory.observe(Some(next.clone())), Some(Ok(_))));
         next.tabs.push(tab("s-two", None, SessionModeChoice::Auto));
         assert!(matches!(memory.observe(Some(next.clone())), Some(Ok(_))));
-        next.active = 1;
+        (next.active, next.claude_active) = (Some(1), Some(1));
         assert!(matches!(memory.observe(Some(next.clone())), Some(Ok(_))));
         next.tabs.reverse();
         assert!(matches!(memory.observe(Some(next.clone())), Some(Ok(_))), "a reorder");
@@ -1125,8 +1251,8 @@ mod tests {
         assert_eq!(load(&dir, &root()), Loaded::Saved(two()));
     }
 
-    fn codex(session: &str, mode: SessionModeChoice) -> SavedExternalTab {
-        SavedExternalTab {
+    fn codex(session: &str, mode: SessionModeChoice) -> SavedTab {
+        SavedTab {
             agent: AgentId::Codex,
             conversation_id: "0123456789abcdef0123456789abcdef".to_string(),
             provider_session_id: session.to_string(),
@@ -1138,16 +1264,20 @@ mod tests {
 
     #[test]
     fn external_tabs_round_trip_and_old_files_load() {
-        let mut saved = two();
-        saved.external_tabs = vec![
-            codex("thread-a", SessionModeChoice::Bypass),
-            SavedExternalTab {
-                agent: AgentId::Acp("gemini".into()),
-                name: None,
-                ..codex("session-b", SessionModeChoice::Auto)
-            },
-        ];
-        saved.active_external = Some(1);
+        let saved = and_others(
+            two(),
+            vec![
+                codex("thread-a", SessionModeChoice::Bypass),
+                SavedTab {
+                    agent: AgentId::Acp("gemini".into()),
+                    name: None,
+                    ..codex("session-b", SessionModeChoice::Auto)
+                },
+            ],
+            Some(1),
+        );
+        assert_eq!(saved.active, Some(3), "the other agent's tab on screen wins");
+        assert_eq!(saved.claude_active, Some(1));
         let text = encode(&saved, &root());
         assert!(text.contains("\"external_tabs\""), "{text}");
         assert!(
@@ -1155,6 +1285,9 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\"version\": 1"), "the version stays 1: {text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["active"], 1, "the Claude tab a Claude-only reader puts on screen");
+        assert_eq!(value["active_external"], 1);
         assert_eq!(decode(&text, &root()), Ok(saved));
 
         // A window that ran only Claude writes exactly what it always wrote.
@@ -1165,40 +1298,117 @@ mod tests {
             {"conversation_id":"c","provider_session_id":"s-one","mode":"auto"}],"active":0}"#;
         let loaded = decode(old, &root()).unwrap();
         assert_eq!(loaded.tabs.len(), 1);
-        assert!(loaded.external_tabs.is_empty() && loaded.active_external.is_none());
+        assert!(!loaded.has_other_agents());
+        assert_eq!(loaded.active, Some(0));
 
         // An entry for Claude, an unknown agent or a session listed twice is never kept as another
         // agent's tab; an agent this build does not know is left out and the rest of the file kept.
-        let mut twice = two();
-        twice.external_tabs = vec![
-            codex("thread-a", SessionModeChoice::Auto),
-            codex("thread-a", SessionModeChoice::Bypass),
-        ];
-        twice.active_external = Some(1);
-        let kept = decode(&encode(&twice, &root()), &root()).unwrap();
-        assert_eq!(kept.external_tabs, vec![codex("thread-a", SessionModeChoice::Auto)]);
-        assert_eq!(
-            kept.active_external,
-            Some(0),
-            "the active entry keeps pointing at its session"
+        let twice = and_others(
+            two(),
+            vec![
+                codex("thread-a", SessionModeChoice::Auto),
+                codex("thread-a", SessionModeChoice::Bypass),
+            ],
+            Some(1),
         );
+        let kept = decode(&encode(&twice, &root()), &root()).unwrap();
+        assert_eq!(
+            kept.other_tabs().cloned().collect::<Vec<_>>(),
+            vec![codex("thread-a", SessionModeChoice::Auto)]
+        );
+        assert_eq!(kept.active, Some(2), "the active entry keeps pointing at its session");
         let claude_as_external = encode(&twice, &root()).replace("\"agent\": \"codex\"", "\"agent\": \"claude\"");
-        assert!(decode(&claude_as_external, &root()).unwrap().external_tabs.is_empty());
+        let read = decode(&claude_as_external, &root()).unwrap();
+        assert!(!read.has_other_agents());
+        assert_eq!(read.tabs, two().tabs, "nor is it added to the Claude tabs");
         let unknown = encode(&twice, &root()).replacen("\"agent\": \"codex\"", "\"agent\": \"openai\"", 1);
         let read = decode(&unknown, &root()).expect("the rest of the file is still usable");
-        assert_eq!(read.tabs, two().tabs);
-        assert_eq!(read.external_tabs, vec![codex("thread-a", SessionModeChoice::Bypass)]);
-        assert_eq!(read.active_external, Some(0));
+        assert_eq!(read.claude_tabs().cloned().collect::<Vec<_>>(), two().tabs);
+        assert_eq!(
+            read.other_tabs().cloned().collect::<Vec<_>>(),
+            vec![codex("thread-a", SessionModeChoice::Bypass)]
+        );
+        assert_eq!(read.active, Some(2));
 
         // A file that holds only another agent's tabs is still something to offer at launch.
         let dir = ScratchDir::new("nv-saved-tabs", "external-only");
-        let only_external = SavedTabs {
-            external_tabs: vec![codex("thread-a", SessionModeChoice::Auto)],
-            active_external: Some(0),
-            ..SavedTabs::default()
-        };
+        let only_external =
+            SavedTabs::from_parts(Vec::new(), 0, vec![codex("thread-a", SessionModeChoice::Auto)], Some(0));
+        assert_eq!((only_external.active, only_external.claude_active), (Some(0), None));
         save(&dir, &root(), &only_external).unwrap();
         assert_eq!(startup(Some(&dir), &root()).0, Some(only_external));
+    }
+
+    /// Two agents may give a session the same id: each is its own tab, in the file and read back.
+    #[test]
+    fn the_same_session_id_under_two_agents_is_two_tabs() {
+        let saved = and_others(
+            two(),
+            vec![SavedTab {
+                agent: AgentId::Acp("gemini".into()),
+                ..codex("s-one", SessionModeChoice::Auto)
+            }],
+            None,
+        );
+        let read = decode(&encode(&saved, &root()), &root()).unwrap();
+        assert_eq!(read, saved);
+        assert_eq!(read.tabs.len(), 3);
+    }
+
+    /// Reading a file, writing what was read and reading that again gives what the first read gave:
+    /// what a file means survives a write, though entries a hand edit broke or an unknown agent's are
+    /// not written back.
+    #[test]
+    fn saved_tabs_round_trip_by_meaning() {
+        let fixtures = [
+            // Claude tabs only, hand-edited: a blank entry, a repeat, the active index past them.
+            r#"{"version":1,"project_root":"/home/user/project","active":3,"tabs":[
+                {"conversation_id":"c","provider_session_id":"a","mode":"auto","name":"api"},
+                {"conversation_id":"c","provider_session_id":"","mode":"auto"},
+                {"conversation_id":"c","provider_session_id":"a","mode":"bypass"},
+                {"conversation_id":"c","provider_session_id":"b","mode":"manual","view":3}]}"#,
+            // Both kinds, another agent's tab on screen past one this build does not know, and a
+            // Claude entry among the other agents'.
+            r#"{"version":1,"project_root":"/home/user/project","active":1,"tabs":[
+                {"conversation_id":"c","provider_session_id":"a","mode":"auto"},
+                {"conversation_id":"c","provider_session_id":"b","mode":"auto"}],
+                "external_tabs":[
+                {"agent":"openai","conversation_id":"c","provider_session_id":"o","mode":"auto"},
+                {"agent":"claude","conversation_id":"c","provider_session_id":"z","mode":"auto"},
+                {"agent":"codex","conversation_id":"c","provider_session_id":"t","mode":"bypass","view":2},
+                {"agent":"acp:gemini","conversation_id":"c","provider_session_id":"a","mode":"auto"}],
+                "active_external":2}"#,
+            // Other agents' tabs only, none of them on screen.
+            r#"{"version":1,"project_root":"/home/user/project","active":0,"tabs":[],
+                "external_tabs":[
+                {"agent":"codex","conversation_id":"c","provider_session_id":"t","mode":"auto"},
+                {"agent":"codex","conversation_id":"c","provider_session_id":"t","mode":"bypass"},
+                {"agent":"acp:gemini","conversation_id":"c","provider_session_id":"g","mode":"manual"}]}"#,
+        ];
+        for fixture in fixtures {
+            let first = decode(fixture, &root()).unwrap_or_else(|e| panic!("{e}: {fixture}"));
+            let again = decode(&encode(&first, &root()), &root()).unwrap();
+            assert_eq!(again, first, "{fixture}");
+        }
+        let both = decode(fixtures[1], &root()).unwrap();
+        let ids: Vec<(String, &str)> = both
+            .tabs
+            .iter()
+            .map(|t| (t.agent.record_name(), t.provider_session_id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("claude".to_string(), "a"),
+                ("claude".to_string(), "b"),
+                ("codex".to_string(), "t"),
+                ("acp:gemini".to_string(), "a"),
+            ]
+        );
+        assert_eq!(both.active_tab().map(|t| t.provider_session_id.as_str()), Some("t"));
+        assert_eq!(both.claude_active, Some(1));
+        let others_only = decode(fixtures[2], &root()).unwrap();
+        assert_eq!((others_only.active, others_only.claude_active), (None, None));
     }
 
     /// What an Eitri from before external tabs reads: its own `TabsFile`, copied here as it was.
@@ -1206,29 +1416,34 @@ mod tests {
     struct OlderTabsFile {
         version: u32,
         project_root: String,
-        tabs: Vec<SavedTab>,
+        tabs: Vec<OlderTab>,
         active: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct OlderTab {
+        provider_session_id: String,
+        mode: SessionModeChoice,
     }
 
     #[test]
     fn an_older_reader_ignores_external_tabs() {
-        let mut saved = two();
-        saved.external_tabs = vec![codex("thread-a", SessionModeChoice::Bypass)];
-        saved.active_external = Some(0);
+        let saved = and_others(two(), vec![codex("thread-a", SessionModeChoice::Bypass)], Some(0));
         let text = encode(&saved, &root());
         let older: OlderTabsFile = serde_json::from_str(&text).expect("an older build reads the file");
         assert_eq!(older.version, VERSION);
         assert_eq!(older.project_root, root().to_string_lossy());
+        let read: Vec<(&str, SessionModeChoice)> = older
+            .tabs
+            .iter()
+            .map(|t| (t.provider_session_id.as_str(), t.mode))
+            .collect();
         assert_eq!(
-            older.tabs,
-            two().tabs,
+            read,
+            [("s-one", SessionModeChoice::Auto), ("s-two", SessionModeChoice::Bypass)],
             "only the Claude tabs, so no Codex thread resumes as Claude"
         );
-        assert_eq!(
-            older.active,
-            two().active,
-            "and a Claude tab to fall back to as the active one"
-        );
+        assert_eq!(older.active, 1, "and a Claude tab to fall back to as the active one");
     }
 }
 
@@ -1245,6 +1460,7 @@ mod measure {
             .join(format!("saved-tabs-{}", std::process::id()));
         let root = Path::new("/p");
         let tab = |i: usize| SavedTab {
+            agent: AgentId::Claude,
             conversation_id: format!("c{i}"),
             provider_session_id: format!("s{i}"),
             name: None,
@@ -1254,12 +1470,7 @@ mod measure {
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();
         for i in 0..200 {
-            let now = SavedTabs {
-                tabs: (0..4).map(|t| tab(t + i % 2)).collect(),
-                active: 0,
-                external_tabs: Vec::new(),
-                active_external: None,
-            };
+            let now = SavedTabs::from_parts((0..4).map(|t| tab(t + i % 2)).collect(), 0, Vec::new(), None);
             let started = std::time::Instant::now();
             let written = memory.observe(Some(now));
             times.push(started.elapsed());
@@ -1277,12 +1488,7 @@ mod measure {
         let mut writer = TabWriter::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();
         for i in 0..200 {
-            let now = SavedTabs {
-                tabs: (0..4).map(|t| tab(t + i % 2)).collect(),
-                active: 0,
-                external_tabs: Vec::new(),
-                active_external: None,
-            };
+            let now = SavedTabs::from_parts((0..4).map(|t| tab(t + i % 2)).collect(), 0, Vec::new(), None);
             let started = std::time::Instant::now();
             writer.observe(Some(now));
             times.push(started.elapsed());

@@ -38,7 +38,7 @@ fn live_set_on(kind: BackendKind, dir: &std::path::Path) -> (TabSet, eitri_core:
     let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a sidecar session starts; is this running under a test-account wrapper?");
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     (set, tab)
 }
 
@@ -86,9 +86,9 @@ fn pump_until(
 }
 
 fn shut_down(set: &mut TabSet) {
-    for mut tab in set.take_all() {
-        if let TabBackend::Live(backend) = &mut tab.backend {
-            backend.shutdown();
+    for tab in set.take_all() {
+        if let Some(retired) = tab.retired {
+            retired.into_backend().shutdown();
         }
     }
 }

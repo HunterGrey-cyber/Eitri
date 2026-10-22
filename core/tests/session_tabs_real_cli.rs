@@ -74,9 +74,13 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
     let dir = project();
     let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
     let background = set.active();
-    set.get_mut(background).unwrap().backend = TabBackend::Live(start(&dir));
+    set.get_mut(background)
+        .unwrap()
+        .set_backend(TabBackend::Live(start(&dir)));
     let foreground = set.open(AgentId::Claude);
-    set.get_mut(foreground).unwrap().backend = TabBackend::Live(start(&dir));
+    set.get_mut(foreground)
+        .unwrap()
+        .set_backend(TabBackend::Live(start(&dir)));
 
     // 1. The background tab reads a file inside the project (the policy answers it, no card) while
     //    the active tab streams a reply.
@@ -176,9 +180,9 @@ fn two_tabs_run_at_once_and_a_background_card_reaches_its_own_session() {
         "the card never reached the other tab"
     );
 
-    for mut tab in set.take_all() {
-        if let TabBackend::Live(backend) = &mut tab.backend {
-            backend.shutdown();
+    for tab in set.take_all() {
+        if let Some(retired) = tab.retired {
+            retired.into_backend().shutdown();
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

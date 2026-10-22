@@ -87,9 +87,9 @@ struct LiveSet(TabSet);
 
 impl Drop for LiveSet {
     fn drop(&mut self) {
-        for mut tab in self.0.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in self.0.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -113,7 +113,7 @@ fn auto_tab(dir: &Path) -> (LiveSet, TabId) {
          later); point EITRI_VERDANDI_CHECKOUT at a checkout at or after the pin. Advertised: {:?}",
         backend.provider_info().map(|i| i.advertised_capabilities.clone())
     );
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     (LiveSet(set), tab)
 }
 
@@ -143,9 +143,9 @@ fn drive_turn(set: &mut TabSet, dir: &Path, tab: TabId, prompt: &str, label: &st
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let out = set.pump(dir, true);
-        if let Some(mut tripped) = out.tripped.into_iter().next() {
+        if let Some(tripped) = out.tripped.into_iter().next() {
             let reason = tripped.reason.clone();
-            tripped.backend.shutdown();
+            tripped.retired.into_backend().shutdown();
             panic!("{label}: the tripwire closed the session: {reason}");
         }
         let events = events_from_payload(out.active_payload.as_deref());

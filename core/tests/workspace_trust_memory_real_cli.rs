@@ -346,9 +346,9 @@ struct Live(TabSet);
 
 impl Drop for Live {
     fn drop(&mut self) {
-        for mut tab in self.0.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in self.0.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -401,9 +401,9 @@ fn drive_turn(set: &mut TabSet, tab: TabId, project: &Path, prompt: &str, label:
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         let out = set.pump(project, true);
-        if let Some(mut tripped) = out.tripped.into_iter().next() {
+        if let Some(tripped) = out.tripped.into_iter().next() {
             let reason = tripped.reason.clone();
-            tripped.backend.shutdown();
+            tripped.retired.into_backend().shutdown();
             panic!("{label}: the session closed before the turn ended: {reason}");
         }
         let waiting: Vec<(String, String, serde_json::Value)> = {
@@ -476,7 +476,7 @@ fn run_arm(trust: ProjectTrust, fx: &Fixture, label: &str) -> (BTreeMap<&'static
     let backend = AgentBackend::start(BackendKind::Sidecar, &fx.project, None, trust)
         .map_err(|e| e.message)
         .unwrap_or_else(|e| panic!("{label}: the session did not start: {e} (is this running under a test-account wrapper?)"));
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     let mut live = Live(set);
     let set = &mut live.0;
 

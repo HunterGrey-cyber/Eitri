@@ -15,6 +15,8 @@ pub struct RecordingProvider {
     /// Every turn text a send reached the provider with, accepted or refused.
     turns: std::sync::Mutex<Vec<String>>,
     interrupts: AtomicUsize,
+    /// While on, every `interrupt_turn` fails as a broken transport would: a fatal error, the session gone.
+    failing_interrupts: AtomicBool,
     refusing: AtomicBool,
     /// While enabled, refuse every `resolve_permission` with a provider error.
     /// This exercises `AgentBackend::approve_pending`'s failed-allow path, which keeps a card.
@@ -99,6 +101,10 @@ impl RecordingProvider {
     pub fn refuse_sends(&self, on: bool) {
         self.refusing.store(on, Ordering::SeqCst);
     }
+    /// While on, every interrupt fails as a dead session's would (fatal, not a complaint about timing).
+    pub fn fail_interrupts(&self, on: bool) {
+        self.failing_interrupts.store(on, Ordering::SeqCst);
+    }
     /// While on, every `resolve_permission` (an allow or a deny) is refused as a provider error.
     pub fn refuse_resolutions(&self, on: bool) {
         self.refusing_resolutions.store(on, Ordering::SeqCst);
@@ -134,6 +140,11 @@ impl agent::AgentProvider for RecordingProvider {
     }
     fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
         self.interrupts.fetch_add(1, Ordering::SeqCst);
+        if self.failing_interrupts.load(Ordering::SeqCst) {
+            return Err(agent::ProviderError::Transport(
+                "the scripted agent's pipe is closed".into(),
+            ));
+        }
         Ok(())
     }
     fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {

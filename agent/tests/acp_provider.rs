@@ -1550,3 +1550,137 @@ fn an_over_cap_permission_request_naming_no_session_does_not_mark_a_call_of_this
         "another session's request marked this session's call"
     );
 }
+
+// ---------------------------------------------------------------- an agent that ends on its own
+
+/// An agent whose output ends while its stderr stays open and says nothing yet. The card it asked for
+/// goes, and an answer to it from another thread (the UI's) returns while stderr is still open: the
+/// notice of the end waits for stderr without holding the provider. The pump that reads the end carries
+/// no notice yet; once stderr closes, the next pumps send it.
+#[test]
+fn a_card_answer_does_not_wait_for_a_closed_agents_stderr() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let gate = std::env::temp_dir().join(format!("eitri-acp-stderr-gate-{}-{stamp}", std::process::id()));
+    let mut script = boot("agent");
+    script.extend([
+        expect_prompt(3, "touch"),
+        agent_request(
+            7,
+            "session/request_permission",
+            permission_params("c1", options_with_always()),
+        ),
+        json!({"exit": 0}),
+    ]);
+    // A shell runs the stand-in, then closes its own stdout (the stand-in's was the same pipe) and holds
+    // stderr open and empty until the gate file appears; the wait is capped so a failed test leaves no
+    // child behind.
+    let wrapper = r#""$0" "$1"
+exec >&-
+i=0
+while [ ! -e "$2" ] && [ "$i" -lt 1000 ]; do sleep 0.01; i=$((i+1)); done
+echo "stand-in: gone" >&2
+"#;
+    let agent = AcpAgentSpec {
+        name: "stand-in".to_string(),
+        argv: vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(wrapper),
+            OsString::from(standin()),
+            OsString::from(Value::Array(script).to_string()),
+            OsString::from(&gate),
+        ],
+        auto_mode: None,
+    };
+    let provider = std::sync::Arc::new(AcpProvider::connect(agent, std::env::temp_dir()).expect("connects"));
+    provider.start(start_request(None)).expect("starts");
+    send(&provider, "touch").expect("sends");
+
+    // Pump until the card the agent asked for is dropped: that pump read the end of its output.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut card = None;
+    let mut before_stderr = Vec::new();
+    loop {
+        let batch = provider.pump();
+        for event in &batch {
+            match event {
+                AgentDomainEvent::PermissionRequested { permission_id, .. } => card = Some(permission_id.clone()),
+                AgentDomainEvent::PermissionResolved {
+                    permission_id,
+                    outcome: PermissionOutcome::ProviderFailed,
+                } => assert_eq!(Some(permission_id), card.as_ref(), "{batch:#?}"),
+                _ => {}
+            }
+        }
+        let ended = batch.iter().any(|e| {
+            matches!(
+                e,
+                AgentDomainEvent::PermissionResolved {
+                    outcome: PermissionOutcome::ProviderFailed,
+                    ..
+                }
+            )
+        });
+        before_stderr.extend(batch);
+        if ended {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent's end was never read: {before_stderr:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let card = card.expect("a card was drawn");
+    assert!(
+        !before_stderr
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+        "the notice was sent while stderr was still open and empty, so the pump waited for it: {before_stderr:#?}"
+    );
+
+    // The UI thread's answer, while the agent's stderr is still open.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let answering = {
+        let provider = provider.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(allow(&provider, &card));
+        })
+    };
+    let answer = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("an answer to a card of an ended agent hung");
+    answering.join().expect("the answering thread ends");
+    assert!(
+        matches!(
+            answer,
+            Err(ProviderError::Provider {
+                code: ProviderErrorCode::ProviderUnavailable,
+                ..
+            })
+        ),
+        "an ended agent takes no answer: {answer:?}"
+    );
+
+    std::fs::write(&gate, b"").expect("the gate opens");
+    let events = pump_until(&provider, "the notice of the agent's end", |e| {
+        matches!(e, AgentDomainEvent::SessionUnavailable { .. })
+    });
+    let _ = std::fs::remove_file(&gate);
+    let notices: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::SessionUnavailable { reason } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "{events:#?}");
+    assert!(
+        notices[0].starts_with("stand-in ended unexpectedly (the agent closed its output)"),
+        "{}",
+        notices[0]
+    );
+}

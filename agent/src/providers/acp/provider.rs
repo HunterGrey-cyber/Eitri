@@ -58,6 +58,8 @@ const PUMP_BATCH: usize = 4096;
 const UNKNOWN_KEPT: usize = 64;
 /// The longest stderr tail put in a notice.
 const NOTICE_TAIL_CHARS: usize = 400;
+/// How long a child's end waits for its stderr before the notice goes without it.
+const CLOSING_NOTICE_WAIT: Duration = Duration::from_millis(100);
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -153,6 +155,9 @@ struct State {
     loading: bool,
     /// The loaded session's history, until the host takes it. Never pumped.
     history: Vec<AgentDomainEvent>,
+    /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
+    /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
+    closing_notice: Option<(String, Instant)>,
     closed: bool,
     dead: bool,
 }
@@ -643,27 +648,33 @@ impl AcpProvider {
         st.dead = true;
         // Nothing can answer what waited any more.
         self.drop_cards(st, PermissionOutcome::ProviderFailed, false);
-        // The end of the output stream can be read a moment before the last of stderr; give it a short
-        // chance so the notice says why the child went.
-        let mut tail = String::new();
-        for _ in 0..5 {
-            tail = lock(&self.link)
-                .as_ref()
-                .map(|l| notice_tail(&l.stderr_tail()))
-                .unwrap_or_default();
-            if !tail.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        // The end of the output stream can be read a moment before the last of stderr; the notice waits a
+        // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
+        // state, which the UI thread's calls (a card's answer, Esc, a send, the gauge) take.
+        st.closing_notice = Some((reason.to_string(), Instant::now() + CLOSING_NOTICE_WAIT));
+        self.finish_closing_notice(st);
+    }
+
+    /// Sends the child's end once its stderr says why, or once the wait is over without it.
+    fn finish_closing_notice(&self, st: &mut State) {
+        let Some((reason, until)) = st.closing_notice.as_ref() else {
+            return;
+        };
+        let tail = lock(&self.link)
+            .as_ref()
+            .map(|l| notice_tail(&l.stderr_tail()))
+            .unwrap_or_default();
+        if tail.is_empty() && Instant::now() < *until {
+            return;
         }
         let suffix = if tail.is_empty() {
             String::new()
         } else {
             format!(": {tail}")
         };
-        st.events.push_back(AgentDomainEvent::SessionUnavailable {
-            reason: format!("{} ended unexpectedly ({reason}){suffix}", self.agent),
-        });
+        let reason = format!("{} ended unexpectedly ({reason}){suffix}", self.agent);
+        st.closing_notice = None;
+        st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
     }
 
     fn on_update(&self, st: &mut State, params: Value) {
@@ -1072,6 +1083,8 @@ impl AgentProvider for AcpProvider {
                 self.finish_turn(&mut st);
             }
         }
+        // Also once the host has closed the session: a child that ended first still says why.
+        self.finish_closing_notice(&mut st);
         st.events.drain(..).collect()
     }
 }

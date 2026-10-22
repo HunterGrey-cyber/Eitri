@@ -1513,7 +1513,7 @@ fn check_relative(path: &str) -> Result<(), String> {
 
 /// Whether a send from `tab` waits instead of going out: the checks `send_review` ends with.
 fn would_wait(tab: &Tab) -> bool {
-    match &tab.backend {
+    match tab.backend() {
         TabBackend::Live(backend) => {
             tab.turn_running() || tab.pending_handoff.is_some() || !backend.projection().pending_permissions.is_empty()
         }

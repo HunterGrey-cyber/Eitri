@@ -124,9 +124,9 @@ struct Live(TabSet);
 
 impl Drop for Live {
     fn drop(&mut self) {
-        for mut tab in self.0.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in self.0.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -151,7 +151,7 @@ fn run_arm(kind: BackendKind, trust: ProjectTrust, fx: &Fixture, expect_all: boo
                  the CLI rejects fails here or at the first turn: its stderr is the cause)"
             )
         });
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     let mut live = Live(set);
     let set = &mut live.0;
     set.get_mut(tab)
@@ -165,9 +165,9 @@ fn run_arm(kind: BackendKind, trust: ProjectTrust, fx: &Fixture, expect_all: boo
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let out = set.pump(&fx.project, true);
-        if let Some(mut tripped) = out.tripped.into_iter().next() {
+        if let Some(tripped) = out.tripped.into_iter().next() {
             let reason = tripped.reason.clone();
-            tripped.backend.shutdown();
+            tripped.retired.into_backend().shutdown();
             panic!("the session closed before the turn ended ({kind:?}, {trust:?}): {reason}");
         }
         let running = set.get(tab).unwrap().turn_running();

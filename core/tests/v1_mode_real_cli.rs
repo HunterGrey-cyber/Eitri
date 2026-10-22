@@ -58,7 +58,7 @@
 //! after the card as a trip. Read the raw lines each prints before recording any figure or branch.
 
 use agent::{AgentDomainEvent, PermissionDecision, PermissionMode, PermissionOutcome, PrefixRules};
-use eitri_core::agent_backend::{AgentBackend, BackendKind, GateOrigin};
+use eitri_core::agent_backend::{AgentBackend, AnsweredForYou, BackendKind, GateOrigin, HumanApprovals};
 use eitri_core::agent_bridge::SessionModeChoice;
 use eitri_core::tab_set::{ConfirmOutcome, ModeCycle, TabBackend, TabSet};
 use eitri_core::tabs::TabId;
@@ -96,9 +96,9 @@ fn scratch(label: &str, name: &str) -> PathBuf {
 /// Shuts down every live backend still held by `set`. Idempotent: `take_all` empties the tab list,
 /// so calling this twice (once explicitly, once from `LiveSet::drop`) does nothing the second time.
 fn shut_down(set: &mut TabSet) {
-    for mut tab in set.take_all() {
-        if let TabBackend::Live(backend) = &mut tab.backend {
-            backend.shutdown();
+    for tab in set.take_all() {
+        if let Some(retired) = tab.retired {
+            retired.into_backend().shutdown();
         }
     }
 }
@@ -180,7 +180,7 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a session starts; is this running under a test-account wrapper?");
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     (LiveSet(set), tab)
 }
 
@@ -191,7 +191,7 @@ fn auto_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a session starts; is this running under a test-account wrapper?");
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     (LiveSet(set), tab)
 }
 
@@ -597,9 +597,9 @@ fn drive_turn(
         let out = set.pump(dir, true);
         let events = events_from_payload(out.active_payload.as_deref());
         on_events(set, &events);
-        if let Some(mut t) = out.tripped.into_iter().next() {
+        if let Some(t) = out.tripped.into_iter().next() {
             let reason = t.reason.clone();
-            t.backend.shutdown();
+            t.retired.into_backend().shutdown();
             panic!("{label}: the tripwire fired before the turn even started: {reason}");
         }
         if set.get(tab).unwrap().turn_running() {
@@ -614,9 +614,9 @@ fn drive_turn(
         let out = set.pump(dir, true);
         let events = events_from_payload(out.active_payload.as_deref());
         on_events(set, &events);
-        if let Some(mut t) = out.tripped.into_iter().next() {
+        if let Some(t) = out.tripped.into_iter().next() {
             let reason = t.reason.clone();
-            t.backend.shutdown();
+            t.retired.into_backend().shutdown();
             panic!("{label}: the tripwire fired mid-turn: {reason}");
         }
         if !set.get(tab).unwrap().turn_running() {
@@ -785,7 +785,7 @@ fn sidecar_bypass_answers_every_call_and_the_cli_runs_them() {
     );
 }
 
-/// Measures bypass answer latency by driving `take_ui_delivery_with_rules` every 1 ms,
+/// Measures bypass answer latency by driving `take_revised_ui_delivery` every 1 ms,
 /// bypassing the 33 ms pump. Reads five in-project files, one call per file.
 ///
 /// Pairs each resolution's `permission_id` with its request's `tool_use_id`. Other tools
@@ -862,7 +862,16 @@ fn host_answer_latency_in_bypass() {
     while !turn_ended {
         let before_ms = start.elapsed().as_secs_f64() * 1000.0;
         note_requests(&backend, &mut requests, &mut requested_at, before_ms);
-        let delivery = backend.take_ui_delivery_with_rules(&dir, &rules, PermissionMode::Bypass, &mut host_answered);
+        let delivery = backend
+            .take_revised_ui_delivery(
+                &dir,
+                &rules,
+                PermissionMode::Bypass,
+                &mut host_answered,
+                &mut HumanApprovals::default(),
+                &mut AnsweredForYou::default(),
+            )
+            .without_revisions();
         let now_ms = start.elapsed().as_secs_f64() * 1000.0;
         note_requests(&backend, &mut requests, &mut requested_at, now_ms);
         if let agent::UiDelivery::Events(events) = delivery {
@@ -1753,7 +1762,7 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
     let backend = AgentBackend::start(kind, &dir, None, agent::setting_sources::ProjectTrust::Trusted)
         .map_err(|e| e.message)
         .expect("a session starts; is this running under a test-account wrapper?");
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     let mut trace = GateTrace::new(&dir);
     // The tool-use id of the card for the Write of inside.txt that this probe denied, if one came.
     let mut denied_call: Option<String> = None;
@@ -1766,8 +1775,8 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
     while branch.is_none() && Instant::now() < early_deadline {
         let out = set.pump(&dir, true);
         if !out.tripped.is_empty() {
-            for mut t in out.tripped {
-                t.backend.shutdown();
+            for t in out.tripped {
+                t.retired.into_backend().shutdown();
             }
             branch = Some(DefaultModeBranch::Tripped);
         }
@@ -1795,8 +1804,8 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
             let mut found = loop {
                 let out = set.pump(&dir, true);
                 if !out.tripped.is_empty() {
-                    for mut t in out.tripped {
-                        t.backend.shutdown();
+                    for t in out.tripped {
+                        t.retired.into_backend().shutdown();
                     }
                     break DefaultModeBranch::Tripped;
                 }
@@ -1889,8 +1898,8 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
                         }
                     }
                     if !out.tripped.is_empty() {
-                        for mut t in out.tripped {
-                            t.backend.shutdown();
+                        for t in out.tripped {
+                            t.retired.into_backend().shutdown();
                         }
                         // A trip after answering the card must still set `found` to `Tripped`.
                         // Leaving it at `Gated` skips the trip checks and reports the wrong
@@ -1954,7 +1963,7 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
     if let DefaultModeBranch::Tripped = branch {
         let state = set.get(tab).unwrap();
         let wire_state = state.wire_state();
-        let TabBackend::Failed { reason } = &state.backend else {
+        let TabBackend::Failed { reason } = state.backend() else {
             panic!("{label}: a tripped tab must be Failed but was {wire_state:?}");
         };
         println!("[v1-mode] test5 {label}: [permission] {reason}");
@@ -2692,7 +2701,7 @@ fn a_manual_tab_cards_an_in_project_write_on_a_cli_auto_session() {
         backend.capabilities().cli_auto_mode,
         "INCONCLUSIVE: this sidecar does not run the CLI's own auto mode, so there is no deferral to refuse"
     );
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     let rel = "manual.txt";
     set.get_mut(tab)
         .unwrap()

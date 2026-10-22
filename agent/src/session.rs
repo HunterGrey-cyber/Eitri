@@ -20,9 +20,11 @@ use std::path::Path;
 /// domain event alongside the reduced projection (a future consumer may want the raw stream, e.g.
 /// to render every text delta as it arrived rather than just the reducer's flattened view).
 pub struct AgentSession {
-    process: AgentProcess,
+    process: Option<AgentProcess>,
     pub projection: AgentSessionProjection,
     event_log: Vec<AgentDomainEvent>,
+    pending_delivery: Vec<(u64, AgentDomainEvent)>,
+    ui_snapshot_revision: Option<u64>,
     /// Which real channel each currently-pending permission arrived on -- needed by
     /// `respond_permission` to route the answer, never exposed via `AgentSessionProjection` (see
     /// this module's own header doc). Entries are inserted alongside the matching
@@ -56,17 +58,34 @@ impl AgentSession {
     pub fn start(project_dir: &Path, disallowed_tools: &[&str], project: ProjectTrust) -> std::io::Result<Self> {
         let process = AgentProcess::spawn(project_dir, disallowed_tools, project)?;
         Ok(Self {
-            process,
+            process: Some(process),
             projection: AgentSessionProjection::default(),
             event_log: Vec::new(),
+            pending_delivery: Vec::new(),
+            ui_snapshot_revision: None,
             pending_permission_sources: HashMap::new(),
             interrupt_requested: false,
             last_text_message_id: None,
         })
     }
 
+    /// A transport-free session for exercising the legacy reducer without launching a CLI.
+    #[cfg(feature = "test-support")]
+    pub fn for_tests() -> Self {
+        Self {
+            process: None,
+            projection: AgentSessionProjection::default(),
+            event_log: Vec::new(),
+            pending_delivery: Vec::new(),
+            ui_snapshot_revision: None,
+            pending_permission_sources: HashMap::new(),
+            interrupt_requested: false,
+            last_text_message_id: None,
+        }
+    }
+
     /// Writes one user turn to the underlying process, synthesizes and folds `TurnStarted`
-    /// immediately on success, and returns it. Global Constraint: one active turn per session --
+    /// immediately on success, and queues it for the pump. One active turn per session --
     /// rejects (does not queue) a second call while `self.projection.active_turn_id` is `Some`.
     ///
     /// `TurnStarted` is only folded once the write has actually succeeded: setting it first meant
@@ -81,46 +100,48 @@ impl AgentSession {
                 "a turn is already in progress on this session",
             ));
         }
-        self.process.send_turn(text)?;
+        if let Some(process) = &mut self.process {
+            process.send_turn(text)?;
+        }
         let turn_id = uuid::Uuid::new_v4().to_string();
         let event = AgentDomainEvent::TurnStarted { turn_id };
-        self.fold(event.clone());
-        Ok(vec![event])
+        self.fold(event);
+        Ok(Vec::new())
     }
 
     /// Sends a real interrupt control_request (`AgentProcess::interrupt` already releases every
     /// pending hook connection at the transport level, denying each -- see its own doc). Folds and
-    /// returns a `PermissionResolved { outcome: CancelledByInterrupt }` for every permission that
+    /// queues a `PermissionResolved { outcome: CancelledByInterrupt }` for every permission that
     /// was pending at the moment of the call, draining `pending_permission_sources` to match.
     /// Does NOT fold a `TurnCompleted` here -- see `interrupt_requested`'s own doc for why that
     /// must wait for the turn's real terminal event.
     pub fn interrupt(&mut self) -> std::io::Result<Vec<AgentDomainEvent>> {
-        self.process.interrupt()?;
+        if let Some(process) = &mut self.process {
+            process.interrupt()?;
+        }
         if self.projection.active_turn_id.is_some() {
             self.interrupt_requested = true;
         }
 
         let pending_ids: Vec<String> = self.projection.pending_permissions.keys().cloned().collect();
-        let mut events = Vec::with_capacity(pending_ids.len());
         for permission_id in pending_ids {
             self.pending_permission_sources.remove(&permission_id);
             let event = AgentDomainEvent::PermissionResolved {
                 permission_id,
                 outcome: PermissionOutcome::CancelledByInterrupt,
             };
-            self.fold(event.clone());
-            events.push(event);
+            self.fold(event);
         }
-        Ok(events)
+        Ok(Vec::new())
     }
 
     /// Answers one specific pending permission request, looked up by `permission_id` in
     /// `pending_permission_sources` to find which real channel to route the answer over. Folds
-    /// and returns a `PermissionResolved` event only once the decision has genuinely been written
+    /// and queues a `PermissionResolved` event only once the decision has genuinely been written
     /// -- a failed write leaves the request pending and still answerable, matching the pre-Phase-1
     /// `AgentSession::respond_permission`'s identical reasoning. Returns `ErrorKind::NotFound` if
     /// no pending request carries that id (an already-answered or unknown id) -- callers must
-    /// treat that as a benign no-op, per this plan's Global Constraint on duplicate/unknown ids.
+    /// treat that as a benign no-op because a duplicate answer does not end the session.
     /// Answers one pending permission request.
     ///
     /// Unlike the sidecar provider, this backend has no event source for the answer: the Claude CLI
@@ -148,8 +169,9 @@ impl AgentSession {
                 format!("no pending permission request with id {permission_id}"),
             ));
         };
-        self.process
-            .respond_permission(permission_id, source, decision.allows(), decision.reason())?;
+        if let Some(process) = &mut self.process {
+            process.respond_permission(permission_id, source, decision.allows(), decision.reason())?;
+        }
         self.pending_permission_sources.remove(permission_id);
         let outcome = if decision.allows() {
             PermissionOutcome::Allowed
@@ -160,8 +182,8 @@ impl AgentSession {
             permission_id: permission_id.to_string(),
             outcome,
         };
-        self.fold(event.clone());
-        Ok(vec![event])
+        self.fold(event);
+        Ok(Vec::new())
     }
 
     /// Non-blocking drain: pulls whatever real wire events have arrived from the underlying
@@ -174,28 +196,31 @@ impl AgentSession {
         self.pump_revised().into_iter().map(|(_, event)| event).collect()
     }
 
-    /// [`Self::pump`], with each event's revision: `projection.last_revision` read right after that
-    /// event's own fold -- the tag the sidecar's ingestion queue carries too
-    /// (`crate::ingestion::RevisedDelivery`), so a caller compares both backends' events against a
-    /// snapshot's revision the same way. Here every event is folded in this very call, so none can
-    /// already be in a snapshot read before it; the tag is for uniformity, not because this backend
-    /// has the race.
+    /// Drains events with the revision assigned at their fold. Locally produced events keep
+    /// their place before wire events, even when the command that produced them failed.
     pub fn pump_revised(&mut self) -> Vec<(u64, AgentDomainEvent)> {
-        let mut produced = Vec::new();
-        for wire_event in self.process.poll_events() {
+        for wire_event in self.process.as_mut().map(|p| p.poll_events()).unwrap_or_default() {
             for domain_event in self.translate_event(wire_event) {
-                self.fold(domain_event.clone());
-                produced.push((self.projection.last_revision, domain_event));
+                self.fold(domain_event);
             }
         }
-        produced
+        std::mem::take(&mut self.pending_delivery)
+    }
+
+    /// Remembers the newest snapshot so its events are not drawn twice on the next drain.
+    pub fn note_ui_snapshot(&mut self, revision: u64) {
+        self.ui_snapshot_revision = Some(self.ui_snapshot_revision.unwrap_or(0).max(revision));
+    }
+
+    pub fn take_ui_snapshot_revision(&mut self) -> Option<u64> {
+        self.ui_snapshot_revision.take()
     }
 
     pub fn event_log(&self) -> &[AgentDomainEvent] {
         &self.event_log
     }
 
-    /// Folds an event this side produced rather than the provider, and hands it back for the UI.
+    /// Folds an event this side produced and queues it for delivery through the pump.
     ///
     /// The legacy twin of `AgentConversation::fold_locally`. Only for facts this side genuinely
     /// owns -- what the user typed is the case it exists for -- never for provider state, which is
@@ -213,15 +238,17 @@ impl AgentSession {
     }
 
     pub fn pid(&self) -> u32 {
-        self.process.pid()
+        self.process.as_ref().expect("a live transport has a pid").pid()
     }
 
     pub fn has_exited(&mut self) -> bool {
-        self.process.has_exited()
+        self.process.as_mut().is_some_and(|p| p.has_exited())
     }
 
     pub fn shutdown(&mut self) {
-        self.process.shutdown();
+        if let Some(process) = &mut self.process {
+            process.shutdown();
+        }
         // Cancel pending permissions when the session ends, as on interrupt: no answer can be
         // routed to an ended session. Emit `PermissionOutcome::CancelledBySessionClose` for each
         // request and remove its routing source before closing the projection.
@@ -242,6 +269,8 @@ impl AgentSession {
     /// place either happens, so the two never drift apart.
     fn fold(&mut self, event: AgentDomainEvent) {
         self.projection.apply(&event);
+        self.pending_delivery
+            .push((self.projection.last_revision, event.clone()));
         self.event_log.push(event);
     }
 
@@ -483,6 +512,62 @@ fn permission_requested_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn local_permission_answers_are_delivered_once_with_their_fold_revision() {
+        let mut session = AgentSession::for_tests();
+        session.fold_locally(AgentDomainEvent::PermissionRequested {
+            permission_id: "permission".into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: json!({}),
+            provider_prompt: None,
+        });
+        session
+            .pending_permission_sources
+            .insert("permission".into(), PermissionSource::HookRelay);
+        let requested_revision = session.projection.last_revision;
+        session.pump_revised();
+        assert!(session
+            .respond_permission("permission", PermissionDecision::Allow)
+            .unwrap()
+            .is_empty());
+        let delivery = session.pump_revised();
+        assert_eq!(delivery.len(), 1);
+        assert_eq!(delivery[0].0, requested_revision + 1);
+        assert!(
+            matches!(&delivery[0].1, AgentDomainEvent::PermissionResolved { permission_id, outcome: PermissionOutcome::Allowed } if permission_id == "permission")
+        );
+        assert!(session.pump_revised().is_empty());
+    }
+
+    #[test]
+    fn interrupt_queues_pending_cancellations_without_finishing_the_turn() {
+        let mut session = AgentSession::for_tests();
+        session.send_turn("hello").unwrap();
+        session.fold_locally(AgentDomainEvent::PermissionRequested {
+            permission_id: "permission".into(),
+            tool_use_id: None,
+            tool_name: "Write".into(),
+            input: json!({}),
+            provider_prompt: None,
+        });
+        session.pump_revised();
+        assert!(session.interrupt().unwrap().is_empty());
+        let delivery = session.pump_revised();
+        assert_eq!(delivery.len(), 1);
+        assert!(matches!(
+            delivery[0].1,
+            AgentDomainEvent::PermissionResolved {
+                outcome: PermissionOutcome::CancelledByInterrupt,
+                ..
+            }
+        ));
+        assert!(
+            session.projection.active_turn_id.is_some(),
+            "the wire still owes the turn's terminal event"
+        );
+    }
 
     const REAL_ID: &str = "toolu_01CtdezhmhUCrBaswxW5HYmC";
 

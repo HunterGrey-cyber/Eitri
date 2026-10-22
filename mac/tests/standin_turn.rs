@@ -28,9 +28,9 @@ struct LiveSet(TabSet);
 
 impl Drop for LiveSet {
     fn drop(&mut self) {
-        for mut tab in self.0.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in self.0.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -110,7 +110,7 @@ fn the_stand_in_holds_a_turn_raises_a_card_and_finishes_when_told() {
     )
     .map_err(|e| e.message)
     .expect("a sidecar session starts with the stand-in");
-    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
 
     // ---- 1: a held turn with a card.
     set.get_mut(tab)

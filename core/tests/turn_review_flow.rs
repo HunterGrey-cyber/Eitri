@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent::{AgentConversation, AgentDomainEvent, TurnOutcome};
-use eitri_core::agent_backend::{AgentBackend, BackendKind};
+use eitri_core::agent_backend::{AgentBackend, AgentId, BackendKind};
 use eitri_core::agent_bridge::{parse_inbound_message, InboundMessage, SessionModeChoice};
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::nvim_rpc::{Answer, Pending};
@@ -347,7 +347,13 @@ fn live_backend(project: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
         agent::setting_sources::ProjectTrust::Untrusted,
     )
     .unwrap();
-    (provider, AgentBackend::Sidecar(Box::new(conversation)))
+    (
+        provider,
+        AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        },
+    )
 }
 
 impl Fixture {
@@ -391,7 +397,10 @@ impl Fixture {
 
     fn give_session(&mut self) {
         let (provider, backend) = live_backend(&self.project);
-        self.tabs.get_mut(self.tab).unwrap().backend = TabBackend::Live(backend);
+        self.tabs
+            .get_mut(self.tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
         provider.open_session(SESSION, &self.project);
         self.provider = provider;
         let (tab, project) = (self.tab, self.project.clone());
@@ -515,9 +524,9 @@ impl Fixture {
     }
 
     fn shut_down(mut self) {
-        for mut tab in self.tabs.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in self.tabs.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -665,8 +674,8 @@ fn a_revert_for_a_tab_closed_meanwhile_is_refused() {
     let before = fingerprint(&f.file("a.txt"));
 
     let mut closed = f.tabs.remove(f.tab).expect("the tab was open");
-    if let TabBackend::Live(backend) = &mut closed.backend {
-        backend.shutdown();
+    if let Some(retired) = closed.retired.take() {
+        retired.into_backend().shutdown();
     }
     assert_eq!(f.tabs.active(), spare);
     editor.release(clear_buffer());
@@ -695,7 +704,7 @@ fn a_session_change_meanwhile_is_refused() {
 
     // The tab now holds another session: its backend is swapped for one that opened a different id.
     let (other, backend) = live_backend(&f.project);
-    let old = std::mem::replace(&mut f.tabs.get_mut(f.tab).unwrap().backend, TabBackend::Live(backend));
+    let old = f.tabs.get_mut(f.tab).unwrap().set_backend(TabBackend::Live(backend));
     if let TabBackend::Live(mut old) = old {
         old.shutdown();
     }
@@ -809,7 +818,7 @@ fn a_window_that_holds_no_presence_refuses_every_write() {
         .unwrap();
     let tab = tabs.active();
     let (provider, backend) = live_backend(&project);
-    tabs.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
     provider.open_session(SESSION, &project);
     until("the session", || {
         tabs.pump(&project, true);
@@ -826,9 +835,9 @@ fn a_window_that_holds_no_presence_refuses_every_write() {
     let why = result_of(&outs, "r1").unwrap_err();
     assert!(why.starts_with("this window's presence lock is not held"), "{why}");
     assert_eq!(editor.asked(), 0);
-    for mut tab in tabs.take_all() {
-        if let TabBackend::Live(backend) = &mut tab.backend {
-            backend.shutdown();
+    for tab in tabs.take_all() {
+        if let Some(retired) = tab.retired {
+            retired.into_backend().shutdown();
         }
     }
 }
@@ -931,8 +940,8 @@ fn a_comment_whose_tab_closed_while_it_was_quoted_is_refused() {
     let _spare = f.tabs.open(eitri_core::tab_set::AgentId::Claude);
     let mut outs = f.handle(None, comment("c1", f.tab, n, "a.txt", "hello"));
     let mut closed = f.tabs.remove(f.tab).unwrap();
-    if let TabBackend::Live(backend) = &mut closed.backend {
-        backend.shutdown();
+    if let Some(retired) = closed.retired.take() {
+        retired.into_backend().shutdown();
     }
     if !answered(&outs, "c1") {
         outs.extend(f.drive(None, "c1"));
@@ -2033,8 +2042,8 @@ fn an_editor_revert_for_a_closed_tab_is_dropped() {
     editor.queue_event(revert_event(&f, n, "a.txt", 1, 2, "two", "TWO", "lf"));
     let gone = f.tab;
     let mut closed = f.tabs.remove(gone).expect("the tab was open");
-    if let TabBackend::Live(backend) = &mut closed.backend {
-        backend.shutdown();
+    if let Some(retired) = closed.retired.take() {
+        retired.into_backend().shutdown();
     }
     let outs = tick_until(&mut f, &editor, "the events to be drained", |_| {
         editor.events.borrow().is_empty()

@@ -1,7 +1,7 @@
 //! One window's session tabs: one conversation, and so one `AgentBackend`,
 //! per tab, every one of them running. GTK-free: `eitri_panel::agent_panel` spawns the connect and
 //! handoff workers and hands this set their receivers; the panel's tick calls [`TabSet::pump_views`], which
-//! drains EVERY tab -- `take_ui_delivery` is where the permission policy answers what needs no
+//! drains EVERY tab -- `take_revised_ui_delivery` is where the permission policy answers what needs no
 //! human, so a tab that was not pumped would stall on its first `Read`.
 //!
 //! **Lock order, inherited:** on the sidecar path `projection()` holds the ingestion mutex and
@@ -22,7 +22,7 @@ use crate::agent_bridge::{
     serialize_tabs_for_js, CallNotes, SessionModeChoice, SnapshotView, TabRef, TabStateWire, TabView, TurnTime,
 };
 use crate::attention::{Attention, AttentionTracker};
-use crate::saved_tabs::{SavedExternalTab, SavedTab, SavedTabs};
+use crate::saved_tabs::{SavedTab, SavedTabs};
 use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
 pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
@@ -109,9 +109,6 @@ pub struct PendingHandoff {
     /// path ignores it and it is dropped with the rest of this struct when the command is
     /// dispatched, at which point the worker's send simply fails.
     pub dropped_rx: mpsc::Receiver<()>,
-    /// The chat page the handoff was asked from: it holds the request, so its `command_result` goes
-    /// there even if the tab has moved to another view since.
-    pub page: ViewId,
 }
 
 /// One message typed while a turn ran. `wire` uses the editor context at the moment it was
@@ -164,12 +161,12 @@ pub enum QueuedState {
 /// What a flush sent, and how the backend answered.
 pub struct Flush {
     pub typed: String,
-    pub outcome: Result<Vec<agent::AgentDomainEvent>, BackendError>,
+    pub outcome: Result<(), BackendError>,
 }
 
 pub enum SendNow {
     /// A turn was running: it was asked to stop; the queue goes out when it ends.
-    Interrupting(Result<Vec<agent::AgentDomainEvent>, BackendError>),
+    Interrupting(Result<(), BackendError>),
     /// Idle: flushed at once (`None` when there was nothing to send).
     Flushed(Option<Flush>),
 }
@@ -226,11 +223,6 @@ pub struct Tab {
     pub number: u16,
     /// The rename (`prefix ,`), already normalized.
     pub name: Option<String>,
-    /// The first prompt's title, or the resumed record's display title.
-    pub title: Option<String>,
-    /// `title` came from the record a resume or restore was started from, before the CLI's own title
-    /// for the session may have been read: a later read replaces it ([`TabSet::retitle_from`]).
-    pub title_from_record: bool,
     /// The tab's permission mode survives panel reloads. Keep it private so entering bypass can
     /// only happen through `cycle_mode`/`confirm_bypass`, which require confirmation.
     /// `mode()` provides read-only access; this module's tests may write the field directly.
@@ -241,21 +233,11 @@ pub struct Tab {
     /// The chat view that shows this tab: the base view unless the tab was bound to an extra one.
     /// Private so that only the set binds a tab, which keeps the base view's active tab unbound.
     view: ViewId,
-    /// The view this tab was just moved out of, whose page may still post one `draft` for it: its
-    /// composer mirrors on a timer and flushes when it loses the keys, which can land after the move.
-    /// Cleared once that draft is taken, or as soon as the draft is set any other way (a newer
-    /// mirror, an nvim edit, a send, a start-over): that copy is newer than the late one.
-    left_view: Option<ViewId>,
-    pub backend: TabBackend,
-    /// Which of the project's own configuration tiers the session of this tab was given; set when
-    /// the session is spawned, so a later change of the window's answer leaves running sessions as
-    /// they were.
-    pub project_tiers: Option<agent::setting_sources::ProjectTrust>,
+    /// Private so that a live backend leaves a tab only through the set, as a counted [`Retired`];
+    /// [`Tab::backend`] reads it, [`TabSet::start`] puts a connect in.
+    backend: TabBackend,
+    pub session: SessionState,
     pub attention: AttentionTracker,
-    /// The WebView's copy is behind: this tab took events while it was not active.
-    pub stale: bool,
-    pub turn_trace: Option<crate::turn_trace::TurnTrace>,
-    pub reported_start_failure: bool,
     /// Whether the session had been open when the tab went `Failed`, so the panel words the
     /// failure as a session that stopped rather than one that never started. Every place that
     /// swaps in `Failed` sets it; it means nothing while the backend is anything else.
@@ -268,101 +250,15 @@ pub struct Tab {
     pub pending_handoff: Option<PendingHandoff>,
     /// Held per tab here so a panel reload cannot lose the last terminal handoff.
     pub last_handoff: Option<agent::handoff::ClaudeResumeCommand>,
-    /// Messages typed while a turn ran, oldest first. Flushed as one turn when the
-    /// turn ends, never while a card waits.
-    pub queue: Vec<Queued>,
-    /// Why the last flush was refused. Cleared by a flush that goes out, a take-back or
-    /// a reset.
-    pub queue_error: Option<String>,
-    /// Why messages typed while the turn ran are held rather than in the turn (the agent cannot take
-    /// them, refused one, or the turn ended before it read one). Shown once under the queue; cleared when
-    /// nothing is held any more.
-    pub queue_note: Option<String>,
-    /// The panel's composer text, mirrored here so a switch or a reload cannot lose it.
-    pub draft: String,
-    /// Permission id -> the rule the card offers: only for a card a rule would answer.
-    pub rule_offers: std::collections::BTreeMap<String, agent::PrefixRule>,
     /// The scratch edit of the draft in nvim, when one is open (set by the shell's round trip).
     pub editing_draft: Option<u64>,
     /// The comments and reverts collected in this tab's turn review. Held here, not in the WebView,
     /// so a panel reload keeps it; it goes with the tab and is not saved.
     pub review_draft: crate::turn_review::ReviewDraft,
-    /// Whether a turn is running in what the pump has DELIVERED (a `TurnStarted` without its
-    /// `TurnCompleted`), so it reports a turn's end exactly once. Read off the event
-    /// stream rather than re-read from `projection()` after the delivery: on the sidecar path the
-    /// ingestion thread folds into the projection concurrently, so a re-read can already include a
-    /// completion the delivery did not carry, and the end was then never reported.
-    was_running: bool,
-    /// What the rows and cards say beyond the projection, kept for every later snapshot: the saved
-    /// rule that answered a call (`note_rule_answers`), and the `Write` cards whose
-    /// file did not exist when they were raised (`note_new_files`).
+    /// What the rows and cards say beyond the projection, kept for every later snapshot: who answered
+    /// a call without a card ([`NoteLedger`]), and the `Write` cards whose file did not exist when
+    /// they were raised (`note_new_files`).
     notes: CallNotes,
-    /// Tool-use id -> the rule and `(tool_name, input)` whose gate
-    /// `AgentBackend::answer_what_needs_no_human` answered. Kept until the call completes, then moved
-    /// to `notes.allowed_by_rule`, like `auto_edit_candidates`.
-    /// Only `AnsweredForYou::by_rule` fills this map. A call merely starting is not evidence that a
-    /// rule answered it: CLI validation may fail first, or bypass may answer the gate instead.
-    /// A later card for the same call removes the candidate, by id or by matching `(tool_name, input)`
-    /// when no id is supplied. The provider may send `toolUseId: ''`, which `translate.rs` maps to
-    /// `None`; matching only by id would wrongly label a later human approval as "allowed by rule".
-    /// A `Resync` converts candidates whose calls finished among dropped events into notes. It drops
-    /// candidates still awaiting a human in the projection, since overflow can lose the
-    /// `PermissionRequested` that would have removed them. Cleared on fresh backend installation
-    /// (`collect_starts`).
-    rule_candidates: std::collections::BTreeMap<String, RuleCandidate>,
-    /// Tool-use id -> the `(tool_name, input)` seen by the acceptEdits fast path when it answered
-    /// a `Write`/`Edit`/`NotebookEdit` gate. Completion turns it into `notes.allowed_by_auto` through
-    /// `note_auto_edit_answers`. Fill only from `AgentBackend::take_revised_ui_delivery` answers
-    /// marked by `AnsweredForYou::by_the_fast_path`. A call can finish without a card because CLI
-    /// validation failed before any gate, so completion alone is insufficient. A later card drops
-    /// the candidate by id, or by matching `(tool_name, input)` if the card has no id, just as for
-    /// `rule_candidates`. `Resync` turns candidates completed among dropped events into notes.
-    /// Clear with `prompt_note_candidates`.
-    auto_edit_candidates: std::collections::BTreeMap<String, CandidateCall>,
-    /// Tool-use ids already in `notes.auto_creates_file` that no events payload has carried yet
-    ///. The note is made when the gate is answered, and a gate
-    /// usually arrives in a batch of its own that the answer leaves empty (`RevisedDelivery::
-    /// Nothing`, no payload), so it waits here for the next one; a `Resync`'s snapshot carries every
-    /// note and empties it. Cleared with `auto_edit_candidates`.
-    creates_file_unsent: BTreeSet<String>,
-    /// The pending permission ids `rule_offers` was last computed for, sorted, so the classifier
-    /// (which canonicalizes `Bash` arguments) runs once per change rather than every tick.
-    rule_offers_seen: Vec<String>,
-    /// The running turn's id and when (wall clock, ms since the epoch) the first tick saw it
-    /// running. The panel holds only the active tab's state, so without this a switch back to a tab
-    /// mid-turn restarted its elapsed clock at `0s+` (the phase-3 GUI pass, 2026-09-25); the
-    /// snapshot carries it as `turnStartedAtMs`. Stamped from the projection, not from a
-    /// `TurnStarted` event, because a legacy `TurnStarted` is returned by `send_turn` and never
-    /// pumped -- so it is at most one 33 ms tick late, on both backends.
-    turn_clock: Option<(String, u64)>,
-    /// How many of the newest entries in `notes.turn_times` no payload has carried yet. The active
-    /// tab's events payload takes exactly those; a snapshot carries all of them and zeroes this. A
-    /// background tab's count grows until a switch sends its snapshot.
-    turn_times_unsent: usize,
-    /// Permission ids this tab answered `allow` for, through `approve_pending` in bypass or
-    /// `answer_what_needs_no_human` under the classifier, while awaiting `PermissionResolved`.
-    /// Hide these from `SnapshotView::of` and the tray's resync/attention feed so answered requests
-    /// never draw or count as cards. Only `tab_set` may insert, keeping the hiding rule within
-    /// this module. This module's tests read the set directly.
-    host_answered: BTreeSet<String>,
-    /// The calls the user approved on a card in this tab, this turn, each with the tool and input the
-    /// card showed: the CLI's own prompt for exactly such a call, which follows the
-    /// gate's request for it, is answered `allow` without a second card, once -- as the real CLI asks
-    /// once. Written only by `TabSet::answer_card` on an Approve that reached the provider; emptied
-    /// when the turn ends (the CLI asks within the turn that made the call), on EVERY `Resync` (one
-    /// can swallow a turn boundary -- Codex's finding), on `r` and with the backend. Private for the
-    /// reason `host_answered` is.
-    human_allowed: crate::agent_backend::HumanApprovals,
-    /// Tool-use id -> the note for a call whose CLI prompt was answered without a card.
-    /// On completion it becomes `notes.prompt_notes`, as a rule candidate does.
-    prompt_note_candidates: std::collections::BTreeMap<String, String>,
-    /// Permission ids the user answered on a card here (`TabSet::answer_card`, any response)
-    /// that the projection still lists as pending until the provider's `PermissionResolved` arrives.
-    /// `refresh_offers` never offers a rule for them again, and [`Tab::card_is_waiting`] returns false,
-    /// so replaying a response after a tab switch or panel reload cannot save a rule. Removing an
-    /// offer only once is insufficient: a later pump could recreate it when another id arrives.
-    /// Pruned with `host_answered` once the id leaves the projection, and private for the same reason.
-    user_answered: BTreeSet<String>,
     /// The flags of the writes (a revert, an undo) waiting on this tab ([`TabSet::review_ticket`]).
     /// Weak, so a finished write's flag goes with it; closing the tab clears every one that is
     /// still alive. Private: only the ticket route registers or clears them.
@@ -374,21 +270,132 @@ pub struct Tab {
     gate_log: Vec<crate::agent_backend::GateAnswer>,
 }
 
-/// Keeps the row note of each CLI prompt the host answered that names its call, for the call's row
-/// once it completes. Takes the map, not the tab, so a caller holding the tab's backend borrowed can
-/// still use it.
-fn note_answered_prompts(
-    candidates: &mut std::collections::BTreeMap<String, String>,
-    prompts: Vec<crate::agent_backend::PromptAnsweredForYou>,
-) {
-    candidates.extend(
-        prompts
-            .into_iter()
-            .map(|answered| (answered.tool_use_id, answered.note)),
-    );
+/// State replaced together when a tab installs or starts over a session. Public only because
+/// `Tab::session` is; the fields that decide what the page and the tray may show stay private, so
+/// only this module can change them.
+#[derive(Default)]
+pub struct SessionState {
+    /// The first prompt's title, or the resumed record's display title.
+    pub title: Option<String>,
+    /// `title` came from the record a resume or restore was started from, before the CLI's own title
+    /// for the session may have been read: a later read replaces it ([`TabSet::retitle_from`]).
+    pub title_from_record: bool,
+    /// The view this tab was just moved out of, whose page may still post one `draft` for it: its
+    /// composer mirrors on a timer and flushes when it loses the keys, which can land after the move.
+    /// Cleared once that draft is taken, or as soon as the draft is set any other way (a newer
+    /// mirror, an nvim edit, a send, a start-over): that copy is newer than the late one.
+    left_view: Option<ViewId>,
+    /// Which of the project's own configuration tiers the session of this tab was given; set when
+    /// the session is spawned, so a later change of the window's answer leaves running sessions as
+    /// they were. Kept when the backend is installed, since it is set while the tab is starting.
+    pub project_tiers: Option<agent::setting_sources::ProjectTrust>,
+    /// The page needs a snapshot because this session received events while hidden.
+    pub stale: bool,
+    /// Tracks a turn's progress from input through delivery to the page.
+    pub turn_trace: Option<crate::turn_trace::TurnTrace>,
+    /// Prevents reporting the same start failure more than once.
+    pub reported_start_failure: bool,
+    /// Messages typed while a turn ran or while the session started, oldest first, kept across page
+    /// reloads. Flushed as one turn when the turn ends, never while a card waits.
+    pub queue: Vec<Queued>,
+    /// The last refused flush's reason, until the queue changes or is sent.
+    pub queue_error: Option<String>,
+    /// Explains why messages are held instead of entering the running turn.
+    pub queue_note: Option<String>,
+    /// The composer mirror survives tab switches and page reloads.
+    draft: String,
+    /// Permission id to the saved rule offered on its waiting card.
+    pub rule_offers: std::collections::BTreeMap<String, agent::PrefixRule>,
+    /// Tracks delivered turn boundaries so a turn's end is reported once. Re-reading the projection
+    /// instead could see a completion folded concurrently before its delivery reaches the pump.
+    was_running: bool,
+    /// Calls answered without a card, waiting for completion before their row says who answered
+    /// ([`NoteLedger`]).
+    note_ledger: NoteLedger,
+    /// File-creation notes that no events payload has carried yet. The note is made when the gate is
+    /// answered, and a gate usually arrives in a batch of its own that the answer leaves empty (no
+    /// payload), so it waits here for the next one; a `Resync`'s snapshot carries every note and
+    /// empties it.
+    creates_file_unsent: BTreeSet<String>,
+    /// Sorted pending ids prevent recomputing unchanged rule offers on every tick.
+    rule_offers_seen: Vec<String>,
+    /// The running turn's id and when (wall clock, ms since the epoch) the first tick saw it running.
+    /// The panel holds only the active tab's state, so without this a switch back to a tab mid-turn
+    /// would restart its elapsed clock; the snapshot carries it as `turnStartedAtMs`. Stamped from the
+    /// projection, not from a `TurnStarted` event, so a snapshot and a pumped batch use the same
+    /// clock; it is at most one 33 ms tick late, on every backend.
+    turn_clock: Option<(String, u64)>,
+    /// How many of the newest entries in `notes.turn_times` no payload has carried yet. The active
+    /// tab's events payload takes exactly those; a snapshot carries all of them and zeroes this.
+    turn_times_unsent: usize,
+    /// Permission ids this tab answered `allow` on the user's behalf (in bypass, or under the
+    /// classifier) and is still waiting on the provider's `PermissionResolved` for. Hidden from the
+    /// snapshot and from the tray, so a request nobody needs to see never draws a card and never
+    /// counts. Private: only `tab_set` may insert, so the hiding rule cannot be bypassed from outside
+    /// this module.
+    host_answered: BTreeSet<String>,
+    /// The calls the user approved on a card in this tab, this turn, each with the tool and input the
+    /// card showed: the CLI's own prompt for exactly such a call, which follows the gate's request
+    /// for it, is answered `allow` without a second card, once, as the real CLI asks once. Written
+    /// only by `TabSet::answer_card` on an Approve that reached the provider; emptied when the turn
+    /// ends (the CLI asks within the turn that made the call), on every `Resync` (one can swallow a
+    /// turn boundary), on a start-over and with the backend. Private for the reason `host_answered`
+    /// is.
+    human_allowed: crate::agent_backend::HumanApprovals,
+    /// Permission ids the user answered on a card here (any decision) that the projection still lists
+    /// as pending, on the sidecar path until the provider's own `PermissionResolved` arrives. A rule
+    /// is never offered for one again and [`Tab::card_is_waiting`] says no, so a second response for
+    /// the same id (a replay after a tab switch or a page reload) can never save a rule; removing the
+    /// offer once was not enough, as the next pump that saw another id arrive put it back. Pruned
+    /// with `host_answered` once the id leaves the projection. Private for the reason
+    /// `host_answered` is.
+    user_answered: BTreeSet<String>,
+}
+
+impl SessionState {
+    /// What a tab without a backend forgets: the backend that answered, noted or timed these on the
+    /// user's behalf is gone, so there is nothing left to hide or note. The title, tiers, draft and
+    /// queue stay until the next session boundary.
+    fn forget_answers(&mut self) {
+        self.was_running = false;
+        self.turn_clock = None;
+        self.host_answered.clear();
+        self.human_allowed.clear();
+        self.note_ledger.clear();
+        self.creates_file_unsent.clear();
+        self.user_answered.clear();
+    }
+
+    /// The part a freshly installed backend starts with. What the tab gathered while its backend
+    /// connected is kept: the tiers it was spawned with, what the user typed or queued meanwhile, and
+    /// whether the page's copy is behind. Everything the earlier session answered, noted or timed is
+    /// dropped, and so is any field added later unless it is named here.
+    fn for_installed_backend(self) -> SessionState {
+        SessionState {
+            project_tiers: self.project_tiers,
+            left_view: self.left_view,
+            draft: self.draft,
+            queue: self.queue,
+            queue_error: self.queue_error,
+            queue_note: self.queue_note,
+            stale: self.stale,
+            ..SessionState::default()
+        }
+    }
 }
 
 impl Tab {
+    /// The composer mirror survives tab switches and page reloads.
+    pub fn draft(&self) -> &str {
+        &self.session.draft
+    }
+
+    /// A replacement is newer than a mirror still on its way from the previous view.
+    fn replace_draft(&mut self, text: String) {
+        self.session.draft = text;
+        self.session.left_view = None;
+    }
+
     /// Every request this tab's host answered itself (a deferral or an `allow`), recorded where the
     /// answer was sent, so it holds one a resolution had already removed from the projection.
     #[cfg(any(test, feature = "test-support"))]
@@ -401,41 +408,19 @@ impl Tab {
             id,
             number,
             name: None,
-            title: None,
-            title_from_record: false,
             mode,
             agent,
             view: ViewId::BASE,
-            left_view: None,
             backend: TabBackend::NotStarted,
-            project_tiers: None,
+            session: SessionState::default(),
             attention: AttentionTracker::default(),
-            stale: false,
-            turn_trace: None,
-            reported_start_failure: false,
             failed_after_start: false,
             failed_resume: None,
             pending_handoff: None,
             last_handoff: None,
-            queue: Vec::new(),
-            queue_error: None,
-            queue_note: None,
-            draft: String::new(),
-            rule_offers: std::collections::BTreeMap::new(),
             editing_draft: None,
             review_draft: crate::turn_review::ReviewDraft::default(),
-            was_running: false,
-            rule_offers_seen: Vec::new(),
             notes: CallNotes::default(),
-            rule_candidates: std::collections::BTreeMap::new(),
-            auto_edit_candidates: std::collections::BTreeMap::new(),
-            creates_file_unsent: BTreeSet::new(),
-            turn_clock: None,
-            turn_times_unsent: 0,
-            host_answered: BTreeSet::new(),
-            human_allowed: crate::agent_backend::HumanApprovals::default(),
-            prompt_note_candidates: std::collections::BTreeMap::new(),
-            user_answered: BTreeSet::new(),
             review_watchers: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             gate_log: Vec::new(),
@@ -455,7 +440,7 @@ impl Tab {
     /// as pending and `user_answered` does not contain it. The panel checks this before saving an
     /// "Always allow" rule.
     pub fn card_is_waiting(&self, permission_id: &str) -> bool {
-        !self.user_answered.contains(permission_id)
+        !self.session.user_answered.contains(permission_id)
             && self
                 .live()
                 .is_some_and(|backend| backend.projection().pending_permissions.contains_key(permission_id))
@@ -463,7 +448,7 @@ impl Tab {
 
     /// When this tab's running turn started, if one is running (see `turn_clock`).
     pub fn turn_started_at_ms(&self) -> Option<u64> {
-        self.turn_clock.as_ref().map(|(_, at)| *at)
+        self.session.turn_clock.as_ref().map(|(_, at)| *at)
     }
 
     /// The tab's own permission mode. Read-only outside this module -- see the field's own doc.
@@ -490,7 +475,7 @@ impl Tab {
             AgentId::Claude => kind == BackendKind::Sidecar,
             AgentId::Codex => true,
             AgentId::Acp(_) => match &self.backend {
-                TabBackend::Live(AgentBackend::External(external)) => external.conversation().resumes(),
+                TabBackend::Live(AgentBackend::Conversation { conversation, .. }) => conversation.resumes(),
                 TabBackend::Starting(pending) => pending.resume.is_some(),
                 TabBackend::AwaitingTrust(AwaitingTrust {
                     start: DeferredStart::Resume { .. },
@@ -498,6 +483,53 @@ impl Tab {
                 }) => true,
                 _ => false,
             },
+        }
+    }
+
+    /// What this tab holds or is doing to get a session.
+    pub fn backend(&self) -> &TabBackend {
+        &self.backend
+    }
+
+    /// Puts `backend` in place as it is and returns what was there, for a test that builds the state it
+    /// needs; nothing is counted or shut down.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_backend(&mut self, backend: TabBackend) -> TabBackend {
+        std::mem::replace(&mut self.backend, backend)
+    }
+
+    /// A tab the set no longer holds ([`TabSet::remove`], [`TabSet::take_all`]) hands over what is left
+    /// of its backend: a connect or a put-off start, never a live session, which the set took out first.
+    pub fn into_backend(self) -> TabBackend {
+        self.backend
+    }
+
+    /// Puts `Failed { reason }` in place of the backend together with the two fields every such swap
+    /// sets: whether the session had opened (`after_start`) and the saved session the file keeps for
+    /// the tab (`failed_resume`). A live backend that was there leaves counted in `retiring`.
+    fn fail_live(
+        &mut self,
+        retiring: &mut RetiringCounts,
+        reason: String,
+        after_start: bool,
+        failed_resume: Option<String>,
+    ) -> Option<Retired> {
+        self.failed_after_start = after_start;
+        self.failed_resume = failed_resume;
+        match std::mem::replace(&mut self.backend, TabBackend::Failed { reason }) {
+            TabBackend::Live(backend) => Some(Retired::new(retiring, self.id, backend)),
+            _ => None,
+        }
+    }
+
+    /// Takes a live backend out, counted in `retiring`, and leaves `NotStarted`; anything else stays.
+    fn retire_live(&mut self, retiring: &mut RetiringCounts) -> Option<Retired> {
+        match std::mem::replace(&mut self.backend, TabBackend::NotStarted) {
+            TabBackend::Live(backend) => Some(Retired::new(retiring, self.id, backend)),
+            other => {
+                self.backend = other;
+                None
+            }
         }
     }
 
@@ -540,28 +572,34 @@ impl Tab {
     /// where it stood, with the reason. Read from the projection's record (`steer_outcome`), not from a
     /// batch of events, so a resync that dropped the events loses none of it. Whether the queue changed.
     fn settle_steered(&mut self) -> bool {
-        if self.queue.iter().all(|q| q.is_held() && q.dropped_as.is_empty()) {
+        if self
+            .session
+            .queue
+            .iter()
+            .all(|q| q.is_held() && q.dropped_as.is_empty())
+        {
             return false;
         }
         let TabBackend::Live(backend) = &self.backend else {
             return false;
         };
         let projection = backend.projection();
-        settle_against(&mut self.queue, &mut self.queue_note, &projection)
+        settle_against(&mut self.session.queue, &mut self.session.queue_note, &projection)
     }
 
-    /// The tab's session is being taken away (a tripwire): what it reported is applied, and a message
-    /// still in the turn is held again, since nothing will report on it any more.
+    /// The tab's session is being taken away (a tripwire, a fatal outcome, a session that never opened, the
+    /// terminal handoff): what it reported is applied, and a message still in the turn is held again, since
+    /// nothing will report on it any more.
     /// Whether the queue changed.
     fn hold_steered_on_failure(&mut self) -> bool {
         let settled = self.settle_steered();
-        if self.queue.iter().all(Queued::is_held) {
+        if self.session.queue.iter().all(Queued::is_held) {
             return settled;
         }
-        for item in self.queue.iter_mut() {
+        for item in self.session.queue.iter_mut() {
             item.state = QueuedState::Held;
         }
-        self.queue_note = Some(held_note("the session was closed before the agent read it"));
+        self.session.queue_note = Some(held_note("the session was closed before the agent read it"));
         true
     }
 
@@ -573,7 +611,7 @@ impl Tab {
 
     /// The messages sent into the running turn that the agent has not been seen to read.
     pub fn steered_unconfirmed(&self) -> usize {
-        self.queue.iter().filter(|q| !q.is_held()).count()
+        self.session.queue.iter().filter(|q| !q.is_held()).count()
     }
 
     /// The session `r` continues on this ended tab: one its agent stopped itself with the conversation whole,
@@ -622,7 +660,7 @@ impl Tab {
 
     pub fn label_name(&self) -> String {
         let id = self.provider_session_id();
-        tabs::label_name(self.name.as_deref(), self.title.as_deref(), id.as_deref())
+        tabs::label_name(self.name.as_deref(), self.session.title.as_deref(), id.as_deref())
     }
 
     fn view(&self, resumable: bool) -> TabView {
@@ -643,7 +681,7 @@ impl Tab {
             },
             failed_after_start: matches!(self.backend, TabBackend::Failed { .. }) && self.failed_after_start,
             resumes_on_r: self.resumes_on_r(resumable).is_some(),
-            title: self.title.clone(),
+            title: self.session.title.clone(),
             agent: self.agent.record_name(),
         }
     }
@@ -669,7 +707,7 @@ pub struct PumpOutput {
     pub queue_changed: Vec<TabId>,
     /// Tabs failed this tick because their CLI reported an ungated permission mode, with each
     /// backend removed for shutdown. The caller shuts them down off the GTK thread, as it does for
-    /// closed tabs (`eitri_panel::agent_panel`'s `Retiring::backend`).
+    /// closed tabs (`eitri_panel::agent_panel`'s `spawn_teardown`).
     pub tripped: Vec<Tripped>,
     /// Turns whose end snapshot landed this tick, for the status band (empty without a turn
     /// review installed).
@@ -698,7 +736,62 @@ pub struct Tripped {
     pub reason: String,
     /// The session, still running until the caller shuts it down: its shutdown is what denies the
     /// requests left pending in it.
-    pub backend: AgentBackend,
+    pub retired: Retired,
+}
+
+/// How many shutdowns are outstanding per tab id ([`TabSet::retire_done`] ends one).
+type RetiringCounts = std::collections::BTreeMap<u64, usize>;
+
+/// A live backend taken out of its tab to be shut down off the GTK thread. Only the set builds one,
+/// and building one counts the tab as retiring: until the caller reports [`TabSet::retire_done`] for
+/// [`Retired::tab`], the window's presence stays as if a turn of the tab ran, since an agent's
+/// subagent can still write while its session shuts down. Every way a backend leaves a tab yields
+/// one: a close, `r`, the tripwire, a lost session, the terminal handoff and the window's close.
+#[must_use = "a retired backend is shut down off the GTK thread and its retirement reported"]
+pub struct Retired {
+    tab: TabId,
+    backend: AgentBackend,
+}
+
+impl Retired {
+    /// The one constructor: counts `tab` as retiring in `retiring`. The caller syncs the presence.
+    fn new(retiring: &mut RetiringCounts, tab: TabId, backend: AgentBackend) -> Self {
+        *retiring.entry(tab.0).or_insert(0) += 1;
+        Retired { tab, backend }
+    }
+
+    /// The tab the backend was counted as retiring for.
+    pub fn tab(&self) -> TabId {
+        self.tab
+    }
+
+    pub fn backend(&self) -> &AgentBackend {
+        &self.backend
+    }
+
+    /// The backend itself, for the worker that shuts it down and drops it.
+    pub fn into_backend(self) -> AgentBackend {
+        self.backend
+    }
+}
+
+/// A tab taken out of the set ([`TabSet::remove`], [`TabSet::take_all`]): the tab, whose backend is
+/// whatever was not live (a connect, a put-off start), and the live backend, retired.
+pub struct RemovedTab {
+    pub tab: Tab,
+    pub retired: Option<Retired>,
+}
+
+/// How a tab's session was lost, for [`TabSet::fail_session`]: it decides how the panel words the
+/// failure and whether the saved-tabs file keeps the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedHow {
+    /// The session had opened and then stopped (a command's fatal outcome): the panel says it stopped,
+    /// and the file no longer keeps it.
+    AfterStart,
+    /// The session ended before it ever opened: the panel says it never started, and the file keeps the
+    /// conversation it was starting or resuming until the tab is closed or started over.
+    StartNeverOpened,
 }
 
 /// The line under the queue that says why its messages wait for the turn to end.
@@ -888,13 +981,8 @@ pub enum ModeCycle {
 /// What `confirm_bypass` did with a stored `BypassPlan`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfirmOutcome {
-    /// Entered bypass, approving `approved` cards from the plan. `resolved` holds the local
-    /// `AgentBackend::approve_pending` events: legacy `PermissionResolved`s that no pump carries.
-    /// The caller must send them to the panel or approved cards stay drawn. Empty on the sidecar.
-    Entered {
-        approved: usize,
-        resolved: Vec<AgentDomainEvent>,
-    },
+    /// Entered bypass, having approved `approved` cards. Resolutions reach the page through the pump.
+    Entered { approved: usize },
     /// The tab was already in bypass by the time this confirm arrived (a race, not an error):
     /// nothing to do.
     AlreadyBypass,
@@ -1026,7 +1114,7 @@ pub struct TabSet {
     /// left must not be mistaken for a user who closed every tab.
     closing: bool,
     /// Watches every tab's turns and snapshots the project around them; `None` until installed,
-    /// and never on the legacy backend, whose turn starts never pass through the pump. Only the
+    /// and never on the legacy backend, which does not support turn review. Only the
     /// pump and the tab bookkeeping feed it: no answer or send path reads it.
     turn_review: Option<crate::turn_review::TurnReview>,
     /// The user switched turn review off (`review.enabled = false`): no review is installed and a
@@ -1037,10 +1125,11 @@ pub struct TabSet {
     /// window's revert. `None` until [`TabSet::hold_presence`].
     presence: Option<crate::turn_review::PresenceHolder>,
     /// Tabs whose backend left them still live and is being shut down elsewhere (a closed tab, `r`,
-    /// a tripped or failed session), each with how many such shutdowns are outstanding. Their
-    /// presence is kept as if a turn ran: an agent's subagent can still write during the shutdown's
-    /// grace. [`TabSet::retire_done`] ends one.
-    retiring: std::collections::BTreeMap<u64, usize>,
+    /// a tripped or failed session, a terminal handoff, the window's close), each with how many such
+    /// shutdowns are outstanding. Only [`Retired`]'s constructor adds to it. Their presence is kept as
+    /// if a turn ran: an agent's subagent can still write during the shutdown's grace.
+    /// [`TabSet::retire_done`] ends one.
+    retiring: RetiringCounts,
     /// What every live backend calls when it folded something, so the window need not poll for it
     /// ([`set_ui_wake`](Self::set_ui_wake)).
     ui_wake: Option<agent::UiWake>,
@@ -1057,8 +1146,8 @@ pub struct TabSet {
     #[cfg(test)]
     redeliver_covered: bool,
     /// One-shot test hook just before the `Resync` snapshot read, after the early turn-clock read,
-    /// the three `projection()` calls and `approve_pending`'s bypass sweep. This reaches the race
-    /// that `after_drain`, which runs before those lock cycles, cannot.
+    /// the projection read and `approve_pending`'s bypass sweep. This reaches the race that
+    /// `after_drain`, which runs before those lock cycles, cannot.
     #[cfg(test)]
     before_resync_snapshot: Option<BackendSeam>,
 }
@@ -1105,7 +1194,7 @@ impl TabSet {
             turn_review: None,
             turn_review_off: false,
             presence: None,
-            retiring: std::collections::BTreeMap::new(),
+            retiring: RetiringCounts::new(),
             ui_wake: None,
             layout_views: Vec::new(),
             #[cfg(test)]
@@ -1142,7 +1231,7 @@ impl TabSet {
     pub fn retitle_from(&mut self, title_of: impl Fn(&str) -> Option<String>) -> bool {
         let mut changed = false;
         for tab in &mut self.tabs {
-            if !tab.title_from_record {
+            if !tab.session.title_from_record {
                 continue;
             }
             let Some(session) = tab.live().and_then(AgentBackend::provider_session_id) else {
@@ -1151,9 +1240,9 @@ impl TabSet {
             // Once: the tab takes the CLI's title as it is when first known (the old synchronous read at the
             // resume did no more), or keeps its own when that already is it, and follows no later retitle.
             if let Some(title) = title_of(&session) {
-                tab.title_from_record = false;
-                if tab.title.as_ref() != Some(&title) {
-                    tab.title = Some(title);
+                tab.session.title_from_record = false;
+                if tab.session.title.as_ref() != Some(&title) {
+                    tab.session.title = Some(title);
                     changed = true;
                 }
             }
@@ -1180,8 +1269,7 @@ impl TabSet {
             .is_some_and(crate::turn_review::TurnReview::has_work_in_flight)
     }
 
-    /// Starts reviewing turns. Refused on the legacy backend: its turn starts are returned by the
-    /// send rather than delivered, so the review would never see a turn begin.
+    /// Starts reviewing turns on a backend that supports turn review. Legacy remains unsupported.
     pub fn install_turn_review(&mut self, review: crate::turn_review::TurnReview) -> Result<(), &'static str> {
         if self.kind == BackendKind::Legacy {
             return Err(TURN_REVIEW_NEEDS_SIDECAR);
@@ -1211,7 +1299,7 @@ impl TabSet {
     }
 
     /// Hands the presence the ids of the tabs whose turns run, and of those whose backend is still
-    /// being shut down ([`TabSet::note_retiring`]). Reads only the tabs and touches no disk: the
+    /// being shut down (a [`Retired`] not yet reported done). Reads only the tabs and touches no disk: the
     /// presence thread does that.
     fn sync_presence(&self) {
         if let Some(holder) = &self.presence {
@@ -1226,18 +1314,18 @@ impl TabSet {
         }
     }
 
-    /// A live backend of `tab` was taken away to be shut down elsewhere: until that shutdown has
-    /// returned ([`TabSet::retire_done`]), the window's presence stays as if a turn of `tab` ran, so
+    /// A live backend of `tab` taken away to be shut down elsewhere, counted: until that shutdown is
+    /// reported ([`TabSet::retire_done`]), the window's presence stays as if a turn of `tab` ran, so
     /// no window reverts a file the agent may still be writing. Every backend counts; Claude's
-    /// shutdown is simply quick. The set's own `remove`, `reset` and tripwire call it; a caller that
-    /// takes a live backend out of a tab itself calls it too.
-    pub fn note_retiring(&mut self, tab: TabId) {
-        *self.retiring.entry(tab.0).or_insert(0) += 1;
+    /// shutdown is simply quick.
+    fn retire(&mut self, tab: TabId, backend: AgentBackend) -> Retired {
+        let retired = Retired::new(&mut self.retiring, tab, backend);
         self.sync_presence();
+        retired
     }
 
-    /// One shutdown [`TabSet::note_retiring`] counted for `tab` has returned. A tab with none
-    /// outstanding is left alone.
+    /// The shutdown of one [`Retired`] counted for `tab` has returned. A tab with none outstanding is
+    /// left alone.
     pub fn retire_done(&mut self, tab: TabId) {
         if let Some(count) = self.retiring.get_mut(&tab.0) {
             *count -= 1;
@@ -1246,6 +1334,47 @@ impl TabSet {
             }
         }
         self.sync_presence();
+    }
+
+    /// The session of `tab` is lost (`reason` says why): whatever it reported about the messages put into
+    /// its turn is applied and a message it never read is held again, since nothing will report on it any
+    /// more; then its cards end (`shown`: whether the tab is on screen), `Failed { reason }` takes its
+    /// place, and `failed_after_start` and `failed_resume` are set as `how` says. A live backend is
+    /// returned retired, for the caller to shut down off the GTK thread and report with
+    /// [`TabSet::retire_done`]. `None` for a tab that is gone or held no live backend.
+    pub fn fail_session(&mut self, tab: TabId, reason: String, how: FailedHow, shown: bool) -> Option<Retired> {
+        let at = self.position(tab)?;
+        let t = &mut self.tabs[at];
+        t.hold_steered_on_failure();
+        // The cards of a session that is gone can no longer be answered.
+        t.attention.session_ended(shown);
+        let retired = match how {
+            FailedHow::AfterStart => t.fail_live(&mut self.retiring, reason, true, None),
+            FailedHow::StartNeverOpened => {
+                t.session.reported_start_failure = true;
+                // The session that never opened is still the one the file should keep for this tab.
+                let kept = t.live().and_then(AgentBackend::provider_session_id);
+                t.fail_live(&mut self.retiring, reason, false, kept)
+            }
+        };
+        self.sync_presence();
+        retired
+    }
+
+    /// The live session of `tab`, taken for the terminal handoff: a message it never read is held again,
+    /// as for any session taken away, the tab becomes `NotStarted` (so no further turn can be sent), and
+    /// the backend is returned retired, counted until the caller reports its shutdown with
+    /// [`TabSet::retire_done`]. `None`, and the tab untouched, when it holds no live session.
+    pub fn take_for_handoff(&mut self, tab: TabId) -> Option<Retired> {
+        let t = self.get_mut(tab)?;
+        if !matches!(t.backend, TabBackend::Live(_)) {
+            return None;
+        }
+        t.hold_steered_on_failure();
+        let TabBackend::Live(backend) = std::mem::replace(&mut t.backend, TabBackend::NotStarted) else {
+            unreachable!("matched as live above")
+        };
+        Some(self.retire(tab, backend))
     }
 
     /// The installed turn review, for building review jobs.
@@ -1517,11 +1646,11 @@ impl TabSet {
         base.get(base_index.min(base.len().checked_sub(1)?)).copied()
     }
 
-    /// Takes a tab out and hands it back: its backend, pending start or handoff are the caller's to
-    /// shut down or watch. A live backend is counted as retiring ([`TabSet::note_retiring`]): the
-    /// caller reports [`TabSet::retire_done`] once its shutdown has returned. When the base view's
-    /// last tab goes, a fresh tab 1 opens there, whatever the extra views still hold.
-    pub fn remove(&mut self, id: TabId) -> Option<Tab> {
+    /// Takes a tab out and hands it back: its live backend, retired, its pending start or handoff are
+    /// the caller's to shut down or watch; the caller reports [`TabSet::retire_done`] once the retired
+    /// backend's shutdown has returned. When the base view's last tab goes, a fresh tab 1 opens there
+    ///, whatever the extra views still hold.
+    pub fn remove(&mut self, id: TabId) -> Option<RemovedTab> {
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let base_index = self.base_tabs().iter().position(|t| *t == id);
         let before = self.active;
@@ -1532,10 +1661,8 @@ impl TabSet {
         if let Some(review) = self.turn_review.as_mut() {
             review.close_tab(id.0, wall_clock_ms());
         }
-        if matches!(tab.backend, TabBackend::Live(_)) {
-            // Before the sync below, so the presence never drops between the turn and the shutdown.
-            *self.retiring.entry(id.0).or_insert(0) += 1;
-        }
+        // Counted before the sync below, so the presence never drops between the turn and the shutdown.
+        let retired = tab.retire_live(&mut self.retiring);
         self.sync_presence();
         self.removed_arrived += tab.attention.attention().arrived;
         self.recency.retain(|t| *t != id);
@@ -1567,7 +1694,7 @@ impl TabSet {
             self.drop_bypass_prompt_in(ViewId::BASE);
         }
         debug_assert!(self.v1_holds());
-        Some(tab)
+        Some(RemovedTab { tab, retired })
     }
 
     /// V1: the base view's active tab exists and is a base-view tab (so the base view always holds
@@ -1664,7 +1791,7 @@ impl TabSet {
             .expect("the active tab is a base-view tab");
         let at = self.position(moved).expect("the active tab exists");
         self.tabs[at].view = view;
-        self.tabs[at].left_view = Some(ViewId::BASE);
+        self.tabs[at].session.left_view = Some(ViewId::BASE);
         let fallback = self.base_fallback(base_index).expect("two base-view tabs were checked");
         self.last_active = None;
         self.active = fallback;
@@ -1681,7 +1808,7 @@ impl TabSet {
         let tab = self.tab_in(view)?;
         let at = self.position(tab).expect("tab_in names a tab it has");
         self.tabs[at].view = ViewId::BASE;
-        self.tabs[at].left_view = Some(view);
+        self.tabs[at].session.left_view = Some(view);
         self.drop_prompts_about(tab);
         // The view is left showing nothing: whatever it was asking goes too.
         if self.pending_bypass.as_ref().is_some_and(|plan| plan.page == view) {
@@ -1756,12 +1883,8 @@ impl TabSet {
     /// another now, nothing is stopped and the user is asked to look again, since the answer was to a
     /// different question. Every refusal is benign and leaves the session as it was: no such tab, no
     /// live session, a turn running (an interrupt stops what it left), nothing left running.
-    pub fn stop_background(&mut self, id: TabId, shown: u32) -> Result<Vec<AgentDomainEvent>, BackendError> {
-        let benign = |message: String| BackendError {
-            message,
-            benign: true,
-            folded_events: Vec::new(),
-        };
+    pub fn stop_background(&mut self, id: TabId, shown: u32) -> Result<(), BackendError> {
+        let benign = |message: String| BackendError { message, benign: true };
         let Some(tab) = self.get_mut(id) else {
             return Err(benign(format!("no tab {}", id.0)));
         };
@@ -1995,26 +2118,22 @@ impl TabSet {
                     Some(backend) => backend.approve_pending(&now, "on entering bypass"),
                     None => crate::agent_backend::Approved::default(),
                 };
-                tab.host_answered.extend(answered.ids.iter().cloned());
+                tab.session.host_answered.extend(answered.ids.iter().cloned());
                 // The CLI's own prompts it answered say so on their calls' rows once those complete.
-                note_answered_prompts(&mut tab.prompt_note_candidates, answered.prompts);
+                tab.session
+                    .note_ledger
+                    .record_report(NoteReport::prompts(answered.prompts));
                 let answered_set: BTreeSet<String> = answered.ids.iter().cloned().collect();
                 tab.attention.retain_pending(|id| !answered_set.contains(id));
                 let approved = answered.ids.len();
                 let number = tab.number;
                 eprintln!("[permission] mode is now bypass (tab {number}, approved {approved} waiting)");
-                Ok(ConfirmOutcome::Entered {
-                    approved,
-                    resolved: answered.events,
-                })
+                Ok(ConfirmOutcome::Entered { approved })
             }
             BypassScope::Default => {
                 self.default_mode = SessionModeChoice::Bypass;
                 eprintln!("[permission] mode is now bypass (new sessions)");
-                Ok(ConfirmOutcome::Entered {
-                    approved: 0,
-                    resolved: Vec::new(),
-                })
+                Ok(ConfirmOutcome::Entered { approved: 0 })
             }
         }
     }
@@ -2039,18 +2158,16 @@ impl TabSet {
         page: ViewId,
         permission_id: &str,
         decision: agent::PermissionDecision,
-    ) -> Result<Vec<AgentDomainEvent>, BackendError> {
+    ) -> Result<(), BackendError> {
         let no_session = || BackendError {
             message: "no active session".to_string(),
             benign: true,
-            folded_events: Vec::new(),
         };
         if let Some(tab) = self.get(id) {
             if !self.may_answer(id, page) {
                 return Err(BackendError {
                     message: format!("tab {} is not shown in this page", tab.number),
                     benign: false,
-                    folded_events: Vec::new(),
                 });
             }
         }
@@ -2066,17 +2183,17 @@ impl TabSet {
                 Some((id, p.tool_name.clone(), p.input.clone()))
             });
         let approves = decision.allows();
-        let events = backend.respond_permission(permission_id, decision)?;
+        backend.respond_permission(permission_id, decision)?;
         if approves {
             if let Some((tool_use_id, tool_name, input)) = call {
-                tab.human_allowed.record(&tool_use_id, &tool_name, &input);
+                tab.session.human_allowed.record(&tool_use_id, &tool_name, &input);
             }
         }
         // A successful answer removes the rule offer and adds the id to `user_answered`, preventing
         // a new offer for this card. A failed answer leaves both the card and its offer open.
-        tab.rule_offers.remove(permission_id);
-        tab.user_answered.insert(permission_id.to_string());
-        Ok(events)
+        tab.session.rule_offers.remove(permission_id);
+        tab.session.user_answered.insert(permission_id.to_string());
+        Ok(())
     }
 
     /// Clears every prompt of the window: the bypass prompt, the restore question
@@ -2237,6 +2354,22 @@ impl TabSet {
             .collect()
     }
 
+    /// A connect for `tab` begins: `pending` is what it reports to. A tab that holds a live session
+    /// keeps it, and the connect is dropped (its worker then drops what it builds): nothing reaches
+    /// here for a live tab, since a start begins from an empty tab or one waiting for the trust
+    /// question.
+    pub fn start(&mut self, tab: TabId, pending: PendingStart) {
+        let Some(t) = self.get_mut(tab) else { return };
+        if matches!(t.backend, TabBackend::Live(_)) {
+            eprintln!(
+                "[tabs] tab {}: a start for a tab with a live session was dropped",
+                tab.0
+            );
+            return;
+        }
+        t.backend = TabBackend::Starting(pending);
+    }
+
     fn take_start(&mut self, tab: TabId) -> Option<DeferredStart> {
         let t = self.get_mut(tab)?;
         match std::mem::replace(&mut t.backend, TabBackend::NotStarted) {
@@ -2254,7 +2387,8 @@ impl TabSet {
     }
 
     /// `r`: an ended or failed tab back to empty, keeping its number, name and mode.
-    pub fn reset(&mut self, id: TabId) -> Result<Option<AgentBackend>, String> {
+    /// A live backend comes back retired, for the caller to shut down and report.
+    pub fn reset(&mut self, id: TabId) -> Result<Option<Retired>, String> {
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
         let waiting = matches!(tab.backend, TabBackend::AwaitingTrust(_));
         match tab.wire_state() {
@@ -2263,8 +2397,8 @@ impl TabSet {
             _ if waiting => {}
             _ => return Err("only an ended or failed tab starts over".to_string()),
         }
-        // Restore the queue and unsent draft as the draft, oldest first. A deferred first message
-        // comes before them because it was typed first.
+        // The queue and the unsent draft come back as the draft, oldest first. A first
+        // message that was put off comes back with them, ahead of the rest: it was typed first.
         let mut parts: Vec<String> = Vec::new();
         if let TabBackend::AwaitingTrust(AwaitingTrust {
             start: DeferredStart::FirstSend { first_turn, .. },
@@ -2273,43 +2407,17 @@ impl TabSet {
         {
             parts.push(first_turn.typed.clone());
         }
-        parts.extend(std::mem::take(&mut tab.queue).into_iter().map(|q| q.text));
-        if !tab.draft.trim().is_empty() {
-            parts.push(std::mem::take(&mut tab.draft));
+        parts.extend(std::mem::take(&mut tab.session.queue).into_iter().map(|q| q.text));
+        if !tab.session.draft.trim().is_empty() {
+            parts.push(tab.draft().to_string());
         }
-        tab.draft = parts.join("\n\n");
-        tab.left_view = None;
-        tab.queue_error = None;
-        tab.queue_note = None;
-        tab.rule_offers.clear();
-        tab.rule_offers_seen.clear();
-        tab.user_answered.clear();
-        tab.was_running = false;
         let old = std::mem::replace(&mut tab.backend, TabBackend::NotStarted);
-        // An empty tab shows what its next session would get, not what the last one had.
-        tab.project_tiers = None;
-        tab.title = None;
-        tab.title_from_record = false;
+        tab.session = SessionState::default();
+        tab.replace_draft(parts.join("\n\n"));
         tab.attention.restart();
-        tab.stale = false;
-        tab.turn_trace = None;
-        tab.reported_start_failure = false;
-        // The backend that answered these is gone with `old`, so there is nothing left to hide.
-        // `tab.mode` stays unchanged: a bypass tab resets to an empty bypass tab.
-        tab.host_answered.clear();
-        // Resetting an ended or failed tab to `NotStarted` invalidates the open bypass prompt.
-        // Drop it so `y` cannot answer a question about the tab's previous state. `confirm_bypass` also
-        // rechecks the tab kind before acting.
-        tab.human_allowed.clear();
-        tab.prompt_note_candidates.clear();
-        tab.auto_edit_candidates.clear();
-        tab.creates_file_unsent.clear();
         self.pending_bypass = None;
         Ok(match old {
-            TabBackend::Live(backend) => {
-                self.note_retiring(id);
-                Some(backend)
-            }
+            TabBackend::Live(backend) => Some(self.retire(id, backend)),
             _ => None,
         })
     }
@@ -2333,16 +2441,22 @@ impl TabSet {
             .map(|t| t.id)
     }
 
-    /// Every Claude session this window has open or just handed off: filtered out of `hello`
-    /// and of the chooser's records.
-    pub fn open_session_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.tabs.iter().filter_map(Tab::provider_session_id).collect();
-        ids.extend(
-            self.tabs
-                .iter()
-                .filter_map(|t| t.last_handoff.as_ref().map(|c| c.provider_session_id().to_string())),
-        );
-        ids
+    /// Every session this window has open or just handed off, each with its agent, as session ids are
+    /// each agent's own and two agents may use the same one: filtered out of `hello` and of the
+    /// chooser's records, and left out of a restore. A handed-off session is Claude's, the only agent
+    /// a terminal takes over.
+    pub fn open_sessions(&self) -> Vec<(AgentId, String)> {
+        let mut open: Vec<(AgentId, String)> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.provider_session_id().map(|id| (t.agent.clone(), id)))
+            .collect();
+        open.extend(self.tabs.iter().filter_map(|t| {
+            t.last_handoff
+                .as_ref()
+                .map(|c| (AgentId::Claude, c.provider_session_id().to_string()))
+        }));
+        open
     }
 
     pub fn route_resume(
@@ -2418,525 +2532,525 @@ impl TabSet {
         if let Some(review) = self.turn_review.as_mut() {
             out.review_hints = review.poll();
         }
-        let rules = &self.rules;
-        let ui_wake = self.ui_wake.as_ref();
         let mut review = self.turn_review.as_mut();
+        let mut tick = PumpTick {
+            project_root,
+            rules: &self.rules,
+            ui_wake: self.ui_wake.as_ref(),
+            retiring: &mut self.retiring,
+            #[cfg(test)]
+            after_drain: &mut self.after_drain,
+            #[cfg(test)]
+            redeliver_covered: self.redeliver_covered,
+            #[cfg(test)]
+            before_resync_snapshot: &mut self.before_resync_snapshot,
+        };
         for tab in &mut self.tabs {
             let is_active = tab.id == active;
-            let view = tab.view;
             // `TabSet::is_shown`, read off the tab itself: the set is borrowed by this loop.
-            let in_a_page = is_active || !view.is_base();
-            let on_screen = in_a_page && mapped(view);
-            let TabBackend::Live(backend) = &mut tab.backend else {
-                if let Some(review) = review.as_deref_mut() {
-                    review.tab_has_no_session(tab.id.0, wall_clock_ms());
-                }
-                // No backend holds no card: the backstop `agent_panel` had for `session.is_none()`.
-                tab.attention.retain_pending(|_| false);
-                tab.was_running = false;
-                tab.turn_clock = None;
-                // The backend that answered these on the user's behalf is gone; nothing left to hide.
-                tab.host_answered.clear();
-                tab.human_allowed.clear();
-                tab.prompt_note_candidates.clear();
-                tab.auto_edit_candidates.clear();
-                tab.creates_file_unsent.clear();
-                tab.user_answered.clear();
-                continue;
+            let in_a_page = is_active || !tab.view.is_base();
+            let place = PumpPlace {
+                is_active,
+                in_a_page,
+                on_screen: in_a_page && mapped(tab.view),
             };
-            // A backend put in place some other way than `collect_starts` is told about the wake here.
-            if let Some(wake) = ui_wake {
-                backend.ensure_ui_wake(wake);
-            }
-            let mut turn_ended = false;
-            // Whether this tab's payload goes to the panel this tick (then `shell` prints a complete
-            // trace after dispatching it; otherwise this function does, below).
-            let mut dispatched = false;
-            // `tab.mode`: the classifier's `Auto` path, or bypass answering
-            // everything, and `tab.host_answered` collects every id either path answers so the
-            // Resync arm and `active_state_payloads` can hide them.
-            // `tab.human_allowed`: in `Auto`, the CLI's own prompt for exactly a call
-            // the user approved on a card here is answered without a second card, once. What was
-            // answered without a card becomes a note on its call's row when the call completes.
-            let mut answered_for_you = crate::agent_backend::AnsweredForYou::default();
-            let delivery = backend.take_revised_ui_delivery(
-                project_root,
-                rules,
-                tab.mode.into(),
-                &mut tab.host_answered,
-                &mut tab.human_allowed,
-                &mut answered_for_you,
-            );
-            #[cfg(test)]
-            {
-                if let Some(hook) = self.after_drain.take() {
-                    hook(backend);
-                }
-            }
-            // Take the revision covered by the last snapshot sent for this backend. The drain and snapshot
-            // use separate locks, so ingestion may fold and queue an event between them, leaving it in
-            // both the snapshot and this drain. Each event carries its fold's revision. Folding, queueing
-            // and reading the snapshot revision share one ingestion mutex, so every queued event at or
-            // below that revision was covered and is present in this drain. Take the revision now so no
-            // later drain reuses it. `AgentBackend::note_ui_snapshot` keeps it with the backend so it
-            // cannot outlive the session.
-            let covered = backend.take_ui_snapshot_revision();
-            #[cfg(test)]
-            let covered = covered.filter(|_| !self.redeliver_covered);
-            #[cfg(any(test, feature = "test-support"))]
-            tab.gate_log.extend(answered_for_you.gate_answers);
-            note_answered_prompts(&mut tab.prompt_note_candidates, answered_for_you.prompts);
-            // Keep fast-path answers, saved-rule answers, and `Write` answers for nonexistent files as
-            // captured when answered. The first two wait for call completion (`note_auto_edit_answers`,
-            // `note_rule_answers`); file creation markers need only a payload to carry them
-            // (`creates_file_unsent`).
-            tab.auto_edit_candidates
-                .extend(answered_for_you.by_the_fast_path.into_iter().map(|a| {
-                    (
-                        a.tool_use_id,
-                        CandidateCall {
-                            tool_name: a.tool_name,
-                            input: a.input,
-                        },
-                    )
-                }));
-            tab.rule_candidates
-                .extend(answered_for_you.by_rule.into_iter().map(|a| {
-                    (
-                        a.tool_use_id,
-                        RuleCandidate {
-                            rule: a.rule,
-                            call: CandidateCall {
-                                tool_name: a.tool_name,
-                                input: a.input,
-                            },
-                        },
-                    )
-                }));
-            for id in answered_for_you.creates_file {
-                if tab.notes.auto_creates_file.insert(id.clone()) {
-                    tab.creates_file_unsent.insert(id);
-                }
-            }
-            // The CLI-mode tripwire, before anything of this delivery reaches the
-            // panel or the attention count: from the batch itself, or -- for a report a `Resync`
-            // dropped, or one folded ahead of its delivery -- from the projection's record. The
-            // whole batch is withheld, so no card in it is ever drawn to be approved; the session
-            // is handed out to be shut down, which denies what is still pending in it.
-            let tripped_reason = match &delivery {
-                RevisedDelivery::Events(events) => events.iter().find_map(|(_, event)| match event {
-                    AgentDomainEvent::UngatedCliMode { reported, detail } => {
-                        Some(ungated_cli_mode_reason(reported, detail))
-                    }
-                    AgentDomainEvent::PolicyMismatch { requested, reported } => {
-                        Some(policy_mismatch_reason(requested, reported))
-                    }
-                    _ => None,
-                }),
-                _ => None,
-            };
-            let tripped_reason = tripped_reason.or_else(|| {
-                let projection = backend.projection();
-                if let Some(r) = &projection.ungated_cli_mode {
-                    return Some(ungated_cli_mode_reason(&r.reported, &r.detail));
-                }
-                projection
-                    .policy_mismatch
-                    .as_ref()
-                    .map(|(requested, reported)| policy_mismatch_reason(requested, reported))
-            });
-            if let Some(reason) = tripped_reason {
-                eprintln!("[permission] tab {}: {reason}", tab.id.0);
-                // Nothing will report on a message still in the turn once the session goes.
-                if tab.hold_steered_on_failure() {
-                    out.queue_changed.push(tab.id);
-                }
-                tab.attention.session_ended(on_screen);
-                tab.was_running = false;
-                tab.turn_clock = None;
-                tab.failed_after_start = true;
-                tab.failed_resume = None;
-                let dead = std::mem::replace(&mut tab.backend, TabBackend::Failed { reason: reason.clone() });
-                if let TabBackend::Live(backend) = dead {
-                    *self.retiring.entry(tab.id.0).or_insert(0) += 1;
-                    out.tripped.push(Tripped {
-                        tab: tab.id,
-                        reason,
-                        backend,
-                    });
-                }
-                continue;
-            }
-            // Keeps `tab.turn_clock` in step for the `Events` arm, which builds its payload straight
-            // from the drained batch and takes no further lock after this -- there is no later,
-            // fresher read to prefer. The `Resync` arm is different (see its own comment below) and
-            // re-observes the clock itself from the snapshot it actually sends, rather than reading
-            // `tab.turn_clock` as this call left it.
-            {
-                let projection = backend.projection();
-                observe_turn_clock(
-                    &mut tab.turn_clock,
-                    &mut tab.notes.turn_times,
-                    &mut tab.turn_times_unsent,
-                    &projection,
-                    wall_clock_ms(),
-                );
-            }
-            let mut resynced = false;
-            // This tab's payload for the page that shows it, and its class; handed out below, by view.
-            let mut delivered: Option<(String, crate::panel_cadence::EnvelopeClass)> = None;
-            let mut saw_first_text = false;
-            match delivery {
-                RevisedDelivery::Nothing => {}
-                RevisedDelivery::Events(tagged) => {
-                    // The tags strictly increase, so what the last snapshot already carried is a
-                    // prefix of the batch: `events[..shown]` reached the panel inside that snapshot,
-                    // `events[shown..]` has not reached it at all. Everything below folds the whole
-                    // batch into this tab's own bookkeeping -- none of it has been seen here yet --
-                    // and only the payload leaves the prefix out.
-                    let shown = covered.map_or(0, |through| {
-                        tagged.partition_point(|(revision, _)| *revision <= through)
-                    });
-                    // The envelope's bracket, from the events' own fold revisions: the revision
-                    // before the first one it carries, and that of the batch's last.
-                    let through_revision = tagged.last().map_or(0, |(revision, _)| *revision);
-                    let from_revision = tagged
-                        .get(shown)
-                        .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
-                    let events: Vec<AgentDomainEvent> = tagged.into_iter().map(|(_, event)| event).collect();
-                    let (in_snapshot, fresh) = events.split_at(shown);
-                    for event in &events {
-                        match event {
-                            AgentDomainEvent::TurnStarted { .. } => tab.was_running = true,
-                            // An interrupt's end and the legacy backend's synthesized end are
-                            // `TurnCompleted`s too. Reported whatever `was_running` says: a legacy
-                            // `TurnStarted` is returned by `send_turn` and never pumped.
-                            AgentDomainEvent::TurnCompleted { .. } => {
-                                tab.was_running = false;
-                                turn_ended = true;
-                                // The CLI asks within the turn that made the call (O3).
-                                tab.human_allowed.clear();
-                            }
-                            // The session ended: its queue waits for `r`, not a flush.
-                            AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
-                                tab.was_running = false;
-                            }
-                            // `Tab::mode` is authoritative; provider reports do not change it. A `PermissionModeChanged`
-                            // that reaches here names `default`; other modes became `UngatedCliMode` above.
-                            //
-                            // A resolution removes the id previously answered on the user's behalf from `host_answered`,
-                            // since it no longer needs to be hidden.
-                            AgentDomainEvent::PermissionResolved { permission_id, .. } => {
-                                tab.host_answered.remove(permission_id);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // The whole batch, what the snapshot already carried included: the review has
-                    // seen neither part. Only enqueues.
-                    if let Some(review) = review.as_deref_mut() {
-                        let session = backend.provider_session_id().unwrap_or_default();
-                        let now = wall_clock_ms();
-                        for event in &events {
-                            review.observe(tab.id.0, &session, event, now);
-                        }
-                    }
-                    let fresh_notes = CallNotes {
-                        allowed_by_rule: note_rule_answers(
-                            &mut tab.rule_candidates,
-                            &mut tab.notes.allowed_by_rule,
-                            &events,
-                        ),
-                        creates_file: note_new_files(&mut tab.notes.creates_file, &events, project_root),
-                        prompt_notes: note_prompt_answers(
-                            &mut tab.prompt_note_candidates,
-                            &mut tab.notes.prompt_notes,
-                            &events,
-                        ),
-                        allowed_by_auto: note_auto_edit_answers(
-                            &mut tab.auto_edit_candidates,
-                            &mut tab.notes.allowed_by_auto,
-                            &events,
-                        ),
-                        auto_creates_file: std::mem::take(&mut tab.creates_file_unsent),
-                        // Only a shown tab's payload leaves here; a background tab's turns wait for
-                        // the snapshot its next switch sends.
-                        turn_times: if in_a_page {
-                            let times = &tab.notes.turn_times;
-                            let fresh = times[times.len() - tab.turn_times_unsent.min(times.len())..].to_vec();
-                            tab.turn_times_unsent = 0;
-                            fresh
-                        } else {
-                            Vec::new()
-                        },
-                    };
-                    // Every card in the batch is counted, those the snapshot drew included: they are
-                    // pending all the same, and this tab has not counted them yet.
-                    tab.attention.observe(&events, on_screen);
-                    if let Some(trace) = tab.turn_trace.as_mut() {
-                        if !in_snapshot.is_empty() {
-                            trace.observe_in_snapshot(in_snapshot);
-                        }
-                        let first_text = trace.observe(fresh);
-                        if in_a_page {
-                            saw_first_text = first_text;
-                        } else if first_text {
-                            trace.mark_background();
-                        }
-                    }
-                    if in_a_page {
-                        // Nothing to send when the snapshot carried the whole batch -- unless the
-                        // batch produced notes, which that snapshot (serialized before this tab had
-                        // folded these events) did not carry; the panel applies notes to what it
-                        // already holds (`applyCallNotes`), so they go on their own.
-                        if !fresh.is_empty() || !fresh_notes.is_empty() {
-                            delivered = Some((
-                                serialize_events_with_notes_for_js(
-                                    tab.id,
-                                    from_revision,
-                                    through_revision,
-                                    fresh,
-                                    &fresh_notes,
-                                ),
-                                crate::panel_cadence::classify_events(fresh, !fresh_notes.is_empty()),
-                            ));
-                            dispatched = true;
-                        }
-                    } else {
-                        tab.stale = true;
-                    }
-                }
-                RevisedDelivery::Resync => {
-                    resynced = true;
-                    // The events are gone; show the panel a snapshot.
-                    //
-                    // The drain and `SnapshotView::of` take separate `Mutex<IngestState>` locks, with a bypass
-                    // `approve_pending` lock cycle between them because answering must happen outside the lock.
-                    // A batch folded in this gap is queued for the next tick and already in this snapshot.
-                    // Read the snapshot revision under its serialization guard and note it on the backend, so
-                    // the next drain omits that batch from the payload, as after `active_state_payloads`.
-                    let running = backend.projection().active_turn_id.is_some();
-                    turn_ended = tab.was_running && !running;
-                    tab.was_running = running;
-                    // Unconditionally (Codex's finding): the dropped events may have held a turn's
-                    // end and the next one's start, which `was_running` cannot see, and an approval
-                    // must never outlive its turn. Costs at most a card.
-                    tab.human_allowed.clear();
-                    // A candidate whose call finished inside the dropped events becomes its note now,
-                    // so the snapshot below already carries it.
-                    {
-                        let projection = backend.projection();
-                        let finished: Vec<String> = tab
-                            .prompt_note_candidates
-                            .keys()
-                            .filter(|id| {
-                                projection
-                                    .tool_calls
-                                    .iter()
-                                    .any(|call| &call.tool_use_id == *id && call.result.is_some())
-                            })
-                            .cloned()
-                            .collect();
-                        for id in finished {
-                            if let Some(note) = tab.prompt_note_candidates.remove(&id) {
-                                tab.notes.prompt_notes.insert(id, note);
-                            }
-                        }
-                        // A fast-path answer is captured when given. If its call completed among dropped events,
-                        // convert its candidate into a note here so it cannot linger indefinitely.
-                        let finished: Vec<String> = tab
-                            .auto_edit_candidates
-                            .keys()
-                            .filter(|id| {
-                                projection
-                                    .tool_calls
-                                    .iter()
-                                    .any(|call| &call.tool_use_id == *id && call.result.is_some())
-                            })
-                            .cloned()
-                            .collect();
-                        for id in finished {
-                            tab.auto_edit_candidates.remove(&id);
-                            tab.notes.allowed_by_auto.insert(id);
-                        }
-                        // A rule's answer is captured when given. If its call completed among dropped events,
-                        // convert its candidate into a note here too. The still-pending sweep below cannot remove a
-                        // candidate whose call has already finished, so without this sweep it would linger indefinitely.
-                        let finished: Vec<String> = tab
-                            .rule_candidates
-                            .keys()
-                            .filter(|id| {
-                                projection
-                                    .tool_calls
-                                    .iter()
-                                    .any(|call| &call.tool_use_id == *id && call.result.is_some())
-                            })
-                            .cloned()
-                            .collect();
-                        for id in finished {
-                            if let Some(candidate) = tab.rule_candidates.remove(&id) {
-                                tab.notes.allowed_by_rule.insert(id, candidate.rule);
-                            }
-                        }
-                        // The snapshot below carries every note, these included.
-                        tab.creates_file_unsent.clear();
-                    }
-                    // A dropped `PermissionRequested` can leave a candidate whose call has not finished, while
-                    // the projection still shows its permission awaiting a human. The completed-call sweep above
-                    // cannot remove it. `answer_what_needs_no_human` never runs on a dropped batch, so a real card
-                    // will be drawn from the snapshot. Remove its candidate instead of making a note, or a later
-                    // human approval would be mislabeled "allowed by auto".
-                    //
-                    // `rule_candidates` can lose the same removal event in `note_rule_answers`. Remove those by id
-                    // too, or a human approval could be mislabeled "allowed by rule".
-                    //
-                    // Exclude requests already in `host_answered`: they remain pending until the provider folds
-                    // `PermissionResolved`, but the snapshot hides their cards. Sweeping them would lose an answer
-                    // merely because `Resync` arrived before its resolution. Auto candidates exist only after the
-                    // fast path answered the gate, so an unanswered card for one is the CLI's later prompt for the
-                    // same call.
-                    // The same applies to rule candidates: they exist only after a rule answered the gate, and a
-                    // later unanswered card is the CLI's prompt for that call. Both candidate maps need the
-                    // `host_answered` filter to retain answers until call completion while provider resolutions
-                    // are still pending.
-                    {
-                        let still_pending: BTreeSet<String> = backend
-                            .projection()
-                            .pending_permissions
-                            .values()
-                            .filter(|p| !tab.host_answered.contains(&p.permission_id))
-                            .filter_map(|p| p.tool_use_id.clone())
-                            .collect();
-                        tab.auto_edit_candidates.retain(|id, _| !still_pending.contains(id));
-                        tab.rule_candidates.retain(|id, _| !still_pending.contains(id));
-                    }
-                    let pending: Vec<String> = backend.projection().pending_permissions.keys().cloned().collect();
-                    // In bypass, resync sends pending requests lost to overflow through `approve_pending`,
-                    // as confirmation does, so rebuilding the panel never creates cards for those requests.
-                    // Also filter out requests already answered by the classifier in `Auto`.
-                    if tab.mode == SessionModeChoice::Bypass {
-                        let sweep: Vec<String> = pending
-                            .iter()
-                            .filter(|id| !tab.host_answered.contains(*id))
-                            .cloned()
-                            .collect();
-                        // The events (legacy's own resolutions) are not needed here: the snapshot below
-                        // is read after they were folded, so it already shows those cards answered.
-                        let answered = backend.approve_pending(&sweep, "in bypass after a resync");
-                        tab.host_answered.extend(answered.ids);
-                        note_answered_prompts(&mut tab.prompt_note_candidates, answered.prompts);
-                    }
-                    tab.attention
-                        .resync(pending.iter().filter(|id| !tab.host_answered.contains(*id)).cloned());
-                    if in_a_page {
-                        #[cfg(test)]
-                        {
-                            if let Some(hook) = self.before_resync_snapshot.take() {
-                                hook(backend);
-                            }
-                        }
-                        let (payload, revision) = {
-                            let view = SnapshotView::of(backend, &tab.host_answered);
-                            // Read the turn clock from this snapshot's view under its serialization guard. The earlier
-                            // read above `match delivery` can be stale after this arm's `projection()` calls and bypass
-                            // sweep. If a turn ends and another starts in that gap, the early read still names the old
-                            // turn while the snapshot names the new one. The panel treats the stamped time as exact,
-                            // so use the same guarded observation as `active_state_payloads`.
-                            observe_turn_clock(
-                                &mut tab.turn_clock,
-                                &mut tab.notes.turn_times,
-                                &mut tab.turn_times_unsent,
-                                &view.projection,
-                                wall_clock_ms(),
-                            );
-                            let payload = serialize_snapshot_with_notes_for_js(
-                                tab.id,
-                                &view,
-                                tab.turn_clock.as_ref().map(|(_, at)| *at),
-                                &tab.notes,
-                            );
-                            tab.turn_times_unsent = 0;
-                            // Under the guard the snapshot is serialized from (see the arm's comment).
-                            (payload, view.projection.last_revision)
-                        };
-                        backend.note_ui_snapshot(revision);
-                        // A snapshot replaces the panel's state: never held behind a cadence slot.
-                        delivered = Some((payload, crate::panel_cadence::EnvelopeClass::Immediate));
-                        dispatched = true;
-                    } else {
-                        tab.stale = true;
-                    }
-                }
-            }
-            if is_active {
-                out.first_text |= saw_first_text;
-                if let Some((payload, class)) = delivered {
-                    out.active_payload = Some(payload);
-                    out.active_class = class;
-                }
-            } else if let Some((payload, class)) = delivered {
-                out.view_payloads.push(ShownPayload {
-                    view,
-                    tab: tab.id,
-                    payload,
-                    class,
-                    first_text: saw_first_text,
-                });
-            } else if saw_first_text {
-                // No payload carries it, so no page will stamp its paint.
-                if let Some(trace) = tab.turn_trace.as_mut() {
-                    trace.mark_background();
-                }
-            }
-            // After the resync, not inside it: the review learns from the rebuilt projection what
-            // the dropped events would have told it. Each read in its own statement (lock order).
-            if resynced {
-                if let Some(review) = review.as_deref_mut() {
-                    let session = backend.provider_session_id().unwrap_or_default();
-                    let running = backend.projection().active_turn_id.clone();
-                    let background = backend.projection().background_calls;
-                    let at_end = backend.projection().background_at_last_turn_end;
-                    let now = wall_clock_ms();
-                    // A turn the resync ends ended with the count it had then, not with the one now:
-                    // the command may have finished among the dropped events.
-                    let count = |running| AgentDomainEvent::BackgroundCalls { running };
-                    review.observe(tab.id.0, &session, &count(at_end), now);
-                    review.observe_resync(tab.id.0, &session, running.as_deref(), now);
-                    review.observe(tab.id.0, &session, &count(background), now);
-                }
-            }
-            // Print a completed trace here if there is no dispatch to wait for: a background tab, or an
-            // active tab with no panel delivery this tick. Its end may have arrived only in a snapshot.
-            // `shell` prints dispatched traces after stamping their dispatch.
-            if !dispatched {
-                if let Some(trace) = tab.turn_trace.as_mut() {
-                    if trace.is_complete() {
-                        trace.emit();
-                    }
-                }
-            }
-            let still: std::collections::HashSet<String> =
-                backend.projection().pending_permissions.keys().cloned().collect();
-            tab.attention.retain_pending(|id| still.contains(id));
-            tab.host_answered.retain(|id| still.contains(id));
-            tab.user_answered.retain(|id| still.contains(id));
-            if refresh_offers(tab, project_root) {
-                out.offers_changed.push(tab.id);
-            }
-            // What the agent did with the messages put into its turn, read off the projection this
-            // delivery (or resync) left: delivered ones leave the queue as their rows arrive.
-            if tab.settle_steered() {
-                out.queue_changed.push(tab.id);
-            }
-            // `turn_running()` guards a turn that has already started again (a send that raced the
-            // completion): the queue waits for that one's end instead.
-            if turn_ended && !tab.turn_running() {
-                out.turn_ended.push(tab.id);
-            }
+            Self::pump_tab(tab, &mut tick, review.as_deref_mut(), place, &mut out);
         }
         // A `TurnStarted` folded in this pump.
         self.sync_presence();
         out
+    }
+
+    /// One tab's share of [`TabSet::pump_views`]: drains its backend, fails it if its CLI reported a
+    /// mode the gate cannot hold, hands the delivery to the arm that matches it, and settles what is
+    /// left once that arm is done.
+    fn pump_tab(
+        tab: &mut Tab,
+        tick: &mut PumpTick<'_>,
+        mut review: Option<&mut crate::turn_review::TurnReview>,
+        place: PumpPlace,
+        out: &mut PumpOutput,
+    ) {
+        let TabBackend::Live(backend) = &mut tab.backend else {
+            if let Some(review) = review.as_deref_mut() {
+                review.tab_has_no_session(tab.id.0, wall_clock_ms());
+            }
+            // No backend holds no card: the backstop `agent_panel` had for `session.is_none()`.
+            tab.attention.retain_pending(|_| false);
+            tab.session.forget_answers();
+            return;
+        };
+        // A backend put in place some other way than `collect_starts` is told about the wake here.
+        if let Some(wake) = tick.ui_wake {
+            backend.ensure_ui_wake(wake);
+        }
+        // `tab.mode`: the classifier's `Auto` path, or bypass answering everything, and
+        // `tab.host_answered` collects every id either path answers so the Resync arm and
+        // `active_state_payloads` can hide them. `tab.human_allowed`: in `Auto`, the CLI's own prompt
+        // for exactly a call the user approved on a card here is answered without a second card, once.
+        // What was answered without a card becomes a note on its call's row when the call completes.
+        let mut answered_for_you = crate::agent_backend::AnsweredForYou::default();
+        let delivery = backend.take_revised_ui_delivery(
+            tick.project_root,
+            tick.rules,
+            tab.mode.into(),
+            &mut tab.session.host_answered,
+            &mut tab.session.human_allowed,
+            &mut answered_for_you,
+        );
+        #[cfg(test)]
+        {
+            if let Some(hook) = tick.after_drain.take() {
+                hook(backend);
+            }
+        }
+        // What the last snapshot of this backend the panel was sent already carried: a snapshot and
+        // the drain before it are separate lock acquisitions, and the sidecar's ingestion thread
+        // folds and queues in between, so such an event is in that snapshot AND in this drain. Every
+        // queued event carries the revision its own fold produced, and the fold, the queueing and
+        // the snapshot's read of `last_revision` each happen under the one ingestion mutex: an event
+        // tagged at or below the snapshot's revision is exactly one it carried, and all of them were
+        // queued before it was read -- so this drain holds every one. Taken here, so nothing later
+        // compares against it; kept by the backend (`AgentBackend::note_ui_snapshot`), so it never
+        // outlives the session it was read from.
+        let covered = backend.take_ui_snapshot_revision();
+        #[cfg(test)]
+        let covered = covered.filter(|_| !tick.redeliver_covered);
+        #[cfg(any(test, feature = "test-support"))]
+        tab.gate_log.extend(answered_for_you.gate_answers);
+        // What the fast path answered, what a saved rule answered and the CLI prompts answered
+        // without a card, as recorded at the answer itself, wait in the ledger for their calls to
+        // complete. Each `Write` answered without a card over no file is true already, and waits
+        // only for a payload to carry it (`creates_file_unsent`).
+        tab.session.note_ledger.record_report(NoteReport {
+            prompts: answered_for_you.prompts,
+            by_the_fast_path: answered_for_you.by_the_fast_path,
+            by_rule: answered_for_you.by_rule,
+        });
+        for id in answered_for_you.creates_file {
+            if tab.notes.auto_creates_file.insert(id.clone()) {
+                tab.session.creates_file_unsent.insert(id);
+            }
+        }
+        if let Some(reason) = Self::pump_tripped_reason(&delivery, backend) {
+            Self::pump_trip(tab, tick.retiring, reason, place.on_screen, out);
+            return;
+        }
+        // Keeps `tab.turn_clock` in step for the `Events` arm, which builds its payload straight
+        // from the drained batch and takes no further lock after this -- there is no later,
+        // fresher read to prefer. The `Resync` arm is different (see its own comment) and
+        // re-observes the clock itself from the snapshot it actually sends, rather than reading
+        // `tab.turn_clock` as this call left it.
+        {
+            let projection = backend.projection();
+            observe_turn_clock(
+                &mut tab.session.turn_clock,
+                &mut tab.notes.turn_times,
+                &mut tab.session.turn_times_unsent,
+                &projection,
+                wall_clock_ms(),
+            );
+        }
+        let resynced = matches!(delivery, RevisedDelivery::Resync);
+        let mut live = LiveTab {
+            id: tab.id,
+            mode: tab.mode,
+            backend,
+            session: &mut tab.session,
+            notes: &mut tab.notes,
+            attention: &mut tab.attention,
+        };
+        let arm = match delivery {
+            RevisedDelivery::Nothing => ArmOutcome::default(),
+            RevisedDelivery::Events(tagged) => Self::pump_arm_events(
+                &mut live,
+                tagged,
+                covered,
+                tick.project_root,
+                review.as_deref_mut(),
+                place,
+            ),
+            RevisedDelivery::Resync => {
+                let (turn_ended, pending) = Self::pump_arm_resync(&mut live);
+                // A resync in bypass sweeps whatever the overflow dropped through the same
+                // `approve_pending` a confirm uses, so a request never drawn as a card is never rebuilt
+                // as one by the very mechanism meant to rebuild the panel honestly. This also hides
+                // what the classifier already answered in `Auto`, closing the gap `attention`'s module
+                // doc used to record for `resync` itself. Answered here, outside every guard of the
+                // projection: answering a permission must happen outside the lock.
+                if live.mode == SessionModeChoice::Bypass {
+                    let sweep: Vec<String> = pending
+                        .iter()
+                        .filter(|id| !live.session.host_answered.contains(*id))
+                        .cloned()
+                        .collect();
+                    // The events (legacy's own resolutions) are not needed here: the snapshot is read
+                    // after they were folded, so it already shows those cards answered.
+                    let answered = live.backend.approve_pending(&sweep, "in bypass after a resync");
+                    live.session.host_answered.extend(answered.ids);
+                    live.session
+                        .note_ledger
+                        .record_report(NoteReport::prompts(answered.prompts));
+                }
+                Self::pump_resync_show(&mut live, &pending, turn_ended, tick, place)
+            }
+        };
+        let still = Self::pump_after_match(live.backend, live.id, review, resynced);
+        Self::pump_settle(tab, arm, place, &still, tick.project_root, out);
+    }
+
+    /// The CLI-mode tripwire, before anything of this delivery reaches the panel or the attention
+    /// count: from the batch itself, or -- for a report a `Resync` dropped, or one folded ahead of
+    /// its delivery -- from the projection's record.
+    fn pump_tripped_reason(delivery: &RevisedDelivery, backend: &AgentBackend) -> Option<String> {
+        let in_batch = match delivery {
+            RevisedDelivery::Events(events) => events.iter().find_map(|(_, event)| match event {
+                AgentDomainEvent::UngatedCliMode { reported, detail } => {
+                    Some(ungated_cli_mode_reason(reported, detail))
+                }
+                AgentDomainEvent::PolicyMismatch { requested, reported } => {
+                    Some(policy_mismatch_reason(requested, reported))
+                }
+                _ => None,
+            }),
+            _ => None,
+        };
+        in_batch.or_else(|| {
+            let projection = backend.projection();
+            if let Some(r) = &projection.ungated_cli_mode {
+                return Some(ungated_cli_mode_reason(&r.reported, &r.detail));
+            }
+            projection
+                .policy_mismatch
+                .as_ref()
+                .map(|(requested, reported)| policy_mismatch_reason(requested, reported))
+        })
+    }
+
+    /// Fails a tab the tripwire caught. The whole batch is withheld, so no card in it is ever drawn
+    /// to be approved; the session is handed out to be shut down, which denies what is still
+    /// pending in it.
+    fn pump_trip(tab: &mut Tab, retiring: &mut RetiringCounts, reason: String, on_screen: bool, out: &mut PumpOutput) {
+        eprintln!("[permission] tab {}: {reason}", tab.id.0);
+        // Nothing will report on a message still in the turn once the session goes.
+        if tab.hold_steered_on_failure() {
+            out.queue_changed.push(tab.id);
+        }
+        tab.attention.session_ended(on_screen);
+        tab.session.forget_answers();
+        if let Some(retired) = tab.fail_live(retiring, reason.clone(), true, None) {
+            out.tripped.push(Tripped {
+                tab: tab.id,
+                reason,
+                retired,
+            });
+        }
+    }
+
+    /// The `Events` arm: folds the drained batch into the tab's own bookkeeping and, for a tab a page
+    /// shows, builds the payload of what the last snapshot did not already carry.
+    fn pump_arm_events(
+        live: &mut LiveTab<'_>,
+        tagged: Vec<(u64, AgentDomainEvent)>,
+        covered: Option<u64>,
+        project_root: &Path,
+        review: Option<&mut crate::turn_review::TurnReview>,
+        place: PumpPlace,
+    ) -> ArmOutcome {
+        let mut arm = ArmOutcome::default();
+        // The tags strictly increase, so what the last snapshot already carried is a prefix of the
+        // batch: `events[..shown]` reached the panel inside that snapshot, `events[shown..]` has not
+        // reached it at all. Everything below folds the whole batch into this tab's own bookkeeping
+        // -- none of it has been seen here yet -- and only the payload leaves the prefix out.
+        let shown = covered.map_or(0, |through| {
+            tagged.partition_point(|(revision, _)| *revision <= through)
+        });
+        // The envelope's bracket, from the events' own fold revisions: the revision before the first
+        // one it carries, and that of the batch's last.
+        let through_revision = tagged.last().map_or(0, |(revision, _)| *revision);
+        let from_revision = tagged
+            .get(shown)
+            .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
+        let events: Vec<AgentDomainEvent> = tagged.into_iter().map(|(_, event)| event).collect();
+        let (in_snapshot, fresh) = events.split_at(shown);
+        for event in &events {
+            match event {
+                AgentDomainEvent::TurnStarted { .. } => live.session.was_running = true,
+                // An interrupt's end and the legacy backend's synthesized end are `TurnCompleted`s
+                // too. Reported whatever `was_running` says: a legacy `TurnStarted` is returned by
+                // `send_turn` and never pumped.
+                AgentDomainEvent::TurnCompleted { .. } => {
+                    live.session.was_running = false;
+                    arm.turn_ended = true;
+                    // The CLI asks within the turn that made the call.
+                    live.session.human_allowed.clear();
+                }
+                // The session ended: its queue waits for `r`, not a flush.
+                AgentDomainEvent::SessionClosed { .. } | AgentDomainEvent::SessionUnavailable { .. } => {
+                    live.session.was_running = false;
+                }
+                // `Tab::mode` is the only authority: nothing a provider reports moves it.
+                // A `PermissionModeChanged` that got this far named `default` (anything else became
+                // `UngatedCliMode`, handled by the tripwire), so there is nothing to do with it.
+                //
+                // A resolution for an id this pump (or an earlier one) already answered on the
+                // user's behalf: forgotten now, since there is nothing left to hide it from.
+                AgentDomainEvent::PermissionResolved { permission_id, .. } => {
+                    live.session.host_answered.remove(permission_id);
+                }
+                _ => {}
+            }
+        }
+        // The whole batch, what the snapshot already carried included: the review has seen neither
+        // part. Only enqueues.
+        if let Some(review) = review {
+            let session = live.backend.provider_session_id().unwrap_or_default();
+            let now = wall_clock_ms();
+            for event in &events {
+                review.observe(live.id.0, &session, event, now);
+            }
+        }
+        let mut fresh_notes = CallNotes {
+            creates_file: note_new_files(&mut live.notes.creates_file, &events, project_root),
+            auto_creates_file: std::mem::take(&mut live.session.creates_file_unsent),
+            // Only a shown tab's payload leaves here; a background tab's turns wait for the snapshot
+            // its next switch sends.
+            turn_times: if place.in_a_page {
+                let times = &live.notes.turn_times;
+                let fresh = times[times.len() - live.session.turn_times_unsent.min(times.len())..].to_vec();
+                live.session.turn_times_unsent = 0;
+                fresh
+            } else {
+                Vec::new()
+            },
+            ..CallNotes::default()
+        };
+        live.session.note_ledger.fold(&events, live.notes, &mut fresh_notes);
+        // Every card in the batch is counted, those the snapshot drew included: they are pending all
+        // the same, and this tab has not counted them yet.
+        live.attention.observe(&events, place.on_screen);
+        if let Some(trace) = live.session.turn_trace.as_mut() {
+            if !in_snapshot.is_empty() {
+                trace.observe_in_snapshot(in_snapshot);
+            }
+            let first_text = trace.observe(fresh);
+            if place.in_a_page {
+                arm.saw_first_text = first_text;
+            } else if first_text {
+                trace.mark_background();
+            }
+        }
+        if place.in_a_page {
+            // Nothing to send when the snapshot carried the whole batch -- unless the batch produced
+            // notes, which that snapshot (serialized before this tab had folded these events) did not
+            // carry; the panel applies notes to what it already holds (`applyCallNotes`), so they go
+            // on their own.
+            if !fresh.is_empty() || !fresh_notes.is_empty() {
+                arm.delivered = Some((
+                    serialize_events_with_notes_for_js(live.id, from_revision, through_revision, fresh, &fresh_notes),
+                    crate::panel_cadence::classify_events(fresh, !fresh_notes.is_empty()),
+                ));
+            }
+        } else {
+            live.session.stale = true;
+        }
+        arm
+    }
+
+    /// The `Resync` arm up to its bypass sweep: the events are gone, and the snapshot is what the
+    /// panel is shown now. Returns whether the tab's turn ended and the ids of the cards pending.
+    ///
+    /// The arm drains (`take_revised_ui_delivery`, before it) and then reads a fresh
+    /// `SnapshotView::of` (in [`TabSet::pump_resync_show`], for a tab a page shows) as two separate
+    /// lock acquisitions on `Mutex<IngestState>`, with this read and `approve_pending`'s own lock
+    /// cycle for a bypass tab in between (answering a permission must happen outside the lock). A
+    /// batch folded in that gap is queued for the next tick AND already in the snapshot sent: the
+    /// snapshot's revision, read under the guard it is serialized from, is noted on the backend, and
+    /// the next drain leaves that batch out of the payload, exactly as after `active_state_payloads`'
+    /// snapshot.
+    fn pump_arm_resync(live: &mut LiveTab<'_>) -> (bool, Vec<String>) {
+        // Everything the arm reads before answering, from one read of the projection, so the turn it
+        // sees running, the notes the ledger settles and the cards still pending agree.
+        let (turn_ended, pending) = {
+            let projection = live.backend.projection();
+            let running = projection.active_turn_id.is_some();
+            let turn_ended = live.session.was_running && !running;
+            live.session.was_running = running;
+            // Unconditionally: the dropped events may have held a turn's end and the next one's
+            // start, which `was_running` cannot see, and an approval must never outlive its turn.
+            // Costs at most a card.
+            live.session.human_allowed.clear();
+            // The ledger stands in for the dropped events: a candidate whose call finished among them
+            // becomes its note now, so the snapshot already carries it, and a gate candidate whose
+            // call has a card still pending is dropped (`NoteLedger::resync`).
+            live.session
+                .note_ledger
+                .resync(&projection, &live.session.host_answered, live.notes);
+            (turn_ended, projection.pending_permissions.keys().cloned().collect())
+        };
+        // The snapshot carries every note.
+        live.session.creates_file_unsent.clear();
+        (turn_ended, pending)
+    }
+
+    /// The `Resync` arm after its bypass sweep: counts the cards still to be answered and, for a tab
+    /// a page shows, sends the snapshot.
+    fn pump_resync_show(
+        live: &mut LiveTab<'_>,
+        pending: &[String],
+        turn_ended: bool,
+        tick: &mut PumpTick<'_>,
+        place: PumpPlace,
+    ) -> ArmOutcome {
+        let mut arm = ArmOutcome {
+            turn_ended,
+            ..ArmOutcome::default()
+        };
+        live.attention.resync(
+            pending
+                .iter()
+                .filter(|id| !live.session.host_answered.contains(*id))
+                .cloned(),
+        );
+        if !place.in_a_page {
+            live.session.stale = true;
+            return arm;
+        }
+        #[cfg(test)]
+        {
+            if let Some(hook) = tick.before_resync_snapshot.take() {
+                hook(live.backend);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = tick;
+        let (payload, revision) = {
+            let view = SnapshotView::of(live.backend, &live.session.host_answered);
+            // Observed from this snapshot's own view, under the guard it is serialized from -- not
+            // the early read before the arm, which the arm's own further lock cycles (its read of the
+            // projection and `approve_pending`'s bypass sweep) can leave stale: if a turn ends and the
+            // next starts in that gap, the early read still names the first turn while this snapshot
+            // already names the second, and the panel takes the stamped time as exact (as
+            // `active_state_payloads` does, whose own snapshot has the identical shape).
+            observe_turn_clock(
+                &mut live.session.turn_clock,
+                &mut live.notes.turn_times,
+                &mut live.session.turn_times_unsent,
+                &view.projection,
+                wall_clock_ms(),
+            );
+            let payload = serialize_snapshot_with_notes_for_js(
+                live.id,
+                &view,
+                live.session.turn_clock.as_ref().map(|(_, at)| *at),
+                live.notes,
+            );
+            live.session.turn_times_unsent = 0;
+            // Under the guard the snapshot is serialized from (see `pump_arm_resync`'s doc).
+            (payload, view.projection.last_revision)
+        };
+        live.backend.note_ui_snapshot(revision);
+        // A snapshot replaces the panel's state: never held behind a cadence slot.
+        arm.delivered = Some((payload, crate::panel_cadence::EnvelopeClass::Immediate));
+        arm
+    }
+
+    /// What a tab's tick reads after its arm, from one read of the projection: the cards still
+    /// pending and, after a resync, what the turn review learns from the rebuilt projection that the
+    /// dropped events would have told it. Returns the pending ids.
+    fn pump_after_match(
+        backend: &AgentBackend,
+        tab: TabId,
+        review: Option<&mut crate::turn_review::TurnReview>,
+        resynced: bool,
+    ) -> std::collections::HashSet<String> {
+        let review = review.filter(|_| resynced);
+        // Its own statement, before the read below: it takes the same lock.
+        let session = review
+            .as_ref()
+            .map(|_| backend.provider_session_id().unwrap_or_default());
+        let (still, running, background, at_end) = {
+            let projection = backend.projection();
+            (
+                projection.pending_permissions.keys().cloned().collect(),
+                projection.active_turn_id.clone(),
+                projection.background_calls,
+                projection.background_at_last_turn_end,
+            )
+        };
+        if let (Some(review), Some(session)) = (review, session) {
+            let now = wall_clock_ms();
+            // A turn the resync ends ended with the count it had then, not with the one now: the
+            // command may have finished among the dropped events.
+            let count = |running| AgentDomainEvent::BackgroundCalls { running };
+            review.observe(tab.0, &session, &count(at_end), now);
+            review.observe_resync(tab.0, &session, running.as_deref(), now);
+            review.observe(tab.0, &session, &count(background), now);
+        }
+        still
+    }
+
+    /// The end of a tab's tick: hands its payload to the page that shows it, prints a trace nothing
+    /// will print, forgets the cards that are no longer pending, and reports offers, steered messages
+    /// and a turn's end.
+    fn pump_settle(
+        tab: &mut Tab,
+        arm: ArmOutcome,
+        place: PumpPlace,
+        still: &std::collections::HashSet<String>,
+        project_root: &Path,
+        out: &mut PumpOutput,
+    ) {
+        // Whether this tab's payload goes to the panel this tick (then `shell` prints a complete
+        // trace after dispatching it; otherwise this function does, below).
+        let dispatched = arm.delivered.is_some();
+        if place.is_active {
+            out.first_text |= arm.saw_first_text;
+            if let Some((payload, class)) = arm.delivered {
+                out.active_payload = Some(payload);
+                out.active_class = class;
+            }
+        } else if let Some((payload, class)) = arm.delivered {
+            out.view_payloads.push(ShownPayload {
+                view: tab.view,
+                tab: tab.id,
+                payload,
+                class,
+                first_text: arm.saw_first_text,
+            });
+        } else if arm.saw_first_text {
+            // No payload carries it, so no page will stamp its paint.
+            if let Some(trace) = tab.session.turn_trace.as_mut() {
+                trace.mark_background();
+            }
+        }
+        // A trace with no dispatch to wait for is printed here once it finishes: a background
+        // tab's, and the active tab's when nothing of it reached the panel this tick -- its end
+        // may have arrived only inside a snapshot. A dispatched one is printed
+        // by `shell`, after it stamps the dispatch.
+        if !dispatched {
+            if let Some(trace) = tab.session.turn_trace.as_mut() {
+                if trace.is_complete() {
+                    trace.emit();
+                }
+            }
+        }
+        tab.attention.retain_pending(|id| still.contains(id));
+        tab.session.host_answered.retain(|id| still.contains(id));
+        tab.session.user_answered.retain(|id| still.contains(id));
+        if refresh_offers(tab, project_root) {
+            out.offers_changed.push(tab.id);
+        }
+        // What the agent did with the messages put into its turn, read off the projection this
+        // delivery (or resync) left: delivered ones leave the queue as their rows arrive.
+        if tab.settle_steered() {
+            out.queue_changed.push(tab.id);
+        }
+        // `turn_running()` guards a turn that has already started again (a send that raced the
+        // completion): the queue waits for that one's end instead.
+        if arm.turn_ended && !tab.turn_running() {
+            out.turn_ended.push(tab.id);
+        }
     }
 
     /// Collects every connect that finished. An installed backend clears the tab's previous
@@ -2954,7 +3068,6 @@ impl TabSet {
                 Err(mpsc::TryRecvError::Disconnected) => Err(BackendError {
                     message: "the backend connect worker stopped without reporting a result".to_string(),
                     benign: false,
-                    folded_events: Vec::new(),
                 }),
             };
             let TabBackend::Starting(pending) = std::mem::replace(&mut tab.backend, TabBackend::NotStarted) else {
@@ -2984,25 +3097,13 @@ impl TabSet {
                         backend.ensure_ui_wake(wake);
                     }
                     tab.backend = TabBackend::Live(backend);
-                    tab.was_running = false;
+                    tab.session = std::mem::take(&mut tab.session).for_installed_backend();
                     tab.attention.restart();
                     tab.notes = CallNotes::default();
-                    // A new session numbers its turns afresh, and the old tab's last turn was not
-                    // seen to end: its clock and durations belong to the session that is gone.
-                    tab.turn_clock = None;
-                    tab.turn_times_unsent = 0;
-                    tab.rule_candidates.clear();
-                    tab.auto_edit_candidates.clear();
-                    tab.creates_file_unsent.clear();
-                    tab.prompt_note_candidates.clear();
                     tab.last_handoff = None;
-                    tab.reported_start_failure = false;
-                    tab.title = pending.resumed_title;
+                    tab.session.title = pending.resumed_title;
                     // Only Claude's sessions have a transcript the CLI titles.
-                    tab.title_from_record = tab.title.is_some() && tab.agent == AgentId::Claude;
-                    // A freshly installed backend has answered nothing yet on this tab's behalf.
-                    tab.host_answered.clear();
-                    tab.user_answered.clear();
+                    tab.session.title_from_record = tab.session.title.is_some() && tab.agent == AgentId::Claude;
                     collected.push(StartCollected::Installed {
                         tab: tab.id,
                         request_id: pending.request_id,
@@ -3056,30 +3157,30 @@ impl TabSet {
             return Vec::new();
         }
         let tab = self.get_mut(tab).expect("a shown tab exists");
-        tab.stale = false;
+        tab.session.stale = false;
         let mut payloads = Vec::new();
         match &mut tab.backend {
             TabBackend::Live(backend) => {
                 let (payload, revision) = {
-                    let view = SnapshotView::of(backend, &tab.host_answered);
+                    let view = SnapshotView::of(backend, &tab.session.host_answered);
                     // The clock follows the turn this very snapshot names: one that started since
                     // the last tick is stamped now, as that tick would have, and a clock left from
                     // the turn before it is never sent with this one's id (the panel trusts it as
                     // exact).
                     observe_turn_clock(
-                        &mut tab.turn_clock,
+                        &mut tab.session.turn_clock,
                         &mut tab.notes.turn_times,
-                        &mut tab.turn_times_unsent,
+                        &mut tab.session.turn_times_unsent,
                         &view.projection,
                         wall_clock_ms(),
                     );
                     let payload = serialize_snapshot_with_notes_for_js(
                         tab.id,
                         &view,
-                        tab.turn_clock.as_ref().map(|(_, at)| *at),
+                        tab.session.turn_clock.as_ref().map(|(_, at)| *at),
                         &tab.notes,
                     );
-                    tab.turn_times_unsent = 0;
+                    tab.session.turn_times_unsent = 0;
                     (payload, view.projection.last_revision)
                 };
                 backend.note_ui_snapshot(revision);
@@ -3094,16 +3195,16 @@ impl TabSet {
         }
         payloads.push(crate::agent_bridge::serialize_queue_for_js(
             tab.id,
-            &tab.queue,
-            tab.queue_error.as_deref(),
-            tab.queue_note.as_deref(),
+            &tab.session.queue,
+            tab.session.queue_error.as_deref(),
+            tab.session.queue_note.as_deref(),
             tab.steers(),
         ));
-        payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.draft));
+        payloads.push(crate::agent_bridge::serialize_draft_for_js(tab.id, &tab.session.draft));
         if tab.live().is_some() {
             payloads.push(crate::agent_bridge::serialize_rule_offers_for_js(
                 tab.id,
-                &tab.rule_offers,
+                &tab.session.rule_offers,
             ));
         }
         payloads.push(crate::agent_bridge::serialize_scratch_for_js(
@@ -3232,7 +3333,7 @@ impl TabSet {
         self.get(id).is_some_and(|t| {
             matches!(t.backend, TabBackend::Starting(_) | TabBackend::AwaitingTrust(_))
                 || t.turn_running()
-                || !t.queue.is_empty()
+                || !t.session.queue.is_empty()
         })
     }
 
@@ -3242,7 +3343,7 @@ impl TabSet {
             number: tab.number,
             label_name: tab.label_name(),
             turn_running: tab.turn_running(),
-            queued: tab.queue.len() - tab.steered_unconfirmed(),
+            queued: tab.session.queue.len() - tab.steered_unconfirmed(),
             steered: tab.steered_unconfirmed(),
             legacy: self.kind == BackendKind::Legacy && tab.agent == AgentId::Claude,
             has_backend: tab.live().is_some(),
@@ -3289,7 +3390,7 @@ impl TabSet {
                 return Err("this tab's session has ended; press r to start over".to_string())
             }
         }
-        tab.queue.push(Queued {
+        tab.session.queue.push(Queued {
             text: text.to_string(),
             wire,
             queued_at_ms: now_ms,
@@ -3297,7 +3398,7 @@ impl TabSet {
             steerable,
             dropped_as: Vec::new(),
         });
-        Ok(tab.queue.len())
+        Ok(tab.session.queue.len())
     }
 
     /// Enter while a turn runs: the tab's held messages, oldest first, go into the running turn when its
@@ -3315,7 +3416,7 @@ impl TabSet {
         let mut next = self.next_steer;
         let Some(tab) = self.get_mut(id) else { return false };
         let mut changed = tab.settle_steered();
-        if tab.pending_handoff.is_some() || !tab.turn_running() || !tab.queue.iter().any(Queued::is_held) {
+        if tab.pending_handoff.is_some() || !tab.turn_running() || !tab.session.queue.iter().any(Queued::is_held) {
             return changed;
         }
         let label = tab.agent.label();
@@ -3324,7 +3425,7 @@ impl TabSet {
         };
         let reads_commands = reads_slash_commands(&tab.agent, &backend.projection());
         let mut refusal = None;
-        for item in tab.queue.iter_mut().filter(|q| q.is_held()) {
+        for item in tab.session.queue.iter_mut().filter(|q| q.is_held()) {
             // A provider that stopped waiting on a message reports it dropped although the agent may
             // still read it, and sent again under a new id it could run twice. It waits for the turn's
             // end instead, where a late delivery under its old id takes it out of the queue.
@@ -3368,8 +3469,8 @@ impl TabSet {
             }
         }
         let note = refusal.as_deref().map(held_note);
-        changed |= tab.queue_note != note;
-        tab.queue_note = note;
+        changed |= tab.session.queue_note != note;
+        tab.session.queue_note = note;
         self.next_steer = next;
         changed
     }
@@ -3385,7 +3486,7 @@ impl TabSet {
     /// straddle a delivery and turn completion, making a read message look unreported and sending it twice.
     pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
         let tab = self.get_mut(id)?;
-        if tab.queue.is_empty() || tab.pending_handoff.is_some() {
+        if tab.session.queue.is_empty() || tab.pending_handoff.is_some() {
             return None;
         }
         {
@@ -3393,30 +3494,32 @@ impl TabSet {
                 return None;
             };
             let projection = backend.projection();
-            settle_against(&mut tab.queue, &mut tab.queue_note, &projection);
+            settle_against(&mut tab.session.queue, &mut tab.session.queue_note, &projection);
             if projection.active_turn_id.is_some() || !projection.pending_permissions.is_empty() {
                 return None;
             }
         }
-        if tab.queue.is_empty() {
+        if tab.session.queue.is_empty() {
             return None;
         }
-        if !tab.queue.iter().all(Queued::is_held) {
+        if !tab.session.queue.iter().all(Queued::is_held) {
             eprintln!(
                 "[agent_panel] tab {}: the agent never said whether it read a message sent into its turn; it is sent again",
                 tab.id.0
             );
-            for item in tab.queue.iter_mut() {
+            for item in tab.session.queue.iter_mut() {
                 item.state = QueuedState::Held;
             }
         }
         let wire = tab
+            .session
             .queue
             .iter()
             .map(|q| q.wire.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
         let typed = tab
+            .session
             .queue
             .iter()
             .map(|q| q.text.as_str())
@@ -3427,14 +3530,14 @@ impl TabSet {
         let outcome = tab.live_mut().expect("checked above").send_turn_in(&wire, &typed, mode);
         match &outcome {
             Ok(_) => {
-                tab.queue.clear();
-                tab.queue_error = None;
-                tab.queue_note = None;
-                tab.turn_trace = trace;
+                tab.session.queue.clear();
+                tab.session.queue_error = None;
+                tab.session.queue_note = None;
+                tab.session.turn_trace = trace;
             }
-            Err(error) => tab.queue_error = Some(error.message.clone()),
+            Err(error) => tab.session.queue_error = Some(error.message.clone()),
         }
-        tab.was_running = tab.turn_running();
+        tab.session.was_running = tab.turn_running();
         Some(Flush { typed, outcome })
     }
 
@@ -3498,8 +3601,7 @@ impl TabSet {
         tab.editing_draft = None;
         let draft = match done {
             crate::scratch::EditDone::Written(text) => {
-                tab.draft = text.clone();
-                tab.left_view = None;
+                tab.replace_draft(text.clone());
                 Some(text.clone())
             }
             _ => None,
@@ -3532,10 +3634,9 @@ impl TabSet {
             tab.editing_draft = None;
             let saved = match results.iter().find(|(result_id, _)| *result_id == id) {
                 Some((_, crate::scratch::EditDone::Written(text)))
-                    if *text != tab.draft && Some(text.as_str()) != tab.draft.strip_suffix('\n') =>
+                    if *text != tab.session.draft && Some(text.as_str()) != tab.session.draft.strip_suffix('\n') =>
                 {
-                    tab.draft = text.clone();
-                    tab.left_view = None;
+                    tab.replace_draft(text.clone());
                     Some(text.clone())
                 }
                 _ => None,
@@ -3550,21 +3651,21 @@ impl TabSet {
     pub fn take_back_queue(&mut self, id: TabId) -> Vec<String> {
         let Some(tab) = self.get_mut(id) else { return Vec::new() };
         tab.settle_steered();
-        tab.queue_error = None;
-        tab.queue_note = None;
-        let (held, steered): (Vec<Queued>, Vec<Queued>) =
-            std::mem::take(&mut tab.queue).into_iter().partition(Queued::is_held);
-        tab.queue = steered;
+        tab.session.queue_error = None;
+        tab.session.queue_note = None;
+        let (held, steered): (Vec<Queued>, Vec<Queued>) = std::mem::take(&mut tab.session.queue)
+            .into_iter()
+            .partition(Queued::is_held);
+        tab.session.queue = steered;
         held.into_iter().map(|q| q.text).collect()
     }
 
-    /// Store the panel's draft mirror without echoing it.
-    /// This copy is newer than any late mirror from the page the tab left, so
-    /// [`TabSet::take_late_draft`] must no longer accept that page's copy.
+    /// The panel's mirror. Never echoed.
+    /// A copy set here is newer than anything the page the tab last left could still post, so that
+    /// page's late mirror ([`TabSet::take_late_draft`]) is no longer taken.
     pub fn set_draft(&mut self, id: TabId, text: &str) -> bool {
         let Some(tab) = self.get_mut(id) else { return false };
-        tab.draft = text.to_string();
-        tab.left_view = None;
+        tab.replace_draft(text.to_string());
         true
     }
 
@@ -3573,10 +3674,10 @@ impl TabSet {
     /// in since the move. Any other draft for a tab another page shows is not this page's to give.
     pub fn take_late_draft(&mut self, tab: TabId, from: ViewId) -> bool {
         let Some(t) = self.get_mut(tab) else { return false };
-        if t.left_view != Some(from) {
+        if t.session.left_view != Some(from) {
             return false;
         }
-        t.left_view = None;
+        t.session.left_view = None;
         true
     }
 
@@ -3586,38 +3687,39 @@ impl TabSet {
     /// rather than waiting for the mirror.
     pub fn note_sent(&mut self, id: TabId) {
         if let Some(tab) = self.get_mut(id) {
-            tab.draft.clear();
-            tab.left_view = None;
+            tab.replace_draft(String::new());
         }
     }
 
     /// The queued texts of one tab, oldest first (the close path reads them before removing it).
     pub fn queue_texts(&self, id: TabId) -> Vec<String> {
         self.get(id)
-            .map(|t| t.queue.iter().map(|q| q.text.clone()).collect())
+            .map(|t| t.session.queue.iter().map(|q| q.text.clone()).collect())
             .unwrap_or_default()
     }
 
     /// Every tab's queue, summed (the window-close prompt): held messages and those sent into a
     /// running turn that the agent has not been seen to read.
     pub fn queued_count(&self) -> usize {
-        self.tabs.iter().map(|t| t.queue.len()).sum()
+        self.tabs.iter().map(|t| t.session.queue.len()).sum()
     }
 
     /// The window is closing; take every queued text, tab by tab, for the history.
     pub fn take_every_queued_text(&mut self) -> Vec<String> {
         self.tabs
             .iter_mut()
-            .flat_map(|t| std::mem::take(&mut t.queue).into_iter().map(|q| q.text))
+            .flat_map(|t| std::mem::take(&mut t.session.queue).into_iter().map(|q| q.text))
             .collect()
     }
 
-    /// The window is closing: every tab, for the close path to tear down.
+    /// The window is closing: every tab, for the close path to tear down, each live backend retired
+    /// like a closed tab's. Nothing reports those retirements done: the presence they keep ends with
+    /// the window's.
     ///
     /// `take_all` leaves the set without tabs, so `active_tab()` would panic afterwards. Only the
     /// close path calls it, after setting `shutting_down`, and nothing reads the set after that
     /// (`eitri_panel::agent_panel` checks `shutting_down` first on every path that reaches the set).
-    pub fn take_all(&mut self) -> Vec<Tab> {
+    pub fn take_all(&mut self) -> Vec<RemovedTab> {
         self.closing = true;
         for tab in &mut self.tabs {
             tab.cancel_review_watchers();
@@ -3628,7 +3730,16 @@ impl TabSet {
                 review.close_tab(tab.id.0, now);
             }
         }
-        std::mem::take(&mut self.tabs)
+        let retiring = &mut self.retiring;
+        let removed = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(|mut tab| {
+                let retired = tab.retire_live(retiring);
+                RemovedTab { tab, retired }
+            })
+            .collect();
+        self.sync_presence();
+        removed
     }
 
     /// Whether no tab of this window has started a session (or is starting one): the state a launch
@@ -3641,7 +3752,7 @@ impl TabSet {
     /// and has handed its tabs over to be torn down -- closing every tab is not the user closing
     /// them. A tab is listed when it has a session, which includes one still being resumed. Claude
     /// tabs are listed only on the sidecar backend, the only one that resumes; another agent's tab
-    /// whose agent resumes is listed whatever the window's Claude backend, in `external_tabs`. A tab
+    /// whose agent resumes is listed whatever the window's Claude backend, after the Claude tabs. A tab
     /// bound to an extra chat view is saved with that view's number, so a restore can put it back
     /// there; a restore still waiting for its trust answer keeps the views it was saved with.
     ///
@@ -3651,7 +3762,7 @@ impl TabSet {
         if self.closing {
             return None;
         }
-        let external: Vec<(TabId, SavedExternalTab)> = self
+        let external: Vec<(TabId, SavedTab)> = self
             .tabs
             .iter()
             .filter(|tab| tab.agent.is_external() && (tab.resumable(self.kind) || tab.failed_resume.is_some()))
@@ -3659,7 +3770,7 @@ impl TabSet {
                 let session = self.saved_session_id(tab)?;
                 Some((
                     tab.id,
-                    SavedExternalTab {
+                    SavedTab {
                         agent: tab.agent.clone(),
                         conversation_id: conversation_id.to_string(),
                         provider_session_id: session,
@@ -3670,19 +3781,19 @@ impl TabSet {
                 ))
             })
             .collect();
-        let mut active_external = external.iter().position(|(id, _)| *id == self.active);
+        let mut others_active = external.iter().position(|(id, _)| *id == self.active);
         let waiting_active = self.waiting_restore_active();
-        let mut external_tabs: Vec<SavedExternalTab> = external.into_iter().map(|(_, saved)| saved).collect();
+        let mut others: Vec<SavedTab> = external.into_iter().map(|(_, saved)| saved).collect();
         // A restore waiting for the trust question has no tab for its sessions yet; they stay in the
         // file meanwhile, so a session started in another tab does not write over them. A dashboard
         // restore's are left out only while the window has nothing else to save: then nothing is written
         // and the file still holds them (`settle_waiting_restore`).
         let waiting = self.waiting_restore_tabs();
         for granted in waiting.iter().filter(|g| g.planned.agent.is_external()) {
-            if active_external.is_none() && waiting_active == Some(granted.planned.provider_session_id.as_str()) {
-                active_external = Some(external_tabs.len());
+            if others_active.is_none() && waiting_active == Some(granted.planned.provider_session_id.as_str()) {
+                others_active = Some(others.len());
             }
-            external_tabs.push(SavedExternalTab {
+            others.push(SavedTab {
                 agent: granted.planned.agent.clone(),
                 conversation_id: conversation_id.to_string(),
                 provider_session_id: granted.planned.provider_session_id.clone(),
@@ -3692,11 +3803,7 @@ impl TabSet {
             });
         }
         if self.kind != BackendKind::Sidecar {
-            return Some(SavedTabs {
-                external_tabs,
-                active_external,
-                ..SavedTabs::default()
-            });
+            return Some(SavedTabs::from_parts(Vec::new(), 0, others, others_active));
         }
         // `provider_session_id` is read in its own statement per tab (the lock-order rule above).
         let mut listed: Vec<(TabId, SavedTab)> = self
@@ -3708,6 +3815,7 @@ impl TabSet {
                 Some((
                     tab.id,
                     SavedTab {
+                        agent: AgentId::Claude,
                         conversation_id: conversation_id.to_string(),
                         provider_session_id: session,
                         name: tab.name.clone(),
@@ -3737,6 +3845,7 @@ impl TabSet {
             listed.push((
                 TabId(u64::MAX),
                 SavedTab {
+                    agent: AgentId::Claude,
                     conversation_id: conversation_id.to_string(),
                     provider_session_id: granted.planned.provider_session_id.clone(),
                     name: granted.planned.name.clone(),
@@ -3745,12 +3854,12 @@ impl TabSet {
                 },
             ));
         }
-        Some(SavedTabs {
-            tabs: listed.into_iter().map(|(_, saved)| saved).collect(),
+        Some(SavedTabs::from_parts(
+            listed.into_iter().map(|(_, saved)| saved).collect(),
             active,
-            external_tabs,
-            active_external,
-        })
+            others,
+            others_active,
+        ))
     }
 
     /// The session `tab` is saved under: the one it holds, or, for a tab that failed starting a saved
@@ -3805,8 +3914,7 @@ impl TabSet {
     /// Whether the window has anything to save besides a dashboard restore that is waiting for the trust
     /// question: a write of the file would then leave that restore's sessions out.
     fn saves_more_than_the_offer(&self) -> bool {
-        self.saved_snapshot("")
-            .is_some_and(|saved| !saved.tabs.is_empty() || !saved.external_tabs.is_empty())
+        self.saved_snapshot("").is_some_and(|saved| !saved.is_empty())
     }
 
     /// A dashboard restore waiting for the trust question stops being on offer once another tab has
@@ -3873,7 +3981,7 @@ impl TabSet {
             .iter()
             .enumerate()
             .filter(|(_, tab)| {
-                matches!(tab.backend, TabBackend::NotStarted) && tab.name.is_none() && tab.title.is_none()
+                matches!(tab.backend, TabBackend::NotStarted) && tab.name.is_none() && tab.session.title.is_none()
             })
             .map(|(at, _)| at)
             .collect();
@@ -4174,7 +4282,7 @@ impl TabSet {
                 if let Some(at) = self.position(tab) {
                     let t = &mut self.tabs[at];
                     t.backend = TabBackend::NotStarted;
-                    t.reported_start_failure = false;
+                    t.session.reported_start_failure = false;
                     t.agent = agent;
                     self.give_mode(at, mode);
                 }
@@ -4222,126 +4330,273 @@ fn grant(plan: RestorePlan, policy: BypassPolicy, asked: bool) -> RestoreGo {
     }
 }
 
-/// The exact `(tool_name, input)` seen by a rule or fast-path answer, kept with its candidate.
-/// Match later cards by content when `PermissionRequested` has no tool-use id, and remove the
-/// candidate. An empty `toolUseId` maps to `None` in `translate.rs`, so id matching cannot find
-/// such cards. Use exact `Value` equality, which ignores object key order, as `HumanApprovals`
-/// does. The sets are small and short-lived, so no canonical form is needed.
+/// The exact `(tool_name, input)` a rule's or the fast path's own answer saw, kept alongside a
+/// candidate so a later card for the very same call that names no tool-use id can still be matched
+/// by content and drop the candidate: the sidecar sends an empty tool-use id when the CLI gave none,
+/// and such a card has no id for the ordinary "same id" removal to find. Equality is exact (`Value`
+/// equality, which ignores object key order), as `HumanApprovals` compares calls: small, short-lived
+/// sets, and no canonical form to get wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CandidateCall {
     tool_name: String,
     input: serde_json::Value,
 }
 
-/// A saved prefix rule's own candidate: its display string, and the call its answer
-/// saw, for the id-less-card match `CandidateCall`'s own doc describes.
+/// Which note a candidate becomes on its call's row once the call completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NoteKind {
+    /// A saved prefix rule answered the call's gate: "allowed by rule `Bash(npm ci *)`".
+    Rule,
+    /// The acceptEdits fast path answered the call's gate: "allowed by auto".
+    AutoEdit,
+    /// The CLI's own prompt for the call was answered without a card, with the note to show.
+    PromptNote,
+}
+
+impl NoteKind {
+    /// Whether a later card for the same call means a human answered after all. A gate answered by a
+    /// rule or the fast path can still be followed by the CLI's own prompt for the call, drawn as a
+    /// card; a CLI prompt answered without a card is the last question about its call.
+    fn dropped_by_a_later_card(self) -> bool {
+        !matches!(self, NoteKind::PromptNote)
+    }
+}
+
+/// What one candidate turns into, and the call a later card is matched against by content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RuleCandidate {
-    rule: String,
-    call: CandidateCall,
+enum NoteCandidate {
+    Rule { rule: String, call: CandidateCall },
+    AutoEdit(CandidateCall),
+    PromptNote(String),
 }
 
-/// Find the candidate removed by a later `PermissionRequested`: match its tool-use id, or
-/// match `(tool_name, input)` if the request has no id. Content matching picks the first id
-/// in `BTreeMap` order. Identical concurrent `Bash`/`Write`/`Edit`/`NotebookEdit` calls answered
-/// the same way may collide, but their arguments and resulting notes are identical, so the
-/// row displays the same result either way.
-fn dropped_candidate_id<'a, V>(
-    candidates: &'a std::collections::BTreeMap<String, V>,
-    tool_use_id: &Option<String>,
-    tool_name: &str,
-    input: &serde_json::Value,
-    call_of: impl Fn(&'a V) -> &'a CandidateCall,
-) -> Option<String> {
-    if let Some(id) = tool_use_id {
-        return candidates.contains_key(id).then(|| id.clone());
-    }
-    for (id, value) in candidates {
-        let call = call_of(value);
-        if call.tool_name == tool_name && call.input == *input {
-            return Some(id.clone());
+impl NoteCandidate {
+    fn kind(&self) -> NoteKind {
+        match self {
+            NoteCandidate::Rule { .. } => NoteKind::Rule,
+            NoteCandidate::AutoEdit(_) => NoteKind::AutoEdit,
+            NoteCandidate::PromptNote(_) => NoteKind::PromptNote,
         }
     }
-    None
+
+    fn call(&self) -> Option<&CandidateCall> {
+        match self {
+            NoteCandidate::Rule { call, .. } | NoteCandidate::AutoEdit(call) => Some(call),
+            NoteCandidate::PromptNote(_) => None,
+        }
+    }
+
+    /// Writes this candidate's note for call `id` into `notes`.
+    fn note_into(self, id: String, notes: &mut CallNotes) {
+        match self {
+            NoteCandidate::Rule { rule, .. } => {
+                notes.allowed_by_rule.insert(id, rule);
+            }
+            NoteCandidate::AutoEdit(_) => {
+                notes.allowed_by_auto.insert(id);
+            }
+            NoteCandidate::PromptNote(note) => {
+                notes.prompt_notes.insert(id, note);
+            }
+        }
+    }
 }
 
-/// Save tool calls answered by a saved prefix rule as pairs of tool-use id and rule text,
-/// such as `Bash(git log *)`, in the tab's `notes` for later snapshots.
+/// What a host answer reports for the ledger. `answer_what_needs_no_human` reports all three;
+/// `approve_pending` answers only cards and reports only the CLI prompts among them, so the other two
+/// stay empty.
+#[derive(Default)]
+struct NoteReport {
+    prompts: Vec<crate::agent_backend::PromptAnsweredForYou>,
+    by_the_fast_path: Vec<crate::agent_backend::FastPathAnsweredForYou>,
+    by_rule: Vec<crate::agent_backend::RuleAnsweredForYou>,
+}
+
+impl NoteReport {
+    fn prompts(prompts: Vec<crate::agent_backend::PromptAnsweredForYou>) -> NoteReport {
+        NoteReport {
+            prompts,
+            ..NoteReport::default()
+        }
+    }
+}
+
+/// Calls answered without a card, each waiting for its call to complete before its row gets a note
+/// saying who answered. Only what the host reports it answered is recorded, at the answer itself, and
+/// never inferred from a card's absence: a call can fail the CLI's own validation before any gate
+/// runs, or a switch to bypass can answer the gate instead, and either would then read as allowed by
+/// something that never allowed it.
 ///
-/// Candidates come only from answers `AgentBackend::answer_what_needs_no_human` actually gave.
-/// A delivered `PermissionRequested` removes the matching candidate because a card still needs
-/// an answer. Match by id when present, otherwise by tool name and input. `ToolCallCompleted`
-/// turns each surviving candidate into a note. Matching a started call against a rule or seeing
-/// no card does not prove the rule answered: validation may fail before the gate, or bypass
-/// may answer the gate instead.
-fn note_rule_answers(
-    candidates: &mut std::collections::BTreeMap<String, RuleCandidate>,
-    notes: &mut std::collections::BTreeMap<String, String>,
-    events: &[AgentDomainEvent],
-) -> std::collections::BTreeMap<String, String> {
-    let mut fresh = std::collections::BTreeMap::new();
-    for event in events {
-        match event {
-            AgentDomainEvent::PermissionRequested {
-                tool_use_id,
-                tool_name,
-                input,
-                ..
-            } => {
-                if let Some(id) = dropped_candidate_id(candidates, tool_use_id, tool_name, input, |c| &c.call) {
-                    candidates.remove(&id);
-                }
-            }
-            AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
-                if let Some(candidate) = candidates.remove(tool_use_id) {
-                    notes.insert(tool_use_id.clone(), candidate.rule.clone());
-                    fresh.insert(tool_use_id.clone(), candidate.rule);
-                }
-            }
-            _ => {}
-        }
-    }
-    fresh
+/// Keyed by call and kind, since one call can wait for more than one note (a gate a rule answered,
+/// then the CLI's own prompt for it). Every way a candidate ends goes through here: a completed call
+/// turns it into its note ([`NoteLedger::fold`], [`NoteLedger::resync`]); a later card for the same
+/// call drops a gate's candidate, since a human answered too; and the whole ledger goes with the
+/// session that answered ([`NoteLedger::clear`]).
+#[derive(Debug, Default)]
+struct NoteLedger {
+    candidates: std::collections::BTreeMap<(String, NoteKind), NoteCandidate>,
 }
 
-/// Track `Write`/`Edit`/`NotebookEdit` calls answered by the acceptEdits fast path.
-/// Return their tool-use ids and keep them in `notes.allowed_by_auto` for later snapshots.
-///
-/// `candidates` contains only answers reported by `AgentBackend::answer_what_needs_no_human`.
-/// A later `PermissionRequested` removes a candidate by id, or by matching content when the
-/// card has no id, through `dropped_candidate_id`. The CLI delivered a card after the gate.
-/// `ToolCallCompleted` turns a surviving candidate into a note.
-/// Starting and finishing without a card is insufficient: CLI `validateInput` may fail
-/// before a hook runs, a card may omit its tool-use id, or bypass may answer the gate.
-fn note_auto_edit_answers(
-    candidates: &mut std::collections::BTreeMap<String, CandidateCall>,
-    notes: &mut BTreeSet<String>,
-    events: &[AgentDomainEvent],
-) -> BTreeSet<String> {
-    let mut fresh = BTreeSet::new();
-    for event in events {
-        match event {
-            AgentDomainEvent::PermissionRequested {
-                tool_use_id,
-                tool_name,
-                input,
-                ..
-            } => {
-                if let Some(id) = dropped_candidate_id(candidates, tool_use_id, tool_name, input, |c| c) {
-                    candidates.remove(&id);
-                }
-            }
-            AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
-                if candidates.remove(tool_use_id).is_none() {
-                    continue;
-                }
-                notes.insert(tool_use_id.clone());
-                fresh.insert(tool_use_id.clone());
-            }
-            _ => {}
+impl NoteLedger {
+    /// Notes that call `id` was answered without a card; a second answer of the same kind for the
+    /// same call replaces the first.
+    fn record(&mut self, id: String, candidate: NoteCandidate) {
+        self.candidates.insert((id, candidate.kind()), candidate);
+    }
+
+    /// Records everything one host answer reports.
+    fn record_report(&mut self, report: NoteReport) {
+        for answered in report.prompts {
+            self.record(answered.tool_use_id, NoteCandidate::PromptNote(answered.note));
+        }
+        for answered in report.by_the_fast_path {
+            let call = CandidateCall {
+                tool_name: answered.tool_name,
+                input: answered.input,
+            };
+            self.record(answered.tool_use_id, NoteCandidate::AutoEdit(call));
+        }
+        for answered in report.by_rule {
+            let call = CandidateCall {
+                tool_name: answered.tool_name,
+                input: answered.input,
+            };
+            let rule = answered.rule;
+            self.record(answered.tool_use_id, NoteCandidate::Rule { rule, call });
         }
     }
-    fresh
+
+    /// Folds one batch of events in order. A `PermissionRequested` drops the gate candidate of each
+    /// kind it matches ([`NoteLedger::dropped_by_card`]). A `ToolCallCompleted` turns every candidate
+    /// of its call into a note, kept in `kept` for later snapshots and added to `fresh`, this batch's
+    /// own.
+    fn fold(&mut self, events: &[AgentDomainEvent], kept: &mut CallNotes, fresh: &mut CallNotes) {
+        for event in events {
+            match event {
+                AgentDomainEvent::PermissionRequested {
+                    tool_use_id,
+                    tool_name,
+                    input,
+                    ..
+                } => {
+                    for kind in [NoteKind::Rule, NoteKind::AutoEdit] {
+                        if let Some(key) = self.dropped_by_card(kind, tool_use_id, tool_name, input) {
+                            self.candidates.remove(&key);
+                        }
+                    }
+                }
+                AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } => {
+                    for kind in [NoteKind::Rule, NoteKind::AutoEdit, NoteKind::PromptNote] {
+                        if let Some(candidate) = self.candidates.remove(&(tool_use_id.clone(), kind)) {
+                            candidate.clone().note_into(tool_use_id.clone(), kept);
+                            candidate.note_into(tool_use_id.clone(), fresh);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The gate candidate of `kind` a card drops: the one naming the card's own tool-use id; or, for a
+    /// card naming none, the first in id order whose call has the card's exact tool and input. Two
+    /// identical concurrent calls answered the same way could match the wrong one of the two, but
+    /// their rows' notes would read the same either way.
+    fn dropped_by_card(
+        &self,
+        kind: NoteKind,
+        tool_use_id: &Option<String>,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<(String, NoteKind)> {
+        if let Some(id) = tool_use_id {
+            let key = (id.clone(), kind);
+            return self.candidates.contains_key(&key).then_some(key);
+        }
+        self.candidates
+            .iter()
+            .find(|((_, k), candidate)| {
+                *k == kind
+                    && candidate
+                        .call()
+                        .is_some_and(|call| call.tool_name == tool_name && call.input == *input)
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    /// What a `Resync` does in place of the events it dropped, from the projection read once. A
+    /// candidate whose call finished becomes its note in `kept`, so the snapshot sent next carries it.
+    /// A gate candidate whose call still has a pending card nobody answered for the user is dropped:
+    /// the card that would have dropped it was among the dropped events, and whatever answers that
+    /// card now is a human. A request this tab answered itself (`host_answered`) can still be listed
+    /// as pending until the provider's resolution folds, and is no card: it is left out, or a
+    /// `Resync` that merely came early would drop an answer recorded at the answer itself
+    /// (`a_resync_before_the_call_finishes_keeps_its_fast_path_answer` and `..._keeps_its_rule_answer`
+    /// each fail without that filter).
+    fn resync(
+        &mut self,
+        projection: &agent::AgentSessionProjection,
+        host_answered: &BTreeSet<String>,
+        kept: &mut CallNotes,
+    ) {
+        let finished: Vec<(String, NoteKind)> = self
+            .candidates
+            .keys()
+            .filter(|(id, _)| {
+                projection
+                    .tool_calls
+                    .iter()
+                    .any(|call| &call.tool_use_id == id && call.result.is_some())
+            })
+            .cloned()
+            .collect();
+        for key in finished {
+            if let Some(candidate) = self.candidates.remove(&key) {
+                candidate.note_into(key.0, kept);
+            }
+        }
+        let still_pending: BTreeSet<&str> = projection
+            .pending_permissions
+            .values()
+            .filter(|p| !host_answered.contains(&p.permission_id))
+            .filter_map(|p| p.tool_use_id.as_deref())
+            .collect();
+        self.candidates
+            .retain(|(id, kind), _| !(kind.dropped_by_a_later_card() && still_pending.contains(id.as_str())));
+    }
+
+    /// Forgets every candidate: the session that answered them is gone.
+    fn clear(&mut self) {
+        self.candidates.clear();
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: &str, kind: NoteKind) -> Option<&NoteCandidate> {
+        self.candidates.get(&(id.to_string(), kind))
+    }
+
+    #[cfg(test)]
+    fn has(&self, id: &str, kind: NoteKind) -> bool {
+        self.get(id, kind).is_some()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    #[cfg(test)]
+    fn count(&self, kind: NoteKind) -> usize {
+        self.candidates.keys().filter(|(_, k)| *k == kind).count()
+    }
+
+    #[cfg(test)]
+    fn prompt_note(&self, id: &str) -> Option<&str> {
+        match self.get(id, NoteKind::PromptNote)? {
+            NoteCandidate::PromptNote(note) => Some(note),
+            _ => None,
+        }
+    }
 }
 
 /// The `Write` cards in this batch whose file does not exist now, when the card is
@@ -4403,7 +4658,7 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
         projection
             .pending_permissions
             .values()
-            .filter(|p| cards.contains(&p.permission_id) && !tab.host_answered.contains(&p.permission_id))
+            .filter(|p| cards.contains(&p.permission_id) && !tab.session.host_answered.contains(&p.permission_id))
             .map(|p| (p.seq, p.permission_id.clone()))
             .collect()
     };
@@ -4411,30 +4666,59 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
     ordered.into_iter().map(|(_, id)| id).collect()
 }
 
-/// A CLI-prompt candidate whose call completes in this batch becomes its row's note.
-/// Keep it in `notes` for later snapshots and return it among this batch's new notes.
-fn note_prompt_answers(
-    candidates: &mut std::collections::BTreeMap<String, String>,
-    notes: &mut std::collections::BTreeMap<String, String>,
-    events: &[AgentDomainEvent],
-) -> std::collections::BTreeMap<String, String> {
-    let mut fresh = std::collections::BTreeMap::new();
-    for event in events {
-        if let AgentDomainEvent::ToolCallCompleted { tool_use_id, .. } = event {
-            if let Some(note) = candidates.remove(tool_use_id) {
-                notes.insert(tool_use_id.clone(), note.clone());
-                fresh.insert(tool_use_id.clone(), note);
-            }
-        }
-    }
-    fresh
+/// What one [`TabSet::pump_views`] shares across its tabs, borrowed from the set beside its tabs. The
+/// turn review is not in it: it is handed only to the steps that feed it, so the arm that answers
+/// permissions cannot reach it.
+struct PumpTick<'a> {
+    project_root: &'a Path,
+    rules: &'a agent::PrefixRules,
+    ui_wake: Option<&'a agent::UiWake>,
+    retiring: &'a mut RetiringCounts,
+    #[cfg(test)]
+    after_drain: &'a mut Option<BackendSeam>,
+    #[cfg(test)]
+    redeliver_covered: bool,
+    #[cfg(test)]
+    before_resync_snapshot: &'a mut Option<BackendSeam>,
+}
+
+/// Where a tab is shown during one pump.
+#[derive(Clone, Copy)]
+struct PumpPlace {
+    /// The base view's active tab.
+    is_active: bool,
+    /// Shown in some view's page: the base view's active tab, or a tab bound to an extra view.
+    in_a_page: bool,
+    /// Shown in a page that is mapped now.
+    on_screen: bool,
+}
+
+/// The parts of a live tab a pump arm works on, borrowed apart so the backend is used beside them.
+struct LiveTab<'a> {
+    id: TabId,
+    mode: SessionModeChoice,
+    backend: &'a mut AgentBackend,
+    session: &'a mut SessionState,
+    notes: &'a mut CallNotes,
+    attention: &'a mut AttentionTracker,
+}
+
+/// What a pump arm leaves for the rest of its tab's tick.
+#[derive(Default)]
+struct ArmOutcome {
+    /// The tab's turn went from running to not running.
+    turn_ended: bool,
+    /// This tab's payload for the page that shows it, and its class.
+    delivered: Option<(String, crate::panel_cadence::EnvelopeClass)>,
+    /// The tab's turn trace saw its first text in this batch, in a tab a page shows.
+    saw_first_text: bool,
 }
 
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
     let Some(backend) = tab.live() else {
-        let had = !tab.rule_offers.is_empty();
-        tab.rule_offers.clear();
-        tab.rule_offers_seen.clear();
+        let had = !tab.session.rule_offers.is_empty();
+        tab.session.rule_offers.clear();
+        tab.session.rule_offers_seen.clear();
         return had;
     };
     let pending: Vec<(String, String, serde_json::Value)> = {
@@ -4445,15 +4729,15 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
         let mut cards: Vec<&agent::PermissionRequestRecord> = projection
             .pending_permissions
             .values()
-            .filter(|p| p.provider_prompt.is_none() && !tab.user_answered.contains(&p.permission_id))
+            .filter(|p| p.provider_prompt.is_none() && !tab.session.user_answered.contains(&p.permission_id))
             .collect();
         cards.sort_by(|a, b| a.permission_id.cmp(&b.permission_id));
         // Compared by id before anything is copied: this runs on every tick, and a card's input
         // can be a whole file's content.
-        let same = cards.len() == tab.rule_offers_seen.len()
+        let same = cards.len() == tab.session.rule_offers_seen.len()
             && cards
                 .iter()
-                .zip(&tab.rule_offers_seen)
+                .zip(&tab.session.rule_offers_seen)
                 .all(|(p, seen)| &p.permission_id == seen);
         if same {
             return false;
@@ -4463,13 +4747,13 @@ fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {
             .map(|p| (p.permission_id.clone(), p.tool_name.clone(), p.input.clone()))
             .collect()
     };
-    tab.rule_offers_seen = pending.iter().map(|p| p.0.clone()).collect();
+    tab.session.rule_offers_seen = pending.iter().map(|p| p.0.clone()).collect();
     let offers: std::collections::BTreeMap<String, agent::PrefixRule> = pending
         .into_iter()
         .filter_map(|(id, tool, input)| agent::permission_rules::offer(&tool, &input, project_root).map(|r| (id, r)))
         .collect();
-    let changed = offers != tab.rule_offers;
-    tab.rule_offers = offers;
+    let changed = offers != tab.session.rule_offers;
+    tab.session.rule_offers = offers;
     changed
 }
 
@@ -4589,7 +4873,13 @@ mod tests {
         let provider = Arc::new(RecordingProvider::default());
         let conversation =
             AgentConversation::create(provider.clone(), dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
-        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+        (
+            provider,
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            },
+        )
     }
 
     fn until(what: &str, mut done: impl FnMut() -> bool) {
@@ -4651,9 +4941,9 @@ mod tests {
     }
 
     fn shut_down_all(set: &mut TabSet) {
-        for mut tab in set.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in set.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -4718,7 +5008,6 @@ mod tests {
                 .unwrap(),
             closed_rx,
             dropped_rx,
-            page: ViewId::BASE,
         });
         assert!(set.needs_polling(), "a handoff's close is still running");
         set.get_mut(tab).unwrap().pending_handoff = None;
@@ -4755,7 +5044,7 @@ mod tests {
         let fresh = set.open(AgentId::Claude);
         let (other_provider, other) = live(&dir);
         set.get_mut(fresh).unwrap().backend = TabBackend::Live(other);
-        set.get_mut(fresh).unwrap().title = Some("its own prompt".into());
+        set.get_mut(fresh).unwrap().session.title = Some("its own prompt".into());
         other_provider.open_session("s-fresh", &dir);
         until("the other session id", || {
             set.get(fresh)
@@ -4769,24 +5058,24 @@ mod tests {
         assert!(!set.retitle_from(|_| None), "nothing known yet");
         assert!(set.retitle_from(titles));
         assert_eq!(
-            set.get(resumed).unwrap().title.as_deref(),
+            set.get(resumed).unwrap().session.title.as_deref(),
             Some("CLI title of s-resumed")
         );
-        assert_eq!(set.get(fresh).unwrap().title.as_deref(), Some("its own prompt"));
+        assert_eq!(set.get(fresh).unwrap().session.title.as_deref(), Some("its own prompt"));
         assert!(!set.retitle_from(titles), "the same title again changes nothing");
         assert!(
             !set.retitle_from(|_| Some("retitled again".into())),
             "a later retitle is not followed, as the read at the resume was not"
         );
         assert_eq!(
-            set.get(resumed).unwrap().title.as_deref(),
+            set.get(resumed).unwrap().session.title.as_deref(),
             Some("CLI title of s-resumed")
         );
-        assert!(!set.get(resumed).unwrap().title_from_record);
+        assert!(!set.get(resumed).unwrap().session.title_from_record);
         // A record whose title already was the CLI's (the cache was warm at the resume): kept, and done.
-        set.get_mut(resumed).unwrap().title_from_record = true;
+        set.get_mut(resumed).unwrap().session.title_from_record = true;
         assert!(!set.retitle_from(|_| Some("CLI title of s-resumed".into())));
-        assert!(!set.get(resumed).unwrap().title_from_record);
+        assert!(!set.get(resumed).unwrap().session.title_from_record);
         shut_down_all(&mut set);
     }
 
@@ -4853,8 +5142,8 @@ mod tests {
         );
     }
 
-    /// The pump calls `take_ui_delivery` on every tab, so policy answers a background tab's
-    /// `Read` even while nothing from that tab is dispatched to the panel.
+    /// The pump calls `take_revised_ui_delivery` on every tab, so the policy can answer a
+    /// background tab's `Read` even when that tab sends no UI payload.
     #[test]
     fn the_pump_answers_what_needs_no_human_in_a_background_tab() {
         let dir = workspace("tabs-background-pump");
@@ -4877,7 +5166,7 @@ mod tests {
             set.get(background).unwrap().attention.attention().pending == 1
         });
         assert_eq!(background_provider.resolutions(), vec![("perm-read".to_string(), true)]);
-        assert!(set.get(background).unwrap().stale);
+        assert!(set.get(background).unwrap().session.stale);
         assert_eq!(set.attention().pending, 1, "the tray sums every tab");
         let tabs: serde_json::Value = serde_json::from_str(&set.tabs_payload()).unwrap();
         assert_eq!(tabs["active"], foreground.0);
@@ -4898,7 +5187,7 @@ mod tests {
             "the auto-answered Read is hidden; only the Write is a real card"
         );
         assert_eq!(snapshot["state"]["pendingPermissions"][0]["permissionId"], "perm-write");
-        assert!(!set.get(background).unwrap().stale);
+        assert!(!set.get(background).unwrap().session.stale);
         shut_down_all(&mut set);
     }
 
@@ -5203,7 +5492,7 @@ mod tests {
             "the turn's end must still be reported exactly once after a snapshot carried it"
         );
         assert_eq!(
-            set.get(tab).unwrap().queue.len(),
+            set.get(tab).unwrap().session.queue.len(),
             1,
             "the queued message must still be waiting for the flush this enables"
         );
@@ -5509,7 +5798,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&payload.unwrap()).unwrap();
         assert_eq!(value["kind"], "events");
         assert_eq!(value["tab"], active.0);
-        assert!(!set.get(active).unwrap().stale);
+        assert!(!set.get(active).unwrap().session.stale);
         assert_eq!(set.running_count(), 1, "a turn is running");
         shut_down_all(&mut set);
     }
@@ -5538,7 +5827,7 @@ mod tests {
         assert!(set.collect_starts().is_empty(), "no tab in the set was waiting for it");
         assert!(set.tabs().iter().all(|t| t.live().is_none()));
         assert_eq!(set.active(), keep);
-        let TabBackend::Starting(pending) = closed.backend else {
+        let TabBackend::Starting(pending) = closed.tab.backend else {
             panic!("the closed tab kept its pending start")
         };
         let mut orphan = pending.result_rx.try_recv().unwrap().map_err(|e| e.message).unwrap();
@@ -5573,7 +5862,7 @@ mod tests {
         set.collect_starts();
         let tab = set.get(first).unwrap();
         assert_eq!(tab.name.as_deref(), Some("parser work"));
-        assert_eq!(tab.title.as_deref(), Some("fix the parser"));
+        assert_eq!(tab.session.title.as_deref(), Some("fix the parser"));
         assert_eq!(tab.label_name(), "parser work");
 
         let second = set.open(AgentId::Claude);
@@ -5610,6 +5899,147 @@ mod tests {
         set.remove(second).unwrap();
         assert_eq!(set.attention().arrived, 2, "a close kept the count");
         shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_new_session_starts_with_no_per_session_state() {
+        let dir = workspace("tabs-fresh-session");
+        let mut set = set();
+        let id = set.active();
+        let (_, backend) = live(&dir);
+        let tab = set.get_mut(id).unwrap();
+        tab.backend = TabBackend::Live(backend);
+        tab.session.title = Some("old title".into());
+        tab.session.title_from_record = true;
+        tab.attention.observe(&[write("old-card")], false);
+        tab.session.turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
+        tab.session.reported_start_failure = true;
+        tab.session
+            .rule_offers
+            .insert("old-card".into(), agent::PrefixRule::parse("Bash(ls *)").unwrap());
+        tab.session.rule_offers_seen.push("old-card".into());
+        tab.session.was_running = true;
+        let call = CandidateCall {
+            tool_name: "Write".into(),
+            input: serde_json::json!({"file_path": "old.rs"}),
+        };
+        tab.session.note_ledger.record(
+            "old-call".into(),
+            NoteCandidate::Rule {
+                rule: "Bash(ls *)".into(),
+                call: call.clone(),
+            },
+        );
+        tab.session
+            .note_ledger
+            .record("old-call".into(), NoteCandidate::AutoEdit(call));
+        tab.session.creates_file_unsent.insert("old-call".into());
+        tab.session.turn_clock = Some(("old-turn".into(), 1));
+        tab.session.turn_times_unsent = 1;
+        tab.session.host_answered.insert("old-card".into());
+        tab.session
+            .human_allowed
+            .record("old-call", "Write", &serde_json::json!({}));
+        tab.session
+            .note_ledger
+            .record("old-call".into(), NoteCandidate::PromptNote("old note".into()));
+        tab.session.user_answered.insert("old-card".into());
+        let TabBackend::Live(mut backend) = std::mem::replace(&mut tab.backend, TabBackend::NotStarted) else {
+            unreachable!()
+        };
+        backend.shutdown();
+        let tx = starting(&mut set, id, None, None);
+        tx.send(Ok(live(&dir).1)).unwrap();
+        assert!(matches!(
+            set.collect_starts().as_slice(),
+            [StartCollected::Installed { .. }]
+        ));
+        let tab = set.get(id).unwrap();
+        assert!(tab.session.human_allowed.is_empty());
+        assert!(tab.session.title.is_none());
+        assert!(!tab.session.title_from_record);
+        assert_eq!(tab.attention.attention().pending, 0);
+        assert!(!tab.attention.attention().unread);
+        assert!(tab.session.turn_trace.is_none());
+        assert!(!tab.session.reported_start_failure);
+        assert!(tab.session.rule_offers.is_empty());
+        assert!(tab.session.rule_offers_seen.is_empty());
+        assert!(!tab.session.was_running);
+        assert!(tab.session.note_ledger.is_empty());
+        assert!(tab.session.creates_file_unsent.is_empty());
+        assert!(tab.session.turn_clock.is_none());
+        assert_eq!(tab.session.turn_times_unsent, 0);
+        assert!(tab.session.host_answered.is_empty());
+        assert!(tab.session.user_answered.is_empty());
+        shut_down_all(&mut set);
+    }
+
+    /// The tiers are named as the start begins, and the user may type and queue while the backend
+    /// connects; installing the backend must not throw any of that away.
+    #[test]
+    fn a_tab_keeps_what_it_gathered_while_its_backend_started() {
+        let dir = workspace("tabs-kept-while-starting");
+        let mut set = set();
+        let id = set.active();
+        let tx = starting(&mut set, id, None, None);
+        set.queue_message(id, "queued while starting", "queued while starting".into(), 1, true)
+            .unwrap();
+        let tab = set.get_mut(id).unwrap();
+        tab.session.project_tiers = Some(agent::setting_sources::ProjectTrust::Untrusted);
+        tab.session.stale = true;
+        tab.session.queue_error = Some("refused flush".into());
+        tab.session.queue_note = Some("held note".into());
+        tab.replace_draft("typed while starting".into());
+        tab.session.left_view = Some(ViewId::BASE);
+        tx.send(Ok(live(&dir).1)).unwrap();
+        assert!(matches!(
+            set.collect_starts().as_slice(),
+            [StartCollected::Installed { .. }]
+        ));
+        let tab = set.get(id).unwrap();
+        assert!(matches!(tab.backend(), TabBackend::Live(_)));
+        assert_eq!(
+            tab.session.project_tiers,
+            Some(agent::setting_sources::ProjectTrust::Untrusted)
+        );
+        assert_eq!(tab.session.left_view, Some(ViewId::BASE));
+        assert!(tab.session.stale);
+        assert_eq!(
+            tab.session.queue.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(),
+            ["queued while starting"]
+        );
+        assert_eq!(tab.session.queue_error.as_deref(), Some("refused flush"));
+        assert_eq!(tab.session.queue_note.as_deref(), Some("held note"));
+        assert_eq!(tab.session.draft, "typed while starting");
+        shut_down_all(&mut set);
+    }
+
+    #[test]
+    fn a_handed_off_tab_keeps_its_resume_command_and_title_across_a_pump() {
+        let dir = workspace("tabs-handoff-pump");
+        let mut set = set();
+        let id = set.active();
+        let tab = set.get_mut(id).unwrap();
+        tab.backend = TabBackend::Live(live(&dir).1);
+        tab.session.title = Some("continue this conversation".into());
+        let command =
+            agent::handoff::ClaudeResumeCommand::for_session(dir.to_str().unwrap(), "1857dcd5-973b-46a2").unwrap();
+        let mut backend = set.take_for_handoff(id).unwrap().into_backend();
+        backend.shutdown();
+        set.retire_done(id);
+        set.get_mut(id).unwrap().last_handoff = Some(command);
+        let before = set.active_state_payloads();
+        for _ in 0..2 {
+            set.pump_views(&dir, &|_| true);
+        }
+        let tab = set.get(id).unwrap();
+        assert!(matches!(tab.backend, TabBackend::NotStarted));
+        assert_eq!(tab.session.title.as_deref(), Some("continue this conversation"));
+        assert_eq!(
+            tab.last_handoff.as_ref().unwrap().provider_session_id(),
+            "1857dcd5-973b-46a2"
+        );
+        assert_eq!(set.active_state_payloads(), before);
     }
 
     #[test]
@@ -5677,7 +6107,7 @@ mod tests {
         until("the session id", || {
             set.get(holder).unwrap().provider_session_id().is_some()
         });
-        assert_eq!(set.open_session_ids(), vec!["claude-open".to_string()]);
+        assert_eq!(set.open_sessions(), vec![(AgentId::Claude, "claude-open".to_string())]);
         let other = set.open(AgentId::Claude);
 
         assert_eq!(
@@ -5729,10 +6159,7 @@ mod tests {
         assert_eq!(first_plan.scope, BypassScope::Tab(tab));
         assert_eq!(
             set.confirm_bypass(first_plan.scope, first_plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         assert_eq!(
             set.default_mode(),
@@ -5783,10 +6210,7 @@ mod tests {
 
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
         assert_eq!(
@@ -5881,10 +6305,7 @@ mod tests {
 
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 1,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 1 })
         );
         assert_eq!(first_provider.resolutions(), vec![("p1".to_string(), true)]);
         assert!(second_provider.resolutions().is_empty());
@@ -5944,10 +6365,7 @@ mod tests {
         );
         assert_eq!(
             set.confirm_bypass(reprompted.scope, reprompted.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 2,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 2 })
         );
         shut_down_all(&mut set);
     }
@@ -5963,10 +6381,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
 
         provider.queue(write("p3"));
@@ -5982,7 +6397,7 @@ mod tests {
         });
         assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
         assert_eq!(
-            set.get(tab).unwrap().host_answered,
+            set.get(tab).unwrap().session.host_answered,
             BTreeSet::from(["p3".to_string(), "p4".to_string()])
         );
 
@@ -5996,7 +6411,7 @@ mod tests {
         });
         until("host_answered empties", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.is_empty()
+            set.get(tab).unwrap().session.host_answered.is_empty()
         });
         shut_down_all(&mut set);
     }
@@ -6011,10 +6426,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
 
         // Leaving bypass lands on manual, where the policy answers again (and an edit cards).
@@ -6049,10 +6461,7 @@ mod tests {
 
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
 
@@ -6079,10 +6488,7 @@ mod tests {
                 assert_eq!(plan.scope, BypassScope::Default);
                 assert_eq!(
                     set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-                    Ok(ConfirmOutcome::Entered {
-                        approved: 0,
-                        resolved: vec![]
-                    })
+                    Ok(ConfirmOutcome::Entered { approved: 0 })
                 );
             }
             other => panic!("auto -> bypass must ask first: {other:?}"),
@@ -6148,15 +6554,11 @@ mod tests {
             );
             assert_eq!(
                 set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-                Ok(ConfirmOutcome::Entered {
-                    approved: 0,
-                    resolved: vec![]
-                })
+                Ok(ConfirmOutcome::Entered { approved: 0 })
             );
             tx.send(Err(BackendError {
                 message: "boom".into(),
                 benign: false,
-                folded_events: Vec::new(),
             }))
             .unwrap();
             set.collect_starts();
@@ -6247,10 +6649,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
 
         provider.queue(write("pre"));
@@ -6258,7 +6657,7 @@ mod tests {
             "pre answered, still pending (the double no test provides its own resolution)",
             || {
                 set.pump(&dir, true);
-                set.get(tab).unwrap().host_answered.contains("pre")
+                set.get(tab).unwrap().session.host_answered.contains("pre")
                     && set
                         .get(tab)
                         .unwrap()
@@ -6323,11 +6722,7 @@ mod tests {
         let pending = snapshot["state"]["pendingPermissions"].as_array().unwrap();
         assert!(pending.is_empty(), "no swept id is drawn: {pending:?}");
         assert_eq!(
-            set.get(tab)
-                .unwrap()
-                .prompt_note_candidates
-                .get("toolu_lost_ask")
-                .map(String::as_str),
+            set.get(tab).unwrap().session.note_ledger.prompt_note("toolu_lost_ask"),
             Some("your ask rule: Bash(cat:*) — allowed in bypass"),
             "the swept CLI prompt's call will say so on its row"
         );
@@ -6348,7 +6743,7 @@ mod tests {
         provider.queue(read("seen"));
         until("the classifier answered it", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("seen")
+            set.get(tab).unwrap().session.host_answered.contains("seen")
         });
 
         provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
@@ -6565,10 +6960,7 @@ mod tests {
         assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 1,
-                resolved: vec![]
-            }),
+            Ok(ConfirmOutcome::Entered { approved: 1 }),
             "must not Reprompt for the classifier-answered id"
         );
         let mut resolutions = provider.resolutions();
@@ -6636,10 +7028,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         assert_eq!(set.default_mode(), SessionModeChoice::Bypass);
 
@@ -6737,10 +7126,7 @@ mod tests {
         assert_eq!(fresh.prompt, tabs::PromptScope::LiveTab);
         assert_eq!(
             set.confirm_bypass(fresh.scope, fresh.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: vec![]
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         assert_eq!(set.get(tab).unwrap().mode, SessionModeChoice::Bypass);
         assert_eq!(
@@ -6951,7 +7337,13 @@ mod tests {
         let provider = Arc::new(RecordingProvider::interruptible());
         let conversation =
             AgentConversation::create(provider.clone(), dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
-        (provider, AgentBackend::Sidecar(Box::new(conversation)))
+        (
+            provider,
+            AgentBackend::Conversation {
+                agent: AgentId::Claude,
+                conversation: Box::new(conversation),
+            },
+        )
     }
 
     fn started(id: &str) -> AgentDomainEvent {
@@ -6976,7 +7368,7 @@ mod tests {
         let mut ended = Vec::new();
         until("the turn state", || {
             ended.extend(set.pump(dir, true).turn_ended);
-            set.get(tab).unwrap().was_running == running
+            set.get(tab).unwrap().session.was_running == running
         });
         ended
     }
@@ -7013,7 +7405,7 @@ mod tests {
             vec!["ctx A\n\nand the tests\n\nctx B\n\nthen commit".to_string()],
             "one turn, each item with the context captured when it was queued"
         );
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         shut_down_all(&mut set);
     }
 
@@ -7155,7 +7547,11 @@ mod tests {
             ended_at >= started_at + 25,
             "the turn ran at least the sleep: {started_at} -> {ended_at}"
         );
-        assert_eq!(set.get(tab).unwrap().turn_times_unsent, 0, "the events carried it");
+        assert_eq!(
+            set.get(tab).unwrap().session.turn_times_unsent,
+            0,
+            "the events carried it"
+        );
         let newest = {
             let snapshot: serde_json::Value = serde_json::from_str(&the_snapshot(set.active_state_payloads())).unwrap();
             let transcript = snapshot["state"]["transcript"].as_array().unwrap().clone();
@@ -7258,13 +7654,13 @@ mod tests {
         provider.queue(completed("t1", agent::TurnOutcome::Completed));
         until("the background tab's turn to end", || {
             set.pump(&dir, true);
-            !set.get(background).unwrap().was_running
+            !set.get(background).unwrap().session.was_running
         });
-        assert_eq!(set.get(background).unwrap().turn_times_unsent, 1);
+        assert_eq!(set.get(background).unwrap().session.turn_times_unsent, 1);
         set.select(background);
         let times = snapshot_turn_times(&mut set);
         assert_eq!(times[0]["turnId"], "t1");
-        assert_eq!(set.get(background).unwrap().turn_times_unsent, 0);
+        assert_eq!(set.get(background).unwrap().session.turn_times_unsent, 0);
         set.remove(foreground).unwrap();
         shut_down_all(&mut set);
     }
@@ -7339,8 +7735,8 @@ mod tests {
         let flush = set.flush_queue(tab).unwrap();
         assert!(flush.outcome.is_err());
         let t = set.get(tab).unwrap();
-        assert_eq!(t.queue.len(), 1, "never dropped");
-        assert!(t.queue_error.is_some(), "the line saying why");
+        assert_eq!(t.session.queue.len(), 1, "never dropped");
+        assert!(t.session.queue_error.is_some(), "the line saying why");
         for _ in 0..10 {
             assert!(
                 set.pump(&dir, true).turn_ended.is_empty(),
@@ -7424,7 +7820,7 @@ mod tests {
         set.queue_message(tab, "a", "a".into(), 1, true).unwrap();
         set.queue_message(tab, "b", "b".into(), 2, true).unwrap();
         assert_eq!(set.take_back_queue(tab), vec!["a".to_string(), "b".to_string()]);
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         assert!(set.take_back_queue(tab).is_empty());
         shut_down_all(&mut set);
     }
@@ -7463,15 +7859,15 @@ mod tests {
         let tab = set.active();
         {
             let t = set.get_mut(tab).unwrap();
-            t.queue.push(Queued::held("q1", "q1".into(), 1));
-            t.queue.push(Queued::held("q2", "q2".into(), 2));
-            t.draft = "half".into();
+            t.session.queue.push(Queued::held("q1", "q1".into(), 1));
+            t.session.queue.push(Queued::held("q2", "q2".into(), 2));
+            t.replace_draft("half".into());
             t.backend = TabBackend::Failed { reason: "gone".into() };
         }
         set.reset(tab).unwrap();
         let t = set.get(tab).unwrap();
-        assert_eq!(t.draft, "q1\n\nq2\n\nhalf");
-        assert!(t.queue.is_empty());
+        assert_eq!(t.session.draft, "q1\n\nq2\n\nhalf");
+        assert!(t.session.queue.is_empty());
         assert_eq!(set.close_facts(tab).unwrap().queued, 0);
     }
 
@@ -7481,7 +7877,11 @@ mod tests {
         let one = set.active();
         let two = set.open(AgentId::Claude);
         for (tab, text) in [(one, "a"), (two, "b"), (two, "c")] {
-            set.get_mut(tab).unwrap().queue.push(Queued::held(text, text.into(), 0));
+            set.get_mut(tab)
+                .unwrap()
+                .session
+                .queue
+                .push(Queued::held(text, text.into(), 0));
         }
         assert_eq!(set.close_facts(two).unwrap().queued, 2);
         assert_eq!(set.queued_count(), 3);
@@ -7515,10 +7915,15 @@ mod tests {
         until("the cargo card", || {
             changed.extend(set.pump(&dir, true).offers_changed);
             set.get(background).unwrap().attention.attention().pending == 1
-                && set.get(background).unwrap().rule_offers.contains_key("perm-cargo")
+                && set
+                    .get(background)
+                    .unwrap()
+                    .session
+                    .rule_offers
+                    .contains_key("perm-cargo")
         });
         assert_eq!(provider.resolutions(), vec![("perm-npm".to_string(), true)]);
-        let offers = &set.get(background).unwrap().rule_offers;
+        let offers = &set.get(background).unwrap().session.rule_offers;
         assert_eq!(offers["perm-cargo"].display(), "cargo test *");
         assert!(changed.contains(&background));
         shut_down_all(&mut set);
@@ -7815,9 +8220,14 @@ mod tests {
         });
         until("the fast path to answer the gate", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-gate")
+            set.get(tab).unwrap().session.host_answered.contains("perm-gate")
         });
-        assert!(set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_edit"));
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_edit", NoteKind::AutoEdit));
 
         // The CLI's own follow-up prompt for the same call (O3), plus filler enough to overflow the
         // queue so the whole batch -- the prompt's `PermissionRequested` included -- is dropped and
@@ -7839,7 +8249,11 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
         assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
         assert!(
-            !set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_edit"),
+            !set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_edit", NoteKind::AutoEdit),
             "the still-pending sweep must drop a candidate whose own further card is genuinely pending"
         );
 
@@ -8017,7 +8431,7 @@ mod tests {
         provider.queue(call_done("toolu_sw", false));
         let payloads = pump_until_done(&mut set, &dir, "toolu_sw");
         assert!(
-            set.get(tab).unwrap().host_answered.contains("perm-sw"),
+            set.get(tab).unwrap().session.host_answered.contains("perm-sw"),
             "bypass answered it"
         );
         assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
@@ -8088,7 +8502,7 @@ mod tests {
         });
         until("bypass to answer the gate", || {
             payloads.extend(set.pump(&dir, true).active_payload);
-            set.get(tab).unwrap().host_answered.contains("perm-alone")
+            set.get(tab).unwrap().session.host_answered.contains("perm-alone")
         });
         provider.queue(call_done("toolu_alone", false));
         payloads.extend(pump_until_done(&mut set, &dir, "toolu_alone"));
@@ -8126,9 +8540,14 @@ mod tests {
         });
         until("the fast path to answer the edit", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-fp")
+            set.get(tab).unwrap().session.host_answered.contains("perm-fp")
         });
-        assert!(set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_fp"));
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_fp", NoteKind::AutoEdit));
         // One batch, not one `queue` call per event (`queue_all`'s doc): otherwise the ingestion
         // thread can fold the completion alone, before the filler loop even finishes pushing the
         // rest of the batch, so the `until` below could succeed before the overflow actually did.
@@ -8150,7 +8569,12 @@ mod tests {
             call_in_snapshot(&mut set, "toolu_fp")["allowedByAuto"],
             serde_json::json!(true)
         );
-        assert!(!set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_fp"));
+        assert!(!set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_fp", NoteKind::AutoEdit));
         shut_down_all(&mut set);
     }
 
@@ -8178,7 +8602,7 @@ mod tests {
         });
         until("the fast path to answer the edit", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-pa")
+            set.get(tab).unwrap().session.host_answered.contains("perm-pa")
         });
         // One batch (`queue_all`'s doc), for the same reason every other prefix+filler sequence in
         // this file uses it, even though this particular `until` loops on `pump` itself below and so
@@ -8197,7 +8621,11 @@ mod tests {
             saw_snapshot
         });
         assert!(
-            set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_pa"),
+            set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_pa", NoteKind::AutoEdit),
             "the resync dropped a fast-path candidate whose call had not finished"
         );
         provider.queue(call_done("toolu_pa", false));
@@ -8211,7 +8639,7 @@ mod tests {
 
     /// After the fast path allows a gate, the CLI can raise its own sensitive-file prompt for
     /// the same call. If a human approves that card, completion must not say "allowed by auto".
-    /// The `PermissionRequested` arm of `note_auto_edit_answers` removes the candidate.
+    /// The `PermissionRequested` arm of `NoteLedger::fold` removes the candidate.
     #[test]
     fn the_clis_own_prompt_after_the_fast_path_drops_the_auto_note() {
         let dir = workspace("tabs-cli-prompt-drops-auto");
@@ -8232,9 +8660,14 @@ mod tests {
         });
         until("the fast path to answer the gate", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-pb-gate")
+            set.get(tab).unwrap().session.host_answered.contains("perm-pb-gate")
         });
-        assert!(set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_pb"));
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_pb", NoteKind::AutoEdit));
         provider.queue(resolved("perm-pb-gate"));
         provider.queue(cli_prompt("perm-pb-cli", "toolu_pb", "Edit", input, None));
         until("the CLI's own prompt as a card", || {
@@ -8276,9 +8709,14 @@ mod tests {
         });
         until("the classifier to answer the read", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-pc")
+            set.get(tab).unwrap().session.host_answered.contains("perm-pc")
         });
-        assert!(!set.get(tab).unwrap().auto_edit_candidates.contains_key("toolu_pc"));
+        assert!(!set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_pc", NoteKind::AutoEdit));
         provider.queue(call_done("toolu_pc", false));
         let payloads = pump_until_done(&mut set, &dir, "toolu_pc");
         assert!(auto_notes_in(&payloads).is_empty(), "{payloads:?}");
@@ -8314,7 +8752,11 @@ mod tests {
         });
         until("the rule to answer the gate as a candidate", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().rule_candidates.contains_key("toolu_npm")
+            set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_npm", NoteKind::Rule)
         });
 
         // The CLI's own follow-up prompt for the same call (O3), plus filler enough to overflow the
@@ -8337,7 +8779,11 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
         assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
         assert!(
-            !set.get(tab).unwrap().rule_candidates.contains_key("toolu_npm"),
+            !set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_npm", NoteKind::Rule),
             "the still-pending sweep must drop a candidate whose own further card is genuinely pending"
         );
 
@@ -8549,51 +8995,151 @@ mod tests {
         assert_eq!(notes, fresh);
     }
 
-    /// Seed candidates directly, as `pump` does from `AnsweredForYou::by_rule`.
-    /// `note_rule_answers` does not infer them from `ToolCallStarted` arguments. A delivered card
-    /// removes a candidate, whether the rule answer failed or the CLI prompted after the gate.
-    /// A candidate with no such card becomes a note when its call completes.
-    #[test]
-    fn note_rule_answers_drops_a_kept_card_and_notes_a_surviving_candidate() {
-        let card = |id: &str| AgentDomainEvent::PermissionRequested {
+    fn npm_card(id: &str) -> AgentDomainEvent {
+        AgentDomainEvent::PermissionRequested {
             permission_id: format!("perm-{id}"),
             tool_use_id: Some(id.into()),
             tool_name: "Bash".into(),
             input: serde_json::json!({ "command": "npm ci" }),
             provider_prompt: None,
-        };
-        let done = |id: &str| AgentDomainEvent::ToolCallCompleted {
-            turn_id: "t1".into(),
-            tool_use_id: id.into(),
-            content: serde_json::json!("ok"),
-            is_error: false,
-        };
-        let rule_call = |command: &str| RuleCandidate {
+        }
+    }
+
+    fn npm_rule_candidate() -> NoteCandidate {
+        NoteCandidate::Rule {
             rule: "Bash(npm ci *)".to_string(),
             call: CandidateCall {
                 tool_name: "Bash".to_string(),
-                input: serde_json::json!({ "command": command }),
+                input: serde_json::json!({ "command": "npm ci" }),
             },
-        };
-        let mut candidates = std::collections::BTreeMap::new();
-        candidates.insert("toolu_carded".to_string(), rule_call("npm ci"));
-        candidates.insert("toolu_ruled".to_string(), rule_call("npm ci"));
-        let mut notes = std::collections::BTreeMap::new();
+        }
+    }
+
+    /// A rule's answer is noted only once its call completes, and only if no card for the same call
+    /// came first: such a card means a human answered too (the rule's own answer failed, or the CLI
+    /// asked again after the gate).
+    #[test]
+    fn a_card_for_a_rule_answered_call_drops_its_note_and_a_surviving_one_is_noted_on_completion() {
+        let mut ledger = NoteLedger::default();
+        ledger.record("toolu_carded".to_string(), npm_rule_candidate());
+        ledger.record("toolu_ruled".to_string(), npm_rule_candidate());
+        let mut kept = CallNotes::default();
         // Spread over two batches, as a card and its answer are: the candidate outlives the first.
-        let first = note_rule_answers(&mut candidates, &mut notes, &[card("toolu_carded")]);
+        let mut first = CallNotes::default();
+        ledger.fold(&[npm_card("toolu_carded")], &mut kept, &mut first);
         assert!(first.is_empty());
-        let second = note_rule_answers(
-            &mut candidates,
-            &mut notes,
-            &[done("toolu_carded"), done("toolu_ruled")],
+        let mut second = CallNotes::default();
+        ledger.fold(
+            &[call_done("toolu_carded", false), call_done("toolu_ruled", false)],
+            &mut kept,
+            &mut second,
         );
         assert_eq!(
-            second.into_iter().collect::<Vec<_>>(),
+            second.allowed_by_rule.into_iter().collect::<Vec<_>>(),
             vec![("toolu_ruled".to_string(), "Bash(npm ci *)".to_string())]
         );
-        assert!(candidates.is_empty());
-        assert!(!notes.contains_key("toolu_carded"), "a card was delivered for it");
-        assert_eq!(notes.get("toolu_ruled"), Some(&"Bash(npm ci *)".to_string()));
+        assert!(ledger.is_empty());
+        assert!(
+            !kept.allowed_by_rule.contains_key("toolu_carded"),
+            "a card was delivered for it"
+        );
+        assert_eq!(
+            kept.allowed_by_rule.get("toolu_ruled"),
+            Some(&"Bash(npm ci *)".to_string())
+        );
+    }
+
+    /// One call can wait for two notes at once: its gate answered by a rule, then the CLI's own prompt
+    /// for it answered without a card. A card for the call drops the gate's note (someone answered
+    /// after the rule), never the prompt's own, which the call's completion then shows.
+    #[test]
+    fn a_call_keeps_its_prompt_note_when_a_card_drops_its_rule_note() {
+        let mut ledger = NoteLedger::default();
+        ledger.record("toolu_both".to_string(), npm_rule_candidate());
+        ledger.record(
+            "toolu_both".to_string(),
+            NoteCandidate::PromptNote("Claude Code asked — allowed in bypass".to_string()),
+        );
+        let mut kept = CallNotes::default();
+        let mut fresh = CallNotes::default();
+        ledger.fold(
+            &[npm_card("toolu_both"), call_done("toolu_both", false)],
+            &mut kept,
+            &mut fresh,
+        );
+        assert!(fresh.allowed_by_rule.is_empty(), "the card dropped the rule's note");
+        assert_eq!(
+            fresh.prompt_notes.get("toolu_both").map(String::as_str),
+            Some("Claude Code asked — allowed in bypass")
+        );
+        assert_eq!(kept, fresh);
+        assert!(ledger.is_empty());
+    }
+
+    /// A resync reads the projection in place of the events it dropped: every candidate whose call
+    /// finished becomes its note; a gate's candidate whose call still has a card nobody answered for
+    /// the user is dropped, while one whose only pending request this tab answered itself, and a CLI
+    /// prompt's note, wait on.
+    #[test]
+    fn a_resync_notes_finished_calls_and_drops_gate_candidates_with_a_card_still_pending() {
+        let edit = |path: &str| {
+            NoteCandidate::AutoEdit(CandidateCall {
+                tool_name: "Edit".to_string(),
+                input: serde_json::json!({ "file_path": path }),
+            })
+        };
+        let mut ledger = NoteLedger::default();
+        ledger.record("toolu_done".to_string(), edit("done.rs"));
+        ledger.record("toolu_done".to_string(), npm_rule_candidate());
+        ledger.record("toolu_carded".to_string(), edit("carded.rs"));
+        ledger.record("toolu_carded".to_string(), npm_rule_candidate());
+        ledger.record(
+            "toolu_carded".to_string(),
+            NoteCandidate::PromptNote("Claude Code asked — allowed with your approval".to_string()),
+        );
+        ledger.record("toolu_ours".to_string(), edit("ours.rs"));
+        let begun = |id: &str| AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: id.into(),
+            name: "Edit".into(),
+            input: serde_json::json!({}),
+        };
+        let mut projection = agent::AgentSessionProjection::default();
+        for event in [
+            started("t1"),
+            begun("toolu_done"),
+            call_done("toolu_done", false),
+            begun("toolu_carded"),
+            npm_card("toolu_carded"),
+            begun("toolu_ours"),
+            npm_card("toolu_ours"),
+        ] {
+            projection.apply(&event);
+        }
+        assert_eq!(projection.pending_permissions.len(), 2, "both cards are still pending");
+        let host_answered: BTreeSet<String> = ["perm-toolu_ours".to_string()].into();
+        let mut kept = CallNotes::default();
+        ledger.resync(&projection, &host_answered, &mut kept);
+        assert!(kept.allowed_by_auto.contains("toolu_done"));
+        assert_eq!(
+            kept.allowed_by_rule.get("toolu_done").map(String::as_str),
+            Some("Bash(npm ci *)")
+        );
+        assert_eq!(kept.allowed_by_auto.len() + kept.allowed_by_rule.len(), 2);
+        assert!(kept.prompt_notes.is_empty(), "no prompt's call finished");
+        assert!(
+            !ledger.has("toolu_carded", NoteKind::AutoEdit),
+            "a human answers its card"
+        );
+        assert!(!ledger.has("toolu_carded", NoteKind::Rule), "a human answers its card");
+        assert!(
+            ledger.has("toolu_carded", NoteKind::PromptNote),
+            "a card never drops a prompt's note"
+        );
+        assert!(
+            ledger.has("toolu_ours", NoteKind::AutoEdit),
+            "the only pending request is one this tab answered"
+        );
     }
 
     /// The CLI runs `validateInput` before `PreToolUse` hooks. A Bash call can fail with `is_error`
@@ -8659,7 +9205,7 @@ mod tests {
         provider.queue(call_done("toolu_sw", false));
         let payloads = pump_until_done(&mut set, &dir, "toolu_sw");
         assert!(
-            set.get(tab).unwrap().host_answered.contains("perm-sw"),
+            set.get(tab).unwrap().session.host_answered.contains("perm-sw"),
             "bypass answered it"
         );
         let notes: Vec<serde_json::Value> = payloads
@@ -8674,7 +9220,7 @@ mod tests {
 
     /// The CLI's follow-up prompt for a call already answered by a rule can have an empty tool-use
     /// id, which `translate.rs` maps to `None`. Match this card to its candidate by content through
-    /// `dropped_candidate_id`, so human approval cannot leave an "allowed by rule" note.
+    /// `NoteLedger::dropped_by_card`, so human approval cannot leave an "allowed by rule" note.
     #[test]
     fn an_id_less_follow_up_card_a_human_answers_drops_the_rule_candidate_by_content() {
         let dir = workspace("tabs-rule-id-less-follow-up");
@@ -8696,7 +9242,11 @@ mod tests {
         });
         until("the rule to answer the gate as a candidate", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().rule_candidates.contains_key("toolu_idless")
+            set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_idless", NoteKind::Rule)
         });
 
         // The CLI's follow-up prompt has no tool-use id. `needs_its_own_card()` is false
@@ -8722,7 +9272,11 @@ mod tests {
             set.get(tab).unwrap().attention.attention().pending == 1
         });
         assert!(
-            !set.get(tab).unwrap().rule_candidates.contains_key("toolu_idless"),
+            !set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_idless", NoteKind::Rule),
             "the id-less follow-up card must still drop the candidate, matched by content"
         );
 
@@ -8743,9 +9297,8 @@ mod tests {
 
     /// A rule-eligible request stays a card if the provider refuses the auto-answer. No
     /// `by_rule` candidate is recorded because candidates are added only on success. With an
-    /// empty tool-use id, the content match in `note_rule_answers` (`dropped_candidate_id`)
-    /// must find nothing to drop. A later human approval must never be labeled "allowed by
-    /// rule".
+    /// empty tool-use id, the content match in `NoteLedger::dropped_by_card` must find nothing
+    /// to drop. A later human approval must never be labeled "allowed by rule".
     #[test]
     fn a_carded_rule_request_a_human_approves_is_never_named_by_rule() {
         let dir = workspace("tabs-rule-refused-answer");
@@ -8773,7 +9326,7 @@ mod tests {
             set.get(tab).unwrap().attention.attention().pending == 1
         });
         assert!(
-            set.get(tab).unwrap().rule_candidates.is_empty(),
+            set.get(tab).unwrap().session.note_ledger.count(NoteKind::Rule) == 0,
             "the answer failed; no candidate was ever recorded"
         );
         provider.refuse_resolutions(false);
@@ -8815,9 +9368,14 @@ mod tests {
         });
         until("the rule to answer the call", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-rp")
+            set.get(tab).unwrap().session.host_answered.contains("perm-rp")
         });
-        assert!(set.get(tab).unwrap().rule_candidates.contains_key("toolu_rp"));
+        assert!(set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_rp", NoteKind::Rule));
         // One batch, not one `queue` call per event (`queue_all`'s doc): otherwise the ingestion
         // thread can fold the completion alone, before the filler loop even finishes pushing the
         // rest of the batch, so the `until` below could succeed before the overflow actually did.
@@ -8839,12 +9397,17 @@ mod tests {
             call_in_snapshot(&mut set, "toolu_rp")["allowedByRule"],
             serde_json::json!("Bash(npm ci *)")
         );
-        assert!(!set.get(tab).unwrap().rule_candidates.contains_key("toolu_rp"));
+        assert!(!set
+            .get(tab)
+            .unwrap()
+            .session
+            .note_ledger
+            .has("toolu_rp", NoteKind::Rule));
         shut_down_all(&mut set);
     }
 
     /// Item (b) of this task's own review: the still-pending sweep's `host_answered` filter, pinned
-    /// for `auto_edit_candidates` by `a_resync_before_the_call_finishes_keeps_its_fast_path_answer`,
+    /// for fast-path candidates by `a_resync_before_the_call_finishes_keeps_its_fast_path_answer`,
     /// had no rule counterpart either. A `Resync` that lands after the rule answered a call's gate
     /// but BEFORE its call completes: the provider has not reported the request resolved, so the
     /// projection still lists it pending; the still-pending sweep must leave it out (`host_answered`)
@@ -8874,7 +9437,7 @@ mod tests {
         });
         until("the rule to answer the call", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().host_answered.contains("perm-rb")
+            set.get(tab).unwrap().session.host_answered.contains("perm-rb")
         });
         // One batch (`queue_all`'s doc), for the same reason every other prefix+filler sequence in
         // this file uses it, even though this particular `until` loops on `pump` itself below and so
@@ -8893,7 +9456,11 @@ mod tests {
             saw_snapshot
         });
         assert!(
-            set.get(tab).unwrap().rule_candidates.contains_key("toolu_rb"),
+            set.get(tab)
+                .unwrap()
+                .session
+                .note_ledger
+                .has("toolu_rb", NoteKind::Rule),
             "the resync dropped a rule candidate whose call had not finished"
         );
         provider.queue(call_done("toolu_rb", false));
@@ -8913,7 +9480,7 @@ mod tests {
         let background = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(background).unwrap().backend = TabBackend::Live(backend);
-        set.get_mut(background).unwrap().turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
+        set.get_mut(background).unwrap().session.turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
         set.open(AgentId::Claude);
         provider.queue(started("t1"));
         provider.queue(AgentDomainEvent::ContentDelta {
@@ -8928,11 +9495,12 @@ mod tests {
                 && set
                     .get(background)
                     .unwrap()
+                    .session
                     .turn_trace
                     .as_ref()
                     .is_some_and(crate::turn_trace::TurnTrace::is_finished)
         });
-        let trace = set.get(background).unwrap().turn_trace.as_ref().unwrap();
+        let trace = set.get(background).unwrap().session.turn_trace.as_ref().unwrap();
         assert!(trace.line().contains("first_paint_frame=bg"), "{}", trace.line());
         assert!(
             trace.is_emitted(),
@@ -8953,7 +9521,7 @@ mod tests {
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
-        set.get_mut(tab).unwrap().turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
+        set.get_mut(tab).unwrap().session.turn_trace = Some(crate::turn_trace::TurnTrace::started_now());
 
         // The ingestion thread folds the whole turn independently, without a tick draining it.
         provider.queue(started("t1"));
@@ -8974,7 +9542,7 @@ mod tests {
             "the whole batch was already in the snapshot"
         );
 
-        let trace = set.get(tab).unwrap().turn_trace.as_ref().unwrap();
+        let trace = set.get(tab).unwrap().session.turn_trace.as_ref().unwrap();
         assert!(
             trace.is_emitted(),
             "a turn folded entirely inside a snapshot must still be printed: nothing else will"
@@ -9053,8 +9621,12 @@ mod tests {
             .finish_scratch_edit(7, &crate::scratch::EditDone::Written("after".into()))
             .expect("edit 7 belongs to a tab");
         assert_eq!((tab, draft.as_deref()), (first, Some("after")));
-        assert_eq!(set.get(first).unwrap().draft, "after");
-        assert_eq!(set.get(second).unwrap().draft, "second's own", "never the active tab");
+        assert_eq!(set.get(first).unwrap().session.draft, "after");
+        assert_eq!(
+            set.get(second).unwrap().session.draft,
+            "second's own",
+            "never the active tab"
+        );
         assert_eq!(set.get(first).unwrap().editing_draft, None);
         assert!(
             set.finish_scratch_edit(7, &crate::scratch::EditDone::Discarded)
@@ -9067,7 +9639,7 @@ mod tests {
             .finish_scratch_edit(9, &crate::scratch::EditDone::Discarded)
             .unwrap();
         assert_eq!(draft, None, ":q! changes nothing");
-        assert_eq!(set.get(second).unwrap().draft, "second's own");
+        assert_eq!(set.get(second).unwrap().session.draft, "second's own");
     }
 
     #[test]
@@ -9102,10 +9674,10 @@ mod tests {
                 (silent, None),
             ]
         );
-        assert_eq!(set.get(changed).unwrap().draft, "new");
-        assert_eq!(set.get(identical).unwrap().draft, "same\n");
-        assert_eq!(set.get(discarded).unwrap().draft, "kept");
-        assert_eq!(set.get(silent).unwrap().draft, "also kept");
+        assert_eq!(set.get(changed).unwrap().session.draft, "new");
+        assert_eq!(set.get(identical).unwrap().session.draft, "same\n");
+        assert_eq!(set.get(discarded).unwrap().session.draft, "kept");
+        assert_eq!(set.get(silent).unwrap().session.draft, "also kept");
         for tab in [changed, identical, discarded, silent] {
             assert_eq!(set.get(tab).unwrap().editing_draft, None);
         }
@@ -9166,8 +9738,8 @@ mod tests {
             0,
             "the pump shuts nothing down on the GTK thread itself"
         );
-        for mut t in tripped {
-            t.backend.shutdown();
+        for t in tripped {
+            t.retired.into_backend().shutdown();
         }
         assert_eq!(provider.closes(), 1);
 
@@ -9233,8 +9805,8 @@ mod tests {
             0,
             "the pump shuts nothing down on the GTK thread itself"
         );
-        for mut t in tripped {
-            t.backend.shutdown();
+        for t in tripped {
+            t.retired.into_backend().shutdown();
         }
         assert_eq!(provider.closes(), 1);
 
@@ -9279,8 +9851,8 @@ mod tests {
             !tripped.is_empty()
         });
         let reason = tripped[0].reason.clone();
-        for mut t in tripped {
-            t.backend.shutdown();
+        for t in tripped {
+            t.retired.into_backend().shutdown();
         }
         {
             let tab = set.get_mut(never_started_tab).unwrap();
@@ -9355,7 +9927,7 @@ mod tests {
             provider.open_session("claude-1", &dir);
         }
         until("an overflowed UI queue", || {
-            let AgentBackend::Sidecar(conversation) = &backend else {
+            let AgentBackend::Conversation { conversation, .. } = &backend else {
                 unreachable!("`live` builds a sidecar")
             };
             let stats = conversation.ingest_stats();
@@ -9370,8 +9942,8 @@ mod tests {
         let out = set.pump(&dir, true);
         assert_eq!(out.tripped.len(), 1, "the first pump already closes it");
         assert!(matches!(set.get(tab).unwrap().backend, TabBackend::Failed { .. }));
-        for mut t in out.tripped {
-            t.backend.shutdown();
+        for t in out.tripped {
+            t.retired.into_backend().shutdown();
         }
         shut_down_all(&mut set);
     }
@@ -9522,7 +10094,7 @@ mod tests {
             .respond_permission("perm-direct", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
-        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+        assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
 
         provider.queue(resolved("perm-denied"));
         provider.queue(resolved("perm-direct"));
@@ -9555,7 +10127,7 @@ mod tests {
         set.answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
-        assert!(set.get(tab).unwrap().human_allowed.contains("toolu_c"));
+        assert!(set.get(tab).unwrap().session.human_allowed.contains("toolu_c"));
         provider.queue(resolved("perm-hook"));
         provider.queue(AgentDomainEvent::TurnCompleted {
             turn_id: "t1".into(),
@@ -9567,7 +10139,7 @@ mod tests {
         });
         until("the turn ends", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().human_allowed.is_empty()
+            set.get(tab).unwrap().session.human_allowed.is_empty()
         });
         shut_down_all(&mut set);
     }
@@ -9583,10 +10155,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: Vec::new()
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         provider.queue(cli_prompt(
             "perm-cli",
@@ -9656,7 +10225,7 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().attention.attention().pending == 2
         });
-        let offers = &set.get(tab).unwrap().rule_offers;
+        let offers = &set.get(tab).unwrap().session.rule_offers;
         assert!(offers.contains_key("perm-gate"), "{offers:?}");
         assert!(!offers.contains_key("perm-cli"), "{offers:?}");
         shut_down_all(&mut set);
@@ -9732,17 +10301,16 @@ mod tests {
         );
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 6,
-                resolved: Vec::new()
-            })
+            Ok(ConfirmOutcome::Entered { approved: 6 })
         );
         assert_eq!(
             provider.resolutions(),
             all.iter().map(|id| (id.clone(), true)).collect::<Vec<_>>()
         );
         assert_eq!(set.get(tab).unwrap().attention.attention().pending, 0);
-        assert!(all.iter().all(|id| set.get(tab).unwrap().host_answered.contains(id)));
+        assert!(all
+            .iter()
+            .all(|id| set.get(tab).unwrap().session.host_answered.contains(id)));
         provider.queue(call_done("toolu_g", false));
         pump_until_done(&mut set, &dir, "toolu_g");
         assert_eq!(
@@ -9798,10 +10366,7 @@ mod tests {
         assert_eq!(again.approve, vec!["perm-write".to_string(), "perm-ask".to_string()]);
         assert_eq!(
             set.confirm_bypass(again.scope, again.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 2,
-                resolved: Vec::new()
-            })
+            Ok(ConfirmOutcome::Entered { approved: 2 })
         );
         assert_eq!(
             provider.resolutions(),
@@ -9846,7 +10411,7 @@ mod tests {
         set.answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .map_err(|e| e.message)
             .unwrap();
-        assert!(set.get(tab).unwrap().human_allowed.contains("toolu_reused"));
+        assert!(set.get(tab).unwrap().session.human_allowed.contains("toolu_reused"));
 
         provider.queue(resolved("perm-hook"));
         provider.queue(AgentDomainEvent::TurnCompleted {
@@ -9877,7 +10442,7 @@ mod tests {
         let out = set.pump(&dir, true);
         let payload: serde_json::Value = serde_json::from_str(&out.active_payload.expect("a payload")).unwrap();
         assert_eq!(payload["kind"], "snapshot", "the overflow must have become a Resync");
-        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+        assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
 
         provider.queue(cli_prompt(
             "perm-cli-t2",
@@ -9901,9 +10466,11 @@ mod tests {
         let tab = set.active();
         let t = set.get_mut(tab).unwrap();
         t.backend = TabBackend::Failed { reason: "gone".into() };
-        t.human_allowed.record("toolu_x", "Write", &serde_json::json!({}));
+        t.session
+            .human_allowed
+            .record("toolu_x", "Write", &serde_json::json!({}));
         set.reset(tab).unwrap();
-        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+        assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
     }
 
     /// A tab with no backend holds no approvals: the pump's non-live arm forgets them (review #4, C3).
@@ -9914,10 +10481,11 @@ mod tests {
         let tab = set.active();
         set.get_mut(tab)
             .unwrap()
+            .session
             .human_allowed
             .record("toolu_x", "Write", &serde_json::json!({}));
         set.pump(&dir, true);
-        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+        assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
     }
 
     /// An Approve the provider refused approved nothing, so nothing is recorded (review #4, C4).
@@ -9937,7 +10505,7 @@ mod tests {
         assert!(set
             .answer_card(tab, ViewId::BASE, "perm-hook", agent::PermissionDecision::Allow)
             .is_err());
-        assert!(set.get(tab).unwrap().human_allowed.is_empty());
+        assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
         shut_down_all(&mut set);
     }
 
@@ -9954,10 +10522,7 @@ mod tests {
         let plan = plan(set.cycle_mode(tab, ViewId::BASE));
         assert_eq!(
             set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
-            Ok(ConfirmOutcome::Entered {
-                approved: 0,
-                resolved: Vec::new()
-            })
+            Ok(ConfirmOutcome::Entered { approved: 0 })
         );
         let input = serde_json::json!({ "file_path": ".git/probe2", "content": "o3" });
         provider.queue(AgentDomainEvent::ToolCallStarted {
@@ -10019,7 +10584,6 @@ mod tests {
         BackendError {
             message: message.to_string(),
             benign: false,
-            folded_events: Vec::new(),
         }
     }
 
@@ -10050,12 +10614,12 @@ mod tests {
         assert_eq!(saved.tabs[0].mode, SessionModeChoice::Auto);
         assert_eq!(saved.tabs[1].mode, SessionModeChoice::Bypass);
         assert!(saved.tabs.iter().all(|t| t.conversation_id == PROJECT));
-        assert_eq!(saved.active, 1, "the tab on screen, among the listed ones");
+        assert_eq!(saved.active, Some(1), "the tab on screen, among the listed ones");
 
         set.select(empty);
         assert_eq!(
             set.saved_snapshot(PROJECT).unwrap().active,
-            1,
+            Some(1),
             "an empty tab on screen falls back to the last listed one"
         );
         shut_down_all(&mut set);
@@ -10076,15 +10640,15 @@ mod tests {
         set.select(d);
         assert_eq!(
             set.saved_snapshot(PROJECT).unwrap().active,
-            1,
+            Some(1),
             "b was the last listed tab on screen"
         );
         set.select(a);
         set.select(c);
-        assert_eq!(set.saved_snapshot(PROJECT).unwrap().active, 0, "now it was a");
+        assert_eq!(set.saved_snapshot(PROJECT).unwrap().active, Some(0), "now it was a");
         // Closing the tab it fell back to hands the fallback to the one before it.
         set.remove(a);
-        assert_eq!(set.saved_snapshot(PROJECT).unwrap().active, 0);
+        assert_eq!(set.saved_snapshot(PROJECT).unwrap().active, Some(0));
         assert_eq!(ids(&set.saved_snapshot(PROJECT).unwrap()), ["s-b"]);
         shut_down_all(&mut set);
     }
@@ -10127,9 +10691,9 @@ mod tests {
         assert!(set.saved_snapshot(PROJECT).is_some());
         let taken = set.take_all();
         assert_eq!(set.saved_snapshot(PROJECT), None);
-        for mut tab in taken {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in taken {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -10524,6 +11088,22 @@ mod tests {
     }
 
     #[test]
+    fn replacing_the_draft_ends_the_late_mirror_allowance() {
+        let mut set = set();
+        let tab = set.active();
+        set.set_draft(tab, "mirrored before the move");
+        set.open(AgentId::Claude);
+        assert!(set.select(tab));
+        let view = ViewId::new(2).unwrap();
+        assert_eq!(set.break_out(view), Ok(tab));
+        assert!(set.take_late_draft(tab, ViewId::BASE));
+
+        assert_eq!(set.join_back(view), Some(tab));
+        set.get_mut(tab).unwrap().replace_draft("newer draft".into());
+        assert!(!set.take_late_draft(tab, view));
+    }
+
+    #[test]
     fn a_late_draft_is_taken_once_from_the_view_the_tab_left_and_never_after_a_newer_one() {
         let mut set = set();
         let first = set.active();
@@ -10563,7 +11143,7 @@ mod tests {
             !set.take_late_draft(first, view),
             "an nvim edit came back after the move"
         );
-        assert_eq!(set.get(first).unwrap().draft, "edited in nvim");
+        assert_eq!(set.get(first).unwrap().session.draft, "edited in nvim");
 
         joined(&mut set);
         set.begin_scratch_edit(first, 2).unwrap();
@@ -10921,11 +11501,11 @@ mod tests {
         let second = set.open(AgentId::Claude);
         give_session(&mut set, second, &dir, "s-two");
         assert!(show(&set, &mut memory), "a second session");
-        assert_eq!(on_disk(&state).active, 1);
+        assert_eq!(on_disk(&state).active, Some(1));
 
         set.select(first);
         assert!(show(&set, &mut memory), "the active tab switched");
-        assert_eq!(on_disk(&state).active, 0);
+        assert_eq!(on_disk(&state).active, Some(0));
 
         set.get_mut(second).unwrap().mode = SessionModeChoice::Bypass;
         assert!(show(&set, &mut memory), "its mode changed");
@@ -10942,9 +11522,9 @@ mod tests {
         let before = std::fs::read_to_string(state.join(crate::layout::persist::file_name(&root))).unwrap();
         let taken = set.take_all();
         assert!(!show(&set, &mut memory));
-        for mut tab in taken {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in taken {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
         assert!(!show(&set, &mut memory));
@@ -11029,7 +11609,10 @@ mod tests {
         let provider = Arc::new(RecordingProvider::cli_auto());
         let conversation =
             AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
-        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Sidecar(Box::new(conversation)));
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        });
         let input = serde_json::json!({ "file_path": dir.join("main.rs"), "content": "fn main() { }\n" });
         provider.queue_all(vec![
             AgentDomainEvent::CliPermissionMode {
@@ -11391,8 +11974,8 @@ mod tests {
             seen_from_elsewhere(&review) == Some(Busy::OtherWindow { pid: 4242 })
         });
 
-        // A legacy turn begins in a send, with no event for the pump to fold: the projection just
-        // has an active turn by the next pump.
+        // A send can fold a legacy turn before the pump sees it; presence must observe the
+        // projection even when no review is installed.
         let tab = set.active();
         let (provider, backend) = live(&dir);
         set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
@@ -11455,8 +12038,8 @@ mod tests {
         // Its backend may still be writing until its shutdown returns: the file stays until then.
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(seen_from_elsewhere(&review), Some(Busy::TurnRunning { pid: 4242 }));
-        if let TabBackend::Live(backend) = &mut closed.backend {
-            backend.shutdown();
+        if let Some(retired) = closed.retired.take() {
+            retired.into_backend().shutdown();
         }
         set.retire_done(tab);
         until("the turn's file is gone", || {
@@ -11509,8 +12092,8 @@ mod tests {
         });
         let other = set.open(AgentId::Claude);
         let mut closed = set.remove(tab).unwrap();
-        if let TabBackend::Live(backend) = &mut closed.backend {
-            backend.shutdown();
+        if let Some(retired) = closed.retired.take() {
+            retired.into_backend().shutdown();
         }
         assert_eq!(set.active(), other);
         // The tab's session stays tracked until its end snapshot is reported.
@@ -11627,7 +12210,7 @@ mod tests {
             let projection = backend.projection();
             projection.user_prompts.last().is_some_and(|p| p.text == text)
         });
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         shut_down_all(&mut set);
     }
 
@@ -11726,8 +12309,8 @@ mod tests {
         );
         assert!(!ticket.is_current(&set));
         assert_eq!(set.active(), other);
-        if let TabBackend::Live(backend) = &mut closed.backend {
-            backend.shutdown();
+        if let Some(retired) = closed.retired.take() {
+            retired.into_backend().shutdown();
         }
         shut_down_all(&mut set);
     }
@@ -11743,8 +12326,8 @@ mod tests {
         let kept = set.review_ticket(second).unwrap();
         let mut closed = set.remove(first).unwrap();
         assert!(kept.is_current(&set));
-        if let TabBackend::Live(backend) = &mut closed.backend {
-            backend.shutdown();
+        if let Some(retired) = closed.retired.take() {
+            retired.into_backend().shutdown();
         }
         shut_down_all(&mut set);
     }
@@ -11762,9 +12345,9 @@ mod tests {
         let tabs = set.take_all();
         assert!(!a.wanted.load(Ordering::SeqCst));
         assert!(!b.wanted.load(Ordering::SeqCst));
-        for mut tab in tabs {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in tabs {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -12062,22 +12645,22 @@ mod tests {
     #[test]
     fn reset_hands_back_a_deferred_first_send() {
         let (mut set, tab, _) = asked(first_send("r1", "fix the build"));
-        set.get_mut(tab).unwrap().draft = "and then the tests".into();
+        set.get_mut(tab).unwrap().replace_draft("and then the tests".into());
         let old = set.reset(tab).expect("a waiting tab starts over");
         assert!(old.is_none(), "nothing was spawned");
         let t = set.get(tab).unwrap();
         assert!(matches!(t.backend, TabBackend::NotStarted));
         assert_eq!(
-            t.draft, "fix the build\n\nand then the tests",
+            t.session.draft, "fix the build\n\nand then the tests",
             "the typed text comes back first"
         );
-        assert_eq!(t.project_tiers, None);
+        assert_eq!(t.session.project_tiers, None);
         assert!(set.awaiting_trust().is_empty());
 
         // A resume has no text to give back: it is dropped.
         let (mut set, tab, _) = asked(resume_of("r2", "sess-1"));
         assert!(set.reset(tab).unwrap().is_none());
-        assert!(set.get(tab).unwrap().draft.is_empty());
+        assert!(set.get(tab).unwrap().session.draft.is_empty());
         assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
     }
 
@@ -12086,7 +12669,7 @@ mod tests {
         let (mut set, tab, nonce) = asked(first_send("r1", "hi"));
         let other = set.open(AgentId::Claude);
         let closed = set.remove(tab).expect("the tab closes");
-        match closed.backend {
+        match closed.tab.backend {
             TabBackend::AwaitingTrust(waiting) => assert_eq!(waiting.start.request_id(), Some("r1")),
             _ => panic!("the tab was waiting"),
         }
@@ -12150,7 +12733,7 @@ mod tests {
             set.tabs().iter().all(|t| !matches!(t.backend, TabBackend::Starting(_))),
             "nothing is starting"
         );
-        assert!(set.open_session_ids().is_empty(), "no lease or session is named yet");
+        assert!(set.open_sessions().is_empty(), "no lease or session is named yet");
         let nonce = set.ask_trust(from).unwrap();
         let DeferredStart::Restore { go } = set.take_answered(from, nonce, ViewId::BASE).unwrap() else {
             panic!("the restore comes back")
@@ -12573,6 +13156,74 @@ mod tests {
         assert_eq!(set.get(background).unwrap().mode(), SessionModeChoice::Auto);
     }
 
+    #[cfg(feature = "legacy-backend")]
+    #[test]
+    fn legacy_events_reach_the_page_on_the_next_pump() {
+        let dir = workspace("legacy-next-pump");
+        let mut set = set();
+        let tab = set.active();
+        let mut backend = AgentBackend::Legacy(agent::AgentSession::for_tests());
+        let outcome: Result<(), BackendError> = backend.send_turn("wire text", "typed text");
+        assert!(
+            outcome.is_ok(),
+            "the send succeeds while event delivery waits for the pump"
+        );
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        let out = set.pump_views(&dir, &|_| true);
+        let payload: serde_json::Value = serde_json::from_str(out.active_payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["events"][0]["type"], "user_prompt_submitted");
+        assert_eq!(payload["events"][0]["text"], "typed text");
+        assert_eq!(payload["events"][1]["type"], "turn_started");
+        assert!(set.pump_views(&dir, &|_| true).active_payload.is_none());
+        shut_down_all(&mut set);
+    }
+
+    #[cfg(feature = "legacy-backend")]
+    #[test]
+    fn a_rejected_legacy_send_keeps_its_prompt_in_the_pump() {
+        let dir = workspace("legacy-refused-pump");
+        let mut set = set();
+        let tab = set.active();
+        let mut backend = AgentBackend::Legacy(agent::AgentSession::for_tests());
+        backend.send_turn("first", "first").unwrap();
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        set.pump_views(&dir, &|_| true);
+        let error = set
+            .get_mut(tab)
+            .unwrap()
+            .live_mut()
+            .unwrap()
+            .send_turn("second", "second")
+            .unwrap_err();
+        assert!(
+            error.benign,
+            "a running turn refuses another send without ending the session"
+        );
+        let out = set.pump_views(&dir, &|_| true);
+        let payload: serde_json::Value = serde_json::from_str(out.active_payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["events"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["events"][0]["text"], "second");
+        shut_down_all(&mut set);
+    }
+
+    #[cfg(feature = "legacy-backend")]
+    #[test]
+    fn a_legacy_snapshot_covers_queued_local_events() {
+        let dir = workspace("legacy-snapshot-pump");
+        let mut set = set();
+        let tab = set.active();
+        let mut backend = AgentBackend::Legacy(agent::AgentSession::for_tests());
+        backend.send_turn("first", "first").unwrap();
+        let revision = backend.projection().last_revision;
+        backend.note_ui_snapshot(revision);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        assert!(
+            set.pump_views(&dir, &|_| true).active_payload.is_none(),
+            "a snapshot already drew the queued prompt and turn start"
+        );
+        shut_down_all(&mut set);
+    }
+
     #[test]
     fn a_bound_tabs_events_go_to_its_view_and_it_is_never_stale() {
         let dir = workspace("views-bound-tab-events");
@@ -12603,7 +13254,7 @@ mod tests {
                 bound_text += &events_text(Some(&shown.payload));
             }
             assert!(out.view_payloads.len() <= 1);
-            assert!(!set.get(bound).unwrap().stale, "a bound tab is never stale");
+            assert!(!set.get(bound).unwrap().session.stale, "a bound tab is never stale");
             base_text.contains("from the base view") && bound_text.contains("from view two")
         });
         assert!(
@@ -12616,7 +13267,7 @@ mod tests {
         bound_provider.queue(completed("v1", agent::TurnOutcome::Completed));
         until("the bound tab's turn end", || {
             set.pump_views(&dir, &|_| true);
-            !set.get(bound).unwrap().was_running
+            !set.get(bound).unwrap().session.was_running
         });
         assert!(!set.get(bound).unwrap().attention.attention().unread);
 
@@ -12633,7 +13284,7 @@ mod tests {
                 assert_eq!((shown.view, shown.tab), (view(2), bound));
                 hidden_text += &events_text(Some(&shown.payload));
             }
-            assert!(!set.get(bound).unwrap().stale, "a bound tab is never stale");
+            assert!(!set.get(bound).unwrap().session.stale, "a bound tab is never stale");
             set.get(bound).unwrap().attention.attention().unread
         });
         assert!(hidden_text.contains("while hidden"), "{hidden_text}");
@@ -12668,7 +13319,7 @@ mod tests {
         provider.queue(started("t1"));
         until("the bound tab's turn to start", || {
             set.pump_views(&dir, &|_| true);
-            set.get(bound).unwrap().was_running
+            set.get(bound).unwrap().session.was_running
         });
         provider.queue(text_delta("t1", "done"));
         provider.queue(completed("t1", agent::TurnOutcome::Completed));
@@ -12686,7 +13337,11 @@ mod tests {
             times.is_some()
         });
         assert_eq!(times.unwrap()[0]["turnId"], "t1");
-        assert_eq!(set.get(bound).unwrap().turn_times_unsent, 0, "the envelope carried it");
+        assert_eq!(
+            set.get(bound).unwrap().session.turn_times_unsent,
+            0,
+            "the envelope carried it"
+        );
 
         // Without pumping in between: enough to overflow the sidecar's own UI queue.
         provider.queue(started("t2"));
@@ -12717,7 +13372,7 @@ mod tests {
             "the snapshot carries the durations"
         );
         assert!(snapshot_text(&payload).contains("chunk 299"));
-        assert!(!set.get(bound).unwrap().stale, "a bound tab is never stale");
+        assert!(!set.get(bound).unwrap().session.stale, "a bound tab is never stale");
         shut_down_all(&mut set);
     }
 
@@ -12855,15 +13510,13 @@ mod tests {
 
         let saved = set.saved_snapshot("conv").unwrap();
         let claude: Vec<(&str, Option<u8>)> = saved
-            .tabs
-            .iter()
+            .claude_tabs()
             .map(|t| (t.provider_session_id.as_str(), t.view))
             .collect();
         assert_eq!(claude, [("s-1", None), ("s-2", Some(3)), ("s-3", None)]);
-        assert_eq!(saved.active, 2, "the base view's active tab, as before");
+        assert_eq!(saved.active, Some(2), "the base view's active tab, as before");
         let external: Vec<(&str, Option<u8>)> = saved
-            .external_tabs
-            .iter()
+            .other_tabs()
             .map(|t| (t.provider_session_id.as_str(), t.view))
             .collect();
         assert_eq!(external, [("thread-1", None), ("thread-2", Some(4))]);
@@ -13256,6 +13909,17 @@ mod external_tab_tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    /// The other agents' tabs of a saved set, in order.
+    fn others(saved: &SavedTabs) -> Vec<&SavedTab> {
+        saved.other_tabs().collect()
+    }
+
+    /// Where the tab that comes back on screen stands among the other agents' tabs, when it is one.
+    fn others_active(saved: &SavedTabs) -> Option<usize> {
+        let index = saved.active.filter(|i| saved.tabs[*i].agent.is_external())?;
+        Some(index - saved.claude_tabs().count())
+    }
+
     fn workspace(label: &str) -> PathBuf {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir(label);
@@ -13411,9 +14075,9 @@ mod external_tab_tests {
             vec![reviewer(Reviewer::Agent), reviewer(Reviewer::User)],
             "Auto's turn is reviewed by the agent, Bypass's reaches Eitri"
         );
-        for mut t in set.take_all() {
-            if let TabBackend::Live(b) = &mut t.backend {
-                b.shutdown();
+        for t in set.take_all() {
+            if let Some(retired) = t.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -13494,9 +14158,9 @@ mod external_tab_tests {
             provider.policies(),
             vec![reviewer(Reviewer::Agent), reviewer(Reviewer::User)]
         );
-        for mut t in set.take_all() {
-            if let TabBackend::Live(b) = &mut t.backend {
-                b.shutdown();
+        for t in set.take_all() {
+            if let Some(retired) = t.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -13538,9 +14202,9 @@ mod external_tab_tests {
             provider.policies(),
             vec![reviewer(Reviewer::User), reviewer(Reviewer::Agent)]
         );
-        for mut t in set.take_all() {
-            if let TabBackend::Live(b) = &mut t.backend {
-                b.shutdown();
+        for t in set.take_all() {
+            if let Some(retired) = t.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -13642,9 +14306,9 @@ mod external_tab_tests {
         let number = set.get(tab).unwrap().number;
         assert!(note.starts_with("gem tabs have no manual mode"), "{note}");
         assert!(note.ends_with(&format!("tab {number} is in auto")), "{note}");
-        for mut t in set.take_all() {
-            if let TabBackend::Live(b) = &mut t.backend {
-                b.shutdown();
+        for t in set.take_all() {
+            if let Some(retired) = t.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -13768,9 +14432,9 @@ mod external_tab_tests {
         ));
         assert_eq!(set.active(), codex, "the saved active tab is shown");
         let saved = set.saved_snapshot("conv").unwrap();
-        assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");
-        assert_eq!(saved.external_tabs[0].provider_session_id, "codex-b");
-        assert_eq!(saved.active_external, Some(0));
+        assert_eq!(others(&saved).len(), 1, "kept in the saved file while it waits");
+        assert_eq!(others(&saved)[0].provider_session_id, "codex-b");
+        assert_eq!(others_active(&saved), Some(0));
         assert_eq!(run.outcome(), None, "claude-a is still connecting");
         assert_eq!(run.restored, 1, "the waiting tab is back");
 
@@ -13797,10 +14461,13 @@ mod external_tab_tests {
         });
         set.select(tab);
         let saved = set.saved_snapshot("conv").unwrap();
-        assert!(saved.tabs.is_empty(), "the empty Claude tab has nothing to save");
+        assert!(
+            saved.claude_tabs().next().is_none(),
+            "the empty Claude tab has nothing to save"
+        );
         assert_eq!(
-            saved.external_tabs,
-            vec![crate::saved_tabs::SavedExternalTab {
+            saved.tabs,
+            vec![SavedTab {
                 agent: AgentId::Codex,
                 conversation_id: "conv".into(),
                 provider_session_id: "thread-1".into(),
@@ -13809,14 +14476,14 @@ mod external_tab_tests {
                 view: None,
             }]
         );
-        assert_eq!(saved.active_external, Some(0));
+        assert_eq!(others_active(&saved), Some(0));
         // A window on the legacy Claude backend still keeps its Codex tabs.
         set.kind = BackendKind::Legacy;
-        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        assert_eq!(others(&set.saved_snapshot("conv").unwrap()).len(), 1);
         drop(provider);
-        for mut t in set.take_all() {
-            if let TabBackend::Live(b) = &mut t.backend {
-                b.shutdown();
+        for t in set.take_all() {
+            if let Some(retired) = t.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -13857,7 +14524,6 @@ mod external_tab_tests {
         tx.send(Err(BackendError {
             message: "Codex could not start: CODEX_HOME is relative".into(),
             benign: false,
-            folded_events: Vec::new(),
         }))
         .unwrap();
         let collected = set.collect_starts();
@@ -13865,12 +14531,12 @@ mod external_tab_tests {
         assert_eq!(set.get(codex).unwrap().wire_state(), TabStateWire::Failed);
 
         let saved = set.saved_snapshot("conv").unwrap();
-        assert_eq!(saved.external_tabs.len(), 1, "the conversation is still in the file");
-        assert_eq!(saved.external_tabs[0].agent, AgentId::Codex);
-        assert_eq!(saved.external_tabs[0].provider_session_id, "codex-b");
-        assert_eq!(saved.external_tabs[0].name.as_deref(), Some("parser work"));
-        assert_eq!(saved.external_tabs[0].mode, SessionModeChoice::Bypass);
-        assert_eq!(saved.active_external, Some(0));
+        assert_eq!(others(&saved).len(), 1, "the conversation is still in the file");
+        assert_eq!(others(&saved)[0].agent, AgentId::Codex);
+        assert_eq!(others(&saved)[0].provider_session_id, "codex-b");
+        assert_eq!(others(&saved)[0].name.as_deref(), Some("parser work"));
+        assert_eq!(others(&saved)[0].mode, SessionModeChoice::Bypass);
+        assert_eq!(others_active(&saved), Some(0));
 
         // The same session opened in another tab is that tab's entry, not listed twice.
         let other = set.open(AgentId::Codex);
@@ -13884,27 +14550,27 @@ mod external_tab_tests {
             asking: None,
             recording: false,
         });
-        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        assert_eq!(others(&set.saved_snapshot("conv").unwrap()).len(), 1);
         set.remove(other).unwrap();
 
         // Starting it over is the user's choice of a fresh session; closing it is the user's choice to let go.
         let mut again = set.saved_snapshot("conv").unwrap();
-        assert_eq!(again.external_tabs.len(), 1);
+        assert_eq!(others(&again).len(), 1);
         set.reset(codex).unwrap();
         again = set.saved_snapshot("conv").unwrap();
-        assert!(again.external_tabs.is_empty(), "a tab started over holds no session");
+        assert!(others(&again).is_empty(), "a tab started over holds no session");
 
         set.get_mut(codex).unwrap().backend = TabBackend::Failed { reason: "x".into() };
         set.get_mut(codex).unwrap().failed_resume = Some("codex-b".into());
-        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        assert_eq!(others(&set.saved_snapshot("conv").unwrap()).len(), 1);
         // A second failed tab of the same session (its resume by hand refused too) is not a second entry.
         let twin = set.open(AgentId::Codex);
         set.get_mut(twin).unwrap().backend = TabBackend::Failed { reason: "y".into() };
         set.get_mut(twin).unwrap().failed_resume = Some("codex-b".into());
-        assert_eq!(set.saved_snapshot("conv").unwrap().external_tabs.len(), 1);
+        assert_eq!(others(&set.saved_snapshot("conv").unwrap()).len(), 1);
         set.remove(twin).unwrap();
         set.remove(codex).unwrap();
-        assert!(set.saved_snapshot("conv").unwrap().external_tabs.is_empty());
+        assert!(others(&set.saved_snapshot("conv").unwrap()).is_empty());
     }
 
     /// An ACP tab is saved, and comes back, exactly when its agent said it can load a saved session.
@@ -13937,18 +14603,18 @@ mod external_tab_tests {
             assert_eq!(set.get(tab).unwrap().resumable(BackendKind::Sidecar), resumes);
             set.select(tab);
             let saved = set.saved_snapshot("conv").unwrap();
-            assert_eq!(saved.external_tabs.len(), saved_count, "loadSession {resumes}");
+            assert_eq!(others(&saved).len(), saved_count, "loadSession {resumes}");
             if resumes {
-                assert_eq!(saved.external_tabs[0].agent, agent);
-                assert_eq!(saved.external_tabs[0].provider_session_id, "thread-1");
-                assert_eq!(saved.active_external, Some(0));
+                assert_eq!(others(&saved)[0].agent, agent);
+                assert_eq!(others(&saved)[0].provider_session_id, "thread-1");
+                assert_eq!(others_active(&saved), Some(0));
             } else {
-                assert_eq!(saved.active_external, None);
+                assert_eq!(others_active(&saved), None);
             }
             drop(provider);
-            for mut t in set.take_all() {
-                if let TabBackend::Live(b) = &mut t.backend {
-                    b.shutdown();
+            for t in set.take_all() {
+                if let Some(retired) = t.retired {
+                    retired.into_backend().shutdown();
                 }
             }
         }
@@ -13970,8 +14636,8 @@ mod external_tab_tests {
             .expect("the ACP tab came back");
         assert!(set.get(waiting).unwrap().resumable(BackendKind::Sidecar));
         let saved = set.saved_snapshot("conv").unwrap();
-        assert_eq!(saved.external_tabs.len(), 1, "kept in the saved file while it waits");
-        assert_eq!(saved.external_tabs[0].provider_session_id, "gem-s");
+        assert_eq!(others(&saved).len(), 1, "kept in the saved file while it waits");
+        assert_eq!(others(&saved)[0].provider_session_id, "gem-s");
     }
 
     #[test]
@@ -13991,12 +14657,78 @@ mod external_tab_tests {
             Err(crate::turn_review::Blocked::TurnRunningHere),
             "the backend is still being shut down"
         );
-        if let TabBackend::Live(b) = &mut removed.backend {
-            b.shutdown();
+        if let Some(retired) = removed.retired.take() {
+            retired.into_backend().shutdown();
         }
         set.retire_done(tab);
         assert_eq!(guard.check(), Ok(()));
         // A second report for the same tab changes nothing.
+        set.retire_done(tab);
+        assert_eq!(guard.check(), Ok(()));
+    }
+
+    /// The terminal handoff takes the live session away like every other way: until its shutdown has
+    /// returned, the window's presence stays as if a turn ran, so no revert writes meanwhile.
+    #[test]
+    fn a_handed_off_session_counts_as_retiring_until_its_shutdown_returns() {
+        let dir = workspace("external-handoff-retiring");
+        let (mut set, tab, _provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        let review = dir.join(".review-state");
+        set.hold_presence(crate::turn_review::PresenceHolder::start(review, std::process::id()));
+        let guard = set.presence_guard().unwrap();
+        until("the presence is held", || {
+            !matches!(guard.check(), Err(crate::turn_review::Blocked::NotHeld(_)))
+        });
+        assert_eq!(guard.check(), Ok(()));
+        let mut backend = set
+            .take_for_handoff(tab)
+            .expect("the live session is taken")
+            .into_backend();
+        assert!(matches!(set.get(tab).unwrap().backend, TabBackend::NotStarted));
+        assert_eq!(
+            guard.check(),
+            Err(crate::turn_review::Blocked::TurnRunningHere),
+            "the handed-off session is still being shut down"
+        );
+        assert!(set.take_for_handoff(tab).is_none(), "nothing live is left to take");
+        backend.shutdown();
+        set.retire_done(tab);
+        assert_eq!(guard.check(), Ok(()));
+    }
+
+    /// A session handed to a terminal leaves its tab the way every other one does: as a counted
+    /// `Retired` naming the tab, whose presence stays until its shutdown is reported, not merely until
+    /// the shutdown returns.
+    #[test]
+    fn the_handoff_rule_is_the_retiring_rule() {
+        let dir = workspace("external-handoff-retired");
+        let (mut set, tab, _provider) = codex_tab(&dir, SessionModeChoice::Auto);
+        let review = dir.join(".review-state");
+        set.hold_presence(crate::turn_review::PresenceHolder::start(review, std::process::id()));
+        let guard = set.presence_guard().unwrap();
+        until("the presence is held", || {
+            !matches!(guard.check(), Err(crate::turn_review::Blocked::NotHeld(_)))
+        });
+        assert_eq!(guard.check(), Ok(()));
+        let retired = set.take_for_handoff(tab).expect("the live session is taken");
+        assert_eq!(
+            retired.tab(),
+            tab,
+            "the retired backend names the tab it was counted for"
+        );
+        assert_eq!(
+            guard.check(),
+            Err(crate::turn_review::Blocked::TurnRunningHere),
+            "the handed-off session is still being shut down"
+        );
+        let mut backend = retired.into_backend();
+        backend.shutdown();
+        drop(backend);
+        assert_eq!(
+            guard.check(),
+            Err(crate::turn_review::Blocked::TurnRunningHere),
+            "the presence ends when the shutdown is reported, as for every retired backend"
+        );
         set.retire_done(tab);
         assert_eq!(guard.check(), Ok(()));
     }
@@ -14038,7 +14770,7 @@ mod steer_tests {
                     all.queue_changed.extend(out.queue_changed);
                 }
             }
-            set.get(tab).unwrap().was_running == running
+            set.get(tab).unwrap().session.was_running == running
         });
         all.unwrap()
     }
@@ -14091,6 +14823,7 @@ mod steer_tests {
     fn queue(set: &TabSet, tab: TabId) -> Vec<(String, bool)> {
         set.get(tab)
             .unwrap()
+            .session
             .queue
             .iter()
             .map(|q| (q.text.clone(), !q.is_held()))
@@ -14098,7 +14831,7 @@ mod steer_tests {
     }
 
     fn note(set: &TabSet, tab: TabId) -> Option<String> {
-        set.get(tab).unwrap().queue_note.clone()
+        set.get(tab).unwrap().session.queue_note.clone()
     }
 
     fn prompts(set: &TabSet, tab: TabId) -> Vec<String> {
@@ -14114,9 +14847,9 @@ mod steer_tests {
     }
 
     fn shut_down(set: &mut TabSet) {
-        for mut tab in set.take_all() {
-            if let TabBackend::Live(backend) = &mut tab.backend {
-                backend.shutdown();
+        for tab in set.take_all() {
+            if let Some(retired) = tab.retired {
+                retired.into_backend().shutdown();
             }
         }
     }
@@ -14146,7 +14879,7 @@ mod steer_tests {
         let mut changed = Vec::new();
         until("the message leaves the queue", || {
             changed.extend(set.pump(&dir, true).queue_changed);
-            set.get(tab).unwrap().queue.is_empty()
+            set.get(tab).unwrap().session.queue.is_empty()
         });
         assert_eq!(changed, [tab], "the panel is sent the queue again");
         assert_eq!(prompts(&set, tab), ["look at the parser too"]);
@@ -14179,7 +14912,7 @@ mod steer_tests {
         assert!(flush.outcome.is_ok());
         assert_eq!(flush.typed, "and the tests");
         assert_eq!(provider.inner.turns(), ["ctx\n\nand the tests"]);
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         assert_eq!(note(&set, tab), None);
         shut_down(&mut set);
     }
@@ -14230,7 +14963,7 @@ mod steer_tests {
         ]);
         let out = pump_until_running(&mut set, &dir, tab, false);
         assert_eq!(out.turn_ended, [tab]);
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         assert!(set.flush_queue(tab).is_none());
         assert!(provider.inner.turns().is_empty(), "never sent as a turn of its own");
         assert_eq!(
@@ -14279,7 +15012,7 @@ mod steer_tests {
         ]);
         until("the late delivery takes the message out of the queue", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().queue.is_empty()
+            set.get(tab).unwrap().session.queue.is_empty()
         });
         assert_eq!(note(&set, tab), None);
         provider
@@ -14355,7 +15088,7 @@ mod steer_tests {
         });
         until("the late delivery takes the message out of the queue", || {
             set.pump(&dir, true);
-            set.get(tab).unwrap().queue.len() == 1
+            set.get(tab).unwrap().session.queue.len() == 1
         });
         assert_eq!(queue(&set, tab), [("and the docs".to_string(), false)]);
         provider
@@ -14531,7 +15264,10 @@ mod steer_tests {
         let provider = Arc::new(RecordingProvider::default());
         let conversation =
             AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
-        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Sidecar(Box::new(conversation)));
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        });
         provider.queue(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
         pump_until_running(&mut set, &dir, tab, true);
         enter(&mut set, tab, "later");
@@ -14650,7 +15386,7 @@ mod steer_tests {
                 .is_some()
         });
         assert!(set.take_back_queue(tab).is_empty());
-        assert!(set.get(tab).unwrap().queue.is_empty(), "settled without a pump");
+        assert!(set.get(tab).unwrap().session.queue.is_empty(), "settled without a pump");
         shut_down(&mut set);
     }
 
@@ -14714,7 +15450,7 @@ mod steer_tests {
             provider.inner.turns().is_empty(),
             "the message the agent read was not sent again"
         );
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         shut_down(&mut set);
     }
 
@@ -14740,7 +15476,7 @@ mod steer_tests {
                 .is_some()
         });
         assert!(set.flush_queue(tab).is_none());
-        assert!(set.get(tab).unwrap().queue.is_empty());
+        assert!(set.get(tab).unwrap().session.queue.is_empty());
         assert!(provider.inner.turns().is_empty());
         shut_down(&mut set);
     }
@@ -14806,7 +15542,7 @@ mod steer_tests {
             let mut out = set.pump(&dir, true);
             changed.append(&mut out.queue_changed);
             for tripped in out.tripped {
-                let mut backend = tripped.backend;
+                let mut backend = tripped.retired.into_backend();
                 backend.shutdown();
             }
             matches!(set.get(tab).unwrap().backend, TabBackend::Failed { .. })
@@ -14817,6 +15553,73 @@ mod steer_tests {
             Some("held until the turn ends: the session was closed before the agent read it")
         );
         assert_eq!(changed, [tab], "the panel is sent the queue again");
+        shut_down(&mut set);
+    }
+
+    /// A command that fails fatally takes the session away like a tripwire: a message still in the turn
+    /// is held again with the reason, and `↑` takes it back.
+    #[test]
+    fn a_fatal_command_holds_a_steered_message_again() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-fatal", true);
+        enter(&mut set, tab, "in the turn");
+        assert_eq!(provider.steers().len(), 1, "it went into the turn");
+        let mut backend = set
+            .fail_session(tab, "gone".into(), FailedHow::AfterStart, true)
+            .expect("the live backend is handed back to be shut down")
+            .into_backend();
+        backend.shutdown();
+        assert!(matches!(
+            &set.get(tab).unwrap().backend,
+            TabBackend::Failed { reason } if reason == "gone"
+        ));
+        assert!(set.get(tab).unwrap().failed_after_start);
+        assert_eq!(queue(&set, tab), [("in the turn".to_string(), false)]);
+        // Read before the take-back, which clears the note.
+        assert_eq!(
+            note(&set, tab),
+            Some(held_note("the session was closed before the agent read it"))
+        );
+        assert_eq!(set.take_back_queue(tab), ["in the turn"]);
+        set.retire_done(tab);
+        shut_down(&mut set);
+    }
+
+    /// What the agent reported before its session went is applied first: the message it read leaves the
+    /// queue, and only the one it did not is held again, where it stood.
+    #[test]
+    fn only_the_steered_messages_the_agent_did_not_take_are_held_again_in_order() {
+        let (_dir, mut set, tab, provider) = running_codex("steer-fatal-partly-read", true);
+        enter(&mut set, tab, "read");
+        enter(&mut set, tab, "not read");
+        let ids: Vec<String> = provider.steers().into_iter().map(|s| s.client_message_id).collect();
+        assert_eq!(ids.len(), 2, "both went into the turn");
+        provider.inner.queue(AgentDomainEvent::UserMessageDelivered {
+            client_message_id: ids[0].clone(),
+            turn_id: "turn-1".into(),
+            text: "read".into(),
+        });
+        until("the delivery is folded", || {
+            set.get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .steer_outcome(&ids[0])
+                .is_some()
+        });
+        assert_eq!(
+            queue(&set, tab),
+            [("read".to_string(), true), ("not read".to_string(), true)],
+            "not settled before the failure"
+        );
+        let mut backend = set
+            .fail_session(tab, "gone".into(), FailedHow::AfterStart, false)
+            .unwrap()
+            .into_backend();
+        backend.shutdown();
+        assert_eq!(queue(&set, tab), [("not read".to_string(), false)]);
+        assert_eq!(set.take_back_queue(tab), ["not read"]);
+        set.retire_done(tab);
         shut_down(&mut set);
     }
 

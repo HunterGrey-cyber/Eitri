@@ -84,40 +84,36 @@ pub const GONE: &str = "its saved record is gone";
 pub const HELD_ELSEWHERE: &str = "open in another window";
 pub const NOT_REGISTERED: &str = "its agent is not registered in init.lua";
 
+/// Whether `record` is a session `open` holds: the same agent's session of the same id. Two agents
+/// may use the same id, so an open session of one never hides the other's record.
+pub fn is_open(open: &[(AgentId, String)], record: &ResumableSession) -> bool {
+    open.iter()
+        .any(|(agent, id)| *id == record.provider_session_id && agent.record_name() == record.provider)
+}
+
 /// Sorts `saved` into what can be resumed and what cannot. `records` are the sessions this project
 /// can resume (`agent::resumable_sessions`, with their display titles), of every agent: a saved tab
 /// is matched only with a record its own agent wrote. `open` the sessions this window already has
-/// open (left out without comment: they are already where they should be), and `held` says whether
-/// a lease on an agent's session is held right now. The Claude tabs come first, then the other
-/// agents' tabs, each in saved order.
+/// open, each with its agent (`TabSet::open_sessions`): a saved tab whose agent has that session open
+/// here is left out without comment, as it is already where it should be, while another agent's
+/// session that happens to share its id does not keep it from coming back. `held` says whether a
+/// lease on an agent's session is held right now. The tabs are planned in saved order, the Claude
+/// tabs first.
 pub fn plan(
     saved: &SavedTabs,
     records: &[ResumableSession],
-    open: &[String],
+    open: &[(AgentId, String)],
     held: impl Fn(&AgentId, &str) -> bool,
 ) -> RestorePlan {
     let mut items = Vec::new();
     let mut skipped = Vec::new();
-    let claude = saved.tabs.iter().map(|t| {
-        (
-            AgentId::Claude,
-            t.provider_session_id.as_str(),
-            t.name.as_deref(),
-            t.mode,
-            t.view,
-        )
-    });
-    let external = saved.external_tabs.iter().map(|t| {
-        (
-            t.agent.clone(),
-            t.provider_session_id.as_str(),
-            t.name.as_deref(),
-            t.mode,
-            t.view,
-        )
-    });
-    for (agent, id, saved_name, saved_mode, saved_view) in claude.chain(external) {
-        if open.iter().any(|o| o == id) {
+    for tab in &saved.tabs {
+        let (agent, id) = (tab.agent.clone(), tab.provider_session_id.as_str());
+        let (saved_name, saved_mode, saved_view) = (tab.name.as_deref(), tab.mode, tab.view);
+        if open
+            .iter()
+            .any(|(open_agent, open_id)| *open_agent == agent && open_id == id)
+        {
             continue;
         }
         let provider = agent.record_name();
@@ -152,10 +148,7 @@ pub fn plan(
             view: saved_view.and_then(ViewId::new).filter(|view| !view.is_base()),
         });
     }
-    let active_session = match saved.active_external {
-        Some(i) => saved.external_tabs.get(i).map(|t| t.provider_session_id.clone()),
-        None => saved.tabs.get(saved.active).map(|t| t.provider_session_id.clone()),
-    };
+    let active_session = saved.active_tab().map(|t| t.provider_session_id.clone());
     RestorePlan {
         items,
         skipped,
@@ -355,10 +348,10 @@ mod tests {
     use crate::saved_tabs::SavedTab;
 
     fn saved(tabs: &[(&str, Option<&str>, SessionModeChoice)], active: usize) -> SavedTabs {
-        SavedTabs {
-            tabs: tabs
-                .iter()
+        SavedTabs::from_parts(
+            tabs.iter()
                 .map(|(id, name, mode)| SavedTab {
+                    agent: AgentId::Claude,
                     conversation_id: "c".to_string(),
                     provider_session_id: id.to_string(),
                     name: name.map(str::to_string),
@@ -367,8 +360,9 @@ mod tests {
                 })
                 .collect(),
             active,
-            ..SavedTabs::default()
-        }
+            Vec::new(),
+            None,
+        )
     }
 
     fn record(id: &str, name: Option<&str>, title: Option<&str>) -> ResumableSession {
@@ -420,7 +414,7 @@ mod tests {
     #[test]
     fn a_tab_of_an_agent_no_longer_registered_is_skipped_with_its_reason() {
         let mut saved = saved(&[("a", None, Auto)], 0);
-        let acp = |name: &str, id: &str| crate::saved_tabs::SavedExternalTab {
+        let acp = |name: &str, id: &str| SavedTab {
             agent: AgentId::Acp(name.to_string()),
             conversation_id: "c".to_string(),
             provider_session_id: id.to_string(),
@@ -428,7 +422,7 @@ mod tests {
             mode: Auto,
             view: None,
         };
-        saved.external_tabs = vec![acp("gem", "g-1"), acp("gone", "x-1")];
+        saved.tabs.extend([acp("gem", "g-1"), acp("gone", "x-1")]);
         let acp_record = |name: &str, id: &str| ResumableSession {
             provider: format!("acp:{name}"),
             ..record(id, None, Some(id))
@@ -499,14 +493,14 @@ mod tests {
         saved.tabs[1].view = Some(3);
         saved.tabs[2].view = Some(1);
         saved.tabs[3].view = Some(42);
-        saved.external_tabs = vec![crate::saved_tabs::SavedExternalTab {
+        saved.tabs.push(SavedTab {
             agent: AgentId::Codex,
             conversation_id: "c".to_string(),
             provider_session_id: "x".to_string(),
             name: None,
             mode: Auto,
             view: Some(2),
-        }];
+        });
         let records = [
             record("a", None, None),
             record("b", None, None),
@@ -534,9 +528,61 @@ mod tests {
     fn a_session_this_window_already_has_open_is_left_out_without_comment() {
         let saved = saved(&[("open", None, Auto), ("other", None, Auto)], 0);
         let records = [record("open", None, None), record("other", None, None)];
-        let plan = plan(&saved, &records, &["open".to_string()], |_, _| false);
+        let plan = plan(&saved, &records, &[(AgentId::Claude, "open".to_string())], |_, _| false);
         assert_eq!(plan.items.len(), 1);
         assert!(plan.skipped.is_empty());
+    }
+
+    /// Session ids are each agent's own: an open tab of one agent does not stand for another agent's
+    /// saved tab that happens to carry the same id, which still comes back.
+    #[test]
+    fn a_saved_tab_of_another_agent_with_an_open_tabs_id_is_still_restored() {
+        let gemini = AgentId::Acp("gemini".to_string());
+        let mut saved = saved(&[("shared", None, Auto)], 0);
+        saved.tabs.push(SavedTab {
+            agent: AgentId::Acp("claude-code".to_string()),
+            conversation_id: "c".to_string(),
+            provider_session_id: "shared".to_string(),
+            name: None,
+            mode: Auto,
+            view: None,
+        });
+        let acp_record = |name: &str| ResumableSession {
+            provider: format!("acp:{name}"),
+            ..record("shared", None, Some(name))
+        };
+        let records = [
+            record("shared", None, None),
+            acp_record("claude-code"),
+            acp_record("gemini"),
+        ];
+        let open = [(gemini, "shared".to_string())];
+        let plan = plan(&saved, &records, &open, |_, _| false);
+        let planned: Vec<(String, &str)> = plan
+            .items
+            .iter()
+            .map(|i| (i.agent.record_name(), i.provider_session_id.as_str()))
+            .collect();
+        assert_eq!(
+            planned,
+            [
+                ("claude".to_string(), "shared"),
+                ("acp:claude-code".to_string(), "shared")
+            ],
+            "the open session is the gemini agent's, neither saved tab's"
+        );
+        assert!(plan.skipped.is_empty());
+
+        // The same agent's session open here is still left out.
+        let open = [(AgentId::Acp("claude-code".to_string()), "shared".to_string())];
+        let plan = super::plan(&saved, &records, &open, |_, _| false);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].agent, AgentId::Claude);
+
+        // And a record is hidden only by its own agent's open session.
+        assert!(is_open(&open, &acp_record("claude-code")));
+        assert!(!is_open(&open, &acp_record("gemini")));
+        assert!(!is_open(&open, &record("shared", None, None)));
     }
 
     #[test]
