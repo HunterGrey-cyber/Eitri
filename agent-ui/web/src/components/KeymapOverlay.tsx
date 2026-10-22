@@ -16,7 +16,7 @@ type Props = {
   prefixKeys: KeyHelp[];
   /** The prefix as a person reads it (`Ctrl+b`), for the last heading. */
   prefixLabel: string;
-  /** The panel's own which-key table, for the new "Leader and tab
+  /** The panel's own which-key table, for the "Leader and tab
    *  keys" section -- the same table the leader engine (`../leader`) and `resolveKey` read. */
   panel: PanelTable;
   /** The lines of the user's tmux config the import did not take (`shell`'s `keymap` envelope,
@@ -84,8 +84,8 @@ function Section({ title, rows, note, headingRef }: { title: string; rows: KeyHe
   );
 }
 
-/** Explain `PanelTable.leaderSource` on the first line so a fallback to Space is visible to the
- *  user. */
+/** What the first line says about the panel's leader, by `PanelTable.leaderSource`: the fallback to Space is a fact
+ *  worth a person reading, not a silent default. */
 function leaderSourceNote(source: PanelTable["leaderSource"]): string {
   switch (source) {
     case "mapleader":
@@ -100,7 +100,7 @@ function leaderSourceNote(source: PanelTable["leaderSource"]): string {
   }
 }
 
-/** A binding's own row reads its source too: a default
+/** A binding's own row reads its source too (`defaults < nvim < init.lua`): a default
  *  row names nothing (it is simply what this list already promises), an nvim mapping or an
  *  `init.lua` override says so, so this list can never claim a key the panel does not actually
  *  bind, or hide which layer put it there. */
@@ -108,9 +108,10 @@ function bindingSourceSuffix(source: PanelBinding["source"]): string {
   return source === "nvim" ? " (from nvim)" : source === "init.lua" ? " (init.lua)" : "";
 }
 
-/** The panel's leader and tab bindings appear between "This panel" and "Anywhere in the window".
- *  Show the leader, then each full key sequence using `sequenceTitle`, with its `desc` and
- *  source suffix, matching the which-key box. */
+/** The panel's own leader and tab-key table (between "This panel" and
+ *  "Anywhere in the window", since these are the same BROWSE keys' own extension): the leader
+ *  itself, then every binding as a full key sequence (`sequenceTitle` -- `Space b d`, the same
+ *  humanization the which-key box draws), each with its own `desc` and source suffix. */
 function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
   return (
     <section>
@@ -137,24 +138,26 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
   );
 }
 
-/** Whether the leader engine claims `v` or `V` before `resolveKey` can enter VISUAL. A key is
- *  claimed when it is the leader or the first key of any binding. `startSequence` matches
- *  `keys[0]`, so a two-key binding claims its first key just like a single-key binding. */
+/** Whether `key` (`"v"`/`"V"`) reaches `resolveKey`'s VISUAL branch at all, or is claimed first by
+ *  the leader engine (`App.tsx`, ahead of every call to `resolveKey`) -- the leader itself, or a
+ *  binding's first key, the same two ways `startSequence` (`../leader`) can claim any key: its own
+ *  `step` matches on `keys[0]`, not on `keys.length === 1` (a two-key binding such as `["v", "x"]` armed a sequence on `v` exactly the same as a single-key
+ *  one would, and this note still called it free). */
 function visualKeyClaim(panel: PanelTable, key: string): "leader" | "binding" | null {
   if (key === panel.leader) return "leader";
   return panel.bindings.some((b) => b.keys[0] === key) ? "binding" : null;
 }
 
-/** Describe how to reach CARET and VISUAL when the leader or a panel binding claims `v` or `V`.
- *  `v` enters CARET and `V` enters the region directly, where `v`/`V` can still change
- *  selection. Call a key the leader only when it is the leader; describe an ordinary panel
- *  binding as bound elsewhere. */
+/** Explain which selection entry keys remain available when a leader or panel binding claims
+ *  `v` or `V`. `v` enters CARET; `V` selects lines directly, and the region can switch with `v`/`V`.
+ *  Name a leader conflict only when the key is the leader; other bindings are "bound elsewhere". */
 function visualEntryNote(panel: PanelTable): string {
   const vClaim = visualKeyClaim(panel, "v");
   const capitalVClaim = visualKeyClaim(panel, "V");
   if (vClaim === null && capitalVClaim === null) {
-    // Ctrl+e/Ctrl+y scroll the region without leaving it, so the note must name this exception
-    // to "any other key leaves".
+    // Ctrl+e/Ctrl+y scroll the region instead of
+    // ending it now (CARET_KEYS/VISUAL_KEYS' own new row), so "any other key leaves" needs its
+    // one exception named here too.
     return "Any other key leaves (Ctrl+e/Ctrl+y scroll instead). The panel is read-only; Ctrl+g opens the row in nvim for search, text objects, registers.";
   }
   if (vClaim !== null && capitalVClaim !== null) {
@@ -191,9 +194,9 @@ function KeyTable({ heading, rows }: { heading: string; rows: KeyHelp[] }) {
   );
 }
 
-/** The "Selecting (v)" section sits between "This panel" and "Leader and tab keys". Show
- *  CARET_KEYS and VISUAL_KEYS in separate tables, each headed by its mode name, so shared keys
- *  such as `gg` and `Esc` retain their mode-specific meanings. */
+/** The "Selecting (v)" section shows `CARET_KEYS` and `VISUAL_KEYS` in separate named tables.
+ *  Shared keys such as `gg` and differing `Esc` actions would be ambiguous in one table.
+ *  These arrays also supply the keymap checks against `resolveKey`'s region branches. */
 function Selecting({ panel }: { panel: PanelTable }) {
   return (
     <section>
@@ -205,9 +208,13 @@ function Selecting({ panel }: { panel: PanelTable }) {
   );
 }
 
-/** Slash commands use a plain list because they are commands rather than keybindings. This also
- *  keeps them out of key-table row counts. Names come from `../slashCommands` in table order.
- *  `listedSlashCommands` omits `/config`. Bare `/model` can be sent and opens `../SlashPicker`. */
+/** The `?` overlay's "Slash commands" section, listing the commands that work. A plain list rather than the
+ *  two-column `Section` layout above -- nothing here is a keybinding, and a bare `<ul>` keeps this section out of
+ *  every existing `tr`-counting test in this file's own test suite (`KeymapOverlay.test.tsx`'s "lists every row...").
+ *  Names come from `../slashCommands`'s own table (a real-CLI record), in that table's order, less what Enter holds
+ *  back: `/config` is left out (`listedSlashCommands`; a GUI pass on 2026-09-27 saw the held-back flash send the
+ *  reader here to find `/config`). `/model` reads plainly now: a bare `/model` sends too, and opens a picker
+ *  (`../SlashPicker`). */
 function SlashCommands() {
   return (
     <section>
@@ -257,12 +264,15 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         {" "}PageDown/PageUp or Space a page{prefixLabel === "Ctrl+b" ? " (Ctrl+b is the prefix)" : ""};
         gg/G top/bottom. ? / Esc / q close.
       </p>
-      {/* Rust's `install_module_nav` claims `Ctrl+j` before `resolveKey`, so add it here rather
-          than to `BROWSE_KEYS`, which tests tie to `resolveKey` in both directions. The Typing
-          section likewise adds GTK-handled keys separately. `Ctrl+[` is handled by the
-          `../ctrlBracket` document listener, so describe it in the note rather than as a
-          `BROWSE_KEYS` row. The note also explains each permission mode; the status band names
-          the active mode. */}
+      {/* `Ctrl+j` here is Rust's mirror (`install_module_nav`) claiming the chord
+          ahead of `resolveKey`, never `resolveKey` itself -- so it is spliced in here rather than
+          added to `BROWSE_KEYS`, which `keymap.test.ts` ties to `resolveKey` both ways and would fail
+          on a key that table never claims (`BROWSE_KEYS <-> resolveKey`, forward direction). The
+          "Typing" section below already does the same for its own two GTK-decided rows.
+          "`Ctrl+[` is Esc" is one document listener (`../ctrlBracket`), not a key `resolveKey`
+          sees, so it is this group's `note` -- not a row of `BROWSE_KEYS` either. What each permission
+          mode does is said here too: the start screen used to say it under its mode row, and that row is
+          gone (the status band names the mode). */}
       {/* The page the keys were in when the sheet was asked for comes first: those are the keys the reader
           was just using. Its title and rows are the page's own text, so they go through `Section`, which
           draws text nodes only. */}
@@ -295,11 +305,12 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."
         rows={[
           ...INPUT_KEYS.map((row) => cycleRow(row, modes)),
-          // The pane-motion row lists only Ctrl+h/l. Ctrl+j/k have their own meanings in the rows
-          // below, so including them here would give conflicting descriptions.
+          // Narrowed from "Ctrl+h / j / k / l" -- `j`/`k` are no
+          // longer plain pane motion while typing (the two rows below claim them instead), so
+          // listing them here too said two different things about the same key in the same section.
           { keys: "Ctrl+h / l", what: "Move between panes (Eitri keeps these)" },
           { keys: prefixLabel, what: "The prefix (Eitri keeps it)" },
-          // V1 C1: Rust's mirror (`install_module_nav`) claims these two ahead of
+          // Rust's mirror (`install_module_nav`) claims these two ahead of
           // `Composer` itself, the same reason the two rows above are spliced in here rather than
           // added to `INPUT_KEYS` -- that constant is tied to `COMPOSER_CHORDS` both ways
           // (`composerKeys.test.ts`, `Composer.test.tsx`) and would fail on a key `Composer` never

@@ -31,9 +31,11 @@ export function runSummary(calls: ToolCallRecord[]): string {
     : text;
 }
 
-/** `Write`, `Edit` and `NotebookEdit` can finish without a permission card under `acceptEdits`.
- *  Keep each change in its own row so it cannot disappear into a tool-count summary. These tools
- *  end a run on either side, just as failed or gated calls do; reads and searches still fold. */
+/** With the acceptEdits fast path, a `Write`/`Edit`/`NotebookEdit` can now
+ *  finish with no card at all, exactly as an ordinary read does -- so without this exclusion the
+ *  loop below would fold it into a `Read 4 files, Edit ×1`-shaped run and the change it made would
+ *  never be its own row. A run of other tools now stops at one of these three, on both sides, the
+ *  same way a failed or still-gated call already does; reads and searches keep folding as before. */
 const NEVER_FOLDED_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "fileChange"]);
 
 /** The same for an ACP agent's file-changing kinds: the change is its own row, not a count in a run. */
@@ -43,21 +45,28 @@ const neverFolded = (call: ToolCallRecord): boolean =>
   // A subagent's call keeps its own row, so whose it is stays on screen instead of inside a count.
   subagentOf(call.name, call.input) !== null;
 
-/** Fold consecutive finished, ungated tool calls into one `run` row when there are at least
- *  two and another item follows or the turn has ended. Expanded runs and the detailed view keep
+/** Consecutive finished, ungated tool calls -- two or more, with something after
+ *  them or a turn that is over -- become one `run` row. Expanded runs and the detailed view keep
  *  every call.
  *
- * Failed calls end a run and keep their own `✗` row. A run's fixed `✓` sign and count summary
- * would otherwise hide the failure until the row was expanded.
+ * A failed call never joins a run (sw-panel-render-5): every run row draws a fixed `✓` sign and
+ * `runSummary` names only counts, so a failing call folded in among successes vanished behind a
+ * success sign until the reader expanded the row. Excluding it from the loop below ends the run at
+ * the failure -- the failing call falls out to the single-item path just below, and its own row
+ * draws `✗` exactly as an unfolded failed call always has (`MessageList.tsx`'s `toolSign`).
  *
- * Under `hidden`, remove thinking before folding. Under `collapsed` and `preview`, fold finished
- * thoughts between calls into the run so a thought before every call does not break it up.
- * Expanding the run restores those thoughts as separate rows. Thoughts before the first call,
- * after the last call, or still being written keep their own rows. Under `expanded`, thoughts
- * never fold. The detailed view keeps everything at every thinking level.
+ * Thinking (`opts.thinking`): under `hidden` its rows are left out before anything is folded, so runs
+ * fold exactly as they would with no thinking at all. Under `collapsed` and `preview` a finished
+ * thinking block that sits BETWEEN two calls of a run is folded into the run with them: an agent that
+ * thinks before every call would otherwise break every run into single rows, one thought row between
+ * each, and a run exists to keep that quiet. Expanding the run puts the thoughts back as their own rows.
+ * A thought before the first call or after the last stays a row of its own, as does one still being
+ * written. Under `expanded` no thought is folded away. The detailed view keeps everything, thinking
+ * included, whatever the level.
  *
- * Runs stop at a call or thought from another turn so each turn's "Worked for" line can follow
- * its last row. An item without a turn can join either side. */
+ * A run never crosses from one turn into the next (a call or thought of another turn ends it): a turn's
+ * "Worked for" line stands under the turn's last row, and a run holding two turns' calls would leave it
+ * nowhere to stand. An item that names no turn joins either side. */
 export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineItem[] {
   if (opts.detailed) return timeline;
   const level = opts.thinking ?? "collapsed";

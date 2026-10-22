@@ -20,20 +20,44 @@ function records(value: number): string {
 }
 
 /**
- * Text for the history notice row. Report the source and truncation independently so a
- * truncated fallback copy gets both sentences.
+ * The one line the notice row says.
  *
- * Counts come from this restore because the character budget can bind before the item limit.
- * `restoredItems` counts rows after folding in Rust. Omitted items were dropped before folding
- * and cannot be expressed in rows, so the two counts use different units.
+ * Built from two independent statements rather than picked from a table of four, because the two
+ * things it can report are independent: WHERE the history came from, and WHETHER it was cut. The
+ * design's table lists the four combinations that occur in practice and this produces each of them
+ * word for word; the fifth -- a fallback copy that was also truncated -- gets both sentences,
+ * because invariant 14 requires the fallback always to be announced and invariant 9 requires
+ * truncation always to be announced, and dropping either to fit a four-row table would break one of
+ * them silently.
  *
- * Describe what was read, without claiming what the model remembers. The CLI rebuilds its own
- * context; a compaction summary must not be presented as the user's words.
- * A fallback means the transcript was not used, which can happen even when it is readable but
- * contains no restorable items. The backend's reason string explains the cause.
+ * **Every number here comes out of this restore, never out of a build-wide constant**.
+ * The sentence used to print `HISTORY_MAX_ITEMS`, the 400-item ceiling, as
+ * though truncation always stopped there -- but the character budget binds first about as often,
+ * and the reviewer measured one real session restoring 32 items while the panel would have said
+ * 400, and another restoring 107 of 300. `restoredItems` is now counted in Rust AFTER the fold, so
+ * it is the number of rows this list actually holds; the constant that used to live in this file,
+ * and the test that tied it to Rust's own source, went with the sentence that needed it.
  *
- * Omit the absolute source path here because it would wrap repeatedly in a narrow panel.
- * The row provides a Copy path button instead.
+ * **The two numbers are in different units, deliberately.** Restored is counted in rows; omitted is
+ * counted in the items truncation dropped, which no fold ever saw and which therefore cannot be
+ * expressed in rows. `agent/src/history/load.rs::restorable_item_count` carries the argument. Both
+ * are exact in their own unit, which is the honest pair available.
+ *
+ * **Says only what was read, never what the agent remembers**: what a
+ * resumed session actually carries into the model is the CLI's business, rebuilt from its own
+ * context, and this side cannot know it. The concrete cautionary case is a compaction summary --
+ * text telling the model what it remembers -- which an earlier draft of the parser would have
+ * shown as the user's own words.
+ *
+ * **And says only what was observed about the transcript.** The fallback sentence used to open
+ * "Claude's transcript could not be read", which is false for the most ordinary reason of all: a
+ * file that reads perfectly and holds nothing this build can restore (a session whose user lines
+ * are all slash-command echoes, `isMeta` injections or a compaction summary). It now says the
+ * transcript was not USED, which is true whatever the reason, and Rust's own reason string carries
+ * the rest.
+ *
+ * The source path is deliberately not in here: it is an absolute path, it would wrap this line
+ * several times in a narrow panel, and the row carries a Copy path button for it instead.
  */
 export function historyNoticeText(notice: HistoryNotice): string {
   // `null` means "certainly omitted, not countable" (the scan started partway into a file too large

@@ -4,25 +4,34 @@ import type { TurnClock } from "../types";
 
 type Props = {
   phase: TurnPhase;
-  /** `null` transiently or when the backend/build does not supply a clock.
-   *  Omit the elapsed-time reading in that case rather than guessing. */
+  /** `null` only transiently, or on a backend/build that never wires the clock up -- rendered
+   *  without an elapsed-time reading in that case rather than guessing at one. */
   clock: TurnClock | null;
 };
 
-/** Show the phase word and elapsed clock while the caller's `ActivityLine.working` predicate is true.
- * This component relies on the caller to determine whether a turn is in flight.
- * `ActivityLine` supplies the motion through its star, which holds still while `phase.kind === "blocked"`
- * because permission is pending and the agent is not working. The phase word and clock still render. */
+/**
+ * The in-flight motion indicator. A caller mounts this only while `ActivityLine`'s own `working`
+ * predicate is true (`ActivityLine` took this over from the old `StatusLine`) -- this component does
+ * not re-derive that condition,
+ * so mounting it at all is the caller's claim that a turn is in flight.
+ *
+ * The phase word and the elapsed clock. The motion that says a turn is in flight is the activity line's
+ * star (`ActivityLine`), which holds still while `phase.kind === "blocked"`: a pending permission means
+ * the AGENT is not working, so animating a claim that it is would be a lie. The word and the
+ * clock still render in that phase -- only the motion stops.
+ */
 export function TurnActivity({ phase, clock }: Props) {
-  // Tick once a second in this component so the elapsed clock does not re-render the whole panel
-  // on top of streaming updates. The state value is unused; it only forces `elapsed` to be
-  // recomputed on the next tick.
+  // One tick a second, local to this leaf: `setState` here re-renders only this component, not the
+  // whole panel, which is what keeps a long-running turn's elapsed clock from adding a second
+  // per-second re-render pass on top of the streaming pump. The value itself is never read;
+  // it exists only to force React to recompute `elapsed` below on the next tick.
   const [, setTick] = useState(0);
   useEffect(() => {
     if (clock === null) return;
     const id = window.setInterval(() => setTick((n) => n + 1), 1000);
-    // Clear the interval when the effect runs again and on unmount, so removing the indicator
-    // also stops its timer.
+    // Cleared on every re-run of this effect AND on unmount -- the latter is what makes "the
+    // indicator is gone" and "no timer is left running" the same fact rather than two that could
+    // drift apart.
     return () => window.clearInterval(id);
   }, [clock?.turnId]);
 

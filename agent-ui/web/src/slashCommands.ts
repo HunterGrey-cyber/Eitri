@@ -1,9 +1,13 @@
 import { isHiddenChar } from "./revealHidden";
 
-/** Classifies slash commands and controls whether they can be sent.
- *  `works` means the command has an observable effect; `sent-as-text` means the model answered
- *  the literal words. `no-op`, `error` and `hangs` are held back if added to the table, although
- *  no current entry has one of those classes. */
+/** Whether a typed slash command is actually sent, and what the panel says when it is not. The table
+ *  below is transcribed by hand from a real-CLI classification of every command (sidecar backend,
+ *  CLI 2.1.283, `ANTHROPIC_MODEL=haiku`); nothing here re-derives it.
+ *
+ *  Five classes: **works** (the command's own effect is observable), **sent-as-text**
+ *  (the model answered the literal words), **no-op**, **error**, **hangs**. None of the 28 commands
+ *  classified landed in the last three -- they exist here only as a holdback reason, for a future row
+ *  this table might gain. */
 export type SlashCommandClass = "works" | "sent-as-text" | "no-op" | "error" | "hangs";
 
 export type SlashAction =
@@ -14,15 +18,16 @@ export type SlashAction =
   | { kind: "pointer"; text: string };
 
 export interface SlashCommandEntry {
-  /** Command name without the leading slash, in lower case as used by the CLI.
-   *  Other spellings miss this table and are sent as unknown commands. */
+  /** Without the leading "/", lower-case (the CLI's own commands are lower-case; anything else is
+   *  simply not in this table and is sent as an unknown command, which the CLI answers itself). */
   name: string;
   class: SlashCommandClass;
   /** A local action takes precedence over the recorded CLI behavior for a bare word. */
   action?: SlashAction;
 }
 
-/** Preserve this order so `worksSlashCommands` gives the `?` overlay a stable command list. */
+/** The classification's own row order, preserved here because `worksSlashCommands` below relies on
+ *  it (the `?` overlay lists the **works** rows -- this order is what keeps that list stable). */
 export const SLASH_COMMANDS: readonly SlashCommandEntry[] = [
   { name: "help", class: "sent-as-text", action: { kind: "keymap" } },
   { name: "clear", class: "works" },
@@ -66,7 +71,7 @@ const BY_NAME: ReadonlyMap<string, SlashCommandEntry> = new Map(SLASH_COMMANDS.m
  *  command belongs in this set. */
 const INTERACTIVE_ONLY_UNCONDITIONAL: ReadonlySet<string> = new Set(["login", "config", "resume"]);
 
-/** Classes that are always held back, regardless of name. No row
+/** Classes that are always held back, regardless of name (no-op, error, hangs). No row
  *  in `SLASH_COMMANDS` carries one of these today -- kept as real classes rather than folded away so
  *  a future row classed this way is held back with no further code change. */
 const HELD_BACK_CLASSES: ReadonlySet<SlashCommandClass> = new Set(["no-op", "error", "hangs"]);
@@ -92,9 +97,10 @@ export function slashAction(text: string): SlashAction | null {
   return BY_NAME.get(parsed.name)?.action ?? null;
 }
 
-/** Returns the blocked command's name without the slash for the flash message, or `null` to send.
- *  Named interactive-only commands and held-back classes are blocked. `/model`, `/effort` and
- *  unknown commands pass, with or without arguments. */
+/** Whether Enter must refuse to send this draft. Returns the command name (without the
+ *  leading "/", for the flash text below) when held back; `null` means send it as today -- a
+ *  **works** or **sent-as-text** command, `/model`/`/effort` (bare or with an argument), and any
+ *  other unknown `/word` all fall through to `null` here. */
 export function heldBackSlashCommand(text: string): string | null {
   const parsed = parseSlashCommand(text);
   if (parsed === null || slashAction(text) !== null) return null;
@@ -105,31 +111,37 @@ export function heldBackSlashCommand(text: string): string | null {
   return null;
 }
 
-/** Recognize a bare `/model` or `/effort` with no argument so the panel can parse its reply into
- *  `SlashPicker` options. Return `null` for other commands, plain text or commands with
- *  arguments. `App.tsx` watches the next `turn_completed` only for bare commands; the picker's
- *  own choice always sends an argument and must not reopen a picker. */
+/** Whether `text` is exactly a bare `/model` or `/effort` -- no
+ *  argument, nothing else typed -- the shape whose reply this panel now parses into a picker
+ *  (`../components/SlashPicker`). Anything else (an argument present, a different command, plain
+ *  text) is `null`: `App.tsx` arms the picker's "watch the next turn_completed" state only on this,
+ *  never on `/model sonnet` (an ordinary, already-working send) or on the picker's own `onChoose`
+ *  send, which always carries an argument and so is never mistaken for a fresh bare command. */
 export function barePickerCommand(text: string): "model" | "effort" | null {
   const parsed = parseSlashCommand(text);
   if (parsed === null || parsed.hasArgument) return null;
   return parsed.name === "model" || parsed.name === "effort" ? parsed.name : null;
 }
 
-/** Flash text for a blocked slash command, pointing to `?` for commands that work. */
+/** What the band flashes: "`/<name> does not work in Eitri — ? lists the ones that do`", pointing
+ *  at the overlay that answers the next question. */
 export function slashCommandFlashText(name: string): string {
   return `/${name} does not work in Eitri — ? lists the ones that do`;
 }
 
-/** Lists `works` entries in `SLASH_COMMANDS` order for the `?` overlay.
- *  Classification and holdback are independent: `/model` and `/config` remain in this list
- *  even though sending them is restricted. */
+/** The `?` overlay's "Slash commands" section, listing the commands that work --
+ *  exactly the rows classed **works** in `SLASH_COMMANDS`' own order, `/model` and `/config`
+ *  included even though both are held back from being sent (the table's class and the holdback
+ *  above are deliberately independent: a command can work and still need a picker to send). */
 export function worksSlashCommands(): string[] {
   return SLASH_COMMANDS.filter((entry) => entry.class === "works").map((entry) => entry.name);
 }
 
-/** Commands shown by the `?` overlay: rows classed **works** that Enter would actually send.
- *  Exclude unconditionally held commands such as `/config` so the list agrees with sending
- *  behavior. `worksSlashCommands` still returns the table's class without filtering holdbacks. */
+/** What the `?` overlay lists (the v1-ui GUI pass, 2026-09-27): the **works** rows that Enter would
+ *  actually send. The pass saw `/config` refused with that flash ("does not work in <the product> — ? lists
+ *  the ones that do") while `?` listed `/config`, so the two contradicted each other on one screen. A command
+ *  held back unconditionally (`/config`, the only one left since a bare `/model` opens a picker instead of being
+ *  held back) is left out; `worksSlashCommands` above stays the table's own class, unchanged. */
 export function listedSlashCommands(): string[] {
   return worksSlashCommands().flatMap((name) => (heldBackSlashCommand(`/${name}`) === null ? [name] : []));
 }
@@ -144,10 +156,12 @@ export interface CompletionCommand {
   hint?: string;
 }
 
-/** Extra `sent-as-text` commands listed in the menu because their replies act on the request:
- *  `/init` explores the project, `/review` asks what to inspect, and `/security-review` checks
- *  preconditions. Omit commands that only report they are unavailable or not installed, including
- *  `/pr-comments` and `/todos`, so completions do not offer messages that do nothing. */
+/** Which Claude commands the menu lists, besides the **works** rows: `sent-as-text` rows whose reply
+ *  is the model acting on the request -- `/init` explored the project, `/review` asked what to review,
+ *  `/security-review` ran its own precondition check -- rather than the uniform "isn't available in this
+ *  environment" the rest of that class answered. Those
+ *  rest-of-the-class rows, and `/pr-comments` and `/todos` (the model said they are not installed), would
+ *  complete into a message that does nothing, so the menu leaves them out. */
 const LISTED_SENT_AS_TEXT: ReadonlySet<string> = new Set(["init", "review", "security-review"]);
 
 /** One line each, shortened from the CLI's own command reference (code.claude.com/docs/en/commands).

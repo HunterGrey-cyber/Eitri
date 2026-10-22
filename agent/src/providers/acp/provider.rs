@@ -24,6 +24,7 @@ use super::history::History;
 use super::translate::{self, Fold};
 use super::wire::{self, method, ChunkKind, InitializeResponse, OptionKind, PermissionRequest, ToolCallFields, Update};
 use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
+use crate::external_link::{self, link_error, lock, provider_error, ClosingNotice};
 use crate::jsonrpc_link::{
     resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkHandoff, LinkSpec, OverCapReply, Pending, Skipped,
     REQUEST_TOO_LARGE,
@@ -36,7 +37,6 @@ use crate::provider::{
 };
 use crate::provider_move::{forget_unclaimed, handed_ids, MovedAnswer, START_WAIT};
 use crate::MoveRefusedWhy;
-use crate::SIDECAR_EXIT_GRACE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
@@ -44,7 +44,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long the handshake may take. An agent started through a package runner may fetch itself first.
@@ -61,10 +61,6 @@ const POLL: Duration = Duration::from_millis(5);
 const PUMP_BATCH: usize = 4096;
 /// Unknown names remembered so each is logged once.
 const UNKNOWN_KEPT: usize = 64;
-/// The longest stderr tail put in a notice.
-const NOTICE_TAIL_CHARS: usize = 400;
-/// How long a child's end waits for its stderr before the notice goes without it.
-const CLOSING_NOTICE_WAIT: Duration = Duration::from_millis(100);
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -175,7 +171,7 @@ struct State {
     history: Vec<AgentDomainEvent>,
     /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
     /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
-    closing_notice: Option<(String, Instant)>,
+    closing_notice: Option<ClosingNotice>,
     closed: bool,
     dead: bool,
     /// A chat taken up from another process waits for its move's commit, and pumps nothing until then:
@@ -213,27 +209,6 @@ fn note_commands(st: &mut State, commands: Vec<SlashCommand>) {
     }
     st.commands = commands.clone();
     st.events.push_back(AgentDomainEvent::CommandsAvailable { commands });
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn provider_error(code: ProviderErrorCode, message: impl Into<String>) -> ProviderError {
-    ProviderError::Provider {
-        code,
-        message: message.into(),
-    }
-}
-
-/// The end of the child's stderr, short enough for a notice. Email addresses are already replaced.
-fn notice_tail(tail: &str) -> String {
-    let tail = tail.trim();
-    let count = tail.chars().count();
-    if count <= NOTICE_TAIL_CHARS {
-        return tail.to_string();
-    }
-    tail.chars().skip(count - NOTICE_TAIL_CHARS).collect()
 }
 
 /// A mode as a sentence for the tab.
@@ -283,7 +258,7 @@ impl AcpProvider {
         let init = match Self::handshake(&spec.name, &link) {
             Ok(init) => init,
             Err(e) => {
-                link.shutdown(SIDECAR_EXIT_GRACE);
+                external_link::stop_child(link);
                 return Err(e);
             }
         };
@@ -401,7 +376,7 @@ impl AcpProvider {
             // the queue afterwards leaves nothing of the replay behind.
             let answer = pending.try_take();
             loop {
-                let next = lock(&self.link).as_ref().and_then(JsonRpcLink::try_recv);
+                let next = external_link::try_recv(&self.link);
                 let Some(message) = next else { break };
                 self.fold_boot(message, boot);
             }
@@ -632,7 +607,7 @@ impl AcpProvider {
             return true;
         }
         for _ in 0..PUMP_BATCH {
-            let next = lock(&self.link).as_ref().and_then(JsonRpcLink::try_recv);
+            let next = external_link::try_recv(&self.link);
             let Some(message) = next else { return true };
             self.fold(st, message);
         }
@@ -674,30 +649,15 @@ impl AcpProvider {
         // The end of the output stream can be read a moment before the last of stderr; the notice waits a
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls (a card's answer, Esc, a send, the gauge) take.
-        st.closing_notice = Some((reason.to_string(), Instant::now() + CLOSING_NOTICE_WAIT));
+        st.closing_notice = Some(ClosingNotice::new(reason, Instant::now()));
         self.finish_closing_notice(st);
     }
 
     /// Sends the child's end once its stderr says why, or once the wait is over without it.
     fn finish_closing_notice(&self, st: &mut State) {
-        let Some((reason, until)) = st.closing_notice.as_ref() else {
-            return;
-        };
-        let tail = lock(&self.link)
-            .as_ref()
-            .map(|l| notice_tail(&l.stderr_tail()))
-            .unwrap_or_default();
-        if tail.is_empty() && Instant::now() < *until {
-            return;
+        if let Some(reason) = external_link::finish_closing_notice(&mut st.closing_notice, &self.agent, &self.link) {
+            st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
         }
-        let suffix = if tail.is_empty() {
-            String::new()
-        } else {
-            format!(": {tail}")
-        };
-        let reason = format!("{} ended unexpectedly ({reason}){suffix}", self.agent);
-        st.closing_notice = None;
-        st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
     }
 
     fn on_update(&self, st: &mut State, params: Value) {
@@ -932,31 +892,6 @@ impl AcpProvider {
             usage,
             detail,
         });
-    }
-}
-
-/// A failed call on the link as the error the host shows.
-fn link_error(agent: &str, link: &JsonRpcLink, what: &str, e: LinkError) -> ProviderError {
-    match e {
-        LinkError::Timeout => ProviderError::Timeout,
-        LinkError::Closed => {
-            let tail = notice_tail(&link.stderr_tail());
-            let suffix = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(": {tail}")
-            };
-            ProviderError::Transport(format!("{agent} ended before it answered {what}{suffix}"))
-        }
-        LinkError::Busy => ProviderError::Transport(format!("{agent} is not reading its input")),
-        LinkError::TooLarge => provider_error(
-            ProviderErrorCode::ProviderProtocolError,
-            format!("{agent}'s answer to {what} was larger than 16 MiB"),
-        ),
-        LinkError::Rpc { message, .. } => provider_error(
-            ProviderErrorCode::ProviderProtocolError,
-            format!("{agent} refused {what}: {message}"),
-        ),
     }
 }
 
@@ -1419,10 +1354,7 @@ impl AgentProvider for AcpProvider {
                 let _ = pending.wait(Instant::now() + CLOSE_WAIT);
             }
         }
-        let link = lock(&self.link).take();
-        if let Some(link) = link {
-            link.shutdown(SIDECAR_EXIT_GRACE);
-        }
+        external_link::stop_linked_child(&self.link);
         Ok(())
     }
 

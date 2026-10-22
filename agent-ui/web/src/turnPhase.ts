@@ -1,10 +1,13 @@
 import type { AgentUiState } from "./types";
 
 /**
- * The agent's current phase for the motion indicator, derived only from `AgentUiState`.
- * The caller uses it while `status.kind === "running" && activeTurnId !== null`.
- * A pending permission produces `blocked`: the agent is waiting for the user,
- * so the caller must hide the motion indicator.
+ * What the agent is doing right now, for the in-flight motion indicator.
+ * Five phases, read off `AgentUiState` alone -- this is
+ * a pure function, called only while `ActivityLine`'s own `working` predicate (`status.kind ===
+ * "running" && activeTurnId !== null`) is true (formerly `StatusLine`'s).
+ *
+ * `blocked` is not a variant of "in flight": while a permission card is up the agent is not
+ * working, the user is, and the caller must not render the meter for it.
  */
 export type TurnPhase =
   | { kind: "sent" }
@@ -14,40 +17,103 @@ export type TurnPhase =
   | { kind: "blocked" };
 
 /**
- * The order of these checks determines the visible phase:
+ * The rules, in order -- each rule's place in
+ * the list is load-bearing, not incidental:
  *
- * 1. A pending permission overrides everything else, regardless of sequence ordering.
- * 2. Use the newest unfinished tool call unless later assistant text, thinking, or a new
- *    user prompt displaces it.
- * 3. Check thinking before transcript messages because thinking can resume after text.
- * 4. If the last item is a transcript message, use `replying`.
- * 5. Otherwise use `sent`, including when only the user's prompt has arrived.
+ * 1. A pending permission overrides everything else, regardless of `seq` ordering against the tool
+ *    call it gates (unverified whether that ordering ever matters in practice; the override does
+ *    not depend on it either way).
+ * 2. `running <Tool>` holds when there is an unfinished tool call -- the NEWEST one, which is the
+ *    one the phase is named after -- **and** none of its three displacers has arrived after it:
+ *    assistant text, a thinking delta, or a new user prompt. See the block comment below: this
+ *    clause replaced an `openTool.seq === lastItemSeq` qualifier that was wrong in two reproduced
+ *    ways, and its own first version, which named only the first two displacers, was wrong in a
+ *    third.
+ * 3. Thinking, checked BEFORE the last-item-is-a-message rule: thinking can resume after text has
+ *    already streamed, and rule 4 alone would misreport `replying` while it does.
+ * 4. The last item being a transcript message reads `replying`.
+ * 5. Otherwise (the last item is your own prompt, or nothing has landed at all) reads `sent`.
  *
- * A tool call need not be the last item. A parallel call can complete while it is still
- * running, and a denial creates no item, leaving the denied call's `result` null.
- * Later assistant text or thinking displaces a denied call. A newer tool call only
- * changes which unfinished call names the phase; it does not displace other live calls.
+ * ## Rule 2, and why it does not ask whether the tool call is the last ITEM
  *
- * `toolCalls` persists between turns. Interrupted and denied calls can retain null results,
- * so a later prompt must prevent an old call from naming the next turn's initial phase.
- * Only calls from earlier turns are displaced by a prompt. `user_message_delivered` can
- * add a prompt during a running turn without stopping that turn's tool calls.
+ * It used to. The qualifier was `openTool.seq === lastItemSeq`, written to stop a DENIED call
+ * (whose `result` stays `null` forever, `agent/src/projection.rs`'s `PermissionResolved` arm) from
+ * reading `running <Tool>` for the rest of the turn. An earlier version had two reproduced defects,
+ * both of which come from asking the wrong question:
  *
- * `turnThinking` is ephemeral and is cleared by snapshots and unrelated events.
- * `thinkingOpen` is persisted as `thinking_open` while the newest thought is being written.
- * Replies, calls, prompts, and turn endings close it in both folds. Either flag produces
- * `thinking`, so snapshots and unrelated events preserve a thought that is still open.
- * A thinking delta with no text opens no block and can still be lost: without an unfinished
- * call it degrades to `sent`; with one and no later text it degrades to `tool`.
- * A denied call cannot be distinguished from a live call in the snapshot. The next
- * thinking delta or assistant text displaces it.
+ * - **Parallel calls.** `reducer.ts`'s own `permission_requested` comment says "a turn can have
+ *   several of the same tool in flight". With A and B both started and B completing first, B's
+ *   record is still the highest-`seq` ITEM, so A -- genuinely running -- failed the qualifier and
+ *   the phase fell through to `sent`, whose own definition is "the last thing on the timeline is
+ *   your prompt, nothing has come back yet". A sibling call completing is not evidence about this
+ *   call.
+ * - **A denial.** `permission_resolved` creates no item, so after a denial the tool call is still
+ *   the last item and the qualifier still matched -- the panel animated "running Bash" for a call
+ *   the user had just refused, and a thinking delta (which creates no item this reads) could not displace
+ *   it, because rule 2 sits ahead of rule 3.
  *
- * `permission_resolved` carries an outcome, but `toolCalls` stores no verdict in
- * `AgentSessionProjection::apply`. The reducer must match that snapshot shape; a verdict
- * stored only in the frontend would disappear on resync. Persisting it needs a wire change.
+ * So rule 2 stopped asking "is the tool call the latest item" and asks "is the tool still what is
+ * happening". A denial is followed by the model thinking or answering, and **either** displaces it,
+ * which is what closes the case the old qualifier was written for.
  *
- * Read `userPrompts`, `transcript`, and `toolCalls` directly. `buildTimeline` moves linked
- * permission cards under their calls for display, so its order is not chronology.
+ * ### The three displacers, and the asymmetry between them
+ *
+ * An open tool call stops being the phase when any of these has arrived after it:
+ *
+ * - **assistant TEXT** (`lastMessageSeq`) -- the model has moved on to answering;
+ * - **thinking** (`state.turnThinking`, or a thought still open: `state.thinkingOpen`) -- the model has
+ *   moved on to deciding;
+ * - **a new user PROMPT** (`lastPromptSeq`) -- the user has moved on, and whatever that call was
+ *   doing belongs to a turn that is over.
+ *
+ * **A newer TOOL CALL is deliberately NOT a displacer: it only RENAMES the phase.** The difference
+ * is what each event says about the call already in flight. A sibling call starting says nothing
+ * about it -- `reducer.ts`'s own `permission_requested` comment records that "a turn can have
+ * several of the same tool in flight" -- so two calls in flight means two things are happening, and
+ * the phase moves to the newest unfinished one rather than falling through to `sent`. A new prompt
+ * is the opposite: `toolCalls` is never cleared between turns, and the two shapes that leave
+ * `result: null` FOREVER -- an interrupt, and a denial -- would otherwise carry their call into the
+ * next turn as "the newest unfinished call" with nothing able to displace it, because a prompt is
+ * not text and the interrupted model emits no further delta. `ActivityLine` renders `running` from
+ * the instant `turn_started` lands, so that stale call would animate for the whole round trip
+ * between Enter and the model's first delta -- naming a tool the user had just stopped or refused,
+ * in exactly the window `sent` exists to name. The
+ * first version of this amendment dropped `lastItemSeq` without putting `lastPromptSeq` in its
+ * place, and the three tests named "into the next turn" in `turnPhase.test.ts` are that gap.
+ *
+ * The prompt displacer is scoped to calls of an earlier turn: a prompt can also arrive inside a turn (a
+ * message put into the running turn, `user_message_delivered`, lands where the agent read it), and a
+ * call of the running turn is still running whatever the user said meanwhile, so it keeps the phase.
+ *
+ * ## What a resync degrades this to
+ *
+ * `turnThinking` is ephemeral and **can only ever be lost, never invented**, and
+ * `applySnapshot` clears it, as does any other event (a list of commands, a count of background
+ * calls). `thinkingOpen` is not ephemeral: it is on the wire (Rust's `thinking_open`), true exactly
+ * while the newest thought is still being written, and closed by the same events in both folds (a
+ * reply, a call, a prompt, a turn's end). So the phase is `thinking` while either says so, and a
+ * snapshot or an unrelated event taken mid-thought keeps it. What a resync can still lose is only a
+ * thinking delta with no text (it opens no block), which degrades:
+ *
+ * - with no unfinished tool call, `thinking` -> `sent`;
+ * - **with** an unfinished tool call and no text after it, `thinking` -> `tool`. For a live call that
+ *   is correct and is the common case. For a DENIED call it is the old defect for one event's worth
+ *   of time, and it is not fixable on this side: the snapshot carries no record that a permission was
+ *   denied, so nothing here can tell them apart until the next thinking delta or the model's next
+ *   text arrives. Both are the documented direction: less specific, never inventing `thinking`.
+ *
+ * A `permission_resolved` EVENT does carry an `outcome` (`"denied"` among them), and remembering it
+ * per tool call would make rule 2 exact rather than displaceable. It is deliberately not done here:
+ * `toolCalls` is a SNAPSHOT collection whose shape `reducer.ts` is required to fold identically to
+ * `AgentSessionProjection::apply`, and Rust records no verdict there -- so a frontend-only field
+ * would be dropped by the very resync this paragraph is about, buying nothing and costing the one
+ * property that keeps the two folds honest. Closing it properly is a wire change.
+ *
+ * ## What it reads
+ *
+ * The raw `userPrompts`/`transcript`/`toolCalls` collections directly, not `buildTimeline` -- that
+ * function re-anchors a linked permission card under its tool call for RENDERING order, which is
+ * not the same thing as chronology.
  */
 export function phaseOf(state: AgentUiState): TurnPhase {
   if (state.pendingPermissions.length > 0) return { kind: "blocked" };
@@ -121,7 +187,8 @@ export function phaseOf(state: AgentUiState): TurnPhase {
   return { kind: "sent" };
 }
 
-/** The label `TurnActivity` renders for a phase, distinguishing activity states with words. */
+/** The exact word (or words) `TurnActivity` renders for a phase -- one word per phase: four
+ * distinguishable words replace four separate animations, which read as noise rather than state. */
 export function phaseWord(phase: TurnPhase): string {
   switch (phase.kind) {
     case "sent":

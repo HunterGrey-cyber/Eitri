@@ -1,4 +1,4 @@
-/** C4: an IME's own Enter/Esc/`?`. `isComposing`, or the legacy 229 some WebKit builds
+/** An IME's own Enter/Esc/`?` belong to the IME, not to the panel. `isComposing`, or the legacy 229 some WebKit builds
  *  still report -- the same pair `TabBar`'s rename and `Chooser`'s filter already test. */
 export function isImeKey(e: { isComposing: boolean; keyCode: number }): boolean {
   return e.isComposing || e.keyCode === 229;
@@ -26,10 +26,11 @@ export function readlineEdit(
   return { value: value.slice(0, from) + value.slice(start), caret: from };
 }
 
-/** Claude Code's two newline keys. `Alt+Enter` replaces the selection with a newline. Plain
- *  Enter with no selection and a backslash before the caret replaces that backslash with a
- *  newline. Return `null` for other Enter keys: Ctrl+Enter, Meta+Enter and plain Enter without
- *  that backslash still send. Shift+Enter is handled by the textarea's own newline behavior. */
+/** Claude Code's two newline keys, which used to send the draft. `Alt+Enter`
+ *  inserts a newline in place of the selection; a plain Enter with a backslash right before the caret
+ *  (and no selection) removes that backslash and inserts a newline in its place. `null` for every other
+ *  Enter -- Ctrl+Enter and Meta+Enter keep sending (now), a plain Enter with no such backslash sends,
+ *  and Shift+Enter never gets here (it is the textarea's own newline). */
 export function enterNewline(
   value: string,
   start: number,
@@ -59,7 +60,7 @@ export function growHeight(scrollHeight: number, panelHeight: number): number {
   return Math.min(scrollHeight, Math.floor(panelHeight * 0.4));
 }
 
-/** Restore queued text before the current box contents. */
+/** The queue comes back first, then whatever is in the box: the queued messages were written first. */
 export function mergeTaken(texts: string[], current: string): string {
   const parts = current.trim() === "" ? texts : [...texts, current];
   return parts.join("\n\n");
@@ -75,7 +76,7 @@ export const COMPOSER_CHORDS: string[] = [
   "Enter",
   "Ctrl+Enter",
   "Shift+Enter",
-  // A design decision: Claude Code's own two newline keys.
+  // Claude Code's own two newline keys.
   "Alt+Enter / \\ Enter",
   "↑ / ↓",
   "Ctrl+r",
@@ -85,7 +86,7 @@ export const COMPOSER_CHORDS: string[] = [
   "Tab",
   "Ctrl+w / Ctrl+u",
   "Ctrl+c",
-  // A design decision: like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which approves the
+  // Like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which approves the
   // oldest waiting card on it.
   "Ctrl+y",
   "Ctrl+g",

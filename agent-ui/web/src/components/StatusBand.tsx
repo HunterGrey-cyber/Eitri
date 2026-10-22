@@ -4,7 +4,7 @@ import type { BandFacts, Seg } from "../band";
 
 type Props = {
   facts: BandFacts;
-  /** Same claim `Footer`'s old mode block made: dim,
+  /** Same claim `Footer`'s old mode block made (moved here unchanged): dim,
    *  never hidden, while this pane lacks the keys. */
   paneFocused: boolean;
   /** The key that brings the keyboard into this panel (`panelEntryKey`), named in the dim mode block's title.
@@ -20,7 +20,7 @@ type Props = {
 };
 
 /** `facts.pill`'s leading `"⏵⏵ "` names the mode word after it (`"manual"`/`"auto"`/`"bypass"`), which is all
- *  `data-mode-name` needs -- `App.tsx` only ever builds this in the
+ *  `data-mode-name` needs (the mode glyph's colouring) -- `App.tsx` only ever builds this in the
  *  short form (`modePill(mode, cycleOffered, true)`), so there is nothing else in the string to
  *  strip. `undefined` for a pill that never carries the glyph (a future caller, a test fixture that
  *  built its own `BandFacts` by hand) -- drawn as plain text with no glyph span rather than guessing. */
@@ -127,7 +127,7 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump 
   const wrapping = segs.some((seg) => seg.wraps === true);
 
   return (
-    // C1c: the band stops being a `j`/`k` stop -- `data-nav-stop="status-band"` is gone
+    // The band stops being a `j`/`k` stop -- `data-nav-stop="status-band"` is gone
     // -- because `j` reaching the last stop now flashes `i or Ctrl+j to type` there instead of
     // landing the cursor on it. Its own details stay reachable on `<leader>i`, `prefix i` and a
     // click (`onOpenDetail` below), none of which go through `nav.ts`'s stop list.

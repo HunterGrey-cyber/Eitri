@@ -14,16 +14,18 @@ type Props = {
    *  `event.target === event.currentTarget` is exactly a click that landed on this element and not
    *  on anything it contains, so a click inside the table never fires it. */
   onClose: () => void;
-  /** Called by Enter or a click on the trailing Continue in a terminal action row. Omit the
-   *  callback to hide that row. `App.tsx` opens `ContinueInTerminal`'s confirmation here rather
-   *  than handing off immediately, so a click cannot close a live conversation without
-   *  confirmation. */
+  /** A trailing action row, `Continue in a terminal…`,
+   *  below every fact row -- `Enter` on it or a click calls this. Absent, no such row is drawn
+   *  (the start screen has no session to hand off, and never opens this popover in the first
+   *  place, but this stays a plain optional prop rather than assuming that). What this callback
+   *  DOES is `App.tsx`'s choice -- opening `ContinueInTerminal`'s confirmation, not performing the
+   *  handoff itself, so a click here never closes a live conversation with no confirmation seen. */
   onHandoff?: () => void;
 };
 
 /** This session's details, opened by `prefix i` or a click on the band: a
  *  two-column table of `rows`, shaped like `KeymapOverlay`, plus an optional trailing action row
- *. */
+ *  (`onHandoff`). */
 export const DetailPopover = forwardRef<HTMLDivElement, Props>(function DetailPopover({ rows, current, onClose, onHandoff }, ref) {
   // The row `j`/`k` sit on stays in view: once phase 3's rows made the table taller than a short
   // panel, the highlight walked off the bottom with nothing following it (the phase-3 GUI pass).

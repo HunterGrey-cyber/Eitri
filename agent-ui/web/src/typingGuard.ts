@@ -1,44 +1,31 @@
-/**
- * Keep typed prose from answering permission cards or triggering BROWSE actions.
- * Arrivals land in BROWSE with the cursor on a waiting card, so the first letters of a
- * sentence can arrive as command keys.
- *
- * - `a`/`d`/`D` require no other key within `TYPING_GUARD_MS` before or after them.
- *   They are deferred, and any keydown before the wait ends cancels them. The wait after
- *   the key protects the first letter of a sentence; the check before it protects later letters.
- * - Enter on a focused card button requires a pause before it, unless the entire unbroken
- *   run before it consists of `h`, `l`, Tab, or Shift+Tab and began with a key after a pause.
- *   Checking only the last key would let "cancel" end with `l` walking onto Approve and
- *   Enter approving it. A run of only walk keys can still act: "l" then Enter approves,
- *   and "ll" then Enter denies. Pausing before the final `l` in prose also permits that walk.
- *   Enter is claimed and deferred like `a`/`d`, with the walk exception still applied.
- *   `App.tsx` presses the button only if the preceding key moved focus onto that button,
- *   or a HINT landing focused it with no intervening key. Track landings where focus moves,
- *   rather than inferring them from key names. The guard counts keys with `keyCount`;
- *   `App.tsx` ties the landing to the key that caused it.
- * - A held key's repeat (`event.repeat`) never answers.
- * - `mayActAfterMotion` guards the leader and Enter/Space on Stop. They act only after a
- *   pause or an unbroken run of motion keys (`j`/`k`/`h`/`l`/`g`/`G`/Tab) that began after one.
- *   Otherwise prose can trigger leader commands or move from the last row to Stop with `j`
- *   and interrupt with Space. Motion sequences such as `jj<Space>bd` remain usable.
- * - The global HINT trigger `f` and single-key table bindings can be the first key of prose,
- *   so checking preceding motions cannot protect them. They use `defer` and act only if no
- *   other key arrives for `TYPING_GUARD_MS`. Otherwise a sentence starting with `f` can
- *   start HINT, or one starting with `L` can switch tabs and send its remaining text elsewhere.
- * - `mayStartInput` allows `i`/`o`/`A` to enter INPUT only after a pause, with no motion
- *   exception. A word such as "look" must not walk with `l` and open INPUT with `o`.
- *   A swallowed key shows `TYPE_HINT_FLASH`.
- * - A BROWSE `y` opens a copy burst (`noteCopy`/`afterCopy`): keys within `TYPING_GUARD_MS`
- *   of the copy are treated as typing, so `y i w` cannot open INPUT and insert `w`.
- *   The copy still happens immediately and overwrites the clipboard. Text typed without
- *   entering INPUT is still dropped; a lone `i` after a pause still works.
- *
- * Pure: this never reads the DOM. Timestamps come from the caller's `event.timeStamp`.
- * Timers are injectable and default to globals looked up at call time so fake timers apply.
- */
+/** Guards commands against prose typed immediately after a card arrival in BROWSE mode.
+ * A permission answer must stand alone so the first letters of a sentence cannot approve a card.
+ * `a`/`d`/`D` require no other key within `TYPING_GUARD_MS` before or after them. They wait,
+ * and any keydown before the timer ends cancels the answer. Repeated keydowns never answer.
+ * Enter on a focused card button also requires a quiet window before it, except after an unbroken
+ * run of `h`, `l`, Tab or Shift+Tab that began with a key standing alone.
+ * Checking only the immediately preceding key would allow words ending in `l` to approve a card:
+ * `l` from the card row focuses Approve. A run consisting only of walk keys still answers,
+ * and a pause before a final walk key still allows the following Enter.
+ * Enter is claimed and deferred to prevent native button activation. `App.tsx` activates only when
+ * the immediately preceding key focused that exact button, or a HINT landed there with no key since.
+ * Focus landings are recorded where focus moves. This guard only counts keys through `keyCount`.
+ * The leader and Enter/Space on Stop require a lone key or an unbroken run of motion keys
+ * (`j`/`k`/`h`/`l`/`g`/`G`/Tab) that began with one. This keeps words from opening leader sequences
+ * or activating Stop after a motion letter moves focus there.
+ * `f` and single-key table bindings can be the first letter of prose, so a backward check cannot
+ * protect them. They use `defer` to wait for `TYPING_GUARD_MS` and act only if no other key arrives.
+ * `i`/`o`/`A` enter INPUT only when `mayStartInput` allows a lone key, with no motion exception;
+ * otherwise a word beginning with `lo` could walk and then open INPUT. Swallowed keys show `TYPE_HINT_FLASH`.
+ * A BROWSE `y` copies immediately and opens a burst through `noteCopy`/`afterCopy`. Keys within
+ * `TYPING_GUARD_MS` of the copy count as typing, preventing `y i w` from opening INPUT after copying.
+ * The copy still overwrites the clipboard, and text typed without entering INPUT is still dropped.
+ * A lone `i` after a pause enters INPUT normally.
+ * Pure: this guard never reads the DOM. The caller supplies timestamps (`event.timeStamp`).
+ * Timers are injectable and default to globals looked up at call time so fake timers apply. */
 
-/** The guard window before and after a key. Prose at 60 wpm is about 200 ms per key;
- *  a deliberate single `a` leaves a longer gap. This is a tunable timing value. */
+/** The guard window, both sides. Typed prose at 60 wpm is ~200 ms a key; a
+ *  deliberate single `a` waits well over this for the next key. A tunable, not a key. */
 export const TYPING_GUARD_MS = 250;
 
 /** The keys that walk onto a card button, so Enter at the end of a run made only of them is not
@@ -46,12 +33,13 @@ export const TYPING_GUARD_MS = 250;
  *  `code: "Tab"` shape to it). */
 const WALK_KEYS = new Set(["h", "l", "Tab"]);
 
-/** The keys that move the cursor without typing (`keymap.ts`'s BROWSE motions, the empty
- *  tab's `j`/`k`, and Tab). `mayActAfterMotion` allows the leader or Enter/Space on Stop after
- *  a run of these keys. `WALK_KEYS` stays narrower for a card's Approve/Deny controls. */
+/** The keys that move the cursor without typing anything (`keymap.ts`'s BROWSE motions, the empty
+ *  tab's `j`/`k`, and Tab), so the leader or Enter/Space on Stop at the end of a run made only of
+ *  them is a quick motion, not prose (`mayActAfterMotion`). Wider than `WALK_KEYS` on purpose: that
+ *  set stays the narrower rule for a card's Approve/Deny, which is untouched. */
 const MOTION_KEYS = new Set(["h", "j", "k", "l", "g", "G", "Tab", "ArrowUp", "ArrowDown"]);
 
-/** Bare modifiers are not "a key". `key` values from the
+/** Bare modifiers are not "a key": holding Shift or Ctrl is not typing. `key` values from the
  *  UI Events KeyboardEvent key list's modifier section. */
 const MODIFIER_KEYS = new Set([
   "Alt",
@@ -90,10 +78,10 @@ export function hintTypingFlash(): string {
   return "f starts HINT only on its own — i or Ctrl+j to type";
 }
 
-/** The band message when typing suppresses a single-key table binding, as in `hintTypingFlash`.
- *  `key` is the human-readable key; these bindings are never the leader or a space.
- *  `desc` is `PanelBinding.desc`, so the message names the actual action, such as closing a
- *  tab, instead of assuming every binding switches tabs. Empty-tab `r`/`w` use it too. */
+/** The band message when typing cancels a deferred single-key table binding.
+ *  `key` is the human-readable key label. `desc` is the binding's `PanelBinding.desc`, so the message
+ *  names the blocked action instead of assuming all such keys switch tabs.
+ *  The empty tab's single-letter actions (`r`, `w`) use the same format. */
 export function tableKeyTypingFlash(key: string, desc: string): string {
   return `${key} (${desc}) runs only on its own — i or Ctrl+j to type`;
 }
@@ -213,11 +201,13 @@ export class TypingGuard {
     return this.previousRunIsMotion;
   }
 
-  /** BROWSE's `i`/`o`/`A` enter INPUT only after a pause: no key within `TYPING_GUARD_MS`
-   *  before the key `onKey` just recorded. Neither Enter's walk exception nor
-   *  `mayActAfterMotion`'s motion exception applies. A lone motion letter can start a word:
-   *  allowing `l` then `o` would turn "look at" into INPUT containing "ok at".
-   *  A fast `ji` therefore needs a pause before `i`. Repeats never enter INPUT. */
+  /** BROWSE's `i`/`o`/`A` enter INPUT only on a pure
+   *  pause -- nothing pressed within `TYPING_GUARD_MS` before the key `onKey` just recorded, exactly
+   *  `mayAnswerNow`'s rule with none of its Enter exception, and **none of `mayActAfterMotion`'s motion
+   *  exception either**. A lone `h`/`j`/`k`/`l`/`G` is as much the first letter of a word as a motion, so
+   *  with that exception "look at" walked with `l` and opened INPUT with `o` ("ok at"), and "how", "hi",
+   *  "like", "join" and "Good" did the same. The price, stated: a fast `ji` chord now needs a pause. A
+   *  repeat never may. */
   mayStartInput(t: number, repeat: boolean): boolean {
     return this.mayAnswerNow("", t, repeat);
   }

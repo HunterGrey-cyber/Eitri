@@ -32,6 +32,7 @@ use super::wire::{
     TurnStartResponse, TurnStatus, TurnSteerParams,
 };
 use crate::external::{ExternalProvider, ExternalStart, Reviewer, TurnPolicy, ANSWERED_BY_EITRI};
+use crate::external_link::{self, lock, provider_error, ClosingNotice};
 use crate::jsonrpc_link::{Framing, Incoming, JsonRpcLink, LinkError, LinkHandoff, LinkSpec, Pending, Skipped};
 use crate::projection::{
     thinking_open_after, ContentKind, PermissionOutcome, ResumeStatus, TurnEndDetail, TurnOutcome,
@@ -42,7 +43,8 @@ use crate::provider::{
     ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
 };
 use crate::provider_move::{at_offset, forget_unclaimed, handed_ids, offset_ms, MovedAnswer, START_WAIT};
-use crate::{AgentDomainEvent, MoveRefusedWhy, SIDECAR_EXIT_GRACE, UNARY_RPC_TIMEOUT};
+use crate::steer_gate::{SteerEntry, SteerGate};
+use crate::{AgentDomainEvent, MoveRefusedWhy, UNARY_RPC_TIMEOUT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -51,7 +53,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The oldest Codex Eitri drives. Below it a start is refused, naming both versions.
@@ -79,8 +81,6 @@ const SEND_DRAIN_BATCHES: usize = 8;
 const UNKNOWN_METHODS_KEPT: usize = 64;
 /// Turns of threads not (yet) in the family remembered at most, for a child announced after its turn began.
 const EARLY_TURNS_KEPT: usize = 64;
-/// The longest stderr tail put in a notice.
-const NOTICE_TAIL_CHARS: usize = 400;
 /// How long after an interrupt the tab's turn waits for the calls Codex was running to end. Codex ends an
 /// interrupted turn at once but lets a running command go on to its own end, so a command or file change
 /// still running when this has passed is stopped with the whole session.
@@ -386,10 +386,10 @@ struct State {
     /// first. Each ends as `UserMessageDelivered` (its `userMessage` item came) or `UserMessageDropped`
     /// (refused, or the turn or session ended first: Codex forgets a message it had not read when the turn
     /// is interrupted, measured on 0.162.1).
-    steers: Vec<SentSteer>,
+    steers: SteerGate<SentSteer>,
     /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
     /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
-    closing_notice: Option<(String, Instant)>,
+    closing_notice: Option<ClosingNotice>,
     /// Closed by the host.
     closed: bool,
     /// The child ended on its own, or was stopped.
@@ -636,6 +636,20 @@ impl SentInterrupt {
     }
 }
 
+impl SteerEntry for SentSteer {
+    fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+
+    fn in_flight(&self) -> bool {
+        self.answer.is_some()
+    }
+}
+
 impl SentSteer {
     fn into_moved(self) -> MovedSteer {
         let SentSteer {
@@ -679,15 +693,6 @@ const BLOCKED_REASONS: [&str; 2] = [BLOCKED_POLICY, BLOCKED_RESUME];
 /// The start of the id Eitri gives a turn whose start it could not read.
 const UNREAD_TURN_PREFIX: &str = "eitri-unread-turn-";
 
-/// How long a child's end waits for its stderr before the notice goes without it.
-const CLOSING_NOTICE_WAIT: Duration = Duration::from_millis(100);
-
-/// Why a message waiting behind a refused one was not sent either.
-const BEHIND_A_REFUSAL: &str = "an earlier message was not taken, and this one waits behind it";
-
-/// The most messages sent into one turn and not yet read; a further one waits for the turn's end.
-const MAX_STEERS: usize = 64;
-
 /// Why an adopted chat refuses what needs its link running: its move is not committed yet.
 const NOT_COMMITTED: &str = "this chat's move here is not committed yet";
 
@@ -706,8 +711,8 @@ fn later_deadlines(st: &mut State, by: Duration) {
             *at += by;
         }
     }
-    if let Some((_, until)) = st.closing_notice.as_mut() {
-        *until += by;
+    if let Some(notice) = st.closing_notice.as_mut() {
+        notice.until += by;
     }
 }
 
@@ -751,50 +756,9 @@ pub struct CodexProvider {
     steer_unsupported: AtomicBool,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn provider_error(code: ProviderErrorCode, message: impl Into<String>) -> ProviderError {
-    ProviderError::Provider {
-        code,
-        message: message.into(),
-    }
-}
-
-/// The end of the child's stderr, short enough for a notice. Email addresses are already replaced.
-fn notice_tail(tail: &str) -> String {
-    let tail = tail.trim();
-    let count = tail.chars().count();
-    if count <= NOTICE_TAIL_CHARS {
-        return tail.to_string();
-    }
-    tail.chars().skip(count - NOTICE_TAIL_CHARS).collect()
-}
-
 /// A failed call on the link as the error the host shows.
 fn link_error(link: &JsonRpcLink, what: &str, e: LinkError) -> ProviderError {
-    match e {
-        LinkError::Timeout => ProviderError::Timeout,
-        LinkError::Closed => {
-            let tail = notice_tail(&link.stderr_tail());
-            let suffix = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(": {tail}")
-            };
-            ProviderError::Transport(format!("Codex ended before it answered {what}{suffix}"))
-        }
-        LinkError::Busy => ProviderError::Transport("Codex is not reading its input".to_string()),
-        LinkError::TooLarge => provider_error(
-            ProviderErrorCode::ProviderProtocolError,
-            format!("Codex's answer to {what} was larger than 16 MiB"),
-        ),
-        LinkError::Rpc { message, .. } => provider_error(
-            ProviderErrorCode::ProviderProtocolError,
-            format!("Codex refused {what}: {message}"),
-        ),
-    }
+    external_link::link_error("Codex", link, what, e)
 }
 
 /// The directory Codex keeps the user's own configuration in: what it reported, else what it would have
@@ -1383,23 +1347,12 @@ impl CodexProvider {
                             self.steer_unsupported.store(true, Ordering::Release);
                         }
                         eprintln!("agent: Codex did not take a message into the running turn ({e})");
-                        let refused = st.steers.remove(at);
-                        st.events.push_back(AgentDomainEvent::UserMessageDropped {
-                            client_message_id: refused.client_id,
-                            reason: steer_refusal(&e),
-                        });
-                        let behind: Vec<SentSteer> = st.steers.drain(at..).collect();
-                        for later in behind {
-                            st.events.push_back(AgentDomainEvent::UserMessageDropped {
-                                client_message_id: later.client_id,
-                                reason: BEHIND_A_REFUSAL.to_string(),
-                            });
-                        }
+                        st.events.extend(st.steers.refused(at, &steer_refusal(&e)));
                         return;
                     }
                 }
             } else if st.steers[at].waiting.is_some() {
-                if !send_waiting {
+                if !send_waiting || st.steers.next_to_send() != Some(at) {
                     return;
                 }
                 let params = st.steers[at].waiting.take().expect("checked above");
@@ -1760,7 +1713,7 @@ impl CodexProvider {
             }
             let next = match st.held.pop_front() {
                 Some(message) => Some(message),
-                None => lock(&self.link).as_ref().and_then(JsonRpcLink::try_recv),
+                None => external_link::try_recv(&self.link),
             };
             let Some(message) = next else { return true };
             handled += 1;
@@ -1791,30 +1744,15 @@ impl CodexProvider {
         // The end of the output stream can be read a moment before the last of stderr; the notice waits a
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls take.
-        st.closing_notice = Some((reason.to_string(), Instant::now() + CLOSING_NOTICE_WAIT));
+        st.closing_notice = Some(ClosingNotice::new(reason, Instant::now()));
         self.finish_closing_notice(st);
     }
 
     /// Sends the child's end once its stderr says why, or once the wait is over without it.
     fn finish_closing_notice(&self, st: &mut State) {
-        let Some((reason, until)) = st.closing_notice.as_ref() else {
-            return;
-        };
-        let tail = lock(&self.link)
-            .as_ref()
-            .map(|l| notice_tail(&l.stderr_tail()))
-            .unwrap_or_default();
-        if tail.is_empty() && Instant::now() < *until {
-            return;
+        if let Some(reason) = external_link::finish_closing_notice(&mut st.closing_notice, "Codex", &self.link) {
+            st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
         }
-        let suffix = if tail.is_empty() {
-            String::new()
-        } else {
-            format!(": {tail}")
-        };
-        let reason = format!("Codex ended unexpectedly ({reason}){suffix}");
-        st.closing_notice = None;
-        st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
     }
 
     fn on_skipped(&self, st: &mut State, skipped: Skipped) {
@@ -2606,7 +2544,7 @@ impl CodexProvider {
                 .name("eitri-codex-stop".to_string())
                 .spawn(move || {
                     let _set = set;
-                    link.shutdown(SIDECAR_EXIT_GRACE);
+                    external_link::stop_child(link);
                 })
                 .ok();
         } else {
@@ -2962,7 +2900,7 @@ impl CodexProvider {
             start_abandoned,
             user_reviewed,
             steers: steers.into_iter().map(SentSteer::into_moved).collect(),
-            closing_notice: closing_notice.map(|(reason, until)| (reason, offset_ms(until, now))),
+            closing_notice: closing_notice.map(|notice| (notice.reason, offset_ms(notice.until, now))),
             thought_open,
             thought_scanned,
             thought_part,
@@ -3100,7 +3038,7 @@ impl CodexProvider {
         let steers = steers
             .into_iter()
             .map(|moved| SentSteer::from_moved(moved, &link))
-            .collect::<io::Result<Vec<_>>>()?;
+            .collect::<io::Result<SteerGate<_>>>()?;
         forget_unclaimed(&link, handed);
         let state = State {
             thread_id,
@@ -3135,7 +3073,10 @@ impl CodexProvider {
             start_abandoned,
             user_reviewed,
             steers,
-            closing_notice: closing_notice.map(|(reason, ms)| (reason, at_offset(ms, now))),
+            closing_notice: closing_notice.map(|(reason, ms)| ClosingNotice {
+                reason,
+                until: at_offset(ms, now),
+            }),
             closed: false,
             dead: false,
             thought_open,
@@ -3269,12 +3210,6 @@ impl AgentProvider for CodexProvider {
             Some(_) => return Err(no_turn("Eitri could not read the turn's start")),
             None => return Err(no_turn("only a subagent is running")),
         }
-        if st.steers.len() >= MAX_STEERS {
-            return Err(provider_error(
-                ProviderErrorCode::TurnAlreadyActive,
-                "too many messages are waiting for Codex to read them",
-            ));
-        }
         let thread_id = st.thread_id.clone().unwrap_or_default();
         let params = to_json(&TurnSteerParams::new(
             thread_id,
@@ -3282,20 +3217,19 @@ impl AgentProvider for CodexProvider {
             request.text,
             request.expected_turn_id,
         ))?;
-        // Behind a message whose answer has not come, this one waits unsent (`follow_steers`).
-        let behind = st.steers.iter().any(|s| s.answer.is_some() || s.waiting.is_some());
-        let (answer, waiting) = if behind {
-            (None, Some(params))
-        } else {
-            (Some(self.request(method::TURN_STEER, params)?), None)
-        };
-        st.steers.push(SentSteer {
-            client_id: request.client_message_id,
-            as_typed: request.as_typed,
-            answer,
-            waiting,
-        });
-        Ok(())
+        st.steers.open(&request.client_message_id, "Codex", |behind| {
+            let (answer, waiting) = if behind {
+                (None, Some(params))
+            } else {
+                (Some(self.request(method::TURN_STEER, params)?), None)
+            };
+            Ok(SentSteer {
+                client_id: request.client_message_id.clone(),
+                as_typed: request.as_typed,
+                answer,
+                waiting,
+            })
+        })
     }
 
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
@@ -3372,10 +3306,7 @@ impl AgentProvider for CodexProvider {
                 }
             }
         }
-        let link = lock(&self.link).take();
-        if let Some(link) = link {
-            link.shutdown(SIDECAR_EXIT_GRACE);
-        }
+        external_link::stop_linked_child(&self.link);
         Ok(())
     }
 

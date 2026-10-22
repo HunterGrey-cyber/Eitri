@@ -197,7 +197,7 @@ export type ResumableSession = {
    *  -- for a session recorded before titles were kept; such a row still shows only its id and time,
    *  and nothing may be made up in its place. */
   title?: string | null;
-  /** The tab's rename, kept on the record; the chooser shows it ahead of the title. */
+  /** The tab's rename, kept on the record so it outlives the tab; the chooser shows it ahead of the title. */
   name?: string | null;
 };
 /** A tab's permission mode, Eitri's own (`SessionModeChoice` in Rust), in `Shift+Tab`'s order: manual
@@ -391,8 +391,7 @@ export type AgentUiState = {
   nextSeq: Seq;
   /** Reducer-internal, never on the wire: true from a `content_delta` with `kind: "thinking"` until
    * the next event of any other kind. The one ephemeral bit `turnPhase.ts`'s `phaseOf` reads that is
-   * not already sitting in the four collections above.
-   * **Invariant: can only ever be LOST, never invented.** Every way of losing it (a resync, a
+   * not already sitting in the four collections above. **Invariant: can only ever be LOST, never invented.** Every way of losing it (a resync, a
    * reload, any other event) degrades the phase it feeds toward `sent`/`replying`/`tool` -- less
    * specific, never wrong -- because it is cleared by the ABSENCE of a special case in `applyEvent`
    * rather than by a maintained list of event types that ought to clear it. Nothing may set it to
@@ -474,8 +473,8 @@ export type Hello = {
    * Rust ranks this; the frontend renders it in array order and sorts nothing. */
   resumableSessions: ResumableSession[];
   expectedVerdandiRevision: string | null;
-  /** `agent::account`'s configured name, `null` when none is set
-   *  (`serialize_hello_for_js`'s own `"account"` field). Read by the empty tab's dashboard
+  /** `agent::account`'s configured name, `null` when none is set (`serialize_hello_for_js`'s
+   *  own `"account"` field). Read by the empty tab's dashboard
    *  (its cwd/backend/account line) and by nothing else yet. */
   account: string | null;
   /** The saved tabs the dashboard offers back (`restore_last`), or `null` when there is nothing to
@@ -608,13 +607,13 @@ export type AgentDomainEvent =
     }
   | { type: "session_unavailable"; reason: string }
   | { type: "session_closed"; reason: string }
-  /** The sidecar's own acknowledgement of a `set_permission_mode` RPC (a
-   *  synchronous unary call issued on the GTK thread, never optimistic). `mode` is Eitri's own
-   *  `PermissionModeChoice`; `provider_mode` is Verdandi's raw string (diagnostics only); `floor_applied`
-   *  is `true` exactly when Verdandi's bypass floor (`usesDefaultBypassDeny`) still restricted
-   *  the session (a deny list) despite `unrestricted: true` -- logged loudly, never silently. **The reducer ignores
-   *  this event on purpose**: the mode a tab is in lives on the `tabs` envelope (`TabInfo.mode`), not
-   *  on this per-session projection, so folding it here would just be a second, driftable copy. */
+  /** The sidecar's own acknowledgement of a `set_permission_mode` RPC (a synchronous unary call issued on the GTK
+   *  thread, never optimistic). `mode` is Eitri's own `PermissionModeChoice`; `provider_mode` is Verdandi's raw
+   *  string (diagnostics only); `floor_applied` is `true` exactly when Verdandi's bypass floor
+   *  (`usesDefaultBypassDeny`) still restricted the session (a deny list) despite `unrestricted: true` -- logged
+   *  loudly, never silently. **The reducer ignores this event on purpose**: the mode a tab is in lives on the `tabs`
+   *  envelope (`TabInfo.mode`), not on this per-session projection, so folding it here would just be a second,
+   *  driftable copy. */
   | { type: "permission_mode_changed"; mode: PermissionModeChoice; provider_mode: string; floor_applied: boolean }
   /** What the CLI says its permission mode is, on a session that asked for its own auto mode
    *  (`AgentDomainEvent::CliPermissionMode`): read by Rust's answer path, nothing for the view. */
@@ -674,9 +673,9 @@ export type TabInfo = {
    *  session in the same tab instead of emptying it to a start screen (`TabView::resumes_on_r`). Rust always
    *  sends it; absent reads as false. */
   resumesOnR?: boolean;
-  /** The record's title: the first prompt's title, or a
-   *  resumed record's display title. `null` before one exists. Read by the chooser's open-tab rows
-   *  once they join a `ChooserTab` to its `TabInfo` here. */
+  /** The record's title: the first prompt's title, or a resumed record's display title. `null`
+   *  before one exists. Read by the chooser's open-tab rows (their second line) once they join a
+   *  `ChooserTab` to its `TabInfo` here. */
   title: string | null;
   /** The agent the tab runs, as records name it: `claude`, `codex`, `acp:<name>` (`TabView::agent`). Rust
    *  always sends it; a tab without it reads as Claude's. */

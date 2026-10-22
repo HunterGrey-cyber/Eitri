@@ -75,10 +75,12 @@ export function EditDiff({
              overwritten -- a plain create is not a danger, and the warning below read as one. */
           <div className="permission-card-edit-note">Creates a new file.</div>
         ) : (
-          /* A Write request gives only the file's new content. A patch could falsely suggest
-             existing content survives, so state that the whole file is written. Use this wording
-             when file-existence information is absent too. `preview.wholeFileNote` overrides it for
-             content such as a NotebookEdit cell; undefined keeps the Write wording. */
+          /* Said rather than implied. A Write request carries only what the file WILL contain, so a
+             patch-shaped rendering would suggest the rest of the file survives. It may not. Also
+             what is shown when nobody looked (a snapshot from before F22, a call no card gated).
+             `preview.wholeFileNote` overrides this wording for a tool whose whole
+             content is not a whole file (`NotebookEdit`'s cell) -- `undefined` for `Write` keeps
+             this exact pinned sentence. */
           <div className="permission-card-edit-note">
             {notePieces !== null ? <Revealed pieces={notePieces} /> : "Writes the whole file. The request does not say what is there now."}
           </div>

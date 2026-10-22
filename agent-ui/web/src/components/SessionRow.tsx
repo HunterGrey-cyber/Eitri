@@ -1,7 +1,7 @@
 import type { ResumableSession } from "../types";
 
 /** Shows the first 8 characters of a provider session id -- moved out of `ModeSelector.tsx`
- *  unchanged. */
+ *  unchanged when `EmptyTab` replaced that start screen. */
 export function shortId(id: string): string {
   return id.slice(0, 8);
 }

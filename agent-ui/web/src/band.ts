@@ -2,13 +2,14 @@ import type { PanelMode } from "./keymap";
 import type { EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
 
-/** A segment's identity, used for lookups.
- *  `bandLayout`'s construction order determines degrade order and render order. */
+/** One segment's identity, in priority order (used only for lookups here --
+ *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
 export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "usage" | "review" | "recovery" | "ending" | "background";
 
-/** One band segment's text and side of the gap. The left holds mode, pill, `⚑N`, `⧗N`, and
- *  message; the right holds showcmd, `⚠`, context, model, usage, position, and `↓N`.
- *  `StatusBand` groups by `side` when rendering; `bandLayout` reorders only by priority. */
+/** One piece of the band: the text to show and which side of the gap it belongs on (left of the
+ *  gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
+ *  model, usage, position, `↓N`). `StatusBand` groups by `side` when it renders; `bandLayout` itself
+ *  never reorders by side, only by priority. */
 export type Seg = {
   id: SegId;
   text: string;
@@ -39,7 +40,7 @@ export type BandFacts = {
   /** The active tab's latest usage, formatted by `usageSegment`: `text` is the segment and `title`
    *  its tooltip. Null until a turn reports usage, and always null on an empty tab. */
   usage: UsageFact | null;
-  /** A design decision (2026-09-30): the card INPUT's `Ctrl+y` would approve -- the active tab's
+  /** The card INPUT's `Ctrl+y` would approve -- the active tab's
    *  oldest waiting card -- set by `App.tsx` only while one waits and the composer has the keys, so
    *  the band says which card that one key answers. Optional: absent (or `null`) is "nothing to
    *  name", which every caller that predates #39 means. */
@@ -90,7 +91,7 @@ export type ApproveFact = { tool: string; summary: string };
 /** How long `cardSummary` lets a card's summary run on the band, the `…` included. */
 const CARD_SUMMARY_MAX = 40;
 
-/** A design decision: a card in one short line for the band -- what the call acts on (its command,
+/** A card in one short line for the band -- what the call acts on (its command,
  *  file, path or URL, the fields a person checks before approving), else `summarizeInput`'s own
  *  order's remaining fields, else compact JSON; whitespace collapsed; cut to `CARD_SUMMARY_MAX`
  *  characters in the middle, head … tail. A `Bash` card's `description` is the
@@ -109,8 +110,8 @@ export function cardSummary(input: unknown): string {
   const line = (text ?? JSON.stringify(input) ?? "").replace(/\s+/g, " ").trim();
   const chars = Array.from(line);
   if (chars.length <= CARD_SUMMARY_MAX) return line;
-  // Cut the middle so the summary keeps the command's tail. Options such as `--force` and
-  // suffixes such as `| sudo bash` can matter when approving it.
+  // Cut in the middle, not at the end -- the tail of a long command is often
+  // the part that matters (`| sudo bash`, `--force`), and it is what a person approving must see.
   const tail = Math.floor((CARD_SUMMARY_MAX - 1) / 2) + 4;
   const head = CARD_SUMMARY_MAX - 1 - tail;
   return `${chars.slice(0, head).join("")}…${chars.slice(chars.length - tail).join("")}`;
@@ -120,12 +121,14 @@ export function cardSummary(input: unknown): string {
  *  the breakdown the text has no room for. */
 export type UsageFact = { text: string; title: string };
 
-/** Count these East Asian wide and fullwidth ranges as two cells so file and model names
- *  do not overrun the band's monospace budget. This is a subset of Unicode's width table:
- *  CJK ideographs and extensions, Hangul syllables and jamo, and fullwidth forms. */
+/** vim's East Asian Wide/Fullwidth ranges, counted twice: a CJK file
+ *  name or model name must not silently overrun the band's monospace budget. Not a full Unicode
+ *  East-Asian-Width table -- just the ranges the fixtures and a long CJK file name such as
+ *  (`说明文档非常长的文件名称.md`) actually exercise: CJK Unified Ideographs and their extension
+ *  blocks, Hangul syllables and jamo, and the fullwidth forms block. */
 const WIDE = /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/u;
 
-/** Character count with East Asian wide characters counted twice. Iterates by code
+/** Character count with East Asian wide characters counted twice, as a terminal draws them. Iterates by code
  *  point, not UTF-16 unit, so a codepoint outside the BMP is never split into two "wide" halves. */
 export function textWidth(text: string): number {
   let n = 0;
@@ -225,7 +228,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   return segs;
 }
 
-/** The model without its leading `claude-`: `"claude-sonnet-5"` ->
+/** The model without its leading `claude-`, which every model shares: `"claude-sonnet-5"` ->
  *  `"sonnet-5"`. A model that never carried the prefix (or `null`, before a session reports one)
  *  passes through unchanged. */
 export function shortModel(model: string | null): string | null {

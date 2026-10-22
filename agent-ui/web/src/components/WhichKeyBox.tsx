@@ -5,8 +5,8 @@ type Props = {
    *  prefix's own literal char, `"g"`/`"z"`/`"["`/`"]"`) -- drawn on the box's own top border,
    *  which-key.nvim's convention for its popup's title. */
   title: string;
-  /** The node's continuations in `boxEntries`/`FIXED_PENDING_ENTRIES` order:
-   *  leaves before groups. */
+  /** The node's continuations, in the order `boxEntries`/`FIXED_PENDING_ENTRIES` already decided:
+   *  leaves before groups, as which-key.nvim sorts them. */
   entries: BoxEntry[];
   /** A click on a row: the same key `App.tsx` would feed the sequence engine had it been typed
    *  next. Does nothing to a disabled entry's own semantics -- `App.tsx` decides that, this
@@ -14,7 +14,7 @@ type Props = {
   onPick: (key: string) => void;
 };
 
-/** The which-key popup:
+/** The which-key popup (shaped like which-key.nvim's own default popup):
  *  drawn `WHICH_KEY_DELAY_MS` after a leader/table sequence, or one of `resolveKey`'s own reserved
  *  `g`/`z`/`[`/`]` prefixes, is still pending with nothing else to show yet. Holds no keyboard
  *  handling of its own -- `App.tsx`'s `onKeyDown` reads the same `PanelTable` this box is drawn

@@ -15,17 +15,22 @@ type Props = {
    *  row and used only to seed the starting cursor; picking a different row never "un-marks" it,
    *  since nothing here claims to know what Enter will end up changing until it is sent. */
   current: string | null;
-  /** Incremented by `App` to return focus to an open picker after a GTK focus cycle,
-   *  `arrive` or a HINT landing, as with `Chooser`'s `focusRequest`.
-   *  Focus the root so `j`/`k`/`Enter`/`Escape` reach its `onKeyDown`. Mount also focuses the root. */
+  /** Bumped by
+   *  `App` the same way `Chooser`'s own `focusRequest` is, whenever the keys arrive somewhere that
+   *  could otherwise steal them out from under an open picker (a GTK focus round trip, `arrive`, a
+   *  HINT landing) -- re-focuses the root so `j`/`k`/`Enter`/`Escape` keep reaching this component's
+   *  own `onKeyDown` rather than going nowhere. Mount still focuses too (whatever `focusRequest`
+   *  starts at). */
   focusRequest: number;
   onChoose: (value: string) => void;
   onCancel: () => void;
 };
 
-/** Picker opened by a bare `/model` or `/effort` reply, parsed by `../slashPicker` in `App.tsx`.
- *  Uses the chooser's keys: `j`/`k`, `↓`/`↑` and `Ctrl+n`/`Ctrl+p` move, `Enter` chooses,
- *  and `Escape`/`q` cancel without sending. Clicking a row chooses it directly, as in `Chooser`. */
+/** The picker a bare `/model`/`/effort` reply opens
+ *  (`App.tsx`'s own wiring watches for the reply and parses it via `../slashPicker`). Copies the
+ *  chooser's own keys (`./Chooser`): `j`/`k` -- and `↓`/`↑` and `Ctrl+n`/`Ctrl+p` -- move, `Enter`
+ *  chooses, `Escape`/`q` cancel with nothing sent -- no new binding, the same table `prefix w` already
+ *  uses. A click on a row chooses it directly, the same as a chooser row's own `onClick`. */
 export function SlashPicker({ kind, options, current, focusRequest, onChoose, onCancel }: Props) {
   const startIndex = current === null ? -1 : options.indexOf(current);
   const [cursor, setCursor] = useState(startIndex === -1 ? 0 : startIndex);
@@ -34,8 +39,9 @@ export function SlashPicker({ kind, options, current, focusRequest, onChoose, on
     rootRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRequest]);
-  // Keep the highlighted row in view on long `/model` lists when the cursor changes,
-  // as `Chooser` does for its selection.
+  // As `Chooser`'s own identical effect does: the highlighted
+  // row can scroll out of view on a long `/model` list before `j`/`k` walks it back into the
+  // viewport otherwise.
   useEffect(() => {
     rootRef.current?.querySelector(".slash-picker-row.current")?.scrollIntoView({ block: "nearest" });
   }, [cursor]);

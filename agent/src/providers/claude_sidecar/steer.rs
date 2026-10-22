@@ -43,7 +43,11 @@
 //! the sending, so every rule here is tested without a sidecar or a runtime. `R` is the request the
 //! caller sends; it is only kept and handed back.
 
-use crate::provider::{ProviderError, ProviderErrorCode};
+use crate::provider::ProviderError;
+#[cfg(test)]
+use crate::steer_gate::BEHIND_A_REFUSAL;
+pub(crate) use crate::steer_gate::MAX_OPEN_STEERS;
+use crate::steer_gate::{self, SteerEntry};
 use crate::AgentDomainEvent;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -55,16 +59,11 @@ use std::time::Duration;
 /// stream.
 pub(crate) const FOLLOW_UP_WAIT: Duration = Duration::from_secs(5);
 
-/// The most messages that may be open at once; a further one is held by the host for the turn's end.
-pub(crate) const MAX_OPEN_STEERS: usize = 64;
-
 /// Why a message is reported dropped when its fate was never said and the wait for a follow-up turn
 /// ran out.
 pub(crate) const UNREPORTED: &str = "Claude did not say whether it read it";
 /// Why a message is reported dropped when the session ended with its fate open.
 pub(crate) const SESSION_ENDED: &str = "the session ended before Claude read it";
-/// Why a message waiting behind a refused one is dropped unsent.
-pub(crate) const BEHIND_A_REFUSAL: &str = "an earlier message was not taken, and this one waits behind it";
 /// Why a message waiting behind one whose answer was lost is dropped unsent.
 pub(crate) const BEHIND_AN_UNKNOWN: &str =
     "an earlier message may not have reached Claude, and this one waits behind it";
@@ -90,6 +89,20 @@ struct OpenSteer<R> {
     sending: Sending<R>,
 }
 
+impl<R> SteerEntry for OpenSteer<R> {
+    fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    fn waiting(&self) -> bool {
+        matches!(self.sending, Sending::Waiting(_))
+    }
+
+    fn in_flight(&self) -> bool {
+        matches!(self.sending, Sending::InFlight)
+    }
+}
+
 /// Why a session's gate cannot be handed to another process now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SteerBusy {
@@ -111,7 +124,7 @@ pub(crate) struct Passed {
 #[derive(Debug)]
 pub(crate) struct SteerGate<R> {
     /// In the order the host handed them over.
-    open: Vec<OpenSteer<R>>,
+    open: steer_gate::SteerGate<OpenSteer<R>>,
     /// The held `TurnCompleted` and everything after it, while `holding` is set.
     held: Vec<AgentDomainEvent>,
     /// The generation of the hold in force, so a timer armed for an earlier one does nothing.
@@ -128,7 +141,7 @@ pub(crate) struct SteerGate<R> {
 impl<R> Default for SteerGate<R> {
     fn default() -> Self {
         Self {
-            open: Vec::new(),
+            open: steer_gate::SteerGate::default(),
             held: Vec::new(),
             holding: None,
             generations: 0,
@@ -143,33 +156,20 @@ impl<R> SteerGate<R> {
     /// message before it to be answered, and [`Self::accepted`] hands it out then. Refused, nothing
     /// recorded, when the id is already open or too many are open; the host holds it for the turn's end.
     pub(crate) fn open(&mut self, client_id: &str, as_typed: String, request: R) -> Result<Option<R>, ProviderError> {
-        let refuse = |code, message: &str| ProviderError::Provider {
-            code,
-            message: message.to_string(),
-        };
-        if self.open.iter().any(|s| s.client_id == client_id) {
-            return Err(refuse(
-                ProviderErrorCode::IdempotencyConflict,
-                "this message was already sent to Claude",
-            ));
-        }
-        if self.open.len() >= MAX_OPEN_STEERS {
-            return Err(refuse(
-                ProviderErrorCode::TurnAlreadyActive,
-                "too many messages are waiting for Claude to read them",
-            ));
-        }
-        let behind = self.open.iter().any(|s| !matches!(s.sending, Sending::Answered));
-        let (sending, now) = if behind {
-            (Sending::Waiting(request), None)
-        } else {
-            (Sending::InFlight, Some(request))
-        };
-        self.open.push(OpenSteer {
-            client_id: client_id.to_string(),
-            as_typed,
-            sending,
-        });
+        let mut now = None;
+        self.open.open(client_id, "Claude", |behind| {
+            let sending = if behind {
+                Sending::Waiting(request)
+            } else {
+                now = Some(request);
+                Sending::InFlight
+            };
+            Ok(OpenSteer {
+                client_id: client_id.to_string(),
+                as_typed,
+                sending,
+            })
+        })?;
         Ok(now)
     }
 
@@ -187,9 +187,7 @@ impl<R> SteerGate<R> {
         let Some(at) = self.open.iter().position(|s| s.client_id == client_id) else {
             return Vec::new();
         };
-        let steer = self.open.remove(at);
-        let mut out = vec![dropped(steer.client_id, reason)];
-        out.extend(self.drop_waiting(BEHIND_A_REFUSAL));
+        let out = self.open.refused(at, reason);
         self.settled(out)
     }
 
@@ -353,13 +351,8 @@ impl<R> SteerGate<R> {
 
     /// The first waiting message, once nothing is in flight.
     fn next_to_send(&mut self) -> Option<(String, R)> {
-        if self.open.iter().any(|s| matches!(s.sending, Sending::InFlight)) {
-            return None;
-        }
-        let steer = self
-            .open
-            .iter_mut()
-            .find(|s| matches!(s.sending, Sending::Waiting(_)))?;
+        let at = self.open.next_to_send()?;
+        let steer = &mut self.open[at];
         let Sending::Waiting(request) = std::mem::replace(&mut steer.sending, Sending::InFlight) else {
             unreachable!("found waiting above");
         };
@@ -371,7 +364,7 @@ impl<R> SteerGate<R> {
         let (waiting, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open)
             .into_iter()
             .partition(|s| matches!(s.sending, Sending::Waiting(_)));
-        self.open = kept;
+        self.open = kept.into_iter().collect();
         waiting.into_iter().map(|s| dropped(s.client_id, reason)).collect()
     }
 

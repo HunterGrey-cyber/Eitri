@@ -6,10 +6,14 @@ import type { EditorLink, Hello, PermissionModeChoice } from "../types";
  *  `r` used to walk all eight; the chooser (`w`/`prefix w`) is where every record still lives. */
 export type DashItem = "new" | "restore" | "resume" | "sessions" | "mode" | "keys";
 
-/** Direct keys for dashboard items, shared with `EmptyTab.onKeyDown` so displayed letters and
- *  dispatch stay in sync. `mode` displays `⇧Tab` only: bare `m` could trigger during typing.
- *  The item remains reachable by navigation and Enter, Shift+Tab through `modeKey.ts`, or
- *  `<leader>m`. */
+/** The key each item runs on directly -- also what `EmptyTab`'s `onKeyDown`
+ *  dispatches on. Exported so that file and this one cannot silently disagree about which letter
+ *  goes with which item.
+ *
+ *  `mode`'s column reads `⇧Tab`, not a letter -- the dashboard no longer claims
+ *  a bare `m` (it collided with a fast typist's ordinary prose, e.g. "make", "mode"). The item is
+ *  still reachable by `j`/`k` + Enter, Shift+Tab (`modeKey.ts`'s document-capture router, untouched
+ *  here) and `<leader>m`; `EmptyTab` never dispatches on this string, it is display only. */
 export const DASH_ITEM_KEY: Record<DashItem, string> = {
   new: "i",
   restore: "s",
@@ -34,10 +38,17 @@ export function dashItems(hello: Hello): DashItem[] {
   return items;
 }
 
-/** Text explaining permission modes. Unknown modes draw no consequence line. In auto mode,
- *  project reads, read-only `Bash`, and `Write`/`Edit`/`NotebookEdit` inside the project
- *  outside protected paths run without a card; other operations ask. This matches
- *  `agent/src/permission_policy.rs`. Bypass runs edits and commands without asking. */
+/** The consequence line (a choice must say what it does), fitted to what
+ *  `agent/src/permission_policy.rs` and bypass mode actually do -- not a
+ *  mockup's wording, which this project has no way to keep in sync with the policy by
+ *  construction. A mode this build does not know (neither key present) draws no line at all,
+ *  rather than a guess.
+ *
+ *  `auto`'s line says what the mode is: Claude Code's acceptEdits fast path, where
+ *  `Write`/`Edit`/`NotebookEdit` inside the project, outside its protected paths, run with no card,
+ *  as project reads and read-only `Bash` already did; anything else is a card. That is what
+ *  `agent/src/permission_policy.rs` does in this build. The key and the name "auto" are kept, so
+ *  nobody relearns them. `bypass`'s line is untouched. */
 export const MODE_CONSEQUENCE: Record<string, string> = {
   manual: "Safe reads run; every edit and anything else asks.",
   auto: "Edits in this project and safe reads run; anything else asks.",
@@ -79,8 +90,10 @@ function narrowCwd(path: string): string {
   return short.startsWith("~") ? `~/…/${base}` : `…/${base}`;
 }
 
-/** Working directory with the home path abbreviated to `~`, followed by the optional account.
- *  Narrow mode shortens the directory and omits the account. */
+/** `<cwd, ~-abbreviated> · <account>` (the line used to read
+ *  `<cwd> · <backend> · <account>`, but the backend reads "sidecar" in every release build and
+ *  carries nothing; it lives only in `prefix i` / `<leader>i`). narrow
+ *  drops the account and cuts the cwd. */
 function whereLine(hello: Hello, narrow: boolean, agent: string | null): string {
   const cwd = narrow ? narrowCwd(hello.projectDir) : abbreviateHome(hello.projectDir);
   const parts = [cwd];

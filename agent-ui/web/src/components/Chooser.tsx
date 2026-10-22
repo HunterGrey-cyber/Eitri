@@ -15,9 +15,11 @@ type Props = {
   defaultMode: PermissionModeChoice;
   projectDir: string;
   newTabChord: string;
-  /** Bumped by `App` on regained pane focus, `enter_input` and `arrive` to restore chooser focus.
-   *  Focus the rename input if open, else the filter input if open, else the root.
-   *  Mount also focuses, regardless of the initial counter value. */
+  /** Bumped by `App` on `pane_focus` regaining focus, `enter_input` and `arrive`,
+   *  so a chooser that lost DOM focus across a GTK round trip gets it back -- the rename input if
+   *  one is open, else the filter input if one is open, else the root. Mount counts as a request
+   *  too (initial value 0 or otherwise -- the effect below always runs on mount, like the old
+   *  mount-only effect it replaces). */
   focusRequest: number;
   /** Bumped by `dropPendingKeys()` for cancellation routes this chooser never receives as keys:
    *  focus changes, arrival, HINT, tab switches, and other overlays. Clears its lone-g wait along
@@ -30,9 +32,10 @@ type Props = {
   onCloseTab: (tab: TabId) => void;
   onRenameTab: (tab: TabId, name: string) => void;
   onCycleMode: () => void;
-  /** Shift+Tab on an open tab's row toggles that tab's mode where Rust allows it. Leaving bypass
-   *  works on any tab in any state. Entering bypass requires the active tab and asks for
-   *  confirmation, answered in the chooser. */
+  /** `Shift+Tab` on an open tab's own row: toggles THAT tab's mode -- an open tab's mode
+   *  is switchable, so the old "fixed for this session" flash was false. Only offered
+   *  where Rust would act on it: leaving bypass (any tab, any state), or entering it on the active
+   *  tab (Rust asks first; the prompt is answered here, in the chooser). */
   onCycleTabMode: (tab: TabId) => void;
   onLeave: () => void;
   /** The window-close prompt AND an open bypass confirm both own every key ahead of
@@ -54,8 +57,8 @@ function projectName(dir: string): string {
   return segment === "" ? dir : segment;
 }
 
-/** Wraps the first case-insensitive match of `needle` in `text` with `<mark>`.
- *  Renders plain text when `needle` is empty or absent from `text`. */
+/** Wraps the first case-insensitive match of `needle` in `text` with `<mark>`, so a filter shows
+ *  where it matched. Renders `text` plain when `needle` is empty or does not occur. */
 function Highlighted({ text, needle }: { text: string; needle: string }): ReactNode {
   if (needle === "") return text;
   const idx = text.toLowerCase().indexOf(needle);
@@ -98,10 +101,19 @@ function tabNumber(tab: { tab: TabId; label: string }, info: TabInfo | null): nu
   return Number(tab.label.split(" ", 1)[0]) || 0;
 }
 
-/** Shows the mode and location for starting or resuming the current row above the keys.
- *  For open tabs, `tabModeRoute` determines what `Shift+Tab` can do from here.
- *  The mode key cycles manual -> auto -> bypass, so the hint says "cycle".
- *  Uses "auto mode" in the full sentence rather than the shorter wording from `modePill`. */
+/** The mode line, above the keys (a choice says what it does): what a resume of the row under the
+ *  cursor will run in, and where. An open tab's own mode is no longer "fixed":
+ *  the line says what `Shift+Tab` does to it from here -- see `tabModeRoute`.
+ *
+ *  The mode key cycles manual -> auto -> bypass (Claude Code's order), so the hint says "cycle" (it said
+ *  "toggle" while the key was an auto/bypass toggle, 2026-09-27 to 2026-10-14; before that "cycle", after
+ *  Claude Code's own N-mode footer).
+ *
+ *  Deliberately NOT `modePill` (`tabs.ts`) -- that helper's own established wording is `⏵⏵ auto on
+ *  (shift+tab to cycle)` (`tabs.test.ts`), one word short of the chooser's
+ *  `Resume in ⏵⏵ auto mode on (shift+tab to cycle)`: the
+ *  chooser's own phrasing names the mode as a noun ("auto mode") before saying it is on, which
+ *  reads better in a full sentence than the footer pill's terser form does. */
 function modeLine(row: ChooserRow | undefined, active: TabInfo | null, defaultMode: PermissionModeChoice): ReactNode {
   // A filter with no matches leaves `row` undefined. Return no mode line instead of reading
   // `row.kind` and unmounting the panel. `keysLine` handles the same missing row.
@@ -201,7 +213,7 @@ export function Chooser({
     setFlash({ text, seq: flashSeq.current });
   }
 
-  // Defect 5: starts on the active tab's row, not row 1.
+  // Starts on the active tab's row, not row 1: the reader is most likely to stay or move one step.
   const [cursor, setCursor] = useState(() => {
     const rows = chooserRows(envelope, tabs, "");
     return Math.max(0, rows.findIndex((r) => r.kind === "tab" && r.tab.tab === active));
@@ -229,9 +241,11 @@ export function Chooser({
   });
   const activeInfo = tabs.find((t) => t.id === active) ?? null;
 
-  /** Restores focus on mount and each `focusRequest` change to the active rename input,
-   *  filter input or root. Do not call `select()` here: regaining focus must preserve an
-   *  unfinished value and its selection. The `[renaming]` effect selects on a fresh rename. */
+  /** Replaces the old mount-only focus effect (`focusRequest` starts at some value
+   *  either way, so mount still focuses). Re-focuses whichever of the rename input, the filter
+   *  input or the root currently has the live control, on every bump from `App` -- not just once.
+   *  No `select()` here (that would clobber a half-typed rename/filter value on a mere re-focus);
+   *  the `[renaming]` effect below still selects, since ITS trigger really is a fresh rename. */
   useEffect(() => {
     if (renaming !== null) renameRef.current?.focus();
     else if (filtering) filterRef.current?.focus();
@@ -277,9 +291,11 @@ export function Chooser({
     else showFlash(`switch to tab ${tabNumber(row.tab, row.info)} to change its mode`);
   }
 
-  // A lone `g` waits without a timeout. The next key completes `gg` or is swallowed to cancel the
-  // wait, so `gx` cannot close a tab and `gEnter` cannot choose a row. Bare modifiers keep
-  // waiting.
+  // vim's `gg` (missing until a GUI pass on 2026-09-26). A lone `g` waits for its next key
+  // with no timeout, and that key either completes `gg` or cancels the wait -- swallowed, nothing runs,
+  // as vim's `nv_g_cmd` does for a `g` no command follows. It used to drop the `g` and then do what the
+  // key does, so `gx` asked to close a tab and `gEnter` chose a row. A bare modifier is not "the next
+  // key" (the Shift of a `G`).
   const pendingG = useRef(false);
   // Clear the pending `g` on the window's cancellation routes. This also runs on mount, when
   // nothing is waiting.
@@ -288,13 +304,16 @@ export function Chooser({
   }, [dropKeysRequest]);
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (composing(event)) return;
-    // A bypass or window-close confirmation takes every key before chooser navigation, filter or
-    // rename inputs, and Shift+Tab. Answering a y/n prompt must never move the cursor or choose
-    // a row.
+    // A bypass (or window-close) confirm owns every key ahead of everything else in
+    // here too, even the filter/rename inputs and this component's own Shift+Tab below -- `j`/`k`/
+    // `Enter` must never move the cursor or choose a row while it is answering a y/n instead.
     if (answerConfirm(event)) return;
-    // Claim Shift+Tab even in the filter or rename input. The document-capture router sends it here
-    // while the chooser is open, and `cycleMode` selects the row-dependent action. Handle it
-    // before the text-input guard because Shift+Tab types no text.
+    // Shift+Tab is claimed here even while the filter or rename input is focused --
+    // App.tsx's document-capture router (`modeKey.ts`) already routed here (`route === "overlay"`)
+    // because the chooser is open, and this component's own row-dependent choice (`cycleMode`) still
+    // decides between `cycle_mode` and `cycle_default_mode`. Ahead of the filtering/renaming guard,
+    // deliberately: that guard exists to stop navigation keys from fighting a typed value, but
+    // Shift+Tab types nothing into either box.
     if (isShiftTab(event)) {
       event.preventDefault();
       event.stopPropagation();
@@ -459,7 +478,8 @@ function ChooserRowItem({
   onRenameCancel: () => void;
 }) {
   const classes = ["chooser-row", current ? "current" : "", choosable(row) ? "" : "unchoosable"].filter(Boolean).join(" ");
-  // The current row replaces its usual sign with the panel cursor: a solid block containing `›`.
+  // The current row's sign cell is the panel's cursor, a solid block holding `›`, in
+  // place of whatever sign the row has (a GUI pass on 2026-09-26 found it was never drawn).
   const cursorSign = <span className="chooser-sign">›</span>;
   if (row.kind === "new") {
     return (
@@ -478,9 +498,10 @@ function ChooserRowItem({
     const sign = word === "running" ? "running" : word === "done, unread" ? "unread" : null;
     const mode = row.info?.mode ?? "auto";
     const title = row.info?.title ?? null;
-    // Bypass is the one mode worth a glance here; auto is the default and carries nothing new. The
-    // backend name is not drawn here at all: it lives only in `prefix i` / `<leader>i`
-    // (`DetailPopover`).
+    // Every row once read "⏵⏵ auto · sidecar", which no other session picker shows and which said
+    // nothing: bypass is the one mode worth a glance here (auto is the default and carries nothing
+    // new); the backend name is gone entirely (it lives only in `prefix i` / `<leader>i`,
+    // `DetailPopover`).
     const bypass = mode === "bypass";
     return (
       <div className={classes} onClick={onClick}>
@@ -515,7 +536,8 @@ function ChooserRowItem({
           )}
           <span className="chooser-right">
             {row.tab.marker === "needs_input" && `⚑${row.tab.pending > 1 ? row.tab.pending : ""} `}
-            {/* A not-started tab's label already says new (`tabs::label`), so its state word would repeat it. */}
+            {/* An empty (not-started) tab's own label already says "new" (`tabs::label`); its state
+                word would only repeat it. */}
             {word !== "new" && word}
           </span>
         </span>
@@ -546,8 +568,8 @@ function ChooserRowItem({
         <span className="chooser-right">{relativeWhen(Date.now(), record.updatedAt)}</span>
       </span>
       <span className="chooser-line2 chooser-muted">
-        {/* The short id distinguishes untitled sessions. The backend name adds no distinction in
-            release builds. */}
+        {/* No longer "sidecar · <id>" -- the backend carries nothing (every
+            release build reads "sidecar"), the short id is what tells an untitled record apart. */}
         {record.heldElsewhere ? "open in another window, can't be resumed here" : shortId(record.providerSessionId)}
       </span>
     </div>

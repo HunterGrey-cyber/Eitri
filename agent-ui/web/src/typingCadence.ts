@@ -1,6 +1,6 @@
 /**
- * The page's half of the agent panel's typing cadence (a design decision, revised 2026-09-29;
- * `core/src/panel_cadence.rs` is the Rust half). While the user types in the editor, Rust pushes the
+ * The page's half of the agent panel's typing cadence (`core/src/panel_cadence.rs` is the Rust
+ * half). While the user types in the editor, Rust pushes the
  * stream on an even cadence so the panel causes few, evenly spaced GTK frame-clock cycles -- each one
  * can make the editor's next frame land a refresh late. The page's own motion must not undo that:
  * the activity line's star repaints on its own, so while the user types it is slowed to no faster than

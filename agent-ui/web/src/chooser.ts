@@ -16,9 +16,10 @@ function recordLead(record: ChooserRecord): string {
   return record.name ?? record.title ?? "untitled";
 }
 
-/** Searchable text for the row's first line, matched case-insensitively by `/`.
- *  A record can display both `name` and `title`, so search both fields even when `recordLead`
- *  chooses only one as the leading label. */
+/** Line 1's searchable text (also what `/` matches against, case-insensitively). A record's `name`
+ *  and `title` are both shown on the row at once (`RecordLead`) when both are set, so both must be
+ *  searchable -- not just whichever `recordLead` picks as the leading label: a user filters by
+ *  whichever of the two they remember. */
 function rowSearchText(row: ChooserRow): string {
   if (row.kind === "new") return "New session";
   if (row.kind === "tab") {
@@ -37,7 +38,8 @@ export function rowKey(row: ChooserRow): string {
   return `record:${row.record.providerSessionId}`;
 }
 
-/** A record another window's lease holds is shown and never chosen. Every
+/** A record another window's lease holds is shown and never chosen, since two windows must never
+ *  drive one session. Every
  *  other row -- `New session`, an open tab -- is always choosable. */
 export function choosable(row: ChooserRow): boolean {
   return row.kind !== "record" || !row.record.heldElsewhere;
@@ -52,9 +54,10 @@ export function pickerStep(event: { key: string; ctrlKey: boolean }): 1 | -1 | n
   return null;
 }
 
-/** Lists `New session`, then open tabs, then records open in no tab, preserving Rust's order.
- *  Joins each open row to `TabInfo` by id for its number, name, title, mode and state.
- *  Drops `New session` while filtering so `j`/`k` do not visit an unmatched row. */
+/** `prefix w`: `New session` first, then open tabs, then records open
+ *  in no tab -- Rust's own order. `tabs` joins each open row to its `TabInfo` (the `tabs` entry of
+ *  the same id) for number/name/title/mode/state. `New session` drops out while filtering (it matches nothing typed,
+ *  and staying would make `j`/`k` skip an unmatched row for no reason). */
 export function chooserRows(env: ChooserEnvelope, tabs: TabInfo[], filter: string): ChooserRow[] {
   const openRows: ChooserRow[] = env.open.map((tab) => ({
     kind: "tab",
@@ -104,9 +107,11 @@ export function relativeWhen(nowMs: number, stamp: string): string {
   return new Date(millis).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-/** The mode and destination for starting or resuming a session. Use the active tab's mode when it
- *  is not started, since the session lands there. Otherwise open a new tab with the window's
- *  remembered default. No active tab also means a new tab. */
+/** The mode a resume (of `New session` or a record) will actually run in, and where it
+ *  lands. The active tab's own mode when that tab is `not_started` (the resume goes into it,
+ *  `ResumeRoute::StartIn`); otherwise the window's remembered default, since a resume then opens a
+ *  new tab (`TabSet::default_mode`). `active === null` (no tab yet) takes the same "a new tab"
+ *  branch -- there is nothing to start it in. */
 export function resumeMode(
   active: TabInfo | null,
   defaultMode: PermissionModeChoice,

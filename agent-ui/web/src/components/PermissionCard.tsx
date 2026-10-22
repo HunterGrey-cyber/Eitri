@@ -27,14 +27,14 @@ type Props = {
    *  Show Rust's words unchanged so `remember: true` is offered only for a request Rust can
    *  answer with that rule. The card never generates its own suggestion. */
   ruleOffer?: string | null;
-  /** v1 hardening: the panel already answered this card -- by `a`/`d`, which answer by
+  /** The panel already answered this card -- by `a`/`d`, which answer by
    *  the card's id and never press these buttons, or by a click it has already sent. The panel's
    *  own guard (`App.tsx`'s `answerPermission`) refuses a second answer either way; this is what
    *  draws the card inert once it did. */
   alreadyAnswered?: boolean;
   onAnswer: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
   /** The reason box as it is typed into, and `""` when the card goes away: `d` sends the same
-   *  reason this card's Deny would. */
+   *  reason this card's Deny would, so the two ways of denying never disagree. */
   onReasonChange?: (permissionId: string, reason: string) => void;
 };
 
@@ -42,9 +42,10 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
   const [reason, setReason] = useState("");
   const [clicked, setClicked] = useState(false);
   const answered = clicked || alreadyAnswered;
-  // When the panel withdraws an answer, clear this card's click guard so its buttons work again.
-  // This can happen when Rust cannot save an Always allow rule and leaves the card pending.
-  // The reset follows `alreadyAnswered` changing from true to false; a card without panel updates keeps its local guard.
+  // The panel withdrew its answer (Rust refused it and left the card waiting -- an "Always allow"
+  // whose rule could not be saved): this card's own click goes with it, or its buttons
+  // would stay disabled for good. Only on the panel's true -> false; a
+  // card rendered with no panel behind it (`alreadyAnswered` never set) keeps its own guard.
   useEffect(() => {
     if (!alreadyAnswered) setClicked(false);
   }, [alreadyAnswered]);
@@ -187,16 +188,20 @@ function askRuleText(rule: MatchedAskRule): string {
   return rule.ruleContent === null ? rule.toolName : `${rule.toolName}(${rule.ruleContent})`;
 }
 
-/** Show what the call would do so the user can decide whether to allow it.
- * File-changing tools use `EditDiff`, which conversation rows can also use for folded previews.
- * Other inputs render as JSON, with `Bash` commands shown as shell text when available.
- * `PreToolUse` already carries the complete input object; these previews need no extra wire fields. */
+/** What the call would do, for a person deciding whether to allow it.
+ *
+ * A file-changing tool gets a real diff (`EditDiff`, its own component so a conversation row can
+ * fold it too); everything else gets its input as JSON, which for a `Bash`
+ * or an `mcp__*` call is the honest rendering. The data for both has always been in the request --
+ * `PreToolUse` carries the whole tool-input object -- so this is a rendering change and nothing
+ * more: no new event, no wire field, no protocol work.
+ */
 function ToolInput({ toolName, input, createsFile }: { toolName: string; input: unknown; createsFile?: boolean }) {
   if (isExternalTool(toolName)) return <ExternalInput toolName={toolName} input={input} />;
   const preview = editPreview(toolName, input);
   if (preview !== null) {
     // No cap here: a card shows the whole change, unlike the folded preview a conversation row gets
-    //.
+    // (`EditDiff`'s `maxLines`).
     return <EditDiff preview={preview} createsFile={createsFile} />;
   }
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;

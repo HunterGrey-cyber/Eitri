@@ -1,8 +1,6 @@
-/**
- * `>` in VISUAL/V-LINE quotes the highlighted text into the tab's draft without sending it.
- * `App.tsx` reads the DOM text through the same checks as `y` and manages draft, mode and caret
- * changes. This module only formats and appends text.
- */
+/** `>` in VISUAL/V-LINE quotes highlighted text into the tab draft without sending it. `App.tsx`
+ * reads the same checked, shielded selection as `y` and handles draft, mode and caret changes.
+ * This module only formats and appends text. */
 
 /** Normalize `\r\n` and `\r` to `\n`, trim leading and trailing blank lines, and prefix each
  *  remaining line with `> `. Whitespace-only lines become bare `>`. Join with `\n` and append

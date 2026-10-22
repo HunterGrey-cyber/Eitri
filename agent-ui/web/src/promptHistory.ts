@@ -1,4 +1,4 @@
-/** Where `↑`/`↓` are in the project's history. `index` null: on the draft itself. */
+/** Where `↑`/`↓` are in the project's history, as readline walks it. `index` null: on the draft itself. */
 export type HistoryWalk = { index: number | null; stash: string };
 
 export function stepHistory(

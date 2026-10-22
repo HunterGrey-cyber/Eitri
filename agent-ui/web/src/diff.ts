@@ -193,10 +193,16 @@ function computeEditPreview(toolName: string, input: object): EditPreview | null
     };
   }
 
-  // `NotebookEdit` has no previous cell contents to diff against. Treat `new_source` as a whole-cell
-  // write, like `Write` for a whole file, using `notebook_path` rather than `file_path`.
-  // `edit_mode: "delete"` has no `new_source`, so give it deletion wording instead of an empty write diff.
-  // Name the cell with `cell_id` when supplied. An absent `edit_mode` defaults to "replace" in the tool schema.
+  // `NotebookEdit`'s own schema (`notebook_path`, `new_source`) has no "before"
+  // field to diff against -- the tool is never told what a cell held, only asked what it should
+  // hold now -- so this is a whole-content write of one cell, the same shape `Write` is for a whole
+  // file, filed under `notebook_path` rather than `file_path`.
+  //
+  // `edit_mode: "delete"` carries no `new_source` at all (there is nothing to
+  // write), so treating it like every other `NotebookEdit` produced an empty diff, "+0 −0" and
+  // "Writes the whole cell" -- true of nothing, and silent about the one thing that actually
+  // happened. `edit_mode` defaults to "replace" when the field is absent, matching the tool's own
+  // schema; only "delete" gets its own wording here, named by `cell_id` when the call gives one.
   if (toolName === "NotebookEdit") {
     const notebookPath = str("notebook_path");
     const cellId = str("cell_id");

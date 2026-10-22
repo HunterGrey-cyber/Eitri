@@ -5,7 +5,7 @@ export function pathLabel(i: number): string {
   return HINT_ALPHABET[i] ?? "";
 }
 
-/** Show several candidate paths in the footer, each with a HINT letter. */
+/** `gf` with several paths: each with a HINT letter, in the footer, until a letter picks one. */
 export function PathPick({ paths }: { paths: PathRef[] }) {
   return (
     <span className="path-pick" role="listbox">

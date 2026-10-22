@@ -3,8 +3,8 @@ import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } fr
 
 /** Envelopes about ONE tab. Everything else is about the window.
  *
- *  Phase 3: the queue, the draft mirror, the taken-back queue, the rule offers and the scratch
- *  state are each a tab's own -- `history`, `editor_context`,
+ *  The queue, the draft mirror, the taken-back queue, the rule offers and the scratch
+ *  state are each a tab's own, since each belongs to one conversation -- `history`, `editor_context`,
  *  `editor_link` and `notice` are window-scoped and stay out of this set. The review overlay's two replies
  *  are the active tab's, as are its draft and the send preview (`review_recovery` is the project's journal, so
  *  not); `review_hint` is deliberately not here -- it is kept for the tab it names while
@@ -23,12 +23,11 @@ export function acceptsEnvelope(payload: { kind: string; tab?: number }, activeT
   return activeTab !== null && payload.tab === activeTab;
 }
 
-/** Format the permission-mode pill with the panel's mode names from `hello.permissionModes`; its
- *  `auto` differs from the CLI mode. Every tab can attempt a mode change through `modeKeyRoute`.
- *  `cycleOffered` controls the hint in the long form. The bottom band uses `short = true`,
- *  omitting "on" and the hint to save room; backend, model and full mode details appear under
- *  `prefix i`. The default remains the long form. In the short form, bypass spells out "bypass
- *  permissions on" because it answers waiting permission cards automatically. */
+/** The mode pill uses the panel's mode names from `hello.permissionModes`; `auto` differs from the CLI's.
+ *  Every tab can attempt to cycle through `modeKeyRoute`. `cycleOffered` only controls the long form's hint.
+ *  The bottom band uses `short = true` to omit "on" and the cycle hint when space is tight.
+ *  The short bypass pill spells out `⏵⏵ bypass permissions on` so its effect is clear.
+ *  Backend, model and the full pill are shown under `prefix i`. `short` defaults to `false` for long-form callers. */
 export function modePill(mode: PermissionModeChoice, cycleOffered: boolean, short = false): string {
   if (short) return mode === "bypass" ? "⏵⏵ bypass permissions on" : `⏵⏵ ${mode}`;
   // The key cycles manual -> auto -> bypass, Claude Code's order and word.
@@ -49,7 +48,8 @@ export function markerGlyph(marker: TabMarker | null, pending: number): string {
   }
 }
 
-/** vim's `'showtabline'` = 1, and during an inline rename. */
+/** vim's `'showtabline'` = 1 (the bar shows only with two or more tabs, since one tab has nothing to
+ *  switch to), and during an inline rename, which needs the bar to type into. */
 export function showTabBar(tabCount: number, renaming: boolean): boolean {
   return tabCount >= 2 || renaming;
 }
@@ -92,8 +92,8 @@ export function countedTabTarget(tabs: TabsEnvelope, action: "tab.next" | "tab.p
 }
 
 /** What a tab's reader had on screen: kept in the WebView per tab. Lost on `prefix r`,
- *  as today. Phase 3 moves the unsent composer text, with the queue, to Rust -- it is no
- *  longer part of this store. `detailed` is the detailed-view toggle. */
+ *  as today. The unsent composer text lives with the queue in Rust -- it is no
+ *  longer part of this store. `detailed` is the detailed-view toggle (Ctrl+o). */
 export type TabViewState = {
   cursor: number;
   mode: PanelMode;
@@ -101,13 +101,15 @@ export type TabViewState = {
   scrollTop: number;
   atBottom: boolean;
   detailed: boolean;
-  /** The unread pill's `seq` threshold when the tab was left, or `null` if following or never parked.
-   *  Restore it as `MessageList`'s `unseenSeed` so rows arriving while the tab is away still count.
-   *  Without it, the reused list would start counting from the restored timeline's current length. */
+  /** The `seq` threshold `MessageList`'s unread pill was counting from when the tab was left
+   *  -- `null` when the tab was left following (nothing parked) or never had one. Seeded back
+   *  into `MessageList` as `unseenSeed` on restore, so a row that arrived while the tab was away is
+   *  still counted: without this, a tab switch reuses `MessageList`, and its first `updatePill` after
+   *  the restore would start counting fresh from the just-restored timeline's own length. */
   unseenAfterSeq: number | null;
 };
 
-/** How long after the last keystroke the composer mirrors its text to Rust. */
+/** How long after the last keystroke the composer mirrors its text to Rust (so a reload keeps it). */
 export const DRAFT_MIRROR_DELAY_MS = 300;
 
 /** How long after a refused send the page puts back itself Rust's `draft` echo of that refusal is still told apart

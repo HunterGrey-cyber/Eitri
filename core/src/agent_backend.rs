@@ -84,6 +84,11 @@ const _: () = {
 ///
 /// The sidecar's lives behind the ingestion thread's lock and the legacy backend's is a plain field.
 /// Both deref to the same type, so call sites read `backend.projection().status` either way.
+///
+/// A `Guarded` one holds that lock, which is not reentrant: while it lives, its thread calls nothing
+/// else on the same backend that reads conversation state, or that call waits on its own thread (a debug
+/// build panics instead, naming the call). [`AgentBackend::provider_session_id`] is the exception, kept
+/// behind a lock of its own.
 pub enum ProjectionRef<'a> {
     Borrowed(&'a AgentSessionProjection),
     Guarded(ProjectionGuard<'a>),
@@ -691,7 +696,8 @@ impl AgentBackend {
 
     /// The Claude session UUID, once the provider has reported it. Distinct from the projection's
     /// `session_id` (Verdandi's) for the sidecar backend; identical for the legacy one, whose CLI
-    /// never separated them.
+    /// never separated them. It takes no lock the projection holds, so it may be read while a
+    /// [`ProjectionRef`] from this backend lives.
     pub fn provider_session_id(&self) -> Option<String> {
         match self {
             AgentBackend::Legacy(session) => session.projection.provider_session_id.clone(),

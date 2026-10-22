@@ -1,7 +1,10 @@
-/** Parse the headless CLI reply to a bare `/model` or `/effort` into `SlashPicker` options. Read
- *  every option from the reply rather than maintaining a fixed list, so changed choices need no
- *  code change. Unrecognized reply shapes or empty option lists return `null`. `App.tsx` then
- *  displays the reply as ordinary text and opens no picker. */
+/** Parses the headless CLI's own reply (its shape captured from the CLI on 2026-09-28) to a bare `/model` or `/effort` into the
+ *  options `../components/SlashPicker` shows. Deliberately never a hard-coded model/effort list --
+ *  every option comes out of the reply text itself, so a CLI whose choices change is reflected here
+ *  with no code change, and a CLI whose reply shape changed entirely (a version this was never
+ *  checked against) simply fails to parse, which both functions report as `null` rather than a
+ *  guess. `App.tsx` shows the reply as ordinary text and opens no picker on `null` -- never a
+ *  picker with nothing in it. */
 
 /** A parsed `/model` reply: the options `/model <name>` accepts, in the CLI's own order, and the
  *  current model's name (the bare word inside the backticks after "Current model: ") when the
@@ -43,9 +46,11 @@ export function parseModelReply(text: string): ModelReply | null {
   return { current, options };
 }
 
-/** Levels accepted by `/effort <level>`, parsed from the bare command's reply. The usage reply
- *  lists options without a current level, so this type has no current selection for the picker
- *  to mark. */
+/** A parsed `/effort` reply: the levels `/effort <level>` accepts. The bare command's own reply
+ *  never names a current level (unlike `/model`'s) -- CLI 2.1.283's verbatim reply is only
+ *  `"Usage: /effort <low|medium|high|xhigh|max|auto>"` -- so there is nothing to mark as current in
+ *  the picker this builds; the probe's own recommendation says so in the
+ *  picker's hint line instead. */
 export type EffortReply = { options: string[] };
 
 const EFFORT_USAGE_RE = /Usage: \/effort <([^>]+)>/;

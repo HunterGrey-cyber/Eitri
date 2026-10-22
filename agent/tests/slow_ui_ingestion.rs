@@ -426,43 +426,49 @@ fn the_projection_advances_while_the_ui_is_asleep() {
     assert_eq!(conversation.ingest_stats().events_ingested, 301);
 }
 
-/// `AgentConversation`'s accessors all share ONE `std::sync::Mutex`, which is not reentrant --
-/// so a caller holding the projection guard must not call any of the others.
+/// The session id is not behind the projection's lock: another thread holding the projection guard
+/// does not hold up a read of it.
 ///
-/// This is a characterization test, and it is here because the property is invisible at the call
-/// site: `projection()` returns something that derefs like a plain struct, and
-/// `provider_session_id()` reads like a field access. On 2026-09-15 a `shell` call site put the
-/// second inside the first's scope and deadlocked the GTK main loop outright -- no input, no window
-/// close, the last frame still painted, so it looked alive rather than hung. Only the sidecar path
-/// could show it: the legacy backend's `projection()` borrows a plain field and locks nothing.
-///
-/// Measured across threads rather than re-entered on one, because re-entering is the deadlock and a
-/// test cannot come back from it.
+/// The property is invisible at the call site: `projection()` returns something that derefs like a
+/// plain struct, and `provider_session_id()` reads like a field access. On 2026-09-15 a `shell` call
+/// site read the second inside the first's scope while both took the same lock, and deadlocked the GTK
+/// main loop outright -- no input, no window close, the last frame still painted, so it looked alive
+/// rather than hung. Only the sidecar path could show it: the legacy backend's `projection()` borrows a
+/// plain field and locks nothing. Re-entering on one thread is covered inside the crate; this one reads
+/// across threads, by ordering: the guard is released only after the read has returned.
 #[test]
-fn every_accessor_shares_one_lock_with_the_projection_guard() {
+fn the_session_id_is_read_while_another_thread_holds_the_projection_guard() {
     let provider = Arc::new(ScriptedProvider::new());
     let conversation = Arc::new(conversation(provider.clone()));
 
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let holder = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
             let guard = conversation.projection();
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
             drop(guard);
         })
     };
-    // Long enough that the holder is certainly inside its sleep, short enough to leave most of it.
-    std::thread::sleep(std::time::Duration::from_millis(60));
+    held_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the holder took the projection guard");
 
-    let start = std::time::Instant::now();
-    let _ = conversation.provider_session_id();
-    let waited = start.elapsed();
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let _ = read_tx.send(conversation.provider_session_id());
+        });
+    }
+    // A hang guard only: the guard stays held until this has an answer or gives up.
+    let read = read_rx.recv_timeout(Duration::from_secs(10));
+    release_tx.send(()).unwrap();
     holder.join().unwrap();
-
     assert!(
-        waited >= std::time::Duration::from_millis(200),
-        "provider_session_id() returned in {waited:?} while another thread held the projection \
-         guard -- if the locks have been genuinely split, that is an improvement and this test \
-         should be rewritten deliberately. If they have not, the measurement is wrong."
+        read.is_ok(),
+        "provider_session_id() waited for the projection guard another thread held"
     );
 }

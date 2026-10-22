@@ -54,7 +54,7 @@ export type OutboundMessage =
   /** `Ctrl+Enter`: queue this text (if non-empty), then interrupt if a turn is
    *  running, or flush at once if idle. */
   | { type: "send_now"; request_id: string; tab: TabId; text: string }
-  /** The box's text, mirrored. Rust answers nothing. */
+  /** The box's text, mirrored so a reload or a tab switch keeps it. Rust answers nothing. */
   | { type: "draft"; request_id: string; tab: TabId; text: string }
   /** The scratch-editor round trip's draft half: the box's text handed
    *  to the nvim scratch buffer for editing with `Ctrl+g`. */
@@ -71,7 +71,7 @@ export type OutboundMessage =
   /** `Ctrl+g` on a pending edit card for one file: the file as it is on disk beside the file as the card
    *  would leave it, read-only (`proposal.ts#proposalOf`). `path` is the card's own. */
   | { type: "view_proposal"; request_id: string; path: string; change: ProposedChange }
-  /** A tab.* panel-table action: the same verbs the
+  /** A tab.* panel-table action (`runPanelAction`): the same verbs the
    *  prefix's own tmux window keys run. Window-level, like the prefix's own `tab_verb` -- whichever
    *  tab is under the keys decides, so this carries no `tab` of its own (Rust's `InboundMessage::
    *  TabVerb` has none either); sent through `postToRust` directly rather than `post()`, which would
@@ -110,16 +110,19 @@ export type OutboundMessage =
    *  refuses a command typed for another agent than the active tab runs. `InboundMessage::TrustCommand`,
    *  `core/src/agent_bridge.rs`. */
   | { type: "trust_command"; request_id: string; action: "trust" | "untrust"; agent: string }
-  /** Mirror the window's effective mode whenever it changes and once after `ready`. Rust keeps one
-   *  value per window because `install_module_nav`, which reads it, is installed once per window.
-   *  The empty tab's menu and composer also count as browse and input. Use other for states that
-   *  are neither live BROWSE nor live INPUT. */
+  /** The composer mirror: the effective mode this window is in, whenever it changes (and once
+   *  after `ready`). Window-level, like `TabVerb` -- Rust keeps one value per window, not per tab,
+   *  because the capture controller (`install_module_nav`) that reads it back is itself installed
+   *  once per window. `"other"` covers everything that is neither a live BROWSE nor a live INPUT:
+   *  the empty tab's own menu/composer count as `"browse"`/`"input"` too (`core::agent_bridge::
+   *  PanelKeys`). */
   | { type: "panel_keys"; request_id: string; mode: PanelKeysMode }
-  /** Return a `nav_key` this page could not apply because the mode mirror was stale, an overlay
-   *  owns the keys, or the session ended. Rust then runs the chord's ordinary `move_focus` instead
-   *  of dropping the key. */
+  /** A stale mirror, either way: a `nav_key` this page could not apply -- the mirror was a
+   *  keystroke stale, an overlay owns the keys, or the session it named has ended -- comes back
+   *  here so Rust runs the chord's ordinary `move_focus` instead of silently dropping the key
+   *  (`core::agent_bridge::NavKeyDirection`, `serialize_nav_key_for_js`). */
   | { type: "nav_fallthrough"; request_id: string; direction: NavKeyDirection }
-  /** `Ctrl+w h/j/k/l` in BROWSE: move the keys from
+  /** `Ctrl+w h/j/k/l` in BROWSE (vim's `CTRL-W h/j/k/l`): move the keys from
    *  the panel to the module on that side, by geometry -- exactly what `Ctrl+h/j/k/l` do from it (shell
    *  runs `move_focus(agent, direction)`, the same hook a `nav_fallthrough` uses). Window-level, like
    *  `nav_fallthrough`; a side with no module leaves the keys where they are. Rust answers with a
@@ -159,7 +162,7 @@ export type OutboundMessage =
   /** `x` on a comment. Answered by a `review_draft`. */
   | { type: "review_comment_remove"; request_id: string; tab: TabId; id: number }
   /** `s`: `confirm: null` asks for the preview (a `review_send_preview`); `y` on it sends the draft with the
-   *  preview's `digest`. A confirmed send is answered by a `command_result`. */
+   *  `digest` the preview carried. A confirmed send is answered by a `command_result`. */
   | { type: "review_send"; request_id: string; tab: TabId; confirm: string | null }
   /** Enter on a recovery row: restore what an interrupted revert replaced, or forget it. Window-level: the
    *  journal belongs to the project, so no tab. Answered by a `command_result`. */
@@ -229,12 +232,13 @@ type InboundHandler = (
         createsFile?: { permissionId: string; toolUseId: string | null }[];
         /** Calls in this batch whose CLI prompt was answered without a card. */
         promptNotes?: { toolUseId: string; note: string }[];
-        /** Tool-use ids of `Write`, `Edit`, or `NotebookEdit` calls answered by the acceptEdits
-         *  fast path without a card. Absent when none were. */
+        /** Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast
+         *  path answered with no card; absent when none were. */
         autoNotes?: string[];
-        /** Tool-use ids of `Write` calls answered without a card by acceptEdits or bypass,
-         *  for paths that did not exist just before the answer. Carries the `createsFile` signal
-         *  for calls that raised no card to carry it. */
+        /** Tool-use ids of a `Write` answered with no card -- by the
+         *  acceptEdits fast path, or in bypass -- over a path where
+         *  nothing existed just before the answer -- `createsFile`'s own signal, but for a call that
+         *  never raised a card to carry it on. */
         autoCreatesFile?: string[];
         /** The turns that ended in this batch and how long each ran (`TurnTimeWire`); absent when none did. */
         turnTimes?: TurnTimeWire[];
@@ -267,10 +271,11 @@ type InboundHandler = (
      *  to send this now sends `arrive` instead. A click on a row still lands in BROWSE on that row.
      *  See `serialize_enter_input_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "enter_input" }
-    /** Keyboard arrivals enter BROWSE on the oldest pending card, or the last row with following
-     *  resumed if none waits. Covers pane navigation, `prefix a`, a tray chip without a card,
-     *  and a launch with keyboard focus already in the chat.
-     *  See `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. */
+    /** Every OTHER keyboard arrival (`Ctrl+h/j/k/l` into the chat, `prefix a`/a tray chip with no
+     *  card, a launch that starts with the keys already in the chat): BROWSE, on the oldest pending
+     *  card if one waits, else on the last row with following resumed. Reverses the 2026-09-19 choice
+     *  that `Ctrl+l` put the caret straight into the composer: a reader arrives to read first. See
+     *  `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "arrive" }
     /** `shell`'s keys for the `?` overlay (`serialize_keymap_for_js`). */
     | ({ kind: "keymap" } & KeymapHelp)
@@ -281,8 +286,8 @@ type InboundHandler = (
     /** `prefix ?`: open the `?` overlay in BROWSE, with a plugin page's section first when that page held the
      *  keys. See `serialize_open_keymap_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "open_keymap"; opening?: number; plugin?: PluginKeysHelp }
-    /** `prefix :` opens the `:` command line without executing a command. Serialized by
-     *  `serialize_open_command_line_for_js` in `core/src/agent_bridge.rs`. */
+    /** `prefix :` (tmux `command-prompt`): open the `:` command line, which runs
+     *  nothing. See `serialize_open_command_line_for_js` in `core/src/agent_bridge.rs`. */
     | { kind: "open_command_line" }
     /** The chat was brought back to answer a card (its tray chip `agent ⚑N`, or `Ctrl+a a`): BROWSE,
      *  with the cursor on the oldest pending card. See `serialize_focus_permission_for_js` in
@@ -344,18 +349,18 @@ type InboundHandler = (
     /** Per pending card, the "always allow" rule it would install, keyed by
      *  permission id; a card with no entry offers no third button. */
     | { kind: "rule_offers"; tab: TabId; offers: Record<string, string> }
-    /** V1's editor-context line, window-scoped. */
+    /** The editor-context line, window-scoped (one editor per window). */
     | ({ kind: "editor_context" } & ContextSummary)
     /** Companion mode only (never sent by the one-window mode): where the panel stands with the
      *  editor beside it. Window-scoped. `serialize_editor_link_for_js`, `core/src/agent_bridge.rs`. */
     | { kind: "editor_link"; state: EditorLinkState; text: string }
-    /** Whether the scratch editor currently has this tab's draft open. */
+    /** Whether the scratch-editor round trip currently has this tab's draft open in nvim. */
     | { kind: "scratch"; tab: TabId; editing: boolean }
     /** The footer's transient line, from Rust -- e.g. a `gf` refusal. */
     | { kind: "notice"; text: string }
-    /** `install_module_nav` claimed bare `Ctrl+j`/`Ctrl+k` using the mode mirror last posted by
-     *  this page. This is window-level because it concerns whether BROWSE or INPUT has the keys, so
-     *  it carries no tab id. */
+    /** `install_module_nav` claimed a bare `Ctrl+j`/`Ctrl+k` against the mirror this page
+     *  last posted. Window-level, like `enter_input`/`arrive` -- there is no tab to name, since it
+     *  is about which of BROWSE/INPUT has the keys, not about a tab's own state. */
     | { kind: "nav_key"; direction: NavKeyDirection }
     /** The reply to `review_request`: the turns, the files and the notes (`serialize_review_for_js`,
      *  `core/src/agent_bridge.rs`). Tab-scoped; matched to the overlay by `requestId`. */

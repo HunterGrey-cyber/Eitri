@@ -8,8 +8,9 @@ type Props = {
   tabs: TabInfo[];
   active: TabId;
   renaming: { tab: TabId; initial: string } | null;
-  /** Incremented by `App` when `pane_focus` regains focus to refocus a rename field after a GTK focus cycle.
-   *  Call `focus()` alone so text the user is still typing is not selected again. */
+  /** Bumped by `App` on `pane_focus` regaining focus, so a rename field that lost
+   *  DOM focus across a GTK round trip gets it back. `focus()` only -- a re-focus must not
+   *  re-select the text the user may already be part way through typing. */
   focusRequest: number;
   onSelect: (tab: TabId) => void;
   onRenameCommit: (name: string) => void;
@@ -89,8 +90,8 @@ function RenameField({
     ref.current?.focus();
     ref.current?.select();
   }, []);
-  // Refocus on later requests without `select()`, which would select a half-typed name
-  // again each time `pane_focus` regains focus.
+  // Re-focus only, on every later request -- `select()` here would clobber a
+  // half-typed name each time `pane_focus` regains focus.
   useEffect(() => {
     if (focusRequest > 0) ref.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps

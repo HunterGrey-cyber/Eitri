@@ -56,23 +56,28 @@ type Props = {
    *  `App.tsx` owns the timer; this component only reads the key. */
   yankedKey?: string | null;
   onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
-  /** v1 hardening: the cards already answered from this panel, by `permissionId` --
+  /** The cards already answered from this panel, by `permissionId` --
    *  `App.tsx` owns the set, since `a`/`d` answer a card by its id rather than through its buttons.
    *  Absent: none. */
   answeredPermissions?: ReadonlySet<string>;
-  /** Each card's reason box as it is typed into, so `App.tsx`'s `d` can send it. */
+  /** Each card's reason box as it is typed into, so `App.tsx`'s `d` can send it as the Deny button would. */
   onPermissionReason?: (permissionId: string, reason: string) => void;
   /** Open clicked path links and inline code that parses as a path, matching the keyboard's
    *  `gf` target through `App.tsx`'s `open-path` action. When absent, clicks retain their normal
    *  control behavior without opening paths. */
   onOpenPath?: (ref: PathRef) => void;
-  /** Reports the unread pill to the caller so it can appear in the band without covering text.
-   *  `label` is `↓N`, `↓ ⚑` for a card below the view, or bare `↓` when shown with nothing counted yet.
-   *  `null` hides the pill. `jump` calls `jumpToEnd` and reads `listRef` fresh when invoked.
-   *  `afterSeq` is the largest `seq` on screen when following stopped, or `null` while following.
-   *  The caller can save it in `TabViewState.unseenAfterSeq` across a tab switch and return it as `unseenSeed`.
-   *  Called whenever `updatePill` recomputes the pill, including with `null`.
-   *  The caller holds the latest value, as `pill`/`setPill` do internally. */
+  /** The unread pill, reported upward rather than floated over the last line here (it sits at the
+   *  band's right, `↓N` inverted, never over text). `label` is the band's
+   *  compact form -- `↓N`, `↓ ⚑` when a card is below the view, or bare `↓` while shown with
+   *  nothing counted yet (`pillShown`'s own "far from the bottom, nothing new" case) -- `null` when
+   *  the pill should not show at all. `jump` is this call's own `jumpToEnd`, safe to invoke any time
+   *  after this fires (it reads `listRef` fresh, not a stale snapshot). `afterSeq` is the current
+   *  `seq` threshold itself -- the largest `seq` on screen when following last
+   *  stopped, `null` while following -- reported so a caller can save it across a tab switch
+   *  (`App.tsx`'s `TabViewState.unseenAfterSeq`) and hand it back as `unseenSeed` below. Called every
+   *  time this component recomputes the pill (`updatePill`, below), including with `null` -- the
+   *  caller (the band's `unread` fact) is expected to just hold the latest value, the same way
+   *  `pill`/`setPill` already do internally. */
   onUnreadChange?: (label: string | null, jump: () => void, afterSeq: number | null) => void;
   /** Seeds the unread threshold back in on a tab switch: a tab switch reuses this
    *  component, so without this the first `updatePill` after a restore falls back to counting from
@@ -82,9 +87,10 @@ type Props = {
    *  back to the same `afterSeq` still re-fires the effect. `null` for a tab with no saved threshold
    *  (never parked, or restored at the bottom) -- nothing to seed. */
   unseenSeed?: { afterSeq: number; tick: number } | null;
-  /** Active selection mode: `"caret"`, `"visual"`, or `"vline"`; `null` or absent in BROWSE.
-   *  Drives `data-visual` for the list's selection and current-row styles. `App.tsx` builds the
-   *  selection directly on the DOM, so this prop only controls styling here. */
+  /** `"caret"`/`"visual"`/`"vline"` while one is on,
+   *  `null`/absent in BROWSE. Drives `data-visual` on the list (`index.css`'s `::selection`/
+   *  `.row-current` overrides) -- nothing else here reads it, since the region's own selection is
+   *  built directly on the DOM by `App.tsx`, not through props. */
   visual?: "caret" | "visual" | "vline" | null;
 };
 
@@ -111,9 +117,10 @@ function isAbandonedCall(call: ToolCallRecord, state: AgentUiState, sessionEnded
   if (call.result !== null) return false;
   if (sessionEnded) return true;
   if (state.history !== null && call.seq < state.history.uptoSeq) return true;
-  // Both backends stamp each event with its turn id, so a result can only arrive in the call's own turn.
-  // An interrupted, failed or superseded turn cannot finish the call; leaving it running would show a permanent spinner.
-  // For a call without a turn id, treat it as abandoned when no turn is active.
+  // A result only ever arrives inside the call's own turn (both backends stamp every event of a
+  // turn with its id). Once that turn is not the active one -- interrupted, failed, or followed by
+  // another -- it never will (an interrupted turn once left `◐ Running…`
+  // forever). A call with no turn id on it falls back to "no turn is in flight at all".
   return call.turnId ? call.turnId !== state.activeTurnId : state.activeTurnId === null;
 }
 
@@ -339,11 +346,10 @@ export function MessageList({
       lastScrollTopRef.current = list.scrollTop;
     }
   };
-  /** The largest `seq` on screen when following stopped, or `null` while following.
-   *  A timeline index is not a reliable unread cutoff. This component survives tab switches, and
-   *  using the restored timeline's length would miss rows that arrived while the tab was away.
-   *  Also, `buildTimeline` places a permission card after its tool call, so a newly arrived card
-   *  can sit before an old length cutoff. A `seq` threshold counts arrivals independently of array position. */
+  /** The largest timeline `seq` when following last stopped; `null` while following.
+   *  A length cutoff loses unread rows after a tab restore because the component is reused.
+   *  It also misses new permission cards inserted after older calls before that array index.
+   *  A `seq` threshold counts arrival order regardless of where a card is drawn. */
   const unseenAfterSeqRef = useRef<number | null>(null);
   const [pill, setPill] = useState<string | null>(null);
   const updatePill = () => {
@@ -418,14 +424,21 @@ export function MessageList({
   const onScroll = () => {
     const list = listRef.current;
     if (list === null) return;
-    // Check the true bottom before user scroll direction, and direction before the near-bottom threshold.
-    // An upward user scroll stops following even within the threshold; otherwise the next delta would undo it.
-    // The true-bottom check keeps following armed when content shrinks and the browser clamps `scrollTop`.
-    // Only a downward user scroll re-arms following within the wider threshold; an unchanged position does not.
-    // A scroll event at a provisional gesture's starting position must not clear that stop or re-arm following.
-    // WebKitGTK can send an animated wheel's first scroll event before the view moves. Re-arming then
-    // would let a snap cancel the wheel. The gesture timer settles the stop when steering ends,
-    // or after a held pointer is released.
+    // The order matters (2026-09-19): the threshold used to be checked
+    // FIRST, so a `k` step that ended within the threshold of the bottom turned following straight
+    // back ON and the next streamed delta snapped the view back down. A user's scroll UP always
+    // stops following unless it left the view at the TRUE bottom, which is also where the browser
+    // clamps `scrollTop` after content shrinks (a resolved permission card's row going away) -- a
+    // user at the bottom stays followed through that. The threshold only re-arms on a scroll that
+    // went DOWN, never on the effect's own synchronous call below, where nothing moved.
+    //
+    // An event that finds the list where a pending gesture found it says nothing about
+    // that gesture, so at the bottom it neither re-arms following nor clears the stop. WebKitGTK
+    // animates a wheel's scroll, and its FIRST scroll event, 0-1ms after the wheel, can report no
+    // movement yet (seen in 2 of 8 wheels at the tail); re-arming on it let the next delta's snap, or
+    // a new row's smooth scroll, cancel the wheel's scroll -- the case the provisional stop exists to
+    // prevent. A pending stop always has its gesture's timer armed (or a pointer held, whose release
+    // arms it), so the stop is still settled when the gesture ends (`settleWhenGestureEnds`).
     const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
     const stop = provisionalStopRef.current;
     const gestureNotYetMoved = stop !== null && Math.abs(list.scrollTop - stop.from) <= AT_BOTTOM_PX;
@@ -537,12 +550,13 @@ export function MessageList({
       settleTimerRef.current = null;
     };
   }, []);
-  // Run on every `state` change so both new rows and streamed growth remain in view while following.
-  // Read `onScroll()` synchronously first because the browser may deliver a user scroll event a frame late.
-  // Panel commands also announce their intent through `noteUserScroll` before moving the list.
-  // Use a layout effect to snap before paint; a passive effect can paint new text below the viewport first.
-  // Snap for both new rows and growth. Repeated smooth animations during streaming can keep restarting.
-  // Observe newly mounted rows so size changes without a state change also update the following view.
+  // While following, every state update snaps to the end for both new rows and streamed growth.
+  // Use a layout effect so new text is visible before paint. Smooth scrolling would leave a new
+  // row hidden during its animation and restart repeatedly as streamed text arrives.
+  // Read `onScroll()` first to catch user movement whose scroll event has not arrived yet.
+  // `noteUserScroll` also stops following before upward panel navigation scrolls.
+  // `observeChildren` registers new rows with the `ResizeObserver`, which follows later size
+  // changes even when no state update occurs.
   useLayoutEffect(() => {
     onScroll();
     const list = listRef.current;
@@ -554,14 +568,23 @@ export function MessageList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
-  /** Restore the unread threshold when `App.tsx` restores a parked tab's view.
-   *  Run after the `[state]` effect so this `updatePill()` replaces any value computed from the previous tab
-   *  or the initial following state. Key on `unseenSeed?.tick` so equal thresholds on later switches still apply.
-   *  Use a layout effect: child layout effects run before the parent's scroll restore.
-   *  Set following to false and seed the threshold before that restore can produce a scroll event,
-   *  so the event retains the saved cutoff instead of computing one from the restored timeline.
-   *  `updatePill` clears the threshold only while following. `jumpToEnd` relies on its scroll event
-   *  reaching `onScroll` and `updatePill` rather than changing the threshold directly. */
+  /** Seeds the unread threshold back in when `App.tsx` restores a parked tab's view.
+   *  Declared -- and so run -- AFTER the `[state]` effect above: that effect's own `updatePill()` ran
+   *  first, against whatever `unseenAfterSeqRef` already held (stale from the tab just left, or reset
+   *  to `null` by `followingRef.current` still being `true` from this component's initial mount
+   *  default); this effect's own `updatePill()` call runs after it and is what `onUnreadChange`'s
+   *  caller actually ends up holding. Keyed on `unseenSeed?.tick`, not on `unseenSeed` itself, so a
+   *  second switch back to a tab whose threshold happens to be numerically the same still re-fires --
+   *  see the prop's own doc comment. A LAYOUT effect, and not by accident: `App.tsx`'s own scroll
+   *  restore (`useLayoutEffect` on `[restoreTick]`) is what actually moves `list.scrollTop` to the
+   *  parked position, and child layout effects run before the parent's -- so this must set
+   *  `followingRef.current = false` and the threshold BEFORE that restore runs, or the restore's own
+   *  (later, asynchronous) `scroll` event would recompute the threshold itself from whatever the
+   *  timeline holds by then, rather than from what `App.tsx` remembered. ASSUMES `if (following)
+   *  unseenAfterSeqRef.current = null` above is the only other place this ref is reset -- checked:
+   *  `jumpToEnd` does not touch it directly (it relies on the `scroll` event it provokes reaching
+   *  `onScroll` -> `updatePill`), and the `[state]` effect above only ever calls `updatePill`, never
+   *  writes the ref itself. */
   useLayoutEffect(() => {
     if (unseenSeed == null) return;
     followingRef.current = false;

@@ -2,18 +2,31 @@ import type { HistoryNotice as HistoryNoticeData } from "../types";
 import { historyNoticeText } from "../history";
 
 /**
- * A fixed notice at the head of the conversation says which history seeded the session.
- * Show it for complete and truncated restores so earlier messages are distinct from new ones.
- * The source matters because the original transcript and the local session copy can differ.
+ * One fixed line at the top of the conversation saying what this session was seeded with
+ * at resume.
  *
- * This is not a conversation row: `data-nav-stop="row"` would shift every row index below it,
- * including the cursor, `permissionTarget`, and scroll helpers. It has no `seq` and never enters
- * `buildTimeline`, so it does not affect timeline ordering.
+ * **Drawn whenever history was restored, not only when it was truncated.** The question it answers
+ * first is "is this what we said last time, or what we said just now?", and the second is "where
+ * did it come from" -- which has consequences (Claude's own transcript and Eitri's copy of
+ * the same session can genuinely differ). Truncation is the third thing it can say, and since the
+ * item cap became 400 it is the rare one: 8 of this machine's 44 real sessions.
  *
- * `stopsIn` keeps non-row stops only when they contain an enabled control. The Copy path button
- * makes this notice reachable by `j`/`k` and gives access to its source file. `sourcePath` is
- * nonempty because restored history comes from one file, so the button is always present.
- * The notice has no Dismiss control because it must remain visible whenever history was restored.
+ * **It is not a conversation row and must never become one.** Row indices are counted across the
+ * whole panel (`App.tsx`), so a `data-nav-stop="row"` here would shift the cursor index of every
+ * row below it and carry `permissionTarget` and the scroll helpers with it. It holds no `seq`,
+ * never reaches `buildTimeline`, and takes no part in the timeline's ordering.
+ *
+ * **The Copy path button is what makes the row reachable at all.** `nav.ts`'s `stopsIn` keeps a
+ * stop only when it is a row or contains an enabled control, so a notice that merely copied
+ * `.command-notice`'s `data-nav-stop` attribute would be silently filtered out of `j`/`k` -- which
+ * is exactly what the first draft of this row did. The button is not there to satisfy that rule,
+ * though: the notice owes a way out to the file itself, and `y`-to-copy is this panel's own precedent
+ * (the terminal-handoff command). `sourcePath` is never empty -- a notice exists only when history
+ * was restored, and history comes from exactly one file -- so the control always exists and the
+ * row is always reachable.
+ *
+ * **No Dismiss**, unlike `.command-notice`: a line that can be closed does not satisfy "whenever
+ * history was restored, this is shown" (invariant 11).
  */
 export function HistoryNotice({ notice }: { notice: HistoryNoticeData }) {
   return (

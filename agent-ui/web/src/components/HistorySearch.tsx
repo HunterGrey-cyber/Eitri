@@ -7,9 +7,9 @@ type Props = {
   history: string[];
   onAccept: (text: string) => void;
   onCancel: () => void;
-  /** Report Enter, Tab, and Escape before stopping them here. They never bubble to `App`'s
-   *  typing guard, so without this callback a following `Ctrl+y` could approve a card. This
-   *  matches the `/` and `:` input lines' use of `noteLineKey`. */
+  /** Report Enter, Tab, and Escape before stopping propagation. They never reach `App`'s
+   *  `onKeyDown`, so its typing guard would otherwise miss them and could let an immediate
+   *  `Ctrl+y` approve a card. This uses `noteLineKey`, like the `/` and `:` lines. */
   onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
 };
 

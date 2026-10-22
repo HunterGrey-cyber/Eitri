@@ -1,5 +1,5 @@
 /** The panel's which-key sequence engine: leader-driven multi-key bindings over `PanelTable`
- *.
+ *  (modelled on which-key.nvim's `lua/which-key/state.lua`).
  *
  * `resolveKey` (`./keymap`) still owns every fixed single-key row and the four reserved two-key
  * pairs (`gg`/`gf`/`zh`/`zl`/`[[`/`]]`/`[]`/`][`, Global Constraint #4); this module owns the
@@ -46,9 +46,12 @@ function step(table: PanelTable, typed: string[], atStart: boolean): SeqStep {
   return atStart ? { kind: "none" } : { kind: "cancel" };
 }
 
-/** Start a possible sequence. The leader cannot start while `onControl` says a focused control
- *  has the keys. Reserved `g`/`z`/`[`/`]` prefixes belong to `resolveKey`, even when the table
- *  defines a sequence such as `[b`; its pending-pair lookup resolves those bindings. */
+/** The first key of a possible sequence. `onControl` is whether a focused control (not the row
+ *  itself) currently has the keys -- the leader is never a sequence start there (the leader belongs
+ *  to the document, not to a focused input; `resolveKey` keeps the IME half of this same rule). `g`/`z`/`[`/`]` are
+ *  always left to `resolveKey`'s own reserved-pair machinery, never started here, even if the table also defines a
+ *  longer sequence starting with one of them (`[b`) -- that longer sequence is instead reached through `resolveKey`'s
+ *  own pending switch (`tableHit`), not through this function. */
 export function startSequence(table: PanelTable, key: string, onControl: boolean): SeqStep {
   if (PENDING_FIRST.has(key)) return { kind: "none" }; // resolveKey's own two-key prefixes
   if (key === table.leader) return onControl ? { kind: "none" } : step(table, ["<leader>"], true);
@@ -57,7 +60,7 @@ export function startSequence(table: PanelTable, key: string, onControl: boolean
 
 /** Whether `key` is one of `resolveKey`'s reserved two-key prefixes (`g`/`z`/`[`/`]`). For a
  *  screen that has no `resolveKey` of its own (the empty tab's dashboard) but must still reach a
- *  table pair such as `[b`. */
+ *  table pair such as `[b`, so tab stepping works there as in a live tab. */
 export function isPendingFirst(key: string): boolean {
   return PENDING_FIRST.has(key);
 }
@@ -68,9 +71,10 @@ export function pendingPairBinding(table: PanelTable, prefix: string, key: strin
   return table.bindings.find((b) => b.keys.length === 2 && b.keys[0] === prefix && b.keys[1] === key) ?? null;
 }
 
-/** Advance a sequence pending at `typed`. Escape cancels; Backspace goes up one level or
- *  cancels at the top. Other keys continue, run a binding, or cancel if unmatched.
- *  An unmatched pending key is swallowed, unlike an unmatched first key. */
+/** The next key of a sequence already pending at `typed`. `Escape` cancels outright; `Backspace`
+ *  goes up one level (or cancels from the top); anything else either continues, runs, or -- if it
+ *  matches nothing under this node -- cancels (an unbound key at a pending node is swallowed, as
+ *  which-key.nvim does, not passed through, unlike an unmatched key at the very start). */
 export function advanceSequence(table: PanelTable, typed: string[], key: string): SeqStep {
   if (key === "Escape") return { kind: "cancel" };
   if (key === "Backspace") {
@@ -83,7 +87,7 @@ export function advanceSequence(table: PanelTable, typed: string[], key: string)
 
 /** One row of the which-key popup box: a real binding's own key and description, or a group label
  *  (`+tab`) standing in for everything under it. `disabled` greys out `mode.cycle` once a session
- *  has started. */
+ *  has started (cycling the empty tab's mode makes no sense once it is no longer empty). */
 export type BoxEntry = { key: string; label: string; group: boolean; disabled: boolean };
 
 /** How a table key reads to a person: the leader as its label (`Space`), anything else as itself. */
@@ -92,11 +96,10 @@ function humanKey(table: PanelTable, k: string): string {
 }
 
 /** Distinct next keys reachable from `typed`: direct bindings in table order, then groups
- *  in `table.groups` order. A key is a group if a binding continues beyond it.
- *  Group labels come from `table.groups`, falling back to `+<key>`.
- *
- *  `modeFixed` means `mode.cycle` would flash instead of posting a change, so its entry is disabled.
- *  A live tab that supports switching can still cycle; `modeKeyRoute` determines the route. */
+ *  in `table.groups` order. A key is a group when another binding continues past it.
+ *  Its label comes from `table.groups` when registered, or a synthesized `+<key>`.
+ *  `modeFixed` indicates that `mode.cycle` would flash instead of posting. A live tab may
+ *  still support cycling; `modeKey.ts`'s `modeKeyRoute` determines that behavior. */
 export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
   const depth = typed.length;
   const atDepth = table.bindings.filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
@@ -127,23 +130,23 @@ export function sequenceTitle(table: PanelTable, typed: string[]): string {
   return typed.map((k) => humanKey(table, k)).join(" ");
 }
 
-/** `resolveKey`'s reserved two-key prefixes have
- *  no `PanelBinding` of their own (they are fixed rows, not table entries),
- *  so a which-key box opened on one of them (`g`/`z`/`[`/`]`/`Ctrl+w`, held past
+/** `resolveKey`'s reserved two-key prefixes (the four of them, and `Ctrl+w`) have
+ *  no `PanelBinding` of their own (they are fixed rows, not table entries, so no config can rebind
+ *  them), so a which-key box opened on one of them (`g`/`z`/`[`/`]`/`Ctrl+w`, held past
  *  `WHICH_KEY_DELAY_MS`) is filled in by hand rather than from `table.bindings`. */
 export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
   g: [
     { key: "g", label: "first row", group: false, disabled: false },
     { key: "f", label: "open path", group: false, disabled: false },
-    // Label `FIXED_PAIRS.g.x`, which opens the row's web link.
-    // `leader.test.ts` checks that these entries and the fixed pairs list the same keys.
+    // `FIXED_PAIRS.g.x`, the row's web link (`leader.test.ts` holds the two lists to the
+    // same keys).
     { key: "x", label: "open link", group: false, disabled: false },
   ],
   z: [
     { key: "h", label: "scroll table left", group: false, disabled: false },
     { key: "l", label: "scroll table right", group: false, disabled: false },
-    // Label the six row-scroll and fold pairs in `FIXED_PAIRS.z`.
-    // `leader.test.ts` checks that these entries and the fixed pairs list the same keys.
+    // The six pairs `FIXED_PAIRS.z` gained (`leader.test.ts` holds the two lists to
+    // the same keys).
     { key: "t", label: "row to top", group: false, disabled: false },
     { key: "z", label: "row to middle", group: false, disabled: false },
     { key: "b", label: "row to bottom", group: false, disabled: false },
@@ -153,16 +156,16 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
   ],
   "[": [
     { key: "[", label: "previous prompt", group: false, disabled: false },
-    // `FIXED_PAIRS["["].p` jumps to the waiting card before the cursor.
+    // `FIXED_PAIRS["["].p`, the card waiting for an answer before the cursor.
     { key: "p", label: "previous waiting card", group: false, disabled: false },
   ],
   "]": [
     { key: "]", label: "next prompt", group: false, disabled: false },
-    // `FIXED_PAIRS["]"].p` jumps to the waiting card after the cursor.
+    // `FIXED_PAIRS["]"].p`, the card waiting for an answer after the cursor.
     { key: "p", label: "next waiting card", group: false, disabled: false },
   ],
-  // Label Ctrl+w's four module directions. `App.tsx` titles the box Ctrl+w;
-  // the internal prefix token uses the chord spelling "C-w".
+  // `Ctrl+w`'s four pairs, the module the keys go to. The box's title for it is
+  // `Ctrl+w` (`App.tsx`), the prefix's own spelling `"C-w"` being tmux's, not a person's.
   "C-w": [
     { key: "h", label: "module left", group: false, disabled: false },
     { key: "j", label: "module below", group: false, disabled: false },

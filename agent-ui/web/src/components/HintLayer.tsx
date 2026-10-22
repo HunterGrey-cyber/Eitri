@@ -1,16 +1,29 @@
-/** HINT labels are positioned relative to the panel root after each commit, before paint.
- *  Events can move targets while HINT is active; measuring during render would use stale DOM.
- *  Detached targets get no label because their zero rect would put a phantom tag at the corner.
- *  Targets outside the visible area also get no label, so tags do not cover the surrounding UI.
- *  Their letters stay assigned by index, and landing on an offscreen target reveals its row.
- *  A user wheel scroll cancels HINT through the window scroll controller.
- *  Rows with no usable sign cell, including a clipped sliver, get a small label at their visible
- *  top-left instead of one covering the row. These labels are measured and kept clear of later labels.
- *  Placement must settle because the effect runs again after `setPlacements`. `labelHeight` uses
- *  whole pixels, `SLIVER_SLACK_PX` avoids treating nearly full-height cells as slivers, and
- *  `samePlacements` ignores sub-pixel differences. `MAX_SELF_PASSES` bounds layout changes to
- *  avoid reaching React's update-depth limit and replacing the panel with its crash fallback.
- *  The `hint-bg`/`hint-fg` colour pair is checked for contrast in Rust (`tokens.rs`). */
+/** The panel's HINT labels: one absolutely positioned tag per frozen target, over the panel root
+ *  (the conversation, or the start screen). Positions are the targets' rects relative to the root,
+ *  measured after EVERY commit of the App while labels are up (a layout effect, so before paint) --
+ *  not only on `hint_show`/`hint_prefix`: events keep arriving during HINT, and measuring is what
+ *  keeps a label on a target that moved. After the commit, not during render: a render runs before
+ *  React has applied that render's own DOM changes, so it would measure the page one update late.
+ *  A target that has LEFT the page since `hint_collect` (a streamed reply re-rendering its code
+ *  block, a card answered or closed) gets no label: a detached element measures as an all-zero
+ *  rect, which would draw its tag at the panel's corner as a phantom, and landing on it already
+ *  does nothing (`App.tsx::landOnHint`). The other labels keep their letters, because `shell`
+ *  addresses them by index. A target that is still on the page but has moved OUT of view -- the
+ *  list following a streamed reply to its end scrolls it past the list's edge -- gets no label
+ *  either, by the same `hintVisible` test `hint_collect` froze it with: measured where it now is,
+ *  its tag would be drawn over the winbar, the status line or the composer.
+ *  Its letter still lands on it, and landing reveals the row. A user's own wheel scroll does not
+ *  come here: it cancels the whole HINT (`shell/src/hint.rs`'s window-level scroll controller).
+ *  A row whose sign cell has no width or has scrolled away is labelled like a link, small, at the
+ *  row's visible top-left -- never sized to the row; so does one whose sign cell only a sliver
+ *  of shows, and such a label is measured like any other and never covered by a later label.
+ *  Placement has to SETTLE, because this effect re-runs after its own `setPlacements`: a label's
+ *  height is read one way whatever kind of label it is (`labelHeight`: a whole-pixel box height), a sign cell is a sliver only when it is
+ *  clearly shorter than a label (`SLIVER_SLACK_PX`), two placements a sub-pixel apart are the same one
+ *  (`samePlacements`), and a layer whose own re-placing keeps changing the layout stops after `MAX_SELF_PASSES`
+ *  rather than looping until React's update-depth limit replaces the whole panel with its crash fallback.
+ *  None of this has been seen on a screen. The colour pair is `hint-bg`/`hint-fg`, guarded
+ *  against each other in Rust (`tokens.rs`). */
 import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { clipBox, firstShownLine, visibleBox } from "../nav";
@@ -22,10 +35,10 @@ export type ShownHint = { target: HintTarget; label: string };
  *  longer in view. */
 type Placement = { top: number; left: number; width?: number; height?: number; shift?: boolean } | null;
 
-/** Fallback label size for the clamps until a label can be measured: one `--fs-xs` line plus 3px
- *  padding on each side at the default 14px font. Use measured `labelSize` after rendering
- *  because a larger `agent.font_size` or zoom can double the size and make a 16px clamp
- *  overflow. jsdom uses the fallback because it measures no layout. */
+/** Fallback label size until drawn labels can be measured by `labelSize`.
+ *  `.hint-label` uses one `--fs-xs` line plus 3px padding per side at the default 14px font.
+ *  Larger fonts or zoom need measured dimensions so clamps do not let labels overhang the clip box.
+ *  jsdom supplies no measurements, so tests use this fallback too. */
 export const LABEL_PX = 16;
 
 /** The height a label would have at its own font size, read off the style `index.css` gives every
@@ -47,11 +60,13 @@ function labelHeight(label: HTMLElement): number {
   return label.style.width === "" ? label.offsetHeight : Math.round(naturalHeight(label));
 }
 
-/** The largest label in `layer`, or `LABEL_PX` for a dimension not yet measured. The placement
- *  effect runs after every commit, using the fallback first and measured sizes next. A
- *  sign-cell-sized label contributes only `labelHeight`, since its width belongs to the cell.
- *  Fallback row labels have their own boxes and contribute both dimensions, so larger fonts
- *  cannot overflow a clamp based on 16px. */
+/** The largest label drawn in `layer` (a two-letter label is wider than a one-letter one), or `LABEL_PX` for
+ *  a dimension nothing has been drawn to measure yet. The placement effect runs after every commit, so the
+ *  first pass uses the fallback and the next one the measured size. A label sized to its sign cell has a width
+ *  that says nothing about a label's own, so only its height is read (`labelHeight`); a row's FALLBACK label
+ *  (no usable sign cell, `place`) has a box of its own and gives its width too -- they
+ *  used to be left out, so at `agent.font_size` 32 a label of ~31px was clamped as if it were 16 and spilled
+ *  past the list. */
 function labelSize(layer: HTMLElement | null): { width: number; height: number } {
   let width = 0;
   let height = 0;
@@ -116,14 +131,14 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
     if (vis === null || clip === null) return null;
     limits[i] = clip.right - label.width - origin.left;
     const clampTop = (want: number) => Math.max(clip.top, Math.min(want, clip.bottom - label.height)) - origin.top;
-    // Clamp sideways too: a link in a horizontally scrolled wide table can start left of its clip box.
+    // Sideways too -- a link in a wide table scrolled sideways starts left of its box.
     const clampLeft = (want: number) => Math.max(clip.left, Math.min(want, clip.right - label.width)) - origin.left;
     if (target.kind === "code") return { top: clampTop(vis.top + 4), left: vis.right - origin.left - 4, shift: true };
     if (target.kind === "row") {
       const sign = target.el.querySelector<HTMLElement>(".row-sign");
       const cell = sign === null ? null : visibleBox(sign, root);
-      // A clipped sign cell shorter than a label would squash the label into a sliver. Use the
-      // fallback below instead.
+      // A sign cell that only a sliver of shows -- clipped, and what shows shorter
+      // than a label -- would squash its label to that sliver. It takes the fallback below instead.
       const sliver =
         cell !== null &&
         cell.height + SLIVER_SLACK_PX < label.height &&
@@ -142,10 +157,12 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
     const at = target.kind === "link" ? firstShownLine(target.el, root) : r;
     return { top: clampTop(at.top - 6), left: clampLeft(at.left - 6) };
   });
-  // A large fallback row label can extend from the row's top-left into nearby link or control
-  // labels. Move a later overlapping label to the fallback label's right edge when it fits in the
-  // clip box. Leave it in place when there is no room. Sized sign-column labels and code labels are
-  // unchanged.
+  // A row's fallback label sits at the row's top-left and, once labels are
+  // big (`agent.font_size` 32, a zoom), reaches past the sign column into the text, where a link or control
+  // on the row's first line has its own label a few px to the right -- which, drawn later, hid the row
+  // label's last letter. A later label that would overlap an earlier fallback row label moves to its right
+  // edge (kept inside the clip box; with no room it stays), so neither is covered. Sized labels, which sit
+  // inside their sign column, and code labels, which hang left of the block's right edge, are left alone.
   const rowLabels: Rect[] = [];
   placed.forEach((p, i) => {
     if (p === null || p.width !== undefined || p.shift === true) return;

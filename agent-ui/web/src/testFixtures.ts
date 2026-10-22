@@ -1,7 +1,8 @@
 import type { PanelBinding, PanelTable } from "./keymap";
 
-/** Shared test binding with `desc` defaulting to the action name and `source` set to "default".
- *  Tests using a `PanelTable` reuse this fixture instead of keeping separate copies. */
+/** One binding, defaulting its `desc` to the action name and its `source` to "default" -- shared
+ *  by every test that needs a `PanelTable` (`leader.test.ts`, `App.test.tsx` and
+ *  `KeymapOverlay.test.tsx` build on the same fixture rather than each keeping its own copy). */
 export const binding = (keys: string[], action: PanelBinding["action"], desc: string = action): PanelBinding => ({
   keys,
   action,
@@ -9,9 +10,10 @@ export const binding = (keys: string[], action: PanelBinding["action"], desc: st
   source: "default",
 });
 
-/** A small panel table with one-key leaves (`H`/`L`), a two-key reserved-prefix binding (`[ b`),
- *  three leader sequences, two sharing a group label, and both group labels. It is shared by
- *  `leader.test.ts`, `App.test.tsx` and `KeymapOverlay.test.tsx`. */
+/** A small panel table covering a one-key leaf (`H`/`L`), a two-key binding through one of
+ *  `resolveKey`'s own reserved prefixes (`[ b`), three leader sequences (two of them sharing a
+ *  group label), and the two group labels themselves -- exactly what `leader.test.ts` and
+ *  `App.test.tsx`/`KeymapOverlay.test.tsx` exercise. */
 export const TABLE: PanelTable = {
   leader: " ",
   leaderLabel: "Space",

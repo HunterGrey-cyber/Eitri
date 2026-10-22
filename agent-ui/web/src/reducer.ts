@@ -166,10 +166,12 @@ export function transcriptEntriesCopiedCount(): number {
  */
 export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState {
   const seq = incoming.nextSeq;
-  // Advance `nextSeq` once here so every `return state` below includes it, even when no visible
-  // state changes. Each event is still an ordered occurrence. Clear `turnThinking` by default
-  // rather than maintaining a list of events that clear it. Only a `content_delta` with kind
-  // `thinking` sets it back to true.
+  // Advanced once, here, so every `return state` below carries it -- including the arms that change
+  // nothing else. An event with no visible effect is still a real, ordered occurrence.
+  //
+  // `turnThinking` defaults to false here too, for every event: it is cleared by the ABSENCE of a
+  // special case rather than by a maintained list of event types that ought to clear it.
+  // Only the `content_delta`/`"thinking"` arm below sets it back to true.
   const state: AgentUiState = { ...incoming, nextSeq: seq + 1, turnThinking: false };
   switch (event.type) {
     case "session_opened":
@@ -239,11 +241,17 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
           turnThinking: true,
         };
       }
-      // Guard against TS/Rust variant drift at runtime. TypeScript has narrowed `event.kind` to
-      // "text" after the thinking case, so a cast is needed to check for an unknown variant.
-      // Without the guard, a new Rust variant could append a transcript entry with undefined text.
-      // `renderMarkdown` would throw inside `marked`, unmounting the panel without an error boundary.
-      // This protects the same boundary as the switch's `default` arm.
+      // A RUNTIME defence against TS/Rust drift, not a type-level branch -- which is exactly why
+      // it needs the cast. `ContentKind` is `{Text, Thinking}` today, so TS has already narrowed
+      // `event.kind` to "text" by this line and the comparison is dead by the types. It is not
+      // dead at runtime: a third variant added on the Rust side without a matching case here would
+      // otherwise fall through into the text path below and append a transcript entry whose `text`
+      // is `undefined`, which `MessageList` hands to `renderMarkdown`, which throws inside
+      // `marked` -- and this app has no error boundary, so the whole panel unmounts. This arm used
+      // to read `if (event.kind !== "text") return state;` and the in-flight motion change turned
+      // it into `if (event.kind === "thinking")`, dropping the guard, which was reproduced as an
+      // unmount on 2026-09-20. Same shape, and same reason, as the `default:` arm at
+      // the bottom of this switch.
       if ((event.kind as string) !== "text") return state;
       // `event.kind` is narrowed to "text" here, the only other member of the union.
       // `transcript` holds assistant MESSAGES, not content events. Under partial streaming a single
@@ -334,8 +342,10 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
         ],
       };
     case "permission_resolved":
-      // Rust sends `permission_resolved` when `AgentSession::respond_permission` or `interrupt()`
-      // resolves the request. Remove the card from this event so its lifetime follows Rust state.
+      // The one authoritative source for "this permission card is gone".
+      // Replaces the deleted markPermissionAnswered: this now arrives as a real event from Rust
+      // the instant AgentSession::respond_permission or interrupt() resolves it, never as a
+      // frontend-local guess.
       return { ...state, pendingPermissions: state.pendingPermissions.filter((p) => p.permissionId !== event.permission_id) };
     case "turn_completed": {
       // Clear the in-flight turn on `turn_completed`. Finishing a turn does not end the
@@ -495,13 +505,16 @@ export type CallNotes = {
   createsFile?: readonly { permissionId: string; toolUseId: string | null }[];
   /** Calls whose CLI prompt was answered without a card, with the note shown on each call's row. */
   promptNotes?: readonly { toolUseId: string; note: string }[];
-  /** Tool-use ids for `Write`, `Edit` or `NotebookEdit` calls answered by the acceptEdits fast
-   *  path without a card. Unlike `ruleNotes`, these have no separate message: `toolRegistry.tsx`
-   *  labels their rows "allowed by auto". */
+  /** Tool-use ids of a `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path
+   *  answered with no card. No message of its own, unlike `ruleNotes` -- there is only one fast
+   *  path, so the row just says "allowed by auto" (`toolRegistry.tsx`). */
   autoNotes?: readonly string[];
-  /** Tool-use ids for `Write` calls answered without a card, through acceptEdits or bypass, when
-   *  the path did not exist just before the answer. `createsFile` is keyed by permission id and only
-   *  covers calls with cards. This signal keeps a new-file write from showing an overwrite warning. */
+  /** Tool-use ids of a `Write` answered with no card -- by the acceptEdits
+   *  fast path, or in bypass -- over a path where nothing existed
+   *  just before the answer was sent. `createsFile`'s own signal is keyed by permission id and only
+   *  ever set for a call that raised a card (F22) -- a `Write` answered without one raises none, so
+   *  without this its row kept `createsFile`'s absence and showed the overwrite warning for a file
+   *  that never existed. */
   autoCreatesFile?: readonly string[];
 };
 
@@ -624,9 +637,11 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
   };
 }
 
-/** Whether `resume_outcome` confirms the requested session. Share this predicate with
- * `applyEvent` and `App.tsx`, which uses it to stop `turnClock`, so both interpret the outcome
- * alike. A forked attach may legitimately return a different session id. */
+/** Whether a `resume_outcome` confirms the session that was actually asked for -- the same
+ * predicate `applyEvent`'s own `resume_outcome` arm used to compute inline. Exported so `App.tsx`
+ * can decide whether a resume outcome ends the in-flight-motion clock (`turnClock`)
+ * without re-deriving this rule a second time; a forked attach is not a substitution because
+ * forking legitimately returns a different id. */
 export function resumeAttached(event: Extract<AgentDomainEvent, { type: "resume_outcome" }>): boolean {
   return event.status === "attached" && (event.forked || event.attached_provider_session_id === event.requested_provider_session_id);
 }

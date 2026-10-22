@@ -19,8 +19,8 @@
 
 export const STOP_ATTR = "data-nav-stop";
 
-/** Label alphabet shared with the window-wide `f` HINT. It excludes `f`, which starts HINT.
- *  The `gf` path picker and `gx` link picker reuse it for their letter labels. */
+/** Label alphabet shared with the window-wide `f` HINT. It excludes `f` because that key starts
+ *  HINT. The `gf` path picker and `gx` link picker reuse it for their footer lists. */
 export const HINT_ALPHABET = "asdjklghweruio";
 
 /** A web link as `web_url` (`panel/src/agent_panel.rs`) will re-check it -- `http(s)`
@@ -120,18 +120,32 @@ export function linkClickNeedsLook(
   return url;
 }
 
-/** Whether `el` is inside a control a key activates by default: a button, summary, link or
- *  element with `role="button"`.
+/** Whether `el` is, or sits inside, a control a key press ACTIVATES by default -- a `<button>`, a
+ *  `<summary>`, a link, or anything wearing `role="button"`.
  *
- *  Calling `preventDefault()` on Enter for a focused button suppresses its activation click.
- *  Tab-to-Approve then Enter must keep working so permission decisions remain keyboard reachable.
- *  Space on buttons and Enter on tool-card summaries need the same protection.
+ *  This is the second half of "the panel does not own every keystroke inside its own subtree", and
+ *  it is not a theoretical one. Enter's default action on a focused `<button>` *is* its activation
+ *  click; there is no separate click event to let through. So a keydown handler that claims Enter
+ *  from any non-editable target and calls `preventDefault()` does not merely also do something
+ *  else -- it silently DELETES the button's activation.
  *
- *  `closest` also handles targets inside a button, such as a strong or span element, while
- *  keyboard activation targets the button itself. Both must bypass the panel's key handler.
+ *  **Observed on an installed build before it was fixed** (2026-09-18: no key could reach Approve).
+ *  Tab-to-Approve then Enter is the only keyboard route to a permission
+ *  decision today -- the `a`/`d` allow/deny keys belong to a later sub-project and are
+ *  deliberately not in this keyboard skeleton -- and this panel's own `onKeyDown` had taken it
+ *  away. Before this branch nothing listened for Enter at all, so the route worked; the branch
+ *  created the hole and the fix restores exactly what was there, rather than pulling the later
+ *  sub-project's keys forward to paper over it.
  *
- *  Keeping this helper in `nav.ts` lets `App.tsx` and `EmptyTab.tsx` share the leader engine's
- *  control check without importing one component into the other and creating a circular import. */
+ *  The same applies to Space on a button and to Enter on `<summary>` (the generic tool card's
+ *  disclosure, `toolRegistry.tsx`), which is why this is a selector over activatable controls and
+ *  not a special case for Enter. `closest`, not a tag check: a real click target is usually a
+ *  `<strong>`/`<span>` INSIDE the button, and focus-then-Enter dispatches the keydown at the
+ *  button itself -- both have to bail.
+ *
+ *  Moved here from `App.tsx` (Space never reached the leader engine on the empty tab's dashboard, because the leader
+ *  engine lived only in `App.tsx` and could not be imported into `EmptyTab.tsx` without a circular import back into
+ *  the component that renders it). `nav.ts` already sits below both without importing either. */
 export function isActivatableControl(el: EventTarget | null): el is HTMLElement {
   if (!(el instanceof HTMLElement)) return false;
   return el.closest("button, summary, a[href], [role=button]") !== null;
@@ -244,7 +258,7 @@ function ownStops(root: HTMLElement): HTMLElement[] {
 
 /** The conversation rows under `root`, in document order: index `i` here is timeline index `i`.
  *  Only real rows -- a `data-nav-stop="row"` inside another stop (a reply's own HTML) is never
- *  one. Every site that turns the cursor into an element goes through this. The same
+ *  one. Every site that turns the cursor into an element goes through this, so they all agree. The same
  *  array is returned until the stops change (`ownStops`), so a caller can tell a changed list by
  *  identity. */
 export function conversationRows(root: HTMLElement): HTMLElement[] {
@@ -334,17 +348,11 @@ export interface CountedLanding {
   from: HTMLElement | null;
 }
 
-/**
- * A counted `j` (+1) or `k` (-1) takes `times` steps, each from the previous landing.
- * The walk stops at a non-row stop or a clamped boundary, matching where single steps stop.
- * Returns `null` when the region has no stops.
- *
- * Read the stops, rows and row indices once. Each step then moves along the index without DOM
- * queries, so large counts do not trigger repeated full-tree scans.
- *
- * Steps after the first start from the walk's position rather than `document.activeElement`.
- * Otherwise focus inside a stop would restart every step there and make `3j` move only once.
- */
+/** Walk `times` steps of `j` (+1) or `k` (-1), starting each step from the previous landing. Stop
+ * early at a non-conversation stop or a boundary where clamping makes no progress. Return `null`
+ * if there are no stops. Read the stops, rows and row indices once so each step needs no DOM
+ * queries. Consult focus only for the initial position; rereading a focused control on every
+ * step would repeatedly restart at its stop and make `3j` move only once. */
 export function countedStop(
   root: HTMLElement,
   cursor: number | null,
@@ -416,12 +424,12 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
   return null;
 }
 
-/** A panel target of global `f` HINT: a conversation row, a code block or web link inside a row,
- *  an enabled control from `controlsOf`, or a marked composer. Code and link targets remember
- *  their row so landing moves the row cursor. Landing on a link focuses it without clicking it.
- *  The list is frozen at `hint_collect`, and `shell` addresses entries by index afterward.
- *  `rowIndex` is only the index at collection time. Landing reads it from the element again
- *  because rows can be inserted above it while labels are displayed. */
+/** One panel target of the global `f` HINT: a conversation row, a fenced code block inside one (which remembers its
+ *  row, because landing on it moves the row cursor there), a web link inside one (the anchor, which likewise
+ *  remembers its row -- landing focuses it and never clicks it), or an enabled control from `controlsOf`. The list is
+ *  frozen at `hint_collect` and `shell` addresses its entries by index from then on. `rowIndex` is the row's index at
+ *  that moment only; landing re-reads it from the element, because rows can be inserted above it while the labels are
+ *  up. */
 export type HintTarget =
   | { kind: "row"; el: HTMLElement; rowIndex: number }
   | { kind: "control"; el: HTMLElement }
@@ -429,14 +437,14 @@ export type HintTarget =
   | { kind: "link"; el: HTMLAnchorElement; rowIndex: number }
   | { kind: "composer"; el: HTMLElement };
 
-/** Marks the composer as a HINT target. The composer is in no
+/** Marks the composer as a HINT target (the panel's input box is one). The composer is in no
  *  `data-nav-stop` -- `j`/`k` never walk into it, `i` and `Ctrl+l` are its routes -- and in BROWSE it
  *  is a plain `div`, which `CONTROL_SELECTOR` does not match, so without this marker HINT could never
  *  reach it. `Composer` sets it only while INPUT can be entered. */
 export const HINT_COMPOSER_ATTR = "data-hint-composer";
 
 /** The elements known to scroll their own content (index.css): the conversation's list, the tab
- *  bar, and the launch chooser's list. Named here as
+ *  bar (sideways), and the launch chooser's list. Named here as
  *  well as read off the computed style below, because jsdom loads no stylesheet and the tests must
  *  see these three. `.session-choice` is gone -- the old resumable-session picker it named was
  *  replaced by `EmptyTab` (F3) and the launch chooser (`.chooser-list`). */
@@ -486,9 +494,9 @@ export function visibleBox(el: HTMLElement, root: HTMLElement): Box | null {
   return clip === null ? null : overlap(clip, box);
 }
 
-/** Whether `el` has a non-zero visible box inside `root` and every clipping ancestor.
- *  This is exactly `visibleBox(el, root) !== null`, so target selection and label placement use
- *  the same clipped area even within nested scrollers. */
+/** Whether `el` has a non-zero box visible inside `root` and every intervening ancestor that
+ *  clips overflow. Nested scrollers must all let it through. This is exactly whether
+ *  `visibleBox` is non-null, so label eligibility and placement agree. */
 export function hintVisible(el: HTMLElement, root: HTMLElement): boolean {
   return visibleBox(el, root) !== null;
 }

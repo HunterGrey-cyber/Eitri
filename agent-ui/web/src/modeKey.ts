@@ -3,7 +3,8 @@ import { TYPING_GUARD_MS } from "./typingGuard";
 import type { PermissionModeChoice, TabInfo } from "./types";
 
 /** Claude Code's mode key (Shift+Tab cycles the permission mode), claimed everywhere in the chat so it never
- *  becomes WebKit's backward focus navigation or GTK's `move-focus`. */
+ *  becomes WebKit's backward focus navigation or GTK's `move-focus`: the mode must switch from anywhere in
+ *  the agent pane, not only from the input. */
 export function isModeCycleKey(e: {
   key: string;
   code?: string;
@@ -37,9 +38,11 @@ export type ModeKeyState = {
   tabMode: PermissionModeChoice | null;
 };
 
-/** `not_started`, `starting` and `live` tabs can cycle modes without a provider capability check.
- *  Rust decides whether a cycle enters bypass and may request `confirm_bypass` instead.
- *  Ended and failed tabs can leave bypass but cannot enter it. */
+/** `not_started`, `starting`
+ *  and `live` all always cycle now -- there is no provider capability left to gate on, since every
+ *  session is gated and Rust is the one authority for whether a cycle actually lands in bypass (it
+ *  may reprompt with `confirm_bypass` instead of just applying it). `ended`/`failed` can only LEAVE
+ *  bypass, never enter it. */
 export function modeKeyRoute(s: ModeKeyState): "overlay" | "cycle" | "fixed" | "none" {
   if (s.confirmOpen || s.chooserOpen) return "overlay";
   if (s.tabState === null) return "none";

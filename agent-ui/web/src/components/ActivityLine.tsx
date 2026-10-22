@@ -17,11 +17,13 @@ type Props = {
   /** How many items are queued behind the running turn. Shown beside the
    *  interrupt key, never with `pendingTool`, which takes over the same slot instead. */
   queued?: number;
-  /** The oldest pending permission card's tool name, or `null` if none waits.
-   *  Replaces the queue count: a waiting card already prevents the queue from flushing. */
+  /** The tool name of the oldest pending permission card, or `null` when none waits. While it is
+   *  set, this line names the card rather than the queue count -- a card already means the queue
+   *  cannot flush, so the two are never both worth reading. */
   pendingTool?: string | null;
-  /** The card hint names `a`/`d` in BROWSE. In INPUT it says Escape first because keys go to the
-   *  composer. Defaults to browse for callers that omit the mode. */
+  /** The card row reads differently by mode -- `a`/`d`
+   *  answer directly in BROWSE, but INPUT's keys go to the composer, so it says `Esc` first.
+   *  Defaulted to `"browse"` for existing callers that never cared before this. */
   mode?: PanelMode;
 };
 
@@ -56,10 +58,10 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       {pendingTool === null && <TurnActivity phase={phase} clock={turnClock} />}
       {pendingTool !== null ? (
         <span className="activity-card">
-          {/* The hint names both requirements for answering: move the cursor onto the card with
-              `j`/`k`/`G`, then press `a`/`d` alone after `TYPING_GUARD_MS` without a key.
-              Without those details, a misplaced cursor or a key too soon after `Esc` produces
-              a refusal the hint does not explain. */}
+          {/* `a`/`d` answer only the card under the cursor through `permissionTarget`, and only
+              after `TYPING_GUARD_MS` since the last key. The hint says "j to it" to explain
+              navigation onto the card and "alone" to explain the pause, avoiding unexplained
+              refusals when the cursor is elsewhere or `a` follows Escape too soon. */}
           ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
         </span>
       ) : (

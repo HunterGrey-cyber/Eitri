@@ -2,13 +2,31 @@ import { createElement, Fragment } from "react";
 import type { ReactNode } from "react";
 import type { Problem } from "../problems";
 
-/** A row on the shared sign-column grid.
- * Derive both `data-sign` and the visible `.row-sign` from one `sign` argument so they cannot drift.
- * Tests can inspect the data attribute without reading rendered text. The visible glyph is
- * `aria-hidden` because the row's text and role already convey its meaning.
- * `current` marks the conversation cursor so users can see which row `Enter` expands or `y` copies.
- * `--nv-cursorline` supplies a background highlight, as it does for choice-row hover.
- * `App.tsx` clamps the cursor when the timeline shrinks so those actions do not use a stale index. */
+/** One row on the sign-column grid every item in this document renders on, as vim's sign column does.
+ *
+ * **One component, not six.** This shape existed six times -- `MessageList`'s own module-private
+ * copy plus five hand-written ones (`App.tsx`'s two session-ended rows, `TerminalHandoff`'s command
+ * card, `ModeSelector`'s two choice rows -- `ModeSelector` itself is gone, replaced by
+ * `EmptyTab`) -- and each hand-written copy wrote its glyph TWICE, once
+ * as `data-sign` and once as the visible `.row-sign` text. Tests assert on `data-sign`; the user
+ * reads the span. Nothing checked that the two agreed, so editing one and not the other drifts past
+ * a green suite. Here there is one `sign` argument and both readings are derived from it, which is
+ * what makes the disagreement unrepresentable rather than merely unlikely.
+ *
+ * `data-sign` carries the glyph as data, separately from the `aria-hidden` presentational copy, so
+ * a test can assert state without reading rendered text and a screen reader is not told it twice --
+ * the glyph repeats what the row's own text and role already say, and announcing "rangle" before
+ * every prompt is noise.
+ *
+ * `current` is the conversation's cursor: `Enter` expands "the current item" and `y` copies it
+ * (`App.tsx`'s `onKeyDown`), and a cursor nobody can see is not a cursor, it is a trap -- there was
+ * no way to know which row either key would act on. `--nv-cursorline` is a BACKGROUND (nvim's own
+ * `Visual` highlight, already used this way by `.row-choice:hover`), so the "no signal
+ * colour as text" guard `indexCss.test.ts` enforces does not apply to it. Scroll/resync/
+ * shrinking-timeline behaviour beyond just showing where the cursor is stays out of scope
+ * here -- the cursor-clamping `App.tsx` already does when the timeline shrinks
+ * is the one piece of that `y`/`Enter` themselves needed in order not to act on a stale index.
+ */
 type RowProps = {
   /** The row's kind, as the `row-<kind>` class the stylesheet keys on. */
   kind: string;
@@ -38,9 +56,12 @@ type RowProps = {
   /** Makes this row a keyboard stop (`../nav`): `"row"` for a conversation row, which carries the
    *  cursor; any other name for a row that is reached by focusing it, like a start-screen choice. */
   navStop?: string;
-  /** A startup failure's `classify()` result: a headline and remedy drawn above unchanged `children`.
-   *  `null` or omission draws nothing extra, including for unrecognized failures.
-   *  Callers perform classification; this component only renders the supplied result. */
+  /** When `children` carries a startup failure's raw text, `problem` is that
+   *  text's `classify()` result -- a headline and remedy drawn ABOVE `children`, which stays
+   *  exactly as it was ("never hide the evidence"). `null`/omitted (the common case: an
+   *  unrecognised failure, or a row with nothing to classify) draws nothing extra. Callers compute
+   *  `classify()` themselves; this component only knows how to render its result, so it stays
+   *  content-agnostic the same way `sign`/`kind` already are. */
   problem?: Problem | null;
   children: ReactNode;
 };

@@ -1776,22 +1776,19 @@ input::placeholder {
    strength, rather than a blend of them -- a plain surface, the mode section marked by its own
    cursorline fill and its label, which is what the old `.panel-footer .mode-block` already did, carried
    forward rather than reinvented. */
-/* The band is as tall as the editor's statusline beside it. A plain
-   `min-height` grows with whatever the band's children need (the `⏵⏵`
-   fallback symbol font in particular has its own metrics), so the band never actually matched the
-   editor's own statusline beside it. `--nv-editor-row` is the editor's real cell height
-   (`core/src/theme/tokens.rs`, `ThemeTokens.editor_row_px`, `None` until `neovide-editor` reports
-   one -- the `24px` fallback is what a reload before that first report, or `--clean`, still
-   shows). `overflow: hidden` is what actually stops a child from growing the row instead of
-   clipping to it -- a bigger min-height alone would not have fixed this.
-   No top rule: the composer card above it is the foot's boundary, and a hairline under the card read
-   as a second edge. With no border, the line box is the whole row, so the text sits on the same
-   centre line as the editor's statusline text.
-   The band continues the editor's statusline across the divider: the same fill and text pair
-   (`--nv-chrome`, nvim's `StatusLine`), and the same row -- lifted by the rows nvim keeps under its
-   statusline for the command line (`'cmdheight'`, `--nv-editor-cmd-rows`), which are blank here as
-   the editor's are between messages. With no editor beside the band the variable is absent and the
-   band keeps the bottom row. */
+/* The band under the agent's input should be exactly as tall as the editor's statusline beside
+   it, so the two read as one row across the window -- `min-height` grows with whatever the band's children need (the
+   `⏵⏵` fallback symbol font in particular has its own metrics), so the band never actually matched the editor's own
+   statusline beside it. `--nv-editor-row` is the editor's real cell height (`core/src/theme/tokens.rs`,
+   `ThemeTokens.editor_row_px`, `None` until `neovide-editor` reports one -- the `24px` fallback is what a reload
+   before that first report, or `--clean`, still shows). `overflow: hidden` is what actually stops a child from
+   growing the row instead of clipping to it -- a bigger min-height alone would not have fixed this. No top rule: the
+   composer card above it is the foot's boundary, and a hairline under the card read as a second edge. With no border,
+   the line box is the whole row, so the text sits on the same centre line as the editor's statusline text. The band
+   continues the editor's statusline across the divider: the same fill and text pair (`--nv-chrome`, nvim's
+   `StatusLine`), and the same row -- lifted by the rows nvim keeps under its statusline for the command line
+   (`'cmdheight'`, `--nv-editor-cmd-rows`), which are blank here as the editor's are between messages. With no editor
+   beside the band the variable is absent and the band keeps the bottom row. */
 .status-band {
   display: flex;
   align-items: center;
@@ -1845,7 +1842,7 @@ input::placeholder {
 .band-seg {
   white-space: nowrap;
 }
-/* WebKit zoom 1.5 measured a 47-column
+/* A sandbox GUI pass on 2026-09-27 at WebKit zoom 1.5 measured a 47-column
    band, where the bypass prompt (`Switch to bypass and approve the 1 waiting card? (y/n)`), the
    empty-tab bypass prompt (`Switch to bypass? New sessions in this window start in bypass too (y/n)`)
    and the flash (`y must be pressed on its own to enter bypass ...`) all lost their own
@@ -1854,10 +1851,10 @@ input::placeholder {
    that actually needs it (a segment `bandLayout` marked `wraps`), so a short prompt/flash still
    renders on the one fixed row exactly as before, and the moment `wraps` stops being set (the
    prompt/flash itself ending, or the band widening enough to fit it), the class -- and this height
-   -- disappear with it, restoring the `--nv-editor-row` height.
+   -- disappear with it, restoring the `--nv-editor-row` height the band otherwise keeps.
    `align-items: flex-start` keeps the mode block pinned to the first line while the wrapped text
-   grows the row underneath it; the mode block can instead be centred
-   against the wrapped block. */
+   grows the row underneath it -- stated here rather than reinvented quietly if a later pass wants
+   the mode block centred against the wrapped block instead. */
 .status-band--wrap {
   height: auto;
   min-height: var(--nv-editor-row, 24px);

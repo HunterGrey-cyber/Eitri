@@ -144,9 +144,21 @@ struct AdoptionContext {
     provider_advertises_resume: bool,
 }
 
+/// The provider's own session id, once known, behind a lock of its own rather than the state's: it is
+/// read from the UI thread (a handoff, the panel header) at moments that may already hold the
+/// projection, and a second lock of the state from that thread would never return.
+///
+/// Written only by the ingestion thread and only while it holds the state lock as well (taken state
+/// first, then this one, never the other way round), so a reader holding the state lock sees the id
+/// that goes with the state it reads. It changes on every `SessionOpened`, so it is not set once.
+type SessionIdSlot = Arc<Mutex<Option<String>>>;
+
+fn read_session_id(slot: &Mutex<Option<String>>) -> Option<String> {
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
 struct IngestState {
     projection: AgentSessionProjection,
-    provider_session_id: Option<String>,
     /// Held for as long as this conversation drives the provider session. Taken on the ingestion
     /// thread rather than the UI thread, which is also where it belongs: acquiring it touches the
     /// filesystem, and doing that on a GTK tick is exactly the kind of thing that causes the stalls
@@ -358,11 +370,14 @@ impl IngestState {
     /// for the page, and for an idle conversation holding a live declaration no fold would rebuild.
     ///
     /// Destructures `Self` without a rest pattern: a field added to the ingest does not compile here
-    /// until it is placed in the move or named as not moved.
-    fn take_move_record(&self) -> Result<(ChatMoveCore, IngestHandoff), HandoffRefused> {
+    /// until it is placed in the move or named as not moved. `provider_session_id` is the slot's,
+    /// read while this state's lock is held.
+    fn take_move_record(
+        &self,
+        provider_session_id: Option<String>,
+    ) -> Result<(ChatMoveCore, IngestHandoff), HandoffRefused> {
         let IngestState {
             projection,
-            provider_session_id,
             // Moves as a descriptor beside the record, never inside it.
             lease: _,
             pending_ui,
@@ -397,7 +412,7 @@ impl IngestState {
             None => return Err(HandoffRefused::Unsettled),
         };
         let handoff = IngestHandoff {
-            provider_session_id: provider_session_id.clone(),
+            provider_session_id,
             resume_outcome: resume_outcome.clone(),
             stats: *stats,
             pending_title: pending_title.clone(),
@@ -409,8 +424,9 @@ impl IngestState {
     }
 
     /// An adopted conversation's state: the source's, with the running turn and the lifecycle list
-    /// rebuilt from the move's records so a later move of it carries them again.
-    fn moved(moved: MovedIngest) -> Self {
+    /// rebuilt from the move's records so a later move of it carries them again; with the session id
+    /// the source's slot held, for this one's.
+    fn moved(moved: MovedIngest) -> (Self, Option<String>) {
         let MovedIngest {
             projection,
             core,
@@ -441,9 +457,8 @@ impl IngestState {
             record_written,
             history_dirty,
         } = state;
-        IngestState {
+        let state = IngestState {
             projection,
-            provider_session_id,
             lease,
             pending_ui: VecDeque::new(),
             resync_pending: false,
@@ -460,7 +475,8 @@ impl IngestState {
             lifecycle_since_open,
             running_turn,
             folded_through,
-        }
+        };
+        (state, provider_session_id)
     }
 
     fn take_revised_delivery(&mut self) -> RevisedDelivery {
@@ -496,6 +512,10 @@ fn wake_ui(slot: &Mutex<Option<UiWake>>) {
 /// A conversation's ingestion thread and the state it owns.
 pub struct ConversationIngest {
     state: Arc<Mutex<IngestState>>,
+    session_id: SessionIdSlot,
+    /// Which thread holds this conversation's [`ProjectionGuard`], so a call that would lock the state
+    /// again from that thread fails at once rather than waiting on itself.
+    holder: GuardHolder,
     stop: Arc<AtomicBool>,
     /// Raised by the provider when it queued events, and here when something the thread acts on
     /// was noted (a title, a name, a local fold, the stop).
@@ -521,12 +541,74 @@ pub struct ConversationIngest {
 /// A guard rather than a clone: the UI reads this on every tick (up to 30 a second), and cloning a conversation's
 /// whole transcript that often would reintroduce, as CPU, the cost this module just removed as
 /// memory.
-pub struct ProjectionGuard<'a>(MutexGuard<'a, IngestState>);
+///
+/// It holds the conversation's state lock, which is not reentrant: while it lives, its thread may call
+/// nothing on the same conversation that locks the state again (see [`ConversationIngest::projection`]).
+/// It records its thread on the conversation for as long as it lives, and in a debug build every such
+/// call checks that record and panics, naming itself, instead of hanging.
+pub struct ProjectionGuard<'a> {
+    state: MutexGuard<'a, IngestState>,
+    holder: &'a GuardHolder,
+}
 
 impl std::ops::Deref for ProjectionGuard<'_> {
     type Target = AgentSessionProjection;
     fn deref(&self) -> &AgentSessionProjection {
-        &self.0.projection
+        &self.state.projection
+    }
+}
+
+impl Drop for ProjectionGuard<'_> {
+    // Runs before the state lock is released, so no moment exists in which another call on this
+    // thread could find the lock held and the record clear.
+    fn drop(&mut self) {
+        self.holder.leave();
+    }
+}
+
+/// The thread holding one conversation's [`ProjectionGuard`], kept per conversation: holding one
+/// conversation's projection leaves every other conversation free to use from the same thread. Kept
+/// only in debug builds; in a release build every method is empty.
+#[derive(Default)]
+struct GuardHolder {
+    #[cfg(debug_assertions)]
+    thread: Mutex<Option<std::thread::ThreadId>>,
+}
+
+impl GuardHolder {
+    /// Called once the state lock is held.
+    fn enter(&self) {
+        #[cfg(debug_assertions)]
+        {
+            *self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
+        }
+    }
+
+    fn leave(&self) {
+        #[cfg(debug_assertions)]
+        {
+            *self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Panics when this thread holds the guard: `accessor` is about to lock the state (or wait for a
+    /// thread that does), and would wait forever on a lock its own thread holds. A guard held by another
+    /// thread is no reason to panic: the call waits for it, as any lock does.
+    fn refuse_reentry(&self, accessor: &str) {
+        #[cfg(debug_assertions)]
+        {
+            let held_here = *self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                == Some(std::thread::current().id());
+            if held_here {
+                panic!(
+                    "ConversationIngest::{accessor} was called while this thread holds the same conversation's \
+                     projection guard: the state lock is not reentrant, so the call would never return. \
+                     Read what is needed from the guard, or call this before taking it."
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = accessor;
     }
 }
 
@@ -562,7 +644,6 @@ impl ConversationIngest {
         let record_written = initial_provider_session_id.is_some();
         let state = IngestState {
             projection: seed,
-            provider_session_id: initial_provider_session_id,
             lease: initial_lease,
             pending_ui: VecDeque::new(),
             resync_pending: false,
@@ -582,7 +663,7 @@ impl ConversationIngest {
             canonical_cwd,
             provider_advertises_resume,
         };
-        Self::spawn(provider, state, context)
+        Self::spawn(provider, state, initial_provider_session_id, context)
     }
 
     /// Continues a conversation another window held, from the state its move carried: the rebuilt
@@ -602,15 +683,18 @@ impl ConversationIngest {
             canonical_cwd,
             provider_advertises_resume,
         };
-        Self::spawn(provider, IngestState::moved(moved), context)
+        let (state, provider_session_id) = IngestState::moved(moved);
+        Self::spawn(provider, state, provider_session_id, context)
     }
 
     fn spawn(
         provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
         state: IngestState,
+        provider_session_id: Option<String>,
         context: AdoptionContext,
     ) -> Self {
         let state = Arc::new(Mutex::new(state));
+        let session_id: SessionIdSlot = Arc::new(Mutex::new(provider_session_id));
         let stop = Arc::new(AtomicBool::new(false));
         let frozen = Arc::new(AtomicBool::new(false));
         let pump_gate = Arc::new(Mutex::new(()));
@@ -622,6 +706,7 @@ impl ConversationIngest {
         let ui_wake: UiWakeSlot = Arc::new(Mutex::new(None));
         let thread = {
             let state = Arc::clone(&state);
+            let session_id = Arc::clone(&session_id);
             let halt = Halt {
                 stop: Arc::clone(&stop),
                 frozen: Arc::clone(&frozen),
@@ -630,12 +715,14 @@ impl ConversationIngest {
             let ui_wake = Arc::clone(&ui_wake);
             std::thread::Builder::new()
                 .name("eitri-agent-ingest".to_string())
-                .spawn(move || ingest_loop(provider, state, halt, announced, context, ui_wake))
+                .spawn(move || ingest_loop(provider, state, session_id, halt, announced, context, ui_wake))
                 .expect("spawning the agent ingestion thread")
         };
 
         Self {
             state,
+            session_id,
+            holder: GuardHolder::default(),
             stop,
             wake,
             ui_wake,
@@ -655,6 +742,9 @@ impl ConversationIngest {
     /// Waits for a batch being folded, and the writes after it, to finish: call it off the GTK
     /// thread.
     pub(crate) fn freeze(&self) {
+        // The batch it waits for ends by locking the state, so a freeze under this thread's own guard
+        // would wait on that thread forever.
+        self.holder.refuse_reentry("freeze");
         let _held = self.pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.frozen.store(true, Ordering::SeqCst);
     }
@@ -668,7 +758,9 @@ impl ConversationIngest {
     /// The records a move carries and the ingest's own state, read under one lock (see
     /// `IngestState::take_move_record`).
     pub(crate) fn take_move_record(&self) -> Result<(ChatMoveCore, IngestHandoff), HandoffRefused> {
-        self.state.lock().unwrap().take_move_record()
+        let state = self.lock_state("take_move_record");
+        // Read with the state's lock held, so the id is the one that goes with this state.
+        state.take_move_record(read_session_id(&self.session_id))
     }
 
     /// The ingest's fixed identity: the name the lease and the record are keyed by, and whether the
@@ -680,9 +772,7 @@ impl ConversationIngest {
     /// A second descriptor on the session lease's open file, for the other window: the lock is the
     /// open file's, so it stays held while either descriptor is open. `None` without a lease.
     pub(crate) fn lease_descriptor(&self) -> Option<std::io::Result<std::os::fd::OwnedFd>> {
-        self.state
-            .lock()
-            .unwrap()
+        self.lock_state("lease_descriptor")
             .lease
             .as_ref()
             .map(SessionLease::descriptor_for_move)
@@ -691,32 +781,46 @@ impl ConversationIngest {
     /// Writes `pid` into the lease file as its owner, through the descriptor the lease holds. Nothing
     /// to do without a lease.
     pub(crate) fn rewrite_lease_owner(&self, pid: u32) -> std::io::Result<()> {
-        match &self.state.lock().unwrap().lease {
+        match &self.lock_state("rewrite_lease_owner").lease {
             Some(lease) => lease.rewrite_owner_pid(pid),
             None => Ok(()),
         }
     }
 
-    /// Holds the state lock for as long as the returned guard lives.
-    ///
-    /// **Nothing else on this type may be called while that guard is alive.** Every accessor below
-    /// locks the same `std::sync::Mutex`, which is not reentrant, so a second call from the same
-    /// thread blocks on a lock that thread already holds and never wakes. On 2026-09-15 that took
-    /// the whole GTK main loop down from one call site in `shell` that read
-    /// `provider_session_id()` inside this guard's scope -- no input, no window close, and the
-    /// last frame still on screen, so it looked alive. Read what you need from the guard, or take
-    /// the other values first.
-    pub fn projection(&self) -> ProjectionGuard<'_> {
-        ProjectionGuard(self.state.lock().unwrap())
+    /// The state lock, for an accessor named `accessor`: refused first (in a debug build) when this
+    /// thread holds the projection guard, since the lock would then wait on its own thread.
+    fn lock_state(&self, accessor: &'static str) -> MutexGuard<'_, IngestState> {
+        self.holder.refuse_reentry(accessor);
+        self.state.lock().unwrap()
     }
 
-    /// Locks. See `projection`'s warning: never call this while holding a `ProjectionGuard`.
+    /// Holds the state lock for as long as the returned guard lives.
+    ///
+    /// **While that guard is alive its thread may call nothing on this conversation that takes the
+    /// state lock**: every accessor here does except [`Self::provider_session_id`], `identity`,
+    /// `unfreeze` and the UI wake's two, and `std::sync::Mutex` is not reentrant, so a second lock
+    /// from the same thread would block on a lock that thread already holds and never wake. On
+    /// 2026-09-15 that took the whole GTK main loop down from one call site in `shell` that read the
+    /// session id inside this guard's scope -- no input, no window close, and the last frame still
+    /// on screen, so it looked alive. In a debug build such a call panics, naming itself, instead.
+    /// Read what you need from the guard, or take the other values first.
+    pub fn projection(&self) -> ProjectionGuard<'_> {
+        let state = self.lock_state("projection");
+        self.holder.enter();
+        ProjectionGuard {
+            state,
+            holder: &self.holder,
+        }
+    }
+
+    /// Takes only the session id's own lock, never the state's, so it may be read while this thread
+    /// holds the projection guard.
     pub fn provider_session_id(&self) -> Option<String> {
-        self.state.lock().unwrap().provider_session_id.clone()
+        read_session_id(&self.session_id)
     }
 
     pub fn stats(&self) -> IngestStats {
-        self.state.lock().unwrap().stats
+        self.lock_state("stats").stats
     }
 
     /// Keeps `title` for the ingestion thread to write (`AgentConversation::note_title`). Nothing
@@ -725,14 +829,14 @@ impl ConversationIngest {
     /// record once it exists (`flush_title`), so there is no moment in which a title can be handed
     /// over and then find nowhere to go. Only the first title is kept.
     pub(crate) fn note_title(&self, title: String) {
-        self.state.lock().unwrap().pending_title.get_or_insert(title);
+        self.lock_state("note_title").pending_title.get_or_insert(title);
         self.wake.raise();
     }
 
     /// Keeps a rename (`prefix ,`) for the ingestion thread to write. The last one noted wins,
     /// unlike `note_title`'s first-wins: `None` clears it. Nothing here touches the disk.
     pub(crate) fn note_name(&self, name: Option<String>) {
-        self.state.lock().unwrap().pending_name = Some(name);
+        self.lock_state("note_name").pending_name = Some(name);
         self.wake.raise();
     }
 
@@ -750,23 +854,23 @@ impl ConversationIngest {
 
     /// The provider's resume verdict, once it has stated one.
     pub fn resume_outcome(&self) -> Option<ResumeOutcomeRecord> {
-        self.state.lock().unwrap().resume_outcome.clone()
+        self.lock_state("resume_outcome").resume_outcome.clone()
     }
 
     /// Releases the session lease. Called last on shutdown, so the lease outlives the provider's own
     /// session teardown and no other client can take it while this one is still closing.
     pub(crate) fn release_lease(&self) {
-        self.state.lock().unwrap().lease = None;
+        self.lock_state("release_lease").lease = None;
     }
 
     /// What the UI should apply. Called from the GTK tick.
     pub fn take_delivery(&self) -> UiDelivery {
-        self.state.lock().unwrap().take_delivery()
+        self.lock_state("take_delivery").take_delivery()
     }
 
     /// [`Self::take_delivery`], with each event's fold revision ([`RevisedDelivery`]).
     pub fn take_revised_delivery(&self) -> RevisedDelivery {
-        self.state.lock().unwrap().take_revised_delivery()
+        self.lock_state("take_revised_delivery").take_revised_delivery()
     }
 
     /// Folds an event this side produced rather than the provider.
@@ -776,7 +880,7 @@ impl ConversationIngest {
     /// which no provider reports back. Never for provider lifecycle state, which is the provider's
     /// to state.
     pub(crate) fn fold_locally(&self, event: AgentDomainEvent) {
-        self.state.lock().unwrap().fold(event);
+        self.lock_state("fold_locally").fold(event);
         // The fold may have marked the history for writing, which the thread does.
         self.wake.raise();
         wake_ui(&self.ui_wake);
@@ -810,6 +914,7 @@ struct Halt {
 fn ingest_loop(
     provider: Arc<dyn crate::provider::AgentProvider + Send + Sync>,
     state: Arc<Mutex<IngestState>>,
+    session_id: SessionIdSlot,
     halt: Halt,
     // The provider's own signal, which `ConversationIngest` also raises; `None` when the provider
     // announces nothing and so has to be asked on a timer.
@@ -856,11 +961,11 @@ fn ingest_loop(
             .filter(|through| Some(*through) != noted_through);
         noted_through = through.or(noted_through);
         // Before the idle check, so a title noted while the provider is quiet still gets written.
-        flush_title(&state, &context);
-        flush_name(&state, &context);
+        flush_title(&state, &session_id, &context);
+        flush_name(&state, &session_id, &context);
         // Likewise: the turn whose completion marked the history dirty is usually the last event of
         // a quiet stretch, so waiting for the next non-empty pump would delay every write.
-        flush_history(&state, &context);
+        flush_history(&state, &session_id, &context);
         if events.is_empty() {
             // A provider event can become no domain event, and the position still moves past it.
             if let Some(through) = through {
@@ -886,11 +991,14 @@ fn ingest_loop(
                     provider_session_id, ..
                 } = &event
                 {
+                    // Taken while the state's lock is held, the one order the two are ever taken in:
+                    // a reader holding the state lock then sees the id that goes with that state.
+                    let mut session = session_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     // Only the FIRST one. `SessionOpened` repeats -- the Agent SDK emits a
                     // system/init at the start of every turn, not once per session -- so adopting
                     // unconditionally would re-take a lease this conversation already holds, on
                     // every single turn.
-                    if guard.provider_session_id.is_none() {
+                    if session.is_none() {
                         adopt = Some(provider_session_id.clone());
                         // A title noted before this point goes into the record adoption writes. One
                         // noted after it waits in `pending_title` until `record_written`, and
@@ -899,7 +1007,7 @@ fn ingest_loop(
                         // Same shape for a rename noted before adoption.
                         name = guard.pending_name.take();
                     }
-                    guard.provider_session_id = Some(provider_session_id.clone());
+                    *session = Some(provider_session_id.clone());
                 }
                 guard.fold(event);
             }
@@ -922,7 +1030,7 @@ fn ingest_loop(
 /// Writes a title noted after this session's record was written -- into that record, on this
 /// thread. A no-op until `record_written`, and whenever nothing is pending: one uncontended lock
 /// per poll. Best-effort, like the record itself: a failure is a row without a title next time.
-fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
+fn flush_title(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, context: &AdoptionContext) {
     let (title, provider_session_id) = {
         let mut guard = state.lock().unwrap();
         if !guard.record_written {
@@ -931,7 +1039,7 @@ fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
         let Some(title) = guard.pending_title.take() else {
             return;
         };
-        let Some(id) = guard.provider_session_id.clone() else {
+        let Some(id) = read_session_id(session_id) else {
             return;
         };
         (title, id)
@@ -943,7 +1051,7 @@ fn flush_title(state: &Mutex<IngestState>, context: &AdoptionContext) {
 
 /// Writes a rename noted after this session's record was written. The same two gates as
 /// `flush_title`: the record is on disk, and the Claude id is known.
-fn flush_name(state: &Mutex<IngestState>, context: &AdoptionContext) {
+fn flush_name(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, context: &AdoptionContext) {
     let (name, provider_session_id) = {
         let mut guard = state.lock().unwrap();
         if !guard.record_written {
@@ -952,7 +1060,7 @@ fn flush_name(state: &Mutex<IngestState>, context: &AdoptionContext) {
         let Some(name) = guard.pending_name.take() else {
             return;
         };
-        let Some(id) = guard.provider_session_id.clone() else {
+        let Some(id) = read_session_id(session_id) else {
             return;
         };
         (name, id)
@@ -989,13 +1097,13 @@ fn flush_name(state: &Mutex<IngestState>, context: &AdoptionContext) {
 /// write back on the UI thread, which is the one thing this whole arrangement exists to prevent.
 /// The cost is the design's own accepted one: a `kill -9`, a power loss or a close can lose the last
 /// turn. A is the fallback; B normally covers it.
-fn flush_history(state: &Mutex<IngestState>, context: &AdoptionContext) {
+fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, context: &AdoptionContext) {
     let (provider_session_id, user_prompts, transcript, tool_calls) = {
         let mut guard = state.lock().unwrap();
         if !guard.history_dirty || !guard.record_written {
             return;
         }
-        let Some(id) = guard.provider_session_id.clone() else {
+        let Some(id) = read_session_id(session_id) else {
             return;
         };
         // Cleared before the write, not after: a turn that completes while this one is writing must
@@ -1177,7 +1285,7 @@ pub(crate) mod tests {
         crate::state_dirs::redirect_state_to_a_test_root();
         let conversation_id = uuid::Uuid::new_v4().simple().to_string();
         let mut initial = state();
-        initial.provider_session_id = Some("sess-in-the-gap".to_string());
+        let session_id = Mutex::new(Some("sess-in-the-gap".to_string()));
         initial.record_written = false;
         initial.history_dirty = true;
         initial
@@ -1185,7 +1293,7 @@ pub(crate) mod tests {
             .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
         let state = Mutex::new(initial);
 
-        flush_history(&state, &adoption_context(&conversation_id));
+        flush_history(&state, &session_id, &adoption_context(&conversation_id));
 
         assert!(
             !crate::history::store::history_path(&conversation_id, "sess-in-the-gap")
@@ -1197,7 +1305,7 @@ pub(crate) mod tests {
         assert!(state.lock().unwrap().history_dirty);
 
         state.lock().unwrap().record_written = true;
-        flush_history(&state, &adoption_context(&conversation_id));
+        flush_history(&state, &session_id, &adoption_context(&conversation_id));
         assert!(crate::history::store::load(&conversation_id, "sess-in-the-gap").is_ok());
     }
 
@@ -1220,7 +1328,7 @@ pub(crate) mod tests {
         })
         .unwrap();
         let mut initial = state();
-        initial.provider_session_id = Some("sess-used".to_string());
+        let session_id = Mutex::new(Some("sess-used".to_string()));
         initial.record_written = true;
         initial.history_dirty = true;
         initial
@@ -1228,7 +1336,7 @@ pub(crate) mod tests {
             .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
         let state = Mutex::new(initial);
 
-        flush_history(&state, &adoption_context(&conversation_id));
+        flush_history(&state, &session_id, &adoption_context(&conversation_id));
 
         let record = crate::persistence::load_conversation_record(&conversation_id, "sess-used").unwrap();
         assert_ne!(record.updated_at, "1000", "the turn moved it");
@@ -1242,7 +1350,7 @@ pub(crate) mod tests {
         assert_eq!(record.name.as_deref(), Some("a name"));
 
         let moved = record.updated_at.clone();
-        flush_history(&state, &adoption_context(&conversation_id));
+        flush_history(&state, &session_id, &adoption_context(&conversation_id));
         let again = crate::persistence::load_conversation_record(&conversation_id, "sess-used").unwrap();
         assert_eq!(again.updated_at, moved, "nothing new was stored, so nothing moved");
     }
@@ -1296,7 +1404,6 @@ pub(crate) mod tests {
     fn state() -> IngestState {
         IngestState {
             projection: AgentSessionProjection::default(),
-            provider_session_id: None,
             lease: None,
             pending_ui: VecDeque::new(),
             resync_pending: false,
@@ -1756,5 +1863,111 @@ mod idle_wakeups {
         let pumps = provider.pumps.load(Ordering::Relaxed);
         ingest.stop();
         assert!(pumps >= 10, "asked only {pumps} times in 200 ms");
+    }
+}
+
+#[cfg(test)]
+mod guard_reentry {
+    use super::idle_wakeups::Quiet;
+    use super::*;
+    use std::time::Duration;
+
+    fn start(provider: Arc<Quiet>) -> ConversationIngest {
+        ConversationIngest::start(
+            provider,
+            "claude",
+            uuid::Uuid::new_v4().simple().to_string(),
+            "/tmp/ws".into(),
+            false,
+            None,
+            None,
+            AgentSessionProjection::default(),
+        )
+    }
+
+    /// Runs `f` on a thread of its own and waits for it, so a call that blocks on a lock its own
+    /// thread holds fails the test instead of hanging the run. `None` when it did not finish; the
+    /// thread is then left behind, stuck.
+    fn finishes<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<std::thread::Result<T>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+        });
+        rx.recv_timeout(Duration::from_secs(10)).ok()
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what} did not happen within 5 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The session id lives behind a lock of its own, so reading it while this thread holds the
+    /// projection returns, both for an id the conversation started with and for one the ingestion
+    /// thread adopted from a `SessionOpened`.
+    #[test]
+    fn the_session_id_can_be_read_under_the_projection_guard() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let provider = Arc::new(Quiet::default());
+        let ingest = start(provider.clone());
+        provider.queued.lock().unwrap().push(AgentDomainEvent::SessionOpened {
+            session_id: "verdandi-1".into(),
+            provider_session_id: "sess-adopted".into(),
+            model: "m".into(),
+            cwd: "/tmp/ws".into(),
+        });
+        wait_for("the adoption", || ingest.provider_session_id().is_some());
+        let read = finishes(move || {
+            let projection = ingest.projection();
+            let id = ingest.provider_session_id();
+            let folded = projection.provider_session_id.clone();
+            drop(projection);
+            (id, folded)
+        })
+        .expect("reading the session id under the projection guard never returned")
+        .expect("reading the session id under the projection guard panicked");
+        assert_eq!(read.0.as_deref(), Some("sess-adopted"));
+        assert_eq!(read.1.as_deref(), Some("sess-adopted"));
+    }
+
+    /// A second lock of the state from the thread that holds the projection would wait on itself
+    /// forever; in a debug build it panics at once, naming the call.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "fold_locally")]
+    fn folding_under_the_projection_guard_panics() {
+        let ingest = start(Arc::new(Quiet::default()));
+        let outcome = finishes(move || {
+            let _projection = ingest.projection();
+            ingest.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        });
+        if let Some(Err(payload)) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// What is refused is re-entering the same conversation: holding one conversation's projection
+    /// leaves every other conversation usable from the same thread, and once the guard is dropped
+    /// its own conversation is usable again.
+    #[test]
+    fn another_conversations_guard_does_not_stop_this_one() {
+        let held = start(Arc::new(Quiet::default()));
+        let other = start(Arc::new(Quiet::default()));
+        let outcome = finishes(move || {
+            let projection = held.projection();
+            other.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: "other".into() });
+            let _ = other.stats();
+            let _ = other.provider_session_id();
+            let prompts = other.projection().user_prompts.len();
+            drop(projection);
+            held.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: "held".into() });
+            let held_prompts = held.projection().user_prompts.len();
+            (prompts, held_prompts)
+        })
+        .expect("using another conversation under this one's projection guard never returned")
+        .expect("using another conversation under this one's projection guard panicked");
+        assert_eq!(outcome, (1, 1));
     }
 }

@@ -26,8 +26,10 @@ export function handoffBlockedReason(providerSessionId: string | null, turnInPro
 }
 
 type Props = {
-  /** Controlled by `App.tsx`'s `handoffOpen`: both entry points, `<leader>t` and the detail
-   *  popover's trailing row, are outside this component. `false` renders nothing. */
+  /** Controlled from `App.tsx`'s own `handoffOpen`, since
+   *  there is no permanently visible button left to hold `confirming` as this component's own state
+   *  any more -- the only entry points are `<leader>t` and the detail popover's trailing row, both
+   *  outside this component. `false` renders nothing at all. */
   open: boolean;
   /** `Esc`, or the confirmation's own Cancel button. Never called by this component on its own
    *  initiative otherwise -- in particular, NOT once `onHandoff` is pressed (see that button's own
@@ -49,9 +51,12 @@ type Props = {
   onHandoff: () => void;
 };
 
-/** Confirmation opened by `<leader>t` or the detail popover's trailing row.
- *  When `open` is false it renders nothing. Confirm before closing the conversation,
- *  because a backend without resume support cannot reopen it. */
+/** The confirmation `<leader>t` and the detail popover's trailing row both open -- there is no
+ *  separate "closed" idle state with its own button any more; `open` false
+ *  is that state, and it draws nothing.
+ *
+ * It confirms rather than acting because the action closes the conversation — on a backend with no
+ * resume, irreversibly. Stating that afterwards would be too late. */
 export function ContinueInTerminal({ open, onClose, providerSessionId, turnInProgress, canResume, handingOff, onHandoff }: Props) {
   const blocked = handingOff
     ? "This conversation is being closed — the command will appear here once that has finished."
@@ -91,9 +96,12 @@ export function ContinueInTerminal({ open, onClose, providerSessionId, turnInPro
   );
 }
 
-/** The command shown after the session has closed.
- * This path starts no terminal and takes no session lock. Present it as a manual command with
- * a concurrency warning: another process can resume the same session and write to the same transcript. */
+/** What the user is given once the session really has been closed.
+ *
+ * Every claim here is one the code can back. Eitri started no terminal and took no lock on this
+ * session: handing over the command instead of spawning the supported handoff wrapper is honest
+ * only when it is shown as the raw/manual path and carries a concurrency warning, and even the
+ * path that does hold a lease cannot promise more. So this says what is true and no more. */
 export function HandoffCommandCard({ handoff }: { handoff: HandoffCommand }) {
   return (
     // Same two-cell shape as the rest of the panel-as-document grid (panel-as-document task 3):

@@ -14,8 +14,9 @@ import typescript from "highlight.js/lib/languages/typescript";
 import yaml from "highlight.js/lib/languages/yaml";
 import { escapeText, isHiddenChar } from "./revealHidden";
 
-/* Register only the selected languages from `lib/core` to keep the single-file bundle small.
-   `tsx` aliases typescript, and TOML uses highlight.js's `ini` grammar. */
+/* The twelve languages the panel highlights, registered from `lib/core` rather than the default bundle
+   so the single-file `dist` carries these and not all 190. `tsx` is typescript's own alias, and
+   `toml` is highlight.js's `ini` grammar, which is what it ships for TOML. */
 for (const [name, language] of [
   ["rust", rust], ["typescript", typescript], ["javascript", javascript], ["python", python],
   ["go", go], ["lua", lua], ["bash", bash], ["json", json], ["toml", toml], ["yaml", yaml],
@@ -28,7 +29,7 @@ hljs.registerAliases(["js", "jsx"], { languageName: "javascript" });
 hljs.registerAliases(["sh", "shell", "zsh"], { languageName: "bash" });
 
 /* Exported so `highlightCoverage.test.ts` can run the SAME registered highlighter this module uses
-   internally, rather than a second copy of the registration
+   internally (the class-to-CSS coverage check), rather than a second copy of the registration
    block above drifting out of sync with this one. */
 export { hljs };
 
@@ -42,12 +43,19 @@ export { hljs };
    the flag). Confirmed by reproducing the failure first: without this flag every fenced block in
    `markdown.test.ts` rendered as an empty `<pre><code></code></pre>`. Re-check both this flag and
    the token shape if marked is upgraded. */
-/* Images inside link text, including badges and mixed content, must not render their own anchors.
-   Nested anchors are split into siblings by the HTML parser, making the image text point at the
-   image URL instead of the enclosing link. `linkDepth` tracks the synchronous inline parse so
-   the image renderer can detect an enclosing link, even through emphasis.
-   Save `defaultLink` before overriding it to retain marked's href cleaning and title handling.
-   `Renderer.prototype.link` already accepts an object argument, unlike code's legacy shim. */
+/* An image inside a link's text (the badge pattern
+   `[![badge](img-url)](real-url)`, or mixed content like `[see ![b](img)](real-url)`) must not
+   become the `image` renderer's own `<a>` (below) nested inside the `link` renderer's `<a>`. Left
+   as two overlapping anchors, an HTML parser splits them into SIBLINGS (the adoption agency
+   algorithm never lets an `<a>` nest inside another) -- reproduced in jsdom: the real link loses
+   the image's part of its text, and that part, visible and clickable, points at the image URL
+   instead. `linkDepth` is how `image` knows it is inside a link: `marked.parse` is synchronous and
+   links cannot nest (CommonMark), so a module counter the `link` renderer raises around its own
+   inline parse is exact, at any depth of emphasis in between. `defaultLink` is saved before
+   `marked.use()` overrides `link`, so `link` below can still call the REAL default implementation
+   (its href cleaning and its `title` handling stay marked's own) -- `Renderer.prototype.link` is
+   already written in the object-argument ("new renderer") shape `marked.d.ts` documents, so no
+   positional-args shim applies to it, unlike `code` below. */
 const defaultLink = Renderer.prototype.link;
 let linkDepth = 0;
 
@@ -112,11 +120,14 @@ marked.use({
         linkDepth -= 1;
       }
     },
-    /* Markdown images become plain links showing their alt text and full URL. The sanitizer
-       removes `img`, `picture` and `source` so remote images cannot fetch without a click; the
-       default image renderer would lose the URL entirely. DOMPurify sanitizes this renderer's
-       output like ordinary links, stripping disallowed `href` schemes without a separate
-       cleaning step. */
+    /* A markdown image is never loaded. `img`/`picture`/`source` are
+       dropped entirely by the sanitizer below (a remote pixel must not fetch with no click), so an
+       `![alt](url)` that reached the DEFAULT image renderer would just vanish -- losing the one
+       piece of information (the URL) a reader needs to judge whether to open it. This renderer
+       turns it into a plain link instead, showing the alt text and the full URL; DOMPurify still
+       runs on the result afterward (same order as `link` above and every other renderer here), so
+       an `href` scheme it doesn't allow (`javascript:`, …) is stripped exactly as it is for a
+       normal markdown link -- there is no separate cleaning step to keep in sync. */
     image({ href, text }: { href: string; title?: string | null; text: string }) {
       /* `text` (the alt) arrives ALREADY html-escaped -- marked's own tokenizer does it at token
          creation (`outputLink`'s image branch, `text: escape$1(text)`), unlike `href` and unlike
@@ -151,8 +162,9 @@ marked.use({
   },
 });
 
-/* Allow only classes emitted by this renderer. A reply must not retain `class="row row-current"`
-   or other panel classes, since DOMPurify otherwise preserves arbitrary class values. */
+/* Classes markdown.ts itself ever emits. A reply's own
+   `class="row row-current"` (a reply drawn as a fake panel row) or anything else copied from `index.css`
+   must not survive sanitizing -- DOMPurify's default `class` handling keeps any value verbatim. */
 const ALLOWED_CLASS_PREFIXES = ["hljs-", "language-"];
 const ALLOWED_CLASSES = new Set(["table-scroll"]);
 /* `code-escape` is kept only on a `<span>` whose whole text is an escape (`⟨U+XXXX⟩`), as the code
@@ -214,22 +226,42 @@ function installSanitizeHooks(): void {
   });
 }
 
-/* One configuration for reply sanitizing.
-   - Disable `data-` and `aria-` attributes so reply HTML cannot impersonate panel navigation
-     or rendering markers such as `data-nav-stop`, `data-nav-action`, `data-path` and `aria-current`.
-   - Forbid `id`, `name`, `role`, `form` and `formaction` separately: the prefix flags do not
-     cover them. They can imitate controls or redirect a real form submission.
-   - Forbid the `style` tag and attribute. The panel uses inline CSS, so its CSP allows inline
-     styles and cannot prevent a reply from painting over controls.
-   - Forbid media and embedded content that can load remote resources without a click.
-     Include MathML: its namespace permits resource-bearing elements and is not emitted here.
-     Markdown images become links in the image renderer before this sanitizer runs.
-   - Forbid `background`: DOMPurify allows it on table elements, and WebKitGTK turns it into
-     a CSS background image that loads without a click.
-   - Forbid `dialog`: its browser styles let an open dialog cover later rows, including
-     permission cards, without a style attribute. Keep its contents in the reply's normal flow.
-   - Forbid popover and command invoker attributes: their target ids could name panel controls.
-     Markdown does not emit these attributes. Forbid `tabindex` so replies cannot add Tab stops. */
+/* What a reply must not carry -- a fake panel row, an overlay, a zero-click remote load -- in one
+   config for the one `sanitize` call below.
+   - `ALLOW_DATA_ATTR: false` / `ALLOW_ARIA_ATTR: false`: a reply cannot carry `data-nav-stop`,
+     `data-nav-action`, `data-path`, `aria-current`, … -- the attributes the panel's own navigation
+     and rendering key off.
+   - `id`/`name`/`role`/`form`/`formaction`: not `data-`/`aria-` prefixed, so the two flags above
+     don't reach them; `role` alone is enough to fake a `role="button"` node, and `formaction` can
+     redirect a real `<form>` submit.
+   - `style` tag and attribute: forbidden outright (a styled reply can paint an overlay over the
+     panel) -- a CSP cannot do this job, because
+     the panel's own CSS is inline, so `style-src` must already allow it.
+   - `picture`/`source`/`video`/`audio`/`input`/`iframe`/`object`/`embed`/`svg`/`image`/`img`/`math`:
+     every zero-click remote-load vector that was reproduced, plus MathML (DOMPurify's default
+     profile allows the whole `math` namespace, including `<mglyph src=…>`; not itself reproduced as
+     a WebKitGTK load, but the same shape as the `svg image href` vector this list already closes,
+     and nothing here ever legitimately emits `<math>`). Markdown's own `![alt](url)` never
+     reaches this list -- the `image` renderer above turns it into a link before marked's output
+     ever gets here.
+   - `background`: the one FORBID_ATTR gap found after the rest of this list -- DOMPurify's
+     default allowlist keeps `background` on `table`/`tr`/`td`/`th`/`thead`/`tbody`/`tfoot` (an
+     https value passes its URI check too), and WebKitGTK maps it to a `background-image`
+     presentational hint, so it loads with no click, the same class of vector as the remote loads above.
+     Reproduced in jsdom: `<table background="https://…"><tr><td>x</td></tr></table>` and a `<td
+     background=…>` inside a real markdown table both kept the attribute unchanged before this.
+   - `dialog`: an overlay with no `style` at all. WebKitGTK's own UA stylesheet gives
+     it `position: absolute; inset-inline: 0; margin: auto; background-color: Canvas` and
+     `dialog[open] { display: block }`; `.row` and `.message-list` are not positioned, so an
+     `<dialog open>` in a reply lays out against `.agent-ui-scroller` and paints, opaque, over the
+     rows after it -- the real permission card included, which is the `style` overlay above rebuilt from
+     an allowed tag. Reproduced in jsdom: it came through unchanged, `open` and all. Its content
+     is kept, in flow, as the rest of the reply.
+   - `popover`/`popovertarget`/`popovertargetaction`/`commandfor`/`command`/`tabindex`:
+     each needs a click, an id or a Tab to do anything, but none is anything markdown emits,
+     and the invoker attributes name their target by id -- which could be one of the PANEL's own
+     ids, since only the reply's own `id`s are forbidden above. `tabindex` would make part of a
+     reply a stop for `Tab`, which is how the panel's own controls are reached. */
 /* What the reader sees is what a copy takes. A reply's own HTML can hold text that is in the DOM
    but not seen in three ways this list closes: a `hidden` attribute (a `<span hidden>` tail on a
    command), a collapsed `<details>` body, and a colour of its own -- `<font color>` matching the
@@ -297,14 +329,21 @@ export function markdownParseCount(): number {
 }
 
 /**
- * Convert Markdown to HTML, highlight it, then sanitize the complete output.
- * Highlighting emits spans around escaped text; DOMPurify must check that generated HTML too.
- * Sanitizing first would leave the highlighter's later output unchecked.
- * Keep the whole pipeline in one exported function so components cannot skip a step.
+ * Markdown to HTML, highlighted and then sanitized — in that order, deliberately.
  *
- * A bounded cache evicts in insertion order to avoid parsing every visible message on each j press.
- * `perf.test.tsx` measured 500 parses per press over 500 messages without caching.
- * Theme changes use CSS variables rather than changing this HTML, so cached strings stay valid.
+ * Highlighting BEFORE the sanitize is the safe order: highlight.js
+ * emits `<span class="hljs-*">` around text it has already escaped, and the whole document still
+ * passes through DOMPurify afterwards, so the existing security boundary does not move. Sanitizing
+ * first and highlighting after would hand highlight.js sanitized HTML to re-parse and put its
+ * output on the page unchecked.
+ *
+ * One function, exported from one module, so no component can do half of this.
+ *
+ * Memoized in a bounded, insertion-order-evicted cache. A `j` press re-renders the
+ * whole panel; before this, every visible message was re-parsed (marked + highlight.js +
+ * DOMPurify) on every press -- measured at 500 `marked.parse` calls per press over 500 messages
+ * (`perf.test.tsx`). The theme never changes this HTML (highlighting emits classes, colours come
+ * from CSS variables), so a cached string cannot go stale.
  */
 export const MARKDOWN_CACHE_LIMIT = 1000;
 const cache = new Map<string, string>();

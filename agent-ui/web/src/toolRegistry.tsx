@@ -406,11 +406,11 @@ export const TOOL_REGISTRY: Record<string, ToolRenderConfig> = {
     quiet: true,
     renderInvocation: (input) => <div className="tool-card tool-card-muted">ToolSearch {summarizeInput(input)}</div>,
   },
-  // Show a diff of `new_source` against empty text because the tool schema has no "before" field,
-  // as handled by `editPreview`.
+  // A real diff (its `new_source` against nothing -- the tool's own schema has no
+  // "before" field, see `editPreview`'s own doc), not just a one-line summary of the raw input.
   NotebookEdit: editConfig("NotebookEdit", "NotebookEdit", "notebook_path"),
   // Ordinary `tool_use` blocks named "Skill" -- no distinct wire event -- so this stays a
-  // rendering-layer special case.
+  // rendering-layer special case (kept out of `renderToolCall` itself, which stays tool-agnostic).
   Skill: {
     label: "Skill",
     renderInvocation: (input) => <div className="tool-card tool-card-skill">Used skill: {commandOf(input)}</div>,
@@ -652,22 +652,24 @@ function ChangedInputNote({ name, change }: { name: string; change: InputChange 
   );
 }
 
-/** `ToolResult` owns head/tail truncation so renderers do not duplicate it.
- * `opts.gated` hides invocation details already shown by the pending permission card.
- * Repeating a command or diff above a card asking to run it can make it look approved.
- * `opts.detailed` (`Ctrl+o`) widens the result's cut and never folds it.
- * `opts.expanded` is Enter's per-row toggle, used by `editConfig` to show the rest of a diff.
- * It defaults to `showResult` to preserve behaviour for callers passing only two arguments.
- * `opts.abandoned` tells `ToolResult` that a null result will never arrive.
- * `MessageList.tsx`'s `isAbandonedCall` determines this from state unavailable here. */
+/** `showResult` controls folding so long output need not push the conversation away.
+ *  `ToolResult` owns head/tail truncation; keep that logic on one shared path.
+ *  `opts.gated` hides invocation details already shown by the waiting card, avoiding a duplicate
+ *  command or diff that could look approved. `opts.detailed` (`Ctrl+o`) widens truncation and never folds.
+ *  `opts.expanded` is the per-row `Enter` toggle for diff lines and defaults to `showResult`
+ *  to preserve existing callers' behavior. `opts.abandoned` tells `ToolResult` that a null result
+ *  will never arrive. `MessageList.tsx`'s `isAbandonedCall` determines this from state held by the caller. */
 export function renderToolCall(
   call: ToolCallRecord,
   showResult = true,
   opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
-  // Pass `opts.detailed` through to `editConfig` so Ctrl+o widens Edit/Write/NotebookEdit diffs
-  // as well as `ToolResult`'s head/tail cut, even when the row is not expanded.
+  // `opts.detailed` (Ctrl+o) used to reach only `ToolResult`'s own head/tail
+  // cut, never `editConfig`'s `maxLines`, so a folded (unexpanded) Edit/Write/NotebookEdit row
+  // stayed folded even in the detailed view -- silently, since `EditDiff`'s own doc already
+  // promised "everywhere except the detailed view and an expanded row" (`editConfig`'s comment
+  // above). `Ctrl+o` now widens a diff exactly as it widens a `Bash`/`Read` result.
   const invocation = opts.gated ? (
     <div className="tool-card tool-card-gated">{call.name} · waiting for approval</div>
   ) : config ? (
@@ -713,8 +715,10 @@ export function renderToolCall(
   // of the same call. Rust supplies the text, shown muted beside the saved-rule note.
   const promptNote =
     call.promptNote === undefined ? null : <div className="tool-rule-note tool-prompt-note">{call.promptNote}</div>;
-  // A `Write`/`Edit`/`NotebookEdit` answered by the acceptEdits fast path shows a muted note.
-  // Saved rules never apply to these tools, so this note and `ruleNote` cannot both be present.
+  // A `Write`/`Edit`/`NotebookEdit` the acceptEdits fast path answered with no
+  // card says so, muted, the same way a rule-answered row does -- the two never both apply (no rule
+  // ever fires for these three tools, `agent::permission_policy`'s module doc), so this and
+  // `ruleNote` are never both non-null for the same call.
   const autoNote = call.allowedByAuto === true ? <div className="tool-rule-note">allowed by auto</div> : null;
   // The CLI refused this call on its own -- its auto-mode classifier, most often -- and the model was
   // told so in the call's error result. Muted like the notes above; the CLI's reason verbatim, and

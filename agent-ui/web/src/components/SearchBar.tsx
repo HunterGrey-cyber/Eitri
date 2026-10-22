@@ -13,8 +13,9 @@ type Props = {
   lead?: string;
   /** The box's accessible name. */
   label?: string;
-  /** Increment to return focus to an already open box when `:` or `/` is typed elsewhere.
-   *  The box also focuses on mount. A number keeps successive requests distinct. */
+  /** Bumped to hand the box the keys again while it is already open -- `:` or `/`
+   *  typed where the keys went instead (a click took them), which used to wipe the line and leave
+   *  them there. The box also takes them when it mounts. A number, so no request is coalesced away. */
   focusRequest?: number;
 };
 
@@ -56,8 +57,10 @@ export function SearchBar({
             e.stopPropagation();
             onCancel(e);
           } else if (isTab(e)) {
-            // Keep Tab in the command line so browser focus movement cannot expose permission actions to typing.
-            // Prevent the default focus move without stopping propagation, so the panel's typing guard still sees the key.
+            // Vim's command line never leaves on Tab (it completes there).
+            // The browser's own focus move put the keys on the band's button just after this box, so
+            // the line stayed drawn while BROWSE had them: `:`, Tab, `l`, Enter pressed Approve.
+            // Claimed and nothing else; not stopped, so the panel's typing guard still counts it.
             e.preventDefault();
           }
         }}

@@ -1,10 +1,14 @@
-/** Classifies failure text into a headline and remedy displayed above the unchanged raw text.
- *  Unknown failures return `null`, so callers show only the raw text.
+/** A pure classifier from a failure text (the failed tab's `failure`, or an
+ *  error row's raw text) to a headline and a remedy, drawn ABOVE that raw text, which always stays
+ *  -- the evidence is never hidden. An unrecognised failure returns `null`, and
+ *  callers must render exactly what they show today in that case: no headline, just the raw text.
  *
- *  Recognizers match diagnostic substrings or shapes from captured fixtures. The login recognizer
- *  uses the interactive authentication diagnostic; a logged-out sidecar fixture is not available.
- *  The in-range-but-untested compatibility warning stays in the header as `⚠` and must not match
- *  a startup-failure recognizer here. */
+ *  Every recognizer here matches on a substring or shape of a real, captured diagnostic (the two
+ *  fixtures under `fixtures/problems/`) or, for "not logged in", on Claude Code's own
+ *  documented interactive string, since a logged-out diagnostic was never captured. The sidecar's own "inside the supported range but
+ *  untested" compatibility diagnostic is deliberately NOT matched by anything here: it stays the
+ *  header's `⚠`, and this module has no rule that could catch it,
+ *  which is the point -- adding one would be the regression. */
 
 export type Problem = {
   headline: string;
@@ -145,8 +149,8 @@ const CLASSIFIERS: ((text: string, account: string | null) => Problem | null)[] 
   (text, account) => classifyNotLoggedIn(text, account),
 ];
 
-/** `account` adds its config directory to the login remedy. Other failure types ignore it,
- *  so callers that do not need that remedy may omit it. */
+/** `account` is only consulted by the "not logged in" row (which, with `--account`, also names the
+ *  account's config directory); every other caller may omit it. */
 export function classify(text: string, account: string | null = null): Problem | null {
   for (const classifier of CLASSIFIERS) {
     const problem = classifier(text, account);

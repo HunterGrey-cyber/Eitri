@@ -719,7 +719,7 @@ export function reviewTitle(envelope: ReviewEnvelope): string {
   return `review · turn ${envelope.current} of ${total}${span} · changed on disk during this turn`;
 }
 
-/** The lines the header shows under its title: the review's own notes, as Rust worded them, less the one
+/** The lines the header shows under its title: the notes Rust wrote for this turn review, in its words, less the one
  *  the title already says. Rust is the only source of these, so a mark is never said twice in two
  *  wordings, and a turn's state is described as it really is (an end snapshot that failed in this run is
  *  not "did not finish"). */

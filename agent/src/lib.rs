@@ -23,6 +23,7 @@ mod runtime_thread;
 mod session;
 #[cfg(not(feature = "legacy-backend"))]
 mod session_stub;
+mod steer_gate;
 /// Runs a test body under a chosen umask in a child copy of the test binary, so the process-wide
 /// umask is never changed while other tests create files.
 #[cfg(test)]
@@ -38,6 +39,7 @@ pub mod account;
 #[cfg(target_os = "linux")]
 pub mod child;
 pub mod external;
+pub mod external_link;
 pub mod external_writer;
 pub mod handoff;
 pub mod history;

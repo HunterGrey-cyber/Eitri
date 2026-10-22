@@ -12,7 +12,7 @@ function toolPrimary(name: string, input: unknown): string {
   return JSON.stringify(input, null, 2);
 }
 
-/** Text copied by `y`, ready to paste back. */
+/** What `y` copies: the text a person would paste back. */
 export function primaryText(item: TimelineItem): string {
   switch (item.kind) {
     case "prompt":

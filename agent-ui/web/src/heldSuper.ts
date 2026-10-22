@@ -1,9 +1,14 @@
-/** Tracks held Super/Hyper keys from their own keydown and keyup events. WebKitGTK 2.52.6
- *  reports neither metaKey nor getModifierState("Super"/"Hyper") on another key's event while
- *  Super is held. It does deliver the Super key's own events, so remembering them prevents
- *  Super+a from answering a permission card. A missed keyup can leave a key marked as held and
- *  cause answer keys to be refused. Resetting on blur and visibilitychange clears that state
- *  when focus moves away. */
+/** Whether a Super/Hyper key is physically held, tracked from that key's OWN keydown and keyup.
+ *
+ *  A 2026-09-28 sandbox pass answered the question `keymap.ts`'s `KeyLike` doc left open: WebKitGTK 2.52.6 never
+ *  reports a held Super on ANOTHER key's event -- `metaKey` is false and `getModifierState("Super"/"Hyper")` reads
+ *  false while Super is down, so `hasSuperOrHyper` alone let `Super+a` answer a permission card. What WebKitGTK does
+ *  deliver is the Super key's own keydown (`key: "Super"`, `code: "OSLeft"`) and keyup. So this module remembers it,
+ *  the way a terminal tracks a held modifier it cannot query.
+ *
+ *  A missed keyup (focus moved away with Super still down, as GNOME's own Super tap does when it opens
+ *  the overview) would leave this true, which only ever makes an answer key refuse -- the safe side --
+ *  and `reset` runs on every `blur` and `visibilitychange`, which that focus change also fires. */
 
 const SUPER_KEYS = new Set(["Super", "Hyper", "OS"]);
 const SUPER_CODES = new Set(["OSLeft", "OSRight", "MetaLeft", "MetaRight"]);
@@ -35,10 +40,12 @@ export function superHeld(): boolean {
   return held.size > 0;
 }
 
-/** Installs the listeners and returns their removal. `App.tsx` registers these at window
- *  capture in its first effect, before HINT's `swallowWhilePending` can hide Super's keydown.
- *  The shell filter in `shell/src/panel_super.rs` covers presses GTK claims before the page
- *  and Super still held when focus returns, wherever GDK reports it in the modifier state. */
+/** Installs the listeners and returns their removal. App.tsx calls this in its FIRST effect: capture
+ *  phase on the window, registered before HINT's `swallowWhilePending`, which stops a key's
+ *  propagation on that same tier and would otherwise hide Super's keydown from this.
+ *  What this cannot see -- a Super press GTK claims before the page gets it, or Super
+ *  still held when focus comes back -- is what the shell's own filter in front of the WebView covers
+ *  (`shell/src/panel_super.rs`), wherever GDK reports Super in its modifier state. */
 export function installHeldSuperTracking(doc: Document, win: Window): () => void {
   const down = (event: KeyboardEvent) => noteKey("keydown", event);
   const up = (event: KeyboardEvent) => noteKey("keyup", event);
