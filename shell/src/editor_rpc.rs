@@ -1,6 +1,7 @@
-//! [`EditorRpc`] over the editor this window embeds: a question for its nvim runs on a thread of
-//! its own (`NeovideEditorPane::exec_lua`), and the answer comes back through a [`Pending`] the
-//! panel polls from its tick. Nothing here waits.
+//! [`EditorRpc`] over the editor this window embeds: a question for its nvim goes to the nvim
+//! session's call line (`NeovideEditorPane::exec_lua`), which writes calls in the order they were
+//! made, and the answer comes back through a [`Pending`] the panel polls from its tick. Nothing here
+//! waits.
 
 use std::rc::Rc;
 
@@ -37,7 +38,7 @@ impl EditorRpc for EmbeddedEditorRpc {
             return Pending::failed(RpcError::Unavailable("the editor is not ready yet".to_owned()));
         }
         let (answer, pending) = Pending::pair();
-        // The reply runs on the call's own thread, so it holds only the `Send` answer.
+        // The reply runs on the call line's thread, so it holds only the `Send` answer.
         let reply = Box::new(move |result: Result<Value, String>| answer.send(result.map_err(RpcError::Nvim)));
         // editor-rpc-scan: forwards a caller's constant
         if self.pane.exec_lua(code, args, reply) {

@@ -22,6 +22,13 @@ beforeEach(() => {
   y = 0;
   x = 0;
   tops = new Map();
+  // Text fixtures have boxes unless CSS removes them; jsdom performs no layout.
+  vi.spyOn(Element.prototype, "getClientRects").mockImplementation(function (this: Element) {
+    for (let el: Element | null = this; el; el = el.parentElement) {
+      if (getComputedStyle(el).display === "none") return [] as unknown as DOMRectList;
+    }
+    return (getComputedStyle(this).display === "contents" ? [] : [rect(0)]) as unknown as DOMRectList;
+  });
   window.eitriPlugin = { call: vi.fn(async () => ({ rows: GENERIC_ROWS })), on: () => () => {} };
   Object.defineProperty(window, "scrollY", { configurable: true, get: () => y });
   // Reduced motion makes every scroll one instant write.
@@ -218,6 +225,33 @@ describe("visibility", () => {
     } finally {
       restore();
     }
+  });
+
+  it("a display: contents wrapper holding only text is searched where its parent is drawn", () => {
+    const restore = engineVisibility();
+    try {
+      const root = document.createElement("main");
+      const deep = '<span style="display: contents">'.repeat(12) + "alpha" + "</span>".repeat(12);
+      root.innerHTML = '<p><span style="display: contents">alpha</span></p><p>' + deep + "</p>" +
+        '<div style="display: none"><span style="display: contents">alpha</span></div>';
+      document.body.append(root);
+      const found = matchRanges(root, "alpha", undefined, "smart");
+      expect(found.map((range) => range.startContainer.parentElement!.tagName)).toEqual(["SPAN", "SPAN"]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("without checkVisibility an element's client rects decide whether its text is searched", () => {
+    // jsdom has no checkVisibility, so this is the path an engine without it takes.
+    expect(typeof (Element.prototype as Partial<HTMLElement>).checkVisibility).toBe("undefined");
+    const root = document.createElement("main");
+    root.innerHTML = '<p>alpha</p><div style="display: none"><p>alpha</p></div>' +
+      '<span style="display: contents">alpha</span><p class="boxless">alpha</p>';
+    document.body.append(root);
+    vi.spyOn(root.querySelector(".boxless")!, "getClientRects").mockImplementation(() => [] as unknown as DOMRectList);
+    const found = matchRanges(root, "alpha", undefined, "smart");
+    expect(found.map((range) => range.startContainer.parentElement!.tagName)).toEqual(["P", "SPAN"]);
   });
 });
 

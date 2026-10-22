@@ -29,9 +29,10 @@ pub(crate) static DEFAULT_CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::M
 pub use editor_area::PresentationCounts;
 pub use nvim_rpc::{CallWatch, NvimMode};
 
-/// What [`NeovideEditorPane::exec_lua`] calls with nvim's answer, on the call's own thread: the
+/// What [`NeovideEditorPane::exec_lua`] calls with nvim's answer, on the session's call thread: the
 /// value, or the error text (nvim's, or why the connection could not answer). It must not touch
-/// anything that belongs to the GTK thread.
+/// anything that belongs to the GTK thread, and must return at once: every other call of the
+/// session waits while it runs.
 pub type LuaReply = Box<dyn FnOnce(Result<rmpv::Value, String>) + Send + 'static>;
 pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
@@ -183,6 +184,9 @@ pub struct LiveSession {
     nvim_process: Arc<nvim_child::NvimProcess>,
     /// The last [`NeovideEditorPane::exec_lua_watched`] request and its watch (`nvim_rpc`).
     watched: Option<nvim_rpc::WatchedCall>,
+    /// Every request this session makes for a caller, written to nvim in the order they were made
+    /// (`nvim_rpc`'s module doc); started by the first one.
+    calls: std::cell::OnceCell<nvim_rpc::CallLine>,
     /// When the ending started, and on which schedule ([`NeovideEditorPane::end_nvim`]), so a
     /// second ending -- the window's shutdown after it -- keeps to the first one's schedule and
     /// starts no second watch.
@@ -235,10 +239,20 @@ impl LiveSession {
             last_logged_layout: Cell::new(None),
             nvim_process,
             watched: None,
+            calls: std::cell::OnceCell::new(),
             ending: Cell::new(None),
             unreachable_said: Cell::new(false),
             serial: NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// This session's call line, its thread started by the first call.
+    fn call_line(&self) -> std::io::Result<&nvim_rpc::CallLine> {
+        if let Some(line) = self.calls.get() {
+            return Ok(line);
+        }
+        let line = nvim_rpc::CallLine::start("calls")?;
+        Ok(self.calls.get_or_init(|| line))
     }
 
     /// Whether the harness reports an exit while nvim's own process is still alive.
@@ -1931,10 +1945,12 @@ impl NeovideEditorPane {
 
     /// Has nvim run `code` through `nvim_exec_lua` -- an RPC request, never typed keys, so a key nvim
     /// is waiting for (after `f`, inside `getchar()`) cannot swallow it (`nvim_rpc`'s module doc) --
-    /// made from a thread of its own, returning at once. Until the request comes back, a second thread
-    /// asks nvim's fast `nvim_get_mode` every 250 ms, so a host can tell an nvim showing a dialog from
-    /// one whose loop is stuck ([`watched_call`](Self::watched_call)). Replaces the previous watch
-    /// (whose request still runs to its end). `false`, sending nothing, when nvim is not running.
+    /// handed to the session's call line, returning at once: it is written after every
+    /// [`exec_lua`](Self::exec_lua) call made before it, without waiting for their answers. Until the
+    /// request comes back, a thread of its own asks nvim's fast `nvim_get_mode` every 250 ms, so a
+    /// host can tell an nvim showing a dialog from one whose loop is stuck
+    /// ([`watched_call`](Self::watched_call)). Replaces the previous watch (whose request still runs
+    /// to its end). `false`, sending nothing, when nvim is not running.
     pub fn exec_lua_watched(&self, code: &str) -> bool {
         let mut live = self.live_state.borrow_mut();
         let LiveState::Ready(session) = &mut *live else {
@@ -1950,7 +1966,7 @@ impl NeovideEditorPane {
         let call = {
             let nvim = nvim.clone();
             let code = code.to_owned();
-            move || async move {
+            async move {
                 match nvim.exec_lua(&code, vec![]).await {
                     Ok(_) => {
                         println!("[live] exec_lua_watched: the Lua returned");
@@ -1974,7 +1990,10 @@ impl NeovideEditorPane {
                 ))
             }
         };
-        match nvim_rpc::WatchedCall::start("exec_lua", call, probe) {
+        let started = session
+            .call_line()
+            .and_then(|line| nvim_rpc::WatchedCall::start(line, "exec_lua", call, probe));
+        match started {
             Ok(watched) => {
                 session.watched = Some(watched);
                 // Buys one service run and one frame (the tick starts); nothing in `service` reads
@@ -1989,35 +2008,41 @@ impl NeovideEditorPane {
         }
     }
 
-    /// `nvim_exec_lua(code, args)` on a thread of its own; `reply` runs on that thread once nvim
-    /// answered (or the connection ended). `false`, `reply` dropped uncalled, when nvim is not
-    /// running or the thread could not start.
+    /// `nvim_exec_lua(code, args)` handed to the session's call line: written to nvim after every
+    /// call this pane made before it (this and [`exec_lua_watched`](Self::exec_lua_watched)), and
+    /// without waiting for their answers; nvim runs them in that order. `reply` runs on the line's
+    /// thread once nvim answered (or the connection ended). `false`, `reply` dropped uncalled and
+    /// nothing sent, when nvim is not running or the line's thread could not start.
     ///
-    /// The thread lives until nvim answers, which may be long: nvim queues a request while it
-    /// waits for a key, and answers after the key. So a caller keeps at most one call outstanding
-    /// for each thing it asks. Unlike [`exec_lua_watched`](Self::exec_lua_watched) this keeps no
-    /// record in the session and starts no watch: the quit and its watch stay the window's own.
+    /// nvim may take long to answer: it queues a request while it waits for a key, and answers
+    /// after the key. A call nobody waits for any more stays on the line until then, costing no
+    /// thread of its own, and every later call is still written behind it. Unlike
+    /// [`exec_lua_watched`](Self::exec_lua_watched) this keeps no record in the session and starts no
+    /// watch: the quit and its watch stay the window's own.
     pub fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>, reply: LuaReply) -> bool {
-        let nvim = {
-            let live = self.live_state.borrow();
-            let LiveState::Ready(session) = &*live else {
-                return false;
-            };
-            if session.harness.has_neovim_exited() {
+        let live = self.live_state.borrow();
+        let LiveState::Ready(session) = &*live else {
+            return false;
+        };
+        if session.harness.has_neovim_exited() {
+            return false;
+        }
+        let Some(nvim) = session.harness.neovim_handler().clone_current_neovim() else {
+            return false;
+        };
+        let line = match session.call_line() {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("[live] exec_lua: could not start the call line's thread ({err}) -- nothing sent");
                 return false;
             }
-            let Some(nvim) = session.harness.neovim_handler().clone_current_neovim() else {
-                return false;
-            };
-            nvim
         };
         let call = async move { nvim.exec_lua(code, args).await.map_err(|e| e.to_string()) };
-        match nvim_rpc::spawn_answered("exec_lua", call, reply) {
-            Ok(()) => true,
-            Err(err) => {
-                eprintln!("[live] exec_lua: could not start its thread ({err}) -- nothing sent");
-                false
-            }
+        if line.submit(call, reply) {
+            true
+        } else {
+            eprintln!("[live] exec_lua: the call line's thread is gone -- nothing sent");
+            false
         }
     }
 

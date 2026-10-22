@@ -34,18 +34,20 @@ use super::theme::PageTheme;
 use super::trace;
 use crate::editor_rpc::EditorRpc;
 use crate::keymap::{Chord, KeySpec};
-use crate::nvim_rpc::Pending;
+use crate::nvim_rpc;
 
 /// How long an editor call may take before the page is told the editor is busy.
 pub const EDITOR_DEADLINE: Duration = Duration::from_secs(5);
 /// How often a pending editor answer is looked at, by a one-shot timer, while one is outstanding.
 pub const EDITOR_POLL: Duration = Duration::from_millis(20);
-/// How often an assist call the page has already been told about is looked at: it stays tracked until the
-/// editor answers, so the calls behind it never overtake it, but nobody is waiting on it any more.
-pub const EDITOR_LATE_POLL: Duration = Duration::from_millis(250);
+/// How often a follow call past its deadline is looked at. The follow sends one call at a time, so it waits
+/// for that answer before its next call, but no page waits on it any more.
+pub const FOLLOW_LATE_POLL: Duration = Duration::from_millis(250);
 /// How long a page-supplied path (or a task's program and working directory) may take to check before the
 /// page is told the filesystem did not answer.
 pub const CHECK_DEADLINE: Duration = Duration::from_secs(5);
+/// How long a store operation (`state.*`, `log.*`) may take before the page is told the store did not answer.
+pub const STORE_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a key sequence waits for its next key until the editor reports its own `timeoutlen`: vim's
 /// default.
 pub const DEFAULT_TIMEOUTLEN: u32 = 1000;
@@ -66,6 +68,76 @@ pub trait LayoutPort {
     fn focus(&self, target: FocusTarget) -> Result<(), String>;
 }
 
+/// A request the page is still owed an answer for, in whichever line it waits: the editor's calls, the assist
+/// line, the path checks, the store, the follow queue. Each has a deadline, so no page waits on the host for
+/// good.
+struct Pending<T> {
+    /// The page's id: `None` for a request the host made on its own (the clear when the plugin stops), and
+    /// once the page has had its answer.
+    re: Option<u64>,
+    /// The document that asked: an answer goes to it only, never to one that replaced it.
+    document: u64,
+    /// When the page is told the request took too long, if nothing has answered it by then.
+    deadline: Instant,
+    on: T,
+}
+
+impl<T> Pending<T> {
+    fn new(re: Option<u64>, document: u64, deadline: Instant, on: T) -> Pending<T> {
+        Pending {
+            re,
+            document,
+            deadline,
+            on,
+        }
+    }
+}
+
+/// Who an answer may still reach: the current document, unless the window is closing.
+#[derive(Debug, Clone, Copy)]
+struct Audience {
+    document: u64,
+    closed: bool,
+}
+
+/// The one place a request's answer is sent or dropped. A request whose document has been replaced, or one
+/// still owed when the window is closing, loses its id here with one log line (the work it asked for is not
+/// undone). Otherwise `answer` gives the reply: `Some` sends it and spends the id, so no request is answered
+/// twice; `None` leaves it owed.
+fn answer_or_drop<T>(
+    plugin: &str,
+    audience: Audience,
+    pending: &mut Pending<T>,
+    answer: impl FnOnce(u64) -> Option<Reply>,
+    replies: &mut Vec<Reply>,
+) {
+    let Some(re) = pending.re else { return };
+    if audience.closed || pending.document != audience.document {
+        pending.re = None;
+        let reason = if audience.closed {
+            "the window is closing"
+        } else {
+            "the requesting document was replaced"
+        };
+        log_dropped_reply(plugin, re, reason);
+        return;
+    }
+    if let Some(reply) = answer(re) {
+        pending.re = None;
+        replies.push(reply);
+    }
+}
+
+fn log_dropped_reply(plugin: &str, re: u64, reason: &str) {
+    eprintln!("[plugin {plugin}] dropped reply {re}: {reason}");
+}
+
+/// The owed request with page id `re`, taken out of `owed`.
+fn take_owed(owed: &mut Vec<Pending<()>>, re: u64) -> Option<Pending<()>> {
+    let at = owed.iter().position(|p| p.re == Some(re))?;
+    Some(owed.remove(at))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
     Open,
@@ -74,29 +146,19 @@ enum Call {
 }
 
 struct EditorCall {
-    /// `None` for a call the host made on its own (the clear when the plugin stops): nobody is answered.
-    re: Option<u64>,
     call: Call,
-    pending: Pending,
-    deadline: Instant,
-    /// The document that asked; its answer is dropped once another document has replaced it.
-    document: u64,
+    answer: nvim_rpc::Pending,
 }
 
-/// An assist call waiting for the one before it to be answered.
+/// An assist call waiting behind an apply whose root is still being checked.
 ///
-/// The editor runs every request on a thread of its own, so two requests sent back to back may reach nvim in
-/// either order: a clear that overtakes the apply it was meant to undo clears nothing, and the apply then
-/// installs settings no one will ever clear. Assist calls are therefore sent one at a time, each after the
-/// previous one has been answered (or has run out its deadline).
-struct ParkedAssist {
-    /// `None` for a call the host made on its own, or once the page has been told the editor is busy.
-    re: Option<u64>,
-    op: AssistOp,
-    deadline: Instant,
-    document: u64,
-}
-
+/// The editor writes calls in the order they were made (`EditorRpc`'s doc), so an assist call goes out as
+/// soon as nothing ahead of it is still being checked, whether or not the calls before it have been
+/// answered: a clear made after an apply reaches nvim after it and undoes it. In the rare case the embedded
+/// editor writes two of them swapped, each carries the order it was made in and the snippet skips one older
+/// than a call it has already run (`editor::assist_apply`), so the call made last is still the one in force.
+/// Only the check, which runs on the path checker's thread, can take longer than the calls made after it;
+/// the assist line keeps their order across it.
 enum AssistOp {
     /// An apply whose root is still being checked: it holds its place in line, and nothing behind it is sent
     /// until it is either an `Apply` or gone.
@@ -257,25 +319,18 @@ impl PathChecker {
     }
 }
 
-/// The one follow call out to the editor: the host's own (install, follow, text, teardown) or a page's.
+/// The one follow call out to the editor: the host's own (install, follow, text, teardown) or a page's. Its
+/// document is the one that was current when it was sent; a text or a reply for another one is dropped.
 struct FollowCall {
     op: FollowOp,
-    pending: Pending,
-    deadline: Instant,
+    answer: nvim_rpc::Pending,
     /// The editor session it was sent to; a call to an earlier session is given up, not waited for.
     session: Option<u64>,
-    /// The document that was current when it was sent; a text or a reply for another one is dropped.
-    document: u64,
-    /// The page's id for a page's call, until it has been answered (or told the editor is busy).
-    re: Option<u64>,
 }
 
-/// An `editor.open` or `task.start` waiting for its check.
+/// An `editor.open`, `editor.open_link` or `task.start` waiting for its check.
 struct Checking {
     ticket: u64,
-    re: u64,
-    document: u64,
-    deadline: Instant,
     then: Then,
 }
 
@@ -311,15 +366,20 @@ struct PluginHostState {
     layout: Option<Rc<dyn LayoutPort>>,
     tasks: TaskRunner,
     store: Option<StoreWorker>,
-    /// The store worker carries a ticket rather than the page's id: ticket -> (document, the page's id).
-    store_waiting: BTreeMap<u64, (u64, u64)>,
+    /// The store worker carries a ticket rather than the page's id: ticket -> the request.
+    store_waiting: BTreeMap<u64, Pending<()>>,
+    /// How long a store operation may take; `STORE_DEADLINE` unless a test shortened it.
+    store_deadline: Duration,
+    /// Handed to the store worker when it starts: each operation then waits for one message (tests only).
+    store_gate: Option<mpsc::Receiver<()>>,
     next_ticket: u64,
-    calls: Vec<EditorCall>,
+    calls: Vec<Pending<EditorCall>>,
     /// An assist was sent and not cleared since.
     assisted: bool,
-    parked: VecDeque<ParkedAssist>,
+    /// Assist calls waiting behind an apply whose root is still being checked, in the order they were asked.
+    parked: VecDeque<Pending<AssistOp>>,
     checker: Option<PathChecker>,
-    checking: Vec<Checking>,
+    checking: Vec<Pending<Checking>>,
     /// Handed to the checker when it starts: each check then waits for one message (tests only).
     check_gate: Option<mpsc::Receiver<()>>,
     /// Whether the page's module holds the keys of an active window, as the window last said.
@@ -339,7 +399,11 @@ struct PluginHostState {
     declared: Option<Vec<EffectiveRow>>,
     /// What to ask nvim next for a page that follows the editor's buffer.
     follow: FollowState,
-    follow_call: Option<FollowCall>,
+    follow_call: Option<Pending<FollowCall>>,
+    /// The page's reveals, jumps and links waiting in the follow queue: the queue sends one call at a time and
+    /// waits for its answer, so they are owed their answer here, by their own deadline, however long the call
+    /// ahead of them takes.
+    follow_owed: Vec<Pending<()>>,
     /// The window's follow socket: until it is given, nothing of the follow state reaches nvim (an install
     /// needs somewhere to report to).
     follow_socket: Option<PathBuf>,
@@ -536,6 +600,8 @@ impl PluginHost {
             tasks: TaskRunner::new(wake.clone()),
             store: None,
             store_waiting: BTreeMap::new(),
+            store_deadline: STORE_DEADLINE,
+            store_gate: None,
             next_ticket: 1,
             calls: Vec::new(),
             assisted: false,
@@ -553,6 +619,7 @@ impl PluginHost {
             declared: None,
             follow: FollowState::new(),
             follow_call: None,
+            follow_owed: Vec::new(),
             follow_socket: None,
             scratch_dir: None,
             page_follows_document: None,
@@ -738,6 +805,68 @@ impl PluginHost {
         tx
     }
 
+    /// Holds every store operation until the returned sender sends one message for it, so a test can stand in
+    /// for a lock another window holds or a disk that does not answer. Dropping the sender lets every operation
+    /// through. Must be called before the first store operation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn gate_store(&self) -> mpsc::Sender<()> {
+        let (tx, rx) = mpsc::channel();
+        self.state.borrow_mut().store_gate = Some(rx);
+        tx
+    }
+
+    /// How long a store operation may take before the page is told it did not answer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_store_deadline(&self, deadline: Duration) {
+        self.state.borrow_mut().store_deadline = deadline;
+    }
+
+    /// Who an answer may reach now.
+    fn audience(&self) -> Audience {
+        let st = self.state.borrow();
+        Audience {
+            document: st.document,
+            closed: st.closed,
+        }
+    }
+
+    /// Sends what a step owes the page, in order.
+    fn send_replies(&self, replies: Vec<Reply>) {
+        for reply in replies {
+            self.reply(reply);
+        }
+    }
+
+    /// Puts a page's reveal, jump or link in the follow queue, owed its answer by `deadline`. Returns what the
+    /// page is still owed for the reveal it replaced, if any.
+    fn park_page_op(&self, op: FollowOp, re: u64, deadline: Instant) -> Option<Pending<()>> {
+        let mut st = self.state.borrow_mut();
+        let replaced = st.follow.park(op);
+        let document = st.document;
+        st.follow_owed.push(Pending::new(Some(re), document, deadline, ()));
+        replaced.and_then(|old| take_owed(&mut st.follow_owed, old))
+    }
+
+    /// Tells the page about each reveal, jump or link still in the follow queue past its deadline. The op keeps
+    /// its place and is still sent; its answer then goes to nobody.
+    fn expire_follow_owed(&self, now: Instant, replies: &mut Vec<Reply>) {
+        let audience = self.audience();
+        let mut st = self.state.borrow_mut();
+        st.follow_owed.retain_mut(|owed| {
+            if now < owed.deadline {
+                return true;
+            }
+            answer_or_drop(
+                self.id(),
+                audience,
+                owed,
+                |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY)),
+                replies,
+            );
+            false
+        });
+    }
+
     /// Hands a check to the worker; the ticket names its answer.
     fn submit_check(&self, job: CheckJob) -> Result<u64, String> {
         let mut st = self.state.borrow_mut();
@@ -761,13 +890,12 @@ impl PluginHost {
         };
         let mut st = self.state.borrow_mut();
         let document = st.document;
-        st.checking.push(Checking {
-            ticket,
-            re,
+        st.checking.push(Pending::new(
+            Some(re),
             document,
-            deadline: now + CHECK_DEADLINE,
-            then,
-        });
+            now + CHECK_DEADLINE,
+            Checking { ticket, then },
+        ));
         None
     }
 
@@ -1079,31 +1207,33 @@ impl PluginHost {
         if !changed {
             return;
         }
-        let (stale, waiting, current) = {
+        let audience = self.audience();
+        let (stale, waiting) = {
             let mut st = self.state.borrow_mut();
             // Buffer numbers and ticks belong to one nvim.
             st.view = None;
             st.last_text = None;
-            let stale = st.follow_call.take_if(|c| c.session != target);
+            let stale = st.follow_call.take_if(|c| c.on.session != target);
             // A reveal, jump or link still in line names the old editor's buffers (or was asked of it): sent to
             // the next one, it could move another buffer's cursor or open a file the user has moved on from.
-            let waiting = st.follow.drop_page_ops();
-            (stale, waiting, st.document)
+            let waiting: Vec<Pending<()>> = st
+                .follow
+                .drop_page_ops()
+                .into_iter()
+                .filter_map(|re| take_owed(&mut st.follow_owed, re))
+                .collect();
+            (stale, waiting)
         };
-        if let Some(call) = stale {
-            if let Some(re) = call.re {
-                if call.document == current {
-                    self.reply(Reply::err(re, ErrorCode::EditorUnavailable, "the editor restarted"));
-                } else {
-                    self.log_dropped_reply(re, "the requesting document was replaced");
-                }
-            }
+        let restarted = |re| Some(Reply::err(re, ErrorCode::EditorUnavailable, "the editor restarted"));
+        let mut replies = Vec::new();
+        if let Some(mut call) = stale {
+            answer_or_drop(self.id(), audience, &mut call, restarted, &mut replies);
             self.state.borrow_mut().follow.done(Done::Failed, now);
         }
-        // Every op in line was asked by the current document: a replaced one's are dropped when it goes.
-        for re in waiting {
-            self.reply(Reply::err(re, ErrorCode::EditorUnavailable, "the editor restarted"));
+        for mut owed in waiting {
+            answer_or_drop(self.id(), audience, &mut owed, restarted, &mut replies);
         }
+        self.send_replies(replies);
     }
 
     fn follow_failed(&self, what: &str, why: &str) {
@@ -1120,44 +1250,47 @@ impl PluginHost {
     }
 
     /// Takes the follow call's answer if it has come, tells a page past the deadline that the editor is busy,
-    /// and keeps a late call tracked so nothing overtakes it.
+    /// and keeps a late call tracked: the follow sends its next call only once this one is answered, so an
+    /// nvim held in a prompt is not sent a call every few seconds.
     fn take_follow_answer(&self, now: Instant, replies: &mut Vec<Reply>) {
+        let audience = self.audience();
         let taken = {
             let mut st = self.state.borrow_mut();
-            let current = st.document;
             let Some(call) = st.follow_call.as_mut() else { return };
-            if call.document != current {
-                if let Some(re) = call.re.take() {
-                    self.log_dropped_reply(re, "the requesting document was replaced");
-                }
-            }
-            match call.pending.try_take() {
+            // A replaced document's id is let go at once; the call itself stays tracked until nvim answers.
+            answer_or_drop(self.id(), audience, call, |_| None, replies);
+            match call.on.answer.try_take() {
                 Some(answer) => st.follow_call.take().map(|call| (call, answer)),
                 None => {
                     if now >= call.deadline {
-                        if let Some(re) = call.re.take() {
-                            replies.push(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY));
-                        }
+                        answer_or_drop(
+                            self.id(),
+                            audience,
+                            call,
+                            |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY)),
+                            replies,
+                        );
                     }
                     None
                 }
             }
         };
-        let Some((call, answer)) = taken else { return };
-        let current = self.state.borrow().document;
+        let Some((mut call, answer)) = taken else { return };
         let done = match answer {
             Ok(value) => {
                 let in_time = now < call.deadline;
-                self.follow_answered(&call, &value, call.document == current, in_time, replies)
+                let current = call.document == audience.document;
+                self.follow_answered(&mut call, audience, &value, current, in_time, replies)
             }
             Err(e) => {
-                if let Some(re) = call.re {
-                    replies.push(Reply::err(
+                let unavailable = |re| {
+                    Some(Reply::err(
                         re,
                         ErrorCode::EditorUnavailable,
                         &format!("the editor could not be asked: {e}"),
-                    ));
-                }
+                    ))
+                };
+                answer_or_drop(self.id(), audience, &mut call, unavailable, replies);
                 self.follow_failed("a follow call failed", &e.to_string());
                 Done::Failed
             }
@@ -1172,13 +1305,16 @@ impl PluginHost {
     /// still is, `in_time` whether the answer was taken before the call's deadline.
     fn follow_answered(
         &self,
-        call: &FollowCall,
+        call: &mut Pending<FollowCall>,
+        audience: Audience,
         value: &rmpv::Value,
         current: bool,
         in_time: bool,
         replies: &mut Vec<Reply>,
     ) -> Done {
-        match &call.op {
+        // A copy, so the page's answer below can be given through `answer_or_drop`, which takes the call.
+        let op = call.on.op.clone();
+        match &op {
             FollowOp::Install => match editor::read_installed(value) {
                 Ok(installed) if installed.early => Done::Early,
                 Ok(installed) => {
@@ -1272,7 +1408,7 @@ impl PluginHost {
             },
             FollowOp::Reveal { line, .. } | FollowOp::Jump { line, .. } => {
                 let applied = read_applied(value);
-                let (event, focus) = match &call.op {
+                let (event, focus) = match &op {
                     FollowOp::Jump { focus, .. } => ("jump", *focus),
                     _ => ("reveal", false),
                 };
@@ -1290,21 +1426,23 @@ impl PluginHost {
                         }
                     }
                 }
-                if let Some(re) = call.re {
-                    replies.push(match applied {
+                let answer = |re| {
+                    Some(match applied {
                         Ok(applied) => Reply::ok(re, json!({ "applied": applied })),
                         Err(why) => Reply::err(re, ErrorCode::Io, &why),
-                    });
-                }
+                    })
+                };
+                answer_or_drop(self.id(), audience, call, answer, replies);
                 Done::Other
             }
             FollowOp::OpenLink { .. } => {
-                if let Some(re) = call.re {
-                    replies.push(match decode_open(value) {
+                let answer = |re| {
+                    Some(match decode_open(value) {
                         Ok(opened) => Reply::ok(re, json!({ "how": opened.how, "line": opened.line })),
                         Err(why) => Reply::err(re, ErrorCode::Io, &why),
-                    });
-                }
+                    })
+                };
+                answer_or_drop(self.id(), audience, call, answer, replies);
                 Done::Other
             }
             FollowOp::Teardown => Done::Other,
@@ -1353,7 +1491,7 @@ impl PluginHost {
         };
         let session = editor.target();
         let id = self.id();
-        let (pending, re) = match &op {
+        let (answer, re) = match &op {
             FollowOp::Install => {
                 let (socket, scratch_dir) = {
                     let st = self.state.borrow();
@@ -1403,20 +1541,21 @@ impl PluginHost {
         };
         let mut st = self.state.borrow_mut();
         let document = st.document;
-        st.follow_call = Some(FollowCall {
-            op,
-            pending,
-            deadline: now + EDITOR_DEADLINE,
-            session,
-            document,
-            re,
-        });
+        // A page's op keeps what is left of its own deadline; one whose page was already told the editor is busy
+        // goes out owing nobody.
+        let owed = re.and_then(|re| take_owed(&mut st.follow_owed, re));
+        let (re, deadline) = match owed {
+            Some(owed) => (owed.re, owed.deadline),
+            None => (None, now + EDITOR_DEADLINE),
+        };
+        st.follow_call = Some(Pending::new(re, document, deadline, FollowCall { op, answer, session }));
         None
     }
 
     /// The follow state's part of `pump`: the session check, the answer, the next call. Returns when to run
     /// again. Nothing reaches nvim before the window has given the follow socket.
     fn pump_follow(&self, now: Instant, replies: &mut Vec<Reply>) -> Option<Instant> {
+        self.expire_follow_owed(now, replies);
         let fed = self.state.borrow().follow_socket.is_some();
         if !fed {
             return None;
@@ -1428,7 +1567,7 @@ impl PluginHost {
         match &st.follow_call {
             Some(call) => Some(
                 now + if now >= call.deadline {
-                    EDITOR_LATE_POLL
+                    FOLLOW_LATE_POLL
                 } else {
                     EDITOR_POLL
                 },
@@ -1450,12 +1589,15 @@ impl PluginHost {
             st.follow.page_forgot();
             // What the old one asked of the editor and is still waiting in line is not sent: its answer would
             // carry an id the new document may be using for something else.
-            let dropped = st.follow.drop_page_ops();
-            (st.follow_socket.is_some(), dropped)
+            st.follow.drop_page_ops();
+            (st.follow_socket.is_some(), std::mem::take(&mut st.follow_owed))
         };
-        for re in dropped {
-            self.log_dropped_reply(re, "the requesting document was replaced");
+        let audience = self.audience();
+        let mut replies = Vec::new();
+        for mut owed in dropped {
+            answer_or_drop(self.id(), audience, &mut owed, |_| None, &mut replies);
         }
+        self.send_replies(replies);
         if follows {
             (self.wake)();
         }
@@ -1471,10 +1613,6 @@ impl PluginHost {
 
     fn reply(&self, reply: Reply) {
         self.page.send(&reply.to_text());
-    }
-
-    fn log_dropped_reply(&self, re: u64, reason: &str) {
-        eprintln!("[plugin {}] dropped reply {re}: {reason}", self.id());
     }
 
     pub fn page_message(&self, raw: &str, now: Instant) {
@@ -1519,6 +1657,8 @@ impl PluginHost {
                 // before the first event.
                 self.reply(self.hello(re));
                 self.send_focus();
+                // A run may have ended while the document was loading, with no later output to wake us.
+                (self.wake)();
                 None
             }
             Verb::KeysDeclare(args) => Some(self.keys_declare(re, args.rows)),
@@ -1546,13 +1686,14 @@ impl PluginHost {
             Verb::EditorAssist(args) => self.editor_assist(re, &args.root, args.diagnostics, args.inlay_hints, now),
             Verb::EditorAssistClear(_) => self.editor_clear(Some(re), now),
             Verb::LayoutFocus(args) => Some(self.focus(re, args.target)),
-            Verb::StateRead(args) => self.store_op(re, StoreOp::Read { key: args.key }),
+            Verb::StateRead(args) => self.store_op(re, StoreOp::Read { key: args.key }, now),
             Verb::StateWrite(args) => self.store_op(
                 re,
                 StoreOp::Write {
                     key: args.key,
                     value: args.value,
                 },
+                now,
             ),
             Verb::LogAppend(args) => self.store_op(
                 re,
@@ -1560,6 +1701,7 @@ impl PluginHost {
                     stream: args.stream,
                     items: args.items,
                 },
+                now,
             ),
             Verb::LogRead(args) => self.store_op(
                 re,
@@ -1567,10 +1709,11 @@ impl PluginHost {
                     stream: args.stream,
                     from: args.from,
                 },
+                now,
             ),
             Verb::EditorFollow(_) => self.editor_follow(re),
-            Verb::EditorReveal(args) => self.editor_reveal(re, args),
-            Verb::EditorJump(args) => self.editor_jump(re, args),
+            Verb::EditorReveal(args) => self.editor_reveal(re, args, now),
+            Verb::EditorJump(args) => self.editor_jump(re, args, now),
             Verb::EditorOpenLink(args) => self.editor_open_link(re, args, now),
         }
     }
@@ -1614,40 +1757,51 @@ impl PluginHost {
         self.state.borrow().view.as_ref().is_some_and(|v| v.buf == buf)
     }
 
-    fn editor_reveal(&self, re: u64, args: EditorReveal) -> Option<Reply> {
+    fn editor_reveal(&self, re: u64, args: EditorReveal, now: Instant) -> Option<Reply> {
         if let Some(refused) = self.follow_verb_refusal(re, "editor.reveal", args.check()) {
             return Some(refused);
         }
         if !self.is_followed(args.buf) {
             return Some(Reply::ok(re, json!({ "applied": false })));
         }
-        let replaced = self.state.borrow_mut().follow.park(FollowOp::Reveal {
+        let op = FollowOp::Reveal {
             buf: args.buf,
             line: args.line,
             token: args.token,
             re,
-        });
-        if let Some(old) = replaced {
-            self.reply(Reply::ok(old, json!({ "applied": false })));
+        };
+        if let Some(mut old) = self.park_page_op(op, re, now + EDITOR_DEADLINE) {
+            let mut replies = Vec::new();
+            let audience = self.audience();
+            answer_or_drop(
+                self.id(),
+                audience,
+                &mut old,
+                |re| Some(Reply::ok(re, json!({ "applied": false }))),
+                &mut replies,
+            );
+            self.send_replies(replies);
         }
         self.wake_follow();
         None
     }
 
-    fn editor_jump(&self, re: u64, args: EditorJump) -> Option<Reply> {
+    fn editor_jump(&self, re: u64, args: EditorJump, now: Instant) -> Option<Reply> {
         if let Some(refused) = self.follow_verb_refusal(re, "editor.jump", args.check()) {
             return Some(refused);
         }
         if !self.is_followed(args.buf) {
             return Some(Reply::ok(re, json!({ "applied": false })));
         }
-        self.state.borrow_mut().follow.park(FollowOp::Jump {
+        let op = FollowOp::Jump {
             buf: args.buf,
             line: args.line,
             col: args.col,
             focus: args.focus,
             re,
-        });
+        };
+        // A jump replaces nothing.
+        let _ = self.park_page_op(op, re, now + EDITOR_DEADLINE);
         self.wake_follow();
         None
     }
@@ -1835,16 +1989,11 @@ impl PluginHost {
         editor.filter(|e| e.target().is_some())
     }
 
-    fn push_call(&self, re: Option<u64>, call: Call, pending: Pending, deadline: Instant) {
+    fn push_call(&self, re: Option<u64>, call: Call, answer: nvim_rpc::Pending, deadline: Instant) {
         let mut st = self.state.borrow_mut();
         let document = st.document;
-        st.calls.push(EditorCall {
-            re,
-            call,
-            pending,
-            deadline,
-            document,
-        });
+        st.calls
+            .push(Pending::new(re, document, deadline, EditorCall { call, answer }));
     }
 
     fn editor_open(&self, re: u64, raw: &str, line: Option<u32>, col: Option<u32>, now: Instant) -> Option<Reply> {
@@ -1876,8 +2025,8 @@ impl PluginHost {
             ));
             return;
         };
-        let pending = editor::open(&*editor, path, line, col);
-        self.push_call(Some(re), Call::Open, pending, deadline);
+        let answer = editor::open(&*editor, path, line, col);
+        self.push_call(Some(re), Call::Open, answer, deadline);
     }
 
     fn editor_assist(&self, re: u64, raw: &str, diagnostics: OnOff, inlay_hints: OnOff, now: Instant) -> Option<Reply> {
@@ -1901,17 +2050,14 @@ impl PluginHost {
         // Parked even when nothing is outstanding, so a clear sent while the root is being checked waits
         // behind it.
         let document = st.document;
-        st.parked.push_back(ParkedAssist {
-            re: Some(re),
-            op: AssistOp::Checking {
-                ticket,
-                raw: raw.to_owned(),
-                diagnostics: diagnostics == OnOff::On,
-                inlay_hints: inlay_hints == OnOff::On,
-            },
-            deadline: now + EDITOR_DEADLINE,
-            document,
-        });
+        let op = AssistOp::Checking {
+            ticket,
+            raw: raw.to_owned(),
+            diagnostics: diagnostics == OnOff::On,
+            inlay_hints: inlay_hints == OnOff::On,
+        };
+        st.parked
+            .push_back(Pending::new(Some(re), document, now + EDITOR_DEADLINE, op));
         None
     }
 
@@ -1925,21 +2071,14 @@ impl PluginHost {
         None
     }
 
-    /// Sends an assist call now when none is outstanding, else parks it behind the ones that are.
+    /// Sends an assist call now when no apply ahead of it is still being checked, else parks it behind that.
     fn assist_call(&self, re: Option<u64>, op: AssistOp, now: Instant) {
-        let busy = {
-            let st = self.state.borrow();
-            !st.parked.is_empty() || st.calls.iter().any(|c| matches!(c.call, Call::Assist | Call::Clear))
-        };
+        let busy = !self.state.borrow().parked.is_empty();
         if busy {
             let mut st = self.state.borrow_mut();
             let document = st.document;
-            st.parked.push_back(ParkedAssist {
-                re,
-                op,
-                deadline: now + EDITOR_DEADLINE,
-                document,
-            });
+            st.parked
+                .push_back(Pending::new(re, document, now + EDITOR_DEADLINE, op));
             return;
         }
         let _ = self.send_assist(re, op, now + EDITOR_DEADLINE);
@@ -1950,7 +2089,7 @@ impl PluginHost {
         let Some(editor) = self.editor() else {
             return re.map(|re| Reply::err(re, ErrorCode::EditorUnavailable, "this window has no editor running"));
         };
-        let (call, pending) = match &op {
+        let (call, answer) = match &op {
             AssistOp::Checking { .. } => return None,
             AssistOp::Apply {
                 root,
@@ -1962,7 +2101,7 @@ impl PluginHost {
             ),
             AssistOp::Clear => (Call::Clear, editor::assist_clear(&*editor, self.id())),
         };
-        self.push_call(re, call, pending, deadline);
+        self.push_call(re, call, answer, deadline);
         None
     }
 
@@ -1985,7 +2124,7 @@ impl PluginHost {
         }
     }
 
-    fn store_op(&self, re: u64, op: StoreOp) -> Option<Reply> {
+    fn store_op(&self, re: u64, op: StoreOp, now: Instant) -> Option<Reply> {
         let Some(store) = self.store.clone() else {
             return Some(Reply::err(
                 re,
@@ -1995,7 +2134,8 @@ impl PluginHost {
         };
         let mut st = self.state.borrow_mut();
         if st.store.is_none() {
-            let spawned = StoreWorker::spawn(store, self.wake.clone());
+            let gate = st.store_gate.take();
+            let spawned = StoreWorker::spawn(store, self.wake.clone(), gate);
             match spawned {
                 Ok(worker) => st.store = Some(worker),
                 Err(e) => {
@@ -2010,16 +2150,18 @@ impl PluginHost {
         let ticket = st.next_ticket;
         st.next_ticket += 1;
         let document = st.document;
-        st.store_waiting.insert(ticket, (document, re));
+        let deadline = now + st.store_deadline;
+        st.store_waiting
+            .insert(ticket, Pending::new(Some(re), document, deadline, ()));
         if let Some(worker) = st.store.as_ref() {
-            worker.submit(ticket, op);
+            worker.submit(ticket, op, deadline);
         }
         None
     }
 
-    fn answered(&self, call: &EditorCall, value: &rmpv::Value) -> Option<Reply> {
-        let re = call.re?;
-        Some(match call.call {
+    /// The page's reply to an editor call nvim answered.
+    fn answered(call: Call, re: u64, value: &rmpv::Value) -> Reply {
+        match call {
             Call::Open => Reply::ok(re, json!({})),
             Call::Assist => match decode_apply(value) {
                 Ok(a) => Reply::ok(
@@ -2036,15 +2178,22 @@ impl PluginHost {
                 Ok(c) => Reply::ok(re, json!({ "restored": c.restored, "left_alone": c.left_alone })),
                 Err(why) => Reply::err(re, ErrorCode::Io, &why),
             },
-        })
+        }
     }
 
     /// Takes what is ready -- task output, editor answers, store answers -- and sends it; returns when to
     /// be run again if something is held for a time (a partial batch, an editor answer still out), else
     /// `None`: then only the wake runs it.
     pub fn pump(&self, now: Instant) -> Option<Instant> {
-        let (events, mut next) = self.state.borrow_mut().tasks.poll(now);
-        let hello = self.state.borrow().hello;
+        let (events, mut next) = {
+            let mut st = self.state.borrow_mut();
+            // Runs belong to the plugin: their events stay queued until a document can receive them.
+            if st.hello {
+                st.tasks.poll(now)
+            } else {
+                (Vec::new(), None)
+            }
+        };
         for event in &events {
             if let TaskEvent::Exit {
                 kind: ExitKind::SpawnFailed(why),
@@ -2053,9 +2202,7 @@ impl PluginHost {
             {
                 eprintln!("[plugin {}] a task failed to start: {why}", self.id());
             }
-            if hello {
-                self.page.send(&event_message(event));
-            }
+            self.page.send(&event_message(event));
         }
 
         let mut replies = Vec::new();
@@ -2063,25 +2210,27 @@ impl PluginHost {
 
         let calls = std::mem::take(&mut self.state.borrow_mut().calls);
         let layout = self.state.borrow().layout.clone();
-        let current = self.state.borrow().document;
+        let audience = self.audience();
         let mut keep = Vec::new();
         for mut call in calls {
-            if call.document != current {
-                if let Some(re) = call.re.take() {
-                    self.log_dropped_reply(re, "the requesting document was replaced");
-                }
-                // Asked by a document that has been replaced: no answer, and the keys stay where they are.
-                if call.call == Call::Open {
-                    continue;
-                }
-                // An assist call stays tracked until the editor has answered it, silently: the calls behind
-                // it are sent only then.
+            if call.document != audience.document {
+                // Asked by a document that has been replaced: no answer, and the keys stay where they are. The
+                // call itself still reaches nvim ahead of every later one.
+                answer_or_drop(self.id(), audience, &mut call, |_| None, &mut replies);
+                continue;
             }
-            let answer = call.pending.try_take();
+            let kind = call.on.call;
+            let answer = call.on.answer.try_take();
             match answer {
                 Some(Ok(value)) => {
-                    replies.extend(self.answered(&call, &value));
-                    if call.call == Call::Open {
+                    answer_or_drop(
+                        self.id(),
+                        audience,
+                        &mut call,
+                        |re| Some(Self::answered(kind, re, &value)),
+                        &mut replies,
+                    );
+                    if kind == Call::Open {
                         if let Some(layout) = &layout {
                             if let Err(why) = layout.focus(FocusTarget::Editor) {
                                 eprintln!("[plugin {}] the editor could not take the keys: {why}", self.id());
@@ -2089,28 +2238,26 @@ impl PluginHost {
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    if let Some(re) = call.re {
-                        replies.push(Reply::err(
-                            re,
-                            ErrorCode::EditorUnavailable,
-                            &format!("the editor could not be asked: {e}"),
-                        ));
-                    }
-                }
+                Some(Err(e)) => answer_or_drop(
+                    self.id(),
+                    audience,
+                    &mut call,
+                    |re| {
+                        let message = format!("the editor could not be asked: {e}");
+                        Some(Reply::err(re, ErrorCode::EditorUnavailable, &message))
+                    },
+                    &mut replies,
+                ),
                 None if now >= call.deadline => {
-                    if let Some(re) = call.re.take() {
-                        replies.push(Reply::err(
-                            re,
-                            ErrorCode::EditorTimeout,
-                            "the editor did not answer within 5 s; it may be waiting for a key (press Esc and try again)",
-                        ));
-                    }
-                    // The request is still on its way to nvim and may run later. An assist call is kept until
-                    // it is answered, so the clear behind it can never reach nvim first and be undone by it.
-                    if call.call != Call::Open {
-                        keep.push(call);
-                    }
+                    // The request is still on its way to nvim and may run later, still ahead of every call made
+                    // after it, so nothing waits for its answer.
+                    answer_or_drop(
+                        self.id(),
+                        audience,
+                        &mut call,
+                        |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY)),
+                        &mut replies,
+                    );
                 }
                 None => keep.push(call),
             }
@@ -2120,50 +2267,33 @@ impl PluginHost {
         if let Some(at) = self.pump_follow(now, &mut replies) {
             next = Some(next.map_or(at, |n| n.min(at)));
         }
+        self.take_store_answers(now, &mut replies);
         {
             let st = self.state.borrow();
-            for call in &st.calls {
-                let at = now
-                    + if now >= call.deadline {
-                        EDITOR_LATE_POLL
-                    } else {
-                        EDITOR_POLL
-                    };
+            if !st.calls.is_empty() {
+                // Every call left is within its deadline: the ones past it were dropped above.
+                let at = now + EDITOR_POLL;
                 next = Some(next.map_or(at, |n| n.min(at)));
             }
-            // A check's answer raises the wake; the timer is only for its deadline.
-            let deadlines = st.checking.iter().map(|c| c.deadline).chain(
-                st.parked
-                    .iter()
-                    .filter(|p| matches!(p.op, AssistOp::Checking { .. }))
-                    .map(|p| p.deadline),
-            );
+            // A check's and a store operation's answer raise the wake, and the follow queue asks for its own
+            // timer while a call is out: what is owed meanwhile needs a timer only for its deadline.
+            let deadlines = st
+                .checking
+                .iter()
+                .map(|c| c.deadline)
+                .chain(
+                    st.parked
+                        .iter()
+                        .filter(|p| matches!(p.on, AssistOp::Checking { .. }))
+                        .map(|p| p.deadline),
+                )
+                .chain(st.store_waiting.values().map(|p| p.deadline))
+                .chain(st.follow_owed.iter().map(|p| p.deadline));
             for at in deadlines {
                 next = Some(next.map_or(at, |n| n.min(at)));
             }
         }
-
-        let results = self
-            .state
-            .borrow()
-            .store
-            .as_ref()
-            .map(StoreWorker::try_results)
-            .unwrap_or_default();
-        for (ticket, result) in results {
-            let waiting = self.state.borrow_mut().store_waiting.remove(&ticket);
-            // The work itself was done (a write stays written); only the answer to a replaced document is dropped.
-            if let Some((document, re)) = waiting {
-                if document == current {
-                    replies.push(store_reply(re, result));
-                } else {
-                    self.log_dropped_reply(re, "the requesting document was replaced");
-                }
-            }
-        }
-        for reply in replies {
-            self.reply(reply);
-        }
+        self.send_replies(replies);
         let changed = {
             let mut st = self.state.borrow_mut();
             let armed = next.is_some();
@@ -2186,15 +2316,7 @@ impl PluginHost {
                 .map(|c| c.rx.try_iter().collect())
                 .unwrap_or_default()
         };
-        let (current, closed) = {
-            let st = self.state.borrow();
-            (st.document, st.closed)
-        };
-        let drop_reason = if closed {
-            "the window is closing"
-        } else {
-            "the requesting document was replaced"
-        };
+        let audience = self.audience();
         for (ticket, checked) in results {
             if let Checked::Project(found) = checked {
                 let name = self.state.borrow_mut().project_asked.remove(&ticket);
@@ -2205,44 +2327,48 @@ impl PluginHost {
             }
             let waiting = {
                 let mut st = self.state.borrow_mut();
-                let at = st.checking.iter().position(|c| c.ticket == ticket);
+                let at = st.checking.iter().position(|c| c.on.ticket == ticket);
                 at.map(|i| st.checking.remove(i))
             };
-            if let Some(c) = waiting {
+            if let Some(mut c) = waiting {
                 // The document that asked is gone (a reload, a stop) or the window is closing: nothing is
                 // opened or started on its behalf.
-                if c.document != current || closed {
-                    self.log_dropped_reply(c.re, drop_reason);
-                    continue;
-                }
+                answer_or_drop(self.id(), audience, &mut c, |_| None, replies);
                 // Finished after its deadline but before a pump gave it up: the page is told the filesystem
                 // was too slow, as it would have been a moment earlier, and nothing is opened or started.
                 if now >= c.deadline {
-                    replies.push(Reply::err(c.re, ErrorCode::Io, CHECK_TIMEOUT));
-                    continue;
+                    answer_or_drop(
+                        self.id(),
+                        audience,
+                        &mut c,
+                        |re| Some(Reply::err(re, ErrorCode::Io, CHECK_TIMEOUT)),
+                        replies,
+                    );
                 }
-                match (c.then, checked) {
+                let Some(re) = c.re else { continue };
+                match (c.on.then, checked) {
                     (Then::Open { raw, .. }, Checked::Path(Err(refusal))) => {
-                        replies.push(path_refusal(c.re, refusal, &raw))
+                        replies.push(path_refusal(re, refusal, &raw))
                     }
                     (Then::Open { line, col, .. }, Checked::Path(Ok(path))) => {
-                        self.open_checked(c.re, &path, line, col, c.deadline)
+                        self.open_checked(re, &path, line, col, c.deadline)
                     }
                     (Then::Task { task, vars }, Checked::Task(resolved)) => {
-                        replies.push(self.task_start(c.re, &task, &vars, resolved))
+                        replies.push(self.task_start(re, &task, &vars, resolved))
                     }
                     (Then::Link { target, .. }, Checked::Path(Err(refusal))) => {
-                        replies.push(link_refusal(c.re, refusal, &target))
+                        replies.push(link_refusal(re, refusal, &target))
                     }
                     (Then::Link { line, session, .. }, Checked::Path(Ok(path))) => {
-                        let mut st = self.state.borrow_mut();
-                        if st.follow.current_session() != session {
+                        let current_session = self.state.borrow().follow.current_session();
+                        if current_session != session {
                             // The editor the link was clicked against is gone; a new one is not asked to
                             // open files on its behalf.
-                            replies.push(Reply::err(c.re, ErrorCode::EditorUnavailable, "the editor restarted"));
+                            replies.push(Reply::err(re, ErrorCode::EditorUnavailable, "the editor restarted"));
                         } else {
-                            // Sent by the follow queue, after the call out and any parked before it.
-                            st.follow.park(FollowOp::OpenLink { path, line, re: c.re });
+                            // Sent by the follow queue, after the call out and any parked before it, within what
+                            // is left of the request's deadline. A link replaces nothing.
+                            let _ = self.park_page_op(FollowOp::OpenLink { path, line, re }, re, c.deadline);
                         }
                     }
                     _ => {}
@@ -2254,7 +2380,7 @@ impl PluginHost {
             let at = st
                 .parked
                 .iter()
-                .position(|p| matches!(p.op, AssistOp::Checking { ticket: t, .. } if t == ticket));
+                .position(|p| matches!(p.on, AssistOp::Checking { ticket: t, .. } if t == ticket));
             let Some(i) = at else { continue };
             match result {
                 Ok(root) => {
@@ -2263,9 +2389,9 @@ impl PluginHost {
                         diagnostics,
                         inlay_hints,
                         ..
-                    } = parked.op
+                    } = parked.on
                     {
-                        parked.op = AssistOp::Apply {
+                        parked.on = AssistOp::Apply {
                             root,
                             diagnostics,
                             inlay_hints,
@@ -2273,93 +2399,98 @@ impl PluginHost {
                     }
                 }
                 Err(refusal) => {
-                    let Some(parked) = st.parked.remove(i) else { continue };
-                    if let (Some(re), AssistOp::Checking { raw, .. }) = (parked.re, &parked.op) {
-                        if parked.document == current {
-                            replies.push(path_refusal(re, refusal, raw));
-                        } else {
-                            self.log_dropped_reply(re, drop_reason);
-                        }
-                    }
+                    let Some(mut parked) = st.parked.remove(i) else {
+                        continue;
+                    };
+                    let raw = match &parked.on {
+                        AssistOp::Checking { raw, .. } => raw.clone(),
+                        _ => continue,
+                    };
+                    let refused = |re| Some(path_refusal(re, refusal, &raw));
+                    answer_or_drop(self.id(), audience, &mut parked, refused, replies);
                 }
             }
         }
 
         // A check past its deadline is given up: whatever it finds later is dropped, and nothing is opened,
         // started or applied for it.
+        let timed_out = |re| Some(Reply::err(re, ErrorCode::Io, CHECK_TIMEOUT));
         let mut st = self.state.borrow_mut();
-        let mut expired = Vec::new();
-        st.checking.retain(|c| {
+        st.checking.retain_mut(|c| {
             if now < c.deadline {
                 return true;
             }
-            if c.document == current && !closed {
-                expired.push(c.re);
-            } else {
-                self.log_dropped_reply(c.re, drop_reason);
-            }
+            answer_or_drop(self.id(), audience, c, timed_out, replies);
             false
         });
-        st.parked.retain(|p| {
-            if !matches!(p.op, AssistOp::Checking { .. }) || now < p.deadline {
+        st.parked.retain_mut(|p| {
+            if !matches!(p.on, AssistOp::Checking { .. }) || now < p.deadline {
                 return true;
             }
-            if let Some(re) = p.re {
-                if p.document == current {
-                    expired.push(re);
-                } else {
-                    self.log_dropped_reply(re, drop_reason);
-                }
-            }
+            answer_or_drop(self.id(), audience, p, timed_out, replies);
             false
         });
-        replies.extend(
-            expired
-                .into_iter()
-                .map(|re| Reply::err(re, ErrorCode::Io, CHECK_TIMEOUT)),
-        );
     }
 
-    /// Sends the assist call at the head of the line once none is outstanding, and tells the page whose call
-    /// has waited out its deadline that the editor is busy (the call itself still goes out).
+    /// Takes the store's answers and tells the page about each operation past its deadline. The work itself is
+    /// never undone: an answer for a replaced document is dropped, a write the page was told timed out may
+    /// still apply, and its late answer goes to nobody.
+    fn take_store_answers(&self, now: Instant, replies: &mut Vec<Reply>) {
+        let results = self
+            .state
+            .borrow()
+            .store
+            .as_ref()
+            .map(StoreWorker::try_results)
+            .unwrap_or_default();
+        let audience = self.audience();
+        for (ticket, result) in results {
+            let waiting = self.state.borrow_mut().store_waiting.remove(&ticket);
+            if let Some(mut waiting) = waiting {
+                let answer = |re| Some(store_reply(re, result));
+                answer_or_drop(self.id(), audience, &mut waiting, answer, replies);
+            }
+        }
+        let mut st = self.state.borrow_mut();
+        let late = format!(
+            "the plugin's store did not answer within {:?}; a write may still be applied",
+            st.store_deadline
+        );
+        let timed_out = |re| Some(Reply::err(re, ErrorCode::Io, &late));
+        // A replaced document's operations are let go at once, so their deadlines arm no timer.
+        st.store_waiting.retain(|_, waiting| {
+            if now < waiting.deadline && waiting.document == audience.document && !audience.closed {
+                return true;
+            }
+            answer_or_drop(self.id(), audience, waiting, timed_out, replies);
+            false
+        });
+    }
+
+    /// Sends the assist calls at the head of the line, up to the first apply whose root is still being checked,
+    /// and tells the page whose call has waited out its deadline that the editor is busy (the call itself still
+    /// goes out, in its place).
     fn send_parked(&self, now: Instant, replies: &mut Vec<Reply>) {
-        let current = self.state.borrow().document;
+        let audience = self.audience();
         {
             let mut st = self.state.borrow_mut();
-            for parked in st.parked.iter_mut() {
-                if now < parked.deadline {
-                    continue;
-                }
-                if let Some(re) = parked.re.take() {
-                    if parked.document == current {
-                        replies.push(Reply::err(
-                            re,
-                            ErrorCode::EditorTimeout,
-                            "the editor did not answer within 5 s; it may be waiting for a key (press Esc and try again)",
-                        ));
-                    } else {
-                        self.log_dropped_reply(re, "the requesting document was replaced");
-                    }
-                }
+            for parked in st.parked.iter_mut().filter(|p| now >= p.deadline) {
+                let busy = |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY));
+                answer_or_drop(self.id(), audience, parked, busy, replies);
             }
         }
         loop {
             let next = {
                 let mut st = self.state.borrow_mut();
-                if st.calls.iter().any(|c| matches!(c.call, Call::Assist | Call::Clear)) {
-                    return;
-                }
-                if matches!(st.parked.front().map(|p| &p.op), Some(AssistOp::Checking { .. })) {
+                if matches!(st.parked.front().map(|p| &p.on), Some(AssistOp::Checking { .. })) {
                     return;
                 }
                 st.parked.pop_front()
             };
-            let Some(parked) = next else { return };
-            let re = parked.re.filter(|_| parked.document == current);
-            if let Some(re) = parked.re.filter(|_| parked.document != current) {
-                self.log_dropped_reply(re, "the requesting document was replaced");
-            }
-            if let Some(reply) = self.send_assist(re, parked.op, parked.deadline) {
+            let Some(mut parked) = next else { return };
+            // A replaced document's call still goes out in its place, answering nobody.
+            answer_or_drop(self.id(), audience, &mut parked, |_| None, replies);
+            if let Some(reply) = self.send_assist(parked.re, parked.on, parked.deadline) {
                 replies.push(reply);
             }
         }
@@ -2367,10 +2498,12 @@ impl PluginHost {
 
     /// The plugin's module was closed (prefix `x`): every run is stopped, the assist is put back and the follow
     /// snippet is taken down. The page is gone, so nothing is answered and nothing more is sent until a new page
-    /// says hello.
+    /// says hello. The stopped runs are not polled before then, so that page's hello lists them and their exits
+    /// reach it; what they hold meanwhile is bounded by the runner's held-output cap.
     ///
-    /// The clear waits for an assist call still out, so it can never overtake it; the returned time is when
-    /// `pump` must run for that, as it does after any other call that leaves an editor answer outstanding.
+    /// The clear is made after every assist call already sent, so it undoes them whether or not they have been
+    /// answered, and stays in force even if the editor writes it ahead of one of them (`AssistOp`); the returned time is when `pump` must run to take its answer, as it does after any other
+    /// call that leaves an editor answer outstanding.
     pub fn stop(&self, now: Instant) -> Option<Instant> {
         self.new_document();
         let assisted = {
@@ -2512,6 +2645,81 @@ mod tests {
         );
         let sent = page.take();
         assert_eq!(sent[0]["result"]["host"], "eitri");
+    }
+
+    #[test]
+    fn a_store_read_behind_a_held_lock_is_refused_at_its_deadline_and_the_write_still_lands() {
+        let s = Scratch::new("host-store-deadline");
+        let (dir, settings) = demo_plugin(&s.0);
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
+        let store = PluginStore::new(s.0.join("state"), "demo");
+        store.write("position", &json!("before")).unwrap();
+        let page = Rc::new(Page::default());
+        let (done, woken) = mpsc::channel();
+        let wake = Arc::new(move || {
+            let _ = done.send(());
+        });
+        let host = PluginHost::new(plugin, page.clone(), wake, Some(store.clone()), Vec::new());
+        // Each store operation waits for the test's word, as one behind a lock another window holds would.
+        let gate = host.gate_store();
+        let deadline = Duration::from_millis(50);
+        host.set_store_deadline(deadline);
+        let t0 = Instant::now();
+        let ask = |id: u64, verb: &str, args: Value| {
+            host.page_message(&json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string(), t0);
+        };
+        ask(1, "state.write", json!({"key": "position", "value": "after"}));
+        ask(2, "state.read", json!({"key": "position"}));
+        let next = host.pump(t0);
+        assert!(page.take().is_empty(), "nothing is answered before the deadline");
+        assert!(
+            next.is_some_and(|at| at <= t0 + deadline),
+            "the host asks to run again by the deadline, as no answer will wake it: {next:?}"
+        );
+
+        assert_eq!(host.pump(t0 + deadline), None, "nothing is owed once both were refused");
+        let sent = page.take();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        for (reply, re) in sent.iter().zip([1, 2]) {
+            assert_eq!(reply["re"], re, "{reply}");
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert_eq!(reply["error"]["code"], "io", "{reply}");
+        }
+
+        // The lock is let go: the write the page was told timed out still applies, and its late answer, like
+        // the read's, goes to nobody.
+        drop(gate);
+        for _ in 0..2 {
+            woken
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the store worker answers once let through");
+        }
+        host.pump(Instant::now());
+        assert!(
+            page.take().is_empty(),
+            "a request already refused is not answered again"
+        );
+        assert_eq!(store.read("position").unwrap(), Some(json!("after")));
+    }
+
+    #[test]
+    fn a_store_answer_for_a_replaced_document_arms_no_timer() {
+        let s = Scratch::new("host-store-replaced");
+        let (dir, settings) = demo_plugin(&s.0);
+        let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &settings, None).unwrap());
+        let store = PluginStore::new(s.0.join("state"), "demo");
+        let page = Rc::new(Page::default());
+        let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), Some(store), Vec::new());
+        let _gate = host.gate_store();
+        let t0 = Instant::now();
+        host.page_message(
+            &json!({"v": 1, "id": 3, "verb": "state.read", "args": {"key": "position"}}).to_string(),
+            t0,
+        );
+        host.new_document();
+        assert_eq!(host.pump(t0), None, "an answer nobody can receive needs no deadline");
+        assert!(page.take().is_empty());
+        assert!(host.state.borrow().store_waiting.is_empty());
     }
 
     #[test]

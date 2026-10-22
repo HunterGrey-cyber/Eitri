@@ -5,13 +5,33 @@ local op, opts = ...
 
 -- `owners`: owner -> its state. `buffers`: bufnr -> the one record of a buffer, shared by every owner holding it,
 -- so the value put back after the last owner is the buffer's own and never another owner's setting. `seq` orders
--- applies, so the owner applied most recently is the one whose values stay when another clears.
+-- applies, so the owner applied most recently is the one whose values stay when another clears. `last`: owner ->
+-- the newest call run for it, `{ maker, order }` (see `made_last`).
 local reg = rawget(_G, '__eitri_plugin_assist')
 if reg == nil then
-  reg = { owners = {}, buffers = {}, seq = 0 }
+  reg = { owners = {}, buffers = {}, seq = 0, last = {} }
   rawset(_G, '__eitri_plugin_assist', reg)
 end
+-- A registry left by a copy of this chunk from before `last` existed.
+reg.last = reg.last or {}
 local all, shared = reg.owners, reg.buffers
+
+-- Whether this call is the newest made for its owner, recording it if so. A window's calls can, rarely, reach nvim
+-- in another order than they were made in; an apply landing after the clear made to undo it would then stay in
+-- force. Each call carries `maker` (the Eitri process) and `order` (counting up in that process), and one older
+-- than a call already run for the same owner and maker is skipped, so the call made last is the one in force. A
+-- call from another maker, or without an order, always runs.
+local function made_last(o)
+  if o.order == nil then
+    return true
+  end
+  local last = reg.last[o.owner]
+  if last ~= nil and last.maker == o.maker and o.order < last.order then
+    return false
+  end
+  reg.last[o.owner] = { maker = o.maker, order = o.order }
+  return true
+end
 
 local function have_diag()
   return type(vim.diagnostic) == 'table'
@@ -228,8 +248,21 @@ local function apply(o)
 end
 
 if op == 'apply' then
+  if not made_last(opts) then
+    -- Overtaken by a later call, which is what stays in force: nothing is touched.
+    return {
+      diagnostics = opts.diagnostics,
+      inlay_hints = opts.inlay_hints,
+      buffers = 0,
+      partial = not (have_diag() and have_hint()),
+      skipped = true,
+    }
+  end
   return apply(opts)
 elseif op == 'clear' then
+  if not made_last(opts) then
+    return { restored = 0, left_alone = 0, skipped = true }
+  end
   return clear(opts.owner)
 end
 error('plugin_assist: unknown op ' .. tostring(op))

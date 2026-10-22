@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 import type { KitGroup, KitLabels } from "./index";
 import { isGenericAction, type Row } from "./rows";
 import { currentSettings } from "./settings";
@@ -102,3 +103,8 @@ export function openSheet(rows: Row[], labels?: KitLabels): void {
   document.body.append(sheet);
   sheet.focus();
 }
+
+onRemove(() => {
+  closeSheet();
+  restoreFocus = null;
+});

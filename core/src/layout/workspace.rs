@@ -131,7 +131,7 @@ pub fn fit_to_with(layout: &mut Layout, modules: &[ModuleId], decls: &[ModuleDec
             notes.push(if placement == Placement::BelowEditor {
                 format!("placed '{id}' below the editor, hidden: another workspace has it")
             } else {
-                format!("placed '{id}' where its open rule says, hidden: another workspace has it")
+                format!("placed '{id}' where its open rule says ({placement:?}), hidden: another workspace has it")
             });
         }
     }
@@ -408,6 +408,11 @@ impl Workspaces {
     /// one, and for a name that is not a workspace.
     pub fn stored(&self, name: &str) -> Option<&Layout> {
         self.stored.get(name)
+    }
+
+    /// [`Workspaces::stored`], to change.
+    pub fn stored_mut_of(&mut self, name: &str) -> Option<&mut Layout> {
+        self.stored.get_mut(name)
     }
 
     pub fn kept(&self) -> &Kept {

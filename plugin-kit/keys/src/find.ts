@@ -1,9 +1,11 @@
+import { onRemove } from "./bridge";
 import { hScrollerOf, jump, jumpX, maxOf, maxXOf, scrollerOf, scrollToAnimated, viewWidthOf, type ScrollTargetEl } from "./glide";
 import { showMessage } from "./hud";
 import type { KitMessage } from "./index";
 import { currentSettings, type FindCase } from "./settings";
 import { ensureStyle } from "./style";
 import { isEscape } from "./events";
+import { isRendered } from "./visible";
 
 /** Elements the engine never draws. */
 const UNDRAWN = "script, style, noscript, template, [hidden]";
@@ -48,7 +50,7 @@ function kindOf(el: Element, exclude: string | undefined): Kind {
   // A closed details element renders only its summary.
   const parent = el.parentElement;
   if (parent instanceof HTMLDetailsElement && !parent.open && el.tagName !== "SUMMARY") return "gone";
-  if (!rendered(el)) return "gone";
+  if (!isRendered(el)) return "gone";
   if (el.matches(SKIP)) return "apart";
   if (exclude) {
     try {
@@ -62,17 +64,6 @@ function kindOf(el: Element, exclude: string | undefined): Kind {
   return display === "" || display === "contents" || display.startsWith("inline") || display.startsWith("ruby")
     ? "inline"
     : "block";
-}
-
-/** Whether the engine draws `el`. An element with `display: contents` has no box of its own, so `checkVisibility`
- *  says false for it although its children are drawn; its own ancestors decide instead. */
-function rendered(el: Element): boolean {
-  for (let at: Element | null = el; at; at = at.parentElement) {
-    const visible = (at as Element & { checkVisibility?: () => boolean }).checkVisibility?.();
-    if (visible !== false) return true;
-    if (getComputedStyle(at).display !== "contents") return false;
-  }
-  return true;
 }
 
 /** The rendered text nodes under `root` in document order, with `null` wherever the page shows a break between two
@@ -469,6 +460,8 @@ export function resetFind(): void {
   prompt?.remove();
   prompt = null;
   options = {};
+  selected = null;
+  restoreFocus = null;
 }
 
 export function findPromptOpen(): boolean {
@@ -548,3 +541,5 @@ export function openFind(): void {
   prompt.hidden = false;
   input.focus();
 }
+
+onRemove(resetFind);

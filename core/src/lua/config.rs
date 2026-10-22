@@ -18,8 +18,8 @@ use std::rc::Rc;
 #[derive(Default)]
 pub struct ConfigStore {
     values: HashMap<String, Stored>,
-    /// The first `set` this store could not hold, as the startup-failure text.
-    refused: Option<String>,
+    /// Shares startup validation with the other Lua APIs.
+    init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
 }
 
 /// One stored value: the text of a string or number, or a boolean kept as one.
@@ -47,75 +47,72 @@ impl ConfigStore {
         self.values.get(key).map(Stored::as_str)
     }
 
-    /// The message of the first `eitri.config.set` that could not be stored, or `None`. A value
-    /// that is not a string, a number, a boolean or `nil` (a table, a function), a string that is
-    /// not UTF-8, or a key that is not a string never reaches the store, so every key Eitri reads
-    /// would silently keep its default -- `agent.account` among them, which then spends whichever
-    /// account launched the window. `Kernel::load_init_file` makes it a startup failure once
-    /// init.lua has run; it is remembered here because a `pcall` around the call swallows the Lua
-    /// error.
-    pub fn refused(&self) -> Option<&str> {
-        self.refused.as_deref()
+    /// The first set refusal recorded at the Lua function boundary during init.
+    /// Keeping it outside Lua makes a caught error visible to startup validation.
+    pub fn refused(&self) -> Option<String> {
+        self.init_refusals
+            .as_ref()
+            .and_then(|shared| shared.borrow().message("eitri.config.set"))
     }
-}
-
-/// Remembers the first refusal for `ConfigStore::refused` and hands back the Lua error, so the rest
-/// of the chunk stops as it does for any other error.
-fn refuse(store: &RefCell<ConfigStore>, message: String) -> mlua::Error {
-    store.borrow_mut().refused.get_or_insert_with(|| message.clone());
-    mlua::Error::RuntimeError(message)
 }
 
 /// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
+    store.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
     let config_table = lua.create_table()?;
 
     let store_for_get = store.clone();
-    let get_fn = lua.create_function(move |lua, key: String| -> mlua::Result<Value> {
-        match store_for_get.borrow().values.get(&key) {
-            Some(Stored::Text(text)) => text.clone().into_lua(lua),
-            Some(Stored::Switch(on)) => Ok(Value::Boolean(*on)),
-            None => Ok(Value::Nil),
-        }
-    })?;
+    let get_fn = super::kernel::registering_function(
+        lua,
+        "eitri.config.get",
+        move |lua, key: String| -> mlua::Result<Value> {
+            match store_for_get.borrow().values.get(&key) {
+                Some(Stored::Text(text)) => text.clone().into_lua(lua),
+                Some(Stored::Switch(on)) => Ok(Value::Boolean(*on)),
+                None => Ok(Value::Nil),
+            }
+        },
+    )?;
 
     let store_for_set = store.clone();
-    let set_fn = lua.create_function(move |lua, (key, value): (Value, Value)| {
-        let key = match key {
-            Value::String(ref text) => text.to_str().map(|text| text.to_string()).ok(),
-            _ => None,
-        };
-        let Some(key) = key else {
-            return Err(refuse(
-                &store_for_set,
-                "eitri.config.set: the key must be a string".to_string(),
-            ));
-        };
-        let stored = match value {
-            // `nil` unsets the key, as assigning `nil` removes a Lua table's entry. It is also what
-            // `os.getenv` gives for an unset variable, and an empty string already means unset to
-            // every key Eitri reads.
-            Value::Nil => {
-                store_for_set.borrow_mut().values.remove(&key);
-                return Ok(());
+    let set_fn =
+        super::kernel::registering_function(lua, "eitri.config.set", move |lua, (key, value): (Value, Value)| {
+            let key = match key {
+                Value::String(ref text) => text.to_str().map(|text| text.to_string()).ok(),
+                _ => None,
+            };
+            let Some(key) = key else {
+                return Err(mlua::Error::RuntimeError(
+                    "eitri.config.set: the key must be a string".to_string(),
+                ));
+            };
+            let stored = match value {
+                // `nil` unsets the key, as assigning `nil` removes a Lua table's entry. It is also what
+                // `os.getenv` gives for an unset variable, and an empty string already means unset to
+                // every key Eitri reads.
+                Value::Nil => {
+                    store_for_set.borrow_mut().values.remove(&key);
+                    return Ok(());
+                }
+                Value::Boolean(on) => Ok(Stored::Switch(on)),
+                Value::String(_) | Value::Integer(_) | Value::Number(_) => String::from_lua(value, lua)
+                    .map(Stored::Text)
+                    .map_err(|_| "the string is not UTF-8".to_string()),
+                other => Err(format!(
+                    "a {} value cannot be stored (only a string, a number or a boolean)",
+                    other.type_name()
+                )),
+            };
+            match stored {
+                Ok(stored) => {
+                    store_for_set.borrow_mut().values.insert(key, stored);
+                    Ok(())
+                }
+                Err(why) => Err(mlua::Error::RuntimeError(format!(
+                    "eitri.config.set({key:?}, ...): {why}"
+                ))),
             }
-            Value::Boolean(on) => Ok(Stored::Switch(on)),
-            Value::String(_) | Value::Integer(_) | Value::Number(_) => String::from_lua(value, lua)
-                .map(Stored::Text)
-                .map_err(|_| "the string is not UTF-8".to_string()),
-            other => Err(format!(
-                "a {} value cannot be stored (only a string, a number or a boolean)",
-                other.type_name()
-            )),
-        };
-        match stored {
-            Ok(stored) => {
-                store_for_set.borrow_mut().values.insert(key, stored);
-                Ok(())
-            }
-            Err(why) => Err(refuse(&store_for_set, format!("eitri.config.set({key:?}, ...): {why}"))),
-        }
-    })?;
+        })?;
 
     config_table.set("get", get_fn)?;
     config_table.set("set", set_fn)?;
@@ -304,7 +301,7 @@ mod tests {
 
         assert!(lua.load(r#"eitri.config.set({}, "work")"#).exec().is_err());
         assert_eq!(
-            store.borrow().refused(),
+            store.borrow().refused().as_deref(),
             Some("eitri.config.set: the key must be a string")
         );
     }

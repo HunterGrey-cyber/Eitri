@@ -10,6 +10,9 @@ let cleanup: (() => void) | undefined;
 let events: Map<string, (data: unknown) => void>;
 
 function box(el: Element, x = 10, y = 10, width = 30, height = 20) {
+  // Both geometry APIs describe the same box without a layout engine.
+  vi.spyOn(el, "getClientRects").mockImplementation(() =>
+    (width > 0 && height > 0 ? [el.getBoundingClientRect()] : []) as unknown as DOMRectList);
   vi.spyOn(el, "getBoundingClientRect").mockReturnValue({
     x, y, left: x, top: y, right: x + width, bottom: y + height, width, height,
     toJSON: () => ({}),
@@ -626,6 +629,24 @@ describe("hint labels outside their targets", () => {
     const texts = labels().map((label) => label.textContent!);
     expect(new Set(texts).size).toBe(texts.length);
     for (const a of texts) for (const b of texts) if (a !== b) expect(b.startsWith(a)).toBe(false);
+  });
+
+  it("a_reinstall_forgets_the_kept_hint", async () => {
+    sizes();
+    const column = Array.from({ length: 20 }, (_, i) => button(100, 10 + 30 * i));
+    const kept = column[17];
+    kept.dataset.eitriHintKeep = "";
+    await start();
+    key("f");
+    const remembered = labelAt(12 + 30 * 17).textContent!;
+    for (const character of remembered) key(character);
+    cleanup!();
+    await start();
+    setCurrent(column[0]);
+    const expected = assignLabels(collectTargets(document, []), { x: 115, y: 20 }).get(kept);
+    expect(expected).not.toBe(remembered);
+    key("f");
+    expect(labelAt(12 + 30 * 17).textContent).toBe(expected);
   });
 
   it("forgets the kept label after another target is activated", async () => {

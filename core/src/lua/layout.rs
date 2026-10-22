@@ -2,9 +2,8 @@
 //!
 //! - `eitri.layout.default{ ... }`, in `init.lua`: the first window's tree, used whenever no saved
 //!   layout can be (a first launch, or a state file that cannot be used). A malformed table is a
-//!   startup failure naming the call: [`LayoutStore::default_tree`] holds the error for `shell`, which
-//!   exits naming it once `init.lua` has run -- the discipline `agent.font_size` follows, since
-//!   `init.lua`'s own errors are only logged.
+//!   startup failure naming the call: the kernel records refusals at the function boundary, including
+//!   errors Lua catches, and a later default call replaces the earlier result.
 //! - `eitri.layout.rule(target, opts)`, in `init.lua`: where automatically opened modules go.
 //! - `eitri.layout.open(kind, opts?)`: queues a new terminal or chat view once the window exists.
 //! - `eitri.layout.show(id)`, `.hide(id)`, `.focus(id)`, `.split(id, 'right'|'below')`,
@@ -86,7 +85,7 @@ pub struct LayoutStore {
     default: Option<Result<LuaTree, String>>,
     defined: Vec<(String, Result<LuaTree, String>)>,
     rules: OpenRules,
-    rule_error: Option<String>,
+    init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
     workspaces: Option<Rc<RefCell<Workspaces>>>,
     requests: Vec<LayoutRequest>,
     accepting: bool,
@@ -97,8 +96,12 @@ pub struct LayoutStore {
 impl LayoutStore {
     /// `init.lua`'s open rules, or the first refusal among its `eitri.layout.rule` calls, which stops startup.
     pub fn rules(&self) -> Result<&OpenRules, String> {
-        match &self.rule_error {
-            Some(error) => Err(error.clone()),
+        match self
+            .init_refusals
+            .as_ref()
+            .and_then(|shared| shared.borrow().message("eitri.layout.rule"))
+        {
+            Some(error) => Err(error),
             None => Ok(&self.rules),
         }
     }
@@ -141,12 +144,13 @@ impl LayoutStore {
 
 /// `pub`: `shell`'s `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlua::Result<()> {
+    store.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
     let table = lua.create_table()?;
 
     let default_store = store.clone();
     table.set(
         "default",
-        lua.create_function(move |_, tree: Value| {
+        super::kernel::registering_function(lua, "eitri.layout.default", move |_, tree: Value| {
             if default_store.borrow().accepting {
                 return Err(mlua::Error::RuntimeError(
                     "eitri.layout.default: only in init.lua, before the window exists".to_string(),
@@ -165,7 +169,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let workspace_store = store.clone();
     table.set(
         "workspace",
-        lua.create_function(move |_, (name, tree): (Value, Value)| {
+        super::kernel::registering_function(lua, "eitri.layout.workspace", move |_, (name, tree): (Value, Value)| {
             if workspace_store.borrow().accepting {
                 return Err(mlua::Error::RuntimeError(
                     "eitri.layout.workspace: only in init.lua, before the window exists".to_string(),
@@ -220,7 +224,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let rule_store = store.clone();
     table.set(
         "rule",
-        lua.create_function(move |_, (target, opts): (Value, Value)| {
+        super::kernel::registering_function(lua, "eitri.layout.rule", move |_, (target, opts): (Value, Value)| {
             if rule_store.borrow().accepting {
                 return Err(mlua::Error::RuntimeError(
                     "eitri.layout.rule: only in init.lua, before the window exists".to_string(),
@@ -231,14 +235,12 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                     "eitri.layout.rule: the target must be a string, not a {}",
                     target.type_name()
                 );
-                rule_store.borrow_mut().rule_error.get_or_insert(message.clone());
                 return Err(mlua::Error::RuntimeError(message));
             };
             let target = match target.to_str() {
                 Ok(target) => target.to_string(),
                 Err(_) => {
                     let message = "eitri.layout.rule: the target must be UTF-8".to_string();
-                    rule_store.borrow_mut().rule_error.get_or_insert(message.clone());
                     return Err(mlua::Error::RuntimeError(message));
                 }
             };
@@ -252,7 +254,6 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
             let mut store = rule_store.borrow_mut();
             let added = parsed.and_then(|(t, rule)| store.rules.add(t, rule).map_err(|e| format!("{call}: {e}")));
             if let Err(message) = added {
-                store.rule_error.get_or_insert(message.clone());
                 return Err(mlua::Error::RuntimeError(message));
             }
             Ok(())
@@ -262,7 +263,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let open_store = store.clone();
     table.set(
         "open",
-        lua.create_function(move |_, (kind, opts): (Value, Value)| {
+        super::kernel::registering_function(lua, "eitri.layout.open", move |_, (kind, opts): (Value, Value)| {
             let refuse = |what: String| {
                 mlua::Error::RuntimeError(format!(
                     "eitri.layout.open: kind must be \"terminal\" or \"agent\", not {what}"
@@ -291,7 +292,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let switch_store = store.clone();
     table.set(
         "switch",
-        lua.create_function(move |_, name: String| {
+        super::kernel::registering_function(lua, "eitri.layout.switch", move |_, name: String| {
             Workspaces::valid_name(&name)
                 .map_err(|err| mlua::Error::RuntimeError(format!("eitri.layout.switch: {err}")))?;
             queue(&switch_store, "switch", LayoutRequest::Switch(name))
@@ -302,40 +303,52 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
         let store = store.clone();
         table.set(
             name,
-            lua.create_function(move |_, id: String| {
-                let id = module_arg(name, &id)?;
-                let request = match name {
-                    "show" => LayoutRequest::Show(id),
-                    "hide" => LayoutRequest::Hide(id),
-                    _ => LayoutRequest::Focus(id),
-                };
-                queue(&store, name, request)
-            })?,
+            super::kernel::registering_function(
+                lua,
+                match name {
+                    "show" => "eitri.layout.show",
+                    "hide" => "eitri.layout.hide",
+                    _ => "eitri.layout.focus",
+                },
+                move |_, id: String| {
+                    let id = module_arg(name, &id)?;
+                    let request = match name {
+                        "show" => LayoutRequest::Show(id),
+                        "hide" => LayoutRequest::Hide(id),
+                        _ => LayoutRequest::Focus(id),
+                    };
+                    queue(&store, name, request)
+                },
+            )?,
         )?;
     }
 
     let split_store = store.clone();
     table.set(
         "split",
-        lua.create_function(move |_, (id, direction): (String, String)| {
-            let id = module_arg("split", &id)?;
-            let axis = match direction.as_str() {
-                "right" => Axis::Row,
-                "below" => Axis::Column,
-                other => {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "eitri.layout.split: {other:?} is not 'right' or 'below'"
-                    )))
-                }
-            };
-            queue(&split_store, "split", LayoutRequest::Split(id, axis))
-        })?,
+        super::kernel::registering_function(
+            lua,
+            "eitri.layout.split",
+            move |_, (id, direction): (String, String)| {
+                let id = module_arg("split", &id)?;
+                let axis = match direction.as_str() {
+                    "right" => Axis::Row,
+                    "below" => Axis::Column,
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "eitri.layout.split: {other:?} is not 'right' or 'below'"
+                        )))
+                    }
+                };
+                queue(&split_store, "split", LayoutRequest::Split(id, axis))
+            },
+        )?,
     )?;
 
     let run_store = store.clone();
     table.set(
         "run",
-        lua.create_function(move |lua, (name, options): (Value, Value)| {
+        super::kernel::registering_function(lua, "eitri.layout.run", move |lua, (name, options): (Value, Value)| {
             let Value::String(name) = name else {
                 return Err(mlua::Error::RuntimeError(format!(
                     "eitri.layout.run: the action name must be a string, not a {}",
@@ -381,7 +394,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let float_store = store.clone();
     table.set(
         "float",
-        lua.create_function(move |_, (id, rect): (String, Value)| {
+        super::kernel::registering_function(lua, "eitri.layout.float", move |_, (id, rect): (String, Value)| {
             let id = module_arg("float", &id)?;
             if id == ModuleId::editor() {
                 return Err(mlua::Error::RuntimeError(
@@ -407,7 +420,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let mark_store = store.clone();
     table.set(
         "mark",
-        lua.create_function(move |_, id: String| {
+        super::kernel::registering_function(lua, "eitri.layout.mark", move |_, id: String| {
             let id = module_arg("mark", &id)?;
             queue(&mark_store, "mark", LayoutRequest::Mark(id))
         })?,
@@ -416,7 +429,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
     let export_store = store.clone();
     table.set(
         "export",
-        lua.create_function(move |_, ()| {
+        super::kernel::registering_function(lua, "eitri.layout.export", move |_, ()| {
             let store = export_store
                 .try_borrow()
                 .map_err(|_| mlua::Error::RuntimeError("eitri.layout.export: the layout is being changed".into()))?;
@@ -442,7 +455,7 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
 
     table.set(
         "get",
-        lua.create_function(move |lua, ()| {
+        super::kernel::registering_function(lua, "eitri.layout.get", move |lua, ()| {
             let store = store.borrow();
             let live = store.layout.as_ref().filter(|_| store.accepting).ok_or_else(|| {
                 mlua::Error::RuntimeError(
@@ -455,9 +468,9 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                         .to_string(),
                 )
             })?;
-            let table = match layout.root().children.as_slice() {
-                [only] => node_table(lua, &only.node, None)?,
-                _ => con_table(lua, layout.root(), None)?,
+            let table = match crate::layout::export::root_written_as_child(&layout) {
+                Some(child) => node_table(lua, child, None)?,
+                None => con_table(lua, layout.root(), None)?,
             };
             if !layout.floats().is_empty() {
                 let floats = lua.create_table()?;
@@ -526,15 +539,7 @@ fn node_table(lua: &Lua, node: &Node, share: Option<f32>) -> mlua::Result<Table>
 /// share (the last takes what the others leave).
 fn con_table(lua: &Lua, c: &Con, share: Option<f32>) -> mlua::Result<Table> {
     let table = lua.create_table()?;
-    table.raw_set(
-        1,
-        match c.layout {
-            ConLayout::SplitH => "row",
-            ConLayout::SplitV => "column",
-            ConLayout::Tabbed => "tabbed",
-            ConLayout::Stacked => "stacked",
-        },
-    )?;
+    table.raw_set(1, crate::layout::export::head_name(c.layout))?;
     if c.layout.axis().is_none() {
         table.raw_set("active", c.focus + 1)?;
     }
@@ -1539,6 +1544,46 @@ mod tests {
                 arrange(&live.borrow(), &frame).modules,
                 "{size:?}"
             );
+        }
+    }
+
+    #[test]
+    fn get_keeps_the_head_of_a_one_tile_tabbed_root() {
+        let tree = default_of("eitri.layout.default{ 'tabbed', {'editor'}, {'agent'} }").unwrap();
+        let mut layout = Layout::new(tree, ModuleId::editor()).unwrap();
+        let frame = crate::layout::Frame::new(crate::layout::Size { w: 1280, h: 721 }, 1);
+        crate::layout::float_toggle(&mut layout, &ModuleId::agent(), &frame).unwrap();
+        let (lua, _, _) = attached(layout);
+        let table: Table = lua.load("return eitri.layout.get()").eval().unwrap();
+        assert_eq!(table.get::<String>(1).unwrap(), "tabbed");
+        assert_eq!(table.get::<Table>(2).unwrap().get::<String>(1).unwrap(), "editor");
+    }
+
+    #[test]
+    fn a_stripped_get_reads_back_as_the_same_root() {
+        for (head, mode) in [("tabbed", ConLayout::Tabbed), ("stacked", ConLayout::Stacked)] {
+            let tree = default_of(&format!(
+                "eitri.layout.default{{ '{head}', {{'editor'}}, {{'agent'}} }}"
+            ))
+            .unwrap();
+            let mut layout = Layout::new(tree, ModuleId::editor()).unwrap();
+            let frame = crate::layout::Frame::new(crate::layout::Size { w: 1280, h: 721 }, 1);
+            crate::layout::float_toggle(&mut layout, &ModuleId::agent(), &frame).unwrap();
+            let (lua, store, _) = attached(layout);
+            store
+                .borrow_mut()
+                .attach_workspaces(Rc::new(RefCell::new(Workspaces::single())));
+            let table: Table = lua.load("return eitri.layout.get()").eval().unwrap();
+            for key in ["focus", "hidden", "zoomed", "marked", "workspace", "workspaces"] {
+                table.raw_set(key, Value::Nil).unwrap();
+            }
+            let tree = parse_tree(&Value::Table(table)).unwrap();
+            let root = tree.tiled.as_con().unwrap();
+            assert_eq!(root.layout, mode);
+            assert_eq!(root.children.len(), 1);
+            assert_eq!(root.children[0].node, Node::Leaf(ModuleId::editor()));
+            assert_eq!(tree.floats.len(), 1);
+            assert_eq!(tree.floats[0].id, ModuleId::agent());
         }
     }
 

@@ -46,3 +46,27 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
   expect(ts.getPreEmitDiagnostics(consumer).map((error) => ts.flattenDiagnosticMessageText(error.messageText, "\n")))
     .toEqual([]);
 });
+
+
+it("every_module_with_mutable_state_registers_a_reset", () => {
+  const missing = ts.sys.readDirectory("src", [".ts"], undefined, ["*.ts"])
+    .filter((file) => !file.endsWith(".test.ts"))
+    .filter((file) => {
+      const source = ts.createSourceFile(file, ts.sys.readFile(file)!, ts.ScriptTarget.Latest, true);
+      const mutable = source.statements.some((statement) => ts.isVariableStatement(statement) &&
+        ((statement.declarationList.flags & ts.NodeFlags.Let) !== 0 ||
+          statement.declarationList.declarations.some(({ initializer }) => initializer &&
+            ts.isNewExpression(initializer) && ts.isIdentifier(initializer.expression) &&
+            ["Set", "Map"].includes(initializer.expression.text))));
+      let registered = false;
+      const visit = (node: ts.Node) => {
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "onRemove") {
+          registered = true;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+      return mutable && !registered;
+    });
+  expect(missing).toEqual([]);
+});

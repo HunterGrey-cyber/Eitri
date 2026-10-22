@@ -1,0 +1,298 @@
+{
+  "defaults": {
+    "scroll_step": 60,
+    "smooth": true,
+    "prefix_wait": true,
+    "which_key_delay": 200,
+    "hint_chars": "sadfjklewcmpgh",
+    "find_case": "smart"
+  },
+  "ranges": {
+    "scroll_step": [
+      10,
+      400
+    ],
+    "which_key_delay": [
+      0,
+      5000
+    ],
+    "hint_chars": [
+      2,
+      26
+    ]
+  },
+  "accepted": [
+    {
+      "field": "scroll_step",
+      "value": 10
+    },
+    {
+      "field": "scroll_step",
+      "value": 40
+    },
+    {
+      "field": "scroll_step",
+      "value": 400
+    },
+    {
+      "field": "smooth",
+      "value": true
+    },
+    {
+      "field": "smooth",
+      "value": false
+    },
+    {
+      "field": "prefix_wait",
+      "value": true
+    },
+    {
+      "field": "prefix_wait",
+      "value": false
+    },
+    {
+      "field": "which_key_delay",
+      "value": null
+    },
+    {
+      "field": "which_key_delay",
+      "value": 0
+    },
+    {
+      "field": "which_key_delay",
+      "value": 5000
+    },
+    {
+      "field": "hint_chars",
+      "value": "ab"
+    },
+    {
+      "field": "hint_chars",
+      "value": "asdf"
+    },
+    {
+      "field": "hint_chars",
+      "value": "abcdefghijklmnopqrstuvwxyz"
+    },
+    {
+      "field": "find_case",
+      "value": "smart"
+    },
+    {
+      "field": "find_case",
+      "value": "ignore"
+    },
+    {
+      "field": "find_case",
+      "value": "match"
+    }
+  ],
+  "refused": [
+    {
+      "field": "scroll_step",
+      "value": -1
+    },
+    {
+      "field": "scroll_step",
+      "value": 9
+    },
+    {
+      "field": "scroll_step",
+      "value": 401
+    },
+    {
+      "field": "scroll_step",
+      "value": 60.5
+    },
+    {
+      "field": "scroll_step",
+      "value": "fast"
+    },
+    {
+      "field": "scroll_step",
+      "value": true
+    },
+    {
+      "field": "smooth",
+      "value": "yes"
+    },
+    {
+      "field": "smooth",
+      "value": 1
+    },
+    {
+      "field": "prefix_wait",
+      "value": "no"
+    },
+    {
+      "field": "prefix_wait",
+      "value": 0
+    },
+    {
+      "field": "which_key_delay",
+      "value": -1
+    },
+    {
+      "field": "which_key_delay",
+      "value": 5001
+    },
+    {
+      "field": "which_key_delay",
+      "value": 0.5
+    },
+    {
+      "field": "which_key_delay",
+      "value": true
+    },
+    {
+      "field": "which_key_delay",
+      "value": "slow"
+    },
+    {
+      "field": "hint_chars",
+      "value": "a"
+    },
+    {
+      "field": "hint_chars",
+      "value": "aa"
+    },
+    {
+      "field": "hint_chars",
+      "value": "abC"
+    },
+    {
+      "field": "hint_chars",
+      "value": "ab1"
+    },
+    {
+      "field": "hint_chars",
+      "value": "a\nb"
+    },
+    {
+      "field": "hint_chars",
+      "value": "a\rb"
+    },
+    {
+      "field": "hint_chars",
+      "value": "éa"
+    },
+    {
+      "field": "hint_chars",
+      "value": "abcdefghijklmnopqrstuvwxyzx"
+    },
+    {
+      "field": "find_case",
+      "value": "Smart"
+    },
+    {
+      "field": "find_case",
+      "value": "loud"
+    }
+  ],
+  "prefixes": [
+    {
+      "human": "Ctrl+a",
+      "kit": "<C-a>"
+    },
+    {
+      "human": "Ctrl+b",
+      "kit": "<C-b>"
+    },
+    {
+      "human": "Ctrl+c",
+      "kit": "<C-c>"
+    },
+    {
+      "human": "Ctrl+d",
+      "kit": "<C-d>"
+    },
+    {
+      "human": "Ctrl+e",
+      "kit": "<C-e>"
+    },
+    {
+      "human": "Ctrl+f",
+      "kit": "<C-f>"
+    },
+    {
+      "human": "Ctrl+g",
+      "kit": "<C-g>"
+    },
+    {
+      "human": "Ctrl+h",
+      "kit": "<C-h>"
+    },
+    {
+      "human": "Ctrl+i",
+      "kit": "<C-i>"
+    },
+    {
+      "human": "Ctrl+j",
+      "kit": "<C-j>"
+    },
+    {
+      "human": "Ctrl+k",
+      "kit": "<C-k>"
+    },
+    {
+      "human": "Ctrl+l",
+      "kit": "<C-l>"
+    },
+    {
+      "human": "Ctrl+m",
+      "kit": "<C-m>"
+    },
+    {
+      "human": "Ctrl+n",
+      "kit": "<C-n>"
+    },
+    {
+      "human": "Ctrl+o",
+      "kit": "<C-o>"
+    },
+    {
+      "human": "Ctrl+p",
+      "kit": "<C-p>"
+    },
+    {
+      "human": "Ctrl+q",
+      "kit": "<C-q>"
+    },
+    {
+      "human": "Ctrl+r",
+      "kit": "<C-r>"
+    },
+    {
+      "human": "Ctrl+s",
+      "kit": "<C-s>"
+    },
+    {
+      "human": "Ctrl+t",
+      "kit": "<C-t>"
+    },
+    {
+      "human": "Ctrl+u",
+      "kit": "<C-u>"
+    },
+    {
+      "human": "Ctrl+v",
+      "kit": "<C-v>"
+    },
+    {
+      "human": "Ctrl+w",
+      "kit": "<C-w>"
+    },
+    {
+      "human": "Ctrl+x",
+      "kit": "<C-x>"
+    },
+    {
+      "human": "Ctrl+y",
+      "kit": "<C-y>"
+    },
+    {
+      "human": "Ctrl+z",
+      "kit": "<C-z>"
+    }
+  ]
+}

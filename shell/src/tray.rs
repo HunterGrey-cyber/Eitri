@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use eitri_core::attention::Attention;
-use eitri_core::layout::{chip_label, tray_covered, ConLayout, Layout, ModuleId, ModuleKind, Selection};
+use eitri_core::layout::{chip_label, export::head_name, tray_covered, Layout, ModuleId, ModuleKind, Selection};
 use gtk4::prelude::*;
 
 /// A module's name on its chip and in the prefix strip: the built-ins by kind, a numbered instance by
@@ -58,12 +58,7 @@ pub(crate) fn selection_text(layout: &Layout, title: &dyn Fn(&ModuleId) -> Strin
         return None;
     };
     let con = layout.root().find(id)?;
-    let kind = match con.layout {
-        ConLayout::SplitH => "row",
-        ConLayout::SplitV => "column",
-        ConLayout::Tabbed => "tabbed",
-        ConLayout::Stacked => "stacked",
-    };
+    let kind = head_name(con.layout);
     let titles: Vec<String> = con.leaves().iter().filter(|m| layout.is_shown(m)).map(title).collect();
     Some(format!("selected: {kind} ({})", titles.join(", ")))
 }

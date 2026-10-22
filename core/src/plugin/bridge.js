@@ -133,6 +133,10 @@
         reject(hostError("too_large", "a message may be at most 256 KiB"));
         return;
       }
+      // No timer here: the host answers every call, at the latest with an error at the call's deadline (the
+      // editor, a path check and the store each have one), so the promise settles even when the work behind
+      // it never finishes. The one exception is a call made before the host started a new document (a reload,
+      // a restore from the page cache): the host drops its answer.
       pending.set(id, { resolve: resolve, reject: reject, verb: verb });
       handler.postMessage(text);
     });

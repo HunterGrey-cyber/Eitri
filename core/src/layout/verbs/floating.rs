@@ -1,7 +1,7 @@
 //! Floating, docking and scratchpad operations keep modules in one layer at a time.
 
 use super::path_to;
-use crate::layout::con::{Child, ConLayout, Node, MAX_CHILDREN};
+use crate::layout::con::{insert_halving, ConLayout, Node, MAX_CHILDREN};
 use crate::layout::float::{float_floor, Float, FloatRect, DEFAULT_FLOAT_SHARE};
 use crate::layout::geometry::{hide, Direction, Frame, Rect};
 use crate::layout::tree::{Axis, Layout, LayoutError, MIN_RATIO, RIGHT_OF_ROOT_SHARE};
@@ -52,14 +52,11 @@ fn sink(layout: &mut Layout, id: &ModuleId) -> Result<(), LayoutError> {
         if parent.children.len() >= MAX_CHILDREN {
             return Err(LayoutError::TooMany { limit: MAX_CHILDREN });
         }
-        let half = parent.children[i].share / 2.0;
-        parent.children[i].share = half;
+        let even = parent.children[i].share < 2.0 * MIN_RATIO;
         parent.children[i].pin = None;
-        parent.children.insert(i + 1, Child::new(Node::Leaf(id.clone()), half));
-        if half < MIN_RATIO {
-            let share = 1.0 / parent.children.len() as f32;
+        insert_halving(parent, i, Node::Leaf(id.clone()));
+        if even {
             for child in &mut parent.children {
-                child.share = share;
                 if child.node.leaves().iter().any(|m| m == id || layout.is_shown(m)) {
                     child.pin = None;
                 }
@@ -179,7 +176,7 @@ pub fn float_at(
     let rect = rect
         .or_else(|| layout.float_memory().get(id).copied())
         .unwrap_or_else(|| FloatRect::centred(frame.size, DEFAULT_FLOAT_SHARE));
-    let root = layout.root_node().without(id).expect("another tile is in view");
+    let root = layout.detach_tile(id).map_err(|_| LayoutError::LastTiled(id.clone()))?;
     layout.unzoom();
     // The float must exist before replacing the tree so no module disappears between layers.
     layout.push_float(Float {
@@ -343,6 +340,7 @@ pub fn mode_toggle_target(layout: &Layout) -> Option<ModuleId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::con::Child;
     use crate::layout::cycle::next_on_screen;
     use crate::layout::geometry::{arrange, navigate, resize, Nav, Size};
     use crate::layout::kill::{kill, Reopen};

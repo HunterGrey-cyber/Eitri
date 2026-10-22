@@ -62,34 +62,9 @@ pub const SAVE_DEBOUNCE_MS: u64 = 500;
 /// at those two levels is kept.
 const TOP_KEYS: [&str; 4] = ["version", "project_root", "current", "workspaces"];
 const WORKSPACE_KEYS: [&str; 6] = ["name", "focus", "hidden", "tiled", "floating", "float_memory"];
-/// The workspace keys of the build before floats, which carried `floating` and `float_memory` as kept
-/// keys.
-const WORKSPACE_KEYS_BEFORE_FLOATS: [&str; 4] = ["name", "focus", "hidden", "tiled"];
-
 /// The keys of one entry of a workspace's `floating` list, and of its `float_memory` list.
 const FLOAT_KEYS: [&str; 6] = ["module", "cx", "cy", "w", "h", "scratch"];
 const MEMORY_KEYS: [&str; 5] = ["module", "cx", "cy", "w", "h"];
-
-/// Which build reads a version 2 file: this one, or the build before floats, which carried `floating`
-/// and `float_memory` as kept keys. The second exists for tests that pin what that build does with
-/// this one's file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum Reader {
-    ThisBuild,
-    BeforeFloats,
-}
-
-impl Reader {
-    /// The workspace keys this reader knows; anything else in a workspace is kept, and a write strips
-    /// these from what was kept.
-    fn workspace_keys(self) -> &'static [&'static str] {
-        match self {
-            Reader::ThisBuild => &WORKSPACE_KEYS,
-            Reader::BeforeFloats => &WORKSPACE_KEYS_BEFORE_FLOATS,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------------------------
 // Version 1, read only.
@@ -330,17 +305,6 @@ fn kept_except(kept: Option<&Map<String, Value>>, known: &[&str]) -> Map<String,
 /// pretty JSON, so a person can read and fix it, with what a later build wrote after the keys this
 /// one writes. A retired editor is written shown (`Layout::saved_hidden`).
 pub fn encode_v2(workspaces: &Workspaces, current: &Layout, project_root: &Path) -> String {
-    encode_by(workspaces, current, project_root, Reader::ThisBuild)
-}
-
-/// The writer of the same build: `BeforeFloats` strips kept keys by that build's list, so a `floating`
-/// it kept is written back as it was read.
-#[cfg(test)]
-pub(crate) fn encode_v2_as(workspaces: &Workspaces, current: &Layout, project_root: &Path, reader: Reader) -> String {
-    encode_by(workspaces, current, project_root, reader)
-}
-
-fn encode_by(workspaces: &Workspaces, current: &Layout, project_root: &Path, reader: Reader) -> String {
     let file = FileOut {
         version: V2,
         project_root: project_root.to_string_lossy().into_owned(),
@@ -348,40 +312,35 @@ fn encode_by(workspaces: &Workspaces, current: &Layout, project_root: &Path, rea
         workspaces: workspaces
             .each(current)
             .into_iter()
-            .map(|(name, layout)| {
-                let floats_written = reader == Reader::ThisBuild;
-                WorkspaceOut {
-                    name,
-                    focus: layout.focus().as_str(),
-                    hidden: layout.saved_hidden().iter().map(|id| id.as_str().to_string()).collect(),
-                    tiled: NodeOut::of_con(layout.root()),
-                    floating: layout
-                        .floats()
-                        .iter()
-                        .filter(|_| floats_written)
-                        .map(|float| FloatOut {
-                            module: float.id.as_str(),
-                            cx: float.rect.cx,
-                            cy: float.rect.cy,
-                            w: float.rect.w,
-                            h: float.rect.h,
-                            scratch: float.scratch,
-                        })
-                        .collect(),
-                    float_memory: layout
-                        .float_memory()
-                        .iter()
-                        .filter(|_| floats_written)
-                        .map(|(id, rect)| MemoryOut {
-                            module: id.as_str(),
-                            cx: rect.cx,
-                            cy: rect.cy,
-                            w: rect.w,
-                            h: rect.h,
-                        })
-                        .collect(),
-                    kept: kept_except(workspaces.kept_for(name), reader.workspace_keys()),
-                }
+            .map(|(name, layout)| WorkspaceOut {
+                name,
+                focus: layout.focus().as_str(),
+                hidden: layout.saved_hidden().iter().map(|id| id.as_str().to_string()).collect(),
+                tiled: NodeOut::of_con(layout.root()),
+                floating: layout
+                    .floats()
+                    .iter()
+                    .map(|float| FloatOut {
+                        module: float.id.as_str(),
+                        cx: float.rect.cx,
+                        cy: float.rect.cy,
+                        w: float.rect.w,
+                        h: float.rect.h,
+                        scratch: float.scratch,
+                    })
+                    .collect(),
+                float_memory: layout
+                    .float_memory()
+                    .iter()
+                    .map(|(id, rect)| MemoryOut {
+                        module: id.as_str(),
+                        cx: rect.cx,
+                        cy: rect.cy,
+                        w: rect.w,
+                        h: rect.h,
+                    })
+                    .collect(),
+                kept: kept_except(workspaces.kept_for(name), &WORKSPACE_KEYS),
             })
             .collect(),
         kept: kept_except(Some(&workspaces.kept().top), &TOP_KEYS),
@@ -411,6 +370,9 @@ struct ReadWorkspace {
     name: String,
     layout: Layout,
     kept: Map<String, Value>,
+    /// Float memory naming an instance only another workspace holds, kept until the fit gives this
+    /// workspace that instance.
+    held_memory: Vec<(ModuleId, FloatRect)>,
 }
 
 fn take_str(map: &mut Map<String, Value>, key: &str) -> Result<String, String> {
@@ -530,13 +492,15 @@ fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) 
     }
 }
 
-/// Whether [`Con::normalise`] or `Layout::new` would change `c`'s shape: a container below the root
-/// with fewer than two children, or a root whose one child is a container.
+/// Whether [`Con::normalise`] or `Layout::new` would change `c`'s shape: an empty container below the
+/// root, a split container below the root with one child, or a root whose one child is a container. A
+/// tabbed or stacked container of one child is left as it is by both, so it is not counted: the note
+/// would otherwise come back on every open of a file this build wrote itself.
 fn unnormalised(c: &Con, is_root: bool) -> bool {
     let own = if is_root {
         matches!(c.children.as_slice(), [only] if matches!(only.node, Node::Con(_)))
     } else {
-        c.children.len() < 2
+        c.children.is_empty() || (c.children.len() == 1 && c.layout.axis().is_some())
     };
     own || c
         .children
@@ -656,17 +620,17 @@ fn read_float_list(
 /// Its floats and float memory are read leniently ([`read_float_list`]) and go to the rebuild with the
 /// tree. One the rebuild leaves out -- the editor floating, a module also tiled or floating twice, a
 /// module this window has no host for -- sets `copy`; a rectangle it only clamps does not, since the
-/// window shows it clamped and writes it clamped. `reader` decides whether `floating` and
-/// `float_memory` are this workspace's own keys or, for the build before floats, kept ones.
+/// window shows it clamped and writes it clamped. A memory entry naming an instance this workspace
+/// does not hold itself is held back ([`ReadWorkspace::held_memory`]): another workspace may hold that
+/// instance, and the rebuild, which knows only this workspace's own, would drop it.
 fn read_workspace(
     name: &str,
     mut map: Map<String, Value>,
     lua: &[ModuleDecl],
     notes: &mut Vec<String>,
     copy: &mut bool,
-    instances: &[ModuleId],
-    reader: Reader,
-) -> Result<(Layout, Map<String, Value>), String> {
+    makes_instance: &dyn Fn(&ModuleId) -> bool,
+) -> Result<ReadWorkspace, String> {
     let mut own = Vec::new();
     let focus = ModuleId::parse(&take_str(&mut map, "focus")?).map_err(|e| e.to_string())?;
     let hidden = match map.remove("hidden") {
@@ -689,55 +653,56 @@ fn read_workspace(
             own.push(format!("normalised a container in workspace '{name}'"));
         }
     }
-    // The builds before floats are also the builds before chat views: their reconcile leaves a
-    // tiled `agent#N` out, so they keep a copy of the file for a build that reads it.
-    if reader == Reader::BeforeFloats
-        && tree
-            .leaves()
-            .iter()
-            .any(|id| id.kind() == super::module::ModuleKind::Agent && id.number() >= 2)
-    {
-        *copy = true;
+    let listed = read_float_list(
+        map.remove("floating"),
+        "floating",
+        "floating item",
+        &FLOAT_KEYS,
+        name,
+        &mut own,
+        copy,
+    );
+    let floats: Vec<Float> = listed
+        .into_iter()
+        .map(|(id, rect, scratch)| Float { id, rect, scratch })
+        .collect();
+    let listed = read_float_list(
+        map.remove("float_memory"),
+        "float_memory",
+        "float memory item",
+        &MEMORY_KEYS,
+        name,
+        &mut own,
+        copy,
+    );
+    let memory_read = listed.len();
+    let mut memory = BTreeMap::new();
+    for (id, rect, _) in listed {
+        memory.entry(id).or_insert(rect);
     }
-    let (mut floats, mut memory) = (Vec::new(), BTreeMap::new());
-    let mut memory_read = 0;
-    if reader == Reader::ThisBuild {
-        let listed = read_float_list(
-            map.remove("floating"),
-            "floating",
-            "floating item",
-            &FLOAT_KEYS,
-            name,
-            &mut own,
-            copy,
-        );
-        floats = listed
-            .into_iter()
-            .map(|(id, rect, scratch)| Float { id, rect, scratch })
-            .collect();
-        let listed = read_float_list(
-            map.remove("float_memory"),
-            "float_memory",
-            "float memory item",
-            &MEMORY_KEYS,
-            name,
-            &mut own,
-            copy,
-        );
-        memory_read = listed.len();
-        for (id, rect, _) in listed {
-            memory.entry(id).or_insert(rect);
-        }
-        if memory.len() < memory_read {
-            own.push(format!(
-                "float_memory of workspace '{name}' names a module twice; the first is kept"
-            ));
-        }
+    if memory.len() < memory_read {
+        own.push(format!(
+            "float_memory of workspace '{name}' names a module twice; the first is kept"
+        ));
     }
     let floats_read = floats.len();
+    // Only this workspace's own instances: the others' are placed after every workspace is read.
+    let instances: Vec<ModuleId> = tree
+        .leaves()
+        .into_iter()
+        .chain(floats.iter().map(|float| float.id.clone()))
+        .filter(|id| makes_instance(id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (held, memory): (BTreeMap<_, _>, BTreeMap<_, _>) = memory
+        .into_iter()
+        .partition(|(id, _)| makes_instance(id) && !instances.contains(id));
     let reconciled =
-        reconcile_floating(tree, floats, memory, &hidden, Some(&focus), lua, instances).map_err(|e| e.to_string())?;
-    if reconciled.layout.floats().len() < floats_read || reconciled.layout.float_memory().len() < memory_read {
+        reconcile_floating(tree, floats, memory, &hidden, Some(&focus), lua, &instances).map_err(|e| e.to_string())?;
+    if reconciled.layout.floats().len() < floats_read
+        || reconciled.layout.float_memory().len() + held.len() < memory_read
+    {
         *copy = true;
     }
     own.extend(
@@ -747,7 +712,12 @@ fn read_workspace(
             .map(|note| format!("workspace '{name}': {note}")),
     );
     notes.extend(own);
-    Ok((reconciled.layout, map))
+    Ok(ReadWorkspace {
+        name: name.to_string(),
+        layout: reconciled.layout,
+        kept: map,
+        held_memory: held.into_iter().collect(),
+    })
 }
 
 fn left_out(label: &str, why: &str, notes: &mut Vec<String>, copy: &mut bool) {
@@ -775,29 +745,7 @@ pub fn decode_v2_with(
     lua: &[ModuleDecl],
     deferred: &[ModuleId],
 ) -> Result<Opened, String> {
-    decode_by(text, project_root, lua, deferred, Reader::ThisBuild)
-}
-
-/// [`decode_v2`] as `reader` reads the file: for tests that pin what the build before floats does
-/// with this one's file.
-#[cfg(test)]
-pub(crate) fn decode_v2_as(
-    text: &str,
-    project_root: &Path,
-    lua: &[ModuleDecl],
-    reader: Reader,
-) -> Result<Opened, String> {
-    decode_by(text, project_root, lua, &[], reader)
-}
-
-fn decode_by(
-    text: &str,
-    project_root: &Path,
-    lua: &[ModuleDecl],
-    deferred: &[ModuleId],
-    reader: Reader,
-) -> Result<Opened, String> {
-    match decode_v2_as_written(text, project_root, lua, deferred, reader) {
+    match decode_v2_as_written(text, project_root, lua, deferred) {
         Ok(mut opened) => {
             opened.notes = opened.notes.iter().map(|note| printable(note)).collect();
             Ok(opened)
@@ -848,7 +796,6 @@ fn decode_v2_as_written(
     project_root: &Path,
     lua: &[ModuleDecl],
     deferred: &[ModuleId],
-    reader: Reader,
 ) -> Result<Opened, String> {
     let deepest = nesting(text);
     if deepest > MAX_NESTING {
@@ -884,94 +831,10 @@ fn decode_v2_as_written(
         return Err("not a layout file (no list of `workspaces`)".to_string());
     };
 
-    // Tiled leaves and floats create instances, in every workspace; names in kept data reserve their
-    // numbers instead. The builds before floats had no chat views, so for them only a terminal is an
-    // instance and an `agent#N` stays a module the window does not have. A deferred module is held the
-    // same way: the window never places it, so only a workspace that names it brings it back.
-    let makes_instance = |id: &ModuleId| {
-        deferred.contains(id)
-            || id.number() >= 2
-                && match reader {
-                    Reader::ThisBuild => id.kind().has_instances(),
-                    Reader::BeforeFloats => id.kind() == super::module::ModuleKind::Terminal,
-                }
-    };
-    fn instances_in(node: &Value, makes_instance: &dyn Fn(&ModuleId) -> bool, found: &mut BTreeSet<ModuleId>) {
-        match node.get("type").and_then(Value::as_str) {
-            Some("leaf") => {
-                if let Some(id) = node
-                    .get("module")
-                    .and_then(Value::as_str)
-                    .and_then(|s| ModuleId::parse(s).ok())
-                {
-                    if makes_instance(&id) {
-                        found.insert(id);
-                    }
-                }
-            }
-            Some("con") => {
-                if let Some(children) = node.get("children").and_then(Value::as_array) {
-                    for child in children {
-                        if let Some(node) = child.get("node") {
-                            instances_in(node, makes_instance, found);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // The instances one workspace makes: its tiled leaves, and the float entries it reads. Only an
-    // entry the workspace reads makes an instance: one it leaves out is gone, with its note, and must
-    // not come back as a hidden tile holding an instance number. The entry is read again with its
-    // workspace, which notes what is wrong with it.
-    let own_instances = |item: &Value| {
-        let mut found = BTreeSet::new();
-        if let Some(tiled) = item.get("tiled") {
-            instances_in(tiled, &makes_instance, &mut found);
-        }
-        if reader == Reader::ThisBuild {
-            if let Some(Value::Array(floats)) = item.get("floating") {
-                let (mut unused_notes, mut unused_copy) = (Vec::new(), false);
-                for float in floats {
-                    let Ok((id, _, _)) = read_float_entry(float, &FLOAT_KEYS, "", &mut unused_notes, &mut unused_copy)
-                    else {
-                        continue;
-                    };
-                    if makes_instance(&id) {
-                        found.insert(id);
-                    }
-                }
-            }
-        }
-        found
-    };
-    // Only a workspace that reads makes instances: one left out is gone, with its note, and the
-    // modules it tiles must not come back as hidden tiles holding instance numbers in the others.
-    // Each item is read here as the loop below reads it, knowing its own instances (a workspace
-    // that shows only instances must still read) but not the other workspaces' yet.
-    let mut instances = BTreeSet::new();
-    {
-        let (mut scratch_notes, mut scratch_copy) = (Vec::new(), false);
-        let mut seen = BTreeSet::new();
-        for item in &items {
-            let Value::Object(map) = item else {
-                continue;
-            };
-            let mut map = map.clone();
-            let Ok(name) = take_str(&mut map, "name") else {
-                continue;
-            };
-            if Workspaces::valid_name(&name).is_err() || !seen.insert(name.clone()) {
-                continue;
-            }
-            let own: Vec<ModuleId> = own_instances(item).into_iter().collect();
-            if read_workspace(&name, map, lua, &mut scratch_notes, &mut scratch_copy, &own, reader).is_ok() {
-                instances.extend(own);
-            }
-        }
-    }
-    let instances: Vec<_> = instances.into_iter().collect();
+    // Only a workspace's own tiled leaves and floats create instances; names in kept data reserve
+    // their numbers. Deferred modules are held the same way, without the window placing them itself.
+    // Missing instances are placed after every workspace is read, so a discarded entry creates none.
+    let makes_instance = |id: &ModuleId| deferred.contains(id) || id.number() >= 2 && id.kind().has_instances();
 
     let mut notes = Vec::new();
     let mut copy = false;
@@ -999,8 +862,8 @@ fn decode_v2_as_written(
             left_out(&label, "an earlier workspace has that name", &mut notes, &mut copy);
             continue;
         }
-        match read_workspace(&name, map, lua, &mut notes, &mut copy, &instances, reader) {
-            Ok((layout, kept)) => read.push(ReadWorkspace { name, layout, kept }),
+        match read_workspace(&name, map, lua, &mut notes, &mut copy, &makes_instance) {
+            Ok(ws) => read.push(ws),
             Err(why) => left_out(&label, &why, &mut notes, &mut copy),
         }
     }
@@ -1041,7 +904,9 @@ fn decode_v2_as_written(
     };
     let mut stored = BTreeMap::new();
     let mut current_layout = None;
+    let mut held_memory = Vec::new();
     for ws in read {
+        held_memory.push((ws.name.clone(), ws.held_memory));
         kept.per_workspace.insert(ws.name.clone(), ws.kept);
         if ws.name == current {
             current_layout = Some(ws.layout);
@@ -1049,10 +914,28 @@ fn decode_v2_as_written(
             stored.insert(ws.name, ws.layout);
         }
     }
-    let workspaces = Workspaces::from_parts(order, stored, current, kept).map_err(|e| e.to_string())?;
+    let mut workspaces = Workspaces::from_parts(order, stored, current, kept).map_err(|e| e.to_string())?;
+    let mut current = current_layout.expect("the current workspace is one of those read");
+    notes.extend(workspaces.fit_all_with(&mut current, lua));
+    // The fit has given every workspace each instance any of them holds, so a held memory entry is kept
+    // exactly when some workspace holds its instance, as the rebuild keeps one for a module it has.
+    for (name, held) in held_memory {
+        let layout = match workspaces.stored_mut_of(&name) {
+            Some(layout) => layout,
+            None => &mut current,
+        };
+        for (id, rect) in held {
+            if layout.remember_float(&id, rect.clamped()).is_err() {
+                notes.push(format!(
+                    "workspace '{name}': float memory of '{id}' left out: this window has no such module"
+                ));
+                copy = true;
+            }
+        }
+    }
     Ok(Opened {
         workspaces,
-        current: current_layout.expect("the current workspace is one of those read"),
+        current,
         notes,
         keep_copy: copy.then(|| text.to_string()),
     })
@@ -1288,6 +1171,9 @@ pub fn copy_aside_v2(dir: &Path, project_root: &Path, text: &str) -> std::io::Re
 }
 
 #[cfg(test)]
+mod frozen_reader;
+
+#[cfg(test)]
 mod tests {
     use super::super::geometry::{arrange, settle_pins, Frame, Size};
     use super::super::module::Placement;
@@ -1518,6 +1404,43 @@ mod tests {
                 Axis::Row
             );
             assert!(back.notes.is_empty());
+        }
+    }
+
+    /// A tab container left with one tab is a state this build saves itself, so reading it back is not a
+    /// repair: it opens unchanged, with no note and no copy. A split container of one child around it is
+    /// still dissolved, with the note.
+    #[test]
+    fn a_one_tab_container_this_build_writes_opens_with_no_note() {
+        for kind in [ConLayout::Tabbed, ConLayout::Stacked] {
+            let tabs = Con::new(kind, vec![Child::new(Node::Leaf(ModuleId::agent()), 1.0)]);
+            let layout = Layout::new(
+                Node::split(
+                    Axis::Row,
+                    0.5,
+                    Node::Leaf(ModuleId::editor()),
+                    Node::split(Axis::Column, 0.5, Node::Con(tabs), Node::Leaf(ModuleId::terminal())),
+                ),
+                ModuleId::editor(),
+            )
+            .unwrap();
+            let text = one(&layout);
+            let back = decode_v2(&text, &root(), &[]).unwrap();
+            assert_eq!(back.current.root(), layout.root());
+            assert!(back.notes.is_empty(), "{:?}", back.notes);
+            assert_eq!(back.keep_copy, None);
+
+            let mut value = json_of(&text);
+            let slot = &mut value["workspaces"][0]["tiled"]["children"][1]["node"]["children"][0]["node"];
+            let tab_node = slot.clone();
+            *slot = json!({"type": "con", "layout": "splitv", "children": [{"share": 1.0, "node": tab_node}]});
+            let back = decode_v2(&value.to_string(), &root(), &[]).unwrap();
+            assert_eq!(back.notes, ["normalised a container in workspace 'main'"]);
+            assert_eq!(
+                back.current.root(),
+                layout.root(),
+                "only the split around the tabs goes"
+            );
         }
     }
 
@@ -2766,6 +2689,120 @@ mod tests {
         assert_eq!(restored.keep_copy, None);
     }
 
+    /// A workspace that lacks another's instance gets it the way the running window places one: after
+    /// its own reconcile has placed the registered panels it lacks, by the same fit, so a file opens as
+    /// the window would have arranged it and the instance is placed once.
+    #[test]
+    fn a_workspace_missing_an_instance_places_it_after_the_declared_panels() {
+        let t2 = id("terminal#2");
+        let side = ModuleDecl {
+            id: ModuleId::lua("side"),
+            placement: Placement::RightOfRoot,
+        };
+        let terminal_at_side = ModuleDecl {
+            id: ModuleId::terminal(),
+            placement: Placement::RightOfRoot,
+        };
+        let lua = vec![side.clone(), terminal_at_side];
+        let place = |layout: &mut Layout, id: &ModuleId| {
+            let root = super::super::tree::place_new(layout.root_node(), id, Placement::RightOfRoot).0;
+            layout.replace_root(root);
+        };
+        let mut main = plain();
+        place(&mut main, &side.id);
+        place(&mut main, &t2);
+        let text = encode_v2(&with(&["main", "w2"], "main", &[main.clone(), plain()]), &main, &root());
+
+        let back = decode_v2(&text, &root(), &lua).unwrap();
+        assert_eq!(back.current.root(), main.root(), "{:?}", back.notes);
+        let w2 = back.workspaces.stored("w2").unwrap();
+        let mut expected = plain();
+        place(&mut expected, &side.id);
+        place(&mut expected, &t2);
+        assert_eq!(
+            w2.root(),
+            expected.root(),
+            "the declared panel first, then the instance at its kind's open rule: {:?}",
+            back.notes
+        );
+        assert_eq!(&w2.leaves()[w2.leaves().len() - 2..], [side.id.clone(), t2.clone()]);
+        assert!(w2.hidden().contains(&t2) && !w2.hidden().contains(&side.id));
+        assert_eq!(
+            back.notes,
+            [
+                "workspace 'w2': placed 'lua:side' where a first launch does (RightOfRoot)",
+                "workspace 'w2': placed 'terminal#2' where its open rule says (RightOfRoot), hidden: another \
+                 workspace has it",
+            ]
+        );
+        assert_eq!(back.keep_copy, None);
+
+        let mut live = back.current.clone();
+        let mut workspaces = back.workspaces.clone();
+        assert!(
+            workspaces.fit_all_with(&mut live, &lua).is_empty(),
+            "the window's own fit after opening finds nothing left to place"
+        );
+    }
+
+    #[test]
+    fn float_memory_of_an_instance_only_another_workspace_holds_is_kept() {
+        let t2 = id("terminal#2");
+        let mut main = plain();
+        main.replace_root(super::super::tree::place_new(main.root_node(), &t2, Placement::BelowEditor).0);
+        let text = encode_v2(&with(&["main", "w2"], "main", &[main.clone(), plain()]), &main, &root());
+        let mut file: Value = serde_json::from_str(&text).unwrap();
+        file["workspaces"][1]["float_memory"] =
+            json!([{"module": "terminal#2", "cx": 0.25, "cy": 0.5, "w": 600, "h": 400}]);
+
+        let back = decode_v2(&file.to_string(), &root(), &[terminal_decl()]).unwrap();
+        let w2 = back.workspaces.stored("w2").unwrap();
+        assert_eq!(
+            w2.float_memory().get(&t2),
+            Some(&rect(0.25, 0.5, 600, 400)),
+            "the rectangle is there for when terminal#2 next floats in w2: {:?}",
+            back.notes
+        );
+        assert_eq!(
+            back.notes,
+            ["workspace 'w2': placed 'terminal#2' below the editor, hidden: another workspace has it"],
+            "no note claims the memory was left out"
+        );
+        assert_eq!(back.keep_copy, None, "nothing of the file was lost");
+    }
+
+    #[test]
+    fn float_memory_of_an_instance_no_workspace_holds_is_still_left_out() {
+        let t2 = id("terminal#2");
+        let mut study = plain();
+        study.replace_root(super::super::tree::place_new(study.root_node(), &t2, Placement::BelowEditor).0);
+        let text = encode_v2(&with(&["main", "study"], "main", &[plain(), study]), &plain(), &root());
+        let mut file: Value = serde_json::from_str(&text).unwrap();
+        file["workspaces"][0]["float_memory"] = json!([
+            {"module": "terminal#2", "cx": 0.25, "cy": 0.5, "w": 600, "h": 400},
+            {"module": "terminal#3", "cx": 0.75, "cy": 0.5, "w": 500, "h": 300},
+        ]);
+
+        let back = decode_v2(&file.to_string(), &root(), &[terminal_decl()]).unwrap();
+        assert_eq!(
+            back.current.float_memory().keys().collect::<Vec<_>>(),
+            [&t2],
+            "the current workspace keeps the memory of the instance study holds, and only that: {:?}",
+            back.notes
+        );
+        assert_eq!(
+            back.notes,
+            [
+                "workspace 'main': placed 'terminal#2' below the editor, hidden: another workspace has it",
+                "workspace 'main': float memory of 'terminal#3' left out: this window has no such module",
+            ]
+        );
+        assert!(
+            back.keep_copy.is_some(),
+            "a memory entry was dropped, so the file's text is kept"
+        );
+    }
+
     /// Two workspaces: `agent#2` tiled in `main`, `agent#3` a float in `study`, written by this build.
     fn a_file_with_two_chat_views() -> (String, Float) {
         let mut main = plain();
@@ -2813,7 +2850,7 @@ mod tests {
     #[test]
     fn the_build_before_floats_still_leaves_a_chat_view_out_and_keeps_a_copy() {
         let (text, _) = a_file_with_two_chat_views();
-        let old = decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap();
+        let old = frozen_reader::decode_v2(&text, &root(), &[]).unwrap();
         assert!(!old.current.contains(&id("agent#2")));
         assert!(
             old.notes
@@ -3176,7 +3213,7 @@ mod tests {
     }
 
     /// A workspace that shows only instances is one the window saves itself (hide refuses only the
-    /// last visible module), so the first pass must read it knowing its own instances.
+    /// last visible module), so each workspace must be read knowing its own instances.
     #[test]
     fn a_workspace_showing_only_instances_still_opens() {
         let leaf = |module: &str| json!({"share": 0.25, "node": {"type": "leaf", "module": module}});
@@ -3242,7 +3279,7 @@ mod tests {
             assert!(back.current.floats().is_empty() && back.current.float_memory().is_empty());
             assert!(back.notes.is_empty(), "{:?}", back.notes);
             assert_eq!(back.keep_copy, None);
-            assert_eq!(back, decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap());
+            assert_eq!(back, frozen_reader::decode_v2(&text, &root(), &[]).unwrap());
             assert_eq!(encode_v2(&back.workspaces, &back.current, &root()), text);
         }
     }
@@ -3297,7 +3334,7 @@ mod tests {
     fn the_first_units_reader_keeps_a_float_of_an_instance_it_does_not_place() {
         let layout = plain_with(vec![float("terminal#2", rect(0.5, 0.45, 900, 420), true)], &[]);
         let text = one(&layout);
-        let old = decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap();
+        let old = frozen_reader::decode_v2(&text, &root(), &[]).unwrap();
         assert_eq!(
             old.workspaces.kept_for("main").unwrap()["floating"],
             json_of(&text)["workspaces"][0]["floating"]
@@ -3307,7 +3344,7 @@ mod tests {
         assert!(old.notes.is_empty(), "{:?}", old.notes);
         assert_eq!(old.keep_copy, None);
 
-        let old_text = encode_v2_as(&old.workspaces, &old.current, &root(), Reader::BeforeFloats);
+        let old_text = frozen_reader::encode_v2(&old.workspaces, &old.current, &root());
         assert_eq!(
             json_of(&old_text),
             json_of(&text),
@@ -3325,11 +3362,11 @@ mod tests {
         let stowed = float("terminal#2", rect(0.5, 0.45, 900, 420), true);
         let layout = plain_with(vec![stowed.clone()], &["terminal#2"]);
         let text = one(&layout);
-        let old = decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap();
+        let old = frozen_reader::decode_v2(&text, &root(), &[]).unwrap();
         assert!(old.notes.is_empty(), "{:?}", old.notes);
         assert_eq!(old.keep_copy, None);
 
-        let old_text = encode_v2_as(&old.workspaces, &old.current, &root(), Reader::BeforeFloats);
+        let old_text = frozen_reader::encode_v2(&old.workspaces, &old.current, &root());
         let written = json_of(&old_text);
         assert_eq!(written["workspaces"][0]["hidden"], json!([]));
         assert_eq!(
@@ -3366,7 +3403,7 @@ mod tests {
             .contains(&id("terminal#2")));
         let text = encode_v2(&opened.workspaces, &opened.current, &root());
 
-        let old = decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap();
+        let old = frozen_reader::decode_v2(&text, &root(), &[]).unwrap();
         assert!(
             old.notes.contains(
                 &"floating of workspace 'main' names 'terminal#2', which this version places itself; a copy is kept"
@@ -3385,7 +3422,7 @@ mod tests {
         assert_eq!(old.keep_copy.as_deref(), Some(text.as_str()));
         assert!(old.current.leaves().contains(&id("terminal#2")) && old.current.hidden().contains(&id("terminal#2")));
 
-        let old_text = encode_v2_as(&old.workspaces, &old.current, &root(), Reader::BeforeFloats);
+        let old_text = frozen_reader::encode_v2(&old.workspaces, &old.current, &root());
         let back = decode_v2(&old_text, &root(), &[]).unwrap();
         for (name, layout) in back.workspaces.each(&back.current) {
             assert!(layout.floats().is_empty(), "{name}");
@@ -3404,7 +3441,7 @@ mod tests {
         )
         .unwrap();
         let text = one(&layout);
-        let old = decode_v2_as(&text, &root(), &[], Reader::BeforeFloats).unwrap();
+        let old = frozen_reader::decode_v2(&text, &root(), &[]).unwrap();
         for note in [
             "floating of workspace 'main' names 'terminal', which this version places itself; a copy is kept",
             "float_memory of workspace 'main' names 'agent', which this version places itself; a copy is kept",

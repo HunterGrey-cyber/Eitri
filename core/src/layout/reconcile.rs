@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use super::con::{ConLayout, Node, Pin};
+use super::con::{remove_child, ConLayout, Node, Pin};
 use super::float::{Float, FloatRect};
 use super::module::{declared_placement, ModuleDecl, ModuleId, ModuleKind, Placement};
 use super::tree::{place_new, Layout, LayoutError};
@@ -353,10 +353,10 @@ fn pin_bottom_rows(node: &mut Node, below_root: &dyn Fn(&ModuleId) -> bool, note
     pin_bottom_rows(&mut c.children[0].node, below_root, notes);
 }
 
-/// `node` without the leaves `keep` refuses. A container left with one child is replaced by it, which
-/// takes the container's place; one left with more has their shares scaled back up to 1. `None` if
-/// nothing is left. The refused ids go into `dropped`, in tree order; a leaf left alone where a
-/// container was, by refused siblings, goes into `uncovered` (step 1's hidden editor).
+/// `node` without the leaves `keep` refuses. A split left with one child is replaced by it;
+/// tabbed and stacked containers keep their strip. Surviving shares scale back up to 1.
+/// `None` if nothing is left. The refused ids go into `dropped`, in tree order; a leaf left
+/// alone by refused siblings goes into `uncovered` so a hidden editor can be shown again.
 fn prune(
     node: Node,
     keep: &dyn Fn(&ModuleId) -> bool,
@@ -374,42 +374,25 @@ fn prune(
         }
         Node::Con(mut c) => {
             let before = c.children.len();
-            let focus = c.focus;
-            let mut kept_before_focus = 0;
-            c.children = std::mem::take(&mut c.children)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, mut ch)| {
-                    ch.node = prune(ch.node, keep, dropped, uncovered)?;
-                    if i < focus {
-                        kept_before_focus += 1;
-                    }
-                    Some(ch)
-                })
-                .collect();
-            if !c.children.is_empty() && c.children.len() != before {
-                // The remembered child (the drawn tab) stays the same child while it survives, and
-                // passes to the one that followed it, wrapping, when it was left out.
-                c.focus = kept_before_focus % c.children.len();
+            let mut at = 0;
+            while at < c.children.len() {
+                let node = std::mem::replace(&mut c.children[at].node, Node::Leaf(ModuleId::editor()));
+                if let Some(node) = prune(node, keep, dropped, uncovered) {
+                    c.children[at].node = node;
+                    at += 1;
+                } else {
+                    remove_child(&mut c, at);
+                }
+            }
+            if c.children.len() == 1 && before > 1 {
+                if let Node::Leaf(id) = &c.children[0].node {
+                    uncovered.push(id.clone());
+                }
             }
             match c.children.len() {
                 0 => None,
-                1 if before > 1 => {
-                    let only = c.children.pop().expect("one child").node;
-                    if let Node::Leaf(id) = &only {
-                        uncovered.push(id.clone());
-                    }
-                    Some(only)
-                }
-                n => {
-                    if n != before {
-                        let sum: f32 = c.children.iter().map(|ch| ch.share).sum();
-                        for ch in &mut c.children {
-                            ch.share /= sum;
-                        }
-                    }
-                    Some(Node::Con(c))
-                }
+                1 if c.layout.axis().is_some() => Some(c.children.pop().expect("one child").node),
+                _ => Some(Node::Con(c)),
             }
         }
     }
@@ -711,6 +694,72 @@ mod tests {
         let r = reconcile_default(nested.clone(), &[]).unwrap();
         same_as(&r, nested);
         assert!(r.notes.is_empty(), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn a_reopened_tab_strip_keeps_its_last_tab() {
+        for mode in [ConLayout::Tabbed, ConLayout::Stacked] {
+            let mut strip = Con::new(
+                mode,
+                vec![
+                    Child::new(leaf(agent()), 0.5),
+                    Child::new(leaf(ModuleId::lua("gone")), 0.5),
+                ],
+            );
+            strip.focus = 1;
+            strip.last_split = Axis::Column;
+            let strip_id = strip.id;
+            let r = reconcile(
+                row(leaf(editor()), Node::Con(strip)),
+                &BTreeSet::new(),
+                Some(&editor()),
+                &[],
+                &[],
+            )
+            .unwrap();
+            let strip = r.layout.root().children[1]
+                .node
+                .as_con()
+                .expect("the remaining tab keeps its strip");
+            assert_eq!(strip.id, strip_id);
+            assert_eq!(strip.layout, mode);
+            assert_eq!(strip.last_split, Axis::Column);
+            assert_eq!(strip.focus, 0);
+            assert_eq!(strip.children, vec![Child::new(leaf(agent()), 1.0)]);
+            assert!(r.layout.is_titled_on_strip(&agent()));
+        }
+    }
+
+    #[test]
+    fn the_editor_under_a_gone_main_panel_in_a_kept_strip_is_shown() {
+        for mode in [ConLayout::Tabbed, ConLayout::Stacked] {
+            let main = ModuleId::lua("main");
+            let strip = Con::new(
+                mode,
+                vec![Child::new(leaf(main.clone()), 0.5), Child::new(leaf(editor()), 0.5)],
+            );
+            let strip_id = strip.id;
+            let r = reconcile(
+                row(Node::Con(strip), leaf(agent())),
+                &set(&[editor()]),
+                Some(&main),
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert!(
+                r.layout.is_shown(&editor()),
+                "the vanished panel no longer covers the editor"
+            );
+            assert!(r.layout.is_visible(&editor()));
+            assert_eq!(r.layout.focus(), &editor());
+            let strip = r.layout.root().find(strip_id).expect("the editor keeps its strip");
+            assert_eq!(strip.layout, mode);
+            assert_eq!(strip.children.len(), 1);
+            assert_eq!(strip.children[0].share, 1.0);
+            assert_eq!(strip.children[0].node.leaves(), vec![editor(), term()]);
+            assert!(r.notes.iter().any(|note| note.starts_with("showed 'editor':")));
+        }
     }
 
     /// Leaving a module out of a tabbed container keeps the drawn tab on the same child, or on the

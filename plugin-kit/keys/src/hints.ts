@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 /*! The prefix-free hint label scheme below is adapted from Vimium, under this notice (also ../LICENSE-vimium):
  *
  * The MIT License (MIT)
@@ -24,6 +25,7 @@
  */
 import type { HintTarget } from "./index";
 import { ensureStyle } from "./style";
+import { isOperable } from "./visible";
 
 export type { HintTarget } from "./index";
 
@@ -59,13 +61,15 @@ export function placeLabel(
 
 let kept: { el: Element; label: string } | null = null;
 
+onRemove(() => { kept = null; });
+
 const TARGETS = 'a[href], button, summary, input, select, textarea, [role="button"], [role="tab"], ' +
   '[role="option"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-eitri-target]';
 const CLIPPING = /^(auto|scroll|hidden|clip|overlay)$/;
 
 function visibleRect(el: Element, root: Document) {
   const view = root.defaultView;
-  if (!view || !el.isConnected || el.ownerDocument !== root || el.matches(":disabled")) return null;
+  if (!view || !el.isConnected || el.ownerDocument !== root || !isOperable(el)) return null;
   // A modal dialog makes the rest of the document inert without adding an inert attribute.
   for (const dialog of root.querySelectorAll("dialog[open]")) {
     let modal = false;

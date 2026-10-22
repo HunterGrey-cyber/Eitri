@@ -43,3 +43,11 @@ export function timeoutOf(data: unknown): number | undefined {
   return record(data) && typeof data.timeoutlen === "number" && Number.isFinite(data.timeoutlen) && data.timeoutlen >= 0
     ? data.timeoutlen : undefined;
 }
+
+// Modules register without importing the installer, which imports their key handlers.
+export const removalResets: Array<() => void> = [];
+
+/** Registrations survive removal so every reinstall starts with the same module resets. */
+export function onRemove(reset: () => void): void {
+  removalResets.push(reset);
+}

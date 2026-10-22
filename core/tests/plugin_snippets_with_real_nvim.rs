@@ -137,6 +137,21 @@ fn clear(c: &mut Case, owner: &str) -> (u64, u64) {
     (get("restored"), get("left_alone"))
 }
 
+/// An assist call that says when it was made: `maker` and `order`, as the host sends them.
+fn made(c: &mut Case, op: &str, owner: &str, diagnostics: bool, hints: bool, maker: &str, order: u64) -> Value {
+    let mut pairs = vec![
+        ("owner", owner.into()),
+        ("maker", maker.into()),
+        ("order", order.into()),
+    ];
+    if op == "apply" {
+        pairs.push(("root", s(&c.root.clone())));
+        pairs.push(("diagnostics", diagnostics.into()));
+        pairs.push(("inlay_hints", hints.into()));
+    }
+    c.nvim.lua(PLUGIN_ASSIST_LUA, vec![op.into(), opts_map(&pairs)])
+}
+
 fn field<'a>(v: &'a Value, k: &str) -> &'a Value {
     &v.as_map()
         .unwrap()
@@ -169,6 +184,39 @@ fn assist_applies_then_clears_exactly_and_leaves_buffers_outside_alone() {
         vec![],
     );
     assert_eq!(gone, Value::from(false), "the augroup is deleted");
+}
+
+/// Two calls of one window can reach nvim swapped; the one made last must be what stays in force, so a stop's
+/// clear that overtook its apply leaves nothing set behind it.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_assist_call_overtaken_by_a_later_one_changes_nothing() {
+    let mut c = case("order");
+    let a = c.a.clone();
+    edit(&mut c, &a);
+    attach(&mut c, &a);
+    set(&mut c, &a, true, true);
+    // The clear made second arrives first, then the apply made before it.
+    let cleared = made(&mut c, "clear", "demo", false, false, "m", 2);
+    assert_eq!(field(&cleared, "restored").as_u64(), Some(0));
+    let late = made(&mut c, "apply", "demo", false, false, "m", 1);
+    assert_eq!(field(&late, "skipped").as_bool(), Some(true));
+    assert_eq!(field(&late, "buffers").as_u64(), Some(0));
+    assert_eq!(state(&mut c, &a), (true, true), "the late apply set nothing");
+    let gone = c.nvim.lua(
+        "return pcall(vim.api.nvim_get_autocmds, { group = 'EitriPluginAssist_demo' })",
+        vec![],
+    );
+    assert_eq!(gone, Value::from(false), "the late apply left no augroup");
+    // Two applies swapped: the later one's values stay.
+    made(&mut c, "apply", "demo", false, true, "m", 4);
+    let older = made(&mut c, "apply", "demo", true, false, "m", 3);
+    assert_eq!(field(&older, "skipped").as_bool(), Some(true));
+    assert_eq!(state(&mut c, &a), (false, true));
+    // Another process counts on its own: its calls run whatever its numbers.
+    let other = made(&mut c, "clear", "demo", false, false, "n", 1);
+    assert_eq!(field(&other, "restored").as_u64(), Some(2), "both settings put back");
+    assert_eq!(state(&mut c, &a), (true, true));
 }
 
 #[test]

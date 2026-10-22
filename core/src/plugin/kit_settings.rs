@@ -134,6 +134,65 @@ mod tests {
         from_config(|key| map.get(key).cloned())
     }
 
+    fn shared_table() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugin/fixtures/kit_settings.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn kit_settings_match_the_shared_table() {
+        let table = shared_table();
+        assert_eq!(
+            serde_json::to_value(KeysSettings::default()).unwrap(),
+            table["defaults"]
+        );
+        for group in ["accepted", "refused"] {
+            for example in table[group].as_array().unwrap() {
+                let field = example["field"].as_str().unwrap();
+                let key = format!("plugins.keys.{field}");
+                let value = &example["value"];
+                let raw = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => "false".into(),
+                    _ => value.to_string(),
+                };
+                let result = parse(&[(&key, &raw)]);
+                if group == "accepted" {
+                    assert_eq!(serde_json::to_value(result.unwrap()).unwrap()[field], *value);
+                } else {
+                    assert!(result.is_err(), "{field} = {value} must be refused");
+                }
+            }
+        }
+        for (field, range) in table["ranges"].as_object().unwrap() {
+            let key = format!("plugins.keys.{field}");
+            let min = range[0].as_i64().unwrap();
+            let max = range[1].as_i64().unwrap();
+            for (n, accepted) in [(min - 1, false), (min, true), (max, true), (max + 1, false)] {
+                let raw = if field == "hint_chars" {
+                    "abcdefghijklmnopqrstuvwxyz".repeat(2)[..n as usize].to_owned()
+                } else {
+                    n.to_string()
+                };
+                assert_eq!(parse(&[(&key, &raw)]).is_ok(), accepted, "{field} = {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_prefix_the_keymap_accepts_round_trips_through_the_kit() {
+        let table = shared_table();
+        let prefixes = table["prefixes"].as_array().unwrap();
+        assert_eq!(prefixes.len(), 26);
+        for (letter, prefix) in ('a'..='z').zip(prefixes) {
+            for input in [letter, letter.to_ascii_uppercase()] {
+                let key = crate::keymap::KeySpec::parse(&format!("C-{input}")).unwrap();
+                assert_eq!(key.human(), prefix["human"].as_str().unwrap());
+                assert_eq!(key.to_vim(), prefix["kit"].as_str().unwrap());
+            }
+        }
+    }
+
     #[test]
     fn unset_keys_give_the_defaults() {
         assert_eq!(

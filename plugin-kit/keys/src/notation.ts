@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 import type { KeySeq, KeyStroke } from "./index";
 export type { KeySeq, KeyStroke } from "./index";
 
@@ -6,11 +7,17 @@ const NAMED: Record<string, string> = {
   Up: "ArrowUp", Down: "ArrowDown", Space: " ", Tab: "Tab", Home: "Home", End: "End", Del: "Delete", lt: "<",
 };
 
-const NAMES = new Map(Object.entries(NAMED).map(([name, key]) => [name.toLowerCase(), key]));
-NAMES.set("enter", "Enter");
-NAMES.set("return", "Enter");
-NAMES.set("bslash", "\\");
-NAMES.set("bar", "|");
+function names(): Map<string, string> {
+  const names = new Map(Object.entries(NAMED).map(([name, key]) => [name.toLowerCase(), key]));
+  names.set("enter", "Enter");
+  names.set("return", "Enter");
+  names.set("bslash", "\\");
+  names.set("bar", "|");
+  return names;
+}
+
+let NAMES = names();
+onRemove(() => { NAMES = names(); });
 
 function shifted(key: string): boolean {
   return /^[A-Z~!@#$%^&*()_+{}|:"<>?]$/.test(key);

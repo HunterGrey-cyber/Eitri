@@ -2,7 +2,7 @@
 //! directory, its manifest checked and its settings, roots and
 //! directories made ready while `init.lua` runs. The window turns each loaded plugin into a Lua panel module
 //! `lua:<id>` whose content is the plugin's page. Every refusal is a startup failure naming the call
-//! (`PluginRegistry::refused`, checked after `init.lua` ran, so a `pcall` around the call changes nothing).
+//! recorded by the kernel at the function boundary during init, so a `pcall` cannot hide it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -67,7 +67,7 @@ impl PluginRegistration {
 #[derive(Default)]
 pub struct PluginRegistry {
     plugins: Vec<PluginRegistration>,
-    refused: Option<String>,
+    init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
 }
 
 impl PluginRegistry {
@@ -75,14 +75,10 @@ impl PluginRegistry {
         &self.plugins
     }
 
-    pub fn refused(&self) -> Option<&str> {
-        self.refused.as_deref()
-    }
-
-    fn refuse(&mut self, message: String) {
-        if self.refused.is_none() {
-            self.refused = Some(message);
-        }
+    pub fn refused(&self) -> Option<String> {
+        self.init_refusals
+            .as_ref()
+            .and_then(|shared| shared.borrow().message("eitri.plugin.load"))
     }
 }
 
@@ -247,10 +243,10 @@ fn install_with_log(
     search: SearchEnv,
     log: Rc<dyn Fn(&str)>,
 ) -> mlua::Result<()> {
+    registry.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
     let table = lua.create_table()?;
-    // Both arguments are taken as plain values and checked here, so a wrong type is a refusal this registry
-    // keeps, not a conversion error `init.lua` could swallow.
-    let load = lua.create_function(move |_, (arg, opts): (Value, Value)| {
+    // Plain values let validation name the argument that cannot be loaded.
+    let load = super::kernel::registering_function(lua, "eitri.plugin.load", move |_, (arg, opts): (Value, Value)| {
         let outcome = register(arg, opts, state_root.as_deref(), home.as_deref(), &search, &*log).and_then(
             |(registration, label)| {
                 let twice = registry
@@ -278,10 +274,7 @@ fn install_with_log(
                 registry.borrow_mut().plugins.push(registration);
                 Ok(())
             }
-            Err(message) => {
-                registry.borrow_mut().refuse(message.clone());
-                Err(mlua::Error::RuntimeError(message))
-            }
+            Err(message) => Err(mlua::Error::RuntimeError(message)),
         }
     })?;
     table.set("load", load)?;
@@ -292,7 +285,7 @@ fn install_with_log(
 /// so an `init.lua` written for the full window still loads.
 pub fn refuse_plugins(lua: &Lua, eitri: &Table) -> mlua::Result<()> {
     let told = Rc::new(Cell::new(false));
-    let load = lua.create_function(move |_, _args: mlua::MultiValue| {
+    let load = super::kernel::registering_function(lua, "eitri.plugin.load", move |_, _args: mlua::MultiValue| {
         if !told.replace(true) {
             eprintln!("eitri: plugins are not in this window");
         }
@@ -656,7 +649,7 @@ mod tests {
             s.0.join("sys/eitri/plugins/other").display()
         );
         assert!(err.contains(&want), "{err}");
-        assert_eq!(registry.borrow().refused(), Some(want.as_str()));
+        assert_eq!(registry.borrow().refused().as_deref(), Some(want.as_str()));
         assert!(registry.borrow().plugins().is_empty());
         assert!(lines.borrow().is_empty(), "{:?}", lines.borrow());
         assert!(
@@ -677,7 +670,7 @@ mod tests {
             s.0.join("sys/eitri/plugins/markdwn").display()
         );
         assert!(err.contains(&want), "{err}");
-        assert_eq!(registry.borrow().refused(), Some(want.as_str()));
+        assert_eq!(registry.borrow().refused().as_deref(), Some(want.as_str()));
     }
 
     #[test]

@@ -913,6 +913,7 @@ describe("prefixes that wait, Space and Esc", () => {
     vi.spyOn(target, "getBoundingClientRect").mockReturnValue({
       x: 10, y: 10, left: 10, top: 10, right: 40, bottom: 30, width: 30, height: 20, toJSON: () => ({}),
     });
+    vi.spyOn(target, "getClientRects").mockReturnValue([new DOMRect(10, 10, 30, 20)] as unknown as DOMRectList);
     vi.spyOn(target, "clientWidth", "get").mockReturnValue(30);
     vi.spyOn(target, "clientHeight", "get").mockReturnValue(20);
     const click = vi.fn();
@@ -1077,6 +1078,49 @@ describe("a focus list", () => {
     vi.spyOn(HTMLElement.prototype, "getClientRects").mockImplementation(function (this: HTMLElement) {
       return (this.dataset.unrendered ? [] : [new DOMRect(0, 0, 10, 10)]) as unknown as DOMRectList;
     });
+  });
+  it("j_steps_over_a_disabled_button_in_a_list", async () => {
+    document.body.innerHTML = '<nav data-eitri-list><a href="#1">1</a><button disabled>2</button><a href="#3">3</a></nav>';
+    await start();
+    const links = document.querySelectorAll("nav a");
+    (links[0] as HTMLElement).focus();
+    expect(key("j", {}, document.activeElement!).defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(links[1]);
+  });
+  it("j_skips_an_item_whose_focus_did_not_take", async () => {
+    document.body.innerHTML = '<nav data-eitri-list><a href="#1">1</a><a href="#2">2</a><a href="#3">3</a></nav>';
+    await start();
+    const links = document.querySelectorAll<HTMLElement>("nav a");
+    vi.spyOn(links[1], "focus").mockImplementation(() => {});
+    links[0].focus();
+    key("j", {}, document.activeElement!);
+    expect(document.activeElement).toBe(links[2]);
+  });
+  it("inert_and_hidden_visibility_items_are_not_list_items", async () => {
+    document.body.innerHTML = '<nav data-eitri-list><a href="#1">1</a><a href="#2">2</a><a href="#3">3</a><a href="#4">4</a></nav>';
+    await start();
+    const links = document.querySelectorAll<HTMLElement>("nav a");
+    const closest = links[1].closest.bind(links[1]);
+    vi.spyOn(links[1], "closest").mockImplementation((selector) => selector === "[inert]" ? links[1] : closest(selector));
+    const computedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el) => new Proxy(computedStyle(el), {
+      get: (target, prop) => prop === "visibility" && el === links[2] ? "hidden" : Reflect.get(target, prop),
+    }));
+    links[0].focus();
+    key("j", {}, document.activeElement!);
+    expect(document.activeElement).toBe(links[3]);
+  });
+  it("j_with_no_operable_item_after_the_focused_one_keeps_the_focus", async () => {
+    document.body.innerHTML = '<nav data-eitri-list><a href="#1">1</a><button disabled>2</button><button disabled>3</button></nav>';
+    await start();
+    const first = document.querySelector<HTMLElement>("nav a")!;
+    const disabled = [...document.querySelectorAll<HTMLElement>("nav button")].map((el) => vi.spyOn(el, "focus"));
+    first.focus();
+    for (let press = 0; press < 2; press++) {
+      expect(key("j", {}, first).defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(first);
+    }
+    for (const focus of disabled) expect(focus).not.toHaveBeenCalled();
   });
   it("j and k move focus between the list's links instead of scrolling", async () => {
     document.body.insertAdjacentHTML("beforeend",

@@ -441,9 +441,18 @@ fn a_hidden_bottom_row_stays_around_a_preset_and_other_hidden_modules_collapse_a
 
     let mut layout = fixture("row(editor, lua:h hidden, agent, terminal)");
     preset(&mut layout, Preset::MainVertical).unwrap();
-    let mut want = fixture(&format!(
-        "row(editor {e}, column(agent 0.5, terminal 0.5, lua:h hidden))",
-        e = e()
+    let mut want = fixture("row(editor, agent, terminal, lua:h hidden)");
+    want.replace_root(Node::split(
+        Axis::Row,
+        DEFAULT_EDITOR_SHARE,
+        Node::Leaf(id("editor")),
+        Node::Con(Con::new(
+            ConLayout::SplitV,
+            ["agent", "terminal", "lua:h"]
+                .into_iter()
+                .map(|name| super::super::con::Child::new(Node::Leaf(id(name)), 1.0 / 3.0))
+                .collect(),
+        )),
     ));
     same_rects(&layout, &want);
     layout.show(&id("lua:h")).unwrap();

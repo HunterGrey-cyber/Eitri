@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 /** Frame-driven scrolling for the generic scroll actions.
  *
  *  A key press eases one move, and presses that come while a move runs add to where it is heading, so N presses
@@ -545,3 +546,5 @@ export function scrollToAnimated(el: ScrollTargetEl, top: number): void {
   g.code = null;
   run(g);
 }
+
+onRemove(cancelGlide);

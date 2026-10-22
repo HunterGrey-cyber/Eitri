@@ -107,7 +107,7 @@ pub fn kill(
         Reopen::At(placement) => {
             // The module can be the root's only tile while everything else floats: taking it out
             // leaves no tree to place it into, so it stays hidden where it is, as `InPlace` leaves it.
-            if let Some(root) = layout.root_node().without(id) {
+            if let Ok(root) = layout.detach_tile(id) {
                 layout.take_float(id);
                 // A first launch hides the editor under a Lua `main` panel (`place_new`'s `true`). Not
                 // here: the panel is hidden, so hiding the editor too would empty its region, and the

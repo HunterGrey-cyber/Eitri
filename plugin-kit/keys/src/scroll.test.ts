@@ -9,6 +9,9 @@ import { runScroll } from "./scroll";
 let y = 1000;
 beforeEach(() => {
   y = 1000;
+  // Navigation fixtures are drawn links; jsdom provides no layout boxes.
+  vi.spyOn(Element.prototype, "getClientRects").mockReturnValue(
+    [new DOMRect(0, 0, 100, 20)] as unknown as DOMRectList);
   Object.defineProperty(window, "scrollY", { configurable: true, get: () => y });
   Object.defineProperty(window, "matchMedia", { configurable: true, value: () => ({ matches: true }) });
   vi.spyOn(window, "scrollTo").mockImplementation(((opts: ScrollToOptions) => { y = opts.top!; }) as typeof window.scrollTo);

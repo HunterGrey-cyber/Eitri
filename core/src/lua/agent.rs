@@ -1,8 +1,8 @@
 //! `eitri.agent.register({ name, command, project_files, auto_mode })`: an agent spoken to over ACP.
 //!
 //! The registration is configuration the user wrote, so every refusal is a startup failure naming the
-//! key (`AgentRegistry::refused`, checked by `Kernel::run_and_check_init_file` after `init.lua` ran, so a
-//! `pcall` around the call changes nothing). Nothing is started here: a tab of a registered agent starts
+//! key. The kernel records it at the function boundary while init.lua runs, so a `pcall` cannot hide it.
+//! Nothing is started here: a tab of a registered agent starts
 //! only after the user trusted the project for it.
 
 use mlua::{Lua, Table, Value};
@@ -32,8 +32,8 @@ pub struct AgentRegistration {
 #[derive(Default)]
 pub struct AgentRegistry {
     agents: Vec<AgentRegistration>,
-    /// The first refusal, kept however `init.lua` handled the Lua error.
-    refused: Option<String>,
+    /// Shares startup validation with the other Lua APIs.
+    init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
 }
 
 impl AgentRegistry {
@@ -48,8 +48,10 @@ impl AgentRegistry {
     }
 
     /// The message of the first registration refused, or `None`.
-    pub fn refused(&self) -> Option<&str> {
-        self.refused.as_deref()
+    pub fn refused(&self) -> Option<String> {
+        self.init_refusals
+            .as_ref()
+            .and_then(|shared| shared.borrow().message("eitri.agent.register"))
     }
 }
 
@@ -183,7 +185,8 @@ fn describe(key: &Value) -> String {
 
 /// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<AgentRegistry>>) -> mlua::Result<()> {
-    let register = lua.create_function(move |_, spec: Value| {
+    registry.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
+    let register = super::kernel::registering_function(lua, "eitri.agent.register", move |_, spec: Value| {
         let parsed = match &spec {
             Value::Table(table) => parse_registration(table),
             other => Err(format!("{PREFIX}: takes a table, not a {}", other.type_name())),
@@ -200,10 +203,7 @@ pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<AgentRegistry>>) -
                 registry.borrow_mut().agents.push(agent);
                 Ok(())
             }
-            Err(message) => {
-                registry.borrow_mut().refused.get_or_insert_with(|| message.clone());
-                Err(mlua::Error::RuntimeError(message))
-            }
+            Err(message) => Err(mlua::Error::RuntimeError(message)),
         }
     })?;
     let agent = lua.create_table()?;
@@ -229,11 +229,7 @@ mod tests {
     fn refusal(source: &str) -> String {
         let (lua, registry) = engine();
         let err = lua.load(source).exec().expect_err(source).to_string();
-        let kept = registry
-            .borrow()
-            .refused()
-            .map(str::to_owned)
-            .expect("the refusal is kept");
+        let kept = registry.borrow().refused().expect("the refusal is kept");
         assert!(err.contains(&kept), "{err} / {kept}");
         assert!(registry.borrow().agents().is_empty());
         kept

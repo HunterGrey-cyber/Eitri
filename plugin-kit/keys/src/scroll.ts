@@ -1,13 +1,14 @@
 import { glideAction } from "./glide";
+import { isOperable } from "./visible";
 
 const PREVIOUS = /\b(?:prev|previous|back|older)\b|[<‹←«]|上一/i;
 const NEXT = /\b(?:next|forward|newer)\b|[>›→»]|下一/i;
 
 function follow(direction: "prev" | "next"): boolean {
-  const rel = document.querySelector<HTMLAnchorElement>(`a[rel~="${direction}"][href]`);
+  const rel = [...document.querySelectorAll<HTMLAnchorElement>(`a[rel~="${direction}"][href]`)].find(isOperable);
   const pattern = direction === "prev" ? PREVIOUS : NEXT;
   const link = rel ?? [...document.querySelectorAll<HTMLAnchorElement>("a[href]")]
-    .find((candidate) => pattern.test(candidate.textContent ?? ""));
+    .find((candidate) => isOperable(candidate) && pattern.test(candidate.textContent ?? ""));
   if (!link) return false;
   link.click();
   return true;

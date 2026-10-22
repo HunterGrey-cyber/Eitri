@@ -14,6 +14,20 @@ use rmpv::Value;
 
 use crate::nvim_rpc::{NvimLink, Pending};
 
+/// **Calls are written in the order they were made.** Every call made through one handle reaches
+/// nvim after every call made through it before, and nvim runs them in that order; each is answered
+/// by its own request id, so a later call is written at once, never held back until an earlier one
+/// is answered. A caller that stops waiting for an answer (its deadline passed) changes nothing: the
+/// call stays ahead of every later one. So a caller orders its calls by making them in order, and
+/// never holds one back until the previous one is answered. Both transports keep this: the
+/// companion's [`NvimLink`] queues every frame to one writer thread, and the embedded editor hands
+/// every call to its session's one call line (`neovide_editor`'s `nvim_rpc`), where the window's
+/// quit (`NeovideEditorPane::exec_lua_watched`) is written in order with them too. The embedded
+/// editor has one gap the companion does not: nvim-rs takes two locks of its own before it writes a
+/// request, and when another writer frees one in the instant between two of the line's polls, the
+/// later call can be written first (`nvim_rpc`'s module doc). It is rare, but a caller for whom two
+/// calls run swapped would leave a wrong state for good makes the older one harmless to run late
+/// (the plugin host's assist calls carry the order they were made in, `plugin::editor`).
 pub trait EditorRpc {
     /// `nvim_exec_lua(code, args)`. `code` is a compile-time constant; every value travels in
     /// `args`. A transport with no editor to ask answers [`crate::nvim_rpc::RpcError::Unavailable`]
@@ -22,6 +36,8 @@ pub trait EditorRpc {
 
     /// Changes whenever the nvim behind this handle changes (attach, retarget, restart), so a
     /// caller can tell an answer about one editor from a question to the next; `None`: no editor.
+    /// The order above holds within one target: a call to the next editor is not ordered with one
+    /// still out at the last.
     fn target(&self) -> Option<u64>;
 }
 

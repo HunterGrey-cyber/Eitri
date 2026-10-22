@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 export type FindCase = "smart" | "ignore" | "match";
 export type KitSettings = {
   scrollStep: number;
@@ -35,6 +36,8 @@ export function settingsOf(wire: unknown): KitSettings {
 }
 
 let settings = DEFAULT_SETTINGS;
+
+onRemove(() => { settings = DEFAULT_SETTINGS; });
 
 export function useSettings(next: KitSettings): void {
   settings = next;

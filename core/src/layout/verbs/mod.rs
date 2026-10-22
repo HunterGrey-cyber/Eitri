@@ -15,10 +15,10 @@ pub use floating::{
 pub use move_dir::move_dir;
 pub use select::{focus_child, focus_parent};
 
-use super::con::{Con, ConId, ConLayout, Node};
+use super::con::{Child, Con, ConId, ConLayout, Node};
 use super::geometry::{arrange_with, Direction, Frame};
 use super::module::ModuleId;
-use super::ops::{even, even_chain, hidden_bottom_rows};
+use super::ops::{even, even_con, hidden_bottom_rows};
 use super::tree::{
     Axis, Branch, Layout, LayoutError, Selection, BELOW_ROOT_SHARE, DEFAULT_EDITOR_SHARE, MAX_RATIO, MIN_RATIO,
     RIGHT_OF_ROOT_SHARE,
@@ -161,12 +161,18 @@ pub fn move_far(layout: &mut Layout, target: &ModuleId, dir: Direction, frame: &
             .node;
     }
     let unit = unit.clone();
-    let rest = unit
-        .leaves()
-        .iter()
-        .try_fold(tree.clone(), |rest, id| rest.without(id))
-        .expect("another module is shown, so it is still in the tree");
-    let root = wrap_far(unit, rest, dir);
+    let mut remaining = layout.clone();
+    for id in unit.leaves() {
+        let rest = remaining
+            .detach_tile(&id)
+            .map_err(|_| LayoutError::LastVisible(target.clone()))?;
+        // Keep intermediate trees private so a refusal preserves focus, undo and the original tree.
+        *remaining.root_mut() = match rest {
+            Node::Con(c) => c,
+            leaf => Con::new(ConLayout::SplitH, vec![Child::new(leaf, 1.0)]),
+        };
+    }
+    let root = wrap_far(unit, remaining.root_node(), dir);
     apply(layout, root);
     Ok(true)
 }
@@ -292,7 +298,7 @@ pub fn preset(layout: &mut Layout, preset: Preset) -> Result<(), LayoutError> {
                         outer,
                         ratio,
                         Node::Leaf(shown[0].clone()),
-                        even_chain(inner, leaves(rest), n - 1),
+                        even_con(inner, leaves(rest), n - 1),
                     )
                 }
                 Preset::Tiled => {
@@ -310,10 +316,10 @@ pub fn preset(layout: &mut Layout, preset: Preset) -> Result<(), LayoutError> {
                         if i + 1 == chunks.len() {
                             items.extend(hidden.iter().cloned());
                         }
-                        nodes.push(even_chain(Axis::Row, leaves(items), chunk.len()));
+                        nodes.push(even_con(Axis::Row, leaves(items), chunk.len()));
                     }
                     let count = nodes.len();
-                    even_chain(Axis::Column, nodes, count)
+                    even_con(Axis::Column, nodes, count)
                 }
                 Preset::EvenHorizontal | Preset::EvenVertical => unreachable!(),
             };
@@ -627,5 +633,214 @@ mod selection_tests {
             vec![ModuleId::terminal(), ModuleId::editor()]
         );
         assert_eq!(l.focus(), &ModuleId::editor());
+    }
+}
+
+#[cfg(test)]
+mod preset_containers {
+    use super::*;
+    use crate::layout::con::MAX_CHILDREN;
+    use crate::layout::fixture::fixture;
+    use crate::layout::geometry::{arrange, Size};
+    use crate::layout::module::{ModuleDecl, Placement};
+    use crate::layout::persist::{decode_v2, encode_v2};
+    use std::collections::BTreeMap;
+
+    const FRAMES: [Size; 3] = [
+        Size { w: 1280, h: 721 },
+        Size { w: 1920, h: 1040 },
+        Size { w: 800, h: 600 },
+    ];
+    fn rects(layout: &Layout, size: Size) -> BTreeMap<ModuleId, super::super::geometry::Rect> {
+        arrange(layout, &Frame::new(size, 1)).modules.into_iter().collect()
+    }
+    use crate::layout::workspace::Workspaces;
+
+    fn four() -> Layout {
+        fixture("row(editor, agent, terminal, lua:x)")
+    }
+
+    #[test]
+    fn an_even_preset_is_one_container_of_four() {
+        let mut layout = four();
+        preset(&mut layout, Preset::EvenHorizontal).unwrap();
+        assert_eq!(layout.last_preset(), Some(Preset::EvenHorizontal));
+        assert_eq!(layout.root().children.len(), 4);
+        assert!(layout
+            .root()
+            .children
+            .iter()
+            .all(|child| matches!(child.node, Node::Leaf(_))));
+    }
+
+    #[test]
+    fn a_move_out_of_the_first_slot_of_an_even_preset_swaps_neighbours() {
+        let mut layout = four();
+        preset(&mut layout, Preset::EvenHorizontal).unwrap();
+        let before = layout.clone();
+        let original = rects(&layout, FRAMES[0]);
+        assert_eq!(move_dir(&mut layout, &ModuleId::editor(), Direction::Right), Ok(true));
+        let moved = rects(&layout, FRAMES[0]);
+        assert_eq!(moved[&ModuleId::editor()], original[&ModuleId::agent()]);
+        assert_eq!(moved[&ModuleId::agent()], original[&ModuleId::editor()]);
+        layout.undo().unwrap();
+        assert_eq!(layout.root(), before.root());
+    }
+
+    #[test]
+    fn moving_the_last_of_an_even_row_left_twice_keeps_every_width() {
+        let mut layout = four();
+        preset(&mut layout, Preset::EvenHorizontal).unwrap();
+        let original = rects(&layout, FRAMES[0]);
+        for _ in 0..2 {
+            assert_eq!(move_dir(&mut layout, &ModuleId::lua("x"), Direction::Left), Ok(true));
+            for (id, rect) in rects(&layout, FRAMES[0]) {
+                assert!((rect.w - original[&id].w).abs() <= 1, "{id} keeps its width");
+            }
+        }
+    }
+
+    fn chain(axis: Axis, items: Vec<Node>, shown: usize) -> Node {
+        let mut items: Vec<_> = items.into_iter().enumerate().collect();
+        let mut node = items.pop().expect("a chain needs a member").1;
+        for (i, item) in items.into_iter().rev() {
+            let ratio = if i + 1 < shown { 1.0 / (shown - i) as f32 } else { 0.5 };
+            node = Node::split(axis, ratio.clamp(MIN_RATIO, MAX_RATIO), item, node);
+        }
+        node
+    }
+
+    fn chain_preset(layout: &mut Layout, preset: Preset) {
+        let kept = hidden_bottom_rows(layout);
+        let shown = shown(layout);
+        let hidden: Vec<_> = layout
+            .leaves()
+            .into_iter()
+            .filter(|id| !layout.is_shown(id) && kept.iter().all(|row| row.id != *id))
+            .collect();
+        let n = shown.len();
+        let leaves = |ids: Vec<ModuleId>| ids.into_iter().map(Node::Leaf).collect();
+        let mut root = match preset {
+            Preset::EvenHorizontal | Preset::EvenVertical => {
+                let axis = if preset == Preset::EvenHorizontal {
+                    Axis::Row
+                } else {
+                    Axis::Column
+                };
+                chain(axis, leaves(shown.into_iter().chain(hidden).collect()), n)
+            }
+            Preset::MainHorizontal | Preset::MainVertical => {
+                let (outer, inner, ratio) = if preset == Preset::MainVertical {
+                    (Axis::Row, Axis::Column, DEFAULT_EDITOR_SHARE)
+                } else {
+                    (Axis::Column, Axis::Row, BELOW_ROOT_SHARE)
+                };
+                Node::split(
+                    outer,
+                    ratio,
+                    Node::Leaf(shown[0].clone()),
+                    chain(inner, leaves(shown[1..].iter().cloned().chain(hidden).collect()), n - 1),
+                )
+            }
+            Preset::Tiled => {
+                let (mut rows, mut cols) = (1, 1);
+                while rows * cols < n {
+                    rows += 1;
+                    if rows * cols < n {
+                        cols += 1;
+                    }
+                }
+                let chunks: Vec<_> = shown.chunks(cols).collect();
+                let nodes: Vec<_> = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let mut items = chunk.to_vec();
+                        if i + 1 == chunks.len() {
+                            items.extend(hidden.iter().cloned());
+                        }
+                        chain(Axis::Row, leaves(items), chunk.len())
+                    })
+                    .collect();
+                let count = nodes.len();
+                chain(Axis::Column, nodes, count)
+            }
+        };
+        for row in kept.into_iter().rev() {
+            root = row.around(root);
+        }
+        layout.replace_root(root);
+    }
+
+    #[test]
+    fn every_preset_draws_the_same_rectangles_as_the_chain() {
+        for count in 2..=20 {
+            let names: Vec<_> = ["editor".to_string(), "agent".to_string(), "terminal".to_string()]
+                .into_iter()
+                .chain((0..17).map(|i| format!("lua:x{i}")))
+                .take(count)
+                .collect();
+            for hidden in [false, true] {
+                let mut items = names.clone();
+                if hidden {
+                    items.push("lua:hidden hidden".into());
+                }
+                let start = fixture(&format!("row({})", items.join(", ")));
+                for p in Preset::CYCLE {
+                    let mut got = start.clone();
+                    let mut want = start.clone();
+                    preset(&mut got, p).unwrap();
+                    chain_preset(&mut want, p);
+                    for size in FRAMES {
+                        assert_eq!(rects(&got, size), rects(&want, size), "{p:?}, {count} modules");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_preset_over_more_modules_than_a_container_holds_stays_valid() {
+        fn bounded(c: &Con) {
+            assert!(c.children.len() <= MAX_CHILDREN);
+            for child in &c.children {
+                if let Node::Con(c) = &child.node {
+                    bounded(c);
+                }
+            }
+        }
+        let names: Vec<_> = ["editor".to_string(), "agent".to_string(), "terminal".to_string()]
+            .into_iter()
+            .chain((0..18).map(|i| format!("lua:x{i}")))
+            .collect();
+        let lua: Vec<_> = (0..18)
+            .map(|i| ModuleDecl {
+                id: ModuleId::lua(&format!("x{i}")),
+                placement: Placement::RightOfRoot,
+            })
+            .collect();
+        for shown in [2, 20] {
+            let items: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    if i < shown {
+                        name.clone()
+                    } else {
+                        format!("{name} hidden")
+                    }
+                })
+                .collect();
+            for p in Preset::CYCLE {
+                let mut layout = fixture(&format!("row({})", items.join(", ")));
+                preset(&mut layout, p).unwrap();
+                bounded(layout.root());
+                let path = std::path::Path::new("/layout-preset");
+                let text = encode_v2(&Workspaces::single(), &layout, path);
+                let back = decode_v2(&text, path, &lua).unwrap();
+                assert_eq!(back.current.root(), layout.root(), "{p:?}, {shown} shown modules");
+                assert_eq!(encode_v2(&back.workspaces, &back.current, path), text);
+            }
+        }
     }
 }

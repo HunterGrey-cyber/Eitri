@@ -1,19 +1,25 @@
-import { effectiveRows, hasKeys, pluginBridge, timeoutOf } from "./bridge";
+import { effectiveRows, hasKeys, onRemove as registerReset, pluginBridge, removalResets, timeoutOf } from "./bridge";
 import { blockedEvent, isEscape, shouldSkip, textField } from "./events";
 import { installHeldSuperTracking, reset as resetSuper, superHeld } from "./held-super";
-import { cancelGlide, endHold, holdCode } from "./glide";
-import { clearFind, configureFind, findNext, openFind, resetFind } from "./find";
+import { endHold, holdCode } from "./glide";
+import { clearFind, configureFind, findNext, openFind } from "./find";
 import { activate, startHints } from "./hints";
-import { forgetStatus, setDimmed, setModeWords, showMessage, showMode, showStatus, showWhichKey } from "./hud";
+import { setDimmed, setModeWords, showMessage, showMode, showStatus, showWhichKey } from "./hud";
 import { canonicalOf, parseNotation, strokeOf, type KeyStroke } from "./notation";
 import { createResolver } from "./resolver";
 import { genericRows, isGenericAction, type Row } from "./rows";
 import { runScroll } from "./scroll";
-import { currentSettings, DEFAULT_SETTINGS, prefixKey, settingsOf, useSettings } from "./settings";
+import { isOperable } from "./visible";
+import { currentSettings, prefixKey, settingsOf, useSettings } from "./settings";
 import { closeSheet, openSheet, sheetIsOpen, sheetKey } from "./sheet";
 import type { InstallOptions, KitLabels } from "./index";
 
 export type { HintTarget, InstallOptions } from "./index";
+
+/** Registers a module reset for every installation removal; registrations survive reinstalls. */
+export function onRemove(reset: () => void): void {
+  registerReset(reset);
+}
 
 let current: Element | null = null;
 let pageHasKeys = true;
@@ -21,20 +27,14 @@ let removeInstallation: (() => void) | undefined;
 let generation = 0;
 let installedRows: Row[] | null = null;
 
-/** How deep the search below a `display: contents` element goes; a wrapper chain longer than this is not a list item. */
-const CONTENTS_DEPTH = 8;
-
-/** Whether CSS renders `el` at all: a `display: none` ancestor (a folded contents group) leaves it with no box, and
- *  focusing it fails, which would trap list movement on it. `checkVisibility` where the engine has it, else an
- *  element with no client rects is not rendered. An element that is itself `display: contents` has no box either way
- *  but its children are drawn in its place, so it counts as rendered when one of them does. */
-function isRendered(el: HTMLElement, depth = 0): boolean {
-  if (depth < CONTENTS_DEPTH && getComputedStyle(el).display === "contents") {
-    return [...el.children].some((child) => isRendered(child as HTMLElement, depth + 1));
-  }
-  if (typeof el.checkVisibility === "function") return el.checkVisibility();
-  return el.getClientRects().length > 0;
-}
+onRemove(() => {
+  setCurrent(null);
+  pageHasKeys = true;
+  installedRows = null;
+  removeInstallation = undefined;
+  // Tickets remain unique so an earlier pending declaration cannot become current again.
+  ++generation;
+});
 
 export function keysOf(action: string): string[] {
   return [...(installedRows?.find((row) => row.action === action)?.keys ?? [])];
@@ -318,14 +318,19 @@ export async function install(opts: InstallOptions): Promise<() => void> {
       const active = document.activeElement;
       const list = active?.closest("[data-eitri-list]");
       if (list) {
-        const items = [...list.querySelectorAll<HTMLElement>("a[href], button")]
-          .filter((item) => !item.closest('[hidden], [aria-hidden="true"]') && isRendered(item));
+        const items = [...list.querySelectorAll<HTMLElement>("a[href], button")].filter(isOperable);
         const index = items.indexOf(active as HTMLElement);
-        const next = index < 0 ? (action === "scroll.down" ? 0 : items.length - 1)
-          : Math.max(0, Math.min(items.length - 1, index + (action === "scroll.down" ? 1 : -1)));
-        const target = items[next];
-        target?.focus({ preventScroll: true });
-        target?.scrollIntoView?.({ block: "nearest" });
+        const direction = action === "scroll.down" ? 1 : -1;
+        const next = index < 0 ? (direction === 1 ? 0 : items.length - 1) : index + direction;
+        for (let at = next, attempts = 0; at >= 0 && at < items.length && attempts < items.length;
+          at += direction, attempts++) {
+          const before = document.activeElement;
+          items[at].focus({ preventScroll: true });
+          if (document.activeElement !== before) {
+            items[at].scrollIntoView?.({ block: "nearest" });
+            break;
+          }
+        }
         return true;
       }
     }
@@ -391,9 +396,6 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   const remove = () => {
     if (removed) return;
     removed = true;
-    cancelGlide();
-    resetFind();
-    useSettings(DEFAULT_SETTINGS);
     hints?.cancel();
     window.clearTimeout(timer);
     window.clearTimeout(observedTimer);
@@ -411,13 +413,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     stopSuper();
     focus();
     config();
-    closeSheet();
-    setCurrent(null);
-    installedRows = null;
-    forgetStatus();
-    setModeWords(undefined);
-    document.getElementById("eitri-keys-hud")?.remove();
-    if (removeInstallation === remove) removeInstallation = undefined;
+    for (const reset of removalResets.slice().reverse()) reset();
   };
   removeInstallation = remove;
   return remove;

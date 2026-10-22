@@ -534,21 +534,24 @@ fn build_ui(
     // it can be used, else `init.lua`'s `eitri.layout.default`, else the first launch. A malformed
     // default is a startup failure naming the call; a state file that cannot be used is not, since it
     // is state rather than config -- it is logged and the default opens.
-    let lua_default = match lua_engine.layout.borrow().default_tree().cloned() {
-        Some(Ok(tree)) => Some(tree),
-        Some(Err(message)) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-        None => None,
-    };
-    let rules = match lua_engine.layout.borrow().rules().cloned() {
-        Ok(rules) => Rc::new(rules),
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            std::process::exit(1);
-        }
-    };
+    if let Some(message) = lua_engine.init_refusal() {
+        eprintln!("eitri: {message}");
+        std::process::exit(1);
+    }
+    let lua_default = lua_engine
+        .layout
+        .borrow()
+        .default_tree()
+        .cloned()
+        .map(|tree| tree.expect("the kernel checked the default layout"));
+    let rules = Rc::new(
+        lua_engine
+            .layout
+            .borrow()
+            .rules()
+            .cloned()
+            .expect("the kernel checked open rules"),
+    );
     // Where the window places a module when no module holds the keys -- a first launch, a reconcile of
     // the file or a template, a module a workspace lacks, a module back after a kill: the Lua panels at
     // their rule's place, else their `position`, and each built-in or instance a rule names. Every one

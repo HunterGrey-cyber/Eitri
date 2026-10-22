@@ -3,7 +3,7 @@
 //! to allocate existing children elsewhere without reparenting widgets. Each ends a zoom first,
 //! as tmux's corresponding verbs do.
 
-use super::con::{Child, Con, ConLayout, Node, Pin, MAX_CHILDREN};
+use super::con::{insert_halving, Child, Con, ConLayout, Node, Pin, MAX_CHILDREN};
 use super::geometry::{navigate, Direction, Frame, Nav};
 use super::module::ModuleId;
 use super::tree::{Axis, Branch, Layout, LayoutError, MAX_RATIO, MIN_RATIO};
@@ -50,9 +50,8 @@ fn place_side(
         return Err(LayoutError::Hidden(target.clone()));
     }
     let mut root = layout
-        .root_node()
-        .without(module)
-        .expect("`target` is another module, still in the tree");
+        .detach_tile(module)
+        .map_err(|_| LayoutError::LastTiled(module.clone()))?;
     fn sibling(
         root: &mut Node,
         module: &ModuleId,
@@ -75,17 +74,14 @@ fn place_side(
             if c.children.len() >= MAX_CHILDREN {
                 return Err(LayoutError::TooMany { limit: MAX_CHILDREN });
             }
-            let half = c.children[i].share / 2.0;
-            c.children[i].share = half;
+            let even = c.children[i].share < 2.0 * MIN_RATIO;
             c.children[i].pin = None;
-            c.children.insert(
-                if before { i } else { i + 1 },
-                Child::new(Node::Leaf(module.clone()), half),
-            );
-            if half < MIN_RATIO {
-                let share = 1.0 / c.children.len() as f32;
+            insert_halving(c, i, Node::Leaf(module.clone()));
+            if before {
+                c.children.swap(i, i + 1);
+            }
+            if even {
                 for child in &mut c.children {
-                    child.share = share;
                     if child.node.leaves().iter().any(|m| m == module || layout.is_shown(m)) {
                         child.pin = None;
                     }
@@ -153,9 +149,8 @@ pub fn place_as_tab(layout: &mut Layout, module: &ModuleId, target: &ModuleId, d
         return Err(LayoutError::Hidden(target.clone()));
     }
     let mut root = layout
-        .root_node()
-        .without(module)
-        .expect("`target` is another module, still in the tree");
+        .detach_tile(module)
+        .map_err(|_| LayoutError::LastTiled(module.clone()))?;
     fn into_tabs(root: &mut Node, module: &ModuleId, target: &ModuleId, draw: bool) -> Result<bool, LayoutError> {
         let Node::Con(c) = root else { return Ok(false) };
         if let Some(i) = c
@@ -169,19 +164,9 @@ pub fn place_as_tab(layout: &mut Layout, module: &ModuleId, target: &ModuleId, d
             if c.children.len() >= MAX_CHILDREN {
                 return Err(LayoutError::TooMany { limit: MAX_CHILDREN });
             }
-            let half = c.children[i].share / 2.0;
-            c.children[i].share = half;
-            c.children.insert(i + 1, Child::new(Node::Leaf(module.clone()), half));
-            if half < MIN_RATIO {
-                let share = 1.0 / c.children.len() as f32;
-                for child in &mut c.children {
-                    child.share = share;
-                }
-            }
+            insert_halving(c, i, Node::Leaf(module.clone()));
             if draw {
                 c.focus = i + 1;
-            } else if c.focus > i {
-                c.focus += 1;
             }
             return Ok(true);
         }
@@ -233,13 +218,9 @@ pub fn swap(layout: &mut Layout, focused: &ModuleId, dir: Direction, frame: &Fra
     Some(other)
 }
 
-/// `Ctrl+a |` (`Axis::Row`) and `Ctrl+a _` (`Axis::Column`) put shown modules in tree order
-/// into one row or column with equal shares. Ratios `1/n, 1/(n-1), ...` form a binary chain.
-/// A shown bottom row joins the chain and loses its pin so its share is equal too.
-/// A hidden bottom row, such as the default terminal, stays around the chain with its pin
-/// and length, so showing it restores its height and `F11` does not grow it.
-/// Other hidden modules stay hidden at the chain's end, taking no space until shown.
-/// Focus stays put.
+/// Equal shares put every shown module in one row or column and clear its pin. Hidden bottom
+/// rows keep their placement and length around that container, so showing one restores its row.
+/// Other hidden modules stay at the end, where they take no space until shown. The keys stay put.
 pub fn even(layout: &mut Layout, axis: Axis) {
     layout.unzoom();
     let kept = hidden_bottom_rows(layout);
@@ -250,21 +231,37 @@ pub fn even(layout: &mut Layout, axis: Axis) {
         .partition(|id| layout.is_shown(id));
     let n = shown.len();
     let items: Vec<ModuleId> = shown.into_iter().chain(hidden).collect();
-    let mut node = even_chain(axis, items.into_iter().map(Node::Leaf).collect(), n);
+    let mut node = even_con(axis, items.into_iter().map(Node::Leaf).collect(), n);
     for row in kept.into_iter().rev() {
         node = row.around(node);
     }
     layout.replace_root(node);
 }
 
-pub(super) fn even_chain(axis: Axis, items: Vec<Node>, shown: usize) -> Node {
-    let mut items: Vec<_> = items.into_iter().enumerate().collect();
-    let mut node = items.pop().expect("a chain needs a member").1;
-    for (i, item) in items.into_iter().rev() {
-        let ratio = if i + 1 < shown { 1.0 / (shown - i) as f32 } else { 0.5 };
-        node = Node::split(axis, ratio.clamp(MIN_RATIO, MAX_RATIO), item, node);
+pub(super) fn even_con(axis: Axis, mut items: Vec<Node>, shown: usize) -> Node {
+    if items.len() > MAX_CHILDREN {
+        // Keep a shown module beside the hidden tail so collapsing it preserves that module's slot.
+        let prefix = shown.min(MAX_CHILDREN) - 1;
+        let mut tail: Vec<_> = items.split_off(prefix).into_iter().enumerate().collect();
+        let mut node = tail.pop().expect("an overflow tail needs a member").1;
+        for (i, item) in tail.into_iter().rev() {
+            let ratio = if i + 1 < shown - prefix {
+                1.0 / (shown - prefix - i) as f32
+            } else {
+                0.5
+            };
+            node = Node::split(axis, ratio.clamp(MIN_RATIO, MAX_RATIO), item, node);
+        }
+        items.push(node);
     }
-    node
+    if items.len() == 1 {
+        return items.pop().unwrap();
+    }
+    let share = 1.0 / items.len() as f32;
+    Node::Con(Con::new(
+        ConLayout::of_axis(axis),
+        items.into_iter().map(|item| Child::new(item, share)).collect(),
+    ))
 }
 
 /// `swap.prev` / `swap.next`: `focused` changes places

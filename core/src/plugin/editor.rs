@@ -4,6 +4,9 @@
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
@@ -32,19 +35,46 @@ pub fn open(rpc: &dyn EditorRpc, path: &Path, line: Option<u32>, col: Option<u32
     rpc.exec_lua(PLUGIN_OPEN_LUA, vec![Value::Map(opts)])
 }
 
+/// Where an assist call stands in the order this process made them: `maker` names the process, `order` counts up.
+///
+/// The embedded editor can, rarely, write a call ahead of one made just before it (its call line polls the
+/// requests in order, but nvim-rs takes two locks of its own before it writes, and another writer can free one in
+/// the instant between two polls). Two assist calls swapped would leave the wrong one in force for good: an apply
+/// landing after the clear that should undo it keeps its settings after the plugin stopped. So each assist call
+/// says when it was made, and the snippet skips one older than a call it has already run for the same owner and
+/// maker. One counter for the whole process, so a plugin stopped and started again keeps counting up; the maker
+/// tells this process from another attached to the same nvim, whose count is its own.
+fn assist_order() -> [(Value, Value); 2] {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static MAKER: OnceLock<String> = OnceLock::new();
+    let maker = MAKER.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}-{nanos}", std::process::id())
+    });
+    [
+        (Value::from("maker"), Value::from(maker.as_str())),
+        (Value::from("order"), Value::from(NEXT.fetch_add(1, Ordering::Relaxed))),
+    ]
+}
+
 pub fn assist_apply(rpc: &dyn EditorRpc, owner: &str, root: &Path, diagnostics: bool, inlay_hints: bool) -> Pending {
-    let opts = Value::Map(vec![
+    let mut opts = vec![
         (Value::from("owner"), Value::from(owner)),
         (Value::from("root"), path_value(root)),
         (Value::from("diagnostics"), Value::from(diagnostics)),
         (Value::from("inlay_hints"), Value::from(inlay_hints)),
-    ]);
-    rpc.exec_lua(PLUGIN_ASSIST_LUA, vec![Value::from("apply"), opts])
+    ];
+    opts.extend(assist_order());
+    rpc.exec_lua(PLUGIN_ASSIST_LUA, vec![Value::from("apply"), Value::Map(opts)])
 }
 
 pub fn assist_clear(rpc: &dyn EditorRpc, owner: &str) -> Pending {
-    let opts = Value::Map(vec![(Value::from("owner"), Value::from(owner))]);
-    rpc.exec_lua(PLUGIN_ASSIST_LUA, vec![Value::from("clear"), opts])
+    let mut opts = vec![(Value::from("owner"), Value::from(owner))];
+    opts.extend(assist_order());
+    rpc.exec_lua(PLUGIN_ASSIST_LUA, vec![Value::from("clear"), Value::Map(opts)])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +367,37 @@ mod tests {
         );
         assert_eq!(calls[1].1[0], Value::from("apply"));
         assert_eq!(calls[2].1[0], Value::from("clear"));
+    }
+
+    /// The snippet keeps the call made last in force even when two reach nvim swapped, so each one has to say
+    /// when it was made: by the same maker, counting up.
+    #[test]
+    fn assist_calls_carry_the_order_they_were_made_in() {
+        let rpc = Recorder::default();
+        let _ = assist_apply(&rpc, "demo", Path::new("/w/ex"), false, true);
+        let _ = assist_clear(&rpc, "demo");
+        let _ = assist_apply(&rpc, "other", Path::new("/w/ex"), true, true);
+        let calls = rpc.0.borrow();
+        let made: Vec<(String, u64)> = calls
+            .iter()
+            .map(|(_, args)| {
+                let maker = field(&args[1], "maker")
+                    .and_then(Value::as_str)
+                    .expect("a maker")
+                    .to_owned();
+                let order = field(&args[1], "order").and_then(Value::as_u64).expect("an order");
+                (maker, order)
+            })
+            .collect();
+        assert!(!made[0].0.is_empty());
+        assert!(
+            made.iter().all(|(maker, _)| *maker == made[0].0),
+            "one maker per process: {made:?}"
+        );
+        assert!(
+            made[0].1 < made[1].1 && made[1].1 < made[2].1,
+            "counting up across owners: {made:?}"
+        );
     }
 
     #[test]

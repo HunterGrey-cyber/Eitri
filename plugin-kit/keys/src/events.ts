@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 const NATIVE_CONTROL = "button, a, summary, input, select, textarea, [role=button], [role=tab], [role=option], [role=checkbox], [role=switch]";
 
 /** `spaceToKeys`: the page binds a sequence that starts with Space, so Space on a focused control belongs to the
@@ -21,9 +22,14 @@ export function isEscape(ev: KeyboardEvent): boolean {
 
 // Input types that take typed text. A checkbox, radio, button, range, colour or file input takes no text, so focusing
 // one (a label click focuses it) must not turn the page's keys off.
-const TEXT_INPUTS = new Set([
-  "text", "search", "email", "url", "tel", "password", "number", "date", "datetime-local", "month", "time", "week",
-]);
+function textInputs(): Set<string> {
+  return new Set([
+    "text", "search", "email", "url", "tel", "password", "number", "date", "datetime-local", "month", "time", "week",
+  ]);
+}
+
+let TEXT_INPUTS = textInputs();
+onRemove(() => { TEXT_INPUTS = textInputs(); });
 
 export function textField(el: Element | null): HTMLElement | null {
   if (!(el instanceof HTMLElement)) return null;

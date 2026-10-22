@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 import type { Mode } from "./rows";
 import { ensureStyle } from "./style";
 
@@ -12,6 +13,18 @@ let modeWords = { ...MODES };
 /** What the HUD last showed. A held key renders on every repeat, so a render that would show the same thing writes
  *  nothing: no style or layout work on a fixed bar thirty times a second. */
 let shown: string | null = null;
+
+onRemove(() => {
+  mode = "normal";
+  pending = "";
+  message = "";
+  whichKey = "";
+  status = "";
+  dimmed = false;
+  modeWords = { ...MODES };
+  shown = null;
+  document.getElementById("eitri-keys-hud")?.remove();
+});
 
 function render(): void {
   let hud = document.getElementById("eitri-keys-hud");

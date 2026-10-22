@@ -13,6 +13,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -128,12 +129,18 @@ fn own_regular(file: &File, path: &Path) -> Result<(), StoreError> {
         .map_err(|e| io(path, e))
 }
 
+/// How often a lock another window holds is tried again while an operation still has time.
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
 /// An `flock` held until dropped.
 // The open descriptor is the lock: closing it releases the `flock`, so it is held and never read.
 struct Locked(#[allow(dead_code)] File);
 
 impl Locked {
-    fn take(path: &Path, operation: libc::c_int) -> Result<Locked, StoreError> {
+    /// Waits for the lock: for as long as it takes with no `until`, else until then. A window whose process
+    /// stopped while holding the lock would otherwise hold this worker, and every operation queued behind
+    /// it, for good. The lock is always tried once, so a free lock is taken even past `until`.
+    fn take(path: &Path, operation: libc::c_int, until: Option<Instant>) -> Result<Locked, StoreError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -144,14 +151,30 @@ impl Locked {
             .open(path)
             .map_err(|e| io(path, e))?;
         own_regular(&file, path)?;
+        let operation = if until.is_some() {
+            operation | libc::LOCK_NB
+        } else {
+            operation
+        };
         loop {
             // SAFETY: the descriptor is `file`'s own and stays open for the call.
             if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
                 return Ok(Locked(file));
             }
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EINTR) {
-                return Err(io(path, e));
+            match (e.raw_os_error(), until) {
+                (Some(libc::EINTR), _) => {}
+                (Some(libc::EWOULDBLOCK), Some(until)) => {
+                    let now = Instant::now();
+                    if now >= until {
+                        return Err(io(
+                            path,
+                            std::io::Error::other("another window held the lock for longer than the request may wait"),
+                        ));
+                    }
+                    std::thread::sleep(LOCK_RETRY.min(until - now));
+                }
+                _ => return Err(io(path, e)),
             }
         }
     }
@@ -213,6 +236,11 @@ impl PluginStore {
     }
 
     pub fn write(&self, key: &str, value: &Value) -> Result<(), StoreError> {
+        self.write_until(key, value, None)
+    }
+
+    /// [`Self::write`], waiting for another window's lock only until `until`.
+    fn write_until(&self, key: &str, value: &Value, until: Option<Instant>) -> Result<(), StoreError> {
         if !valid_key(key) {
             return Err(bad(format!(
                 "key {:?} must be [a-z0-9_.-], 1-64, not starting with .",
@@ -228,7 +256,7 @@ impl PluginStore {
         // One writer at a time per plugin: the key count and the temporary name are shared by every window
         // and every worker, so the count, the write and the rename are one step. Key names cannot start with
         // a dot, so this file never collides with a key.
-        let _lock = Locked::take(&dir.join(".write.lock"), libc::LOCK_EX)?;
+        let _lock = Locked::take(&dir.join(".write.lock"), libc::LOCK_EX, until)?;
         if !path.exists() {
             let keys = std::fs::read_dir(&dir)
                 .map_err(|e| io(&dir, e))?
@@ -285,6 +313,11 @@ impl PluginStore {
     }
 
     pub fn append(&self, stream: &str, items: &[Value]) -> Result<(), StoreError> {
+        self.append_until(stream, items, None)
+    }
+
+    /// [`Self::append`], waiting for another window's lock only until `until`.
+    fn append_until(&self, stream: &str, items: &[Value], until: Option<Instant>) -> Result<(), StoreError> {
         if !valid_stream(stream) {
             return Err(bad(format!(
                 "stream {stream:?} must be [a-z0-9-], 1-40, not starting with -"
@@ -308,8 +341,8 @@ impl PluginStore {
         let log = self.sub("log")?;
         // The 1 GiB limit spans every stream, so the check and the append are one step across streams: the
         // plugin-wide lock is always taken before a stream's (a stream name cannot start with a dot).
-        let _plugin_lock = Locked::take(&log.join(".total.lock"), libc::LOCK_EX)?;
-        let _lock = Locked::take(&log.join(format!("{stream}.lock")), libc::LOCK_EX)?;
+        let _plugin_lock = Locked::take(&log.join(".total.lock"), libc::LOCK_EX, until)?;
+        let _lock = Locked::take(&log.join(format!("{stream}.lock")), libc::LOCK_EX, until)?;
         if self.log_bytes(&log)? + text.len() as u64 > self.limits.total_log_bytes {
             return Err(too_large(
                 "this plugin's logs have reached their 1 GiB limit; export the log and start a new one",
@@ -353,6 +386,16 @@ impl PluginStore {
     /// cursor of the next page, `None` when this page reached the end. An item is never split; a line that
     /// is not JSON is skipped and logged.
     pub fn read_log(&self, stream: &str, from: Option<&str>) -> Result<(Vec<Value>, Option<String>), StoreError> {
+        self.read_log_until(stream, from, None)
+    }
+
+    /// [`Self::read_log`], waiting for another window's lock only until `until`.
+    fn read_log_until(
+        &self,
+        stream: &str,
+        from: Option<&str>,
+        until: Option<Instant>,
+    ) -> Result<(Vec<Value>, Option<String>), StoreError> {
         if !valid_stream(stream) {
             return Err(bad(format!(
                 "stream {stream:?} must be [a-z0-9-], 1-40, not starting with -"
@@ -368,7 +411,7 @@ impl PluginStore {
         if !log.exists() {
             return Ok((Vec::new(), None));
         }
-        let _lock = Locked::take(&self.sub("log")?.join(format!("{stream}.lock")), libc::LOCK_SH)?;
+        let _lock = Locked::take(&self.sub("log")?.join(format!("{stream}.lock")), libc::LOCK_SH, until)?;
         let segments = self.segments(&log, stream)?;
         let mut items = Vec::new();
         let mut budget = self.limits.read_page_bytes;
@@ -500,26 +543,46 @@ pub enum StoreOp {
     ReadLog { stream: String, from: Option<String> },
 }
 
-/// One thread per plugin that does the store's work in order and raises the host's wake per answer.
+impl PluginStore {
+    /// One operation as the page asked it, waiting for another window's lock only until `until`.
+    fn run(&self, op: StoreOp, until: Instant) -> Result<Value, StoreError> {
+        let until = Some(until);
+        match op {
+            StoreOp::Read { key } => self.read(&key).map(|v| json!({ "value": v })),
+            StoreOp::Write { key, value } => self.write_until(&key, &value, until).map(|()| json!({})),
+            StoreOp::Append { stream, items } => self.append_until(&stream, &items, until).map(|()| json!({})),
+            StoreOp::ReadLog { stream, from } => self
+                .read_log_until(&stream, from.as_deref(), until)
+                .map(|(items, next)| json!({ "items": items, "next": next })),
+        }
+    }
+}
+
+/// One thread per plugin that does the store's work in order and raises the host's wake per answer. Each
+/// operation carries its deadline: past it, a lock another window holds is no longer waited for, so one stuck
+/// window cannot hold every later operation. An operation is still run when it reaches the worker after its
+/// deadline, so a write the page was told timed out may still apply.
 pub struct StoreWorker {
-    tx: mpsc::Sender<(u64, StoreOp)>,
+    tx: mpsc::Sender<(u64, StoreOp, Instant)>,
     rx: mpsc::Receiver<(u64, Result<Value, StoreError>)>,
 }
 
 impl StoreWorker {
-    pub fn spawn(store: PluginStore, wake: agent::UiWake) -> std::io::Result<StoreWorker> {
-        let (tx, jobs) = mpsc::channel::<(u64, StoreOp)>();
+    /// With a `gate`, each operation first waits for one message on it (tests only: it stands in for a disk
+    /// or a lock that does not answer); a closed gate lets everything through.
+    pub fn spawn(
+        store: PluginStore,
+        wake: agent::UiWake,
+        gate: Option<mpsc::Receiver<()>>,
+    ) -> std::io::Result<StoreWorker> {
+        let (tx, jobs) = mpsc::channel::<(u64, StoreOp, Instant)>();
         let (done, rx) = mpsc::channel();
         std::thread::Builder::new().name("plugin-store".into()).spawn(move || {
-            for (re, op) in jobs {
-                let result = match op {
-                    StoreOp::Read { key } => store.read(&key).map(|v| json!({ "value": v })),
-                    StoreOp::Write { key, value } => store.write(&key, &value).map(|()| json!({})),
-                    StoreOp::Append { stream, items } => store.append(&stream, &items).map(|()| json!({})),
-                    StoreOp::ReadLog { stream, from } => store
-                        .read_log(&stream, from.as_deref())
-                        .map(|(items, next)| json!({ "items": items, "next": next })),
-                };
+            for (re, op, until) in jobs {
+                if let Some(gate) = &gate {
+                    let _ = gate.recv();
+                }
+                let result = store.run(op, until);
                 if done.send((re, result)).is_err() {
                     return;
                 }
@@ -529,8 +592,8 @@ impl StoreWorker {
         Ok(StoreWorker { tx, rx })
     }
 
-    pub fn submit(&self, re: u64, op: StoreOp) {
-        let _ = self.tx.send((re, op));
+    pub fn submit(&self, re: u64, op: StoreOp, until: Instant) {
+        let _ = self.tx.send((re, op, until));
     }
 
     pub fn try_results(&self) -> Vec<(u64, Result<Value, StoreError>)> {
@@ -829,16 +892,19 @@ mod tests {
             std::sync::Arc::new(move || {
                 w.fetch_add(1, Ordering::SeqCst);
             }),
+            None,
         )
         .unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
         worker.submit(
             7,
             StoreOp::Write {
                 key: "k".into(),
                 value: json!(1),
             },
+            until,
         );
-        worker.submit(8, StoreOp::Read { key: "k".into() });
+        worker.submit(8, StoreOp::Read { key: "k".into() }, until);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut got = Vec::new();
         while got.len() < 2 {
@@ -848,5 +914,30 @@ mod tests {
         }
         assert_eq!(got, [(7, Ok(json!({}))), (8, Ok(json!({"value": 1})))]);
         assert!(wakes.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn a_lock_another_window_holds_past_the_deadline_fails_the_write_instead_of_waiting() {
+        let s = Scratch::new("lock-deadline");
+        let st = store(&s, Limits::DEFAULT);
+        st.write("k", &json!(1)).unwrap();
+        // flock locks belong to an open file, so a second open of the lock file in this process conflicts
+        // with the store's exactly as another window's would.
+        let lock_path = s.0.join("eitri/plugins/demo/state/.write.lock");
+        let held = Locked::take(&lock_path, libc::LOCK_EX, None).unwrap();
+        let refused = st.write_until("k", &json!(2), Some(Instant::now())).unwrap_err();
+        assert_eq!(refused.kind, StoreErrorKind::Io, "{refused:?}");
+        assert_eq!(
+            st.read("k").unwrap(),
+            Some(json!(1)),
+            "the refused write changed nothing"
+        );
+        drop(held);
+        st.write_until("k", &json!(3), Some(Instant::now())).unwrap();
+        assert_eq!(
+            st.read("k").unwrap(),
+            Some(json!(3)),
+            "a free lock is taken even past the deadline"
+        );
     }
 }

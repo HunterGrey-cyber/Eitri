@@ -2,8 +2,9 @@
 //! `init.lua`, or the built-in first launch. The core persistence module handles the file
 //! format, reconciliation and failures.
 //!
-//! Arrangement changes are saved 500ms after the last change. At window close, an unwritten
-//! change is saved synchronously.
+//! Arrangement changes are saved 500ms after the last change and once more at window close if a
+//! change is still unwritten. A writer thread reads, decodes and writes the file rather than
+//! the GTK thread. Closing waits up to five seconds for that thread to finish the final write.
 //!
 //! Only arrangement changes trigger a save: each workspace's tree, shares and pinned lengths,
 //! floating rectangles and remembered rectangles, hidden modules, and the current workspace
@@ -61,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use eitri_core::layout::persist::{self, Loaded, V2State};
 use eitri_core::layout::rules::{At, OpenPoint, NOMINAL_GRID};
-use eitri_core::layout::workspace::MAIN;
+use eitri_core::layout::workspace::{Kept, MAIN};
 use eitri_core::layout::{
     apply_launch_rule, first_launch_decls, reconcile_default_floating_with, Con, FloatRect, Layout, ModuleDecl,
     ModuleId, ModuleKind, Node, OpenRule, OpenRules, Placement, Workspaces,
@@ -328,8 +329,391 @@ fn take_settled_lengths(base: &mut Con, now: &Con) {
     }
 }
 
+/// How long the close waits for the state file's writes to finish: far longer than a small file's write takes
+/// on a working disk. A filesystem slower than that loses the last arrangement, never the file (`persist::save`
+/// writes through a `.tmp` and a rename).
+const CLOSE_FLUSH_BOUND: Duration = Duration::from_secs(5);
+
+/// Everything one save needs, copied on the GTK thread: no `Rc`, nothing borrowed, so the writer thread can
+/// read, decode and write while the window goes on.
+struct SaveJob {
+    dir: PathBuf,
+    project_root: PathBuf,
+    /// The registered Lua panels: the file read again before the write is decoded as `load` decodes it, so
+    /// that "unusable" and "partly usable" mean what they meant when the window opened.
+    lua: Vec<ModuleDecl>,
+    /// The modules the window never places by itself, decoded with as at startup (`persist::load_with`).
+    deferred: Vec<ModuleId>,
+    /// The text of a file this window opened only in part, not yet copied aside.
+    keep_copy: Option<String>,
+    /// Every workspace, the current one's layout being `current`, as they were when the job was made.
+    workspaces: Workspaces,
+    current: Layout,
+    /// Every module the window places, in any workspace (`Workspaces::placed`).
+    placed: BTreeSet<ModuleId>,
+    /// The arrangement this job writes: what `base` becomes once the write is taken.
+    now: Arrangement,
+    /// Which of the window's submits this is, counting up: its result is matched to what the window kept of it.
+    job: u64,
+}
+
+/// What became of one [`SaveJob`].
+enum SaveDone {
+    /// The file holds `now`. `kept` are the file's kept keys as they were just before the write, for the live
+    /// workspaces to take (`None` when there was no file to take them from); `copy_taken` says the job dealt with the bytes this window opened (copied them
+    /// aside, or found the file was no longer those bytes), so they are not looked at again.
+    Written {
+        now: Arrangement,
+        job: u64,
+        kept: Option<Kept>,
+        copy_taken: bool,
+    },
+    /// Nothing was written; why is already logged. The next change, or the close, tries again.
+    NotWritten,
+}
+
+/// The read-decide-write of one save, away from any display: the bytes this window opened copied aside while
+/// they are still the file, the file as it is now made safe to write over, then the write.
+fn run_save(mut job: SaveJob) -> SaveDone {
+    // Not flags set at startup: the file may have changed since -- a hand-edit, another window, another build
+    // -- and what was true of it when this window opened says nothing of it now.
+    if !copy_what_was_opened(&job.dir, &job.project_root, job.keep_copy.as_deref()) {
+        return SaveDone::NotWritten;
+    }
+    let Some(kept) = make_way(&job) else {
+        return SaveDone::NotWritten;
+    };
+    if let Some(kept) = &kept {
+        job.workspaces.retake_kept(kept.clone());
+    }
+    match persist::save(&job.dir, &job.project_root, &job.workspaces, &job.current) {
+        Ok(_) => SaveDone::Written {
+            now: job.now,
+            job: job.job,
+            kept,
+            copy_taken: job.keep_copy.is_some(),
+        },
+        Err(err) => {
+            eprintln!("[layout] could not save {}: {err}", job.dir.display());
+            SaveDone::NotWritten
+        }
+    }
+}
+
+/// Before the first write after opening a file only in part: its bytes (`opened`) copied aside, if the file is
+/// still those bytes. `false` when that could not be done and nothing may be written yet; the copy is tried
+/// again at the next save.
+fn copy_what_was_opened(dir: &Path, project_root: &Path, opened: Option<&str>) -> bool {
+    let Some(opened) = opened else {
+        return true;
+    };
+    match persist::read_v2_text(dir, project_root) {
+        Ok(Some(text)) if text == opened => match persist::copy_aside_v2(dir, project_root, opened) {
+            Ok(aside) => println!(
+                "[layout] the file this window opened, of which this build could not carry everything, is kept \
+                 as {}",
+                aside.display()
+            ),
+            Err(err) => {
+                eprintln!("[layout] could not copy aside the file this window opened ({err}); not saved");
+                return false;
+            }
+        },
+        // Another window wrote since, or the file is gone: what is there is not the text this window
+        // opened, and not this window's to keep.
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("[layout] could not read the file to copy it aside ({err}); not saved");
+            return false;
+        }
+    }
+    true
+}
+
+/// The file as it is now, made safe to write over: wholly unusable, set aside; partly usable, its text copied
+/// aside; usable or partly, its kept keys returned to be taken. A kept key naming a module this window places
+/// -- in any of its workspaces now, not only in the file's trees -- is not taken: a later build may have
+/// floated a module this window has since tiled, and writing both would put it in two places; the file's text
+/// is copied aside instead, as for a partly usable file. `None` when that could not be done and nothing may be
+/// written; `Some(None)` when there is no file, or it was set aside, so there are no kept keys to take.
+fn make_way(job: &SaveJob) -> Option<Option<Kept>> {
+    let (dir, project_root) = (job.dir.as_path(), job.project_root.as_path());
+    let (text, mut kept, mut copy) = match persist::v2_state_with(dir, project_root, &job.lua, &job.deferred) {
+        V2State::Missing => return Some(None),
+        V2State::Usable(text, kept) => (text, kept, false),
+        V2State::Partly(text, kept) => (text, kept, true),
+        V2State::Unusable(_) => {
+            return match persist::set_aside_v2(dir, project_root) {
+                Ok(aside) => {
+                    println!(
+                        "[layout] the file this build could not use is kept as {}",
+                        aside.display()
+                    );
+                    Some(None)
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(None),
+                Err(err) => {
+                    eprintln!("[layout] could not set aside the file this build could not use ({err}); not saved");
+                    None
+                }
+            };
+        }
+    };
+    let dropped = kept.drop_placed(&job.placed);
+    copy |= !dropped.is_empty();
+    if copy {
+        match persist::copy_aside_v2(dir, project_root, &text) {
+            Ok(aside) => println!(
+                "[layout] the file, part of which this build cannot carry, is kept as {}",
+                aside.display()
+            ),
+            Err(err) => {
+                eprintln!("[layout] could not copy aside the file this build can only partly use ({err}); not saved");
+                return None;
+            }
+        }
+    }
+    for note in dropped {
+        println!("[layout] {note}");
+    }
+    Some(Some(kept))
+}
+
+/// What the writer thread and the window share.
+#[derive(Default)]
+struct WriterState {
+    /// The next job; a newer one replaces it before it starts, since only the newest arrangement is worth
+    /// writing.
+    pending: Option<SaveJob>,
+    /// Whether a job is being run now.
+    running: bool,
+    /// Results the window has not taken yet, in the order their jobs ran.
+    done: Vec<SaveDone>,
+    /// The window is gone: the thread runs what is pending and ends.
+    closed: bool,
+}
+
+struct WriterShared {
+    state: std::sync::Mutex<WriterState>,
+    /// Signalled when a job is submitted, when one finishes, and when the window goes.
+    changed: std::sync::Condvar,
+    #[cfg(test)]
+    gate: Option<std::sync::Arc<WriteGate>>,
+}
+
+impl WriterShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WriterState> {
+        // A job runs outside the lock, so a poisoned lock holds only finished bookkeeping.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One thread that runs the window's saves, in order, the newest pending job replacing an older pending one:
+/// the state file is read, decoded and written there, never on the GTK thread, which only copies what a save
+/// needs. When a job finishes the thread wakes the GTK thread's main loop, which takes the result
+/// ([`LayoutSaver`]'s `collect`).
+struct LayoutWriter {
+    shared: std::sync::Arc<WriterShared>,
+}
+
+impl LayoutWriter {
+    fn spawn() -> LayoutWriter {
+        LayoutWriter::start(WriterShared {
+            state: Default::default(),
+            changed: Default::default(),
+            #[cfg(test)]
+            gate: None,
+        })
+    }
+
+    fn start(shared: WriterShared) -> LayoutWriter {
+        let shared = std::sync::Arc::new(shared);
+        let thread_shared = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("layout-writer".into())
+            .spawn(move || LayoutWriter::run(&thread_shared));
+        if let Err(err) = spawned {
+            // Without the thread nothing is ever written: said once, and every flush then reports it.
+            eprintln!("[layout] could not start the layout writer ({err}); this window's layout will not be kept");
+        }
+        LayoutWriter { shared }
+    }
+
+    fn run(shared: &WriterShared) {
+        loop {
+            let job = {
+                let mut state = shared.lock();
+                while state.pending.is_none() && !state.closed {
+                    state = shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+                let Some(job) = state.pending.take() else { return };
+                state.running = true;
+                job
+            };
+            #[cfg(test)]
+            if let Some(gate) = &shared.gate {
+                gate.hold();
+            }
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_save(job))).unwrap_or_else(|_| {
+                eprintln!("[layout] the layout writer failed while saving; not saved");
+                SaveDone::NotWritten
+            });
+            {
+                let mut state = shared.lock();
+                state.done.push(done);
+                state.running = false;
+            }
+            shared.changed.notify_all();
+            // The closure carries nothing of the window, so it is `Send`: it takes the results of the savers
+            // of whichever thread runs it, which is the GTK thread in the app.
+            glib::idle_add_once(collect_on_this_thread);
+        }
+    }
+
+    fn submit(&self, job: SaveJob) {
+        self.shared.lock().pending = Some(job);
+        self.shared.changed.notify_all();
+    }
+
+    /// Waits for every submitted job, at most `bound`; whether they all finished.
+    fn flush(&self, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        let mut state = self.shared.lock();
+        while state.pending.is_some() || state.running {
+            let Some(left) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                return false;
+            };
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
+
+    /// Results not yet taken, without waiting.
+    fn take_done(&self) -> Vec<SaveDone> {
+        std::mem::take(&mut self.shared.lock().done)
+    }
+
+    /// Whether no job is pending or running: every result there will be is then among those not yet taken.
+    fn idle(&self) -> bool {
+        let state = self.shared.lock();
+        state.pending.is_none() && !state.running
+    }
+}
+
+impl Drop for LayoutWriter {
+    fn drop(&mut self) {
+        // A pending job is still run: the thread ends once nothing is left.
+        self.shared.lock().closed = true;
+        self.shared.changed.notify_all();
+        #[cfg(test)]
+        if let Some(gate) = &self.shared.gate {
+            gate.open();
+        }
+    }
+}
+
+/// Holds the writer before each job until the test opens it, or lets one job through, so a test can change
+/// the arrangement, or close, while a write is under way.
+#[cfg(test)]
+struct WriteGate {
+    state: std::sync::Mutex<GateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct GateState {
+    /// Every job may run.
+    open: bool,
+    /// Jobs that may run while the gate is closed, one each.
+    passes: usize,
+    /// How many jobs have reached the gate.
+    held: usize,
+}
+
+#[cfg(test)]
+impl WriteGate {
+    fn closed() -> std::sync::Arc<WriteGate> {
+        std::sync::Arc::new(WriteGate {
+            state: Default::default(),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn hold(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.held += 1;
+        self.changed.notify_all();
+        while !state.open && state.passes == 0 {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if !state.open {
+            state.passes -= 1;
+        }
+    }
+
+    fn open(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).open = true;
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).open = false;
+    }
+
+    /// Lets the job held at the gate, or the next to reach it, run while the gate stays closed.
+    fn pass_one(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).passes += 1;
+        self.changed.notify_all();
+    }
+
+    /// Waits until `count` jobs have reached the gate; `false` after a hang guard of ten seconds.
+    fn wait_held(&self, count: usize) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(10), |state| state.held < count)
+            .unwrap_or_else(|e| e.into_inner());
+        state.held >= count
+    }
+}
+
+thread_local! {
+    /// The savers made on this thread: what a writer's wake-up looks through, since it cannot carry an `Rc`.
+    static SAVERS_HERE: RefCell<Vec<std::rc::Weak<LayoutSaver>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Takes the finished saves of every saver made on this thread.
+fn collect_on_this_thread() {
+    let savers: Vec<Rc<LayoutSaver>> = SAVERS_HERE.with(|savers| {
+        let mut savers = savers.borrow_mut();
+        savers.retain(|saver| saver.strong_count() > 0);
+        savers.iter().filter_map(std::rc::Weak::upgrade).collect()
+    });
+    for saver in savers {
+        saver.collect();
+    }
+}
+
+/// One arrangement given to the writer, as `base` is to hold it once that write is taken: the job's own
+/// arrangement with each pinned length that settled on screen since. A length the window changed after the
+/// submit is not in it -- that change belongs to a later job, and is written, or retried, as that job's.
+struct Submitted {
+    job: u64,
+    arrangement: Arrangement,
+}
+
 /// Writes the state file [`persist::SAVE_DEBOUNCE_MS`] after the last change of the arrangement, and
-/// at close -- what, and when, is this module's doc.
+/// at close -- what, and when, is this module's doc. The file is read, decoded and written on a
+/// [`LayoutWriter`]'s thread; the GTK thread copies what a save needs and takes the results.
 pub(crate) struct LayoutSaver {
     dir: Option<PathBuf>,
     project_root: PathBuf,
@@ -337,21 +721,28 @@ pub(crate) struct LayoutSaver {
     layout: Rc<RefCell<Layout>>,
     /// Every workspace of the window; the current one's layout is `layout`.
     workspaces: Rc<RefCell<Workspaces>>,
-    /// The registered Lua panels: the file read again before a write is decoded as `load` decodes
-    /// it, so that "unusable" and "partly usable" mean what they meant when the window opened.
+    /// The registered Lua panels, for the writer's decode of the file and for `Workspaces::placed`.
     lua: Vec<ModuleDecl>,
     /// The modules the window never places by itself: the file read again before a write is decoded with
     /// them, as it was read at startup, so one the file holds is not taken for a module this build cannot carry.
     deferred: RefCell<Vec<ModuleId>>,
-    /// The exact text of a file this window opened only in part, until its first write copies it
-    /// aside (or finds the file is no longer those bytes).
+    /// The exact text of a file this window opened only in part, until a write that copied it aside
+    /// (or found the file is no longer those bytes) is taken.
     keep_copy: RefCell<Option<String>>,
     pending: RefCell<Option<glib::SourceId>>,
     /// When the grid last reported a change: what a debounce timer that fires checks.
     last_change: Cell<Option<Instant>>,
-    /// What a change is measured from: the arrangement the window opened with (its pinned lengths as
-    /// they settled), or the one it last wrote.
+    /// The arrangement the window opened with (its pinned lengths as they settled), or the one it last
+    /// wrote, as far as the results taken so far tell.
     base: RefCell<Arrangement>,
+    /// The arrangements given to the writer whose jobs may still be pending, running, or finished and not
+    /// taken, oldest first; empty once every result is taken. A change is measured from the last when there
+    /// is one, else from `base`: an arrangement changed back to `base` while a different one is being written
+    /// is itself a change, and is written after it.
+    submitted: RefCell<Vec<Submitted>>,
+    /// The number the next submit's job carries.
+    next_job: Cell<u64>,
+    writer: LayoutWriter,
 }
 
 impl LayoutSaver {
@@ -367,6 +758,26 @@ impl LayoutSaver {
         lua: Vec<ModuleDecl>,
         keep_copy: Option<String>,
     ) -> Rc<LayoutSaver> {
+        LayoutSaver::with_writer(
+            dir,
+            project_root,
+            layout,
+            workspaces,
+            lua,
+            keep_copy,
+            LayoutWriter::spawn(),
+        )
+    }
+
+    fn with_writer(
+        dir: Option<PathBuf>,
+        project_root: &Path,
+        layout: Rc<RefCell<Layout>>,
+        workspaces: Rc<RefCell<Workspaces>>,
+        lua: Vec<ModuleDecl>,
+        keep_copy: Option<String>,
+        writer: LayoutWriter,
+    ) -> Rc<LayoutSaver> {
         if dir.is_none() {
             eprintln!(
                 "[layout] no usable state directory (XDG_STATE_HOME absolute, or HOME absolute); this window's \
@@ -374,7 +785,7 @@ impl LayoutSaver {
             );
         }
         let base = Arrangement::of(&workspaces.borrow(), &layout.borrow());
-        Rc::new(LayoutSaver {
+        let saver = Rc::new(LayoutSaver {
             dir,
             project_root: project_root.to_path_buf(),
             layout,
@@ -385,7 +796,12 @@ impl LayoutSaver {
             pending: RefCell::new(None),
             last_change: Cell::new(None),
             base: RefCell::new(base),
-        })
+            submitted: RefCell::new(Vec::new()),
+            next_job: Cell::new(0),
+            writer,
+        });
+        SAVERS_HERE.with(|savers| savers.borrow_mut().push(Rc::downgrade(&saver)));
+        saver
     }
 
     /// The modules the window never places by itself, as the startup read used them (`persist::load_with`).
@@ -402,6 +818,7 @@ impl LayoutSaver {
         if self.dir.is_none() {
             return;
         }
+        self.collect();
         self.last_change.set(Some(Instant::now()));
         if self.pending.borrow().is_some() || !self.arrangement_changed() {
             return;
@@ -417,7 +834,9 @@ impl LayoutSaver {
             let since = saver.last_change.get().map_or(Duration::MAX, |at| at.elapsed());
             match debounce_left(since) {
                 Some(left) => saver.arm(left),
-                None => saver.save_now(),
+                None => {
+                    saver.submit_if_changed();
+                }
             }
         });
         *self.pending.borrow_mut() = Some(source);
@@ -430,154 +849,137 @@ impl LayoutSaver {
         Some(Arrangement::of(&workspaces, &layout))
     }
 
-    /// Whether the arrangement differs from `base`. `false` while either is borrowed: the timer is
-    /// armed by the next change, and the close handler saves whatever it is.
+    /// Whether `now` differs from what a change is measured from: the arrangement last submitted while
+    /// one is outstanding, else `base`.
+    fn differs(&self, now: &Arrangement) -> bool {
+        match self.submitted.borrow().last() {
+            Some(submitted) => *now != submitted.arrangement,
+            None => *now != *self.base.borrow(),
+        }
+    }
+
+    /// Whether the arrangement changed since it was last submitted or written. `false` while the layout
+    /// or the workspaces are borrowed: the timer is armed by the next change, and the close handler saves
+    /// whatever it is.
     fn arrangement_changed(&self) -> bool {
-        self.arrangement().is_some_and(|now| now != *self.base.borrow())
+        self.arrangement().is_some_and(|now| self.differs(&now))
     }
 
     /// The grid's settle hook: a pinned split got its length on screen. That is not a change, so the
-    /// length joins `base`.
+    /// length joins `base`, and each arrangement given to the writer and not yet taken back.
     pub(crate) fn settled(&self) {
         if let Ok(layout) = self.layout.try_borrow() {
             if let Some(root) = self.base.borrow_mut().current_root_mut() {
                 take_settled_lengths(root, layout.root());
             }
-        }
-    }
-
-    /// Before the first write after opening a file only in part: its bytes copied aside, if the file
-    /// is still those bytes. `false` when that could not be done and nothing may be written yet; the
-    /// copy is tried again at the next save.
-    fn copy_what_was_opened(&self, dir: &Path) -> bool {
-        let Some(opened) = self.keep_copy.borrow().clone() else {
-            return true;
-        };
-        match persist::read_v2_text(dir, &self.project_root) {
-            Ok(Some(text)) if text == opened => match persist::copy_aside_v2(dir, &self.project_root, &opened) {
-                Ok(aside) => println!(
-                    "[layout] the file this window opened, of which this build could not carry everything, is \
-                     kept as {}",
-                    aside.display()
-                ),
-                Err(err) => {
-                    eprintln!("[layout] could not copy aside the file this window opened ({err}); not saved");
-                    return false;
+            for submitted in self.submitted.borrow_mut().iter_mut() {
+                if let Some(root) = submitted.arrangement.current_root_mut() {
+                    take_settled_lengths(root, layout.root());
                 }
-            },
-            // Another window wrote since, or the file is gone: what is there is not the text this
-            // window opened, and not this window's to keep.
-            Ok(_) => {}
-            Err(err) => {
-                eprintln!("[layout] could not read the file to copy it aside ({err}); not saved");
-                return false;
             }
         }
-        *self.keep_copy.borrow_mut() = None;
-        true
     }
 
-    /// The file as it is now, made safe to write over: wholly unusable, set aside; partly usable, its
-    /// text copied aside; usable or partly, its kept keys taken. A kept key naming a module this
-    /// window places -- in any of its workspaces now, not only in the file's trees -- is not taken: a
-    /// later build may have floated a module this window has since tiled, and writing both would put
-    /// it in two places; the file's text is copied aside instead, as for a partly usable file.
-    /// `false` when that could not be done and nothing may be written.
-    fn make_way(&self, dir: &Path) -> bool {
-        let (text, mut kept, mut copy) =
-            match persist::v2_state_with(dir, &self.project_root, &self.lua, &self.deferred.borrow()) {
-                V2State::Missing => return true,
-                V2State::Usable(text, kept) => (text, kept, false),
-                V2State::Partly(text, kept) => (text, kept, true),
-                V2State::Unusable(_) => {
-                    return match persist::set_aside_v2(dir, &self.project_root) {
-                        Ok(aside) => {
-                            println!(
-                                "[layout] the file this build could not use is kept as {}",
-                                aside.display()
-                            );
-                            true
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                        Err(err) => {
-                            eprintln!(
-                                "[layout] could not set aside the file this build could not use ({err}); not saved"
-                            );
-                            false
-                        }
-                    };
+    /// Gives the writer this window's workspaces if their arrangement changed since it was last submitted
+    /// or written, and returns without waiting for the write: the debounce timer's call. Whether a job was
+    /// submitted.
+    fn submit_if_changed(&self) -> bool {
+        let Some(dir) = &self.dir else { return false };
+        self.collect();
+        let job = match (self.layout.try_borrow(), self.workspaces.try_borrow()) {
+            (Ok(layout), Ok(workspaces)) => {
+                let now = Arrangement::of(&workspaces, &layout);
+                if !self.differs(&now) {
+                    return false;
                 }
-            };
-        let placed = match (self.layout.try_borrow(), self.workspaces.try_borrow()) {
-            (Ok(layout), Ok(workspaces)) => workspaces.placed(&layout, &self.lua),
+                SaveJob {
+                    dir: dir.clone(),
+                    project_root: self.project_root.clone(),
+                    lua: self.lua.clone(),
+                    deferred: self.deferred.borrow().clone(),
+                    keep_copy: self.keep_copy.borrow().clone(),
+                    workspaces: workspaces.clone(),
+                    current: layout.clone(),
+                    placed: workspaces.placed(&layout, &self.lua),
+                    now,
+                    job: self.next_job.get(),
+                }
+            }
             _ => {
                 eprintln!("[layout] the layout was busy; not saved this time");
                 return false;
             }
         };
-        let dropped = kept.drop_placed(&placed);
-        copy |= !dropped.is_empty();
-        if copy {
-            match persist::copy_aside_v2(dir, &self.project_root, &text) {
-                Ok(aside) => println!(
-                    "[layout] the file, part of which this build cannot carry, is kept as {}",
-                    aside.display()
-                ),
-                Err(err) => {
-                    eprintln!(
-                        "[layout] could not copy aside the file this build can only partly use ({err}); not saved"
-                    );
-                    return false;
-                }
+        self.next_job.set(job.job + 1);
+        self.submitted.borrow_mut().push(Submitted {
+            job: job.job,
+            arrangement: job.now.clone(),
+        });
+        self.writer.submit(job);
+        true
+    }
+
+    /// Takes the writer's finished saves: a write moves `base` and gives the live workspaces the file's
+    /// kept keys; once nothing is outstanding, changes are measured from `base` again, so a write that
+    /// failed leaves its change to be tried again.
+    fn collect(&self) {
+        let mut done = self.writer.take_done();
+        let idle = self.writer.idle();
+        if idle {
+            // Finished between the two calls above: taken now, since no other result can follow.
+            done.extend(self.writer.take_done());
+        }
+        for result in done {
+            let SaveDone::Written {
+                now,
+                job,
+                kept,
+                copy_taken,
+            } = result
+            else {
+                continue;
+            };
+            // What the window kept of this job holds the lengths that settled on screen since its submit,
+            // which are not a change; jobs submitted before it were run before it or replaced by it.
+            let mut submitted = self.submitted.borrow_mut();
+            submitted.retain(|earlier| earlier.job >= job);
+            let base = match submitted.first() {
+                Some(this) if this.job == job => this.arrangement.clone(),
+                _ => now,
+            };
+            drop(submitted);
+            *self.base.borrow_mut() = base;
+            if copy_taken {
+                *self.keep_copy.borrow_mut() = None;
             }
-        }
-        for note in dropped {
-            println!("[layout] {note}");
-        }
-        match self.workspaces.try_borrow_mut() {
-            Ok(mut workspaces) => {
+            // Busy, the live workspaces keep the kept keys they have; the next write takes the file's again.
+            if let (Some(kept), Ok(mut workspaces)) = (kept, self.workspaces.try_borrow_mut()) {
                 workspaces.retake_kept(kept);
-                true
             }
-            Err(_) => {
-                eprintln!("[layout] the workspaces were busy; not saved this time");
-                false
-            }
+        }
+        if idle {
+            self.submitted.borrow_mut().clear();
         }
     }
 
-    /// Writes this window's workspaces now if their arrangement changed since `base`, dropping a
-    /// pending timer: the close handler's call, and the timer's. The file is read again first, to
-    /// know what the write replaces (this module's doc); nothing is written if what must be kept of
-    /// it cannot be.
+    /// Submits this window's workspaces if their arrangement changed since they were last submitted or
+    /// written, dropping a pending timer, and waits up to [`CLOSE_FLUSH_BOUND`] for the writer to finish
+    /// every job: the close handler's call, so the window's final arrangement is the file's last write.
     pub(crate) fn save_now(&self) {
         if let Some(source) = self.pending.borrow_mut().take() {
             source.remove();
         }
-        let Some(dir) = &self.dir else { return };
-        let (now, current) = match (self.layout.try_borrow(), self.workspaces.try_borrow()) {
-            (Ok(layout), Ok(workspaces)) => (Arrangement::of(&workspaces, &layout), layout.clone()),
-            _ => {
-                eprintln!("[layout] the layout was busy; not saved this time");
-                return;
-            }
-        };
-        if now == *self.base.borrow() {
+        if self.dir.is_none() {
             return;
         }
-        // Not flags set at startup: the file may have changed since -- a hand-edit, another window,
-        // another build -- and what was true of it when this window opened says nothing of it now.
-        if !self.copy_what_was_opened(dir) || !self.make_way(dir) {
-            return;
+        self.submit_if_changed();
+        if !self.writer.flush(CLOSE_FLUSH_BOUND) {
+            eprintln!(
+                "[layout] the layout was still being written after {}s; not waiting longer",
+                CLOSE_FLUSH_BOUND.as_secs()
+            );
         }
-        let Ok(workspaces) = self.workspaces.try_borrow() else {
-            eprintln!("[layout] the workspaces were busy; not saved this time");
-            return;
-        };
-        match persist::save(dir, &self.project_root, &workspaces, &current) {
-            Ok(_) => *self.base.borrow_mut() = now,
-            Err(err) => eprintln!("[layout] could not save {}: {err}", dir.display()),
-        }
+        self.collect();
     }
 }
 
@@ -1565,6 +1967,146 @@ mod tests {
         assert_eq!(file_text(&dir), written_by(&layout), "the close writes it");
     }
 
+    /// A saver whose writer waits at a gate before each job until the test opens it.
+    fn gated_saver(dir: &Path, layout: &Rc<RefCell<Layout>>) -> (Rc<LayoutSaver>, std::sync::Arc<WriteGate>) {
+        let gate = WriteGate::closed();
+        let writer = LayoutWriter::start(WriterShared {
+            state: Default::default(),
+            changed: Default::default(),
+            gate: Some(gate.clone()),
+        });
+        let saver = LayoutSaver::with_writer(
+            Some(dir.to_path_buf()),
+            root(),
+            layout.clone(),
+            one_workspace(),
+            Vec::new(),
+            None,
+            writer,
+        );
+        (saver, gate)
+    }
+
+    /// Opens the gate once a job is queued behind the one the writer holds, from another thread, so the
+    /// close's wait can start first; says whether one was queued before its hang guard ran out.
+    fn open_when_queued(saver: &LayoutSaver, gate: &std::sync::Arc<WriteGate>) -> std::thread::JoinHandle<bool> {
+        let shared = saver.writer.shared.clone();
+        let gate = gate.clone();
+        std::thread::spawn(move || {
+            let state = shared.lock();
+            let (state, _) = shared
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(10), |state| state.pending.is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            let queued = state.pending.is_some();
+            drop(state);
+            gate.open();
+            queued
+        })
+    }
+
+    /// The debounce timer's call hands the save to the writer and returns: the file is read, decoded and
+    /// written on the writer's thread, so a slow disk never holds the window.
+    #[test]
+    fn the_debounced_save_returns_before_the_write() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-writer-thread");
+        let path = dir.join(persist::file_name_v2(root()));
+        let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
+        let (saver, gate) = gated_saver(&dir, &layout);
+        layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        assert!(saver.submit_if_changed(), "an arrangement change goes to the writer");
+        assert!(gate.wait_held(1), "the writer took the job");
+        assert!(!path.exists(), "the timer's call returned while the write still waits");
+
+        gate.open();
+        assert!(saver.writer.flush(Duration::from_secs(10)));
+        assert_eq!(file_text(&dir), written_by(&layout));
+        saver.collect();
+        assert!(
+            !saver.arrangement_changed(),
+            "the write was taken, so nothing is left to write"
+        );
+    }
+
+    /// The window closes while an earlier arrangement is still being written: the close queues the final
+    /// one behind it and waits, so the file ends with the final arrangement, never overtaken by the older.
+    #[test]
+    fn a_close_during_a_running_write_writes_the_final_arrangement_last() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-close-while-writing");
+        let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
+        let (saver, gate) = gated_saver(&dir, &layout);
+        layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        let earlier = written_by(&layout);
+        assert!(saver.submit_if_changed());
+        assert!(gate.wait_held(1), "the earlier write is under way");
+
+        eitri_core::layout::hide(&mut layout.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
+        let opener = open_when_queued(&saver, &gate);
+        saver.save_now();
+        assert!(
+            opener.join().unwrap(),
+            "the final arrangement was queued behind the running write"
+        );
+        let last = written_by(&layout);
+        assert_ne!(last, earlier);
+        assert_eq!(file_text(&dir), last, "the final arrangement is the last write");
+    }
+
+    /// A write that fails leaves `base` where it was, so the change is still unwritten and the next save
+    /// submits it again. The write is failed by a directory where this process's `.tmp` goes, which fails
+    /// for root too, where a read-only directory would not.
+    #[test]
+    fn a_write_that_fails_leaves_the_base_and_the_next_change_retries() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-writer-fails");
+        let path = dir.join(persist::file_name_v2(root()));
+        std::fs::create_dir_all(persist::temporary(&path).join("in the way")).unwrap();
+        let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
+        let opened_with = Arrangement::of(&Workspaces::single(), &layout.borrow());
+        let saver = saver_for(&dir, &layout);
+        layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        assert!(saver.submit_if_changed());
+        assert!(saver.writer.flush(Duration::from_secs(10)));
+        saver.collect();
+        assert!(!path.exists(), "the write failed");
+        assert_eq!(
+            *saver.base.borrow(),
+            opened_with,
+            "a failed write does not move the base"
+        );
+        assert!(saver.arrangement_changed(), "so the change is still unwritten");
+
+        std::fs::remove_dir_all(persist::temporary(&path)).unwrap();
+        assert!(saver.submit_if_changed(), "the next save submits it again");
+        assert!(saver.writer.flush(Duration::from_secs(10)));
+        assert_eq!(file_text(&dir), written_by(&layout));
+    }
+
+    /// Saved A; B is being written; the arrangement goes back to A and the window closes. A is measured
+    /// against B, the arrangement last given to the writer, not against the A last written, so it is
+    /// written after B and the file ends as the window did.
+    #[test]
+    fn an_undo_to_the_saved_arrangement_during_a_running_write_is_written_last() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-undo-while-writing");
+        let layout = Rc::new(RefCell::new(crate::terminal::initial_layout(&[]).unwrap()));
+        let (saver, gate) = gated_saver(&dir, &layout);
+        gate.open();
+        layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        saver.save_now();
+        let saved = layout.borrow().clone();
+        let a = file_text(&dir);
+        assert_eq!(a, written_by(&layout));
+
+        gate.close();
+        eitri_core::layout::hide(&mut layout.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
+        assert!(saver.submit_if_changed());
+        assert!(gate.wait_held(2), "B is under way");
+        *layout.borrow_mut() = saved;
+        let opener = open_when_queued(&saver, &gate);
+        saver.save_now();
+        assert!(opener.join().unwrap(), "the way back to A was queued behind B");
+        assert_eq!(file_text(&dir), a, "A, written after B");
+    }
+
     /// A settle copies into `base` only a length `base` did not have (`take_settled_lengths`), so a
     /// real change of a pinned length is not taken for a settle. Here `Ctrl+a k` grows the bottom
     /// terminal, and before the debounce fires a pinned Lua bottom panel is shown -- it settles, so
@@ -1608,6 +2150,82 @@ mod tests {
         saver.save_now();
         assert!(path.exists(), "the terminal's new height is a change, and is written");
         assert_eq!(file_text(&dir), written_by(&layout));
+    }
+
+    /// A write that finishes while a later arrangement waits behind it moves `base` to what that write
+    /// held, with only the lengths that settled on screen since, never to the later arrangement: here a
+    /// hidden Lua bottom panel with no length yet is written; meanwhile it is shown, settles, is grown
+    /// and hidden again, and that later arrangement's write fails. The growth is still unwritten, and
+    /// the next save writes it.
+    #[test]
+    fn a_failed_later_write_leaves_its_resize_unwritten_after_an_earlier_write_succeeds() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-saver-later-write-fails");
+        let path = dir.join(persist::file_name_v2(root()));
+        let logs = ModuleId::lua("logs");
+        let lua = vec![ModuleDecl {
+            id: logs.clone(),
+            placement: Placement::BelowRoot,
+        }];
+        let mut start = crate::terminal::initial_layout(&lua).unwrap();
+        start.show(&ModuleId::terminal()).unwrap();
+        if start.is_shown(&logs) {
+            eitri_core::layout::hide(&mut start, &logs, &frame()).unwrap();
+        }
+        eitri_core::layout::settle_pins(&mut start, &frame());
+        let layout = Rc::new(RefCell::new(start));
+        let gate = WriteGate::closed();
+        let writer = LayoutWriter::start(WriterShared {
+            state: Default::default(),
+            changed: Default::default(),
+            gate: Some(gate.clone()),
+        });
+        let saver = LayoutSaver::with_writer(
+            Some(dir.clone()),
+            root(),
+            layout.clone(),
+            one_workspace(),
+            lua,
+            None,
+            writer,
+        );
+
+        eitri_core::layout::hide(&mut layout.borrow_mut(), &ModuleId::agent(), &frame()).unwrap();
+        assert!(saver.submit_if_changed(), "the first arrangement goes to the writer");
+        assert!(gate.wait_held(1), "and is held before its write");
+
+        layout.borrow_mut().show(&logs).unwrap();
+        assert!(
+            eitri_core::layout::settle_pins(&mut layout.borrow_mut(), &frame()),
+            "the panel's pin settled: the hook runs"
+        );
+        saver.settled();
+        layout.borrow_mut().set_focus(&logs).unwrap();
+        assert!(eitri_core::layout::resize(
+            &mut layout.borrow_mut(),
+            &logs,
+            Direction::Up,
+            5,
+            &frame()
+        ));
+        eitri_core::layout::hide(&mut layout.borrow_mut(), &logs, &frame()).unwrap();
+        assert!(saver.submit_if_changed(), "the grown panel is a change");
+
+        gate.pass_one();
+        assert!(gate.wait_held(2), "the first write ran and the second waits");
+        let first = file_text(&dir);
+        std::fs::create_dir_all(persist::temporary(&path).join("in the way")).unwrap();
+        gate.open();
+        assert!(saver.writer.flush(Duration::from_secs(10)));
+        saver.collect();
+        assert_eq!(file_text(&dir), first, "the second write failed");
+        assert!(
+            saver.arrangement_changed(),
+            "the panel's new length was never written, so it is still a change"
+        );
+
+        std::fs::remove_dir_all(persist::temporary(&path)).unwrap();
+        saver.save_now();
+        assert_eq!(file_text(&dir), written_by(&layout), "the next save writes it");
     }
 
     /// A pinned child of a container with three children, one pin settled in `now` and not in `base`.

@@ -203,6 +203,10 @@ pub enum Zoom {
     Con(ConId),
 }
 
+/// Detaching a tile would leave no tiled tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Emptied;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
     root: Con,
@@ -385,6 +389,15 @@ impl Layout {
         match self.root.children.as_slice() {
             [only] if self.root.layout.axis().is_some() => only.node.clone(),
             _ => Node::Con(self.root.clone()),
+        }
+    }
+
+    /// Returns the tree without a tile, leaving this layout unchanged until its caller accepts it.
+    pub(crate) fn detach_tile(&mut self, id: &ModuleId) -> Result<Node, Emptied> {
+        let rest = Node::Con(self.root.clone()).without(id).ok_or(Emptied)?;
+        match rest {
+            Node::Con(mut c) if c.children.len() == 1 && c.layout.axis().is_some() => Ok(c.children.remove(0).node),
+            rest => Ok(rest),
         }
     }
 
@@ -575,6 +588,22 @@ impl Layout {
 
     pub fn float_memory(&self) -> &BTreeMap<ModuleId, FloatRect> {
         &self.float_memory
+    }
+
+    /// Remembers the rectangle `id` floats at when it next floats. Refused for the editor, which never
+    /// floats, for a module this layout does not hold, and for a rectangle out of range.
+    pub(crate) fn remember_float(&mut self, id: &ModuleId, rect: FloatRect) -> Result<(), LayoutError> {
+        if *id == ModuleId::editor() {
+            return Err(LayoutError::EditorNeverFloats);
+        }
+        if !self.contains(id) {
+            return Err(LayoutError::NotInTree(id.clone()));
+        }
+        if !rect.is_valid() {
+            return Err(LayoutError::FloatRect(id.clone()));
+        }
+        self.float_memory.insert(id.clone(), rect);
+        Ok(())
     }
 
     /// The most recently used tiled module that is in view.
@@ -1006,11 +1035,7 @@ impl Layout {
             self.take_float(id);
             None
         } else {
-            Some(
-                self.root_node()
-                    .without(id)
-                    .ok_or_else(|| LayoutError::LastVisible(id.clone()))?,
-            )
+            Some(self.detach_tile(id).map_err(|_| LayoutError::LastVisible(id.clone()))?)
         };
         self.float_memory.remove(id);
         if self.zoomed() == Some(id) {
@@ -1117,6 +1142,70 @@ mod tests {
 
     fn decl(id: &str, placement: Placement) -> ModuleDecl {
         ModuleDecl { id: lua(id), placement }
+    }
+
+    #[test]
+    fn detaching_the_last_tile_says_so_instead_of_panicking() {
+        use super::super::geometry::Direction;
+        use super::super::kill::{kill, Reopen};
+        use super::super::ops::{place, place_as_tab};
+        use super::super::verbs::{float_at, move_far};
+
+        let tile = ModuleId::parse("terminal#2").unwrap();
+        let floating = ModuleId::agent();
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        for mode in [ConLayout::SplitH, ConLayout::Tabbed, ConLayout::Stacked] {
+            let mut layout = Layout::from_parts_floating(
+                Node::Con(Con::new(mode, vec![Child::new(Node::Leaf(tile.clone()), 1.0)])),
+                vec![Float {
+                    id: floating.clone(),
+                    rect: FloatRect::centred(frame.size, 0.6),
+                    scratch: false,
+                }],
+                BTreeSet::new(),
+                tile.clone(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let before = layout.clone();
+            assert_eq!(layout.detach_tile(&tile), Err(Emptied));
+            assert_eq!(layout, before);
+            assert_eq!(layout.remove(&tile), Err(LayoutError::LastVisible(tile.clone())));
+            assert_eq!(
+                float_at(&mut layout, &tile, None, &frame),
+                Err(LayoutError::LastTiled(tile.clone()))
+            );
+            assert_eq!(
+                move_far(&mut layout, &tile, Direction::Right, &frame),
+                Err(LayoutError::LastVisible(tile.clone()))
+            );
+            assert_eq!(
+                place(&mut layout, &tile, &floating, Axis::Row),
+                Err(LayoutError::SameModule(tile.clone()))
+            );
+            assert_eq!(
+                place_as_tab(&mut layout, &tile, &floating, true),
+                Err(LayoutError::SameModule(tile.clone()))
+            );
+            assert_eq!(layout, before);
+
+            kill(&mut layout, &tile, Reopen::At(Placement::RightOfRoot), &frame).unwrap();
+            assert_eq!(layout.root(), before.root());
+            assert!(!layout.is_shown(&tile));
+            assert_eq!(layout.focus(), &floating);
+
+            for tab in [false, true] {
+                let mut layout = before.clone();
+                if tab {
+                    place_as_tab(&mut layout, &floating, &tile, true).unwrap();
+                } else {
+                    place(&mut layout, &floating, &tile, Axis::Row).unwrap();
+                }
+                assert_eq!(layout.leaves(), [tile.clone(), floating.clone()]);
+                assert!(!layout.is_floating(&floating));
+                layout.root().check(true).unwrap();
+            }
+        }
     }
 
     #[test]

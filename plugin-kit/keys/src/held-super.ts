@@ -1,3 +1,4 @@
+import { onRemove } from "./bridge";
 /** WebKit can omit Super from other keys' modifier flags, so remember its own press and release.
  * A lost release only withholds actions; blur and visibility changes clear that stale state. */
 
@@ -47,3 +48,5 @@ export function installHeldSuperTracking(doc: Document, win: Window): () => void
     reset();
   };
 }
+
+onRemove(reset);

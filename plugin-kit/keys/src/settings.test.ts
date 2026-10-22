@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, prefixKey, settingsOf } from "./settings";
 
@@ -45,4 +48,45 @@ describe("prefixKey", () => {
       expect(prefixKey(label)).toBeNull();
     }
   });
+});
+
+const fields = {
+  scroll_step: "scrollStep", smooth: "smooth", prefix_wait: "prefixWait",
+  which_key_delay: "whichKeyDelay", hint_chars: "hintChars", find_case: "findCase",
+} as const;
+
+function sharedTable() {
+  return JSON.parse(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)),
+    "../../../core/src/plugin/fixtures/kit_settings.json"), "utf8")) as {
+    defaults: Record<keyof typeof fields, unknown>;
+    ranges: Partial<Record<keyof typeof fields, [number, number]>>;
+    accepted: { field: keyof typeof fields; value: unknown }[];
+    refused: { field: keyof typeof fields; value: unknown }[];
+    prefixes: { human: string; kit: string }[];
+  };
+}
+
+it("settingsMatchTheSharedTable", () => {
+  const table = sharedTable();
+  expect(DEFAULT_SETTINGS).toEqual(Object.fromEntries(
+    Object.entries(table.defaults).map(([field, value]) => [fields[field as keyof typeof fields], value])));
+  for (const { field, value } of table.accepted) {
+    expect(settingsOf({ [field]: value })[fields[field]]).toEqual(value);
+  }
+  for (const { field, value } of table.refused) {
+    expect(settingsOf({ [field]: value })[fields[field]]).toEqual(DEFAULT_SETTINGS[fields[field]]);
+  }
+  for (const [field, [min, max]] of Object.entries(table.ranges)) {
+    const member = fields[field as keyof typeof fields];
+    for (const [n, accepted] of [[min - 1, false], [min, true], [max, true], [max + 1, false]] as const) {
+      const value = field === "hint_chars" ? "abcdefghijklmnopqrstuvwxyz".repeat(2).slice(0, n) : n;
+      expect(settingsOf({ [field]: value })[member]).toEqual(accepted ? value : DEFAULT_SETTINGS[member]);
+    }
+  }
+});
+
+it("every_prefix_the_keymap_accepts_round_trips_through_the_kit", () => {
+  const prefixes = sharedTable().prefixes;
+  expect(prefixes).toHaveLength(26);
+  for (const { human, kit } of prefixes) expect(prefixKey(human)).toBe(kit);
 });

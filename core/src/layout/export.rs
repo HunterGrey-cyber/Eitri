@@ -4,6 +4,24 @@ use std::collections::BTreeSet;
 
 use super::{con::unwritten_share, workspace::MAIN, Con, ConLayout, Layout, ModuleKind, Node, Workspaces};
 
+/// Only a one-child split can lose its head without removing a tab strip.
+pub fn root_written_as_child(layout: &Layout) -> Option<&Node> {
+    match layout.root().children.as_slice() {
+        [only] if layout.root().layout.axis().is_some() => Some(&only.node),
+        _ => None,
+    }
+}
+
+/// The container names used by Lua layout trees and the selected-container label.
+pub fn head_name(layout: ConLayout) -> &'static str {
+    match layout {
+        ConLayout::SplitH => "row",
+        ConLayout::SplitV => "column",
+        ConLayout::Tabbed => "tabbed",
+        ConLayout::Stacked => "stacked",
+    }
+}
+
 /// The layout of every workspace as `init.lua` calls, in the grammar `eitri.layout.default` reads.
 ///
 /// Calls up to 120 columns stay on one line. Longer calls break after the shallowest table comma
@@ -69,11 +87,9 @@ pub fn export_lua(live: &Layout, workspaces: Option<&Workspaces>) -> String {
     let calls = layouts
         .iter()
         .map(|(name, layout)| {
-            // A tabbed or stacked root keeps its tab strip with one child, so only a split root of
-            // one child is written as that child.
-            let mut tree = match layout.root().children.as_slice() {
-                [only] if layout.root().layout.axis().is_some() => node(&only.node, None),
-                _ => container(layout.root(), None),
+            let mut tree = match root_written_as_child(layout) {
+                Some(child) => node(child, None),
+                None => container(layout.root(), None),
             };
             if !layout.floats().is_empty() {
                 let floats = layout
@@ -152,12 +168,7 @@ fn node(value: &Node, share: Option<f32>) -> String {
 }
 
 fn container(con: &Con, share: Option<f32>) -> String {
-    let head = match con.layout {
-        ConLayout::SplitH => "row",
-        ConLayout::SplitV => "column",
-        ConLayout::Tabbed => "tabbed",
-        ConLayout::Stacked => "stacked",
-    };
+    let head = head_name(con.layout);
     // The last share is left out when the grammar's remainder reads it back as the same `f32`.
     // Trading shares in `f32` lets a container's shares drift off 1 by a rounding error; the share is
     // then written, since a remainder off by that error can move a divider by a pixel.

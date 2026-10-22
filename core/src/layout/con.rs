@@ -78,6 +78,36 @@ pub struct Con {
     pub children: Vec<Child>,
     pub focus: usize,
 }
+
+/// Inserts after `at`, sharing that child's space and preserving the remembered child.
+/// Callers check capacity first and handle pins according to the placement's visibility rules.
+pub(crate) fn insert_halving(con: &mut Con, at: usize, node: Node) {
+    let half = con.children[at].share / 2.0;
+    con.children[at].share = half;
+    con.children.insert(at + 1, Child::new(node, half));
+    if con.focus > at {
+        con.focus += 1;
+    }
+    if half < MIN_RATIO {
+        let share = 1.0 / con.children.len() as f32;
+        for child in &mut con.children {
+            child.share = share;
+        }
+    }
+}
+
+/// Removes one slot, giving its space to the survivors and its focus to the following child.
+pub(crate) fn remove_child(con: &mut Con, at: usize) -> Node {
+    let removed = con.children.remove(at).node;
+    if con.children.is_empty() {
+        con.focus = 0;
+    } else {
+        con.focus = (con.focus - usize::from(at < con.focus)) % con.children.len();
+        con.rescale();
+    }
+    removed
+}
+
 impl PartialEq for Con {
     fn eq(&self, other: &Self) -> bool {
         self.layout == other.layout
@@ -139,31 +169,24 @@ impl Node {
                 if !c.leaves().contains(id) {
                     return Some(Self::Con(c));
                 }
-                let old_len = c.children.len();
-                let focus = c.focus;
-                let mut before = 0;
-                c.children = c
-                    .children
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, mut ch)| {
-                        ch.node = ch.node.without(id)?;
-                        if i < focus {
-                            before += 1;
-                        }
-                        Some(ch)
-                    })
-                    .collect();
+                let mut at = 0;
+                while at < c.children.len() {
+                    if !c.children[at].node.leaves().contains(id) {
+                        at += 1;
+                        continue;
+                    }
+                    let node = std::mem::replace(&mut c.children[at].node, Self::Leaf(id.clone()));
+                    if let Some(node) = node.without(id) {
+                        c.children[at].node = node;
+                        at += 1;
+                    } else {
+                        remove_child(&mut c, at);
+                    }
+                }
                 match c.children.len() {
                     0 => None,
                     1 if c.layout.axis().is_some() => Some(c.children.pop().unwrap().node),
-                    _ => {
-                        if c.children.len() != old_len {
-                            c.rescale();
-                        }
-                        c.focus = before % c.children.len();
-                        Some(Self::Con(c))
-                    }
+                    _ => Some(Self::Con(c)),
                 }
             }
         }

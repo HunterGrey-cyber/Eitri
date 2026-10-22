@@ -29,9 +29,8 @@ pub struct CommandEntry {
 #[derive(Default)]
 pub struct CommandRegistry {
     commands: HashMap<String, CommandEntry>,
-    /// The first refusal `register` raised (sw-lua-5), kept however init.lua handled the Lua error
-    /// -- a `pcall` included -- so the shell can refuse to start on it (`refused`).
-    refused: Option<String>,
+    /// Shares the startup decision with the other Lua APIs.
+    init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
 }
 
 impl CommandRegistry {
@@ -60,8 +59,10 @@ impl CommandRegistry {
 
     /// The message of the first command id `register` refused, or `None`. `pub`:
     /// `Kernel::load_init_file` makes it a startup failure once init.lua has run.
-    pub fn refused(&self) -> Option<&str> {
-        self.refused.as_deref()
+    pub fn refused(&self) -> Option<String> {
+        self.init_refusals
+            .as_ref()
+            .and_then(|shared| shared.borrow().message("eitri.command.register"))
     }
 
     /// `pub`: `main.rs` iterates every registered command to wire a real GTK action for it.
@@ -83,19 +84,15 @@ fn is_valid_command_id(id: &str) -> bool {
 
 /// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>) -> mlua::Result<()> {
+    registry.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
     let command_table = lua.create_table()?;
-    let register_fn = lua.create_function(move |lua, spec: Table| {
+    let register_fn = super::kernel::registering_function(lua, "eitri.command.register", move |lua, spec: Table| {
         let id: String = spec.get("id")?;
         if !is_valid_command_id(&id) {
-            // An uncaught error here stops the rest of the `.exec()` chunk, including later commands,
-            // keymaps, panels and `agent.account`. A `pcall` can swallow that Lua error, so also retain the
-            // message in `CommandRegistry::refused`. `load_init_file` checks it and refuses startup with
-            // the message even if Lua caught the error. This keeps invalid ids from reaching GTK.
             let message = format!(
                 "eitri.command.register: invalid command id {id:?} -- only ASCII letters, digits, \
                  '-' and '.' are allowed (an invalid id crashes the whole process once bound to a keybinding)"
             );
-            registry.borrow_mut().refused.get_or_insert_with(|| message.clone());
             return Err(mlua::Error::RuntimeError(message));
         }
         let title: String = spec.get("title")?;
@@ -346,11 +343,7 @@ mod tests {
         )
         .exec()
         .expect("the chunk itself caught the refusal and went on");
-        let refused = registry
-            .borrow()
-            .refused()
-            .map(str::to_owned)
-            .expect("the refusal was remembered");
+        let refused = registry.borrow().refused().expect("the refusal was remembered");
         assert!(refused.contains("my command"), "names the id: {refused}");
         assert!(registry.borrow().get("fine").is_some());
     }

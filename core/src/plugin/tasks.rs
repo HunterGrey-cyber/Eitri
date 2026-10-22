@@ -407,8 +407,20 @@ fn deliver(shared: &Shared, stream: Stream, cuts: &mut Vec<Cut>, wake: &agent::U
                         }
                         continue;
                     }
+                    // The tail is bounded on its own and is what a returning page reads, so it keeps the newest
+                    // stdout line even when the queue below has no room for it.
                     if stream == Stream::Stdout {
                         out.tail.push(line.clone());
+                    }
+                    // A page can remain unready across many rate windows, so held output needs its own bound.
+                    if out.bytes + line.len() + LINE_OVERHEAD > RATE_BYTES {
+                        out.dropped_lines += 1;
+                        out.dropped_bytes += line.len() as u64;
+                        if out.since.is_none() {
+                            out.since = Some(now);
+                            raise = true;
+                        }
+                        continue;
                     }
                     if out.since.is_none() {
                         out.since = Some(now);
@@ -822,6 +834,59 @@ mod tests {
             .expect("the reader was not released");
         assert!(!got, "a reader must stop once the run has ended");
         reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn held_output_stays_bounded_when_the_rate_window_renews() {
+        for stream in [Stream::Stdout, Stream::Stderr] {
+            let shared = Shared::new();
+            let wake: agent::UiWake = Arc::new(|| {});
+            let line = "x".repeat(RATE_BYTES / 4 - LINE_OVERHEAD);
+            for _ in 0..8 {
+                // A fresh budget models another output window while the page is still loading.
+                lock(&shared.out).rate = RateWindow::new(RATE_WINDOW, RATE_BYTES);
+                deliver(&shared, stream, &mut vec![Cut::Line(line.clone())], &wake);
+            }
+            let mut out = lock(&shared.out);
+            assert_eq!(out.bytes, RATE_BYTES, "held output cannot grow across rate windows");
+            assert_eq!(out.lines.len(), 4);
+            assert_eq!(out.dropped_lines, 4);
+            assert_eq!(out.dropped_bytes, (line.len() * 4) as u64);
+            let mut events = Vec::new();
+            drain(&mut out, 1, &mut events);
+            assert_eq!(out.bytes, 0);
+            drop(out);
+
+            deliver(&shared, stream, &mut vec![Cut::Line("resumed".into())], &wake);
+            assert_eq!(lock(&shared.out).lines.back(), Some(&(stream, "resumed".into())));
+        }
+    }
+
+    #[test]
+    fn stdout_refused_by_the_held_cap_still_becomes_the_tails_last_line() {
+        let shared = Shared::new();
+        let wake: agent::UiWake = Arc::new(|| {});
+        let line = "x".repeat(RATE_BYTES / 4 - LINE_OVERHEAD);
+        for _ in 0..4 {
+            deliver(&shared, Stream::Stdout, &mut vec![Cut::Line(line.clone())], &wake);
+        }
+        assert_eq!(lock(&shared.out).bytes, RATE_BYTES, "the queue is full");
+        // A new rate window: the line is admitted by the rate but finds no room in the queue.
+        lock(&shared.out).rate = RateWindow::new(RATE_WINDOW, RATE_BYTES);
+        deliver(
+            &shared,
+            Stream::Stdout,
+            &mut vec![Cut::Line("status: newest".into())],
+            &wake,
+        );
+        let out = lock(&shared.out);
+        assert_eq!(out.lines.len(), 4, "the full queue takes no more");
+        assert_eq!(out.dropped_lines, 1, "the refused line is counted as output not sent");
+        assert_eq!(
+            out.tail.lines().last().map(String::as_str),
+            Some("status: newest"),
+            "a returning page must read the run's newest stdout line"
+        );
     }
 
     #[test]
