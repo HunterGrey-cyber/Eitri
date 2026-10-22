@@ -435,8 +435,8 @@ pub enum InboundMessage {
     },
     /// `gx` opens this web link in the system browser. The page sends a WHATWG-normalized
     /// address from `agent-ui/web/src/nav.ts#webUrl`; `shell` rechecks it in
-    /// `agent_panel.rs#web_url` before `gtk4::UriLauncher`. No `serde(default)`: a missing
-    /// address is malformed.
+    /// `panel/src/links.rs#web_url` before `gtk4::UriLauncher`. No `serde(default)`: a
+    /// missing address is malformed.
     OpenUrl {
         request_id: String,
         url: String,

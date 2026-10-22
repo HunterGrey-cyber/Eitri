@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
 import watchRs from "../../../agent/src/providers/claude_sidecar/watch.rs?raw";
-import agentPanelRs from "../../../panel/src/agent_panel.rs?raw";
+import startsRs from "../../../panel/src/starts.rs?raw";
 import cliMissingFixture from "./fixtures/problems/cli-missing.txt?raw";
 import cliOutOfRangeFixture from "./fixtures/problems/cli-out-of-range.txt?raw";
 import notLoggedInFixture from "./fixtures/problems/not-logged-in.txt?raw";
@@ -141,8 +141,8 @@ describe("a sidecar that stopped under a session", () => {
   // And the wrapper against the panel's Rust that writes it (`report_sessions_that_never_opened`,
   // via its `never_opened_message` helper): if its wording drifts, `failureEvidence` silently stops
   // unwrapping and the guess is shown again.
-  it("unwraps exactly what agent_panel.rs's never-opened format! writes", () => {
-    const source = agentPanelRs.replace(/\\\n\s*/g, "");
+  it("unwraps exactly what starts.rs's never-opened format! writes", () => {
+    const source = startsRs.replace(/\\\n\s*/g, "");
     const literal = /"(the session ended before it started \(\{reason\}\)[^"]*)"/.exec(source);
     expect(literal).not.toBeNull();
     const written = literal![1].replace("{reason}", INNER);
@@ -151,11 +151,11 @@ describe("a sidecar that stopped under a session", () => {
   });
 
   // `never_opened_message` gives a stopped sidecar its own literal rather than wrapping it in the
-  // "most likely no longer exists" guess. Read that literal from `agent_panel.rs`, write it with a
+  // "most likely no longer exists" guess. Read that literal from `starts.rs`, write it with a
   // real INNER, and check this module still identifies it as "the sidecar stopped" with no wrapper
   // guess left over.
   it("shell's own never-opened-message literal for a stopped sidecar carries no guess", () => {
-    const source = agentPanelRs.replace(/\\\n\s*/g, "");
+    const source = startsRs.replace(/\\\n\s*/g, "");
     const literal = /"(the agent sidecar stopped \(\{reason\}\)[^"]*)"/.exec(source);
     expect(literal).not.toBeNull();
     const written = literal![1].replace("{reason}", INNER);

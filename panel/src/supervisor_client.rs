@@ -240,7 +240,7 @@ impl SupervisorClient {
     }
 
     /// Sends a `Status` message only if `status` differs from the last one actually sent --
-    /// called from every run of `agent_panel.rs`'s tick, so without this dedup every tick
+    /// called from every run of the panel's tick (`tick.rs`), so without this dedup every tick
     /// would write to the socket regardless of whether anything changed.
     pub fn send_status(&mut self, status: AgentStatus) {
         if self.dead || self.last_sent_status == Some(status) {

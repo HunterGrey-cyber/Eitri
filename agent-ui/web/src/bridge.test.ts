@@ -376,7 +376,7 @@ describe("OutboundMessage: pane_nav serialises exactly", () => {
 /* Pins `open_url`'s exact wire string, including field order. The core test
    `parses_open_url_as_a_window_level_message` parses the same string to keep spelling aligned.
    The page sends the normalized `href` from `nav.ts#webUrl`; Rust validates it in
-   `agent_panel.rs#web_url` before it reaches `UriLauncher`. */
+   `panel/src/links.rs#web_url` before it reaches `UriLauncher`. */
 describe("OutboundMessage: open_url serialises exactly", () => {
   it("names the type, the request id and the url, in that order", () => {
     const message: OutboundMessage = { type: "open_url", request_id: "req-1", url: "https://example.com/a" };

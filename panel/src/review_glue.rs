@@ -1,0 +1,1254 @@
+//! Turn review's side of the panel: the review and proposal jobs, the review hints a page shows, the
+//! review flow's answers routed back to the page that asked, and the editor's answers to a draft edit.
+
+use super::*;
+
+/// The `review_settings` envelope for the state as it is: whether `c` can open a review, and whether
+/// the user asked to be told about a turn's changes.
+pub(super) fn review_settings_payload(state: &AgentPanelState) -> String {
+    eitri_core::agent_bridge::serialize_review_settings_for_js(state.review_enabled, state.review_hint)
+}
+
+/// The three values a turn review is built from.
+pub(super) struct ReviewRoots {
+    pub(super) state_home: Option<std::ffi::OsString>,
+    pub(super) home: Option<std::ffi::OsString>,
+    pub(super) canonical_root: PathBuf,
+}
+
+/// `init.lua`'s two review keys, applied once after it ran.
+pub struct ReviewConfig {
+    pub enabled: bool,
+    pub hint: bool,
+}
+
+impl AgentPanelState {
+    /// The state half of [`AgentPanelHandle::set_review`], which needs no page.
+    pub(super) fn apply_review(&mut self, review: ReviewConfig) {
+        self.review_hint = review.hint;
+        self.review_enabled = false;
+        if review.enabled {
+            let roots = &self.review_roots;
+            let installed = eitri_core::turn_review::TurnReview::new(
+                roots.state_home.as_deref(),
+                roots.home.as_deref(),
+                &roots.canonical_root,
+            );
+            match self.tabs.install_turn_review(installed) {
+                Ok(()) => self.review_enabled = true,
+                Err(why) => eprintln!("[agent_panel] {why}"),
+            }
+        } else {
+            self.tabs.turn_review_off();
+            eprintln!("[review] turn review is off (init.lua's review.enabled = false)");
+        }
+    }
+}
+
+/// What follows the window's answer to a request for nvim (`Effect::AskEditor`).
+pub(super) enum EditorThen {
+    /// The request of `view`'s page, known to it as `request_id`, is answered: taken, or refused with
+    /// why the editor could not take it.
+    Answer { view: ViewId, request_id: String },
+    /// A draft edit of `tab`: on its way, the draft is `text` and the edit is polled until it comes
+    /// back; refused, the edit is undone. Then the page's request is answered.
+    Draft {
+        view: ViewId,
+        request_id: String,
+        tab: TabId,
+        text: String,
+        edit: eitri_core::scratch::PendingEdit,
+    },
+}
+
+/// The step after the window answered a request for nvim (`answer`: `Err` says why the editor could not
+/// take it).
+pub(super) fn editor_answered(state: &mut AgentPanelState, then: EditorThen, answer: Result<(), String>) -> Outbox {
+    let mut out = Outbox::default();
+    match then {
+        EditorThen::Answer { view, request_id } => {
+            out.send(
+                view,
+                serialize_command_result_for_js(&request_id, answer.as_ref().map(|_| ()).map_err(String::as_str)),
+            );
+        }
+        EditorThen::Draft {
+            view,
+            request_id,
+            tab,
+            text,
+            edit,
+        } => match answer {
+            Err(why) => {
+                state
+                    .tabs
+                    .finish_scratch_edit(edit.id, &eitri_core::scratch::EditDone::Discarded);
+                edit.cleanup();
+                out.send(view, serialize_command_result_for_js(&request_id, Err(&why)));
+            }
+            Ok(()) => {
+                state.tabs.set_draft(tab, &text);
+                state.pending_edits.push(edit);
+                out.send(view, eitri_core::agent_bridge::serialize_scratch_for_js(tab, true));
+                out.send(view, serialize_command_result_for_js(&request_id, Ok(())));
+            }
+        },
+    }
+    out
+}
+
+/// The most reviews worked out at once. Each one runs git over the shadow repository, and a panel
+/// that asks again before an answer arrives is told to wait rather than queueing without bound.
+pub(super) const MAX_REVIEW_JOBS: usize = 4;
+
+/// One review being worked out on a worker thread.
+pub(super) struct PendingReview {
+    pub(super) request_id: String,
+    /// The page that asked: the answer goes there.
+    pub(super) view: ViewId,
+    /// The finished envelope, or why there is none.
+    pub(super) rx: mpsc::Receiver<Result<String, String>>,
+    /// The tab and turn whose status-band hint the page drops when this review's envelope arrives:
+    /// Rust forgets the remembered hint only then, since a refused or failed review leaves the hint
+    /// on the page.
+    pub(super) clears_hint: Option<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
+}
+
+/// Runs `work` on a worker thread; the tick sends what it returns (see [`poll_review_jobs`]).
+/// Refused while [`MAX_REVIEW_JOBS`] are already out.
+pub(super) fn start_review_job(
+    state: &mut AgentPanelState,
+    view: ViewId,
+    request_id: &str,
+    clears_hint: Option<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
+    work: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> Result<(), String> {
+    if state.review_jobs.len() >= MAX_REVIEW_JOBS {
+        return Err("reviews are still being worked out; try again in a moment".to_string());
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+        let _ = tx.send(work());
+    });
+    state.review_jobs.push(PendingReview {
+        request_id: request_id.to_string(),
+        view,
+        rx,
+        clears_hint,
+    });
+    Ok(())
+}
+
+/// What the finished jobs of `jobs` owe the panel, in order: an envelope for a review that was
+/// worked out, a failing `command_result` for one that could not be (or whose worker died). The
+/// finished ones leave `jobs`. The second list is the hints those envelopes clear on the page.
+#[cfg(test)]
+pub(super) fn finished_reviews(
+    jobs: &mut Vec<PendingReview>,
+) -> (Vec<String>, Vec<(u64, eitri_core::agent_bridge::ReviewTurnWire)>) {
+    let (payloads, cleared) = finished_reviews_by_page(jobs);
+    (payloads.into_iter().map(|(_, payload)| payload).collect(), cleared)
+}
+
+/// What [`finished_reviews_by_page`] found: each payload with the page it goes to, and the hints the
+/// reviews among them clear.
+pub(super) type ReviewsDone = (
+    Vec<(ViewId, String)>,
+    Vec<(u64, eitri_core::agent_bridge::ReviewTurnWire)>,
+);
+
+/// [`finished_reviews`], each payload with the view of the page that asked for it.
+pub(super) fn finished_reviews_by_page(jobs: &mut Vec<PendingReview>) -> ReviewsDone {
+    let mut payloads = Vec::new();
+    let mut cleared = Vec::new();
+    jobs.retain(|job| match job.rx.try_recv() {
+        Ok(Ok(envelope)) => {
+            payloads.push((job.view, envelope));
+            cleared.extend(job.clears_hint);
+            false
+        }
+        Ok(Err(why)) => {
+            payloads.push((job.view, serialize_command_result_for_js(&job.request_id, Err(&why))));
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            payloads.push((
+                job.view,
+                serialize_command_result_for_js(&job.request_id, Err("the review stopped before it finished")),
+            ));
+            false
+        }
+        Err(mpsc::TryRecvError::Empty) => true,
+    });
+    (payloads, cleared)
+}
+
+/// The hints a finished turn may show: all of them with `review.hint` on, none otherwise, so a
+/// quiet window never queues or dispatches one.
+pub(super) fn hints_to_keep(
+    hint_on: bool,
+    hints: Vec<eitri_core::turn_review::ReviewHint>,
+) -> Vec<eitri_core::turn_review::ReviewHint> {
+    if hint_on {
+        hints
+    } else {
+        Vec::new()
+    }
+}
+
+/// Adds `new` to the hints still waiting for the page, in order; a tab's older hint is dropped
+/// because the newer one (even `files: 0`, which clears) supersedes it.
+pub(super) fn keep_newest_hint_per_tab(
+    waiting: &mut Vec<eitri_core::turn_review::ReviewHint>,
+    new: Vec<eitri_core::turn_review::ReviewHint>,
+) {
+    for hint in new {
+        waiting.retain(|old| old.tab != hint.tab);
+        waiting.push(hint);
+    }
+}
+
+/// Records what the page was just sent, so a later document can be told again: a hint with files
+/// replaces its tab's, one with none clears it.
+pub(super) fn keep_shown_hints(
+    shown: &mut Vec<eitri_core::turn_review::ReviewHint>,
+    sent: &[eitri_core::turn_review::ReviewHint],
+) {
+    for hint in sent {
+        shown.retain(|old| old.tab != hint.tab);
+        if hint.files > 0 {
+            shown.push(hint.clone());
+        }
+    }
+}
+
+/// The page clears `tab`'s hint on receiving that tab's review of a turn at least as new as the
+/// hint's, so a reload must not bring it back.
+pub(super) fn forget_hint_for_review(
+    shown: &mut Vec<eitri_core::turn_review::ReviewHint>,
+    tab: u64,
+    asked: eitri_core::agent_bridge::ReviewTurnWire,
+) {
+    use eitri_core::agent_bridge::ReviewTurnWire;
+    shown.retain(|hint| {
+        hint.tab != tab
+            || match asked {
+                ReviewTurnWire::Latest => false,
+                ReviewTurnWire::N(turn) => turn < hint.turn,
+            }
+    });
+}
+
+/// Forgets the shown hints of a tab that closed or is running a turn: the page drops a tab's hint
+/// when a turn starts, and a turn that ends without a hint of its own would otherwise leave this
+/// record holding one the page no longer has.
+pub(super) fn forget_hints_of_running_or_closed_tabs(state: &mut AgentPanelState) {
+    let tabs = &state.tabs;
+    state.shown_hints.retain(|hint| {
+        tabs.get(eitri_core::tabs::TabId(hint.tab))
+            .is_some_and(|tab| !tab.turn_running())
+    });
+}
+
+/// The status-band hint `tab` showed in the page it left, to the ready page of `view` it moved to:
+/// that page was never sent it, and the tick does not send a shown hint again. A page not ready yet is
+/// sent it with the rest on its `ready` ([`hints_for_new_document`]).
+pub(super) fn send_moved_hint(state: &mut AgentPanelState, tab: TabId, view: ViewId, out: &mut Outbox) {
+    if !state.ready(view) {
+        return;
+    }
+    forget_hints_of_running_or_closed_tabs(state);
+    let hint = state
+        .shown_hints
+        .iter()
+        .find(|hint| hint.tab == tab.0)
+        .map(eitri_core::agent_bridge::serialize_review_hint_for_js);
+    if let Some(hint) = hint {
+        out.send(view, hint);
+    }
+}
+
+/// What a new document in `view`'s page is owed of the hints the last one showed: only those of the
+/// tabs in that view.
+pub(super) fn hints_for_new_document(
+    state: &mut AgentPanelState,
+    view: ViewId,
+) -> Vec<eitri_core::turn_review::ReviewHint> {
+    forget_hints_of_running_or_closed_tabs(state);
+    state
+        .shown_hints
+        .iter()
+        .filter(|hint| state.tabs.view_of(TabId(hint.tab)) == view)
+        .cloned()
+        .collect()
+}
+
+/// The waiting hints whose tab's view has a ready page, each with that view; the others keep waiting.
+pub(super) fn take_hints_for_ready_pages(
+    state: &mut AgentPanelState,
+) -> Vec<(ViewId, eitri_core::turn_review::ReviewHint)> {
+    let waiting = std::mem::take(&mut state.review_hints);
+    let mut ready = Vec::new();
+    for hint in waiting {
+        let view = state.tabs.view_of(TabId(hint.tab));
+        if state.ready(view) {
+            ready.push((view, hint));
+        } else {
+            state.review_hints.push(hint);
+        }
+    }
+    ready
+}
+
+/// The tick's half of a review: whatever a worker finished goes to the page that asked.
+pub(super) fn poll_review_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
+    if state.review_jobs.is_empty() {
+        return;
+    }
+    let (payloads, cleared) = finished_reviews_by_page(&mut state.review_jobs);
+    for (tab, turn) in cleared {
+        forget_hint_for_review(&mut state.shown_hints, tab, turn);
+    }
+    for (view, payload) in payloads {
+        out.send(view, payload);
+    }
+}
+
+/// One pending edit's proposal being read on a worker thread.
+pub(super) struct PendingProposal {
+    pub(super) request_id: String,
+    /// The page that asked: the answer goes there.
+    pub(super) view: ViewId,
+    /// The file's name as resolved; nvim takes the filetype from it.
+    pub(super) name: String,
+    pub(super) rx: mpsc::Receiver<Result<(String, String), eitri_core::scratch::ProposalRefused>>,
+}
+
+/// Reads `file` and applies `change` on a worker thread; the tick hands nvim the result (see
+/// [`poll_proposal_jobs`]). Refused while [`MAX_REVIEW_JOBS`] are already out.
+pub(super) fn start_proposal_job(
+    state: &mut AgentPanelState,
+    view: ViewId,
+    request_id: &str,
+    file: PathBuf,
+    change: eitri_core::agent_bridge::ProposedChange,
+) -> Result<(), String> {
+    if state.proposal_jobs.len() >= MAX_REVIEW_JOBS {
+        return Err("proposals are still being read; try again in a moment".to_string());
+    }
+    let name = file.to_string_lossy().into_owned();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+        let _ = tx.send(eitri_core::scratch::proposal_texts(&file, &change));
+    });
+    state.proposal_jobs.push(PendingProposal {
+        request_id: request_id.to_string(),
+        view,
+        name,
+        rx,
+    });
+    Ok(())
+}
+
+/// The tick's half of a proposal: a finished read is written to the scratch directory and handed to the
+/// editor, whose answer is the page's; a refusal, or a worker that died, answers the page with why.
+pub(super) fn poll_proposal_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
+    let mut i = 0;
+    while i < state.proposal_jobs.len() {
+        let read = match state.proposal_jobs[i].rx.try_recv() {
+            Ok(read) => read.map_err(|why| why.to_string()),
+            Err(mpsc::TryRecvError::Empty) => {
+                i += 1;
+                continue;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the proposal could not be read: its worker stopped".to_string())
+            }
+        };
+        let job = state.proposal_jobs.remove(i);
+        let prepared = read.and_then(|(base, proposed)| match state.scratch.as_mut() {
+            Some(dir) => dir
+                .prepare_proposal(&job.name, &base, &proposed)
+                .map_err(|e| format!("could not write the scratch file: {e}")),
+            None => Err("the scratch directory could not be created at startup".to_string()),
+        });
+        match prepared {
+            Ok(request) => out.effect(Effect::AskEditor {
+                request,
+                then: EditorThen::Answer {
+                    view: job.view,
+                    request_id: job.request_id,
+                },
+            }),
+            Err(why) => out.send(job.view, serialize_command_result_for_js(&job.request_id, Err(&why))),
+        }
+    }
+}
+
+/// What the review flow owes the panel: an answer goes to the page that sent its request, under the id
+/// that page knows it by, a tab's draft to the page of the tab's view, the window's interrupted reverts
+/// to the base page, and a confirmed review that was sent is applied as any flush of a tab's queue is.
+/// The requests the flow no longer owes an answer are forgotten afterwards.
+pub(super) fn dispatch_review_outs(
+    state: &mut AgentPanelState,
+    screen: &Screen,
+    outs: Vec<eitri_core::turn_review::Out>,
+    out: &mut Outbox,
+) {
+    use eitri_core::turn_review::Out;
+    for owed in outs {
+        match owed {
+            Out::Envelope(payload) => out.send(ViewId::BASE, payload),
+            // The flow knows the request by the ledger's key.
+            Out::Answer {
+                request_id: key,
+                payload,
+            } => {
+                let asked = state
+                    .owed
+                    .get(&key)
+                    .filter(|answer| answer.what == Owed::ReviewRequest)
+                    .map(|answer| (answer.page, answer.request_id.clone()));
+                match asked {
+                    Some((Some(view), request_id)) => out.send(view, answer_under(&payload, &key, &request_id)),
+                    // The page that asked has closed.
+                    Some((None, _)) => {}
+                    None => eprintln!("[agent_panel] review answer for {key}: no page asked for it"),
+                }
+            }
+            Out::Draft(tab, payload) => send_to_tabs_page(state, tab, payload, out),
+            Out::Flushed(tab, flush) => apply_flush(state, screen, tab, flush, out),
+            Out::QueueChanged(tab) => send_queue(state, tab, out),
+            Out::EditorOpened => out.effect(Effect::EditorOpened),
+        }
+    }
+    let flow = &state.review_flow;
+    state
+        .owed
+        .retain(|key, answer| answer.what != Owed::ReviewRequest || flow.owes_answer(key));
+}
+
+/// `payload`, an answer the review flow made under the ledger's `key`, under `request_id`, the id the
+/// page that asked knows it by. Every answer the flow makes names its request at the top level.
+pub(super) fn answer_under(payload: &str, key: &str, request_id: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(serde_json::Value::Object(mut fields))
+            if fields.get("requestId").and_then(|id| id.as_str()) == Some(key) =>
+        {
+            fields.insert("requestId".to_string(), serde_json::Value::from(request_id));
+            serde_json::Value::Object(fields).to_string()
+        }
+        _ => {
+            eprintln!("[agent_panel] review answer for {key} does not name it; sent as it is");
+            payload.to_string()
+        }
+    }
+}
+
+/// `message`, a review message, under `key` in place of the id its page gave it.
+pub(super) fn review_message_under(mut message: InboundMessage, key: &str) -> InboundMessage {
+    match &mut message {
+        InboundMessage::ReviewRevert { request_id, .. }
+        | InboundMessage::ReviewUndo { request_id, .. }
+        | InboundMessage::ReviewCommentAdd { request_id, .. }
+        | InboundMessage::ReviewCommentRemove { request_id, .. }
+        | InboundMessage::ReviewSend { request_id, .. }
+        | InboundMessage::ReviewRecover { request_id, .. }
+        | InboundMessage::OpenInEditor { request_id, .. } => *request_id = key.to_string(),
+        _ => debug_assert!(false, "a message that is not the review flow's was given a ledger key"),
+    }
+    message
+}
+
+/// One review message for the flow from `view`'s page, with the window's editor handle if it has one.
+/// What the flow answers, now or on a later tick, goes to that page. The flow is given the ledger's
+/// key for the request, so a request id another page also has out is never mixed up with it; the
+/// same page's id still out is the same request.
+pub(super) fn run_review_flow(
+    state: &mut AgentPanelState,
+    screen: &Screen,
+    view: ViewId,
+    message: InboundMessage,
+    out: &mut Outbox,
+) {
+    let request_id = message.request_id().to_string();
+    let key = state
+        .owed
+        .key_where(|answer| {
+            answer.what == Owed::ReviewRequest && answer.page == Some(view) && answer.request_id == request_id
+        })
+        .unwrap_or_else(|| state.owed.owe(view, &request_id, Owed::ReviewRequest));
+    let message = review_message_under(message, &key);
+    state.review_editor.sync(&mut state.review_flow);
+    let outs = state.review_flow.handle(
+        message,
+        &mut state.tabs,
+        state.editor_rpc.as_deref(),
+        std::time::Instant::now(),
+    );
+    dispatch_review_outs(state, screen, outs, out);
+}
+
+/// The tick's half of the review flow: editor answers, workers that finished and tickets whose tab
+/// went away, each answer for the page that sent its request.
+pub(super) fn poll_review_flow(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
+    if state.review_flow.is_idle() {
+        return;
+    }
+    state.review_editor.sync(&mut state.review_flow);
+    let outs = state
+        .review_flow
+        .tick(&mut state.tabs, state.editor_rpc.as_deref(), std::time::Instant::now());
+    dispatch_review_outs(state, screen, outs, out);
+}
+
+/// The return half of a scratch edit: every edit whose marker appeared goes back to the tab it came from,
+/// told to the page that shows it, and the keys return to the chat view of the last such tab.
+pub(super) fn poll_scratch_edits(state: &mut AgentPanelState, out: &mut Outbox) {
+    if state.pending_edits.is_empty() {
+        return;
+    }
+    let mut finished: Vec<(eitri_core::scratch::PendingEdit, eitri_core::scratch::EditDone)> = Vec::new();
+    state.pending_edits.retain(|edit| match edit.poll() {
+        Some(result) => {
+            finished.push((edit.clone(), result));
+            false
+        }
+        None => true,
+    });
+    if finished.is_empty() {
+        return;
+    }
+    let mut keys_to = ViewId::BASE;
+    for (edit, result) in finished {
+        let returned = state.tabs.finish_scratch_edit(edit.id, &result);
+        edit.cleanup();
+        let Some((tab, draft)) = returned else { continue };
+        let (shown, view) = (state.shown_in(tab), state.tabs.view_of(tab));
+        keys_to = view;
+        if let Some(shown) = shown {
+            if let Some(text) = &draft {
+                out.send(shown, eitri_core::agent_bridge::serialize_draft_for_js(tab, text));
+            }
+            out.send(shown, eitri_core::agent_bridge::serialize_scratch_for_js(tab, false));
+        }
+        if let eitri_core::scratch::EditDone::Failed(why) = &result {
+            out.send(
+                view,
+                eitri_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
+            );
+        }
+    }
+    out.effect(Effect::EditorDone(keys_to));
+}
+
+/// Ends every draft edit still out in nvim, for an editor that went away: the body file's text
+/// becomes the draft when it differs from what was handed out, else the draft keeps its own text.
+/// A marker nvim wrote wins; without one the body is read as it stands. Each edit's files go after
+/// it is read. Returns the tabs that had an edit out, oldest edit first, with the new draft where
+/// there is one.
+pub(super) fn end_pending_edits(state: &mut AgentPanelState) -> Vec<(TabId, Option<String>)> {
+    use eitri_core::scratch::EditDone;
+    let edits = std::mem::take(&mut state.pending_edits);
+    let results: Vec<(u64, EditDone)> = edits
+        .iter()
+        .map(|edit| {
+            let done = edit
+                .poll()
+                .unwrap_or_else(|| match std::fs::read_to_string(&edit.body) {
+                    Ok(raw) => EditDone::Written(raw.strip_suffix('\n').unwrap_or(&raw).to_string()),
+                    Err(_) => EditDone::Discarded,
+                });
+            (edit.id, done)
+        })
+        .collect();
+    let ended = state.tabs.cancel_scratch_edits(&results);
+    for edit in &edits {
+        edit.cleanup();
+    }
+    ended
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_panel::tests::*;
+
+    /// The review switches reach the page: off before `init.lua`'s values are applied, at once to a
+    /// page already listening when they are, before the tabs on every `ready`, and again to a document
+    /// that replaces the first.
+    #[test]
+    fn the_review_settings_are_told_at_once_and_again_on_every_ready() {
+        let (handle, page) = handle_with_strict_page();
+        page.inner.visible.set(true);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
+        let settings = |page: &std::cell::RefCell<Vec<String>>| -> Vec<(bool, bool)> {
+            page.borrow()
+                .iter()
+                .filter(|e| kind_of(e) == "review_settings")
+                .map(|e| {
+                    let v = serde_json::from_str::<serde_json::Value>(e).unwrap();
+                    (v["enabled"].as_bool().unwrap(), v["hint"].as_bool().unwrap())
+                })
+                .collect()
+        };
+        let kinds: Vec<String> = page.inner.sent.borrow().iter().map(|e| kind_of(e)).collect();
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("review_settings") < at("tabs"), "{kinds:?}");
+        assert_eq!(settings(&page.inner.sent), vec![(false, false)]);
+        handle.set_review(ReviewConfig {
+            enabled: true,
+            hint: true,
+        });
+        assert_eq!(settings(&page.inner.sent), vec![(false, false), (true, true)]);
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
+        assert_eq!(
+            settings(&page.inner.sent),
+            vec![(false, false), (true, true), (true, true)]
+        );
+        handle.set_review(ReviewConfig {
+            enabled: false,
+            hint: true,
+        });
+        assert_eq!(settings(&page.inner.sent).last(), Some(&(false, true)));
+    }
+
+    /// `Ctrl+g` on a pending `Write` of a file that is not there yet: the page's message goes through the
+    /// arm and the worker, and the tick hands the editor one `diff` request against an empty file, then
+    /// answers the page. The file itself is never made.
+    #[test]
+    fn a_view_proposal_for_a_new_file_reaches_the_editor() {
+        let (handle, page) = settled_panel();
+        let scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let project = scratch.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let scratch_root = scratch.path().to_path_buf();
+        // The panel's own scratch directory, made beside the project so both go with the test's cleanup.
+        let panel_scratch = eitri_core::scratch::ScratchDir::in_dir(&scratch_root).expect("a panel scratch directory");
+        {
+            let mut state = handle.state.borrow_mut();
+            state.project_dir = project.clone();
+            state.scratch = Some(panel_scratch);
+        }
+        let asked: Rc<RefCell<Vec<eitri_core::scratch::ScratchRequest>>> = Rc::default();
+        let recorder = asked.clone();
+        handle.on_editor_request(move |request| {
+            recorder.borrow_mut().push(request.clone());
+            Ok(())
+        });
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"view_proposal","request_id":"vp1","path":"src/new.rs","change":{"kind":"content","content":"fn main() {}\n"}}"#,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while asked.borrow().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the proposal never reached the editor"
+            );
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(asked.borrow().len(), 1, "one editor request");
+        let hex = asked.borrow()[0].hex().to_string();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["op"], "diff");
+        assert_eq!(value["name"], project.join("src/new.rs").to_string_lossy().as_ref());
+        assert_eq!(std::fs::read_to_string(value["base"].as_str().unwrap()).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(value["proposed"].as_str().unwrap()).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(
+            !project.join("src/new.rs").exists(),
+            "the proposal never writes the file"
+        );
+        let answered = page
+            .sent
+            .borrow()
+            .iter()
+            .any(|p| p.contains(r#""requestId":"vp1""#) && p.contains(r#""ok":true"#));
+        assert!(answered, "the page's request was answered");
+        assert!(handle.state.borrow().proposal_jobs.is_empty());
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        scratch.cleanup();
+    }
+
+    /// `review.enabled` and `review.hint` reach the panel's state: enabled installs a review and the hint
+    /// follows its key; disabled leaves none and a request for one says why.
+    #[test]
+    fn the_review_keys_reach_the_panel_state() {
+        use eitri_core::turn_review::{Scope, TurnRef};
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: false,
+        });
+        assert!(state.borrow().tabs.turn_review().is_some());
+        assert!(state.borrow().review_enabled);
+        assert!(!state.borrow().review_hint);
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: true,
+        });
+        assert!(state.borrow().review_hint);
+
+        // A backend without turn boundaries installs none, so the page is not told `c` would open one.
+        let state = state_for_hooks(TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto));
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: true,
+        });
+        assert!(state.borrow().tabs.turn_review().is_none());
+        assert!(!state.borrow().review_enabled);
+
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: false,
+            hint: true,
+        });
+        let state = state.borrow();
+        assert!(state.tabs.turn_review().is_none());
+        assert!(!state.review_enabled);
+        let tab = state.tabs.active();
+        assert_eq!(
+            state
+                .tabs
+                .review_overview_job(tab, TurnRef::Latest, Scope::Turn)
+                .err()
+                .as_deref(),
+            Some(eitri_core::tab_set::TURN_REVIEW_OFF)
+        );
+    }
+
+    /// Without `review.hint` a finished turn's hint is dropped before it is queued, so nothing is
+    /// ever dispatched; with it, every hint passes.
+    #[test]
+    fn hints_are_dropped_unless_opted_in() {
+        use eitri_core::turn_review::ReviewHint;
+        let hints = || {
+            vec![
+                ReviewHint {
+                    tab: 1,
+                    turn: 1,
+                    files: 3,
+                },
+                ReviewHint {
+                    tab: 2,
+                    turn: 1,
+                    files: 0,
+                },
+            ]
+        };
+        assert!(hints_to_keep(false, hints()).is_empty());
+        assert_eq!(hints_to_keep(true, hints()), hints());
+    }
+
+    /// A hint that arrives while the page is not ready is kept for it, one per tab, the newest.
+    #[test]
+    fn a_waiting_review_hint_is_replaced_only_by_the_same_tabs_newer_one() {
+        use eitri_core::turn_review::ReviewHint;
+        let hint = |tab, turn, files| ReviewHint { tab, turn, files };
+        let mut waiting = Vec::new();
+        keep_newest_hint_per_tab(&mut waiting, vec![hint(1, 1, 3), hint(2, 1, 1)]);
+        keep_newest_hint_per_tab(&mut waiting, vec![hint(1, 2, 0)]);
+        assert_eq!(waiting, vec![hint(2, 1, 1), hint(1, 2, 0)]);
+        keep_newest_hint_per_tab(&mut waiting, Vec::new());
+        assert_eq!(waiting.len(), 2);
+    }
+
+    /// What the page was sent is kept for the document that replaces it: a hint with files stands for its
+    /// tab until a newer one, and one with none clears it.
+    #[test]
+    fn a_shown_review_hint_is_kept_until_a_newer_one_for_its_tab_replaces_or_clears_it() {
+        use eitri_core::turn_review::ReviewHint;
+        let hint = |tab, turn, files| ReviewHint { tab, turn, files };
+        let mut shown = Vec::new();
+        keep_shown_hints(&mut shown, &[hint(1, 1, 2), hint(2, 1, 5)]);
+        keep_shown_hints(&mut shown, &[hint(1, 2, 3)]);
+        assert_eq!(shown, vec![hint(2, 1, 5), hint(1, 2, 3)]);
+        keep_shown_hints(&mut shown, &[hint(2, 2, 0)]);
+        assert_eq!(shown, vec![hint(1, 2, 3)]);
+        keep_shown_hints(&mut shown, &[]);
+        assert_eq!(shown, vec![hint(1, 2, 3)]);
+    }
+
+    /// Opening a tab's review of the turn the hint is about, or a newer one, is what clears the hint on the
+    /// page; a review of an older turn is not.
+    #[test]
+    fn asking_for_a_tabs_review_forgets_its_shown_hint_only_when_the_page_would_clear_it() {
+        use eitri_core::agent_bridge::ReviewTurnWire;
+        use eitri_core::turn_review::ReviewHint;
+        let hint = |tab, turn, files| ReviewHint { tab, turn, files };
+        let fresh = || vec![hint(1, 4, 2), hint(2, 4, 2)];
+        let mut shown = fresh();
+        forget_hint_for_review(&mut shown, 1, ReviewTurnWire::Latest);
+        assert_eq!(shown, vec![hint(2, 4, 2)]);
+        let mut shown = fresh();
+        forget_hint_for_review(&mut shown, 1, ReviewTurnWire::N(3));
+        assert_eq!(shown, fresh());
+        forget_hint_for_review(&mut shown, 1, ReviewTurnWire::N(4));
+        assert_eq!(shown, vec![hint(2, 4, 2)]);
+    }
+
+    /// A reloaded document is told again the hints the last one showed, for the tabs that still exist; a
+    /// closed tab's is forgotten, and asking twice (two reloads) gives the same answer.
+    #[test]
+    fn a_new_document_is_owed_the_hints_the_last_one_showed() {
+        use eitri_core::turn_review::ReviewHint;
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let tab = state.borrow().tabs.active().0;
+        let live = ReviewHint { tab, turn: 2, files: 3 };
+        keep_shown_hints(
+            &mut state.borrow_mut().shown_hints,
+            &[
+                live.clone(),
+                ReviewHint {
+                    tab: tab + 100,
+                    turn: 1,
+                    files: 1,
+                },
+            ],
+        );
+        assert_eq!(
+            hints_for_new_document(&mut state.borrow_mut(), ViewId::BASE),
+            vec![live.clone()]
+        );
+        assert_eq!(
+            hints_for_new_document(&mut state.borrow_mut(), ViewId::BASE),
+            vec![live]
+        );
+    }
+
+    /// A review's answer is the worker's envelope as it is; a job that failed or whose worker died
+    /// is a failing `command_result` for its own request; one still running is left in the list.
+    #[test]
+    fn finished_reviews_answer_each_request_once_and_leave_the_running_one() {
+        let (done_tx, done_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (died_tx, died_rx) = mpsc::channel::<Result<String, String>>();
+        let (_running_tx, running_rx) = mpsc::channel::<Result<String, String>>();
+        done_tx
+            .send(Ok(r#"{"kind":"review","requestId":"a"}"#.to_string()))
+            .unwrap();
+        failed_tx.send(Err("no such turn".to_string())).unwrap();
+        drop(died_tx);
+        let mut jobs = vec![
+            PendingReview {
+                request_id: "a".into(),
+                view: ViewId::BASE,
+                rx: done_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
+            },
+            PendingReview {
+                request_id: "b".into(),
+                view: ViewId::BASE,
+                rx: failed_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
+            },
+            PendingReview {
+                request_id: "c".into(),
+                view: ViewId::BASE,
+                rx: died_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
+            },
+            PendingReview {
+                request_id: "d".into(),
+                view: ViewId::BASE,
+                rx: running_rx,
+                clears_hint: Some((7, eitri_core::agent_bridge::ReviewTurnWire::Latest)),
+            },
+        ];
+        let (payloads, cleared) = finished_reviews(&mut jobs);
+        // Only the review that was worked out clears a hint; a failed or dead one leaves it on the page.
+        assert_eq!(cleared, vec![(7, eitri_core::agent_bridge::ReviewTurnWire::Latest)]);
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0], r#"{"kind":"review","requestId":"a"}"#);
+        let failed: serde_json::Value = serde_json::from_str(&payloads[1]).unwrap();
+        assert_eq!(
+            failed,
+            serde_json::json!({ "kind": "command_result", "requestId": "b", "ok": false, "error": "no such turn" })
+        );
+        let died: serde_json::Value = serde_json::from_str(&payloads[2]).unwrap();
+        assert_eq!(
+            (died["requestId"].as_str(), died["ok"].as_bool()),
+            (Some("c"), Some(false))
+        );
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].request_id, "d");
+        let (again, cleared_again) = finished_reviews(&mut jobs);
+        assert!(again.is_empty() && cleared_again.is_empty(), "nothing is sent twice");
+    }
+
+    /// An editor that went away takes its pending draft edits with it: a body saved in nvim becomes
+    /// the draft, an unsaved one leaves it alone, and the files are gone afterwards.
+    #[test]
+    fn ending_pending_edits_keeps_a_saved_body_and_removes_the_files() {
+        let dir = std::env::temp_dir().join(format!("ap-{}-edits", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
+        let saved = set.active();
+        let unsaved = set.open(eitri_core::tab_set::AgentId::Claude);
+        set.set_draft(saved, "old");
+        set.set_draft(unsaved, "kept\n");
+        let edit = |id: u64, body: &str| {
+            let edit = eitri_core::scratch::PendingEdit {
+                id,
+                body: dir.join(format!("{id}-draft.md")),
+                done: dir.join(format!("{id}-draft.done")),
+            };
+            std::fs::write(&edit.body, body).unwrap();
+            edit
+        };
+        let (first, second) = (edit(1, "new text\n"), edit(2, "kept\n"));
+        set.begin_scratch_edit(saved, 1).unwrap();
+        set.begin_scratch_edit(unsaved, 2).unwrap();
+        let state = state_for_hooks(set);
+        state.borrow_mut().pending_edits = vec![first.clone(), second.clone()];
+
+        let ended = end_pending_edits(&mut state.borrow_mut());
+
+        assert_eq!(ended, vec![(saved, Some("new text".to_string())), (unsaved, None)]);
+        let state = state.borrow();
+        assert!(state.pending_edits.is_empty());
+        assert_eq!(state.tabs.get(saved).unwrap().draft(), "new text");
+        assert_eq!(state.tabs.get(unsaved).unwrap().draft(), "kept\n");
+        assert!(
+            !first.body.exists() && !second.body.exists(),
+            "the scratch files are removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proposal_still_being_read_is_dropped_when_its_page_goes_idle() {
+        let (handle, base, second) = handle_with_two_pages();
+        let asked = Rc::new(RefCell::new(0usize));
+        handle.on_editor_request({
+            let asked = asked.clone();
+            move |_request| {
+                *asked.borrow_mut() += 1;
+                Ok(())
+            }
+        });
+        let mut senders = Vec::new();
+        for (page_view, id) in [(view(2), "p-2"), (ViewId::BASE, "p-base")] {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            handle.state.borrow_mut().proposal_jobs.push(PendingProposal {
+                request_id: id.into(),
+                view: page_view,
+                name: "a.rs".into(),
+                rx,
+            });
+        }
+        handle.idle_page(view(2));
+        let left: Vec<String> = handle
+            .state
+            .borrow()
+            .proposal_jobs
+            .iter()
+            .map(|job| job.request_id.clone())
+            .collect();
+        assert_eq!(left, vec!["p-base".to_string()], "only the idle page's proposal goes");
+        clear(&[&base, &second]);
+        assert!(
+            senders[0].send(Ok(("a\n".into(), "b\n".into()))).is_err(),
+            "the idle page's worker has no one to answer"
+        );
+        handle.tick();
+        assert_eq!(
+            *asked.borrow(),
+            0,
+            "nothing is raised in the editor for a page that is gone"
+        );
+        assert_eq!(
+            result_for(&second.sent.borrow(), "p-2"),
+            None,
+            "the idle page is answered nothing"
+        );
+        handle.state.borrow_mut().proposal_jobs.clear();
+    }
+
+    /// The review flow's answers go to the page whose request they answer, a tab's draft to the page
+    /// that shows the tab, and the window's interrupted reverts to the base page; a request the flow
+    /// no longer owes is forgotten.
+    #[test]
+    fn review_flow_answers_go_to_the_page_that_asked() {
+        use eitri_core::turn_review::Out;
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        let first = handle
+            .state
+            .borrow_mut()
+            .owed
+            .owe(view(2), "req-1", Owed::ReviewRequest);
+        let other = handle
+            .state
+            .borrow_mut()
+            .owed
+            .owe(ViewId::BASE, "req-2", Owed::ReviewRequest);
+        clear(&[&base, &second]);
+        // The flow answers under the key it was given.
+        let answer = |key: &str| Out::Answer {
+            request_id: key.to_string(),
+            payload: serialize_command_result_for_js(key, Ok(())),
+        };
+        handle.run_seen(|state, screen, out| {
+            dispatch_review_outs(
+                state,
+                screen,
+                vec![
+                    answer(&first),
+                    answer(&other),
+                    Out::Draft(tab, format!(r#"{{"kind":"review_draft","tab":{}}}"#, tab.0)),
+                    Out::Envelope(r#"{"kind":"review_recovery","entries":[]}"#.to_string()),
+                ],
+                out,
+            )
+        });
+        assert_eq!(result_for(&second.sent.borrow(), "req-1"), Some(Ok(())));
+        assert_eq!(result_for(&second.sent.borrow(), "req-2"), None);
+        assert_eq!(result_for(&base.sent.borrow(), "req-2"), Some(Ok(())));
+        assert_eq!(result_for(&base.sent.borrow(), "req-1"), None);
+        assert_eq!(
+            result_for(&second.sent.borrow(), &first),
+            None,
+            "the key stays the window's"
+        );
+        assert!(sent_about(&second, "review_draft", tab));
+        assert!(!sent_about(&base, "review_draft", tab));
+        let kinds = |page: &RecordingPage| -> Vec<String> {
+            page.sent
+                .borrow()
+                .iter()
+                .map(|e| json_of(e)["kind"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        assert!(kinds(&base).contains(&"review_recovery".to_string()));
+        assert!(!kinds(&second).contains(&"review_recovery".to_string()));
+        assert!(handle.state.borrow().owed.is_empty(), "the flow owes neither any more");
+    }
+
+    /// How many `command_result`s for `request_id` `page` was sent.
+    fn results_named(page: &RecordingPage, request_id: &str) -> usize {
+        page.sent
+            .borrow()
+            .iter()
+            .map(|p| json_of(p))
+            .filter(|v| v["kind"] == "command_result" && v["requestId"] == request_id)
+            .count()
+    }
+
+    /// Two pages number their review requests alike: page 2's request with the id of one the base page
+    /// still has out is worked on as its own, and each answer reaches only the page that asked, once.
+    #[test]
+    fn two_pages_reviewing_under_one_request_id_are_each_answered_in_their_own_page() {
+        use eitri_core::turn_review::Out;
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        handle
+            .state
+            .borrow_mut()
+            .owed
+            .owe(ViewId::BASE, "req-7", Owed::ReviewRequest);
+        clear(&[&base, &second]);
+        // The tab has no review session: the flow refuses page 2's undo at once, as its own.
+        handle.page_message(
+            view(2),
+            &format!(r#"{{"type":"review_undo","request_id":"req-7","tab":{}}}"#, tab.0),
+        );
+        assert_eq!(results_named(&second, "req-7"), 1, "{:?}", second.sent.borrow());
+        assert_eq!(results_named(&base, "req-7"), 0);
+
+        // Both out at once, answered in one batch with different words: neither takes the other's.
+        let seconds = handle
+            .state
+            .borrow_mut()
+            .owed
+            .owe(view(2), "req-7", Owed::ReviewRequest);
+        let bases = handle
+            .state
+            .borrow_mut()
+            .owed
+            .owe(ViewId::BASE, "req-7", Owed::ReviewRequest);
+        clear(&[&base, &second]);
+        handle.run_seen(|state, screen, out| {
+            dispatch_review_outs(
+                state,
+                screen,
+                vec![
+                    Out::Answer {
+                        request_id: seconds.clone(),
+                        payload: serialize_command_result_for_js(&seconds, Err("page two's")),
+                    },
+                    Out::Answer {
+                        request_id: bases.clone(),
+                        payload: serialize_command_result_for_js(&bases, Ok(())),
+                    },
+                ],
+                out,
+            )
+        });
+        assert_eq!(
+            result_for(&second.sent.borrow(), "req-7"),
+            Some(Err("page two's".to_string()))
+        );
+        assert_eq!(result_for(&base.sent.borrow(), "req-7"), Some(Ok(())));
+        assert_eq!(results_named(&second, "req-7"), 1);
+        assert_eq!(results_named(&base, "req-7"), 1);
+    }
+
+    /// A page that closes with a start, a review request, a `:trust` and a terminal handoff still out
+    /// is sent none of their answers, not even when its view is given a new page whose requests reuse
+    /// the old ids; the base page, with one of each out under the same id, gets each of its own.
+    #[test]
+    fn a_closed_page_owes_nothing_and_the_rest_are_answered() {
+        use eitri_core::turn_review::Out;
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let (handle, base, second) = handle_with_two_pages();
+        let third = attach_recording_page(&handle, view(3));
+        handle.page_message(view(3), READY);
+        let started_from_base = handle.state.borrow().tabs.active();
+        // Shown in page 3: what page 2 asked about it must not land there either.
+        let started_from_second = handle.open_in(view(3)).unwrap();
+        let handed_from_base = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let handed_from_second = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let mut closes = Vec::new();
+        for (tab, asked_from) in [(handed_from_base, ViewId::BASE), (handed_from_second, view(2))] {
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let (_dropped_tx, dropped_rx) = mpsc::channel();
+            let mut state = handle.state.borrow_mut();
+            state.owed.owe(asked_from, "r1", Owed::Handoff(tab));
+            state.tabs.get_mut(tab).unwrap().pending_handoff = Some(PendingHandoff {
+                request_id: "r1".into(),
+                command: a_command(),
+                closed_rx,
+                dropped_rx,
+            });
+            closes.push(closed_tx);
+        }
+        let (reviews, trusts) = {
+            let mut state = handle.state.borrow_mut();
+            note_start_page(&mut state, started_from_base, "r1", ViewId::BASE);
+            note_start_page(&mut state, started_from_second, "r1", view(2));
+            let reviews = [
+                state.owed.owe(ViewId::BASE, "r1", Owed::ReviewRequest),
+                state.owed.owe(view(2), "r1", Owed::ReviewRequest),
+            ];
+            let trusts = [
+                state.owed.owe(
+                    ViewId::BASE,
+                    "r1",
+                    Owed::TrustCommand {
+                        tab: started_from_base,
+                        typed_in: ViewId::BASE,
+                    },
+                ),
+                state.owed.owe(
+                    view(2),
+                    "r1",
+                    Owed::TrustCommand {
+                        tab: started_from_second,
+                        typed_in: view(2),
+                    },
+                ),
+            ];
+            (reviews, trusts)
+        };
+        assert_eq!(handle.state.borrow().owed.owed_to(view(2)), 4);
+
+        handle.idle_page(view(2));
+        // The view's page is used again: its new document numbers its requests from the start.
+        let reopened = attach_recording_page(&handle, view(2));
+        handle.page_message(view(2), READY);
+        assert_eq!(
+            handle.state.borrow().owed.owed_to(view(2)),
+            0,
+            "the closed page is owed nothing"
+        );
+        assert_eq!(handle.state.borrow().owed.owed_to(ViewId::BASE), 4);
+        clear(&[&base, &second, &third, &reopened]);
+
+        for tab in [started_from_base, started_from_second] {
+            handle.run(|state, out| {
+                send_start_answer(state, tab, "r1", serialize_command_result_for_js("r1", Ok(())), out)
+            });
+        }
+        handle.run_seen(|state, screen, out| {
+            dispatch_review_outs(
+                state,
+                screen,
+                reviews
+                    .iter()
+                    .map(|key| Out::Answer {
+                        request_id: key.clone(),
+                        payload: serialize_command_result_for_js(key, Ok(())),
+                    })
+                    .collect(),
+                out,
+            )
+        });
+        let mut out = Outbox::default();
+        for key in &trusts {
+            let ended = end_trust_command(&mut handle.state.borrow_mut(), key);
+            if let Some((typed_in, request_id)) = ended {
+                out.push(typed_in, serialize_command_result_for_js(&request_id, Ok(())));
+            }
+        }
+        out.deliver(&handle.state, &handle.pages);
+        for closed in closes {
+            closed.send(()).unwrap();
+        }
+        tick_handle_until(&handle, "both handoffs collected", || {
+            let state = handle.state.borrow();
+            [handed_from_base, handed_from_second]
+                .iter()
+                .all(|tab| state.tabs.get(*tab).unwrap().pending_handoff.is_none())
+        });
+
+        assert_eq!(results_named(&base, "r1"), 4, "{:?}", base.sent.borrow());
+        for (page, which) in [
+            (&reopened, "page 2's new document"),
+            (&second, "page 2's old one"),
+            (&third, "page 3"),
+        ] {
+            assert_eq!(results_named(page, "r1"), 0, "{which}: {:?}", page.sent.borrow());
+        }
+        assert!(
+            handle.state.borrow().owed.is_empty(),
+            "every answer is spent or dropped"
+        );
+    }
+
+    /// A tab whose turn left a review hint in page 2 brings it to the base page when it joins back, and
+    /// takes it to page 2 when it breaks out again: the page it arrives in was never sent it.
+    #[test]
+    fn a_moved_tab_brings_its_review_hint_to_its_new_page() {
+        let (handle, base, second) = handle_with_two_pages();
+        let tab = handle.open_in(view(2)).unwrap();
+        let hint = eitri_core::turn_review::ReviewHint {
+            tab: tab.0,
+            turn: 1,
+            files: 2,
+        };
+        handle.state.borrow_mut().shown_hints.push(hint.clone());
+        clear(&[&base, &second]);
+        assert_eq!(handle.join_back(view(2)), Ok(tab));
+        assert!(sent_about(&base, "review_hint", tab), "{:?}", base.sent.borrow());
+        clear(&[&base, &second]);
+        assert_eq!(handle.break_out(view(2)), Ok(tab));
+        assert!(sent_about(&second, "review_hint", tab), "{:?}", second.sent.borrow());
+        assert!(!sent_about(&base, "review_hint", tab));
+    }
+}

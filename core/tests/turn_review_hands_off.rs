@@ -227,13 +227,26 @@ fn arms<'a>(code: &'a str, path: &str) -> Vec<&'a str> {
 }
 
 /// Directories (relative to the workspace root) that hold the panel's code.
-const PANEL_DIRS: &[&str] = &["shell/src", "panel/src"];
+const PANEL_DIRS: &[&str] = &["panel/src"];
 
-/// The panel's code: the one file under `PANEL_DIRS` that handles the page's messages. Found by what it
-/// defines, not by its path, so the scan follows the panel when it moves and fails when it is gone.
+/// The panel's code: every file under `PANEL_DIRS`, which must hold the page's message handler (so the
+/// scan fails when the panel has moved away). The panel's paths are spread over that crate's files, so
+/// all of them are read: a scan of one would pass on whatever was left in it once code moved out.
 fn panel_code() -> String {
     let read = eitri_core::source_scan::rust_sources(PANEL_DIRS);
-    code_only(&eitri_core::source_scan::file_with(&read, "fn handle_inbound_message(").text)
+    eitri_core::source_scan::require_anchors(&read, &["fn handle_inbound_message("]);
+    panel_code_of(&read)
+}
+
+/// The code of every file of `read` (comments and literals blanked, test modules left out), joined.
+fn panel_code_of(read: &[eitri_core::source_scan::Source]) -> String {
+    read.iter()
+        .map(|source| {
+            let code = code_only(&source.text);
+            let tests = eitri_core::source_scan::modules(&code, "tests");
+            eitri_core::source_scan::without(&code, &tests) + "\n"
+        })
+        .collect()
 }
 
 fn read(relative: &str) -> String {
@@ -483,6 +496,27 @@ fn only_the_confirmed_review_send_reaches_the_send_path() {
             "an answer or ordinary send path reaches send_review"
         );
     }
+}
+
+#[test]
+fn a_review_read_on_a_send_path_in_a_second_panel_file_fails_the_scan() {
+    let file = |path: &str, text: &str| eitri_core::source_scan::Source {
+        path: path.to_owned(),
+        text: text.to_owned(),
+    };
+    let read = [
+        file("panel/src/a.rs", "fn handle_inbound_message() {}"),
+        file(
+            "panel/src/b.rs",
+            "fn apply_sent() { apply_flush(); let hint = ReviewHint::new(); }",
+        ),
+    ];
+    let panel = panel_code_of(&read);
+    let sent = functions(&panel, "apply_sent");
+    assert_eq!(sent.len(), 1, "the second file's function is read");
+    let failure = std::panic::catch_unwind(|| check("apply_sent", &sent, "apply_flush")).unwrap_err();
+    let why = failure.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(why.contains("reads turn review state"), "{why}");
 }
 
 /// The scan's own helpers: an exception is by function name, and a call is found by its name.

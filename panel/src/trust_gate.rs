@@ -3528,16 +3528,41 @@ mod tests {
     /// the panel that wires it ever names that file.
     #[test]
     fn the_gate_never_names_the_accounts_config_file() {
-        const SCANNED: &[&str] = &["shell/src", "panel/src"];
-        let read = scan::rust_sources(SCANNED);
-        for needle in ["struct TrustGate", "struct AgentPanelState"] {
-            let source = scan::file_with(&read, needle);
+        let read = scan::rust_sources(&["panel/src"]);
+        scan::require_anchors(&read, &["struct TrustGate", "struct AgentPanelState"]);
+        no_file_names_the_accounts_config(&read);
+    }
+
+    /// Panics if any file of `sources` names the account's config file, comments and literals included:
+    /// the panel's wiring of the gate is spread over the files of this crate, so all of them are read.
+    fn no_file_names_the_accounts_config(sources: &[scan::Source]) {
+        for source in sources {
             assert!(
                 !source.text.contains(concat!(".claude", ".json")),
                 "{} names it",
                 source.path
             );
         }
+    }
+
+    #[test]
+    fn a_second_panel_file_naming_the_accounts_config_fails_the_scan() {
+        let file = |path: &str, text: String| scan::Source {
+            path: path.to_owned(),
+            text,
+        };
+        let named = format!("const CONFIG: &str = \"~/{}\";", concat!(".claude", ".json"));
+        let read = vec![
+            file(
+                "panel/src/a.rs",
+                "struct TrustGate;\nstruct AgentPanelState;".to_owned(),
+            ),
+            file("panel/src/b.rs", named),
+        ];
+        let failure = std::panic::catch_unwind(|| no_file_names_the_accounts_config(&read)).unwrap_err();
+        let why = failure.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(why.contains("panel/src/b.rs names it"), "{why}");
+        no_file_names_the_accounts_config(&read[..1]);
     }
 
     // ---- one gate, several agents ---------------------------------------------------------------

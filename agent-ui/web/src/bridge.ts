@@ -137,7 +137,7 @@ export type OutboundMessage =
   | { type: "keymap_closed"; request_id: string; opening: number; return_keys: boolean }
   /** `gx` on a web link: open this address in the system browser. `url` is
    *  the WHATWG-normalized `href` (`nav.ts#webUrl`) -- what the pick showed -- never the spelling the reply
-   *  wrote. Window-level, like `open_path`; Rust re-checks it (`agent_panel.rs#web_url`, http(s) and a plain
+   *  wrote. Window-level, like `open_path`; Rust re-checks it (`panel/src/links.rs#web_url`, http(s) and a plain
    *  host only) and answers with a `command_result`, an error when it is not a web link.
    *  `InboundMessage::OpenUrl`, `core/src/agent_bridge.rs`. */
   | { type: "open_url"; request_id: string; url: string }

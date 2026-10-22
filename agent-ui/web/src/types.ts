@@ -207,7 +207,7 @@ export type PermissionModeChoice = "manual" | "auto" | "bypass";
 /** The command that continues a conversation Eitri has just closed, in the user's own terminal.
  *
  * Arrives once, in a `handoff` envelope, and only AFTER the real session shutdown has finished —
- * `agent_panel.rs`'s `collect_pending_handoff` dispatches it there and nowhere else, so nobody can
+ * `panel/src/handoffs.rs`'s `collect_pending_handoffs` dispatches it there and nowhere else, so nobody can
  * be looking at this line while Eitri is still driving the session.
  *
  * `command` is a ready-to-paste POSIX-shell line (`cd <dir> && claude --resume <id>`), built by

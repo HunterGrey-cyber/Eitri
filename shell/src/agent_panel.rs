@@ -568,7 +568,21 @@ mod tests {
         // state. Any further direct send would let an envelope overtake a held one -- a snapshot
         // ahead of the events before it draws them twice. The one script that reaches the page is
         // the WebKit surface's own.
-        let panel = panel_code();
+        the_panels_logic_sends_only_through_the_funnel(&panel_code());
+        let shell = webkit_half();
+        assert_eq!(
+            shell.matches(".evaluate_javascript(").count(),
+            1,
+            "the WebKit half sends to the page outside `PageSurface::send`"
+        );
+        let surface = impl_blocks(&shell, "implPageSurfaceforWebKitPage");
+        assert_eq!(surface.len(), 1);
+        assert_eq!(surface[0].matches(".evaluate_javascript(").count(), 1);
+        assert_eq!(shell.matches(".send_direct(").count(), 0);
+    }
+
+    /// Panics unless `panel`, the panel's logic, sends to a page only through `PanelPage`'s funnel.
+    fn the_panels_logic_sends_only_through_the_funnel(panel: &str) {
         assert_eq!(
             panel.matches(".evaluate_javascript(").count(),
             0,
@@ -588,16 +602,27 @@ mod tests {
             !panel.contains("pacer_for("),
             "the pacer is the page's own, never looked up by the page's view"
         );
-        let shell = webkit_half();
-        assert_eq!(
-            shell.matches(".evaluate_javascript(").count(),
-            1,
-            "the WebKit half sends to the page outside `PageSurface::send`"
-        );
-        let surface = impl_blocks(&shell, "implPageSurfaceforWebKitPage");
-        assert_eq!(surface.len(), 1);
-        assert_eq!(surface[0].matches(".evaluate_javascript(").count(), 1);
-        assert_eq!(shell.matches(".send_direct(").count(), 0);
+    }
+
+    #[test]
+    fn a_send_past_the_funnel_in_a_second_file_of_the_panel_fails_the_scan() {
+        use eitri_core::source_scan::Source;
+        let file = |path: &str, text: &str| Source {
+            path: path.to_owned(),
+            text: text.to_owned(),
+        };
+        let funnel = "fn dispatch(page: &P) { page.flush(); page.send_direct(p); }\n\
+                      fn set_theme(page: &P) { page.send_direct(t); }\n";
+        let clean = [file("panel/src/a.rs", funnel), file("panel/src/b.rs", "fn other() {}")];
+        the_panels_logic_sends_only_through_the_funnel(&panel_code_of(&clean));
+        let read = [
+            file("panel/src/a.rs", funnel),
+            file("panel/src/b.rs", "fn late(view: &W) { view.evaluate_javascript(s); }"),
+        ];
+        let code = panel_code_of(&read);
+        let failure = std::panic::catch_unwind(|| the_panels_logic_sends_only_through_the_funnel(&code)).unwrap_err();
+        let why = failure.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(why.contains("outside the funnel"), "{why}");
     }
 
     #[test]
@@ -610,13 +635,26 @@ mod tests {
         assert_eq!(webkit_half().matches(".send_stream(").count(), 0);
     }
 
-    /// The code (comments and literals blanked, no test module) of the panel's logic: the one file under
-    /// `shell/src` and `panel/src` that defines `handle_inbound_message`.
+    /// The code (comments and literals blanked, no test module) of the panel's logic: every file of
+    /// `panel/src`, which holds the panel's message handler. The logic is spread over that crate's files, so
+    /// a scan of it reads them all.
     fn panel_code() -> String {
         use eitri_core::source_scan as scan;
-        let sources = scan::rust_sources(&["shell/src", "panel/src"]);
-        let code = scan::code_only(&scan::file_with(&sources, "fn handle_inbound_message(").text);
-        scan::without(&code, &scan::modules(&code, "tests"))
+        let sources = scan::rust_sources(&["panel/src"]);
+        scan::require_anchors(&sources, &["fn handle_inbound_message(", "struct AgentPanelState"]);
+        panel_code_of(&sources)
+    }
+
+    /// The code of every file of `sources`, comments, literals and test modules left out, joined.
+    fn panel_code_of(sources: &[eitri_core::source_scan::Source]) -> String {
+        use eitri_core::source_scan as scan;
+        sources
+            .iter()
+            .map(|source| {
+                let code = scan::code_only(&source.text);
+                scan::without(&code, &scan::modules(&code, "tests")) + "\n"
+            })
+            .collect()
     }
 
     /// The code (no test module) of the WebKit half: the one file under `shell/src` that defines `WebKitPage`.

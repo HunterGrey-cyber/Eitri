@@ -4,15 +4,21 @@
 //! through that gate: one that calls a send primitive must hold a `SendGate`, which only
 //! `begin_turn_send` builds, or be one of the backend's own send primitives.
 
-use eitri_core::source_scan::{braced, code_only, read_required, without, word_ends};
+use eitri_core::source_scan::{braced, code_only, read_required, rust_sources, without, word_ends};
 
-/// The files a turn of Eitri's is sent from, and the backend's own send primitives in them.
-const FILES: &[&str] = &[
-    "core/src/tab_set.rs",
-    "core/src/tab_set/moving.rs",
-    "core/src/agent_backend.rs",
-    "panel/src/agent_panel.rs",
-];
+/// The files a turn of Eitri's is sent from: the tab set's and the backend's, and every file of the panel,
+/// whose code is spread over the files of its crate (so a file it gains is read without naming it here).
+fn files() -> Vec<String> {
+    let mut files: Vec<String> = [
+        "core/src/tab_set.rs",
+        "core/src/tab_set/moving.rs",
+        "core/src/agent_backend.rs",
+    ]
+    .map(String::from)
+    .to_vec();
+    files.extend(rust_sources(&["panel/src"]).into_iter().map(|source| source.path));
+    files
+}
 
 /// The methods that put a turn on its way to an agent.
 const SEND_METHODS: &[&str] = &["send_turn", "send_turn_in", "send_turn_with"];
@@ -143,6 +149,19 @@ fn ungated<'a>(path: &str, code: &'a str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Every function of `sources` (each a path and its shipped code) that sends a turn without a gate, as
+/// `path: name`: each file is read on its own, so a send that moves to another file is still found.
+fn ungated_in(sources: &[(String, String)]) -> Vec<String> {
+    sources
+        .iter()
+        .flat_map(|(path, code)| {
+            ungated(path, code)
+                .into_iter()
+                .map(move |name| format!("{path}: {name}"))
+        })
+        .collect()
+}
+
 /// Whether the `SendGate` ending at `at` in `code` builds one (`SendGate { .. }` as an expression), not
 /// names the type where it is declared, implemented or returned.
 fn builds_a_gate(code: &str, at: usize) -> bool {
@@ -163,15 +182,19 @@ fn every_turn_starting_send_goes_through_begin_turn_send() {
             "{path} no longer has `{send}`: a turn now leaves for its agent from somewhere this scan does not name"
         );
     }
-    for path in FILES {
-        let code = shipped(path);
-        let open = ungated(path, &code);
-        assert!(
-            open.is_empty(),
-            "{path}: {open:?} send a turn without the gate `begin_turn_send` hands out, so the turn could reach \
-             the agent before its tab is in the running set"
-        );
-    }
+    let sources: Vec<(String, String)> = files()
+        .into_iter()
+        .map(|path| {
+            let code = shipped(&path);
+            (path, code)
+        })
+        .collect();
+    let open = ungated_in(&sources);
+    assert!(
+        open.is_empty(),
+        "{open:?} send a turn without the gate `begin_turn_send` hands out, so the turn could reach the agent \
+         before its tab is in the running set"
+    );
     // A gate is the proof its tab entered `starting`: only `begin_turn_send` may build one.
     let code = shipped("core/src/tab_set/moving.rs");
     let builder = functions_of(&code)
@@ -187,7 +210,7 @@ fn every_turn_starting_send_goes_through_begin_turn_send() {
              `starting`"
         );
     }
-    for path in FILES.iter().filter(|p| **p != "core/src/tab_set/moving.rs") {
+    for path in files().iter().filter(|p| p.as_str() != "core/src/tab_set/moving.rs") {
         let code = shipped(path);
         let built = word_ends(&code, "SendGate")
             .into_iter()
@@ -208,5 +231,26 @@ fn a_send_outside_the_gate_is_caught() {
     assert_eq!(
         ungated("core/src/tab_set.rs", code),
         vec!["free", "send_turn", "arrays"]
+    );
+}
+
+#[test]
+fn a_send_outside_the_gate_in_a_second_panel_file_is_caught() {
+    // The panel's code is spread over the files of its crate: a gated send in one file must not hide an
+    // ungated one in another.
+    let sources = [
+        (
+            "panel/src/agent_panel.rs".to_string(),
+            "fn gated(&mut self, gate: SendGate) { tab.send_turn(x); }".to_string(),
+        ),
+        (
+            "panel/src/starts.rs".to_string(),
+            "fn free(b: &mut B) { b.send_turn_in(&w, &t, m); }".to_string(),
+        ),
+    ];
+    assert_eq!(ungated_in(&sources), vec!["panel/src/starts.rs: free"]);
+    assert!(
+        files().iter().any(|path| path == "panel/src/starts.rs"),
+        "the scan reads every file of panel/src, so a send in a file other than agent_panel.rs is checked"
     );
 }

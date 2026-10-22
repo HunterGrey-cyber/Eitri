@@ -130,8 +130,8 @@ fn read_b(transcript_path: std::io::Result<PathBuf>) -> BOutcome {
     };
     // **Refused before it is opened, and this is a hang fix rather than a tidiness rule.**
     // `File::open` on a FIFO blocks in `open(2)` until a writer appears, and this call sits on the
-    // backend-start worker, which `collect_pending_start` polls with `try_recv` and no timeout
-    // while the window is open (`panel/src/agent_panel.rs`) -- the 3-second bound exists only on
+    // backend-start worker, which `collect_pending_starts` polls with `try_recv` and no timeout
+    // while the window is open (`panel/src/starts.rs`) -- the 3-second bound exists only on
     // the close path. So a FIFO, a device node or a directory at this path would leave the panel in
     // its connecting state for the life of the window, with nothing printed and no way back to the
     // start screen. A `metadata` call does not block (it is a `stat`), so asking first turns a hang
@@ -1053,7 +1053,7 @@ mod tests {
     /// ordinary reported fallback.
     ///
     /// `File::open` on a FIFO blocks in `open(2)` until a writer appears, and this call sits on the
-    /// backend-start worker, which `collect_pending_start` polls with `try_recv` and no timeout --
+    /// backend-start worker, which `collect_pending_starts` polls with `try_recv` and no timeout --
     /// so the panel would sit in its connecting state for the life of the window. A directory
     /// stands in for the FIFO here because it needs no `mkfifo` and no second thread, and it
     /// exercises the same guard on the same line; the guard is a `metadata` check, which cannot

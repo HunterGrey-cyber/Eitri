@@ -26,7 +26,7 @@ const DESTRUCTURES: &[(&str, &str)] = &[
     ("core/src/agent_backend.rs", "ExternalConversation"),
     ("core/src/agent_backend.rs", "BackendHandoff"),
     // The panel's per-tab record, taken up in the window the tab lands in.
-    ("panel/src/agent_panel.rs", "PanelTabHandoff"),
+    ("panel/src/handoffs.rs", "PanelTabHandoff"),
 ];
 
 /// Each file that builds a Codex or ACP provider's move record, and each struct it destructures there,
@@ -113,7 +113,7 @@ fn the_provider_handoffs_name_every_field() {
 /// few of them with a rest pattern; the one that builds the tab's record names every field.
 #[test]
 fn the_panels_tab_record_names_every_field_of_the_panels_state() {
-    let path = "panel/src/agent_panel.rs";
+    let path = "panel/src/handoffs.rs";
     let code = code_only(&read_required(path).text);
     // The record's builder, not the handle's method of the same name that calls it.
     let builders: Vec<&str> = functions(&code, "panel_tab_handoff")
