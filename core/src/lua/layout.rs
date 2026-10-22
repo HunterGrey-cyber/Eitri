@@ -12,7 +12,9 @@
 //!   [`LayoutRequest`] that `shell` carries out when the handler returns. Before the window exists
 //!   they refuse, naming `default` as the way to shape the first window.
 //!
-//! - `eitri.layout.get()` reads a fresh table of the live layout once the window exists.
+//! - `eitri.layout.get()` reads a fresh table of the live layout once the window exists, with `window`
+//!   (`"1"`, `"2"`, or nil for a window whose pair another window holds) and `away`, the modules the
+//!   other window holds.
 //!
 //! `run` takes the names and options `eitri.keymap.set` takes, for layout actions only, so a key
 //! and a Lua call reach every verb the same way.
@@ -91,6 +93,18 @@ pub struct LayoutStore {
     accepting: bool,
     lua_panels: Vec<String>,
     layout: Option<Rc<RefCell<Layout>>>,
+    window: Option<&'static str>,
+}
+
+/// How `eitri.window` and `get().window` name a window: `"1"` for the one that holds the pair (a
+/// window alone included), `"2"` for the second, and nothing for a window on a project whose pair
+/// another window holds.
+pub fn window_name(role: crate::window_link::pair::Role) -> Option<&'static str> {
+    match role {
+        crate::window_link::pair::Role::Main => Some("1"),
+        crate::window_link::pair::Role::Second => Some("2"),
+        crate::window_link::pair::Role::Unpaired => None,
+    }
 }
 
 impl LayoutStore {
@@ -119,6 +133,12 @@ impl LayoutStore {
     /// The window's live layout, so `get` reads its current state.
     pub fn attach(&mut self, layout: Rc<RefCell<Layout>>) {
         self.layout = Some(layout);
+    }
+
+    /// Which window of a pair this is, for `get().window` ([`window_name`]); `Kernel::set_window`
+    /// sets it with `eitri.window`.
+    pub fn set_window(&mut self, window: Option<&'static str>) {
+        self.window = window;
     }
 
     /// The registered panel ids that `module.<id>` may name.
@@ -489,10 +509,22 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<LayoutStore>>) -> mlu
                 table.set("floating", floats)?;
             }
             table.set("focus", layout.focus().as_str())?;
+            // An away module is listed once, under `away`: what the other window holds is not a hide.
             table.set(
                 "hidden",
-                lua.create_sequence_from(layout.hidden().iter().map(ModuleId::as_str))?,
+                lua.create_sequence_from(
+                    layout
+                        .hidden()
+                        .iter()
+                        .filter(|id| !layout.is_away(id))
+                        .map(ModuleId::as_str),
+                )?,
             )?;
+            table.set(
+                "away",
+                lua.create_sequence_from(layout.away().iter().map(ModuleId::as_str))?,
+            )?;
+            table.set("window", store.window)?;
             let zoomed = match layout.zoom() {
                 Some(crate::layout::Zoom::Module(id)) => Some(id.clone()),
                 Some(crate::layout::Zoom::Con(id)) => layout
@@ -1105,7 +1137,7 @@ mod tests {
         .unwrap();
         let (lua, store, live) = attached(live);
         lua.load(
-            "t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.zoomed = nil; t.marked = nil; \
+            "t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.away = nil; t.zoomed = nil; t.marked = nil; \
              t.workspace = nil; t.workspaces = nil",
         )
         .exec()
@@ -1528,7 +1560,7 @@ mod tests {
         let (lua, _, live) = attached(layout);
         let table: Value = lua
             .load(
-                "local t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.zoomed = nil; t.marked = nil; return t",
+                "local t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.away = nil; t.zoomed = nil; t.marked = nil; return t",
             )
             .eval()
             .unwrap();
@@ -1574,7 +1606,7 @@ mod tests {
                 .borrow_mut()
                 .attach_workspaces(Rc::new(RefCell::new(Workspaces::single())));
             let table: Table = lua.load("return eitri.layout.get()").eval().unwrap();
-            for key in ["focus", "hidden", "zoomed", "marked", "workspace", "workspaces"] {
+            for key in ["focus", "hidden", "away", "zoomed", "marked", "workspace", "workspaces"] {
                 table.raw_set(key, Value::Nil).unwrap();
             }
             let tree = parse_tree(&Value::Table(table)).unwrap();
@@ -1627,7 +1659,7 @@ mod tests {
                 if table.get::<String>(1).unwrap() == head {
                     assert_eq!(table.get::<usize>("active").unwrap(), 2);
                 }
-                for key in ["focus", "hidden", "zoomed", "marked"] {
+                for key in ["focus", "hidden", "away", "zoomed", "marked"] {
                     table.raw_set(key, Value::Nil).unwrap();
                 }
                 let back = Layout::new(parse_default(&Value::Table(table)).unwrap(), focus).unwrap();
@@ -2073,7 +2105,7 @@ mod tests {
         assert_eq!(got, "terminal#2 0.50 0.45 900 420 true");
         let table: Value = lua
             .load(
-                "local t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.zoomed = nil; t.marked = nil; return t",
+                "local t = eitri.layout.get(); t.focus = nil; t.hidden = nil; t.away = nil; t.zoomed = nil; t.marked = nil; return t",
             )
             .eval()
             .unwrap();
@@ -2190,5 +2222,49 @@ mod tests {
         };
         row.check(true).unwrap();
         assert!(row.children[3].share < MIN_RATIO, "{}", row.children[3].share);
+    }
+
+    #[test]
+    fn lua_get_reports_the_window_and_the_away_ids() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let root = Node::split(
+            crate::layout::Axis::Column,
+            0.6,
+            Node::split(
+                crate::layout::Axis::Row,
+                0.6,
+                Node::Leaf(ModuleId::editor()),
+                Node::Leaf(ModuleId::agent()),
+            ),
+            Node::split(
+                crate::layout::Axis::Row,
+                0.5,
+                Node::Leaf(ModuleId::terminal()),
+                Node::Leaf(t2.clone()),
+            ),
+        );
+        let mut layout = Layout::from_parts(root, BTreeSet::from([ModuleId::terminal()]), ModuleId::editor()).unwrap();
+        layout.set_away(&t2, true).unwrap();
+        let (lua, store, live) = attached(layout);
+        let read = |lua: &Lua| -> (Option<String>, Vec<String>, Vec<String>) {
+            lua.load("local t = eitri.layout.get(); return t.window, t.away, t.hidden")
+                .eval::<(Option<String>, Vec<String>, Vec<String>)>()
+                .unwrap()
+        };
+        assert_eq!(
+            read(&lua),
+            (None, vec!["terminal#2".to_string()], vec!["terminal".to_string()]),
+            "a window with no pair is neither; an away module is listed once, as away"
+        );
+        for (role, name) in [
+            (crate::window_link::pair::Role::Main, Some("1")),
+            (crate::window_link::pair::Role::Second, Some("2")),
+            (crate::window_link::pair::Role::Unpaired, None),
+        ] {
+            store.borrow_mut().set_window(window_name(role));
+            assert_eq!(read(&lua).0.as_deref(), name, "{role:?}");
+        }
+        live.borrow_mut().set_away(&t2, false).unwrap();
+        assert_eq!(read(&lua).1, Vec::<String>::new(), "back, it is no longer away");
     }
 }

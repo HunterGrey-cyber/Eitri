@@ -169,6 +169,19 @@ pub struct WindowLayout {
     pub modules: Vec<(ModuleId, bool)>,
 }
 
+impl WindowLayout {
+    /// The same window with every module in `away` counted off screen, whatever its host says: the
+    /// other window of the pair holds those, so a label here could land on nothing.
+    pub fn skipping_away(mut self, away: &std::collections::BTreeSet<ModuleId>) -> WindowLayout {
+        for (id, visible) in &mut self.modules {
+            if away.contains(id) {
+                *visible = false;
+            }
+        }
+        self
+    }
+}
+
 /// Where a landing goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {

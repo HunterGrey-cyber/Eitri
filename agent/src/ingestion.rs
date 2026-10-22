@@ -734,19 +734,29 @@ impl ConversationIngest {
         }
     }
 
-    /// Stops taking events from the provider, and returns once no batch is in hand: every event the
-    /// provider gave up before this returns is folded, and none after it until [`Self::unfreeze`].
-    /// The thread writes nothing while frozen either (no title, name, history or record), so what a
-    /// move carries is all there is. Local folds still happen: they are the caller's own.
+    /// Stops taking events from the provider if no batch is in hand now, and says whether it did: once
+    /// it returns `true`, every event the provider gave up before is folded, and none after it until
+    /// [`Self::unfreeze`]. The thread writes nothing while frozen either (no title, name, history or
+    /// record), so what a move carries is all there is. Local folds still happen: they are the caller's
+    /// own.
     ///
-    /// Waits for a batch being folded, and the writes after it, to finish: call it off the GTK
-    /// thread.
-    pub(crate) fn freeze(&self) {
-        // The batch it waits for ends by locking the state, so a freeze under this thread's own guard
-        // would wait on that thread forever.
-        self.holder.refuse_reentry("freeze");
-        let _held = self.pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Never waits: a batch being folded, and the writes after it (a history write touches the disk),
+    /// make it return `false` with nothing changed, and the caller asks again later. The window's own
+    /// thread calls this, and it must never stall behind the ingest thread's disk work.
+    pub(crate) fn try_freeze(&self) -> bool {
+        // Set only while the gate is held, so a set flag means the thread has no batch in hand and
+        // takes none: a second ask needs no gate.
+        if self.frozen.load(Ordering::SeqCst) {
+            return true;
+        }
+        let held = match self.pump_gate.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
         self.frozen.store(true, Ordering::SeqCst);
+        drop(held);
+        true
     }
 
     /// Lets the thread take events again, from where the provider kept them.
@@ -1685,6 +1695,51 @@ mod idle_wakeups {
         }
     }
 
+    /// An announcing provider whose next pump, once armed, stays in hand until the test lets it go.
+    #[derive(Default)]
+    struct Stalling {
+        announcing: Announcing,
+        stall: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl AgentProvider for Stalling {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.announcing.capabilities()
+        }
+        fn info(&self) -> ProviderInfo {
+            self.announcing.info()
+        }
+        fn create_session(&self, r: CreateSessionRequest) -> Result<String, ProviderError> {
+            self.announcing.create_session(r)
+        }
+        fn resume_session(&self, r: ResumeSessionRequest) -> Result<String, ProviderError> {
+            self.announcing.resume_session(r)
+        }
+        fn send_turn(&self, r: SendTurnRequest) -> Result<String, ProviderError> {
+            self.announcing.send_turn(r)
+        }
+        fn interrupt_turn(&self, r: InterruptTurnRequest) -> Result<(), ProviderError> {
+            self.announcing.interrupt_turn(r)
+        }
+        fn resolve_permission(&self, r: ResolvePermissionRequest) -> Result<(), ProviderError> {
+            self.announcing.resolve_permission(r)
+        }
+        fn close_session(&self, r: CloseSessionRequest) -> Result<(), ProviderError> {
+            self.announcing.close_session(r)
+        }
+        fn pump(&self) -> Vec<AgentDomainEvent> {
+            let armed = self.stall.lock().unwrap().take();
+            if let Some((inside, release)) = armed {
+                let _ = inside.send(());
+                let _ = release.recv();
+            }
+            self.announcing.pump()
+        }
+        fn event_signal(&self) -> Option<Arc<EventSignal>> {
+            self.announcing.event_signal()
+        }
+    }
+
     fn start(provider: Arc<dyn AgentProvider + Send + Sync>) -> ConversationIngest {
         ConversationIngest::start(
             provider,
@@ -1774,6 +1829,60 @@ mod idle_wakeups {
         assert_eq!(wakes.load(Ordering::SeqCst), 3, "a local fold wakes at once");
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(wakes.load(Ordering::SeqCst), 3);
+    }
+
+    /// A freeze asked while the thread has a batch in hand is refused at once instead of waiting for the
+    /// batch and the writes after it: the window's own thread asks, and a history write touches the
+    /// disk. Asked again once the batch is done, it holds, and nothing is folded until it is let go.
+    #[test]
+    fn a_freeze_never_waits_for_a_batch_in_hand() {
+        let provider = Arc::new(Stalling::default());
+        let ingest = start(provider.clone());
+        wait_for("the first pump", || {
+            provider.announcing.quiet.pumps.load(Ordering::Relaxed) >= 1
+        });
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *provider.stall.lock().unwrap() = Some((inside_tx, release_rx));
+        provider.announcing.signal.raise();
+        inside_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the thread takes a batch");
+        // Lets the batch go after the check, or after 5 s if the check itself is stuck behind the batch,
+        // so a freeze that waits fails the assertion below instead of hanging the test.
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel::<()>();
+        let releaser = std::thread::spawn(move || {
+            let _ = checked_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let _ = release_tx.send(());
+        });
+
+        let frozen = ingest.try_freeze();
+        let _ = checked_tx.send(());
+        releaser.join().unwrap();
+        assert!(!frozen, "a batch in hand refuses the freeze");
+        assert!(
+            !ingest.frozen.load(Ordering::SeqCst),
+            "a refused freeze changes nothing"
+        );
+
+        wait_for("the freeze once the batch is done", || ingest.try_freeze());
+        provider
+            .announcing
+            .quiet
+            .queued
+            .lock()
+            .unwrap()
+            .push(AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        provider.announcing.signal.raise();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            ingest.projection().user_prompts.is_empty(),
+            "nothing is folded while frozen"
+        );
+        ingest.unfreeze();
+        wait_for("the fold after the freeze is let go", || {
+            ingest.projection().user_prompts.len() == 1
+        });
     }
 
     type Hook = Arc<dyn Fn() + Send + Sync>;

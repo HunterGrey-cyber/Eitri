@@ -238,11 +238,23 @@ impl ExternalConversation {
 /// agent's.
 impl From<ExternalConversation> for AgentBackend {
     fn from(external: ExternalConversation) -> Self {
+        // Every field named: what a moved tab's conversation is rebuilt from must account for each
+        // part of the holder, or a part added later would be lost on the way into a backend.
+        let ExternalConversation { agent, conversation } = external;
         AgentBackend::Conversation {
-            agent: external.agent,
-            conversation: Box::new(external.conversation),
+            agent,
+            conversation: Box::new(conversation),
         }
     }
+}
+
+/// The backend's own part of a chat's move record, beside the conversation's: which agent the
+/// conversation is with. The destination rebuilds the backend from it through the same checked way an
+/// external agent's backend is always made ([`ExternalConversation::new`]), so a record naming another
+/// agent than the adopted provider's is refused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackendHandoff {
+    pub agent: AgentId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1342,6 +1354,65 @@ impl AgentBackend {
             AgentBackend::Conversation { conversation, .. } => conversation.shutdown(),
         }
     }
+
+    /// A move begins: the conversation stops folding where its ingest stands
+    /// (`AgentConversation::freeze_folding`), so the caller's last pump delivers everything there is.
+    /// The legacy backend has no conversation to hand over and is refused.
+    pub fn freeze_folding(&mut self) -> Result<(), agent::HandoffRefused> {
+        match self {
+            AgentBackend::Legacy(_) => Err(agent::HandoffRefused::Mismatch("a legacy session")),
+            AgentBackend::Conversation { conversation, .. } => conversation.freeze_folding(),
+        }
+    }
+
+    /// After the last pump: the records the move carries. Refused, and folding resumed, as
+    /// `AgentConversation::take_frozen` says.
+    pub fn take_frozen(
+        &mut self,
+    ) -> Result<(agent::ChatMoveCore, agent::ConversationHandoff, BackendHandoff), agent::HandoffRefused> {
+        match self {
+            AgentBackend::Legacy(_) => Err(agent::HandoffRefused::Mismatch("a legacy session")),
+            AgentBackend::Conversation { agent, conversation } => {
+                let (core, handoff) = conversation.take_frozen()?;
+                Ok((core, handoff, BackendHandoff { agent: agent.clone() }))
+            }
+        }
+    }
+
+    /// The move did not happen: folding resumes from where the provider kept its events.
+    pub fn unfreeze_folding(&mut self) {
+        if let AgentBackend::Conversation { conversation, .. } = self {
+            conversation.unfreeze();
+        }
+    }
+
+    /// The backend of a chat another window froze for a move: its conversation rebuilt by folding
+    /// (`AgentConversation::adopt_moved`), held for the agent the record names. An external agent's is
+    /// checked as every external backend is ([`ExternalConversation::new`]).
+    pub fn adopt_moved(
+        core: agent::ChatMoveCore,
+        conversation: agent::ConversationHandoff,
+        backend: BackendHandoff,
+        provider: agent::MovedProvider,
+    ) -> Result<AgentBackend, BackendError> {
+        let BackendHandoff { agent } = backend;
+        let conversation = AgentConversation::adopt_moved(core, conversation, provider)
+            .map_err(|refused| BackendError::fatal(format!("the moved chat could not be taken up: {refused}")))?;
+        if agent.is_external() {
+            return ExternalConversation::new(agent, conversation).map(AgentBackend::from);
+        }
+        if conversation.provider_name() != agent.record_name() {
+            return Err(BackendError::fatal(format!(
+                "a {} session cannot be held as a {} tab",
+                conversation.provider_name(),
+                agent.record_name()
+            )));
+        }
+        Ok(AgentBackend::Conversation {
+            agent,
+            conversation: Box::new(conversation),
+        })
+    }
 }
 
 /// What [`AgentBackend::approve_pending`] answered: the successful ids and the row notes for
@@ -1671,7 +1742,7 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
 /// which ignores object key order) with no canonical form to get wrong and no collision to argue
 /// about. The set is small and short-lived -- emptied at every turn end, every `Resync`, `r` and with
 /// the backend (`TabSet`).
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HumanApprovals {
     calls: std::collections::BTreeMap<String, (String, serde_json::Value)>,
 }
@@ -1778,14 +1849,14 @@ pub struct AnsweredForYou {
 /// prompt that follows an allowed call (its sensitive-file check). The second is a separate
 /// question the CLI asks after the gate has allowed the call, so it is no evidence that the gate
 /// saw the call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GateOrigin {
     GateRequest,
     ProviderPrompt,
 }
 
 /// One request the host answered itself: see [`AnsweredForYou::gate_answers`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GateAnswer {
     pub origin: GateOrigin,
     pub permission_id: String,

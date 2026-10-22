@@ -349,6 +349,9 @@ pub struct Manifest {
     pub commands: Vec<CommandDecl>,
     pub module: Option<ModuleTable>,
     pub images: Option<NetImages>,
+    /// `[page] handoff`: the page answers `host.save` with its state, which the page that replaces it in another
+    /// window receives in its `host.hello` reply. False unless the manifest says so.
+    pub handoff: bool,
 }
 
 impl Manifest {
@@ -380,6 +383,7 @@ struct RawManifest {
     #[serde(default)]
     commands: BTreeMap<String, RawCommand>,
     module: Option<RawModule>,
+    page: Option<RawPage>,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +427,12 @@ struct RawFollow {
 #[serde(deny_unknown_fields)]
 struct RawCommand {
     does: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPage {
+    handoff: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -890,6 +900,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         commands,
         module,
         images,
+        handoff: raw.page.and_then(|p| p.handoff).unwrap_or(false),
     })
 }
 
@@ -1282,6 +1293,25 @@ mod tests {
             let text = EXAMPLE.replacen("images = \"${images}\"", &format!("images = {value}"), 1);
             assert_eq!(parse_manifest(&text).unwrap().images, Some(want));
         }
+    }
+
+    #[test]
+    fn a_page_table_with_handoff_parses_and_an_unknown_page_key_is_refused() {
+        assert!(
+            !parse_manifest(EXAMPLE).unwrap().handoff,
+            "a page hands nothing over unless its manifest says so"
+        );
+        let with = |table: &str| format!("{EXAMPLE}\n[page]\n{table}");
+        assert!(parse_manifest(&with("handoff = true\n")).unwrap().handoff);
+        assert!(!parse_manifest(&with("handoff = false\n")).unwrap().handoff);
+        assert!(
+            !parse_manifest(&with("")).unwrap().handoff,
+            "an empty table keeps the default"
+        );
+        let err = parse_manifest(&with("handoff = true\nrestore = true\n")).unwrap_err();
+        assert!(err.contains("restore"), "{err}");
+        let err = parse_manifest(&with("handoff = \"yes\"\n")).unwrap_err();
+        assert!(err.contains("handoff"), "{err}");
     }
 
     /// The preview plugin's manifest as its design gives it, comments included.

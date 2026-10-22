@@ -182,12 +182,13 @@ def _contents_by_dst(doc):
     return {entry["dst"]: entry for entry in doc.get("contents", [])}
 
 
-# --- the four binaries every release ships (no agent-hook anywhere) ------------------------
+# --- the five binaries every release ships (no agent-hook anywhere) ------------------------
 
 RELEASE_BINARY_DSTS = {
     "/usr/lib/eitri/shell",
     "/usr/lib/eitri/eitri-supervisor",
     "/usr/lib/eitri/eitri-tmux-shim",
+    "/usr/lib/eitri/eitri-run-guard",
     "/usr/lib/eitri/eitri-claude-handoff",
 }
 
@@ -270,7 +271,7 @@ class NeitherProfileNamesAgentHook(unittest.TestCase):
                 self.assertNotIn("agent-hook", entry["src"], (path, entry))
                 self.assertNotIn("agent-hook", entry["dst"], (path, entry))
 
-    def test_the_four_binaries_are_at_the_same_dsts_in_both_profiles(self):
+    def test_the_five_binaries_are_at_the_same_dsts_in_both_profiles(self):
         public_dsts = set(_contents_by_dst(_load_yaml(PUBLIC_PATH)))
         private_dsts = set(_contents_by_dst(_load_yaml(PRIVATE_PATH)))
         self.assertTrue(RELEASE_BINARY_DSTS <= public_dsts, public_dsts)

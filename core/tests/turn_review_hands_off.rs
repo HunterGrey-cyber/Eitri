@@ -277,12 +277,28 @@ fn the_permission_and_send_paths_never_read_review_state() {
     for (name, anchor) in [
         ("answer_card", "respond_permission"),
         ("confirm_bypass", "approve_pending"),
-        ("flush_queue", "send_turn_in"),
+        ("flush_queue", "send_when_allowed"),
+        // The one function every turn goes out through, and the one message it sends on its own.
+        ("release_turn_send", "send_turn_in"),
+        ("send_one", "send_turn_in"),
         ("send_now", "interrupt"),
         ("queue_message", "queued_at_ms"),
         ("steer_held", "steer"),
     ] {
         check(&format!("TabSet::{name}"), &functions(&tabs, name), anchor);
+    }
+    // A turn's way out before that: its tab enters the running set and waits, in a linked window, for
+    // the presence; a first message or a composer's message is handed to the tab set here.
+    let moving = read("src/tab_set/moving.rs");
+    for (name, anchor) in [
+        ("begin_turn_send", "sync_confirmed"),
+        ("send_when_allowed", "decide"),
+        ("decide", "release_turn_send"),
+        ("send_first_turn", "begin_turn_send"),
+        ("send_prompt", "begin_turn_send"),
+        ("poll_turn_sends", "poll_at"),
+    ] {
+        check(&format!("TabSet::{name}"), &functions(&moving, name), anchor);
     }
     check(
         "TabSet::pump's resync arm",
@@ -306,7 +322,12 @@ fn the_permission_and_send_paths_never_read_review_state() {
     check(
         "agent_panel's send_first_turn",
         &functions(&panel, "send_first_turn"),
-        "send_turn_in",
+        "send_first_turn",
+    );
+    check(
+        "agent_panel's apply_sent",
+        &functions(&panel, "apply_sent"),
+        "apply_flush",
     );
     for (variant, anchor) in [
         ("SendMessage", "note_sent"),
@@ -429,13 +450,20 @@ fn only_the_confirmed_review_send_reaches_the_send_path() {
         "answer_card",
         "confirm_bypass",
         "flush_queue",
+        "release_turn_send",
+        "send_one",
         "send_now",
         "queue_message",
         "steer_held",
     ] {
         regions.extend(functions(&tabs, name));
     }
-    for name in ["answer_permission_response", "apply_confirm_bypass", "send_first_turn"] {
+    for name in [
+        "answer_permission_response",
+        "apply_confirm_bypass",
+        "send_first_turn",
+        "apply_sent",
+    ] {
         regions.extend(functions(&panel, name));
     }
     for variant in [

@@ -136,6 +136,31 @@ pub struct KeysDeclareArgs {
     pub rows: Vec<KeyRowArg>,
 }
 
+/// The largest state `page.saved` may hand over, measured as JSON text.
+pub const MAX_SAVED_STATE: usize = 256 * 1024;
+/// Room a `page.saved` message has past `MAX_SAVED_STATE` for what wraps the state (`v`, `id`, `verb`, `args`), so a
+/// state at the limit is not refused for the bytes around it; the state's own limit is then `PageSaved::check`'s.
+pub const SAVED_ENVELOPE: usize = 1024;
+
+/// `page.saved`: the page's answer to `host.save`, its own transient view as any JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageSaved {
+    pub state: Value,
+}
+
+impl PageSaved {
+    /// The state is measured on its own, so the limit holds whatever the message around it may grow to.
+    pub fn check(&self) -> Result<(), String> {
+        let bytes = serde_json::to_string(&self.state).map_or(usize::MAX, |text| text.len());
+        if bytes > MAX_SAVED_STATE {
+            Err(format!("{bytes} bytes; a saved state may be at most 256 KiB"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// The longest link target a page may hand to `editor.open_link`.
 pub const MAX_LINK_TARGET: usize = 4096;
 
@@ -233,14 +258,19 @@ pub enum Verb {
     EditorJump(EditorJump),
     #[serde(rename = "editor.open_link")]
     EditorOpenLink(EditorOpenLink),
+    #[serde(rename = "page.saved")]
+    PageSaved(PageSaved),
+    #[serde(rename = "page.ready")]
+    PageReady(NoArgs),
 }
 
 impl Verb {
     /// The capability a verb needs. `host.hello` needs none, and neither does `keys.declare`: it grants no
-    /// power, only records text the window shows.
+    /// power, only records text the window shows. `page.saved` and `page.ready` need none either: the manifest's
+    /// `[page] handoff` admits them, and the host checks it.
     pub fn capability(&self) -> Option<Capability> {
         match self {
-            Verb::HostHello(_) | Verb::KeysDeclare(_) => None,
+            Verb::HostHello(_) | Verb::KeysDeclare(_) | Verb::PageSaved(_) | Verb::PageReady(_) => None,
             Verb::EditorFollow(_) | Verb::EditorReveal(_) | Verb::EditorJump(_) | Verb::EditorOpenLink(_) => {
                 Some(Capability::EditorFollow)
             }
@@ -270,6 +300,8 @@ impl Verb {
             Verb::EditorReveal(_) => "editor.reveal",
             Verb::EditorJump(_) => "editor.jump",
             Verb::EditorOpenLink(_) => "editor.open_link",
+            Verb::PageSaved(_) => "page.saved",
+            Verb::PageReady(_) => "page.ready",
         }
     }
 }
@@ -327,7 +359,15 @@ pub fn parse_request(raw: &str) -> Inbound {
         return refused(None, ErrorCode::BadRequest, "not a JSON object");
     };
     let re = map.get("id").and_then(Value::as_u64);
-    if raw.len() > MAX_PAGE_MESSAGE {
+    if map.get("verb").and_then(Value::as_str) == Some("page.saved") {
+        if raw.len() > MAX_SAVED_STATE + SAVED_ENVELOPE {
+            return refused(
+                re,
+                ErrorCode::TooLarge,
+                format!("{} bytes; a saved state may be at most 256 KiB", raw.len()),
+            );
+        }
+    } else if raw.len() > MAX_PAGE_MESSAGE {
         return refused(
             re,
             ErrorCode::TooLarge,
@@ -489,6 +529,8 @@ pub struct ThemeEvent {
 pub const EVENT_EDITOR_VIEW: &str = "editor.view";
 pub const EVENT_EDITOR_TEXT: &str = "editor.text";
 pub const EVENT_EDITOR_CLOSED: &str = "editor.closed";
+/// The host asks a page that hands its state over for that state; its data is `{}`.
+pub const EVENT_HOST_SAVE: &str = "host.save";
 
 /// nvim's cursor in the followed window: `line` 1-based, `col` nvim's 0-based byte column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -681,6 +723,7 @@ mod tests {
                 "editor.closed" => {
                     serde_json::to_value(serde_json::from_value::<EditorClosed>(event.data.clone()).unwrap())
                 }
+                "host.save" => serde_json::to_value(serde_json::from_value::<NoArgs>(event.data.clone()).unwrap()),
                 other => panic!("{name}: unknown event {other}"),
             }
             .unwrap();
@@ -1053,6 +1096,125 @@ mod tests {
             event_text(EVENT_EDITOR_CLOSED, &closed),
             r#"{"v":1,"event":"editor.closed","data":{"buf":3,"reason":"wiped"}}"#
         );
+    }
+
+    #[test]
+    fn the_handoff_fixtures_parse_to_their_verbs_and_need_no_capability() {
+        let verb = |name: &str| match parse_request(&fixture_text(name)) {
+            Inbound::Request(r) => r.verb,
+            Inbound::Refused { message, .. } => panic!("{name}: {message}"),
+        };
+        let saved = verb("req-page-saved.json");
+        assert_eq!(saved.name(), "page.saved");
+        assert_eq!(
+            saved.capability(),
+            None,
+            "the manifest's [page] table grants it, not a capability"
+        );
+        let Verb::PageSaved(args) = saved else {
+            panic!("not page.saved")
+        };
+        assert_eq!(args.state["scroll_top"], 1240);
+        assert_eq!(args.check(), Ok(()));
+        assert_eq!(verb("req-page-ready.json"), Verb::PageReady(NoArgs {}));
+        assert_eq!(verb("req-page-ready.json").capability(), None);
+        assert!(matches!(
+            parse_request(&fixture_text("bad-page-saved-no-state.json")),
+            Inbound::Refused {
+                re: Some(42),
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ));
+        assert_eq!(
+            event_text(EVENT_HOST_SAVE, &NoArgs {}),
+            r#"{"v":1,"event":"host.save","data":{}}"#
+        );
+    }
+
+    #[test]
+    fn a_saved_state_is_checked_against_its_own_limit_as_json_text() {
+        // Two bytes of quotes around the text, so this one is exactly at the limit.
+        let at = PageSaved {
+            state: Value::String("x".repeat(MAX_SAVED_STATE - 2)),
+        };
+        assert_eq!(at.check(), Ok(()));
+        let over = PageSaved {
+            state: Value::String("x".repeat(MAX_SAVED_STATE - 1)),
+        };
+        assert_eq!(
+            over.check(),
+            Err(format!(
+                "{} bytes; a saved state may be at most 256 KiB",
+                MAX_SAVED_STATE + 1
+            ))
+        );
+        assert_eq!(
+            PageSaved { state: Value::Null }.check(),
+            Ok(()),
+            "a page may hand over nothing"
+        );
+    }
+
+    #[test]
+    fn a_saved_state_at_its_limit_is_admitted_with_the_message_around_it() {
+        let message = |id: u64, state_len: usize| {
+            format!(
+                r#"{{"v":1,"id":{id},"verb":"page.saved","args":{{"state":"{}"}}}}"#,
+                "x".repeat(state_len)
+            )
+        };
+        // Two bytes of quotes around the text, so this state is exactly at its limit, and the message past the
+        // general message limit.
+        let at = message(u64::MAX, MAX_SAVED_STATE - 2);
+        assert!(
+            at.len() > MAX_PAGE_MESSAGE,
+            "the boundary needs a message over the general limit"
+        );
+        let Inbound::Request(Request {
+            verb: Verb::PageSaved(args),
+            ..
+        }) = parse_request(&at)
+        else {
+            panic!("a state at its limit must reach the host")
+        };
+        assert_eq!(args.check(), Ok(()));
+        // One byte more parses too, and the state's own check refuses it.
+        let Inbound::Request(Request {
+            verb: Verb::PageSaved(over),
+            ..
+        }) = parse_request(&message(5, MAX_SAVED_STATE - 1))
+        else {
+            panic!("a state one byte over its limit is refused by its own check, not the message limit")
+        };
+        assert!(over.check().is_err());
+        // Past the room for the wrapping the message itself is too large, with the state limit's text.
+        let padded = format!(
+            r#"{{"v":1,"id":6,"verb":"page.saved","args":{{"state":"x"}}{}}}"#,
+            " ".repeat(MAX_SAVED_STATE + SAVED_ENVELOPE)
+        );
+        match parse_request(&padded) {
+            Inbound::Refused {
+                re: Some(6),
+                code: ErrorCode::TooLarge,
+                message,
+            } => assert!(message.contains("saved state may be at most 256 KiB"), "{message}"),
+            other => panic!("a padded page.saved must be too large: {other:?}"),
+        }
+        // Other verbs keep the general limit.
+        let write = format!(
+            r#"{{"v":1,"id":7,"verb":"state.write","args":{{"key":"k","value":"{}"}}}}"#,
+            "x".repeat(MAX_PAGE_MESSAGE - 60)
+        );
+        assert!(write.len() > MAX_PAGE_MESSAGE && write.len() <= MAX_SAVED_STATE + SAVED_ENVELOPE);
+        assert!(matches!(
+            parse_request(&write),
+            Inbound::Refused {
+                re: Some(7),
+                code: ErrorCode::TooLarge,
+                ..
+            }
+        ));
     }
 
     #[test]

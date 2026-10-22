@@ -24,8 +24,9 @@ use super::manifest::Capability;
 use super::page_policy;
 use super::protocol::{
     self, ClosedReason, Cursor, DocPrefixes, EditorClosed, EditorJump, EditorOpenLink, EditorReveal, EditorText,
-    EditorView, ErrorCode, ExitStatus, FocusEvent, FocusTarget, Inbound, KeyRowArg, KeysConfig, OnOff, Reply,
-    StreamName, TaskExit, TaskOutput, TooLarge, Verb, EVENT_EDITOR_CLOSED, EVENT_EDITOR_TEXT, EVENT_EDITOR_VIEW,
+    EditorView, ErrorCode, ExitStatus, FocusEvent, FocusTarget, Inbound, KeyRowArg, KeysConfig, NoArgs, OnOff,
+    PageSaved, Reply, StreamName, TaskExit, TaskOutput, TooLarge, Verb, EVENT_EDITOR_CLOSED, EVENT_EDITOR_TEXT,
+    EVENT_EDITOR_VIEW,
 };
 use super::roots::{self, PathRefusal};
 use super::state::{PluginStore, StoreError, StoreErrorKind, StoreOp, StoreWorker};
@@ -353,6 +354,33 @@ enum Then {
     },
 }
 
+/// What [`PluginHost::take_saved`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveOutcome {
+    /// The page's state, as it answered `host.save`.
+    Saved(Value),
+    /// The deadline passed with no answer, or the page could not answer (it had not said hello, or its document
+    /// was replaced): the move goes on without state.
+    TimedOut,
+    /// Asked, not answered, and the deadline is still ahead.
+    Waiting,
+    /// Nothing was asked since the last outcome was taken.
+    NotAsked,
+    /// The plugin's manifest has no `[page] handoff = true`: its page is reopened, not handed over.
+    NotHandoff,
+}
+
+/// How long a page has to answer `host.save` before a move goes on without its state.
+pub const SAVE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// A `host.save` sent to the page, until its outcome is taken.
+struct SaveAsk {
+    deadline: Instant,
+    answer: Option<Value>,
+    /// No answer can come: the page was not listening when asked, or the asked document is gone.
+    unanswerable: bool,
+}
+
 struct PluginHostState {
     /// The page said `host.hello` since it last started loading: events reach it from then on.
     hello: bool,
@@ -439,6 +467,11 @@ struct PluginHostState {
     projects: BTreeMap<String, Option<(PathBuf, PathBuf)>>,
     /// Project lookups out on the path worker: ticket -> buffer name.
     project_asked: BTreeMap<u64, String>,
+    save: Option<SaveAsk>,
+    /// The state a page in another window handed over, for the next `host.hello` reply only.
+    restored: Option<Value>,
+    /// The current document said `page.ready` and nobody has taken it since.
+    ready: bool,
 }
 
 pub struct PluginHost {
@@ -636,6 +669,9 @@ impl PluginHost {
             home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
             projects: BTreeMap::new(),
             project_asked: BTreeMap::new(),
+            save: None,
+            restored: None,
+            ready: false,
         };
         PluginHost {
             plugin,
@@ -1590,6 +1626,11 @@ impl PluginHost {
             // What the old one asked of the editor and is still waiting in line is not sent: its answer would
             // carry an id the new document may be using for something else.
             st.follow.drop_page_ops();
+            // The new document was not asked for its state and has not drawn one.
+            st.ready = false;
+            if let Some(ask) = st.save.as_mut() {
+                ask.unanswerable |= ask.answer.is_none();
+            }
             (st.follow_socket.is_some(), std::mem::take(&mut st.follow_owed))
         };
         let audience = self.audience();
@@ -1715,7 +1756,115 @@ impl PluginHost {
             Verb::EditorReveal(args) => self.editor_reveal(re, args, now),
             Verb::EditorJump(args) => self.editor_jump(re, args, now),
             Verb::EditorOpenLink(args) => self.editor_open_link(re, args, now),
+            Verb::PageSaved(args) => Some(self.page_saved(re, args, now)),
+            Verb::PageReady(_) => Some(self.page_ready(re)),
         }
+    }
+
+    fn not_handoff(re: u64, verb: &str) -> Reply {
+        Reply::err(
+            re,
+            ErrorCode::NotDeclared,
+            &format!("{verb} needs [page] handoff = true in the plugin's manifest"),
+        )
+    }
+
+    /// Asks the page for its state, to hand to its successor in another window; the answer, or why there is
+    /// none, is [`Self::take_saved`]'s. A plugin without `[page] handoff` is not asked.
+    pub fn request_save(&self, deadline: Instant) {
+        if !self.plugin.manifest.handoff {
+            return;
+        }
+        let listening = {
+            let mut st = self.state.borrow_mut();
+            let listening = st.hello && !st.closed;
+            st.save = Some(SaveAsk {
+                deadline,
+                answer: None,
+                unanswerable: !listening,
+            });
+            listening
+        };
+        if listening {
+            self.page
+                .send(&protocol::event_text(protocol::EVENT_HOST_SAVE, &NoArgs {}));
+        }
+    }
+
+    /// The outcome of the last [`Self::request_save`]. Anything but `Waiting` ends the question: a later answer
+    /// is refused.
+    pub fn take_saved(&self, now: Instant) -> SaveOutcome {
+        if !self.plugin.manifest.handoff {
+            return SaveOutcome::NotHandoff;
+        }
+        let mut st = self.state.borrow_mut();
+        match st.save.take() {
+            None => SaveOutcome::NotAsked,
+            Some(SaveAsk {
+                answer: Some(state), ..
+            }) => SaveOutcome::Saved(state),
+            Some(ask) if ask.unanswerable || now >= ask.deadline => SaveOutcome::TimedOut,
+            Some(ask) => {
+                st.save = Some(ask);
+                SaveOutcome::Waiting
+            }
+        }
+    }
+
+    /// The state the page's predecessor in another window handed over; the next `host.hello` reply carries it,
+    /// and no later one. Ignored for a plugin without `[page] handoff`, whose page never applies one.
+    pub fn set_restored(&self, state: Value) {
+        if self.plugin.manifest.handoff {
+            self.state.borrow_mut().restored = Some(state);
+        }
+    }
+
+    /// Whether the page has said `page.ready` (it applied its restored state and drew it) since this was last
+    /// taken.
+    pub fn take_ready(&self) -> bool {
+        std::mem::take(&mut self.state.borrow_mut().ready)
+    }
+
+    fn page_saved(&self, re: u64, args: PageSaved, now: Instant) -> Reply {
+        if !self.plugin.manifest.handoff {
+            return Self::not_handoff(re, "page.saved");
+        }
+        if let Err(why) = args.check() {
+            return Reply::err(re, ErrorCode::TooLarge, &why);
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            match st.save.as_mut() {
+                Some(ask) if ask.answer.is_none() && !ask.unanswerable && now < ask.deadline => {
+                    ask.answer = Some(args.state);
+                }
+                _ => {
+                    return Reply::err(
+                        re,
+                        ErrorCode::BadRequest,
+                        "page.saved answers host.save, and no host.save is waiting for an answer",
+                    );
+                }
+            }
+        }
+        // Whoever waits for the state learns of it on the next pump rather than at its deadline.
+        (self.wake)();
+        Reply::ok(re, json!({}))
+    }
+
+    fn page_ready(&self, re: u64) -> Reply {
+        if !self.plugin.manifest.handoff {
+            return Self::not_handoff(re, "page.ready");
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            if !st.hello {
+                return Reply::err(re, ErrorCode::BadRequest, "page.ready before host.hello");
+            }
+            st.ready = true;
+        }
+        (self.wake)();
+        Reply::ok(re, json!({}))
     }
 
     /// What every follow verb needs first: the page said hello, its arguments pass their check, and there is an
@@ -1865,14 +2014,15 @@ impl PluginHost {
         // is delivered once (in the tail) and not again as output.
         let runs = self.state.borrow_mut().tasks.attach();
         self.state.borrow_mut().hello = true;
-        let (timeoutlen, prefix, module_key, theme, keys_settings) = {
-            let st = self.state.borrow();
+        let (timeoutlen, prefix, module_key, theme, keys_settings, restored) = {
+            let mut st = self.state.borrow_mut();
             (
                 st.timeoutlen,
                 st.prefix_label.clone(),
                 st.module_key.clone(),
                 st.theme.to_json(),
                 st.keys_settings.clone(),
+                st.restored.take(),
             )
         };
         let manifest = &self.plugin.manifest;
@@ -1903,6 +2053,7 @@ impl PluginHost {
                 "prefix": prefix,
                 "module_key": module_key,
                 "theme": theme,
+                "restored": restored,
             }),
         )
     }
@@ -2572,12 +2723,23 @@ mod tests {
     /// A plugin whose manifest declares no capability at all, so every verb these tests send is one a
     /// page may send without asking for anything.
     fn rig(overrides: Vec<PluginKeyOp>) -> Rig {
+        rig_with(overrides, "")
+    }
+
+    /// As [`rig`], for a plugin whose page hands its state over.
+    fn handoff_rig() -> Rig {
+        rig_with(vec![], "[page]\nhandoff = true\n")
+    }
+
+    fn rig_with(overrides: Vec<PluginKeyOp>, tables: &str) -> Rig {
         let s = Scratch::new("host-keys");
         let (dir, _) = demo_plugin(&s.0);
         std::fs::write(
             dir.join("eitri-plugin.toml"),
-            "id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\n\
-             site = \"build/site\"\nentry = \"index.html\"\ncapabilities = []\n",
+            format!(
+                "id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\n\
+                 site = \"build/site\"\nentry = \"index.html\"\ncapabilities = []\n{tables}"
+            ),
         )
         .unwrap();
         let plugin = Rc::new(load_plugin(dir.to_str().unwrap(), &BTreeMap::new(), None).unwrap());
@@ -2588,8 +2750,20 @@ mod tests {
 
     impl Rig {
         fn send(&self, id: u64, verb: &str, args: Value) {
+            self.send_at(Instant::now(), id, verb, args);
+        }
+
+        fn send_at(&self, now: Instant, id: u64, verb: &str, args: Value) {
             let text = json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string();
-            self.host.page_message(&text, Instant::now());
+            self.host.page_message(&text, now);
+        }
+
+        /// Sends one message and returns the one reply it gets.
+        fn ask_at(&self, now: Instant, id: u64, verb: &str, args: Value) -> Value {
+            self.send_at(now, id, verb, args);
+            let mut sent = self.page.take();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            sent.remove(0)
         }
 
         fn hello(&self) -> Vec<Value> {
@@ -2611,6 +2785,141 @@ mod tests {
 
     fn focus_events(sent: &[Value]) -> Vec<Value> {
         sent.iter().filter(|m| m["event"] == "focus").cloned().collect()
+    }
+
+    fn error_code(reply: &Value) -> &str {
+        reply["error"]["code"].as_str().unwrap_or("")
+    }
+
+    #[test]
+    fn host_save_times_out_after_one_second_and_the_move_goes_on_without_state() {
+        let r = handoff_rig();
+        r.hello();
+        let t0 = Instant::now();
+        assert_eq!(r.host.take_saved(t0), SaveOutcome::NotAsked);
+        r.host.request_save(t0 + SAVE_DEADLINE);
+        assert_eq!(r.page.take(), vec![json!({"v": 1, "event": "host.save", "data": {}})]);
+        assert_eq!(r.host.take_saved(t0 + Duration::from_millis(999)), SaveOutcome::Waiting);
+        assert_eq!(r.host.take_saved(t0 + SAVE_DEADLINE), SaveOutcome::TimedOut);
+        // An answer after the deadline is refused: the move has already gone on without it.
+        let late = r.ask_at(t0 + SAVE_DEADLINE, 5, "page.saved", json!({"state": {"scroll": 3}}));
+        assert_eq!(error_code(&late), "bad_request", "{late}");
+        assert_eq!(r.host.take_saved(t0 + SAVE_DEADLINE), SaveOutcome::NotAsked);
+
+        // In time, the state is kept until taken, even when it is taken after the deadline.
+        let t1 = Instant::now();
+        r.host.request_save(t1 + SAVE_DEADLINE);
+        r.page.take();
+        let reply = r.ask_at(t1, 6, "page.saved", json!({"state": {"scroll": 3}}));
+        assert_eq!(
+            (reply["re"].clone(), reply["ok"].clone()),
+            (json!(6), json!(true)),
+            "{reply}"
+        );
+        let again = r.ask_at(t1, 7, "page.saved", json!({"state": {"scroll": 4}}));
+        assert_eq!(error_code(&again), "bad_request", "one answer per question: {again}");
+        assert_eq!(
+            r.host.take_saved(t1 + 2 * SAVE_DEADLINE),
+            SaveOutcome::Saved(json!({"scroll": 3}))
+        );
+        assert_eq!(r.host.take_saved(t1), SaveOutcome::NotAsked);
+
+        // A page that has not said hello cannot hear the question, so the move does not wait for it.
+        let quiet = handoff_rig();
+        quiet.host.request_save(t0 + SAVE_DEADLINE);
+        assert!(quiet.page.take().is_empty());
+        assert_eq!(quiet.host.take_saved(t0), SaveOutcome::TimedOut);
+
+        // A document replaced while it was asked never answers either.
+        let reloaded = handoff_rig();
+        reloaded.hello();
+        reloaded.host.request_save(t0 + SAVE_DEADLINE);
+        reloaded.host.page_committed();
+        assert_eq!(reloaded.host.take_saved(t0), SaveOutcome::TimedOut);
+
+        // A plugin without the table is not asked at all, and may not answer.
+        let plain = rig(vec![]);
+        plain.hello();
+        plain.host.request_save(t0 + SAVE_DEADLINE);
+        assert!(plain.page.take().is_empty());
+        assert_eq!(plain.host.take_saved(t0), SaveOutcome::NotHandoff);
+        let refused = plain.ask_at(t0, 8, "page.saved", json!({"state": 1}));
+        assert_eq!(error_code(&refused), "not_declared", "{refused}");
+    }
+
+    #[test]
+    fn a_saved_state_over_256_kib_is_refused() {
+        let r = handoff_rig();
+        r.hello();
+        let t0 = Instant::now();
+        r.host.request_save(t0 + SAVE_DEADLINE);
+        r.page.take();
+        let big = json!({"state": "x".repeat(protocol::MAX_SAVED_STATE)});
+        let reply = r.ask_at(t0, 9, "page.saved", big);
+        assert_eq!(error_code(&reply), "too_large", "{reply}");
+        assert!(
+            reply["error"]["message"].as_str().unwrap().contains("256 KiB"),
+            "{reply}"
+        );
+        // Nothing was kept, and the question is still open for a state that fits.
+        assert_eq!(r.host.take_saved(t0), SaveOutcome::Waiting);
+        let fits = r.ask_at(t0, 10, "page.saved", json!({"state": "x"}));
+        assert_eq!(fits["ok"], true, "{fits}");
+        assert_eq!(r.host.take_saved(t0), SaveOutcome::Saved(json!("x")));
+    }
+
+    #[test]
+    fn restored_is_delivered_once_in_the_next_hello_reply() {
+        let hello_restored = |r: &Rig| {
+            let sent = r.hello();
+            let reply = sent.iter().find(|m| m["re"] == 1).expect("a reply").clone();
+            reply["result"]
+                .get("restored")
+                .cloned()
+                .expect("hello always carries restored")
+        };
+        let r = handoff_rig();
+        assert_eq!(hello_restored(&r), Value::Null);
+        r.host.set_restored(json!({"scroll": 12, "draft": "let"}));
+        assert!(r.page.take().is_empty(), "the state waits for the page's hello");
+        r.host.page_committed();
+        r.page.take();
+        assert_eq!(hello_restored(&r), json!({"scroll": 12, "draft": "let"}));
+        assert_eq!(hello_restored(&r), Value::Null, "given once");
+        r.host.page_committed();
+        r.page.take();
+        assert_eq!(hello_restored(&r), Value::Null, "a later document starts afresh");
+
+        let plain = rig(vec![]);
+        plain.host.set_restored(json!({"scroll": 12}));
+        assert_eq!(
+            hello_restored(&plain),
+            Value::Null,
+            "a page without the table never asked for one"
+        );
+    }
+
+    #[test]
+    fn page_ready_is_taken_once() {
+        let r = handoff_rig();
+        let early = r.ask_at(Instant::now(), 3, "page.ready", json!({}));
+        assert_eq!(error_code(&early), "bad_request", "ready before hello: {early}");
+        assert!(!r.host.take_ready());
+        r.hello();
+        assert!(!r.host.take_ready());
+        let reply = r.ask_at(Instant::now(), 4, "page.ready", json!({}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert!(r.host.take_ready());
+        assert!(!r.host.take_ready(), "taken once");
+        r.ask_at(Instant::now(), 5, "page.ready", json!({}));
+        r.host.page_committed();
+        assert!(!r.host.take_ready(), "the document that was ready is gone");
+
+        let plain = rig(vec![]);
+        plain.hello();
+        let refused = plain.ask_at(Instant::now(), 6, "page.ready", json!({}));
+        assert_eq!(error_code(&refused), "not_declared", "{refused}");
+        assert!(!plain.host.take_ready());
     }
 
     #[test]

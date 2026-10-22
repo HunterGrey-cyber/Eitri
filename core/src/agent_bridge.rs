@@ -1431,7 +1431,7 @@ pub fn serialize_events_for_js(
 /// What `TabSet::pump` knows about a tool call that the projection does not, carried beside the
 /// events and in snapshots. Only additive fields on the wire, each left out when it says nothing, so
 /// a payload without notes is byte-identical to one from before they existed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallNotes {
     /// Tool-use id -> the saved prefix rule that answered its permission request (`Bash(git log *)`,
     /// for example).
@@ -1465,7 +1465,7 @@ pub struct CallNotes {
 
 /// When one finished turn started and ended, on the panel's `Date.now()` clock. Both ends are read
 /// from the tab's tick, so a turn is at most one tick (about 33 ms) longer than it was.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TurnTime {
     pub turn_id: String,
     pub started_at_ms: u64,

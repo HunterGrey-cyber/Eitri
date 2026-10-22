@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "id": 40,
+  "verb": "page.saved",
+  "args": {
+    "state": {
+      "scroll_top": 1240,
+      "open": [
+        "intro",
+        "setup"
+      ],
+      "draft": "fn main() {"
+    }
+  }
+}

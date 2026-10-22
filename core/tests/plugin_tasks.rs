@@ -1,22 +1,41 @@
 //! The task runner with real child processes: `sh`, `sleep` and `head`. Every wait is a 60 s hang guard;
 //! nothing asserts how long anything took.
+//! The runs go through the Linux-only run guard, so the file is built for Linux alone.
+
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eitri_core::plugin::tasks::{ExitKind, Launch, StartError, Stream, TaskEvent, TaskRunner};
+use eitri_core::plugin::tasks::{ExitKind, GuardCommand, Launch, StartError, Stream, TaskEvent, TaskRunner};
 
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
+/// This binary's guard: it serves only when a runner started it as one.
+#[test]
+fn guard_entry() {
+    if std::env::var_os(eitri_core::run_guard::HELPER_VAR).is_some() {
+        eitri_core::run_guard::serve_inherited();
+    }
+}
+
+/// Every run here goes through a guard, as a window's runs do.
 fn runner() -> (TaskRunner, Arc<AtomicUsize>) {
+    runner_with(Some(eitri_core::run_guard::test_binary_guard("guard_entry")))
+}
+
+fn runner_with(guard: Option<GuardCommand>) -> (TaskRunner, Arc<AtomicUsize>) {
     let wakes = Arc::new(AtomicUsize::new(0));
     let counter = wakes.clone();
     (
-        TaskRunner::new(Arc::new(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        })),
+        TaskRunner::with_guard(
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            guard,
+        ),
         wakes,
     )
 }
@@ -119,6 +138,20 @@ fn a_run_reports_its_output_and_exit_code() {
         .iter()
         .any(|e| matches!(e, TaskEvent::Output { stream: Stream::Stderr, lines, .. } if lines == &["two"])));
     assert!(r.is_idle());
+}
+
+#[test]
+fn a_runner_without_a_guard_starts_its_task_itself() {
+    let (mut r, _) = runner_with(None);
+    let run = r
+        .start(sh("t", "echo one; echo two 1>&2; echo \"parent=$PPID\"; exit 3", None))
+        .unwrap();
+    let (events, kind, _, _) = until_exit(&mut r, run);
+    assert_eq!(kind, ExitKind::Exited(3));
+    assert_eq!(
+        stdout_lines(&events),
+        ["one".to_owned(), format!("parent={}", std::process::id())]
+    );
 }
 
 #[test]

@@ -10,7 +10,7 @@ use crate::attention::{AgentPlace, Attention};
 
 /// Every module not on screen, in tree order, except one titled on a strip that is
 /// ([`Layout::is_titled_on_strip`]). A module gone for the rest of the window has no chip because
-/// nothing would bring it back.
+/// nothing would bring it back, and an away one has none because the other window holds it.
 pub fn tray(layout: &Layout) -> Vec<ModuleId> {
     tray_covered(layout, &[])
 }
@@ -22,7 +22,10 @@ pub fn tray_covered(layout: &Layout, covered: &[ModuleId]) -> Vec<ModuleId> {
         .into_iter()
         .filter(|id| {
             (layout.is_visible(id) && covered.contains(id))
-                || (!layout.is_visible(id) && !layout.is_gone(id) && !layout.is_titled_on_strip(id))
+                || (!layout.is_visible(id)
+                    && !layout.is_gone(id)
+                    && !layout.is_away(id)
+                    && !layout.is_titled_on_strip(id))
         })
         .collect()
 }

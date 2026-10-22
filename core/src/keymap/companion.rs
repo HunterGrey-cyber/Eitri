@@ -63,6 +63,11 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::WorkspaceSwitch { .. }
         | Action::WorkspaceNew
         | Action::TabBreak
+        | Action::WindowNew
+        | Action::WindowOther
+        | Action::MoveToWindow { .. }
+        | Action::WorkspaceToWindow { .. }
+        | Action::WorkspaceSwapWindow
         | Action::SelectLast
         | Action::SelectNext
         | Action::Split { .. }
@@ -159,6 +164,17 @@ mod tests {
             (Action::WorkspaceSwitch { name: "x".into() }, CompanionVerb::Refuse),
             (Action::WorkspaceNew, CompanionVerb::Refuse),
             (Action::TabBreak, CompanionVerb::Refuse),
+            (Action::WindowNew, CompanionVerb::Refuse),
+            (Action::WindowOther, CompanionVerb::Refuse),
+            (
+                Action::MoveToWindow {
+                    module: None,
+                    follow: false,
+                },
+                CompanionVerb::Refuse,
+            ),
+            (Action::WorkspaceToWindow { follow: true }, CompanionVerb::Refuse),
+            (Action::WorkspaceSwapWindow, CompanionVerb::Refuse),
             (Action::SelectNumber, CompanionVerb::Refuse),
             (Action::MoveFar(Direction::Left), CompanionVerb::Refuse),
             (Action::Zoom, CompanionVerb::Refuse),

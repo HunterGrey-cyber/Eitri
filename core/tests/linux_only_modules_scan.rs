@@ -14,6 +14,7 @@ const LINUX_ONLY: &[(&str, &str, &str)] = &[
     ("agent/src/lib.rs", "child", "agent/src/child.rs"),
     ("core/src/window_link/mod.rs", "link", "core/src/window_link/link.rs"),
     ("core/src/window_link/mod.rs", "start", "core/src/window_link/start.rs"),
+    ("core/src/lib.rs", "run_guard", "core/src/run_guard.rs"),
 ];
 
 /// Names that exist only on Linux among the calls these modules make.

@@ -170,8 +170,8 @@ t_from_source_clone_head_match_builds_and_installs() {
 	if ! grep -Fqx "cargo build --release --locked --target-dir $TH/.cache/eitri/src/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
-	# Installed exactly like the prebuilt path: the four binaries, the launcher, RELEASE, licences.
-	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff; do
+	# Installed exactly like the prebuilt path: the five binaries, the launcher, RELEASE, licences.
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard; do
 		expect_exec "$TH/.local/lib/eitri/$b"
 	done
 	expect_exec "$TH/.local/bin/eitri"

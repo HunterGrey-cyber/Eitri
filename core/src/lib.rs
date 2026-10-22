@@ -36,6 +36,8 @@ pub mod project_root;
 pub mod project_trust;
 pub mod prompt_history;
 pub mod review_editor;
+#[cfg(target_os = "linux")]
+pub mod run_guard;
 pub mod saved_tabs;
 pub mod scratch;
 pub mod split;

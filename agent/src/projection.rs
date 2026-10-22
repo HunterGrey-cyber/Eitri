@@ -1204,6 +1204,12 @@ pub struct AgentSessionProjection {
     /// How the latest turn ended when it did not complete, until the next turn starts: what the
     /// panel's status band shows. `None` while a turn runs and after one that completed.
     pub last_turn_ending: Option<TurnEndingKind>,
+    /// The `seq` at which the latest `TurnCompleted` was folded, whatever its outcome, or `None` before
+    /// the first. `turn_endings` records only the turns that did not complete; a host that lost the
+    /// events to a resync reads here whether a turn it started has since ended. Not serialized: no view
+    /// draws it.
+    #[serde(skip)]
+    pub last_turn_end_seq: Option<u64>,
     /// The last usage a provider actually reported, or `None` if none ever has -- the state of a
     /// session before its first report, of one resumed from history (which seeds none), and of a
     /// sidecar that predates `TurnUsage`. A consumer must render `None` as unknown; rendering it as
@@ -1752,6 +1758,7 @@ impl AgentSessionProjection {
                 ..
             } => {
                 self.background_at_last_turn_end = self.background_calls;
+                self.last_turn_end_seq = Some(seq);
                 let kind = match outcome {
                     TurnOutcome::Completed => None,
                     TurnOutcome::Interrupted => Some(TurnEndingKind::Interrupted),

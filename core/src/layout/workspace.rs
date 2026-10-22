@@ -145,9 +145,13 @@ impl Workspaces {
     }
 
     /// Fits every workspace to their combined modules, using declarations for missing modules only.
+    /// A module away in any workspace is away in every one, including one it is added to here: the
+    /// other window holds it, whichever workspace is current.
     pub fn fit_all_with(&mut self, live: &mut Layout, decls: &[ModuleDecl]) -> Vec<String> {
         let mut modules = Vec::new();
+        let mut away = BTreeSet::new();
         for (_, layout) in self.each(live) {
+            away.extend(layout.away());
             for id in layout.modules() {
                 if !modules.contains(&id) {
                     modules.push(id);
@@ -168,6 +172,10 @@ impl Workspaces {
                     .into_iter()
                     .map(|note| format!("workspace '{name}': {note}")),
             );
+            for id in &away {
+                // Another module stays shown: the chat is never away, and a layout without one is refused.
+                let _ = layout.set_away(id, true);
+            }
         }
         notes
     }
@@ -384,14 +392,27 @@ impl Workspaces {
         true
     }
 
-    /// Retires a module in every stored layout, showing the chat when nothing else would remain.
+    /// Retires a module in every stored layout, showing the chat when nothing else would remain. One
+    /// away in a layout is left as it is there: the other window holds it.
     pub fn retire_everywhere(&mut self, id: &ModuleId, frame: &Frame) {
         for layout in self.stored.values_mut() {
-            if layout.contains(id) && !layout.is_gone(id) {
+            if layout.contains(id) && !layout.is_gone(id) && !layout.is_away(id) {
                 if let Err(LayoutError::LastVisible(_)) = kill(layout, id, Reopen::Never, frame) {
                     let _ = layout.show(&ModuleId::agent());
                     let _ = kill(layout, id, Reopen::Never, frame);
                 }
+            }
+        }
+    }
+
+    /// Marks `id` away, or back, in every stored layout that holds it ([`Layout::set_away`]): its leaf
+    /// stays where it is in each, so coming back puts it where it was in every workspace. The live
+    /// layout is the caller's, as for [`Workspaces::retire_everywhere`].
+    pub fn set_away_everywhere(&mut self, id: &ModuleId, away: bool) {
+        for layout in self.stored.values_mut() {
+            if layout.contains(id) {
+                // Refused only when nothing else could be shown, and every layout holds the chat.
+                let _ = layout.set_away(id, away);
             }
         }
     }
@@ -1293,6 +1314,208 @@ mod tests {
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()),
             "a built-in's or an instance's declaration does not make it placed by this window"
+        );
+    }
+
+    fn away_frame() -> Frame<'static> {
+        Frame::new(crate::layout::Size { w: 1280, h: 721 }, 1)
+    }
+
+    fn rects_of(layout: &Layout) -> BTreeMap<ModuleId, crate::layout::Rect> {
+        crate::layout::arrange(layout, &away_frame())
+            .modules
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn an_away_module_keeps_its_leaf_in_every_workspace_and_takes_no_space() {
+        let term = ModuleId::terminal();
+        let mut live = fixture("row(editor 0.6, column(agent, terminal))");
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2", "3"]),
+            BTreeMap::from([
+                ("2".to_string(), fixture("column(row(editor, agent), terminal)")),
+                (
+                    "3".to_string(),
+                    fixture("row(editor 0.6, column(agent, terminal hidden))"),
+                ),
+            ]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        let before: Vec<Layout> = ws.each(&live).into_iter().map(|(_, l)| l.clone()).collect();
+        assert_eq!(live.set_away(&term, true), Ok(true));
+        assert_eq!(live.set_away(&term, true), Ok(false), "a second call changes nothing");
+        ws.set_away_everywhere(&term, true);
+        for ((name, layout), before) in ws.each(&live).into_iter().zip(&before) {
+            assert!(layout.is_away(&term), "{name}: away");
+            assert!(layout.leaves().contains(&term), "{name}: its leaf stays in the tree");
+            assert!(layout.modules().contains(&term), "{name}: its number stays counted");
+            assert_eq!(layout.away(), BTreeSet::from([term.clone()]), "{name}");
+            assert_eq!(layout.root(), before.root(), "{name}: the tree is untouched");
+            assert!(!rects_of(layout).contains_key(&term), "{name}: it gets no space");
+            let mut hidden = before.clone();
+            if hidden.is_shown(&term) {
+                crate::layout::hide(&mut hidden, &term, &away_frame()).unwrap();
+            }
+            assert_eq!(
+                rects_of(layout),
+                rects_of(&hidden),
+                "{name}: the others share the space as for a hide"
+            );
+            assert!(
+                !layout.saved_hidden().contains(&term) || before.hidden().contains(&term),
+                "{name}: the state file keeps it as the user left it"
+            );
+        }
+        assert_eq!(live.show(&term), Err(LayoutError::Away(term.clone())));
+        assert_eq!(live.set_mark(&term), Err(LayoutError::Away(term.clone())));
+        assert_eq!(
+            kill(&mut live, &term, Reopen::Never, &away_frame()),
+            Err(LayoutError::Away(term.clone()))
+        );
+        assert_eq!(LayoutError::Away(term).to_string(), "'terminal' is in the other window");
+    }
+
+    #[test]
+    fn a_module_back_from_away_is_where_it_was_in_every_workspace() {
+        use crate::layout::{Child, Con, ConLayout, FloatRect, Node};
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        // Window one's main workspace: the instance is the drawn tab beside the chat, the editor has the keys.
+        let mut tabs = Con::new(
+            ConLayout::Tabbed,
+            vec![
+                Child::new(Node::Leaf(ModuleId::agent()), 0.5),
+                Child::new(Node::Leaf(t2.clone()), 0.5),
+            ],
+        );
+        tabs.focus = 1;
+        let mut live = Layout::new(
+            Node::Con(Con::new(
+                ConLayout::SplitH,
+                vec![
+                    Child::new(Node::Leaf(ModuleId::editor()), 0.6),
+                    Child::new(Node::Con(tabs), 0.4),
+                ],
+            )),
+            ModuleId::editor(),
+        )
+        .unwrap();
+        // Workspace 2: it floats, and has the keys.
+        let mut floating = fixture("row(editor 0.6, agent)");
+        let rect = FloatRect {
+            cx: 0.3,
+            cy: 0.6,
+            w: 500,
+            h: 280,
+        };
+        floating.add_float(&t2, rect, false).unwrap();
+        floating.set_focus(&t2).unwrap();
+        // Workspace 3: hidden below the chat.
+        let hidden = fixture("row(editor 0.6, column(agent, terminal#2 hidden))");
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2", "3"]),
+            BTreeMap::from([("2".to_string(), floating), ("3".to_string(), hidden)]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        let before: Vec<Layout> = ws.each(&live).into_iter().map(|(_, l)| l.clone()).collect();
+        assert!(live.is_visible(&t2));
+
+        live.set_away(&t2, true).unwrap();
+        ws.set_away_everywhere(&t2, true);
+        assert!(
+            live.is_visible(&ModuleId::agent()),
+            "the tab beside it is drawn meanwhile"
+        );
+        let two = ws.stored("2").unwrap();
+        assert_ne!(two.focus(), &t2, "the keys leave with it");
+        assert!(two.is_shown(two.focus()));
+        assert!(rects_of(two).len() == 2 && two.float_of(&t2).unwrap().rect == rect);
+
+        live.set_away(&t2, false).unwrap();
+        ws.set_away_everywhere(&t2, false);
+        for ((name, layout), before) in ws.each(&live).into_iter().zip(&before) {
+            assert!(!layout.is_away(&t2) && layout.away().is_empty(), "{name}");
+            assert_eq!(layout.root(), before.root(), "{name}: the same tree, tabs and all");
+            assert_eq!(
+                layout.floats(),
+                before.floats(),
+                "{name}: the same floats and rectangles"
+            );
+            assert_eq!(layout.hidden(), before.hidden(), "{name}: shown or hidden as before");
+            assert_eq!(rects_of(layout), rects_of(before), "{name}: on screen where it was");
+        }
+        assert!(live.is_visible(&t2), "the drawn tab again");
+        assert_ne!(
+            ws.stored("2").unwrap().focus(),
+            &t2,
+            "coming back does not take the keys"
+        );
+    }
+
+    #[test]
+    fn fit_all_and_retire_everywhere_leave_away_modules_alone() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut live = fixture("row(editor 0.6, column(agent, terminal#2))");
+        live.set_away(&t2, true).unwrap();
+        let live_before = live.clone();
+        let mut ws = Workspaces::from_parts(
+            names(&["main", "2"]),
+            BTreeMap::from([("2".to_string(), layout())]),
+            "main".into(),
+            Kept::default(),
+        )
+        .unwrap();
+        ws.fit_all(&mut live);
+        assert_eq!(live, live_before, "the live layout already held it");
+        let two = ws.stored("2").unwrap();
+        assert!(two.contains(&t2), "a workspace that lacked it holds its leaf");
+        assert!(two.is_away(&t2), "and holds it away: the other window has it");
+        assert!(!two.is_shown(&t2));
+        let mut back = two.clone();
+        back.set_away(&t2, false).unwrap();
+        assert!(
+            back.hidden().contains(&t2),
+            "it was added hidden, and comes back hidden"
+        );
+
+        let two_before = ws.stored("2").unwrap().clone();
+        ws.retire_everywhere(&t2, &away_frame());
+        assert_eq!(
+            ws.stored("2").unwrap(),
+            &two_before,
+            "an away module is not retired here"
+        );
+        ws.retire_everywhere(&ModuleId::editor(), &away_frame());
+        let two = ws.stored("2").unwrap();
+        assert!(two.is_gone(&ModuleId::editor()));
+        assert!(
+            two.is_away(&t2) && two.contains(&t2) && !two.is_gone(&t2),
+            "the editor's retirement leaves it be"
+        );
+        assert!(two.is_shown(&ModuleId::agent()));
+    }
+
+    #[test]
+    fn the_last_module_on_screen_going_away_leaves_the_chat_in_its_place() {
+        let t2 = ModuleId::parse("terminal#2").unwrap();
+        let mut live = fixture("row(editor hidden, column(agent hidden, terminal#2 focus))");
+        live.set_away(&t2, true).unwrap();
+        assert!(live.is_shown(&ModuleId::agent()), "a window always shows something");
+        assert_eq!(live.focus(), &ModuleId::agent());
+        let mut lone = Layout::new(crate::layout::Node::Leaf(ModuleId::agent()), ModuleId::agent()).unwrap();
+        assert_eq!(
+            lone.set_away(&ModuleId::agent(), true),
+            Err(LayoutError::LastVisible(ModuleId::agent()))
+        );
+        assert_eq!(
+            lone.set_away(&t2, true),
+            Err(LayoutError::NotInTree(t2.clone())),
+            "only a module the layout holds"
         );
     }
 }

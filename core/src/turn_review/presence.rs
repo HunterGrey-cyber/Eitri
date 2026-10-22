@@ -338,9 +338,9 @@ impl PresenceHolder {
     }
 
     /// [`start`](Self::start) whose thread waits for `gate` before it opens anything, so a test can
-    /// show that nothing on the caller's side waits for the thread.
-    #[cfg(test)]
-    pub(crate) fn start_parked(review_dir: PathBuf, pid: u32) -> (PresenceHolder, mpsc::Sender<()>) {
+    /// show that nothing on the caller's side waits for the thread, and a prompt stays held for it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_parked(review_dir: PathBuf, pid: u32) -> (PresenceHolder, mpsc::Sender<()>) {
         let (release, gate) = mpsc::channel();
         (Self::start_gated(review_dir, pid, Some(gate)), release)
     }

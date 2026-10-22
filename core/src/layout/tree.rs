@@ -134,6 +134,8 @@ pub enum LayoutError {
     SameModule(ModuleId),
     /// Killed for the rest of this window (`super::kill`, `Reopen::Never`).
     Gone(ModuleId),
+    /// The other window of the pair holds it now ([`Layout::is_away`]).
+    Away(ModuleId),
     NoMark,
     MarkedIsTarget(ModuleId),
     MarkHidden(ModuleId),
@@ -175,6 +177,7 @@ impl fmt::Display for LayoutError {
             LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
             LayoutError::SameModule(id) => write!(f, "'{id}' cannot be placed next to itself"),
             LayoutError::Gone(id) => write!(f, "'{id}' was closed and cannot be reopened in this window"),
+            LayoutError::Away(id) => write!(f, "'{id}' is in the other window"),
         }
     }
 }
@@ -230,6 +233,14 @@ pub struct Layout {
     /// them ended, not because the user hid them, so the state file writes them shown
     /// ([`Layout::saved_hidden`]). A subset of `gone`.
     retired_shown: BTreeSet<ModuleId>,
+    /// Modules the other window of the pair holds now: hidden here, each leaf (or float) left where
+    /// it was, so one that comes back is in its old place. Like a gone module they cannot be shown,
+    /// placed, marked or killed here, and unlike one they come back ([`Layout::set_away`]). A subset
+    /// of `hidden`.
+    away: BTreeSet<ModuleId>,
+    /// The away modules that were shown when they left: coming back shows them again, and the state
+    /// file writes them shown ([`Layout::saved_hidden`]). A subset of `away`.
+    away_shown: BTreeSet<ModuleId>,
 }
 
 impl Layout {
@@ -272,6 +283,8 @@ impl Layout {
             mru,
             gone: BTreeSet::new(),
             retired_shown: BTreeSet::new(),
+            away: BTreeSet::new(),
+            away_shown: BTreeSet::new(),
         })
     }
 
@@ -419,9 +432,14 @@ impl Layout {
     /// The saved hidden set excludes modules that were shown when retired, such as the editor
     /// after nvim ended (`super::kill`'s `Reopen::Never`). Retirement ends the process without
     /// changing the saved arrangement, so relaunch shows those modules where they were.
-    /// A module hidden by the user stays hidden.
+    /// A module hidden by the user stays hidden. A module moved to another window is likewise
+    /// saved as it was when it left; its absence does not change this window's saved arrangement.
     pub fn saved_hidden(&self) -> BTreeSet<ModuleId> {
-        self.hidden.difference(&self.retired_shown).cloned().collect()
+        self.hidden
+            .iter()
+            .filter(|id| !self.retired_shown.contains(*id) && !self.away_shown.contains(*id))
+            .cloned()
+            .collect()
     }
 
     pub fn zoomed(&self) -> Option<&ModuleId> {
@@ -492,6 +510,9 @@ impl Layout {
         if self.is_gone(id) {
             return Err(LayoutError::Gone(id.clone()));
         }
+        if self.is_away(id) {
+            return Err(LayoutError::Away(id.clone()));
+        }
         self.mark = Some(id.clone());
         Ok(())
     }
@@ -552,6 +573,82 @@ impl Layout {
         self.gone.contains(id)
     }
 
+    /// Held by the other window of the pair: hidden here, its place kept ([`Layout::set_away`]).
+    pub fn is_away(&self, id: &ModuleId) -> bool {
+        self.away.contains(id)
+    }
+
+    /// Every module away in the other window. [`Layout::modules`] still lists them: their leaves are
+    /// here, and so are their numbers.
+    pub fn away(&self) -> BTreeSet<ModuleId> {
+        self.away.clone()
+    }
+
+    /// Marks `id` away (`true`) or back (`false`); `Ok(false)` when it already was. Away, it stays in
+    /// the tree or among the floats exactly where it is, hidden, and nothing here can show it; back,
+    /// it is shown again if it was shown when it left. A module leaving takes no keys and no mark
+    /// with it: the keys go to the most recent module on screen. When it was the only module on
+    /// screen the chat is shown in its place (the editor if the chat is away too), as a retirement
+    /// does, since a window always shows something; `LastVisible` if there is nothing else at all.
+    pub fn set_away(&mut self, id: &ModuleId, away: bool) -> Result<bool, LayoutError> {
+        if !self.contains(id) {
+            return Err(LayoutError::NotInTree(id.clone()));
+        }
+        if !away {
+            if !self.away.remove(id) {
+                return Ok(false);
+            }
+            if self.away_shown.remove(id) {
+                self.hidden.remove(id);
+            }
+            if self.zoomed().is_some_and(|z| self.is_tabbed_away(z)) {
+                self.unzoom();
+            }
+            return Ok(true);
+        }
+        if self.away.contains(id) {
+            return Ok(false);
+        }
+        let was_shown = !self.hidden.contains(id);
+        if was_shown && !self.modules().iter().any(|m| m != id && self.is_shown(m)) {
+            let stand_in = [ModuleId::agent(), ModuleId::editor()]
+                .into_iter()
+                .chain(self.modules())
+                .find(|m| m != id && self.contains(m) && !self.is_gone(m) && !self.is_away(m))
+                .ok_or_else(|| LayoutError::LastVisible(id.clone()))?;
+            self.hidden.remove(&stand_in);
+        }
+        if self.zoomed() == Some(id) {
+            self.zoomed = None;
+        }
+        self.hidden.insert(id.clone());
+        self.away.insert(id.clone());
+        if was_shown {
+            self.away_shown.insert(id.clone());
+        }
+        if self.mark.as_ref() == Some(id) {
+            self.mark = None;
+        }
+        self.retain_selection();
+        if &self.focus == id {
+            // On screen first: a module merely not tabbed away may sit outside a container zoom that
+            // outlived the leaving module, and the keys would then land where nothing is drawn.
+            let next = self
+                .mru
+                .iter()
+                .find(|m| self.is_visible(m))
+                .or_else(|| self.mru.iter().find(|m| self.is_in_view(m)))
+                .or_else(|| self.mru.iter().find(|m| self.is_shown(m)))
+                .cloned()
+                .expect("a module stays shown");
+            if self.zoom_hides(&next) {
+                self.unzoom();
+            }
+            self.set_focus(&next)?;
+        }
+        Ok(true)
+    }
+
     /// The tiled tree's leaves, in tree order; floats are not leaves ([`Layout::modules`]).
     pub fn leaves(&self) -> Vec<ModuleId> {
         self.root.leaves()
@@ -570,8 +667,9 @@ impl Layout {
     }
 
     /// A hidden scratch float is stowed in the scratchpad.
+    /// An away float is not: the scratchpad cannot bring up what the other window holds.
     pub fn is_stowed(&self, id: &ModuleId) -> bool {
-        self.hidden.contains(id) && self.float_of(id).is_some_and(|float| float.scratch)
+        self.hidden.contains(id) && !self.away.contains(id) && self.float_of(id).is_some_and(|float| float.scratch)
     }
 
     /// Every module: tiled leaves in tree order, then floats bottom first.
@@ -932,6 +1030,9 @@ impl Layout {
         if self.gone.contains(id) {
             return Err(LayoutError::Gone(id.clone()));
         }
+        if self.away.contains(id) {
+            return Err(LayoutError::Away(id.clone()));
+        }
         let changed = self.hidden.remove(id);
         if self.zoomed().is_some_and(|z| self.is_tabbed_away(z)) {
             self.unzoom();
@@ -1023,7 +1124,8 @@ impl Layout {
         Ok(true)
     }
 
-    /// Removes a numbered instance, giving its keys to the editor or the first shown leaf.
+    /// Removes a numbered instance, giving its keys to the editor or the first shown leaf. An away
+    /// instance can be removed: what ran in it may end in the other window.
     pub fn remove(&mut self, id: &ModuleId) -> Result<(), LayoutError> {
         if id.number() == 1 {
             return Err(LayoutError::NotAnInstance(id.clone()));
@@ -1045,6 +1147,8 @@ impl Layout {
         self.hidden.remove(id);
         self.gone.remove(id);
         self.retired_shown.remove(id);
+        self.away.remove(id);
+        self.away_shown.remove(id);
         if self.mark.as_ref() == Some(id) {
             self.clear_mark();
         }
@@ -1055,8 +1159,8 @@ impl Layout {
         if !modules.iter().any(|m| self.is_shown(m)) {
             let first = modules
                 .iter()
-                .find(|m| **m == ModuleId::editor() && !self.is_gone(m))
-                .or_else(|| modules.iter().find(|m| !self.is_gone(m)))
+                .find(|m| **m == ModuleId::editor() && !self.is_gone(m) && !self.is_away(m))
+                .or_else(|| modules.iter().find(|m| !self.is_gone(m) && !self.is_away(m)))
                 .ok_or_else(|| LayoutError::LastVisible(id.clone()))?;
             self.hidden.remove(first);
         }
@@ -1766,5 +1870,86 @@ mod tests {
             "the only module shown"
         );
         assert_eq!(layout.zoom(), None);
+    }
+
+    #[test]
+    fn the_keys_leaving_with_an_away_module_stay_inside_the_container_zoom() {
+        let mut layout = beside_a_container();
+        let pair = layout.container_of(&lua("a")).unwrap();
+        layout.set_focus(&ModuleId::editor()).unwrap();
+        layout.set_focus(&lua("b")).unwrap();
+        layout.select(Selection::Con(pair));
+        assert_eq!(layout.toggle_zoom(&lua("b")), ZoomChange::Zoomed);
+        assert_eq!(layout.zoom(), Some(&Zoom::Con(pair)));
+
+        layout.set_away(&lua("b"), true).unwrap();
+        assert_eq!(
+            layout.zoom(),
+            Some(&Zoom::Con(pair)),
+            "the zoomed container still shows a"
+        );
+        assert_eq!(
+            layout.focus(),
+            &lua("a"),
+            "the editor is more recent but the zoom leaves it off screen"
+        );
+        assert!(
+            layout.is_visible(layout.focus()),
+            "the keys sit on a module that is drawn"
+        );
+    }
+
+    #[test]
+    fn an_away_float_is_not_drawn_and_keeps_its_rectangle() {
+        use super::super::verbs::{scratchpad_show, ScratchShow};
+        let frame = Frame::new(Size { w: 1280, h: 721 }, 1);
+        let notes = ModuleId::parse("terminal#2").unwrap();
+        let scratch = ModuleId::parse("terminal#3").unwrap();
+        let rect = FloatRect {
+            cx: 0.7,
+            cy: 0.4,
+            w: 420,
+            h: 260,
+        };
+        let mut layout = Layout::initial(&[]).unwrap();
+        layout.add_float(&notes, rect, false).unwrap();
+        layout.add_float(&scratch, rect, true).unwrap();
+        crate::layout::scratchpad_move(&mut layout, &scratch, &frame).unwrap();
+        assert!(layout.is_stowed(&scratch));
+        let drawn = |layout: &Layout| -> BTreeMap<ModuleId, super::super::geometry::Rect> {
+            let arrangement = arrange(layout, &frame);
+            let floats = arrangement.floats.into_iter().map(|spot| (spot.id, spot.rect));
+            arrangement.modules.into_iter().chain(floats).collect()
+        };
+        let before = drawn(&layout);
+        assert!(before.contains_key(&notes));
+
+        layout.set_away(&notes, true).unwrap();
+        layout.set_away(&scratch, true).unwrap();
+        assert!(!drawn(&layout).contains_key(&notes), "an away float is not drawn");
+        assert!(arrange(&layout, &frame).floats.is_empty());
+        assert_eq!(
+            layout.float_of(&notes).map(|f| f.rect),
+            Some(rect),
+            "its rectangle is kept"
+        );
+        assert!(
+            !layout.is_stowed(&scratch),
+            "the scratchpad does not hold what the other window has"
+        );
+        assert_eq!(scratchpad_show(&mut layout, None, &frame), Err(LayoutError::NoScratch));
+        assert_eq!(
+            scratchpad_show(&mut layout, Some(&scratch), &frame),
+            Err(LayoutError::Away(scratch.clone()))
+        );
+
+        layout.set_away(&notes, false).unwrap();
+        layout.set_away(&scratch, false).unwrap();
+        assert_eq!(drawn(&layout), before, "back where it floated");
+        assert!(layout.is_stowed(&scratch), "and the stowed one is stowed again");
+        assert!(matches!(
+            scratchpad_show(&mut layout, None, &frame),
+            Ok(ScratchShow::Shown(id)) if id == scratch
+        ));
     }
 }

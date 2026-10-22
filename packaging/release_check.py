@@ -553,7 +553,7 @@ def check_no_legacy_symbols(nm_c_text: str) -> None:
 # A reused target directory may contain binaries left by a development build, such as
 # `agent-hook`, that were not produced by this release build.
 
-RELEASE_BINARIES = ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff")
+RELEASE_BINARIES = ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard")
 
 
 def _json_messages(lines: Iterable[str]) -> list[dict]:
@@ -566,7 +566,7 @@ def _json_messages(lines: Iterable[str]) -> list[dict]:
 
 
 def release_executables(lines: Iterable[str]) -> list[str]:
-    """The executable paths cargo reported building, in RELEASE_BINARIES order. Exactly those four
+    """The executable paths cargo reported building, in RELEASE_BINARIES order. Exactly those five
     basenames, each once, or ReleaseCheckError naming what differs."""
     execs = [m["executable"] for m in _json_messages(lines)
              if m.get("reason") == "compiler-artifact" and m.get("executable")]

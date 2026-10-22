@@ -92,6 +92,7 @@ package() {
 	install -m0755 "$top/lib/eitri/shell" "$pkgdir/usr/lib/eitri/shell"
 	install -m0755 "$top/lib/eitri/eitri-supervisor" "$pkgdir/usr/lib/eitri/eitri-supervisor"
 	install -m0755 "$top/lib/eitri/eitri-tmux-shim" "$pkgdir/usr/lib/eitri/eitri-tmux-shim"
+	install -m0755 "$top/lib/eitri/eitri-run-guard" "$pkgdir/usr/lib/eitri/eitri-run-guard"
 	install -m0755 "$top/lib/eitri/eitri-claude-handoff" "$pkgdir/usr/lib/eitri/eitri-claude-handoff"
 	install -m0755 "$top/lib/eitri/eitri-setup" "$pkgdir/usr/lib/eitri/eitri-setup"
 	install -m0755 "$srcdir/sidecar/verdandi-claude-sidecar" "$pkgdir/usr/lib/eitri/verdandi-claude-sidecar"

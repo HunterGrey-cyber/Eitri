@@ -103,6 +103,22 @@ pub enum Action {
     /// tmux `break-pane`: the base view's active tab out into a chat view of its own; pressed in that view,
     /// the tab joins the base view again.
     TabBreak,
+    /// Open this project's second window, or raise it when it is open.
+    WindowNew,
+    /// Give the keys to the other window of the pair.
+    WindowOther,
+    /// Move the module with the keys, or `module`, to the other window (a module the other window holds comes
+    /// here, as tmux's `join-pane -s`); with `follow`, the keys go with it.
+    MoveToWindow {
+        module: Option<ModuleId>,
+        follow: bool,
+    },
+    /// Move the current workspace to the other window.
+    WorkspaceToWindow {
+        follow: bool,
+    },
+    /// Swap this window's current workspace with the other window's.
+    WorkspaceSwapWindow,
     /// vim `<C-w>H/J/K/L`: move the module to the window's far edge.
     MoveFar(Direction),
     /// i3 `layout toggle split`: switch the containing split's axis.
@@ -261,6 +277,7 @@ struct Opts {
     keys: Option<String>,
     repeatable: Option<bool>,
     up: Option<bool>,
+    follow: Option<bool>,
     cwd: Option<String>,
     kind: Option<String>,
     module: Option<String>,
@@ -287,18 +304,19 @@ fn read_opts(opts: &[(String, OptValue)]) -> Result<Opts, ActionError> {
             ("keys", OptValue::Str(s)) => out.keys = Some(s.clone()),
             ("repeatable", OptValue::Bool(b)) => out.repeatable = Some(*b),
             ("up", OptValue::Bool(b)) => out.up = Some(*b),
+            ("follow", OptValue::Bool(b)) => out.follow = Some(*b),
             ("cells" | "n", other) => return Err(bad(name, format!("must be a whole number, not {}", other.kind()))),
             ("cwd" | "kind" | "module" | "name", other) => {
                 return Err(bad(name, format!("must be a string, not {}", other.kind())))
             }
             ("keys", other) => return Err(bad(name, format!("must be one tmux key name, not {}", other.kind()))),
-            ("repeatable" | "up", other) => {
+            ("repeatable" | "up" | "follow", other) => {
                 return Err(bad(name, format!("must be true or false, not {}", other.kind())))
             }
             _ => {
                 return Err(bad(
                     name,
-                    "is not an option (cells, n, keys, repeatable, up, cwd, kind, module, name)",
+                    "is not an option (cells, n, keys, repeatable, up, cwd, kind, module, name, follow)",
                 ))
             }
         }
@@ -392,6 +410,30 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
                 &["name"],
             )
         }
+        "window.new" => (Action::WindowNew, &[]),
+        "window.other" => (Action::WindowOther, &[]),
+        "move.to-window" => {
+            let module = o
+                .module
+                .as_deref()
+                .map(ModuleId::parse)
+                .transpose()
+                .map_err(|err| bad("module", format!("must be a module id: {err}")))?;
+            (
+                Action::MoveToWindow {
+                    module,
+                    follow: o.follow.unwrap_or(false),
+                },
+                &["module", "follow"],
+            )
+        }
+        "workspace.to-window" => (
+            Action::WorkspaceToWindow {
+                follow: o.follow.unwrap_or(false),
+            },
+            &["follow"],
+        ),
+        "workspace.swap-window" => (Action::WorkspaceSwapWindow, &[]),
         "zoom" => (Action::Zoom, &[]),
         "container.toggle-split" => (Action::ToggleSplit, &[]),
         "rotate.up" => (Action::Rotate { down: false }, &[]),
@@ -501,6 +543,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         (o.kind.is_some(), "kind"),
         (o.module.is_some(), "module"),
         (o.name.is_some(), "name"),
+        (o.follow.is_some(), "follow"),
     ] {
         if given && !takes.contains(&option) {
             return Err(bad(option, format!("is not an option of {name}")));
@@ -566,7 +609,12 @@ impl Action {
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
             | Action::WorkspaceNew
-            | Action::TabBreak => FloatRule::Acts,
+            | Action::TabBreak
+            | Action::WindowNew
+            | Action::WindowOther
+            | Action::MoveToWindow { .. }
+            | Action::WorkspaceToWindow { .. }
+            | Action::WorkspaceSwapWindow => FloatRule::Acts,
         }
     }
 
@@ -588,7 +636,8 @@ impl Action {
             | Action::ModuleHide
             | Action::Swap(_)
             | Action::SwapMarked
-            | Action::MarkToggle => SelectionRule::Refuses,
+            | Action::MarkToggle
+            | Action::MoveToWindow { .. } => SelectionRule::Refuses,
             Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Split { .. }
@@ -623,7 +672,11 @@ impl Action {
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
             | Action::WorkspaceNew
-            | Action::TabBreak => SelectionRule::Resets,
+            | Action::TabBreak
+            | Action::WindowNew
+            | Action::WindowOther
+            | Action::WorkspaceToWindow { .. }
+            | Action::WorkspaceSwapWindow => SelectionRule::Resets,
         }
     }
 
@@ -671,7 +724,12 @@ impl Action {
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
             | Action::WorkspaceNew
-            | Action::TabBreak => true,
+            | Action::TabBreak
+            | Action::WindowNew
+            | Action::WindowOther
+            | Action::MoveToWindow { .. }
+            | Action::WorkspaceToWindow { .. }
+            | Action::WorkspaceSwapWindow => true,
             Action::SendPrefix
             | Action::SendKeys(_)
             | Action::Tab(_)
@@ -710,6 +768,11 @@ impl Action {
             Action::WorkspaceSwitch { .. } => "workspace.switch".into(),
             Action::WorkspaceNew => "workspace.new".into(),
             Action::TabBreak => "tab.break".into(),
+            Action::WindowNew => "window.new".into(),
+            Action::WindowOther => "window.other".into(),
+            Action::MoveToWindow { .. } => "move.to-window".into(),
+            Action::WorkspaceToWindow { .. } => "workspace.to-window".into(),
+            Action::WorkspaceSwapWindow => "workspace.swap-window".into(),
             Action::Zoom => "zoom".into(),
             Action::MoveFar(dir) => format!("move.far-{}", direction_name(*dir)),
             Action::ToggleSplit => "container.toggle-split".into(),
@@ -771,6 +834,17 @@ impl Action {
         match self {
             Action::ScratchpadShow { module: Some(id) } => vec![("module".into(), OptValue::Str(id.as_str().into()))],
             Action::WorkspaceSwitch { name } => vec![("name".into(), OptValue::Str(name.clone()))],
+            Action::MoveToWindow { module, follow } => {
+                let mut out = Vec::new();
+                if let Some(id) = module {
+                    out.push(("module".into(), OptValue::Str(id.as_str().into())));
+                }
+                if *follow {
+                    out.push(("follow".into(), OptValue::Bool(true)));
+                }
+                out
+            }
+            Action::WorkspaceToWindow { follow: true } => vec![("follow".into(), OptValue::Bool(true))],
             Action::Split {
                 cwd: SplitCwd::Pane, ..
             } => vec![("cwd".into(), OptValue::Str("pane".into()))],
@@ -802,6 +876,14 @@ impl Action {
             Action::TabBreak => {
                 "Break this session tab out into a chat view of its own; in that view, join it back".into()
             }
+            Action::WindowNew => "Open this project's second window, or raise it".into(),
+            Action::WindowOther => "Give the keys to the other window".into(),
+            Action::MoveToWindow { module: None, .. } => "Move this module to the other window".into(),
+            Action::MoveToWindow { module: Some(id), .. } => {
+                format!("Move {id} to the other window, or bring it here when the other window holds it")
+            }
+            Action::WorkspaceToWindow { .. } => "Move this workspace to the other window".into(),
+            Action::WorkspaceSwapWindow => "Swap this workspace with the other window's".into(),
             Action::FloatToggle => "Float this module over the others, or put a floating one back in the layout".into(),
             Action::FocusModeToggle => {
                 "Give the keys to the most recent module of the other layer, floating or tiled".into()
@@ -925,6 +1007,78 @@ mod tests {
     use crate::keymap::table::Keymap;
 
     #[test]
+    fn the_window_verbs_parse_by_name_round_trip_and_take_their_options() {
+        let s = |v: &str| OptValue::Str(v.to_string());
+        let b = OptValue::Bool;
+        let cases: Vec<(&str, Vec<(String, OptValue)>, Action)> = vec![
+            ("window.new", vec![], Action::WindowNew),
+            ("window.other", vec![], Action::WindowOther),
+            (
+                "move.to-window",
+                vec![],
+                Action::MoveToWindow {
+                    module: None,
+                    follow: false,
+                },
+            ),
+            (
+                "move.to-window",
+                vec![("module".into(), s("terminal#2")), ("follow".into(), b(true))],
+                Action::MoveToWindow {
+                    module: Some(ModuleId::parse("terminal#2").unwrap()),
+                    follow: true,
+                },
+            ),
+            (
+                "workspace.to-window",
+                vec![("follow".into(), b(true))],
+                Action::WorkspaceToWindow { follow: true },
+            ),
+            (
+                "workspace.to-window",
+                vec![],
+                Action::WorkspaceToWindow { follow: false },
+            ),
+            ("workspace.swap-window", vec![], Action::WorkspaceSwapWindow),
+        ];
+        for (name, opts, action) in cases {
+            let got = parse(name, &opts, &[]).unwrap().action;
+            assert_eq!(got, action, "{name}");
+            assert_eq!(got.name(), name);
+            assert_eq!(
+                parse(&got.name(), &got.options(), &[]).unwrap().action,
+                got,
+                "{name} round trip"
+            );
+            assert!(got.is_layout(), "{name}");
+            assert_eq!(got.on_a_float(), FloatRule::Acts, "{name}");
+            assert!(!got.describe("Ctrl+b", "e / a / t").is_empty());
+        }
+        assert_eq!(
+            Action::MoveToWindow {
+                module: None,
+                follow: false
+            }
+            .selection_rule(),
+            SelectionRule::Refuses
+        );
+        assert_eq!(Action::WorkspaceSwapWindow.selection_rule(), SelectionRule::Resets);
+        let err = parse("window.new", &[("follow".into(), b(true))], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not an option of window.new"), "{err}");
+        let err = parse("move.to-window", &[("follow".into(), s("yes"))], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("true or false"), "{err}");
+        let err = parse("move.to-window", &[("module".into(), s("chat"))], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a module id"), "{err}");
+        assert!(parse("move.to-windows", &[], &[]).is_err());
+    }
+
+    #[test]
     fn tab_break_parses_by_name_and_is_a_layout_action() {
         let got = parse("tab.break", &[], &[]).unwrap();
         assert_eq!(got.action, Action::TabBreak);
@@ -1034,7 +1188,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("(cells, n, keys, repeatable, up, cwd, kind, module, name)"),
+            err.contains("(cells, n, keys, repeatable, up, cwd, kind, module, name, follow)"),
             "{err}"
         );
     }
@@ -1470,7 +1624,7 @@ mod tests {
             parse("zoom", &[("wat".into(), OptValue::Int(1))], &[]),
             Err(bad(
                 "wat",
-                "is not an option (cells, n, keys, repeatable, up, cwd, kind, module, name)"
+                "is not an option (cells, n, keys, repeatable, up, cwd, kind, module, name, follow)"
             ))
         );
     }

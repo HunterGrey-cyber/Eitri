@@ -999,6 +999,23 @@ mod tests {
     }
 
     #[test]
+    fn the_window_verbs_have_no_default_key() {
+        let map = Keymap::defaults();
+        for action in [
+            Action::WindowNew,
+            Action::WindowOther,
+            Action::MoveToWindow {
+                module: None,
+                follow: false,
+            },
+            Action::WorkspaceToWindow { follow: false },
+            Action::WorkspaceSwapWindow,
+        ] {
+            assert!(map.keys_for(&action).is_empty(), "{action:?} has no default key");
+        }
+    }
+
+    #[test]
     fn the_float_and_workspace_defaults() {
         let map = Keymap::defaults();
         let bound = |key: &str| {

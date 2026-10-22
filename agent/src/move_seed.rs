@@ -162,6 +162,9 @@ pub enum HandoffRefused {
     Unsettled,
     /// Folded events the source had not delivered when the record was to be taken.
     Undelivered,
+    /// Its ingest was folding a batch, or writing after one, when the freeze was asked: nothing was
+    /// changed, and the same freeze asked again in a moment goes through.
+    Folding,
     /// The source's last pump could not finish (its answers were not taken in time).
     LastPump(String),
     /// The destination could not rebuild the projection.
@@ -176,6 +179,7 @@ impl std::fmt::Display for HandoffRefused {
             HandoffRefused::Closing => f.write_str("the conversation is closing"),
             HandoffRefused::Unsettled => f.write_str("a card or a reply of this conversation is still open"),
             HandoffRefused::Undelivered => f.write_str("the conversation has events its page has not been given"),
+            HandoffRefused::Folding => f.write_str("the conversation is folding its events; ask again"),
             HandoffRefused::LastPump(why) => write!(f, "the last answers were not taken: {why}"),
             HandoffRefused::Seed(refused) => write!(f, "the conversation could not be rebuilt: {refused}"),
             HandoffRefused::Mismatch(what) => write!(f, "{what} is not this conversation's"),
@@ -231,6 +235,9 @@ impl AgentSessionProjection {
             pending_permissions: _,
             turn_endings,
             last_turn_ending,
+            // Not carried: it tells the window that started a turn whether it ended, and a tab moves
+            // only once no turn of its own is starting.
+            last_turn_end_seq: _,
             usage,
             // Live: whether the next delta continues a reply is the running turn's to say.
             assistant_message_open: _,

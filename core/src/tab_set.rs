@@ -8,8 +8,8 @@
 //! `provider_session_id()` takes it again. Never call the second while holding the first's guard
 //! (the 2026-09-15 GTK freeze). Every method below reads them in separate statements.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Weak};
 
@@ -27,7 +27,14 @@ use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
 pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
 
+mod moving;
+pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
+
+#[cfg(test)]
+mod move_tests;
+
 /// The first turn of a session started by it, composed when Enter was pressed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FirstTurn {
     /// With the editor context composed in: what goes to the model.
     pub wire: String,
@@ -113,7 +120,7 @@ pub struct PendingHandoff {
 
 /// One message typed while a turn ran. `wire` uses the editor context at the moment it was
 /// queued; `text` is what was typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Queued {
     pub text: String,
     pub wire: String,
@@ -149,7 +156,7 @@ impl Queued {
 
 /// Where a typed message is: waiting for the turn to end, or sent into the running turn and not yet
 /// read by the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueuedState {
     /// Goes out with the next turn (`TabSet::flush_queue`), or into this one when the agent can take it.
     Held,
@@ -961,6 +968,14 @@ impl std::error::Error for ViewError {}
 /// What a stop of the background says when the agent left nothing running.
 pub const NOTHING_IN_THE_BACKGROUND: &str = "nothing is running in the background";
 
+/// The band's note for a tab frozen for a move to the other window: it takes no input and answers no
+/// card until the move is done or called off.
+pub const MOVING: &str = "moving";
+
+/// Why a message is refused while another of its tab's messages waits for the presence to mark its
+/// turn as running.
+pub const SEND_HELD: &str = "a message of this tab is still waiting to go out";
+
 /// `1 command` or `N commands`: how the panel counts what an agent left running.
 pub fn running_in_background(n: u32) -> String {
     if n == 1 {
@@ -1130,6 +1145,38 @@ pub struct TabSet {
     /// if a turn ran: an agent's subagent can still write during the shutdown's grace.
     /// [`TabSet::retire_done`] ends one.
     retiring: RetiringCounts,
+    /// Tabs a turn of Eitri's is about to start in, or started in without its `TurnStarted` folded
+    /// yet: entered just before the prompt goes out ([`TabSet::begin_turn_send`]) and left on that
+    /// `TurnStarted`, a failed send, or a lifecycle event or turn ending folded after the entry. The
+    /// presence counts them as running, so no window reverts while a turn may be starting, and a
+    /// linked window's prompt waits until the presence thread holds their files.
+    starting: BTreeSet<u64>,
+    /// For each tab in `starting`, the projection's revision when it entered: only an event folded
+    /// after it can say the start is over.
+    starting_since: BTreeMap<u64, u64>,
+    /// Prompts held until the presence says they may go out (a linked window), by tab: at most one
+    /// per tab ([`TabSet::poll_turn_sends`]).
+    pending_sends: BTreeMap<u64, moving::PendingSend>,
+    /// Whether this window is linked to another one (`TabSet::set_partner`): then a prompt waits for
+    /// its presence file before it goes out.
+    linked: bool,
+    /// A prompt's file could not be confirmed: the partner is to be told `presence{held: false}`
+    /// ([`TabSet::take_presence_false_owed`]).
+    presence_false_owed: bool,
+    /// Tabs frozen for a move to the other window: they take no input and answer no card until the
+    /// move is done ([`TabSet::hand_over`]) or does not happen ([`TabSet::unfreeze`]).
+    moving: BTreeSet<u64>,
+    /// When a tab's move was first refused because its running turn's session is not known yet, and when
+    /// it was last refused so: the move waits for it a bounded while, then is refused for good.
+    unbound_since: BTreeMap<u64, (std::time::Instant, std::time::Instant)>,
+    /// The project root the last pump judged paths against, which a move's last pump uses too.
+    project_root: Option<PathBuf>,
+    /// What a move's last pump produced for the page that still shows the tab, handed to the caller
+    /// with the next pump's output.
+    held_pump: Option<moving::HeldPump>,
+    /// Tabs whose held queue should go out as if their turn had just ended: one whose turn ended while
+    /// it was frozen for a move, or one that arrived idle with messages waiting.
+    flush_owed: BTreeSet<u64>,
     /// What every live backend calls when it folded something, so the window need not poll for it
     /// ([`set_ui_wake`](Self::set_ui_wake)).
     ui_wake: Option<agent::UiWake>,
@@ -1195,6 +1242,16 @@ impl TabSet {
             turn_review_off: false,
             presence: None,
             retiring: RetiringCounts::new(),
+            starting: BTreeSet::new(),
+            starting_since: BTreeMap::new(),
+            pending_sends: BTreeMap::new(),
+            linked: false,
+            presence_false_owed: false,
+            moving: BTreeSet::new(),
+            unbound_since: BTreeMap::new(),
+            project_root: None,
+            held_pump: None,
+            flush_owed: BTreeSet::new(),
             ui_wake: None,
             layout_views: Vec::new(),
             #[cfg(test)]
@@ -1252,10 +1309,15 @@ impl TabSet {
 
     /// Whether something here can become ready without telling anyone, so the window has to keep
     /// pumping on its tick: a connect or a terminal handoff running on a worker, a live backend that does
-    /// not announce its events (the legacy one, or any before [`set_ui_wake`](Self::set_ui_wake)), or turn
-    /// review waiting for its workers. When this is false, nothing changes here until a backend's wake, or
-    /// a command from the window, says so.
+    /// not announce its events (the legacy one, or any before [`set_ui_wake`](Self::set_ui_wake)), turn
+    /// review waiting for its workers, or a prompt held for the presence (the presence thread's
+    /// confirmation and the hold's own deadline raise no wake; [`TabSet::poll_turn_sends`] finds them).
+    /// When this is false, nothing changes here until a backend's wake, or a command from the window, says
+    /// so.
     pub fn needs_polling(&self) -> bool {
+        if !self.pending_sends.is_empty() {
+            return true;
+        }
         self.tabs.iter().any(|tab| {
             tab.pending_handoff.is_some()
                 || match &tab.backend {
@@ -1298,20 +1360,26 @@ impl TabSet {
         self.presence.as_ref().map(crate::turn_review::PresenceHolder::guard)
     }
 
-    /// Hands the presence the ids of the tabs whose turns run, and of those whose backend is still
-    /// being shut down (a [`Retired`] not yet reported done). Reads only the tabs and touches no disk: the
-    /// presence thread does that.
+    /// Hands the presence the ids of the tabs whose turns run, of those a turn is starting in
+    /// (`starting`), and of those whose backend is still being shut down (a [`Retired`] not yet reported
+    /// done). Reads only the tabs and touches no disk: the presence thread does that.
     fn sync_presence(&self) {
         if let Some(holder) = &self.presence {
-            let mut running: BTreeSet<u64> = self
-                .tabs
-                .iter()
-                .filter(|tab| tab.turn_running())
-                .map(|tab| tab.id.0)
-                .collect();
-            running.extend(self.retiring.keys().copied());
-            holder.sync(&running);
+            holder.sync(&self.running_set());
         }
+    }
+
+    /// The tabs the presence counts as running a turn: see [`TabSet::sync_presence`].
+    fn running_set(&self) -> BTreeSet<u64> {
+        let mut running: BTreeSet<u64> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.turn_running())
+            .map(|tab| tab.id.0)
+            .collect();
+        running.extend(self.retiring.keys().copied());
+        running.extend(self.starting.iter().copied());
+        running
     }
 
     /// A live backend of `tab` taken away to be shut down elsewhere, counted: until that shutdown is
@@ -1365,7 +1433,11 @@ impl TabSet {
     /// as for any session taken away, the tab becomes `NotStarted` (so no further turn can be sent), and
     /// the backend is returned retired, counted until the caller reports its shutdown with
     /// [`TabSet::retire_done`]. `None`, and the tab untouched, when it holds no live session.
+    /// A tab frozen for a move is not taken: its session is the move's.
     pub fn take_for_handoff(&mut self, tab: TabId) -> Option<Retired> {
+        if self.moving.contains(&tab.0) {
+            return None;
+        }
         let t = self.get_mut(tab)?;
         if !matches!(t.backend, TabBackend::Live(_)) {
             return None;
@@ -1650,7 +1722,14 @@ impl TabSet {
     /// the caller's to shut down or watch; the caller reports [`TabSet::retire_done`] once the retired
     /// backend's shutdown has returned. When the base view's last tab goes, a fresh tab 1 opens there
     ///, whatever the extra views still hold.
+    ///
+    /// A tab frozen for a move is not taken out (`None`, as for a tab that is not here): its backend is
+    /// the other window's to take up, and retiring it here would shut that session down. It leaves
+    /// through [`TabSet::hand_over`], or takes input again through [`TabSet::unfreeze`].
     pub fn remove(&mut self, id: TabId) -> Option<RemovedTab> {
+        if self.moving.contains(&id.0) {
+            return None;
+        }
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let base_index = self.base_tabs().iter().position(|t| *t == id);
         let before = self.active;
@@ -1663,7 +1742,18 @@ impl TabSet {
         }
         // Counted before the sync below, so the presence never drops between the turn and the shutdown.
         let retired = tab.retire_live(&mut self.retiring);
+        self.forget_move_state(id);
         self.sync_presence();
+        self.tab_left(&tab, base_index, before);
+        Some(RemovedTab { tab, retired })
+    }
+
+    /// What the set does once `tab` has left it, closed or handed to the other window: its arrivals
+    /// still count, nothing remembers it, a prompt about it goes, and the base view keeps an active tab
+    /// (a fresh tab 1 when its last one left). `base_index` is where the tab stood among the
+    /// base view's tabs, `before` the active tab before it left.
+    fn tab_left(&mut self, tab: &Tab, base_index: Option<usize>, before: TabId) {
+        let id = tab.id;
         self.removed_arrived += tab.attention.attention().arrived;
         self.recency.retain(|t| *t != id);
         if self.last_active == Some(id) {
@@ -1694,7 +1784,6 @@ impl TabSet {
             self.drop_bypass_prompt_in(ViewId::BASE);
         }
         debug_assert!(self.v1_holds());
-        Some(RemovedTab { tab, retired })
     }
 
     /// V1: the base view's active tab exists and is a base-view tab (so the base view always holds
@@ -1885,6 +1974,9 @@ impl TabSet {
     /// live session, a turn running (an interrupt stops what it left), nothing left running.
     pub fn stop_background(&mut self, id: TabId, shown: u32) -> Result<(), BackendError> {
         let benign = |message: String| BackendError { message, benign: true };
+        if self.moving.contains(&id.0) {
+            return Err(benign(MOVING.to_string()));
+        }
         let Some(tab) = self.get_mut(id) else {
             return Err(benign(format!("no tab {}", id.0)));
         };
@@ -1927,6 +2019,9 @@ impl TabSet {
     /// an empty tab whose agent has no manual puts the tab in auto but the window default in manual,
     /// as on any other empty tab: auto there is only what that agent offers instead.
     pub fn cycle_mode(&mut self, id: TabId, page: ViewId) -> Result<ModeCycle, String> {
+        if self.moving.contains(&id.0) {
+            return Err(MOVING.to_string());
+        }
         // A press from a page that does not show the tab is about something else: refused before
         // anything changes.
         if let Some(tab) = self.get(id) {
@@ -2058,6 +2153,11 @@ impl TabSet {
             Some(plan) if plan.scope == scope && plan.nonce == nonce && plan.page == page => {}
             _ => return Err("that prompt is no longer current".to_string()),
         }
+        if let BypassScope::Tab(tab) = scope {
+            if self.moving.contains(&tab.0) {
+                return Err(MOVING.to_string());
+            }
+        }
         let plan = self.pending_bypass.take().expect("checked above");
         match scope {
             BypassScope::Tab(id) => {
@@ -2163,6 +2263,14 @@ impl TabSet {
             message: "no active session".to_string(),
             benign: true,
         };
+        // A card of a tab being moved is answered by no one here: it waits for the window the tab
+        // lands in, or for this one again if the move does not happen.
+        if self.moving.contains(&id.0) {
+            return Err(BackendError {
+                message: MOVING.to_string(),
+                benign: true,
+            });
+        }
         if let Some(tab) = self.get(id) {
             if !self.may_answer(id, page) {
                 return Err(BackendError {
@@ -2247,7 +2355,11 @@ impl TabSet {
 
     /// Puts a start off until the trust question is answered. Only an empty tab can wait: a tab with
     /// a session, one that is connecting and one already waiting each have their own start.
+    /// A tab frozen for a move starts nothing here: its record is already taken.
     pub fn defer_start(&mut self, tab: TabId, start: DeferredStart) -> Result<(), String> {
+        if self.moving.contains(&tab.0) {
+            return Err(MOVING.to_string());
+        }
         let t = self.get_mut(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
         match t.backend {
             TabBackend::NotStarted => {}
@@ -2279,8 +2391,12 @@ impl TabSet {
     /// Whether an answer carrying `nonce` may be taken for `tab` now, sent by chat page `page`: the
     /// tab is in that page's view and on screen there, waiting, not already recording, and the
     /// question it shows is this one. Changes nothing.
+    /// A tab frozen for a move takes no answer: its question is asked again where it lands.
     pub fn check_trust_answer(&self, tab: TabId, nonce: u64, page: ViewId) -> Result<(), String> {
         let t = self.get(tab).ok_or_else(|| format!("no tab {}", tab.0))?;
+        if self.moving.contains(&tab.0) {
+            return Err(MOVING.to_string());
+        }
         if !self.may_answer(tab, page) {
             return Err(format!("tab {} is not shown in this page", t.number));
         }
@@ -2323,6 +2439,9 @@ impl TabSet {
 
     /// The start whose `y` the worker confirmed, even when the user has since moved to another tab.
     pub fn take_recorded(&mut self, tab: TabId) -> Option<DeferredStart> {
+        if self.moving.contains(&tab.0) {
+            return None;
+        }
         match &self.get(tab)?.backend {
             TabBackend::AwaitingTrust(AwaitingTrust { recording: true, .. }) => self.take_start(tab),
             _ => None,
@@ -2331,7 +2450,11 @@ impl TabSet {
 
     /// The route that asks nothing (the answer is already known): hands the start over. Refused
     /// while a record is being written, whose result decides.
+    /// Nothing is handed over for a tab frozen for a move: it starts where it lands.
     pub fn take_deferred(&mut self, tab: TabId) -> Option<DeferredStart> {
+        if self.moving.contains(&tab.0) {
+            return None;
+        }
         match &self.get(tab)?.backend {
             TabBackend::AwaitingTrust(AwaitingTrust { recording: false, .. }) => self.take_start(tab),
             _ => None,
@@ -2359,6 +2482,10 @@ impl TabSet {
     /// here for a live tab, since a start begins from an empty tab or one waiting for the trust
     /// question.
     pub fn start(&mut self, tab: TabId, pending: PendingStart) {
+        if self.moving.contains(&tab.0) {
+            eprintln!("[tabs] tab {}: a start for a tab being moved was dropped", tab.0);
+            return;
+        }
         let Some(t) = self.get_mut(tab) else { return };
         if matches!(t.backend, TabBackend::Live(_)) {
             eprintln!(
@@ -2389,6 +2516,9 @@ impl TabSet {
     /// `r`: an ended or failed tab back to empty, keeping its number, name and mode.
     /// A live backend comes back retired, for the caller to shut down and report.
     pub fn reset(&mut self, id: TabId) -> Result<Option<Retired>, String> {
+        if self.moving.contains(&id.0) {
+            return Err(MOVING.to_string());
+        }
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
         let waiting = matches!(tab.backend, TabBackend::AwaitingTrust(_));
         match tab.wire_state() {
@@ -2515,17 +2645,17 @@ impl TabSet {
     /// unread.
     pub fn pump_views(&mut self, project_root: &Path, mapped: &dyn Fn(ViewId) -> bool) -> PumpOutput {
         let active = self.active;
-        let mut out = PumpOutput {
-            active_payload: None,
-            active_class: crate::panel_cadence::EnvelopeClass::Immediate,
-            first_text: false,
-            turn_ended: Vec::new(),
-            offers_changed: Vec::new(),
-            queue_changed: Vec::new(),
-            tripped: Vec::new(),
-            review_hints: Vec::new(),
-            view_payloads: Vec::new(),
+        self.project_root = Some(project_root.to_path_buf());
+        let mut out = match self.held_pump.take() {
+            Some(held) => self.still_wanted(held),
+            None => PumpOutput::empty(),
         };
+        let owed: Vec<u64> = std::mem::take(&mut self.flush_owed).into_iter().collect();
+        for id in owed {
+            if self.get(TabId(id)).is_some_and(|t| !t.turn_running()) && !self.moving.contains(&id) {
+                out.turn_ended.push(TabId(id));
+            }
+        }
         // A turn a send started since the last pump (a legacy turn begins this way) is seen here.
         self.sync_presence();
         // Before this tick's events: a base that landed by now is not pending for them.
@@ -2538,6 +2668,9 @@ impl TabSet {
             rules: &self.rules,
             ui_wake: self.ui_wake.as_ref(),
             retiring: &mut self.retiring,
+            starting: &mut self.starting,
+            starting_since: &mut self.starting_since,
+            held_sends: &self.pending_sends,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]
@@ -2546,6 +2679,11 @@ impl TabSet {
             before_resync_snapshot: &mut self.before_resync_snapshot,
         };
         for tab in &mut self.tabs {
+            // A tab frozen for a move delivers nothing more here: its last pump ran at the freeze, and
+            // whatever it folds from now on is the other window's to deliver.
+            if self.moving.contains(&tab.id.0) {
+                continue;
+            }
             let is_active = tab.id == active;
             // `TabSet::is_shown`, read off the tab itself: the set is borrowed by this loop.
             let in_a_page = is_active || !tab.view.is_base();
@@ -2556,6 +2694,12 @@ impl TabSet {
             };
             Self::pump_tab(tab, &mut tick, review.as_deref_mut(), place, &mut out);
         }
+        // A start whose tab is gone or no longer holds a session is over.
+        let tabs = &self.tabs;
+        self.starting
+            .retain(|id| tabs.iter().any(|t| t.id.0 == *id && t.live().is_some()));
+        let starting = &self.starting;
+        self.starting_since.retain(|id, _| starting.contains(id));
         // A `TurnStarted` folded in this pump.
         self.sync_presence();
         out
@@ -2616,6 +2760,14 @@ impl TabSet {
         let covered = backend.take_ui_snapshot_revision();
         #[cfg(test)]
         let covered = covered.filter(|_| !tick.redeliver_covered);
+        Self::end_start_if_over(
+            tab.id,
+            backend,
+            &delivery,
+            tick.starting,
+            tick.starting_since,
+            tick.held_sends,
+        );
         #[cfg(any(test, feature = "test-support"))]
         tab.gate_log.extend(answered_for_you.gate_answers);
         // What the fast path answered, what a saved rule answered and the CLI prompts answered
@@ -3007,8 +3159,20 @@ impl TabSet {
         if place.is_active {
             out.first_text |= arm.saw_first_text;
             if let Some((payload, class)) = arm.delivered {
-                out.active_payload = Some(payload);
-                out.active_class = class;
+                if out.active_payload.is_some() {
+                    // A move's last pump already left this page a payload, which goes first: this one
+                    // follows it, addressed to the same page.
+                    out.view_payloads.push(ShownPayload {
+                        view: ViewId::BASE,
+                        tab: tab.id,
+                        payload,
+                        class,
+                        first_text: arm.saw_first_text,
+                    });
+                } else {
+                    out.active_payload = Some(payload);
+                    out.active_class = class;
+                }
             }
         } else if let Some((payload, class)) = arm.delivered {
             out.view_payloads.push(ShownPayload {
@@ -3379,6 +3543,9 @@ impl TabSet {
         now_ms: u64,
         steerable: bool,
     ) -> Result<usize, String> {
+        if self.moving.contains(&id.0) {
+            return Err(MOVING.to_string());
+        }
         let tab = self.get_mut(id).ok_or_else(|| format!("no tab {}", id.0))?;
         if tab.pending_handoff.is_some() {
             return Err("this tab is being handed off to a terminal".to_string());
@@ -3413,6 +3580,9 @@ impl TabSet {
     /// waiting does not stop it: the agent reads the message once that call is answered, sooner than the
     /// turn's end, and the card keeps its own keys. Whether the queue changed.
     pub fn steer_held(&mut self, id: TabId, now_ms: u64, shown_turn: Option<&str>) -> bool {
+        if self.moving.contains(&id.0) {
+            return false;
+        }
         let mut next = self.next_steer;
         let Some(tab) = self.get_mut(id) else { return false };
         let mut changed = tab.settle_steered();
@@ -3485,60 +3655,151 @@ impl TabSet {
     /// Read delivery outcomes and the active turn under one projection lock. Separate reads could
     /// straddle a delivery and turn completion, making a read message look unreported and sending it twice.
     pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
-        let tab = self.get_mut(id)?;
-        if tab.session.queue.is_empty() || tab.pending_handoff.is_some() {
+        // A turn already starting in the tab takes the queue at its end, as a running turn does: sent
+        // now, the queue would be a second turn the agent refuses.
+        if self.starting.contains(&id.0) || self.pending_sends.contains_key(&id.0) || !self.queue_can_go(id) {
             return None;
+        }
+        let gate = self.begin_turn_send(id);
+        match self.send_when_allowed(gate, moving::TurnSend::Queue)? {
+            Sent::Flushed { flush, .. } => Some(flush),
+            Sent::First { .. } | Sent::Prompt { .. } | Sent::NotSent { .. } => None,
+        }
+    }
+
+    /// Whether the queue of `id` can go out as a turn now: it holds something, the tab is live and
+    /// idle with no card waiting, and it is not handed off or moving. Settles what the agent reported
+    /// about the messages put into its turn first, under the same hold of the projection.
+    fn queue_can_go(&mut self, id: TabId) -> bool {
+        if self.moving.contains(&id.0) {
+            return false;
+        }
+        let Some(tab) = self.get_mut(id) else {
+            return false;
+        };
+        if tab.session.queue.is_empty() || tab.pending_handoff.is_some() {
+            return false;
         }
         {
             let TabBackend::Live(backend) = &tab.backend else {
-                return None;
+                return false;
             };
             let projection = backend.projection();
             settle_against(&mut tab.session.queue, &mut tab.session.queue_note, &projection);
             if projection.active_turn_id.is_some() || !projection.pending_permissions.is_empty() {
-                return None;
+                return false;
             }
         }
-        if tab.session.queue.is_empty() {
-            return None;
-        }
-        if !tab.session.queue.iter().all(Queued::is_held) {
-            eprintln!(
-                "[agent_panel] tab {}: the agent never said whether it read a message sent into its turn; it is sent again",
-                tab.id.0
-            );
-            for item in tab.session.queue.iter_mut() {
-                item.state = QueuedState::Held;
+        !tab.session.queue.is_empty()
+    }
+
+    /// The one place a turn of Eitri's goes out to an agent: the tab's queue as one turn, or a new
+    /// session's first message. Takes the [`SendGate`] that let it go, which only
+    /// [`TabSet::begin_turn_send`] makes, so no turn reaches an agent without its tab having entered
+    /// `starting` first. `None` when the queue can no longer go (a turn started meanwhile, the tab
+    /// left): its start is over, and the queue waits as it would have.
+    fn release_turn_send(&mut self, gate: SendGate, what: moving::TurnSend) -> Option<Sent> {
+        let id = gate.tab();
+        let sent = match what {
+            moving::TurnSend::Queue => {
+                if !self.queue_can_go(id) {
+                    self.end_start_of(&gate);
+                    return None;
+                }
+                let tab = self.get_mut(id).expect("checked by queue_can_go");
+                if !tab.session.queue.iter().all(Queued::is_held) {
+                    eprintln!(
+                        "[agent_panel] tab {}: the agent never said whether it read a message sent into its turn; it is sent again",
+                        tab.id.0
+                    );
+                    for item in tab.session.queue.iter_mut() {
+                        item.state = QueuedState::Held;
+                    }
+                }
+                let wire = tab
+                    .session
+                    .queue
+                    .iter()
+                    .map(|q| q.wire.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let typed = tab
+                    .session
+                    .queue
+                    .iter()
+                    .map(|q| q.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let trace = crate::turn_trace::TurnTrace::start();
+                let mode = tab.mode;
+                let outcome = tab.live_mut().expect("checked above").send_turn_in(&wire, &typed, mode);
+                match &outcome {
+                    Ok(_) => {
+                        tab.session.queue.clear();
+                        tab.session.queue_error = None;
+                        tab.session.queue_note = None;
+                        tab.session.turn_trace = trace;
+                    }
+                    Err(error) => tab.session.queue_error = Some(error.message.clone()),
+                }
+                tab.session.was_running = tab.turn_running();
+                let failed = outcome.is_err();
+                if failed {
+                    self.end_start_of(&gate);
+                }
+                Sent::Flushed {
+                    tab: id,
+                    flush: Flush { typed, outcome },
+                }
             }
-        }
-        let wire = tab
-            .session
-            .queue
-            .iter()
-            .map(|q| q.wire.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let typed = tab
-            .session
-            .queue
-            .iter()
-            .map(|q| q.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let trace = crate::turn_trace::TurnTrace::start();
-        let mode = tab.mode;
-        let outcome = tab.live_mut().expect("checked above").send_turn_in(&wire, &typed, mode);
-        match &outcome {
-            Ok(_) => {
-                tab.session.queue.clear();
-                tab.session.queue_error = None;
-                tab.session.queue_note = None;
-                tab.session.turn_trace = trace;
+            moving::TurnSend::First { request_id, turn } => {
+                let outcome = self.send_one(&gate, &turn);
+                Sent::First {
+                    tab: id,
+                    request_id,
+                    typed: turn.typed,
+                    outcome,
+                }
             }
-            Err(error) => tab.session.queue_error = Some(error.message.clone()),
+            moving::TurnSend::Prompt { request_id, page, turn } => {
+                let outcome = self.send_one(&gate, &turn);
+                Sent::Prompt {
+                    tab: id,
+                    page,
+                    request_id,
+                    typed: turn.typed,
+                    outcome,
+                }
+            }
+        };
+        Some(sent)
+    }
+
+    /// One message of `id`, as it was composed, sent as its own turn under the tab's mode, traced from
+    /// now. Only [`TabSet::release_turn_send`] calls it, once the gate let the message go.
+    fn send_one(&mut self, gate: &SendGate, turn: &FirstTurn) -> Result<(), BackendError> {
+        let id = gate.tab();
+        let outcome = match self.get_mut(id) {
+            Some(tab) => {
+                tab.session.turn_trace = crate::turn_trace::TurnTrace::start();
+                let mode = tab.mode;
+                match tab.live_mut() {
+                    Some(backend) => backend.send_turn_in(&turn.wire, &turn.typed, mode),
+                    None => Err(BackendError {
+                        message: "no active session".to_string(),
+                        benign: true,
+                    }),
+                }
+            }
+            None => Err(BackendError {
+                message: format!("no tab {}", id.0),
+                benign: true,
+            }),
+        };
+        if outcome.is_err() {
+            self.end_start_of(gate);
         }
-        tab.session.was_running = tab.turn_running();
-        Some(Flush { typed, outcome })
+        outcome
     }
 
     /// The tab's review draft (memory only).
@@ -3567,6 +3828,9 @@ impl TabSet {
 
     /// Queue nonempty text, then interrupt a running turn or flush the queue.
     pub fn send_now(&mut self, id: TabId, text: &str, wire: String, now_ms: u64) -> Result<SendNow, String> {
+        if self.moving.contains(&id.0) {
+            return Err(MOVING.to_string());
+        }
         if !text.trim().is_empty() {
             self.queue_message(id, text, wire, now_ms, true)?;
         }
@@ -3731,13 +3995,16 @@ impl TabSet {
             }
         }
         let retiring = &mut self.retiring;
-        let removed = std::mem::take(&mut self.tabs)
+        let removed: Vec<RemovedTab> = std::mem::take(&mut self.tabs)
             .into_iter()
             .map(|mut tab| {
                 let retired = tab.retire_live(retiring);
                 RemovedTab { tab, retired }
             })
             .collect();
+        for tab in &removed {
+            self.forget_move_state(tab.tab.id);
+        }
         self.sync_presence();
         removed
     }
@@ -4336,14 +4603,14 @@ fn grant(plan: RestorePlan, policy: BypassPolicy, asked: bool) -> RestoreGo {
 /// and such a card has no id for the ordinary "same id" removal to find. Equality is exact (`Value`
 /// equality, which ignores object key order), as `HumanApprovals` compares calls: small, short-lived
 /// sets, and no canonical form to get wrong.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CandidateCall {
     tool_name: String,
     input: serde_json::Value,
 }
 
 /// Which note a candidate becomes on its call's row once the call completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 enum NoteKind {
     /// A saved prefix rule answered the call's gate: "allowed by rule `Bash(npm ci *)`".
     Rule,
@@ -4363,7 +4630,7 @@ impl NoteKind {
 }
 
 /// What one candidate turns into, and the call a later card is matched against by content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum NoteCandidate {
     Rule { rule: String, call: CandidateCall },
     AutoEdit(CandidateCall),
@@ -4432,9 +4699,30 @@ impl NoteReport {
 /// turns it into its note ([`NoteLedger::fold`], [`NoteLedger::resync`]); a later card for the same
 /// call drops a gate's candidate, since a human answered too; and the whole ledger goes with the
 /// session that answered ([`NoteLedger::clear`]).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct NoteLedger {
+    /// Written as a list of entries: a JSON object's keys are strings, and these keys are pairs.
+    #[serde(with = "ledger_entries")]
     candidates: std::collections::BTreeMap<(String, NoteKind), NoteCandidate>,
+}
+
+/// [`NoteLedger::candidates`] as a list of `(key, candidate)` entries, in key order.
+mod ledger_entries {
+    use super::{NoteCandidate, NoteKind};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    type Entries = BTreeMap<(String, NoteKind), NoteCandidate>;
+
+    pub(super) fn serialize<S: Serializer>(entries: &Entries, serializer: S) -> Result<S::Ok, S::Error> {
+        entries.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Entries, D::Error> {
+        Ok(Vec::<((String, NoteKind), NoteCandidate)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 impl NoteLedger {
@@ -4674,6 +4962,10 @@ struct PumpTick<'a> {
     rules: &'a agent::PrefixRules,
     ui_wake: Option<&'a agent::UiWake>,
     retiring: &'a mut RetiringCounts,
+    starting: &'a mut BTreeSet<u64>,
+    starting_since: &'a mut BTreeMap<u64, u64>,
+    /// The prompts held for the presence: their tabs stay in `starting` whatever is folded.
+    held_sends: &'a BTreeMap<u64, moving::PendingSend>,
     #[cfg(test)]
     after_drain: &'a mut Option<BackendSeam>,
     #[cfg(test)]

@@ -261,6 +261,16 @@ impl Kernel {
         })
     }
 
+    /// Names this window for Lua before `init.lua` runs: `eitri.window` (`"1"`, `"2"`, or nil for a
+    /// window whose pair another window holds) and `eitri.layout.get().window`. Both windows run the
+    /// same `init.lua`, so this is how it keeps a side effect to one of them.
+    pub fn set_window(&self, role: crate::window_link::pair::Role) -> mlua::Result<()> {
+        let name = super::layout::window_name(role);
+        self.layout.borrow_mut().set_window(name);
+        let eitri: Table = self.lua.globals().get("eitri")?;
+        eitri.set("window", name)
+    }
+
     pub fn emit(&self, event_name: &str) {
         super::event::emit(&self.lua, &self.events, event_name, Value::Nil);
     }
@@ -462,6 +472,34 @@ mod tests {
         assert_eq!(kernel.init_refusal(), None);
         assert_eq!(kernel.commands.borrow().refused(), None);
         assert_eq!(kernel.layout.borrow().default_tree(), None);
+    }
+
+    #[test]
+    fn eitri_window_is_readable_from_init_lua() {
+        use crate::window_link::pair::Role;
+        let scratch = crate::plugin::test_support::Scratch::new("lua-eitri-window");
+        let init = scratch.0.join("init.lua");
+        std::fs::write(
+            &init,
+            "eitri.config.set('seen', tostring(eitri.window))\n\
+             if eitri.window == '2' then eitri.config.set('only.second', true) end\n",
+        )
+        .unwrap();
+        for (role, seen, only_second) in [
+            (Some(Role::Main), "1", None),
+            (Some(Role::Second), "2", Some("true")),
+            (Some(Role::Unpaired), "nil", None),
+            (None, "nil", None),
+        ] {
+            let kernel = Kernel::new(scratch.0.clone(), refuse_panels).unwrap();
+            if let Some(role) = role {
+                kernel.set_window(role).unwrap();
+            }
+            assert_eq!(kernel.run_and_check_init_file(&init), Ok(()));
+            let config = kernel.config.borrow();
+            assert_eq!(config.get("seen"), Some(seen), "{role:?}");
+            assert_eq!(config.get("only.second"), only_second, "{role:?}");
+        }
     }
 
     #[test]

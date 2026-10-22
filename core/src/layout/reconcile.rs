@@ -19,7 +19,8 @@
 //!    skipping modules already floating. The base terminal goes hidden below the editor's own
 //!    leaf; registered Lua panels follow their declared positions.
 //! 5. Keeps hidden state only for modules still present and float memory only for remaining
-//!    modules other than the editor.
+//!    modules other than the editor. A module away in the other window ([`reconcile_away`]) is kept
+//!    where it is, like a retired editor: hidden, never given the keys, and not counted as on screen.
 //! 6. Gives the keys to a shown saved focus, otherwise where a first launch gives them: the
 //!    editor, else the first registered Lua panel placed in its place, else the first module
 //!    in view. Tabbed and stacked containers keep their drawn child, so choosing focus never
@@ -98,7 +99,35 @@ pub fn reconcile_floating(
     lua: &[ModuleDecl],
     instances: &[ModuleId],
 ) -> Result<Reconciled, ReconcileError> {
-    reconcile_with(root, floats, memory, hidden, focus, lua, instances, false)
+    reconcile_with(
+        root,
+        floats,
+        memory,
+        hidden,
+        &BTreeSet::new(),
+        focus,
+        lua,
+        instances,
+        false,
+    )
+}
+
+/// [`reconcile_floating`] for a window some of whose modules the other window of the pair holds:
+/// each of `away` this window has a module for keeps its place, is away in the result
+/// ([`Layout::set_away`]), and never takes the keys; `hidden` is still what the user hid, so one that
+/// comes back is shown or hidden as it was. An id in `away` the tree does not hold is ignored.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_away(
+    root: Node,
+    floats: Vec<Float>,
+    memory: BTreeMap<ModuleId, FloatRect>,
+    hidden: &BTreeSet<ModuleId>,
+    away: &BTreeSet<ModuleId>,
+    focus: Option<&ModuleId>,
+    lua: &[ModuleDecl],
+    instances: &[ModuleId],
+) -> Result<Reconciled, ReconcileError> {
+    reconcile_with(root, floats, memory, hidden, away, focus, lua, instances, false)
 }
 
 /// Reconciles a Lua default or a template, keeping the instances -- terminals and chat views -- named
@@ -134,6 +163,7 @@ pub fn reconcile_default_floating_with(
         floats,
         BTreeMap::new(),
         &BTreeSet::new(),
+        &BTreeSet::new(),
         None,
         lua,
         &instances,
@@ -141,11 +171,13 @@ pub fn reconcile_default_floating_with(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_with(
     root: Node,
     floats: Vec<Float>,
     memory: BTreeMap<ModuleId, FloatRect>,
     hidden: &BTreeSet<ModuleId>,
+    away: &BTreeSet<ModuleId>,
     focus: Option<&ModuleId>,
     lua: &[ModuleDecl],
     instances: &[ModuleId],
@@ -250,11 +282,17 @@ fn reconcile_with(
             decl.id, decl.placement
         ));
     }
+    let away: BTreeSet<ModuleId> = away
+        .iter()
+        .filter(|id| root.leaves().contains(id) || kept.iter().any(|float| float.id == **id))
+        .cloned()
+        .collect();
+    let on_screen = |id: &ModuleId| !hidden.contains(id) && !away.contains(id);
     let shown: Vec<ModuleId> = root
         .leaves()
         .into_iter()
         .chain(kept.iter().map(|float| float.id.clone()))
-        .filter(|id| !hidden.contains(id))
+        .filter(|id| on_screen(id))
         .collect();
     let mut kept_memory = BTreeMap::new();
     for (id, rect) in memory {
@@ -272,16 +310,20 @@ fn reconcile_with(
         Some(f) if shown.contains(f) => f.clone(),
         _ => {
             let mut in_view = Vec::new();
-            drawn_leaves(&root, &|id| !hidden.contains(id), &mut in_view);
+            drawn_leaves(&root, &on_screen, &mut in_view);
             in_view.extend(
                 kept.iter()
-                    .filter(|float| !hidden.contains(&float.id))
+                    .filter(|float| on_screen(&float.id))
                     .map(|float| float.id.clone()),
             );
             first_focus(&in_view, lua).ok_or(ReconcileError::NothingVisible)?
         }
     };
-    let layout = Layout::from_parts_floating(root, kept, hidden, focus, kept_memory).map_err(ReconcileError::Layout)?;
+    let mut layout =
+        Layout::from_parts_floating(root, kept, hidden, focus, kept_memory).map_err(ReconcileError::Layout)?;
+    for id in &away {
+        layout.set_away(id, true).map_err(ReconcileError::Layout)?;
+    }
     Ok(Reconciled { layout, notes })
 }
 
@@ -1080,6 +1122,87 @@ mod tests {
         assert!(
             !layout.modules().contains(&ModuleId::parse("agent#3").unwrap()),
             "nor places it"
+        );
+    }
+
+    #[test]
+    fn reconcile_tray_hint_and_select_number_skip_an_away_module() {
+        use crate::hint::{order_targets, Slot, WindowLayout};
+        let side = ModuleId::lua("side");
+        let lua = [ModuleDecl {
+            id: side.clone(),
+            placement: Placement::RightOfRoot,
+        }];
+        let r = reconcile_away(
+            saved_with_side(),
+            Vec::new(),
+            BTreeMap::new(),
+            &set(&[agent()]),
+            &set(&[term(), ModuleId::lua("not-here")]),
+            Some(&term()),
+            &lua,
+            &[],
+        )
+        .unwrap();
+        let layout = &r.layout;
+        assert!(
+            layout.leaves().contains(&term()),
+            "its leaf is kept where the file had it"
+        );
+        assert_eq!(layout.away(), set(&[term()]), "an away id with no leaf here is ignored");
+        assert_eq!(layout.focus(), &editor(), "the keys never start on an away module");
+
+        let tray = super::super::tray::tray(layout);
+        assert!(tray.contains(&agent()), "a hidden module has a chip");
+        assert!(!tray.contains(&term()), "an away one has none");
+
+        let numbered: Vec<ModuleId> = super::super::number::number_plan(layout)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(numbered, vec![editor(), side.clone()]);
+
+        let window = WindowLayout {
+            top_visible: Vec::new(),
+            modules: layout.leaves().into_iter().map(|id| (id, true)).collect(),
+        }
+        .skipping_away(&layout.away());
+        let order = order_targets(&window);
+        let slots: Vec<Slot> = order.before.iter().chain(&order.after).cloned().collect();
+        assert!(
+            !slots.contains(&Slot::Module(term())),
+            "HINT labels nothing the other window holds"
+        );
+        assert!(slots.contains(&Slot::Module(side)));
+
+        let mut back = r.layout.clone();
+        back.set_away(&term(), false).unwrap();
+        assert!(back.is_shown(&term()), "it was not hidden, so it comes back shown");
+        assert!(back.hidden().contains(&agent()), "and the user's own hide stays");
+
+        assert_eq!(
+            reconcile_away(
+                leaf(editor()),
+                vec![Float {
+                    id: agent(),
+                    rect: FloatRect {
+                        cx: 0.5,
+                        cy: 0.5,
+                        w: 400,
+                        h: 300
+                    },
+                    scratch: false
+                }],
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &set(&[editor()]),
+                None,
+                &[],
+                &[],
+            )
+            .map(|r| r.layout.focus().clone()),
+            Ok(agent()),
+            "the keys go to what this window shows, not to the away editor"
         );
     }
 }

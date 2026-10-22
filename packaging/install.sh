@@ -30,7 +30,7 @@ NV_SIGNATURE_NAMESPACE='eitri-release'
 NV_GTK_FLOOR_MINOR=14
 NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.10.0'
-NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff'
+NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).

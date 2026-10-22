@@ -3,7 +3,7 @@
 //! in the record or named as not moved. This reads the files that build those records as source text
 //! and fails if any such destructure ends in `..`, or if one it guards is gone.
 
-use eitri_core::source_scan::{braced, code_only, read_required, word_ends};
+use eitri_core::source_scan::{braced, code_only, functions, read_required, word_ends};
 
 /// Each file that builds a move record, and each struct it destructures there.
 const DESTRUCTURES: &[(&str, &str)] = &[
@@ -18,6 +18,15 @@ const DESTRUCTURES: &[(&str, &str)] = &[
     ("agent/src/providers/claude_sidecar/moving.rs", "WatchMark"),
     ("agent/src/providers/claude_sidecar/mod.rs", "WatchState"),
     ("agent/src/providers/claude_sidecar/steer.rs", "SteerGate"),
+    // The tab's own record, out of the tab and its session state and back into a tab.
+    ("core/src/tab_set/moving.rs", "Tab"),
+    ("core/src/tab_set/moving.rs", "SessionState"),
+    ("core/src/tab_set/moving.rs", "TabHandoff"),
+    // The backend around an external agent's conversation, and its part of the record.
+    ("core/src/agent_backend.rs", "ExternalConversation"),
+    ("core/src/agent_backend.rs", "BackendHandoff"),
+    // The panel's per-tab record, taken up in the window the tab lands in.
+    ("panel/src/agent_panel.rs", "PanelTabHandoff"),
 ];
 
 /// Each file that builds a Codex or ACP provider's move record, and each struct it destructures there,
@@ -98,6 +107,35 @@ fn the_provider_handoffs_name_every_field() {
             "{path} destructures `{name}` with a rest pattern, so a new field of the provider would move silently or not at all: {open:?}"
         );
     }
+}
+
+/// The panel's state holds every page's and window's fields beside the tab's, and other code reads a
+/// few of them with a rest pattern; the one that builds the tab's record names every field.
+#[test]
+fn the_panels_tab_record_names_every_field_of_the_panels_state() {
+    let path = "panel/src/agent_panel.rs";
+    let code = code_only(&read_required(path).text);
+    // The record's builder, not the handle's method of the same name that calls it.
+    let builders: Vec<&str> = functions(&code, "panel_tab_handoff")
+        .into_iter()
+        .filter(|body| !let_patterns(body, "AgentPanelState").is_empty())
+        .collect();
+    assert_eq!(
+        builders.len(),
+        1,
+        "{path} no longer builds the panel's tab record in one `panel_tab_handoff` that destructures its state"
+    );
+    let patterns = let_patterns(builders[0], "AgentPanelState");
+    assert!(
+        !patterns.is_empty(),
+        "{path}'s `panel_tab_handoff` no longer destructures `AgentPanelState`"
+    );
+    let open = with_rest(&patterns);
+    assert!(
+        open.is_empty(),
+        "{path}'s `panel_tab_handoff` destructures `AgentPanelState` with a rest pattern, so a new per-tab field \
+         would stay behind silently: {open:?}"
+    );
 }
 
 #[test]

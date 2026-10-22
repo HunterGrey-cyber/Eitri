@@ -9,6 +9,8 @@
     return;
   }
   var LIMIT = 256 * 1024;
+  // A saved state may itself be 256 KiB, so its message gets room for what wraps it; the host checks the state.
+  var SAVED_LIMIT = LIMIT + 1024;
   var pending = new Map();
   var listeners = new Map();
   // A reply may run in a different document after navigation, including a cached page's restore.
@@ -129,8 +131,11 @@
         return;
       }
       // The host counts UTF-8 bytes.
-      if (new TextEncoder().encode(text).length > LIMIT) {
-        reject(hostError("too_large", "a message may be at most 256 KiB"));
+      var saved = verb === "page.saved";
+      if (new TextEncoder().encode(text).length > (saved ? SAVED_LIMIT : LIMIT)) {
+        reject(
+          hostError("too_large", saved ? "a saved state may be at most 256 KiB" : "a message may be at most 256 KiB")
+        );
         return;
       }
       // No timer here: the host answers every call, at the latest with an error at the call's deadline (the

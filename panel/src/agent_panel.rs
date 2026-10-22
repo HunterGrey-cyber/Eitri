@@ -1297,6 +1297,21 @@ impl AgentPanelHandle {
 }
 
 impl AgentPanelHandle {
+    /// For a move of `tab` to the other window: the panel's own record of the tab, or why it does not
+    /// move now.
+    pub fn panel_tab_handoff(&self, tab: TabId) -> Result<PanelTabHandoff, String> {
+        self.wake();
+        panel_tab_handoff(&self.state.borrow(), tab)
+    }
+
+    /// Takes up the panel's record of a tab another window moved here as `tab`.
+    pub fn adopt_panel_tab(&self, tab: TabId, handoff: PanelTabHandoff) {
+        self.wake();
+        adopt_panel_tab(&mut self.state.borrow_mut(), tab, handoff);
+    }
+}
+
+impl AgentPanelHandle {
     /// The tick's steady cadence: fast enough that streaming text feels live (a ~30-60fps cadence). The
     /// host runs the tick when [`run_tick`](Self::run_tick) and the wake say so, never sooner than this after
     /// the last one, and on this cadence only while something it acts on cannot say when it is ready
@@ -2528,6 +2543,10 @@ impl AgentPanelHandle {
             {
                 return Err("a tab is still being handed off to a terminal; kill the chat once that finishes");
             }
+            // Checked for every tab first, as above, so a refusal closes none of them.
+            if ids.iter().any(|id| state.tabs.is_moving(*id)) {
+                return Err("a tab is moving to the other window; kill the chat once that finishes");
+            }
             ids
         };
         self.run(|state, out| {
@@ -2795,6 +2814,17 @@ fn tick_send(
     for tab in pumped.queue_changed {
         send_queue(state, tab, out);
     }
+    // Prompts a linked window held until its presence marked their turns as running.
+    for sent in state.tabs.poll_turn_sends(std::time::Instant::now()) {
+        apply_sent(state, screen, sent, out);
+    }
+    // A held message whose tab left without `close_tab`, which answers it (the window closing), is
+    // answered by no one.
+    let tabs = &state.tabs;
+    state.owed.retain(|_, answer| match answer.what {
+        Owed::HeldPrompt(tab) => tabs.send_is_held(tab),
+        _ => true,
+    });
     // A turn ended in these tabs; their queued messages go out now.
     for tab in pumped.turn_ended {
         if let Some(flush) = state.tabs.flush_queue(tab) {
@@ -4432,6 +4462,9 @@ enum Owed {
     TrustCommand { tab: TabId, typed_in: ViewId },
     /// The terminal handoff of this tab, answered once its session's close has returned.
     Handoff(TabId),
+    /// A message of this tab typed in the page, held until the presence marks its turn as running:
+    /// answered when it goes out or is not sent. A tab has at most one held.
+    HeldPrompt(TabId),
 }
 
 /// One answer owed to a page.
@@ -6169,12 +6202,17 @@ fn collect_pending_starts(state: &mut AgentPanelState, screen: &Screen, out: &mu
             }
         }
     }
-    // A start that ended another way (its tab closed, or was reset into a new one) owes nothing.
+    // A start that ended another way (its tab closed, or was reset into a new one) owes nothing. A first
+    // message held for the presence is still owed to the page it came from, which may no longer show the
+    // tab.
     let tabs = &state.tabs;
     state.owed.retain(|_, answer| match answer.what {
-        Owed::StartPage(tab) => tabs
-            .get(tab)
-            .is_some_and(|t| matches!(t.backend(), TabBackend::Starting(_) | TabBackend::AwaitingTrust(_))),
+        Owed::StartPage(tab) => {
+            tabs.send_is_held(tab)
+                || tabs
+                    .get(tab)
+                    .is_some_and(|t| matches!(t.backend(), TabBackend::Starting(_) | TabBackend::AwaitingTrust(_)))
+        }
         _ => true,
     });
     finish_restore(state, out);
@@ -6258,19 +6296,312 @@ fn send_first_turn(
     turn: FirstTurn,
     out: &mut Outbox,
 ) {
-    let mut mode = eitri_core::agent_bridge::SessionModeChoice::Auto;
-    if let Some(t) = state.tabs.get_mut(tab) {
-        t.session.turn_trace = eitri_core::turn_trace::TurnTrace::start();
-        mode = t.mode();
+    // Through the tab set, which puts the tab in the running set before anything goes out; in a linked
+    // window the message may wait there for the presence, and the tick reports it then.
+    if let Some(sent) = state.tabs.send_first_turn(tab, request_id, turn) {
+        apply_sent(state, screen, sent, out);
     }
-    let outcome =
-        backend_for(&mut state.tabs, tab).and_then(|backend| backend.send_turn_in(&turn.wire, &turn.typed, mode));
+}
+
+/// What a turn the tab set let go did: a flushed queue, a first message (its `send_message` answered
+/// in the page it came from, unless that page has closed), or one the presence could not mark as
+/// running, which waits at the head of its queue.
+fn apply_sent(state: &mut AgentPanelState, screen: &Screen, sent: eitri_core::tab_set::Sent, out: &mut Outbox) {
+    use eitri_core::tab_set::Sent;
+    match sent {
+        Sent::Flushed { tab, flush } => apply_flush(state, screen, tab, flush, out),
+        Sent::First {
+            tab,
+            request_id,
+            typed,
+            outcome,
+        } => {
+            if outcome.is_ok() {
+                title_from_first_prompt(state, tab, &typed);
+            }
+            let view = start_answer_dest(state, tab, &request_id).map(|sent_from| dest_view(state, sent_from));
+            apply_outcome(
+                state,
+                screen,
+                tab,
+                view.map(|view| (view, request_id.as_str())),
+                outcome,
+                out,
+            );
+        }
+        Sent::Prompt {
+            tab,
+            page,
+            request_id,
+            typed,
+            outcome,
+        } => {
+            let page = held_prompt_page(state, tab, &request_id, page);
+            prompt_sent(
+                state,
+                screen,
+                tab,
+                page.map(|page| (page, request_id.as_str())),
+                &typed,
+                outcome,
+                out,
+            );
+        }
+        Sent::NotSent {
+            tab,
+            note,
+            request_id,
+            page,
+        } => {
+            if let Some(request_id) = request_id {
+                let view = match page {
+                    Some(page) => held_prompt_page(state, tab, &request_id, page),
+                    None => start_answer_dest(state, tab, &request_id).map(|sent_from| dest_view(state, sent_from)),
+                };
+                let refused = Err(eitri_core::agent_backend::BackendError {
+                    message: note,
+                    benign: true,
+                });
+                apply_outcome(
+                    state,
+                    screen,
+                    tab,
+                    view.map(|view| (view, request_id.as_str())),
+                    refused,
+                    out,
+                );
+            }
+            send_queue(state, tab, out);
+        }
+    }
+}
+
+/// A typed message's outcome: a sent one may title the tab, and the command's result goes to `request`'s
+/// page (none when that page has gone).
+fn prompt_sent(
+    state: &mut AgentPanelState,
+    screen: &Screen,
+    tab: TabId,
+    request: Option<(ViewId, &str)>,
+    typed: &str,
+    outcome: Result<(), BackendError>,
+    out: &mut Outbox,
+) {
     if outcome.is_ok() {
-        title_from_first_prompt(state, tab, &turn.typed);
+        title_from_first_prompt(state, tab, typed);
     }
-    // The `send_message` is answered in the page it came from, unless that page has closed.
-    let view = start_answer_dest(state, tab, request_id).map(|sent_from| dest_view(state, sent_from));
-    apply_outcome(state, screen, tab, view.map(|view| (view, request_id)), outcome, out);
+    apply_outcome(state, screen, tab, request, outcome, out);
+}
+
+/// The page a held message's result goes to, as the ledger has it: its page, or `None` once that page
+/// has gone (a page reusing its view numbers its requests afresh, so the old id would name one of its
+/// own). The entry is spent. A message with no entry was never held, and is answered to `page`.
+fn held_prompt_page(state: &mut AgentPanelState, tab: TabId, request_id: &str, page: ViewId) -> Option<ViewId> {
+    match state
+        .owed
+        .take_where(|answer| answer.what == Owed::HeldPrompt(tab) && answer.request_id == request_id)
+    {
+        Some(asked) => asked.page,
+        None => Some(page),
+    }
+}
+
+/// One turn of a tab's review hint, as it crosses to the other window: the tab it names is renumbered
+/// there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MovedHint {
+    turn: u32,
+    files: usize,
+}
+
+/// What the panel keeps for a tab beyond the tab set, as the tab moves to the other window: its
+/// status-band hints, shown or not yet shown, which the page it lands in is owed as a reloaded document
+/// would be. Not moved: a scratch edit out in the editor (the editor's window sends its draft to the
+/// tab's holder) and review jobs on workers (they finish where they run and report to the holder). A
+/// tab with a start in flight, an `r` continuing a session in it, or a review request of its page not
+/// yet answered does not move; each lasts seconds at most.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelTabHandoff {
+    shown_hints: Vec<MovedHint>,
+    review_hints: Vec<MovedHint>,
+}
+
+impl PanelTabHandoff {
+    /// The record as it crosses the link.
+    pub fn to_value(&self) -> serde_json::Value {
+        let hints = |hints: &[MovedHint]| {
+            hints
+                .iter()
+                .map(|h| serde_json::json!({ "turn": h.turn, "files": h.files }))
+                .collect::<Vec<_>>()
+        };
+        serde_json::json!({
+            "shown_hints": hints(&self.shown_hints),
+            "review_hints": hints(&self.review_hints),
+        })
+    }
+
+    /// The record read back; anything but the shape [`Self::to_value`] writes is refused.
+    pub fn from_value(value: &serde_json::Value) -> Result<PanelTabHandoff, String> {
+        let hints = |key: &str| -> Result<Vec<MovedHint>, String> {
+            let list = value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("the panel's record has no `{key}` list"))?;
+            list.iter()
+                .map(|hint| {
+                    let turn = hint.get("turn").and_then(serde_json::Value::as_u64);
+                    let files = hint.get("files").and_then(serde_json::Value::as_u64);
+                    match (
+                        turn.and_then(|t| u32::try_from(t).ok()),
+                        files.and_then(|f| usize::try_from(f).ok()),
+                    ) {
+                        (Some(turn), Some(files)) => Ok(MovedHint { turn, files }),
+                        _ => Err(format!("a hint in `{key}` is not a turn and a file count")),
+                    }
+                })
+                .collect()
+        };
+        Ok(PanelTabHandoff {
+            shown_hints: hints("shown_hints")?,
+            review_hints: hints("review_hints")?,
+        })
+    }
+}
+
+/// The panel's record of `tab` for a move, or why the tab does not move now. Every field of the panel's
+/// state is named: one added later does not compile here until it is placed in the record or named as
+/// not the tab's.
+fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<PanelTabHandoff, String> {
+    let AgentPanelState {
+        // The tab's own state beyond the tab set.
+        shown_hints,
+        review_hints,
+        // Refusals: each is the tab's for a few seconds at most.
+        owed,
+        resume_after,
+        // Named, not moved: a scratch edit is out in the editor, whose window sends the draft to the
+        // tab's holder; a review job finishes where it runs and reports to the holder.
+        pending_edits: _,
+        review_jobs: _,
+        // The tab itself moves through the tab set's own record.
+        tabs,
+        // The window's, not the tab's.
+        document: _,
+        host: _,
+        backend_kind: _,
+        project_dir: _,
+        canonical_project_dir: _,
+        prefs_dir: _,
+        editor_context: _,
+        supervisor: _,
+        supervisor_pending: _,
+        shutting_down: _,
+        wake: _,
+        last_tick: _,
+        #[cfg(any(test, feature = "test-support"))]
+            ticks_run: _,
+        theme: _,
+        keymap_help: _,
+        pages: _,
+        tabs_recorded: _,
+        view_empty_hook: _,
+        show_view_hook: _,
+        emptied_views: _,
+        empty_views_judged: _,
+        chooser_view: _,
+        typing_cadence: _,
+        editor_has_keys: _,
+        thinking_display: _,
+        hint_hook: _,
+        answer_gate: _,
+        coverage: _,
+        attention_hook: _,
+        reported_tabs: _,
+        scratch: _,
+        proposal_jobs: _,
+        review_hint: _,
+        review_enabled: _,
+        review_roots: _,
+        editor_request_hook: _,
+        editor_rpc: _,
+        review_flow: _,
+        review_editor: _,
+        editor_done_hook: _,
+        retiring: _,
+        history_dir: _,
+        rules_dir: _,
+        history: _,
+        editor_link: _,
+        tab_verb_hook: _,
+        nav_fallthrough_hook: _,
+        keymap_closed_hook: _,
+        tab_memory: _,
+        titles: _,
+        hello_titles_stale: _,
+        chooser_listed: _,
+        chooser_titles_stale: _,
+        conversation_id: _,
+        restore_source: _,
+        restore_policy: _,
+        bypass_by_config: _,
+        mode_remembered: _,
+        default_agent: _,
+        codex_command: _,
+        acp_agents: _,
+        start_notes: _,
+        restore_run: _,
+        toast_hook: _,
+        trust: _,
+        spawner: _,
+    } = state;
+    if tabs.get(tab).is_none() {
+        return Err(format!("no tab {}", tab.0));
+    }
+    let page = tabs.view_of(tab);
+    let owes = |what: &dyn Fn(&OwedAnswer) -> bool| owed.owed.values().any(what);
+    if owes(&|answer| answer.what == Owed::StartPage(tab)) {
+        return Err("its session is still starting".to_string());
+    }
+    if resume_after.contains_key(&tab) {
+        return Err("a session is being continued in it".to_string());
+    }
+    if owes(&|answer| answer.what == Owed::ReviewRequest && answer.page == Some(page)) {
+        return Err("a review its page asked for is still being worked out".to_string());
+    }
+    let of_tab = |hints: &[eitri_core::turn_review::ReviewHint]| {
+        hints
+            .iter()
+            .filter(|hint| hint.tab == tab.0)
+            .map(|hint| MovedHint {
+                turn: hint.turn,
+                files: hint.files,
+            })
+            .collect()
+    };
+    Ok(PanelTabHandoff {
+        shown_hints: of_tab(shown_hints),
+        review_hints: of_tab(review_hints),
+    })
+}
+
+/// Takes up the panel's record of a tab another window moved here, now `tab`: every hint it carries is
+/// owed to the page that shows it, which is sent them once it is ready.
+fn adopt_panel_tab(state: &mut AgentPanelState, tab: TabId, handoff: PanelTabHandoff) {
+    let PanelTabHandoff {
+        shown_hints,
+        review_hints,
+    } = handoff;
+    let hints: Vec<eitri_core::turn_review::ReviewHint> = shown_hints
+        .into_iter()
+        .chain(review_hints)
+        .map(|hint| eitri_core::turn_review::ReviewHint {
+            tab: tab.0,
+            turn: hint.turn,
+            files: hint.files,
+        })
+        .collect();
+    keep_newest_hint_per_tab(&mut state.review_hints, hints);
 }
 
 /// A tab with no title takes its first prompt's (`agent::persistence::title_from_prompt`, the rule
@@ -7200,7 +7531,7 @@ fn handle_inbound_message(
             // ...and no longer the tab's draft (a refusal puts it back in the box panel-side).
             state.tabs.note_sent(tab);
             enum Plan {
-                Sent(Result<(), BackendError>),
+                Send(FirstTurn),
                 Defer(FirstTurn),
                 Refused(&'static str),
             }
@@ -7210,26 +7541,24 @@ fn handle_inbound_message(
                 // `send_turn` on either path. A `None` context means the turn goes out exactly as
                 // the user typed it.
                 let composed = eitri_core::editor_context::compose_turn_text(&text, (state.editor_context)().as_ref());
+                let moving = state.tabs.is_moving(tab);
                 let t = state.tabs.get_mut(tab).expect("resolved above");
-                if t.pending_handoff.is_some() {
+                if moving {
+                    // Its record is taken: a turn or a start begun here would not move with it.
+                    Plan::Refused(eitri_core::tab_set::MOVING)
+                } else if t.pending_handoff.is_some() {
                     // Starting here would spawn a second `claude` alongside the one still being
                     // closed, in the same project.
                     Plan::Refused("the previous session is still being handed off to a terminal")
                 } else {
-                    let mode = t.mode();
                     match t.backend() {
-                        TabBackend::Live(_) => {
-                            let backend = t.live_mut().expect("matched as live");
-                            // Stamped before the call, so the trace's zero is the user's action
-                            // rather than the moment the backend got around to accepting it.
-                            let trace = eitri_core::turn_trace::TurnTrace::start();
-                            // `&text` second, and it is the user's own: the panel shows what was
-                            // typed, never the composed wire text. The tab's mode goes with it: an
-                            // external agent's turn runs under it.
-                            let outcome = backend.send_turn_in(&composed, &text, mode);
-                            t.session.turn_trace = trace;
-                            Plan::Sent(outcome)
-                        }
+                        // `typed` is the user's own: the panel shows what was typed, never the
+                        // composed wire text. The tab set sends it under the tab's mode (an external
+                        // agent's turn runs under it), traced from the send.
+                        TabBackend::Live(_) => Plan::Send(FirstTurn {
+                            wire: composed,
+                            typed: text.clone(),
+                        }),
                         // The session waits for the trust check (and, when it must, the question)
                         // before anything is spawned.
                         TabBackend::NotStarted => Plan::Defer(FirstTurn {
@@ -7243,12 +7572,28 @@ fn handle_inbound_message(
                 }
             };
             match plan {
-                Plan::Sent(outcome) => {
-                    if outcome.is_ok() {
-                        title_from_first_prompt(state, tab, &text);
+                // Through the tab set, which puts the tab in the running set before anything goes out; in a
+                // linked window the message may wait there for the presence, and the tick answers it then.
+                Plan::Send(turn) => match state.tabs.send_prompt(tab, &request_id, view, turn) {
+                    // Answered here, to this page: a refusal never reached the ledger, and must not
+                    // take a held message's entry that an earlier page numbered alike.
+                    Some(eitri_core::tab_set::Sent::Prompt { typed, outcome, .. }) => {
+                        prompt_sent(state, screen, tab, Some((view, &request_id)), &typed, outcome, &mut out);
                     }
-                    apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
-                }
+                    Some(eitri_core::tab_set::Sent::NotSent { note, .. }) => {
+                        let refused = Err(BackendError {
+                            message: note,
+                            benign: true,
+                        });
+                        apply_command_outcome(state, screen, view, tab, &request_id, refused, &mut out);
+                        send_queue(state, tab, &mut out);
+                    }
+                    Some(sent) => apply_sent(state, screen, sent, &mut out),
+                    // Held for the presence: the tick answers it, to this page if it is still there.
+                    None => {
+                        state.owed.owe(view, &request_id, Owed::HeldPrompt(tab));
+                    }
+                },
                 // The `command_result` is owed once the connect finishes and the first turn is
                 // sent (`collect_pending_starts`), or when the question is put off.
                 Plan::Defer(first_turn) => {
@@ -7318,7 +7663,15 @@ fn handle_inbound_message(
         }
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
-            let outcome = backend_for(&mut state.tabs, tab).and_then(AgentBackend::interrupt);
+            // A frozen tab's turn moves as it runs: stopped here, the record would not say so.
+            let outcome = if state.tabs.is_moving(tab) {
+                Err(BackendError {
+                    message: eitri_core::tab_set::MOVING.to_string(),
+                    benign: true,
+                })
+            } else {
+                backend_for(&mut state.tabs, tab).and_then(AgentBackend::interrupt)
+            };
             apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
         }
         InboundMessage::StopBackground { running, .. } => {
@@ -7377,6 +7730,12 @@ fn handle_inbound_message(
         }
         InboundMessage::HandoffToTerminal { .. } => {
             let tab = tab_of(target);
+            // Its session is the move's: handed to a terminal, the window it lands in would hold a
+            // closed one.
+            if state.tabs.is_moving(tab) {
+                refuse(&mut out, eitri_core::tab_set::MOVING);
+                return out;
+            }
             // The command is built from canonical state FIRST, while the session is still readable
             // -- ownership moves to the shutdown worker below and nothing here can read it after
             // that. Owned values rather than borrows because `prepare_handoff` is a pure function
@@ -8299,6 +8658,9 @@ fn tab_action_for(verb: TabVerbWire) -> TabAction {
 
 /// `y` to `prefix &`: `tabs::close_steps`, in order. The record is never deleted.
 ///
+/// **Refused while the tab moves to the other window** (`MOVING`): the agent is that window's to take
+/// up, and the close would interrupt and shut it down.
+///
 /// **Refused while the tab is handing off**: the close takes
 /// at most the sidecar's 10 s `close_session`, and the only thing it produces is the command the
 /// user asked to be shown. Closing the tab under it would drop the command and the
@@ -8306,7 +8668,8 @@ fn tab_action_for(verb: TabVerbWire) -> TabAction {
 ///
 /// A tab closed while it is still connecting has its `send_message`/`resume` answered with an
 /// error here, so the panel's in-flight record is closed and a first message comes back with its
-/// text; its connect is kept in `Retiring` and shut down when it finishes.
+/// text; its connect is kept in `Retiring` and shut down when it finishes. A message held for the
+/// presence (a first one or a composer's) is answered the same way, to the page that sent it.
 ///
 /// A tab bound to an extra view leaves that view empty: its page is sent its empty strip, and the
 /// window is told by the next tick (`on_view_empty`), never from inside a page's own message.
@@ -8319,10 +8682,22 @@ fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) -> Resul
     if state.tabs.get(tab).is_some_and(|t| t.pending_handoff.is_some()) {
         return Err("this tab is still being handed off to a terminal; close it once that finishes");
     }
+    // Its agent is being handed to the other window: an interrupt or a shutdown here would end the
+    // session that window is taking up. The move either lands there or is called off and the tab
+    // takes input again.
+    if state.tabs.is_moving(tab) {
+        return Err(eitri_core::tab_set::MOVING);
+    }
     // A wait for the tab's old backend goes with the tab; nothing will start in it.
     state.resume_after.remove(&tab);
     // Taken before the removal: a start asked from a page the tab has since left is answered there.
     let start_page = state.owed.take_where(|answer| answer.what == Owed::StartPage(tab));
+    // A message held for the presence goes with the tab, unsent: its command is answered like a start
+    // in flight, so its text comes back to the page that typed it.
+    let held = state
+        .tabs
+        .held_send_request(tab)
+        .map(|(request_id, page)| (request_id.to_string(), page));
     let mut owed = Vec::new();
     for step in eitri_core::tabs::close_steps(&facts) {
         match step {
@@ -8368,6 +8743,19 @@ fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) -> Resul
     // message sent in the base view, its tab broken out while it waited, is still the base page's to
     // report (with its text) and to take back.
     // A page that has closed is sent nothing.
+    match held {
+        // A first message: its start's page is the one owed.
+        Some((request_id, None)) => owed.push(request_id),
+        Some((request_id, Some(page))) => {
+            if let Some(typed_in) = held_prompt_page(state, tab, &request_id, page) {
+                out.send(
+                    typed_in,
+                    serialize_command_result_for_js(&request_id, Err(TAB_CLOSED_MESSAGE)),
+                );
+            }
+        }
+        None => {}
+    }
     for request_id in owed {
         let asked_from = match &start_page {
             Some(asked) if asked.request_id == request_id => match asked.page {
@@ -9307,6 +9695,31 @@ mod tests {
         );
     }
 
+    /// A tab frozen for a move is not closed: its agent is the other window's to take up, and the close
+    /// would interrupt it and shut it down. Once the move is called off the tab closes as any other.
+    #[test]
+    fn a_tab_moving_to_the_other_window_is_not_closed() {
+        let (handle, _page, _host) = handle_with_recording_page();
+        let moving = handle.state.borrow_mut().tabs.open(AgentId::Claude);
+        let _frozen = handle
+            .state
+            .borrow_mut()
+            .tabs
+            .freeze_for_move(moving)
+            .expect("a tab with no session freezes");
+        assert_eq!(
+            handle.run(|state, out| close_tab(state, moving, out)),
+            Err(eitri_core::tab_set::MOVING)
+        );
+        assert!(
+            handle.state.borrow().tabs.get(moving).is_some(),
+            "the tab stays for its move"
+        );
+        handle.state.borrow_mut().tabs.unfreeze(moving);
+        handle.run(|state, out| close_tab(state, moving, out)).unwrap();
+        assert!(handle.state.borrow().tabs.get(moving).is_none());
+    }
+
     /// A closed tab's agent may still be writing while its backend shuts down (a subagent, during
     /// the shutdown's grace), so the window's presence stays as if a turn ran until that shutdown has
     /// returned: no revert in this window or another one can write meanwhile.
@@ -10229,6 +10642,207 @@ mod tests {
     /// A spawner whose every start fails at once (its sender is gone), so no test starts a process.
     fn spawn_nothing() -> Spawner {
         Spawner::Fake(Rc::new(RefCell::new(|_call: SpawnCall| mpsc::channel().1)))
+    }
+
+    /// A tab moves only once nothing of its page's is still on its way: a start, a session continued in
+    /// it with `r`, a review its page asked for. A request of another page does not hold it.
+    #[test]
+    fn a_tab_with_a_start_in_flight_or_a_resume_or_a_pending_review_request_refuses_the_move() {
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tabs.active();
+        let other = tabs.open(eitri_core::tab_set::AgentId::Claude);
+        let two = ViewId::new(2).unwrap();
+        assert_eq!(tabs.break_out(two), Ok(other));
+        let state = state_for_hooks(tabs);
+        let mut s = state.borrow_mut();
+        assert!(panel_tab_handoff(&s, tab).is_ok(), "nothing holds it");
+
+        let start = s.owed.owe(ViewId::BASE, "start-1", Owed::StartPage(tab));
+        assert!(panel_tab_handoff(&s, tab).unwrap_err().contains("starting"));
+        s.owed.owed.remove(&start);
+
+        s.resume_after.insert(tab, ("sess-r".into(), mpsc::channel().1));
+        assert!(panel_tab_handoff(&s, tab).unwrap_err().contains("continued"));
+        s.resume_after.clear();
+
+        let review = s.owed.owe(ViewId::BASE, "review-1", Owed::ReviewRequest);
+        assert!(panel_tab_handoff(&s, tab).unwrap_err().contains("review"));
+        assert!(
+            panel_tab_handoff(&s, other).is_ok(),
+            "a review asked for by another page does not hold this tab"
+        );
+        s.owed.owed.remove(&review);
+        assert!(panel_tab_handoff(&s, tab).is_ok());
+        assert!(panel_tab_handoff(&s, TabId(999)).is_err());
+    }
+
+    /// A message held for the presence is answered to the page that typed it, and to no page once that
+    /// one has gone: a page reusing its view numbers its requests afresh, so the old id would name one of
+    /// its own.
+    #[test]
+    fn a_held_messages_answer_goes_only_to_the_page_that_typed_it() {
+        use eitri_core::tab_set::Sent;
+        let tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tabs.active();
+        let state = state_for_hooks(tabs);
+        let screen = Screen::read(&state, &Pages::default());
+        let two = ViewId::new(2).unwrap();
+        let prompt = |request_id: &str| Sent::Prompt {
+            tab,
+            page: two,
+            request_id: request_id.into(),
+            typed: "hi".into(),
+            outcome: Ok(()),
+        };
+        let answers_to = |out: &Outbox, request_id: &str| {
+            out.dests()
+                .into_iter()
+                .zip(out.payloads())
+                .filter(|(_, payload)| {
+                    let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    value["kind"] == "command_result" && value["requestId"] == request_id
+                })
+                .map(|(dest, _)| dest)
+                .collect::<Vec<_>>()
+        };
+        let mut s = state.borrow_mut();
+
+        s.owed.owe(two, "3", Owed::HeldPrompt(tab));
+        s.owed.page_closed(two);
+        let mut out = Outbox::default();
+        apply_sent(&mut s, &screen, prompt("3"), &mut out);
+        assert!(answers_to(&out, "3").is_empty(), "the page that typed it is gone");
+        assert!(s.owed.is_empty(), "and the entry is spent");
+
+        s.owed.owe(two, "4", Owed::HeldPrompt(tab));
+        let mut out = Outbox::default();
+        apply_sent(&mut s, &screen, prompt("4"), &mut out);
+        assert_eq!(
+            answers_to(&out, "4"),
+            vec![Dest::Page(two)],
+            "answered where it was typed"
+        );
+        assert!(s.owed.is_empty());
+    }
+
+    /// In a linked window a message waits for the presence. A first message held so keeps its start's
+    /// page in the ledger once its session is live (the tab may have been broken out meanwhile), and a
+    /// held message of either kind that goes with its closed tab is answered, unsent, to the page that
+    /// sent it, so that page takes its text back.
+    #[test]
+    fn a_held_message_keeps_its_page_and_is_answered_when_its_tab_closes() {
+        use eitri_core::tab_set::FirstTurn;
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-held-close");
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let (holder, _parked) =
+            eitri_core::turn_review::PresenceHolder::start_parked(dir.join(".review-state"), std::process::id());
+        tabs.hold_presence(holder);
+        let _ = tabs.set_partner(Some(eitri_core::turn_review::Partner {
+            pid: 100,
+            start: 0,
+            counts_as_other: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        let typed = |text: &str| FirstTurn {
+            wire: text.into(),
+            typed: text.into(),
+        };
+        let composer = tabs.active();
+        let (composer_provider, backend) = live_backend(&dir);
+        tabs.get_mut(composer).unwrap().set_backend(TabBackend::Live(backend));
+        let first = tabs.open(AgentId::Claude);
+        let (first_provider, backend) = live_backend(&dir);
+        tabs.get_mut(first).unwrap().set_backend(TabBackend::Live(backend));
+        let two = ViewId::new(2).unwrap();
+        assert_eq!(tabs.break_out(two), Ok(first));
+        assert!(tabs.send_first_turn(first, "first-1", typed("hi")).is_none(), "held");
+        assert!(tabs
+            .send_prompt(composer, "prompt-1", ViewId::BASE, typed("there"))
+            .is_none());
+        let state = state_for_hooks(tabs);
+        let screen = Screen::read(&state, &Pages::default());
+        let mut s = state.borrow_mut();
+        s.owed.owe(ViewId::BASE, "first-1", Owed::StartPage(first));
+        s.owed.owe(ViewId::BASE, "prompt-1", Owed::HeldPrompt(composer));
+
+        let mut out = Outbox::default();
+        collect_pending_starts(&mut s, &screen, &mut out);
+        assert!(
+            s.owed
+                .key_where(|answer| answer.what == Owed::StartPage(first))
+                .is_some(),
+            "the held first message is still owed to the base page"
+        );
+
+        let answers = |out: &Outbox, request_id: &str| {
+            out.dests()
+                .into_iter()
+                .zip(out.payloads())
+                .filter_map(|(dest, payload)| {
+                    let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                    (value["kind"] == "command_result" && value["requestId"] == request_id)
+                        .then(|| (dest, value["error"].as_str().unwrap_or_default().to_string()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let closed = vec![(Dest::Page(ViewId::BASE), TAB_CLOSED_MESSAGE.to_string())];
+        let mut out = Outbox::default();
+        close_tab(&mut s, first, &mut out).unwrap();
+        assert_eq!(
+            answers(&out, "first-1"),
+            closed,
+            "answered where it was sent, not in the tab's view"
+        );
+        let mut out = Outbox::default();
+        close_tab(&mut s, composer, &mut out).unwrap();
+        assert_eq!(answers(&out, "prompt-1"), closed);
+        assert!(
+            first_provider.turns().is_empty() && composer_provider.turns().is_empty(),
+            "nothing held reached an agent"
+        );
+        assert!(s.owed.is_empty(), "nothing is left owed");
+    }
+
+    /// The hints a tab's page was shown, and the ones it was owed, are owed to the page the tab lands in,
+    /// under the tab's number there; another tab's stay.
+    #[test]
+    fn the_panels_tab_record_carries_its_hints_to_the_page_it_lands_in() {
+        use eitri_core::turn_review::ReviewHint;
+        let mut tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let tab = tabs.active();
+        let other = tabs.open(eitri_core::tab_set::AgentId::Claude);
+        let state = state_for_hooks(tabs);
+        let record = {
+            let mut s = state.borrow_mut();
+            s.shown_hints.push(ReviewHint {
+                tab: tab.0,
+                turn: 2,
+                files: 3,
+            });
+            s.review_hints.push(ReviewHint {
+                tab: other.0,
+                turn: 1,
+                files: 1,
+            });
+            panel_tab_handoff(&s, tab).unwrap()
+        };
+        let carried = PanelTabHandoff::from_value(&record.to_value()).expect("the record reads back");
+        assert_eq!(carried, record);
+        assert!(PanelTabHandoff::from_value(&serde_json::json!({ "shown_hints": [{ "turn": -1 }] })).is_err());
+
+        let dest_tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+        let landed = dest_tabs.active();
+        let dest = state_for_hooks(dest_tabs);
+        adopt_panel_tab(&mut dest.borrow_mut(), landed, carried);
+        assert_eq!(
+            dest.borrow().review_hints,
+            vec![ReviewHint {
+                tab: landed.0,
+                turn: 2,
+                files: 3,
+            }],
+            "owed to the page that shows the tab now"
+        );
     }
 
     /// Each chat view's chip shows its own tabs, so the hook hears a tab's own change even when the

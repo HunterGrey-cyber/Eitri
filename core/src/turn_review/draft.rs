@@ -14,7 +14,7 @@ pub const MAX_COMMENT_CHARS: usize = 4000;
 
 /// One comment on lines of a file, with the text of those lines so the agent finds them even when
 /// the file has moved on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Comment {
     /// Per tab, monotonic: never reused, not even after the draft is cleared.
     pub id: u32,
@@ -28,7 +28,7 @@ pub struct Comment {
 }
 
 /// Where a revert was made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RevertSource {
     /// In the review overlay: it wrote the file itself and can undo it.
     Panel,
@@ -37,7 +37,7 @@ pub enum RevertSource {
 }
 
 /// What a revert put back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RevertShape {
     /// Lines `from..=to` of the file as it is now.
     Lines { from: u32, to: u32 },
@@ -52,7 +52,7 @@ pub enum RevertShape {
 /// What a path held before or after a revert, kind and permission bits included, so an undo puts
 /// back exactly that. The draft's own copy of the revert engine's type: the draft depends on no
 /// engine, and the review flow converts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UndoState {
     Regular { blob: String, mode: u32 },
     Symlink { blob: String },
@@ -60,14 +60,14 @@ pub enum UndoState {
 }
 
 /// What an undo needs: the path as it was before the revert and as the revert wrote it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UndoData {
     pub pre: UndoState,
     pub post: UndoState,
 }
 
 /// A revert to record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NewRevert {
     pub turn: u32,
     pub path: String,
@@ -86,7 +86,7 @@ pub struct NewRevert {
 }
 
 /// A recorded revert.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RevertRecord {
     /// Per tab, monotonic, separate from the comments' ids.
     pub id: u32,
@@ -95,7 +95,7 @@ pub struct RevertRecord {
 }
 
 /// One tab's comments and reverts.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReviewDraft {
     last_comment: u32,
     last_revert: u32,

@@ -60,7 +60,7 @@ overrides:
       - neovim
 
 contents:
-  # All four must land in ONE directory: each companion is located as a sibling of the running
+  # All five must land in ONE directory: each companion is located as a sibling of the running
   # executable (`current_exe()`'s parent). Splitting them produces a build that starts and then
   # silently has no pane switching or supervisor. There were five here and `agent-hook` (legacy's
   # PreToolUse relay); it is gone -- no release contains the legacy backend, the
@@ -71,6 +71,8 @@ contents:
     dst: /usr/lib/eitri/eitri-supervisor
   - src: ./target/release/eitri-tmux-shim
     dst: /usr/lib/eitri/eitri-tmux-shim
+  - src: ./target/release/eitri-run-guard
+    dst: /usr/lib/eitri/eitri-run-guard
   - src: ./target/release/eitri-claude-handoff
     dst: /usr/lib/eitri/eitri-claude-handoff
 

@@ -43,6 +43,9 @@ fn place_side(
     if layout.is_gone(module) {
         return Err(LayoutError::Gone(module.clone()));
     }
+    if layout.is_away(module) {
+        return Err(LayoutError::Away(module.clone()));
+    }
     if !layout.contains(target) {
         return Err(LayoutError::NotInTree(target.clone()));
     }
@@ -141,6 +144,9 @@ pub fn place_as_tab(layout: &mut Layout, module: &ModuleId, target: &ModuleId, d
     }
     if layout.is_gone(module) {
         return Err(LayoutError::Gone(module.clone()));
+    }
+    if layout.is_away(module) {
+        return Err(LayoutError::Away(module.clone()));
     }
     if !layout.contains(target) {
         return Err(LayoutError::NotInTree(target.clone()));

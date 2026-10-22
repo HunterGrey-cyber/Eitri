@@ -11,7 +11,7 @@ description: |
   ours to redistribute, so this package never contains it).
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
-# SPDX: this package (the tarball's four binaries, statically linking nvim-rs
+# SPDX: this package (the tarball's five binaries, statically linking nvim-rs
 # LGPL-3.0-only) plus the collector's own MIT/Apache-2.0/MPL-2.0 findings. No
 # LicenseRef-Anthropic-Claude-Agent-SDK here -- this profile never carries the sidecar.
 license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
@@ -50,7 +50,7 @@ overrides:
       - neovim
 
 contents:
-  # The four binaries every release ships. No agent-hook (legacy's PreToolUse relay): the
+  # The five binaries every release ships. No agent-hook (legacy's PreToolUse relay): the
   # legacy backend is never compiled into a release build in the first place, so there is nothing
   # for that binary to relay for.
   - src: ./target/release/shell
@@ -59,6 +59,8 @@ contents:
     dst: /usr/lib/eitri/eitri-supervisor
   - src: ./target/release/eitri-tmux-shim
     dst: /usr/lib/eitri/eitri-tmux-shim
+  - src: ./target/release/eitri-run-guard
+    dst: /usr/lib/eitri/eitri-run-guard
   - src: ./target/release/eitri-claude-handoff
     dst: /usr/lib/eitri/eitri-claude-handoff
 

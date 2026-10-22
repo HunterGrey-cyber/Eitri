@@ -1195,22 +1195,45 @@ impl AgentConversation {
     /// closing or is idle with a card still waiting.
     ///
     /// The conversation stays frozen after a success: folding resumes only through
-    /// [`Self::unfreeze`], when the move does not happen after all. Waits for a batch being folded:
-    /// call it off the GTK thread.
+    /// [`Self::unfreeze`], when the move does not happen after all. Never waits for a batch being
+    /// folded: refused as [`HandoffRefused::Folding`] meanwhile, before the last pump runs.
     pub fn freeze_for_move(
         &mut self,
         last_pump: impl FnOnce(&mut AgentConversation) -> Result<(), String>,
     ) -> Result<(ChatMoveCore, ConversationHandoff), HandoffRefused> {
+        self.freeze_folding()?;
+        if let Err(why) = last_pump(self) {
+            self.ingest.unfreeze();
+            return Err(HandoffRefused::LastPump(why));
+        }
+        self.take_frozen()
+    }
+
+    /// The first half of [`Self::freeze_for_move`], for a caller whose last pump needs more than the
+    /// conversation (the tab that holds it, whose answers and notes the pump records): stops folding
+    /// at the sequence the ingest reached. Refused, with nothing changed, for a conversation that is
+    /// closing, and while its ingest folds a batch or writes after one ([`HandoffRefused::Folding`]:
+    /// ask again, as nothing here waits for it). The caller runs its pump, then [`Self::take_frozen`],
+    /// or [`Self::unfreeze`] when its pump failed.
+    pub fn freeze_folding(&mut self) -> Result<(), HandoffRefused> {
         if self.close_failed || self.session_id.is_none() {
             return Err(HandoffRefused::Closing);
         }
-        self.ingest.freeze();
-        let taken = last_pump(self).map_err(HandoffRefused::LastPump).and_then(|()| {
-            if self.close_failed || self.session_id.is_none() {
-                return Err(HandoffRefused::Closing);
-            }
+        if !self.ingest.try_freeze() {
+            return Err(HandoffRefused::Folding);
+        }
+        Ok(())
+    }
+
+    /// The second half of [`Self::freeze_for_move`], after the caller's last pump: the records a move
+    /// carries. Refused, and folding resumed, when the conversation is closing, when anything folded is
+    /// still undelivered, and when it is idle with a card still waiting.
+    pub fn take_frozen(&mut self) -> Result<(ChatMoveCore, ConversationHandoff), HandoffRefused> {
+        let taken = if self.close_failed || self.session_id.is_none() {
+            Err(HandoffRefused::Closing)
+        } else {
             self.ingest.take_move_record()
-        });
+        };
         let (core, ingest) = match taken {
             Ok(taken) => taken,
             Err(refused) => {
@@ -1589,6 +1612,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("ingestion never reached: {what}");
+    }
+
+    /// Asks for the freeze until the ingest has no batch in hand, as a window asks again on its next tick
+    /// (the freeze itself never waits); a refusal for any other reason is left for the move to report.
+    fn settled_freeze(source: &mut AgentConversation) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(source.freeze_folding(), Err(HandoffRefused::Folding)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ingest let a freeze through within 5 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Waits until every queued event has been folded.
@@ -2832,6 +2868,7 @@ mod tests {
         fake.queue_wire(2, vec![AgentDomainEvent::BackgroundCalls { running: 0 }]);
         wait_for_ingest(&source, 3);
 
+        settled_freeze(&mut source);
         let (core, _handoff) = source.freeze_for_move(deliver).expect("an idle chat moves");
         assert_eq!(
             core.folded_through, 2,
@@ -2850,6 +2887,7 @@ mod tests {
         fake.queue(lost.clone());
         wait_for_ingest(&source, 2);
 
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).expect("a lost chat still moves");
         assert_eq!(core.lifecycle, vec![lost]);
         let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
@@ -2866,6 +2904,7 @@ mod tests {
     fn an_idle_chat_moves_with_no_running_turn_events() {
         let fake = Arc::new(FakeProvider::new());
         let mut source = after_one_turn(&fake);
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).expect("an idle chat moves");
         assert!(core.running_turn.is_empty(), "nothing runs");
         assert_eq!(core.lifecycle, vec![session_opened()]);
@@ -2906,6 +2945,7 @@ mod tests {
         });
         wait_for_ingest(&source, 11);
 
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).expect("a running turn moves");
         assert_eq!(core.lifecycle, vec![session_opened()], "as of the turn's start");
         assert_eq!(core.running_turn.len(), 6, "the prompt and every event since");
@@ -2949,6 +2989,7 @@ mod tests {
         });
         wait_for_ingest(&source, 10);
 
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).unwrap();
         let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
         let (moved, kept) = (adopted.projection(), source.projection());
@@ -2968,6 +3009,7 @@ mod tests {
         *fake.close_session_error.lock().unwrap() = Some(ProviderError::Timeout);
         source.shutdown();
         assert!(source.close_failed);
+        settled_freeze(&mut source);
         let refused = source.freeze_for_move(|_| panic!("a closing conversation is not pumped for a move"));
         assert!(matches!(refused, Err(HandoffRefused::Closing)));
     }
@@ -2989,6 +3031,7 @@ mod tests {
         wait_for_ingest(&source, 8);
 
         let mut seen = Vec::new();
+        settled_freeze(&mut source);
         let (core, _) = source
             .freeze_for_move(|conversation| {
                 if let crate::UiDelivery::Events(events) = conversation.take_ui_delivery() {
@@ -3028,8 +3071,10 @@ mod tests {
         let fake = Arc::new(FakeProvider::new());
         let mut source = after_one_turn(&fake);
         // A pump that hands the page nothing leaves the events undelivered.
+        settled_freeze(&mut source);
         let refused = source.freeze_for_move(|_| Ok(()));
         assert!(matches!(refused, Err(HandoffRefused::Undelivered)));
+        settled_freeze(&mut source);
         let refused = source.freeze_for_move(|_| Err("the agent did not take the answers".to_string()));
         assert!(matches!(refused, Err(HandoffRefused::LastPump(_))));
 
@@ -3052,6 +3097,7 @@ mod tests {
             provider_prompt: None,
         });
         source.fold_locally(turn_completed("t-late"));
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).unwrap();
         assert_eq!(core.running_turn.len(), 2, "the turn is not over while its card waits");
         let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
@@ -3073,6 +3119,7 @@ mod tests {
         };
         assert!(held(), "the source holds the session");
 
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).unwrap();
         let descriptor = source.lease_descriptor().expect("the source holds a lease").unwrap();
         let lease = SessionLease::from_moved(descriptor, PROVIDER_NAME, &cwd, "claude-uuid-abc").unwrap();
@@ -3108,6 +3155,7 @@ mod tests {
         let mut source = after_one_turn(&fake);
         let _ = adopted_record(&source);
         let cwd = source.canonical_cwd().to_string_lossy().to_string();
+        settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).unwrap();
         let other = SessionLease::try_acquire(PROVIDER_NAME, &cwd, "claude-uuid-other").unwrap();
         let refused = AgentConversation::adopt_moved(core, handoff, moved_provider(Some(other)));
@@ -3121,6 +3169,7 @@ mod tests {
         fake.queue(session_opened());
         let _ = adopted_record(&source);
         let mut source = source;
+        settled_freeze(&mut source);
         let (core, handoff) = source
             .freeze_for_move(|conversation| {
                 // A turn ending just before the move: frozen, the source writes no history for it.

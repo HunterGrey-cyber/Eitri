@@ -29,7 +29,7 @@ Deterministic by construction: every list is sorted, nothing reads the clock, an
 are printed once and referred to afterwards. Running it twice gives byte-identical output.
 
 Inputs it expects to exist (publish.sh / release.sh produce all of them before calling it):
-  <repo>/target/release/{shell,eitri-supervisor,eitri-tmux-shim,eitri-claude-handoff}
+  <repo>/target/release/{shell,eitri-supervisor,eitri-tmux-shim,eitri-claude-handoff,eitri-run-guard}
     (or --binaries-dir DIR; no agent-hook -- it is not in any release)
   dist/verdandi-claude-sidecar                    (sidecar profile only; not read with --no-sidecar)
   agent-ui/web/node_modules                       (shell/build.rs runs npm ci there)
@@ -99,7 +99,7 @@ TARGET = "x86_64-unknown-linux-gnu"
 # Release binaries are installed from target/release. Their Cargo packages are built with
 # `-p shell -p agent -p supervisor --bins` by publish.sh and release.sh.
 # Exclude agent-hook because it belongs to the legacy backend, which release builds omit.
-SHIPPED_BINARIES = ["shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff"]
+SHIPPED_BINARIES = ["shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard"]
 SHIPPED_CARGO_PACKAGES = ["shell", "agent", "supervisor"]
 
 # Spell small counts as words in generated prose, deriving them from the current binary list.

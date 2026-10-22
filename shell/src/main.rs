@@ -92,6 +92,71 @@ fn config_dir() -> PathBuf {
     })
 }
 
+/// The guard plugin tasks run under: `eitri-run-guard` from beside this executable, which loads neither GTK nor
+/// WebKitGTK, or this executable's own `run-guard` when the helper is not there (a build of the `shell` binary
+/// alone) or is another build's.
+fn task_guard_command() -> eitri_core::plugin::tasks::GuardCommand {
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("eitri-run-guard")))
+        .filter(|helper| helper.is_file())
+        .filter(|helper| helper_is_this_build(helper));
+    match helper {
+        Some(program) => eitri_core::plugin::tasks::GuardCommand {
+            program,
+            args: Vec::new(),
+            env: Vec::new(),
+        },
+        None => eitri_core::plugin::tasks::GuardCommand {
+            program: "/proc/self/exe".into(),
+            args: vec![eitri_core::run_guard::SUBCOMMAND.into()],
+            env: Vec::new(),
+        },
+    }
+}
+
+/// Whether `helper` is the guard this executable was built with. A helper left beside it by an earlier build (`cargo
+/// run -p shell` builds only this binary) would run this window's tasks under another build's guard. The helper
+/// answers in about a millisecond; one that does not within the bound is passed over.
+fn helper_is_this_build(helper: &Path) -> bool {
+    use std::io::Read;
+    let spawned = std::process::Command::new(helper)
+        .arg(eitri_core::run_guard::FINGERPRINT_FLAG)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+    let mut answer = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut answer);
+    }
+    let same = answer.trim() == eitri_core::run_guard::fingerprint();
+    if !same {
+        eprintln!(
+            "[eitri] {} is another build's task guard; plugin tasks run under this executable's own",
+            helper.display()
+        );
+    }
+    same
+}
+
 fn main() -> glib::ExitCode {
     // Collected once, before anything else, and consulted through `flag_given` -- never a raw
     // `args_os().any(|a| a == "...")` -- by every early flag scan below (`--version`, `--legacy`,
@@ -103,6 +168,14 @@ fn main() -> glib::ExitCode {
     // directory step. `args_os`, not `args`, and skipping argv[0] (never a
     // flag), for the same non-UTF-8-safety reason `project_root` gives for its own `args_os` use.
     let early_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // `eitri run-guard` holds one plugin task's life for the window that holds the task. It takes its inherited
+    // descriptors before anything here can open, close or hand one on, and never reaches GTK.
+    if early_args
+        .first()
+        .is_some_and(|a| a == eitri_core::run_guard::SUBCOMMAND)
+    {
+        eitri_core::run_guard::serve_inherited();
+    }
     // `eitri panel` is its own command line: the project resolver below would read `panel` as a directory.
     if early_args.first().is_some_and(|a| a == "panel") {
         return companion::run(early_args[1..].to_vec());
@@ -127,6 +200,11 @@ fn main() -> glib::ExitCode {
         println!("{}", version::version_line());
         return glib::ExitCode::SUCCESS;
     }
+
+    // Every plugin task this process starts runs under a guard of its own, so a task lives as long as whichever
+    // window holds it and can move with its page. After the companion, `split` and `--version`, none of which
+    // runs a plugin task: finding the helper spawns it and waits for its answer.
+    eitri_core::plugin::tasks::install_guard(task_guard_command());
 
     // The backend this launch uses, decided here -- before
     // any window exists, and before the stdin detach right below -- so `--legacy` (or
@@ -3897,6 +3975,13 @@ fn build_ui(
                         refuse_said(&refused_name, &toast, &text);
                     }
                 },
+                Action::WindowNew
+                | Action::WindowOther
+                | Action::MoveToWindow { .. }
+                | Action::WorkspaceToWindow { .. }
+                | Action::WorkspaceSwapWindow => {
+                    refuse_text(&refused_name, &toast, "this window has no second window yet");
+                }
                 // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
                 // mode, only while it holds the keys -- elsewhere the same refusal shape as
                 // every other misdirected prefix action (`Action::Module`, above).

@@ -9,6 +9,7 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri d
 ./.local/lib/eitri/RELEASE f
 ./.local/lib/eitri/eitri-claude-handoff f
+./.local/lib/eitri/eitri-run-guard f
 ./.local/lib/eitri/eitri-setup f
 ./.local/lib/eitri/eitri-supervisor f
 ./.local/lib/eitri/eitri-tmux-shim f
@@ -86,7 +87,7 @@ t_fresh_layout() {
 	expect_rc 0
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the installed tree"
 	expect_eq "$(installed_version)" 1.0.0 "the installed version"
-	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-setup; do
+	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-setup; do
 		expect_exec "$TH/.local/lib/eitri/$b"
 	done
 	expect_exec "$TH/.local/bin/eitri"

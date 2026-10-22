@@ -23,6 +23,7 @@
     "module_key": null,
     "prefix": "Ctrl+b",
     "protocol": 1,
+    "restored": null,
     "roots": {
       "plugin": "/w/plugin",
       "work": "/w/work"

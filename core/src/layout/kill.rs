@@ -80,6 +80,9 @@ pub fn can_kill(layout: &Layout, id: &ModuleId) -> Result<KillScope, LayoutError
     if layout.is_gone(id) {
         return Err(LayoutError::Gone(id.clone()));
     }
+    if layout.is_away(id) {
+        return Err(LayoutError::Away(id.clone()));
+    }
     let others_shown = layout.modules().iter().any(|m| m != id && layout.is_shown(m));
     if layout.is_shown(id) && !others_shown {
         return Ok(KillScope::Window);
@@ -100,6 +103,10 @@ pub fn kill(
     }
     if layout.is_gone(id) {
         return Err(LayoutError::Gone(id.clone()));
+    }
+    // What runs in an away module runs in the other window; this one has nothing of it to end.
+    if layout.is_away(id) {
+        return Err(LayoutError::Away(id.clone()));
     }
     let was_shown = !layout.hidden().contains(id);
     let next = hide(layout, id, frame)?;

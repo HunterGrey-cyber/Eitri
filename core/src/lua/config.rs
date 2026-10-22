@@ -56,6 +56,16 @@ impl ConfigStore {
     }
 }
 
+/// The `init.lua` key: `eitri.config.set("window.restore", true | false)`. Whether the window that
+/// holds a pair brings the second window back at start when it was open at the pair's last end.
+pub const WINDOW_RESTORE_KEY: &str = "window.restore";
+
+/// [`WINDOW_RESTORE_KEY`] as stored. Unset means the second window comes back: it is part of the
+/// arrangement the user left, as the workspaces are.
+pub fn parse_window_restore(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(WINDOW_RESTORE_KEY, value, true)
+}
+
 /// `pub`: `Kernel::new` calls this.
 pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlua::Result<()> {
     store.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
@@ -123,6 +133,32 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_restore_takes_a_boolean_and_names_itself_otherwise() {
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        let read = || parse_window_restore(store.borrow().get(WINDOW_RESTORE_KEY));
+
+        assert_eq!(read(), Ok(true), "unset, the second window comes back");
+        for (set, want) in [("false", false), ("true", true), ("'off'", false), ("'on'", true)] {
+            lua.load(format!("eitri.config.set('window.restore', {set})"))
+                .exec()
+                .unwrap();
+            assert_eq!(read(), Ok(want), "{set}");
+        }
+        for bad in ["'later'", "1"] {
+            lua.load(format!("eitri.config.set('window.restore', {bad})"))
+                .exec()
+                .unwrap();
+            let err = read().unwrap_err();
+            assert!(err.contains("\"window.restore\""), "the refusal names its key: {err}");
+            assert!(err.contains("must be true or \"on\" / false or \"off\""), "{err}");
+        }
+    }
 
     #[test]
     fn set_then_get_roundtrips_through_real_lua() {

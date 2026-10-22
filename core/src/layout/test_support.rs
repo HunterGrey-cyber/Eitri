@@ -31,7 +31,7 @@ pub(crate) fn same_rects_opened(got: &Layout, want: &Layout) {
     let open = |layout: &Layout| {
         let mut layout = layout.clone();
         for id in layout.hidden().clone() {
-            if !layout.is_gone(&id) {
+            if !layout.is_gone(&id) && !layout.is_away(&id) {
                 layout.show(&id).unwrap();
             }
         }
