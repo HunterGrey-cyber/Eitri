@@ -825,6 +825,12 @@ impl Shadow {
         list.args(["ls-files", "-z", "--others", "--modified", "--exclude-standard"]);
         let listed = self.run_ok("ls-files", list, None, deadline)?;
         let entries: BTreeSet<&[u8]> = nul_separated(&listed.stdout).collect();
+        #[cfg(test)]
+        tests::AFTER_LISTING.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         if entries.len() > limits.max_files {
             return Err(ShadowError::TooManyFiles {
                 count: entries.len(),
@@ -868,31 +874,141 @@ impl Shadow {
             self.run_ok("update-index", remove, Some(&ignored.stdout), deadline)?;
         }
 
-        let mut add = self.git(Some(index));
-        add.args(["add", "-A"]);
-        let exclusions: Vec<u8> = large
-            .iter()
-            .chain(left_out.iter())
-            .flat_map(|p| b":(top,exclude,literal)".iter().chain(p.iter()).chain(b"\0".iter()))
-            .copied()
-            .collect();
-        if exclusions.is_empty() {
-            self.run_ok("add", add, None, deadline)?;
-        } else {
-            add.args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
-            self.run_ok("add", add, Some(&exclusions), deadline)?;
-        }
+        // What the index holds before the add, so that what the add changed can be told apart. The
+        // listing above is a moment older than the add: a file made or grown in between reaches the
+        // add without its size having been checked, and once in the index unchanged, no later
+        // listing names it again.
+        let before = self.index_blobs(index, deadline)?;
+        let added_and_checked = || -> Result<Vec<Vec<u8>>, ShadowError> {
+            let mut add = self.git(Some(index));
+            add.args(["add", "-A"]);
+            let exclusions: Vec<u8> = large
+                .iter()
+                .chain(left_out.iter())
+                .flat_map(|p| b":(top,exclude,literal)".iter().chain(p.iter()).chain(b"\0".iter()))
+                .copied()
+                .collect();
+            if exclusions.is_empty() {
+                self.run_ok("add", add, None, deadline)?;
+            } else {
+                add.args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+                self.run_ok("add", add, Some(&exclusions), deadline)?;
+            }
+            #[cfg(test)]
+            if let Some(hook) = tests::AFTER_ADD.with(|hook| hook.borrow_mut().take()) {
+                hook()?;
+            }
+
+            // So every blob the add stored or changed is measured as stored, and one over the limit
+            // leaves the index too: a snapshot never holds what it would have left out had the file
+            // been that size when listed.
+            let after = self.index_blobs(index, deadline)?;
+            let changed: Vec<(&[u8], &str)> = after
+                .iter()
+                .filter(|(path, blob)| before.get(*path) != Some(*blob))
+                .map(|(path, blob)| (path.as_slice(), blob.as_str()))
+                .collect();
+            let grown = self.blobs_over(&changed, limits.max_file_bytes, deadline)?;
+            if !grown.is_empty() {
+                let mut remove = self.git(Some(index));
+                remove.args(["update-index", "-z", "--force-remove", "--stdin"]);
+                self.run_ok("update-index", remove, Some(&nul_joined(&grown)), deadline)?;
+            }
+            Ok(grown.into_iter().map(<[u8]>::to_vec).collect())
+        };
+        let grown = match added_and_checked() {
+            Ok(grown) => grown,
+            Err(e) => {
+                // The add may have stored a blob that the check never measured or removed. Kept, the
+                // next snapshot would find it unchanged and hold it at any size; that one starts from an
+                // empty index instead, which measures every blob again.
+                let _ = remove_if_present(index);
+                return Err(e);
+            }
+        };
 
         let mut write = self.git(Some(index));
         write.arg("write-tree");
         let tree = self.run_ok("write-tree", write, None, deadline)?;
         let tree = String::from_utf8_lossy(git::trim_newline(&tree.stdout)).into_owned();
-        let skipped = large
+        let mut skipped: Vec<(PathBuf, Option<FilePrint>)> = large
             .iter()
             .zip(prints)
             .map(|(p, print)| (PathBuf::from(OsString::from_vec(p.to_vec())), Some(print)))
             .collect();
+        for path in grown {
+            let path = PathBuf::from(OsString::from_vec(path));
+            // The print of the file as it is now: what the listing would have taken had it been
+            // this size then. A file gone or no longer regular has none, so its change is not ruled out.
+            let print = FilePrint::of_path(&self.work_tree, &path);
+            skipped.push((path, print));
+        }
         Ok((tree, skipped))
+    }
+
+    /// The regular files (plain or executable) in `index`, each with its blob id.
+    fn index_blobs(&self, index: &Path, deadline: Instant) -> Result<BTreeMap<Vec<u8>, String>, ShadowError> {
+        let mut list = self.git(Some(index));
+        list.args(["ls-files", "-z", "--stage"]);
+        let listed = self.run_ok("ls-files", list, None, deadline)?;
+        let mut blobs = BTreeMap::new();
+        for entry in nul_separated(&listed.stdout) {
+            // `<mode> <blob> <stage>\t<path>`; the path may hold any byte but NUL.
+            let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let (meta, path) = (&entry[..tab], &entry[tab + 1..]);
+            let mut fields = meta.split(|&b| b == b' ');
+            let (Some(mode), Some(blob)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if mode == b"100644" || mode == b"100755" {
+                blobs.insert(path.to_vec(), String::from_utf8_lossy(blob).into_owned());
+            }
+        }
+        Ok(blobs)
+    }
+
+    /// The paths among `entries` whose blob is larger than `max` bytes.
+    fn blobs_over<'a>(
+        &self,
+        entries: &[(&'a [u8], &str)],
+        max: u64,
+        deadline: Instant,
+    ) -> Result<Vec<&'a [u8]>, ShadowError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: BTreeSet<&str> = entries.iter().map(|(_, blob)| *blob).collect();
+        let mut input = String::new();
+        for blob in &wanted {
+            input.push_str(blob);
+            input.push('\n');
+        }
+        let mut check = self.git(None);
+        check.args(["cat-file", "--batch-check=%(objectname) %(objectsize)"]);
+        let checked = self.run_ok("cat-file", check, Some(input.as_bytes()), deadline)?;
+        let mut over = BTreeSet::new();
+        for line in String::from_utf8_lossy(&checked.stdout).lines() {
+            match line.split_once(' ') {
+                Some((blob, size)) => match size.parse::<u64>() {
+                    Ok(size) if size <= max => {}
+                    // Larger, or not a size: a blob the add just stored and git cannot measure is
+                    // not kept on trust.
+                    _ => {
+                        over.insert(blob.to_owned());
+                    }
+                },
+                None => {
+                    over.insert(line.to_owned());
+                }
+            }
+        }
+        Ok(entries
+            .iter()
+            .filter(|(_, blob)| over.contains(*blob))
+            .map(|(path, _)| *path)
+            .collect())
     }
 
     /// Whether the nested repository at `dir` (relative to the work tree) has a commit checked out.
@@ -1545,6 +1661,125 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Run once, on this thread, between a snapshot's listing of the work tree and its add: the
+        /// moment another program's write lands in when it races a snapshot.
+        pub(super) static AFTER_LISTING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        /// Run once, on this thread, right after a snapshot's add; an error from it stands for a run
+        /// whose time ran out before it measured what the add stored.
+        pub(super) static AFTER_ADD: std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(), ShadowError>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A file made over the size limit between the listing and the add is left out all the same,
+    /// in that snapshot and in the next, which finds it unchanged.
+    #[test]
+    fn a_file_made_large_while_a_snapshot_runs_is_left_out() {
+        use std::os::unix::fs::DirBuilderExt;
+        let scratch = std::env::temp_dir().join(format!("eitri-shadow-racing-write-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+        let scratch = scratch.canonicalize().unwrap();
+        let project = scratch.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("small.txt"), b"small\n").unwrap();
+        let review_dir = review_dir_for(Some(scratch.join("state").as_os_str()), None, &project).unwrap();
+        let shadow = Shadow::open_with_excludes(&review_dir, &project, None).unwrap();
+        let limits = Limits {
+            max_file_bytes: 64,
+            ..Limits::default()
+        };
+        let label = |kind| SnapshotLabel {
+            turn: 1,
+            kind,
+            turn_id: "t1".into(),
+            tab: 1,
+            time_ms: 1,
+        };
+        let in_tree = |commit: &str| {
+            let mut cmd = shadow.git(None);
+            cmd.args(["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit]);
+            let out = shadow
+                .run_ok("ls-tree", cmd, None, Instant::now() + READ_TIMEOUT)
+                .unwrap();
+            nul_separated(&out.stdout)
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+        };
+        let taken = |outcome| match outcome {
+            SnapshotOutcome::Taken(snapshot) => snapshot,
+            SnapshotOutcome::Unavailable(why) => panic!("snapshot unavailable: {why}"),
+        };
+
+        let big = project.join("big.txt");
+        AFTER_LISTING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::write(&big, [b'x'; 100]).unwrap()));
+        });
+        let first = taken(shadow.snapshot("s1", &label(SnapshotKind::Warm), &limits));
+        assert!(AFTER_LISTING.with(|hook| hook.borrow().is_none()), "the write ran");
+        assert_eq!(in_tree(&first.commit), ["small.txt"]);
+        assert_eq!(first.skipped_large, [PathBuf::from("big.txt")]);
+        let print = first.left_out.get(Path::new("big.txt")).copied().flatten();
+        assert_eq!(print.map(|p| p.len), Some(100), "printed as it is on disk");
+
+        let second = taken(shadow.snapshot("s1", &label(SnapshotKind::Base), &limits));
+        assert_eq!(in_tree(&second.commit), ["small.txt"]);
+        assert_eq!(second.left_out, first.left_out, "unchanged, and so the same print");
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// A snapshot that fails after its add, with a file made over the limit in between, leaves no
+    /// unmeasured blob behind for the next one to find unchanged and keep.
+    #[test]
+    fn a_snapshot_that_fails_after_its_add_leaves_nothing_unmeasured() {
+        use std::os::unix::fs::DirBuilderExt;
+        let scratch = std::env::temp_dir().join(format!("eitri-shadow-failed-add-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+        let scratch = scratch.canonicalize().unwrap();
+        let project = scratch.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("small.txt"), b"small\n").unwrap();
+        let review_dir = review_dir_for(Some(scratch.join("state").as_os_str()), None, &project).unwrap();
+        let shadow = Shadow::open_with_excludes(&review_dir, &project, None).unwrap();
+        let limits = Limits {
+            max_file_bytes: 64,
+            ..Limits::default()
+        };
+        let label = |kind| SnapshotLabel {
+            turn: 1,
+            kind,
+            turn_id: "t1".into(),
+            tab: 1,
+            time_ms: 1,
+        };
+
+        let big = project.join("big.txt");
+        AFTER_LISTING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::write(&big, [b'x'; 100]).unwrap()));
+        });
+        AFTER_ADD.with(|hook| *hook.borrow_mut() = Some(Box::new(|| Err(ShadowError::TimedOut))));
+        assert!(matches!(
+            shadow.snapshot("s1", &label(SnapshotKind::Warm), &limits),
+            SnapshotOutcome::Unavailable(_)
+        ));
+        assert!(AFTER_ADD.with(|hook| hook.borrow().is_none()), "the failure ran");
+
+        let SnapshotOutcome::Taken(next) = shadow.snapshot("s1", &label(SnapshotKind::Base), &limits) else {
+            panic!("the next snapshot is taken");
+        };
+        let mut cmd = shadow.git(None);
+        cmd.args(["ls-tree", "-r", "-z", "--name-only", "--full-tree", &next.commit]);
+        let out = shadow
+            .run_ok("ls-tree", cmd, None, Instant::now() + READ_TIMEOUT)
+            .unwrap();
+        let names: Vec<String> = nul_separated(&out.stdout)
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        assert_eq!(names, ["small.txt"]);
+        assert_eq!(next.skipped_large, [PathBuf::from("big.txt")]);
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
 
     /// The access mode `file` was opened with.
     fn access_mode(file: &File) -> libc::c_int {

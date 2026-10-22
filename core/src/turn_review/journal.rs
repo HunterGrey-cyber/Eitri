@@ -491,6 +491,11 @@ mod tests {
         std::fs::write(&path, b"one").unwrap();
         let (_, bytes) = lock_and_read(open(), &path).unwrap().expect("unheld");
         assert_eq!(bytes, b"one");
+        // The cases below start from a file no lock was ever taken on. A child that another test thread is starting
+        // holds a copy of every descriptor of this process until it execs, so the lock just dropped on the first
+        // file can stay held for a moment, and a take on that file would answer None.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"two").unwrap();
 
         // Opened, then removed by another worker before this one locks it.
         let early = open();
