@@ -241,7 +241,9 @@ pub struct ClaudeSidecarProvider {
     /// `provider_prompts_from_handshake`, captured at `connect()`: whether `create_session` and
     /// `resume_session` ask this sidecar for the CLI's own permission prompts.
     provider_prompts: bool,
-    /// The watch task of each session opened, newest last; a move cancels the source's.
+    /// The watch task of each session opened, newest last; a move cancels the source's. Only a move
+    /// reads it, so a build without moves keeps none.
+    #[cfg(target_os = "linux")]
     watches: Mutex<Vec<Watch>>,
     /// A sidecar taken over from another process and not committed yet: the session whose watch the
     /// commit opens, and where it goes on from. Nothing is watched, read or answered until then.
@@ -251,6 +253,7 @@ pub struct ClaudeSidecarProvider {
 }
 
 /// One session's watch task.
+#[cfg(target_os = "linux")]
 struct Watch {
     session_id: String,
     task: tokio::task::JoinHandle<()>,
@@ -301,6 +304,7 @@ impl WatchState {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn resumed(mark: &WatchMark, splits_messages: bool, requested: crate::RequestedCliMode) -> Self {
         WatchState {
             tracker: watch::SequenceTracker::after(mark.sequence),
@@ -472,6 +476,7 @@ impl ClaudeSidecarProvider {
             info,
             splits_messages,
             provider_prompts,
+            #[cfg(target_os = "linux")]
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(None),
             released: AtomicBool::new(false),
@@ -582,6 +587,7 @@ impl ClaudeSidecarProvider {
         // The mode this session's `CreateSession` asked for, the one its CLI's reports are judged
         // against: every session this provider creates asks for the same one.
         let requested = requested_cli_mode(&self.capabilities);
+        #[cfg(target_os = "linux")]
         let watched = session_id.clone();
         let task = self.runtime.handle().spawn(async move {
             // The single exit for every abnormal path. Nothing here may return quietly except the
@@ -709,10 +715,15 @@ impl ClaudeSidecarProvider {
                 }
             }
         });
+        #[cfg(target_os = "linux")]
         lock(&self.watches).push(Watch {
             session_id: watched,
             task,
         });
+        // Nothing moves a session here, so nothing will cancel its watch: dropping the handle leaves the
+        // task running, as keeping it did.
+        #[cfg(not(target_os = "linux"))]
+        drop(task);
     }
 }
 
@@ -2864,6 +2875,7 @@ mod tests {
 
     /// A watch taken up elsewhere translates the next event as this one would have: the same split
     /// and the same note, from the sequence after the mark.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_watch_resumed_from_a_mark_goes_on_as_the_one_that_made_it() {
         let requested = crate::RequestedCliMode::Default;

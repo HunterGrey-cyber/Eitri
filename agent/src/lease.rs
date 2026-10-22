@@ -454,9 +454,10 @@ mod tests {
         assert!(SessionLease::try_acquire("claude", "/tmp/project", "prov-2").is_ok());
     }
 
-    /// The probe detects a lease held by this process on another descriptor because `flock`
-    /// locks are per open file description. It reports the lease as free after it is dropped
-    /// and leaves no lock held by the probe.
+    /// The probe sees a lease held by this very process on another descriptor (flock is per open
+    /// file description), reads a lock file nobody holds as free, and never takes it itself.
+    /// The free case is a file no one ever locked, not a lease just dropped: a child another test
+    /// thread is starting keeps a copy of a dropped lease's descriptor, and its lock, until it execs.
     #[test]
     fn is_held_sees_a_held_lease_and_takes_nothing() {
         let _dir = test_override::IsolatedLeasesDir::new();
@@ -464,15 +465,19 @@ mod tests {
             !SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap(),
             "no lock file yet"
         );
-        let lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe").unwrap();
+        let _lease = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe").unwrap();
         assert!(SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap());
         assert!(
             !SessionLease::is_held("claude", "/tmp/project", "prov-other").unwrap(),
             "another session's lease is another key"
         );
-        drop(lease);
-        assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-probe").unwrap());
-        let _again = SessionLease::try_acquire("claude", "/tmp/project", "prov-probe")
+        let never_locked = leases_dir().unwrap().join(format!(
+            "{}.lock",
+            lease_key_hash("claude", "/tmp/project", "prov-free")
+        ));
+        std::fs::File::create(&never_locked).unwrap();
+        assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-free").unwrap());
+        let _taken = SessionLease::try_acquire("claude", "/tmp/project", "prov-free")
             .expect("a probe must leave the lease free to take");
     }
 

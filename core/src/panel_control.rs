@@ -1736,6 +1736,7 @@ mod tests {
     }
 
     /// The request a connection delivered, or the reply it got when it was refused.
+    #[cfg(target_os = "linux")]
     fn exchange(sock: &Path, server: &ControlServer, request: &Request) -> Result<Received, String> {
         let line = encode(request).unwrap();
         let reply = raw(sock, line.as_bytes(), false);

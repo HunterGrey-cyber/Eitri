@@ -1637,8 +1637,10 @@ mod tests {
         assert!(std::os::unix::net::UnixStream::connect(&sidecar.socket_path).is_ok());
 
         drop(sidecar.stdin_keepalive.take());
-        let SidecarProcess::Spawned(child) = &mut sidecar.process else {
-            unreachable!("spawn starts the sidecar here");
+        let child = match &mut sidecar.process {
+            SidecarProcess::Spawned(child) => child,
+            #[cfg(target_os = "linux")]
+            SidecarProcess::Adopted(_) => unreachable!("spawn starts the sidecar here"),
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut exited = false;

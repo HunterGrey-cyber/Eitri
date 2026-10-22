@@ -955,8 +955,8 @@ fn ingest_loop(
         // Read before the pump: an event queued after the pump looked raises the count past this,
         // so the wait below ends at once instead of missing it.
         let seen = announced.as_ref().map(|signal| signal.seen());
-        // Held until this batch is folded, adopted and written: a freeze waits for it, so it never
-        // stops the thread with events taken from the provider and not yet folded.
+        // Held until this batch is folded, adopted and written: a freeze is refused while it is held,
+        // so it never stops the thread with events taken from the provider and not yet folded.
         let batch = pump_gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if frozen.load(Ordering::SeqCst) {
             drop(batch);
@@ -964,8 +964,8 @@ fn ingest_loop(
             continue;
         }
         let events = provider.pump();
-        // Asked under the same gate as the pump: a freeze, which waits for the gate, finds the
-        // position of the last batch folded and of no later one.
+        // Asked under the same gate as the pump: a freeze, which takes the gate only while it is free,
+        // finds the position of the last batch folded and of no later one.
         let through = provider
             .pumped_through()
             .filter(|through| Some(*through) != noted_through);
