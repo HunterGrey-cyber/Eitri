@@ -66,8 +66,8 @@ quiet line of its own, with a mark in front saying whether it finished (`✓`), 
 and removes, with the diff inside it.
 
 - `Esc` leaves the box and goes back to browsing the conversation. In browsing, `j` and `k` step from row to
-  row, `Enter` shows or hides a tool's result, `Ctrl+o` shows the detailed view (every result, with longer excerpts), `y` copies the row and `?`
-  lists all the keys.
+  row, `Enter` shows or hides a tool's result, `Ctrl+o` shows the detailed view (every result, with longer excerpts), `y` copies the row (to the
+  clipboard and the primary selection, so a middle-click pastes it too) and `?` lists all the keys.
 - `Ctrl+c` interrupts the turn that is running.
 - `Enter` on a message you type while a turn is running puts it into that turn without stopping it, as in
   Claude Code and Codex: the agent reads it at its next step, and it shows above the box as `↪ <message>` until

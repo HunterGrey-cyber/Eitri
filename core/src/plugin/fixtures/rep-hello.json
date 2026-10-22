@@ -13,12 +13,12 @@
     "host": "eitri",
     "keys_kit": 1,
     "keys_settings": {
+      "find_case": "smart",
+      "hint_chars": "sadfjklewcmpgh",
+      "prefix_wait": true,
       "scroll_step": 60,
       "smooth": true,
-      "prefix_wait": true,
-      "which_key_delay": 200,
-      "hint_chars": "sadfjklewcmpgh",
-      "find_case": "smart"
+      "which_key_delay": 200
     },
     "module_key": null,
     "prefix": "Ctrl+b",
@@ -60,6 +60,7 @@
         "--nv-error-tint-muted": "#8e9098",
         "--nv-fg": "#e0e2ea",
         "--nv-focus-ring": "#e0e2ea",
+        "--nv-focus-ring-inactive": "#393b40",
         "--nv-font-mono": "\"FiraCode Nerd Font\", monospace",
         "--nv-font-prose": "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif",
         "--nv-hint-bg": "#e0e2ea",

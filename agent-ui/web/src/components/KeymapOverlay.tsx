@@ -1,4 +1,5 @@
-import { forwardRef } from "react";
+import { forwardRef, useLayoutEffect, useRef } from "react";
+import type { Ref } from "react";
 import { browseKeys, CARET_KEYS, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
@@ -35,6 +36,11 @@ type Props = {
   /** The plugin page that held the keys when `prefix ?` opened this sheet: its section comes first. Its title
    *  and rows are the page's own text, drawn as text nodes only. */
   plugin?: PluginKeysHelp;
+  /** Open at the window prefix keys when no plugin section takes precedence. */
+  startAt?: "prefix";
+  /** Which opening request `startAt` belongs to. A different number while the sheet is up positions it again;
+   *  the same number never does, so ordinary re-renders leave the reader's scroll alone. */
+  startRequest?: number;
 };
 
 const ALL_MODES: PermissionModeChoice[] = ["manual", "auto", "bypass"];
@@ -56,10 +62,10 @@ function cycleRow(row: KeyHelp, modes: PermissionModeChoice[]): KeyHelp {
  *  (a `<p>`, like the leader and "Selecting" sections' own): a rule `resolveKey` never sees -- `Ctrl+[`
  *  is Esc is one listener on the document (`../ctrlBracket`) -- cannot be a row of a table
  *  `keymap.test.ts` ties to `resolveKey` both ways. A section with no note draws no `<p>`. */
-function Section({ title, rows, note }: { title: string; rows: KeyHelp[]; note?: string }) {
+function Section({ title, rows, note, headingRef }: { title: string; rows: KeyHelp[]; note?: string; headingRef?: Ref<HTMLHeadingElement> }) {
   return (
     <section>
-      <h2>{title}</h2>
+      <h2 ref={headingRef}>{title}</h2>
       <table>
         <tbody>
           {/* Indexed: a plugin page may list the same keys on two rows (one per context). */}
@@ -222,9 +228,20 @@ function SlashCommands() {
  *  so reading the sheet never acts on a card underneath. Only a click on the backdrop closes it here:
  *  a click inside a table must still allow reading a row or selecting its text. */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, startAt, startRequest = 0 },
   ref,
 ) {
+  const prefixHeading = useRef<HTMLHeadingElement>(null);
+  // Positioned once per request, not per render: a re-render must not undo the reader's own scrolling,
+  // but a new request that arrives while the sheet is up (prefix ? over the chat's ?) moves it.
+  const positionedFor = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    if (positionedFor.current === startRequest) return;
+    positionedFor.current = startRequest;
+    if (startAt === "prefix" && plugin === undefined) {
+      prefixHeading.current?.scrollIntoView({ block: "start" });
+    }
+  }, [startRequest]);
   return (
     <div
       className="keymap-overlay"
@@ -295,6 +312,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       <Section title="Anywhere in the window" rows={windowKeys} />
       <Section
         title={`After ${prefixLabel}`}
+        headingRef={prefixHeading}
         rows={prefixKeys}
         note={companion ? "A companion window has no layout keys: your window manager arranges windows." : undefined}
       />

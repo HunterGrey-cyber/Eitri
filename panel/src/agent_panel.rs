@@ -706,6 +706,9 @@ struct AgentPanelState {
     /// Reviews being worked out on worker threads, polled by the tick: git never runs on the GTK
     /// thread, so the answer comes back through a channel the tick drains.
     review_jobs: Vec<PendingReview>,
+    /// Pending edits' proposals being read on worker threads, polled by the tick: the agent names the
+    /// file, and nothing it names is opened on the GTK thread.
+    proposal_jobs: Vec<PendingProposal>,
     /// Status-band hints not yet shown: the page was not ready (loading, or reloading) when they
     /// arrived. At most one per tab, the newest.
     review_hints: Vec<eitri_core::turn_review::ReviewHint>,
@@ -1181,6 +1184,10 @@ impl AgentPanelHandle {
             let mut state = self.state.borrow_mut();
             state.pages.remove(&view);
             state.owed.page_closed(view);
+            // A proposal still being read answers a page that is gone: finishing it would raise the editor
+            // and take the keys for a view no one sees, and a reused view's next page numbers its requests
+            // afresh. Dropping the receiver leaves the worker's send with nowhere to go.
+            state.proposal_jobs.retain(|job| job.view != view);
             if !state.shutting_down {
                 state.tabs.drop_bypass_prompt_in(view);
             }
@@ -2825,6 +2832,7 @@ fn tick_send(
     send_context_if_changed(state, out);
     poll_scratch_edits(state, out);
     poll_review_jobs(state, out);
+    poll_proposal_jobs(state, out);
     poll_review_flow(state, screen, out);
     // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
     poll_trust(state, screen, out);
@@ -3092,6 +3100,7 @@ fn panel_state(
         scratch,
         pending_edits: Vec::new(),
         review_jobs: Vec::new(),
+        proposal_jobs: Vec::new(),
         review_hints: Vec::new(),
         shown_hints: Vec::new(),
         review_hint: false,
@@ -3162,6 +3171,7 @@ fn bare_state(
         scratch: None,
         pending_edits: Vec::new(),
         review_jobs: Vec::new(),
+        proposal_jobs: Vec::new(),
         review_hints: Vec::new(),
         shown_hints: Vec::new(),
         review_hint: false,
@@ -3237,6 +3247,7 @@ fn needs_polling(state: &AgentPanelState) -> bool {
         || state.supervisor_pending.is_some()
         || !state.pending_edits.is_empty()
         || !state.review_jobs.is_empty()
+        || !state.proposal_jobs.is_empty()
         || !state.review_flow.is_idle()
         || state.trust.is_busy()
 }
@@ -3595,6 +3606,78 @@ fn poll_review_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
     }
     for (view, payload) in payloads {
         out.send(view, payload);
+    }
+}
+
+/// One pending edit's proposal being read on a worker thread.
+struct PendingProposal {
+    request_id: String,
+    /// The page that asked: the answer goes there.
+    view: ViewId,
+    /// The file's name as resolved; nvim takes the filetype from it.
+    name: String,
+    rx: mpsc::Receiver<Result<(String, String), eitri_core::scratch::ProposalRefused>>,
+}
+
+/// Reads `file` and applies `change` on a worker thread; the tick hands nvim the result (see
+/// [`poll_proposal_jobs`]). Refused while [`MAX_REVIEW_JOBS`] are already out.
+fn start_proposal_job(
+    state: &mut AgentPanelState,
+    view: ViewId,
+    request_id: &str,
+    file: PathBuf,
+    change: eitri_core::agent_bridge::ProposedChange,
+) -> Result<(), String> {
+    if state.proposal_jobs.len() >= MAX_REVIEW_JOBS {
+        return Err("proposals are still being read; try again in a moment".to_string());
+    }
+    let name = file.to_string_lossy().into_owned();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+        let _ = tx.send(eitri_core::scratch::proposal_texts(&file, &change));
+    });
+    state.proposal_jobs.push(PendingProposal {
+        request_id: request_id.to_string(),
+        view,
+        name,
+        rx,
+    });
+    Ok(())
+}
+
+/// The tick's half of a proposal: a finished read is written to the scratch directory and handed to the
+/// editor, whose answer is the page's; a refusal, or a worker that died, answers the page with why.
+fn poll_proposal_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
+    let mut i = 0;
+    while i < state.proposal_jobs.len() {
+        let read = match state.proposal_jobs[i].rx.try_recv() {
+            Ok(read) => read.map_err(|why| why.to_string()),
+            Err(mpsc::TryRecvError::Empty) => {
+                i += 1;
+                continue;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the proposal could not be read: its worker stopped".to_string())
+            }
+        };
+        let job = state.proposal_jobs.remove(i);
+        let prepared = read.and_then(|(base, proposed)| match state.scratch.as_mut() {
+            Some(dir) => dir
+                .prepare_proposal(&job.name, &base, &proposed)
+                .map_err(|e| format!("could not write the scratch file: {e}")),
+            None => Err("the scratch directory could not be created at startup".to_string()),
+        });
+        match prepared {
+            Ok(request) => out.effect(Effect::AskEditor {
+                request,
+                then: EditorThen::Answer {
+                    view: job.view,
+                    request_id: job.request_id,
+                },
+            }),
+            Err(why) => out.send(job.view, serialize_command_result_for_js(&job.request_id, Err(&why))),
+        }
     }
 }
 
@@ -6541,6 +6624,7 @@ fn admission(state: &AgentPanelState, msg: &InboundMessage, view: ViewId, target
         | InboundMessage::ReviewRecover { .. }
         | InboundMessage::OpenInEditor { .. }
         | InboundMessage::ViewInEditor { .. }
+        | InboundMessage::ViewProposal { .. }
         | InboundMessage::HintRequest { .. }
         | InboundMessage::HintTargets { .. }
         | InboundMessage::TabVerb { .. }
@@ -7668,6 +7752,18 @@ fn handle_inbound_message(
                 Err(why) => refuse(&mut out, &why),
             }
         }
+        // `Ctrl+g` on a pending edit card: the file is read on a worker, and the tick hands nvim the diff.
+        InboundMessage::ViewProposal { path, change, .. } => {
+            let started = if state.scratch.is_none() {
+                Err("the scratch directory could not be created at startup".to_string())
+            } else {
+                proposal_target(&state.project_dir, &path)
+                    .and_then(|file| start_proposal_job(state, view, &request_id, file, change))
+            };
+            if let Err(why) = started {
+                refuse(&mut out, &why);
+            }
+        }
         // `Ctrl+g`: the draft goes to nvim. Begun here; the window's answer keeps the edit or undoes it.
         InboundMessage::EditDraft { text, .. } => {
             let tab = tab_of(target);
@@ -8082,6 +8178,24 @@ fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std::pa
     Ok(resolved)
 }
 
+/// The file a pending edit's proposal is about, for the path the page sent: relative paths are under the
+/// project root, and a path holding a control character is refused as `gf` refuses it. Whether anything
+/// is there is not asked here: a proposal may create the file, and what is there is read on a worker
+/// (`eitri_core::scratch::proposal_texts`).
+fn proposal_target(project_dir: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+    if eitri_core::agent_bridge::path_holds_control(path) {
+        return Err(format!(
+            "refused to show a proposal for a path holding a control character: {path:?}"
+        ));
+    }
+    let candidate = std::path::Path::new(path);
+    Ok(if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        project_dir.join(candidate)
+    })
+}
+
 /// `open_url`: what a panel key may hand `UriLauncher`. The page sends a WHATWG-normalized
 /// `URL.href` (`nav.ts#webUrl`); no crate here parses the way a browser does (`url` is not a
 /// dependency), so this is a strict re-check instead of a parse: ASCII only, no whitespace, control
@@ -8343,6 +8457,21 @@ mod tests {
             .unwrap_err()
             .contains("no such file"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A proposal may create its file, so the resolver lets a missing path through (what is there is the
+    /// worker's question); a path holding a control character is refused before anything looks at it.
+    #[test]
+    fn proposal_target_lets_a_missing_file_through_and_refuses_a_control_character() {
+        let dir = std::path::Path::new("/nonexistent/eitri-project");
+        assert_eq!(proposal_target(dir, "src/new.rs"), Ok(dir.join("src/new.rs")));
+        assert_eq!(proposal_target(dir, "/abs/new.rs"), Ok(PathBuf::from("/abs/new.rs")));
+        let refused = proposal_target(dir, "notes\nlua(io.open)(string.char(47),string.char(119))").unwrap_err();
+        assert!(refused.contains("control character"), "{refused}");
+        for c in ['\0', '\r', '\t', '\x1b', '\x7f'] {
+            let path = format!("a{c}b.rs");
+            assert!(proposal_target(dir, &path).is_err(), "{path:?}");
+        }
     }
 
     /// Pins `SIDECAR_STOPPED_MARKER` against the Rust that actually produces it, the same way
@@ -9759,6 +9888,16 @@ mod tests {
         assert!(polls(&handle), "a review job");
         handle.state.borrow_mut().review_jobs.clear();
 
+        let (_proposal_tx, proposal_rx) = mpsc::channel();
+        handle.state.borrow_mut().proposal_jobs.push(PendingProposal {
+            request_id: "p".into(),
+            view: ViewId::BASE,
+            name: "a.rs".into(),
+            rx: proposal_rx,
+        });
+        assert!(polls(&handle), "a proposal being read");
+        handle.state.borrow_mut().proposal_jobs.clear();
+
         let mut scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
         let (_request, edit) = scratch.prepare_edit("draft").unwrap();
         handle.state.borrow_mut().pending_edits.push(edit);
@@ -9767,6 +9906,74 @@ mod tests {
             edit.cleanup();
         }
         assert!(!polls(&handle));
+    }
+
+    /// `Ctrl+g` on a pending `Write` of a file that is not there yet: the page's message goes through the
+    /// arm and the worker, and the tick hands the editor one `diff` request against an empty file, then
+    /// answers the page. The file itself is never made.
+    #[test]
+    fn a_view_proposal_for_a_new_file_reaches_the_editor() {
+        let (handle, page) = settled_panel();
+        let scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let project = scratch.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let scratch_root = scratch.path().to_path_buf();
+        // The panel's own scratch directory, made beside the project so both go with the test's cleanup.
+        let panel_scratch = eitri_core::scratch::ScratchDir::in_dir(&scratch_root).expect("a panel scratch directory");
+        {
+            let mut state = handle.state.borrow_mut();
+            state.project_dir = project.clone();
+            state.scratch = Some(panel_scratch);
+        }
+        let asked: Rc<RefCell<Vec<eitri_core::scratch::ScratchRequest>>> = Rc::default();
+        let recorder = asked.clone();
+        handle.on_editor_request(move |request| {
+            recorder.borrow_mut().push(request.clone());
+            Ok(())
+        });
+        handle.page_message(
+            ViewId::BASE,
+            r#"{"type":"view_proposal","request_id":"vp1","path":"src/new.rs","change":{"kind":"content","content":"fn main() {}\n"}}"#,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while asked.borrow().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the proposal never reached the editor"
+            );
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(asked.borrow().len(), 1, "one editor request");
+        let hex = asked.borrow()[0].hex().to_string();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["op"], "diff");
+        assert_eq!(value["name"], project.join("src/new.rs").to_string_lossy().as_ref());
+        assert_eq!(std::fs::read_to_string(value["base"].as_str().unwrap()).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(value["proposed"].as_str().unwrap()).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(
+            !project.join("src/new.rs").exists(),
+            "the proposal never writes the file"
+        );
+        let answered = page
+            .sent
+            .borrow()
+            .iter()
+            .any(|p| p.contains(r#""requestId":"vp1""#) && p.contains(r#""ok":true"#));
+        assert!(answered, "the page's request was answered");
+        assert!(handle.state.borrow().proposal_jobs.is_empty());
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        scratch.cleanup();
     }
 
     /// The review flow's work (here: the recovery journal read it starts once a document is ready and a
@@ -15904,6 +16111,56 @@ mod tests {
             Some(Err(format!("tab {number} is not shown in this page")))
         );
         assert_eq!(handle.state.borrow().tabs.get(moved).unwrap().draft(), "fix the test");
+    }
+
+    #[test]
+    fn a_proposal_still_being_read_is_dropped_when_its_page_goes_idle() {
+        let (handle, base, second) = handle_with_two_pages();
+        let asked = Rc::new(RefCell::new(0usize));
+        handle.on_editor_request({
+            let asked = asked.clone();
+            move |_request| {
+                *asked.borrow_mut() += 1;
+                Ok(())
+            }
+        });
+        let mut senders = Vec::new();
+        for (page_view, id) in [(view(2), "p-2"), (ViewId::BASE, "p-base")] {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            handle.state.borrow_mut().proposal_jobs.push(PendingProposal {
+                request_id: id.into(),
+                view: page_view,
+                name: "a.rs".into(),
+                rx,
+            });
+        }
+        handle.idle_page(view(2));
+        let left: Vec<String> = handle
+            .state
+            .borrow()
+            .proposal_jobs
+            .iter()
+            .map(|job| job.request_id.clone())
+            .collect();
+        assert_eq!(left, vec!["p-base".to_string()], "only the idle page's proposal goes");
+        clear(&[&base, &second]);
+        assert!(
+            senders[0].send(Ok(("a\n".into(), "b\n".into()))).is_err(),
+            "the idle page's worker has no one to answer"
+        );
+        handle.tick();
+        assert_eq!(
+            *asked.borrow(),
+            0,
+            "nothing is raised in the editor for a page that is gone"
+        );
+        assert_eq!(
+            result_for(&second.sent.borrow(), "p-2"),
+            None,
+            "the idle page is answered nothing"
+        );
+        handle.state.borrow_mut().proposal_jobs.clear();
     }
 
     #[test]

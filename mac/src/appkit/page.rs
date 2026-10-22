@@ -428,6 +428,11 @@ define_class!(
                 return;
             };
             let raw = body.to_string();
+            // The page also sends each copy's text for a primary selection, which macOS does not have. The
+            // panel's parser does not know that message and would log it whole, copied text included.
+            if eitri_core::agent_bridge::is_primary_copy(&raw) {
+                return;
+            }
             if let Some(events) = self.ivars().events() {
                 events.page_message(&raw);
             }

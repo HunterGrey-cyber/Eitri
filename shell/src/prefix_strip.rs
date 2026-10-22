@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(
             reads(&pieces),
             "e editor \u{b7} a agent \u{b7} [t terminal] \u{b7} x kill \u{b7} % right \u{b7} \" below \u{b7} \
-             M-1 M-2 even \u{b7} { } swap",
+             M-1 M-2 even \u{b7} { } swap \u{b7} ? keys",
             "a hidden module is dimmed"
         );
     }

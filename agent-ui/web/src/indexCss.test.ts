@@ -83,6 +83,9 @@ const CHROME_BRANCH = /(?:^|[\s.])(?:winbar|status-line|status-band)\b/;
  *  Nothing else. */
 const CURSOR_BRANCH =
   /^(?:\.row-current \.row-sign|\.agent-ui-root button:focus(?: \*)?|\.band-unread|\.chooser-row\.current \.chooser-sign|\.message-list\[data-visual="caret"\] ::selection|\.permission-card-buttons button:first-child)$/;
+/** A selection fill WebKit paints as given: one `--nv-*` token at 99% opacity. 99%, not 100%: WebKit
+ *  turns an opaque `::selection` background into a translucent one meant for white pages. */
+const SELECTION_FILL = /^background: color-mix\(in srgb, var\(--nv-[a-z-]+\) 99%, transparent\)$/;
 /** The global `f` HINT's label, and nothing else. */
 const HINT_BRANCH = /^\.hint-label$/;
 /** The which-key box's own keycap glyph, and nothing else -- a
@@ -158,8 +161,11 @@ function unguardedTextColorDeclarations(source: string): string[] {
     const onHljsSurface = everyBranchIsOnSurface(selector, HLJS_BRANCH);
     const onChromeSurface = everyBranchIsOnSurface(selector, CHROME_BRANCH);
     const body = rule.slice(rule.indexOf("{") + 1, -1);
+    // CARET's block is `--nv-fg` at 99% opacity (see `SELECTION_FILL`): the same fill to the eye, so the
+    // same text guard holds on it.
     const onCursorSurface =
-      everyBranchIsOnSurface(selector, CURSOR_BRANCH) && /(?:^|;)\s*background: var\(--nv-fg\);/.test(body);
+      everyBranchIsOnSurface(selector, CURSOR_BRANCH) &&
+      /(?:^|;)\s*background: (?:var\(--nv-fg\)|color-mix\(in srgb, var\(--nv-fg\) 99%, transparent\));/.test(body);
     const onHintSurface =
       everyBranchIsOnSurface(selector, HINT_BRANCH) && /(?:^|;)\s*background: var\(--nv-hint-bg\);/.test(body);
     const onWkKeySurface = everyBranchIsOnSurface(selector, WK_KEY_BRANCH);
@@ -2909,12 +2915,36 @@ describe("VISUAL mode", () => {
     const stripped = stripComments(css);
     const selectionRule = rulesMatching(stripped, "::selection").find((r) => r.selector.includes("[data-visual]"));
     expect(selectionRule, "no .message-list[data-visual] ::selection rule").toBeDefined();
-    expect(selectionRule!.body).toContain("background: var(--nv-cursorline)");
+    expect(selectionRule!.body).toContain("background: color-mix(in srgb, var(--nv-cursorline) 99%, transparent)");
     // Text keeps its own colour: this rule must not also set `color`.
     expect(selectionRule!.body).not.toMatch(/(?<!background-)color\s*:/);
     const rowCurrentOverride = rulesMatching(stripped, ".row-current").find((r) => r.selector.includes("[data-visual]"));
     expect(rowCurrentOverride, "no .message-list[data-visual] .row-current rule").toBeDefined();
     expect(rowCurrentOverride!.body).toContain("background: none");
+  });
+
+  /* WebKit paints an opaque `::selection` background as a translucent colour that matches it only over
+     white, so on a dark scheme the selection lands within a shade of `bg`: measured in the sandbox,
+     nvim's default Visual `#4f5258` was drawn `#10141b` over its `#14161b` and CARET's `--nv-fg` block
+     came out grey. A fill that is already translucent is painted as given. */
+  it("every selection fill in the chat is translucent, so WebKit paints the token and not a shade of the background", () => {
+    const rules = splitRules(stripComments(css)).filter((r) => r.selector.includes("::selection"));
+    expect(rules.map((r) => r.selector).sort()).toEqual([
+      '.message-list[data-visual="caret"] ::selection',
+      ".message-list[data-visual] ::selection",
+    ]);
+    for (const rule of rules) {
+      const fills = rule.declarations
+        .split(";")
+        .map((d) => d.trim())
+        .filter((d) => /^background(?:-color)?\s*:/.test(d));
+      expect(fills, `${rule.selector} sets one fill`).toHaveLength(1);
+      expect(fills[0], `${rule.selector}'s fill must not be an opaque colour`).toMatch(SELECTION_FILL);
+    }
+    // The pattern refuses what WebKit would repaint: a bare token, and a mix that comes out opaque.
+    expect("background: var(--nv-cursorline)").not.toMatch(SELECTION_FILL);
+    expect("background: color-mix(in srgb, var(--nv-cursorline) 100%, transparent)").not.toMatch(SELECTION_FILL);
+    expect("background: color-mix(in srgb, var(--nv-cursorline) 99%, var(--nv-bg))").not.toMatch(SELECTION_FILL);
   });
 });
 

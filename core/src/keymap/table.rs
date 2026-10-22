@@ -790,17 +790,18 @@ impl Keymap {
     }
 
     /// The verbs the top bar's strip lists after the module keys: the keys bound to
-    /// kill, hide, split right, split below, even and swap, in that order, in tmux spelling. A verb
-    /// nothing is bound to is left out (`hide`, by default, since `x` kills).
+    /// kill, hide, split right, split below, even, swap and the keys sheet, in that order, in tmux spelling.
+    /// A verb nothing is bound to is left out (`hide`, by default, since `x` kills).
     pub fn strip_verbs(&self) -> Vec<String> {
         type Is = fn(&Action) -> bool;
-        let groups: [(&str, Is); 6] = [
+        let groups: [(&str, Is); 7] = [
             ("kill", |a| matches!(a, Action::ModuleKill)),
             ("hide", |a| matches!(a, Action::ModuleHide)),
             ("right", |a| matches!(a, Action::Split { axis: Axis::Row, .. })),
             ("below", |a| matches!(a, Action::Split { axis: Axis::Column, .. })),
             ("even", |a| matches!(a, Action::Even(_))),
             ("swap", |a| matches!(a, Action::Swap(_))),
+            ("keys", |a| matches!(a, Action::PanelKeymap)),
         ];
         groups
             .iter()
@@ -1341,12 +1342,24 @@ mod tests {
     fn the_strip_verbs_come_from_the_table() {
         assert_eq!(
             Keymap::defaults().strip_verbs(),
-            ["x kill", "% right", "\" below", "M-1 M-2 even", "{ } swap"]
+            ["x kill", "% right", "\" below", "M-1 M-2 even", "{ } swap", "? keys"]
         );
         let map = Keymap::apply_user(&[set("X", "module.hide")], &[]).unwrap();
         assert_eq!(map.strip_verbs()[..2], ["x kill".to_string(), "X hide".to_string()]);
         let map = Keymap::apply_user(&[del("%"), set("\\", "split.right")], &[]).unwrap();
         assert_eq!(map.strip_verbs()[1], "\\ right");
+    }
+
+    #[test]
+    fn the_strip_ends_with_the_keys_sheet_key() {
+        assert_eq!(Keymap::defaults().strip_verbs().last().unwrap(), "? keys");
+        let rebound = Keymap::apply_user(&[del("?"), set("/", "panel.keymap")], &[]).unwrap();
+        assert_eq!(rebound.strip_verbs().last().unwrap(), "/ keys");
+        let unbound = Keymap::apply_user(&[del("?")], &[]).unwrap();
+        assert_eq!(
+            unbound.strip_verbs(),
+            ["x kill", "% right", "\" below", "M-1 M-2 even", "{ } swap"]
+        );
     }
 
     #[test]

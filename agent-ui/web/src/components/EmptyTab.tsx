@@ -9,6 +9,7 @@ import type { BoxEntry, SeqStep } from "../leader";
 import { isActivatableControl } from "../nav";
 import { isImeKey } from "../composerKeys";
 import { Composer } from "./Composer";
+import type { SlashAction } from "../slashCommands";
 import { completionSource } from "../slashCommands";
 import type { RestoredDraft } from "./Composer";
 import { HandoffCommandCard } from "./TerminalHandoff";
@@ -88,6 +89,7 @@ export type EmptyTabProps = {
   onModeChange?: (mode: PanelMode) => void;
   restoredDraft: RestoredDraft | null;
   onSend: (text: string) => void;
+  onSlashAction?: (action: SlashAction) => void;
   onResume: (providerSessionId: string) => void;
   /** The dashboard's `s` item / key: bring back the tabs the last window had open. Present with the
    *  item (`hello.restore`); optional so this component's own tests need no stand-in. */
@@ -784,6 +786,11 @@ export function EmptyTab(props: EmptyTabProps) {
             hintTarget={!failed}
             onModeChange={setMode}
             onSend={props.onSend}
+            claudeSlashCommands={!isExternalAgent(props.tab.agent)}
+            onSlashAction={(action) => {
+              if (action.kind === "sessions") runItem("sessions");
+              else props.onSlashAction?.(action);
+            }}
             onDraftChange={props.onDraftChange}
             running={starting}
             onQueue={props.onQueue}

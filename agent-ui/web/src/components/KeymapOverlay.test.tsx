@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { KeymapOverlay } from "./KeymapOverlay";
 import { BROWSE_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, REVIEW_KEYS, VISUAL_KEYS } from "../keymap";
@@ -531,5 +532,56 @@ describe("KeymapOverlay: a plugin page's section", () => {
     const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
     expect(titles[0]).toBe("This panel");
     expect(container.textContent).not.toContain("This plugin has not declared its keys");
+  });
+});
+
+describe("KeymapOverlay opening position", () => {
+  const original = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+  const scrollIntoView = vi.fn();
+
+  beforeEach(() => {
+    scrollIntoView.mockClear();
+    Object.defineProperty(Element.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+  });
+
+  afterEach(() => {
+    if (original) Object.defineProperty(Element.prototype, "scrollIntoView", original);
+    else Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+  });
+
+  it("prefix_question_opens_at_the_prefix_table", () => {
+    const props = { onClose: () => {}, windowKeys: WINDOW, prefixKeys: PREFIX, prefixLabel: "Ctrl+b", panel: EMPTY_PANEL_TABLE };
+    const { container, rerender } = render(<KeymapOverlay {...props} startAt="prefix" />, { wrapper: StrictMode });
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.instances[0]).toBe(sectionTitled(container, "After Ctrl+b").querySelector("h2"));
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    rerender(<KeymapOverlay {...props} startAt="prefix" />);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+  });
+
+  it("a_prefix_request_over_an_open_sheet_moves_it_to_the_prefix_table", () => {
+    const props = { onClose: () => {}, windowKeys: WINDOW, prefixKeys: PREFIX, prefixLabel: "Ctrl+b", panel: EMPTY_PANEL_TABLE };
+    const { container, rerender } = render(<KeymapOverlay {...props} startRequest={0} />, { wrapper: StrictMode });
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    rerender(<KeymapOverlay {...props} startAt="prefix" startRequest={1} />);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.instances[0]).toBe(sectionTitled(container, "After Ctrl+b").querySelector("h2"));
+    rerender(<KeymapOverlay {...props} startAt="prefix" startRequest={1} />);
+    expect(scrollIntoView, "a re-render of the same request leaves the scroll alone").toHaveBeenCalledTimes(1);
+  });
+
+  it("the_chats_own_question_opens_on_this_panel", () => {
+    const { container } = overlay();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(container.querySelector("h2")?.textContent).toBe("This panel");
+  });
+
+  it("a_pages_rows_stay_first", () => {
+    const { container } = render(
+      <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+b"
+        panel={EMPTY_PANEL_TABLE} startAt="prefix" plugin={{ title: "Page keys", rows: [], declared: true }} />,
+    );
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(container.querySelector("h2")?.textContent).toBe("Page keys");
   });
 });

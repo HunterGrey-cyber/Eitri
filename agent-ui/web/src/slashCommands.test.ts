@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  slashAction,
   barePickerCommand,
   builtInCompletions,
   cleanCommands,
@@ -79,7 +80,7 @@ describe("heldBackSlashCommand", () => {
   it("holds back the three unconditional interactive-only commands", () => {
     expect(heldBackSlashCommand("/login")).toBe("login");
     expect(heldBackSlashCommand("/config")).toBe("config");
-    expect(heldBackSlashCommand("/resume")).toBe("resume");
+    expect(heldBackSlashCommand("/resume yesterday")).toBe("resume");
   });
 
   /* Send a bare `/model`: its headless reply is parseable text that the panel turns into a
@@ -194,18 +195,23 @@ describe("the `/` menu's rows", () => {
   it("lists the commands that do something here, in the table's order, with /effort after /model", () => {
     const names = builtInCompletions().map((c) => c.name);
     expect(names).toEqual([
+      "help",
       "clear",
       "compact",
       "cost",
       "context",
       "usage",
+      "status",
       "model",
       "effort",
+      "memory",
       "init",
       "review",
       "security-review",
       "mcp",
       "agents",
+      "resume",
+      "rewind",
       "doctor",
       "output-style",
     ]);
@@ -214,8 +220,8 @@ describe("the `/` menu's rows", () => {
   it("leaves out every command Enter would refuse, and every sent-as-text row that only answers 'not available'", () => {
     const names = new Set(builtInCompletions().map((c) => c.name));
     for (const name of names) expect(heldBackSlashCommand(`/${name}`), name).toBeNull();
-    for (const refused of ["config", "login", "resume"]) expect(names.has(refused), refused).toBe(false);
-    for (const useless of ["help", "status", "memory", "export", "hooks", "permissions", "add-dir", "rewind", "logout", "release-notes", "pr-comments", "todos"]) {
+    for (const refused of ["config", "login"]) expect(names.has(refused), refused).toBe(false);
+    for (const useless of ["export", "hooks", "permissions", "add-dir", "logout", "release-notes", "pr-comments", "todos"]) {
       expect(names.has(useless), useless).toBe(false);
     }
   });
@@ -406,5 +412,23 @@ describe("the built-in rows carry the reference's wording", () => {
     });
     expect(rows.find((c) => c.name === "compact")?.hint).toBe("[instructions]");
     expect(rows.find((c) => c.name === "cost")?.hint).toBeUndefined();
+  });
+});
+
+describe("Eitri slash actions", () => {
+  it("the_five_words_map_to_eitri", () => {
+    expect(slashAction("/help")).toEqual({ kind: "keymap" });
+    expect(slashAction("/status")).toEqual({ kind: "tab-info" });
+    expect(slashAction("/resume")).toEqual({ kind: "sessions" });
+    expect(slashAction("/memory")).toEqual({ kind: "open-path", path: "CLAUDE.md" });
+    expect(slashAction("/rewind")).toEqual({ kind: "pointer", text: "/rewind is not in Eitri — c reviews and reverts this turn's edits" });
+    for (const text of ["/help me", "/statusbar", "/resume yesterday", "hello", ""]) expect(slashAction(text)).toBeNull();
+    expect(slashAction("  /status ")).toEqual({ kind: "tab-info" });
+  });
+
+  it("the_completion_menu_still_lists_them", () => {
+    const names = builtInCompletions().map((row) => row.name);
+    for (const name of ["help", "status", "resume", "memory", "rewind"]) expect(names).toContain(name);
+    expect(completionSource("claude", [{ name: "resume", description: "Resume" }])).toHaveLength(1);
   });
 });

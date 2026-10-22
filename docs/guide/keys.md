@@ -12,7 +12,8 @@ including anything you changed in [your configuration](configuration.md) or took
 The prefix is stock tmux's: press `Ctrl+b`, let go, then press one key. It is read before the editor, the
 panel and the bottom terminal see anything, so it works wherever the keys are. `Esc` cancels it, and a key the
 table does not bind ends the wait without doing anything. To send `Ctrl+b` itself to whatever has the keys,
-press it twice. `<prefix> ?` lists every key of the table.
+press it twice. `<prefix> ?` opens the full keys sheet at the "After <prefix>" table. While the prefix is armed,
+the hint strip ends with `? keys`; it uses the effective key for `panel.keymap`, and leaves that run out if unbound.
 
 The keys marked "repeats" can be pressed again within half a second without the prefix, as in tmux.
 
@@ -104,7 +105,7 @@ import and your tmux configuration bind that key.
 |---|---|
 | `<prefix> f` | HINT: jump anywhere in the window (see [HINT](#hint)) |
 | `<prefix> r` | reload the agent panel; the session keeps running |
-| `<prefix> ?` | the full list of keys, in the panel; closing it with `?`, `Esc`, `q` or a click outside gives the keys back to the module that had them, and puts back a zoom or a hidden chat that opening it changed |
+| `<prefix> ?` | the full list of keys, in the panel, starting at "After <prefix>" (from a plugin page, its own keys come first); the chat's own `?` starts at "This panel". Closing it with `?`, `Esc`, `q` or a click outside gives the keys back to the module that had them, and puts back a zoom or a hidden chat that opening it changed |
 | `<prefix> :` | the panel's `:` command line (see [The command line](#the-command-line)) |
 | `<prefix> Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l` | send that chord itself to whatever has the keys; the bare chords below are Eitri's |
 
@@ -345,12 +346,24 @@ right after a reply arrives do not start HINT or open the box in the middle of a
 | `Esc` | stop typing and go back to BROWSE; with the command menu open, it closes the menu first and keeps the text |
 | `?` | the list of keys, from an empty box |
 
-A message that starts with `/` is a Claude Code slash command. Some work (`/clear`, `/compact`, `/cost`,
-`/context`, `/usage`, `/model`, `/mcp`, `/agents`, `/doctor` and `/output-style` are the ones that show an
-effect), a bare `/model` or `/effort` opens a picker, and a few that need a full terminal (`/login`,
-`/config` and `/resume`) are refused with a message. The rest are sent as ordinary text, which Claude answers
-as words rather than as a command. `?` lists the ones that work. In a Codex tab, or a tab of an agent you
-registered, the message is sent as typed: there is no list of held-back commands and no picker.
+On a Claude tab, five slash words run Eitri's own actions when typed alone, in either the dashboard's
+box or a conversation:
+
+| word | what it does |
+|---|---|
+| `/help` | open the `?` keys sheet |
+| `/status` | show this tab's information (`tab.info`) |
+| `/resume` | open the sessions chooser |
+| `/memory` | open the project's `CLAUDE.md` in the editor; if missing, show `no such file: CLAUDE.md` |
+| `/rewind` | keep the draft and show `/rewind is not in Eitri — c reviews and reverts this turn's edits` |
+
+The first four clear the draft. None of these sends a message to Claude. Other slash commands keep
+their usual behavior: `/clear`, `/compact`, `/cost`, `/context`, `/usage`, `/model`, `/mcp`, `/agents`,
+`/doctor` and `/output-style` show an effect; a bare `/model` or `/effort` opens a picker. `/login` and
+`/config`, and `/resume` with arguments, need a full terminal and are refused with a message. Other
+words, including prompt templates and your own commands, are sent as typed. `?` lists the working
+CLI commands. In a Codex tab or a tab of an agent you registered, all five words are sent as text:
+there are no Claude command holdbacks or pickers.
 
 ### In BROWSE
 
@@ -369,9 +382,9 @@ registered, the message is sent as typed: there is no list of held-back commands
 | `zo` / `zc` | open / close that fold only |
 | `zh` / `zl` | scroll this row's table left / right |
 | `Ctrl+o` | the detailed view: every result, longer excerpts, no collapsed runs |
-| `y` | copy the row (the message, command or path), or the code block HINT landed on |
+| `y` | copy the row (the message, command or path), or the code block HINT landed on; the copy also goes to the primary selection, so a middle-click pastes it too |
 | `Y` | copy a tool row's whole output |
-| `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim |
+| `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim; on a pending edit card for one file (a Claude `Edit`, `MultiEdit` or `Write`, a Codex change that adds one file, an ACP agent's edit of one file), the file as it is on disk beside the file as the edit would leave it, read-only, in a new Neovim tab page (`q` closes it; see [Reviewing a turn](turn-review.md#before-you-approve)); any other card shows its text, as before |
 | `gf` | open the file path on this row in the editor, including a card's or edit row's file headers (several: pick by letter) |
 | `gx` | open this row's web link in your browser (several: pick by letter) |
 | `/` | search the conversation; `Enter` keeps the match, `Esc` goes back |
@@ -421,7 +434,7 @@ You can change them in [your configuration](configuration.md).
   a motion. `v` or `V` starts a selection from there, and `Esc` goes back to BROWSE.
 - In VISUAL (`v`, by character) and V-LINE (`V`, by line): the same motions extend the selection, `o` swaps which
   end moves, `v` and `V` switch between the two modes (a mode's own key goes back to the caret), `y` copies what
-  is highlighted and returns to BROWSE, `>` quotes it into your message and starts typing, and `Esc` goes back
+  is highlighted (to the clipboard and the primary selection) and returns to BROWSE, `>` quotes it into your message and starts typing, and `Esc` goes back
   to the caret.
 - `Ctrl+e` and `Ctrl+y` scroll one line without moving the caret or the selection, and `Ctrl+c` still
   interrupts a running turn. Any other plain key ends the selection with a note naming it; other chords with

@@ -2,6 +2,7 @@ import type { AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
+import type { ProposedChange } from "./proposal";
 
 export type OutboundMessage =
   | { type: "ready"; request_id: string }
@@ -64,6 +65,12 @@ export type OutboundMessage =
   | { type: "open_path"; request_id: string; path: string; line?: number }
   /** `Ctrl+g` on a row: show this text read-only in the scratch split. */
   | { type: "view_in_editor"; request_id: string; title: string; text: string }
+  /** A copy's text for the primary selection too (`primaryCopy.ts`). The shell's page handler takes this
+   *  one kind itself and answers nothing, so it carries no request id. */
+  | { type: "copy_primary"; text: string }
+  /** `Ctrl+g` on a pending edit card for one file: the file as it is on disk beside the file as the card
+   *  would leave it, read-only (`proposal.ts#proposalOf`). `path` is the card's own. */
+  | { type: "view_proposal"; request_id: string; path: string; change: ProposedChange }
   /** A tab.* panel-table action: the same verbs the
    *  prefix's own tmux window keys run. Window-level, like the prefix's own `tab_verb` -- whichever
    *  tab is under the keys decides, so this carries no `tab` of its own (Rust's `InboundMessage::

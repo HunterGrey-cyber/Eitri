@@ -361,6 +361,14 @@ pub enum InboundMessage {
         title: String,
         text: String,
     },
+    /// `Ctrl+g` in BROWSE on a pending edit card whose change names one file: the file as it is on disk
+    /// beside the file as the card would leave it, both read-only. `path` is the agent's own, relative to
+    /// the project or absolute; nothing about it is trusted.
+    ViewProposal {
+        request_id: String,
+        path: String,
+        change: ProposedChange,
+    },
     /// `f` in the panel's BROWSE: ask `shell` to start a global HINT.
     HintRequest {
         request_id: String,
@@ -559,6 +567,7 @@ impl InboundMessage {
             | InboundMessage::HistoryPush { .. }
             | InboundMessage::OpenPath { .. }
             | InboundMessage::ViewInEditor { .. }
+            | InboundMessage::ViewProposal { .. }
             | InboundMessage::TabVerb { .. }
             | InboundMessage::CycleDefaultMode { .. }
             | InboundMessage::CloseOthers { .. }
@@ -608,6 +617,42 @@ impl InboundMessage {
             None => TabRef::Missing,
         }
     }
+}
+
+/// What a pending edit card would do to its one file, as the page read it off the card: replacements made
+/// in order on the file's current text, or the file's whole new content. The page's `ProposedChange`
+/// (`agent-ui/web/src/proposal.ts`) is the other half of this shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProposedChange {
+    Edits {
+        edits: Vec<ProposedEdit>,
+        /// The agent's edit tool reads a CR-LF file with its line ends made LF, replaces there, and writes
+        /// the file's line end back over every line (Claude Code's `Edit` and `MultiEdit` do). Absent reads
+        /// as false: the replacements are made on the bytes as they are.
+        #[serde(default, rename = "crlfAsLf")]
+        crlf_as_lf: bool,
+    },
+    Content {
+        content: String,
+    },
+}
+
+/// One replacement of a [`ProposedChange::Edits`]: `old_text` must be found in the text as the earlier
+/// replacements left it, exactly once unless `replace_all`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposedEdit {
+    pub old_text: String,
+    pub new_text: String,
+    pub replace_all: bool,
+}
+
+/// Whether a path a page sent holds a control character (U+0000-U+001F, U+007F). Such a path is refused
+/// before it is looked up or handed to the editor: a newline in a name has been able to end one editor
+/// command and start another, and no file name an agent shows needs one.
+pub fn path_holds_control(path: &str) -> bool {
+    path.chars().any(|c| c.is_ascii_control())
 }
 
 /// The decision half of a `permission_response`, as a closed set rather than a bool.
@@ -672,6 +717,7 @@ impl InboundMessage {
             | InboundMessage::ReviewRecover { request_id, .. }
             | InboundMessage::OpenInEditor { request_id, .. }
             | InboundMessage::ViewInEditor { request_id, .. }
+            | InboundMessage::ViewProposal { request_id, .. }
             | InboundMessage::TabVerb { request_id, .. }
             | InboundMessage::CycleDefaultMode { request_id }
             | InboundMessage::CloseOthers { request_id }
@@ -704,6 +750,42 @@ pub fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
             None
         }
     }
+}
+
+/// The most text one copy puts in the primary selection: 1 MiB of UTF-8. The page holds the same
+/// number (`agent-ui/web/src/primaryCopy.ts`) and sends nothing longer.
+pub const PRIMARY_COPY_MAX_BYTES: usize = 1 << 20;
+
+/// The text of `{"type":"copy_primary","text":...}`, the one message the chat page's handler takes
+/// itself: the primary selection belongs to the widget's display, which the panel never sees. Anything
+/// else -- another kind, a field more or less, text over `PRIMARY_COPY_MAX_BYTES` -- is `None` and goes
+/// on to `parse_inbound_message`, which does not know this kind. The page can already write the
+/// clipboard, so this hands it nothing new beyond the second selection, and only as plain text.
+pub fn primary_copy(raw: &str) -> Option<String> {
+    // Every message the page posts passes through here first; only one that names the kind is parsed
+    // twice, and none longer than a capped text can be spelled (six bytes of JSON per byte at most).
+    if !raw.contains("\"copy_primary\"") || raw.len() > PRIMARY_COPY_MAX_BYTES * 6 + 64 {
+        return None;
+    }
+    // An object with exactly these two keys: a derived struct would also take the array `[kind, text]`.
+    let message: serde_json::Map<String, Value> = serde_json::from_str(raw).ok()?;
+    if message.len() != 2 || message.get("type")?.as_str()? != "copy_primary" {
+        return None;
+    }
+    let text = message.get("text")?.as_str()?;
+    (text.len() <= PRIMARY_COPY_MAX_BYTES).then(|| text.to_owned())
+}
+
+/// Whether `raw` is a message of the `copy_primary` kind, well formed or not. A host takes every such
+/// message itself, whether or not it has a primary selection to set: the panel's parser does not know the
+/// kind and logs what it cannot parse in full, and this message carries the text the user copied.
+pub fn is_primary_copy(raw: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Kind {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    raw.contains("\"copy_primary\"") && serde_json::from_str::<Kind>(raw).is_ok_and(|m| m.kind == "copy_primary")
 }
 
 /// `{"kind":"command_result","requestId":...,"ok":true}` or
@@ -2377,6 +2459,81 @@ pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_copy_reads_only_its_own_kind_and_caps_the_text() {
+        assert_eq!(
+            primary_copy(r#"{"type":"copy_primary","text":"Run this:\n\nls -la\n\nthen look."}"#).as_deref(),
+            Some("Run this:\n\nls -la\n\nthen look.")
+        );
+        assert_eq!(
+            primary_copy(r#"{"text":"x","type":"copy_primary"}"#).as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            primary_copy(r#"{"type":"copy_primary","text":""}"#).as_deref(),
+            Some("")
+        );
+        for other in [
+            // Another kind, even one whose text names this kind.
+            r#"{"type":"send_message","request_id":"r1","text":"\"copy_primary\""}"#,
+            r#"{"type":"view_in_editor","request_id":"r1","title":"copy_primary","text":"x"}"#,
+            // This kind with anything more, less or other than its text.
+            r#"{"type":"copy_primary","text":"x","request_id":"r1"}"#,
+            r#"{"type":"copy_primary","text":"x","tab":1}"#,
+            r#"{"type":"copy_primary"}"#,
+            r#"{"type":"copy_primary","text":7}"#,
+            r#"{"type":"copy_primary","text":null}"#,
+            r#"{"type":"copy_primary","text":["x"]}"#,
+            r#"{"type":"Copy_Primary","text":"x"}"#,
+            r#"["copy_primary","x"]"#,
+            r#"{"type":"copy_primary","text":"x""#,
+            "",
+        ] {
+            assert_eq!(primary_copy(other), None, "{other}");
+        }
+        let message = |text: &str| serde_json::json!({ "type": "copy_primary", "text": text }).to_string();
+        let at_cap = "x".repeat(PRIMARY_COPY_MAX_BYTES);
+        assert_eq!(primary_copy(&message(&at_cap)), Some(at_cap.clone()));
+        assert_eq!(primary_copy(&message(&format!("{at_cap}x"))), None);
+        // The cap counts UTF-8 bytes, not characters.
+        let two_byte = "\u{e9}".repeat(PRIMARY_COPY_MAX_BYTES / 2);
+        assert_eq!(primary_copy(&message(&two_byte)), Some(two_byte.clone()));
+        assert_eq!(primary_copy(&message(&format!("{two_byte}x"))), None);
+        // The longest a capped text can be spelled in JSON still reads.
+        let escaped = format!(
+            r#"{{"type":"copy_primary","text":"{}"}}"#,
+            "\\u0001".repeat(PRIMARY_COPY_MAX_BYTES)
+        );
+        assert_eq!(primary_copy(&escaped).map(|t| t.len()), Some(PRIMARY_COPY_MAX_BYTES));
+        // The message is the shell's alone: the panel's parser never takes it.
+        assert!(parse_inbound_message(&message("x")).is_none());
+    }
+
+    #[test]
+    fn every_message_of_the_copy_kind_is_known_as_one_so_no_host_hands_it_to_the_panel() {
+        let over_cap =
+            serde_json::json!({ "type": "copy_primary", "text": "x".repeat(PRIMARY_COPY_MAX_BYTES + 1) }).to_string();
+        for copy in [
+            r#"{"type":"copy_primary","text":"secret"}"#,
+            r#"{"text":"secret","type":"copy_primary"}"#,
+            r#"{"type":"copy_primary","text":"secret","request_id":"r1"}"#,
+            r#"{"type":"copy_primary"}"#,
+            over_cap.as_str(),
+        ] {
+            assert!(is_primary_copy(copy), "{copy}");
+        }
+        for other in [
+            r#"{"type":"send_message","request_id":"r1","tab":1,"text":"\"copy_primary\""}"#,
+            r#"{"type":"view_in_editor","request_id":"r1","title":"copy_primary","text":"x"}"#,
+            r#"["copy_primary","x"]"#,
+            r#"{"type":"copy_primary","text":"x""#,
+            r#"{"type":"Copy_Primary","text":"x"}"#,
+            "",
+        ] {
+            assert!(!is_primary_copy(other), "{other}");
+        }
+    }
 
     #[test]
     fn a_chooser_row_names_the_extra_view_that_shows_its_tab() {
@@ -6213,6 +6370,10 @@ mod tests {
                 r#"{"type":"view_in_editor","request_id":"a","title":"Bash","text":"out"}"#,
                 false,
             ),
+            (
+                r#"{"type":"view_proposal","request_id":"a","path":"a.rs","change":{"kind":"content","content":""}}"#,
+                false,
+            ),
         ] {
             let message = parse_inbound_message(json).unwrap_or_else(|| panic!("{json} did not parse"));
             assert_eq!(message.request_id(), "a");
@@ -6224,6 +6385,74 @@ mod tests {
         }
         let untabbed = parse_inbound_message(r#"{"type":"queue_message","request_id":"b","text":"x"}"#).unwrap();
         assert!(matches!(untabbed.tab_ref(), TabRef::Missing), "never the active one");
+    }
+
+    /// A proposal crosses the bridge in either shape, its path kept byte for byte so the panel's refusal sees
+    /// what the agent sent; a shape this build does not know does not parse, and a path holding a control
+    /// character is one the panel refuses before looking at the disk.
+    #[test]
+    fn view_proposal_parses_and_refuses_a_control_character_path() {
+        let edits = parse_inbound_message(
+            r#"{"type":"view_proposal","request_id":"v","path":"src/a.rs","change":{"kind":"edits","edits":[{"oldText":"a","newText":"b","replaceAll":true}]}}"#,
+        )
+        .unwrap();
+        match edits {
+            InboundMessage::ViewProposal { path, change, .. } => {
+                assert_eq!(path, "src/a.rs");
+                assert_eq!(
+                    change,
+                    ProposedChange::Edits {
+                        edits: vec![ProposedEdit {
+                            old_text: "a".into(),
+                            new_text: "b".into(),
+                            replace_all: true,
+                        }],
+                        crlf_as_lf: false,
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let claude = parse_inbound_message(
+            r#"{"type":"view_proposal","request_id":"v","path":"a.rs","change":{"kind":"edits","edits":[{"oldText":"a","newText":"b","replaceAll":false}],"crlfAsLf":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            claude,
+            InboundMessage::ViewProposal {
+                change: ProposedChange::Edits { crlf_as_lf: true, .. },
+                ..
+            }
+        ));
+        let content = parse_inbound_message(
+            r#"{"type":"view_proposal","request_id":"v","path":"new.rs","change":{"kind":"content","content":"fn main() {}\n"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            content,
+            InboundMessage::ViewProposal { change: ProposedChange::Content { ref content }, .. } if content == "fn main() {}\n"
+        ));
+        for unknown in [
+            r#"{"type":"view_proposal","request_id":"v","path":"a.rs","change":{"kind":"delete"}}"#,
+            r#"{"type":"view_proposal","request_id":"v","path":"a.rs","change":{"kind":"edits"}}"#,
+            r#"{"type":"view_proposal","request_id":"v","path":"a.rs"}"#,
+        ] {
+            assert!(parse_inbound_message(unknown).is_none(), "{unknown}");
+        }
+        let hostile = parse_inbound_message(
+            r#"{"type":"view_proposal","request_id":"v","path":"a\nlua(io.open)('x','w')","change":{"kind":"content","content":""}}"#,
+        )
+        .unwrap();
+        let InboundMessage::ViewProposal { path, .. } = hostile else {
+            panic!("a control character is data to the parser")
+        };
+        assert_eq!(path, "a\nlua(io.open)('x','w')");
+        assert!(path_holds_control(&path));
+        for c in ['\0', '\r', '\t', '\x1b', '\x7f'] {
+            assert!(path_holds_control(&format!("a{c}b.rs")), "{c:?}");
+        }
+        assert!(!path_holds_control("src/main.rs"));
+        assert!(!path_holds_control("/abs/naïve file.rs"));
     }
 
     #[test]

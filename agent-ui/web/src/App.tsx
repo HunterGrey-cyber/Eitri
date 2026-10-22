@@ -72,6 +72,7 @@ import type { ShownLink } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
 import { pathsIn, viewText } from "./paths";
+import { proposalOf } from "./proposal";
 import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
 import { LinkPick } from "./components/LinkPick";
@@ -122,6 +123,7 @@ import { Chooser } from "./components/Chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
+import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource } from "./slashCommands";
 import { parseEffortReply, parseModelReply } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
@@ -132,6 +134,7 @@ import type { ApproveFact, BandFacts } from "./band";
 import type { AgentUiState, DetailRow, TabId, TabsEnvelope, ContextSummary, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
+import { copyToPrimary } from "./primaryCopy";
 
 /** The line `agent/src/providers/claude_sidecar/spawn.rs::describe_checkout` writes for version skew.
  *  Moved in from the deleted `statusRow.ts`: the band's `warn` fact
@@ -814,6 +817,7 @@ export default function App() {
   }, [yanked]);
   function copied(text: string, key: string | undefined) {
     void navigator.clipboard?.writeText(text);
+    copyToPrimary(text);
     showFlash(`copied ${countCodePoints(text)} chars`);
     if (key !== undefined) {
       yankSeq.current += 1;
@@ -1116,6 +1120,9 @@ export default function App() {
   /** The number `prefix ?` gave the opening that is showing (`open_keymap`'s `opening`), or `null` when the
    *  panel's own `?` opened it: only the former reports its close to Rust, which may give the keys back. */
   const keymapOpening = useRef<number | null>(null);
+  /** Counts the shell's `open_keymap` envelopes, so one that arrives while the sheet is already up still
+   *  re-renders it and the sheet can move to where that opening starts. */
+  const [keymapRequest, setKeymapRequest] = useState(0);
   /** Whether the showing opening is being closed by the overlay's own keys or a click outside it. Every
    *  other close leaves it false, so a forced close (`:`, a review, a new session) gives nothing back. */
   const keymapClosedByKey = useRef(false);
@@ -1192,6 +1199,27 @@ export default function App() {
     trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
     postToRust({ type: "open_path", request_id: requestId, path: ref.path, ...(ref.line === null ? {} : { line: ref.line }) });
   }
+  function runSlashAction(action: SlashAction) {
+    switch (action.kind) {
+      case "keymap":
+        keymapOpening.current = null;
+        keymapClosedByKey.current = false;
+        setKeymapOpen(true);
+        break;
+      case "tab-info":
+        postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "info" });
+        break;
+      case "sessions":
+        postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "choose" });
+        break;
+      case "open-path":
+        openPath({ path: action.path, line: null });
+        break;
+      case "pointer":
+        showFlash(action.text);
+        break;
+    }
+  }
   /** `c` in BROWSE: opens the review overlay on this tab's latest turn and asks the shell for it. The
    *  overlay is drawn at once, saying it is loading, and filled in by the `review` envelope that answers
    *  this request id (or told why not by the refusal). Recorded as `"review"`, so a refusal is the
@@ -1260,6 +1288,7 @@ export default function App() {
         return;
       case "copy":
         void navigator.clipboard?.writeText(effect.text);
+        copyToPrimary(effect.text);
         showFlash(`copied ${effect.text}`);
         return;
     }
@@ -2523,6 +2552,7 @@ export default function App() {
           setKeymapPlugin(pluginKeysHelp(payload.plugin));
           keymapOpening.current = typeof payload.opening === "number" ? payload.opening : null;
           keymapClosedByKey.current = false;
+          setKeymapRequest((n) => n + 1);
           setKeymapOpen(true);
           break;
         }
@@ -3677,6 +3707,7 @@ export default function App() {
             </div>
           ) : (
             <EmptyTab
+              onSlashAction={runSlashAction}
               hello={hello}
               tab={activeTab}
               handoff={handoff}
@@ -3827,6 +3858,8 @@ export default function App() {
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
               plugin={keymapPlugin ?? undefined}
+              startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
+              startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
               agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
               modes={hello === null ? undefined : tabPermissionModes(hello.permissionModes, activeTab?.agent)}
@@ -5325,13 +5358,20 @@ export default function App() {
         break;
       }
       case "view-in-editor": {
-        // Open the row's full text in a read-only nvim scratch buffer.
+        // Show the row's full text in a read-only nvim scratch buffer. For a pending edit card,
+        // show its proposed change as the file on disk beside the file the card would produce, both
+        // read-only.
         const item = timeline[cursor];
         if (item === undefined) break;
-        const { title, text } = viewText(item);
         const requestId = nextRequestId();
         trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
-        postToRust({ type: "view_in_editor", request_id: requestId, title, text });
+        const proposal = proposalOf(item, answeredRef.current);
+        if (proposal !== null) {
+          postToRust({ type: "view_proposal", request_id: requestId, path: proposal.path, change: proposal.change });
+        } else {
+          const { title, text } = viewText(item);
+          postToRust({ type: "view_in_editor", request_id: requestId, title, text });
+        }
         break;
       }
     }
@@ -5526,6 +5566,8 @@ export default function App() {
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
               plugin={keymapPlugin ?? undefined}
+              startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
+              startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
               agent={isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : null}
               modes={hello === null ? undefined : tabPermissionModes(hello.permissionModes, activeTab?.agent)}
@@ -5662,6 +5704,7 @@ export default function App() {
         onHandoff={handoffToTerminal}
       />
       <Composer
+        onSlashAction={runSlashAction}
         // C1: a running turn no longer disables the composer -- it queues a follow-up instead. Only
         // a dead session, or one already being closed for a terminal handoff, takes no more turns:
         // clearing `activeTurnId` on a lost session must not hand the user an enabled composer

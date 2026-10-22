@@ -55,6 +55,25 @@ The header can carry notes about how exact the comparison is:
 
 A turn that changed nothing says `no files changed on disk`.
 
+### Before you approve
+
+The review shows what changed on disk, so an edit still waiting on its permission card is not in it yet. When
+some of the turn's file-changing calls have no result, the last line counts them and adds
+`Ctrl+g on its card shows the proposal`.
+
+In browsing, `Ctrl+g` on a pending edit card opens a new Neovim tab page with the file as it is on disk on the
+left and the file as the edit would leave it on the right, in diff mode, both read-only; `q` closes the tab page.
+Nothing is written to the file, and your own buffers are not touched. This works for a Claude `Edit`, `MultiEdit`
+or `Write`, a Codex change that adds one file, and an ACP agent's edit of one file. A Codex change to an existing
+file, a change to several files, a delete or a move shows the card's text instead, as `Ctrl+g` does on any other
+row.
+
+If the file changed after the card appeared and the edit no longer fits it, the band says
+`the proposal no longer applies to <path> as it is on disk` rather than showing a diff against the wrong text. A
+path that is not a regular file, a file or a proposed text over 4 MiB, and a file that is not UTF-8 text are refused
+the same way, with the reason. A change of line ends alone still shows: when one side has CR-LF line ends and the
+other LF, the CRs show as `^M`, and a final newline added or removed shows as an empty last line.
+
 ### Moving around
 
 | key | what it does |

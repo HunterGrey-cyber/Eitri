@@ -147,9 +147,14 @@ fn prompted(rest: Vec<Value>) -> Vec<Value> {
 
 /// A provider with its session started and its turn sent, the agent logging its stdin into `dir`.
 fn running(dir: &Path, rest: Vec<Value>) -> AcpProvider {
+    running_as(logged_standin(dir, prompted(rest)))
+}
+
+/// A provider with its session started and its turn sent, the agent run as `argv`.
+fn running_as(argv: Vec<OsString>) -> AcpProvider {
     let spec = AcpAgentSpec {
         name: "stand-in".to_string(),
-        argv: logged_standin(dir, prompted(rest)),
+        argv,
         auto_mode: None,
     };
     let provider = AcpProvider::connect(spec, std::env::temp_dir()).expect("connects");
@@ -335,6 +340,80 @@ fn a_flooding_agent_with_a_full_queue_moves_with_its_messages_in_order() {
     );
     assert_eq!(completed(&after), Some(TurnOutcome::Completed));
     close(&destination);
+}
+
+#[test]
+fn an_agent_whose_end_still_waits_for_its_stderr_refuses_the_move_and_keeps_its_notice() {
+    let dir = scratch("closing-notice");
+    let script_file = dir.join("script.json");
+    let script = prompted(vec![
+        write(
+            json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": {
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "c1", "title": "Run command", "kind": "execute", "status": "pending",
+                         "rawInput": {"command": "touch x", "cwd": "/work"}},
+            "options": [{"optionId": "a-1", "name": "Yes", "kind": "allow_once"},
+                        {"optionId": "r-1", "name": "No", "kind": "reject_once"}]}}),
+        ),
+        json!({"exit": 0}),
+    ]);
+    std::fs::write(&script_file, Value::Array(script).to_string()).expect("the script");
+    let gate = dir.join("gate");
+    // The stand-in ends, the shell closes its own copy of stdout and keeps stderr open and empty until the
+    // gate file appears, capped so a failed test leaves no child behind: the end of the output is read while
+    // the reason is still to come.
+    let wrapper = dir.join("agent.sh");
+    write_script(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\n'{}' '@{}'\nexec >&-\ni=0\nwhile [ ! -e '{}' ] && [ \"$i\" -lt 1000 ]; do sleep 0.01; i=$((i+1)); done\necho 'stand-in: gone' >&2\n",
+            env!("CARGO_BIN_EXE_eitri-agent-standin"),
+            script_file.display(),
+            gate.display()
+        ),
+    );
+    let provider = running_as(vec![OsString::from(&wrapper)]);
+    let before = pump_until(&provider, |events| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                AgentDomainEvent::PermissionResolved {
+                    outcome: PermissionOutcome::ProviderFailed,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        !before
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+        "the notice waits for stderr: {before:#?}"
+    );
+
+    // The agent is gone though its notice is not out yet: there is nothing to move, and the refusal leaves the
+    // notice where the pump finishes it.
+    let refused = provider
+        .freeze_for_move()
+        .map(|_| ())
+        .expect_err("an ended agent does not move");
+    assert_eq!(refused, MoveRefusedWhy::Ended);
+
+    std::fs::write(&gate, b"").expect("the gate opens");
+    let after = pump_until(&provider, |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+    });
+    let notices: Vec<&String> = after
+        .iter()
+        .filter_map(|e| match e {
+            AgentDomainEvent::SessionUnavailable { reason } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "{after:#?}");
+    assert!(notices[0].contains("stand-in: gone"), "{}", notices[0]);
 }
 
 #[test]

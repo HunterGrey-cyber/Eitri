@@ -11,7 +11,7 @@ export const STYLE_TEXT: string =
   '.eitri-keys-message{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 1ch}' +
   '.eitri-keys-status{flex:0 1 auto;max-width:60%;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--nv-chrome-fg, #f4f4f4)}' +
   '.eitri-keys-current{outline:2px solid var(--nv-focus-ring, #cfa85d);outline-offset:3px}' +
-  '.eitri-keys-current.eitri-keys-dimmed{outline-color:var(--nv-border, #8888)}' +
+  '.eitri-keys-current.eitri-keys-dimmed{outline-color:var(--nv-focus-ring-inactive, #8888)}' +
   '.eitri-hint{position:fixed;padding:1px 3px;border-radius:2px;text-transform:none;background:var(--nv-hint-bg, #ffe082);color:var(--nv-hint-fg, #171717);border:1px solid var(--nv-hint-fg, #171717);font:bold 13px/16px var(--nv-font-mono, monospace)}' +
   '.eitri-hint.eitri-hint-danger{border:2px solid var(--nv-error, #9c2525)}' +
   '#eitri-keys-sheet{position:fixed;inset:8%;z-index:2147483646;overflow:auto;padding:24px;background:var(--nv-surface, #20252b);color:var(--nv-surface-fg, #f4f4f4);border:1px solid var(--nv-border, #888);font:14px var(--nv-font-prose, sans-serif)}' +

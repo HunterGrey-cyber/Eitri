@@ -339,6 +339,9 @@ describe("Enter, o, y, [ ] and S", () => {
     expect(requests("open_path"), "the review's own message, not the conversation's").toEqual([]);
     press(container, "y");
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("core/src/x.rs:966");
+    expect(requests("copy_primary"), "the primary selection gets the same text").toEqual([
+      { type: "copy_primary", text: "core/src/x.rs:966" },
+    ]);
   });
 
   it("o on a file with no patch loaded opens it with no line", () => {

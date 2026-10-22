@@ -283,5 +283,16 @@ fn trimming_the_store_never_removes_a_held_write_slot() {
     assert_eq!(other.try_exclusive().unwrap_err(), SlotBusy::Writing);
     assert_eq!(other.try_shared().unwrap_err(), SlotBusy::Writing);
     drop(writing);
-    drop(other.try_exclusive().expect("free once let go"));
+    // A hold just let go can stay held for a moment: a child another test thread is starting (git, for a
+    // snapshot) holds a copy of every descriptor of this process until it execs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let free = loop {
+        match other.try_exclusive() {
+            Err(SlotBusy::Writing | SlotBusy::Reading) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            taken => break taken,
+        }
+    };
+    drop(free.expect("free once let go"));
 }

@@ -171,3 +171,57 @@ describe("Esc with a y/n question up", () => {
     expect(container.querySelector(".slash-menu")).not.toBeNull();
   });
 });
+
+/** The band lays itself out from its measured width, which jsdom never reports: this hands it one. */
+function stubBandWidth(): (container: HTMLElement) => void {
+  type Rec = { callback: ResizeObserverCallback; observed: Element[] };
+  const observers: Rec[] = [];
+  class FakeResizeObserver {
+    private record: Rec;
+    constructor(callback: ResizeObserverCallback) {
+      this.record = { callback, observed: [] };
+      observers.push(this.record);
+    }
+    observe(el: Element) {
+      this.record.observed.push(el);
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+  return (container: HTMLElement) => {
+    const band = container.querySelector(".status-band");
+    const measure = container.querySelector(".band-measure");
+    for (const o of observers) {
+      for (const el of o.observed) {
+        if (el === band) o.callback([{ target: el, contentRect: { width: 900 } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
+        if (el === measure) o.callback([{ target: el, contentRect: { width: 7.2 } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
+      }
+    }
+  };
+}
+
+describe("/rewind on a Claude tab", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends nothing, keeps the draft, and the panel shows its pointer once", () => {
+    const widen = stubBandWidth();
+    const posted: unknown[] = [];
+    (window as unknown as { webkit: unknown }).webkit = {
+      messageHandlers: { eitriAgent: { postMessage: (m: unknown) => posted.push(m) } },
+    };
+    const { container } = inInput(undefined);
+    const pointer = "/rewind is not in Eitri — c reviews and reverts this turn's edits";
+    type(container, "/rewind");
+    const before = posted.length;
+    fireEvent.keyDown(box(container)!, { key: "Enter" });
+    expect(box(container)!.value).toBe("/rewind");
+    act(() => widen(container));
+    expect(container.querySelector(".status-band .band-message")?.textContent, "the band says it").toBe(pointer);
+    expect(posted.slice(before).filter((m) => String(m).includes("/rewind")), "the draft never reaches the agent").toEqual([]);
+    const shown = (container.textContent ?? "").split(pointer).length - 1;
+    expect(shown, "the band and the composer must not both draw the pointer").toBe(1);
+  });
+});

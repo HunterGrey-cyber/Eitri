@@ -6,25 +6,34 @@ import { isHiddenChar } from "./revealHidden";
  *  no current entry has one of those classes. */
 export type SlashCommandClass = "works" | "sent-as-text" | "no-op" | "error" | "hangs";
 
+export type SlashAction =
+  | { kind: "keymap" }
+  | { kind: "tab-info" }
+  | { kind: "sessions" }
+  | { kind: "open-path"; path: string }
+  | { kind: "pointer"; text: string };
+
 export interface SlashCommandEntry {
   /** Command name without the leading slash, in lower case as used by the CLI.
    *  Other spellings miss this table and are sent as unknown commands. */
   name: string;
   class: SlashCommandClass;
+  /** A local action takes precedence over the recorded CLI behavior for a bare word. */
+  action?: SlashAction;
 }
 
 /** Preserve this order so `worksSlashCommands` gives the `?` overlay a stable command list. */
 export const SLASH_COMMANDS: readonly SlashCommandEntry[] = [
-  { name: "help", class: "sent-as-text" },
+  { name: "help", class: "sent-as-text", action: { kind: "keymap" } },
   { name: "clear", class: "works" },
   { name: "compact", class: "works" },
   { name: "cost", class: "works" },
   { name: "context", class: "works" },
   { name: "usage", class: "works" },
-  { name: "status", class: "sent-as-text" },
+  { name: "status", class: "sent-as-text", action: { kind: "tab-info" } },
   { name: "model", class: "works" },
   { name: "config", class: "works" },
-  { name: "memory", class: "sent-as-text" },
+  { name: "memory", class: "sent-as-text", action: { kind: "open-path", path: "CLAUDE.md" } },
   { name: "init", class: "sent-as-text" },
   { name: "review", class: "sent-as-text" },
   { name: "security-review", class: "sent-as-text" },
@@ -36,8 +45,12 @@ export const SLASH_COMMANDS: readonly SlashCommandEntry[] = [
   { name: "hooks", class: "sent-as-text" },
   { name: "permissions", class: "sent-as-text" },
   { name: "add-dir", class: "sent-as-text" },
-  { name: "resume", class: "sent-as-text" },
-  { name: "rewind", class: "sent-as-text" },
+  { name: "resume", class: "sent-as-text", action: { kind: "sessions" } },
+  {
+    name: "rewind",
+    class: "sent-as-text",
+    action: { kind: "pointer", text: "/rewind is not in Eitri — c reviews and reverts this turn's edits" },
+  },
   { name: "login", class: "sent-as-text" },
   { name: "logout", class: "sent-as-text" },
   { name: "doctor", class: "works" },
@@ -72,12 +85,19 @@ function parseSlashCommand(text: string): { name: string; hasArgument: boolean }
   return { name, hasArgument: rest.trim().length > 0 };
 }
 
+/** Only a whole draft names a local action; arguments remain the agent's text. */
+export function slashAction(text: string): SlashAction | null {
+  const parsed = parseSlashCommand(text);
+  if (parsed === null || parsed.hasArgument) return null;
+  return BY_NAME.get(parsed.name)?.action ?? null;
+}
+
 /** Returns the blocked command's name without the slash for the flash message, or `null` to send.
  *  Named interactive-only commands and held-back classes are blocked. `/model`, `/effort` and
  *  unknown commands pass, with or without arguments. */
 export function heldBackSlashCommand(text: string): string | null {
   const parsed = parseSlashCommand(text);
-  if (parsed === null) return null;
+  if (parsed === null || slashAction(text) !== null) return null;
   const { name } = parsed;
   if (INTERACTIVE_ONLY_UNCONDITIONAL.has(name)) return name;
   const entry = BY_NAME.get(name);
@@ -134,6 +154,11 @@ const LISTED_SENT_AS_TEXT: ReadonlySet<string> = new Set(["init", "review", "sec
  *  `/effort` has no row in `SLASH_COMMANDS` -- it postdates the survey -- but a bare `/effort` is sent and
  *  answered with its usage line (`barePickerCommand`), so it is listed beside `/model`. */
 const CLAUDE_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  help: "Show Eitri's keys",
+  status: "Show this tab's information",
+  resume: "Open the sessions chooser",
+  memory: "Open the project's CLAUDE.md in the editor",
+  rewind: "Show where to review and revert this turn's edits",
   clear: "Start a new conversation with empty context",
   compact: "Free up context by summarizing the conversation so far",
   cost: "Show session cost and plan usage limits",
@@ -157,14 +182,13 @@ const CLAUDE_HINTS: Readonly<Record<string, string>> = {
   model: "[model]",
 };
 
-/** Claude Code's own commands the menu offers while the Claude sidecar forwards no list of its own:
- *  the table's rows that do something here, in the table's order, held-back ones (`/config`, `/login`,
- *  `/resume`) left out, and `/effort` after `/model`. Not a full list -- the user's skills and custom and
- *  plugin commands are absent until the sidecar carries the SDK's `supportedCommands()`. */
+/** Until the agent reports its list, offer local actions and commands with a useful headless effect.
+ *  Terminal-only commands are omitted so completion never leads into a refusal. */
 export function builtInCompletions(): CompletionCommand[] {
   const rows = SLASH_COMMANDS.filter(
     (entry) =>
-      (entry.class === "works" || LISTED_SENT_AS_TEXT.has(entry.name)) && heldBackSlashCommand(`/${entry.name}`) === null,
+      (entry.action !== undefined || entry.class === "works" || LISTED_SENT_AS_TEXT.has(entry.name)) &&
+      heldBackSlashCommand(`/${entry.name}`) === null,
   ).map((entry) => entry.name);
   rows.splice(rows.indexOf("model") + 1, 0, "effort");
   return rows.flatMap((name) =>

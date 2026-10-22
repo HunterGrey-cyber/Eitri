@@ -258,3 +258,182 @@ fn a_view_reads_crlf_line_ends_the_way_split_would() {
     }
     dir.cleanup();
 }
+
+/// Writes, one line per window of the current tab page, the window's buffer name and its `modifiable`,
+/// `readonly`, `diff`, `modeline`, `filetype` and `textwidth`, then the tab page count, to `out`.
+fn write_tab_state(out: &std::path::Path) -> String {
+    format!(
+        "lua local t = {{}} \
+         for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do \
+           local b = vim.api.nvim_win_get_buf(w) \
+           t[#t + 1] = table.concat({{ vim.api.nvim_buf_get_name(b), tostring(vim.bo[b].modifiable), \
+             tostring(vim.bo[b].readonly), tostring(vim.wo[w].diff), tostring(vim.bo[b].modeline), \
+             vim.bo[b].filetype, tostring(vim.bo[b].textwidth) }}, ' ') \
+         end \
+         t[#t + 1] = 'tabs ' .. #vim.api.nvim_list_tabpages() \
+         local f = io.open('{}', 'w') f:write(table.concat(t, '\\n')) f:close()",
+        out.display()
+    )
+}
+
+/// The proposal's view is a tab page of its own holding the file on disk and the file as proposed, both
+/// read-only and in diff mode, typed by the real file's name; `q` closes it, and the buffer the user had
+/// open is left as it was.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_diff_op_opens_two_read_only_buffers_in_a_new_tab() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    let mine = dir.path().join("mine.txt");
+    std::fs::write(&mine, "the user's own text\n").unwrap();
+    let request = dir
+        .prepare_proposal("src/main.rs", "fn main() {}\n", "fn main() {\n    run();\n}\n")
+        .unwrap();
+    let opened = dir.path().join("opened");
+    let closed = dir.path().join("closed");
+    nvim(
+        &dir,
+        &[
+            format!("edit {}", mine.display()),
+            "call setline(1, 'typed, not saved')".into(),
+            call(request.hex()),
+            write_tab_state(&opened),
+            "normal q".into(),
+            format!(
+                "lua local f = io.open('{}', 'w') f:write(vim.api.nvim_buf_get_name(0), ' ', \
+                 vim.fn.getline(1), ' ', tostring(vim.bo.modified), ' tabs ', #vim.api.nvim_list_tabpages()) f:close()",
+                closed.display()
+            ),
+        ],
+    );
+    let opened = std::fs::read_to_string(&opened).expect("the diff tab was probed");
+    let lines: Vec<&str> = opened.lines().collect();
+    assert_eq!(lines.len(), 3, "two windows and the tab count: {opened}");
+    assert_eq!(lines[2], "tabs 2", "a new tab page: {opened}");
+    for line in &lines[..2] {
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert!(
+            std::path::Path::new(fields[0]).starts_with(dir.path()),
+            "a scratch buffer, not the real file: {line}"
+        );
+        // The textwidth is left out: the filetype's own plugin may set one.
+        assert_eq!(
+            &fields[1..6],
+            &["false", "true", "true", "false", "rust"],
+            "read-only, in diff mode, no modeline, typed by the real name: {line}"
+        );
+    }
+    assert!(
+        lines[0].contains("-on-disk-main.rs") && lines[1].contains("-proposed-main.rs"),
+        "{opened}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&closed).unwrap(),
+        format!("{} typed, not saved true tabs 1", mine.display()),
+        "q closed the tab and the user's buffer is untouched"
+    );
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "the user's own text\n");
+    dir.cleanup();
+}
+
+/// A proposal is the agent's text: a modeline in it (`vim:` or `ex:`) sets nothing in either buffer.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_modeline_in_a_proposal_never_runs() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    let request = dir
+        .prepare_proposal(
+            "notes.txt",
+            "first\n# vim: set ft=sh textwidth=66:\n",
+            "first\n# ex: set textwidth=77:\nlast\n# vim: set ft=sh:\n",
+        )
+        .unwrap();
+    let probe = dir.path().join("probe");
+    nvim(&dir, &[call(request.hex()), write_tab_state(&probe)]);
+    let probe = std::fs::read_to_string(&probe).expect("the diff tab was probed");
+    let lines: Vec<&str> = probe.lines().collect();
+    assert_eq!(lines.len(), 3, "{probe}");
+    for line in &lines[..2] {
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(
+            &fields[1..],
+            &["false", "true", "true", "false", "text", "0"],
+            "the options the op set, not the modeline's: {line}"
+        );
+    }
+    dir.cleanup();
+}
+
+/// Writes each window's buffer lines of the current tab page to `out`, one window per line, the lines
+/// joined by `|` and a CR shown as `^M`.
+fn write_tab_lines(out: &std::path::Path) -> String {
+    format!(
+        "lua local t = {{}} \
+         for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do \
+           local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(w), 0, -1, false) \
+           t[#t + 1] = (table.concat(lines, '|'):gsub('\\r', '^M')) \
+         end \
+         local f = io.open('{}', 'w') f:write(table.concat(t, '\\n')) f:close()",
+        out.display()
+    )
+}
+
+/// A proposal that changes only line ends must not look like no change: each side keeps the ends the
+/// two sides do not share, so the difference shows in the diff.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_change_of_line_ends_alone_still_shows_in_the_diff() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    for (base, proposed, want) in [
+        // CR-LF made LF: the CRs stay on the left.
+        ("one\r\ntwo\r\n", "one\ntwo\n", "one^M|two^M\none|two"),
+        // The final line end removed: an empty last line on the side that has it.
+        ("one\ntwo\n", "one\ntwo", "one|two|\none|two"),
+        // Both sides CR-LF, and both with a final end: read away on both, as `:split` would.
+        ("one\r\ntwo\r\n", "one\r\nTWO\r\n", "one|two\none|TWO"),
+        // A new file has nothing to disagree with.
+        ("", "one\r\n", "\none"),
+    ] {
+        let request = dir.prepare_proposal("notes.txt", base, proposed).unwrap();
+        let probe = dir.path().join("lines");
+        nvim(&dir, &[call(request.hex()), write_tab_lines(&probe)]);
+        assert_eq!(
+            std::fs::read_to_string(&probe).expect("the diff tab was probed"),
+            want,
+            "{base:?} -> {proposed:?}"
+        );
+    }
+    dir.cleanup();
+}
+
+/// When the proposal's tab is the last one, `q` cannot close it without quitting nvim; the window that
+/// stays leaves diff mode, so the buffer it shows next is not diffed against nothing.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn q_in_the_last_tab_leaves_no_window_in_diff_mode() {
+    let mut dir = ScratchDir::new().expect("a scratch directory");
+    let request = dir.prepare_proposal("main.rs", "a\n", "b\n").unwrap();
+    let probe = dir.path().join("after");
+    nvim(
+        &dir,
+        &[
+            call(request.hex()),
+            "tabonly".into(),
+            "normal q".into(),
+            format!(
+                "lua local t = {{}} \
+                 for _, w in ipairs(vim.api.nvim_list_wins()) do \
+                   t[#t + 1] = table.concat({{ tostring(vim.wo[w].diff), tostring(vim.wo[w].scrollbind), \
+                     tostring(vim.wo[w].cursorbind), vim.wo[w].foldmethod }}, ' ') \
+                 end \
+                 t[#t + 1] = 'tabs ' .. #vim.api.nvim_list_tabpages() \
+                 local f = io.open('{}', 'w') f:write(table.concat(t, '\\n')) f:close()",
+                probe.display()
+            ),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(&probe).expect("the windows were probed"),
+        "false false false manual\ntabs 1"
+    );
+    dir.cleanup();
+}

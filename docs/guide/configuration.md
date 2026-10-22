@@ -49,7 +49,7 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `agent.default` | `"claude"`, `"codex"` or the name of an agent registered with `eitri.agent.register` | `"claude"` | The agent a new tab runs, and the first tab of a fresh window. See [Codex and other agents](agents.md). |
 | `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part stops Eitri at startup. |
 | `agent.default_mode` | `"manual"`, `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
-| `agent.restore` | `"offer"`, `"auto"` or `"off"` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
+| `agent.restore` | `"offer"`, `"auto"`, `"off"` or `false` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
 | `agent.thinking` | `"collapsed"`, `"preview"`, `"expanded"` or `"hidden"` | `"collapsed"` | How the agent panel shows the agent's thinking. `"collapsed"` draws one quiet row per thought, opened with `Enter` like a tool's output; `"preview"` also shows the newest lines of a thought while it is being written, in a box that does not grow; `"expanded"` shows every thought in full; `"hidden"` shows none. `Ctrl+o` shows every thought in full whatever this says. |
 | `agent.user_settings` | `true` / `"on"` or `false` / `"off"` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
 | `modules.chat.on_permission` | `"badge"` or `"reveal"` | `"badge"` | What happens when a permission card arrives while the agent panel is hidden. `"badge"` shows `agent ⚑N` in the top bar and a toast; `"reveal"` brings the panel back where it was, without moving the keys. While another pane is zoomed `"reveal"` shows the badge instead, because showing the panel would not put it on screen. A companion window never hides its panel, so the key does nothing there. |
@@ -333,9 +333,9 @@ shape them in every plugin page at once:
 | key | value | default | what it does |
 |---|---|---|---|
 | `plugins.keys.scroll_step` | a whole number from 10 to 400 | `60` | How far one `j` or `k` scrolls, in pixels. |
-| `plugins.keys.smooth` | `true` or `false` | `true` | Whether scrolling glides. `false` makes every scroll key jump, as does the desktop's reduced-motion setting. |
-| `plugins.keys.prefix_wait` | `true` or `false` | `true` | Whether a key that only begins longer keys (the `g` of `gg`) waits for the next key as long as it takes, as Vim's own `g` does. `false` gives up after Neovim's `timeoutlen`. |
-| `plugins.keys.which_key_delay` | a whole number from 0 to 5000, or `false` | `200` | How many milliseconds after such a key the page's status line lists the keys that may follow. `false` never lists them. |
+| `plugins.keys.smooth` | `true` / `"on"` or `false` / `"off"` | `true` | Whether scrolling glides. `false` makes every scroll key jump, as does the desktop's reduced-motion setting. |
+| `plugins.keys.prefix_wait` | `true` / `"on"` or `false` / `"off"` | `true` | Whether a key that only begins longer keys (the `g` of `gg`) waits for the next key as long as it takes, as Vim's own `g` does. `false` gives up after Neovim's `timeoutlen`. |
+| `plugins.keys.which_key_delay` | a whole number from 0 to 5000, `false` or `"off"` | `200` | How many milliseconds after such a key the page's status line lists the keys that may follow. `false` never lists them. |
 | `plugins.keys.hint_chars` | 2 to 26 different lowercase letters | `"sadfjklewcmpgh"` | The letters the labels of `f` are made of. |
 | `plugins.keys.find_case` | `"smart"`, `"ignore"` or `"match"` | `"smart"` | How `/` treats case: `"smart"` ignores it unless the search has a capital letter, `"ignore"` always ignores it, `"match"` never does. |
 
@@ -352,7 +352,7 @@ key. A page's own keys are changed in its `plugin:<id>` table with `eitri.keymap
 Two settings decide what a new window does with the tabs and the mode of its last session.
 
 ```lua
-eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "auto" or "off"
+eitri.config.set("agent.restore", "offer")        -- "offer" (the default), "auto", "off" or false
 eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the default) or "bypass"
 ```
 
@@ -361,7 +361,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
   records "no tabs" because you closed the window. With `"offer"` the empty tab's dashboard shows a
   `Restore last session` line, `s`, while nothing in the window has started; `"auto"` brings the tabs back at
   launch with no key pressed (unless the project's Claude configuration is new or changed, in which case the
-  restore waits for your answer to the [trust question](permissions.md#trusting-a-project), and `Esc` on it keeps the saved tabs: they come back as failed tabs you can start again with `r`, or, from the empty tab's `Restore last session` line while the tab is still empty, stay on offer); `"off"` neither offers nor remembers. Each tab is resumed (nothing is sent until
+  restore waits for your answer to the [trust question](permissions.md#trusting-a-project), and `Esc` on it keeps the saved tabs: they come back as failed tabs you can start again with `r`, or, from the empty tab's `Restore last session` line while the tab is still empty, stay on offer); `"off"` or `false` neither offers nor remembers; `true` and `"on"` are refused. Each tab is resumed (nothing is sent until
   you type), the one on screen last time is on screen again, and one message says how many came back. A tab
   is skipped, and named, when its saved record is gone or another window holds its session. A tab that was in
   bypass is never put back in bypass without a yes: `s` asks first, and `n` (or `"auto"`) brings it back in

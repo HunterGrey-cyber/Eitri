@@ -142,8 +142,8 @@ describe("Composer and slash commands (P10)", () => {
     );
   });
 
-  it("holds back the unconditional interactive-only commands: /config and /resume", () => {
-    for (const command of ["/config", "/resume"]) {
+  it("holds back interactive-only commands with no local action", () => {
+    for (const command of ["/config", "/resume yesterday"]) {
       const { textarea, onSend } = renderComposer();
       fireEvent.change(textarea, { target: { value: command } });
       fireEvent.keyDown(textarea, { key: "Enter" });
@@ -878,5 +878,50 @@ describe("Composer: the accessible name", () => {
     const { container } = renderComposer();
     expect(container.querySelector("textarea")!.hasAttribute("placeholder")).toBe(false);
     expect(getByRole(container, "textbox", { name: "Message the agent" })).toBe(container.querySelector("textarea"));
+  });
+});
+
+describe("Composer local slash actions", () => {
+  it("a_mapped_word_runs_and_clears_the_draft", () => {
+    for (const [word, action] of [["help", { kind: "keymap" }], ["status", { kind: "tab-info" }], ["resume", { kind: "sessions" }], ["memory", { kind: "open-path", path: "CLAUDE.md" }]] as const) {
+      const onSlashAction = vi.fn();
+      const onQueue = vi.fn();
+      const onSendNow = vi.fn();
+      const onHistoryPush = vi.fn();
+      const { textarea, onSend } = renderComposer({ onSlashAction, running: true, onQueue, onSendNow, onHistoryPush });
+      fireEvent.change(textarea, { target: { value: `/${word}` } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSlashAction).toHaveBeenCalledWith(action);
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onQueue).not.toHaveBeenCalled();
+      expect(onSendNow).not.toHaveBeenCalled();
+      expect(onHistoryPush).not.toHaveBeenCalled();
+      expect(textarea.value).toBe("");
+      cleanup();
+    }
+  });
+
+  it("rewind_sends_nothing_and_keeps_the_draft", () => {
+    const onSlashAction = vi.fn();
+    const { textarea, container, onSend } = renderComposer({ onSlashAction });
+    fireEvent.change(textarea, { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("/rewind");
+    expect(onSlashAction).toHaveBeenCalledWith({ kind: "pointer", text: "/rewind is not in Eitri — c reviews and reverts this turn's edits" });
+    // The band shows the pointer; the composer's own flash stays empty so the text appears once.
+    expect(container.querySelector(".composer-slash-flash")).toBeNull();
+  });
+
+  it("on_another_agents_tab_the_words_are_sent_as_text", () => {
+    for (const word of ["help", "status", "resume", "memory", "rewind"]) {
+      const onSlashAction = vi.fn();
+      const { textarea, onSend } = renderComposer({ claudeSlashCommands: false, onSlashAction });
+      fireEvent.change(textarea, { target: { value: `/${word}` } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith(`/${word}`);
+      expect(onSlashAction).not.toHaveBeenCalled();
+      cleanup();
+    }
   });
 });

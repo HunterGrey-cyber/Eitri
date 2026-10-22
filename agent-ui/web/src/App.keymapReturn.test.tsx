@@ -102,3 +102,17 @@ describe("closing the sheet prefix ? opened", () => {
     expect(closes()).toEqual([expect.objectContaining({ opening: 8, return_keys: false })]);
   });
 });
+
+describe("prefix ? over the sheet the chat's ? opened", () => {
+  it("moves the open sheet to the prefix table", () => {
+    const container = shown();
+    const scroll = vi.fn();
+    Element.prototype.scrollIntoView = scroll;
+    const sheet = openOwn(container);
+    expect(scroll).not.toHaveBeenCalled();
+    dispatch({ kind: "open_keymap", opening: 7 });
+    expect(container.querySelector(".keymap-overlay"), "the same sheet stays up").toBe(sheet);
+    expect(scroll).toHaveBeenCalledTimes(1);
+    expect((scroll.mock.instances[0] as unknown as HTMLElement).textContent).toMatch(/^After /);
+  });
+});

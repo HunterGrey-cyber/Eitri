@@ -207,6 +207,22 @@ mod tests {
         PathBuf::from("/home/someone/project")
     }
 
+    /// The pair lock, taken once it comes free. A lock whose last descriptor here was just closed can stay held
+    /// for a moment: a child another test thread is starting holds a copy of every descriptor of this process
+    /// until it execs.
+    fn take_once_free(dir: &Path) -> Option<PairLock> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match PairLock::try_take(dir, &root()).unwrap() {
+                Some(lock) => return Some(lock),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                None => return None,
+            }
+        }
+    }
+
     #[test]
     fn each_role_names_its_files_beside_window_ones() {
         let hex = &agent::conversation_id_for_cwd(&root())[..16];
@@ -231,7 +247,7 @@ mod tests {
         assert!(first.is_some());
         assert!(PairLock::try_take(&dir, &root()).unwrap().is_none());
         drop(first);
-        assert!(PairLock::try_take(&dir, &root()).unwrap().is_some());
+        assert!(take_once_free(&dir).is_some());
     }
 
     #[test]
@@ -245,7 +261,7 @@ mod tests {
             "the shared copy keeps it"
         );
         drop(second);
-        assert!(PairLock::try_take(&dir, &root()).unwrap().is_some());
+        assert!(take_once_free(&dir).is_some());
     }
 
     #[test]

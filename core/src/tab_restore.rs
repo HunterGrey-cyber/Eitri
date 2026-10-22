@@ -26,19 +26,19 @@ pub enum RestorePolicy {
     Off,
 }
 
-/// The `init.lua` key: `eitri.config.set("agent.restore", "offer" | "auto" | "off")`.
+/// The `init.lua` key: `eitri.config.set("agent.restore", "offer" | "auto" | "off" | false)`.
 pub const RESTORE_KEY: &str = "agent.restore";
 
 impl RestorePolicy {
     /// The value of [`RESTORE_KEY`] as `init.lua` left it: unset is [`RestorePolicy::Offer`]; anything
-    /// but the three words is an error naming the key, as every other configuration key here is.
+    /// but a listed choice is an error naming the key, as every other configuration key here is.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
             None | Some("offer") => Ok(RestorePolicy::Offer),
             Some("auto") => Ok(RestorePolicy::Auto),
-            Some("off") => Ok(RestorePolicy::Off),
+            Some(value) if crate::config_switch::is_off(value) => Ok(RestorePolicy::Off),
             Some(_) => Err(format!(
-                "eitri.config.set(\"{RESTORE_KEY}\", {:?}): must be \"offer\", \"auto\" or \"off\"",
+                "eitri.config.set(\"{RESTORE_KEY}\", {:?}): must be \"offer\", \"auto\" or \"off\" / false",
                 value.unwrap_or_default()
             )),
         }
@@ -379,7 +379,17 @@ mod tests {
     use SessionModeChoice::{Auto, Bypass};
 
     #[test]
-    fn the_policy_reads_its_three_words_and_nothing_else() {
+    fn restore_false_is_off() {
+        for value in ["false", "off", " false ", " off "] {
+            assert_eq!(RestorePolicy::parse(Some(value)), Ok(RestorePolicy::Off));
+        }
+        for value in ["true", "on", "False", "OFF"] {
+            assert!(RestorePolicy::parse(Some(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn the_policy_reads_its_choices_and_rejects_other_values() {
         assert_eq!(RestorePolicy::parse(None), Ok(RestorePolicy::Offer));
         assert_eq!(RestorePolicy::parse(Some("offer")), Ok(RestorePolicy::Offer));
         assert_eq!(RestorePolicy::parse(Some(" auto ")), Ok(RestorePolicy::Auto));

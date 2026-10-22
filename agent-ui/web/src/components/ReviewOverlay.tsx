@@ -207,7 +207,7 @@ export const ReviewOverlay = forwardRef<HTMLDivElement, Props>(function ReviewOv
           )}
           {envelope.pendingNoResult > 0 && (
             <div className="review-note">
-              {envelope.pendingNoResult} file-changing {envelope.pendingNoResult === 1 ? "call has" : "calls have"} no result (still running, or refused)
+              {envelope.pendingNoResult} file-changing {envelope.pendingNoResult === 1 ? "call has" : "calls have"} no result (still running, or refused) · Ctrl+g on its card shows the proposal
             </div>
           )}
         </div>

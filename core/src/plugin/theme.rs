@@ -280,7 +280,7 @@ mod tests {
         let guifont = vec![family; 40].join(",");
         let tokens = ThemeTokens::derive(&payload("dark", &guifont, &[]));
         let theme = PageTheme::from_tokens(&tokens);
-        assert_eq!(theme.vars().len(), 54);
+        assert_eq!(theme.vars().len(), 55);
         assert!(theme.vars().iter().any(|(n, _)| n == "--nv-font-mono"));
         assert_one_root_rule(&theme.user_style_sheet());
     }
@@ -395,8 +395,8 @@ mod tests {
 
     /// Run by hand when the appearance set changes:
     /// `EITRI_WRITE_PLUGIN_FIXTURES=1 cargo test -p eitri-core --lib -- --ignored write_theme_fixtures`.
-    /// Writes into `target/plugin-fixtures/`, never into the source tree; a person copies the two files
-    /// into `core/src/plugin/fixtures/` and reads the diff.
+    /// Generated files stay in `target/plugin-fixtures/` for diff inspection before copying them into
+    /// `core/src/plugin/fixtures/`.
     #[test]
     #[ignore = "writes fixtures; needs EITRI_WRITE_PLUGIN_FIXTURES=1"]
     fn write_theme_fixtures() {
@@ -412,7 +412,13 @@ mod tests {
         });
         let mut hello: Value = serde_json::from_str(include_str!("fixtures/rep-hello.json")).unwrap();
         hello["result"]["theme"] = PageTheme::fallback().to_json();
-        for (name, value) in [("ev-theme.json", event), ("rep-hello.json", hello)] {
+        let mut hello_settings: Value = serde_json::from_str(include_str!("fixtures/rep-hello-settings.json")).unwrap();
+        hello_settings["result"]["theme"] = PageTheme::fallback().to_json();
+        for (name, value) in [
+            ("ev-theme.json", event),
+            ("rep-hello.json", hello),
+            ("rep-hello-settings.json", hello_settings),
+        ] {
             let text = serde_json::to_string_pretty(&value).unwrap() + "\n";
             std::fs::write(out.join(name), text).unwrap();
         }

@@ -22,6 +22,8 @@ const TEXT_CONTRAST: f64 = 4.5;
 /// accent colours toward its foreground. **A token guarded only to this is not a text colour**: as
 /// 12px text on rose-pine dawn, `warn` measured 3.02:1 and `error` 3.84:1.
 const UI_CONTRAST: f64 = 3.0;
+/// An outline without the keys remains visible while receding below the active ring.
+const FOCUS_RING_INACTIVE_CONTRAST: f64 = 1.6;
 /// Only needs to be visibly a band. Not a WCAG figure.
 const CURSORLINE_CONTRAST: f64 = 1.15;
 /// The conversation's cursor band is the only mark of the cursor there (no bar, no outline), so its fill has
@@ -235,6 +237,8 @@ pub struct ThemeTokens {
     /// starts from `String`'s foreground, the colour `mode_input` already names. A border, outline or
     /// fill only, like `warn`; never text.
     pub focus_ring: Rgb,
+    /// A light mix of the active ring into the page, raised only until its outline is visible.
+    pub focus_ring_inactive: Rgb,
     /// Link text in a page beside the editor: the editor's own Markdown link colour ([`LINK_GROUPS`]), else the
     /// colour `--nv-syn-function` has. **Not guarded**, for the reason `syntax` is not: it is the colour the editor
     /// draws the same link with a few pixels to the left, and a guard would make the two differ. It is body text,
@@ -450,6 +454,8 @@ impl ThemeTokens {
             UI_CONTRAST,
         );
 
+        let focus_ring_inactive = cursor_band_fill(bg, focus_ring, 0.12, FOCUS_RING_INACTIVE_CONTRAST);
+
         let syntax: Vec<(&'static str, Rgb)> = SYNTAX
             .iter()
             .map(|&(name, ts, legacy)| (name, g.fg_of(&[ts, legacy]).unwrap_or(fg)))
@@ -514,6 +520,7 @@ impl ThemeTokens {
             cursor_band,
             cursor_band_inactive,
             focus_ring,
+            focus_ring_inactive,
             link,
             syntax,
             font_mono: mono_font_stack(&payload.options.guifont),
@@ -565,6 +572,7 @@ impl ThemeTokens {
             ("cursor-band", self.cursor_band),
             ("cursor-band-inactive", self.cursor_band_inactive),
             ("focus-ring", self.focus_ring),
+            ("focus-ring-inactive", self.focus_ring_inactive),
             ("link", self.link),
         ];
         let mut vars: Vec<(String, String)> = colours
@@ -736,13 +744,13 @@ mod tests {
         assert_eq!(t.color_scheme, "dark");
         let vars = t.css_vars();
         // 45, the status band's three mode blocks as a bg and fg each (2026-10-15), the cursor band's two
-        // fills with the composer's focus ring, and the colour of a Markdown link.
-        assert_eq!(vars.len(), 55);
+        // fills with the composer's focus ring, its inactive mark, and the colour of a Markdown link.
+        assert_eq!(vars.len(), 56);
         assert!(vars
             .iter()
             .all(|(name, value)| name.starts_with("--nv-") && !value.is_empty()));
         let names: std::collections::HashSet<_> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 55, "no duplicate variable names");
+        assert_eq!(names.len(), 56, "no duplicate variable names");
         // The count alone would be satisfied by any variable at all, and this one carries a UNIT --
         // a bare `14` reaches the panel as an invalid `font-size` and every ratio built on it
         // silently falls back to the browser default.
@@ -1411,6 +1419,48 @@ mod tests {
         assert!(vars["--nv-cursor-band"].starts_with('#') && vars["--nv-cursor-band-inactive"].starts_with('#'));
     }
 
+    #[test]
+    fn an_inactive_mark_is_dimmer_than_the_active_one() {
+        let mut cases = hard_palettes();
+        cases.push((
+            "faint-lualine",
+            ThemeTokens::derive(&payload(
+                "dark",
+                &[
+                    ("Normal", hl(Some(0xc0caf5), Some(0x1a1b26))),
+                    ("lualine_a_insert", hl(Some(0x15161e), Some(0x1e2030))),
+                ],
+            )),
+        ));
+        // Eight-bit channels put this ring within a millionth of the contrast floor.
+        let boundary = ThemeTokens::derive(&payload(
+            "dark",
+            &[
+                ("Normal", hl(Some(0xffffff), Some(0x000000))),
+                ("String", hl(Some(0x960fb1), None)),
+            ],
+        ));
+        assert!((boundary.focus_ring.contrast(boundary.bg) - UI_CONTRAST).abs() < 0.000001);
+        cases.push(("ui-contrast-boundary", boundary));
+        for (name, t) in cases {
+            let inactive = t.focus_ring_inactive.contrast(t.bg);
+            let active = t.focus_ring.contrast(t.bg);
+            assert!(
+                inactive >= 1.6 && inactive < active,
+                "{name}: inactive {inactive:.6}, active {active:.6}"
+            );
+            for vars in [t.css_vars(), t.appearance_vars()] {
+                assert_eq!(
+                    vars.iter()
+                        .find(|(n, _)| n == "--nv-focus-ring-inactive")
+                        .map(|(_, v)| v),
+                    Some(&t.focus_ring_inactive.hex()),
+                    "{name}"
+                );
+            }
+        }
+    }
+
     /// The composer's focus ring is a border and outline, so it is held to the non-text 3:1 against `bg` on
     /// every hard palette, with lualine's insert section or without it. A lualine insert block that is
     /// itself the faint `cursorline` stand-in must not be what the ring falls back to.
@@ -1711,14 +1761,15 @@ mod tests {
     }
 
     #[test]
-    fn the_appearance_vars_number_54_and_carry_no_size() {
+    fn the_appearance_vars_number_55_and_carry_no_size() {
         let vars = ThemeTokens::fallback().appearance_vars();
-        assert_eq!(vars.len(), 54);
+        assert_eq!(vars.len(), 55);
         let names: std::collections::HashSet<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names.len(), 54, "no duplicate names");
+        assert_eq!(names.len(), 55, "no duplicate names");
         for name in [
             "--nv-bg",
             "--nv-focus-ring",
+            "--nv-focus-ring-inactive",
             "--nv-syn-tag",
             "--nv-font-prose",
             "--nv-font-mono",

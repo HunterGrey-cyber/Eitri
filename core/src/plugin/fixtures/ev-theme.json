@@ -17,6 +17,7 @@
       "--nv-error-tint-muted": "#615c80",
       "--nv-fg": "#575279",
       "--nv-focus-ring": "#575279",
+      "--nv-focus-ring-inactive": "#c6c0c8",
       "--nv-font-mono": "\"FiraCode Nerd Font\", monospace",
       "--nv-font-prose": "\"IBM Plex Sans\", \"Adwaita Sans\", Inter, system-ui, \"Noto Sans CJK SC\", sans-serif",
       "--nv-hint-bg": "#d7827e",

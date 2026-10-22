@@ -297,6 +297,21 @@ mod tests {
         }
     }
 
+    /// `take`, tried again while it is refused as held, for up to 5 s. A hold just let go can stay held for a
+    /// moment: a child another test thread is starting holds a copy of every descriptor of this process until it
+    /// execs, and the lock goes with the last copy.
+    fn once_free(take: impl Fn() -> Result<SlotHold, SlotBusy>) -> Result<SlotHold, SlotBusy> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match take() {
+                Err(SlotBusy::Writing | SlotBusy::Reading) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn two_holds_in_one_process_exclude_each_other() {
         let scratch = Scratch::new("one-process");
@@ -326,7 +341,7 @@ mod tests {
         );
         drop(reading_too);
 
-        let free = other.try_exclusive().expect("a slot nobody holds is free");
+        let free = once_free(|| other.try_exclusive()).expect("a slot nobody holds is free");
         drop(free);
         assert!(SlotBusy::Writing.to_string().contains("another Eitri window"));
         assert!(SlotBusy::Reading.to_string().contains("another Eitri window"));
@@ -350,7 +365,7 @@ mod tests {
             SlotBusy::Writing
         );
         drop(writing);
-        drop(slot.try_shared().unwrap());
+        drop(once_free(|| slot.try_shared()).unwrap());
     }
 
     #[test]

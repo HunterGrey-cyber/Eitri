@@ -541,11 +541,15 @@ pre {
 .message-list[data-visual] .row-current {
   background: none;
 }
+/* Both fills are their token at 99% opacity. WebKit repaints an opaque `::selection` background as a
+   translucent colour that matches it only over white, which on a dark scheme lands within a shade of
+   `bg` (nvim's default Visual, `#4f5258`, came out `#10141b` on `#14161b`: no selection to see) and
+   turns CARET's block grey. A translucent fill is painted as given, and 1% is no visible difference. */
 .message-list[data-visual] ::selection {
-  background: var(--nv-cursorline);
+  background: color-mix(in srgb, var(--nv-cursorline) 99%, transparent);
 }
 .message-list[data-visual="caret"] ::selection {
-  background: var(--nv-fg);
+  background: color-mix(in srgb, var(--nv-fg) 99%, transparent);
   color: var(--nv-bg);
 }
 .row-yanked {

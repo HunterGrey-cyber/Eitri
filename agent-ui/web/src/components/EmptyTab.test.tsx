@@ -1588,3 +1588,32 @@ describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
     }
   });
 });
+
+describe("EmptyTab slash actions", () => {
+  it("the_empty_tabs_composer_runs_a_mapped_word", () => {
+    const onChooseSessions = vi.fn();
+    const onSlashAction = vi.fn();
+    const { container, props } = renderEmpty({ onChooseSessions, onSlashAction });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "/resume" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onChooseSessions).toHaveBeenCalledTimes(1);
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("");
+    fireEvent.change(textarea, { target: { value: "/status" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSlashAction).toHaveBeenCalledWith({ kind: "tab-info" });
+  });
+
+  it("an_external_agents_empty_tab_sends_the_words_as_text", () => {
+    const onSlashAction = vi.fn();
+    const { container, props } = renderEmpty({ tab: { ...TAB, agent: "acp:demo" }, onSlashAction });
+    const textarea = container.querySelector("textarea")!;
+    for (const word of ["help", "resume", "rewind"]) {
+      fireEvent.change(textarea, { target: { value: `/${word}` } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledWith(`/${word}`);
+    }
+    expect(onSlashAction).not.toHaveBeenCalled();
+  });
+});

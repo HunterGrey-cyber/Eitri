@@ -165,6 +165,8 @@ describe("ReviewOverlay", () => {
     cleanup();
     expect(draw(loaded({ pendingNoResult: 1 })).container.textContent).toContain("1 file-changing call has no result");
     cleanup();
+    expect(draw(loaded({ pendingNoResult: 1 })).container.textContent).toContain("· Ctrl+g on its card shows the proposal");
+    cleanup();
     expect(draw(loaded({ pendingNoResult: 3 })).container.textContent).toContain("3 file-changing calls have no result");
   });
 

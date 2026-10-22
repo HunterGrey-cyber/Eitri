@@ -267,9 +267,21 @@ pub(crate) fn build_chat_page(
     content_manager.register_script_message_handler("eitriAgent", None);
     {
         let handle = handle.clone();
+        // Weak: the page owns this handler, so a strong reference here would keep the page alive forever.
+        let page_widget = webview.downgrade();
         // `view` is moved in here, once: whatever the page posts, it is this page's view's message.
         content_manager.connect_script_message_received(Some("eitriAgent"), move |_manager, js_value| {
             let raw = js_value.to_str();
+            // A copy's text for the primary selection: only a widget reaches its display's selection. One of
+            // this kind that is not well formed is dropped here too, since the panel would log its text.
+            if eitri_core::agent_bridge::is_primary_copy(&raw) {
+                if let Some(text) = eitri_core::agent_bridge::primary_copy(&raw) {
+                    if let Some(widget) = page_widget.upgrade() {
+                        widget.primary_clipboard().set_text(&text);
+                    }
+                }
+                return;
+            }
             handle.page_message(view, &raw);
         });
     }

@@ -48,6 +48,18 @@ describe("the kit stylesheet", () => {
 });
 
 describe("the HUD", () => {
+  it("the_hud_shows_no_mode_word_without_the_keys", () => {
+    for (const mode of ["normal", "hint", "insert"] as const) {
+      showMode(mode, "");
+      setDimmed(true);
+      expect(hud().hidden).toBe(true);
+      setDimmed(false);
+      expect(hud().hidden).toBe(false);
+      expect(part("mode").textContent).toBe(mode.toUpperCase());
+    }
+    expect(STYLE_TEXT).toContain("#eitri-keys-hud[hidden]{display:none}");
+  });
+
   it("names the modes in English by default", () => {
     showMode("normal", "");
     expect(part("mode").textContent).toBe("NORMAL");

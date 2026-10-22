@@ -5528,6 +5528,23 @@ describe("App global HINT: the panel's half", () => {
     expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
   });
 
+  it("primary_gets_the_text_the_clipboard_gets: a reply spanning a code block and prose, and the block alone", () => {
+    conversation();
+    const clipboard = stubClipboard();
+    show(1, collect(1));
+    dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
+    press("y");
+    keyGap();
+    press("y");
+    const copied = clipboard.writeText.mock.calls.map((call) => call[0]);
+    expect(copied).toHaveLength(2);
+    expect(copied[1]).toContain("ls -la");
+    expect(copied[1]).toContain("then look.");
+    expect(posted.filter((m) => m.type === "copy_primary")).toEqual(
+      copied.map((text) => ({ type: "copy_primary", text })),
+    );
+  });
+
   it("any other key after landing on a code block forgets it", () => {
     conversation();
     const clipboard = stubClipboard();
@@ -9313,6 +9330,55 @@ describe("N2 and R3: the editor round trips", () => {
     expect(container.querySelector(".command-notice")).toBeNull();
     vi.unstubAllGlobals();
   });
+
+  /** A tab whose only row is one pending card, the cursor on it. */
+  function withCard(toolName: string, input: unknown) {
+    const rendered = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(
+      snapshotState({
+        activeTurnId: "t",
+        pendingPermissions: [{ seq: 1, permissionId: "p1", toolUseId: null, toolName, input }],
+      }),
+      2,
+    );
+    gg(rendered.container);
+    return rendered;
+  }
+
+  it("ctrl_g_on_a_pending_edit_card_posts_view_proposal", () => {
+    const { container } = withCard("Edit", { file_path: "src/a.rs", old_string: "a", new_string: "b" });
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "g", ctrlKey: true });
+    const sent = lastOfType("view_proposal")!;
+    expect(sent).toMatchObject({
+      path: "src/a.rs",
+      change: { kind: "edits", edits: [{ oldText: "a", newText: "b", replaceAll: false }], crlfAsLf: true },
+    });
+    expect(lastOfType("view_in_editor")).toBeUndefined();
+    // A refusal (the file changed since the card came) is an editor request's like any other: a flash,
+    // never the banner that says the conversation is broken.
+    dispatch({ kind: "command_result", requestId: sent.request_id, ok: false, error: "the proposal no longer applies to src/a.rs as it is on disk" });
+    expect(container.querySelector(".command-notice")).toBeNull();
+  });
+
+  it("ctrl_g_on_an_unsupported_edit_card_is_unchanged", () => {
+    const { container } = withCard("fileChange", { changes: [{ path: "src/a.rs", kind: "update", diff: "@@ -1 +1 @@\n-a\n+b\n" }] });
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "g", ctrlKey: true });
+    expect(lastOfType("view_proposal")).toBeUndefined();
+    expect(lastOfType("view_in_editor")).toMatchObject({ title: "fileChange request" });
+  });
+
+  it("ctrl_g_on_any_other_row_is_unchanged", () => {
+    const { container } = withCard("Bash", { command: "rm build" });
+    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "g", ctrlKey: true });
+    expect(lastOfType("view_proposal")).toBeUndefined();
+    expect(lastOfType("view_in_editor")).toMatchObject({ title: "Bash request" });
+    cleanup();
+    const reply = withPaths("a reply naming src/a.rs");
+    fireEvent.keyDown(reply.container.querySelector(".agent-ui-conversation")!, { key: "g", ctrlKey: true });
+    expect(lastOfType("view_proposal")).toBeUndefined();
+    expect(lastOfType("view_in_editor")).toMatchObject({ text: "a reply naming src/a.rs" });
+  });
 });
 
 /* `gx` opens web links on the cursor row. A single visible link whose text is its address
@@ -11956,6 +12022,18 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector(".band-message")?.textContent).toBe("copied 2 chars");
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
     expect(container.querySelector(".row-current")?.className).toContain("row-prompt");
+  });
+
+  it("VISUAL's y puts the very text it copied in the primary selection, once", () => {
+    const clipboard = stubClipboard();
+    const { root } = startedOnPromptRow();
+    fireEvent.keyDown(root, { key: "v" }); // CARET
+    fireEvent.keyDown(root, { key: "v" }); // VISUAL
+    fireEvent.keyDown(root, { key: "l" });
+    expect(posted.filter((m) => m.type === "copy_primary"), "moving the selection copies nothing").toEqual([]);
+    fireEvent.keyDown(root, { key: "y" });
+    expect(clipboard.writeText).toHaveBeenLastCalledWith("he");
+    expect(posted.filter((m) => m.type === "copy_primary")).toEqual([{ type: "copy_primary", text: "he" }]);
   });
 
   it("a held y after it ends VISUAL does not fall through as BROWSE's own y", () => {

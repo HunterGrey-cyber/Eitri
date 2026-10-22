@@ -69,11 +69,7 @@ pub fn from_config(get: impl Fn(&str) -> Option<String>) -> Result<KeysSettings,
                     .ok_or_else(|| error("must be a whole number from 10 to 400"))?;
             }
             SMOOTH_KEY | PREFIX_WAIT_KEY => {
-                let on = match value {
-                    "true" => true,
-                    "false" => false,
-                    _ => return Err(error("must be true or false")),
-                };
+                let on = crate::config_switch::parse_switch(key, Some(value), true)?;
                 if key == SMOOTH_KEY {
                     settings.smooth = on;
                 } else {
@@ -81,7 +77,7 @@ pub fn from_config(get: impl Fn(&str) -> Option<String>) -> Result<KeysSettings,
                 }
             }
             WHICH_KEY_DELAY_KEY => {
-                settings.which_key_delay = if value == "false" {
+                settings.which_key_delay = if crate::config_switch::is_off(value) {
                     None
                 } else {
                     Some(
@@ -89,7 +85,7 @@ pub fn from_config(get: impl Fn(&str) -> Option<String>) -> Result<KeysSettings,
                             .parse::<u32>()
                             .ok()
                             .filter(|n| *n <= 5000)
-                            .ok_or_else(|| error("must be a whole number from 0 to 5000, or false"))?,
+                            .ok_or_else(|| error("must be a whole number from 0 to 5000, or false or \"off\""))?,
                     )
                 };
             }
@@ -221,6 +217,43 @@ mod tests {
     }
 
     #[test]
+    fn smooth_and_prefix_wait_accept_on_and_off() {
+        for key in [SMOOTH_KEY, PREFIX_WAIT_KEY] {
+            for (value, expected) in [
+                ("true", true),
+                ("on", true),
+                ("false", false),
+                ("off", false),
+                (" on ", true),
+                (" off ", false),
+            ] {
+                let settings = parse(&[(key, value)]).unwrap();
+                assert_eq!(settings.smooth, if key == SMOOTH_KEY { expected } else { true });
+                assert_eq!(
+                    settings.prefix_wait,
+                    if key == PREFIX_WAIT_KEY { expected } else { true }
+                );
+            }
+            for value in ["yes", "1", "On", "FALSE"] {
+                let error = parse(&[(key, value)]).unwrap_err();
+                for word in [key, value, "true", "on", "false", "off"] {
+                    assert!(error.contains(word), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn which_key_delay_off_is_false() {
+        for value in ["false", "off", " false ", " off "] {
+            assert_eq!(parse(&[(WHICH_KEY_DELAY_KEY, value)]).unwrap().which_key_delay, None);
+        }
+        for value in ["on", "true", "Off", "FALSE"] {
+            assert!(parse(&[(WHICH_KEY_DELAY_KEY, value)]).is_err());
+        }
+    }
+
+    #[test]
     fn every_key_reads_its_values() {
         let s = parse(&[
             (SCROLL_STEP_KEY, " 40 "),
@@ -262,22 +295,22 @@ mod tests {
             (SCROLL_STEP_KEY, "401", "must be a whole number from 10 to 400"),
             (SCROLL_STEP_KEY, "60.5", "must be a whole number from 10 to 400"),
             (SCROLL_STEP_KEY, "fast", "must be a whole number from 10 to 400"),
-            (SMOOTH_KEY, "yes", "must be true or false"),
-            (PREFIX_WAIT_KEY, "1", "must be true or false"),
+            (SMOOTH_KEY, "yes", "must be true or \"on\" / false or \"off\""),
+            (PREFIX_WAIT_KEY, "1", "must be true or \"on\" / false or \"off\""),
             (
                 WHICH_KEY_DELAY_KEY,
                 "5001",
-                "must be a whole number from 0 to 5000, or false",
+                "must be a whole number from 0 to 5000, or false or \"off\"",
             ),
             (
                 WHICH_KEY_DELAY_KEY,
                 "true",
-                "must be a whole number from 0 to 5000, or false",
+                "must be a whole number from 0 to 5000, or false or \"off\"",
             ),
             (
                 WHICH_KEY_DELAY_KEY,
                 "-1",
-                "must be a whole number from 0 to 5000, or false",
+                "must be a whole number from 0 to 5000, or false or \"off\"",
             ),
             (HINT_CHARS_KEY, "a", "must be 2 to 26 different lowercase letters a-z"),
             (HINT_CHARS_KEY, "aa", "must be 2 to 26 different lowercase letters a-z"),

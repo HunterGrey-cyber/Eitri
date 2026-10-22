@@ -14,6 +14,7 @@ import type { HistoryWalk } from "../promptHistory";
 import { stepHistory } from "../promptHistory";
 import { pickerStep } from "../chooser";
 import {
+  slashAction,
   heldBackSlashCommand,
   matchCompletions,
   menuToken,
@@ -22,7 +23,7 @@ import {
   SLASH_MENU_ROWS,
   startsMatch,
 } from "../slashCommands";
-import type { CompletionCommand } from "../slashCommands";
+import type { CompletionCommand, SlashAction } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
 import { SlashMenu } from "./SlashMenu";
 import { NO_TEXT_ASSIST } from "../textField";
@@ -116,6 +117,7 @@ type Props = {
   /** Whether a typed `/command` is judged as one of Claude Code's (a held-back one is refused with a
    *  flash). False in another agent's tab, which sends every draft as typed. */
   claudeSlashCommands?: boolean;
+  onSlashAction?: (action: SlashAction) => void;
   /** The commands the `/` menu offers in this tab (`../slashCommands`' `completionSource`). `null`, or
    *  absent, is "no menu": an agent that reports no list (Codex) has nothing to complete. */
   slashCommands?: readonly CompletionCommand[] | null;
@@ -165,6 +167,7 @@ export function Composer({
   editingInNvim = false,
   onOpenKeymap = () => {},
   claudeSlashCommands = true,
+  onSlashAction,
   slashCommands = null,
   onLineKey,
   browseKey = "i",
@@ -319,10 +322,18 @@ export function Composer({
   function submit(now: boolean) {
     if (disabled || editingInNvim) return;
     const body = text;
-    // Held-back slash commands are neither sent nor queued, including through send-now. This
-    // includes `/login`, `/config` and `/resume`. Keep the draft unchanged and show a flash
-    // naming the command. A bare `/model` or `/effort` is sent to open a picker parsed from the
-    // CLI reply.
+    const action = claudeSlashCommands ? slashAction(body) : null;
+    if (action !== null) {
+      onSlashAction?.(action);
+      // A pointer keeps its draft, as a held-back word does; its text is the status band's to show (the
+      // panel's handler puts it there), so the composer drawing it too would say it twice.
+      if (action.kind !== "pointer") {
+        setBox("");
+        setWalk({ index: null, stash: "" });
+      }
+      return;
+    }
+    // A terminal-only command keeps its draft so the user can revise it.
     const held = claudeSlashCommands ? heldBackSlashCommand(body) : null;
     if (held !== null) {
       showSlashFlash(slashCommandFlashText(held));
