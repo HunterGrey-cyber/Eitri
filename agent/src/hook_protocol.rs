@@ -1,6 +1,7 @@
-//! The JSON contract for the `PreToolUse` hook installed via `claude --settings` by
-//! `crate::settings` and spoken on stdin/stdout by the `agent-hook` companion binary.
-//! CLI payload examples are in `agent/tests/fixtures/v2_hook_*.json`.
+//! The JSON contract for the `PreToolUse` hook this crate installs via `claude --settings`
+//! (see `crate::settings`) and the `agent-hook` companion binary speaks on stdin/stdout. Real
+//! shapes confirmed live against the actual CLI (2026-09-07) and captured in
+//! agent/tests/fixtures/v2_hook_*.json.
 
 use serde::Deserialize;
 use serde_json::json;
@@ -14,10 +15,11 @@ pub struct PreToolUseHookInput {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub tool_use_id: String,
-    /// The CLI's permission mode at the time of this call, `"default"` in the fixture.
-    /// Enforcement uses `process::classify_cli_mode` to deny the call and close the session if this
-    /// mode is less restrictive than the requested `default`. Optional because some CLI builds may omit it;
-    /// an absent value is classified as unreported, never as `default`.
+    /// The CLI's own permission mode at the moment of this call (`"default"` in the captured
+    /// fixture). Read by the CLI-mode tripwire (`process::classify_cli_mode`): a mode less
+    /// restrictive than the `default` this crate asks for denies the call and closes the session.
+    /// Optional because nothing guarantees every CLI build sends it; an absent value is classified
+    /// as unreported, never as `default`.
     #[serde(default)]
     pub permission_mode: Option<String>,
 }

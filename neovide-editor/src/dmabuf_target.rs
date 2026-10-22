@@ -1,50 +1,75 @@
-//! Tiled dmabuf presentation buffers, rendered by Skia through GL and handed to GTK as
-//! `GdkDmabufTexture`s.
+//! The editor's own presentation buffers: dmabufs allocated with a tiled layout, rendered by Skia
+//! through GL and handed to GTK as `GdkDmabufTexture`s, instead of the colour texture `GtkGLArea`
+//! allocates for itself.
 //!
-//! `GtkGLArea` exports its colour texture as a dmabuf on every frame starting with GTK 4.16.
-//! Mesa's iris driver reallocates a texture as shareable for export. Without the kernel's tiling
-//! uAPI, including on Intel Gfx12.5+, a shareable texture with no modifier is allocated linear.
-//! At 2432x2482 pixels, copying the Skia intermediate into that buffer took about 3.4 ms of GPU
-//! time per frame, compared with about 0.9 ms for Skia drawing into its tiled target. Drawing
-//! directly into the linear buffer took about 5 ms. Allocating an external buffer with an explicit
-//! tiled modifier, compressed where available, avoids reallocation and lets Skia draw without
-//! the intermediate copy.
+//! **Why this exists (2026-09-28, measured).** `GtkGLArea` (GTK 4.16+) exports its colour texture
+//! as a dmabuf on every frame (`gtk_gl_area_snapshot` -> `gdk_gl_context_export_dmabuf`), and
+//! Mesa's iris driver prepares a texture for export by reallocating it as shareable
+//! (`iris_flush_resource` -> `iris_reallocate_resource_inplace(PIPE_BIND_SHARED | PIPE_BIND_SCANOUT)`).
+//! On a device without the kernel's tiling uAPI -- Intel Gfx12.5+, Meteor Lake included -- a
+//! shareable texture with no modifier is allocated **linear** (`iris_resource_configure_main`), so
+//! every GtkGLArea frame lands in a linear, uncompressed buffer (GTK's own debug output:
+//! `AB24:0`). On a 3072x1920 display at 150 % the editor's buffer is 2432x2482 pixels
+//! (integer scale 2), and GL timer queries put the one copy from the Skia intermediate into that
+//! linear buffer at ~3.4 ms of GPU time per frame, against ~0.9 ms for all of Skia's drawing into
+//! its own tiled target. Drawing straight into the linear buffer was ~5 ms. A buffer we allocate
+//! ourselves with an explicit tiled (and, where offered, compressed) modifier is already
+//! external, so exporting it never reallocates it, Skia can draw into it directly, and the copy
+//! disappears: measured on that Intel display at 165 Hz, 6.8 -> 3.2 ms per frame, 0 pixels different.
 //!
-//! Buffers use the same pixel size, origin and flip as `GtkGLArea`: widget size times GTK's
-//! integer scale factor. Missing EGL, GBM or a mutually supported modifier produces one stderr
-//! message and selects `GtkGLArea`'s buffer for the rest of the GL context. Allocation, import,
-//! framebuffer or texture failures during a frame are also reported. Retrying happens at the
-//! next size change, with a bounded number of attempts per GL context in `editor_area`.
-//! The environment override can force the fallback if a driver draws incorrectly without failing.
+//! The buffers are the same pixel size `GtkGLArea` would have allocated (widget size times GTK's
+//! integer scale factor), drawn with the same origin and flipped the same way, so every geometry
+//! rule in this crate is unchanged. Anything this path cannot set up -- no EGL (GLX), no GBM, no
+//! modifier both GL can render to and GTK can import -- is reported once on stderr and the pane
+//! falls back to `GtkGLArea`'s own buffer for the rest of that GL context. A frame that fails
+//! mid-run (an allocation, an import, an incomplete framebuffer, a texture GTK refuses) is reported
+//! too, and the path is tried again at the next size change, a few times per GL context
+//! (`editor_area`). `EITRI_EDITOR_DMABUF=0` takes the fallback on purpose, for a driver on which
+//! this path draws wrongly without failing (and for the regression test that forces the fallback).
 //!
-//! Enabled by default only on GTK 4.16 and later. GTK 4.14 passes GSK a `GdkGLTexture` with a
-//! `GLsync` and exports no dmabuf. There, avoiding the intermediate copy would add a per-frame EGL
-//! import of a new `GdkDmabufTexture`, whose cost has not been measured. The environment override
-//! can force this path for measurement.
+//! **Only on GTK 4.16 and later by default** ([`decide`]). The cost above exists only where
+//! `GtkGLArea` exports a dmabuf per frame, which began in 4.16. GTK 4.14 (the v1 floor, Ubuntu
+//! 24.04) hands GSK a `GdkGLTexture` with a `GLsync` and exports nothing; there this path would
+//! trade the copy out of the intermediate for GSK's per-frame EGL import of a new
+//! `GdkDmabufTexture`, which was never measured. `EITRI_EDITOR_DMABUF=1` forces the path there,
+//! for measuring it.
 //!
-//! `gdk_display_get_dmabuf_formats` combines formats accepted by GDK's Vulkan, EGL and mmap
-//! importers. A listed modifier need not be directly importable by the active GSK renderer.
-//! Different GPUs, unsupported compressed modifiers or `GSK_RENDERER=cairo` can cause a silent
-//! GPU-to-CPU-to-GPU transfer each frame. The public API cannot identify the importer used for a
-//! texture. `GDK_DEBUG=dmabuf` shows it; forcing the fallback provides an escape hatch.
+//! **What GTK's format list does not promise.** `gdk_display_get_dmabuf_formats` is the union of
+//! what GDK's Vulkan, EGL and mmap importers accept (`gdk_display_init_dmabuf_invoke_callback`,
+//! 4.22.5). A modifier on it is not a promise that the renderer GSK actually uses imports it
+//! directly: where it cannot (GSK's Vulkan device on another GPU than the EGL display -- a hybrid
+//! laptop, NVIDIA offload --, a Vulkan driver that does not offer a compressed modifier the GL
+//! driver does, or `GSK_RENDERER=cairo`), GSK silently downloads the buffer through another
+//! importer every frame, a GPU->CPU->GPU round trip nothing on this side can see. The public API
+//! cannot tell which importer will take a texture. `GDK_DEBUG=dmabuf` shows it;
+//! `EITRI_EDITOR_DMABUF=0` is the escape hatch. Intel (i915, one GPU) and AMD (RADV) have run this path.
 //!
-//! The fallback can also require a download on GTK 4.16+ with GSK's Vulkan renderer. If Vulkan
-//! cannot import `GtkGLArea`'s implicit-modifier export (`AB24:0xffffffffffffff`), GSK downloads
-//! through GL and uploads again. With Mesa RADV at 2432x2482 this took about 10 ms of main-thread
-//! CPU per frame. `GSK_RENDERER=gl` (`ngl` before GTK 4.18) uses EGL import instead; its cost on
-//! AMD has not been measured. GTK below 4.16 exports nothing here and defaults to GL.
-//! [`fallback_hint`] prints one stderr message for a fallback under Vulkan without changing it.
+//! **The fallback itself can cost a download (2026-09-29).** On GTK 4.16+ with GSK's Vulkan
+//! renderer, a driver whose Vulkan cannot import `GtkGLArea`'s implicit-modifier export
+//! (`AB24:0xffffffffffffff`; Mesa RADV, seen in a 2026-09-28 measurement record) makes GSK download
+//! every frame through its GL renderer and upload it again: ~10 ms of main-thread CPU per frame at
+//! 2432x2482, i.e. about +10.75 ms typing at 165 Hz. The workaround is `GSK_RENDERER=gl` (`ngl`
+//! before GTK 4.18), which has GSK import the dmabuf through EGL; it is not yet measured on AMD.
+//! GTK below 4.16 is not affected (source read): `GtkGLArea` exports nothing there and GSK's
+//! default renderer is GL. [`fallback_hint`] prints one stderr line when the fallback is running
+//! under a Vulkan renderer; it changes no behaviour.
 //!
-//! A buffer is reused only after GTK releases every texture over it. GSK retains textures until
-//! the GPU finishes reading them, and the textures keep the dmabuf fds open across resize or
-//! unrealize. Before GTK samples a frame, it must see the GL writes. This path imports an explicit
-//! native fence sync file into the dmabuf as a write with `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`.
-//! Without `EGL_ANDROID_native_fence_sync` or on a kernel before 6.0, it reports this once and
-//! relies on the driver's implicit fence, as `GtkGLArea` does. GSK's Vulkan renderer converts the
-//! implicit fence to a semaphore with `gdk_dmabuf_export_sync_file`.
+//! **Lifetime and synchronization, the same contract as GTK's own buffers.** A buffer is drawn
+//! into only after GTK has released every texture over it. GSK holds a texture whose image a frame
+//! still uses (`gsk_gpu_image_toggle_ref_texture`, GTK 4.14.5 and 4.22.5 alike), so that release
+//! comes after the GPU finished reading it -- which is also what `GtkGLArea` 4.22 relies on when it
+//! reuses its own exported texture (`release_dmabuf_texture`). The texture keeps the dmabuf fds
+//! open until then, whatever happened to the buffer on our side (a resize, an unrealize). Before
+//! GTK samples a frame it has to see our writes: `GtkGLArea` 4.22 and GSK's 4.14 GL import rely
+//! on the driver's implicit fence for that, and GSK's Vulkan renderer turns that fence into a
+//! semaphore (`gdk_dmabuf_export_sync_file`). This path also inserts an explicit one, a native
+//! fence sync file after the frame's GL work imported into the dmabuf as a write
+//! (`DMA_BUF_IOCTL_IMPORT_SYNC_FILE`), so a consumer does not depend on the driver attaching one at
+//! `glFlush`. Where that is unavailable (no `EGL_ANDROID_native_fence_sync`, a kernel before 6.0)
+//! it says so once and relies on the implicit fence, as `GtkGLArea` does.
 //!
-//! `GdkDmabufTextureBuilder` and `gdk_display_get_dmabuf_formats` require GTK 4.14.
-//! GBM is opened at runtime from `libgbm.so.1`, never linked.
+//! GTK API used: `GdkDmabufTextureBuilder` and `gdk_display_get_dmabuf_formats` (both 4.14, the
+//! v1 floor). GBM is opened at runtime (`libgbm.so.1`, Mesa's), never linked.
 
 use std::ffi::{c_char, c_int, c_void, CStr, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

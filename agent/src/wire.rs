@@ -1,7 +1,7 @@
 //! Deserialization types for the specific real wire-JSON shapes this crate models, plus the
 //! translation into `AgentEvent`. Deliberately does NOT attempt to model the CLI's entire
-//! protocol -- see this plan's Global Constraint on `Unknown` as the fallback for everything
-//! else. Every shape below was captured from a real `claude -p --output-format stream-json
+//! protocol -- `Unknown` is the fallback for everything else, so an unmodelled line never stops
+//! the stream. Every shape below was captured from a real `claude -p --output-format stream-json
 //! --verbose` invocation (version 2.1.263), not hand-guessed from documentation -- see
 //! `agent/tests/fixtures/*.json` for the exact (trimmed but real) captured lines this module's
 //! own tests parse.
@@ -115,7 +115,7 @@ struct ControlResponseBody {
 /// `AgentEvent`s. Never panics or returns an error to the caller -- a line that fails to parse
 /// entirely, or whose `type`/`subtype` this crate doesn't model, becomes a single
 /// `AgentEvent::Unknown` carrying whatever raw JSON could be recovered (or an empty object if
-/// even that failed), so the calling stdout-reader loop can keep
+/// even that failed), so the calling stdout-reader loop (`AgentProcess`) can keep
 /// running regardless of what the CLI ever sends.
 pub fn translate_line(line: &str) -> Vec<AgentEvent> {
     let raw: Value = match serde_json::from_str(line) {

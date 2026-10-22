@@ -1,8 +1,9 @@
 // agent/src/providers/claude_sidecar/mod.rs
-//! `ClaudeSidecarProvider` drives the sidecar's gRPC service. It spawns and owns one
-//! sidecar process for its lifetime and connects over a UDS through `tonic` on a dedicated
-//! `RuntimeThread`. Unary RPCs run synchronously here; the event pump handles streaming.
-//! There is no resume RPC available here, so `resume_session` returns
+//! `ClaudeSidecarProvider`: drives Verdandi's `apps/claude-sidecar` gRPC service.
+//! Spawns and owns exactly one sidecar process for its own lifetime, connects to
+//! it over a UDS via `tonic` on a dedicated `RuntimeThread`, and issues the 6 in-scope
+//! unary RPCs synchronously (this file) plus the streaming event pump. `ResumeSession` has
+//! no RPC to call yet -- `resume_session` always returns
 //! `ProviderError::UnsupportedCapability`.
 
 /// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
@@ -56,8 +57,8 @@ use tower::service_fn;
 
 pub const UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The protocol major this client speaks. Connections are refused if the sidecar reports
-/// a different major.
+/// The protocol major this client speaks. A sidecar reporting anything else is refused outright: its
+/// wire contract is not one this client can name.
 pub const CLIENT_PROTOCOL_MAJOR: u32 = 3;
 
 /// Capability strings this client understands, as the sidecar advertises them in
@@ -102,8 +103,8 @@ pub const CLIENT_IMPLEMENTS_RESUME: bool = true;
 /// client asks for a fork and nothing has verified one end to end. Flip it in the change that does
 /// both, not before.
 const CLIENT_IMPLEMENTS_FORK: bool = false;
-/// True since O3 (2026-09-27): a provider prompt is translated with its origin
-/// (`translate::provider_prompt_of`), answered by `eitri_core::agent_backend` on the rules O3 set
+/// True since 2026-09-27: a provider prompt is translated with its origin
+/// (`translate::provider_prompt_of`), answered by `eitri_core::agent_backend` on these rules
 /// (bypass allows it unless the user's own ask rule forced it; Auto allows it only after the human
 /// approved the same call), and drawn as a card with the CLI's own reason otherwise. Before that a
 /// session that asked for these would have had its prompts judged as if the gate had asked.
@@ -396,11 +397,20 @@ fn handshake_with(
         .map_err(|status| std::io::Error::other(format!("handshake failed: {status}")))?
         .into_inner();
 
-    // Reject an incompatible protocol major; tolerate minor differences through protobuf's
-    // unknown-field handling. A conforming peer rejects a mismatched client major during the
-    // handshake RPC, so this branch is a backstop for a peer that returns an incompatible major.
-    // That includes a response omitting the scalar field, which proto3 decodes as zero.
-    // Do not issue commands when the returned wire version is incompatible.
+    // An incompatible major is refused, minor differences are tolerated
+    // (protobuf unknown-field rules cover the new fields a higher minor may add).
+    //
+    // Against a CONFORMING peer this branch is unreachable in both directions, and the comment
+    // here used to claim otherwise ("this catches a sidecar that is too new"). It does not:
+    // `runtimeServiceImpl.ts`'s handshake handler throws `INCOMPATIBLE_PROTOCOL` whenever
+    // `clientProtocolMajor !== PROTOCOL_MAJOR` and otherwise answers with its own
+    // `PROTOCOL_MAJOR`, so version skew either way is refused by the peer and arrives at the
+    // `?` above as a failed RPC -- never here with a mismatched number in hand. What survives
+    // is the check's real job: a backstop against a NON-conforming peer, one that answers a
+    // major it did not just require (a broken build, a different implementation of the service,
+    // or -- since proto3 has no presence on a scalar -- a response that simply omits the field
+    // and so arrives as 0). Cheap, and the alternative is issuing commands to a peer whose
+    // wire contract this client cannot name.
     if handshake.protocol_major != CLIENT_PROTOCOL_MAJOR {
         return Err(std::io::Error::other(format!(
             "claude-sidecar speaks protocol major {} but this client speaks {CLIENT_PROTOCOL_MAJOR}; \
@@ -414,7 +424,7 @@ fn handshake_with(
     let provider_prompts = provider_prompts_from_handshake(&handshake);
     if !provider_prompts {
         // Said once, on stderr only: an older sidecar is not a fault, but a bypass on it is
-        // narrower than the CLI's own bypassPermissions (O3), and this is the line that says why.
+        // narrower than the CLI's own bypassPermissions, and this is the line that says why.
         eprintln!(
             "agent: ClaudeSidecarProvider: this sidecar does not offer {CAP_PROVIDER_PERMISSION_PROMPTS}; \
              a call the CLI itself asks about after the gate allowed it (a write under .git/ or \
@@ -782,9 +792,14 @@ struct BackpressureCounters {
 /// classify a failed reconnect exactly the way a failed unary RPC is classified -- two divergent
 /// copies of this logic is how a fatal `EVENT_GAP` ends up being retried forever on one path.
 fn map_status(status: tonic::Status) -> ProviderError {
-    // Business errors arrive as protobuf-encoded `ErrorDetail` in `grpc-status-details-bin`.
-    // Tonic extracts this trailer into `status.details()`; it is absent from `status.metadata()`.
-    // Decode the details directly so typed provider errors are not lost as transport errors.
+    // Business errors travel as
+    // protobuf-encoded `ErrorDetail` bytes in the standard `grpc-status-details-bin` trailing
+    // metadata key -- but tonic's `Status` already parses that specific well-known trailer out
+    // for you: `status.details()` returns the raw bytes directly, `status.metadata()` does NOT
+    // contain it (confirmed against a real sidecar-returned `SESSION_NOT_FOUND` error during
+    // development -- `status.metadata().get_bin("grpc-status-details-bin")`
+    // silently returned `None` every time; `status.details()` decoded correctly on the first
+    // try). Do not "fix" this back to a `.metadata()` lookup -- that was the actual bug.
     match error_detail(&status) {
         Some(detail) => ProviderError::Provider {
             code: provider_error_code(detail.code()),
@@ -885,10 +900,13 @@ fn steer_refusal(detail: ErrorDetail) -> ProviderError {
     ProviderError::Provider { code, message }
 }
 
-/// Refuses session creation unless the sidecar advertises the gated `interactive` policy,
-/// which every session requires regardless of the tab's mode. Falling back to BYPASS would run
-/// the agent under a policy the user did not choose. Kept as a free function so the check can be
-/// tested without a sidecar.
+/// Refuses to start a session on a sidecar that does not advertise the gated (`interactive`)
+/// policy -- the only one any session is created under, whatever the tab's mode.
+///
+/// Failing loudly is the whole point: the alternative, starting the session under whatever the
+/// provider does offer, would run an agent under a permission policy nobody chose and nobody was
+/// told about. There is no fallback to BYPASS, ever. A free function so it is tested without a
+/// sidecar.
 fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo) -> Result<(), ProviderError> {
     if capabilities.interactive_permission_mode {
         return Ok(());
@@ -907,14 +925,20 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
     })
 }
 
-/// Builds the `CreateSessionRequest` used by both fresh and resumed sessions.
-/// Every session uses `INTERACTIVE` with switching disabled, regardless of the tab's mode.
-/// Only values with distinct runtime behavior are sent. Equivalent permission and persistence
-/// values add no choice, and `executable` is not read by the sidecar. PARTIAL streaming has a
-/// measured effect, so the request sends it.
-/// `provider_prompts_from_handshake` selects `provider_prompts` from the peer's capabilities.
-/// `requested_cli_mode` selects `Auto` only when both `cli_auto_mode` and `permission_defer` are
-/// advertised. `Default` leaves the field unset, preserving the request sent to older sidecars.
+/// Builds the one `CreateSessionRequest` both a fresh session and a resume go through.
+///
+/// The policy is fixed rather than parameterised on purpose, and that includes the
+/// permission policy: every session is `INTERACTIVE` and never switchable, whatever the tab's
+/// mode. This client only ever sends values whose runtime behavior has been confirmed distinct.
+/// `verdandi_rules` is identical to `interactive` in the current sidecar, `external_store` is
+/// identical to `ephemeral`, and
+/// `executable` is not read at all -- sending any of them would be choosing a value that means
+/// nothing. `streaming` is the exception that proves the rule: PARTIAL has a measured, distinct
+/// effect, so it is sent. `provider_prompts` is another: `provider_prompts_from_handshake`, a
+/// policy field that depends on the peer. `cli_mode` is the last
+/// (`requested_cli_mode`): `Auto` only when the handshake offered both `cli_auto_mode` and
+/// `permission_defer`, and `Default` leaves the field unset, so a request to a sidecar without them
+/// is byte-for-byte what it was before the field existed.
 fn build_create_request(
     cwd: String,
     streaming: StreamingPreference,
@@ -967,9 +991,9 @@ fn build_create_request_loading(
         cwd,
         policy: Some(ClaudeHostPolicy {
             configuration: ConfigurationProfile::Native as i32,
-            // The sidecar's `PreToolUse` gate asks the host about every call; bypass is the host answering
-            // `allow` through that gate. The CLI runs `default` or its own `auto` mode, selected by
-            // `cli_permission_mode` below.
+            // Always gated: Verdandi's `PreToolUse` broker asks this host about every call,
+            // and bypass is Eitri answering `allow`, never a policy sent here. The CLI under it
+            // runs `default`, or its own `auto` (`cli_permission_mode` below).
             permissions: ProtoPermissionMode::Interactive as i32,
             persistence: PersistenceMode::HostCli as i32,
             executable: ExecutableSource::HostCli as i32,
@@ -1026,9 +1050,9 @@ fn build_create_request_loading(
                 unrestricted: denied.is_empty(),
                 allow: None,
             }),
-            // Permission switching stays disabled: `true` adds `--allow-dangerously-skip-permissions` to the CLI.
+            // Never switchable: `true` sets --allow-dangerously-skip-permissions on the CLI.
             permission_mode_switchable: false,
-            // O3: the CLI's own permission prompts (its sensitive-file check, which neither the
+            // The CLI's own permission prompts (its sensitive-file check, which neither the
             // gate's `allow` nor a rule silences) come to this host instead of being refused with
             // nobody asked. Meaningful because the session is INTERACTIVE; an older sidecar is never
             // sent it (`provider_prompts_from_handshake`). Adds no tool: the sidecar disallows the
@@ -1110,8 +1134,8 @@ impl AgentProvider for ClaudeSidecarProvider {
         self.info.clone()
     }
 
-    /// Creates only gated sessions. Refuses sidecars without the interactive policy
-    /// rather than starting under another policy.
+    /// Always gated: refused on a sidecar without the interactive policy, never started under
+    /// another one.
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError> {
         self.require_interactive()?;
         self.open_session(fresh_request(
@@ -1131,8 +1155,8 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// is Claude's, and is what continues.
     fn resume_session(&self, request: ResumeSessionRequest) -> Result<String, ProviderError> {
         if !self.capabilities.resume {
-            // The provider does not advertise resume, so do not send the command.
-            // Return an error rather than assuming the server will ignore an unsupported command.
+            // The provider does not advertise it, so this client must not send it: never send a
+            // command on the theory the server will ignore it.
             return Err(ProviderError::UnsupportedCapability("resume"));
         }
         if request.provider_session_id.trim().is_empty() {

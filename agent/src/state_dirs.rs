@@ -50,12 +50,15 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/eitri/conversations"))
 }
 
-/// Returns the history directory beside `conversations_dir()`, using the same resolution.
+/// `$XDG_STATE_HOME/eitri/history/`, beside `conversations_dir()` and resolved the same way.
 ///
-/// History files stay outside `conversations/<conversation_id>/` because both
-/// `persistence::read_conversation_records` and `persistence::prune` treat JSON files there
-/// as `ConversationRecord`s. History would fail to parse on each start screen and remain
-/// unpruned, occupying a slot because pruning preserves files it cannot parse.
+/// A directory of its own rather than a file inside `conversations/<conversation_id>/`, which is
+/// where it would most naturally go. Two functions walk that directory treating every
+/// `.json` in it as a `ConversationRecord`: `persistence::read_conversation_records`, which would
+/// read each history file and throw it away as unparseable on every start screen, and
+/// `persistence::prune`, which deliberately does NOT delete what it cannot parse -- so a history
+/// file left there would occupy one of that directory's slots and never be cleaned up. Beside it
+/// instead, and neither function changes by a line.
 pub(crate) fn history_dir() -> std::io::Result<PathBuf> {
     if let Some(root) = test_root() {
         return Ok(root.join("history"));
@@ -68,21 +71,31 @@ pub(crate) fn history_dir() -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/eitri/history"))
 }
 
-/// Returns the session-lease lock directory. Every process for one user on one machine
-/// must resolve the same directory, or separate lock files could both be acquired.
+/// Where session-lease lock files live. Two platforms, two answers, and every process of one user
+/// on one machine must reach the SAME directory -- two processes that disagree each take "the"
+/// lock in their own directory, both succeed, and nothing reports it.
 ///
-/// On Linux, the directory is under `$XDG_RUNTIME_DIR`; an unset variable is an error.
-/// A lease does not survive reboot, so temporary storage is suitable for these locks.
-/// On macOS, the directory is under the account's `Library/Application Support`, using
-/// `getpwuid_r` for the home directory. `$HOME` and `$XDG_RUNTIME_DIR` are not consulted,
-/// so processes with different environments still lock the same paths.
+/// - **Linux:** `$XDG_RUNTIME_DIR/eitri/session-leases/`, matching this project's own established
+///   pattern for ephemeral, per-session state (`supervisor::socket_path`, `agent::process`'s hook
+///   sockets). A lease has no meaning across a reboot, so tmpfs is right here and wrong for the
+///   records above. Unset is still an error.
+/// - **macOS:** `<home>/Library/Application Support/eitri/session-leases/`, where `<home>` is the
+///   account's home directory from the user database (`getpwuid_r`), not `$HOME`. macOS has no
+///   `XDG_RUNTIME_DIR`, and it is deliberately NOT consulted even when someone sets it: a process
+///   launched with it and one launched without would split the lock. Two other homes were
+///   rejected (2026-09-17):
+///   - `std::env::temp_dir()` reads `$TMPDIR` first, so it has the same split-brain problem, and
+///     this project runs tests with `TMPDIR=/nonexistent`;
+///   - `/var/folders/…/T/` itself is swept by `dirhelper` of files not accessed for 3 days. `flock`
+///     does not touch atime, and the lease file is opened by path with `create(true)`, so a lease
+///     held longer than that (a handed-off `claude --resume` left open) could lose its path and a
+///     second holder could lock a fresh inode alongside the first.
 ///
-/// `std::env::temp_dir()` depends on `$TMPDIR`, which could split the lock directory.
-/// The macOS temporary directory is also swept by `dirhelper` after three days without
-/// access. `flock` does not update atime, so a live lock file there could be unlinked,
-/// letting another process create and lock a fresh inode at the same path.
-/// The application-support directory avoids that temporary-file sweep. Stale files after
-/// reboot hold no `flock` state. `SessionLease::try_acquire` creates the directory with mode 0700.
+///   Nothing cleans `Application Support`. `flock` state does not survive a reboot, so a stale lock
+///   file there is only a file. `SessionLease::try_acquire` creates the directory 0700.
+///
+/// Before 2026-09-17 macOS took the Linux branch and failed on the unset variable: a new session started
+/// without a lease, resume and handoff failed.
 pub(crate) fn leases_dir() -> std::io::Result<PathBuf> {
     if let Some(root) = test_root() {
         return Ok(root.join("session-leases"));
@@ -212,12 +225,14 @@ pub fn test_repository_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Removes sibling roots whose owning process is gone.
+/// Removes every sibling root whose owning process is gone.
 ///
-/// Uses `crate::process_probe::pid_is_alive`, based on `kill(pid, 0)`, on Linux and macOS.
-/// Checking `/proc/<pid>` would misclassify live processes on macOS and delete their roots.
-/// Names that are not PIDs and roots belonging to live processes are left alone.
-/// Deletion failures are ignored so stale test directories cannot fail unrelated tests.
+/// Liveness is `crate::process_probe::pid_is_alive`, i.e. `kill(pid, 0)`, on Linux and macOS alike.
+/// It used to be `/proc/<pid>` existing, which on macOS is never true, so every root -- including
+/// a concurrently running test binary's -- was deleted (until 2026-09-17). A name that is
+/// not a pid, or a pid that is still alive, is left alone; so is anything that fails to delete,
+/// since a test root that cannot be pruned is a cosmetic problem and a panic here would fail an
+/// unrelated test.
 fn prune_dead_roots(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else { return };
     for entry in entries.flatten() {

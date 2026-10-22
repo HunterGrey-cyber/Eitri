@@ -1,25 +1,14 @@
 // agent/src/bin/eitri-claude-handoff.rs
-//! A small wrapper the Eitri host process spawns to hand off an exclusive session lease to a
-//! real, interactive `claude --resume <id>` process. Reads an already-locked lease fd (inherited
-//! across `exec` from the host, never independently re-acquired; see
-//! `agent::lease::SessionLease::into_inherited_fd`'s own doc for why) via `EITRI_LEASE_FD`, and
-//! the session to resume via `EITRI_RESUME_SESSION_ID`. `exec`s the real `claude` binary in
-//! place (this process becomes `claude`; it does not fork a further child) so the lease-holding
-//! process and the interactive CLI are the same PID for the whole time the lease is held; when
-//! `claude` exits, this process (now literally `claude`) exits too, and the OS releases the
-//! `flock` automatically as its last referencing fd closes.
+//! Hand off an exclusive session lease to an interactive `claude --resume <id>` process.
+//! Read the already-locked lease fd inherited from the host and the session id from the
+//! environment, then `exec` the CLI in place. The lease-holding process and CLI share a PID;
+//! when the CLI exits and its last referencing fd closes, the OS releases the `flock`.
 //!
-//! No wrapper stays alive as a supervising parent holding the lock. `exec` ties the lock's
-//! lifetime exactly to the real CLI process's own lifetime, with no second, independent process
-//! whose own death (crash, kill -9, orphaning) would be a separate failure mode the lock's
-//! correctness would depend on. The lease's survival therefore rests on the exec'd `claude`
-//! keeping an inherited descriptor it never asked for, across its own `exec`. That was checked
-//! against the real CLI (`agent/MANUAL_VERIFICATION.md`, handoff section), and
-//! `agent/tests/handoff_conformance.rs` is the standing regression guard for it: it asserts a
-//! second lease acquire attempt fails (`LeaseError::AlreadyHeld`) only after confirming, via
-//! `/proc/<pid>/comm`, that the held-open pid has actually become `claude`, so a regression that
-//! broke fd survival across `exec` would fail loudly there, not pass vacuously against a
-//! not-yet-exec'd wrapper.
+//! The lock lifetime depends on the CLI retaining the inherited descriptor across `exec`.
+//! Replacing the wrapper ties the lease to the CLI's lifetime without a supervising parent's
+//! separate lifetime affecting it. `agent/tests/handoff_conformance.rs` checks that another
+//! acquire fails with `LeaseError::AlreadyHeld` after `/proc/<pid>/comm` confirms that the
+//! process has become `claude`, so the check cannot pass against a wrapper awaiting `exec`.
 
 use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;

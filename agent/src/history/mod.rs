@@ -1,17 +1,24 @@
-//! Restores conversation history so a resumed session can display earlier messages.
+//! Restoring what a conversation already said, so a resumed session does not open onto an empty
+//! panel.
 //!
-//! The Claude CLI transcript, B, is primary. The application's stored copy, A, is the
-//! fallback. [`transcript_jsonl`] reads B, [`composed_block`] removes appended editor
-//! context from prompts, and [`store`] manages A in the application's state directory.
+//! Two sources: **B**, the real Claude CLI's own transcript, is primary, because it is the record
+//! the CLI itself keeps and so the nearer to what the resumed model remembers; **A**, Eitri's own copy,
+//! is the fallback under it. This module holds B's reader ([`transcript_jsonl`]) and the one piece
+//! of text handling B needs that belongs to this project rather than to the CLI
+//! ([`composed_block`]).
 //!
-//! The CLI directory, `$CLAUDE_CONFIG_DIR`, is read-only here: nothing writes, renames,
-//! moves or deletes files there. The stored copy is written only in application state.
-//! Restored content feeds the panel; it does not determine resume safety or permissions,
-//! and it is never composed into a turn sent to the model.
+//! [`store`] is A: Eitri's own copy, under `$XDG_STATE_HOME/eitri/history/`.
+//!
+//! **Nothing here ever writes under `$CLAUDE_CONFIG_DIR`**. B's half never writes,
+//! renames, moves or deletes anything there; that directory belongs to the CLI. A's half writes
+//! only into Eitri's own state directory. Nothing either half reads is evidence: history content
+//! feeds the panel and nothing else -- it never decides whether a resume is safe, never reaches a
+//! permission decision, and is never composed into a turn sent to the model.
 
 pub mod composed_block;
-/// Builds the initial projection for a resumed conversation from either history source.
-/// Crate-internal: only `AgentConversation::resume` calls this; crate consumers do not build seeds.
+/// Turning either stored record into the projection a resumed conversation starts from.
+/// Crate-internal: the only caller is `AgentConversation::resume`, and a seed is not something a
+/// consumer of this crate builds for itself.
 pub(crate) mod load;
 pub mod store;
 pub mod transcript_jsonl;

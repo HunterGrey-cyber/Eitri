@@ -249,7 +249,7 @@ pub fn parse_nvim_version_line(first_line: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// `$XDG_DATA_HOME/eitri/nvim`, or `<home>/.local/share/eitri/nvim` when `XDG_DATA_HOME` is
-/// unset, empty or not absolute -- the same three-case rule `core::layout::persist::state_subdir`
+/// unset, empty or not absolute -- the same three-case rule `core::state_paths::state_subdir`
 /// uses for `XDG_STATE_HOME`, and `agent::providers::claude_sidecar::user_sidecar_path` uses for its
 /// own directory under this same `XDG_DATA_HOME` (that function's own doc: `core` depends on
 /// `agent`, never the reverse, so the rule is reproduced here rather than shared). `None` when

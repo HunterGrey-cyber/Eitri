@@ -1,13 +1,25 @@
-//! Keyboard and IME input for the embedded editor surface. Shared `LiveState` and `LiveSession`
-//! are defined in `crate` (`lib.rs`).
+//! Keyboard + IME input handling for the embedded editor surface.
 //!
-//! Translates `gdk::Key` and `gdk::ModifierType` into nvim's bracketed key notation. Modifier
-//! chords such as `<C-w>`, `<M-x>`, `<D-p>`, and `<C-M-j>`, function keys, arrows, and named
-//! navigation and editing keys are supported. Unrecognized keys are dropped rather than
-//! guessed, as with `crate::mouse::gdk_button_to_button_text`.
+//! Extracted from `poc/neovide_embed_live/src/main.rs` (the embedding probe, `build_ui`'s IME+keyboard
+//! wiring, roughly lines 848-935) as part of the neovide-editor extraction -- mirroring what
+//! `crate::mouse` already does for click/drag/scroll. Shared session state (`LiveState`, and
+//! `LiveSession` reached through it) is defined in `crate` (`lib.rs`).
 //!
-//! The three `preedit-*` signals call `IMContext::set_cursor_location` to place the candidate
-//! window next to nvim's cursor. See `im_cursor_rect_for_editor`.
+//! **Scope (2026-09-08, keyboard depth and candidate placement).** The original extraction
+//! carried over the probe's deliberate simplification -- printable characters via
+//! `Key::to_unicode()` plus four named keys, and *any* held Ctrl/Alt/Super treated as "not plain
+//! text" and dropped. That is no longer true: this module now translates GDK key events into
+//! Neovim's own bracketed key notation, mirroring the fork's own
+//! `neovide::window::keyboard_manager::KeyboardManager` (`format_key_text`/
+//! `format_modifier_string`/`get_special_key`) rule for rule, just keyed off GTK's
+//! `gdk::Key`/`gdk::ModifierType` instead of winit's `KeyEvent`/`ModifiersState`. Modifier chords
+//! (`<C-w>`, `<M-x>`, `<D-p>`, `<C-M-j>`, ...), function keys, arrows, and the
+//! navigation/editing named keys all reach nvim now; unrecognized keys are still silently dropped
+//! rather than guessed at, the same stance `crate::mouse::gdk_button_to_button_text` takes.
+//!
+//! The three `preedit-*` signals additionally call `IMContext::set_cursor_location` so the input
+//! method draws its candidate window next to the real Neovim cursor -- see
+//! `im_cursor_rect_for_editor`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -265,16 +277,32 @@ pub(crate) fn format_key_event(key: Key, state: ModifierType) -> Option<String> 
     Some(format_key_text(&ch.to_string(), false, state))
 }
 
-/// The widget-local rectangle passed to `IMContext::set_cursor_location` anchors the input
-/// method's candidate window to the cursor cell.
+/// The widget-local rectangle handed to `IMContext::set_cursor_location` so the platform input
+/// method draws its candidate window against the real Neovim cursor cell instead of falling back
+/// to the whole widget.
 ///
-/// `LiveHarness::cursor_pixel_position()` already includes `content_region.min`: the renderer
-/// adds the region's grid offset before converting back to pixels. Do not add that offset again.
-/// The cursor position and `grid_scale` use device pixels, while GTK expects widget-local logical
-/// pixels, so divide both by `scale_factor`. The rectangle covers one grid cell so the input
-/// method knows the line height it must not cover.
+/// Three coordinate facts make this a one-liner rather than a re-derivation, and all three were
+/// checked in the fork's own source rather than assumed:
 ///
-/// Use GTK's integer `Widget::scale_factor()`, matching the basis used by the mouse conversions.
+/// 1. `LiveHarness::cursor_pixel_position()` (`Renderer::get_cursor_destination`) is already
+///    expressed in the same pixel space as the `content_region` this crate hands to
+///    `render_frame` -- `RenderedWindow::get_target_position` folds `grid_rect.min`
+///    (`content_region / grid_scale`) into the window's own grid position before
+///    `CursorRenderer::update_cursor_destination` multiplies through by `grid_scale`. So the
+///    `content_region.min` offset `crate::gl_interop::pixel_to_grid_pos` has to *subtract* on the
+///    way in is already *added* here on the way out; there is nothing more to apply.
+/// 2. That space is device pixels (`crate::gl_interop::current_content_region` builds
+///    `content_region` from `gl_area.width() * gl_area.scale_factor()`), whereas
+///    `set_cursor_location` wants widget-local *logical* pixels -- the same units GTK4's own
+///    `GestureClick`/`EventControllerMotion` report `x`/`y` in. Hence the single division by
+///    `scale_factor`, the exact inverse of the multiplication `pixel_to_grid_pos` performs.
+/// 3. The rect's size is one grid cell (`grid_scale`, likewise device pixels -> logical), so the
+///    input method knows the height of the line it must not cover.
+///
+/// `scale_factor` is GTK's own rounded integer `Widget::scale_factor()`, matching every other
+/// coordinate conversion in this crate; the cross-scale click-accuracy work established that both
+/// sides of these conversions share that same rounded basis, so the rounded/true-fractional scale
+/// mismatch never enters the arithmetic.
 pub(crate) fn im_cursor_rect_for_editor(
     cursor_pixel_pos: PixelPos<f32>,
     grid_scale: GridScale,
@@ -346,10 +374,12 @@ pub(crate) fn attach_keyboard_input(
     // nvim through the exact same `send_text_input` path plain keystrokes already use.
     let im_context = IMMulticontext::new();
     im_context.set_client_widget(Some(gl_area));
-    // The editor does not render the `preedit-changed` string. With GTK's default preedit setting,
-    // the input method leaves composition display to this client, making the text invisible.
-    // Disable preedit so the input method shows composition in its own candidate window next to
-    // the cursor rectangle published below.
+    // The editor draws no preedit: nothing here renders `preedit-changed`'s string, and the
+    // renderer has no place for it (native Neovide shows none either). Left at GTK's default,
+    // the input method hands the composition to this client and shows it nowhere -- on the
+    // GNOME with fcitx5 (through GTK_IM_MODULE=fcitx, candidates drawn by kimpanel) the pinyin
+    // being typed was simply invisible (2026-09-28). With preedit off, the input method shows the
+    // composition in its own candidate window, next to the rectangle published below.
     im_context.set_use_preedit(false);
     {
         let live_state = live_state.clone();

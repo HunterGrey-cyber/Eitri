@@ -204,7 +204,7 @@ impl PluginStore {
 
     /// `<state home>/eitri`, from `XDG_STATE_HOME` or `HOME`, as every other piece of Eitri's state.
     pub fn eitri_root_from_env() -> Option<PathBuf> {
-        crate::layout::persist::state_subdir(
+        crate::state_paths::state_subdir(
             std::env::var_os("XDG_STATE_HOME").as_deref(),
             std::env::var_os("HOME").as_deref(),
             "plugins",

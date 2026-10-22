@@ -215,7 +215,7 @@ pub fn paint_ops(canvas: &Canvas, ops: &[PaintOp], metrics: &TerminalMetrics) {
     }
 }
 
-/// tmux copy-mode's `[N/M]`,
+/// tmux copy-mode's `[N/M]` (the indicator a tmux user already reads every day),
 /// right-aligned in the top row: `above` is how many lines the scrolled-back window sits below the
 /// live bottom (`crate::scroll::ScrollView::indicator`), `history` the terminal's whole retained
 /// scrollback. Built as a `PaintOp::DrawNotice` -- never a bespoke fill-plus-text pair -- for the

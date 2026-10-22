@@ -4,8 +4,8 @@
 //! `prepare_eitri_to_cli_handoff` -- this function's only job is: acquire the lease, spawn
 //! `eitri-claude-handoff` with that lease's fd inherited, and confirm the handoff genuinely
 //! started before returning. It does not itself touch any `AgentSession`/`ClaudeSidecarProvider`
-//! -- see this plan's "Explicitly out of scope" section for why no shared session-identity trait
-//! exists yet.
+//! -- no shared session-identity trait exists yet, since nothing beyond this one handoff would use
+//! it.
 
 use crate::lease::{LeaseError, SessionLease};
 use std::process::{Command, Stdio};
@@ -32,9 +32,10 @@ pub enum ResumeCommandError {
     /// human to run AND handed to `exec`, and neither should carry an argument that silently
     /// becomes a flag.
     SessionIdLooksLikeAFlag,
-    /// No working directory. The cwd is part of the session's identity: the handoff wrapper
-    /// runs with `current_dir(canonical_cwd)`, and the lease key includes it. A `--resume`
-    /// without the working directory could run in a different session context.
+    /// No working directory. A session's cwd is part of its identity throughout this design
+    /// (`prepare_eitri_to_cli_handoff` runs the wrapper with `current_dir(canonical_cwd)`, the
+    /// lease key includes it, and an import validates it), so a
+    /// `--resume` with nowhere to run is not a weaker command -- it is a different one.
     MissingCwd,
 }
 
@@ -228,18 +229,26 @@ fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
     ))
 }
 
-/// Acquires the lease and spawns the wrapper with the lease's file descriptor inherited.
-/// The lease stays held throughout the handoff. Success is returned only after `spawn()`
-/// succeeds, so the child exists before the caller receives a successful result.
+/// Acquire the lease, spawn the wrapper with the lease's fd inherited
+/// (never released between acquiring and the child's own successful spawn -- there is no window
+/// where neither this process nor the child holds it), and only return success once `spawn()`
+/// itself succeeds (proving the child process genuinely exists and inherited the fd -- this
+/// was verified against `Command::spawn`'s real fd-inheritance behavior, not assumed).
 ///
-/// The caller must supply an existing Claude session UUID after the conversation has
-/// completed at least one turn. The Agent SDK supplies the id in a `system`/`init` message
-/// when a query starts; `create_session` alone does not produce one. This function only
-/// receives a string and cannot check session state. The caller with access to the
-/// `AgentSessionProjection` must keep the terminal handoff action disabled until then.
+/// # Precondition the caller must enforce
 ///
-/// The companion binary rejects an empty id. A `claude --resume` with a nonexistent id
-/// exits and releases the lease, but still wastes a lease acquisition and a process spawn.
+/// `provider_session_id` must be a real Claude session UUID that actually exists, which means
+/// **the conversation must already have completed at least one turn**. That id is minted from the
+/// Agent SDK's own `system`/`init` message, which the SDK emits when a *query* starts -- so a
+/// session that was created but never asked anything has no id to resume, and `create_session`
+/// alone never produces one. This function cannot check that for you: it only ever sees a `&str`
+/// and holds no session state, so it cannot tell "never took a turn" from any other caller
+/// mistake. Whichever caller owns the `AgentSessionProjection` is the one that can, and a
+/// "continue in a real terminal" UI action must stay disabled until the first turn completes.
+///
+/// Getting it wrong is not unsafe, just useless: the companion binary fail-closes on an empty id,
+/// and a `claude --resume` against a nonexistent one exits on its own, releasing the lease. But it
+/// wastes a real lease acquisition and a real process spawn to accomplish nothing.
 pub fn prepare_eitri_to_cli_handoff(
     provider: &str,
     canonical_cwd: &str,

@@ -1,4 +1,7 @@
 //! GL/Skia interop and content-region math for the editor surface.
+//!
+//! Extracted from poc/neovide_embed_live as the foundational GL wrapping and coordinate
+//! system implementation the editor's embedding was validated on.
 
 use skia_safe::gpu::gl::{Format as GlFormat, FramebufferInfo, Interface as GlInterface};
 use skia_safe::gpu::{backend_render_targets, surfaces, Budgeted, DirectContext, SurfaceOrigin};
@@ -7,9 +10,17 @@ use skia_safe::{AlphaType, Canvas, Color4f, ColorType, ImageInfo, Paint, Rect, S
 use neovide::live_harness::LiveHarness;
 use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
 
-/// Inset in device pixels between the GtkGLArea framebuffer and the content region. Zero lets
-/// the editor fill its pane without a dark frame. A nonzero inset exposes painting outside the
-/// supplied rectangle. Kept as a named constant for the geometry documentation and tests.
+/// Inset (device pixels) between the GtkGLArea's own framebuffer edge and the content region.
+///
+/// **Zero since 2026-09-16, deliberately.** It was 40.0 as a validation aid inherited from
+/// `poc/neovide_embed*`: a non-zero inset made a viewport-containment bleed -- the renderer
+/// painting outside the rect it was handed -- obvious on screen. That validation is finished
+/// (real screenshots at six scale factors, numeric geometry cross-checks), and what the margin left
+/// behind in the product was a hardcoded near-black frame around the editor, dark around a light
+/// colorscheme. The editor now fills its pane.
+///
+/// Kept as a named constant rather than deleted or inlined: it is what this file's doc comments and
+/// geometry tests name, and the frozen `poc/` crates still carry their own copies.
 pub(crate) const CONTENT_MARGIN: f32 = 0.0;
 
 /// GL-context-bound Skia state. Normally Skia draws straight into the pane's own tiled dmabuf
@@ -43,20 +54,37 @@ impl SkiaState {
         }
     }
 
-    /// Invalidates Skia's cached GL state. Call at the start of every render callback, before
-    /// drawing.
+    /// Tell Skia that the GL context's state was changed by someone else since the last frame, so
+    /// it must re-emit its own state instead of trusting its cache. **Call this at the top of
+    /// every render callback, before any drawing.**
     ///
-    /// GTK shares this GL context and can change its state between callbacks. On resize,
-    /// `gtk_gl_area_allocate_buffers()` leaves the new framebuffer texture bound to texture
-    /// unit 0. Skia may still cache its glyph atlas as bound there and skip `glBindTexture`,
-    /// causing glyph quads to sample the opaque framebuffer texture and render as solid blocks.
-    /// Idle render gating can leave that bad frame visible until input arrives.
+    /// This is not a precaution -- it is the fix for a real, reproducible, long-standing rendering
+    /// bug (found 2026-09-07 via `shell`, root-caused 2026-09-08). `GrDirectContext` assumes it is
+    /// the only thing touching the underlying GL context and caches the GL state it has already
+    /// set, most importantly which texture is bound to which texture unit. That assumption does
+    /// not hold inside a `GtkGLArea`: GTK drives the very same GL context around our render
+    /// callback, and on any resize `gtk_gl_area_allocate_buffers()` creates the new colour texture
+    /// backing the area's framebuffer and leaves *it* bound to texture unit 0.
     ///
-    /// Reset on every frame because nvim's resize response and grid repaint arrive
-    /// asynchronously, after the frame that rebuilt the surface. Resetting only that frame
-    /// misses later repaint frames. A full reset also covers framebuffer, program, and blend
-    /// state that GTK can change. The measured reset cost is about 1-4 us in a roughly 3 ms
-    /// render callback.
+    /// Measured directly (`glGetIntegerv(GL_TEXTURE_BINDING_2D)` at the top of the render
+    /// callback): on an ordinary frame the unit-0 binding on entry is the same texture Skia left
+    /// bound on exit from the previous frame, but on a frame following a GTK buffer reallocation
+    /// it is GTK's *new* texture instead -- while Skia's cache still believes its own glyph atlas
+    /// is bound there. Skia therefore skips the `glBindTexture` it would otherwise emit, and every
+    /// glyph-mask draw samples GTK's opaque RGBA framebuffer texture instead of the A8 glyph
+    /// atlas. Full coverage everywhere inside each glyph's quad, so every character paints as a
+    /// solid block the exact shape of its bounding box, with no letterform detail -- and it
+    /// persists, because the idle-render gating correctly stops issuing frames once
+    /// nothing is animating, leaving that one bad frame on screen until real input arrives.
+    ///
+    /// Evidence for why this is unconditional rather than resize-only: resetting only on the frame
+    /// that rebuilds the surface (i.e. only on the resize frame itself) was tested and did **not**
+    /// fix it (0/4 trials clean), because nvim answers the resize asynchronously and the frames
+    /// that repaint the newly-sized grid arrive later. Resetting on every frame does
+    /// (5/5 clean with the full reset here, 4/4 with the narrower `reset_gl_texture_bindings()`).
+    /// The cost measured over a scripted scroll workload is ~1-4us against a ~3ms render callback
+    /// -- roughly 0.1% -- so the wider, safer reset is used: GTK also owns the framebuffer binding
+    /// and can touch program/blend state, and those caches are equally stale for the same reason.
     pub(crate) fn invalidate_cached_gl_state(&mut self) {
         self.gr_context.reset(None);
     }
@@ -311,14 +339,24 @@ pub(crate) fn grid_size_for_content_region(harness: &LiveHarness, content_region
     )
 }
 
-/// Converts a widget-local logical-pixel position from GTK input controllers to a grid column
-/// and row. Multiplying by `scale_factor` converts to the device-pixel space used by
-/// `content_region`. Subtract the region origin, divide by `grid_scale`, floor, and clamp to
-/// `[0, grid_size - 1]`, using the same geometry as `grid_size_for_content_region`.
-///
-/// Plain scale and size arguments keep this math independently testable. Callers pass
-/// `harness.grid_scale()` and `harness.get_grid_size()` so clamping uses the grid confirmed by
-/// nvim's redraw traffic rather than a pending `resize_grid` request.
+/// Converts a widget-local *logical*-pixel position -- exactly what GTK4's `GestureClick`/
+/// `EventControllerMotion`/`EventControllerScroll` all report their `x`/`y` in -- into the (col,
+/// row) grid cell it lands on, reusing the exact content_region/grid-scale relationship
+/// `grid_size_for_content_region` already uses for the resize fix rather than reimplementing
+/// it: `logical * scale_factor` first converts into the same device-pixel space `content_region`
+/// itself is expressed in (mirroring every other device-pixel user in this file, e.g. the initial
+/// `SkiaState` construction's own `widget.width() * widget.scale_factor()`), then
+/// `(pixel - content_region.min) / grid_scale`, floored and clamped to `[0, grid_size - 1]` --
+/// precisely `MouseManager::get_relative_position_at`'s own formula
+/// (`~/src/neovide/src/window/mouse_manager.rs` in the sibling fork checkout).
+/// Callers pass `harness.grid_scale()`/`harness.get_grid_size()`
+/// straight through (rather than this function taking `&LiveHarness` itself) so the coordinate
+/// math stays a pure function of plain values -- independently unit-testable below, and clearly
+/// separated from *which* harness state a caller chooses to clamp against. Every call site in
+/// this crate clamps against `get_grid_size()` (the grid size nvim's own redraw traffic last
+/// actually confirmed), not merely the size last *requested* via `resize_grid`, matching how the
+/// reference clamps against a window's own reported `grid_size` rather than a pending resize
+/// target.
 pub(crate) fn pixel_to_grid_pos(
     logical_x: f64,
     logical_y: f64,
@@ -340,22 +378,26 @@ pub(crate) fn pixel_to_grid_pos(
     )
 }
 
-/// Derives the hit-testing region from the framebuffer size last reported through
-/// `GLArea::resize`, using the same `grid_layout` as rendering. This keeps clicks aligned with
-/// row 0. Recomputing from `widget.width() * scale_factor()` can disagree with GTK's
-/// framebuffer before the widget is drawn at its allocation.
+/// The grid's region for hit testing, derived from the pane's one framebuffer size (`fb`, the
+/// `NeovideEditorPane::fb_size` GTK last reported through `GLArea::resize`) through the same
+/// [`grid_layout`] the render callback draws with, so a click and the frame it lands on can never
+/// disagree about where row 0 starts (the 2026-09-19 lesson: "the snap has to reach
+/// hit-testing"). Before this it re-derived the size as `widget.width() * scale_factor()`, a
+/// second source that only agrees with GTK's while the widget has been drawn at its allocation.
 pub(crate) fn current_content_region(fb: (i32, i32), grid_scale: GridScale) -> PixelRect<f32> {
     grid_layout(fb.0, fb.1, grid_scale, |_| GridSize::new(1, 1)).region
 }
 
-/// Geometry for one frame derived from one framebuffer size: the snapped drawing region, nvim's
-/// `(cols, rows)`, and the sub-cell remainder above the grid (`band_top_px`). Logging the
-/// remainder distinguishes it from a whole blank cmdline row.
+/// Everything the editor's geometry needs for one frame, derived from ONE framebuffer size:
+/// the snapped region the grid is drawn into, the `(cols, rows)` nvim should be sized to, and how
+/// many pixels of sub-cell remainder sit above the grid (`band_top_px`, logged so a GUI pass can
+/// tell a sub-cell band from a whole blank row, which would be nvim's own cmdline instead).
 ///
-/// The remainder belongs above the grid so the bottom row reaches the pane's bottom. Sharing
-/// this calculation across rendering, resizing, tick resync, and hit testing keeps their
-/// geometry aligned instead of mixing GTK's framebuffer size with widget allocation dimensions.
-/// eitri-only.
+/// The sub-cell remainder goes above the grid, never under nvim's last line, where it read as a
+/// stray blank band below the status line. The render callback, the resize handler, the
+/// tick's resync and hit testing each used to derive this themselves, some from GTK's reported
+/// framebuffer and some from `widget.width() * scale_factor()`; one function over one size means
+/// they cannot drift apart. eitri-only.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GridLayout {
     pub region: PixelRect<f32>,
@@ -381,10 +423,10 @@ pub(crate) fn grid_layout(
     }
 }
 
-/// Compares grid cell dimensions by bits because `GridScale` has no `PartialEq`. Before nvim
-/// reports a font, a cell can be NaN; ordinary float inequality would report a change every
-/// frame and continuously request new frames at idle. Comparing bits treats an unchanged NaN
-/// representation as equal.
+/// Whether two grid scales are the same cell, compared by bits. `GridScale` has no `PartialEq`,
+/// and a plain f32 `!=` would call a NaN cell (before nvim reports a font) "changed" on every
+/// frame -- the render callback would then ask for another frame forever, an idle-CPU
+/// regression. By bits, NaN equals itself. eitri-only.
 pub(crate) fn same_grid_scale(a: GridScale, b: GridScale) -> bool {
     (a.width().to_bits(), a.height().to_bits()) == (b.width().to_bits(), b.height().to_bits())
 }

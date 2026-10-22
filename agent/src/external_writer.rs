@@ -1,7 +1,10 @@
-//! Poll the session transcript's mtime for changes while this client expects exclusive access.
-//! A raw CLI writer cannot be prevented because there is no lock both clients observe.
-//! Mtime alone cannot distinguish this client's last write from another writer's change.
-//! Report changes for the caller to handle; `ExternalWriterCheck::Changed` describes that caveat.
+//! Detects an unexpected write to a session's own transcript file while Eitri believes it is
+//! the exclusive writer (an honest boundary: Eitri can only DETECT a concurrent
+//! raw-CLI writer, never prevent one -- there is no lock both sides observe). Polls the
+//! transcript's own mtime; a change Eitri itself did not just cause (this module has no way to
+//! distinguish "Eitri's own last write" from "someone else's" by mtime alone -- see this
+//! module's own doc on `ExternalWriterCheck::Changed` below for the honest caveat) is reported to
+//! the caller to act on.
 
 use crate::transcript::transcript_path;
 use std::path::PathBuf;
@@ -17,11 +20,14 @@ pub struct ExternalWriterWatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalWriterCheck {
     Unchanged,
-    /// The transcript's mtime changed since the last check. This does not distinguish this
-    /// process's own writes from another process's writes. Callers must account for expected
-    /// writes, for example by waiting for them to settle before polling again, or inspect each
-    /// `Changed` result before denying access. This detects changes without preventing them
-    /// or identifying their source.
+    /// The transcript's mtime changed since the last check. This module cannot distinguish "the
+    /// session this same process is driving legitimately wrote a new turn" from "a different
+    /// process wrote to it" -- callers that expect their OWN writes must account for that
+    /// separately (e.g. only start polling again after each of their own writes has settled) or
+    /// treat every `Changed` as worth a closer look rather than an automatic hard denial. This is
+    /// the honest limitation of an advisory lock: Eitri enforces exclusivity only on the paths it
+    /// provides, and never claims an external CLI is locked out because a `flock` exists --
+    /// detection, not prevention, and detection alone cannot attribute a write to its source.
     Changed,
 }
 

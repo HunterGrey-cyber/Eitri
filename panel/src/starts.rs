@@ -431,7 +431,7 @@ pub(super) fn spawn_external(
                 // The start is about to run the self-check: the tab would otherwise sit in "starting"
                 // for seconds with nothing said.
                 if let Ok(program) = &located {
-                    let state_home = eitri_core::layout::persist::state_subdir(
+                    let state_home = eitri_core::state_paths::state_subdir(
                         std::env::var_os("XDG_STATE_HOME").as_deref(),
                         std::env::var_os("HOME").as_deref(),
                         "",

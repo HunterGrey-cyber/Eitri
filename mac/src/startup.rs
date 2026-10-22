@@ -145,7 +145,7 @@ pub fn paths(env: &dyn Fn(&str) -> Option<OsString>, home: &Path, run_dir: &Path
         return Err(format!("the home directory {home:?} is not an absolute path"));
     }
     let neovide_data =
-        eitri_core::layout::persist::state_subdir(env("XDG_STATE_HOME").as_deref(), Some(home.as_os_str()), "neovide")
+        eitri_core::state_paths::state_subdir(env("XDG_STATE_HOME").as_deref(), Some(home.as_os_str()), "neovide")
             .ok_or_else(|| "no state directory could be derived".to_string())?;
     let config_dir = match env("EITRI_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         Some(dir) if Path::new(&dir).is_absolute() => PathBuf::from(dir),
@@ -294,7 +294,7 @@ pub fn output_moves_to_log(goes: OutputGoes, pipe: bool) -> bool {
 
 /// `<state home>/eitri/mac`, where the app's log is kept, by the rule every state directory follows.
 pub fn log_dir(xdg_state_home: Option<&std::ffi::OsStr>, home: &Path) -> Option<PathBuf> {
-    eitri_core::layout::persist::state_subdir(xdg_state_home, Some(home.as_os_str()), "mac")
+    eitri_core::state_paths::state_subdir(xdg_state_home, Some(home.as_os_str()), "mac")
 }
 
 /// What [`move_output_to_log`] did.
@@ -367,7 +367,7 @@ pub fn hold_shared(fd: RawFd, tries: u32, pause: std::time::Duration) -> bool {
 /// lock's open must be that same file.
 pub fn open_project_log(dir: &Path, project_root: &Path) -> Option<ProjectLog> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    eitri_core::layout::persist::create_state_dir(dir).ok()?;
+    eitri_core::state_paths::create_state_dir(dir).ok()?;
     let path = dir.join(eitri_core::companion::stdio::log_file_name(project_root));
     let file = File::options()
         .append(true)

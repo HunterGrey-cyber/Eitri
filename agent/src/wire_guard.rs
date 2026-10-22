@@ -1,30 +1,41 @@
-//! Scans this crate's non-test sources for ways to run `claude` without the permission gate.
+//! The wire guard: a scan of this
+//! crate's own non-test sources for every way back to a `claude` that runs without the gate.
 //!
-//! Legacy sessions use `--permission-mode default` with a `PreToolUse` hook. Sidecar sessions
-//! use INTERACTIVE with `permission_mode_switchable: false`. Bypass is the host answering
-//! `allow` through the gate. The scan catches string literals, protocol constructors,
-//! setters and pre-approval lists that could enable `bypassPermissions` without changing
-//! a function signature.
+//! Since 2026-09-27 the CLI's permission mode is a constant. Every session, on both backends, is gated --
+//! `--permission-mode default` plus the `PreToolUse` hook on legacy, `INTERACTIVE` with
+//! `permission_mode_switchable: false` on the sidecar -- and "bypass" is Eitri answering `allow`
+//! itself. The types carry half of that: no session request has a mode any more. This scan carries
+//! the half the compiler cannot see -- a string literal, a proto enum constructor, a setter, a
+//! pre-approval list -- any of which would put the CLI back in `bypassPermissions` without a single
+//! signature changing.
 //!
-//! A lexer removes comments while preserving string literals, including `//` inside URLs.
-//! Whitespace is collapsed before matching so line wrapping cannot change the result.
-//! The scan covers every `agent/src/**/*.rs`, including `src/bin/`, but excludes
-//! `#[cfg(test)]` module blocks and files reached only through test-only module declarations.
-//! That excludes this file and `runtime_policy_verification.rs`.
+//! Modelled on `socket_path.rs`'s scanner, with two differences that matter. Comments are removed by
+//! a lexer that knows where string literals are (a `//` inside `"http://…"` is not a comment), and
+//! every rule matches on the text with all whitespace collapsed to single spaces, so where rustfmt
+//! breaks a line never decides the verdict.
 //!
-//! [`ALLOWED_ARM`] is the single allowed bypass match arm, identified by file and arm text
-//! rather than line number.
+//! **Scope:** every `agent/src/**/*.rs`, `src/bin/` included. Test code is excluded: a
+//! `#[cfg(test)] mod x { … }` block, and a file reached only through a `#[cfg(test)] mod x;`
+//! declaration (which is how this file excludes itself, and `runtime_policy_verification.rs`).
 //!
-//! Sidecar sessions may also request the CLI's `auto` mode through
-//! `ClaudeHostPolicy.cli_permission_mode = AUTO`. The gate remains installed and the session
-//! stays INTERACTIVE and unswitchable. Auto mode is available only through the handshake.
-//! Each `ClaudeHostPolicy` literal states UNSPECIFIED or matches the requested mode.
-//! Every site that can produce requested `Auto`, protocol `Auto`, or a non-false
-//! `cli_auto_mode` capability must match an entry in [`AUTO_SITES`] by file and text.
+//! **Allowlist: exactly one entry**, matched by file and by the arm's own text, never by a line
+//! number -- see [`ALLOWED_ARM`].
 //!
-//! The scan follows enum aliases, re-exports and `Self::Auto` inside implementations.
-//! Variant imports by name or glob are refused because bare `Auto` is ambiguous.
-//! Assignments to guarded fields include compound operators regardless of whitespace.
+//! **The CLI's own auto mode (2026-10-02).** Since Verdandi protocol 3.14 a gated sidecar session
+//! may ask the CLI to run `auto` under the gate (`ClaudeHostPolicy.cli_permission_mode = AUTO`), so
+//! the CLI's mode is no longer the constant `default`. It is still never ungated: the gate stays
+//! installed, the session stays INTERACTIVE and unswitchable, and `bypassPermissions` stays
+//! unreachable. What this scan adds (rule 6) is that AUTO can only come from the handshake: every
+//! `ClaudeHostPolicy` literal states `cli_permission_mode` as UNSPECIFIED or as the one `match` on
+//! the requested mode, and each place that can produce the requested `Auto` -- the requested-mode
+//! constructor, the proto `Auto` constructor, a non-`false` `cli_auto_mode` capability -- is one of
+//! the [`AUTO_SITES`], by file and text. A new one fails until someone adds it there, on purpose.
+//!
+//! The requested `Auto` is searched for under every name the crate can give it: the enum's aliases
+//! (`use ... as R`, `type R = ...`, a re-export in any file), `Self::Auto` inside an `impl` of it, and
+//! the variants imported by name or by glob (refused at the import, since a bare `Auto` cannot be told
+//! from another type's). An assignment to a guarded field is any assignment operator, compound ones
+//! included, however the `.` and the operator are spaced.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -37,17 +48,19 @@ const PROTO_CLI_PERMISSION_MODE: &str = "claude_runtime_protocol::v1::CliPermiss
 const PROTO_HOST_POLICY: &str = "claude_runtime_protocol::v1::ClaudeHostPolicy";
 const PROTO_CREATE_SESSION_REQUEST: &str = "claude_runtime_protocol::v1::CreateSessionRequest";
 
-/// Allowed sites for requesting the CLI's auto mode, identified by file and surrounding
-/// text with whitespace collapsed. Every [`AUTO_NEEDLES`] occurrence must be inside one
-/// of these sites. Each entry must occur exactly once, so moved or removed sites also fail.
+/// Rule 6: every place that can make a session ask for the CLI's auto mode, as `(file, the text
+/// around it)`, collapsed as the scan collapses it. Each occurrence of one of the
+/// [`AUTO_NEEDLES`] must sit inside one of these, and each of these must be found exactly once: a
+/// site that moved or vanished is a stale entry, and fails like a new site does.
 ///
-/// The capability requires both `cli_auto_mode` and `permission_defer` from the handshake
-/// (`capabilities_from_handshake`). `requested_cli_mode` constructs requested `Auto` from
-/// that capability. `build_create_request_loading` constructs protocol `Auto` only in
-/// the request's matching arm.
-/// Two patterns and a comparison construct nothing: `classify_reported_cli_mode` compares
-/// the CLI's report with the requested mode, and the translator checks that an auto session
-/// never reports a mode switch.
+/// - the capability itself, true only when the handshake offered both `cli_auto_mode` and
+///   `permission_defer` (`capabilities_from_handshake`);
+/// - the one constructor of the requested `Auto`, from that capability (`requested_cli_mode`);
+/// - the one proto `Auto`, as the value of the `Auto` arm of the request's `match`
+///   (`build_create_request_loading`);
+/// - two patterns and a comparison, which construct nothing: the CLI-mode classification of what the CLI
+///   reported against what was asked for (`classify_reported_cli_mode`), and the translator's check
+///   that an auto session never reports a mode switch.
 const AUTO_SITES: &[(&str, &str)] = &[
     (
         "providers/claude_sidecar/mod.rs",
@@ -115,9 +128,9 @@ const FORBIDDEN_EXACT: &[&str] = &[
     "set_cli_permission_mode(",
 ];
 
-/// Forbidden whole words name pre-approval lists: listed tools can run when the hook gives
-/// no answer, bypassing the gate. Whole-word matching leaves `disallowedTools` and
-/// `disallowed_tools` alone because those lists prohibit tools.
+/// Whole words no production source may contain (rule 5). Each is a PRE-APPROVAL list: a tool on it
+/// runs when the hook gives no answer, which is the fall-through the gate exists to close.
+/// Whole words, because `disallowedTools`/`disallowed_tools` contain them and are the opposite.
 const FORBIDDEN_WORDS: &[&str] = &["allowedTools", "allowed_tools"];
 
 /// What one scan found.

@@ -72,17 +72,24 @@ fn the_zoom_level_reaches_a_page_only_through_set_zoom() {
     assert_eq!(set_zoom.len(), 1, "one set_zoom");
     assert_eq!(page.matches(".set_zoom_level(").count(), 1);
     assert_eq!(set_zoom[0].matches(".set_zoom_level(").count(), 1, "inside set_zoom");
-    for path in [
-        "shell/src/plugin_panels.rs",
-        "shell/src/text_size.rs",
-        "shell/src/main.rs",
-    ] {
+    // Every other file of the shell: the window's wiring is spread over `main.rs` and the modules it hands parts of
+    // its window to (`gtk_host/`, `companion/`), so a list of the files that call `set_zoom` today would miss a
+    // second call added where a host or a view is made.
+    let others = scan::rust_sources(&["shell/src"]);
+    scan::require_anchors(&others, &["fn set_zoom(", "fn attach_page("]);
+    let mut read = 0;
+    for source in others.iter().filter(|s| s.path != "shell/src/plugin_page.rs") {
+        let code = scan::code_only(&source.text);
+        let code = scan::without(&code, &scan::modules(&code, "tests"));
         assert_eq!(
-            code(path).matches(".set_zoom_level(").count(),
+            code.matches(".set_zoom_level(").count(),
             0,
-            "set_zoom_level in {path}"
+            "set_zoom_level in {}",
+            source.path
         );
+        read += 1;
     }
+    assert!(read > 3, "the scan read the shell's sources ({read} files)");
     let text_size = code("shell/src/text_size.rs");
     assert!(
         text_size.matches("crate::plugin_page::set_zoom(").count() >= 2,

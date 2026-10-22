@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use agent::{PrefixRule, PrefixRules};
 use serde::{Deserialize, Serialize};
 
-use crate::layout::persist::{file_name, state_subdir, temporary};
+use crate::state_paths::{file_name, state_subdir, temporary};
 
 const VERSION: u32 = 1;
 
@@ -113,7 +113,7 @@ fn read(dir: &Path, project_root: &Path) -> Read {
 /// written back exactly as it was, in its place: it applies to nothing, but it is the user's text,
 /// and a later build, or the user fixing it by hand, may still want it.
 pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Result<PrefixRules> {
-    crate::layout::persist::create_state_dir(dir)?;
+    crate::state_paths::create_state_dir(dir)?;
     let lines = match read(dir, project_root) {
         Read::Lines(lines) => lines,
         Read::Missing => Vec::new(),
@@ -208,7 +208,7 @@ mod tests {
         );
         assert_eq!(
             path(Path::new("/d"), &root()),
-            Path::new("/d").join(crate::layout::persist::file_name(&root()))
+            Path::new("/d").join(crate::state_paths::file_name(&root()))
         );
     }
 

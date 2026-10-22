@@ -297,13 +297,19 @@ impl TerminalMetrics {
     }
 }
 
-/// The family used for a fallback lookup for `first`.
+/// The family a fallback lookup for `first` is asked in.
 ///
-/// Private-use codepoints have font-specific meanings. Looking them up without a family can
-/// select a different pictogram through the `sans-serif` alias. Using the terminal's family
-/// keeps these lookups in its configured fallback chain, where icon fonts can be placed.
-/// Other codepoints keep the unnamed lookup so this does not change their fallback faces,
-/// including the fonts used for CJK text.
+/// A private-use codepoint means only what the font that defines it says: U+F43A is a clock in a
+/// Nerd Font and something else in DejaVu Sans, which also maps it. Asked with no family, fontconfig
+/// answers from the `sans-serif` alias -- DejaVu Sans, on the machine where lualine's clock came out
+/// as another pictogram (seen in a GUI pass, 2026-09-23). Asked in the terminal's own family, it
+/// answers from that family's alias list, which is where a user puts the Nerd Font whose icons their
+/// tools print -- the fallback chain foot takes too (fcft sorts from the primary font's pattern).
+///
+/// Every other codepoint is the same character in any font that has it, so it keeps the unnamed
+/// lookup: asking in `monospace` there would move CJK to whichever face heads that list (NSimSun,
+/// a Song face, on this machine, in place of Microsoft YaHei). Which face CJK gets belongs with
+/// making the terminal's face follow nvim's `guifont`, not with this lookup.
 fn fallback_family(first: char, family: &str) -> &str {
     if is_private_use(first) {
         family

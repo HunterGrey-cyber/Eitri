@@ -1,33 +1,41 @@
-//! Tracks the embedded nvim process so the editor can end it without discarding swap files.
+//! The embedded nvim's own process, and how Eitri ends it.
 //!
-//! `:qa!` discards unsaved buffers and deletes their swap files. `shell::editor_quit` uses
-//! `:confirm qall` to ask the user. `LiveHarness::hang_up` closes stdin, letting nvim exit
-//! with its swap files intact. If nvim stays running, [`end`] sends SIGTERM, then SIGKILL
-//! when [`SCHEDULE`] expires. SIGTERM also ends a dialog that EOF alone does not end.
-//! When a prompt may be open, [`SCHEDULE_IN_A_PROMPT`] sends SIGTERM before closing stdin:
-//! after EOF the fork's exit request fails, leaving nvim waiting for a key it cannot receive.
-//! `tests/no_force_quit.rs` checks that shutdown never sends `:qa!`.
+//! **Ending nvim, never `:qa!`.** `:qa!` discards
+//! unsaved buffers AND deletes their swap files; the pinned fork's own shutdown used to send it.
+//! Now ending an editor is only: nvim's own `:confirm qall` (it asks the user, `shell`'s
+//! `editor_quit`); closing its stdin (the fork's `LiveHarness::hang_up`), on which nvim exits
+//! keeping its swap files; and, where that did not end it, [`end`]'s escalation by the pid held
+//! here -- SIGTERM, which nvim answers the same way and which ends a dialog EOF does not, then
+//! SIGKILL once [`SCHEDULE`]'s patience is spent. Where nvim may be in a prompt, SIGTERM comes
+//! before the hang-up, not after it ([`SCHEDULE_IN_A_PROMPT`], the quit follow-up: after EOF, the
+//! before the hang-up, not after it ([`SCHEDULE_IN_A_PROMPT`]: after EOF, the
+//! no_force_quit.rs` holds the rule.
 //!
-//! [`NvimProcess`] uses nvim's own pid when available, with process discovery as a fallback.
-//! Once the session is up, [`NvimProcess::learn`] asks nvim `getpid()` over RPC on a separate
-//! thread. This identifies nvim even when a shell script on `PATH` or a `NEOVIM_BIN` launcher
-//! starts it without `exec`. The fork's direct child can be that launcher, with `--embed`
-//! in its argv; signalling the launcher alone would leave nvim running.
+//! **Which process is nvim.** Two sources, the better one first ([`NvimProcess`]):
 //!
-//! Before nvim answers, [`NvimChild::find_new`] compares direct children before and after
-//! `LiveHarness::with_options` to find the new child with `--embed` in its argv. It accepts
-//! that process only if `/proc/<pid>/exe` names `nvim`. Otherwise it looks for that process's
-//! `--embed` child whose executable is `nvim`. The process is held from launch because an
-//! exiting launcher leaves nvim re-parented. If neither can be identified, nothing is
-//! signalled ([`Ended::Unknown`]); only the fork's report says whether nvim ended.
+//! 1. **nvim's own answer.** Once the session is up the pane asks nvim `getpid()` over RPC, on a
+//!    thread of its own ([`NvimProcess::learn`]). What answers on the fork's own pipe is nvim,
+//!    whatever started it. Before the pane asked, it took
+//!    the fork's direct child for nvim, and a `nvim` on `PATH` that is a shell script running nvim
+//!    without `exec` -- or a `NEOVIM_BIN` launcher -- IS that child, `--embed` in its argv and all.
+//!    A forced end then reached the launcher and left the hung nvim running
+//!    (`a_launcher_that_does_not_exec_nvim_is_not_what_an_end_reaches`).
+//! 2. **Until nvim answers** (it hung in its config before its loop ever ran): the process the fork
+//!    started -- found by listing this process's direct children just before
+//!    `LiveHarness::with_options` and again just after it, the one new child whose argv carries
+//!    `--embed` ([`NvimChild::find_new`]) -- and only if it is nvim, its `/proc/<pid>/exe` a file
+//!    named `nvim`. Otherwise the one `--embed` child of that process that is (a launcher's nvim),
+//!    held from the launch on, since a launcher that exits leaves nvim re-parented and no longer
+//!    under it. Neither: the pid is not known, nothing is signalled ([`Ended::Unknown`]), and only
+//!    the fork's own report says whether nvim ended.
 //!
-//! A pidfd pins the held process, preventing signals from reaching another process that
-//! reuses its pid. Signalling a process that has already exited is a no-op (`ESRCH`).
-//! Without a pidfd, as on kernels before 5.3, each signal first checks that the pid still
-//! carries `--embed` and, for the fork's direct child, still belongs to this process.
+//! A pidfd is taken on whatever is held, which pins that exact process: a later signal cannot reach
+//! another process that reused the pid, and one sent to a process that already exited is a no-op
+//! (`ESRCH`). Without a pidfd (a kernel before 5.3) a signal checks again, just before it is sent,
+//! that the pid still carries `--embed` and, for the fork's own child, is still ours.
 //!
-//! Only Linux is implemented. Elsewhere no process is held or signalled; only the hang-up
-//! ends nvim.
+//! Only Linux is implemented: elsewhere nothing is ever held, so nothing is signalled and only the
+//! hang-up ends nvim.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -95,9 +103,10 @@ impl NvimChild {
 pub(crate) struct NvimProcess {
     /// What the fork started (source 2): nvim, or a launcher of it.
     launched: Option<NvimChild>,
-    /// The nvim `--embed` child found beneath a launcher at launch, held by a pidfd.
-    /// Find it while the launcher still runs: once the launcher exits, nvim is re-parented and cannot
-    /// be found beneath it. The held pidfd continues to identify whether nvim lives.
+    /// Source 2, resolved at launch -- when the fork's child is not nvim itself, the one nvim
+    /// `--embed` child under it, held by a pidfd from then on. Found while the launcher still runs:
+    /// once it has exited, nvim is re-parented and no longer under it,
+    /// and only this hold still says whether nvim lives.
     found_below: Option<NvimChild>,
     /// Whether `launched` ran nvim itself when it was found (a process gone since has no `exe`).
     launched_is_nvim: bool,
@@ -199,8 +208,8 @@ pub(crate) enum Ended {
     Unknown,
 }
 
-/// The default ending schedule for [`end`]: close stdin immediately, send SIGTERM from 1 s,
-/// and send SIGKILL at 5 s if nvim has not exited.
+/// The schedule Eitri ends nvim on ([`end`]): stdin closed at
+/// once, SIGTERM from 1 s, SIGKILL at 5 s.
 pub(crate) const SCHEDULE: Schedule = Schedule {
     hang_up_after: Duration::ZERO,
     term_after: Duration::from_secs(1),
@@ -208,7 +217,7 @@ pub(crate) const SCHEDULE: Schedule = Schedule {
     kill_after: Duration::from_secs(5),
 };
 
-/// The schedule for an nvim that may be in a prompt (the quit follow-up, 2026-09-28): SIGTERM at
+/// The schedule for an nvim that may be in a prompt (2026-09-28): SIGTERM at
 /// once, while nvim's stdin -- its one channel to the UI -- is still open; stdin closed at 1 s;
 /// SIGTERM again each second; SIGKILL at 5 s, still the last resort.
 ///
@@ -230,8 +239,9 @@ pub(crate) const SCHEDULE_IN_A_PROMPT: Schedule = Schedule {
     kill_after: Duration::from_secs(5),
 };
 
-/// Uses [`SCHEDULE_IN_A_PROMPT`] while this pane's `:confirm qall` request is outstanding,
-/// when nvim may be in a prompt. Otherwise uses [`SCHEDULE`], which idle nvim answers on EOF alone.
+/// [`SCHEDULE_IN_A_PROMPT`] when nvim may be in a prompt -- the pane knows it only for its own quit,
+/// whose `:confirm qall` request has not come back -- else [`SCHEDULE`], hang-up first,
+/// which idle nvim answers on the hang-up alone.
 pub(crate) fn schedule(may_be_in_a_prompt: bool) -> Schedule {
     if may_be_in_a_prompt {
         SCHEDULE_IN_A_PROMPT
@@ -240,18 +250,21 @@ pub(crate) fn schedule(may_be_in_a_prompt: bool) -> Schedule {
     }
 }
 
-/// Ends nvim on `schedule`, measured from `started_at`, and returns how it ended.
-/// Calls `hang_up` once at `hang_up_after`, or sooner if nvim is gone or no nvim process is known.
-/// A caller that already closed stdin passes a no-op.
+/// Ends nvim on `schedule`, counted from `started_at`, and returns how. `hang_up` closes nvim's stdin
+/// (the fork's `LiveHarness::hang_up`); it is called once, at `hang_up_after`, or sooner when nvim
+/// is gone or no process is known to be nvim -- a caller that closes stdin itself passes a no-op.
 ///
-/// EOF lets idle nvim preserve modified buffers in swap files instead of discarding them with
-/// `:qa!`. With nvim 0.12.5, it also writes edits not yet synced into those files.
-/// Send SIGTERM from `term_after`, repeated every `term_every`. Nvim's `preserve_exit` handler
-/// preserves edits and swap files and can end a dialog. When nvim may be in a prompt, send SIGTERM
-/// before closing stdin ([`SCHEDULE_IN_A_PROMPT`]) so its exit request can still reach the UI.
-/// At `kill_after`, send SIGKILL to the held pid if needed; unsynced edits may then be lost.
-/// Blocks until exit, at most `kill_after` plus a reap. Returns `Unknown` after hanging up if no
-/// nvim process is known.
+/// Never `:qa!`, which Eitri never sends (`tests/no_force_quit.rs`): on EOF
+/// idle nvim exits keeping the swap files of modified buffers, and writes what it had not synced
+/// into them (measured on 0.12.5, `an_idle_nvim_exits_on_the_hang_up_keeping_its_edit`). SIGTERM
+/// from `term_after`, once per `term_every`: nvim's own deadly-signal handler answers it as it
+/// answers EOF (`preserve_exit`: swap files kept, edits written into them), and ends a dialog,
+/// which EOF does not -- sent before the hang-up where nvim may be in a prompt
+/// ([`SCHEDULE_IN_A_PROMPT`]'s doc says why). Only when nothing ended it by `kill_after` (a stopped
+/// process, a Lua busy loop, a prompt `getout` waits in) SIGKILL by the pid held, which keeps the
+/// swap files without what nvim had not written to them. Blocks until one of those, at most
+/// `kill_after` plus a reap; `Unknown` at once, after the hang-up, when no process is known to be
+/// nvim.
 pub(crate) fn end(process: &NvimProcess, started_at: Instant, schedule: Schedule, hang_up: &mut dyn FnMut()) -> Ended {
     match process.with_nvim(|nvim| end_one(nvim, started_at, schedule, &mut *hang_up)) {
         Some(ended) => ended,
@@ -522,9 +535,9 @@ mod imp {
     }
 }
 
-/// Every test that spawns nvim in this crate takes this lock first.
-/// [`NvimChild::find_new`] examines all children of the test process, so a concurrent spawn in
-/// `nvim_rpc` could be mistaken for its own new child.
+/// Every test in this crate that spawns an `nvim` takes this first: [`NvimChild::find_new`] looks
+/// at every child the test process has, so a concurrent spawn elsewhere (`nvim_rpc`'s real-nvim
+/// test) would be "new" too.
 #[cfg(test)]
 pub(crate) static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

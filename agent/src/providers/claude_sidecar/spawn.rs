@@ -1,6 +1,6 @@
 //! Locates, builds if necessary, and spawns Verdandi's `apps/claude-sidecar` Node.js process --
 //! deliberately NOT reusing `panel/src/supervisor_client.rs`'s spawn pattern wholesale. Two real,
-//! verified differences from that pattern (see this plan's "Verified facts", points 5 and 6):
+//! verified differences from that pattern:
 //!
 //! 1. `apps/claude-sidecar/dist/` is gitignored in Verdandi, not committed -- a git-dependency
 //!    checkout of the Rust protocol crate does NOT give this process a runnable sidecar.
@@ -646,13 +646,27 @@ fn prebuilt_artifact_in(checkout: &Path) -> Option<PathBuf> {
 /// Verdandi's protocol-3 merge was outstanding, after their main absorbed it on 2026-09-18.
 const DEFAULT_CHECKOUT_UNDER_HOME: &str = "src/verdandi";
 
-/// Locates and validates a sidecar checkout for development or integration testing.
-/// An explicit override takes precedence over the default checkout under `$HOME`.
-/// An invalid override fails with an error instead of silently selecting a different sidecar.
-/// The override and `home` are passed in rather than read from the environment here.
-/// `resolve_sidecar_program` already needs the override to rank the checkout against a packaged
-/// artifact, so sharing it keeps selection and lookup in sync. Passing `home` also lets tests
-/// exercise the default path without accidentally using a real checkout on the test machine.
+/// Locates a real Verdandi checkout.
+///
+/// `$EITRI_VERDANDI_CHECKOUT` is a **supported development/integration override**, not a
+/// temporary hack: it is how this client is pointed at a Verdandi feature branch, a protocol
+/// migration, or an isolated checkout while the default one is mid-work. It takes precedence over
+/// the default `$HOME/src/verdandi` and is validated the same way, so a typo'd path
+/// fails with a clear message rather than silently falling back to a different sidecar than the
+/// operator intended.
+///
+/// Either way this is a dev-machine story, not a production distribution one -- packaging
+/// profiles remain separately deferred.
+///
+/// Takes the override -- and `$HOME` -- as arguments rather than reading
+/// either here. `resolve_sidecar_program` already has to know whether an override was supplied, in
+/// order to rank it against a packaged artifact, so reading it in both places made the value and the
+/// decision two separate sources of truth -- a test could pass one path and this function would use
+/// another. Found by exactly that test. `home` joined the same reasoning when step 5 (the default
+/// checkout) needed to be reachable in a test without depending on this MACHINE's own
+/// `$HOME` -- which, on the machine this was written on, really does have a Verdandi checkout with a
+/// real prebuilt artifact underneath it, so a test that read `std::env::var("HOME")` directly would
+/// have silently passed against that checkout instead of the fake one it built.
 fn locate_verdandi_checkout(explicit: Option<&str>, home: Option<&OsStr>) -> std::io::Result<VerdandiCheckout> {
     let (path, from_override) = match explicit.map(str::trim).filter(|p| !p.is_empty()) {
         Some(path) => (PathBuf::from(path), true),
@@ -837,11 +851,15 @@ fn run_command(dir: &Path, program: &str, args: &[&str]) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Builds the user-facing message when the sidecar cannot be found, including when the binary
-/// override names a path that is not a file. Reuse this text for the panel's failure message.
-/// `agent-ui/web/src/problems.ts::classify` matches the exact opening sentence and treats the
-/// remainder as the remedy. Changing that sentence requires updating the classifier's marker
-/// to preserve the panel's headline. `problems.test.ts` checks it directly from the Rust source.
+/// The text shown to the user when the sidecar cannot be found at all -- today only when
+/// `EITRI_SIDECAR_BINARY` names a path that is not a file, but
+/// whoever later turns "no sidecar, no legacy fallback" into a hard error hands this same text to
+/// the panel as the tab's failure, rather than writing a second version of it.
+///
+/// `agent-ui/web/src/problems.ts::classify` recognises this exact opening sentence (its
+/// "sidecar missing" row) and splits the rest off as the remedy -- so changing the sentence without
+/// updating that marker breaks the panel's headline silently. `problems.test.ts` pins it from the
+/// Rust source directly, which is the check that catches it.
 pub fn sidecar_missing_message(searched: &[PathBuf]) -> String {
     let mut message = String::from("The agent sidecar is not installed. Looked for it at:\n");
     for path in searched {
@@ -877,24 +895,41 @@ enum SidecarProgram {
     Checkout(VerdandiCheckout),
 }
 
-/// Resolves the sidecar program from caller-supplied values so precedence can be tested
-/// without changing the process environment.
+/// Decides which of the two shapes to use, from values the caller supplies rather than from the
+/// process environment, so the precedence is testable without mutating it.
 ///
-/// `EITRI_SIDECAR_BINARY`, an explicit binary, wins first. `EITRI_VERDANDI_CHECKOUT`, an explicit
-/// checkout, comes next and is the only source that may trigger `ensure_sidecar_built`;
-/// selecting a checkout explicitly permits building that checkout.
-/// Next comes a packaged executable beside this binary. Its optional revision file is checked
-/// against the pinned revision, and a mismatch produces a warning, as checkout drift does.
-/// Next comes the per-user build at `user_sidecar_path`, where `eitri setup` installs it.
-/// The path includes the pinned revision, so a build for another revision cannot be selected.
-/// Finally, the default checkout is usable only if it already contains a prebuilt artifact.
-/// The sidecar is the default backend, so building an implicitly found checkout would run a build
-/// at session start without an explicit request. A checkout without an artifact is skipped.
-/// Every returned `Checkout` with `prebuilt: None` therefore has `from_override: true`, which
-/// lets `invocation_for` rely on that flag when building.
+/// Precedence, and each step earns its place:
+/// 1. `EITRI_SIDECAR_BINARY` -- an explicit artifact wins over everything, including a checkout,
+///    because someone who names a binary is testing that binary.
+/// 2. `EITRI_VERDANDI_CHECKOUT` -- an explicit checkout beats an installed artifact for the same
+///    reason in the other direction: a developer pointing at a branch wants that branch, and
+///    silently preferring the shipped artifact would make that override look broken. This is also
+///    the ONLY branch that may build (`ensure_sidecar_built`, called from `invocation_for`'s
+///    `Checkout{prebuilt: None}` arm, which `spawn()` feeds it into) -- naming a checkout is the
+///    explicit act that authorizes it.
+/// 3. A packaged artifact beside this binary -- the shape a real install has. A sibling may carry an
+///    optional `<PACKAGED_SIDECAR_BINARY>.rev` file; `spawn()` compares it against
+///    `EXPECTED_VERDANDI_REVISION` and warns on a mismatch (`sibling_rev_skew_warning`), the same
+///    warning the checkout path gives for its own drift.
+/// 4. **New:** a per-user build at `user_sidecar_path`'s exact rev-keyed location -- what
+///    `eitri setup` leaves behind. Keyed by `EXPECTED_VERDANDI_REVISION`, so a build for a
+///    DIFFERENT revision, sitting in its own directory, is never found -- never "almost right".
+/// 5. The default checkout, **and only when it already holds a prebuilt artifact** for this machine.
+///    It never builds: before the sidecar became the default, this branch was reachable only by
+///    someone who had already chosen the sidecar backend, so an unprompted `npm ci` behind it cost
+///    nothing that was not already asked for. Now an unset backend selects the sidecar, so without
+///    this restriction, any
+///    user with a Verdandi clone at the default path would get an unprompted build at session start
+///    -- the exact "a build must never happen behind a backend nobody chose" invariant this crate
+///    already states elsewhere. So a checkout found only here, with nothing prebuilt, is treated the
+///    same as no checkout at all: resolution falls through to the shared `NO_SIDECAR_HINT` error
+///    rather than returning a `Checkout` that would reach `ensure_sidecar_built`. This is why every
+///    `Checkout` this function returns with `prebuilt: None` carries `from_override: true` -- nothing
+///    below step 2 can produce the other combination, so `invocation_for`'s build arm can keep
+///    trusting that shape without re-checking it.
 ///
-/// If nothing is found, the error includes `NO_SIDECAR_HINT` and the exact path `eitri setup`
-/// would use, supplied by `no_sidecar_message`.
+/// Nothing found by any of the five: `Err`, naming `NO_SIDECAR_HINT` plus the exact path a
+/// `eitri setup` run would use (`no_sidecar_message`).
 fn resolve_sidecar_program(
     explicit_binary: Option<&str>,
     explicit_checkout: Option<&str>,
@@ -941,19 +976,44 @@ fn resolve_sidecar_program(
     ))
 }
 
-/// Reports sidecar availability for the backend's startup diagnostic.
-/// This result selects the message, not the backend; legacy is never a fallback.
-/// Availability is ranked like `resolve_sidecar_program` so the diagnostic describes what
-/// startup will actually use, including an explicit checkout that still needs a build.
-/// `SidecarAvailability::Runnable` means there is an executable with nothing to build.
-/// A checkout qualifies when `prebuilt_artifact_in` finds an artifact for this machine;
-/// a per-user build at `user_sidecar_path` qualifies for the same reason.
-/// Using the prebuilt artifact also lets source builds run the same executable as an installed
-/// copy, rather than measuring a separate `node` process running a `dist/` tree.
+/// What a session start will find, as far as backend selection's one startup line cares
+/// (`eitri_core::agent_backend::BackendKind::choose`).
+///
+/// **Correction (2026-09-27): this
+/// decides nothing any more.** It was `packaged_sidecar_available() -> bool`, and it decided the
+/// default backend when `EITRI_AGENT_BACKEND` was unset: `true` selected the sidecar, `false` fell
+/// back to legacy. Legacy is compiled out of every release now and is never a fallback, so every
+/// build selects the sidecar whatever this answers, and the answer only picks the sentence `choose`
+/// prints. It became three-way, ranked exactly like `resolve_sidecar_program`, because the `bool`
+/// made that sentence read "not installed. Run eitri setup" to a developer whose named
+/// `EITRI_VERDANDI_CHECKOUT` the spawn was about to build. The paragraphs below are why
+/// [`SidecarAvailability::Runnable`] means "with nothing to build"; the backend they name as the
+/// fallback is the one that no longer is.
+///
+/// **Corrected 2026-09-18, and the correction is the point.** This first read "a shipped artifact,
+/// and a Verdandi CHECKOUT deliberately does not count", reasoned from: every developer machine has
+/// a checkout, and counting it would switch every source build to a backend whose first start runs
+/// `npm ci` and a TypeScript build with no UI saying why. The conclusion was right and the object
+/// was wrong. What must not happen behind a backend nobody chose is **a build**, not a checkout --
+/// and a checkout that already holds a built artifact for this machine involves no build at all. So
+/// a checkout counts exactly when `prebuilt_artifact_in` finds one, and a checkout with nothing
+/// built still does not count, which keeps the original guarantee intact where it was actually
+/// about something.
+///
+/// It buys a second thing the first version gave away: with this, a source build and an installed
+/// copy run the SAME executable. Before, `cargo run` ran `node` out of a `dist/` tree while the
+/// package ran a Node SEA binary, so a developer-machine measurement was never of the shipped shape.
+///
+/// **Widened again:** a per-user build at `user_sidecar_path`'s location counts too,
+/// for the same reason the checkout case does -- running it involves no build. Without it, a machine
+/// that had already run `eitri setup` would have fallen back to legacy at backend-selection time
+/// (before backend selection printed a line), and would now print the "not installed" line above a
+/// session that then starts fine from step 4.
 pub fn sidecar_availability() -> SidecarAvailability {
-    // Read `HOME` once and pass it to `checkout_path_for` and `sidecar_availability_in`.
-    // Using `var_os` preserves non-UTF-8 paths; a separate `var` call would reject them and
-    // could make the two lookups disagree.
+    // Read once and pass in, not once per call site: `checkout_path_for` and
+    // `sidecar_availability_in` both need `HOME`, and reading it twice (a `var_os` here and a `var`
+    // inside `checkout_path_for`) would make them two independent sources of truth that could
+    // disagree on a non-UTF-8 `HOME` -- `var` fails closed on one, `var_os` never does.
     let home = std::env::var_os("HOME");
     let explicit_checkout = std::env::var("EITRI_VERDANDI_CHECKOUT").ok();
     let checkout_is_explicit = explicit_checkout
@@ -1036,12 +1096,14 @@ fn sidecar_availability_in(
     }
 }
 
-/// Returns the checkout path, preferring the override to the default under `$HOME`.
-/// Leaves validation to checkout resolution: this path only feeds an artifact-existence probe,
-/// so a missing checkout simply yields no artifact.
-/// Takes `home` from `sidecar_availability`, which reads it once for `sidecar_availability_in`.
-/// Sharing that value keeps the lookups consistent for non-UTF-8 paths, which `std::env::var`
-/// rejects but `var_os` preserves.
+/// The checkout path that would be used, override first, `$HOME` default second. Unvalidated on
+/// purpose: this feeds a "does an artifact exist" probe, and a path that is not a checkout simply
+/// holds no artifact. Refusing belongs in `locate_verdandi_checkout`, where it can say so.
+///
+/// Takes `home` rather than reading `$HOME` itself, for the same reason `locate_verdandi_checkout`
+/// does: its one caller (`sidecar_availability`) already reads it once for
+/// `sidecar_availability_in`, and reading it a second time here would let the two disagree on a
+/// non-UTF-8 `HOME` (`std::env::var` fails on one; `var_os` never does).
 fn checkout_path_for(explicit: Option<&str>, home: Option<&OsStr>) -> Option<PathBuf> {
     if let Some(path) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(path));
@@ -1049,16 +1111,20 @@ fn checkout_path_for(explicit: Option<&str>, home: Option<&OsStr>) -> Option<Pat
     home.map(|home| PathBuf::from(home).join(DEFAULT_CHECKOUT_UNDER_HOME))
 }
 
-/// Returns the path to a per-user sidecar build, keyed by the exact revision so a build for
-/// another revision cannot be selected. The filename is `PACKAGED_SIDECAR_BINARY`.
-/// Uses `XDG_DATA_HOME` when it is absolute; otherwise uses `<home>/.local/share`.
-/// Unset, empty and relative `XDG_DATA_HOME` values all use that fallback.
-/// Returns `None` if neither value provides an absolute base, avoiding resolution against the
-/// process's current directory.
-/// This mirrors `core::layout::persist::state_subdir` and `state_dir`. The helper cannot be
-/// shared here because `core` depends on `agent`, so this crate cannot depend on `core`.
-/// `state_dirs::conversations_dir` differs: it accepts a relative `$HOME` and refuses only
-/// when `$HOME` is unset.
+/// `$XDG_DATA_HOME/eitri/sidecar/<rev>/verdandi-claude-sidecar`: where a
+/// sidecar this MACHINE built for itself, with `eitri setup`, lives -- keyed by the exact revision
+/// it was built for so a build for a different revision is never picked up as "close enough" (the
+/// binary looks only in its own rev's directory). Falls back to
+/// `<home>/.local/share/eitri/sidecar/<rev>/verdandi-claude-sidecar` when `XDG_DATA_HOME` is
+/// unset, empty or not an absolute path -- the same three-case rule
+/// `core::layout::persist::state_subdir` uses for `XDG_STATE_HOME` (`state_dir`, that module's own
+/// call site). Reproduced here rather than shared: `core` depends on `agent`, never the reverse, so
+/// this crate cannot reach that helper. `None` when neither variable gives an absolute directory to
+/// build on, rather than silently resolving against this process's cwd -- the same "no boundary, no
+/// answer" shape `core::layout::persist::state_subdir`/`state_dir` give a relative or absent `$HOME`
+/// (cited above). **Not** `state_dirs::conversations_dir`: that function accepts any set `$HOME`,
+/// relative included, and refuses only when `$HOME` is unset entirely -- an earlier revision of
+/// this comment claimed otherwise.
 pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, rev: &str) -> Option<PathBuf> {
     let base = match xdg_data_home {
         Some(data_home) if Path::new(data_home).is_absolute() => PathBuf::from(data_home),
@@ -1070,13 +1136,33 @@ pub fn user_sidecar_path(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>, re
     Some(base.join("eitri/sidecar").join(rev).join(PACKAGED_SIDECAR_BINARY))
 }
 
-/// Shared hint for backend selection and resolution when no runnable sidecar is found.
-/// It starts with the same sentence as `sidecar_missing_message` so the UI can recognise the
-/// failure and show the remaining text as a remedy. Only the opening sentence is shared:
-/// an explicitly missing binary needs a different remedy from exhausted discovery.
-/// The constant omits the user path, which depends on runtime environment variables, and
-/// the expected revision, since `concat!` cannot interpolate a constant identifier.
-/// `no_sidecar_message` appends those details at runtime without duplicating the revision literal.
+/// The fixed hint printed whenever the sidecar backend is selected -- unconditionally, now that it is
+/// the default -- but nothing this client can run is found by any of the five discovery steps.
+/// `pub` and shared verbatim with `eitri_core::agent_backend::BackendKind::choose` (imported
+/// rather than copied), which prints exactly this line at backend-selection time,
+/// before any resolution or spawn is even attempted -- so a user sees the identical words whichever
+/// moment actually catches the failure.
+///
+/// **Starts with `sidecar_missing_message`'s own opening sentence, "The agent sidecar is not
+/// installed.", on purpose.** Both functions describe the same
+/// fact -- no sidecar this client can run -- and
+/// `agent-ui/web/src/problems.ts::classifySidecarMissing` recognises that exact sentence anywhere in
+/// a tab's failure text, splitting the rest off as the shown remedy; `problems.test.ts` pins the
+/// sentence from this file's own source. With a different opening sentence, step 5's
+/// fallthrough -- a fresh public-release user with nothing built, the most common failure --
+/// would reach the panel as unrecognised raw text with no headline or remedy at all.
+/// `sidecar_missing_message`'s own remedy ("Install the Eitri package that ships it") is specific
+/// to that function's one call site (an explicitly named `EITRI_SIDECAR_BINARY` that is not a
+/// file) and would be the wrong remedy to show here even with the sentence matching, which is why
+/// this reuses the sentence rather than the whole function.
+///
+/// Deliberately does NOT carry the filesystem path an `eitri setup` run would use: that path needs
+/// `$XDG_DATA_HOME`/`$HOME`, readable only at runtime, and this is a `const`. Nor does it carry
+/// `EXPECTED_VERDANDI_REVISION` -- `concat!` takes literal tokens, not a `const` identifier, so
+/// splicing the revision in here would mean a second string-literal copy of it, a second source of
+/// truth. `no_sidecar_message` (below) is a runtime `format!` and appends both when they can be
+/// computed; `BackendKind::choose`, which has no specific resolution attempt to report a path for, prints
+/// this constant alone.
 pub const NO_SIDECAR_HINT: &str = "The agent sidecar is not installed. Run \"eitri setup\" -- it builds one for you.";
 
 /// The full message for `resolve_sidecar_program`'s last resort (step 5 finding no prebuilt
@@ -1132,10 +1218,9 @@ fn sidecar_command_for(
         .args(program_args)
         .env("VERDANDI_CLAUDE_SIDECAR_SOCKET", socket_path)
         .stdin(Stdio::piped())
-        // stdout/stderr are captured, not nulled -- `supervisor`'s own follow-up review found that
-        // nulling a spawned child's stderr silently discards real crash diagnostics (2026-09-09,
-        // supervisor-robustness-followup plan). A Node.js sidecar crash during real CLI parity
-        // testing is exactly the kind of thing worth seeing.
+        // stdout/stderr are captured, not nulled -- nulling a spawned child's stderr silently
+        // discards real crash diagnostics (found on `supervisor`'s spawn, 2026-09-09). A Node.js
+        // sidecar crash during real CLI parity testing is exactly the kind of thing worth seeing.
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // A group of its own: a `Ctrl+C` in, or the hangup of, the terminal that started this window
@@ -1190,10 +1275,14 @@ fn is_exe_sibling_artifact(path: &Path, exe_dir: Option<&Path>) -> bool {
     exe_dir.map(|dir| dir.join(PACKAGED_SIDECAR_BINARY)).as_deref() == Some(path)
 }
 
-/// Warns when the sibling artifact's optional `<PACKAGED_SIDECAR_BINARY>.rev` file names
-/// a different revision, indicating revision drift. A missing or empty file, or a prefix match in either direction,
-/// gives no warning. Accepting both prefix directions handles differing revision abbreviation
-/// lengths, using the same comparison as `describe_checkout`.
+/// The drift warning a step-3 sibling's own `<PACKAGED_SIDECAR_BINARY>.rev` file gives: a sibling
+/// may carry an optional `verdandi-claude-sidecar.rev` file; when present
+/// and it does not start with `EXPECTED_VERDANDI_REVISION`, the spawn adds the same skew warning the
+/// checkout path gives. Absent, or a prefix match either direction (the same rule
+/// checkout path gives"). Absent, or a prefix match either direction (the same rule
+/// `describe_checkout` uses for its own git-revision drift check, since `git rev-parse --short`'s
+/// abbreviation length grows with a repository): no warning, the common case for a real install --
+/// the package writes a matching `.rev` file, or none at all on an install predating this file.
 fn sibling_rev_skew_warning(artifact_path: &Path) -> Vec<String> {
     let Some(dir) = artifact_path.parent() else {
         return Vec::new();
@@ -1215,10 +1304,19 @@ fn sibling_rev_skew_warning(artifact_path: &Path) -> Vec<String> {
     )]
 }
 
-/// Turns a resolved `SidecarProgram` into its description, warnings, executable and arguments.
-/// An explicit checkout with `prebuilt: None` invokes the injected `build` closure;
-/// prebuilt checkouts and packaged artifacts do not. The closure lets tests check both paths
-/// without running `npm` or `node`, or changing process environment variables.
+/// Turns a resolved `SidecarProgram` into what `spawn()` actually executes -- description, drift
+/// warnings, the program path and its args -- building a checkout that has nothing prebuilt through
+/// the injected `build` closure rather than calling `ensure_sidecar_built` (or `npm`) directly.
+///
+/// This seam exists so the wiring `spawn()` used to have inline
+/// -- "a `Checkout` with `prebuilt: None` reaches `ensure_sidecar_built`" -- is itself a unit-tested
+/// fact rather than an untested implementation detail. Before this, `resolve_sidecar_program`
+/// returning `Err` for a present-but-unbuilt *default* checkout (step 5) was tested, but nothing
+/// pinned that a `Checkout{prebuilt: None}` that DOES reach this point (only possible from the
+/// explicit `EITRI_VERDANDI_CHECKOUT` branch, step 2) still triggers a build -- a later edit to
+/// `spawn()`'s wiring could have silently stopped building for that case, or started building for a
+/// case that should not, with no test failing either way. The tests on this function now assert
+/// both directions with a fake closure, no real `npm`/`node` and no process-env mutation.
 fn invocation_for(
     program: SidecarProgram,
     exe_dir: Option<&Path>,
@@ -1420,9 +1518,13 @@ fn describe_startup_failure(summary: &str, stderr_tail: &Arc<Mutex<StderrTail>>)
     format!("{summary}; its stderr said:\n{}", lines.join("\n"))
 }
 
-/// Polls `child` for up to `grace`, then calls `kill()` and `wait()` if it has not exited.
-/// Keeping this separate from `SpawnedSidecar::drop` lets tests exercise the shutdown sequence
-/// with a real child process without constructing a whole sidecar.
+/// Polls `child` for up to `grace`, then escalates to SIGKILL if it hasn't exited on its own.
+/// Extracted out of `SpawnedSidecar::drop` so the grace/kill/give-up shape is independently
+/// testable against a real child process rather than only through a whole `SpawnedSidecar`.
+///
+/// Genuinely bounded either way: within `grace` if the child exits on its own, or near-instantly
+/// once `grace` elapses and this falls through to `kill()` + `wait()` -- never an unbounded wait
+/// that could hang the thread dropping it.
 pub(crate) fn stop_child(child: &mut Child, grace: Duration) -> std::io::Result<ExitStatus> {
     let deadline = std::time::Instant::now() + grace;
     loop {
@@ -1439,11 +1541,22 @@ pub(crate) fn stop_child(child: &mut Child, grace: Duration) -> std::io::Result<
 }
 
 impl Drop for SpawnedSidecar {
-    /// Closes the held-open stdin to signal shutdown, then waits up to `SIDECAR_EXIT_GRACE`
-    /// for the sidecar to reap its CLI and cancel pending permissions before exiting.
-    /// If the sidecar is still running after the grace period, kills it and waits for it to exit.
-    /// Only the holder ends the sidecar. An instance that handed it on, or took it over without
-    /// committing, only closes its descriptor copies when its fields drop.
+    /// Graceful-first shutdown: close the held-open stdin (the sidecar's own documented
+    /// parent-death signal, verified for real), wait up to
+    /// `SIDECAR_EXIT_GRACE` (long enough for the sidecar to reap the `claude` CLI it owns before
+    /// exiting -- a graceful exit lets the sidecar fail-close any pending permissions server-side
+    /// before this process moves on), then escalate to SIGKILL if it still hasn't exited --
+    /// the same graceful-then-forced escalation every child here gets. Deliberately simpler than
+    /// `panel/src/supervisor_client.rs::connect_or_spawn`'s own background-thread reaper: that
+    /// pattern exists there because a *detached* supervisor process may run for an unbounded time
+    /// after being spawned, so its eventual `wait()` has no natural bound to block on. Here, by the
+    /// time `drop` runs, the sidecar is either already exiting gracefully (bounded by
+    /// `SIDECAR_EXIT_GRACE`) or about to be SIGKILLed (which returns near-instantly) -- both paths
+    /// are genuinely bounded, so blocking `Drop` itself for at most `SIDECAR_EXIT_GRACE` is a
+    /// deliberate, bounded wait, not an unbounded one.
+    ///
+    /// Only by the sidecar's holder. A process that handed the sidecar on, or took it over and never
+    /// committed, closes its copies of the descriptors as the fields drop, and ends nothing.
     fn drop(&mut self) {
         if !self.holds {
             return;

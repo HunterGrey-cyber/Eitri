@@ -1,13 +1,19 @@
-//! Selection gestures and extraction of the selected text.
+//! Selection: drag, double/triple click, and turning the region into a copyable string
+//! (bottom-terminal phase 3b).
 //!
-//! `alacritty_terminal` supplies `Selection`, `SelectionType`, `Side`, and `Term::selection`.
-//! The grid rotates and clears that selection on scroll and resize.
-//! `Term::selection_to_string` handles wide characters and wrapped lines, so this module
-//! only maps host gestures onto the existing model.
+//! **Adopt, don't build**: `alacritty_terminal` 0.26 already carries the whole
+//! model -- `selection::{Selection, SelectionType}`, `Side`, `Term::selection` (a public field the
+//! grid itself rotates and clears on scroll/resize) and `Term::selection_to_string` (wide characters
+//! and wrapped lines already handled, by the same code alacritty and every other user of this crate
+//! relies on). This module is only the shape a host gesture takes and how it maps onto that field;
+//! nothing here reimplements text extraction.
 //!
-//! Points use absolute grid lines, negative in history, just like [`crate::scroll::ScrollView`].
-//! A selection made while scrolled back therefore names the same cells after returning
-//! to the live bottom.
+//! Points are **absolute** grid lines (negative in history), the same space as
+//! [`crate::scroll::ScrollView`]'s, so a selection made while scrolled back names the same
+//! cells whether or not the view later returns to the bottom.
+//!
+//! A finished selection copies to the clipboard and the primary selection, and typing clears it,
+//! as in foot and alacritty.
 
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};

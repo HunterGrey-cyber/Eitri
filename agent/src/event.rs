@@ -1,7 +1,6 @@
 //! Provider-neutral events this crate produces from the real Claude CLI wire protocol. UI code
-//! (a future `agent-ui`) should only ever see these -- never the raw wire JSON, per this
-//! project's own architecture decision and the
-//! early design assessment's core recommended pattern:
+//! (a future `agent-ui`) should only ever see these -- never the raw wire JSON, so a change in the
+//! CLI's wire format stops at the provider adapter instead of reaching every view:
 //! `wire protocol -> provider adapter -> agent::Event -> session state -> (future) UI`.
 
 use serde_json::Value;
@@ -11,8 +10,9 @@ use serde_json::Value;
 pub enum PermissionSource {
     /// Arrived over the per-conversation `agent-hook` Unix socket — the primary, reliable path.
     HookRelay,
-    /// Arrived as an unsolicited `control_request`/`can_use_tool`. This does not fire for every
-    /// tool call, such as `Bash`, so it is a secondary signal and cannot be the sole gate.
+    /// Arrived as an unsolicited `control_request`/`can_use_tool` — confirmed unreliable (does
+    /// not fire for every tool call, e.g. `Bash`); kept only as a secondary signal, never the
+    /// sole gate.
     CanUseTool,
 }
 
@@ -81,7 +81,7 @@ pub enum AgentEvent {
         source: PermissionSource,
     },
     /// A `PreToolUse` hook call whose own payload reported a permission mode less restrictive than
-    /// `default`. The call itself was already
+    /// `default` (`classify_cli_mode` said `Ungated`). The call itself was already
     /// denied on its connection; this asks the host to close the conversation. Produced by
     /// `process::spawn_hook_listener` INSTEAD of a `PermissionRequest`, so no card can be drawn for
     /// a call the CLI would run if nobody answered it.
@@ -93,8 +93,8 @@ pub enum AgentEvent {
         subtype: String,
         raw: Value,
     },
-    /// Deliberately permissive catch-all -- see this plan's Global Constraint on never letting
-    /// an unrecognized event stop the stream. `kind` is the wire `type` field, `subtype` its
+    /// Deliberately permissive catch-all: an unrecognized event never stops the stream, since a
+    /// newer CLI adds event types this build cannot know. `kind` is the wire `type` field, `subtype` its
     /// `subtype` field if present (many `system` events use this to distinguish e.g.
     /// `hook_started`/`hook_response`/`init`/`thinking_tokens`).
     Unknown {

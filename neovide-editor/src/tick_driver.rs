@@ -1,16 +1,22 @@
-//! Schedules pane service work: pump nvim, watch fullscreen and scale, resync the grid, report
-//! exits and request renders.
+//! Who runs the pane's "service" work (pump nvim, watch fullscreen/scale, resync the grid, report
+//! an exit, queue a render), and when.
 //!
-//! An idle GtkGLArea tick callback uses GDK's 16.667 ms fallback interval, delaying incoming redraw
-//! batches by up to one interval. The shared event-loop watch (`live_watch`) services each pane
-//! when a batch arrives; keep the tick callback registered only while a frame is wanted.
+//! Before 2026-09-29 a `GtkGLArea` tick callback stayed registered for the pane's whole life. With
+//! nothing just drawn, GDK runs such a callback on its 16.667 ms fallback interval, so a redraw
+//! batch that reached the fork's event loop waited 0-16.7 ms (8.5 ms at p50) before anything looked
+//! at it: the whole of the insert-mode typing latency gap measured against native Neovide that day.
 //!
-//! The fd watch uses `G_PRIORITY_DEFAULT_IDLE` (200), below `GDK_PRIORITY_REDRAW` (120), so incoming
-//! batches cannot starve painting. It services the pane and requests frames; `render_frame` also
-//! pumps on each paint. A paint can consume an exit or a fullscreen or scale change that only
-//! service reports, so [`service_pending_after_render`] requests another service run.
-//! Stop the tick in the committed render ([`TickDriver::stop_after_render`]) so a key arriving
-//! just after animation does not wait another refresh.
+//! Now: the one watch on the editors' shared event loop (`live_watch`) runs the pane's service the
+//! moment a batch arrives, and the tick callback is registered only while a frame is wanted. Three
+//! rules keep that safe:
+//!
+//! - **F1:** the fd watch runs at `G_PRIORITY_DEFAULT_IDLE` (200), below `GDK_PRIORITY_REDRAW`
+//!   (120), so a flood of batches can never starve a paint (of this pane, the terminal or the
+//!   panel). It only services and kicks; `render_frame` pumps on every paint anyway.
+//! - **F2:** a render that pumps may consume an exit, a fullscreen change or a scale change that
+//!   only the service reports; [`service_pending_after_render`] asks for one more service run.
+//! - **F3:** the tick stops in the committed render ([`TickDriver::stop_after_render`]) rather than
+//!   one empty cycle later, so a key landing right after an animation does not wait a refresh.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};

@@ -6,8 +6,8 @@
 //!
 //! Every method here is a synchronous, bounded-time Rust function -- matching the existing
 //! `AgentSession` API shape a caller already knows -- even though a real implementation
-//! does real async gRPC I/O underneath via `RuntimeThread`
-//!. Streaming output (assistant text, tool calls, permission requests, ...) is never
+//! (`ClaudeSidecarProvider`) does real async gRPC I/O underneath via `RuntimeThread`.
+//! Streaming output (assistant text, tool calls, permission requests, ...) is never
 //! returned directly from these methods; it arrives via `pump()`, mirroring `AgentSession::pump()`.
 
 use crate::setting_sources::ProjectTrust;
@@ -42,9 +42,11 @@ pub struct CreateSessionRequest {
     pub project: ProjectTrust,
 }
 
-/// Continues an existing provider session. Resumed sessions do not inherit their earlier
-/// permission policy, so they are created gated just like fresh sessions through
-/// `CreateSessionRequest`. No permission mode parameter is needed here.
+/// Continue an existing provider (Claude) session rather than starting a fresh one.
+///
+/// Used to carry a `permission_mode`, because a resumed session does not inherit the policy it
+/// originally ran under. It still does not, and it no longer needs telling: since 2026-09-27 every
+/// session, resumed or fresh, is created gated (see `CreateSessionRequest`).
 #[derive(Debug, Clone)]
 pub struct ResumeSessionRequest {
     /// Claude's own session UUID -- the one `SessionOpened.provider_session_id` reported.
@@ -146,11 +148,15 @@ pub struct CloseSessionRequest {
     pub session_id: String,
 }
 
-/// Capabilities reported by the provider, never inferred from its name, enum members,
-/// or RPCs in a generated stub. Hide or disable unavailable features and send no commands for them.
-/// Each bool has a source in `HandshakeResponse` and represents a choice a caller makes.
-/// `Copy` lets callers pass capabilities freely. Owned lists, versions and diagnostics
-/// belong in `ProviderInfo`.
+/// What a provider can actually do, as reported by the provider itself -- never inferred from a
+/// provider's name, an enum member's existence, or an RPC being present in a generated stub.
+///
+/// This is a contract: a capability that is absent hides or disables the feature in the UI, and
+/// no command is sent on the theory that the server will ignore it. That only works if every field
+/// here has a real wire source, so this struct
+/// stays deliberately small -- one bool per thing a caller genuinely branches on, each derivable
+/// from a real `HandshakeResponse`. `Copy` on purpose: callers pass it around freely, and anything
+/// that needs an owned list (advertised names, versions, diagnostics) belongs in `ProviderInfo`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderCapabilities {
     /// The provider can continue an existing provider session by id.
@@ -159,17 +165,23 @@ pub struct ProviderCapabilities {
     pub fork: bool,
     /// The provider can cancel an in-flight turn.
     pub interrupt: bool,
-    /// The provider advertises BYPASS mode, where tools run without asking.
-    /// This is a handshake fact only. The host implements bypass by answering `allow` through the
-    /// gate, which requires `interactive_permission_mode` rather than provider BYPASS mode.
-    pub bypass_permission_mode: bool,
-    /// The provider advertises INTERACTIVE mode, where tool use raises `PermissionRequested`.
+    /// The provider advertises a BYPASS permission mode: tools run without asking.
     ///
-    /// Tracked separately from `bypass_permission_mode` because providers advertise them independently.
-    /// `verdandi_rules` is not modeled: it behaves identically to INTERACTIVE in the current sidecar,
-    /// so a third choice would add no distinction. Every session uses INTERACTIVE;
-    /// `ClaudeSidecarProvider::require_interactive` refuses providers without it at session creation
-    /// rather than silently choosing another permission policy.
+    /// A reported handshake fact only, never requested: Eitri's bypass is its own
+    /// `allow` answer under the gate, which needs `interactive_permission_mode` and nothing else.
+    pub bypass_permission_mode: bool,
+    /// The provider advertises an INTERACTIVE permission mode: tool use raises a real
+    /// `PermissionRequested` that a human answers.
+    ///
+    /// A separate capability from `bypass_permission_mode` because the two are separately
+    /// advertised and separately absent, and because choosing between them is a decision about what
+    /// the agent is allowed to do unsupervised. `verdandi_rules` is deliberately NOT modeled: it is
+    /// confirmed to behave identically to `interactive` in the current sidecar, so offering it as a
+    /// third choice would be a distinction without a difference.
+    ///
+    /// The only policy any session is created under, so a provider without it is refused
+    /// at session creation (`ClaudeSidecarProvider::require_interactive`), loudly -- never mapped
+    /// onto whatever the provider does offer.
     pub interactive_permission_mode: bool,
     /// Every session this provider creates asks the CLI to run its own `auto` mode under the gate
     /// (Verdandi `ClaudeHostPolicy.cli_permission_mode = AUTO`), and a gate request on it may be
@@ -290,10 +302,10 @@ pub enum ProviderError {
     /// from a business-level error the provider's own service returned successfully as a typed
     /// response.
     Transport(String),
-    /// A business error returned by the provider, such as `SESSION_NOT_FOUND`.
-    /// Carries error text safe to show a human, never raw stderr or an unfiltered stack trace.
-    /// The typed code distinguishes a recoverable ordering error from a dead session
-    /// without parsing the message.
+    /// The provider's own service returned a real business error (e.g. `SESSION_NOT_FOUND`) --
+    /// carries the provider's own error text, already safe to show a human (never raw stderr or an
+    /// unfiltered stack trace), plus the typed code so a caller can tell a
+    /// recoverable ordering complaint from a dead session without parsing that text.
     Provider { code: ProviderErrorCode, message: String },
 }
 
@@ -330,8 +342,8 @@ pub trait AgentProvider {
     fn create_session(&self, request: CreateSessionRequest) -> Result<String, ProviderError>;
     /// Returns the resumed session's own id.
     fn resume_session(&self, request: ResumeSessionRequest) -> Result<String, ProviderError>;
-    /// Returns the new turn's id. At most one turn may be active in a session;
-    /// a second `send_turn` is rejected while a turn is in flight, rather than queued.
+    /// Returns the new turn's own id. At most one active turn per session -- a
+    /// provider rejects a second `send_turn` while one is already in flight rather than queuing it.
     fn send_turn(&self, request: SendTurnRequest) -> Result<String, ProviderError>;
     fn interrupt_turn(&self, request: InterruptTurnRequest) -> Result<(), ProviderError>;
     /// Puts one user message into the running turn without interrupting it. Called on the host's UI

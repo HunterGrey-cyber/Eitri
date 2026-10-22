@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::nofollow::{read_regular_nofollow, Owner};
 use super::{discover, Discovery, EntryKind, Limits, Profile, ProfileEnv};
-use crate::layout::persist;
+use crate::state_paths;
 
 /// A record larger than this is not one of ours. The record is read on every check, from a state
 /// directory another program of the user's could fill, so the reader stays small; a configuration
@@ -117,8 +117,8 @@ struct Record {
 /// that name.
 fn record_name(root: &Path, profile: &Profile) -> String {
     match profile {
-        Profile::Claude => persist::file_name(root),
-        other => format!("{}.{}", persist::file_name(root), other.key()),
+        Profile::Claude => state_paths::file_name(root),
+        other => format!("{}.{}", state_paths::file_name(root), other.key()),
     }
 }
 
@@ -153,7 +153,7 @@ impl TrustStore {
     /// is read or created.
     pub fn new(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> TrustStore {
         TrustStore {
-            dir: persist::state_subdir(xdg_state_home, home, "trust"),
+            dir: state_paths::state_subdir(xdg_state_home, home, "trust"),
         }
     }
 
@@ -253,8 +253,8 @@ impl TrustStore {
                 ),
             ));
         }
-        persist::create_state_dir(&dir)?;
-        let tmp = persist::temporary(&path);
+        state_paths::create_state_dir(&dir)?;
+        let tmp = state_paths::temporary(&path);
         let written =
             agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(err) = written {
@@ -439,4 +439,24 @@ pub fn civil_date(unix: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn every_state_path_is_unchanged() {
+        let store = TrustStore::new(Some(OsStr::new("/state")), Some(OsStr::new("/home/test")));
+        let dir = store.dir.unwrap();
+        let root = Path::new("/projects/state-paths");
+        assert_eq!(
+            dir.join(record_name(root, &Profile::Claude)),
+            Path::new("/state/eitri/trust/410d926fb96fb107.json"),
+        );
+        assert_eq!(
+            dir.join(record_name(root, &Profile::Codex)),
+            Path::new("/state/eitri/trust/410d926fb96fb107.json.codex"),
+        );
+    }
 }

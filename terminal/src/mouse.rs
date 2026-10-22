@@ -30,8 +30,9 @@ impl Button {
     }
 }
 
-/// A wheel notch's direction. The host's vertical scroll controller uses `Up` and `Down`.
-/// `Left` and `Right` let the encoder represent horizontal wheel events too.
+/// A wheel notch's direction. Only `Up`/`Down` are wired to a host gesture (the host's vertical
+/// scroll controller); `Left`/`Right` exist so the encoder is complete for a future horizontal
+/// wheel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WheelDir {
     Up,
@@ -131,9 +132,10 @@ impl Default for MouseModes {
     }
 }
 
-/// The number of arrow-key reports per wheel notch for [`alternate_scroll`].
-/// The same three-line multiplier is shared with the host's scrollback wheel handling
-/// so the two stay in step.
+/// How many reports one wheel notch is worth for [`alternate_scroll`]: xterm/foot/alacritty all
+/// send three arrow keys per notch in the alternate screen (their default `multiplier`, three lines a
+/// notch) -- the same multiplier `shell`'s own scrollback wheel handling uses, kept in one place so
+/// the two never drift apart.
 pub const LINES_PER_NOTCH: usize = 3;
 
 /// The X10/1000 (no SGR) coordinate limit: a coordinate at or past this cannot be encoded as one

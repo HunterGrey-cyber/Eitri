@@ -1,37 +1,70 @@
-//! Locates Claude CLI transcripts and reads conversation history for display after resume.
-//! [`claude_projects_dir`] uses the configured account's projects directory first,
-//! then `CLAUDE_CONFIG_DIR` when set.
-//! Resume stability depends only on the file's modification time ([`is_transcript_stable`]),
-//! never on transcript content.
+//! Locates and probes the real Claude CLI's own transcript files under `~/.claude/projects/`
+//! (the resume stability probe and the external-writer check). This module never reads
+//! or interprets transcript *content* -- only the file's existence and modification time, matching
+//! the project's own repeated discipline of not reimplementing Claude's own private wire/storage
+//! format.
 //!
-//! [`crate::history::store`] provides a fallback, but only covers sessions driven by this
-//! application since history storage was added. CLI transcripts also cover other sessions.
-//! Session files are named `<uuid>.jsonl`, as built by [`transcript_path`]. Subagent logs named
-//! `agent-<hex>.jsonl` carry their parent's `sessionId` and contain no main-chain conversation.
+//! **Correction (2026-09-20).** This module now READS transcript content. The sentence above --
+//! "never reads or interprets transcript *content*" -- was written for the resume safety probe in
+//! the resume safety probe, and **within that scope it still stands**: whether a resume is SAFE is decided
+//! from the file's mtime alone ([`is_transcript_stable`]), never from what is written inside it.
+//! What is overturned is only its general form, "never, for any purpose".
 //!
-//! Only `user` and `assistant` entries become conversation messages. Other entries include
-//! system messages, attachments and side data with no wire-protocol counterpart. The `version`
-//! field identifies the writing CLI, not a schema. Report it when parsing yields nothing;
-//! do not use it to select a parser.
+//! It is overturned because the panel is empty after a resume, and this file is the only place on
+//! disk that remembers the conversation. Eitri's own copy (`$XDG_STATE_HOME/eitri/history/`,
+//! [`crate::history::store`]) exists as a fallback, but it cannot be the primary source: it only
+//! covers sessions Eitri itself drove, and only from the day it was added.
 //!
-//! A `type:"user"` entry may contain injected text rather than a typed prompt. Accept only
-//! `promptSource` values `typed`, `suggestion_accepted`, `queued` and `sdk`, with no exclusion
-//! flags, to avoid displaying injected material as the user's words. Compaction uses a user
-//! entry with `isCompactSummary: true` and a system entry with `subtype:"compact_boundary"`.
+//! **What a real transcript looks like, measured 2026-09-20** over the 822 `.jsonl` files (570 MB,
+//! 117,826 lines) under this machine's own `$CLAUDE_CONFIG_DIR/projects` -- note
+//! [`claude_projects_dir`] below, which is why `~/.claude/projects` is the wrong place to look on a
+//! machine that sets that variable:
 //!
-//! Files under `CLAUDE_CONFIG_DIR` are read-only here. Unknown entry types, unknown content
-//! blocks and malformed lines are skipped and counted. Format changes reduce the displayed
-//! history with a diagnostic rather than aborting a resume.
+//! - The directory holds two kinds of file. **43** are sessions, named `<uuid>.jsonl`, which is what
+//!   [`transcript_path`] builds. **779** are subagent logs, named `agent-<hex>.jsonl`, carrying
+//!   their PARENT's `sessionId`; they hold 77% of the bytes and no main-chain conversation at all.
+//! - A session file carries **fifteen** top-level `type` values. Only four of them -- `user`,
+//!   `assistant`, `system`, `attachment` -- are conversational, and of those only `user` and
+//!   `assistant` become anything. The other eleven (`last-prompt`, `atis-latch`, `permission-mode`,
+//!   `mode`, `ai-title`, `queue-operation`, `file-history-snapshot`, `file-history-delta`,
+//!   `relocated`, `worktree-state`, `cost-state`) are side records the wire protocol has no
+//!   counterpart for. Five more (`started`, `result`, `failed`, `launched`, `fork-context-ref`)
+//!   exist only in the subagent files.
+//! - **There is no schema version.** There IS a `version` field on all four conversational line
+//!   types, 100% of the time, but it is the writing CLI's own version (2.1.270/272/276 here) and
+//!   promises nothing about format. Report it when a parse yields nothing; never branch on it.
+//! - **`type:"user"` does not mean "the user typed this".** In a session file, 962 user lines carry
+//!   no tool result, and only 448 of them are a person's words. The rest are compaction summaries
+//!   (`isCompactSummary`), injected material (`isMeta`), slash-command echoes, local command output,
+//!   bash-mode lines and interrupt markers. Decide with an **allow-list** (`promptSource` ∈ {typed,
+//!   suggestion_accepted, queued, sdk}, and none of the exclusion flags), never a deny-list: the
+//!   failure direction of a deny-list is showing someone else's text under the user's name.
+//! - **Compaction is not `type:"summary"`** -- that value does not occur. It is a `type:"user"` line
+//!   flagged `isCompactSummary: true`, paired with a `type:"system"`, `subtype:"compact_boundary"`
+//!   line.
 //!
-//! Transcript content is never persisted or used for resume safety, permission decisions or
-//! turns sent to the model. It supplies panel history and a display-only resume-picker title.
-//! [`newest_ai_title`] reads the newest `type:"ai-title"` entry in the last 64 KiB each time
-//! the picker is built. [`crate::persistence::title_from_prompt`] normalizes the title.
-//! The result is never written into a `ConversationRecord`; the stored title stays first-one-wins.
-//! Display falls back to the stored title and then the bare id when no CLI title is available.
+//! Reading it comes with four constraints, and none of them is optional:
 //!
-//! Transcript bytes are untrusted model and tool output from another process. Render them
-//! through the same DOMPurify and markdown path as other messages.
+//! 1. **Read-only, forever.** Nothing here writes, renames, moves or deletes anything under
+//!    `$CLAUDE_CONFIG_DIR`. That directory belongs to the CLI.
+//! 2. **Parse defensively, never authoritatively fail.** An unknown line type, an unknown content
+//!    block and a malformed line are all SKIPPED AND COUNTED, never an error that aborts the load.
+//!    A format change must degrade to "less history was shown, and the panel said so", never to a
+//!    failed resume.
+//! 3. **Nothing read here is evidence, and nothing read here is ever persisted.** Transcript
+//!    content feeds the panel, and -- since 2026-09-20 -- supplies the
+//!    *display* title of a row in the resume picker: the newest `type:"ai-title"` line in the
+//!    file's last 64 KiB, read fresh each time the picker is built ([`newest_ai_title`]), normalized
+//!    through the same [`crate::persistence::title_from_prompt`] every other title goes through. It
+//!    is **never written into a `ConversationRecord`**: `title` on disk stays what this project
+//!    recorded at write time, first-one-wins, and the CLI's title is layered *above* it at display
+//!    time only, falling back to it and then to the bare id when it is absent (37 of this machine's
+//!    44 sessions have one; 7 do not). Transcript content still never decides whether a resume is
+//!    safe, never reaches a permission decision, and is never composed into a turn sent to the
+//!    model.
+//! 4. **It is untrusted input.** These bytes are model output and tool output written to disk by
+//!    someone else's process. They render through the same DOMPurify/markdown path every other
+//!    message does; no second rendering path is opened for them.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -96,10 +129,12 @@ pub fn transcript_path(cwd: &str, provider_session_id: &str) -> std::io::Result<
         .join(format!("{provider_session_id}.jsonl")))
 }
 
-/// Checks whether the transcript's modification time stays unchanged across `probe_delay`.
-/// Returns `Ok(true)` if unchanged and `Ok(false)` if it changes, so callers can refuse
-/// resume while the file is being written. A missing file returns `Err` because it is a
-/// different problem from an unstable transcript.
+/// A short stability probe before a resume, which is refused while the transcript is still being
+/// written. Reads the
+/// file's mtime, waits `probe_delay`, reads it again -- `Ok(true)` if unchanged (stable, safe to
+/// treat as not actively being written), `Ok(false)` if it changed (still being written). A
+/// missing file is a real `Err` (not `Ok(false)`) -- the caller has a different, more specific
+/// problem than "unstable" if the transcript doesn't exist at all.
 pub fn is_transcript_stable(path: &Path, probe_delay: Duration) -> std::io::Result<bool> {
     let before = std::fs::metadata(path)?.modified()?;
     std::thread::sleep(probe_delay);
@@ -107,35 +142,53 @@ pub fn is_transcript_stable(path: &Path, probe_delay: Duration) -> std::io::Resu
     Ok(before == after)
 }
 
-/// Bounds how many bytes [`newest_ai_title`] reads from the end of a transcript.
+/// How far back from a transcript's end [`newest_ai_title`] reads, in bytes.
 ///
-/// In a sample of 44 session files, the newest title was at most 33,157 bytes from EOF.
-/// A 64 KiB tail matched a full scan for all 37 titled sessions; a head read found none,
-/// because initial attachment data put the first title beyond the head window.
+/// **Measured, both directions** (2026-09-20, 44 real session files):
+/// the newest `ai-title` line sits a median of 6,928 bytes and at most 33,157 bytes from EOF, so a
+/// 64 KiB tail is twice the worst case seen and was byte-identical to a full scan on all 37 titled
+/// sessions. A 64 KiB HEAD read found it on **none** of them -- a session opens with `attachment`
+/// lines and the first title is already past 117 KB. The direction is not reasoned, it is the
+/// result of running both.
 ///
-/// This is a bounded heuristic. Enough data after the last title pushes it outside the
-/// window, making it indistinguishable from an absent title. The picker then uses its
-/// next title fallback. Expanding the read without a bound would block the GTK main loop
-/// on an arbitrarily large transcript.
+/// It is an empirical margin, not a guarantee. A session that writes more than this after its last
+/// title (one 483,545-byte tool result would do it) reads as having no title, and that miss is
+/// **undetectable**: inside the window it looks exactly like a session that never had one. That is
+/// accepted, because the only consequence is one picker row dropping to the next level of the
+/// ladder, and the alternative -- widening until it is always right -- is an unbounded read of
+/// someone else's file on the GTK main loop.
 pub const AI_TITLE_TAIL_BYTES: u64 = 64 * 1024;
 
-/// Returns the CLI title for display in the resume picker, or `None`.
-/// Reads the last [`AI_TITLE_TAIL_BYTES`] of `path` and takes the `aiTitle` from the last
-/// `type:"ai-title"` entry in that window, so the newest title in the window wins.
+/// The title the CLI itself last recorded for this session, for DISPLAY in the resume picker, or
+/// `None`.
 ///
-/// The result is never written into a `ConversationRecord`. The stored title remains
-/// first-one-wins and `updated_at` is untouched. Every picker build reads the file again.
+/// Since 2026-09-20. It reads the last [`AI_TITLE_TAIL_BYTES`] of `path` and
+/// takes the `aiTitle` of the **last** `type:"ai-title"` line in that window. Measured: this
+/// machine's 37 titled sessions each hold exactly one distinct value, rewritten a median of 24
+/// times, so "the newest wins" is a rule about a case that has not occurred yet rather than one
+/// this machine exercises -- which is why it is decided here instead of left to whichever line a
+/// scan happens to meet first.
 ///
-/// The caller runs on the GTK main loop. The persistence retention cap bounds the picker
-/// to `MAX_RECORDS_PER_CONVERSATION` + 1 rows, so this adds one fixed-size read per row.
-/// Parsing entire transcripts would make main-loop work grow with externally written files.
+/// **Never persisted.** The value is not written into a `ConversationRecord`, so this project's own
+/// `title` keeps its first-one-wins rule and `updated_at` is untouched; every picker re-reads. See
+/// this module's constraint 3.
 ///
-/// [`is_transcript_stable`] sleeps and would stall the main loop, so there is no stability
-/// probe here. A partial last line is skipped like any malformed line; the row can fall
-/// back to its stored title or id.
+/// **Bounded and cheap, because its caller is the GTK main loop.**
+/// `BackendGreeting::for_kind` already reads Eitri's own small records synchronously there, and
+/// `persistence`'s own retention cap already bounds how many rows a picker can have
+/// (`MAX_RECORDS_PER_CONVERSATION` + 1), so this adds one fixed-size read per row and nothing that
+/// grows -- measured at 1.74 ms hot and 5.92 ms cold over this machine's 16 largest sessions
+/// (116 MB in total). **Parsing the whole transcript here would not be acceptable at any speed**:
+/// it would trade a bounded read of Eitri's own files for one that grows with a file this project
+/// neither controls nor knows a bound for (the largest here is 47,254,948 bytes).
 ///
-/// Missing or unreadable files, seek failures, invalid UTF-8, malformed JSON and non-string
-/// or blank titles yield `None`. The caller can use its title fallbacks.
+/// **No stability probe.** [`is_transcript_stable`] sleeps, and a sleep on the GTK main loop is a
+/// visible stall. A half-written last line fails to parse and is skipped like any other malformed
+/// line; the worst outcome is one row without a title.
+///
+/// Every failure -- a missing file, no permission, a seek that fails, invalid UTF-8, malformed
+/// JSON, a non-string or blank `aiTitle` -- is `None`, never an `Err`. The caller has three levels
+/// of ladder and nothing it could do with an error.
 pub fn newest_ai_title(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -201,10 +254,15 @@ pub fn newest_ai_title(path: &Path) -> Option<String> {
     crate::persistence::title_from_prompt(&newest?)
 }
 
-/// Serializes tests that mutate the process-wide `CLAUDE_CONFIG_DIR` environment variable.
-/// Tests in this file and `external_writer.rs` need controlled values, so parallel execution
-/// would otherwise let their mutations interleave. A shared lock protects both files.
-/// `Mutex::new` is const, so the static guard needs no lazy initialization or extra dependency.
+/// Serializes every test in this crate that mutates the process-wide `CLAUDE_CONFIG_DIR` env
+/// var -- this file's own one such test, plus `external_writer.rs`'s three. Both files
+/// independently need a controlled value for it, and cargo's default parallel test runner would
+/// otherwise let one test's mutation interleave with another's -- exactly the real, reproduced
+/// race already found and fixed for a different env var
+/// (`XDG_STATE_HOME` in `persistence.rs`). That fix merged same-file tests into one; this race
+/// spans two different files, so a shared lock is the right shape instead. `std::sync::Mutex::new`
+/// is a `const fn` (stable since Rust 1.63) -- no `OnceLock`/`lazy_static` needed for a bare
+/// `static`, and no new crate dependency (e.g. `serial_test`) for one shared guard.
 #[cfg(test)]
 pub(crate) static CLAUDE_CONFIG_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

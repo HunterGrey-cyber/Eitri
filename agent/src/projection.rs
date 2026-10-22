@@ -1,10 +1,9 @@
 //! The v2 reducer stage sitting above `agent::event::AgentEvent` (Claude-wire-specific, stays
 //! crate-internal beyond `agent::session`'s own translation step): folds a stream of
 //! provider-neutral `AgentDomainEvent`s into a queryable `AgentSessionProjection`, this crate's
-//! sole product-state authority
-//!.
+//! sole product-state authority.
 //!
-//! Deliberately NOT modeled here, per that same design doc and this crate's own YAGNI discipline
+//! Deliberately NOT modeled here, per this crate's own YAGNI discipline
 //! (no field with zero current consumer): `conversation_id`/`provider`/`provider_session_id` as
 //! separate identities (this phase has exactly one provider and no resumable session-id split --
 //! `session_id` alone is what today's single Claude CLI process actually has), `capabilities`,
@@ -21,10 +20,10 @@ pub enum ContentKind {
     Thinking,
 }
 
-/// A turn's terminal state distinguishes completion, interruption, failure and a reached limit.
-/// `LimitReached` comes only from the sidecar, which maps the SDK's `terminal_reason`
-/// (`max_turns`, `blocking_limit`, `rapid_refill_breaker`, `budget_exhausted`) to it.
-/// The legacy backend's translation never chooses it.
+/// A turn's terminal state must distinguish these four outcomes, not
+/// collapse them into one `is_error` bool. `LimitReached` comes only from the sidecar, which maps
+/// the SDK's `terminal_reason` (`max_turns`, `blocking_limit`, `rapid_refill_breaker`,
+/// `budget_exhausted`) to it; the legacy backend's translation never chooses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcome {
@@ -194,7 +193,7 @@ pub enum ProjectionStatus {
     },
 }
 
-/// Provider-neutral (per the design doc's own naming) but Claude-only in practice this phase --
+/// Provider-neutral by name but Claude-only in practice this phase --
 /// see this module's own header doc for what's deliberately not modeled yet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -340,13 +339,15 @@ pub enum AgentDomainEvent {
         /// translate-side match arm for what a `true` here means.
         floor_applied: bool,
     },
-    /// The CLI reported a mode that `crate::classify_cli_mode` classifies as `Ungated` rather than
-    /// at least as restrictive as the requested `default`. An unanswered hook in that mode can let
-    /// the tool run, so the session must close.
+    /// The CLI reported a permission mode less restrictive than the `default` Eitri asks for
+    /// (`crate::classify_cli_mode` said `Ungated`) -- most likely a project's own
+    /// `permissions.defaultMode`. Under such a mode a hook that gives no answer lets the tool run,
+    /// which must never be possible, so the session has to be closed.
     ///
-    /// The sidecar emits this for `SessionReady.permission_mode` or `PermissionModeChanged`.
-    /// Legacy emits it for a `PreToolUse` payload after denying the call. The host's
-    /// `tab_set::TabSet::pump` closes the session and fails the tab.
+    /// Both backends produce it: the sidecar from `SessionReady.permission_mode` or a
+    /// `PermissionModeChanged`, legacy from a `PreToolUse` hook payload (whose call was already
+    /// denied). `eitri_core::tab_set::TabSet::pump` is the one place that closes the session and
+    /// fails the tab.
     UngatedCliMode {
         /// The mode as the CLI named it, verbatim (`bypassPermissions`, `acceptEdits`, ...).
         reported: String,
@@ -1158,8 +1159,7 @@ impl Default for UsageInfo {
 
 /// Eitri's sole product-state authority for one conversation. `pending_permissions`
 /// is a map (not the old `Vec`) so a caller can look up/remove one specific request by id in O(1)
-/// -- exactly what answering one permission card needs, and exactly what the design doc's own
-/// "pending permissions map" wording asks for.
+/// -- exactly what answering one permission card needs.
 ///
 /// **This type is `Serialize` and deliberately not `Deserialize`, and the six record types above
 /// are both.** A projection that can be read off disk is a projection that can arrive carrying
@@ -1183,18 +1183,23 @@ pub struct AgentSessionProjection {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub status: ProjectionStatus,
-    /// `Some(turn_id)` from a successful `AgentSession::send_turn` until the matching
-    /// `TurnCompleted` is folded. A session has at most one active turn, so the caller must
-    /// reject a second `send_turn` while this is `Some` rather than queue it silently.
+    /// `Some(turn_id)` from the moment `AgentSession::send_turn` succeeds until the matching
+    /// `TurnCompleted` is folded. At most one active turn per session -- a
+    /// second `send_turn` while this is `Some` must be rejected by the caller, not
+    /// silently queued.
     pub active_turn_id: Option<String>,
     /// Prompts the user sent, in order, each carrying the `seq` that orders it against the other
     /// three collections.
     pub user_prompts: Vec<UserPromptRecord>,
-    /// Assistant messages in arrival order, each carrying the `seq` that orders it against
-    /// `user_prompts`, `tool_calls` and `pending_permissions`. The four collections stay separate
-    /// so consumers can read one kind of item without filtering a sum type. `seq` gives all four
-    /// a total order so readers can interleave them exactly, even after a snapshot replaces their state.
-    /// The frontend cannot reconstruct arrival order from separate collections without it.
+    /// Assistant messages, in arrival order, each carrying the `seq` that orders it against
+    /// `user_prompts`, `tool_calls` and `pending_permissions`.
+    ///
+    /// A transcript is a single interleaved sequence of items with
+    /// tool calls. The four collections are still stored apart -- a consumer that only wants tool
+    /// calls should not have to filter a sum type for them -- but they are no longer unorderable:
+    /// `seq` is a total order over all four, so a reader can interleave them exactly. That is the
+    /// part the frontend genuinely could not do for itself, because a snapshot replaces its whole
+    /// state and carried no arrival order at all.
     pub transcript: Vec<TranscriptMessage>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub pending_permissions: HashMap<String, PermissionRequestRecord>,
@@ -1355,11 +1360,12 @@ fn push_bounded<T>(queue: &mut VecDeque<(String, T)>, id: &str, value: T) {
 /// How many refusals that arrived ahead of their call a projection holds at once.
 pub const MAX_HELD_DENIALS: usize = 64;
 
-/// Which source supplied the restored history.
+/// Which of the two records a restored history was read from.
 ///
-/// The CLI's transcript is what `claude --resume` in a terminal shows. The host keeps a separate
-/// copy, and the two can differ. The panel identifies the source so users can tell which history
-/// they are seeing and whether a fallback was used.
+/// The distinction is user-facing on purpose: the two can genuinely differ -- Claude's
+/// own transcript is what the CLI maintains and what a `claude --resume` in a terminal shows, while
+/// Eitri's copy is this side's unilateral record. A user with both open must be able to see at a
+/// glance which one the panel is showing, so this is never silently degraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistorySource {
@@ -1369,9 +1375,12 @@ pub enum HistorySource {
     EitriCopy,
 }
 
-/// The information the panel displays about restored history: the conversation, its source,
-/// any omissions and the reason for using a fallback. This struct is the sole input to the notice
-/// row, which appears whenever history is restored, even if nothing was truncated.
+/// Everything the panel needs to say one honest line about a restored history.
+///
+/// Every field here answers a question a user can actually ask -- which conversation
+/// is this, where did it come from, is anything missing, and why am I looking at the fallback --
+/// and nothing here is decoration: this struct is the sole input to the notice row, which is
+/// rendered whenever history was restored at all, not only when it was truncated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryNotice {
     pub source: HistorySource,
@@ -1384,9 +1393,10 @@ pub struct HistoryNotice {
     /// skipped line type (attachments, side records, unknown lines): those are not omitted
     /// conversation and go to the log instead.
     pub omitted_items: Option<usize>,
-    /// The exclusive `seq` bound of restored history: historical items are below it and live items
-    /// are at or above it. Present whenever history is restored, even without truncation, so the
-    /// panel can distinguish historical tool calls that cannot complete from live calls still running.
+    /// The `seq` bound (exclusive) of the restored part: every historical item sits below it and
+    /// every live item at or above it. Present whenever history was restored, not only when it was
+    /// truncated -- the panel needs it to tell a historical tool call with no result (which can
+    /// never complete) from a live one that is still running.
     pub upto_seq: u64,
     /// The file this history was actually read from. Always non-empty: a notice exists only when
     /// history was restored, and history can only come from one file.

@@ -1,15 +1,25 @@
-//! Removes the editor-context block that `compose_turn_text` appended to a stored prompt.
+//! The inverse of wire 1's `compose_turn_text`: taking the editor-context block back off a prompt
+//! that was read from disk.
 //!
-//! This function lives in `agent` because the core crate already depends on `agent`.
-//! Putting it in core would create a dependency cycle for the history reader. The core
-//! editor-context module re-exports it. The round-trip test beside `compose_turn_text` in
-//! `core/src/editor_context/compose.rs` checks `strip(compose(t, ctx)) == t`, so changes to
-//! either direction must remain compatible.
+//! **Why this is not in `eitri_core::editor_context`, beside `compose_turn_text`.**
+//! It belongs there, but that is not buildable: `eitri-core` depends on `agent` (`core/Cargo.toml`),
+//! and the history reader that needs this function lives in `agent`, so putting the function in
+//! `core` would need `agent -> eitri-core -> agent`. The function therefore lives here, and
+//! `eitri_core::editor_context` re-exports it as `strip_composed_block`, so a
+//! caller finds both directions in one module. The round-trip property test
+//! (`strip(compose(t, ctx)) == t`) lives beside `compose_turn_text`'s own cases in
+//! `core/src/editor_context/compose.rs`, which is what matters: the two
+//! directions cannot be changed independently without one of them going red.
 //!
-//! Stored prompts contain the text sent to the model, including appended editor context.
-//! `AgentDomainEvent::UserPromptSubmitted` expects the user's own text. Stripping the block
-//! keeps generated file paths and selections out of the displayed prompt. The block's
-//! format is defined by `compose.rs`.
+//! **Why stripping at all.** Measured 2026-09-20: the prompt text on disk is the WIRE turn,
+//! not what the user typed -- 2 of the 6 SDK-driven sessions on this machine end with a block this
+//! project's own `compose_turn_text` appended. `AgentDomainEvent::UserPromptSubmitted`'s own doc
+//! says `text` is "the text the user typed, deliberately NOT the text that went on the wire", so
+//! feeding the raw on-disk prompt into it would render a file path and a selection nobody wrote,
+//! in violation of the field's own contract.
+//!
+//! **This is not parsing someone else's private format.** The block is text this repository's own
+//! code appended; `compose.rs` owns its shape.
 
 /// The trailing sentence both templates share, kept as its own constant only for the two suffixes
 /// below to be obviously built from the same words `compose_turn_text` uses.
@@ -31,19 +41,30 @@ fn selected_suffix() -> String {
 
 /// Removes the editor-context block `compose_turn_text` appends, if this text ends with one.
 ///
-/// Returns the input unchanged unless its suffix matches this module's templates. Ambiguous text
-/// is stripped less: leaving a block visible is preferable to deleting text the user wrote.
+/// Returns the input unchanged when it does not end with a block this module's own templates could
+/// have produced. It never guesses: no regex, no "looks like a path", no partial match. Recognising
+/// one block too few costs a rendered prompt that carries a sentence the model was genuinely sent;
+/// recognising one too many would delete text the user wrote, so every ambiguity resolves toward
+/// stripping less.
 ///
-/// The rightmost well-formed block is removed. If a block was appended, it reaches the end of the
-/// string and is a candidate, so stripping cannot begin before that block. Selected text that
-/// itself resembles a composed block can cause only part of the appended block to be removed.
+/// **It strips the RIGHTMOST well-formed block, and that choice is what bounds the damage --
+/// PROVIDED a block was appended at all.** A block `compose_turn_text` appended always reaches the
+/// end of the string, so it is always one of the candidates; taking the rightmost therefore cannot
+/// cut before the real block's start. Against such a text it can only under-strip, and only when
+/// the *selected text carried inside the block* itself looks like a whole composed block.
 ///
-/// When no block was appended, `compose_turn_text(t, None) == t`. User text ending in a block-shaped
-/// suffix can therefore lose that suffix. For example, a message quoting
-/// `"\n\nThe user opened the file /p/a.rs in the IDE. <hedge>"` can be shortened this way.
-/// The string contains no indication of whether a block was appended. This affects only the
-/// restored prompt displayed in the panel; nothing is sent, decided or stored differently.
-/// The tests check composition followed by stripping across different input shapes.
+/// **It does NOT follow that no byte a user typed can ever be removed, and an earlier revision of
+/// this comment claimed exactly that.** The premise fails for a text with no appended block: the
+/// wire text and the typed text are then the same string (`compose_turn_text(t, None) == t`), and a
+/// user who types a message that happens to END with something shaped like a block loses it. That is
+/// reachable, not theoretical -- a prompt ending in
+/// `"\n\nThe user opened the file /p/a.rs in the IDE. <hedge>"`, e.g. quoting what the tool sent,
+/// strips to the text before it. There is no fix available at this layer: nothing in the string says
+/// whether a block was appended, and a marker that would say it would have to go on the wire, where
+/// the model would read it. The consequence is bounded -- a restored prompt in the panel shows less
+/// than was typed; nothing is sent, decided or stored differently -- and it is recorded here rather
+/// than papered over. A round trip "for any input" does not hold for the same reason; see this
+/// module's tests, which cover the compose→strip round trip over a matrix of real shapes.
 pub fn strip_composed_block(text: &str) -> &str {
     if let Some(start) = selection_block_start(text) {
         return before_block(text, start);

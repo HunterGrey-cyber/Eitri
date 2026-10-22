@@ -103,10 +103,11 @@ pub fn layout_preedit(
         ..GlyphStyle::default()
     };
 
-    // The fill must cover the terminal cursor's cell even when the preedit text ends before it.
-    // An end caret shifted left from the last column leaves that column beyond the text;
-    // filling only the text would leave the frame's block cursor visible around the beam. Since
-    // `start <= anchor_col` and `anchor_col < cols`, the fill stays within the row.
+    // The fill is what hides the terminal's own cursor, so it reaches the cursor's cell even when
+    // the text does not: an end caret shifted in from the last column leaves that column past the
+    // text, and without this the frame's block cursor stayed drawn there, with the beam inside it.
+    // `start <= anchor_col` always, and `anchor_col < cols`, so the fill
+    // never leaves the row.
     let anchor_col = anchor.col.min(cols - 1);
     let fill_cols = shown.max(anchor_col - start + 1);
     let mut ops = vec![PaintOp::FillCells {

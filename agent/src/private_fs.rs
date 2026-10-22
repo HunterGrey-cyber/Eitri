@@ -5,7 +5,7 @@
 //! created with the process umask's defaults: `0755` directories and `0644` files under the usual
 //! umask 022. Where the path down to the state home is traversable by other accounts (Eitri is
 //! the first to create `~/.local/state`, or `XDG_STATE_HOME` points somewhere shared), any local
-//! user could read every prompt typed into neovibe. The rule now:
+//! user could read every prompt this user typed. The rule now:
 //! directories 0700, files 0600, set exactly whatever the umask, and a directory of Eitri's own
 //! with any other mode (an older build's `0755`, a `0500` a restrictive umask left) is set to
 //! 0700 when Eitri next writes into it -- `chmod`, never `chown`, and only on a real directory
@@ -18,7 +18,7 @@
 //! the handle is `fstat`ed for its owner first, so what is checked is what is changed. (This also
 //! keeps the prost-setter token `wire_guard` forbids out of this crate's production code.)
 //!
-//! **C3 (v1 hardening).** Tightening `root/a/b/...` by re-opening each successive *path*
+//! **Walking by handle, not by path.** Tightening `root/a/b/...` by re-opening each successive *path*
 //! (`root`, then `root/a`, then `root/a/b`, ...) only ever protected the last component of each of
 //! those opens: `O_NOFOLLOW` refuses a symlink in `root`'s own place, but the OS resolves symlinks
 //! in every component that is not the last one it opens -- so a symlinked `root` left `root`
@@ -69,7 +69,7 @@ pub fn is_own_real_dir(path: &Path) -> bool {
 /// from `root` to `dir` once more. The walk is by open handle
 /// (`openat` from the previous component), never by path, so a symlink anywhere from `root`
 /// itself down to `dir`'s parent stops the walk there rather than being resolved through -- see
-/// the module doc's C3 section for why that matters and what a symlinked `root` means.
+/// the module doc's "Walking by handle" section for why that matters and what a symlinked `root` means.
 ///
 /// `root` is the directory Eitri owns outright, `<state home>/eitri` in production; nothing
 /// above it is ever changed, because the state home and the home directory above it are shared
@@ -262,7 +262,7 @@ fn tighten_from_root(root: &Path, below: &Path) {
 /// else (a group or other bit set, or an owner bit missing). Best-effort and silent: a failure
 /// leaves the files below it 0600 all the same.
 ///
-/// This opens `dir` by *path*, so -- exactly as before C3 -- only `dir`'s own last path component
+/// This opens `dir` by *path*, so -- exactly as before the handle walk -- only `dir`'s own last path component
 /// is protected from being a symlink (`O_NOFOLLOW`); an ancestor of `dir` that is itself a symlink
 /// is still resolved by the OS reaching `dir`. That is unchanged and fine for this function's own
 /// callers (a lone directory, or the "not under root" fallback in [`create_private_dir_all`]);

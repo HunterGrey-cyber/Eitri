@@ -43,6 +43,7 @@ pub mod run_guard;
 pub mod saved_tabs;
 pub mod scratch;
 pub mod split;
+pub mod state_paths;
 pub mod tab_restore;
 pub mod tab_set;
 pub mod tabs;

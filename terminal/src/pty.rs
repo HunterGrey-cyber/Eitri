@@ -1,23 +1,35 @@
-//! Own the pseudo-terminal child's creation, resizing, hangup, and reaping here.
+//! The child on a pseudo-terminal: opened, spawned, resized, hung up and reaped here, and nowhere
+//! else in Eitri.
 //!
-//! The `alacritty_terminal::tty` implementation has process-wide effects that do not fit a GTK
-//! application with other child processes. It injects `WINDOWID` and `ALACRITTY_WINDOW_ID`,
-//! exits the process on a failed `TIOCSWINSZ`, blocks in `child.wait()` during `Drop`, installs
-//! a process-wide SIGCHLD handler, and changes the parent process's `TERM`. This implementation
-//! avoids those effects.
+//! **Owned, not `alacritty_terminal::tty`.** That module works, and the spike used it, but each of
+//! its five behaviours below is wrong inside a GTK application that also runs nvim, WebKit and a
+//! sidecar, so this file does the same ~100 lines of work without them (each re-checked in
+//! `alacritty_terminal-0.26.0/src/tty/unix.rs`):
 //!
-//! Child setup is the standard sequence, the one alacritty's Apache-2.0 `from_fd` also uses:
+//! 1. it injects `WINDOWID` and `ALACRITTY_WINDOW_ID` into every child (lines 230, 234);
+//! 2. a failed `TIOCSWINSZ` calls `die!`, i.e. `std::process::exit(1)` -- the whole IDE (line 417);
+//! 3. `Drop` sends SIGHUP and then blocks in `child.wait()` (lines 313, 319) -- on the GTK thread;
+//! 4. it registers a process-wide SIGCHLD handler (line 283), next to glib's and tokio's reaping;
+//! 5. its `setup_env` calls `std::env::set_var("TERM")` on the whole process (`tty/mod.rs:105`).
+//!
+//! What is kept is its child setup, which is the standard sequence (`from_fd`, Apache-2.0):
 //! `setsid`, `TIOCSCTTY` on the new stdin, the six signal dispositions reset, IUTF8 on the tty.
-//! No code is copied from it; the sequence matches because there is one correct sequence.
+//! Nothing below is copied text; the sequence is the same because there is one correct sequence.
 //!
-//! Every child is reaped. The session reaps normal exits. On early return or panic,
-//! [`PtyChild`]'s `Drop` sends hangup and hands the pid to a reaper thread, which kills it
-//! after [`HANGUP_GRACE`] and reaps it without blocking the dropping thread.
+//! **Every child is reaped, on every path.** The session reaps it
+//! when it can say how the child ended; anything else -- an early return after the spawn, a
+//! session thread that panicked -- drops the [`PtyChild`], and its `Drop` hangs the child up and
+//! hands the pid to a one-shot reaper thread that kills it after [`HANGUP_GRACE`] and reaps it. Never
+//! a blocking wait on the dropping thread, which may be GTK's.
 //!
-//! On macOS, `rustix-openpty` sets `CLOEXEC` after opening the PTY, so concurrent spawns can
-//! inherit its descriptors and delay EOF. The `close_range` call is Linux-only; macOS children
-//! can also inherit other descriptors without `CLOEXEC`. The descriptor-isolation guarantee and
-//! its test therefore apply only on Linux.
+//! **macOS** (for the Mac track): `rustix-openpty` sets `CLOEXEC` on the two PTY fds atomically
+//! only on Linux; elsewhere it calls `libc::openpty` and sets it afterwards (`rustix-openpty-0.2.0`
+//! `src/lib.rs:60-61`), so a WebKit or nvim spawn racing on another thread can inherit them and
+//! hold a dead shell's EOF back. Not handled here yet. The `close_range`
+//! call above is also `#[cfg(target_os = "linux")]` only: on
+//! macOS the shell inherits every non-`CLOEXEC` descriptor this process holds, so the "inherits its
+//! terminal and nothing else" guarantee -- and its test, also Linux-only -- does not hold there
+//! either.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -42,8 +54,9 @@ use crate::metrics::TerminalMetrics;
 /// inside this terminal -- that terminal is a separate program the user is running, not the fork.
 pub const REMOVED_ENV: [&str; 3] = ["TMUX", "TMUX_PANE", "NEOVIM_BIN"];
 
-/// Set on the child, replacing whatever the host had. `TERM` is `xterm-256color`;
-/// `TERM_PROGRAM=eitri` lets shell configuration select eitri-only remaps.
+/// Set on the child, replacing whatever the host had. `TERM` is the value foot sets, so a shell's
+/// terminfo-keyed config behaves as it does there; `TERM_PROGRAM=eitri` lets a shell config key
+/// Eitri-only remaps on it.
 pub const SET_ENV: [(&str, &str); 3] = [
     ("TERM", "xterm-256color"),
     ("COLORTERM", "truecolor"),
@@ -91,9 +104,11 @@ pub fn fallback_shell(tried: &[PathBuf], passwd_shell: Option<PathBuf>) -> Optio
 /// starting 4096 bytes -- 64KiB is already far past any real passwd entry, NSS/LDAP included.
 const PASSWD_BUF_MAX_BYTES: usize = 64 * 1024;
 
-/// The login shell for this uid, if present in the passwd database. Retry `ERANGE` with a
-/// doubled buffer so a large NSS or LDAP entry does not look like a missing shell and silently
-/// fall back to `/bin/sh`.
+/// The login shell recorded for this uid, if the passwd database has one.
+///
+/// Retries on `ERANGE` with a doubled buffer: a fixed 4096-byte
+/// buffer silently fell back to `/bin/sh` -- indistinguishable from "no shell configured" -- for any
+/// passwd entry NSS/LDAP made large enough to overflow it (a long GECOS field, say).
 pub fn passwd_shell() -> Option<PathBuf> {
     let mut buf_size = 4096usize;
     loop {
@@ -396,11 +411,20 @@ impl PtyChild {
     /// kernel's own hangup when the last controller side closes; a group signal by pidfd would
     /// reach whatever group the process is in, which is not always its own.
     pub fn hangup(&self) {
-        // SAFETY: `kill` is a syscall on a pid captured when this process spawned the child.
-        // A stale or reused pid can signal the wrong process, but does not cause undefined behaviour.
-        // `try_wait` and `wait` borrow `&mut self` only during their calls, so the type system still
-        // allows a later `hangup(&self)` after reaping. Callers must avoid signalling after the child
-        // has been reaped, since its pid may have been reused.
+        // SAFETY: plain syscall on a pid this process spawned. This is memory-safe regardless of
+        // whether the child has since been reaped -- `kill` on a stale/reused pid is merely the
+        // wrong signal to the wrong process, not undefined behaviour.
+        //
+        // The borrow checker does not rule that out ("reaping takes `&mut self`, so it cannot
+        // have been reused" is false): `try_wait`/`wait` only borrow `&mut self` for the
+        // duration of their own call, so a *later*, separate `&self` call to `hangup` after the
+        // child was already reaped by an earlier call is not prevented by the type system at all.
+        // `&self` stays the signature because every caller (`Drop::drop` checks `try_wait`
+        // immediately before calling this; `shut_down` calls this exactly once, before any reap)
+        // calls it before the child could have been reaped, so this stays a latent hazard in a
+        // public API rather than a live bug. Making it safe by construction would mean `&mut self`
+        // plus an internal `try_wait` guard, an interface change every caller would have to be
+        // re-checked against.
         match &self.child {
             Held::Spawned(child) => unsafe {
                 libc::kill(-(child.id() as libc::pid_t), libc::SIGHUP);
@@ -522,8 +546,9 @@ fn reap_after_grace(pid: libc::pid_t) {
             0 => {
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
-                    // Retry the blocking wait on EINTR. A signal handler installed without
-                    // SA_RESTART could otherwise interrupt it and leave this pid as a zombie.
+                    // Retried on EINTR: a signal handler
+                    // installed without SA_RESTART elsewhere in this process could otherwise
+                    // interrupt the blocking wait and leave this pid a zombie for good.
                     while libc::waitpid(pid, &mut status, 0) == -1
                         && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
                     {}

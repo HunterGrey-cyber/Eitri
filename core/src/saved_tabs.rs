@@ -1,6 +1,6 @@
 //! The session tabs a project had open, kept between launches so the next launch can offer them
 //! back: `$XDG_STATE_HOME/eitri/tabs/<16 hex>.json`, named, written and set aside the way the layout
-//! file is (`layout::persist`): 0600 in a 0700 directory, a `.tmp` beside it and then a rename, a file
+//! file is (`state_paths`): 0600 in a 0700 directory, a `.tmp` beside it and then a rename, a file
 //! that cannot be used moved whole to `<name>.json.unusable` and read as nothing. Never inside the
 //! project.
 //!
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
-use crate::layout::persist::{create_state_dir, file_name, state_subdir, temporary};
+use crate::state_paths::{create_state_dir, file_name, state_subdir, temporary};
 
 /// The file format's version. A file of any other version is not read.
 pub const VERSION: u32 = 1;

@@ -541,7 +541,7 @@ impl AgentBackend {
             .map_err(|e| BackendError::fatal(format!("the project directory cannot be resolved: {e}")))?;
         let provider: std::sync::Arc<dyn agent::ExternalProvider + Send + Sync> = match (&agent, launch) {
             (AgentId::Codex, ExternalLaunch::Codex(program)) => {
-                let state_home = crate::layout::persist::state_subdir(
+                let state_home = crate::state_paths::state_subdir(
                     std::env::var_os("XDG_STATE_HOME").as_deref(),
                     std::env::var_os("HOME").as_deref(),
                     "",

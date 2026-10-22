@@ -81,7 +81,7 @@ pub struct ConversationRecord {
     #[serde(default)]
     pub provider_advertised_resume: bool,
     /// The first line of the first prompt typed in this session, cut to `TITLE_MAX_CHARS`: what the
-    /// resume picker names the row by. Written from
+    /// resume picker names the row by, so it reads as the user's own first sentence. Written from
     /// the prompt AS TYPED -- never the editor context composed above it -- and never rewritten once
     /// set, so a resume keeps the session's original subject (`set_title_if_missing`,
     /// `conversation::persist_record`).
@@ -91,14 +91,14 @@ pub struct ConversationRecord {
     /// when `None`, so a record without one reads exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// The session tab's rename: what the chooser shows ahead
+    /// The session tab's rename (`prefix ,`): what the chooser shows ahead
     /// of the title. The last rename wins and an empty one clears it (`set_name`), unlike `title`,
     /// which is first-one-wins. Absent from the JSON when `None`, so an older record reads as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
-/// The longest title stored, in characters (not bytes: prompts may contain Chinese). A
+/// The longest title stored, in characters (not bytes: a Chinese prompt takes three a character). A
 /// row on the start screen is one line of a narrow panel; this is about two of them, and the CSS
 /// does the rest.
 pub const TITLE_MAX_CHARS: usize = 80;
@@ -123,11 +123,32 @@ pub fn title_from_prompt(prompt: &str) -> Option<String> {
 }
 
 /// A previous conversation in this workspace that can be offered for continuation.
-/// Stores the provider, session id, timestamps and a title captured at write time.
-/// The stored title is first-one-wins. `BackendGreeting::for_kind` can display the CLI's
-/// `type:"ai-title"` from the transcript instead, rereading it on each greeting without
-/// persisting it. The picker falls back to the stored title, then the id and timestamps;
-/// it must not invent a label when neither title exists.
+///
+/// **This is the whole of what one record knows about a session, and it is thin**: a provider name,
+/// a session id, and two timestamps. There is no title, no first prompt, no turn or message count,
+/// no model -- nothing a picker could use to say what a session was ABOUT. **Correction
+/// (2026-09-19): there is a title now**, `title` below -- recorded here at write time, exactly the
+/// route the last sentence of this paragraph names; the rest of what follows still holds. `ConversationRecord` has
+/// never carried any of that, and the one place on disk that does -- the real Claude CLI's own
+/// transcript under `~/.claude/projects/` -- is deliberately off limits: `agent::transcript`'s
+/// module doc states that it "never reads or interprets transcript *content* -- only the file's
+/// existence and modification time", matching this project's repeated decision not to reimplement
+/// Claude's private storage format. So a UI built on this can honestly offer "which session" and
+/// "when", and must not fabricate "what about". Making richer labels possible means recording more
+/// HERE, at write time, not reading someone else's file.
+///
+/// **Correction (2026-09-20).** The two sentences above about the transcript
+/// are overturned: it is no longer off limits, and richer labels no longer have to be recorded
+/// here. `agent::transcript` READS it now -- see that module's own corrected doc, and constraint 3
+/// in particular -- and `BackendGreeting::for_kind` layers the CLI's own `type:"ai-title"` over
+/// `title` when it builds the picker. What that changes is only what a row DISPLAYS. This struct
+/// and the record behind it are untouched: `title` is still what this project recorded at write
+/// time, still first-one-wins, still the only title that reaches disk, and the CLI's is re-read on
+/// every greeting and written nowhere.
+///
+/// **"must not fabricate 'what about'" stands, and is now load-bearing in a second place**: it is
+/// why the display ladder has three real levels (the CLI's title, then this one, then the bare id
+/// and timestamps) rather than a generated label for a row that has neither.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumableSession {
     pub provider: String,
@@ -327,7 +348,7 @@ pub fn save_conversation_record(record: &ConversationRecord) -> std::io::Result<
 
 /// Creates `dir`, which lies under `kind_dir` (`conversations_dir()` or `history_dir()`), 0700 all
 /// the way down from Eitri's own state root -- `kind_dir`'s parent, `<state home>/eitri` -- and
-/// tightens those that an older build left open.
+/// tightens those that an older build left open (`private_fs`'s module doc).
 pub(crate) fn create_private_state_dir(dir: &Path, kind_dir: PathBuf) -> std::io::Result<()> {
     let root = kind_dir.parent().map(Path::to_path_buf).unwrap_or(kind_dir);
     crate::private_fs::create_private_dir_all(dir, &root)
@@ -336,7 +357,7 @@ pub(crate) fn create_private_state_dir(dir: &Path, kind_dir: PathBuf) -> std::io
 /// Writes through a temp file in the SAME directory, then renames over the target.
 ///
 /// The temp file is created 0600, so the record the rename puts in place is 0600 too: a record
-/// carries the session's title, its first prompt line.
+/// carries the session's title, its first prompt line, which no other account may read.
 ///
 /// `std::fs::write` truncates in place, so a crash (or a reader arriving mid-write) between the
 /// truncate and the last byte leaves a file that parses as nothing -- which `resumable_sessions`
@@ -382,14 +403,20 @@ pub(crate) fn write_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Prunes one conversation's directory toward `MAX_RECORDS_PER_CONVERSATION` records
-/// and removes orphaned temp files. The just-written `keep` record is never a candidate,
-/// regardless of its timestamp. Cleanup is best-effort and silent so an unlink failure
-/// does not turn a successful save into an error.
-/// Records with a held session lease are also protected, including leases in other
-/// windows. They still count toward the cap, so pruning removes the oldest unheld
-/// records instead. This calls `SessionLease::is_held` for each candidate.
-/// A lease probe can briefly make a competing `try_acquire` return `AlreadyHeld`.
+/// Keeps one conversation's directory bounded: at most `MAX_RECORDS_PER_CONVERSATION` records, plus
+/// a sweep of temp files orphaned by a process that died mid-write.
+///
+/// `keep` is the record just written, which is never a prune candidate however its stamp ranks --
+/// deleting the record a caller just asked to save would be the one genuinely surprising outcome.
+/// Everything here is best-effort and silent on failure: this is housekeeping, and a save that
+/// succeeded must not be reported as failed because a stale file could not be unlinked.
+///
+/// **A record whose session is open somewhere
+/// (its lease is held -- by a tab of this window, or another window) is never a candidate.** It
+/// still counts toward the cap, so what goes is the oldest record nobody holds -- an open tab must
+/// never lose its own record out from under it, but the cap still binds overall. The lease probe
+/// (`SessionLease::is_held`) is documented to cost a few microseconds of a competing `try_acquire`
+/// seeing `AlreadyHeld`; this is one of the two call sites that accepts that cost.
 fn prune(dir: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut records: Vec<(Option<u128>, String, PathBuf)> = Vec::new();
@@ -422,8 +449,9 @@ fn prune(dir: &Path, keep: &Path) {
                     continue;
                 };
                 let (stamp, _) = updated_at_rank(&record);
-                // A session with a held lease, in this window or another, is never a prune candidate.
-                // Its record still counts toward the cap, so prune the oldest unheld record instead.
+                // A record whose session is open somewhere (its lease is held --
+                // a session tab of this window, or another window) is never a candidate. It still
+                // counts toward the cap, so what goes is the oldest record nobody holds.
                 let held = crate::lease::SessionLease::is_held(
                     &record.provider,
                     &record.canonical_cwd,
@@ -486,12 +514,12 @@ pub(crate) fn existing_record(conversation_id: &str, provider_session_id: &str) 
     (legacy.provider_session_id == provider_session_id).then_some(legacy)
 }
 
-/// Sets the directory record's `title` only if it has none. Returns `Ok(false)` if
-/// no directory record exists or a title is already set; the first title wins.
-/// The ingestion thread calls this through `ingestion::flush_title` only after the
-/// record is on disk, since calling earlier can lose the title to `Ok(false)`.
-/// `updated_at` is unchanged: it means "last started, resumed or finished a turn";
-/// titling is none of those.
+/// Gives this session's directory record `title`, if it has none yet. `Ok(false)` when there is no
+/// directory record or the record already has a title -- the first one wins, for good. Called only
+/// by the ingestion thread, and only once it knows the record is on disk (`ingestion::flush_title`):
+/// a caller that cannot know that loses the title to the `Ok(false)`, which is how the first version
+/// of this feature dropped one.
+/// `updated_at` is left alone: it means "last started, resumed or finished a turn", and titling is none of those.
 pub(crate) fn set_title_if_missing(
     conversation_id: &str,
     provider_session_id: &str,

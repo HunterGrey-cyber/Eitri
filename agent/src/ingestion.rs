@@ -76,15 +76,18 @@ pub enum UiDelivery {
     Resync,
 }
 
-/// [`UiDelivery`] with each event's revision, read under the lock that folds the event.
-/// The tag is the projection's `last_revision` immediately after that fold.
+/// [`UiDelivery`], with each event's revision: the projection's `last_revision` right after that
+/// event was folded, read under the same lock as the fold itself.
 ///
-/// Events may be folded and queued between a caller's last drain and its next snapshot. Tags let
-/// the caller skip queued events already present in that snapshot instead of applying them twice.
-/// `AgentSessionProjection::apply` increments `last_revision` once per fold and nothing else changes
-/// it, so a tag at or below the snapshot's revision is already included. The caller stores that
-/// revision with `AgentConversation::note_ui_snapshot`, and the next drain takes it back. Keeping
-/// it on the conversation prevents a revision from being reused for another session.
+/// **What it is for.** A caller that also hands the UI a snapshot needs to know
+/// which queued events that snapshot already contains. Folding and queueing happen on the ingestion
+/// thread, so between the caller's last drain and the moment it reads a snapshot, more events can be
+/// folded (and so be in the snapshot) and queued (and so reach the next drain) -- the same event,
+/// twice. The snapshot's own `last_revision` and these tags compare directly, because
+/// `AgentSessionProjection::apply` bumps `last_revision` by exactly one per fold and nothing else
+/// moves it: an event tagged at or below a snapshot's revision is already in that snapshot. The
+/// caller notes that revision on the conversation (`AgentConversation::note_ui_snapshot`) and its
+/// next drain takes it back, so a revision never outlives the session it was read from.
 #[derive(Debug)]
 pub enum RevisedDelivery {
     Nothing,
@@ -176,10 +179,11 @@ struct IngestState {
     pending_title: Option<String>,
     /// A rename not yet written; the outer `Option` says whether there is one.
     pending_name: Option<Option<String>>,
-    /// Whether this session's record is on disk. A known session id does not guarantee this:
-    /// adoption sets the id under the lock, then writes the record after releasing it.
-    /// A title written during that gap can be lost because no record exists yet.
-    /// This starts as `true` for a resume because `resume()` writes the record before returning.
+    /// Whether this session's record is on disk. NOT the same moment as the session id
+    /// ([`SessionIdSlot`]) becoming `Some`: adoption sets the id under the lock and writes the record after releasing
+    /// it, and a title written into that gap found no record and was lost (reproduced 20/20). `true`
+    /// from the start for a resume, whose record `resume()` writes before
+    /// it returns.
     record_written: bool,
     /// Whether this conversation has produced something worth storing since its history was last
     /// written. Set by `fold` at a turn boundary and nowhere else -- see `flush_history`.
@@ -1084,9 +1088,9 @@ fn flush_name(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, co
 /// only when there is something new to write.
 ///
 /// **Which thread this runs on is the whole point, and it is not a style preference.** The title
-/// feature's first version wrote from the UI thread and argued from a lock that it was safe; a
-/// review found the session id becomes visible before the record is on disk and reproduced the
-/// title being dropped in that gap, 20 runs out of 20 (`record_written`'s own doc). A history write
+/// feature's first version wrote from the UI thread and argued from a lock that it was safe; but
+/// the session id becomes visible before the record is on disk, and the title was dropped in that
+/// gap, 20 runs out of 20 (`record_written`'s own doc). A history write
 /// is strictly worse on that thread than a title write was: it is two fsyncs and a serialization of
 /// the whole conversation, landing on a 33ms GTK tick.
 ///
@@ -1173,8 +1177,9 @@ fn adopt_provider_session(
             );
             None
         }
-        // The lease could not be taken for a reason other than contention, such as an unusable lease
-        // directory. Do not imply another window holds it: a missing `XDG_RUNTIME_DIR` can cause this path.
+        // Not contention: the lease directory could not be used at all. Saying "another window"
+        // here sent the reader looking for a process that did not exist -- on macOS before 2026-09-17,
+        // every session took this branch because `XDG_RUNTIME_DIR` was unset.
         Err(e) => {
             eprintln!(
                 "agent: could not take the session lease for {provider_session_id}: {e} -- \

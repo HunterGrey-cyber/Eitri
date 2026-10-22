@@ -1,11 +1,17 @@
-//! Pumps Claude CLI `AgentEvent`s through `translate_wire_event` into provider-neutral
-//! `AgentDomainEvent`s, then folds them into a queryable `AgentSessionProjection`.
-//! The session exposes `start`, `send_turn`, `interrupt`, `respond_permission`, `pump` and `shutdown`.
-//! Wire-specific types stay behind this module's public boundary. The translator is
-//! `pub(crate)` so process tests can exercise translation of relayed events.
-//! The private `pending_permission_sources` map retains each request's channel so permission
-//! answers can be routed through `AgentProcess::respond_permission` without exposing that
-//! detail in the projection.
+//! The reducer stage sitting above `agent::process::AgentProcess`: pumps the real Claude-CLI
+//! wire events (`agent::event::AgentEvent`) through a per-session translation step into the
+//! provider-neutral `agent::projection::AgentDomainEvent` vocabulary, then folds each into a
+//! queryable `AgentSessionProjection` -- this crate's real public API for a whole conversation
+//! (`start`/`send_turn`/`interrupt`/`respond_permission`/`pump`/`shutdown`).
+//!
+//! `AgentEvent`/`PermissionSource` (the Claude-wire-specific types) never cross this module's own
+//! public boundary as such: `translate_wire_event` (`pub(crate)`, so `process`'s own tests can
+//! drive the real relayed event one layer further) is the one place they get turned into
+//! `AgentDomainEvent`s, since these wire types are not domain or UI events.
+//! The one piece of Claude-wire-specific state this module still has to keep -- which channel
+//! (`PermissionSource::HookRelay` vs `CanUseTool`) a given pending permission arrived on, needed
+//! to route `AgentProcess::respond_permission`'s answer back correctly -- lives in
+//! `pending_permission_sources`, a private map never exposed through `AgentSessionProjection`.
 
 use crate::event::{AgentEvent, PermissionSource};
 use crate::process::AgentProcess;
@@ -45,16 +51,18 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    /// Spawns the underlying `AgentProcess` for a whole conversation.
-    /// `AgentProcess::spawn` documents `project_dir` and `disallowed_tools`.
-    /// The CLI always runs gated in `default`; no permission mode is passed here.
+    /// Spawns the underlying `AgentProcess` for a whole conversation. See
+    /// `AgentProcess::spawn`'s own doc for what `project_dir`/`disallowed_tools` mean. There is no
+    /// permission mode to pass: the CLI always runs gated, in `default`.
     ///
-    /// Two `AgentSession`s can share a project directory. Each process receives its own
-    /// `PreToolUse` hook configuration through `--settings` in argv, so neither session can
-    /// read, overwrite or delete the other's hook configuration.
-    /// The real-CLI test in `backend_conformance` verifies this isolation.
+    /// **Nothing here claims the directory.** Two `AgentSession`s in one project directory is a
+    /// supported shape, not a hazard to be locked out: each one's `PreToolUse` hook config travels
+    /// in its own CLI process's argv (`--settings`, see `agent::settings`), so neither can read,
+    /// overwrite or delete the other's. `backend_conformance`'s
+    /// `real_two_sessions_in_the_same_project_dir_each_see_only_their_own_permission_hooks`
+    /// asserts exactly that against the real CLI.
     ///
-    /// `project` controls whether the project's settings tiers load.
+    /// `project` decides whether the project's own settings tiers load; the caller states it.
     pub fn start(project_dir: &Path, disallowed_tools: &[&str], project: ProjectTrust) -> std::io::Result<Self> {
         let process = AgentProcess::spawn(project_dir, disallowed_tools, project)?;
         Ok(Self {
@@ -249,9 +257,12 @@ impl AgentSession {
         if let Some(process) = &mut self.process {
             process.shutdown();
         }
-        // Cancel pending permissions when the session ends, as on interrupt: no answer can be
-        // routed to an ended session. Emit `PermissionOutcome::CancelledBySessionClose` for each
-        // request and remove its routing source before closing the projection.
+        // Fail-closed on shutdown, mirroring interrupt()'s identical reasoning: a permission request
+        // from a session that's ending can never be genuinely answered. A shell/window close needs this
+        // specifically for a Rust shell/window close -- the pre-Phase-1 AgentSession::shutdown already
+        // did the equivalent (state.pending_permissions.clear()); this restores that behavior under
+        // the new domain-event vocabulary, giving PermissionOutcome::CancelledBySessionClose its first
+        // real producer.
         let pending_ids: Vec<String> = self.projection.pending_permissions.keys().cloned().collect();
         for permission_id in pending_ids {
             self.pending_permission_sources.remove(&permission_id);

@@ -1,32 +1,28 @@
 // agent/src/providers/claude_sidecar/runtime_policy_verification.rs
-//! Every test in this file spends real Claude tokens. Use the TEST Claude profile.
-//! In the commands below, replace `<test-profile-wrapper>` with an environment wrapper that
-//! selects that profile and routes both CLI and SDK launches through the policy launcher.
-//! Configure the SDK checkout in that environment before running the tests.
-//! Record the CLI build beside the results. The launcher does not pin or print the version,
-//! so the build must be captured separately to identify the runtime boundary being tested.
+//! Every test in this file spends real Claude tokens. Use a test Claude profile.
+//! Capture the CLI version with the results, since runtime behavior depends on the build
+//! and the test launcher neither pins nor reports it.
 //!
 //! ```text
-//! <test-profile-wrapper> claude --version
-//! <test-profile-wrapper> cargo test -p agent --lib runtime_policy -- --ignored --test-threads=1 --nocapture
+//! claude --version
+//! cargo test -p agent --lib runtime_policy -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! `ClaudeHostPolicy.setting_sources` and `ClaudeHostPolicy.tool_policy` restrict spawned agents.
-//! Checking that these fields reach the SDK's `Options` object does not establish runtime behavior.
-//! Each test uses an A/B pair that differs in exactly one protocol field. A hook that never fires
-//! could be unreachable, and an unused tool could have been declined rather than forbidden.
-//! The control arm builds a request with `build_create_request` and changes that field.
-//! The test arm uses `ClaudeSidecarProvider::create_session`, carrying
-//! `CONSERVATIVE_DISALLOWED_TOOLS` and the `[PROJECT, LOCAL]` setting sources.
+//! `ClaudeHostPolicy.setting_sources` and `ClaudeHostPolicy.tool_policy` constrain the
+//! spawned agent. Checking values in the SDK's `Options` object does not establish runtime
+//! behavior. A hook that never fires may be unreachable; a tool the model never calls may
+//! still be allowed. Each test therefore compares two arms differing in exactly one proto field.
 //!
-//! Every session here is gated (`INTERACTIVE`, never switchable). The product sends no other mode,
-//! and `build_create_request` takes no mode argument. A BYPASS deny-list test would measure a
-//! session this client cannot create, so it is not included here.
+//! The CONTROL arm builds a request through `build_create_request` and changes that field.
+//! The TEST arm uses `ClaudeSidecarProvider::create_session`, carrying
+//! `CONSERVATIVE_DISALLOWED_TOOLS` and the `[PROJECT, LOCAL]` selection.
 //!
-//! `build_create_request` and `open_session` stay private to keep the fixed policy out of the public
-//! API. These tests live inside the crate so they can exercise those functions without exposing
-//! policy parameters. Running `cargo test -p agent --lib -- --ignored` spends real tokens:
-//! these tests add model turns to the existing real-CLI tests in `agent::process`.
+//! Every session here is INTERACTIVE and never switchable; `build_create_request` takes
+//! no mode. A BYPASS deny-list test would not cover a session this client can create.
+//!
+//! `build_create_request` and `open_session` stay private so tests do not widen the product's
+//! policy API. These are crate-local `--lib` tests and add model turns to the real-CLI tests:
+//! `cargo test -p agent --lib -- --ignored` spends tokens.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -218,7 +214,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
     // tiers, so the user tier loads. Without this arm the opt-out arm proves nothing: a tier that
     // never loads looks exactly like a tier that is excluded.
     let control = connect();
-    // Gated like every product session; this turn uses no tool, so no permission request is raised.
+    // Gated, as every product session is; this turn uses no tool, so nothing is asked.
     let mut request = build_create_request(
         cwd.path().to_string_lossy().to_string(),
         StreamingPreference::Complete,

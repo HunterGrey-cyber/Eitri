@@ -147,9 +147,10 @@ pub enum SessionCommand {
     Input(NormalizedInput),
     /// A new grid: `TIOCSWINSZ` on the PTY and a `Term` resize, together. Below one cell is one cell.
     Resize(PtySize),
-    /// Whether the pane holds keyboard focus, controlling a solid or hollow cursor.
-    /// This command changes only cursor shape. [`SessionCommand::FocusReport`] sends the focus
-    /// report through `submit` so it cannot overtake keys waiting behind a paste.
+    /// Whether the pane holds the keys: a solid cursor or a hollow one, and nothing else -- the
+    /// report is [`SessionCommand::FocusReport`], sent through the pane's one door (`submit`) so it
+    /// can never overtake keys still waiting behind a paste. This command changes only the cursor's
+    /// shape.
     Focus(bool),
     /// A mouse press, release, motion or wheel notch, encoded on the session thread against the
     /// live `TermMode` (bottom-terminal phase 3c). See [`crate::mouse`].
@@ -167,8 +168,8 @@ pub enum SessionCommand {
     /// A host selection gesture: a drag's start/extend/finish, or a clear. See
     /// [`crate::select`].
     Select(SelectCommand),
-    /// `prefix [` or `prefix PageUp` enters read-only copy mode. Leaving with `q`, `Esc`,
-    /// or a shell exit or restart returns to the live bottom.
+    /// `prefix [`/`prefix PageUp` opens the terminal's own read-only copy mode; leaving it (`q`,
+    /// `Esc`, or the shell exiting/restarting) always snaps back to the live bottom, as tmux's does.
     /// See [`crate::screen::Screen::set_copy_mode`].
     CopyMode(bool),
     /// Read the terminal for a move (module doc): the answer is the record, or why it stays.
@@ -226,7 +227,8 @@ impl ExitInfo {
         }
     }
 
-    /// The line the pane keeps under the last screen.
+    /// The line the pane keeps under the last screen (hold the screen, Enter restarts), so what the
+    /// program printed last stays readable after it exits.
     pub fn notice(&self) -> String {
         if self.detached {
             return "[process left the terminal, still running \u{2014} Enter ends it and restarts]".to_string();
@@ -305,8 +307,8 @@ impl Shared {
         self.ring(wake);
     }
 
-    /// Folds `apply` into the pending update without ringing the host.
-    /// minor 1: a title or bell rides the render clock out (see `Worker::events_pending`) rather
+    /// Folds `apply` into the pending update without ringing the host: a title or bell rides the
+    /// render clock out (see `Worker::events_pending`) rather
     /// than waking the host itself, so a stream with an event on most reads wakes the host once per
     /// rendered frame, not once per loop turn.
     fn apply_pending(&self, apply: impl FnOnce(&mut Update)) {
@@ -703,9 +705,11 @@ impl Worker<'_> {
                 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                // A poll failure such as `ENOMEM` ends the session without a host shutdown request.
-                // Notify the host so the pane shows the exit and Enter can restart it.
-                // `shut_down` consumes `self`, so capture the pieces needed by `publish` first.
+                // Rare (`ENOMEM`, ...), and not host-initiated like the other `shut_down` calls in
+                // this loop: unlike those, the host has no idea this is happening and needs telling,
+                // or the pane goes silent with no notice and Enter does not restart. `shut_down`
+                // consumes `self`, so the pieces `publish` needs are
+                // captured first.
                 let (wake, shared) = (self.wake, self.shared.clone());
                 let exit = self.shut_down();
                 shared.publish(wake, |update| update.exited = exit.or(Some(ExitInfo::UNKNOWN)));
@@ -879,7 +883,7 @@ impl Worker<'_> {
                     self.screen.select(cmd);
                     // `Finish`'s text has nowhere else to reach the host: unlike a PTY read, a
                     // command never falls through to the run loop's own `publish_events` call, so
-                    // this command handler is the one place that has to make it (review: a copy
+                    // this command handler is the one place that has to make it (a copy
                     // made with nothing typed afterward would otherwise sit unpublished until the
                     // next byte of PTY output, which may never come).
                     self.publish_events(Instant::now());
@@ -1208,7 +1212,7 @@ impl Worker<'_> {
     /// does nothing with the wake anyway. Clipboard is the one exception: it is the one event this
     /// pump already acts on, so hidden or not it rings at once rather than waiting for a clock this
     /// pane, while hidden, never polls. A copy to the primary selection is the same kind of event
-    /// too, and so is a finished host selection: the clipboard should not
+    /// (phase 2), and so is a finished host selection: the user's clipboard should not
     /// wait behind a clock for a gesture that already ended.
     fn publish_events(&mut self, now: Instant) {
         let events = self.screen.take_events();

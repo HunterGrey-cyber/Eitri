@@ -78,10 +78,11 @@ pub struct CallWatch {
     pub sent_at: Instant,
     /// The request came back: its Lua returned, or nvim went away.
     pub done: bool,
-    /// Whether nvim answered the request after running it. For `:confirm qall`, an answer means
-    /// nvim did not quit: a successful quit ends the process before sending an answer.
-    /// The host can therefore clear a pending quit. `false` while outstanding or when the request
-    /// ended because nvim exited, distinguishing an exit from a cancelled quit.
+    /// It came back with nvim's answer: nvim took the request, ran it and is still there to say so.
+    /// For a `:confirm qall` that means nvim did NOT quit (a real quit ends the process before any
+    /// answer is sent), so a host can clear the quit it was waiting on. `false` while outstanding,
+    /// and for a request that ended because nvim went away (the two used to be
+    /// one `done`, so a cancelled quit could not be told from an exit).
     pub returned: bool,
     /// The last `nvim_get_mode` answer since it was sent; `None` before the first one.
     pub last_answer: Option<NvimMode>,
@@ -177,10 +178,12 @@ impl WatchedCall {
 }
 
 impl WatchedCall {
-    /// Waits up to `within` for the request's worker to publish how it ended, then returns the watch.
-    /// Nvim-rs delivers an answer or a closed-pipe error through a oneshot. Nvim's exit can reach the
-    /// host before the worker publishes it. Waiting here lets an exit handler read the completed
-    /// result; a request still outstanding at the bound returns with `done == false`.
+    /// The watch once the request's worker has published how it ended, waited for up to `within`.
+    /// nvim-rs hands the answer -- or, when nvim's pipe closes, an
+    /// error -- to the worker through a oneshot, and the worker publishes it a moment later; nvim's
+    /// exit reaches the host without waiting for that. Called at the exit, when nvim-rs's IO loop
+    /// has already resolved the request, this returns within microseconds; a request still
+    /// outstanding at the bound comes back with `done == false`.
     pub(crate) fn settled(&self, within: Duration) -> CallWatch {
         let deadline = Instant::now() + within;
         loop {

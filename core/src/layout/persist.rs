@@ -34,7 +34,6 @@
 //! window's trees or floats, to avoid placing it twice, and copy the file aside.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -944,46 +943,14 @@ fn decode_v2_as_written(
 // ---------------------------------------------------------------------------------------------
 // Files.
 
-/// `<state home>/eitri/<sub>`: the rule `state_dir` states, for any of Eitri's state
-/// directories (`layout`, and the session tabs' `agent`).
-pub fn state_subdir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>, sub: &str) -> Option<PathBuf> {
-    match (xdg_state_home, home) {
-        (Some(state), _) if Path::new(state).is_absolute() => Some(PathBuf::from(state).join("eitri").join(sub)),
-        (_, Some(home)) if Path::new(home).is_absolute() => {
-            Some(PathBuf::from(home).join(".local/state/eitri").join(sub))
-        }
-        _ => None,
-    }
-}
-
-/// Creates `dir` -- a [`state_subdir`], `<state home>/eitri/<sub>` -- and anything missing above
-/// it 0700, and tightens `dir` and its `eitri` parent to 0700 where an older build left either
-/// open. Every writer of Eitri's own state in this
-/// crate creates its directory through this, and writes its files 0600
-/// (`agent::private_fs::write_private`).
-pub fn create_state_dir(dir: &Path) -> std::io::Result<()> {
-    agent::private_fs::create_private_dir_all(dir, dir.parent().unwrap_or(dir))
-}
-
-/// `<state home>/eitri/layout`, from the two variables that decide it: `XDG_STATE_HOME`, else
-/// `$HOME/.local/state` (the XDG spec's own default). An `XDG_STATE_HOME` that is empty or not an
-/// absolute path is ignored, as the XDG spec says to. A `HOME` that is empty or not absolute is
-/// refused too, as `agent::state_dirs` refuses a relative home directory: relative, it would resolve
-/// against the process's cwd, which for a window started with no project argument IS the project --
-/// and nothing is written into the project. `None` when neither gives a directory.
-pub fn state_dir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    state_subdir(xdg_state_home, home, "layout")
-}
-
-/// The version 1 file's name for this canonical project root: 16 hex digits of its SHA-256, `.json`.
-/// This build only reads that file; Eitri's other per-project state files are named the same way.
-pub fn file_name(project_root: &Path) -> String {
-    format!("{}.json", &agent::conversation_id_for_cwd(project_root)[..16])
-}
+// Re-exported for the callers that still reach these through the layout module: the shell's
+// `main.rs`, which moves with the window controller, `window_link`'s start and pair files, and some
+// tests. New code imports `crate::state_paths`.
+pub use crate::state_paths::{create_state_dir, file_name, project_key, state_dir, state_subdir, temporary};
 
 /// The version 2 file's name: the same 16 hex digits, `.v2.json`.
 pub fn file_name_v2(project_root: &Path) -> String {
-    format!("{}.v2.json", &agent::conversation_id_for_cwd(project_root)[..16])
+    format!("{}.v2.json", project_key(project_root))
 }
 
 /// What [`load`] found.
@@ -1144,12 +1111,6 @@ pub fn save(dir: &Path, project_root: &Path, workspaces: &Workspaces, current: &
     Ok(path)
 }
 
-/// Where a file at `path` is written first: for a `.json` file, `<its name>.<this process's id>.tmp`
-/// beside it.
-pub fn temporary(path: &Path) -> PathBuf {
-    path.with_extension(format!("json.{}.tmp", std::process::id()))
-}
-
 /// Moves this project's version 2 file, whole, to `<hash>.v2.json.unusable` beside it and returns
 /// where it went: what the window does before it writes over a file it cannot open. A hand-edit with
 /// one typo, or a file a newer build wrote, is kept for a person to read. An earlier `.unusable` is
@@ -1181,6 +1142,7 @@ mod tests {
     use super::super::v1_reference::{v1_arrange, V1Node, V1Pin};
     use super::*;
     use serde_json::json;
+    use std::ffi::OsStr;
 
     fn root() -> PathBuf {
         PathBuf::from("/home/user/project")

@@ -1,16 +1,26 @@
 // agent/src/history/store.rs
-//! Stores A, the application's copy of conversation history, beside conversation records.
-//! It is the fallback for [`super::transcript_jsonl`], which reads the Claude CLI transcript,
-//! B. The CLI transcript takes precedence when usable. The stored copy supports resumes
-//! when the CLI configuration or transcript is unavailable or no conversation can be parsed.
+//! **A**: Eitri's own copy of a conversation's history, written beside its conversation records.
 //!
-//! History lives outside `conversations/`; see `state_dirs::history_dir`. It carries its
-//! own format `version`, and [`load`] rejects an unknown version in full. The CLI's version
-//! field identifies a release rather than a schema, so it cannot provide this check.
+//! This is the FALLBACK
+//! under [`super::transcript_jsonl`], which reads the real Claude CLI's own transcript. B wins
+//! whenever it can be read at all; A exists for the resume where it cannot -- no
+//! `CLAUDE_CONFIG_DIR`, an unreadable file, or a file whose format this build no longer recognises.
 //!
-//! Only the six record types implement `Deserialize`; `AgentSessionProjection` does not.
-//! Added fields in `StoredHistory` or those record types need `#[serde(default)]` so files
-//! written before the fields existed still load.
+//! Three things about this file are decisions with reasons, not preferences:
+//!
+//! - **It is not in `conversations/`.** See `state_dirs::history_dir`.
+//! - **It carries its own `version`, and an unrecognised one is refused whole.** That field is the
+//!   only defined "I do not know this format" signal anywhere in this feature: the CLI's transcript
+//!   has no schema version at all (its `version` is the CLI's own release, which promises nothing
+//!   about format), so B can only observe a format change as "nothing parsed". A does not have to
+//!   guess, and [`load`] refuses rather than parsing what it can and inventing the rest.
+//! - **Only the six record types are `Deserialize`, never `AgentSessionProjection`.** See that
+//!   type's own doc comment for why.
+//!
+//! Adding a field to `StoredHistory` or to any of the six record types needs `#[serde(default)]`,
+//! or every file written before it stops loading. The precedent is `ConversationRecord`'s
+//! `provider_advertised_resume` and `title`, and the test below is shaped after the one that pins
+//! them (`persistence::tests::a_record_written_before_provider_advertised_resume_existed_still_loads`).
 
 use crate::projection::{ToolCallRecord, TranscriptMessage, UserPromptRecord};
 use serde::{Deserialize, Serialize};
@@ -23,16 +33,17 @@ use std::path::PathBuf;
 /// version is refused whole by [`load`]; that is the point of having the number.
 pub const HISTORY_FORMAT_VERSION: u32 = 1;
 
-/// One conversation's stored history.
+/// One conversation's history as Eitri recorded it.
 ///
-/// Contains prompts, assistant messages, and tool calls, rather than a serialized projection.
-/// Live state is excluded: no projection `status`, `active_turn_id`, `session_id`,
-/// `provider_session_id`, `model`, `cwd`, `usage`, or `pending_permissions`. A restored permission
-/// card would have no live provider request to answer.
+/// Deliberately not a serialized projection. It holds the three collections that ARE history and
+/// nothing that is live state: no `status`, no `active_turn_id`, no `session_id`/
+/// `provider_session_id` inside a projection, no `model`, no `cwd`, no `usage`, and above all no
+/// `pending_permissions` -- a permission card restored from a file would be a request nobody can
+/// answer, since the provider that raised it is gone.
 ///
-/// There is no `next_seq`. Loading refolds the items: stored `seq` values determine their order,
-/// then the projection's `apply` assigns new numbers. Persisting a counter would create a second
-/// source of sequence numbers.
+/// It also carries no `next_seq`. Loading this back is a REFOLD: each item's `seq` is a sorting key
+/// on disk and the projection's own `apply` assigns the numbers again. A stored counter would be a
+/// second numbering authority, and `apply` must stay the only one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredHistory {
     pub version: u32,
@@ -57,9 +68,10 @@ pub enum HistoryLoadError {
     Io(std::io::Error),
     /// The file is not JSON, or not JSON shaped like this version's `StoredHistory`.
     Malformed(serde_json::Error),
-    /// The file declares an unsupported format version. Refuse the whole file without salvaging
-    /// fields or treating it as a parse failure. Return both the found and expected versions so the
-    /// caller can explain the mismatch.
+    /// The file declares a format this build does not know. A clean, defined
+    /// refusal -- NOT a parse failure, and not a partial read: nothing is salvaged, no field is
+    /// guessed at, and the caller is told the two numbers so a human can see which way the skew
+    /// runs.
     UnknownVersion { found: u32, expected: u32 },
 }
 
@@ -81,18 +93,35 @@ impl std::fmt::Display for HistoryLoadError {
 impl std::error::Error for HistoryLoadError {}
 
 impl StoredHistory {
-    /// Builds a truncated snapshot from the three projection collections.
+    /// Builds what should go on disk from the three collections, TRUNCATED.
     ///
-    /// `flush_history` writes the whole projection rather than appending to the stored copy.
-    /// After a resume from the CLI transcript, the next completed turn replaces the stored
-    /// copy with the restored view plus the new turn. Older content present only in the stored
-    /// copy is lost. For example, when `HISTORY_SCAN_MAX_BYTES` limits the restored transcript
-    /// to its tail, the next snapshot contains only that restored history and new content.
+    /// **This doc used to say:** "Truncation on the write path is not belt-and-braces: A
+    /// accumulates ACROSS resumes. A resume loads history into the projection, the session then
+    /// adds to that same projection, and the next write stores both -- which is the property that
+    /// makes A survive a CLI transcript being rotated away, and is also what makes the file grow
+    /// without bound if nothing cuts it here."
     ///
-    /// Each snapshot is bounded. Truncation uses the same caps and direction as the reader:
-    /// `HISTORY_MAX_ITEMS` items and `HISTORY_MAX_CHARS` characters, taking whole items from
-    /// newest to oldest. The newest item is kept even if it alone exceeds the budget. Matching
-    /// the reader prevents repeated writes and reads from discarding different sets of items.
+    /// **Both halves of that were wrong (found 2026-09-20),
+    /// and the sentence is kept above rather than deleted so the next reader can see which claim
+    /// was corrected.** `flush_history` (agent/src/ingestion.rs) writes the WHOLE projection; it
+    /// does not append. After a resume the projection holds whatever was just restored -- when B
+    /// (the CLI's own transcript) supplied it, that is B's view -- so one completed turn overwrites
+    /// A with "what B restored, plus this session's new part", and anything A held beyond B is
+    /// gone. The concrete bad case: a session whose transcript is past `HISTORY_SCAN_MAX_BYTES`
+    /// resumes from B's last 32 MiB, runs one turn, and A now holds only that tail's worth.
+    ///
+    /// So **A is a snapshot of the last projection, not an accumulating archive**, and the file
+    /// cannot grow without bound anyway: every write is a bounded projection. Making it really
+    /// accumulate would need a write-time merge of A with the projection (by `seq`, deduplicated,
+    /// then truncated), which carries its own correctness burden -- the same item can differ in
+    /// text between the two records, which is how compaction works -- and nobody asked for it.
+    /// Deliberately not done here.
+    ///
+    /// **Truncation on the write path stays, and its reason is the one below**, not the growth
+    /// argument above. The caps and the direction are the reader's, deliberately:
+    /// `HISTORY_MAX_ITEMS` items and `HISTORY_MAX_CHARS` characters, whole items only, taken from
+    /// the NEWEST backwards, with the newest item always kept even when it alone is over budget. A
+    /// file cut by one rule and read by another would drop a different set of items on each pass.
     pub fn from_collections(
         conversation_id: String,
         provider_session_id: String,
@@ -187,8 +216,8 @@ fn truncate_to(
         if kept >= max_items {
             break;
         }
-        // Keep at least one item even when it exceeds the character budget. Reporting history with
-        // zero visible rows would be more confusing than showing one oversized row.
+        // At least one item always survives, however large it is: "there is history here" followed
+        // by zero rows is harder to understand than one oversized row.
         if kept > 0 && chars + cost > max_chars {
             break;
         }

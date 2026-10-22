@@ -1,7 +1,11 @@
-//! Scrollback is a read-only pan over retained history using
-//! `terminal_frame::viewport::RawViewport`, which anchors by ordinal.
-//! This module maps host gestures such as `Shift+PageUp`, wheel notches, and `Shift+End`
-//! to movements and clamps them to the terminal's retained history.
+//! Scrollback: a read-only pan over history, over `terminal-frame::viewport::RawViewport` -- the
+//! anchor-by-ordinal model `terminal-frame`'s own module docs argue for, not by offset. Nothing here
+//! reimplements that argument; this module is only the piece `RawViewport` leaves to its caller: what
+//! a host gesture (`Shift+PageUp`, a wheel notch, `Shift+End`) means as a movement, and how far that
+//! movement clamps against the terminal's own retained history.
+//!
+//! The gestures follow tmux copy mode, foot and alacritty, the tools a terminal user already has in
+//! their hands: the `[N/M]` indicator, three lines a wheel notch, and the page keys.
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
@@ -19,10 +23,10 @@ pub enum ScrollRequest {
     /// Move by whole screens (`rows` lines each) -- `Shift+PageUp`/`Shift+PageDown`, matching
     /// alacritty's own `ScrollPageUp`/`ScrollPageDown` (`screen_lines`) and foot's
     /// `scrollback-up-page`/`scrollback-down-page`; also copy mode's own `PageUp`/`PageDown`
-    ///.
+    /// (tmux `page-up`/`page-down`).
     Pages(i32),
     /// Move by half a screen (`rows / 2` lines, at least one) -- copy mode's `Ctrl+u`/`Ctrl+d`
-    ///. No other caller sends this yet.
+    /// (tmux `halfpage-up`/`halfpage-down`). No other caller sends this yet.
     HalfPages(i32),
     /// Return to the live bottom and end the pin -- `Shift+End`, foot's `scrollback-end`, and any
     /// typed key ([`crate::screen::Screen::note_input`]).
@@ -44,9 +48,10 @@ impl ScrollView {
         }
     }
 
-    /// Applies one gesture: pins on the first move up, clamps at the oldest retained line,
-    /// and unpins when the window reaches or passes the live bottom. The alternate screen
-    /// keeps no history (`max_scrollback == 0`); wheel handling can send arrow keys instead.
+    /// Applies one gesture: pins on the first move up, clamps at the oldest retained line, and
+    /// unpins once the window would reach or pass the live bottom. A no-op in the alternate screen
+    /// (`max_scrollback == 0` -- alacritty keeps no history there); the host turns the wheel into
+    /// arrow keys for a program that wants it instead.
     pub fn scroll<T>(&mut self, term: &Term<T>, req: ScrollRequest) {
         if req == ScrollRequest::Bottom {
             self.viewport.unpin();

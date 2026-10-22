@@ -1,22 +1,32 @@
 // agent/src/process_probe.rs
-//! Checks process liveness, resident memory and thread count on Linux and macOS.
-//! macOS has no `/proc`: an absent path cannot establish that a process has exited, and failed
-//! status reads must not appear as zero measurements.
+//! Is a pid alive, how much memory does it hold, how many threads does it run -- asked the same
+//! way on Linux and macOS.
+//!
+//! **Why this exists (2026-09-17).** This crate answered all three by reading
+//! `/proc`, which macOS does not have. The failure is not loud: `!Path::new("/proc/<pid>").exists()`
+//! is simply always true there, so a "the process is gone" assertion passes whether or not it is,
+//! and an `Option` read of `/proc/<pid>/status` quietly becomes "unreadable".
 //!
 //! | question | Linux | macOS |
 //! |---|---|---|
 //! | [`pid_is_alive`] | `kill(pid, 0)` | `kill(pid, 0)` |
-//! | [`resident_kib`] | `VmRSS` in `/proc/<pid>/status` | `proc_pidinfo(PROC_PIDTASKINFO).pti_resident_size` |
-//! | [`thread_count`] | entries of `/proc/<pid>/task` | `proc_pidinfo(PROC_PIDTASKINFO).pti_threadnum` |
+//! | [`resident_kib`] | `VmRSS` in `/proc/<pid>/status` (unchanged) | `proc_pidinfo(PROC_PIDTASKINFO).pti_resident_size` |
+//! | [`thread_count`] | entries of `/proc/<pid>/task` (unchanged) | `proc_pidinfo(PROC_PIDTASKINFO).pti_threadnum` |
 //!
-//! The liveness check counts zombies and other users' processes as alive, matching the Linux
-//! `/proc/<pid>` existence check. On other platforms, memory and thread measurements return
-//! `None`, which callers report as missing rather than zero.
+//! `pid_is_alive` answers the same as the `/proc/<pid>` check it replaces on Linux: both say
+//! "alive" for a zombie and for another user's process. Elsewhere the two measurements return
+//! `None`, which callers report as missing rather than as zero.
 //!
-//! `resident_kib` and `thread_count` are `#[doc(hidden)] pub` for tests, including
-//! `state_dirs::prune_dead_roots`, which is test support.
-//! `pid_is_alive` remains visible in the docs because `instance_dir::sweep_stale_instance_dirs`
-//! uses a false result to permit directory deletion. Its safety contract must be visible to callers.
+//! `resident_kib` and `thread_count` are `#[doc(hidden)] pub`: `agent/tests/` and `agent/src/
+//! process.rs`'s own tests use them, and `state_dirs::prune_dead_roots` uses them too, but that one
+//! is itself test support -- nothing else calls either, so hidden-from-docs is an honest signal.
+//!
+//! `pid_is_alive` is deliberately NOT `#[doc(hidden)]` (removed 2026-09-17): since
+//! then, `eitri-core`'s `instance_dir::sweep_stale_instance_dirs` -- real product code, not test
+//! support -- reads its `false` as permission to delete a directory. See its own doc for the
+//! contract that puts on it; a safety-critical contract a product path depends on belongs where its
+//! callers will actually look for it, not hidden from the docs alongside two functions that really
+//! are test-only.
 
 /// Whether `pid` names a process that exists (running or zombie), by `kill(pid, 0)`.
 ///

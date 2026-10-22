@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::keymap::{Action, HelpRow, Keymap, OptValue, TmuxImport};
 
 /// The file the last notice's fingerprint is kept in, from `XDG_STATE_HOME`/`HOME` by the same rule
-/// as every other state file of Eitri's (`crate::layout::persist::state_subdir`).
+/// as every other state file of Eitri's (`crate::state_paths::state_subdir`).
 pub fn state_file(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    crate::layout::persist::state_subdir(xdg_state_home, home, "keymap-import.json")
+    crate::state_paths::state_subdir(xdg_state_home, home, "keymap-import.json")
 }
 
 fn signature(action: &Action) -> String {

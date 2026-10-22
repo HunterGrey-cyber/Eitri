@@ -1,15 +1,21 @@
-//! Pending PTY writes contain user input and terminal replies in separate queues. A program
-//! that asks questions without reading replies, such as `yes $'\e[6n'`, can fill the tty input
-//! buffer until writes return `EAGAIN`. An unbounded reply queue would then grow at the
-//! program's output rate.
+//! What the session has to write to the PTY and could not yet: the user's input, and the answers
+//! the terminal owes the program.
 //!
-//! User input is retained. Pending replies are capped at [`REPLY_CAP`] bytes; excess replies
-//! are dropped and counted. Input takes priority over replies, except that a partially written
-//! reply finishes first to avoid inserting a key into an escape sequence. A unit of input or
-//! replies is never split by the other kind.
+//! The two are kept apart because they deserve different treatment when the program stops reading
+//! its input. A program that asks the terminal questions and never
+//! reads the answers -- `yes $'\e[6n'` -- fills the tty's input buffer, after which every write
+//! gets `EAGAIN`; a single queue then grows by an answer per question, at the rate the program
+//! can print, until the whole IDE runs out of memory. So:
+//! - **input is never dropped**: it is what the user typed or pasted, and it is bounded by what a
+//!   person can type or a clipboard holds;
+//! - **answers are capped** at [`REPLY_CAP`] bytes pending; beyond it they are dropped and counted.
+//!   An answer nobody reads is worth nothing, and xterm and foot answer on a best-effort basis too;
+//! - **input goes first**, so a backlog of answers never delays a key. The one exception is an
+//!   answer the kernel has already taken part of: it is finished first, because a key in the middle
+//!   of an escape sequence would corrupt both. For the same reason a unit (one key's or one read's
+//!   worth of answers) is never split by the other kind.
 //!
-//! [`Outbox::flush`] receives the write function, so queue behavior can be tested without a
-//! PTY.
+//! Pure: [`Outbox::flush`] is given the write to use, so every rule is tested without a PTY.
 
 use std::collections::VecDeque;
 use std::io;

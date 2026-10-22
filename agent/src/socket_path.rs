@@ -1,19 +1,36 @@
 // agent/src/socket_path.rs
-//! Builds Unix-socket paths in one place so one length check covers every bind in this crate.
+//! Every Unix-socket path this crate binds or hands to a child to bind, built in one place so that
+//! one length check covers all of them.
 //!
-//! A `sockaddr_un` has 104 bytes for `sun_path` on macOS and 108 on Linux, including NUL.
-//! Long temporary-directory prefixes can make otherwise short socket names exceed that limit.
-//! [`MAX_SOCKET_PATH_BYTES`] is 103 on both platforms, using the stricter macOS bound.
+//! **Why this exists (2026-09-17).** A `sockaddr_un`'s `sun_path` is 104 bytes on
+//! macOS and 108 on Linux, NUL included, and Rust's std refuses a path of 104 bytes or more on
+//! macOS with `InvalidInput: path must be shorter than SUN_LEN`. `std::env::temp_dir()` on macOS is
+//! the per-user `/var/folders/<2>/<28>/T/` -- 49 bytes -- where on Linux it is usually `/tmp/`, 5.
+//! The names this crate used before, `neovibe-agent-hook-<hyphenated uuid>.sock` and
+//! `neovibe-claude-sidecar-<hyphenated uuid>.sock`, came to 109 and 113 bytes there, so the legacy
+//! backend could not bind its hook socket at all (in every permission mode, since that bind is
+//! unconditional) and the sidecar could not bind its own.
 //!
-//! [`in_dir`] returns `InvalidInput` with the path, its byte length and the limit before a
-//! bind or spawn. It keeps the requested directory: falling back to world-writable `/tmp`
-//! would change the security properties of the user's private temporary directory.
+//! The limit applied here is macOS's, [`MAX_SOCKET_PATH_BYTES`] = 103, on both platforms. That is
+//! stricter than Linux needs (107) by four bytes; one number is simpler than a `cfg` whose Linux
+//! arm nobody on the Mac can exercise, and no path this crate builds on Linux comes near either.
 //!
-//! [`in_dir`] is public and documented because production code in `pane_switch` and
-//! `theme::feed` also builds socket paths through it. Test code, including `agent/tests/`,
-//! uses it too. `tests::every_sock_path_in_this_crate_is_built_here` scans this crate's sources;
-//! `core/src/socket_path_guard.rs` scans the core crate's sources. Keep the two independent
-//! scanners in step so new construction sites cannot skip the length check.
+//! **What a too-long path does now.** [`in_dir`] returns `InvalidInput` naming the path, its length
+//! and the limit, before anything is bound or spawned. It does not fall back to a shorter directory:
+//! the only short, always-present one is `/tmp`, which is world-writable where the macOS
+//! `temp_dir()` is private to the user, and silently trading one for the other is a security
+//! decision rather than a portability fix. A user whose `TMPDIR` is long enough to hit this gets a
+//! clear error where they used to get std's.
+//!
+//! [`in_dir`] is not `#[doc(hidden)]` (removed 2026-09-17): it started out as test-
+//! only plumbing -- `agent/tests/` binds through it too -- but `eitri-core`'s PRODUCT code
+//! (`pane_switch`, `theme::feed`) now builds every socket path it has through this same function,
+//! so hiding it from the docs would hide the one thing every Mac-bound socket path in this
+//! workspace actually depends on. `tests::every_sock_path_in_this_crate_is_built_here` scans this
+//! crate's own sources so a new construction site here fails a test rather than a Mac;
+//! `eitri-core/src/socket_path_guard.rs` is the reciprocal scanner, over that crate's own
+//! sources, added when L2 T5 put two construction sites there. The two are independent scanners
+//! over two crates, not one shared mechanism -- keep them in step by hand.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -37,9 +54,9 @@ pub fn in_dir(dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Builds the legacy backend's per-conversation `PreToolUse` relay socket path.
-/// The filename uses `HOOK_SOCKET_PREFIX` and a UUID in 32-hex form to keep the path short.
-/// Only the `legacy-backend` feature compiles this function.
+/// The legacy backend's per-conversation `PreToolUse` relay socket: `eitri-hook-<32 hex>.sock`,
+/// 48 bytes of file name (97 under macOS's 49-byte `temp_dir()`). Only in a build with the legacy
+/// backend (`legacy-backend`), its one user.
 #[cfg(feature = "legacy-backend")]
 pub(crate) fn hook_socket(dir: &Path, conversation_id: uuid::Uuid) -> io::Result<PathBuf> {
     in_dir(dir, &format!("{HOOK_SOCKET_PREFIX}{}.sock", conversation_id.simple()))

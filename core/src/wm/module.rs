@@ -71,6 +71,7 @@ impl Lifecycle {
 
     /// Effects have their own batch segment so later allocation decisions still run before them.
     pub fn after_change(&mut self, win: WinId, layout: &Layout, batch: &mut Batch) {
+        self.follow_away(layout);
         let shown: Vec<_> = layout.modules().into_iter().filter(|id| layout.is_shown(id)).collect();
         for id in &shown {
             if let Some(module) = self.modules.iter().find(|m| &m.decl.module == id && m.hosted()) {
@@ -126,6 +127,23 @@ impl Lifecycle {
                 module.state = ModuleState::Shown;
             } else if !matches!(module.state, ModuleState::Killed(_)) {
                 module.state = ModuleState::Hidden;
+            }
+        }
+    }
+
+    /// A module the other window of the pair holds is only a placeholder here: `Away` is not hosted, so no effect
+    /// names it while it is there. Back, it is hosted again and the change's own rules decide what it gets (a
+    /// terminal never started starts once it is shown). A killed or retired module keeps its state: that is about
+    /// its instance, and away is about where it lives.
+    fn follow_away(&mut self, layout: &Layout) {
+        for module in &mut self.modules {
+            let away = layout.is_away(&module.decl.module);
+            match module.state {
+                ModuleState::Away if !away => module.state = ModuleState::Hosted,
+                ModuleState::Hosted | ModuleState::Shown | ModuleState::Hidden if away => {
+                    module.state = ModuleState::Away
+                }
+                _ => {}
             }
         }
     }
@@ -913,6 +931,66 @@ mod tests {
             ]
         );
         assert_eq!(d.state(&p.module), Some(ModuleState::Shown));
+    }
+
+    #[test]
+    fn a_module_the_other_window_holds_is_away_and_no_effect_names_it_until_it_is_back() {
+        let t = terminal("terminal");
+        let p = page("plugin", true, false);
+        let d = Driven::hosted(&[t.clone(), p.clone()], &[t.module.clone()]);
+        let (term, page_id) = (t.module.clone(), p.module.clone());
+        d.shell(move |layout| {
+            layout.set_away(&term, true).unwrap();
+            layout.set_away(&page_id, true).unwrap();
+        });
+        assert_eq!(d.state(&t.module), Some(ModuleState::Away));
+        assert_eq!(d.state(&p.module), Some(ModuleState::Away));
+        assert!(d.ops().is_empty(), "an away module gets no effect: {:?}", d.ops());
+        d.changed();
+        assert!(d.ops().is_empty(), "nor on a later change: {:?}", d.ops());
+
+        let (term, page_id) = (t.module.clone(), p.module.clone());
+        d.shell(move |layout| {
+            layout.set_away(&term, false).unwrap();
+            layout.set_away(&page_id, false).unwrap();
+            layout.show(&term).unwrap();
+        });
+        assert_eq!(d.state(&t.module), Some(ModuleState::Shown));
+        assert_eq!(
+            d.state(&p.module),
+            Some(ModuleState::Shown),
+            "a page shown when it left is shown again"
+        );
+        assert_eq!(d.ops(), vec![start(&t.module), on_screen(&p.module, true)]);
+    }
+
+    #[test]
+    fn an_away_module_keeps_a_kill_it_had() {
+        let t = terminal("terminal");
+        let d = Driven::hosted(&[t.clone()], &[]);
+        let id = t.module.clone();
+        d.shell(move |layout| {
+            kill(layout, &id, Reopen::At(Placement::BelowEditor), &frame()).unwrap();
+        });
+        d.ended(&t.module, Reopen::At(Placement::BelowEditor));
+        let id = t.module.clone();
+        d.shell(move |layout| {
+            layout.set_away(&id, true).unwrap();
+        });
+        assert_eq!(
+            d.state(&t.module),
+            Some(ModuleState::Killed(Reopen::At(Placement::BelowEditor)))
+        );
+        let id = t.module.clone();
+        d.shell(move |layout| {
+            layout.set_away(&id, false).unwrap();
+        });
+        d.show(&t.module);
+        assert_eq!(
+            d.ops(),
+            vec![start(&t.module)],
+            "the killed terminal starts a fresh shell when shown"
+        );
     }
 
     #[test]

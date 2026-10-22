@@ -488,8 +488,8 @@ impl From<GitError> for ShadowError {
 /// `layout/` and the other per-project state use. `None` when neither variable gives a state
 /// directory.
 pub fn review_dir_for(state_home: Option<&OsStr>, home: Option<&OsStr>, project_root: &Path) -> Option<PathBuf> {
-    let base = crate::layout::persist::state_subdir(state_home, home, "review")?;
-    Some(base.join(&agent::conversation_id_for_cwd(project_root)[..16]))
+    let base = crate::state_paths::state_subdir(state_home, home, "review")?;
+    Some(base.join(crate::state_paths::project_key(project_root)))
 }
 
 /// A held `flock` on the store's `lock` file, released on drop.

@@ -1,16 +1,23 @@
 // agent/src/lease.rs
-//! Provides an exclusive advisory `flock` for a provider session. Lease files live under
-//! `$XDG_RUNTIME_DIR` on Linux and `~/Library/Application Support` on macOS; see
-//! `state_dirs::leases_dir`. A lease has no meaning across a reboot. The kernel releases
-//! the lock when the last descriptor referencing its open file description closes,
-//! including on process exit. No heartbeat or stale-lease sweep is needed.
+//! An exclusive, `flock`-backed advisory lock proving one Eitri-participating client currently
+//! owns a given provider session. Lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared
+//! on logout) on Linux, and under `~/Library/Application Support` on macOS, which has no such
+//! directory (see `state_dirs::leases_dir` for why not the temp dir) -- correct here, unlike the persistent identity in `persistence.rs`, since a lease
+//! has no meaning across a reboot. `flock`'s own kernel semantics are the actual safety mechanism:
+//! a crashed or killed process automatically releases every lock it held (every fd referencing the
+//! lock's underlying open file description closes), so this module needs no heartbeat thread or
+//! stale-lease sweep to stay correct.
 //!
-//! The key includes the provider, canonical cwd and session id. Two sessions in one
-//! directory can run independently, while clients using the same key contend. A session
-//! id must exist before acquiring the lease, either on resume or after adoption.
+//! **One lease domain, and it is per SESSION, not per directory**: `try_acquire(provider,
+//! canonical_cwd, provider_session_id)` answers "may this window drive THIS Claude session?", which
+//! is only answerable once a session id exists -- on resume, or after adoption. It is deliberately
+//! NOT a claim on the directory: two windows may each run their own agent in one project, and
+//! only the SECOND window resuming the SAME session is refused.
 //!
-//! The lock applies only to processes that participate in this protocol. It cannot prevent
-//! an independently launched `claude` from writing to the same session transcript.
+//! It is ADVISORY and this module says so rather than implying otherwise: it binds processes that
+//! participate in this protocol. Nothing here can stop a `claude` someone runs by hand in the same
+//! directory, and Claude's own documentation records that two clients resuming one session
+//! interleave a single transcript. No stronger claim is made, because none would be true.
 
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -36,8 +43,9 @@ pub struct SessionLease {
 
 #[derive(Debug)]
 pub enum LeaseError {
-    /// Another process already holds this lease. The caller must offer to focus the existing
-    /// window or fork the session instead of silently retrying acquisition.
+    /// Another process already holds this exact lease: the session is in use. Not a degraded/retry
+    /// condition; the caller must offer focus-existing-window
+    /// or fork, never a silent retry loop.
     AlreadyHeld,
     Io(std::io::Error),
 }
@@ -120,8 +128,8 @@ mod test_override {
     }
 }
 
-/// Hashes the provider, canonical cwd and session id with NUL separators into hex SHA-256.
-/// The lease filename uses this hash so it does not expose the original working path.
+/// The file is named by the key's SHA-256, so no path appears in a name others can list -- the key
+/// is `provider + canonical_cwd + provider_session_id`, hex-encoded SHA-256.
 fn lease_key_hash(provider: &str, canonical_cwd: &str, provider_session_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(provider.as_bytes());
@@ -134,9 +142,11 @@ fn lease_key_hash(provider: &str, canonical_cwd: &str, provider_session_id: &str
 }
 
 impl SessionLease {
-    /// Returns `Err(LeaseError::AlreadyHeld)` immediately if this lease is held, without waiting.
-    /// After acquisition, writes the holding process's pid, instance id and a fixed `started_at`
-    /// timestamp for diagnostics. Future acquisition checks the lock itself, not this metadata.
+    /// Non-blocking: returns `Err(LeaseError::AlreadyHeld)` immediately if another process already
+    /// holds this exact lease, never blocks waiting for it (an unbounded wait would hang the thread
+    /// that asked). Writes diagnostic metadata (owner pid, instance id, a fixed `started_at`
+    /// timestamp) into the file after acquiring the lock -- purely informational, since the lock
+    /// itself (not this metadata) is what a future acquirer's own `try_acquire` actually checks.
     pub fn try_acquire(provider: &str, canonical_cwd: &str, provider_session_id: &str) -> Result<Self, LeaseError> {
         let dir = leases_dir().map_err(LeaseError::Io)?;
         // 0700 for every component this creates. On macOS the directory is under the user's home
@@ -244,8 +254,8 @@ impl SessionLease {
     /// caller as a raw fd number -- clears `FD_CLOEXEC` (Rust's `std::fs::File` sets it by default
     /// on open, which would otherwise close the fd at `exec` time and silently drop the lock) and
     /// `std::mem::forget`s `self` so `SessionLease`'s own `Drop` never runs and closes the fd out
-    /// from under the process that's about to inherit it. This plan's own "Verified facts" point 3
-    /// confirms this exact mechanism (fcntl F_SETFD to clear CLOEXEC, then spawn, then the child
+    /// from under the process that's about to inherit it. Verified for real: this exact mechanism
+    /// (fcntl F_SETFD to clear CLOEXEC, then spawn, then the child
     /// reconstructs a `File` from the inherited fd number) genuinely carries the `flock` state
     /// across `exec` -- do not "simplify" this back to passing a fresh path for the child to
     /// re-open and re-lock itself, which would race against this process's own still-held lock.
@@ -351,9 +361,12 @@ impl SessionLease {
     }
 }
 
-/// Formats a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp for the lease's `started_at` diagnostic.
-/// Uses `std::time::SystemTime` and UTC calendar arithmetic without an extra dependency.
-/// The field is for human inspection; no parser reads it back.
+/// A minimal, dependency-free `YYYY-MM-DDTHH:MM:SSZ`-shaped UTC timestamp for the lease's
+/// `started_at` diagnostic field -- deliberately not pulling in the `chrono` or `time` crate for
+/// one informational field with no parser consuming it back in this phase. Uses
+/// `std::time::SystemTime` and hand-rolled UTC civil-calendar math (the well-known
+/// "days since epoch -> y/m/d" algorithm), not wall-clock-library-quality but sufficient for a
+/// human-readable diagnostic string.
 fn chrono_like_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

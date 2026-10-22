@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::layout::persist::{file_name, state_subdir, temporary};
+use crate::state_paths::{file_name, state_subdir, temporary};
 
 pub const HISTORY_LIMIT: usize = 500;
 
@@ -66,7 +66,7 @@ pub fn load(dir: &Path, project_root: &Path) -> Loaded {
 /// dropped), keeps the newest [`HISTORY_LIMIT`], and rewrites it atomically. Returns every entry,
 /// oldest first. An unreadable file is set aside first and the append starts from empty.
 pub fn append(dir: &Path, project_root: &Path, texts: &[String]) -> std::io::Result<Vec<String>> {
-    crate::layout::persist::create_state_dir(dir)?;
+    crate::state_paths::create_state_dir(dir)?;
     let file = path(dir, project_root);
     let mut lines = match read_lines(&file) {
         Ok(lines) => lines.unwrap_or_default(),
@@ -152,7 +152,7 @@ mod tests {
             Some(PathBuf::from("/s/eitri/history"))
         );
         let name = path(Path::new("/s/eitri/history"), &root());
-        let layout_name = crate::layout::persist::file_name(&root());
+        let layout_name = crate::state_paths::file_name(&root());
         assert_eq!(
             name.file_name().unwrap().to_string_lossy(),
             layout_name.replace(".json", ".jsonl"),

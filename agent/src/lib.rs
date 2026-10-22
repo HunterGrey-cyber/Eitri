@@ -1,18 +1,26 @@
-//! A pure Rust backend for Claude Code CLI sessions. Each conversation uses one long-lived,
-//! full-duplex `claude --print --input-format stream-json --output-format stream-json`
-//! process. User turns and control requests, including mid-turn `interrupt`, go to its stdin.
-//! The stream-json output becomes provider-neutral events folded into session state for
-//! `agent-ui` to consume.
+//! agent: a pure-Rust backend that manages Claude Code CLI sessions. It spawns exactly one
+//! long-lived, full-duplex `claude --print --input-format stream-json --output-format stream-json`
+//! process per whole conversation, streams user turns and control requests (including a real
+//! mid-turn `interrupt`) to its stdin over that process's entire life, translates its real
+//! stream-json wire protocol into provider-neutral events, and folds them into a session state a
+//! future `agent-ui` module will consume. Tool-permission approval is gated by a dynamically
+//! generated `PreToolUse` hook relayed over a per-conversation Unix socket by the `agent-hook`
+//! companion binary -- the CLI's own `can_use_tool` control_request is confirmed leaky and is
+//! never relied on as the gate. No GTK/WebView dependency.
 //!
-//! Tool permissions are gated by a generated `PreToolUse` hook relayed over a per-conversation
-//! Unix socket by the `agent-hook` companion binary. The CLI's `can_use_tool` control request
-//! alone does not reliably gate tool execution. This crate has no GTK or WebView dependency.
+//! The one long-lived process replaced an earlier model of one `claude -p` process per turn, with
+//! continuity through `--resume`, which could not interrupt a turn and had no real permission
+//! gate. Everything else that model had stayed: the wire -> event -> session-state layering and the
+//! orphan-safe shutdown discipline. The wire shapes this crate relies on were captured from the
+//! real CLI and are kept as fixtures under `agent/tests/fixtures/`.
 
 mod conversation;
-// The session, CLI spawning, stream-json wire, and hook relay require `legacy-backend`.
-// `process` remains available because the sidecar uses `PermissionMode`, `disallowed_tools`,
-// `CONSERVATIVE_DISALLOWED_TOOLS`, and CLI-mode classification (`classify_cli_mode`, `CliModeReport`).
-// Only its spawning items are feature-gated.
+// The legacy backend -- the session, the CLI spawn, the stream-json wire and the hook relay -- is
+// compiled only with the `legacy-backend` feature, off in every release, so what users run carries
+// only the sidecar path. `process` stays: `PermissionMode`, `disallowed_tools`,
+// `CONSERVATIVE_DISALLOWED_TOOLS` and the
+// CLI-mode classification (`classify_cli_mode`, `CliModeReport`) live there and the sidecar path uses
+// them, so only its spawn items are gated, in place.
 #[cfg(feature = "legacy-backend")]
 mod event;
 mod process;
@@ -30,8 +38,8 @@ mod steer_gate;
 mod test_umask;
 #[cfg(feature = "legacy-backend")]
 mod wire;
-/// Scans source for routes to an ungated `claude` process. This module is test-only so its own
-/// pattern literals are excluded from the source it scans.
+/// A source scan keeping every route back to an ungated `claude` out of this crate. Test-only,
+/// and declared so on purpose: its own pattern literals are then test code, which it does not scan.
 #[cfg(test)]
 mod wire_guard;
 
@@ -94,8 +102,9 @@ pub use session_stub::AgentSession;
 #[cfg(feature = "legacy-backend")]
 pub use wire::translate_line;
 
-/// Whether this build includes the `legacy-backend` feature. Backend selection reads this
-/// constant so the feature check has a single source.
+/// Whether this build contains the legacy backend (the `legacy-backend` feature, off in every
+/// release). The one place the fact lives: backend
+/// selection reads it rather than repeating the `cfg!`.
 pub const LEGACY_BACKEND_COMPILED: bool = cfg!(feature = "legacy-backend");
 
 /// What a build without the legacy backend says when legacy is asked for: `AgentSession::start`'s

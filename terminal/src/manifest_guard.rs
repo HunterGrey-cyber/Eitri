@@ -1,11 +1,17 @@
-//! Keep GTK and WebKit dependencies out of this crate's `Cargo.toml` so hosts using other
-//! toolkits can build it. A compiler check on imports cannot detect an unused manifest
-//! dependency.
+//! Asserts this crate's own `Cargo.toml` never grows a GTK/WebKit dependency.
 //!
-//! The guard covers the gtk-rs family, including `gdk4`, `gio`, `pango`, and `cairo`. It
-//! catches ordinary dependency entries, `[dependencies.gtk4]` subtables, dotted keys such as
-//! `gtk4.version`, and renamed packages such as `ui = { package = "gtk4" }`. It cannot detect
-//! toolkit dependencies introduced transitively; inspect the normal dependency tree for those.
+//! The same guard `eitri-core` has (`core/src/manifest_guard.rs`), for the same reason: the
+//! property that matters is that a non-GTK host can build this crate -- the macOS track's NSView,
+//! or a future right-side terminal backend -- and a toolkit dependency slipping into the manifest,
+//! used or not, would break that silently. The compiler catches a `use gtk4::...` in `src/`; only
+//! this catches the manifest line.
+//!
+//! Stricter than core's in three ways core's could be walked past: the list covers the whole
+//! gtk-rs family (`gdk4`, `gio`, `pango`, `cairo`, ...), not only four names; a
+//! `[dependencies.gtk4]` sub-table is caught as well as a `gtk4 = ...` line; and so are a dotted key
+//! (`gtk4.version = ...`) and a rename (`ui = { package = "gtk4" }`). What it still cannot see is a
+//! toolkit arriving transitively through another dependency; `cargo tree -p eitri-terminal -e
+//! normal` is the check for that.
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -51,9 +57,9 @@ fn offenders(manifest: &str) -> Vec<String> {
             // names its package in the header itself. That sub-table's *body* is also a dependency
             // table -- it is the two-line spelling of the same thing `name = { ... }` says inline,
             // so `package = "gtk4"` on the line below `[dependencies.ui]` is exactly as much a
-            // rename as `ui = { package = "gtk4" }` is, and must be scanned the same way. A review
-            // (2026-09-23) found this shape passing with zero offenders because only the header's
-            // own name was checked and `in_dependency_table` stayed `false` for it.
+            // rename as `ui = { package = "gtk4" }` is, and must be scanned the same way. Checking
+            // only the header's own name let this shape pass with zero offenders, because
+            // `in_dependency_table` stayed `false` for it.
             if let Some((_, name)) = header.rsplit_once("dependencies.") {
                 in_dependency_table = true;
                 if forbidden(name) {
@@ -75,9 +81,8 @@ fn offenders(manifest: &str) -> Vec<String> {
         // body line directly under `[dependencies.ui]`, as `package = "gtk4"` (the key itself IS
         // "package" and the value is the real name, with no `{ }` at all). The first shape has
         // "package" appear inside `value`; the second has it appear as `key`, so it must be
-        // checked separately or the sub-table form of a rename is missed entirely (2026-09-23
-        // review: this is exactly what was missed, since a sub-table's `package = "gtk4"` line
-        // has no "package" substring in ITS OWN value to find).
+        // checked separately or the sub-table form of a rename is missed entirely (a sub-table's
+        // `package = "gtk4"` line has no "package" substring in ITS OWN value to find).
         let renamed_to = if key.trim() == "package" {
             Some(value)
         } else {
@@ -123,7 +128,7 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
         "[dev-dependencies]\npango = \"0.22\"\n",
         // A rename via the sub-table header form rather than the inline-table form: the same
         // `ui = { package = "gtk4" }` rename, spelled as `[dependencies.ui]` / `package = "gtk4"`.
-        // Found by review (2026-09-23): `header.ends_with("dependencies")` is false for
+        // `header.ends_with("dependencies")` is false for
         // "dependencies.ui" (it ends in "ui"), so `in_dependency_table` never became `true` for
         // this header and the `package = "gtk4"` line inside it was skipped outright.
         "[dependencies.ui]\npackage = \"gtk4\"\nversion = \"0.11\"\n",

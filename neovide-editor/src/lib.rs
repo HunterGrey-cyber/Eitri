@@ -1,12 +1,20 @@
-//! An embeddable Neovide/Skia/GTK4 editor surface.
+//! neovide-editor: the embeddable Neovide/Skia/GTK4 editor surface, extracted from the
+//! validated poc/neovide_embed_live probe, so the shell embeds the path that probe proved.
 //!
-//! `NeovideEditorPane` owns a `LiveHarness` connection to `nvim --embed` and attaches resize,
-//! IME, keyboard, mouse, tick and render callbacks to a `GtkGLArea`. The host creates the
-//! `Application` and `ApplicationWindow`, presents the window and handles close requests.
-//!
-//! When `LiveHarness::has_neovim_exited()` reports that nvim quit on its own, the pane invokes
-//! `on_exited_unrequested`. The host chooses how that affects its window. The host's close-request
-//! handler can call the pane's public `shutdown()` method.
+//! `NeovideEditorPane` is this crate's public surface: a `GtkGLArea`-backed pane that owns a
+//! `LiveHarness` (real `nvim --embed` connection) and wires resize/IME/keyboard/mouse/tick/render
+//! callbacks onto it -- but, unlike the `poc/neovide_embed_live` probe it's extracted from, it
+//! never constructs its own `Application`/`ApplicationWindow`. An embeddable editor surface must
+//! not assume it owns the top-level window: creating the `Application`/`Window`, calling
+//! `.present()`, and deciding what a window-close request should do are all left to the host
+//! (e.g. the shell binary that embeds this pane). The one place the reference probe *did* reach
+//! for its own `window` -- the tick callback calling `window.close()` directly when
+//! `LiveHarness::has_neovim_exited()` comes back true on its own (nvim quit itself, e.g. via
+//! `:qa!` typed inside it, not via the host closing anything) -- is replaced here by invoking a
+//! caller-registered callback (`on_exited_unrequested`), so the host decides what "nvim exited
+//! unrequested" should actually do to its own window. Similarly, the reference's
+//! `connect_close_request` handler (which calls `LiveHarness::shutdown()` and logs the result)
+//! becomes the public `shutdown()` method, for the host's own close-request handler to call.
 
 mod dmabuf_target;
 mod editor_area;
@@ -199,12 +207,22 @@ pub struct LiveSession {
     /// RPC is only sent when the *grid-cell* size actually changes, not on every pixel-level
     /// resize event mid-drag.
     last_grid_size: Cell<GridSize<u32>>,
-    /// Set after the tick reports an unrequested nvim exit through `on_exited_unrequested`.
-    /// `has_neovim_exited()` stays true, so this guard prevents repeated callbacks and log messages
-    /// while the host finishes teardown. `Cell::replace` checks and sets it on the GTK main thread.
+    /// Set once the tick callback has invoked the registered `on_exited_unrequested` callback (if
+    /// any) because `LiveHarness::has_neovim_exited()` came back true on its own (i.e. nvim quit
+    /// itself, e.g. via `:qa!` typed inside it -- not via the host calling `shutdown()`). This is
+    /// the "dead-looking-alive window" fix, adapted for a pane that doesn't own a `Window`:
+    /// `has_neovim_exited()` is monotonic (never goes back to `false`), so without this guard the
+    /// tick callback would fire the callback again on every subsequent tick until the host's own
+    /// teardown actually completes -- harmless in principle but noisy (a duplicate
+    /// `[live] nvim exited...` log line and a duplicate callback invocation every tick in
+    /// between). Read-and-set via `Cell::replace` so the check-and-flag is a single atomic step
+    /// from this single-threaded GTK main-loop caller's point of view.
     ///
-    /// `NeovideEditorPane::shutdown()` also sets it so a host-initiated shutdown is not reported
-    /// again as an unrequested exit when nvim stops.
+    /// Also set (via a plain `Cell::set(true)`, not `replace`) by `NeovideEditorPane::shutdown()`
+    /// itself, for the opposite direction: a *host*-initiated shutdown must trip this same guard
+    /// so a later tick doesn't independently notice `has_neovim_exited() == true` once nvim
+    /// actually exits and fire `on_exited_unrequested` a second time for a shutdown the host
+    /// already knows about.
     close_requested: Cell<bool>,
     /// Set on a `GestureClick` press, cleared on its matching release -- see `mouse::DragState`'s
     /// own doc for what this tracks and why.
@@ -219,9 +237,10 @@ pub struct LiveSession {
     /// position at all, so a scroll event's target grid cell has to come from here -- the last
     /// place the pointer was actually seen.
     pub(crate) last_pointer_pos: Cell<(f64, f64)>,
-    /// The framebuffer size in device pixels last reported by `GLArea::resize`.
-    /// Shared by rendering, resizing and the tick so mouse hit testing uses the size actually drawn
-    /// through `gl_interop::current_content_region` and `gl_interop::GridLayout`.
+    /// The pane's one framebuffer size (device pixels), as GTK last reported it through
+    /// `GLArea::resize` -- shared with the render callback, the resize handler and the tick, so
+    /// the mouse handlers hit-test against exactly the size the frame was drawn at
+    /// (`gl_interop::current_content_region`); see `gl_interop::GridLayout`.
     pub(crate) fb_size: Rc<Cell<(i32, i32)>>,
     /// `(fb_w, fb_h, cell_w bits, cell_h bits, cols, rows)` as the `[layout]` line last printed
     /// it, so the line is printed when the layout changes and never per frame. Bits, not f32, so
@@ -311,12 +330,14 @@ impl LiveSession {
         Ok(self.calls.get_or_init(|| line))
     }
 
-    /// Whether the harness reports an exit while nvim's own process is still alive.
-    /// A launcher that does not `exec` can exit while nvim keeps running and holding the pipes.
-    /// `bridge::run` reports the launcher's exit after waiting 500 ms for the IO stream, and input
-    /// then stops reaching nvim. Defer exit handling until nvim's process is gone ([`exit_events`])
-    /// so the host does not close or retire an editor that may still be writing a file.
-    /// Returns `false` when no nvim process is known; only the harness report is available then.
+    /// The fork reports nvim exited, and nvim's own process is still alive. The fork's report
+    /// follows the process IT started: a `nvim` launcher that does not `exec` exits -- or crashes
+    /// -- and 500 ms later the fork says nvim exited (`bridge::run` waits that long for the IO
+    /// stream, then reports regardless), while nvim runs on, re-parented, perhaps still writing a
+    /// file. The fork takes no keys for it from then on. This is not an exit, and nothing
+    /// that follows an exit -- the window's close, the editor's retirement -- happens until the
+    /// process is gone ([`exit_events`]). `false` when no process is known to be nvim: then the
+    /// fork's report is all there is.
     fn exit_pending(&self) -> bool {
         self.harness.has_neovim_exited() && self.nvim_process.alive_within(Duration::ZERO) == Some(true)
     }
@@ -561,19 +582,23 @@ fn nvim_args(clean: bool, extra: &[String]) -> Vec<String> {
     args
 }
 
-/// Delay after mapping `GLArea` before requesting another frame. A request in the same main-loop
-/// turn can coalesce into the first frame. The 50 ms delay restored content in 50 of 50 re-shows;
-/// a same-turn request worked in only 6 of 8. A frame-clock tick has not been measured here.
+/// How long after this pane's `GLArea` is mapped it asks for one more frame. 50ms is the measured
+/// fix: 50 re-shows of 50 right. A render asked for in the same main-loop
+/// turn as the show coalesces into the first frame and fixed only 6 of 8; a frame-clock "next tick"
+/// is plausible and **unmeasured**, and needs the same 50-cycle check before it replaces this.
 const REMAP_RENDER_DELAY: Duration = Duration::from_millis(50);
 
-/// Schedules one delayed render per map. A new map replaces any pending render, so a burst of
-/// hide/show cycles requests only one frame.
+/// One delayed render per map. A map that arrives while an earlier map's render is still pending
+/// replaces it, so a burst of hide/show cycles asks for one render, not one per cycle.
 ///
-/// Showing the pane over the same rectangle after `set_child_visible(false)` need not emit
-/// `resize` or set `wants_frame`. If nvim redrew while hidden, its traffic is still drained,
-/// but the first mapped frame can show only the cursor until another redraw arrives.
-/// `GtkPaned::set_visible(true)` forces a resize and further renders, masking this case.
-/// It is unclear whether the incomplete frame comes from the renderer or GTK's remapped texture.
+/// Why a map needs a render at all: a host that hides this pane with `set_child_visible(false)`
+/// (the module grid) and shows it again over the same rectangle gives the `GLArea` no `resize`,
+/// so nothing sets `wants_frame`, and the single frame drawn on map is the only frame. If nvim
+/// redrew while the pane was hidden -- the fd watch keeps servicing (draining) nvim --
+/// that frame shows the cursor and nothing else, until nvim's next redraw (measured: 39 re-shows of 50,
+/// and 0 of 8 when only the cursor had moved). `GtkPaned` never showed it: its `set_visible(true)`
+/// forces a resize, and ~14 renders follow. Which half draws the window-less frame, Neovide's
+/// renderer or GTK's texture handling after a re-map, was not isolated.
 struct RemapKick {
     pending: Rc<RefCell<Option<glib::SourceId>>>,
 }
@@ -623,16 +648,18 @@ fn tick_should_render(
     last_animating || new_content || wants_frame || scale_factor_changed_now
 }
 
-/// Whether `connect_cell_size_changed` should fire this frame. `None` means nvim has not yet
-/// reported a cell size and always counts as a change; otherwise compare the sizes directly.
-/// Kept separate from the render callback so this can be tested without constructing `GLArea`
-/// or `LiveSession`.
+/// Whether `connect_cell_size_changed` should fire this frame: `None` (nvim has never
+/// reported a cell yet) always counts as a change, same as `ScaleWatch`'s own first-observe rule;
+/// otherwise a plain inequality. Split out of the render callback -- which borrows `GLArea`/
+/// `LiveSession` types no unit test can construct -- for the same reason `tick_should_render` is.
 fn cell_size_changed(last: Option<(f64, f64)>, now: (f64, f64)) -> bool {
     last != Some(now)
 }
 
-/// The nvim version floor enforced by `NEOVIM_REQUIRED_VERSION` in `bridge/mod.rs`.
-/// Repeated here so the pane's launch-failure message can state the required version directly.
+/// The nvim version floor this pane's pinned fork enforces (`NEOVIM_REQUIRED_VERSION` in
+/// `bridge/mod.rs`) -- restated here because the fork's own too-old error names it as bare numbers
+/// with no context of what *this project* needs, and the pane's own message should say so plainly
+/// rather than make the host go read the fork's source.
 const NVIM_VERSION_FLOOR: &str = "0.10";
 
 /// Where to get a newer nvim -- the same URL the fork's own too-old error already links
@@ -640,14 +667,21 @@ const NVIM_VERSION_FLOOR: &str = "0.10";
 /// URL at all) gets one too.
 const NVIM_INSTALL_URL: &str = "https://github.com/neovim/neovim/wiki/Installing-Neovim";
 
-/// Builds the launch-failure message stored in [`LiveState::Failed`] and passed to
-/// [`NeovideEditorPane::on_start_failed`] from `LiveHarness::with_options`'s raw error chain.
-/// The caller also logs the raw chain to stdout.
+/// The message [`NeovideEditorPane::on_start_failed`] hands the host and [`LiveState::Failed`]
+/// stores, built from the raw error `LiveHarness::with_options` returned (`format!("{err:#}")`, the
+/// fork's own `anyhow` chain -- still logged to stdout verbatim by the caller, unchanged). Two shapes
+/// the pinned fork's `bridge::create_neovim_session` produces:
 ///
-/// For a too-old nvim, [`detected_nvim_version`] extracts the detected version from the harness
-/// error. For a missing executable or another launch failure, keep the raw error detail.
-/// Both messages include the required version and an installation link.
-/// Kept separate so tests can use raw error strings without constructing a live harness.
+/// - **too old**: `"Neovide requires nvim version {major}.{minor}.{patch} or higher, but {found} was
+///   detected. Download the latest version here <url>"` -- [`detected_nvim_version`] pulls `{found}`
+///   back out, since the raw text names the *fork's* floor as bare numbers with no mention of what
+///   Eitri itself needs.
+/// - **missing, or any other launch failure** (`nvim` absent from `PATH`, a spawn error, a socket
+///   that never opens): `.context("Could not locate or start neovim process")`'s own chain, which
+///   never names a version or a place to get one at all.
+///
+/// Split out for the same reason `tick_should_render` is: no unit test here can construct a real
+/// `LiveHarness::with_options` error, so the raw text is the fixture instead.
 fn build_start_failure_message(raw_error: &str) -> String {
     match detected_nvim_version(raw_error) {
         Some(found) => format!(
@@ -672,12 +706,13 @@ fn detected_nvim_version(raw_error: &str) -> Option<&str> {
     Some(version.strip_prefix('v').unwrap_or(version))
 }
 
-/// Exit notifications from the tick. `fork_exited` is the harness report; `nvim_alive` comes
-/// from nvim's pidfd, or is `None` when no nvim process is known.
-/// Report an exit once the process is gone, or on the harness report if no process is known,
-/// so the host does not close or retire an editor while nvim may still be writing.
-/// While the harness reports an exit but the process lives, report it as unreachable once.
-/// The pane's latches suppress repeated notifications.
+/// What the tick reports about nvim's end: the fork's own report is `fork_exited`, and
+/// `nvim_alive` is what the pidfd on nvim's process says (`None`: no process is known to be nvim).
+/// An exit is reported only once nvim's process is gone -- or, with none known, on the fork's word
+/// -- so what a host does on it (close the window, retire the editor) never runs while an nvim we
+/// started may still be writing, and it is reported once however often the tick asks (`said`, the
+/// pane's latches). While the fork says exited and the process lives, the host is told once that
+/// nvim is out of reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ExitEvents {
     unreachable: bool,
@@ -713,10 +748,11 @@ fn spawn_named(name: &'static str) -> impl FnOnce(Job) -> std::io::Result<()> {
     move |job| std::thread::Builder::new().name(name.into()).spawn(job).map(|_| ())
 }
 
-/// Runs `job` on a thread started by `spawn`, or inline if starting the thread fails.
-/// The fallback ensures nvim's termination is still scheduled when thread creation returns
-/// `EAGAIN`. Returns `true` when a thread was started.
-/// A failed `Builder::spawn` consumes its closure, so keep the job in a slot either side can take.
+/// Runs `job` on a thread `spawn` starts, or -- when none can be started (`EAGAIN` under a process
+/// limit) -- here, inline, so what it does is never simply dropped (a dropped ending of nvim left
+/// every later close waiting for it forever). `true` when it went to a
+/// thread. A failed `Builder::spawn` consumes its closure, so the job travels in a slot both sides
+/// can take from.
 fn run_detached(job: Job, spawn: impl FnOnce(Job) -> std::io::Result<()>) -> bool {
     let slot = Arc::new(std::sync::Mutex::new(Some(job)));
     let theirs = slot.clone();
@@ -739,14 +775,15 @@ fn run_detached(job: Job, spawn: impl FnOnce(Job) -> std::io::Result<()>) -> boo
     }
 }
 
-/// Asks nvim for `getpid()` over the harness connection and stores the answer in `process`.
-/// The answering process is nvim itself; a launcher that does not `exec` can be the direct child,
-/// and killing that launcher can leave nvim running.
-///
-/// Use a worker thread because nvim answers only after sourcing the user's configuration,
-/// which may hang. Until it answers, retain the process identified at launch.
-/// Never abandon the request: nvim-rs closes the connection if a response arrives for a dropped
-/// request. Nvim exiting resolves the request with an error.
+/// Asks nvim, over the fork's own connection and on a thread of its own, for its pid (`getpid()`),
+/// and holds the answer in `process` -- the process that answers on nvim's pipe is nvim, whatever
+/// launched it (a `nvim` wrapper that does not `exec`
+/// is the fork's direct child, and a kill of that left the hung nvim running). A thread, not the
+/// GTK thread: nvim answers requests only once its loop runs, which is after the user's whole
+/// config has been sourced -- and never, for an nvim that hung in it (then `process` keeps only
+/// what the fork started, `nvim_child`'s source 2). The request is never abandoned: nvim-rs ends
+/// the whole connection when a response arrives for a dropped request (`nvim_rpc`'s module doc),
+/// and nvim exiting resolves it with an error.
 fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimProcess>) {
     let Some(nvim) = harness.neovim_handler().clone_current_neovim() else {
         println!("[live] no nvim connection to ask for its pid");
@@ -774,25 +811,30 @@ fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimPro
     }
 }
 
-/// Whether the tick should request a frame for [`LiveState::Failed`]. Render once to paint
-/// [`FAILED_COLOR`] and show the failure message, then stop requesting frames.
-/// The state is terminal, so unconditional requests would redraw it at every display refresh.
-/// Kept separate from the GTK callback for testing.
+/// Whether the tick callback should ask for one more frame while [`LiveState::Failed`]: exactly
+/// once -- the frame that actually paints [`FAILED_COLOR`] and the message. A Failed pane renders once
+/// and stops, replacing the old unconditional `true` (`queue_render()` at display
+/// refresh rate for the rest of the window's life, since `Failed` never leaves itself). Split out for
+/// the same reason `tick_should_render` is.
 fn failed_tick_should_render(already_painted: bool) -> bool {
     !already_painted
 }
 
-/// Whether to request a frame without a live session. The tick handles [`LiveState::Ready`]
-/// separately through [`tick_should_render`]. Keeping this dispatch testable checks the actual
-/// `Failed` arm as well as [`failed_tick_should_render`].
+/// Whether the tick callback asks for a frame for a pane with no live session -- every state but
+/// [`LiveState::Ready`], which the tick decides itself ([`tick_should_render`]). Split out so the
+/// `Failed` arm is a test's (`Failed(_) => true` in the tick used to leave the whole suite green, since
+/// only [`failed_tick_should_render`] was tested).
 fn sessionless_tick_should_render(state: &LiveState, failed_painted: bool) -> bool {
     match state {
         // The placeholder-frame dance and the one blocking `LiveHarness::with_options` call both
         // happen *inside* the render callback and only run when a render is actually requested --
         // keep rendering here so that state machine can advance.
         LiveState::NotStarted | LiveState::Starting => true,
-        // `Failed` is terminal and paints the same fill and message each time.
-        // Request frames only until the render callback sets `failed_painted`, then leave it idle.
+        // Failed is a terminal state that paints the same fill and message every time, so
+        // unlike NotStarted/Starting it does NOT keep asking for frames forever -- only until the
+        // render callback has actually painted it once (the `Failed` arm there sets
+        // `failed_painted`). Asking every tick would render at display refresh rate for the rest of
+        // the window's life.
         LiveState::Failed(_) => failed_tick_should_render(failed_painted),
         // Nothing will ever change: no frame is needed.
         LiveState::Exited => false,
@@ -801,12 +843,19 @@ fn sessionless_tick_should_render(state: &LiveState, failed_painted: bool) -> bo
     }
 }
 
-/// The OS scale to pass to `LiveHarness::set_os_scale_factor`, or `None` if `current` already
-/// matches GTK's `Widget::scale_factor()`. Kept pure for tests without a live harness.
+/// The OS-scale value [`sync_os_scale`] should hand `LiveHarness::set_os_scale_factor`, given GTK's
+/// raw `Widget::scale_factor()` right now -- or `None` if `current` (the harness's own
+/// `os_scale_factor()`) already agrees with it. Pure and split out for the same
+/// reason `tick_should_render`/`cell_size_changed` are: no unit test here can construct a real
+/// `LiveHarness`.
 ///
-/// Use GTK's integer factor, matching `pixel_to_grid_pos`, `cell_size` and the tick's widget-size
-/// calculation. Clamp values below 1 to 1 for widgets not yet realized on a surface.
-/// Compare bits as `LiveHarness::set_os_scale_factor` does, so both agree on whether to apply it.
+/// `widget_scale_factor` is GTK's own rounded-up integer (the same basis every hit-test in this
+/// crate already uses -- `pixel_to_grid_pos`, `cell_size`, the tick's own `widget_size` computation
+/// -- never `Surface::scale()`'s fraction). A widget not yet realized on a surface reports `0` (and
+/// never negative in practice), so this treats anything below `1` as `1`, matching every other
+/// `.max(1)` in this crate. Compared against `current` by bits, exactly like
+/// `LiveHarness::set_os_scale_factor` compares internally, so this and that call always agree on
+/// whether anything actually changed.
 fn os_scale_to_apply(current: f64, widget_scale_factor: i32) -> Option<f64> {
     let target = f64::from(widget_scale_factor.max(1));
     if target.to_bits() == current.to_bits() {
@@ -816,17 +865,22 @@ fn os_scale_to_apply(current: f64, widget_scale_factor: i32) -> Option<f64> {
     }
 }
 
-/// Applies GTK's `Widget::scale_factor()` when it differs from the harness's OS scale
-/// ([`os_scale_to_apply`]). Runs in the `Ready` paths of `connect_resize` and the render callback,
-/// before computing a grid from `harness.grid_scale()`.
+/// Applies GTK's current `Widget::scale_factor()` to `harness` when it disagrees with the harness's
+/// own record ([`os_scale_to_apply`]) -- the whole of the scale sync. Called from the two sites that
+/// see a new framebuffer, `connect_resize`'s `Ready` branch and the render callback's `Ready` arm, both
+/// **before** any grid is computed from `harness.grid_scale()`: `set_os_scale_factor` moves the
+/// renderer's cell size synchronously, so calling this before the grid read means a scale change and
+/// the framebuffer resize that always accompanies it (GTK reallocates `GtkGLArea`'s buffers and
+/// fires `resize` on its next snapshot) land in the very same GTK callback, and no tick ever computes
+/// a grid from a cell size and a framebuffer that belong to different scales (see `gl_interop`'s
+/// `snap_tests::a_scale_change_applied_with_its_framebuffer_resizes_nothing` for the invariant this
+/// keeps, and its counter-example for the transient grid it prevents).
 ///
-/// `set_os_scale_factor` changes cell size synchronously. Applying it with the matching new
-/// framebuffer keeps grid calculations from mixing dimensions from different scales.
-/// The scale-factor notification only requests a frame; GTK supplies the resized framebuffer
-/// on its next snapshot, and scale synchronization happens then.
-///
-/// Returns `true` only when the harness applies a change. Logs one `[hidpi]` line for that change;
-/// an unchanged scale costs one bit comparison and produces no log output.
+/// Returns exactly what `LiveHarness::set_os_scale_factor` returns: `true` only on a real, applied
+/// change. Never called from `connect_scale_factor_notify` itself -- that handler only asks for
+/// a frame; this runs once GTK actually hands over the matching new framebuffer. Prints one
+/// `[hidpi]` line on an applied change, for a GUI pass to read; the common case (nothing changed
+/// this frame) costs one bit comparison and prints nothing, so an idle pane stays idle.
 fn sync_os_scale(harness: &mut LiveHarness, widget_scale_factor: i32) -> bool {
     let Some(new_scale) = os_scale_to_apply(harness.os_scale_factor(), widget_scale_factor) else {
         return false;
@@ -860,7 +914,7 @@ pub(crate) struct ScaleObservation {
 /// independently drop a piece of what the zoom-together design's L2 layer needs: the callback
 /// firing, [`tick_should_render`] seeing the change, and a pre-`Ready` write reaching nvim once it
 /// exists. A GTK call site that inlined this logic itself had all three go missing at once under a
-/// review's mutation testing -- a literal `false` in place of the real signal, the callback
+/// mutation testing -- a literal `false` in place of the real signal, the callback
 /// invocation dropped, the pending flush at `Ready` dropped -- each of which stayed green because
 /// nothing in this crate called `observe`/`take_pending_for_ready` by name for a test to hold onto.
 #[derive(Debug)]
@@ -986,15 +1040,17 @@ impl NeovideEditorPane {
         let last_fullscreen_setting: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cell_size_callback: CellSizeCallbackSlot = Rc::new(RefCell::new(None));
         let start_failed_callback: StartFailedCallbackSlot = Rc::new(RefCell::new(None));
-        // Set when the `Failed` arm first paints `FAILED_COLOR` and the message.
-        // The tick reads it through `failed_tick_should_render` to stop requesting frames afterward.
-        // `Failed` is terminal, so this is never reset.
+        // Set once, the first time the `Failed` arm below actually paints `FAILED_COLOR` and
+        // the message -- read by the tick callback ([`failed_tick_should_render`]) to stop asking for
+        // more frames once that one paint has happened. `Failed` never leaves itself, so this is
+        // never reset.
         let failed_painted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Only the render closure below ever reads this -- not stored on `Self`, unlike
         // `cell_size_callback`, which a host registers *after* construction.
         let last_cell_size: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        // Use the framebuffer size reported by `GLArea::resize`, in device pixels, for the grid,
-        // snapping, tick resync and hit testing. `gl_interop::GridLayout` keeps them consistent.
+        // The one framebuffer size (device pixels) the grid, the snap, the tick's resync and hit
+        // testing all derive from -- GTK's own, as `GLArea::resize` reports it, so none of them can
+        // drift from the others; see `gl_interop::GridLayout`.
         let fb_size: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
 
         // GtkWidget::unrealize is RUN_LAST: this normal handler runs before GtkGLArea deletes
@@ -1015,10 +1071,12 @@ impl NeovideEditorPane {
             });
         }
 
-        // GtkGLArea can resize or recreate its FBO. Drop the cached Surface so the next render rebuilds
-        // it with the new framebuffer dimensions in device pixels.
-        // Recompute the grid that fits `content_region` and call `LiveHarness::resize_grid` only if the
-        // cell count changed, keeping nvim's viewport aligned with the host.
+        // --- resize: GtkGLArea's FBO can be resized/recreated under us, so drop the cached
+        // Surface and let the next render() rebuild it against the new framebuffer dimensions
+        // (device pixels, not logical widget units). Also the frozen-scroll fix:
+        // recompute the grid size that actually fits the new content_region and, if it differs
+        // (in grid *cells*, not raw pixels) from what nvim was last told, call
+        // `LiveHarness::resize_grid` so nvim's own viewport tracks the real host size.
         {
             let skia_state = skia_state.clone();
             let live_state = live_state.clone();
@@ -1029,8 +1087,8 @@ impl NeovideEditorPane {
                 let mut live = live_state.borrow_mut();
                 let (forced_next_frame, resized_grid) = if let LiveState::Ready(session) = &mut *live {
                     session.wants_frame.set(true);
-                    // Sync scale before reading `grid_scale()` so the new cell size and the framebuffer supplied
-                    // by this `resize` signal are used together.
+                    // Before any grid is computed from `grid_scale()`, so a scale change and
+                    // the framebuffer this very `resize` signal hands over always land together.
                     sync_os_scale(&mut session.harness, widget.scale_factor());
                     let new_grid_size = grid_layout(width, height, session.harness.grid_scale(), |r| {
                         grid_size_for_content_region(&session.harness, r)
@@ -1104,15 +1162,21 @@ impl NeovideEditorPane {
             });
         }
 
-        // GtkGLArea reallocates its buffers and emits `resize` on the next snapshot after a scale
-        // notification. Request a frame here, or the old image can remain upscaled indefinitely.
-        // Do not change the harness scale or `fb_size` here. `sync_os_scale` runs in `connect_resize`
-        // and the render callback once GTK supplies the matching new framebuffer.
+        // --- scale-factor notify: `GtkGLArea` reallocates its own buffers and fires
+        // `resize` (with the new framebuffer) only on its NEXT snapshot after this notify fires --
+        // and this pane only ever renders on change -- so without asking for a frame here the
+        // old frame stays upscaled indefinitely (measured: `s1-after-scale2.png`, `s1.log` has the
+        // notify line and no `[resize]` for 4s). This handler does exactly that and nothing more: it
+        // never touches the harness or `fb_size` itself. The actual scale sync (`sync_os_scale`) runs
+        // in `connect_resize` and the render callback below, where GTK has handed over the matching
+        // new framebuffer in the very same snapshot -- never here, at notify time, which is why the
+        // notify handler stays this small.
         {
             let live_state = live_state.clone();
             gl_area.connect_scale_factor_notify(move |widget| {
-                // Use `try_borrow`: a GTK signal can run while a render or tick closure already borrows
-                // `live_state`. Skipping that borrow avoids a reentrant `RefCell` panic.
+                // `try_borrow`, not `borrow`: a GTK signal can fire while a render or tick closure
+                // already holds `live_state` borrowed (a `run_tab_verb` panic in the panel once came
+                // from exactly that).
                 if let Ok(live) = live_state.try_borrow() {
                     if let LiveState::Ready(session) = &*live {
                         session.wants_frame.set(true);
@@ -1267,8 +1331,9 @@ impl NeovideEditorPane {
                 // dropped -- the same reentrancy rule the tick callback's `fullscreen_callback_for_tick`
                 // follows (a host's handler can call straight back into this pane).
                 let mut cell_size_changed_to: Option<(f64, f64)> = None;
-                // Set in the `Starting` arm's error case and fired after dropping `live`, allowing reentry.
-                // This fires at most once per pane because `Starting` transitions to `Failed` only once.
+                // Set from inside the `Starting` arm's `Err` case below, fired only *after*
+                // `live` is dropped -- same reentrancy rule. Unlike `cell_size_changed_to` this fires
+                // at most once per pane, since `Starting` -> `Failed` happens exactly once.
                 let mut start_failed_message: Option<String> = None;
                 // Set in the `Ready`, `Failed` and `Exited` arms, acted on after `live` is dropped:
                 // whether the tick callback is still wanted once this frame is committed (F2/F3).
@@ -1362,11 +1427,15 @@ impl NeovideEditorPane {
                                     ),
                                 }
                                 ask_nvim_for_its_pid(&harness, &nvim_process);
-                                // `LiveHarnessOptions::grid_size` only sets the grid at `nvim_ui_attach` time.
-                                // Leaving it `None` uses `DEFAULT_GRID_SIZE` (100x50), independent of this pane's content region.
-                                // Resize immediately to the grid that fits the actual `content_region`.
-                                // Use the shared `grid_layout` geometry. Snapping preserves the number of rows that fit,
-                                // so it gives the same grid size as the unsnapped region.
+                                // The frozen-scroll fix: `LiveHarnessOptions::grid_size`
+                                // (left `None` above, so `DEFAULT_GRID_SIZE` 100x50) only ever
+                                // sets nvim's grid size at `nvim_ui_attach` time and has no
+                                // relationship to this pane's actual `content_region` -- resize
+                                // it immediately to what the real content_region fits.
+                                // Through `grid_layout`, the one geometry every other caller uses;
+                                // snapping never changes the row count
+                                // (`snapping_never_changes_how_many_rows_fit`), so this is the same
+                                // size the unsnapped region gave.
                                 let grid_size = grid_layout(fb_w, fb_h, harness.grid_scale(), |r| {
                                     grid_size_for_content_region(&harness, r)
                                 })
@@ -1410,8 +1479,9 @@ impl NeovideEditorPane {
                                 let elapsed = t0.elapsed();
                                 let raw = format!("{err:#}");
                                 println!("[live] LiveHarness::with_options failed after {elapsed:?}: {raw}");
-                                // Stdout gets the raw error chain. The pane stores and passes the host a message describing
-                                // the failure, the required version and where to get a newer nvim.
+                                // The raw chain above is what stdout gets (unchanged); the
+                                // pane's own state, and what a host is handed, is the built message
+                                // -- what failed, the version floor, where to get a newer nvim.
                                 let message = build_start_failure_message(&raw);
                                 *live = LiveState::Failed(message.clone());
                                 start_failed_message = Some(message);
@@ -1439,10 +1509,12 @@ impl NeovideEditorPane {
                         } else {
                             session.animation_clock.place(frame_time)
                         };
-                        // Sync here too for re-realized widgets or snapshots that do not emit `resize`.
-                        // Together with `connect_resize`, this keeps cell size and framebuffer scale consistent.
-                        // Set `wants_frame` when a scale change is applied here because this path has no resize handler
-                        // to request the next frame.
+                        // Covers a re-realized widget, or any GTK whose snapshot does not
+                        // re-emit `resize` -- `connect_resize` above is the OTHER call site, and
+                        // between the two nothing computes a grid from a cell size and a framebuffer
+                        // that belong to different scales. Unlike `connect_resize`, nothing else on
+                        // this path already sets `wants_frame` for a plain scale change, so fold the
+                        // "did this frame actually apply one" result in here.
                         if sync_os_scale(&mut session.harness, widget.scale_factor()) {
                             session.wants_frame.set(true);
                         }
@@ -1468,9 +1540,12 @@ impl NeovideEditorPane {
                             // The next frame sees the scale already applied, so this does not loop.
                             session.wants_frame.set(true);
                         }
-                        // The host uses the editor's cell height for `--nv-editor-row` to bound the status band.
-                        // Compute it with the same `grid_scale` and `scale_factor` as `cell_size()`.
-                        // Report only changes; `cell_size_changed` treats the first value as a change too.
+                        // The editor's own cell height is what `shell` puts into
+                        // `--nv-editor-row` so the agent panel's status band stops growing past it.
+                        // Computed exactly as `cell_size()` does (same `grid_scale`/`scale_factor`
+                        // pair), fired only when it actually differs from the last value this pane
+                        // reported -- see `cell_size_changed`'s own doc for why `None` always
+                        // counts as a change.
                         let current_scale = session.harness.grid_scale();
                         let factor = f64::from(widget.scale_factor().max(1));
                         let new_cell_size = (
@@ -1543,8 +1618,8 @@ impl NeovideEditorPane {
                     LiveState::Failed(_) => {
                         // The text is drawn by the host's own label, not this canvas.
                         fill_content_region(canvas, &content_region, FAILED_COLOR);
-                        // This marks the paint awaited by `sessionless_tick_should_render`.
-                        // Once set, the tick stops requesting frames.
+                        // This is the one paint `sessionless_tick_should_render` is waiting
+                        // for -- once it is set, the tick callback stops asking for more frames.
                         failed_painted_for_render.set(true);
                         // F3 for a failed pane: this paint is the last one it will ever want, so
                         // the tick stops here rather than one empty cycle later.
@@ -1593,8 +1668,9 @@ impl NeovideEditorPane {
             });
         }
 
-        // Drive redraws from the display's frame clock so pacing follows vsync timing.
-        // Call `queue_render()` only when another frame is needed.
+        // --- drive redraws off the display's frame clock, tying frame pacing to actual
+        // vsync-reported timing rather than a fixed timer -- but, so an idle pane costs nothing, only actually
+        // calls `queue_render()` when something genuinely needs another frame.
         {
             let live_state = live_state.clone();
             // No strong `GLArea` here: the driver owns this service, and the area's own render
@@ -1621,8 +1697,8 @@ impl NeovideEditorPane {
             let fb_size = fb_size.clone();
             // One-shot: `[layout] note:` is printed at most once per pane.
             let layout_note_logged = Cell::new(false);
-            // Read only here; the render callback's `Failed` arm is the sole writer.
-            // See `failed_tick_should_render`.
+            // Read (never written) here -- the render callback's `Failed` arm is the only
+            // writer. See `failed_tick_should_render`.
             let failed_painted_for_tick = failed_painted.clone();
             let service: Service = Rc::new(move |widget: &GLArea, source: ServiceSource| {
                 let mut live = live_state.borrow_mut();
@@ -1669,20 +1745,46 @@ impl NeovideEditorPane {
                             session.last_seen_batches.set(batches_now);
                         }
 
-                        // Resync the grid if its size no longer matches the framebuffer. A window can reach its final
-                        // size while `LiveHarness::with_options` blocks the main loop, without another `resize` after
-                        // the initial snapshot. That leaves a stale grid and an undrawn band at its edge.
-                        // `draw_frame` clears the current content region to nvim's background, so the band has that color.
-                        // Recompute the fitting grid each tick and call `resize_grid` only when `last_grid_size` differs.
+                        // Resize-resync safety net (found 2026-09-07 on real GNOME/Mutter
+                        // hardware, via `shell`, not the headless-sway sandbox every earlier
+                        // resize check ran in): `connect_resize` above is the only other place
+                        // that calls `resize_grid`, and it only fires on a `GtkGLArea` `resize`
+                        // signal. On this real desktop, a window shown already-maximized (or
+                        // resized by the compositor while `LiveHarness::with_options`'s
+                        // synchronous, main-loop-blocking nvim launch was in flight) can settle at
+                        // its final size without ever emitting a *further* `resize` signal after
+                        // the Ready-time snapshot the constructor already takes -- leaving nvim's
+                        // grid permanently sized for a stale, smaller content_region than the
+                        // widget's real one, visible as an undrawn band past the grid's real edge.
+                        // (This comment said "leftover `OUTSIDE_COLOR`" until 2026-09-16; that was
+                        // never right -- `draw_frame` clip-clears the *current* content_region to
+                        // nvim's own background, so the band is that background, not the host's
+                        // clear colour.) Re-deriving the grid size from the widget's *current*
+                        // actual size on every tick (cheap: a handful of integer ops, no
+                        // allocation) and only calling `resize_grid` -- which actually costs --
+                        // when it disagrees with `last_grid_size` makes this self-correcting
+                        // regardless of which exact GTK/Wayland/compositor timing produced the
+                        // staleness, instead of chasing that one root cause.
                         //
-                        // Use `fb_size` from `GLArea::resize`, matching the framebuffer actually drawn.
-                        // In GTK 4.22.5, buffers and the resize signal use widget dimensions times the scale factor.
-                        // They can lag the allocation while hidden or before a snapshot; the next snapshot updates both.
-                        // Log a note if the dimensions differ on a drawn widget, since its buffer sizing may differ.
+                        // The size is GTK's own framebuffer (`fb_size`, set by
+                        // `connect_resize`), no longer `widget.width() * scale_factor()`. GTK
+                        // 4.22.5 derives its buffers and the `resize` signal from that same
+                        // product (`gtkglarea.c`), so the two differ only while the widget has
+                        // not been drawn at its latest allocation (hidden by
+                        // `set_child_visible`, or between an allocation and its snapshot) --
+                        // and then GTK's `resize` on the next snapshot resizes nvim for the size
+                        // actually drawn. The `note:` line records it if they ever differ on a
+                        // drawn widget, which would mean a GTK whose buffers follow some other
+                        // size.
                         //
-                        // During a scale change, `notify::scale-factor` updates the widget factor before the next
-                        // snapshot supplies a new framebuffer and synchronizes the harness. This gap can last longer
-                        // while hidden. Suppress the note during that expected mismatch by checking `os_scale_factor()`.
+                        // A live OS-scale change is exactly this kind of mismatch between GTK's
+                        // `notify::scale-factor` -- which moves `widget.scale_factor()` while the
+                        // harness is still at the old scale and `fb_size` still holds the old
+                        // framebuffer -- and the next snapshot, whose `resize` sets `fb_size` and then
+                        // syncs the harness in the same callback (so the harness never runs ahead of
+                        // `fb_size`). The gap lasts one frame on a drawn widget and longer while the
+                        // pane is hidden. Expected, not the anomaly this note exists for: the added
+                        // `os_scale_factor()` comparison below skips the note while it is open.
                         let (width, height) = fb_size.get();
                         let widget_size = (
                             widget.width() * widget.scale_factor(),
@@ -1730,10 +1832,17 @@ impl NeovideEditorPane {
                         // signals above.
                         let wants_frame = session.wants_frame.replace(false) || grid_resynced;
 
-                        // `shutdown()` handles host-initiated closure. On every service run, check after pumping for
-                        // nvim exiting on its own, such as through `:qa!`. Service also runs from the fd watch for hidden
-                        // or unrealized panes. `exit_events` waits until nvim's own process is gone before reporting an
-                        // exit, and `close_requested` ensures the callback fires only once.
+                        // The "dead-looking-alive pane" fix: `shutdown()` already calls
+                        // `LiveHarness::shutdown()` when the host closes its own window, but
+                        // nothing previously reacted when nvim exits *on its own* (e.g. `:qa!`
+                        // typed inside it). `pump()` just above is what actually observes a real
+                        // `UserEvent::NeovimExited` arriving asynchronously, so checking right
+                        // here, on every service run (the tick, or the fd watch for a hidden or unrealized pane), catches it at the same latency the frame log already
+                        // did. `close_requested.replace(true)` is the one-shot guard documented on
+                        // `LiveSession::close_requested`; only the tick that flips it false->true
+                        // actually fires the callback.
+                        //
+                        // Only once nvim's own process is gone (`exit_events`).
                         let fork_exited = session.harness.has_neovim_exited();
                         let events = exit_events(
                             fork_exited,
@@ -1988,9 +2097,10 @@ impl NeovideEditorPane {
         matches!(&*self.live_state.borrow(), LiveState::Ready(session) if !session.harness.has_neovim_exited())
     }
 
-    /// Whether nvim ran and has exited, including after release ([`LiveState::Exited`]).
-    /// Returns `false` if nvim never started or the harness reports an exit while nvim's own process
-    /// is still alive ([`nvim_exit_pending`](Self::nvim_exit_pending)).
+    /// Whether nvim ran and has exited: seen exited and not yet released, or released
+    /// ([`LiveState::Exited`]). `false` for an nvim that never started, and for one
+    /// the fork reports exited while nvim's own process is still alive
+    /// ([`nvim_exit_pending`](Self::nvim_exit_pending)).
     pub fn nvim_exited(&self) -> bool {
         match &*self.live_state.borrow() {
             LiveState::Ready(session) => session.harness.has_neovim_exited() && !session.exit_pending(),
@@ -2128,10 +2238,10 @@ impl NeovideEditorPane {
         }
     }
 
-    /// Returns [`watched_call`](Self::watched_call) after waiting up to [`SETTLE_WAIT`] for its worker
-    /// to publish how the request ended. Nvim-rs delivers the answer through a oneshot, while nvim's
-    /// exit can reach the host before the worker publishes it. This lets the host distinguish a quit
-    /// that nvim answered from a request ended by nvim's exit.
+    /// [`watched_call`](Self::watched_call) once its worker has published how the request ended,
+    /// waited for up to [`SETTLE_WAIT`]: nvim-rs hands the answer to the
+    /// worker through a oneshot, and nvim's exit reaches the host without waiting for it. For a
+    /// host deciding, at nvim's exit, whether nvim had answered its quit.
     pub fn settled_watched_call(&self) -> Option<CallWatch> {
         match &*self.live_state.borrow() {
             LiveState::Ready(session) => session.watched.as_ref().map(|call| call.settled(SETTLE_WAIT)),
@@ -2139,12 +2249,18 @@ impl NeovideEditorPane {
         }
     }
 
-    /// Ends nvim without `:qa!`, preserving swap files. Uses `nvim_child::schedule`: normally close
-    /// stdin now and send SIGTERM from 1 s; if this pane's `:confirm qall` is outstanding, send SIGTERM
-    /// now and close stdin at 1 s. The stdin timer runs here because the harness lives on this thread.
-    /// A worker signals nvim's held pid and escalates to SIGKILL at 5 s if needed.
-    /// Exit reaches [`on_exited_unrequested`](Self::on_exited_unrequested) once the process is gone.
-    /// Idempotent: another call starts no second watch. Returns `false` without a live session.
+    /// Ends nvim without `:qa!`, which would discard unsaved buffers and their swap files: closes
+    /// its stdin (the fork's
+    /// `LiveHarness::hang_up`), on which nvim exits keeping its swap files, and escalates on a thread
+    /// by the pid this pane holds (`nvim_child::end`: SIGTERM, which nvim answers the same way and
+    /// which ends a dialog EOF does not; SIGKILL after 5 s) -- never the launcher that started it
+    /// (`nvim_child`'s module doc). The order is `nvim_child::schedule`'s: stdin closed now and
+    /// SIGTERM from 1 s; or, while this pane's `:confirm qall` has not come back and nvim may be in
+    /// its prompt, SIGTERM now and stdin closed at 1 s, by a timer on this thread, since the
+    /// harness lives here. Its exit then reaches the host as any exit does,
+    /// once the process is gone ([`on_exited_unrequested`](Self::on_exited_unrequested)).
+    /// Idempotent: a second call starts no second watch. `false`, doing nothing, when there is no
+    /// session.
     pub fn end_nvim(&self) -> bool {
         let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() else {
             return false;
@@ -2206,11 +2322,15 @@ impl NeovideEditorPane {
         Some((f64::from(scale.width()) / factor, f64::from(scale.height()) / factor))
     }
 
-    /// Registers `callback` for changes to the logical pixel `(width, height)` returned by
-    /// [`cell_size`](Self::cell_size), including the first observed value. A host can use these
-    /// dimensions to match a panel's status band to the editor's row height.
-    /// The render callback invokes it after `render_frame` and after dropping `live`, so a host
-    /// handler can call back into the pane. Replaces any earlier callback.
+    /// Registers `callback`, called with `(width, height)` in logical px -- the same numbers
+    /// [`cell_size`](Self::cell_size) returns -- every time the render callback observes them
+    /// differ from the last value this pane reported, first time included, so a host can size a
+    /// neighbour's bottom row (the agent panel's input line) to the editor's own status line beside
+    /// it. Fired from
+    /// the render callback, after `render_frame`, once `live` is dropped -- the same reentrancy
+    /// rule `on_fullscreen_setting`'s callback follows, since a host's handler (`shell` writing
+    /// `--nv-editor-row` into the panel's theme tokens) can call straight back into this pane.
+    /// Replaces any earlier callback.
     pub fn connect_cell_size_changed(&self, callback: impl Fn(f64, f64) + 'static) {
         *self.cell_size_callback.borrow_mut() = Some(Box::new(callback));
     }
@@ -2246,11 +2366,14 @@ impl NeovideEditorPane {
         *self.unreachable_callback.borrow_mut() = Some(Box::new(callback));
     }
 
-    /// Registers a callback for a `LiveHarness::with_options` failure, such as a missing or too-old
-    /// nvim. Called at most once with the message from [`build_start_failure_message`], so the host
-    /// can show a reason even when stdout is unavailable.
-    /// Fires after the render callback drops `live`, allowing the host to call pane methods safely.
-    /// Replaces any previously registered callback.
+    /// Registers `callback`, called at most once, with the human-readable reason
+    /// ([`build_start_failure_message`]) if `LiveHarness::with_options` ever returns `Err` -- nvim
+    /// missing from `PATH`, or older than this fork's floor. Before this there was no way for a host
+    /// to learn *why* the pane went [`LiveState::Failed`] at all; only a `[live] ... failed` line on
+    /// stdout, which a launch from a menu never shows. Fired from the render callback, after `live`
+    /// is dropped -- the same reentrancy rule [`NeovideEditorPane::on_exited_unrequested`]'s own
+    /// callback follows, so a host's handler (`shell` drawing a label over this pane and moving focus
+    /// elsewhere) is free to call back into this pane's own methods. Replaces any earlier callback.
     pub fn on_start_failed(&self, callback: impl Fn(&str) + 'static) {
         *self.start_failed_callback.borrow_mut() = Some(Box::new(callback));
     }
@@ -2318,13 +2441,15 @@ impl NeovideEditorPane {
         Ok(())
     }
 
-    /// Shuts down the live `nvim --embed` connection if one started. Ends nvim by closing stdin and
-    /// signalling its held process, without `:qa!`, which discards edits and deletes swap files.
-    /// Waits on this thread using an existing ending's schedule if one is already underway, for at
-    /// most the schedule's 5 s plus process cleanup. Then calls `LiveHarness::shutdown` to tear down
-    /// the harness; that closes stdin and sends no command.
-    /// The host normally asks nvim to quit with `:confirm qall` first, so this returns immediately
-    /// after that exit. Returns whether the harness saw the exit, or `true` if it never reached `Ready`.
+    /// Shuts down the live `nvim --embed` connection, if one was ever started: the host wires this
+    /// to its own window's `connect_close_request`. **Never `:qa!`** (it once ran
+    /// the fork's quit, which is `:qa!`: unsaved buffers discarded, swap files deleted). Closes
+    /// nvim's stdin and ends it as [`end_nvim`](Self::end_nvim) does, in the same order -- here on
+    /// this thread, on the first ending's schedule if one was already under way -- so it returns
+    /// once nvim's process is gone, at most the schedule's 5 s later; then tears the fork's harness down
+    /// (`LiveHarness::shutdown`, which closes stdin too and sends nothing). A host asks nvim first
+    /// (`shell` sends `:confirm qall` and calls this once nvim has exited), so it normally returns at
+    /// once. Returns whether the fork saw nvim exit -- `true` if `LiveState` never reached `Ready`.
     pub fn shutdown(&self) -> bool {
         let mut live = self.live_state.borrow_mut();
         if let LiveState::Ready(session) = &mut *live {

@@ -1,31 +1,49 @@
 //! `AgentConversation`: one whole conversation, driven by any `AgentProvider`.
 //!
-//! This is the layer `shell` commands and reads. `AgentProvider` issues commands and drains events
-//! without holding a projection. The legacy `AgentSession` provides state for a single backend.
-//! This type supports any provider with the same method shape: `send_turn`, `interrupt`,
-//! `respond_permission`, `pump`, `shutdown`, and a public `projection`.
+//! This is the layer `shell` talks to. It exists because `AgentProvider` is deliberately stateless
+//! -- a provider issues commands and drains events, and holds no projection --
+//! while a UI needs something it can both command and read. The legacy `AgentSession` already plays
+//! that role, but only for the one backend it is welded to.
 //!
-//! The three identities have different sources:
-//! - `conversation_id` is derived here and stays stable for a workspace.
-//! - `session_id` comes from `CreateSessionResponse.session_id`.
-//! - `provider_session_id` comes from `SessionReady.provider_session_id` through an event.
+//! So this type is the provider-agnostic sibling of `AgentSession`, with the same method shape on
+//! purpose (`send_turn` / `interrupt` / `respond_permission` / `pump` / `shutdown`, plus a public
+//! `projection`) so a caller can switch between them without restructuring.
 //!
-//! `provider_session_id` is the value accepted by `claude --resume <id>`. It does not exist until
-//! the session's first real event arrives. A created session that has never opened has no provider
-//! identity yet.
+//! **Three identities, deliberately not collapsed**:
 //!
-//! Lease acquisition and persistence happen in different orders for `create` and `resume`:
-//! - `create` has no `provider_session_id` until the first `SessionOpened` event. The lease is
-//!   acquired and the conversation saved on the ingestion thread when that event is folded.
-//! - `resume` knows the id, so it probes and acquires the lease before asking the provider to resume.
-//!   Acquiring afterward would let two clients start resuming the same session at once.
+//! | identity              | whose        | where it comes from                               |
+//! |-----------------------|--------------|---------------------------------------------------|
+//! | `conversation_id`     | Eitri's    | derived here, stable for a workspace              |
+//! | `session_id`          | Verdandi's   | `CreateSessionResponse.session_id`                |
+//! | `provider_session_id` | Claude's     | `SessionReady.provider_session_id`, via an event  |
 //!
-//! There is no directory lease: separate sessions may run in the same directory. Hook settings are
-//! isolated through the CLI's `--settings` argument (`agent::settings`), rather than a shared
-//! `.claude/` file. The `supervisor` dashboard shows other windows working in the same directory.
+//! They are genuinely different values for the sidecar provider. `provider_session_id` is the one
+//! `claude --resume <id>` takes, and it does not exist until the session's first real event
+//! arrives -- a session that has been created but has never opened has no provider identity yet.
 //!
-//! The session lease is advisory. It coordinates only processes that use this protocol. A manually
-//! started CLI takes no lease and is not stopped; two clients resuming one session share its transcript.
+//! **The lease and the persisted record are wired in here**, and their ORDERING differs between the
+//! two entry points in a way that is easy to get backwards:
+//!
+//! - `create` cannot take a lease up front. The lease key includes `provider_session_id`, and that
+//!   value does not exist until the provider's first `SessionOpened` arrives -- so the lease is
+//!   acquired, and the record written, on the ingestion thread when that event is folded.
+//! - `resume` knows the id before it calls anything, so it probes, acquires, and only THEN asks the
+//!   provider. Acquiring after would leave a window where two clients have both started resuming
+//!   the same Claude session, which is the exact hazard the lease exists to prevent.
+//!
+//! **There is deliberately no lease on the DIRECTORY.** One was written and withdrawn on
+//! 2026-09-15: it delivered prohibition (a second Eitri window in one project refused to start)
+//! where the requirement is isolation, and it broke `agent`'s own security baseline test, which now
+//! asserts that two sessions in one directory each see only their own `PreToolUse` hook. That
+//! isolation is real and lives elsewhere -- the hook config travels in the CLI's own argv
+//! (`--settings`, see `agent::settings`), not in a `.claude/` file two sessions could share. The
+//! cross-window question "is another window running an agent on this project?" is the `supervisor`
+//! dashboard's job, not a lock's.
+//!
+//! The lease is ADVISORY and nothing here says otherwise. It binds
+//! processes that take part in this protocol; a `claude` someone runs by hand in the same directory
+//! takes no lease and is not stopped, and Claude's own documentation records that two clients
+//! resuming one session interleave a single transcript.
 
 use crate::external::{ExternalProvider, ExternalStart, TurnPolicy};
 use crate::ingestion::ConversationIngest;
@@ -47,8 +65,9 @@ pub enum ConversationError {
     /// The underlying provider failed. `ProviderError::is_benign()` says whether the conversation
     /// can continue past it.
     Provider(ProviderError),
-    /// A second turn was submitted while one was already active. Reject it instead of queuing it,
-    /// matching `AgentSession::send_turn`. The conversation remains usable; the caller asked too early.
+    /// A second turn was submitted while one was already active. Rejected here rather than queued,
+    /// matching `AgentSession::send_turn`'s identical rule. Benign: the
+    /// conversation is fine, the caller simply asked too early.
     TurnAlreadyActive,
     /// A command that needs a live session arrived before one existed (or after it closed).
     NoSession,
@@ -83,8 +102,9 @@ pub enum ConversationError {
     LeaseHeld { provider_session_id: String },
     /// The lease could not be taken for a reason other than contention.
     Lease(LeaseError),
-    /// The session transcript is still being written, so another client is likely driving it.
-    /// Refuse to resume while the transcript is changing.
+    /// Claude's own transcript for this session is still being written, so something else is very
+    /// likely driving it right now. So a resume probes first and refuses while the transcript is
+    /// moving: two writers in one transcript would interleave one conversation.
     TranscriptUnstable { provider_session_id: String },
     /// The call does not exist for this conversation's agent: a plain `send_turn` on a conversation
     /// whose agent takes a policy with every turn, or `send_turn_with` on one that does not.
@@ -118,8 +138,8 @@ impl std::fmt::Display for ConversationError {
             ConversationError::TurnAlreadyActive => write!(f, "a turn is already in progress on this conversation"),
             ConversationError::NoSession => write!(f, "no active session"),
             ConversationError::Cwd(e) => write!(f, "could not resolve the working directory: {e}"),
-            // States the advisory boundary rather than implying a guarantee the lock cannot give
-            //: it binds Eitri windows only.
+            // States the advisory boundary rather than implying a guarantee the lock cannot give:
+            // it binds Eitri windows only.
             ConversationError::LeaseHeld { provider_session_id } => write!(
                 f,
                 "session {provider_session_id} is already open in another Eitri window -- close it \
@@ -350,13 +370,15 @@ pub struct AgentConversation {
 impl AgentConversation {
     /// Creates a fresh provider session for `cwd`.
     ///
-    /// `cwd` is canonicalized first so the conversation id, lease, and provider use the same directory.
-    /// Otherwise different spellings of one path could create separate conversations, locks, and files.
+    /// `cwd` is canonicalized first, and the canonical form is what the conversation id, the lease
+    /// and the provider all see -- otherwise `/home/x/proj` and `/home/x/../x/proj` would be two
+    /// conversations for one directory, would take two different locks, and would later map to two
+    /// different persisted records.
     ///
-    /// The session is gated regardless of the tab's mode. The caller decides above this API whether
-    /// to answer permission requests with `allow` automatically.
+    /// No permission mode: the session is gated whatever the tab's mode, and the host decides
+    /// above this API whether to answer its requests `allow` itself.
     ///
-    /// `project` controls whether the project's own settings tiers load; the caller supplies it.
+    /// `project` decides whether the project's own settings tiers load; the caller states it.
     pub fn create(
         provider: Arc<dyn AgentProvider + Send + Sync>,
         cwd: &Path,
@@ -539,15 +561,29 @@ impl AgentConversation {
 
         let conversation_id = conversation_id_for_cwd(&canonical_cwd);
 
-        // Load history after the stability probe and lease acquisition, before asking the provider to
-        // resume. The probe found no transcript writer, and the lease excludes other cooperating clients.
-        // Loading before live events arrive keeps restored history below them in `seq` order.
+        // Here, and nowhere else. The stability probe has just confirmed nothing is
+        // writing the transcript (step 3), the lease is in hand so no other Eitri window is
+        // driving this session (step 4), and the provider has not yet produced a byte -- so the
+        // file cannot move under this read and no live event can precede what it restores.
         //
-        // If the provider refuses the resume, `watch_resume_take_hold` discards this conversation and seed.
-        // Loading after that response could inject history into a projection that already holds live events.
+        // A resume the provider later REFUSES throws this work away along with the whole
+        // conversation (`watch_resume_take_hold` below), which is deliberate: the alternative is
+        // loading after the verdict, which means injecting history into a projection that has
+        // already folded live events, and that is the one thing that would break the `seq` total
+        // order.
         //
-        // This read runs on the worker thread started for `AgentBackend::start`, outside the GTK main loop.
-        // A large transcript can delay the panel's initial history display without blocking UI events.
+        // **This comment used to end:** "Reading the largest real transcript on this machine whole
+        // takes 0.143s in Python." That was offered as the reason the cost is negligible, and it
+        // was a Python measurement standing in for Rust. Kept above rather than deleted, because
+        // what replaced it only moves the conclusion, not the direction: the real figures for the
+        // product path on this machine's largest
+        // transcript (48,805,214 B, tail-scanned), 3 runs each, hot cache -- **70-84 ms in release
+        // and 513-519 ms in debug**. So release is about twice as fast as the Python number and
+        // debug about 3.6x slower than it, and debug is what every `cargo test` and every
+        // `cargo run -p shell` uses. It is still not a stall: this runs on the worker thread
+        // `AgentBackend::start` was spawned onto (`panel/src/starts.rs`), never on the GTK
+        // main loop, so what it costs is the panel filling in that much later after a resume of
+        // that one outsized session. Every other transcript here is a few milliseconds.
         let seed = crate::history::load::seed_for_resume(&cwd_string, &conversation_id, provider_session_id);
 
         let session_id = provider.resume_session(crate::provider::ResumeSessionRequest {
@@ -947,18 +983,26 @@ impl AgentConversation {
         }
     }
 
-    /// Store the first line of `as_typed` as the resume picker's session title. Pass the user's
-    /// prompt as typed, since the wire turn has editor context prepended. Only the first prompt
-    /// with visible text counts; later calls do nothing.
+    /// Records what this session is about, for the resume picker: the first line of `as_typed`, the
+    /// prompt as the user typed it, so the row reads as the user's own first sentence. Pass the typed
+    /// text, never the turn sent on the wire -- that one carries editor context above the user's
+    /// words. Only the first prompt with visible text counts; after that this does nothing.
     ///
-    /// The Agent SDK reports the session id at the start of the first turn, before the persisted
-    /// session entry may exist. Hand the title to `ConversationIngest::note_title` so the ingestion
-    /// thread writes it during adoption or updates the existing entry. Writing here could lose
-    /// a title between id publication and persistence, and would do disk I/O on the GTK main loop.
-    /// Write failures are logged and leave a missing title without breaking the session.
+    /// The Agent SDK reports Claude's session id at the start of the first TURN, so the record
+    /// usually does not exist yet when the first prompt is sent. This only hands the title to the
+    /// ingestion thread (`ConversationIngest::note_title`), which writes it with the record when it
+    /// adopts the session, or into the record once it is on disk. Nothing here touches the disk --
+    /// this runs on the GTK main loop. Best-effort: a failed write is a row without a title next
+    /// time, not a broken session, so it logs.
     ///
-    /// A resumed session keeps its original title. A session saved before titles existed uses
-    /// the first prompt after resume.
+    /// **Correction:** an earlier version wrote the title here when the session
+    /// id was already known, and claimed the lock made that race-free. It did not: the id becomes
+    /// visible before the record is written, and a title handed over in between found no record and
+    /// was dropped, silently, for good (reproduced 20/20). It also did a record write on the UI
+    /// thread for every resumed session.
+    ///
+    /// A resumed session keeps the title it was first given; one recorded before titles existed
+    /// takes its first prompt after the resume.
     pub fn note_title(&mut self, as_typed: &str) {
         if self.title_noted {
             return;
@@ -1125,14 +1169,17 @@ impl AgentConversation {
     /// that is ending can never be genuinely answered and the provider's own terminal events may not
     /// be drained before this process goes away. Idempotent.
     pub fn shutdown(&mut self) {
-        // A failed close leaves provider teardown completion uncertain. A wedged or crashed sidecar may still
-        // be alive for up to `SIDECAR_EXIT_GRACE` before being killed. Keep the lease so another client
-        // cannot resume the same session and write its transcript during teardown.
+        // A failed close means the provider session's own teardown is not known to be done -- a wedged
+        // or crashed sidecar, still closing over up to `SIDECAR_EXIT_GRACE` before it is even
+        // killed. Releasing the lease anyway would let another client resume the same provider
+        // session, writing the same transcript, while this one might still be live.
         //
-        // `self.close_failed` persists across calls because `shutdown` is idempotent. The first call
-        // takes `self.session_id`; later calls skip `close_session`. A local flag would forget the failure
-        // and allow a later call to release the lease. Once set, this field stays set for the rest of
-        // the conversation's lifetime.
+        // `self.close_failed`, not a per-call local: `shutdown` is idempotent, so a second call
+        // finds `self.session_id` already `None` and never calls `close_session` again -- a local
+        // would forget the first call's failure and let the SECOND call's release check below run
+        // with a freshly `false` value, releasing the lease anyway. This field is only ever set,
+        // never cleared, so once a close fails the lease stays held for the rest of this
+        // conversation's life, not just until the next `shutdown()` call.
         if let Some(session_id) = self.session_id.take() {
             if let Err(e) = self.provider.close_session(CloseSessionRequest { session_id }) {
                 eprintln!("agent: AgentConversation::shutdown: close_session failed: {e}");
@@ -2536,11 +2583,10 @@ mod tests {
         );
     }
 
-    /// A failed `close_session` keeps the lease held while the provider may still be tearing down,
-    /// including up to `SIDECAR_EXIT_GRACE` before a wedged child is killed. Releasing it sooner could
-    /// let another client resume the same session and write the same transcript concurrently.
-    /// The lease remains in `self.ingest`. Since `provider` is declared before `ingest` on
-    /// [`AgentConversation`], dropping the conversation tears down the provider before dropping the lease.
+    /// If `close_session` fails, `shutdown` keeps the lease in `self.ingest` so another client cannot
+    /// resume the same transcript while the provider is still tearing down. Teardown may take up
+    /// to `SIDECAR_EXIT_GRACE` before the child is killed. `provider` precedes `ingest` in
+    /// [`AgentConversation`], so dropping it tears down the provider before releasing the lease.
     #[test]
     fn a_failed_close_session_keeps_the_lease_held_until_the_conversation_is_dropped() {
         let fake = Arc::new(FakeProvider::new());
@@ -2571,10 +2617,17 @@ mod tests {
         );
     }
 
-    /// Repeated `shutdown()` calls must keep the lease held after a failed `close_session`.
-    /// The first call takes `self.session_id`, so the second skips `close_session`. A per-call local
-    /// `close_failed` would start false again and allow the second call to release the lease while
-    /// the provider might still be tearing down. The failure must remain stored on the conversation.
+    /// On `a_failed_close_session_keeps_the_lease_held_until_the_conversation_is_dropped`:
+    /// the row above proves the lease survives the ONE `shutdown()` call whose
+    /// `close_session` actually failed. `shutdown` is documented as idempotent
+    /// (`shutdown_closes_the_session_fail_closes_pending_permissions_and_is_idempotent` calls it
+    /// twice as a supported pattern) and every real caller (`panel/src/teardown.rs`'s
+    /// `tear_down`/`tear_down_all` and the handoff
+    /// path) is not the only conceivable one. A per-call local `close_failed` forgets the first
+    /// call's failure: on the second call `self.session_id` is already `None` (taken by the first),
+    /// so `close_session` is never retried, the local is freshly `false`, and the unconditional
+    /// `if !close_failed { release_lease() }` releases the lease anyway -- reopening exactly the
+    /// race the fix closed, on the second call rather than the first.
     #[test]
     fn a_second_idempotent_shutdown_after_a_failed_close_still_does_not_release_the_lease() {
         let fake = Arc::new(FakeProvider::new());

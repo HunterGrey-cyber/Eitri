@@ -1,17 +1,23 @@
-//! Provides the legacy backend's `AgentSession` surface when `legacy-backend` is disabled.
+//! eitri-only: the legacy backend's `AgentSession` in a build without it (the `legacy-backend`
+//! feature off, which is every release).
 //!
-//! The type is uninhabited, but its public surface lets `AgentBackend::Legacy(AgentSession)`
-//! and its call sites in `core` and `shell` compile with feature checks confined to `agent`.
-//! No value can exist, so that backend arm cannot be constructed, and the real session,
-//! CLI spawn, wire and hook-relay code is not compiled. `start` fails with `LEGACY_NOT_IN_BUILD`.
+//! **Uninhabited, with the real type's public surface.** `eitri-core`'s
+//! `AgentBackend::Legacy(AgentSession)` arm and its call sites in `core` and `shell` compile
+//! unchanged against this, so the `cfg` stays inside `agent` (and out of
+//! `core/src/agent_backend.rs`); but no value of this type can exist, so that arm can never be
+//! constructed, and none of the real session, CLI spawn, wire or hook-relay code is compiled.
+//! `start` is the only way in, and it fails with `LEGACY_NOT_IN_BUILD`.
 //!
-//! The struct has a private `Infallible` field so it can also expose `session.projection`,
-//! which callers read and an empty enum could not provide. The private uninhabited field
-//! prevents construction. Instance methods eliminate it with `match self.never {}`.
+//! **A struct with an `Infallible` field, not an empty `enum AgentSession {}`**, and only
+//! because the real type has a public field: `core` reads `session.projection` (three sites in
+//! `agent_backend.rs`), which an enum cannot have. A struct with an uninhabited field is itself
+//! uninhabited, the field is private so nothing outside this module could even try to build one,
+//! and every method body is `match self.never {}` -- the same proof `match *self {}` gives for an
+//! empty enum.
 //!
-//! Keep signatures in step with `session.rs`. Calls added in `core` or `shell` must also
-//! compile against this stub. The test suite runs both the default configuration and
-//! `--features shell/legacy-backend`.
+//! **Keep the signatures in step with `session.rs`.** A method `core` or `shell` starts calling on
+//! the real type fails the default build until it is added here too -- loud, not silent. The test
+//! suite runs both configurations (the default, then `--features shell/legacy-backend`).
 
 use crate::projection::{AgentDomainEvent, AgentSessionProjection};
 use crate::provider::PermissionDecision;
@@ -69,8 +75,8 @@ impl AgentSession {
         match self.never {}
     }
 
-    /// Matches the real type's `pump` with each event's revision.
-    /// The uninhabited receiver makes this method unreachable.
+    /// The real type's `pump` with each event's revision;
+    /// uninhabited here like every other method.
     pub fn pump_revised(&mut self) -> Vec<(u64, AgentDomainEvent)> {
         match self.never {}
     }

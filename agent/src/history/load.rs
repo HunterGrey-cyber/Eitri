@@ -1,21 +1,29 @@
 // agent/src/history/load.rs
-//! Builds the initial projection for a resumed conversation from one stored source.
+//! Turning one of the two stored records into the projection a resumed conversation starts from.
 //!
-//! `AgentSessionProjection::apply` is the only `seq` allocator. Both sources become events:
-//! B supplies parsed events, while A's three collections are merged by stored `seq` and
-//! converted to events. Stored sequence numbers determine order but are not copied into
-//! the projection.
+//! The load happens in one place, through one allocator; when B, Claude's own transcript, cannot be
+//! read it falls to A, Eitri's copy; and B wins whenever it can be read.
 //!
-//! `ConversationIngest::start` receives the complete seed before spawning its thread.
-//! Live events therefore receive sequence numbers after all historical events. The loader
-//! clears `assistant_message_open` so the first live reply cannot join the last stored reply.
+//! Four properties this module holds, each with its reason:
 //!
-//! The CLI transcript, B, takes precedence when usable. Falling back to the stored copy,
-//! A, is announced to the user. The sources are not merged because CLI compaction can
-//! make their contents differ.
+//! 1. **There is exactly one `seq` allocator, and it is `AgentSessionProjection::apply`.** Both
+//!    sources are REFOLDED: B's parser already produces `AgentDomainEvent`s, and A's three stored
+//!    collections are merged by their on-disk `seq` and turned back into events here. A stored
+//!    `seq` is a sort key and is never written back into the projection, so "no item has a number
+//!    that something other than `apply` chose" holds by construction rather than by convention.
+//! 2. **The seed is complete before the first live event exists.** `ConversationIngest::start`
+//!    takes it as a parameter and spawns its thread afterwards, so every live `seq` is greater than
+//!    every historical one with no renumbering, no offset, and nothing for the frontend to change.
+//! 3. **`assistant_message_open` is false when this module returns.** Otherwise the first live
+//!    reply is appended to the last historical assistant message and the two render as one.
+//! 4. **B wins whenever it can be read at all, and a fall to A is always said out loud.** No
+//!    merging, no difference detection, no silent degradation: the two records can genuinely
+//!    differ (the CLI compacts its own context and Eitri's copy does not), and a user with
+//!    `claude --resume` open in a terminal beside this panel must be able to see which one they are
+//!    looking at.
 //!
-//! Restored content is for display. It does not determine permissions or resume safety,
-//! and this loader neither composes it into model input nor writes it back to disk.
+//! Nothing read here is evidence: a restored item feeds the panel and nothing else. It never
+//! reaches a permission decision, is never composed into a turn, and is never written back to disk.
 
 use std::path::{Path, PathBuf};
 
@@ -29,12 +37,14 @@ use super::transcript_jsonl::{read_transcript_history, TranscriptHistory};
 
 /// The projection a resumed conversation starts from.
 ///
-/// Called from `AgentConversation::resume` after acquiring the lease and before asking the provider
-/// to resume. The stability probe has found no transcript writer; the lease excludes other
-/// cooperating clients, and this provider has not yet emitted live events.
+/// Called from `AgentConversation::resume` after the lease is held and before the provider is asked
+/// for anything: the stability probe has just confirmed nothing else is writing the
+/// transcript, the lease means no other Eitri window is driving this session, and the provider has
+/// not yet produced a single byte.
 ///
-/// Never fails. Missing files, denied access, unsupported formats, or an unavailable stored copy
-/// leave a projection with less history so history loading does not prevent a working resume.
+/// Never fails. Every way of not getting history -- no transcript, no permission, a format nothing
+/// here recognises, no stored copy either -- ends in a projection that is merely emptier, because a
+/// resume that works is worth more than a history that is complete.
 pub(crate) fn seed_for_resume(cwd: &str, conversation_id: &str, provider_session_id: &str) -> AgentSessionProjection {
     seed_from(
         crate::transcript::transcript_path(cwd, provider_session_id),
@@ -68,9 +78,9 @@ pub(crate) fn seed_from(
             load_stored(&mut projection, conversation_id, provider_session_id, path, reason);
         }
     }
-    // Close the assistant message on every return path. Restored assistant text leaves this flag
-    // true; the first live delta would otherwise append to the previous session's reply and render
-    // both replies as one bubble.
+    // The last thing this module does on every path. A history whose final item is
+    // assistant text leaves this flag true, and the first live delta would then be appended to that
+    // message -- last session's reply and this one's rendered as a single bubble.
     projection.assistant_message_open = false;
     // Neither source restores thinking today, so this is already false; stated so a later source
     // that does cannot leave a restored thought open for the first live one to be appended to.
@@ -78,17 +88,26 @@ pub(crate) fn seed_from(
     projection
 }
 
-/// Counts the conversational rows held by the projection after events have been folded.
-/// Both loading paths use this count so the notice matches the rows the panel draws.
-/// `apply` coalesces consecutive assistant text into one `TranscriptMessage`, so input
-/// event counts and stored item counts can differ from the displayed row count.
+/// How many conversational items a projection is holding -- the one basis both paths report.
 ///
-/// Called before and after loading, so the difference remains correct even if the
-/// projection already contains items.
+/// **Counted AFTER the fold, and that is the whole point.** Both sources hand `apply` a stream of
+/// events, and `apply` coalesces consecutive assistant text into a single `TranscriptMessage`
+/// (`projection.rs`), so the number of events, slots or stored records that went in is not the
+/// number of rows that come out. Reporting the input count was a real defect, found on
+/// 2026-09-20: over all 45 real top-level transcripts on this machine, 13 disagreed with
+/// what the projection actually held (worst case 400 against 384), and the two paths were reporting
+/// two different quantities under one field name -- B its pre-fold slot count, A its post-truncation
+/// stored-record count. Taking both from here means the number the panel prints is the number of
+/// rows the panel draws, by construction rather than by coincidence.
 ///
-/// `omitted_items` counts items discarded before folding, a different unit from restored
-/// rows. Their row count cannot be recovered because merging would depend on discarded
-/// neighbours.
+/// Called as a before/after pair rather than once at the end: a seed is built on a fresh projection
+/// today, and a difference stays right if that ever stops being true.
+///
+/// **`omitted_items` is deliberately NOT in this unit**, and the notice's sentence therefore mixes
+/// two: restored is counted in rows, omitted in items that were dropped before any fold could see
+/// them. There is no honest way to fold what was discarded -- whether two evicted assistant slots
+/// would have merged depends on neighbours that were also evicted -- so the choice is between a
+/// dropped-item count that is exact in its own unit and a row estimate that is not exact in any.
 fn restorable_item_count(projection: &AgentSessionProjection) -> usize {
     projection.user_prompts.len() + projection.transcript.len() + projection.tool_calls.len()
 }
@@ -103,11 +122,14 @@ enum BOutcome {
     Failed { path: Option<PathBuf>, reason: String },
 }
 
-/// Reads the transcript and determines whether to use it or fall back to stored history.
+/// Which way of not reading B counts as unavailable, as failure or as success, and which says so.
 ///
-/// A non-empty file yielding no conversational items triggers fallback. The transcript has no
-/// schema version, so an unrecognized format can appear as nothing parsed. An empty file is
-/// different: zero bytes represents an empty conversation and does not trigger fallback.
+/// The one case worth reading twice is the middle: a file that exists, holds bytes, and yields no
+/// items at all is treated as a FAILURE rather than as an empty conversation. The transcript
+/// carries no schema version anywhere (measured: none of the 15 line types has one), so "this build
+/// no longer understands this format" has no direct expression on disk and can only be observed as
+/// "nothing parsed". An empty file is different and is not failure: zero bytes is zero
+/// conversation, unambiguously.
 fn read_b(transcript_path: std::io::Result<PathBuf>) -> BOutcome {
     let path = match transcript_path {
         Ok(path) => path,
@@ -150,10 +172,15 @@ fn read_b(transcript_path: std::io::Result<PathBuf>) -> BOutcome {
     }
     match read_transcript_history(&path) {
         Ok(history) if history.parsed_items == 0 => {
-            // Report that nothing could be restored without implying the file could not be read.
-            // A healthy transcript containing only slash-command echoes, `isMeta` injections, or a compaction
-            // summary can yield no items because the allow-list rejects them. Keep the writer version in
-            // the reason to help diagnose a format change when there is one.
+            // **Says what was observed, not what it might mean.** This arm is the "the format
+            // may have changed" signal, but it is reachable with no format change at all: a
+            // session whose `type:"user"` lines are all slash-command echoes, `isMeta` injections
+            // or a compaction summary is correctly rejected by the allow-list and yields nothing
+            // from a perfectly healthy file. The earlier wording ("no records could be parsed")
+            // rode a sentence beginning "Claude's transcript could not be read", which sent a user
+            // to inspect a file that is fine. The version stays: it is still the first thing
+            // somebody debugging a real format change wants, and it costs nothing when there was
+            // no format change.
             let reason = match &history.writer_version {
                 Some(version) => format!("nothing in it could be restored (written by claude {version})"),
                 None => "nothing in it could be restored".to_string(),
@@ -174,8 +201,8 @@ fn read_b(transcript_path: std::io::Result<PathBuf>) -> BOutcome {
     }
 }
 
-/// Describes missing files and denied access directly, preserving the underlying error for
-/// other read failures.
+/// The three wordings a user is shown, and a fall-through that carries the real error rather than
+/// flattening every other failure into one of them.
 fn describe_io_error(e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::NotFound => "transcript file not found".to_string(),
@@ -194,10 +221,10 @@ fn empty_transcript_history() -> TranscriptHistory {
     }
 }
 
-/// Folds transcript events into the projection and records their source.
+/// Folds B in, and records where it came from.
 ///
-/// An empty conversation leaves no notice. A session with no earlier messages needs no
-/// explanation row.
+/// A transcript that parsed cleanly but holds no conversation leaves no notice: there is nothing to
+/// explain, and a row saying "no earlier messages" on a session that genuinely had none is noise.
 fn load_transcript(projection: &mut AgentSessionProjection, path: &Path, history: TranscriptHistory) {
     if history.parsed_items == 0 {
         // Logged from here rather than before the check, so the one line can carry the folded row
@@ -240,8 +267,8 @@ fn load_stored(
 ) {
     let stored = match store::load(conversation_id, provider_session_id) {
         Ok(stored) => stored,
-        // A session that never reached a turn boundary has no stored copy. Leave the panel empty
-        // without adding a notice row.
+        // The ordinary case, not an error: a session that never reached a turn boundary has no
+        // stored copy: no notice, no row, the panel is simply the one it is today.
         Err(HistoryLoadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             eprintln!("agent: Eitri's own history for session {provider_session_id} could not be read: {e}");
@@ -266,9 +293,10 @@ fn load_stored(
     let items_before = restorable_item_count(projection);
     for event in stored_events(&capped) {
         projection.apply(&event);
-        // Each stored `TranscriptMessage` is already coalesced. `apply` closes a run only on a prompt
-        // or turn boundary, and the stored events contain no turn boundaries. Explicitly close each
-        // assistant message so adjacent stored messages do not merge into one row.
+        // The reason A cannot simply be handed to `apply` as a stream: each
+        // stored `TranscriptMessage` is an already-COALESCED assistant message, and `apply` closes
+        // a run only on a prompt or a turn boundary -- neither of which A stores. Two adjacent
+        // stored messages would merge back into one. Closing after every one keeps them apart.
         if matches!(
             event,
             AgentDomainEvent::ContentDelta {
@@ -297,10 +325,12 @@ fn load_stored(
     });
 }
 
-/// Merges the three stored collections by `seq` and reconstructs their events.
+/// A's three collections, merged by their stored `seq` and turned back into the events that
+/// produced them.
 ///
-/// Stored sequence numbers recover the order across collections, then are discarded. `apply`
-/// assigns new contiguous numbers from the current projection's allocator.
+/// The stored `seq` is used HERE and only here: as the sort key that recovers the one order the
+/// three collections were written in. The numbers themselves are then thrown away -- `apply`
+/// assigns new ones, contiguous and this process's own (one allocator).
 fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
     enum Item<'a> {
         Prompt(&'a UserPromptRecord),
@@ -371,15 +401,19 @@ fn stored_events(stored: &StoredHistory) -> Vec<AgentDomainEvent> {
     events
 }
 
-/// Logs parser counts and discarded data to stderr.
+/// One line, to stderr, with everything the parse threw away.
 ///
-/// Keep parser diagnostics out of the notice: they include attachments and side records, so they
-/// cannot be presented as counts of conversation rows. They help diagnose transcript format changes.
+/// These numbers are deliberately not in the notice: "1,431 records were not loaded" next to
+/// a number that also counts attachments and side records would be a figure nobody can explain. In
+/// the log they are the first thing a person debugging a format change wants.
 ///
-/// Log `parsed` and `restored` separately. Consecutive assistant text can fold into one row, so the
-/// parser's item count can exceed the panel's restored row count. `restored` uses the panel's
-/// meaning of a row. It is `None` when zero items were parsed and nothing was folded; that case
-/// also leaves no notice.
+/// **`parsed` and `restored` are two different numbers and this line names both.** Until
+/// 2026-09-20 it printed the parser's own slot count under the word "restored", which is
+/// the panel's word for the rows it draws: a transcript of six adjacent assistant lines logged
+/// "restored 6 items" while the notice beside it said 1, because consecutive assistant text folds
+/// into one row. A debugger reads this line first, so the two must not disagree about a word they
+/// share. `restored` is `None` only where nothing was folded at all -- a transcript that parsed to
+/// zero items, which leaves no notice either.
 fn log_counts(path: &Path, history: &TranscriptHistory, restored: Option<usize>) {
     let counts = history.counts;
     eprintln!(
@@ -389,8 +423,9 @@ fn log_counts(path: &Path, history: &TranscriptHistory, restored: Option<usize>)
          {unknown}, sidechain {sidechain}, rejected user {rejected}, empty prompt {empty}], \
          dropped blocks: {blocks}, orphan tool results: {orphans}, written by claude {version})",
         items = history.parsed_items,
-        // Use singular nouns for a count of one, matching the panel notice. These diagnostics are
-        // read beside that notice and should describe the same counts consistently.
+        // Agreement, for the same reason the panel's own notice has it: this
+        // line is read beside that sentence and "restored 1 rows" in the sentence written to make
+        // the numbers honest reads as a line nobody proofread.
         item_word = if history.parsed_items == 1 { "item" } else { "items" },
         path = path.display(),
         restored = match restored {

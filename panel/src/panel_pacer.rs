@@ -1,18 +1,26 @@
-//! Host-side typing cadence for the panel, using `eitri_core::panel_cadence`.
-//! Each page envelope passes through its PanelPage's [`Pacer`], which sends it now or holds
-//! it for the next slot while preserving wire order.
+//! The host-side half of the panel's typing cadence (`eitri_core::panel_cadence`): every
+//! envelope bound for the agent panel's page passes through the [`Pacer`] its `PanelPage` holds, which
+//! decides -- with the pure rules from that module -- whether it goes now or waits for the next
+//! slot, and keeps the wire order either way.
 //!
-//! `PanelPage::send` and `AgentPanelHandle::dispatch` flush pending envelopes before sending.
-//! This prevents a tab-switch or ready snapshot from overtaking earlier events and drawing
-//! text twice. Only stream payloads from `TabSet::pump` can be held by [`Pacer::send_stream`].
+//! **Where the funnel is.** `PanelPage::send` (the one call the whole module dispatches through)
+//! and `AgentPanelHandle::dispatch` (the guarded twin for the focus,
+//! HINT and arrival envelopes, which flushes through `PanelPage::flush` before it sends) both hand over
+//! whatever is waiting before they send, so nothing can
+//! overtake a held envelope -- in particular no snapshot (a tab switch, a `ready`) can be applied
+//! to the page before the events that came ahead of it, which would draw the same text twice.
+//! Only the pump's own stream payload is ever held
+//! ([`Pacer::send_stream`], classed by `TabSet::pump`).
 //!
-//! Reloads and fresh ready messages call [`Pacer::discard_pending`] because their snapshots
-//! already include the held events in canonical state. Sending those events afterwards would
-//! duplicate text. A held first text is returned for tracing so its turn does not wait for
-//! a paint report that the snapshot's text will never receive.
+//! **What discards.** A document reload and a fresh `ready` throw the held envelopes away
+//! ([`Pacer::discard_pending`]): the `ready` batch carries a snapshot read from canonical state,
+//! which already holds everything they say. Sending them after it would draw it twice. A turn's
+//! held first text is handed back to the caller for its trace, which would otherwise wait for a
+//! paint report the snapshot's text never gets.
 //!
-//! Tests here use a recording [`Sink`]. They do not cover `start_pump_timer` integration or
-//! the resulting WebKit frames, which need a display.
+//! **Not testable without a display**, and so not tested here: that `start_pump_timer` calls this
+//! at all, and the WebKit frames the released envelopes then cause. The rules are all in this
+//! file's tests, against a recording [`Sink`].
 
 use std::time::Instant;
 

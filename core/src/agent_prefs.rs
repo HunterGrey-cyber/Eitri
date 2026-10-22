@@ -1,8 +1,6 @@
-//! The permission mode an empty session tab starts in, remembered per project in the state
-//! directory under `agent/<16 hex>.json`, outside the project. The file is named like the layout
-//! file (`layout::persist::file_name`) and written the same way: a `.tmp` beside it, then renamed.
-//! A file that cannot be used is set aside as `.json.unusable` and read as nothing, as the layout
-//! file is.
+//! Remembers the permission mode for empty session tabs per project, outside the project
+//! directory. Uses the layout file naming scheme and writes a neighboring `.tmp` file before
+//! renaming it. Unusable files are set aside as `.json.unusable` and treated as missing.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -10,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_bridge::SessionModeChoice;
-use crate::layout::persist::{file_name, state_subdir, temporary};
+use crate::state_paths::{file_name, state_subdir, temporary};
 
 const VERSION: u32 = 1;
 
@@ -72,7 +70,7 @@ pub fn save_mode(dir: &Path, project_root: &Path, mode: SessionModeChoice) -> st
             "bypass is never written to disk",
         ));
     }
-    crate::layout::persist::create_state_dir(dir)?;
+    crate::state_paths::create_state_dir(dir)?;
     let path = dir.join(file_name(project_root));
     let tmp = temporary(&path);
     let file = PrefsFile {
@@ -447,7 +445,7 @@ mod tests {
         let path = save_mode(&dir, &root(), SessionModeChoice::Auto).unwrap();
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
-            crate::layout::persist::file_name(&root())
+            crate::state_paths::file_name(&root())
         );
         assert_eq!(
             load_mode(&dir, &root()),
@@ -484,7 +482,7 @@ mod tests {
         let dir = scratch("remembered-bypass");
         // Written directly, the way `another_projects_file_or_a_broken_one_is_unusable...` writes a
         // "foreign" file: `save_mode` itself refuses to write `Bypass`.
-        let path = dir.join(crate::layout::persist::file_name(&root()));
+        let path = dir.join(crate::state_paths::file_name(&root()));
         let raw = format!(
             "{{\"version\":1,\"project_root\":{:?},\"permission_mode\":\"bypass\"}}",
             root().to_string_lossy()
@@ -510,7 +508,7 @@ mod tests {
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after, "the file is left exactly as it was");
         assert!(
-            !dir.join(format!("{}.unusable", crate::layout::persist::file_name(&root())))
+            !dir.join(format!("{}.unusable", crate::state_paths::file_name(&root())))
                 .exists(),
             "a remembered bypass is not unusable -- nothing is set aside"
         );
@@ -519,13 +517,13 @@ mod tests {
     #[test]
     fn another_projects_file_or_a_broken_one_is_unusable_and_set_aside_at_startup() {
         let dir = scratch("unusable");
-        std::fs::write(dir.join(crate::layout::persist::file_name(&root())), "{ not json").unwrap();
+        std::fs::write(dir.join(crate::state_paths::file_name(&root())), "{ not json").unwrap();
         assert!(matches!(load_mode(&dir, &root()), LoadedMode::Unusable(_)));
         let (mode, notes) = startup_mode(Some(&dir), &root());
         assert_eq!(mode, SessionModeChoice::Auto, "read as nothing: the startup default");
         assert!(notes.iter().any(|n| n.contains("unusable")), "{notes:?}");
         assert!(dir
-            .join(format!("{}.unusable", crate::layout::persist::file_name(&root())))
+            .join(format!("{}.unusable", crate::state_paths::file_name(&root())))
             .exists());
         assert_eq!(
             load_mode(&dir, &root()),
@@ -534,7 +532,7 @@ mod tests {
         );
 
         let foreign = "{\"version\":1,\"project_root\":\"/home/user/elsewhere\",\"permission_mode\":\"bypass\"}";
-        std::fs::write(dir.join(crate::layout::persist::file_name(&root())), foreign).unwrap();
+        std::fs::write(dir.join(crate::state_paths::file_name(&root())), foreign).unwrap();
         assert!(
             matches!(load_mode(&dir, &root()), LoadedMode::Unusable(why) if why.contains("written for")),
             "a file under this project's name but written for another root is not this project's"
@@ -667,7 +665,7 @@ mod tests {
         save_mode(&dir, &root(), SessionModeChoice::Auto).unwrap();
         assert!(remembers_a_choice(Some(&dir), &root()));
 
-        let path = dir.join(crate::layout::persist::file_name(&root()));
+        let path = dir.join(crate::state_paths::file_name(&root()));
         let raw = format!(
             "{{\"version\":1,\"project_root\":{:?},\"permission_mode\":\"bypass\"}}",
             root().to_string_lossy()

@@ -154,7 +154,7 @@ fn control_dir_for(xdg_runtime_dir: Option<&OsStr>, tmp: &Path, uid: u32) -> Pat
 
 /// The 16 hex digits that name this project's files, the same key the layout files use.
 fn key(project_root: &Path) -> String {
-    agent::conversation_id_for_cwd(project_root)[..16].to_owned()
+    crate::state_paths::project_key(project_root)
 }
 
 /// `dir/p-<16 hex>.sock`, checked against the 103-byte socket path limit macOS has.

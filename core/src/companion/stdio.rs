@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 
 /// `<state home>/eitri/companion`, by the same rule as the other state directories.
 pub fn log_dir(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    crate::layout::persist::state_subdir(xdg_state_home, home, "companion")
+    crate::state_paths::state_subdir(xdg_state_home, home, "companion")
 }
 
 /// The log's name for this canonical project root: 16 hex digits of its SHA-256, `.log`. One panel
 /// runs per project, so the file is the running panel's own.
 pub fn log_file_name(project_root: &Path) -> String {
-    format!("{}.log", &agent::conversation_id_for_cwd(project_root)[..16])
+    format!("{}.log", crate::state_paths::project_key(project_root))
 }
 
 /// Whether `fd` is a pipe or a socket, which is what a job of nvim's gets; never a terminal or a file.
@@ -59,7 +59,7 @@ pub struct Moved {
 /// Where the output would go: the log file, created 0600 (truncated) in a 0700 directory. `None`
 /// when no directory is known or it cannot be made.
 pub fn open_log(dir: &Path, project_root: &Path) -> Option<(std::fs::File, PathBuf)> {
-    crate::layout::persist::create_state_dir(dir).ok()?;
+    crate::state_paths::create_state_dir(dir).ok()?;
     let path = dir.join(log_file_name(project_root));
     let file = agent::private_fs::open_private(&path).ok()?;
     Some((file, path))

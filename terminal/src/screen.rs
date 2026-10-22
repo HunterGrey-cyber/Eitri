@@ -124,7 +124,8 @@ pub struct CursorCell {
 
 /// The `Term` configuration every Eitri terminal runs with. A function, so a test can pin it.
 ///
-/// - `osc52: OnlyCopy` -- a program may SET the clipboard (nvim's `"+y`), never READ it.
+/// - `osc52: OnlyCopy` -- a program may SET the clipboard (nvim's `"+y`), never READ it: reading it
+///   would hand whatever the user copied elsewhere to any program in the terminal.
 ///   `Term` enforces this itself, before any event reaches the listener.
 /// - `kitty_keyboard: true` -- foot speaks it, `terminal-input` encodes it (its
 ///   `real_app` suite drives nvim with it on), and a program that asks for it should get it.
@@ -157,8 +158,9 @@ impl Dimensions for GridSize {
     }
 }
 
-/// Convert [`PtySize`] to [`GridSize`] in one place for construction and resize. Callers
-/// already apply [`PtySize::clamped`], so no further minimum-size clamp is needed here.
+/// The one place a [`PtySize`] becomes a [`GridSize`]: `new` and
+/// `resize` used to repeat both the `.max(1)` (already redundant with [`PtySize::clamped`], which
+/// every caller here applies first) and the field-by-field construction.
 fn grid_size(size: PtySize) -> GridSize {
     GridSize {
         cols: usize::from(size.cols),
@@ -219,9 +221,10 @@ pub struct Screen {
     cursor_coloring: CursorColoring,
     size: PtySize,
     dirty: bool,
-    /// The frame captured just as a synchronized update opens, or the initial empty grid.
-    /// [`Self::render`] uses it for the live-bottom view while an update is open. Outside an
-    /// update it projects the quiescent live `term`.
+    /// The frame taken at the last transition into a synchronized update (or the empty grid at
+    /// construction). Read by [`Self::render`] only while an update is open AND the view is
+    /// following the live bottom -- outside one, `render` projects the live `term` directly instead,
+    /// since it is then guaranteed quiescent.
     frame: TerminalFrame,
     /// [`Self::content_revision`] when `frame` was projected: a snapshot is taken again only once
     /// the `Term` has changed since. An empty synchronized update (`ESC[?2026h ESC[?2026l`, what
@@ -235,9 +238,9 @@ pub struct Screen {
     /// publication: what [`Self::publication_is_visible`] measures the next one from.
     published_revision: u64,
     published_inert: u64,
-    /// Count updates forced closed by `abort_sync`. Add this to `SyncBarrier`'s `esu_count` in
-    /// [`Self::open_update`] so the ordinal changes whenever an update ends, whether by ESU or
-    /// abort.
+    /// How many updates `abort_sync` has forced closed. `SyncBarrier` has no counter of its own
+    /// for this (only `esu_count`, bumped by a real ESU); added to `esu_count` in [`Self::open_update`]
+    /// so the ordinal changes exactly when an update ENDS, by either path.
     abort_count: u64,
     /// Scrollback: how far back the window is, over `term`'s own retained history.
     scroll: ScrollView,
@@ -253,7 +256,7 @@ pub struct Screen {
     /// arrive through [`Listener`] the way title/bell/clipboard do, and needs this second slot
     /// merged in at the one place a caller reads events out.
     pending_selection: Option<String>,
-    /// Copy mode: read-only, entered by `prefix [`/`prefix PageUp`. Distinct
+    /// Copy mode: read-only, entered by `prefix [`/`prefix PageUp`, as tmux's is. Distinct
     /// from `self.scroll.scrolled()` -- entering shows the `[N/M]` indicator at once, `[0/M]` at the
     /// live bottom, where nothing is pinned yet and the plain scrollback keys show nothing
     /// until the first scroll actually moves the window. See [`Self::copy_mode_indicator`].
@@ -413,14 +416,18 @@ impl Screen {
         screen_replay::build(&mut self.term, &self.shadows)
     }
 
-    /// Parse an output chunk and mark the screen dirty when publication is allowed, never
-    /// midway through a `DECSET 2026` update.
+    /// Parses one chunk of output. Marks the screen dirty when the chunk reached a publication
+    /// point (`terminal-sync`'s rule: never mid-`DECSET 2026` update).
     ///
-    /// Feed `terminal-sync` one byte at a time to capture `self.frame` exactly when `in_sync`
-    /// changes from false to true, before the update can mutate `term`. No other publication
-    /// needs a snapshot because `Self::render` projects the live `term` whenever no update is
-    /// open. A chunk can contain several `BSU ... ESU BSU ...` transitions; each opening
-    /// replaces the snapshot, leaving the state just before the last still-open update.
+    /// Steps `terminal-sync` one byte at a time (matching what it already does internally -- see
+    /// its own "WHY BYTE AT A TIME" doc -- so this adds no real iteration cost) so it can catch the
+    /// exact byte where an update opens (`in_sync` false -> true) and snapshot `self.frame` right
+    /// there, before any of that update's own content can mutate `term`. That is the only point a
+    /// snapshot is structurally required (module doc); every other publication in this
+    /// call needs none, because `Self::render` reprojects the live `term` itself once no update is
+    /// open. A `feed()` call may carry more than one such transition (`BSU ... ESU BSU ...`); each
+    /// one replaces `self.frame`, so what is left after the call is the state right before the
+    /// *last* update that opened in this read, never that update's own half-drawn content.
     pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             let was_in_sync = self.sync.barrier().in_sync();
@@ -454,7 +461,7 @@ impl Screen {
         }
         // Output can evict or reflow what a pinned view holds; re-align once per call, the same
         // cadence `RawViewport::observe`'s own doc asks for ("once per wakeup while pinned"). A
-        // no-op while following the bottom.
+        // no-op while following the bottom, where there is nothing pinned to re-align.
         self.scroll.observe(&self.term);
     }
 
@@ -506,17 +513,25 @@ impl Screen {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Clamp each grid dimension to at least one cell, matching `TIOCSWINSZ`, so `CSI 18 t`
-    /// never reports `0x0`.
+    /// A grid below one cell is stored as one cell, the size `TIOCSWINSZ` gets too, so a
+    /// `CSI 18 t` never answers `0x0`.
     ///
-    /// Resizing changes geometry without a parser dispatch, so it takes no frame snapshot here.
-    /// `Self::render` projects the resized live `term` once no update is open. Ending or
-    /// aborting even an empty update clears `in_sync`, regardless of `SyncBarrier`'s `dirty`
-    /// flag, so the next render sees the resize.
+    /// Takes no *frame* snapshot itself -- `Term::resize` is geometry, not a parser dispatch, so it
+    /// cannot be the transition [`Self::feed`] watches for, and `Self::render` already reprojects
+    /// the live `term` (new size included) the next time it is called with no update open. That
+    /// covers this even when an update IS open at resize time and goes on to publish nothing of its
+    /// own (an ESU/abort with no dispatch in between never latches `SyncBarrier`'s `dirty` flag):
+    /// both still clear `in_sync` unconditionally, so `open_update()` still reports `None` once it
+    /// ends, and the next `render()` picks up the resize regardless.
     ///
-    /// Realign the scrollback anchor with [`ScrollView::observe`] because reflow can shift or
-    /// evict the retained line it points to. Resolving a stale anchor against the resized grid
-    /// could silently show a different line at the same index instead of reporting expiry.
+    /// **Does re-align the scrollback anchor.** A resize reflows
+    /// the grid -- how many logical lines/rows exist -- which can shift or evict what a pinned
+    /// [`ScrollView`] anchor points at, exactly the way output does; [`ScrollView::observe`]'s own
+    /// doc already asks for a call "once per feed -- output and resize both shift what history
+    /// retains." `Self::feed` called it; this did not, so a pinned anchor left stale by a resize
+    /// only [`RawViewport::resolve`](terminal_frame::viewport::RawViewport::resolve)d against the
+    /// *new* grid on the next `render()` -- silently returning whatever line the stale index now
+    /// landed on if it happened to still be in bounds, rather than reporting the anchor expired.
     pub fn resize(&mut self, size: PtySize) {
         let size = size.clamped();
         // `Term::resize` changes nothing for a size with the same cells (a new cell pixel size).
@@ -540,10 +555,13 @@ impl Screen {
         self.dirty = true;
     }
 
-    /// Identify the synchronized update (`ESC[?2026h`) currently holding publication back. The
-    /// ordinal changes when an update ends by ESU or [`Self::abort_sync`], letting callers
-    /// distinguish a new update from one still open. Nested BSUs are idempotent and must not
-    /// change it. Use `esu_count` plus forced aborts rather than counting BSUs.
+    /// The synchronized update (`ESC[?2026h`) that is holding publication back, if one is open: an
+    /// ordinal that changes exactly when an update ENDS (by ESU or by [`Self::abort_sync`]), so a
+    /// caller can tell a new update from one that has stayed open. **Not** a count of BSUs seen:
+    /// `SyncBarrier::begin_sync` is idempotent for a nested BSU
+    /// inside an already-open update, so counting BSUs gave a *different* ordinal for the same
+    /// still-open update on every re-arm -- `esu_count` (bumped only by a real ESU) plus this
+    /// screen's own count of forced aborts does not.
     pub fn open_update(&self) -> Option<u64> {
         let barrier = self.sync.barrier();
         barrier.in_sync().then(|| barrier.esu_count() + self.abort_count)
@@ -631,24 +649,31 @@ impl Screen {
         }
     }
 
-    /// Render the visible screen. `focused` selects a solid cursor when keys go here and a
-    /// hollow cursor otherwise.
+    /// The whole visible screen. `focused` picks a solid or a hollow cursor -- Eitri's rule that a
+    /// solid cursor means the keys go here (`shell/src/pane_focus.rs`).
     ///
-    /// With no synchronized update open, project the quiescent live `term` once per render call
-    /// rather than once per PTY read. During an update, use `self.frame`, captured just before
-    /// the update could mutate `term`. Refresh this live frame whenever no update is open,
-    /// regardless of scroll position, because [`Self::cursor_cell`] uses it and typing targets
-    /// the live screen.
+    /// Outside an open synchronized update, `term` is always quiescent (`open_update() == None`
+    /// means `terminal-sync` is not mid-tear), so this reprojects it fresh, at most once per call
+    /// -- bounded by however often the caller renders, not by the PTY's own read rate. While an
+    /// update is open, that would show the update's own half-drawn content, so this reads
+    /// `self.frame` instead: the snapshot `Self::feed` took at the exact byte the update opened,
+    /// before any of its content could mutate `term`. `self.frame`
+    /// is kept up to date every such call regardless of scroll position -- it is what
+    /// [`Self::cursor_cell`] reports from, and typing always lands on the live screen, never on a
+    /// scrolled-back one.
     ///
-    /// Pinned and expired-anchor views use `terminal_frame::viewport::project_window` at
-    /// `Self::top_line`, cached in `self.pinned_frame`. Reuse the cache during an open update
-    /// because rows near the bottom may still belong to the live screen and be partially drawn.
-    /// The first pinned render must compute a window even during an update if no cached window
-    /// exists. `self.frame` has screen-local row numbers, so substituting it for the pinned
-    /// window could draw blank or misplaced rows.
-    ///
-    /// Append the `[N/M]` indicator after `build_paint_list` only when `ScrollView::indicator`
-    /// provides one.
+    /// Scrollback: while pinned or anchor-expired, the window painted is
+    /// `terminal_frame::viewport::project_window` at `Self::top_line`, cached in `self.pinned_frame`
+    /// the same way `self.frame` is -- some of a near-bottom pin's rows are still the live screen's
+    /// own, which an open update is free to mutate mid-draw, so reading a fresh projection then would
+    /// show the same torn content this crate's whole snapshot design exists to rule out.
+    /// **Exception:** the very first render of a pin still recomputes even mid-update, because
+    /// `self.pinned_frame` starting `None` has no quiescent snapshot to fall back to, and `self.frame`
+    /// is not a substitute -- its rows are numbered `0..rows-1` (screen-local), never the negative
+    /// absolute lines a pinned `top_line` needs, so falling back to it drew blank or misplaced rows
+    /// instead of a torn-but-correctly-positioned one. The `[N/M]` indicator (tmux copy mode's) is
+    /// appended after everything `build_paint_list` drew, only while `ScrollView::indicator` has one
+    /// to show.
     pub fn render(&mut self, focused: bool) -> PaintList {
         let (top_line, mode) = self.scroll.window(&self.term);
         let update_open = self.open_update().is_some();
@@ -692,10 +717,12 @@ impl Screen {
         list
     }
 
-    /// The `[N/M]` indicator used by [`Self::render`]. Outside copy mode, this matches
-    /// [`ScrollView::indicator`], returning `None` until the view is pinned.
-    /// Copy mode also returns `Some((0, M))` at the live bottom so entering it is visible
-    /// before any scroll gesture moves the window.
+    /// [`Self::render`]'s own `[N/M]` reading, extended to copy mode.
+    /// Outside copy mode this is exactly [`ScrollView::indicator`] (the plain scrollback keys):
+    /// `None` until the view is actually pinned. Copy mode additionally reports `Some((0, M))` while
+    /// unpinned -- tmux's own copy mode is visible from the moment it is entered, before any key has
+    /// moved the window, unlike the plain scrollback keys, which show nothing until the first scroll
+    /// pins one.
     fn copy_mode_indicator(&self) -> Option<(usize, usize)> {
         match self.scroll.indicator(&self.term) {
             some @ Some(_) => some,
@@ -705,8 +732,8 @@ impl Screen {
     }
 
     /// `prefix [`/`prefix PageUp` opens copy mode; `q`/`Esc`/a shell exit or restart leaves it
-    ///. Entering neither pins nor unpins by itself: at the live bottom the view
-    /// keeps following new output exactly as it always has -- only
+    /// (as tmux's does). Entering neither pins nor unpins by itself: at the live bottom the view
+    /// keeps following new output exactly as it always has (module doc) -- only
     /// [`Self::copy_mode_indicator`] treats the toggle specially, so `[0/M]` is visible at once.
     /// Leaving always snaps back to the bottom, whether or not the view had been scrolled up while
     /// it was open, and marks the screen dirty either way -- the indicator is part of what a frame
@@ -786,16 +813,19 @@ impl Screen {
         self.scroll.scrolled()
     }
 
-    /// The window's absolute top line, or `0` while following the live bottom.
-    /// Pointer-to-cell conversion uses this to turn a click row into a grid line.
+    /// The window's absolute top line, as [`Self::render`] last computed it: `0` while following the
+    /// bottom. What the host's pointer -> cell conversion needs to turn a click row into a grid line.
     pub fn top_line(&self) -> i32 {
         self.scroll.window(&self.term).0
     }
 
-    /// Handles a key or paste about to reach the program via
-    /// [`crate::session::SessionCommand::Input`]. Typing snaps a scrolled-back view to the live
-    /// bottom and clears the selection. Bare modifier presses and releases leave both unchanged.
-    /// A paste always counts as input.
+    /// A key or paste about to reach the program ([`crate::session::SessionCommand::Input`]):
+    /// typing -- never a bare modifier press or release -- snaps a scrolled-back view to the live
+    /// bottom, the same as alacritty's own `on_terminal_input_start` (`terminal_input::is_modifier_key`'s
+    /// own doc: "a bare modifier press must NOT count as terminal input"), and clears the selection
+    /// (an old selection names text the user has typed past, and alacritty's `on_terminal_input_start`
+    /// applies both at once). A paste always
+    /// counts, having no single key to be a bare modifier.
     pub fn note_input(&mut self, input: &NormalizedInput) {
         let bare_modifier =
             matches!(input, NormalizedInput::Key { event, .. } if terminal_input::is_modifier_key(event));

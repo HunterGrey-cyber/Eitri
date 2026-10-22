@@ -1,5 +1,8 @@
-//! Translates sidecar wire `SessionEvent`s into provider-neutral `AgentDomainEvent`s.
-//! The translation has no I/O or async work, so unit tests can exercise it without a sidecar.
+//! Pure, I/O-free translation from the sidecar's wire-level `SessionEvent` (proto) to this crate's
+//! own provider-neutral `AgentDomainEvent` (the event-flow layering: "Claude gRPC
+//! event -> AgentDomainEvent"). No I/O, no async -- every case is covered by a plain unit test with
+//! no sidecar process involved, matching this crate's own established preference for testing a
+//! pure reducer/translator in isolation before any real-process integration test exercises it.
 
 use crate::process::{classify_cli_mode, classify_reported_cli_mode, CliModeReport, RequestedCliMode};
 use crate::{
@@ -15,7 +18,7 @@ use claude_runtime_protocol::v1::{
 /// Translates one proto `SessionEvent`'s wire fields into this crate's own domain events. Returns
 /// nothing for a genuinely malformed message (unset `oneof`, or unparseable `input_json`/
 /// `content_json`) -- logged via `eprintln!`, never panics, and the caller
-/// simply skips that one occurrence rather than tearing down the whole
+/// (the watch loop) simply skips that one occurrence rather than tearing down the whole
 /// stream over one bad event.
 ///
 /// Usually one event. Two when a `SessionReady` reports a CLI permission mode that is not one the
@@ -50,11 +53,11 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
     let envelope_turn_id = event.turn_id;
     let one = |event: AgentDomainEvent| Some(vec![event]);
     match event.event? {
-        // `permission_mode` is the CLI's `system/init` report, sent again every turn.
-        // For a session requesting `default`, a less restrictive mode must close the session;
-        // `CliModeNote` notes stricter and unreported values. For a session requesting auto mode,
-        // `auto` and its `default` fallback are reported through `CliPermissionMode`.
-        // Any other report closes a session that requested auto mode.
+        // `permission_mode` is the CLI's own `system/init` report, re-sent every turn (read by
+        // nothing before 2026-09-27). On a session that asked for `default`, anything less restrictive
+        // than `default` must close the session, and stricter and unreported values are noted
+        // by `CliModeNote`. On a session that asked for the CLI's auto mode, `auto` and its
+        // `default` fallback are reported on as `CliPermissionMode`, and anything else closes it.
         ProtoEvent::SessionReady(ready) => {
             let reported = ready.permission_mode;
             let mut out = vec![AgentDomainEvent::SessionOpened {
@@ -194,7 +197,7 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
             })
         }
         ProtoEvent::ProviderNotice(notice) => {
-            // Diagnostics only; never surfaced as a domain event.
+            // Diagnostics only -- never surfaced as a domain event.
             eprintln!(
                 "agent: ClaudeSidecarProvider: ProviderNotice kind={} subtype={:?} (turn {})",
                 notice.kind,
@@ -258,8 +261,9 @@ fn translate_one(event: ProtoSessionEvent, requested: RequestedCliMode) -> Optio
                 return None;
             };
             if changed.bypass_default_deny_applied {
-                // Every session requests `unrestricted`, so the default bypass deny floor should not apply.
-                // If it does, the sidecar denies Bash, Write, Edit and NotebookEdit.
+                // Eitri states `unrestricted` on every session (bypass denies nothing, since a mode
+                // named bypass should hold every permission), so this must never happen. If it
+                // does, Verdandi now denies Bash/Write/Edit/NotebookEdit.
                 eprintln!("agent: ClaudeSidecarProvider: entering bypass applied Verdandi's conservative floor");
             }
             one(AgentDomainEvent::PermissionModeChanged {
@@ -418,8 +422,9 @@ fn translate_turn_outcome(outcome: ProtoTurnOutcome) -> TurnOutcome {
     }
 }
 
-/// `AgentDomainEvent::SessionClosed` carries a `String` reason, so the proto's typed
-/// `SessionCloseReason` becomes a short, stable diagnostic string here.
+/// `AgentDomainEvent::SessionClosed` carries a plain `String` reason, so the proto's typed
+/// `SessionCloseReason` enum collapses to a short,
+/// stable diagnostic string here rather than propagating a second parallel typed reason.
 fn translate_close_reason(reason: SessionCloseReason) -> String {
     match reason {
         SessionCloseReason::ClosedByHost => "closed_by_host".to_string(),

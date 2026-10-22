@@ -1,7 +1,9 @@
-//! Render the first change after idle immediately, then at most once per frame interval.
-//! Further changes within that interval coalesce into one render at its end. No changes cause
-//! no renders, avoiding idle redraw work. This logic is pure and can be tested without a thread
-//! or a clock.
+//! When to render: a leading edge, then at most one render per frame interval.
+//!
+//! The first change after an idle period renders at once, so a keystroke's echo waits for nothing.
+//! Further changes inside the interval fold into one render at its end. No change means no render
+//! at all -- the idle cost is zero (an unconditional redraw once cost this project 60x idle CPU).
+//! Pure, so the rule is tested without a thread or a clock.
 
 use std::time::{Duration, Instant};
 

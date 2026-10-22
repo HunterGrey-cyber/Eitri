@@ -1,4 +1,4 @@
-//! "Always allow `git log *` in this project". Claude Code's own rule
+//! "Always allow `git log *` in this project": Claude Code's own rule
 //! syntax, `Bash(git log *)` -- "note the space before `*`, which is required for prefix matching"
 //! (`bin:`, 2.1.282) -- and nothing else in v1.
 //!
@@ -198,13 +198,18 @@ fn is_bare_word(word: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Suggests the first word plus a bare second word (`^[A-Za-z0-9][A-Za-z0-9._-]*$`).
-/// `git log --oneline` suggests `git log *`; `uname -a` suggests `uname *`.
-/// A first word in [`WRAPPERS`], by name or path, or containing an assignment suggests
-/// nothing: the prefix could allow arbitrary commands after the wrapper or assignment.
-/// If the second word is not bare but a later word is, no prefix is offered:
-/// `git -C sub log` must not suggest `git *`, which would also allow `git push --force`.
-/// With no bare words after the options, the first word alone is still offered.
+/// The first word, plus the second when it is a bare word (`^[A-Za-z0-9][A-Za-z0-9._-]*$`), so
+/// `git log --oneline` suggests `git log *` and `uname -a` suggests `uname *`.
+///
+/// Two narrowings of that, both toward fewer offers (the card's own `a` still answers the one
+/// call):
+/// - a first word in [`WRAPPERS`] (by name or by path, `/usr/bin/timeout`) suggests nothing:
+///   `timeout 5 cargo test` offered `timeout 5 *`, which would then allow `timeout 5 rm -rf src`;
+///   nor does a first word that is an assignment (`LC_ALL=C cargo test`), for the same reason;
+/// - a second word that is not bare (an option) with a bare word anywhere after it suggests
+///   nothing: the first word alone would span every subcommand the option was hiding, so
+///   `git -C sub log` offered `git *`, which would then allow `git push --force`. With nothing bare
+///   after the options (`uname -a`), the first word alone is still offered.
 pub fn suggest(command: &str) -> Option<PrefixRule> {
     // A newline starts another command, which a rule built from the first would then not name.
     if command.contains(['\n', '\r']) {

@@ -1,6 +1,10 @@
 //! Mouse-input handling for the embedded editor surface.
-//! Coordinate conversions (`current_content_region`, `pixel_to_grid_pos`) live in `crate::gl_interop`.
-//! Shared session state is defined by `LiveState` and `LiveSession` in `crate`.
+//!
+//! Extracted verbatim from `poc/neovide_embed_live/src/main.rs` (the embedding probe) as part of the
+//! neovide-editor extraction. Coordinate-conversion helpers (`current_content_region`,
+//! `pixel_to_grid_pos`) live in `crate::gl_interop` (extracted earlier in this same effort);
+//! shared session state (`LiveState`, and `LiveSession`/`mouse::DragState` reached through it) is
+//! defined in `crate` (`lib.rs`).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -243,12 +247,11 @@ pub(crate) fn handle_mouse_scroll(
         return glib::Propagation::Proceed;
     }
 
-    // In the sandbox, synthetic virtual-pointer scrolls with `axis_source=Wheel` arrive as
-    // `ScrollUnit::Surface`. A simulated notch of about 10 pixels becomes less than half a
-    // grid line, so several notches may be needed for one `Scroll` RPC. Scrolling still moves
-    // the viewport in both directions. Surface deltas use pixel units and must be divided
-    // by `grid_scale`, matching `handle_pixel_scroll`. Physical wheel classification remains
-    // unverified, so the synthetic result alone does not justify changing this conversion.
+    // A synthetic scroll sent through wlr-virtual-pointer with axis_source=Wheel arrived here
+    // as `ScrollUnit::Surface`. A simulated notch of about 10 pixels then becomes less than half
+    // a grid line, so several notches may be needed for one `Scroll` RPC.
+    // Surface deltas are in pixels and must be divided by `grid_scale` to obtain grid units.
+    // Whether a hardware wheel reports `Wheel` correctly here has not been confirmed.
     let (mut amount_x, mut amount_y) = (dx as f32, dy as f32);
     if controller.unit() == ScrollUnit::Surface {
         let grid_scale = session.harness.grid_scale();

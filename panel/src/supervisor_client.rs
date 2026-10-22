@@ -1,7 +1,8 @@
-//! `shell`'s client of the cross-window agent-status dashboard. Connects once at startup to an
-//! already listening supervisor, registers this instance, and sends updates when derived status changes.
-//! Starting a supervisor requires an explicit request through `spawn_requested`, so connecting
-//! alone does not open another window.
+//! `shell`'s client of the cross-window agent-status dashboard (`eitri-supervisor`). Connects
+//! once at startup to a supervisor that is already listening, registers this instance, and pushes
+//! a status update whenever the derived status actually changes. It does NOT start one: since
+//! 2026-09-19 that needs `EITRI_SUPERVISOR=1`, because a window appearing on screen is a thing
+//! the user asks for (see `spawn_requested`).
 
 use agent::{AgentSessionProjection, ProjectionStatus};
 use std::io::{BufRead, BufReader, Write};

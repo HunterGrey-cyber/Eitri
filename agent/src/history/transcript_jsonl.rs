@@ -1,15 +1,26 @@
-//! Reads a Claude CLI `<uuid>.jsonl` transcript into ordered `AgentDomainEvent`s.
+//! Turning the real Claude CLI's own `<uuid>.jsonl` transcript into ordered `AgentDomainEvent`s.
 //!
-//! Unknown line types, unknown content blocks, malformed lines and an incomplete final
-//! line are skipped and counted. Only file I/O errors return `Err`, so unsupported content
-//! reduces displayed history without making parsing itself fail the resume.
+//! Every number quoted in this file was
+//! measured on 2026-09-20 over the 822 real `.jsonl` files (570 MB, 117,826 lines) under this
+//! machine's own `$CLAUDE_CONFIG_DIR/projects`.
 //!
-//! `type:"user"` alone does not identify the user's own words. Compaction summaries can
-//! also have that type and plain string content. [`user_line_is_the_users_own_words`]
-//! uses an allow-list to keep generated text from appearing under the user's name.
+//! Three properties this module exists to hold, none of which is convenience:
 //!
-//! The constants below bound memory independently of file size. This module reads only
-//! the supplied file; it does not fold events into a projection or write to the CLI directory.
+//! 1. **Nothing here ever fails the load.** An unknown line type, an unknown content block, a
+//!    malformed line and a half-written final line are each SKIPPED AND COUNTED. The only `Err`
+//!    this module can return is a real I/O error opening or reading the file. A format change must
+//!    degrade to "less history was shown", never to a failed resume.
+//! 2. **`type:"user"` does not mean "the user typed this".** The decision is an ALLOW-list
+//!    ([`user_line_is_the_users_own_words`]), never a deny-list, because a deny-list's failure
+//!    direction is rendering someone else's text under the user's name -- and the corpus contains
+//!    exactly such a line: a compaction summary is a `type:"user"` line whose `message.content` is
+//!    a plain string, indistinguishable from a typed prompt by shape alone.
+//! 3. **Memory is bounded by the constants below, not by the file.** The largest real transcript on
+//!    this machine is 47,254,948 bytes.
+//!
+//! What this module does NOT do: fold anything into a projection, write anything anywhere, or read
+//! anything under `$CLAUDE_CONFIG_DIR` other than the one file it is handed. That directory belongs
+//! to the CLI and is read-only, forever.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -22,10 +33,11 @@ use crate::projection::{AgentDomainEvent, ContentKind};
 
 /// The most conversational items a restored history may carry.
 ///
-/// Chosen by replaying the take-from-the-newest rule below over 44 real session files: at 200,
-/// 14 of 44 sessions (32%) were truncated; at 400, 8 of 44 (18%). The cost of the larger number
-/// is the item ceiling and each item's fixed overhead, not text volume: the most text any session
-/// loads is identical under both, because [`HISTORY_MAX_CHARS`] is what caps it.
+/// 400, chosen on 2026-09-20 from these figures. Measured over this machine's 44 real session files by
+/// replaying the exact take-from-the-newest rule below: at 200, 14 of 44 sessions (32%) were
+/// truncated; at 400, 8 of 44 (18%). The cost of the larger number is the item ceiling and each
+/// item's fixed overhead, not text volume -- the most text any session loads is identical under
+/// both, because [`HISTORY_MAX_CHARS`] is what caps it.
 ///
 /// **This number must not appear in an assertion.** Tests pin properties (newest-first, bounded,
 /// announced); changing this constant is not supposed to turn anything red.
@@ -84,13 +96,18 @@ pub struct TranscriptHistory {
     /// expressed on disk. Reconstructing it would mean guessing at those 127 positions, and a wrong
     /// guess silently drops a whole stretch of conversation. Flattening is uglier and loses nothing.
     pub events: Vec<AgentDomainEvent>,
-    /// Conversational items retained by this parser: prompts, assistant text blocks and tool
-    /// calls. A tool result belongs to its call and is not a separate item.
+    /// Conversational items this parse kept -- prompts, assistant text blocks and tool calls. A
+    /// tool result is not an item; it belongs to the call it completes.
     ///
-    /// This count precedes folding and must not be displayed as a row count. `apply` coalesces
-    /// adjacent assistant text into one `TranscriptMessage`. The notice uses the projection's
-    /// count after folding in `history::load`. This field lets `read_b` detect whether anything
-    /// parsed and lets truncation tests check the retained window.
+    /// **This is a PRE-FOLD count and must never be shown to a user.** It counts the slots this
+    /// reader kept, and `AgentSessionProjection::apply` then coalesces consecutive assistant text
+    /// into a single `TranscriptMessage` -- so N adjacent assistant slots become one row on screen.
+    /// Measured (2026-09-20, all 45 real top-level transcripts on this
+    /// machine): 13 of 45 disagree with what the projection ends up holding, worst case 400 slots
+    /// against 384 rows. The number the notice reports is counted in
+    /// `history::load` AFTER the fold, from the projection's own collections; this one exists only
+    /// so `read_b` can ask "did anything parse at all?" and so the truncation tests below can
+    /// assert against the window the reader kept.
     pub parsed_items: usize,
     /// Items dropped by TRUNCATION. `None` means records were certainly omitted but cannot be
     /// counted, which happens exactly when the scan started partway into the file.
@@ -488,9 +505,10 @@ fn flag_is_true(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool) == Some(true)
 }
 
-/// Checks whether a user line contains the user's own words. The caller filters `tool_result`
-/// blocks separately because one line can contain both text and a tool result; the text can be
-/// kept while the tool result is handled separately.
+/// The allow-list of what counts as the user's own words, in full. Condition 1 ("no `tool_result`
+/// block") is applied at the
+/// block level by the caller, because one real line carries both a `text` and a `tool_result` and
+/// the two halves have different answers.
 fn user_line_is_the_users_own_words(value: &Value) -> bool {
     !flag_is_true(value, "isMeta")
         && !flag_is_true(value, "isCompactSummary")

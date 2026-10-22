@@ -1,16 +1,26 @@
-//! Spawns one long-lived, full-duplex `claude` CLI child per conversation with piped stdin,
-//! stdout and stderr. Sends NDJSON turns and control requests to stdin. A per-conversation
-//! Unix-socket listener receives `PreToolUse` permission requests from `agent-hook` and writes
-//! decisions back. The running child maintains continuity without a session ID or `--resume`.
+//! Spawns and manages one long-lived, full-duplex `claude` CLI child process for an entire
+//! conversation (v2).
+//! Unlike v1 (one process per turn, prompt as a CLI arg, no piped stdin, session continuity via
+//! `--resume`), this spawns exactly once per conversation with piped stdin/stdout/stderr, writes
+//! NDJSON turns/control-requests to stdin as the conversation progresses, and relies on a
+//! per-conversation Unix-socket listener thread to receive real `PreToolUse` permission requests
+//! relayed by the `agent-hook` companion binary and write decisions back. Session
+//! continuity is now just "the process is still alive" -- there is no session-id/`--resume`
+//! concept left in this module at all.
 //!
-//! Shutdown closes stdin to send EOF, waits for natural exit, then escalates to SIGTERM and
-//! SIGKILL if needed and waits until the child is gone. It is idempotent and has a `Drop`
-//! fallback.
+//! Shutdown discipline mirrors this project's already-proven `nvim --embed` lifecycle (graceful
+//! attempt, escalate to SIGTERM, escalate to SIGKILL, block until confirmed gone, idempotent,
+//! `Drop` fallback) -- see `neovide-editor`'s `NeovideEditorPane::shutdown`/`LiveHarness::shutdown`
+//! in the sibling `neovide` checkout for the pattern this follows. New here vs v1: `shutdown()`'s
+//! first action is to genuinely close stdin (drop the write end, sending real EOF to the child) --
+//! both official Claude Code SDKs converge on this exact ordering as the real, intended way to ask
+//! a long-lived `claude --print --input-format stream-json` process to wrap up.
 //!
-//! Most items require the `legacy-backend` feature. Shared items compile in every build, with
-//! each legacy item's `cfg` placed on that item. Shared items include
-//! `CONSERVATIVE_DISALLOWED_TOOLS`, `disallowed_tools`, `PermissionMode`, `CliModeReport` and
-//! `classify_cli_mode`.
+//! **Only in a build with the `legacy-backend` feature**, except `CONSERVATIVE_DISALLOWED_TOOLS`,
+//! `disallowed_tools`, `PermissionMode` and the
+//! CLI-mode classification (`CliModeReport`, `classify_cli_mode`), which the sidecar path shares:
+//! they are compiled in every build, and each legacy item around them carries its own `cfg`, in
+//! place, so this file's history and any branch editing it stay mergeable.
 
 #[cfg(feature = "legacy-backend")]
 use crate::event::{AgentEvent, PermissionSource};
@@ -54,13 +64,16 @@ const NATURAL_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// turn that never triggers a real tool call).
 #[cfg(feature = "legacy-backend")]
 const HOOK_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// How long the hook listener waits for an accepted connection to finish its line. Linux
-/// accepted sockets do not inherit the listener's `O_NONBLOCK`, while macOS sockets do. Set
-/// each accepted stream to blocking before using this read timeout in `spawn_hook_listener`.
-///
-/// Without a timeout, a client killed mid-write could leave `read_line` blocked forever and
-/// prevent shutdown. Normally `agent-hook` reads its input before connecting and writes the
-/// complete line immediately.
+/// How long the hook-listener thread waits for an accepted connection to finish writing its one
+/// line before giving up on it. On Linux, `accept()` being non-blocking does NOT make the accepted
+/// `UnixStream` non-blocking too (confirmed real: an accepted socket on Linux does not inherit
+/// `O_NONBLOCK` from a non-blocking listener). **macOS is the opposite** -- XNU copies the flag --
+/// so the listener sets every accepted stream blocking explicitly before relying on this timeout
+/// (see `spawn_hook_listener`; 2026-09-17). Either way, without this, a connection that starts but never
+/// completes its line (a real `agent-hook` process killed/orphaned mid-write) would leave
+/// `read_line` blocked forever, with the same practical effect as the accept()-side deadlock this
+/// module already fixed once. A few hundred ms is generous: under normal operation `agent-hook`
+/// writes its one already-fully-read-from-its-own-stdin line immediately after connecting.
 #[cfg(feature = "legacy-backend")]
 const HOOK_CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -71,47 +84,104 @@ const HOOK_CONNECTION_READ_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(feature = "legacy-backend")]
 const STDERR_TAIL_CAPACITY: usize = 20;
 
-/// A conservative, documented starting point for `disallowed_tools` -- see this plan's Global
-/// Constraint on why this is best-effort, not a guarantee. Callers may pass their own list
+/// A conservative, documented starting point for `disallowed_tools` -- best-effort, not a
+/// guarantee, since no single permission flag reliably blocks all tool use. Callers may pass their own list
 /// instead; this is a suggested default, not hardcoded into `spawn`.
 pub const CONSERVATIVE_DISALLOWED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 
-/// The deny list every session gets, on both backends: empty. There is one CLI permission mode,
-/// `default` under the `PreToolUse` gate, and the host's auto/bypass choice (`PermissionMode`) never
-/// reaches the CLI: bypass is the host answering every request `allow`, and the CLI never runs in
-/// `bypassPermissions`.
+/// The deny list every session gets, on both backends: empty. One list, because since 2026-09-27
+/// there is one CLI permission mode -- `default`, under the `PreToolUse` gate -- and the
+/// host's auto/bypass choice (`PermissionMode`) never reaches the CLI at all.
 ///
-/// `Bash` is not denied, as Claude Code's own `default` mode does not deny it. Its risk is answered
+/// Everything below is this function's history from when it was `disallowed_tools_for(mode)` and
+/// the two modes were two different CLI postures. It is kept verbatim because it is the argument,
+/// both ways, that the 2026-09-27 change settled.
+///
+/// The deny list for a session in `mode`, and the difference between the two is a security
+/// decision, not a convenience.
+///
+/// **Why they differ.** The real gate is the `PreToolUse` hook, and `Bypass` installs none -- see
+/// `spawn_with_binary`, which passes no `--settings` at all in that mode, and Verdandi's own proto
+/// comment saying the same of `BYPASS`. So in `Auto` an `Edit` is a permission card the user
+/// answers, and in `Bypass` it is a file rewritten under a live buffer with no diff, no decision
+/// and nothing in the transcript that had to be read. Those are not the same risk, so they do not
+/// get the same list.
+///
+/// `Auto` therefore drops the three editing tools -- the gate covers them -- and keeps `Bash`,
+/// whose blast radius is not a file but a machine. Un-denying `Bash` is a separate decision with
+/// its own evidence, not a rounding error in this one.
+///
+/// **`Bypass` kept all four until 2026-09-20**, which was a narrower answer than removing the mode:
+/// the mode stayed available and honest, running tools without asking, and the tools it could run
+/// were the ones whose worst case is bounded by what the model can already do through `Read`/`Grep`.
+///
+/// **Changed 2026-09-20: `Bypass` now denies nothing.** A mode named bypass is expected to hold every
+/// permission, and the paragraph above is the answer to why it did not, kept because
+/// its reasoning is unchanged and will be the argument against this when the permission design is
+/// revisited. What the paragraph got wrong is not the risk, it is the NAME: a mode labelled "bypass
+/// all permissions" that is the only mode which cannot edit a file is not a narrow answer, it is a
+/// mode whose label is false. `Auto` allows the three editing tools and gates them with a card;
+/// `Bypass` allowed none of them. The weaker-sounding mode was strictly the more capable one.
+///
+/// **This was a debugging-phase decision with a stated expiry: until the permission design shipped.**
+/// What it restores is exactly the risk the paragraph above names, and nothing has changed about
+/// that risk: with no hook installed, an `Edit` rewrites a file under a live buffer with no diff, no
+/// decision, and nothing in the transcript that had to be read. Before this ships to anyone else,
+/// there is a better answer than either version of this function -- stop using
+/// `bypassPermissions` at all, run `Auto` with the host auto-answering every request, and keep the
+/// tool calls and their diffs in the transcript. That is the shape the other editor integrations
+/// use: ACP's `PermissionOptionKind` makes "stop asking me" an ANSWER (`AllowAlways`), never a
+/// capability the agent loses.
+///
+/// **Changed again, 2026-09-25, for `Auto`: it denies nothing either**, so Auto does what Claude
+/// itself does -- Auto gets `Bash`, as Claude Code's own `default` mode does.
+/// The paragraph above that kept it ("whose blast radius is not a file but a machine") is answered
 /// by the gate rather than by the list: every `Bash` call reaches the `PreToolUse` hook (matcher
 /// `*`, both backends), `crate::permission_policy` auto-answers only a read-only command inside the
-/// project, and everything else (a write, a redirect, compound syntax, an option naming a path
-/// outside the tree) is a card a human answers. Denying `Bash` would also leave the prefix rules
-/// (`crate::permission_rules`) and the card's "always allow" nothing to answer. On the sidecar an
-/// empty list is sent as `unrestricted`.
+/// project, and everything else -- a write, a redirect, compound syntax, an option naming a path
+/// outside the tree -- is a card a human answers. Removing `Bash` also removed the thing phase 3's
+/// prefix rules (`crate::permission_rules`) and the card's "always allow" exist to answer, which the
+/// phase-3 sandbox pass found. So both lists are empty now and what separates the modes is only
+/// the gate: `Auto` installs it, `Bypass` does not. On the sidecar an empty list is sent as
+/// `unrestricted`; Verdandi's `CONSERVATIVE_BYPASS_DENY` floor applies only under `bypass` and its
+/// hook is installed for every other mode, so `Auto` keeps its gate (checked in Verdandi's source,
+/// `usesDefaultBypassDeny` and `createSession`).
 ///
-/// This is best-effort and was documented as such from the start: no single permission flag
-/// reliably blocks all tool use. It is the second line; the hook is the first.
+/// This is best-effort in both modes and was documented as such from the start -- no single
+/// permission flag reliably blocks all tool use. It is the second line; the hook is the first.
+///
+/// **Resolved 2026-09-27: the stated expiry is this design — the CLI never runs in
+/// `bypassPermissions`; bypass is Eitri answering every request `allow`, and still denies
+/// nothing.**
 pub fn disallowed_tools() -> &'static [&'static str] {
-    // Return an empty list so edits and shell commands reach the policy through the `*` hook.
-    // Requests needing approval produce cards; bypass answers them `allow` in the application.
-    // The sidecar request marks the empty list as `unrestricted` in
-    // `providers::claude_sidecar::build_create_request`, avoiding its default
-    // `CONSERVATIVE_BYPASS_DENY` floor.
+    // Empty, not `CONSERVATIVE_DISALLOWED_TOOLS`. The hook gates every tool (matcher `*`), so an edit
+    // or a shell command reaches the policy, and through it the user as a card when it needs one
+    // (so Auto matches Claude Code's own default) -- or, in bypass, Eitri's own `allow`. On the sidecar path
+    // an empty list is sent as `unrestricted` (see `providers::claude_sidecar::build_create_request`).
+    // The constant itself is untouched: it is still the floor Verdandi injects for a caller that says
+    // nothing, and it is still hand-copied there as `CONSERVATIVE_BYPASS_DENY`.
     &[]
 }
 
-/// The host's answer mode: whether Eitri answers every permission request `allow` itself.
-/// This mode is not sent to the CLI. Both backends run gated: `--permission-mode default` with the
-/// `PreToolUse` hook on legacy, and `INTERACTIVE` on the sidecar. The host uses this mode only where
-/// it answers requests. Sending it as a session parameter would either silently ignore the requested
-/// mode or allow the CLI to bypass the gate.
+/// The host's answer mode — whether Eitri answers every permission request `allow` itself. Never
+/// sent to the CLI.
 ///
-/// Serialized on `AgentDomainEvent::PermissionModeChanged` for the panel's JSON snapshot.
-/// `rename_all = "snake_case"` matches the other wire-facing enums in this crate.
+/// It used to be the CLI's own posture: `Auto` spawned `--permission-mode auto` under the hook and
+/// `Bypass` spawned `bypassPermissions` with no hook at all. Since 2026-09-27 every session on
+/// both backends runs gated -- `--permission-mode default` plus the `PreToolUse` hook on legacy,
+/// `INTERACTIVE` on the sidecar -- and this is only what `eitri-core` passes to the one point that
+/// answers requests. No session request carries it: a parameter the wire ignored would
+/// break "a requested permission mode must never silently become a different one", and one the wire
+/// honoured would be a way back to `bypassPermissions`.
 ///
-/// `Manual` is the strictest mode: the host's policy answers every request, and every file write or
-/// edit gets a card ([`crate::classify_in_manual`]). It is never more permissive than `Auto`.
-/// CLI mode reports cannot produce it because they describe the CLI's policy, not the host's.
+/// `Serialize`: carried on `AgentDomainEvent::PermissionModeChanged`, which the panel's snapshot
+/// serializes as JSON. `rename_all = "snake_case"` matches this crate's existing convention for
+/// wire-facing enums (see `AgentDomainEvent`'s own `#[serde(...)]`).
+///
+/// `Manual` is the strictest of the three: Eitri's own policy answers every request, never the
+/// CLI's classifier, and every file write or edit is a card ([`crate::classify_in_manual`]). It is
+/// never more permissive than `Auto` on any request. Nothing that reads a CLI's report produces it:
+/// a report is about the CLI's posture, and this is only the host's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -148,8 +218,9 @@ pub enum CliModeReport {
     Stricter,
     /// Empty: a producer older than the field. Neither a downgrade nor an all-clear; noted once.
     Unreported,
-    /// Anything else, including `bypassPermissions`, `acceptEdits`, unrequested `auto`, or an
-    /// unknown value. The session is closed because the reported mode is not known to preserve the gate.
+    /// Anything else -- `bypassPermissions`, `acceptEdits`, `auto` on a session that did not ask for
+    /// it, or a value this build does not know. The session is closed: an unknown value
+    /// resolves toward stopping.
     Ungated,
 }
 
@@ -254,32 +325,55 @@ pub struct AgentProcess {
     shut_down: bool,
 }
 
-/// Spawns the hook-relay listener thread. Each `PreToolUse` connection carries stdin JSON from
-/// `agent-hook`. The parsed request is emitted over `tx`, and the connection is stored in `pending`
-/// so `respond_permission` can answer it later.
+/// Spawns the hook-relay listener thread: accepts one connection per `PreToolUse` firing, reads
+/// the real stdin JSON `agent-hook` forwarded, parses it, stashes the live connection in
+/// `pending` so `respond_permission` can write the answer back later, and emits a
+/// `PermissionRequest` event over `tx`. Runs a non-blocking `accept()` poll loop with a stop flag
+/// (rather than a blocking `for incoming in listener.incoming()` loop) so the returned stop flag
+/// can make this thread return in bounded time even when nothing ever connects -- a blocking loop
+/// here is a real, confirmed deadlock hazard, not a hypothetical one: removing a Unix socket's
+/// filesystem path does NOT unblock a thread already parked inside `accept()` on Linux (the
+/// listening fd stays valid and blocked regardless of whether its path still exists on disk), so
+/// a real run of the earlier blocking-loop version hung for hours in `shutdown()`'s `join()` the
+/// first time a real test exercised a turn that never triggered a tool call (the common case).
 ///
-/// A non-blocking `accept()` loop polls a stop flag so shutdown completes even if no client connects.
-/// Removing a Unix socket path does not unblock an existing `accept()` on Linux. Accepted streams
-/// are explicitly set blocking because macOS inherits the listener's non-blocking mode while Linux
-/// does not. `HOOK_CONNECTION_READ_TIMEOUT` bounds reads from clients that never finish their line.
+/// Also bounds the per-connection read via `HOOK_CONNECTION_READ_TIMEOUT`: on Linux a non-blocking
+/// listener's accepted streams do NOT themselves come back non-blocking, and on macOS they do, so
+/// each one is set blocking explicitly right after `accept()` (confirmed real on both, same
+/// class of deadlock as the accept()-side one above, just triggered by "a connection starts but
+/// never completes its line" instead of "nothing ever connects") -- without this, a real
+/// `agent-hook` process killed/orphaned mid-write would park this thread in `read_line` forever.
 ///
-/// Read errors, timeouts, empty input and parse errors receive an explicit `deny` before disconnect.
-/// The write is best-effort because the peer may already be gone. Dropping a connection silently
-/// makes `agent-hook` exit successfully with no decision, which under `--permission-mode auto`
-/// lets the CLI decide whether to run the tool. Transport failures must not act as approval.
-/// In `default`, an unanswered hook enters the CLI's permission flow. Headless calls are denied
-/// unless loaded `permissions.allow` rules match. `--setting-sources` loads project and local rules;
-/// user rules also count unless `agent.user_settings` is false. This behavior has not been probed
-/// on a real CLI. Error paths still send an explicit denial because project settings can override
-/// the CLI flag.
+/// **Fail-closed security posture (non-negotiable):** every way this loop can fail to relay a
+/// request -- a read error or read timeout, an empty/EOF line, or a payload that doesn't parse --
+/// writes an explicit `deny` decision back on that connection before dropping it. Silently
+/// dropping the connection instead (what this loop originally did) is a real, confirmed *allow*:
+/// `agent-hook` then exits 0 with empty stdout, its documented "no data" behavior, which the CLI
+/// treats as "the hook expressed no `permissionDecision`" -- under `--permission-mode auto` the
+/// tool call then proceeds on the CLI's own judgment, i.e. exactly the leak this whole hook
+/// mechanism exists to close. A parent crash, a malformed payload, and a transient socket hiccup
+/// must never be indistinguishable from a human's real approval. The deny write is best-effort
+/// (errors ignored): in the "peer already gone" case there is nothing to tell, and attempting it
+/// is harmless. **Since 2026-09-27 the flag is `--permission-mode default`**, under which a hook with
+/// no answer falls to the CLI's own permission flow rather than the classifier's call: a denial,
+/// headless -- **unless a project or local `permissions.allow` rule matches the call**, which that
+/// flow honours without prompting (`--setting-sources` loads them on purpose, and the user tier's
+/// `permissions.allow` counts too unless `agent.user_settings` is false). Not
+/// probed on a real CLI; it was as true under `auto`.
+/// The explicit deny stays anyway, because a project's own settings can outrank the flag (the
+/// tripwire below).
 ///
-/// Kept separate from `spawn` so stopping, stalled reads, error denials and successful parsing can
-/// be tested with a plain `UnixListener` without launching a CLI process.
+/// Split out from `spawn` as its own function (rather than inlined there) specifically so this
+/// exact logic -- the fast-stop guarantee, the stalled-connection guarantee, the fail-closed deny
+/// on every error branch, and the real PreToolUse-parsing happy path -- can be unit-tested
+/// directly against a plain `UnixListener`, without spawning a real `claude` child process at all.
 ///
-/// Each payload's `permission_mode` is classified before its connection is stored. A mode less
-/// restrictive than `default` is denied and emits `AgentEvent::UngatedCliMode` to close the session
-/// instead of showing a card. Stricter or unreported modes are noted once per conversation through
-/// `cli_mode_noted`, then filed normally.
+/// **The CLI-mode tripwire.** Every payload's own `permission_mode` is classified
+/// (`classify_cli_mode`) before the connection is filed. A mode less restrictive than `default`
+/// means something outranked the `--permission-mode default` this crate passes, and under it a hook
+/// that gives no answer lets the tool run -- so that call is denied here, explicitly, and the
+/// conversation is told to close (`AgentEvent::UngatedCliMode`) instead of being shown a card. A
+/// stricter or unreported mode is noted once per conversation (`cli_mode_noted`) and filed as usual.
 #[cfg(feature = "legacy-backend")]
 fn spawn_hook_listener(
     listener: UnixListener,
@@ -330,8 +424,8 @@ fn spawn_hook_listener(
             write_fail_closed_deny(&stream, "relayed request could not be parsed as PreToolUse JSON");
             continue;
         };
-        // Reject calls the CLI could run without an answer before storing them as pending requests.
-        // An absent mode is unreported, never assumed to be `default`.
+        // Before anything is filed: a call the CLI would run on a non-answer is never offered
+        // to anyone to answer. An absent field reads as unreported, never as `default`.
         let reported = parsed.permission_mode.clone().unwrap_or_default();
         match classify_cli_mode(&reported) {
             CliModeReport::Default => {}
@@ -573,14 +667,17 @@ fn build_can_use_tool_response_payload(request_id: &str, allow: bool, reason: Op
 
 #[cfg(feature = "legacy-backend")]
 impl AgentProcess {
-    /// Spawns one long-lived process for the whole conversation. `project_dir` is the CLI's cwd,
-    /// where `--setting-sources` finds project settings, and the root the conversation
-    /// operates on. This crate writes nothing there: hook settings go in argv and the socket goes in
-    /// the temp directory. Every session uses `default` with the `PreToolUse` gate. The host decides
-    /// whether to answer `allow` above this session API, so there is no mode parameter here.
+    /// Spawns exactly one long-lived process for the whole conversation. `project_dir` is both
+    /// the CLI's cwd (so `--setting-sources` resolves the project's own real
+    /// settings there) and the root this conversation operates on. This crate writes nothing into
+    /// it: the hook configuration goes in argv and the per-conversation socket in the temp dir.
     ///
-    /// The caller's `project` value controls whether project settings tiers load through
-    /// `crate::setting_sources::for_session`.
+    /// There is no mode parameter: every conversation runs the CLI in `default` under the
+    /// `PreToolUse` gate, and whether Eitri answers `allow` on its own is decided above this
+    /// crate's session API, never by the CLI.
+    ///
+    /// `project` decides whether the project's own settings tiers load
+    /// (`crate::setting_sources::for_session`); the caller states it.
     pub fn spawn(project_dir: &Path, disallowed_tools: &[&str], project: ProjectTrust) -> std::io::Result<Self> {
         Self::spawn_with_binary(project_dir, disallowed_tools, "claude", project)
     }
@@ -590,7 +687,7 @@ impl AgentProcess {
     /// the real `cmd.spawn()` call genuinely fail (by naming a binary that does not exist) and
     /// assert on this function's real partial-failure cleanup, rather than only reasoning about it.
     ///
-    /// **Ordering here is load-bearing, not incidental** (a real leak a final review caught):
+    /// **Ordering here is load-bearing, not incidental** (getting it wrong once leaked a thread):
     /// the hook-listener *thread* is spawned only AFTER `cmd.spawn()` has succeeded. It used to be
     /// spawned before, which meant a failed `cmd.spawn()` (e.g. `claude` not on `PATH`) returned
     /// `Err` while leaving behind a thread whose stop flag no one could ever set again -- it spun
@@ -646,8 +743,8 @@ impl AgentProcess {
         let socket_path = crate::socket_path::hook_socket(&std::env::temp_dir(), conversation_id)?;
         let _ = std::fs::remove_file(&socket_path); // stale leftover from a prior crash, if any
 
-        // Every process installs the gate through its own argv, isolated from other conversations.
-        // No mode skips hook installation.
+        // Always the gate: it travels in this one process's argv, where no other conversation
+        // can reach it. There used to be a bypass mode that installed none; there is no such mode.
         let hook_settings = crate::settings::hook_settings_arg(&socket_path)?;
 
         // Preflight: every spawn installs a gate, so confirm the resolved binary actually
@@ -699,11 +796,16 @@ impl AgentProcess {
             .arg(crate::setting_sources::cli_argument_for(
                 crate::setting_sources::for_session(user_settings, project),
             ))
-            // Use `default` so an unanswered hook enters the CLI's permission flow rather than its
-            // classifier. Headless calls are denied unless a project/local `permissions.allow` rule matches;
-            // that exception has not been probed on a real CLI. Under `auto`, the classifier was observed
-            // allowing `rm -rf` outside the project tree. The sidecar uses the same underlying mode.
-            // Bypass is the host answering `allow` through the gate.
+            // `default`, never `auto`: under
+            // `default` a hook that gives no answer -- the 600 s hook timeout on an unanswered card,
+            // or any failure that escapes `write_fail_closed_deny` -- is a CLI denial (unless a
+            // project/local `permissions.allow` rule matches the call: the CLI's own flow grants it
+            // then, `spawn_hook_listener`'s doc; not probed), whereas under
+            // `auto` it fell to the model classifier, which was measured allowing `rm -rf` outside
+            // the tree (`spawn_hook_listener`'s fail-closed paragraph calls that exactly the leak
+            // this hook exists to close). It is also the sidecar's mode underneath, so one real-CLI
+            // probe describes both backends. And never the ungated mode: bypass is
+            // Eitri answering `allow`, not a CLI flag.
             .arg("--permission-mode")
             .arg("default")
             .stdin(Stdio::piped())
@@ -850,8 +952,8 @@ impl AgentProcess {
     }
 
     /// Writes one user turn to stdin. Caller's responsibility to only call this once the prior
-    /// turn's `result` has arrived (or before the first turn) -- see this plan's spec on why
-    /// mid-turn stdin queuing is not relied upon.
+    /// turn's `result` has arrived (or before the first turn) -- mid-turn stdin queuing is not
+    /// relied upon: across CLI versions a line written mid-turn has been folded in or silently dropped.
     pub fn send_turn(&mut self, text: &str) -> std::io::Result<()> {
         let payload = serde_json::json!({
             "type": "user",
@@ -1167,12 +1269,13 @@ mod deny_list_tests {
     use super::*;
 }
 
-/// The legacy spawn tests need `AgentProcess` and the hook relay, which are available only
-/// with the `legacy-backend` feature.
+/// The legacy spawn's own tests: all of them need `AgentProcess` and the hook relay, which only a
+/// build with the `legacy-backend` feature has.
 ///
-/// Use separate attributes because `wire_guard` recognizes test code by a literal `#[cfg(test)]`
-/// with further attributes allowed. A combined condition would cause it to scan these tests'
-/// `"bypassPermissions"` fixtures as production source.
+/// Two attributes rather than `#[cfg(all(test, feature = "legacy-backend"))]`, which is the same
+/// condition: `wire_guard` recognises test code by a literal `#[cfg(test)]` (further attributes on the
+/// item allowed), and would otherwise scan these tests' own `"bypassPermissions"` fixtures as
+/// production source.
 #[cfg(test)]
 #[cfg(feature = "legacy-backend")]
 mod tests {

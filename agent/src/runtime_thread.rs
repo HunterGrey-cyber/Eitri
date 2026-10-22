@@ -1,7 +1,10 @@
-//! A long-lived Tokio runtime on a dedicated OS thread, separate from the provider's caller.
-//! A synchronous `block_on` facade waits with a timeout so `AgentProvider` methods can keep
-//! the synchronous `AgentSession` API while performing async gRPC I/O.
-//! `handle()` lets callers spawn long-lived background work such as the event-watch pump.
+//! A single, long-lived Tokio runtime on its own dedicated OS thread, isolated from whatever
+//! thread constructs a provider, so tonic and Tokio never run on a caller's thread. Exposes a
+//! synchronous facade -- `block_on` with a bounded timeout -- so
+//! `AgentProvider`'s trait methods can stay ordinary synchronous Rust functions, matching
+//! the existing `AgentSession` API shape, while their real implementation does async gRPC I/O
+//! underneath. `handle()` is exposed separately for callers that need to spawn a long-lived
+//! background task (the event-watch pump) rather than a single bounded call.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -15,8 +18,8 @@ pub struct RuntimeThread {
 impl RuntimeThread {
     /// Spawns the dedicated OS thread and blocks the calling thread only until the new runtime is
     /// actually constructed and its `Handle` captured -- callers never race a not-yet-ready
-    /// runtime. This function contains the two allowed `.expect()` calls in this whole module
-    ///: building the runtime is a foundational setup failure with no
+    /// runtime. This function contains the two allowed `.expect()` calls in this whole module:
+    /// building the runtime is a foundational setup failure with no
     /// meaningful degraded path (matching `eitri_supervisor.rs`'s own precedent for a bind
     /// failure), and the `handle_rx.recv().expect(..)` immediately following is not a second,
     /// independent risk — it only fires as the direct, causal consequence of that same failure
@@ -35,9 +38,11 @@ impl RuntimeThread {
                 .build()
                 .expect("failed to build Tokio runtime for a Claude provider");
             let _ = handle_tx.send(runtime.handle().clone());
-            // Wait until `Drop` sends shutdown or drops the sender. Either unblocks the runtime
-            // thread so it can exit. Parking on `std::future::pending()` would leave this thread
-            // and its runtime workers alive for the rest of the host process's life.
+            // Blocks until `Drop` sends a shutdown signal (or the sender end is simply dropped,
+            // which also resolves this with an error) -- replaces an earlier permanent
+            // `std::future::pending()` park (which leaked this
+            // thread and the runtime's own worker threads for the rest of the host process's
+            // life, since nothing could ever signal it to stop).
             let _ = runtime.block_on(shutdown_rx);
         });
         let handle = handle_rx
@@ -50,8 +55,9 @@ impl RuntimeThread {
         }
     }
 
-    /// Runs `future` on this runtime and blocks the calling thread until completion or timeout.
-    /// Uses `recv_timeout` so the caller cannot wait indefinitely for the result.
+    /// Runs `future` on this runtime thread and blocks the CALLING thread (never the runtime
+    /// thread itself) until it completes or `timeout` elapses. `recv_timeout`, never bare `recv` --
+    /// no unbounded blocking wait anywhere in this crate, since one would hang its caller for good.
     pub fn block_on<F, T>(&self, future: F, timeout: Duration) -> Result<T, RuntimeThreadError>
     where
         F: std::future::Future<Output = T> + Send + 'static,
@@ -65,7 +71,7 @@ impl RuntimeThread {
         rx.recv_timeout(timeout).map_err(|_| RuntimeThreadError::Timeout)
     }
 
-    /// The raw handle, for spawning a long-lived background task
+    /// The raw handle, for spawning a long-lived background task (the event-watch pump)
     /// rather than a single bounded call.
     pub fn handle(&self) -> &tokio::runtime::Handle {
         &self.handle
@@ -73,9 +79,13 @@ impl RuntimeThread {
 }
 
 impl Drop for RuntimeThread {
-    /// Signals the parked thread to stop, then joins it so the OS thread and runtime workers
-    /// are released, including when provider connection fails partway through.
-    /// The signal unblocks `block_on`; runtime shutdown cancels pending async work.
+    /// Signals the parked background thread to stop, then joins it -- a bounded wait in practice
+    /// (the shutdown signal immediately unblocks `block_on`, and Tokio's own runtime shutdown for
+    /// an otherwise-idle runtime completes promptly, cancelling any still-pending spawned tasks
+    /// rather than waiting on them indefinitely), never an unbounded one. Without this, every
+    /// `RuntimeThread` -- including one held inside a
+    /// `ClaudeSidecarProvider` that fails partway through `connect()` -- permanently leaked its
+    /// OS thread and Tokio runtime worker threads for the rest of the host process's life.
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
