@@ -1106,6 +1106,24 @@ fn build_ui(
     for (id, host) in grid.hosts() {
         wheel_zoom::install(id, &host, text_size_controller.clone());
     }
+    // Every Lua panel's page follows the window's text size: a plugin's page once its view is built
+    // (at startup, or at its first show), any other Lua panel's view now.
+    {
+        let controller = text_size_controller.clone();
+        plugin_panels.set_page_built(Rc::new(move |id: &ModuleId, view: &webkit6::WebView| {
+            controller.attach_page(id.clone(), view);
+        }));
+        let plugin_modules = plugin_panels.modules();
+        for entry in lua_engine.panels.borrow().entries() {
+            let id = ModuleId::lua(&entry.id);
+            if plugin_modules.contains(&id) {
+                continue;
+            }
+            if let Some(view) = entry.widget.downcast_ref::<webkit6::WebView>() {
+                text_size_controller.attach_page(id, view);
+            }
+        }
+    }
 
     let top_bar = chrome::build_top_bar(&window, project_root);
     root.append(&top_bar.widget);
@@ -3537,6 +3555,7 @@ fn build_ui(
                 Action::Text(change) => match text_size::route_focused_module(focused().as_ref()) {
                     text_size::TextSizeTarget::Editor => text_size_controller.apply_editor(change.into()),
                     text_size::TextSizeTarget::Panel => text_size_controller.apply_panel(change.into()),
+                    text_size::TextSizeTarget::Page(page) => text_size_controller.apply_page(&page, change.into()),
                     text_size::TextSizeTarget::Neither => {}
                 },
                 Action::Hint => hint_coordinator.toggle_from_prefix(keycode),

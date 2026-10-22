@@ -3,7 +3,8 @@
 //! origins the manifest declares (and `https`, for a page that shows remote images), a navigation lock, and
 //! the bridge script. What a page may do is decided in `eitri_core::plugin`; this file builds the view and
 //! carries text both ways. Its `PagePort` is the only
-//! place a script is run in the page, and `apply_theme` the only place the window's theme reaches the view.
+//! place a script is run in the page, `apply_theme` the only place the window's theme reaches the view, and
+//! `set_zoom` the only place its text size does.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -322,6 +323,8 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
     if let Some(settings) = WebViewExt::settings(&webview) {
         settings.set_javascript_can_open_windows_automatically(false);
         settings.set_enable_developer_extras(false);
+        // Whole-page zoom: the page's layout scales with its text, so a page sizes nothing for it.
+        settings.set_zoom_text_only(false);
         if spec.console_to_stdout {
             settings.set_enable_write_console_messages_to_stdout(true);
         }
@@ -411,6 +414,21 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
     apply_theme(&webview, theme);
     webview.load_uri(&page_policy::entry_uri(&spec.id, &spec.entry));
     webview
+}
+
+/// The page's zoom level: the window's text size for it (`text_size`'s pages), whole-page, so the layout scales
+/// with the text. WebKit composes it with the desktop's text scaling (it multiplies the level by its own page
+/// scale), so `level` is the user's zoom alone.
+///
+/// WebKit keeps a view's level across loads: it lives on the UI process's page proxy, which hands it to every web
+/// process it starts for the view, so a reload, and a revive after a kill or a crash, keep it. `text_size` sets it
+/// again at every committed load all the same, so a page never shows a level the window does not hold; an equal
+/// level is a no-op in WebKit.
+///
+/// Whole-page needs `zoom-text-only` off: `build` sets it so for a plugin's page, and it is WebKit's default for
+/// any other view.
+pub(crate) fn set_zoom(webview: &WebView, level: f32) {
+    webview.set_zoom_level(f64::from(level));
 }
 
 /// The page, for its host: the one place a script is run in it.

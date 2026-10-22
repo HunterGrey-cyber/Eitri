@@ -93,9 +93,10 @@ pub(crate) fn install(id: ModuleId, host: &gtk4::Widget, text_size: Rc<TextSizeC
         }
         let n = wheel.borrow_mut().scroll_in(controller.unit(), dy);
         for step in steps(n) {
-            match target {
+            match &target {
                 TextSizeTarget::Editor => text_size.apply_editor(step),
                 TextSizeTarget::Panel => text_size.apply_panel(step),
+                TextSizeTarget::Page(page) => text_size.apply_page(page, step),
                 TextSizeTarget::Neither => {}
             }
         }
@@ -168,8 +169,8 @@ mod tests {
         assert!(steps(0).is_empty());
     }
 
-    /// The pane under the pointer, by its module: the editor and the chat have a text size; the
-    /// terminal (until its phase 4) and a Lua panel take the scroll and do nothing.
+    /// The pane under the pointer, by its module: the editor, the chat and a Lua panel's page have a
+    /// text size; the terminal (until its phase 4) takes the scroll and does nothing.
     #[test]
     fn each_module_routes_to_its_own_pane_or_to_nothing() {
         assert_eq!(
@@ -186,7 +187,7 @@ mod tests {
         );
         assert_eq!(
             text_size::route_focused_module(Some(&ModuleId::lua("notes"))),
-            TextSizeTarget::Neither
+            TextSizeTarget::Page(ModuleId::lua("notes"))
         );
     }
 }

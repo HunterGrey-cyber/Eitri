@@ -343,7 +343,12 @@ pub(crate) struct PluginPanels {
     /// The editor's end was told to the hosts and no editor session has been seen since: an exit that is reported
     /// twice (nvim's own exit, then the editor's retirement) tells the pages once.
     editor_gone: Cell<bool>,
+    /// Told of each page's view once it exists, so the window's text size reaches it.
+    page_built: RefCell<Option<PageBuilt>>,
 }
+
+/// What [`PluginPanels::set_page_built`] calls with a module and its new view.
+pub(crate) type PageBuilt = Rc<dyn Fn(&ModuleId, &webkit6::WebView)>;
 
 impl PluginPanels {
     /// Registers every loaded plugin as a Lua panel entry, each host checking its page's keys against the
@@ -492,6 +497,7 @@ impl PluginPanels {
             theme: RefCell::new(theme.clone()),
             follow_totals: RefCell::default(),
             editor_gone: Cell::new(false),
+            page_built: RefCell::new(None),
         })
     }
 
@@ -526,7 +532,23 @@ impl PluginPanels {
         if let Some(build) = build {
             let page = build(theme);
             *panel.port.0.borrow_mut() = page;
+            let (hook, view) = (self.page_built.borrow().clone(), panel.webview.borrow().clone());
+            if let (Some(hook), Some(view)) = (hook, view) {
+                hook(&panel.module, &view);
+            }
         }
+    }
+
+    /// `hook` hears of every page's view: now, of each built already (a page that starts shown is built at
+    /// startup, before the window's text size exists), and later of each built at its first show.
+    pub(crate) fn set_page_built(&self, hook: PageBuilt) {
+        for panel in &self.panels {
+            let view = panel.webview.borrow().clone();
+            if let Some(view) = view {
+                hook(&panel.module, &view);
+            }
+        }
+        *self.page_built.borrow_mut() = Some(hook);
     }
 
     /// The window's theme as the pages last got it (what a page built later starts with).
@@ -864,6 +886,7 @@ mod tests {
             theme: RefCell::new(PageTheme::fallback()),
             follow_totals: RefCell::default(),
             editor_gone: Cell::new(false),
+            page_built: RefCell::new(None),
         }
     }
 

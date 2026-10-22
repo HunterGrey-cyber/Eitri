@@ -62,3 +62,30 @@ fn the_theme_reaches_the_view_only_through_apply_theme() {
         assert_eq!(panels.matches(call).count(), 0, "{call} in plugin_panels.rs");
     }
 }
+
+/// A page's text size reaches its view in one place: `set_zoom`, which the window's text size calls for every
+/// page. A second `set_zoom_level` elsewhere would be a level the text-size model does not hold.
+#[test]
+fn the_zoom_level_reaches_a_page_only_through_set_zoom() {
+    let page = code("shell/src/plugin_page.rs");
+    let set_zoom = scan::functions(&page, "set_zoom");
+    assert_eq!(set_zoom.len(), 1, "one set_zoom");
+    assert_eq!(page.matches(".set_zoom_level(").count(), 1);
+    assert_eq!(set_zoom[0].matches(".set_zoom_level(").count(), 1, "inside set_zoom");
+    for path in [
+        "shell/src/plugin_panels.rs",
+        "shell/src/text_size.rs",
+        "shell/src/main.rs",
+    ] {
+        assert_eq!(
+            code(path).matches(".set_zoom_level(").count(),
+            0,
+            "set_zoom_level in {path}"
+        );
+    }
+    let text_size = code("shell/src/text_size.rs");
+    assert!(
+        text_size.matches("crate::plugin_page::set_zoom(").count() >= 2,
+        "the text size sets a page's level when it is attached and whenever the state moves"
+    );
+}

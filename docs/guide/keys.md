@@ -56,7 +56,7 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri, and then the question, like closing the window, also names the chat turns running or queued and the terminals running a command (`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`); a job left in the background at a shell prompt is not counted |
 | `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal and the toast says `prefix [ scrolls the terminal` |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
-| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only (repeats: keep Ctrl down and press `=` or `-` again) |
+| `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only: the editor, the chat or a plugin's page (repeats: keep Ctrl down and press `=` or `-` again) |
 
 Each of these arrangements ends a zoom when it changes something and leaves it on when there was nothing to do. The
 keys stay with the module that had them, and a hidden module stays hidden. With fewer than two modules on screen they
@@ -114,8 +114,13 @@ import and your tmux configuration bind that key.
 | keys | what they do |
 |---|---|
 | `F11` | fullscreen |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / reset, for the editor and the panel together (the keypad's `+`, `-` and `0` work too) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / reset, for the editor, the panel and every plugin page together (the keypad's `+`, `-` and `0` work too) |
 | `Ctrl+wheel` | text size of the pane under the pointer only |
+
+A plugin's page (the learning plugin, the Markdown preview) is zoomed whole, its layout with its text, and follows the
+editor's size: `Ctrl+=` grows the editor and every page together, a page made larger or smaller on its own keeps that
+difference until `Ctrl+0` or `<prefix> Ctrl+0` on it, and the page keeps its size when it reloads. The page never
+sees these keys.
 
 A companion window (see [Companion mode](companion.md)) has no layout of its own, so there the prefix keeps
 the tab keys, `r`, `?`, `:`, `f`, sending the prefix itself and the arrow keys, which move toward the

@@ -48,13 +48,24 @@
 //! reset. An external writer restoring the last reported value within the same tick
 //! as an application write can hide the change from the watcher and leave `pending`
 //! stuck until the next key.
+//!
+//! Lua panel pages follow `S` with their own factor:
+//! `page zoom = clamp(S * R_page, ZOOM_MIN, ZOOM_MAX)`. WebKit applies this to the whole
+//! page, including layout. Each module's `R_page` starts at 1.0 when first shown,
+//! lasts for the session, and is not persisted. Both-panes steps leave it unchanged;
+//! both-panes reset sets it to 1.0; editor-only steps compensate it to preserve page
+//! size. Prefix keys targeting a page adjust or reset only that page's factor.
+//! Pages use the same `current_s()` and pending-write handling as the panel.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use eitri_core::layout::{ModuleId, ModuleKind};
+use gtk4::glib;
 use gtk4::prelude::*;
 use neovide_editor::NeovideEditorPane;
+use webkit6::prelude::*;
 
 use crate::agent_panel::AgentPanelHandle;
 
@@ -134,6 +145,9 @@ pub(crate) struct TextSize {
     burst: Vec<f32>,
     /// `agent.font_size`, or the shipped default -- the panel's un-zoomed size.
     base: f32,
+    /// Each page shown this session and its factor relative to S (this module's "Pages" section). A
+    /// page not in the map reads 1.0.
+    pages: BTreeMap<ModuleId, f32>,
 }
 
 impl TextSize {
@@ -146,6 +160,7 @@ impl TextSize {
             pending: None,
             burst: Vec::new(),
             base,
+            pages: BTreeMap::new(),
         }
     }
 
@@ -195,9 +210,12 @@ impl TextSize {
         self.write_with_r(s, r)
     }
 
-    /// `app.text-reset` sets S and R to 1.0. If `reported_s` is already 1.0, the write clears
-    /// `pending` even when nvim never answered the outstanding write.
-    pub(crate) fn both_reset(self) -> (Self, Option<f32>) {
+    /// `app.text-reset` sets S, R and every `R_page` to 1.0. If `reported_s` is already 1.0,
+    /// the write clears `pending` even when nvim never answered the outstanding write.
+    pub(crate) fn both_reset(mut self) -> (Self, Option<f32>) {
+        for r in self.pages.values_mut() {
+            *r = 1.0;
+        }
         self.write_with_r(clamp_round_s(1.0), 1.0)
     }
 
@@ -263,6 +281,61 @@ impl TextSize {
             TextStep::Smaller => self.panel_smaller(),
             TextStep::Reset => self.panel_reset(),
         }
+    }
+
+    // --- One pane, a page holding the keys: the panel's three rows, on that page's own factor.
+    // None of these write S, and neither the panel nor any other page moves. ---
+
+    /// The page is shown: from now on an editor-only step keeps it in place. A page already known
+    /// keeps its factor (a page hidden and shown again, or rebuilt after a kill).
+    pub(crate) fn page_shown(mut self, page: &ModuleId) -> Self {
+        self.pages.entry(page.clone()).or_insert(1.0);
+        self
+    }
+
+    /// `R_page`: 1.0 for a page never stepped.
+    fn page_r(&self, page: &ModuleId) -> f32 {
+        self.pages.get(page).copied().unwrap_or(1.0)
+    }
+
+    /// `clamp(S × R_page)` -- the zoom level the page's view is given.
+    pub(crate) fn page_scale(&self, page: &ModuleId) -> f32 {
+        (self.current_s() * self.page_r(page)).clamp(ZOOM_MIN, ZOOM_MAX)
+    }
+
+    /// `P_page' = clamp(P_page + 0.1)`; `R_page' = P_page'/S`.
+    pub(crate) fn page_larger(self, page: &ModuleId) -> Self {
+        let target = self.page_scale(page) + ZOOM_STEP;
+        self.set_page_scale(page, target)
+    }
+
+    /// `P_page' = clamp(P_page - 0.1)`; `R_page' = P_page'/S`.
+    pub(crate) fn page_smaller(self, page: &ModuleId) -> Self {
+        let target = self.page_scale(page) - ZOOM_STEP;
+        self.set_page_scale(page, target)
+    }
+
+    /// `R_page' = 1` -- the page back in step with the editor.
+    pub(crate) fn page_reset(mut self, page: &ModuleId) -> Self {
+        self.pages.insert(page.clone(), 1.0);
+        self
+    }
+
+    pub(crate) fn apply_page_step(self, page: &ModuleId, step: TextStep) -> Self {
+        match step {
+            TextStep::Larger => self.page_larger(page),
+            TextStep::Smaller => self.page_smaller(page),
+            TextStep::Reset => self.page_reset(page),
+        }
+    }
+
+    /// `R_page' = clamp(target)/S`, clamping the target itself for the same reason as
+    /// [`set_panel_scale`](Self::set_panel_scale): the raw factor stays bounded under repeated
+    /// presses at an end of the range.
+    fn set_page_scale(mut self, page: &ModuleId, target: f32) -> Self {
+        let r = target.clamp(ZOOM_MIN, ZOOM_MAX) / self.current_s();
+        self.pages.insert(page.clone(), r);
+        self
     }
 
     // --- What nvim reports. ---
@@ -343,10 +416,14 @@ impl TextSize {
 
     /// Writes a fresh S, adjusting R by the ratio the write moved S so `panel_scale()` (and so
     /// `panel_px()`) comes out unchanged -- see `editor_larger`/`editor_smaller`/`editor_reset`.
-    fn write_s_keeping_panel_px(self, target: f32) -> (Self, Option<f32>) {
+    /// Every shown page's factor is adjusted by the same ratio, so no page moves either.
+    fn write_s_keeping_panel_px(mut self, target: f32) -> (Self, Option<f32>) {
         let old_s = self.current_s();
         let s = clamp_round_s(target);
         let r = self.r * old_s / s;
+        for page_r in self.pages.values_mut() {
+            *page_r = *page_r * old_s / s;
+        }
         self.write_with_r(s, r)
     }
 
@@ -362,22 +439,28 @@ impl TextSize {
 
 /// The target for `Ctrl+a =`/`-`/`0`, selected by the module holding the keys. Centralizing this
 /// choice keeps `main.rs` from duplicating the editor, panel and no-op routing at each call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TextSizeTarget {
     Editor,
     Panel,
+    /// A Lua panel's page (a plugin's page, or one `eitri.panel.register` loads): its own factor.
+    Page(ModuleId),
     Neither,
 }
 
-/// Routes the module currently holding the keys, supplied by [`crate::pane_focus::focused_module`].
-/// The editor and agent receive their respective text-size controls. Other focus targets,
-/// including the top bar, Lua panels and the terminal, yield [`TextSizeTarget::Neither`].
-/// Routing uses module kind, so a Lua panel with the id `"editor"` cannot be treated as the editor.
+/// Routes `focused`, the module currently receiving keys, by its kind.
+/// A Lua panel uses [`TextSizeTarget::Page`]. Focus on the top bar, canvas or
+/// bottom terminal uses [`TextSizeTarget::Neither`], so text-size commands do nothing.
+/// Routing by kind keeps a Lua panel whose id is `"editor"` from being routed as the editor.
 pub(crate) fn route_focused_module(focused: Option<&ModuleId>) -> TextSizeTarget {
-    match focused.map(ModuleId::kind) {
-        Some(ModuleKind::Editor) => TextSizeTarget::Editor,
-        Some(ModuleKind::Agent) => TextSizeTarget::Panel,
-        _ => TextSizeTarget::Neither,
+    let Some(id) = focused else {
+        return TextSizeTarget::Neither;
+    };
+    match id.kind() {
+        ModuleKind::Editor => TextSizeTarget::Editor,
+        ModuleKind::Agent => TextSizeTarget::Panel,
+        ModuleKind::LuaWebview => TextSizeTarget::Page(id.clone()),
+        ModuleKind::Canvas | ModuleKind::Terminal => TextSizeTarget::Neither,
     }
 }
 
@@ -420,6 +503,9 @@ pub(crate) struct TextSizeController {
     /// [`live_panel_font_size_px`]) so a colorscheme change re-derives every other token but never
     /// resets a zoom. This struct writes it; `main.rs` only ever reads it.
     panel_px: Rc<Cell<f32>>,
+    /// Each page's view, by module, given its zoom level whenever the state moves. Weak: the grid
+    /// owns the view, and a killed page's view may go.
+    pages: RefCell<BTreeMap<ModuleId, glib::WeakRef<webkit6::WebView>>>,
 }
 
 impl TextSizeController {
@@ -439,6 +525,7 @@ impl TextSizeController {
             editor,
             panel,
             panel_px,
+            pages: RefCell::default(),
         });
         this.push_panel_px();
 
@@ -541,6 +628,54 @@ impl TextSizeController {
         );
     }
 
+    /// The keymap's `text.larger`/`text.smaller`/`text.reset` (and `Ctrl`+wheel) with the page `page`
+    /// holding the keys. Never touches nvim: only that page's factor moves. A Lua panel with no view
+    /// here (WebKit could not start, or a plugin page not built yet) takes the key and does nothing.
+    pub(crate) fn apply_page(&self, page: &ModuleId, step: TextStep) {
+        if !self.pages.borrow().contains_key(page) {
+            eprintln!("[text-size] {step:?} ({page}): no page view, ignoring");
+            return;
+        }
+        let next = self.state.borrow().clone().apply_page_step(page, step);
+        *self.state.borrow_mut() = next;
+        self.push_panel_px();
+        eprintln!("[text-size] page {page} {:.2}", self.state.borrow().page_scale(page));
+    }
+
+    /// The page `page` now has a view: it follows the editor from here on, at 1.0 relative to it the
+    /// first time (a view built again for the same module keeps the factor it had). The level is set
+    /// again at every committed load, though WebKit keeps it across loads (see
+    /// [`crate::plugin_page::set_zoom`]).
+    pub(crate) fn attach_page(self: &Rc<Self>, page: ModuleId, view: &webkit6::WebView) {
+        let known = self
+            .pages
+            .borrow()
+            .get(&page)
+            .and_then(glib::WeakRef::upgrade)
+            .is_some_and(|known| known == *view);
+        if known {
+            return;
+        }
+        let next = self.state.borrow().clone().page_shown(&page);
+        *self.state.borrow_mut() = next;
+        self.pages.borrow_mut().insert(page.clone(), view.downgrade());
+        {
+            let weak = Rc::downgrade(self);
+            let page = page.clone();
+            view.connect_load_changed(move |view, event| {
+                if event != webkit6::LoadEvent::Committed {
+                    return;
+                }
+                let Some(this) = weak.upgrade() else { return };
+                let level = this.state.borrow().page_scale(&page);
+                crate::plugin_page::set_zoom(view, level);
+            });
+        }
+        let level = self.state.borrow().page_scale(&page);
+        crate::plugin_page::set_zoom(view, level);
+        eprintln!("[text-size] page {page} shown at {level:.2}");
+    }
+
     /// The panel's un-zoomed size moved (it follows the editor's `guifont`, or the desktop's text scaling
     /// moved the conversion): the live size is re-derived from it with the zoom kept.
     pub(crate) fn set_base(&self, base: f32) {
@@ -553,10 +688,21 @@ impl TextSizeController {
         );
     }
 
+    /// The state moved: the panel's px and every page's zoom level follow it.
     fn push_panel_px(&self) {
         let px = self.state.borrow().panel_px();
         self.panel_px.set(px);
         self.panel.set_panel_font_size_px(px);
+        self.push_pages();
+    }
+
+    fn push_pages(&self) {
+        let state = self.state.borrow();
+        for (page, view) in self.pages.borrow().iter() {
+            if let Some(view) = view.upgrade() {
+                crate::plugin_page::set_zoom(&view, state.page_scale(page));
+            }
+        }
     }
 }
 
@@ -588,6 +734,7 @@ mod tests {
             pending: None,
             burst: Vec::new(),
             base,
+            pages: BTreeMap::new(),
         }
     }
 
@@ -1255,15 +1402,10 @@ mod tests {
     }
 
     #[test]
-    fn route_focused_module_is_neither_off_the_top_bar_or_in_a_lua_panel() {
+    fn route_focused_module_is_neither_off_the_top_bar_or_on_the_canvas() {
         assert_eq!(route_focused_module(None), TextSizeTarget::Neither);
         assert_eq!(
-            route_focused_module(Some(&ModuleId::lua("notes"))),
-            TextSizeTarget::Neither
-        );
-        // A Lua panel that named itself "editor" is still a Lua panel.
-        assert_eq!(
-            route_focused_module(Some(&ModuleId::lua("editor"))),
+            route_focused_module(Some(&ModuleId::parse("canvas").unwrap())),
             TextSizeTarget::Neither
         );
         // The bottom terminal's text size is its own until its phase 4 (`main`: pane 2, Neither).
@@ -1271,6 +1413,216 @@ mod tests {
             route_focused_module(Some(&ModuleId::terminal())),
             TextSizeTarget::Neither
         );
+    }
+
+    /// A plugin page (a Lua panel module) holding the keys is its own target, named by its module,
+    /// so the prefix steps that page and no other.
+    #[test]
+    fn route_focused_module_sends_a_lua_panel_to_its_page() {
+        assert_eq!(
+            route_focused_module(Some(&ModuleId::lua("snotra"))),
+            TextSizeTarget::Page(ModuleId::lua("snotra"))
+        );
+        // A Lua panel that named itself "editor" is still a Lua panel, never the editor.
+        assert_eq!(
+            route_focused_module(Some(&ModuleId::lua("editor"))),
+            TextSizeTarget::Page(ModuleId::lua("editor"))
+        );
+    }
+
+    // --- Pages: a plugin page follows S with a factor of its own. ---
+
+    fn page(name: &str) -> ModuleId {
+        ModuleId::lua(name)
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn a_page_first_shown_is_in_step_with_the_editor() {
+        let state = ts(1.3, 0.7, 14.0).page_shown(&page("md"));
+        assert_eq!(state.page_scale(&page("md")), 1.3);
+        assert_eq!(state.page_scale(&page("never-shown")), 1.3);
+    }
+
+    /// `Ctrl+=`/`Ctrl+-` change S and every page follows; no page's factor moves.
+    #[test]
+    fn both_panes_steps_move_every_page_with_s() {
+        let state = ts(1.0, 1.0, 14.0).page_shown(&page("a")).page_larger(&page("a"));
+        let state = state.page_shown(&page("b"));
+        assert!(close(state.page_scale(&page("a")), 1.1));
+        let (state, write) = state.both_larger();
+        assert_eq!(write, Some(1.1));
+        assert!(close(state.page_scale(&page("a")), 1.1 * 1.1));
+        assert!(close(state.page_scale(&page("b")), 1.1));
+        let (state, write) = state.both_smaller();
+        assert_eq!(write, Some(1.0));
+        assert!(close(state.page_scale(&page("a")), 1.1));
+        assert!(close(state.page_scale(&page("b")), 1.0));
+    }
+
+    /// `Ctrl+0` puts S and every page back at 1.0, as it does the panel.
+    #[test]
+    fn both_reset_puts_every_page_back_in_step() {
+        let state = ts(1.6, 1.0, 14.0)
+            .page_shown(&page("a"))
+            .page_larger(&page("a"))
+            .page_shown(&page("b"))
+            .page_smaller(&page("b"));
+        let (state, write) = state.both_reset();
+        assert_eq!(write, Some(1.0));
+        assert_eq!(state.page_scale(&page("a")), 1.0);
+        assert_eq!(state.page_scale(&page("b")), 1.0);
+        assert_eq!(state.r, 1.0);
+    }
+
+    /// The prefix with a page holding the keys: that page alone, the panel's step, nothing written.
+    #[test]
+    fn a_page_step_moves_that_page_alone_and_writes_nothing() {
+        let state = ts(1.5, 1.2, 14.0).page_shown(&page("a")).page_shown(&page("b"));
+        let panel_px = state.panel_px();
+        let next = state.clone().page_larger(&page("a"));
+        assert!(close(next.page_scale(&page("a")), 1.6), "P_page + 0.1 from S = 1.5");
+        assert!(
+            close(next.pages[&page("a")], 1.6 / 1.5),
+            "R_page = P_page / S, not P_page"
+        );
+        assert_eq!(next.page_scale(&page("b")), 1.5, "another page does not move");
+        assert_eq!(next.panel_px(), panel_px, "the panel does not move");
+        assert_eq!(next.reported_s, 1.5);
+        assert_eq!(next.pending, None, "a page step never writes S");
+        let next = next.page_smaller(&page("a")).page_smaller(&page("a"));
+        assert!(close(next.page_scale(&page("a")), 1.4));
+    }
+
+    #[test]
+    fn a_page_reset_puts_that_page_back_in_step_and_leaves_s() {
+        let state = ts(1.4, 1.0, 14.0)
+            .page_shown(&page("a"))
+            .page_larger(&page("a"))
+            .page_shown(&page("b"))
+            .page_larger(&page("b"));
+        let next = state.apply_page_step(&page("a"), TextStep::Reset);
+        assert_eq!(next.page_scale(&page("a")), 1.4);
+        assert!(
+            close(next.page_scale(&page("b")), 1.5),
+            "only the page with the keys resets"
+        );
+        assert_eq!(next.reported_s, 1.4);
+        assert_eq!(next.pending, None);
+    }
+
+    #[test]
+    fn apply_page_step_maps_each_step_to_its_row() {
+        let state = ts(1.0, 1.0, 14.0).page_shown(&page("a"));
+        assert!(close(
+            state
+                .clone()
+                .apply_page_step(&page("a"), TextStep::Larger)
+                .page_scale(&page("a")),
+            1.1
+        ));
+        assert!(close(
+            state
+                .clone()
+                .apply_page_step(&page("a"), TextStep::Smaller)
+                .page_scale(&page("a")),
+            0.9
+        ));
+    }
+
+    /// Repeated presses at the top of the range keep the raw factor bounded, as the panel's do.
+    #[test]
+    fn a_page_step_clamps_the_raw_factor_too() {
+        let mut state = ts(1.0, 1.0, 14.0).page_shown(&page("a"));
+        for _ in 0..40 {
+            state = state.page_larger(&page("a"));
+        }
+        assert_eq!(state.page_scale(&page("a")), ZOOM_MAX);
+        assert!(state.pages[&page("a")] <= ZOOM_MAX + 1e-6);
+        for _ in 0..80 {
+            state = state.page_smaller(&page("a"));
+        }
+        assert_eq!(state.page_scale(&page("a")), ZOOM_MIN);
+    }
+
+    /// An editor-only step keeps every shown page where it was, as it keeps the panel; a page shown
+    /// only afterwards starts in step with the new S.
+    #[test]
+    fn an_editor_only_step_leaves_every_shown_page_in_place() {
+        let state = ts(1.0, 1.0, 14.0)
+            .page_shown(&page("a"))
+            .page_larger(&page("a"))
+            .page_shown(&page("b"));
+        let (a, b) = (state.page_scale(&page("a")), state.page_scale(&page("b")));
+        for op in [
+            TextSize::editor_larger as fn(TextSize) -> (TextSize, Option<f32>),
+            TextSize::editor_smaller,
+        ] {
+            let (next, write) = op(state.clone());
+            assert!(write.is_some());
+            assert!(close(next.page_scale(&page("a")), a));
+            assert!(close(next.page_scale(&page("b")), b));
+            let next = next.nvim_reported_s(write.unwrap());
+            assert!(close(next.page_scale(&page("a")), a), "the echo does not move it");
+        }
+        let (moved, _) = ts(2.0, 1.0, 14.0).page_shown(&page("a")).editor_reset();
+        assert!(close(moved.page_scale(&page("a")), 2.0));
+        let (later, write) = state.editor_larger();
+        assert_eq!(write, Some(1.1));
+        assert!(close(later.page_shown(&page("c")).page_scale(&page("c")), 1.1));
+    }
+
+    /// A page shown again (hidden and shown, or its view rebuilt after a kill) keeps its factor.
+    #[test]
+    fn a_page_shown_again_keeps_its_factor() {
+        let state = ts(1.0, 1.0, 14.0).page_shown(&page("a")).page_larger(&page("a"));
+        let again = state.page_shown(&page("a"));
+        assert!(close(again.page_scale(&page("a")), 1.1));
+    }
+
+    /// A page reads S as the panel does: a pending write moves it at once, and the page step made
+    /// before the echo steps from what the page shows, so the echo moves nothing.
+    #[test]
+    fn a_page_follows_a_pending_write_and_steps_from_what_it_shows() {
+        let state = TextSize::new(14.0, 1.0).page_shown(&page("a"));
+        let (state, write) = state.both_larger();
+        assert_eq!(write, Some(1.1));
+        assert!(
+            close(state.page_scale(&page("a")), 1.1),
+            "the pending write, before any echo"
+        );
+        let state = state.page_larger(&page("a"));
+        assert!(close(state.page_scale(&page("a")), 1.2));
+        let state = state.nvim_reported_s(1.1);
+        assert_eq!(state.pending, None);
+        assert!(close(state.page_scale(&page("a")), 1.2), "the echo does not move it");
+    }
+
+    /// An external `:let` moves every page with it, its factor kept, and the stuck-pending heal
+    /// (`Ctrl+0` at a `reported_s` of 1.0) puts pages back too.
+    #[test]
+    fn an_external_report_moves_pages_and_reset_heals_them() {
+        let state = TextSize::new(14.0, 1.0).page_shown(&page("a")).page_larger(&page("a"));
+        let state = state.nvim_reported_s(2.0);
+        assert!(close(state.page_scale(&page("a")), 2.2));
+        let state = TextSize::new(14.0, 1.0).page_shown(&page("a")).page_larger(&page("a"));
+        let (stuck, _) = state.both_larger();
+        let (healed, write) = stuck.both_reset();
+        assert_eq!(write, Some(1.0));
+        assert_eq!(healed.pending, None);
+        assert_eq!(healed.page_scale(&page("a")), 1.0);
+    }
+
+    /// A report the panel cannot use (not finite, not positive) leaves pages at their factor on 1.0.
+    #[test]
+    fn a_bad_report_reads_as_one_for_pages() {
+        for bad in [f32::NAN, 0.0, -1.0] {
+            let state = TextSize::new(14.0, 1.0).page_shown(&page("a")).nvim_reported_s(bad);
+            assert_eq!(state.page_scale(&page("a")), 1.0, "{bad}");
+        }
     }
 
     #[test]
