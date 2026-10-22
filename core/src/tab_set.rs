@@ -15054,16 +15054,21 @@ mod steer_tests {
                 turn_id: "turn-2".into(),
             },
         ]);
-        until("the follow-up turn is folded", || {
-            set.pump(&dir, true);
-            set.get(tab)
+        until("the follow-up turn is folded and pumped", || {
+            // Read before the pump, not after: the conversation folds on its own thread, so a turn seen
+            // started after a pump returned may have been folded after that pump read the projection,
+            // and the drop folded in the same batch would not have reached the queue yet.
+            let folded = set
+                .get(tab)
                 .unwrap()
                 .live()
                 .unwrap()
                 .projection()
                 .active_turn_id
                 .as_deref()
-                == Some("turn-2")
+                == Some("turn-2");
+            set.pump(&dir, true);
+            folded
         });
         assert_eq!(queue(&set, tab), [("and the tests".to_string(), false)], "held again");
         assert!(set.flush_queue(tab).is_none(), "the follow-up runs");

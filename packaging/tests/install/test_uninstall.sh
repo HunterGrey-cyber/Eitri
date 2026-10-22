@@ -220,17 +220,22 @@ TESTS="$TESTS t_purge_ignores_a_relative_or_empty_xdg_config_home"
 t_purge_ignores_a_relative_or_empty_xdg_config_home() {
 	# A relative or empty XDG_CONFIG_HOME is ignored, as every XDG reader ignores one: the settings
 	# are ~/.config/eitri, never a directory under wherever the installer happens to run.
-	for v in '' xdgconf; do
+	# The values tried are recorded and checked after the loop: a helper that reuses the loop's
+	# variable (sh has no locals) once made both rounds run with another value, and nothing noticed.
+	_pr_ran=
+	for _pr_xdg in '' xdgconf; do
 		populate
 		mkdir -p "$T/cwd/xdgconf/eitri"
 		echo keep >"$T/cwd/xdgconf/eitri/keep"
-		inst --set "XDG_CONFIG_HOME=$v" -- --uninstall --purge
-		expect_rc 0
+		inst --set "XDG_CONFIG_HOME=$_pr_xdg" -- --uninstall --purge
+		expect_rc 0 "XDG_CONFIG_HOME='$_pr_xdg'"
 		expect_out "removing $TH/.config/eitri"
 		expect_absent "$TH/.config/eitri"
 		expect_file "$T/cwd/xdgconf/eitri/keep"
 		rm -rf "$T/cwd/xdgconf"
+		_pr_ran="${_pr_ran}[${_pr_xdg}]"
 	done
+	expect_eq "$_pr_ran" "[][xdgconf]" "the XDG_CONFIG_HOME values tried"
 }
 
 TESTS="$TESTS t_purge_never_removes_eitri_config_dir"

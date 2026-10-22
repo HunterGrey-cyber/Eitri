@@ -75,7 +75,14 @@ fn spawn_hook(socket: Option<&std::path::Path>, payload: &str) -> std::process::
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+    // The hook refuses an unset socket variable before it reads stdin, so it may already have exited
+    // and closed the pipe when this writes: a broken pipe here is that, and the exit code and stderr
+    // read below are what each test judges.
+    match child.stdin.take().unwrap().write_all(payload.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing the hook payload failed: {e}"),
+    }
     child.wait_with_output().unwrap()
 }
 

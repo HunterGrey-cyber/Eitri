@@ -11305,7 +11305,10 @@ mod tests {
     #[test]
     fn an_answered_cards_offer_never_comes_back_and_a_replayed_remember_saves_nothing() {
         agent::state_dirs::redirect_state_to_a_test_root();
-        let dir = agent::state_dirs::test_workspace_dir("panel-permission-remember-race");
+        // Its own repository: the `git push` cards below are offered a rule only when the policy finds
+        // no repository above the project, and the shared temp dir above a bare workspace may hold a
+        // stray `.git`.
+        let dir = agent::state_dirs::test_repository_dir("panel-permission-remember-race");
         let rules_dir = dir.join("rules");
         let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
         let tab = set.active();
@@ -11929,6 +11932,21 @@ mod tests {
 
     /// A project directory with resumable records for `records` and a panel state whose last window
     /// left `saved` open.
+    /// Whether a Claude session's lease is free, asked again for up to five seconds while it looks held.
+    /// A lease just dropped can look held for a moment while another test thread starts a child process:
+    /// the child has a copy of every descriptor of this process until it execs. One never let go is
+    /// still held after the five seconds, so this checks "released within five seconds".
+    fn lease_comes_free(canonical: &str, session: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while agent::lease::SessionLease::is_held("claude", canonical, session).unwrap() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
     fn restore_panel(
         label: &str,
         saved: &[(&str, Option<&str>, SessionModeChoice)],
@@ -12284,7 +12302,7 @@ mod tests {
             .collect();
         assert_eq!(numbers, ["s-1", "s-2", "s-3"].map(|s| Some(s.to_string())));
         drop(resumes.leases);
-        assert!(!agent::lease::SessionLease::is_held("claude", &canonical, "s-1").unwrap());
+        assert!(lease_comes_free(&canonical, "s-1"), "dropping the leases lets them go");
     }
 
     #[test]
@@ -14089,6 +14107,11 @@ mod tests {
         for id in ["s-1", "s-2"] {
             let lease = agent::lease::SessionLease::try_acquire("claude", &canonical, id);
             assert!(lease.is_ok(), "{id} is not leased while the question waits");
+        }
+        // The answer below leases both again, and a lease dropped just above may still be held a moment
+        // by a child another test is starting; the restore would then skip it as open elsewhere.
+        for id in ["s-1", "s-2"] {
+            assert!(lease_comes_free(&canonical, id), "{id}'s probe lease is let go");
         }
         assert!(
             state.borrow().restore_source.is_none(),

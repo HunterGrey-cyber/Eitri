@@ -393,12 +393,14 @@ setup_releases() {
 }
 
 # serve VERSION... : the served tree holds exactly these releases; `latest` is the first named.
+# Its loop variable has the helper's own prefix: sh has no locals, so a plain `v` here overwrote the
+# loop variable of any test that served a release inside its own `for v` loop.
 serve() {
 	rm -rf "$S/srv/releases"
 	mkdir -p "$S/srv/releases/latest/download" "$S/srv/releases/download"
 	cp -R "$S/fix/v$1/." "$S/srv/releases/latest/download/"
-	for v do
-		cp -R "$S/fix/v$v" "$S/srv/releases/download/v$v"
+	for _sv_v do
+		cp -R "$S/fix/v$_sv_v" "$S/srv/releases/download/v$_sv_v"
 	done
 }
 

@@ -193,6 +193,25 @@ pub fn test_workspace_dir(label: &str) -> PathBuf {
         .expect("a test workspace directory just created should resolve")
 }
 
+/// A test workspace (as [`test_workspace_dir`]) that is the top level of its own git repository:
+/// a `.git` holding the least git accepts as a repository (`HEAD` naming a ref, `objects/`,
+/// `refs/`), written by hand so neither git nor the host's templates are involved.
+///
+/// Test-only. For a test whose code under test looks for the repository a git call would use, by
+/// walking up from the project for a `.git`. Under a bare workspace that walk reaches the system temp
+/// dir, which other programs share: a `.git` anyone leaves there (a Codex sandbox makes an empty one
+/// as a mount point while it runs) turns every git call in the workspace into "a repository above the
+/// project root". A `.git` at the workspace itself ends the walk there, so nothing above it counts.
+#[doc(hidden)]
+pub fn test_repository_dir(label: &str) -> PathBuf {
+    let dir = test_workspace_dir(label);
+    let git_dir = dir.join(".git");
+    std::fs::create_dir_all(git_dir.join("objects")).expect("creating a test repository's objects/");
+    std::fs::create_dir_all(git_dir.join("refs/heads")).expect("creating a test repository's refs/");
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("writing a test repository's HEAD");
+    dir
+}
+
 /// Removes sibling roots whose owning process is gone.
 ///
 /// Uses `crate::process_probe::pid_is_alive`, based on `kill(pid, 0)`, on Linux and macOS.
