@@ -1,0 +1,434 @@
+//! The link's GTK side: the link thread's wake descriptor watched on the main context, what arrived drained on
+//! each wake and handed to the handler registered for its kind, and the end of the link reported once.
+//!
+//! The link thread does every read and write, so nothing here waits: a wake drains what is already queued, a send
+//! only queues. A kind with no handler is logged and its descriptors closed, so a message no part of this window
+//! takes cannot hold a descriptor open. The end is reported after every message the other window wrote before
+//! it, as the link thread passes them: `bye{why}` first means a clean close, an end without one means the other
+//! window died or the link broke.
+
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::rc::Rc;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
+
+use eitri_core::window_link::link::{Inbound, LinkHandle};
+use eitri_core::window_link::msg::KINDS;
+use eitri_core::window_link::{LinkError, Msg};
+use gtk4::glib;
+
+use super::LinkEnd;
+
+/// How long a window started here has to finish the handshake. Its `hello` comes once its toolkit is up, which a
+/// loaded machine can take several seconds for; past this the start has failed, and a window that never says hello
+/// must not leave the pair looking as if it had a second window.
+pub const HANDSHAKE_WITHIN: Duration = Duration::from_secs(30);
+
+/// The other window of the pair: its process and that process's start time, which together name it even after
+/// its pid is reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partner {
+    pub pid: u32,
+    pub start: u64,
+}
+
+type Handler = Rc<dyn Fn(&LinkDriver, Msg, Vec<OwnedFd>)>;
+type EndHandler = Rc<dyn Fn(&LinkDriver, &LinkEnd)>;
+
+struct Inner {
+    handle: RefCell<Option<LinkHandle>>,
+    inbound: Receiver<Inbound>,
+    handlers: RefCell<BTreeMap<&'static str, Handler>>,
+    on_end: RefCell<Vec<EndHandler>>,
+    partner: Cell<Option<Partner>>,
+    /// The handshake is done: the other window's `hello` was checked and `welcome` sent (window 1), or `welcome`
+    /// arrived (window 2).
+    linked: Cell<bool>,
+    /// The other window's `bye`, kept until the end it announces arrives.
+    bye: RefCell<Option<String>>,
+    ended: RefCell<Option<LinkEnd>>,
+    /// This window closed the link itself: its end is not reported as the other window's.
+    closed_here: Cell<bool>,
+    /// When the handshake must be done by, for a link whose other window was started here.
+    handshake_by: Cell<Option<Instant>>,
+    watch: RefCell<Option<glib::SourceId>>,
+}
+
+/// One window's end of the link on the GTK thread. Cheap to clone: every clone is the same link.
+#[derive(Clone)]
+pub struct LinkDriver {
+    inner: Rc<Inner>,
+}
+
+impl LinkDriver {
+    /// Wraps a started link. Nothing is read until [`LinkDriver::watch`] (or a test's [`LinkDriver::pump`]).
+    pub fn new(handle: LinkHandle, inbound: Receiver<Inbound>) -> LinkDriver {
+        LinkDriver {
+            inner: Rc::new(Inner {
+                handle: RefCell::new(Some(handle)),
+                inbound,
+                handlers: RefCell::default(),
+                on_end: RefCell::default(),
+                partner: Cell::new(None),
+                linked: Cell::new(false),
+                bye: RefCell::new(None),
+                ended: RefCell::new(None),
+                closed_here: Cell::new(false),
+                handshake_by: Cell::new(None),
+                watch: RefCell::new(None),
+            }),
+        }
+    }
+
+    /// Watches the link's wake descriptor on the default main context; each wake pumps. The watch ends with
+    /// the link. `false` when it could not be added (not on the main context's thread).
+    pub fn watch(&self) -> bool {
+        let fd = match self.inner.handle.borrow().as_ref() {
+            Some(handle) => handle.wake_fd().as_raw_fd(),
+            None => return false,
+        };
+        let me = Rc::downgrade(&self.inner);
+        let watched =
+            neovide_editor::fd_watch::add_local(fd, glib::IOCondition::IN, glib::ffi::G_PRIORITY_DEFAULT, move |_| {
+                let Some(inner) = me.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let driver = LinkDriver { inner };
+                driver.pump();
+                if driver.ended().is_some() || driver.inner.handle.borrow().is_none() {
+                    // GLib removes the source once this returns `Break`, so its id is forgotten here.
+                    driver.inner.watch.borrow_mut().take();
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        let Ok(id) = watched else {
+            eprintln!("[link] BUG: the link is watched off the main context's thread; nothing arrives");
+            return false;
+        };
+        *self.inner.watch.borrow_mut() = Some(id);
+        true
+    }
+
+    /// Registers what `kind`'s messages go to; one handler per kind, a later one replacing it. A kind the
+    /// link does not know is a mistake in this window's code.
+    pub fn on(&self, kind: &'static str, handler: impl Fn(&LinkDriver, Msg, Vec<OwnedFd>) + 'static) {
+        assert!(KINDS.contains(&kind), "the link has no message kind {kind:?}");
+        self.inner.handlers.borrow_mut().insert(kind, Rc::new(handler));
+    }
+
+    /// Registers what runs once when the link ends without this window having closed it.
+    pub fn on_end(&self, handler: impl Fn(&LinkDriver, &LinkEnd) + 'static) {
+        self.inner.on_end.borrow_mut().push(Rc::new(handler));
+    }
+
+    /// Drains what arrived and hands each message to its handler, the end last. Handlers run with nothing of
+    /// the driver borrowed, so one may send, close or register.
+    pub fn pump(&self) {
+        if let Some(handle) = self.inner.handle.borrow().as_ref() {
+            handle.drain_wake();
+        }
+        loop {
+            match self.inner.inbound.try_recv() {
+                Ok(Inbound::Msg { msg, fds }) => self.dispatch(msg, fds),
+                Ok(Inbound::Refused(err)) => eprintln!("[link] a packet from the other window was refused: {err}"),
+                Ok(Inbound::Closed) | Err(TryRecvError::Disconnected) => {
+                    self.end_of_link();
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+    }
+
+    fn dispatch(&self, msg: Msg, fds: Vec<OwnedFd>) {
+        if let Msg::Bye { why } = &msg {
+            println!("[link] the other window says bye: {why}");
+            *self.inner.bye.borrow_mut() = Some(why.clone());
+        }
+        let kind = msg.kind();
+        let handler = self.inner.handlers.borrow().get(kind).cloned();
+        match handler {
+            Some(handler) => handler(self, msg, fds),
+            None if kind == "bye" => {}
+            // The descriptors close as `fds` drops.
+            None => eprintln!("[link] nothing in this window takes `{kind}` yet; dropped"),
+        }
+    }
+
+    fn end_of_link(&self) {
+        if self.inner.ended.borrow().is_some() {
+            return;
+        }
+        let end = match self.inner.bye.borrow_mut().take() {
+            Some(why) => LinkEnd::Bye { why },
+            None => LinkEnd::Eof,
+        };
+        *self.inner.ended.borrow_mut() = Some(end.clone());
+        self.inner.linked.set(false);
+        // The thread has ended: the handle has nothing more to give, and dropping it joins the thread.
+        let handle = self.inner.handle.borrow_mut().take();
+        drop(handle);
+        if self.inner.closed_here.get() {
+            return;
+        }
+        println!("[link] the link to the other window ended ({end:?})");
+        let handlers: Vec<EndHandler> = self.inner.on_end.borrow().clone();
+        for handler in handlers {
+            handler(self, &end);
+        }
+    }
+
+    /// Queues `msg` with `fds` (closed once written); refused at once when the message breaks its kind's rules.
+    /// After the link ended the message is dropped, as on a link the other window closed.
+    pub fn send(&self, msg: Msg, fds: Vec<OwnedFd>) -> Result<(), LinkError> {
+        match self.inner.handle.borrow().as_ref() {
+            Some(handle) => handle.send(msg, fds),
+            None => Ok(()),
+        }
+    }
+
+    /// Says `bye{why}` and closes the link; the other window sees a clean close. This window's own handlers for
+    /// the end do not run: it asked for it.
+    pub fn close(&self, why: &str) {
+        self.inner.closed_here.set(true);
+        self.inner.linked.set(false);
+        // The watch goes first: closing the link closes the descriptor it watches.
+        if let Some(id) = self.inner.watch.borrow_mut().take() {
+            id.remove();
+        }
+        let handle = self.inner.handle.borrow_mut().take();
+        if let Some(handle) = handle {
+            handle.close(why);
+        }
+    }
+
+    pub fn partner(&self) -> Option<Partner> {
+        self.inner.partner.get()
+    }
+
+    pub fn set_partner(&self, partner: Partner) {
+        self.inner.partner.set(Some(partner));
+    }
+
+    /// Whether the handshake is done and the link has not ended.
+    pub fn linked(&self) -> bool {
+        self.inner.linked.get() && self.is_up()
+    }
+
+    pub fn set_linked(&self) {
+        if self.is_up() {
+            self.inner.linked.set(true);
+        }
+    }
+
+    /// The handshake must be done by `at`; [`LinkDriver::handshake_overdue`] ends the link after it.
+    pub fn set_handshake_deadline(&self, at: Instant) {
+        self.inner.handshake_by.set(Some(at));
+    }
+
+    /// At `now`, past the handshake's deadline with no handshake done: the link is closed (the window at its other
+    /// end, should it ever say hello, finds it gone and closes) and `true` is returned, so the pair can start
+    /// another. A linked link, or one with no deadline, is left alone.
+    pub fn handshake_overdue(&self, now: Instant) -> bool {
+        let Some(by) = self.inner.handshake_by.get() else {
+            return false;
+        };
+        if now < by || self.linked() || !self.is_up() {
+            return false;
+        }
+        eprintln!("[link] the second window did not finish the handshake in time; the link is closed");
+        self.close("the handshake was not finished in time");
+        true
+    }
+
+    /// Whether the link still runs, handshake or not.
+    pub fn is_up(&self) -> bool {
+        self.inner.ended.borrow().is_none() && self.inner.handle.borrow().is_some()
+    }
+
+    /// How the link ended, once it has.
+    pub fn ended(&self) -> Option<LinkEnd> {
+        self.inner.ended.borrow().clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use eitri_core::window_link::fdpass;
+    use eitri_core::window_link::link::PresenceFlag;
+    use std::time::{Duration, Instant};
+
+    /// Two linked ends: a driver on one, the bare handle of the other window on the other.
+    pub(crate) fn pair() -> (LinkDriver, LinkHandle, Receiver<Inbound>) {
+        let (a, b) = fdpass::seqpacket_pair().unwrap();
+        let (mine, inbound) = LinkHandle::start(a, PresenceFlag::default()).unwrap();
+        let (theirs, their_inbound) = LinkHandle::start(b, PresenceFlag::default()).unwrap();
+        (LinkDriver::new(mine, inbound), theirs, their_inbound)
+    }
+
+    /// Pumps until `done` holds, for at most five seconds: the link thread delivers on its own schedule.
+    pub(crate) fn pump_until(driver: &LinkDriver, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            driver.pump();
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn messages_reach_the_handler_of_their_kind_and_unclaimed_ones_are_dropped() {
+        let (driver, theirs, _their_inbound) = pair();
+        let seen: Rc<RefCell<Vec<Msg>>> = Rc::default();
+        {
+            let seen = seen.clone();
+            driver.on("away", move |_, msg, fds| {
+                assert!(fds.is_empty());
+                seen.borrow_mut().push(msg);
+            });
+        }
+        theirs.send(Msg::Presence { held: true }, Vec::new()).unwrap();
+        theirs
+            .send(
+                Msg::Away {
+                    ids: vec!["terminal".into()],
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(pump_until(&driver, || !seen.borrow().is_empty()));
+        assert_eq!(
+            *seen.borrow(),
+            vec![Msg::Away {
+                ids: vec!["terminal".into()]
+            }]
+        );
+        assert!(driver.is_up());
+    }
+
+    #[test]
+    fn a_link_end_without_bye_leaves_window_2_unlinked() {
+        let (driver, theirs, _their_inbound) = pair();
+        driver.set_linked();
+        assert!(driver.linked());
+        let ends: Rc<RefCell<Vec<LinkEnd>>> = Rc::default();
+        {
+            let ends = ends.clone();
+            driver.on_end(move |_, end| ends.borrow_mut().push(end.clone()));
+        }
+        // The other window dies: its end of the socket closes with no `bye`.
+        drop(theirs);
+        assert!(pump_until(&driver, || !ends.borrow().is_empty()));
+        assert_eq!(*ends.borrow(), vec![LinkEnd::Eof]);
+        assert!(!driver.linked() && !driver.is_up());
+        assert_eq!(driver.ended(), Some(LinkEnd::Eof));
+        driver.pump();
+        assert_eq!(ends.borrow().len(), 1, "the end is reported once");
+        assert!(
+            driver.send(Msg::Presence { held: true }, Vec::new()).is_ok(),
+            "a send after the end is dropped quietly"
+        );
+    }
+
+    #[test]
+    fn window_1s_clean_close_with_bye_also_leaves_window_2_unlinked() {
+        let (driver, theirs, _their_inbound) = pair();
+        driver.set_linked();
+        let ends: Rc<RefCell<Vec<LinkEnd>>> = Rc::default();
+        {
+            let ends = ends.clone();
+            driver.on_end(move |_, end| ends.borrow_mut().push(end.clone()));
+        }
+        theirs.close("window 1 closed");
+        assert!(pump_until(&driver, || !ends.borrow().is_empty()));
+        assert_eq!(
+            *ends.borrow(),
+            vec![LinkEnd::Bye {
+                why: "window 1 closed".into()
+            }],
+            "a clean close ends the link for window 2 as a crash does, and says so"
+        );
+        assert!(!driver.linked());
+    }
+
+    #[test]
+    fn closing_the_link_here_says_bye_and_reports_no_end_to_this_window() {
+        let (driver, _theirs, their_inbound) = pair();
+        let ends: Rc<Cell<u32>> = Rc::default();
+        {
+            let ends = ends.clone();
+            driver.on_end(move |_, _| ends.set(ends.get() + 1));
+        }
+        driver.close("window 2 closed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = Vec::new();
+        while Instant::now() < deadline {
+            match their_inbound.recv_timeout(Duration::from_millis(50)) {
+                Ok(Inbound::Msg { msg, .. }) => got.push(msg),
+                Ok(Inbound::Closed) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            got,
+            vec![Msg::Bye {
+                why: "window 2 closed".into()
+            }]
+        );
+        driver.pump();
+        assert_eq!(ends.get(), 0, "the window that closed the link is not told it ended");
+        assert!(!driver.is_up());
+    }
+
+    #[test]
+    fn a_handshake_not_done_by_its_deadline_drops_the_link_so_another_window_can_start() {
+        use crate::linked_window::{WindowNew, WindowRole};
+        // A clock of the test's own: instants it makes up, never the time it takes to run.
+        let start = Instant::now();
+        let (driver, _theirs, _their_inbound) = pair();
+        driver.set_handshake_deadline(start + HANDSHAKE_WITHIN);
+        let role = WindowRole::Main {
+            link: Some(driver.clone()),
+        };
+        assert!(!driver.handshake_overdue(start + HANDSHAKE_WITHIN - Duration::from_millis(1)));
+        assert!(driver.is_up(), "before the deadline the start is still waited for");
+        assert_eq!(role.window_new(), WindowNew::Raise);
+
+        assert!(driver.handshake_overdue(start + HANDSHAKE_WITHIN));
+        assert!(!driver.is_up(), "past the deadline the link is gone");
+        assert_eq!(
+            role.window_new(),
+            WindowNew::Spawn,
+            "and window.new starts another window"
+        );
+        assert!(
+            !driver.handshake_overdue(start + HANDSHAKE_WITHIN * 2),
+            "it is dropped once"
+        );
+
+        let (linked, _theirs, _inbound) = pair();
+        linked.set_handshake_deadline(start + HANDSHAKE_WITHIN);
+        linked.set_linked();
+        assert!(!linked.handshake_overdue(start + HANDSHAKE_WITHIN * 2));
+        assert!(linked.linked(), "a link whose handshake is done keeps no deadline");
+
+        let (no_deadline, _theirs, _inbound) = pair();
+        assert!(!no_deadline.handshake_overdue(start + HANDSHAKE_WITHIN * 2));
+        assert!(no_deadline.is_up());
+    }
+
+    #[test]
+    #[should_panic(expected = "no message kind")]
+    fn a_handler_for_a_kind_the_link_does_not_know_is_refused() {
+        let (driver, _theirs, _their_inbound) = pair();
+        driver.on("helo", |_, _, _| {});
+    }
+}

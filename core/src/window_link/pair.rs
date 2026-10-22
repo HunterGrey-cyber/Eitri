@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::state_paths::project_key;
+
 pub const PAIR_FILE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,33 +35,29 @@ impl Role {
     }
 }
 
-fn hex16(project_root: &Path) -> String {
-    agent::conversation_id_for_cwd(project_root)[..16].to_string()
-}
-
 /// In `<state>/eitri/layout/`.
 pub fn layout_file_name(project_root: &Path, role: Role) -> String {
-    format!("{}{}.v2.json", hex16(project_root), role.suffix())
+    format!("{}{}.v2.json", project_key(project_root), role.suffix())
 }
 
 /// In `<state>/eitri/tabs/`.
 pub fn tabs_file_name(project_root: &Path, role: Role) -> String {
-    format!("{}{}.json", hex16(project_root), role.suffix())
+    format!("{}{}.json", project_key(project_root), role.suffix())
 }
 
 /// In `<state>/eitri/layout/`.
 pub fn pair_file_name(project_root: &Path) -> String {
-    format!("{}.pair.json", hex16(project_root))
+    format!("{}.pair.json", project_key(project_root))
 }
 
 /// In `<state>/eitri/layout/`.
 pub fn pair_lock_name(project_root: &Path) -> String {
-    format!("{}.pair.lock", hex16(project_root))
+    format!("{}.pair.lock", project_key(project_root))
 }
 
 /// In `<state>/eitri/log/`.
 pub fn log_file_name(project_root: &Path) -> String {
-    format!("window-2-{}.log", hex16(project_root))
+    format!("window-2-{}.log", project_key(project_root))
 }
 
 /// An exclusive `flock` on the pair's lock file. The lock belongs to the open file description, so every copy of
@@ -72,7 +70,7 @@ pub struct PairLock {
 impl PairLock {
     /// `Ok(None)` while another window holds the pair.
     pub fn try_take(layout_dir: &Path, project_root: &Path) -> io::Result<Option<PairLock>> {
-        crate::layout::persist::create_state_dir(layout_dir)?;
+        crate::state_paths::create_state_dir(layout_dir)?;
         let path = layout_dir.join(pair_lock_name(project_root));
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -180,12 +178,18 @@ pub fn read_pair(layout_dir: &Path, project_root: &Path) -> ReadPair {
 
 /// Written whole to a temporary file beside it, then renamed into place.
 pub fn write_pair(layout_dir: &Path, project_root: &Path, file: &PairFile) -> io::Result<()> {
-    crate::layout::persist::create_state_dir(layout_dir)?;
+    crate::state_paths::create_state_dir(layout_dir)?;
     let path = layout_dir.join(pair_file_name(project_root));
-    let tmp = layout_dir.join(format!("{}.tmp", pair_file_name(project_root)));
+    // This process's own temporary name: window 1 and window 2 may both be writing for a moment as the pair file
+    // passes from one to the other, and a shared name would let one rename the other's half-written file.
+    let tmp = layout_dir.join(format!("{}.{}.tmp", pair_file_name(project_root), std::process::id()));
     let text = serde_json::to_string_pretty(file).expect("a pair file serialises");
-    agent::private_fs::write_private(&tmp, text.as_bytes())?;
-    std::fs::rename(&tmp, &path)
+    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        // Named after this process, a temporary left behind is never written over by a later write.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Renames `path` to `<path>.taken` once its content is safely elsewhere, and returns the new path.
@@ -291,7 +295,9 @@ mod tests {
         assert_eq!(read_pair(&dir, &root()), ReadPair::Read(file.clone()));
         let path = dir.join(pair_file_name(&root()));
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(!dir.join(format!("{}.tmp", pair_file_name(&root()))).exists());
+        assert!(!dir
+            .join(format!("{}.{}.tmp", pair_file_name(&root()), std::process::id()))
+            .exists());
         let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         value["later"] = serde_json::json!(1);
         std::fs::write(&path, value.to_string()).unwrap();

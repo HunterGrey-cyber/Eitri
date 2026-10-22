@@ -181,8 +181,11 @@ impl Controller {
     }
 
     /// The close's save of `win`'s layouts: a pending debounce timer cancelled, a change still unwritten
-    /// handed to the writer, and a wait for the writer to finish. Whether every write finished; `false` for a
-    /// window with no saver or no state directory, or a writer still writing when the wait ran out.
+    /// handed to the writer, and a wait for the writer to finish. Whether the file now holds the window's
+    /// arrangement: `false` for a window with no saver or no state directory, a writer still writing when the wait
+    /// ran out, a write that failed (or an earlier one that did and was not written since), or a layout that could
+    /// not be read. A caller that forgets something only the file is to keep from now on needs that, not merely a
+    /// finished writer.
     pub fn persist_now(&mut self, win: WinId) -> bool {
         let Some(window) = self.windows.get_mut(&win) else {
             return false;
@@ -199,7 +202,11 @@ impl Controller {
             _ => saver.save_now_unread(),
         };
         saver.collect(window.workspaces.try_borrow_mut().ok().as_deref_mut());
-        finished
+        let holds = match (window.layout.try_borrow(), window.workspaces.try_borrow()) {
+            (Ok(layout), Ok(workspaces)) => saver.holds(&layout, &workspaces),
+            _ => false,
+        };
+        finished && holds
     }
 
     /// The shell changed `win`'s layout or workspaces: the saver says whether the save's debounce is to be

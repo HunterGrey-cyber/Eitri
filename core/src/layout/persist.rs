@@ -45,6 +45,8 @@ use super::module::{ModuleDecl, ModuleId};
 use super::reconcile::{reconcile, reconcile_floating, Reconciled};
 use super::tree::{Axis, Branch, Layout, LayoutError, MAX_RATIO, MIN_RATIO};
 use super::workspace::{built_in_and_registered, drop_keys_naming, printable, Kept, Workspaces};
+use crate::window_link::base_tabs::{MovedTabKey, MOVED_TABS_KEY};
+use crate::window_link::pair::{layout_file_name, Role};
 
 /// The version of the file builds before workspaces write, `<hash>.json`; read here only to migrate.
 pub const V1: u32 = 1;
@@ -60,7 +62,18 @@ pub const SAVE_DEBOUNCE_MS: u64 = 500;
 /// The keys of a version 2 file this build reads, at the top level and in a workspace; anything else
 /// at those two levels is kept.
 const TOP_KEYS: [&str; 4] = ["version", "project_root", "current", "workspaces"];
-const WORKSPACE_KEYS: [&str; 6] = ["name", "focus", "hidden", "tiled", "floating", "float_memory"];
+const WORKSPACE_KEYS: [&str; 8] = [
+    "name",
+    "focus",
+    "hidden",
+    "tiled",
+    "floating",
+    "float_memory",
+    "away",
+    MOVED_TABS_KEY,
+];
+/// The workspace keys of the build before two windows: what an older build reads, the rest it keeps or drops.
+const SINGLE_WINDOW_WORKSPACE_KEYS: [&str; 6] = ["name", "focus", "hidden", "tiled", "floating", "float_memory"];
 /// The keys of one entry of a workspace's `floating` list, and of its `float_memory` list.
 const FLOAT_KEYS: [&str; 6] = ["module", "cx", "cy", "w", "h", "scratch"];
 const MEMORY_KEYS: [&str; 5] = ["module", "cx", "cy", "w", "h"];
@@ -200,6 +213,11 @@ struct WorkspaceOut<'a> {
     floating: Vec<FloatOut<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     float_memory: Vec<MemoryOut<'a>>,
+    /// The modules the other window of the pair holds, whose leaves stay here; written only when there are any.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    away: Vec<String>,
+    #[serde(skip_serializing_if = "<[MovedTabKey]>::is_empty")]
+    moved_tabs: &'a [MovedTabKey],
     #[serde(flatten)]
     kept: Map<String, Value>,
 }
@@ -304,6 +322,17 @@ fn kept_except(kept: Option<&Map<String, Value>>, known: &[&str]) -> Map<String,
 /// pretty JSON, so a person can read and fix it, with what a later build wrote after the keys this
 /// one writes. A retired editor is written shown (`Layout::saved_hidden`).
 pub fn encode_v2(workspaces: &Workspaces, current: &Layout, project_root: &Path) -> String {
+    encode_v2_knowing(workspaces, current, project_root, true)
+}
+
+/// [`encode_v2`] by a build that knows the pair's workspace keys (`pair_keys`), or by one from before them,
+/// which writes neither and carries whatever it kept of them as it carries any key it does not know.
+fn encode_v2_knowing(workspaces: &Workspaces, current: &Layout, project_root: &Path, pair_keys: bool) -> String {
+    let known: &[&str] = if pair_keys {
+        &WORKSPACE_KEYS
+    } else {
+        &SINGLE_WINDOW_WORKSPACE_KEYS
+    };
     let file = FileOut {
         version: V2,
         project_root: project_root.to_string_lossy().into_owned(),
@@ -339,7 +368,13 @@ pub fn encode_v2(workspaces: &Workspaces, current: &Layout, project_root: &Path)
                         h: rect.h,
                     })
                     .collect(),
-                kept: kept_except(workspaces.kept_for(name), &WORKSPACE_KEYS),
+                away: if pair_keys {
+                    layout.away().iter().map(|id| id.as_str().to_string()).collect()
+                } else {
+                    Vec::new()
+                },
+                moved_tabs: if pair_keys { workspaces.moved_tabs_of(name) } else { &[] },
+                kept: kept_except(workspaces.kept_for(name), known),
             })
             .collect(),
         kept: kept_except(Some(&workspaces.kept().top), &TOP_KEYS),
@@ -372,6 +407,8 @@ struct ReadWorkspace {
     /// Float memory naming an instance only another workspace holds, kept until the fit gives this
     /// workspace that instance.
     held_memory: Vec<(ModuleId, FloatRect)>,
+    /// The base chat view's tabs that came in with this workspace.
+    moved_tabs: Vec<MovedTabKey>,
 }
 
 fn take_str(map: &mut Map<String, Value>, key: &str) -> Result<String, String> {
@@ -629,8 +666,17 @@ fn read_workspace(
     notes: &mut Vec<String>,
     copy: &mut bool,
     makes_instance: &dyn Fn(&ModuleId) -> bool,
+    pair_keys: bool,
 ) -> Result<ReadWorkspace, String> {
     let mut own = Vec::new();
+    let (away, moved_tabs) = if pair_keys {
+        (
+            read_away(map.remove("away"), name, &mut own, copy),
+            read_moved_tabs(map.remove(MOVED_TABS_KEY), name, &mut own, copy),
+        )
+    } else {
+        (BTreeSet::new(), Vec::new())
+    };
     let focus = ModuleId::parse(&take_str(&mut map, "focus")?).map_err(|e| e.to_string())?;
     let hidden = match map.remove("hidden") {
         Some(Value::Array(items)) => items
@@ -697,8 +743,15 @@ fn read_workspace(
     let (held, memory): (BTreeMap<_, _>, BTreeMap<_, _>) = memory
         .into_iter()
         .partition(|(id, _)| makes_instance(id) && !instances.contains(id));
-    let reconciled =
+    let mut reconciled =
         reconcile_floating(tree, floats, memory, &hidden, Some(&focus), lua, &instances).map_err(|e| e.to_string())?;
+    // Marked once the tree is rebuilt: an away module keeps its leaf, and only a leaf can be away.
+    for id in &away {
+        match reconciled.layout.set_away(id, true) {
+            Ok(_) => {}
+            Err(err) => own.push(format!("workspace '{name}': '{id}' is not held away here: {err}")),
+        }
+    }
     if reconciled.layout.floats().len() < floats_read
         || reconciled.layout.float_memory().len() + held.len() < memory_read
     {
@@ -716,7 +769,61 @@ fn read_workspace(
         layout: reconciled.layout,
         kept: map,
         held_memory: held.into_iter().collect(),
+        moved_tabs,
     })
+}
+
+/// A workspace's `away` list: the modules the other window of the pair held when the file was written. One that
+/// is not a module name is left out, noted, and asks for a copy.
+fn read_away(value: Option<Value>, ws: &str, notes: &mut Vec<String>, copy: &mut bool) -> BTreeSet<ModuleId> {
+    let items = match value {
+        None => return BTreeSet::new(),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            notes.push(format!("away of workspace '{ws}' is not a list; not kept"));
+            *copy = true;
+            return BTreeSet::new();
+        }
+    };
+    let mut away = BTreeSet::new();
+    for item in items {
+        match item.as_str().map(ModuleId::parse) {
+            Some(Ok(id)) => {
+                away.insert(id);
+            }
+            _ => {
+                notes.push(format!("away of workspace '{ws}' holds {item}, not a module; not kept"));
+                *copy = true;
+            }
+        }
+    }
+    away
+}
+
+/// A workspace's record of the base view's tabs that came in with it. An entry that names no agent and session
+/// is left out, noted, and asks for a copy; one named twice is kept once.
+fn read_moved_tabs(value: Option<Value>, ws: &str, notes: &mut Vec<String>, copy: &mut bool) -> Vec<MovedTabKey> {
+    let items = match value {
+        None => return Vec::new(),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            notes.push(format!("{MOVED_TABS_KEY} of workspace '{ws}' is not a list; not kept"));
+            *copy = true;
+            return Vec::new();
+        }
+    };
+    let mut tabs: Vec<MovedTabKey> = Vec::new();
+    for item in items {
+        match serde_json::from_value::<MovedTabKey>(item) {
+            Ok(tab) if !tabs.contains(&tab) => tabs.push(tab),
+            Ok(_) => {}
+            Err(err) => {
+                notes.push(format!("{MOVED_TABS_KEY} of workspace '{ws}': {err}; not kept"));
+                *copy = true;
+            }
+        }
+    }
+    tabs
 }
 
 fn left_out(label: &str, why: &str, notes: &mut Vec<String>, copy: &mut bool) {
@@ -744,7 +851,19 @@ pub fn decode_v2_with(
     lua: &[ModuleDecl],
     deferred: &[ModuleId],
 ) -> Result<Opened, String> {
-    match decode_v2_as_written(text, project_root, lua, deferred) {
+    decode_v2_knowing(text, project_root, lua, deferred, true)
+}
+
+/// [`decode_v2_with`] by a build that knows the pair's workspace keys (`pair_keys`), or by one from before them,
+/// to which they are keys it does not know.
+fn decode_v2_knowing(
+    text: &str,
+    project_root: &Path,
+    lua: &[ModuleDecl],
+    deferred: &[ModuleId],
+    pair_keys: bool,
+) -> Result<Opened, String> {
+    match decode_v2_as_written(text, project_root, lua, deferred, pair_keys) {
         Ok(mut opened) => {
             opened.notes = opened.notes.iter().map(|note| printable(note)).collect();
             Ok(opened)
@@ -795,6 +914,7 @@ fn decode_v2_as_written(
     project_root: &Path,
     lua: &[ModuleDecl],
     deferred: &[ModuleId],
+    pair_keys: bool,
 ) -> Result<Opened, String> {
     let deepest = nesting(text);
     if deepest > MAX_NESTING {
@@ -861,7 +981,7 @@ fn decode_v2_as_written(
             left_out(&label, "an earlier workspace has that name", &mut notes, &mut copy);
             continue;
         }
-        match read_workspace(&name, map, lua, &mut notes, &mut copy, &makes_instance) {
+        match read_workspace(&name, map, lua, &mut notes, &mut copy, &makes_instance, pair_keys) {
             Ok(ws) => read.push(ws),
             Err(why) => left_out(&label, &why, &mut notes, &mut copy),
         }
@@ -904,8 +1024,10 @@ fn decode_v2_as_written(
     let mut stored = BTreeMap::new();
     let mut current_layout = None;
     let mut held_memory = Vec::new();
+    let mut moved_tabs = BTreeMap::new();
     for ws in read {
         held_memory.push((ws.name.clone(), ws.held_memory));
+        moved_tabs.insert(ws.name.clone(), ws.moved_tabs);
         kept.per_workspace.insert(ws.name.clone(), ws.kept);
         if ws.name == current {
             current_layout = Some(ws.layout);
@@ -914,6 +1036,7 @@ fn decode_v2_as_written(
         }
     }
     let mut workspaces = Workspaces::from_parts(order, stored, current, kept).map_err(|e| e.to_string())?;
+    workspaces.set_moved_tabs(moved_tabs);
     let mut current = current_layout.expect("the current workspace is one of those read");
     notes.extend(workspaces.fit_all_with(&mut current, lua));
     // The fit has given every workspace each instance any of them holds, so a held memory entry is kept
@@ -944,13 +1067,19 @@ fn decode_v2_as_written(
 // Files.
 
 // Re-exported for the callers that still reach these through the layout module: the shell's
-// `main.rs`, which moves with the window controller, `window_link`'s start and pair files, and some
-// tests. New code imports `crate::state_paths`.
+// `main.rs`, which moves with the window controller, and some tests. New code imports
+// `crate::state_paths`.
 pub use crate::state_paths::{create_state_dir, file_name, project_key, state_dir, state_subdir, temporary};
 
 /// The version 2 file's name: the same 16 hex digits, `.v2.json`.
 pub fn file_name_v2(project_root: &Path) -> String {
-    format!("{}.v2.json", project_key(project_root))
+    file_name_v2_as(project_root, Role::Main)
+}
+
+/// The version 2 file of a window in `role`: window 1's (or a window alone) is [`file_name_v2`], so an older
+/// build reads it; window 2's is `<hex>-w2.v2.json` and an unpaired window's `<hex>-u.v2.json`.
+pub fn file_name_v2_as(project_root: &Path, role: Role) -> String {
+    layout_file_name(project_root, role)
 }
 
 /// What [`load`] found.
@@ -985,7 +1114,12 @@ pub enum V2State {
 
 /// The version 2 file's text; `None` when there is none.
 pub fn read_v2_text(dir: &Path, project_root: &Path) -> std::io::Result<Option<String>> {
-    match agent::private_fs::read_private_to_string(&dir.join(file_name_v2(project_root))) {
+    read_v2_text_as(dir, project_root, Role::Main)
+}
+
+/// [`read_v2_text`] of the file of a window in `role`.
+pub fn read_v2_text_as(dir: &Path, project_root: &Path, role: Role) -> std::io::Result<Option<String>> {
+    match agent::private_fs::read_private_to_string(&dir.join(file_name_v2_as(project_root, role))) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -1002,8 +1136,14 @@ pub fn load(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> Loaded {
 /// the version 2 file names them, and then put, hidden, into each workspace that lacks them, as a numbered
 /// instance is ([`decode_v2_with`]). The version 1 file predates them and is read as [`load`] reads it.
 pub fn load_with(dir: &Path, project_root: &Path, lua: &[ModuleDecl], deferred: &[ModuleId]) -> Loaded {
-    let v2_path = dir.join(file_name_v2(project_root));
-    let v2_why = match read_v2_text(dir, project_root) {
+    load_as(dir, project_root, Role::Main, lua, deferred)
+}
+
+/// [`load_with`] of the file of a window in `role`. Only window 1's file has a version 1 file before it: window 2
+/// and an unpaired window read their own version 2 file or nothing.
+pub fn load_as(dir: &Path, project_root: &Path, role: Role, lua: &[ModuleDecl], deferred: &[ModuleId]) -> Loaded {
+    let v2_path = dir.join(file_name_v2_as(project_root, role));
+    let v2_why = match read_v2_text_as(dir, project_root, role) {
         Ok(Some(text)) => match decode_v2_with(&text, project_root, lua, deferred) {
             Ok(opened) => return Loaded::Restored(opened),
             Err(why) => Some(format!("{}: {why}", v2_path.display())),
@@ -1011,6 +1151,12 @@ pub fn load_with(dir: &Path, project_root: &Path, lua: &[ModuleDecl], deferred: 
         Ok(None) => None,
         Err(e) => Some(format!("{}: {e}", v2_path.display())),
     };
+    if role != Role::Main {
+        return match v2_why {
+            None => Loaded::Missing,
+            Some(why) => Loaded::Unusable(why),
+        };
+    }
     let v1_path = dir.join(file_name(project_root));
     let v1_why = match agent::private_fs::read_private_to_string(&v1_path) {
         Ok(text) => match decode_v1(&text, project_root, lua) {
@@ -1041,6 +1187,29 @@ pub fn load_with(dir: &Path, project_root: &Path, lua: &[ModuleDecl], deferred: 
     }
 }
 
+/// What a window in `role` opens with. Window 1 and window 2 each read their own file. An unpaired window reads
+/// its own file if there is one, else window 1's once, read-only: nothing of that read is copied aside, since a
+/// copy beside window 1's file is window 1's to make, and what an unpaired window writes goes to its own file.
+pub fn load_for_role(dir: &Path, project_root: &Path, role: Role, lua: &[ModuleDecl], deferred: &[ModuleId]) -> Loaded {
+    let own = load_as(dir, project_root, role, lua, deferred);
+    if role != Role::Unpaired || !matches!(own, Loaded::Missing) {
+        return own;
+    }
+    let read_only = |mut opened: Opened| {
+        opened.keep_copy = None;
+        opened.notes.push(format!(
+            "read from the project's first window's file; this window keeps its own, {}",
+            file_name_v2_as(project_root, Role::Unpaired)
+        ));
+        opened
+    };
+    match load_as(dir, project_root, Role::Main, lua, deferred) {
+        Loaded::Restored(opened) => Loaded::Restored(read_only(opened)),
+        Loaded::Migrated(opened) => Loaded::Migrated(read_only(opened)),
+        other => other,
+    }
+}
+
 /// The version 2 file as it is now, read only to know what a write would replace: whether it can be
 /// used, whether part of it would be lost, and the keys it keeps for a later build.
 pub fn v2_state(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> V2State {
@@ -1050,7 +1219,12 @@ pub fn v2_state(dir: &Path, project_root: &Path, lua: &[ModuleDecl]) -> V2State 
 /// [`v2_state`] read with the window's deferred modules ([`decode_v2_with`]), so one the file holds is not taken
 /// for a module this window cannot carry.
 pub fn v2_state_with(dir: &Path, project_root: &Path, lua: &[ModuleDecl], deferred: &[ModuleId]) -> V2State {
-    let text = match read_v2_text(dir, project_root) {
+    v2_state_as(dir, project_root, Role::Main, lua, deferred)
+}
+
+/// [`v2_state_with`] of the file of a window in `role`.
+pub fn v2_state_as(dir: &Path, project_root: &Path, role: Role, lua: &[ModuleDecl], deferred: &[ModuleId]) -> V2State {
+    let text = match read_v2_text_as(dir, project_root, role) {
         Ok(None) => return V2State::Missing,
         Ok(Some(text)) => text,
         Err(e) => return V2State::Unusable(e.to_string()),
@@ -1098,7 +1272,18 @@ fn write_whole(dir: &Path, path: &Path, text: &str) -> std::io::Result<()> {
 /// A text nested deeper than [`MAX_NESTING`] is not written (`InvalidData`): the next launch could not
 /// read it, and the file already there is a better one to open with.
 pub fn save(dir: &Path, project_root: &Path, workspaces: &Workspaces, current: &Layout) -> std::io::Result<PathBuf> {
-    let path = dir.join(file_name_v2(project_root));
+    save_as(dir, project_root, Role::Main, workspaces, current)
+}
+
+/// [`save`] to the file of a window in `role`.
+pub fn save_as(
+    dir: &Path,
+    project_root: &Path,
+    role: Role,
+    workspaces: &Workspaces,
+    current: &Layout,
+) -> std::io::Result<PathBuf> {
+    let path = dir.join(file_name_v2_as(project_root, role));
     let text = encode_v2(workspaces, current, project_root);
     let deepest = nesting(&text);
     if deepest > MAX_NESTING {
@@ -1116,8 +1301,13 @@ pub fn save(dir: &Path, project_root: &Path, workspaces: &Workspaces, current: &
 /// one typo, or a file a newer build wrote, is kept for a person to read. An earlier `.unusable` is
 /// replaced; a `.partial` never is.
 pub fn set_aside_v2(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
-    let path = dir.join(file_name_v2(project_root));
-    let aside = dir.join(format!("{}.unusable", file_name_v2(project_root)));
+    set_aside_v2_as(dir, project_root, Role::Main)
+}
+
+/// [`set_aside_v2`] of the file of a window in `role`.
+pub fn set_aside_v2_as(dir: &Path, project_root: &Path, role: Role) -> std::io::Result<PathBuf> {
+    let path = dir.join(file_name_v2_as(project_root, role));
+    let aside = dir.join(format!("{}.unusable", file_name_v2_as(project_root, role)));
     std::fs::rename(&path, &aside)?;
     Ok(aside)
 }
@@ -1126,7 +1316,12 @@ pub fn set_aside_v2(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf>
 /// `<hash>.v2.json.partial` beside the file (0600, through its own `.tmp`), and returns where. An
 /// earlier `.partial` is replaced; an `.unusable` never is.
 pub fn copy_aside_v2(dir: &Path, project_root: &Path, text: &str) -> std::io::Result<PathBuf> {
-    let aside = dir.join(format!("{}.partial", file_name_v2(project_root)));
+    copy_aside_v2_as(dir, project_root, Role::Main, text)
+}
+
+/// [`copy_aside_v2`] beside the file of a window in `role`.
+pub fn copy_aside_v2_as(dir: &Path, project_root: &Path, role: Role, text: &str) -> std::io::Result<PathBuf> {
+    let aside = dir.join(format!("{}.partial", file_name_v2_as(project_root, role)));
     write_whole(dir, &aside, text)?;
     Ok(aside)
 }
@@ -3437,5 +3632,174 @@ mod tests {
         assert_eq!(back.keep_copy.as_deref(), Some(text.as_str()));
         assert!(back.workspaces.kept_for("main").is_none());
         assert!(back.current.is_floating(&id("terminal#2")));
+    }
+
+    fn moved(session: &str) -> MovedTabKey {
+        MovedTabKey {
+            agent: crate::agent_backend::AgentId::Claude,
+            session: session.to_string(),
+        }
+    }
+
+    /// The window `left_as` leaves, with its Lua panel held by the other window and one tab that came in with
+    /// `main`.
+    fn left_with_pair_keys() -> (Workspaces, Layout, Vec<ModuleDecl>) {
+        let (mut layout, lua) = left_as();
+        layout.set_away(&ModuleId::lua("notes"), true).unwrap();
+        let mut workspaces = Workspaces::single();
+        workspaces.set_moved_tabs(BTreeMap::from([(
+            MAIN_NAME.to_string(),
+            vec![moved("0c9e4b1a-5d6f-4e21-9a0b-1f2e3d4c5b6a")],
+        )]));
+        (workspaces, layout, lua)
+    }
+
+    const MAIN_NAME: &str = "main";
+
+    #[test]
+    fn away_and_the_moved_tabs_are_workspace_keys_and_read_back() {
+        let (workspaces, layout, lua) = left_with_pair_keys();
+        let text = encode_v2(&workspaces, &layout, &root());
+        let value = json_of(&text);
+        assert_eq!(value["workspaces"][0]["away"], json!(["lua:notes"]));
+        assert_eq!(
+            value["workspaces"][0][MOVED_TABS_KEY],
+            json!(["claude\u{1f}0c9e4b1a-5d6f-4e21-9a0b-1f2e3d4c5b6a"])
+        );
+        assert!(
+            !value["workspaces"][0]["hidden"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("lua:notes")),
+            "an away module is written as it was when it left"
+        );
+        let back = decode_v2(&text, &root(), &lua).unwrap();
+        assert!(back.current.is_away(&ModuleId::lua("notes")));
+        assert_eq!(
+            back.workspaces.moved_tabs_of(MAIN_NAME),
+            workspaces.moved_tabs_of(MAIN_NAME)
+        );
+        assert!(back.keep_copy.is_none(), "{:?}", back.notes);
+        assert_eq!(
+            encode_v2(&back.workspaces, &back.current, &root()),
+            text,
+            "a round trip changes nothing"
+        );
+        // A window with nothing away and no tab record writes neither key, as the build before them did.
+        let plain_text = one(&plain());
+        assert!(!plain_text.contains("\"away\"") && !plain_text.contains(MOVED_TABS_KEY));
+    }
+
+    #[test]
+    fn an_older_builds_persist_reading_away_and_moved_tabs() {
+        let (workspaces, layout, lua) = left_with_pair_keys();
+        let notes_panel = ModuleId::lua("notes");
+        let text = encode_v2(&workspaces, &layout, &root());
+        let written = json_of(&text);
+        // The build before two windows: the two keys are keys it does not know.
+        let older = decode_v2_knowing(&text, &root(), &lua, &[], false).unwrap();
+        assert!(
+            older.current.contains(&notes_panel) && older.current.is_shown(&notes_panel),
+            "an older build builds the away module, as one window does"
+        );
+        assert!(
+            older
+                .notes
+                .iter()
+                .any(|n| n.starts_with("away of workspace 'main' names 'lua:notes'")),
+            "{:?}",
+            older.notes
+        );
+        assert_eq!(
+            older.keep_copy.as_deref(),
+            Some(text.as_str()),
+            "the file is copied aside as .partial before the older build writes over it"
+        );
+        let kept = older.workspaces.kept_for(MAIN_NAME).expect("the tab record is kept");
+        assert!(!kept.contains_key("away"));
+        assert_eq!(kept[MOVED_TABS_KEY], written["workspaces"][0][MOVED_TABS_KEY]);
+        // Its write carries the tab record verbatim, and this build reads it back from there.
+        let rewritten = encode_v2_knowing(&older.workspaces, &older.current, &root(), false);
+        let rewritten_value = json_of(&rewritten);
+        assert_eq!(
+            rewritten_value["workspaces"][0][MOVED_TABS_KEY],
+            written["workspaces"][0][MOVED_TABS_KEY]
+        );
+        assert!(rewritten_value["workspaces"][0].get("away").is_none());
+        let again = decode_v2(&rewritten, &root(), &lua).unwrap();
+        assert_eq!(
+            again.workspaces.moved_tabs_of(MAIN_NAME),
+            workspaces.moved_tabs_of(MAIN_NAME)
+        );
+        assert!(
+            !again.current.is_away(&notes_panel),
+            "what the older build wrote holds nothing away"
+        );
+        assert_eq!(
+            again.current.modules().iter().filter(|m| **m == notes_panel).count(),
+            1,
+            "the module is in the file once"
+        );
+    }
+
+    #[test]
+    fn a_broken_away_or_tab_record_is_left_out_and_asks_for_a_copy() {
+        let mut file = json_of(&one(&plain()));
+        file["workspaces"][0]["away"] = json!(["terminal", 7]);
+        file["workspaces"][0][MOVED_TABS_KEY] = json!(["nobody\u{1f}x", "claude\u{1f}s-1"]);
+        let text = file.to_string();
+        let back = decode_v2(&text, &root(), &[]).unwrap();
+        assert!(back.current.is_away(&ModuleId::terminal()));
+        assert_eq!(back.workspaces.moved_tabs_of(MAIN_NAME), &[moved("s-1")]);
+        assert_eq!(back.keep_copy.as_deref(), Some(text.as_str()), "{:?}", back.notes);
+    }
+
+    #[test]
+    fn each_role_has_its_own_layout_file_and_only_window_one_migrates() {
+        let dir = a_dir("persist-roles");
+        let (workspaces, layout, lua) = left_with_pair_keys();
+        save_as(&dir, &root(), Role::Second, &workspaces, &layout).unwrap();
+        assert!(dir.join(file_name_v2_as(&root(), Role::Second)).exists());
+        assert!(
+            !dir.join(file_name_v2(&root())).exists(),
+            "window 2 never writes window 1's file"
+        );
+        assert!(matches!(
+            load_as(&dir, &root(), Role::Second, &lua, &[]),
+            Loaded::Restored(_)
+        ));
+        assert!(matches!(load(&dir, &root(), &lua), Loaded::Missing));
+        // A version 1 file is window 1's past only.
+        std::fs::write(dir.join(file_name(&root())), "{}").unwrap();
+        assert!(matches!(
+            load_as(&dir, &root(), Role::Unpaired, &lua, &[]),
+            Loaded::Missing
+        ));
+    }
+
+    #[test]
+    fn an_unpaired_window_reads_window_ones_file_read_only_until_it_has_its_own() {
+        let dir = a_dir("persist-unpaired");
+        let (workspaces, layout, lua) = left_with_pair_keys();
+        save(&dir, &root(), &workspaces, &layout).unwrap();
+        let Loaded::Restored(first) = load_for_role(&dir, &root(), Role::Unpaired, &lua, &[]) else {
+            panic!("window 1's file is read")
+        };
+        assert!(first.keep_copy.is_none(), "nothing is copied beside window 1's file");
+        assert!(
+            first.notes.iter().any(|n| n.contains("-u.v2.json")),
+            "{:?}",
+            first.notes
+        );
+        let mut own = first.current.clone();
+        own.set_away(&ModuleId::lua("notes"), false).unwrap();
+        save_as(&dir, &root(), Role::Unpaired, &first.workspaces, &own).unwrap();
+        let Loaded::Restored(second) = load_for_role(&dir, &root(), Role::Unpaired, &lua, &[]) else {
+            panic!("its own file is read")
+        };
+        assert!(
+            !second.current.is_away(&ModuleId::lua("notes")),
+            "its own file, not window 1's"
+        );
     }
 }

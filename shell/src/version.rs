@@ -20,6 +20,30 @@ pub fn version_line() -> String {
     )
 }
 
+/// What `hello` carries so the two windows of a pair can tell they are one build: `<version>+<commit>`. A build
+/// whose commit could not be read (`unknown`) would otherwise match every other such build, so the running
+/// executable's size and modification time in nanoseconds are appended then; window 2 runs window 1's own
+/// `/proc/self/exe`, so the two still agree, and only a window from another build differs.
+pub fn fingerprint() -> String {
+    let exe = std::fs::metadata("/proc/self/exe").ok().map(|meta| exe_stamp(&meta));
+    format_fingerprint(env!("CARGO_PKG_VERSION"), env!("EITRI_BUILD_COMMIT"), exe)
+}
+
+/// The executable's size and modification time in nanoseconds since the epoch.
+fn exe_stamp(meta: &std::fs::Metadata) -> (u64, i128) {
+    use std::os::unix::fs::MetadataExt;
+    let nanos = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    (meta.size(), nanos)
+}
+
+/// [`fingerprint`] with its inputs given, so a test can pin both forms.
+fn format_fingerprint(version: &str, commit: &str, exe: Option<(u64, i128)>) -> String {
+    match (commit, exe) {
+        ("unknown", Some((size, mtime_ns))) => format!("{version}+{commit}+{size}.{mtime_ns}"),
+        _ => format!("{version}+{commit}"),
+    }
+}
+
 /// The formatting `version_line` wraps to the compile-time constants, split out and parameterized
 /// so a test can pin the format with values `env!` cannot supply (`env!` is fixed at compile
 /// time, before this binary or its tests exist).
@@ -69,6 +93,32 @@ mod tests {
             format_version_line("1.0.0", "unknown", "unknown", "unknown"),
             "eitri 1.0.0 (commit unknown, neovide fork unknown, verdandi unknown)"
         );
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_version_and_the_commit() {
+        assert_eq!(
+            format_fingerprint("0.4.0", "abcdef0123456789", Some((10, 20))),
+            "0.4.0+abcdef0123456789",
+            "a known commit names the build by itself"
+        );
+        assert_eq!(
+            format_fingerprint("0.4.0", "unknown", Some((123_456, 1_700_000_000_000_000_007))),
+            "0.4.0+unknown+123456.1700000000000000007",
+            "with no commit, the executable's size and time tell two builds apart"
+        );
+        assert_ne!(
+            format_fingerprint("0.4.0", "unknown", Some((123_456, 1))),
+            format_fingerprint("0.4.0", "unknown", Some((123_456, 2))),
+            "two executables built at different times differ"
+        );
+        assert_eq!(format_fingerprint("0.4.0", "unknown", None), "0.4.0+unknown");
+        let live = fingerprint();
+        assert!(
+            live.starts_with(&format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("EITRI_BUILD_COMMIT"))),
+            "{live}"
+        );
+        assert_eq!(live, fingerprint(), "the same process reads the same fingerprint twice");
     }
 
     #[test]

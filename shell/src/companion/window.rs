@@ -258,6 +258,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         start.backend_kind,
         start.panel_notice.as_deref(),
         None,
+        Default::default(),
     );
     config.apply_to_panel(&agent);
     // The panel reads the context when its tick runs, and its tick runs only when woken.

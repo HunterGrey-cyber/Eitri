@@ -526,6 +526,7 @@ fn panel_state(
         scratch,
         backend_kind,
         document,
+        tab_files,
     } = init;
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
@@ -567,7 +568,7 @@ fn panel_state(
     };
     let canonical_project_dir = canonical_root.to_string_lossy().into_owned();
     let tabs_dir = eitri_core::saved_tabs::state_dir(state_home.as_deref(), home.as_deref());
-    let (restore_source, notes) = eitri_core::saved_tabs::startup(tabs_dir.as_deref(), &project_dir);
+    let (restore_source, notes, takeovers) = tab_files.startup(tabs_dir.as_deref(), &project_dir);
     for note in notes {
         eprintln!("{note}");
     }
@@ -579,7 +580,7 @@ fn panel_state(
         tabs,
         editor_context,
         backend_kind,
-        tab_memory: TabWriter::new(tabs_dir, project_dir.clone()),
+        tab_memory: tab_files.writer(tabs_dir, project_dir.clone(), takeovers),
         conversation_id: agent::conversation_id_for_cwd(&canonical_root),
         project_dir,
         canonical_project_dir,

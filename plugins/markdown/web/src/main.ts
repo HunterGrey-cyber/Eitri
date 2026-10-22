@@ -3,6 +3,8 @@ import "./style/markdown.css";
 import "./style/hljs.css";
 import "./style/alerts.css";
 import "./style/chrome.css";
+import { hasPosition, onRestored, onSave, type MarkdownState } from "./handoff";
+import { kit } from "./kit";
 import { bridge, follow, hello, isEditorClosed, isEditorText, isEditorView, readSettings } from "./protocol";
 import { createMermaid } from "./render/mermaid";
 import { trace } from "./trace";
@@ -10,6 +12,7 @@ import { yankCurrentBlock } from "./view/clipboard";
 import { installKeys } from "./view/keys";
 import { installLinks } from "./view/links";
 import { Preview } from "./view/preview";
+import { lineToY, yToLine } from "./view/sync";
 
 function hasKeysOf(data: unknown): boolean | undefined {
   return data !== null && typeof data === "object" && typeof (data as { has_keys?: unknown }).has_keys === "boolean"
@@ -45,7 +48,26 @@ async function start(): Promise<void> {
   const p = new Preview(root, b, settings, mermaid);
   preview = p;
   p.onFocus(keys);
-  b.on("editor.view", (data) => { if (isEditorView(data)) p.onView(data); });
+  const post = (verb: string, payload: unknown) => {
+    void b.call(verb, payload).catch((error: unknown) => console.error(error));
+  };
+  const searchInput = () => document.querySelector<HTMLInputElement>("#eitri-keys-find input");
+  let restored: MarkdownState | null = null;
+  let search: string | null = null;
+  let ready: (() => void) | null = null;
+  b.on("host.save", () => onSave(() => {
+    const draft = searchInput()?.value ?? search;
+    // No document shown and none waiting: no position, so the successor is ready without a render.
+    if (!restored && p.shownBuf() === null) return { v: 1, topLine: 0, fraction: 0, search: draft, noDocument: true };
+    const line = restored ? restored.topLine + restored.fraction : yToLine(p.index(), window.scrollY);
+    const topLine = Math.floor(line);
+    return { v: 1, topLine, fraction: line - topLine, search: draft };
+  }, post));
+  b.on("editor.view", (data) => {
+    if (!isEditorView(data)) return;
+    // The first view must target the saved line before its text renders, or sync would replace it immediately.
+    p.onView(restored ? { ...data, top: restored.topLine + 1, top_fraction: restored.fraction } : data);
+  });
   b.on("editor.text", (data) => { if (isEditorText(data)) p.onText(data); });
   b.on("editor.closed", (data) => { if (isEditorClosed(data)) p.onClosed(data); });
   // A new colourscheme: the CSS follows by itself; diagrams carry their colours inside, so they draw again.
@@ -67,6 +89,42 @@ async function start(): Promise<void> {
       return true;
     },
   }).catch((error: unknown) => console.error(error));
+  onRestored((h as typeof h & { restored?: unknown }).restored, (state) => {
+    // A state without a position waits for nothing: the search draft is all it carries.
+    restored = hasPosition(state) ? state : null;
+    search = state.search;
+    if (search !== null) {
+      kit()?.findSeed(search);
+      const input = searchInput();
+      if (input) input.value = search;
+      else {
+        // The kit creates its prompt lazily and clears it on opening; refill the draft when it first receives focus.
+        const fill = (event: FocusEvent) => {
+          const input = searchInput();
+          if (!input || event.target !== input) return;
+          input.value = search ?? "";
+          document.removeEventListener("focusin", fill);
+        };
+        document.addEventListener("focusin", fill);
+      }
+    }
+  }, (cb) => {
+    if (restored) ready = cb;
+    else requestAnimationFrame(cb);
+  }, post);
+  // The source map exists only after rendering. Say ready after that position has had a frame to draw.
+  const offRestored = p.afterUpdate((why) => {
+    if (!restored || (why !== "render" && why !== "notice")) return;
+    if (why === "render") {
+      const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      window.scrollTo({ top: lineToY(p.index(), restored.topLine + restored.fraction, max),
+        behavior: "instant" as ScrollBehavior });
+    }
+    restored = null;
+    offRestored();
+    if (ready) requestAnimationFrame(ready);
+    ready = null;
+  });
   await follow(b);
 }
 

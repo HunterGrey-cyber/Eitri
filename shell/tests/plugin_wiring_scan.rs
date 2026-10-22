@@ -496,7 +496,9 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
     let services = file_code("shell/src/gtk_host/services.rs");
     let build = arm(&services, "PluginOp::Build{", "PluginOp::");
     assert!(build.contains("self.plugin_panels.build_page(module,"), "{build}");
-    assert!(code.contains("eitri_core::layout::persist::load_with(dir,project_root,&decls,&deferred)"));
+    assert!(
+        code.contains("eitri_core::layout::persist::load_for_role(dir,project_root,pair.pair_role(),&decls,&deferred)")
+    );
     assert!(code.contains("layout_saver.set_deferred(deferred.clone());"));
     // A switch or an open gives the keys before the change hooks run: the grab builds the page first.
     let focus = code

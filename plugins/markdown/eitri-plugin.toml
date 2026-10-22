@@ -5,6 +5,9 @@ site = "web/dist"                   # the build directory, the same path install
 entry = "index.html"
 capabilities = ["editor.follow", "editor.commands", "net"]
 
+[page]
+handoff = true
+
 [module]
 start = "hidden"                    # "shown" (the default) | "hidden": not placed at a first launch
 at = "right"                        # the declared open rule: an `at` value of eitri.layout.rule

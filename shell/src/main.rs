@@ -19,6 +19,7 @@ mod hint;
 mod kill_pane;
 mod layout;
 mod layout_state;
+mod linked_window;
 mod lua;
 mod module_grid;
 mod pane_focus;
@@ -185,6 +186,24 @@ fn main() -> glib::ExitCode {
     // directory step. `args_os`, not `args`, and skipping argv[0] (never a
     // flag), for the same non-UTF-8-safety reason `project_root` gives for its own `args_os` use.
     let early_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // `eitri linked-window` is window 2 of a pair, started by window 1 with the link's end inherited: that end is
+    // checked and made this process's own before anything else here can open, inherit or hand on a descriptor,
+    // and the window's own log replaces the stdout and stderr it was started with. Its project root is on its
+    // command line, so the project resolver below never reads these arguments.
+    let start = if early_args
+        .first()
+        .is_some_and(|a| a == eitri_core::window_link::start::SUBCOMMAND)
+    {
+        match linked_window::second_first_acts(&early_args[1..]) {
+            Ok(start) => start,
+            Err(message) => {
+                eprintln!("eitri: {message}");
+                return glib::ExitCode::from(2);
+            }
+        }
+    } else {
+        linked_window::WindowStart::Full
+    };
     // `eitri run-guard` holds one plugin task's life for the window that holds the task. It takes its inherited
     // descriptors before anything here can open, close or hand one on, and never reaches GTK.
     if early_args
@@ -267,12 +286,15 @@ fn main() -> glib::ExitCode {
     // Resolved once, here, and then carried as a value into every pane that needs it -- see
     // `eitri_core::project_root`'s own module doc for why three separate `current_dir()` reads
     // were one process-global too many.
-    let project_root = match eitri_core::project_root::resolve() {
-        Ok(root) => root,
-        Err(message) => {
-            eprintln!("eitri: {message}");
-            return glib::ExitCode::FAILURE;
-        }
+    let project_root = match &start {
+        linked_window::WindowStart::Second { root, .. } => root.clone(),
+        linked_window::WindowStart::Full => match eitri_core::project_root::resolve() {
+            Ok(root) => root,
+            Err(message) => {
+                eprintln!("eitri: {message}");
+                return glib::ExitCode::FAILURE;
+            }
+        },
     };
     println!("eitri: project root {}", project_root.display());
 
@@ -287,8 +309,16 @@ fn main() -> glib::ExitCode {
     // deliberate, narrow exception to `pane_switch`'s "never mutate this process's environment"
     // rule (unlike `TMUX`/`TMUX_PANE`, leaking `NEOVIM_BIN` to every other child is harmless: only
     // Neovide reads it, and the bottom terminal's shell removes it itself).
-    match eitri_core::nvim_bin::resolve() {
-        Ok(choice) => {
+    // Window 2 never starts nvim: which one window 1 runs is window 1's, and a missing nvim is no reason for the
+    // window without an editor not to open.
+    let second = matches!(start, linked_window::WindowStart::Second { .. });
+    match if second {
+        Ok(None)
+    } else {
+        eitri_core::nvim_bin::resolve().map(Some)
+    } {
+        Ok(None) => {}
+        Ok(Some(choice)) => {
             println!("{}", choice.describe());
             if let Some(path) = choice.neovim_bin_to_set() {
                 // SAFETY: nothing else in this process has spawned a thread that touches the
@@ -326,8 +356,49 @@ fn main() -> glib::ExitCode {
         eprintln!("[memory] JavaScriptCore refused useJIT=false; the UI process keeps its JIT");
     }
 
+    // A full window takes the project's pair lock here, before it reads any file of the pair (its saved tabs are
+    // read as the window is built); finding it held, the window runs unpaired.
+    let start = RefCell::new(Some(start));
     let app = build_application();
-    app.connect_activate(move |app| build_ui(app, want_clean, &project_root, backend_kind, panel_notice.as_deref()));
+    app.connect_activate(move |app| {
+        // `activate` comes once for a window that opts out of single-instance behaviour.
+        let Some(start) = start.borrow_mut().take() else { return };
+        let pair = match start {
+            linked_window::WindowStart::Full => {
+                let taken = eitri_core::layout::persist::state_dir(
+                    std::env::var_os("XDG_STATE_HOME").as_deref(),
+                    std::env::var_os("HOME").as_deref(),
+                )
+                .ok_or_else(|| std::io::Error::other("no state directory"))
+                .and_then(|dir| eitri_core::window_link::pair::PairLock::try_take(&dir, &project_root));
+                linked_window::spawn::Pair::full(
+                    taken,
+                    &project_root,
+                    backend_kind == eitri_core::agent_backend::BackendKind::Legacy,
+                )
+            }
+            linked_window::WindowStart::Second { sock, token, .. } => {
+                match linked_window::spawn::Pair::second(sock, &project_root) {
+                    Ok(pair) => {
+                        pair.set_activation(token);
+                        pair
+                    }
+                    Err(err) => {
+                        eprintln!("eitri: the link to window 1 could not be started: {err}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        };
+        build_ui(
+            app,
+            want_clean,
+            &project_root,
+            backend_kind,
+            panel_notice.as_deref(),
+            pair,
+        )
+    });
     app.run_with_args::<&str>(&[])
 }
 
@@ -361,7 +432,11 @@ fn build_ui(
     project_root: &Path,
     backend_kind: eitri_core::agent_backend::BackendKind,
     panel_notice: Option<&str>,
+    pair: Rc<linked_window::spawn::Pair>,
 ) {
+    // Window 2 of a pair has no editor: no nvim is started, so none of the editor's feeds, the pane-switch channel
+    // or the scratch directory exists in it, and every use of the editor below is behind its `Option`.
+    let owns_editor = pair.owns_editor();
     // Initialize `gtk-xft-dpi` before building any agent or Lua panel WebView,
     // so it is set when the WebView reads it.
     xft_dpi::ensure_xft_dpi();
@@ -382,21 +457,25 @@ fn build_ui(
     // nvim only at spawn. `None` (logged) leaves the window on the fallback colours.
     // One timer for the four feeds below; each is read once its consumer calls `listen_*`.
     let feed_pump = editor_feeds::FeedPump::start();
-    let mut theme_feed = theme::feed::ThemeFeed::new();
+    let mut theme_feed = owns_editor.then(theme::feed::ThemeFeed::new).flatten();
 
     // Built before the editor pane, because its `child_env()` has to be handed to the pane's
     // constructor -- those variables reach nvim through `Command::env` at spawn time and cannot
     // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
     // own doc); the editor is constructed with an empty child env and behaves exactly as before.
-    let mut pane_switch = pane_switch::open();
+    let mut pane_switch = owns_editor.then(pane_switch::open).flatten();
     // wire 1's feed, built here for the same reason the other two are: its `child_env()` and its
     // `--cmd` must be handed to the editor pane's constructor, and neither can be added to a child
     // that is already running.
-    let mut context_feed = eitri_core::editor_context::feed::EditorContextFeed::new();
+    let mut context_feed = owns_editor
+        .then(eitri_core::editor_context::feed::EditorContextFeed::new)
+        .flatten();
     // Build the feed for nvim's `mapleader`, `timeoutlen`, and Normal-mode maps here.
     // Its `child_env()` and `--cmd` must reach the editor pane's constructor;
     // neither can be added to an already running child.
-    let mut nvim_keys_feed = eitri_core::nvim_keys::feed::NvimKeysFeed::new();
+    let mut nvim_keys_feed = owns_editor
+        .then(eitri_core::nvim_keys::feed::NvimKeysFeed::new)
+        .flatten();
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
@@ -414,7 +493,7 @@ fn build_ui(
     // formatter, or an edit made anywhere else never reaches the buffer.
     nvim_extra_args.extend(eitri_core::buffer_reload::nvim_args());
     // The two nvim round trips: env and `--cmd` reach nvim only at spawn.
-    let scratch_dir = eitri_core::scratch::ScratchDir::new();
+    let scratch_dir = owns_editor.then(eitri_core::scratch::ScratchDir::new).flatten();
     nvim_child_env.extend(scratch_dir.as_ref().map(|dir| dir.child_env()).unwrap_or_default());
     nvim_extra_args.extend(scratch_dir.as_ref().map(|dir| dir.nvim_args()).unwrap_or_default());
     let scratch_path = scratch_dir.as_ref().map(|dir| dir.path().to_path_buf());
@@ -456,12 +535,13 @@ fn build_ui(
     // The window, created and not shown, so no later op names a window that does not exist; its close requests,
     // focus changes and activation reach the controller from here on.
     wm_host.set_application(app);
+    let (wm_role, editor_presence) = pair.wm_spec_role();
     driver.start(
         WinId::MAIN,
         StartStep::Window {
             spec: eitri_core::wm::WindowSpec {
-                role: eitri_core::wm::WindowRole::Main,
-                presence: eitri_core::wm::EditorPresence::Owned,
+                role: wm_role,
+                presence: editor_presence,
                 title: chrome::window_title(&chrome::project_display_name(project_root), None),
             },
         },
@@ -481,14 +561,25 @@ fn build_ui(
     let editor_maker = gtk_host_surfaces::EditorMaker::new(Rc::downgrade(&wm_host));
     wm_host.set_surface_maker(editor_maker.clone());
     driver.start(WinId::MAIN, StartStep::Editor);
-    let gtk_host_surfaces::MadeEditor {
-        pane,
-        host: editor_host,
-        failure: editor_start_failure_label,
-    } = editor_maker.take().expect("the editor phase made the editor");
+    // `None` in window 2, whose editor phase makes nothing.
+    let made_editor = editor_maker.take();
+    assert_eq!(
+        made_editor.is_some(),
+        owns_editor,
+        "the editor phase makes the editor exactly when the window owns one"
+    );
+    let (pane, editor_host, editor_start_failure_label) = match made_editor {
+        Some(gtk_host_surfaces::MadeEditor { pane, host, failure }) => (Some(pane), Some(host), Some(failure)),
+        None => (None, None, None),
+    };
 
     let config_dir = config_dir();
     let lua_engine = Rc::new(LuaEngine::new(config_dir.clone()).expect("LuaEngine construction must not fail"));
+    // `eitri.window` names this window before `init.lua` runs, so a config both windows run can keep a side
+    // effect to one of them.
+    if let Err(err) = lua_engine.set_window(pair.pair_role()) {
+        eprintln!("[lua] eitri.window could not be set: {err}");
+    }
     // What the kernel phase's `init.lua` and the requests phase's `shell:ready` run on.
     wm_host.set_lua(Rc::new(gtk_host_services::LuaKernel {
         engine: lua_engine.clone(),
@@ -501,6 +592,57 @@ fn build_ui(
         Some(feed) => feed_pump.listen_context(feed, scratch_path.clone()).0,
         None => std::rc::Rc::new(|| None),
     };
+    // The pair file, read once by the window that holds the pair, before any other file of the pair: which modules
+    // it gives to window 2 and whether this window takes them back. Window 2 is not started again at a launch, so
+    // what it held comes back here, and its saved tabs are offered after this window's own.
+    let pair_layout_dir = eitri_core::layout::persist::state_dir(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    let window2_restored = false;
+    let pair_restore = match pair_layout_dir.as_deref().filter(|_| pair.holds_pair()) {
+        Some(dir) => {
+            let plan = linked_window::pair_files::read_for_restore(dir, project_root, window2_restored);
+            for note in &plan.notes {
+                println!("{note}");
+            }
+            plan
+        }
+        None => linked_window::pair_files::PairRestore::default(),
+    };
+    let tab_files = linked_window::pair_files::tab_files(
+        pair.pair_role(),
+        pair.holds_pair() && !window2_restored,
+        pair.holds_pair()
+            && linked_window::pair_files::alone_on_project(
+                eitri_core::turn_review::review_dir_for(
+                    std::env::var_os("XDG_STATE_HOME").as_deref(),
+                    std::env::var_os("HOME").as_deref(),
+                    project_root,
+                )
+                .as_deref(),
+            ),
+        window2_restored,
+    );
+    if let Some(dir) = pair_layout_dir.as_deref() {
+        let writing = pair.holds_pair() && !pair_restore.in_the_way;
+        let start = if writing {
+            pair_restore.start.clone()
+        } else {
+            // Window 2's view of the pair, written only once it is orphaned: it is open.
+            eitri_core::window_link::pair::PairFile {
+                window2_open: true,
+                ..Default::default()
+            }
+        };
+        if writing || pair.is_second() {
+            let mut writer = linked_window::pair_files::PairWriter::new(dir, project_root, start, writing);
+            if writing && pair_restore.write_now {
+                writer.write_now();
+            }
+            pair.set_pair_writer(writer);
+        }
+    }
     let (agent_widget, agent_panel_handle) = agent_panel::build_agent_panel(
         project_root.to_path_buf(),
         editor_context_source,
@@ -508,6 +650,7 @@ fn build_ui(
         backend_kind,
         panel_notice,
         None,
+        tab_files,
     );
     // The panel reads the context when its tick runs, and its tick runs only when woken.
     crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
@@ -729,9 +872,11 @@ fn build_ui(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     );
+    // Each window opens its own file; an unpaired window with none of its own yet reads the pair's window 1 file
+    // once, read-only.
     let loaded = state_dir
         .as_deref()
-        .map(|dir| eitri_core::layout::persist::load_with(dir, project_root, &decls, &deferred));
+        .map(|dir| eitri_core::layout::persist::load_for_role(dir, project_root, pair.pair_role(), &decls, &deferred));
     // The key that shows the editor, as the keymap binds it: named by the note a layout that hides
     // the editor prints, the way the toast names its own way back.
     let show_editor: Option<String> = keymap
@@ -796,8 +941,52 @@ fn build_ui(
             std::process::exit(1);
         }
     }
+    // What the window's start owes its role, before anything is drawn: window 2's editor leaf retired and the
+    // pages, panels and instances the pair does not give it marked away; an unpaired window's copy of window 1's
+    // layout with every away mark dropped, since it builds its own instance of everything; window 1's layouts as
+    // the pair file has them, which wins over its own file's away marks.
+    let mut restore_base: Option<(eitri_core::layout::Layout, eitri_core::layout::Workspaces)> = None;
+    if pair.is_second() {
+        let frame = eitri_core::layout::Frame::new(eitri_core::layout::rules::NOMINAL_GRID, 1);
+        if let Err(err) =
+            linked_window::start_second(&mut module_layout.borrow_mut(), &mut workspaces.borrow_mut(), &frame)
+        {
+            eprintln!("eitri: window 2's layout could not start without its editor: {err}");
+            std::process::exit(1);
+        }
+        // Started by `window.new`, not by a restore: the pair gives it nothing yet.
+        linked_window::pair_files::second_start_away(
+            &mut module_layout.borrow_mut(),
+            &mut workspaces.borrow_mut(),
+            &Default::default(),
+        );
+    } else if pair.is_unpaired() {
+        linked_window::ignore_away(&mut module_layout.borrow_mut(), &mut workspaces.borrow_mut());
+    } else if pair.holds_pair() {
+        // Measured from before the restore: what the pair file changed here is a change, written at once.
+        restore_base = Some((module_layout.borrow().clone(), workspaces.borrow().clone()));
+        let can_build = |id: &ModuleId| {
+            (id.number() >= 2 && id.kind().has_instances())
+                || decls.iter().any(|d| d.id == *id)
+                || deferred.contains(id)
+        };
+        for note in linked_window::pair_files::apply_main_restore(
+            &pair_restore,
+            &mut module_layout.borrow_mut(),
+            &mut workspaces.borrow_mut(),
+            &rules,
+            &decls,
+            &can_build,
+        ) {
+            println!("{note}");
+        }
+    } else {
+        // Alone (the pair lock could not be had): no other window can hold anything, so nothing is away here.
+        linked_window::ignore_away(&mut module_layout.borrow_mut(), &mut workspaces.borrow_mut());
+    }
     let mut layout_saver = layout_state::saver(
         state_dir,
+        pair.pair_role(),
         project_root,
         &module_layout,
         &workspaces,
@@ -805,6 +994,12 @@ fn build_ui(
         keep_copy,
     );
     layout_saver.set_deferred(deferred.clone());
+    if let Some((layout, spaces)) = restore_base.take() {
+        layout_saver = layout_saver.with_base(&layout, &spaces);
+        if layout_saver.submit_now(&module_layout.borrow(), &workspaces.borrow()) {
+            println!("[layout] the layout as the pair file left it is written");
+        }
+    }
     // The window's layouts and its saver, given to the controller before any hook that posts to it.
     driver.start(
         WinId::MAIN,
@@ -847,7 +1042,7 @@ fn build_ui(
         lua_pages: lua_pages.clone(),
         plugin_panels: plugin_panels.clone(),
         base_page: agent_widget.clone(),
-        editor: Some((editor_host, pane.widget().clone())),
+        editor: editor_host.zip(pane.as_ref().map(|pane| pane.widget().clone())),
     });
     // Every terminal in the layout the window opens with gets its pane and host now, the base one
     // first and the numbered ones in number order, so the hosts exist before the first `apply`. None
@@ -955,7 +1150,9 @@ fn build_ui(
         }));
         made
     };
-    let startup_modules: Vec<ModuleId> = startup_surfaces.iter().map(|decl| decl.module.clone()).collect();
+    // A window with no editor declares the editor's surface like any other and the controller makes none for it,
+    // so only what is made is checked below.
+    let startup_modules: Vec<ModuleId> = linked_window::hosted_at_start(&startup_surfaces, &pair.wm_spec_role().1);
     wm_host.set_surface_maker(surfaces.clone());
     driver.start(
         WinId::MAIN,
@@ -1052,6 +1249,8 @@ fn build_ui(
                 plugin_panels.build_page(id, &plugin_panels.theme());
             }
             if id.kind() == ModuleKind::Editor {
+                // A window with no editor has nothing to give the keys to.
+                let Some(pane) = &pane else { return false };
                 pane.grab_focus();
                 // `NeovideEditorPane::grab_focus` returns nothing, so ask: did the editor's widget
                 // become the window's focus widget? (It used to say `true` unconditionally, so the
@@ -1174,12 +1373,14 @@ fn build_ui(
         }
     };
     agent_panel_handle.set_theme(&panel_tokens(None));
-    pane.set_clear_color(editor_clear(&eitri_core::theme::ThemeTokens::fallback()));
+    if let Some(pane) = &pane {
+        pane.set_clear_color(editor_clear(&eitri_core::theme::ThemeTokens::fallback()));
+    }
     // Each terminal pane took the fallback colours when created by `make_terminal_pane`. When the
     // editor reports or changes its cell height, save it for `panel_tokens` so later colorscheme
     // changes retain it. Push the height into the panel's live theme through the same `set_theme`
     // path used for font-size zoom.
-    {
+    if let Some(pane) = &pane {
         let editor_row = editor_row.clone();
         let agent_panel_handle = agent_panel_handle.clone();
         pane.connect_cell_size_changed(move |_, h| {
@@ -1191,7 +1392,7 @@ fn build_ui(
     }
     // A key the user pressed in the editor reached nvim: the typing window that paces the agent
     // panel's stream (`AgentPanelHandle::note_editor_key`). A notification only.
-    {
+    if let Some(pane) = &pane {
         let agent_panel_handle = agent_panel_handle.clone();
         pane.connect_key_activity(move || agent_panel_handle.note_editor_key());
     }
@@ -1240,7 +1441,9 @@ fn build_ui(
             );
             theme_css.update(&tokens, window_for_theme.upcast_ref());
             agent_panel_handle.set_theme(&panel_tokens(Some(&payload)));
-            pane_for_theme.set_clear_color(editor_clear(&tokens));
+            if let Some(pane) = &pane_for_theme {
+                pane.set_clear_color(editor_clear(&tokens));
+            }
             // Every terminal pane, idle ones too, so one reused later is already in the theme; and
             // the colours a pane made later starts with.
             let colors = terminal::colors_from(&tokens);
@@ -1263,9 +1466,10 @@ fn build_ui(
     // after resolving which pane holds the keys.
     let text_size_controller = text_size::TextSizeController::install(
         app,
-        // Every window has an editor: a Lua `main` panel hides it rather than replacing it. The pane
-        // buffers text-size writes through `ScaleWatch` until nvim starts.
-        Some(pane.clone()),
+        // Every full window has an editor: a Lua `main` panel hides it rather than replacing it. The
+        // pane buffers text-size writes through `ScaleWatch` until nvim starts. Window 2 has no
+        // editor, so its text size applies only to its panels.
+        pane.clone(),
         agent_panel_handle.clone(),
         panel_base,
         panel_px,
@@ -1409,7 +1613,7 @@ fn build_ui(
         window: window.clone(),
         overlay: hint_overlay.clone(),
         top_items: top_items.clone(),
-        editor: Some(pane.clone()),
+        editor: pane.clone(),
         agent_widget: agent_widget.clone(),
         modules: {
             let grid = grid.clone();
@@ -1466,7 +1670,7 @@ fn build_ui(
     // head of the MRU list `neighbor()` breaks ties with.
     {
         let agent_panel_handle = agent_panel_handle.clone();
-        let editor = pane.clone();
+        let editor = linked_window::OwnEditor(pane.clone());
         let terminals = terminals.clone();
         let module_layout = module_layout.clone();
         let focus_history = focus_history.clone();
@@ -1569,8 +1773,7 @@ fn build_ui(
     // F11 fullscreen and `prefix F11` immersive both follow `g:neovide_fullscreen`.
     // `return_to_pane` restores focus when the top bar hides while focused; `focus_top_bar` can
     // reveal it.
-    let window_modes =
-        window_mode::WindowModes::install(app, &window, &top_bar, Some(pane.clone()), return_to_pane.clone());
+    let window_modes = window_mode::WindowModes::install(app, &window, &top_bar, pane.clone(), return_to_pane.clone());
 
     let focus_top_bar = {
         let top_items = top_items.clone();
@@ -1894,6 +2097,10 @@ fn build_ui(
             if module_layout.borrow().is_gone(&ModuleId::editor()) {
                 return Err(LayoutError::Gone(ModuleId::editor()).to_string());
             }
+            // Window 2's editor is window 1's, and nothing here can drive it.
+            let Some(pane) = &pane else {
+                return Err(linked_window::NO_EDITOR_HERE.to_string());
+            };
             // Check `is_running` before sending keys: an exited nvim is also not ready, but keys sent to
             // it would reach nothing.
             if !pane.is_running() {
@@ -1913,8 +2120,10 @@ fn build_ui(
             Rc::new(move || !module_layout.borrow().is_gone(&ModuleId::editor()))
         };
         // One handle on this window's editor, shared: the chat's turn review and every plugin page ask through it.
-        let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> =
-            Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present));
+        let editor_rpc: Rc<dyn eitri_core::editor_rpc::EditorRpc> = match &pane {
+            Some(pane) => Rc::new(editor_rpc::EmbeddedEditorRpc::new(pane.clone(), editor_present)),
+            None => Rc::new(linked_window::NoEditor),
+        };
         panel_hooks.set_editor_rpc = Some(editor_rpc.clone());
         plugin_panels.set_editor(editor_rpc);
     }
@@ -2042,7 +2251,7 @@ fn build_ui(
         let grid = grid.downgrade();
         let focus_module = focus_module.clone();
         let workspaces = workspaces.clone();
-        let released = Rc::downgrade(&pane);
+        let released = pane.as_ref().map(Rc::downgrade);
         let plugin_panels = plugin_panels.clone();
         let driver = Rc::downgrade(&driver);
         Rc::new(move || {
@@ -2061,7 +2270,7 @@ fn build_ui(
             println!("[modules] editor: nvim quit; the editor is closed for this window");
             let released = released.clone();
             glib::idle_add_local_once(move || {
-                if let Some(pane) = released.upgrade() {
+                if let Some(pane) = released.and_then(|pane| pane.upgrade()) {
                     pane.release_exited();
                 }
             });
@@ -3344,7 +3553,7 @@ fn build_ui(
     let run_verb: Rc<dyn Fn(Action, u32)> = {
         let grid = grid.clone();
         let module_layout = module_layout.clone();
-        let editor = pane.clone();
+        let editor = linked_window::OwnEditor(pane.clone());
         let agent = agent_panel_handle.clone();
         let window_for_focus = window.clone();
         let refused_name = top_bar.app_name.clone();
@@ -4327,9 +4536,9 @@ fn build_ui(
     // resolve navigation then. Capture phase runs before the pane's key controller, which swallows
     // every key. While nvim runs, this controller claims nothing and its navigator handles the
     // keys.
-    {
+    if let Some(pane) = &pane {
         let move_focus = move_focus.clone();
-        let pane_for_nav = Rc::downgrade(&pane);
+        let pane_for_nav = Rc::downgrade(pane);
         let controller = EventControllerKey::new();
         controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         controller.connect_key_pressed(move |_controller, key, _keycode, state| {
@@ -4466,7 +4675,7 @@ fn build_ui(
     // window to close, which in turn drives the connect_close_request handler below (mirrors
     // neovide-editor's own `examples/standalone.rs`), unless nvim was asked to quit: then what it was
     // asked for (`editor_quit::EditorQuitting::nvim_exited`).
-    {
+    if let Some(pane) = &pane {
         let editor_quitting_for_exit = editor_quitting.clone();
         let review_for_exit = agent_panel_handle.clone();
         let plugin_panels = plugin_panels.clone();
@@ -4490,7 +4699,7 @@ fn build_ui(
     // failed editor holds the keys, move them to the chat so input is not trapped. This is the
     // same fallback used when a window close is declined after the editor exits. Returning to the
     // failed editor still allows Ctrl+h/j/k/l navigation out.
-    {
+    if let (Some(pane), Some(editor_start_failure_label)) = (&pane, &editor_start_failure_label) {
         let window = window.clone();
         let grid = grid.downgrade();
         let focus_and_arrive = focus_and_arrive.clone();
@@ -4653,31 +4862,34 @@ fn build_ui(
     // The probe starts before the present phase, whose show and first focus are one batch: it runs nothing that
     // needs the window shown, and the tabs it opens in the startup chat views still exist before the first focus
     // arrives in one, as when it started between the two.
+    // The probe drives a window's own editor, so it runs only where there is one.
     #[cfg(feature = "probe")]
-    grid_probe::start_if_requested(grid_probe::Context {
-        app: app.clone(),
-        window: window.clone(),
-        grid: grid.clone(),
-        pane: pane.clone(),
-        terminal: terminals
-            .borrow()
-            .get(&ModuleId::terminal())
-            .cloned()
-            .expect("the base terminal keeps its pane in the registry"),
-        agent: agent_widget.clone(),
-        project_root: project_root.to_path_buf(),
-        panel: agent_panel_handle.clone(),
-        new_chat_view: new_chat_view.clone(),
-        kill_chat_view: {
-            let kill_now = kill_now.clone();
-            Rc::new(move |id: &ModuleId| {
-                if let Err(err) = kill_now(id, None) {
-                    println!("[modules] {id}: not killed: {err}");
-                }
-            })
-        },
-        chat_views: chat_views.clone(),
-    });
+    if let Some(pane) = &pane {
+        grid_probe::start_if_requested(grid_probe::Context {
+            app: app.clone(),
+            window: window.clone(),
+            grid: grid.clone(),
+            pane: pane.clone(),
+            terminal: terminals
+                .borrow()
+                .get(&ModuleId::terminal())
+                .cloned()
+                .expect("the base terminal keeps its pane in the registry"),
+            agent: agent_widget.clone(),
+            project_root: project_root.to_path_buf(),
+            panel: agent_panel_handle.clone(),
+            new_chat_view: new_chat_view.clone(),
+            kill_chat_view: {
+                let kill_now = kill_now.clone();
+                Rc::new(move |id: &ModuleId| {
+                    if let Err(err) = kill_now(id, None) {
+                        println!("[modules] {id}: not killed: {err}");
+                    }
+                })
+            },
+            chat_views: chat_views.clone(),
+        });
+    }
     // The window shown, then the first module given the keys through `focus_module`: after the show, matching
     // standalone.rs's own `window.present(); pane.grab_focus();` ordering -- focusing a not-yet-shown widget is
     // meaningless. A chat view that took the keys is arrived at, as `Ctrl+a a` arrives: a project whose file
@@ -4687,10 +4899,145 @@ fn build_ui(
     // that resumes a session by itself lands in the composer, or on a waiting card, without anyone having to
     // remember this line. No activation token is handed over: GTK presents with the one the launcher set in
     // the environment, as it always has.
+    // The link's events, now that what they act on exists: on linking, this window says which modules it holds,
+    // and says it again whenever that changes; the other window may ask it to come forward; and when the other
+    // window ends, by a clean close or not, this window takes back what it held for it.
+    {
+        let said: Rc<linked_window::HeldSaid> = Rc::default();
+        let say_held: linked_window::spawn::OnLinked = {
+            let module_layout = module_layout.clone();
+            let workspaces = workspaces.clone();
+            let said = said.clone();
+            Rc::new(move |link| {
+                if !link.linked() {
+                    return;
+                }
+                let (Ok(layout), Ok(workspaces)) = (module_layout.try_borrow(), workspaces.try_borrow()) else {
+                    return;
+                };
+                said.say(link, linked_window::held(&layout, &workspaces));
+            })
+        };
+        {
+            let pair = Rc::downgrade(&pair);
+            let say_held = say_held.clone();
+            grid.connect_changed(move || {
+                if let Some(link) = pair.upgrade().and_then(|pair| pair.link()) {
+                    say_held(&link);
+                }
+            });
+        }
+        let ever_linked = Rc::new(std::cell::Cell::new(false));
+        let linked: linked_window::spawn::OnLinked = {
+            let ever_linked = ever_linked.clone();
+            let toast = toast.clone();
+            let pair_weak = Rc::downgrade(&pair);
+            Rc::new(move |link| {
+                ever_linked.set(true);
+                toast.set_standing(None);
+                // Window 2's open is written into the pair file at once, so the next launch knows it was open. A
+                // window 1 that stopped writing it when an earlier link ended without a goodbye writes it again: the
+                // window 2 now linked does not.
+                if let Some(pair) = pair_weak.upgrade().filter(|pair| pair.holds_pair()) {
+                    pair.with_pair_writer(|writer| {
+                        writer.resume();
+                        writer.window2_opened();
+                    });
+                }
+                // The window at this link's end has heard nothing yet, whatever an earlier window 2 was told.
+                said.new_link();
+                say_held(link);
+            })
+        };
+        // The same raise as the supervisor's request, after the window's first show: the startup's show stays the
+        // controller's present phase.
+        let raise: Rc<dyn Fn(Option<String>)> = {
+            let raised = window.downgrade();
+            Rc::new(move |token: Option<String>| {
+                let Some(raised) = raised.upgrade() else { return };
+                if let Some(token) = token.as_deref() {
+                    raised.set_startup_id(token);
+                }
+                raised.present();
+            })
+        };
+        let ended: linked_window::spawn::OnEnded = {
+            let module_layout = module_layout.clone();
+            let workspaces = workspaces.clone();
+            let grid = grid.downgrade();
+            let toast = toast.clone();
+            let second = pair.is_second();
+            let app = app.downgrade();
+            let plugin_panels = plugin_panels.clone();
+            let lua_pages = lua_pages.clone();
+            let pair_weak = Rc::downgrade(&pair);
+            Rc::new(move |link, end| {
+                let who = link
+                    .partner()
+                    .map_or_else(|| "the other window".to_string(), |p| format!("process {}", p.pid));
+                if second && !ever_linked.get() {
+                    // Window 1 refused the start (another build, or no welcome could be made): a window that was
+                    // never linked has nothing of the pair to keep, and closes.
+                    eprintln!("[window] window 1 ended the link before welcome ({end:?}); window 2 closes");
+                    if let Some(app) = app.upgrade() {
+                        app.quit();
+                    }
+                    return;
+                }
+                let plan = {
+                    let (Ok(mut layout), Ok(mut workspaces)) =
+                        (module_layout.try_borrow_mut(), workspaces.try_borrow_mut())
+                    else {
+                        eprintln!("[window] BUG: the layout was borrowed when the link ended; nothing came back");
+                        return;
+                    };
+                    let plan = linked_window::end_plan(&linked_window::away_everywhere(&layout, &workspaces));
+                    linked_window::apply_end(&plan, &mut layout, &mut workspaces);
+                    plan
+                };
+                println!(
+                    "[window] the other window ({who}) ended: back {:?}, dropped {:?}",
+                    plan.back, plan.dropped
+                );
+                if let Some(pair) = pair_weak.upgrade() {
+                    if second {
+                        // Orphaned, window 2 keeps the pair file from now on, naming what it holds.
+                        let held = match (module_layout.try_borrow(), workspaces.try_borrow()) {
+                            (Ok(layout), Ok(workspaces)) => linked_window::held(&layout, &workspaces),
+                            _ => Default::default(),
+                        };
+                        pair.with_pair_writer(|writer| {
+                            writer.window2_holds(&held);
+                            writer.take_over();
+                        });
+                    } else if matches!(end, linked_window::LinkEnd::Bye { .. }) {
+                        // Window 2 closed: what it held is back here, and the next launch does not start it.
+                        pair.with_pair_writer(|writer| writer.window2_closed());
+                    } else {
+                        // No goodbye: window 2 may still run, orphaned, and keep the pair file itself.
+                        pair.with_pair_writer(|writer| writer.hand_over());
+                    }
+                }
+                if let Some(grid) = grid.upgrade() {
+                    grid.apply();
+                }
+                for id in linked_window::pages_back(&plan) {
+                    if linked_window::reload_page_back(&plugin_panels, &lua_pages, &id) {
+                        println!("[window] {id}: loaded again, from its store as it is now");
+                    }
+                }
+                if second {
+                    // It stays up for as long as this window has no editor window to ask.
+                    toast.set_standing(Some(linked_window::UNLINKED_NOTE));
+                }
+            })
+        };
+        pair.set_hooks(linked_window::spawn::PairHooks { linked, raise, ended });
+    }
     driver.start(
         WinId::MAIN,
         StartStep::Present {
-            activation: None,
+            activation: pair.take_activation().map(eitri_core::wm::ActivationToken),
             arrive: ViewId::of_module(&first),
             first,
         },
@@ -4782,9 +5129,33 @@ fn build_ui(
         // First, and synchronously: the debounce may still be waiting on an arrangement change. With
         // none unwritten this writes nothing -- a click never does (`eitri_core::wm::persist`'s module
         // doc says what is written when).
-        driver.persist_now(WinId::MAIN);
+        let layout_written = driver.persist_now(WinId::MAIN);
+        // The pair file's last write is waited for, briefly: it is a small file renamed into place. Window 2 closing
+        // while it keeps the file ends the pair, so the next launch does not start it again. Once window 1's layout
+        // file holds what it took back at its launch, the pair file forgets what window 2 held; while it does not (a
+        // save that failed), the pair file keeps naming them, so the next launch takes them back again.
+        pair.with_pair_writer(|writer| {
+            if pair.is_second() {
+                writer.window2_left();
+            } else if layout_written {
+                writer.forget_window2_holders();
+            }
+            if !writer.flush(std::time::Duration::from_secs(1)) {
+                eprintln!("[window] the pair file was still being written; not waiting longer");
+            }
+        });
+        // The other window of the pair hears this one is closing, rather than finding the link gone.
+        if let Some(link) = pair.link() {
+            link.close(if pair.is_second() {
+                "window 2 closed"
+            } else {
+                "window 1 closed"
+            });
+        }
         // Kills nvim by its pid if it does not exit within the fork's wait (codex p1 #2).
-        pane.shutdown();
+        if let Some(pane) = &pane {
+            pane.shutdown();
+        }
         // Hangs every terminal's shell up without waiting for it (`TerminalSession`'s `Drop`). Should
         // the process exit first, the kernel closing each PTY master hangs it up anyway.
         for terminal in terminals.borrow().each() {
@@ -4926,7 +5297,8 @@ impl plugin_panels::FollowWindow for GridFollowWindow {
 /// [`editor_quit::QuitHost`] over the real window: one GTK call per method, and the only part of the
 /// editor's quit flow no test reaches (`editor_quit`'s module doc; the GUI checklist covers it).
 struct ShellQuitHost {
-    pane: Rc<NeovideEditorPane>,
+    /// `None` in a window with no editor: no nvim runs there, so every close proceeds without asking one.
+    pane: Option<Rc<NeovideEditorPane>>,
     module_layout: Rc<RefCell<eitri_core::layout::Layout>>,
     grid: glib::WeakRef<ModuleGrid>,
     show_on_screen: Rc<dyn Fn(&ModuleId) -> Result<(), LayoutError>>,
@@ -4948,25 +5320,25 @@ struct ShellQuitHost {
 
 impl editor_quit::QuitHost for ShellQuitHost {
     fn nvim_running(&self) -> bool {
-        self.pane.is_running()
+        self.pane.as_ref().is_some_and(|pane| pane.is_running())
     }
     fn nvim_exited(&self) -> bool {
-        self.pane.nvim_exited()
+        self.pane.as_ref().is_some_and(|pane| pane.nvim_exited())
     }
     fn nvim_exit_pending(&self) -> bool {
-        self.pane.nvim_exit_pending()
+        self.pane.as_ref().is_some_and(|pane| pane.nvim_exit_pending())
     }
     fn watched_call(&self) -> Option<neovide_editor::CallWatch> {
-        self.pane.watched_call()
+        self.pane.as_ref().and_then(|pane| pane.watched_call())
     }
     fn settled_watch(&self) -> Option<neovide_editor::CallWatch> {
-        self.pane.settled_watched_call()
+        self.pane.as_ref().and_then(|pane| pane.settled_watched_call())
     }
     fn send_quit(&self, lua: &str) -> bool {
-        self.pane.exec_lua_watched(lua)
+        self.pane.as_ref().is_some_and(|pane| pane.exec_lua_watched(lua))
     }
     fn end_nvim(&self) -> bool {
-        self.pane.end_nvim()
+        self.pane.as_ref().is_some_and(|pane| pane.end_nvim())
     }
     fn reveal(&self) -> kill_pane::Reveal {
         kill_pane::reveal_for_prompt(&self.module_layout.borrow(), &ModuleId::editor())
@@ -6744,6 +7116,72 @@ mod tests {
             at(concat!("build_", "application()")),
         ];
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    }
+
+    /// Window 2's link end and log come first: before any other subcommand, before the editor environment is
+    /// touched, before any child or thread, and before the project resolver, which would read its arguments as a
+    /// directory.
+    #[test]
+    fn the_linked_window_subcommand_is_dispatched_before_the_project_resolver() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+        let end = start
+            + src[start..]
+                .find(concat!("fn build_", "application"))
+                .expect("build_application");
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} in main"));
+        let order = [
+            at(concat!("args_os().skip(1)", ".collect()")),
+            at(concat!("start::", "SUBCOMMAND")),
+            at(concat!("second_first_acts(", "&early_args[1..])")),
+            at(concat!("run_guard::", "SUBCOMMAND")),
+            at(concat!("companion::run(", "early_args")),
+            at(concat!("drop_inherited", "_editor_env()")),
+            at(concat!("tasks::install", "_guard(")),
+            at(concat!("project_root::", "resolve()")),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        assert_eq!(
+            eitri_core::window_link::start::SUBCOMMAND,
+            "linked-window",
+            "the subcommand window 1 starts window 2 with"
+        );
+    }
+
+    /// Window 2 builds every module but the editor, so nothing in `build_ui` may assume the editor exists: its
+    /// pane is an `Option` from the editor phase on, and nothing takes the pane out of it by force.
+    #[test]
+    fn pane_none_builds_every_module_but_the_editor() {
+        use eitri_core::source_scan as scan;
+        let (_, body) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        assert!(
+            body.contains("let (pane, editor_host, editor_start_failure_label) = match made_editor"),
+            "the editor's pane is taken from the editor phase as an Option"
+        );
+        assert!(body.contains("Some(pane), Some(host), Some(failure)") && body.contains("None => (None, None, None)"));
+        let forced: Vec<String> = scan::word_ends(&body, "pane")
+            .into_iter()
+            .map(|end| {
+                let rest = &body[end..];
+                let stop = rest.find([';', '{', '\n']).unwrap_or(rest.len());
+                rest[..stop].to_string()
+            })
+            .filter(|rest| {
+                ["unwrap", "expect"]
+                    .iter()
+                    .any(|forced| rest.starts_with(&format!(".{forced}(")) || rest.contains(&format!(").{forced}(")))
+            })
+            .collect();
+        assert!(
+            forced.is_empty(),
+            "the editor's pane forced out of its Option: {forced:?}"
+        );
+        assert!(
+            !body.contains("editor_maker.take().expect("),
+            "the editor phase's answer is not expected to hold an editor"
+        );
     }
 
     /// JavaScriptCore reads its options once, when WebKit first starts it, so the UI process's JIT

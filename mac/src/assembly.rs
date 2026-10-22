@@ -353,6 +353,7 @@ pub fn assemble(
         scratch: editor.take_scratch(),
         backend_kind,
         document,
+        tab_files: Default::default(),
     };
     let panel = AgentPanelHandle::new(init, page.is_some(), host);
     if let Some(page) = page {

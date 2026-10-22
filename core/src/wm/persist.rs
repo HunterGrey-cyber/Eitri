@@ -8,8 +8,9 @@
 //!
 //! **What is written, and when.** The file is written only when this window's *arrangement* has
 //! changed since the window opened or last wrote it -- in any of its workspaces, the tree with its
-//! shares and pinned lengths, the floats with their rectangles and the ones remembered, and what is
-//! hidden, and which workspace is current ([`Arrangement`]):
+//! shares and pinned lengths, the floats with their rectangles and the ones remembered, what is
+//! hidden, what the other window of the pair holds and the base view's tabs that came in with a workspace, and
+//! which workspace is current ([`Arrangement`]):
 //! 500ms after the last such change, and at close if one is still unwritten. What is
 //! written is every workspace of this window, with the keys wherever they are at that moment:
 //!
@@ -23,7 +24,9 @@
 //!   shown (the grid's settle, `HostEvent::Settled`), nor a zoom (zoom is not stored): a project opened, zoomed,
 //!   clicked around in and closed keeps following `eitri.layout.default` -- including one added to
 //!   `init.lua` later -- and a file this build could not use is left alone.
-//! - **Two windows on one project** each write all of their own workspaces at their own
+//! - **Each window of a project writes its own file** ([`Saver::set_role`]): the pair's window 1, or a
+//!   window alone, today's; window 2 `-w2`; a window that runs unpaired `-u`. So no window writes another's.
+//!   Unpaired windows share the `-u` file: each writes all of its own workspaces at its own
 //!   arrangement changes, and the last write wins (`persist::save`) -- usually the later change, but a
 //!   window whose wait a zoom or a drag extended can write an earlier change after another window's
 //!   later one. Nothing of the file's arrangement is merged into what is written: a workspace the
@@ -72,6 +75,8 @@ use crate::layout::{
     ModuleDecl, ModuleId, ModuleKind, Node, OpenRule, OpenRules, Placement, Size, Workspaces,
 };
 use crate::lua::layout::LuaTree;
+use crate::window_link::base_tabs::MovedTabKey;
+use crate::window_link::pair::Role;
 
 /// Where the saver's lines go: the process's own output, and in tests also a list the test reads, since the
 /// writer thread logs too.
@@ -307,7 +312,9 @@ pub fn add_defined_workspaces(
 
 /// What the state file keeps of the window besides the keys and a later build's kept keys
 /// (`persist::encode_v2`): every workspace's tree with its shares and pinned lengths, its floats and
-/// remembered float rectangles, and what it hides, in order, and which one is current. A change of
+/// remembered float rectangles, what it hides, which modules the other window of the pair holds (`away`) and
+/// which of the base view's tabs came in with it, in order, and which one is current. A module moving to the
+/// other window, or back, is so a change, and is written. A change of
 /// this, and only of this, writes the file (this module's doc); zoom and the MRU order are not stored
 /// at all, and the keys ride along. Container ids are not compared (`Con`'s equality ignores them).
 #[derive(Debug, Clone, PartialEq)]
@@ -325,6 +332,8 @@ struct WorkspaceArrangement {
     /// must not write the file. The order is still written, as it is when something else is.
     floats: Vec<(ModuleId, FloatRect, bool)>,
     float_memory: BTreeMap<ModuleId, FloatRect>,
+    away: BTreeSet<ModuleId>,
+    moved_tabs: Vec<MovedTabKey>,
 }
 
 impl Arrangement {
@@ -347,6 +356,8 @@ impl Arrangement {
                         hidden: layout.saved_hidden(),
                         floats,
                         float_memory: layout.float_memory().clone(),
+                        away: layout.away(),
+                        moved_tabs: workspaces.moved_tabs_of(name).to_vec(),
                     }
                 })
                 .collect(),
@@ -402,6 +413,8 @@ const CLOSE_FLUSH_BOUND: Duration = Duration::from_secs(5);
 struct SaveJob {
     dir: PathBuf,
     project_root: PathBuf,
+    /// Whose file in the pair this window writes.
+    role: Role,
     /// The registered Lua panels: the file read again before the write is decoded as `load` decodes it, so
     /// that "unusable" and "partly usable" mean what they meant when the window opened.
     lua: Vec<ModuleDecl>,
@@ -443,7 +456,7 @@ fn run_save(mut job: SaveJob) -> SaveDone {
     // Not flags set at startup: the file may have changed since -- a hand-edit, another window, another build
     // -- and what was true of it when this window opened says nothing of it now.
     let log = job.log.clone();
-    if !copy_what_was_opened(&log, &job.dir, &job.project_root, job.keep_copy.as_deref()) {
+    if !copy_what_was_opened(&log, &job.dir, &job.project_root, job.role, job.keep_copy.as_deref()) {
         return SaveDone::NotWritten;
     }
     let Some(kept) = make_way(&job) else {
@@ -452,7 +465,7 @@ fn run_save(mut job: SaveJob) -> SaveDone {
     if let Some(kept) = &kept {
         job.workspaces.retake_kept(kept.clone());
     }
-    match persist::save(&job.dir, &job.project_root, &job.workspaces, &job.current) {
+    match persist::save_as(&job.dir, &job.project_root, job.role, &job.workspaces, &job.current) {
         Ok(_) => SaveDone::Written {
             now: job.now,
             job: job.job,
@@ -469,12 +482,12 @@ fn run_save(mut job: SaveJob) -> SaveDone {
 /// Before the first write after opening a file only in part: its bytes (`opened`) copied aside, if the file is
 /// still those bytes. `false` when that could not be done and nothing may be written yet; the copy is tried
 /// again at the next save.
-fn copy_what_was_opened(log: &Log, dir: &Path, project_root: &Path, opened: Option<&str>) -> bool {
+fn copy_what_was_opened(log: &Log, dir: &Path, project_root: &Path, role: Role, opened: Option<&str>) -> bool {
     let Some(opened) = opened else {
         return true;
     };
-    match persist::read_v2_text(dir, project_root) {
-        Ok(Some(text)) if text == opened => match persist::copy_aside_v2(dir, project_root, opened) {
+    match persist::read_v2_text_as(dir, project_root, role) {
+        Ok(Some(text)) if text == opened => match persist::copy_aside_v2_as(dir, project_root, role, opened) {
             Ok(aside) => log.say(format!(
                 "[layout] the file this window opened, of which this build could not carry everything, is kept \
                  as {}",
@@ -507,13 +520,13 @@ fn copy_what_was_opened(log: &Log, dir: &Path, project_root: &Path, opened: Opti
 /// is copied aside instead, as for a partly usable file. `None` when that could not be done and nothing may be
 /// written; `Some(None)` when there is no file, or it was set aside, so there are no kept keys to take.
 fn make_way(job: &SaveJob) -> Option<Option<Kept>> {
-    let (dir, project_root, log) = (job.dir.as_path(), job.project_root.as_path(), &job.log);
-    let (text, mut kept, mut copy) = match persist::v2_state_with(dir, project_root, &job.lua, &job.deferred) {
+    let (dir, project_root, role, log) = (job.dir.as_path(), job.project_root.as_path(), job.role, &job.log);
+    let (text, mut kept, mut copy) = match persist::v2_state_as(dir, project_root, role, &job.lua, &job.deferred) {
         V2State::Missing => return Some(None),
         V2State::Usable(text, kept) => (text, kept, false),
         V2State::Partly(text, kept) => (text, kept, true),
         V2State::Unusable(_) => {
-            return match persist::set_aside_v2(dir, project_root) {
+            return match persist::set_aside_v2_as(dir, project_root, role) {
                 Ok(aside) => {
                     log.say(format!(
                         "[layout] the file this build could not use is kept as {}",
@@ -534,7 +547,7 @@ fn make_way(job: &SaveJob) -> Option<Option<Kept>> {
     let dropped = kept.drop_placed(&job.placed);
     copy |= !dropped.is_empty();
     if copy {
-        match persist::copy_aside_v2(dir, project_root, &text) {
+        match persist::copy_aside_v2_as(dir, project_root, role, &text) {
             Ok(aside) => log.say(format!(
                 "[layout] the file, part of which this build cannot carry, is kept as {}",
                 aside.display()
@@ -810,6 +823,9 @@ pub enum Fired {
 pub struct Saver {
     dir: Option<PathBuf>,
     project_root: PathBuf,
+    /// Whose file in the pair this window writes: window 1 (or a window alone) today's, window 2 and an unpaired
+    /// window their own.
+    role: Role,
     /// The registered Lua panels, for the writer's decode of the file and for `Workspaces::placed`.
     lua: Vec<ModuleDecl>,
     /// The modules the window never places by itself: the file read again before a write is decoded with
@@ -880,6 +896,7 @@ impl Saver {
         Saver {
             dir,
             project_root: project_root.to_path_buf(),
+            role: Role::Main,
             lua,
             deferred: Vec::new(),
             keep_copy,
@@ -902,6 +919,11 @@ impl Saver {
     /// The modules the window never places by itself, as the startup read used them (`persist::load_with`).
     pub fn set_deferred(&mut self, deferred: Vec<ModuleId>) {
         self.deferred = deferred;
+    }
+
+    /// Whose file in the pair this window writes (`persist::file_name_v2_as`); window 1's until set.
+    pub fn set_role(&mut self, role: Role) {
+        self.role = role;
     }
 
     /// The layout changed at `now`: how long a debounce timer is to wait before the arrangement is compared and
@@ -990,6 +1012,21 @@ impl Saver {
         self.flush()
     }
 
+    /// Hands the window's workspaces to the writer now if their arrangement differs from what a change is measured
+    /// from, without waiting for the write: for a startup that changed the layout it opened on purpose (the
+    /// window's pair taking back what its other window held), which [`Saver::with_base`] measured from before that
+    /// change. Whether a job was submitted.
+    pub fn submit_now(&mut self, layout: &Layout, workspaces: &Workspaces) -> bool {
+        self.submit_if_changed(layout, workspaces)
+    }
+
+    /// Measures changes from `layout` and `workspaces` instead of the ones the saver was made with: a startup
+    /// change made after them is then a change, written by [`Saver::submit_now`] or the close.
+    pub fn with_base(mut self, layout: &Layout, workspaces: &Workspaces) -> Saver {
+        self.base = Arrangement::of(workspaces, layout);
+        self
+    }
+
     /// The close's save while the layout could not be read: nothing more is handed over (said so), and the
     /// writer is waited for as [`Saver::save_now`] waits.
     pub fn save_now_unread(&mut self) -> bool {
@@ -1000,6 +1037,14 @@ impl Saver {
         self.log
             .warn("[layout] the layout was busy; not saved this time".to_string());
         self.flush()
+    }
+
+    /// Whether the file holds `layout` and `workspaces` as far as the results taken so far tell: a state directory,
+    /// nothing given to the writer whose result is untaken, and the arrangement the same as the last one written
+    /// (or the one the window opened with, when it never changed). A failed write leaves the arrangement it was
+    /// to write differing, so this is `false` until a later write succeeds.
+    pub fn holds(&self, layout: &Layout, workspaces: &Workspaces) -> bool {
+        self.dir.is_some() && self.submitted.is_empty() && !self.differs(&Arrangement::of(workspaces, layout))
     }
 
     fn flush(&mut self) -> bool {
@@ -1033,6 +1078,7 @@ impl Saver {
         let job = SaveJob {
             dir: dir.clone(),
             project_root: self.project_root.clone(),
+            role: self.role,
             lua: self.lua.clone(),
             deferred: self.deferred.clone(),
             keep_copy: self.keep_copy.clone(),
@@ -2280,6 +2326,24 @@ mod tests {
         assert_eq!(window.lines(), Vec::<String>::new(), "and no line about a failed write");
     }
 
+    /// A close whose write fails says so: what the window holds is not in the file, so nothing that only the file
+    /// is to keep may be forgotten. The next close that writes says the file holds it.
+    #[test]
+    fn a_close_whose_write_fails_does_not_say_the_file_holds_the_window() {
+        let base = agent::state_dirs::test_workspace_dir("layout-saver-close-fails");
+        let dir = base.join("state");
+        std::fs::write(&dir, "a file where the state directory goes").unwrap();
+        let window = Driven::open(&dir, first_launch_layout(&[]).unwrap(), Workspaces::single());
+        window.layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        window.changed();
+        assert!(!window.driver.persist_now(WIN), "the write failed");
+        assert_eq!(window.writes(), 0);
+        std::fs::remove_file(&dir).unwrap();
+        assert!(window.driver.persist_now(WIN), "written at the next close");
+        assert_eq!(window.writes(), 1);
+        assert_eq!(file_text(&dir), written_by(&window.layout));
+    }
+
     /// A change made after the allocation settled a pin and before the driver's idle hands the settle on --
     /// the bottom row moved by a key already queued -- is still a change: the settle carries the length it
     /// gave the row, so the moved length is not taken for what the window opened with.
@@ -2376,7 +2440,10 @@ mod tests {
 
         {
             let _held = window.layout.borrow_mut();
-            assert!(window.driver.persist_now(WIN), "nothing was left for the writer");
+            assert!(
+                !window.driver.persist_now(WIN),
+                "a layout that could not be read is not known to be in the file"
+            );
         }
         assert_eq!(window.writes(), 0, "nor at a close while the layout was held");
         assert_eq!(window.lines(), vec![BUSY.to_string(), BUSY.to_string()]);

@@ -11,8 +11,15 @@
 //! so that an older build -- which reads `tabs` only and ignores what it does not know -- never
 //! resumes another agent's session as a Claude one. Such a build drops the array on its next write,
 //! which loses only the offer to bring those tabs back. The format's version stays 1 for that reason.
-//! Two windows on one project each write their own set and the last writer wins; the session leases,
-//! not this file, are what stop two windows driving one session.
+//! **Whose file.** Each window of a project's pair writes its own: window 1 (or a window alone) today's
+//! `<16 hex>.json`, window 2 `<16 hex>-w2.json`, a window that runs unpaired `<16 hex>-u.json`
+//! ([`file_name_as`]). Unpaired windows share theirs and the last writer wins; the session leases, not
+//! this file, are what stop two windows driving one session. A window may also offer another window's
+//! saved tabs after its own ([`startup_with`]): that file is first claimed, moved to `<name>.json.claiming` and
+//! only then read (so what is offered is exactly what was moved), then to `<name>.json.offered`; both names only
+//! the offering window touches, so the window it belonged to can write its own again without
+//! losing them; the claim is renamed `<name>.json.taken` once this window's own file holds every one of
+//! them ([`TabWriter::take_over_when_written`]), never before, so no saved tab is ever out of every file.
 //!
 //! **When it is written** is [`TabMemory`]'s job, run on its own thread by [`TabWriter`]: whenever the set it is shown differs from the set
 //! it last saw, and never because the window is closing -- closing closes every tab, and recording
@@ -25,7 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_backend::AgentId;
 use crate::agent_bridge::SessionModeChoice;
-use crate::state_paths::{create_state_dir, file_name, state_subdir, temporary};
+use crate::state_paths::{create_state_dir, state_subdir, temporary};
+use crate::window_link::pair::{tabs_file_name, Role};
 
 /// The file format's version. A file of any other version is not read.
 pub const VERSION: u32 = 1;
@@ -321,10 +329,24 @@ pub enum Loaded {
     Unusable(String),
 }
 
+/// The tabs file of a window in `role`: window 1's (or a window alone) is today's name, so an older build
+/// reads it.
+pub fn file_name_as(project_root: &Path, role: Role) -> String {
+    tabs_file_name(project_root, role)
+}
+
 /// Reads this project's file from `dir`.
 pub fn load(dir: &Path, project_root: &Path) -> Loaded {
-    let path = dir.join(file_name(project_root));
-    match agent::private_fs::read_private_to_string(&path) {
+    load_as(dir, project_root, Role::Main)
+}
+
+/// [`load`] of the file of a window in `role`.
+pub fn load_as(dir: &Path, project_root: &Path, role: Role) -> Loaded {
+    load_path(&dir.join(file_name_as(project_root, role)), project_root)
+}
+
+fn load_path(path: &Path, project_root: &Path) -> Loaded {
+    match agent::private_fs::read_private_to_string(path) {
         Ok(text) => match decode(&text, project_root) {
             Ok(saved) => Loaded::Saved(saved),
             Err(why) => Loaded::Unusable(format!("{}: {why}", path.display())),
@@ -337,8 +359,16 @@ pub fn load(dir: &Path, project_root: &Path) -> Loaded {
 /// Writes this project's file into `dir`, creating it: to a `.tmp` of this process's own beside it and
 /// then renamed over it, so a process that dies mid-write leaves the previous file, never half of one.
 pub fn save(dir: &Path, project_root: &Path, saved: &SavedTabs) -> std::io::Result<PathBuf> {
+    save_as(dir, project_root, Role::Main, saved)
+}
+
+/// [`save`] to the file of a window in `role`.
+pub fn save_as(dir: &Path, project_root: &Path, role: Role, saved: &SavedTabs) -> std::io::Result<PathBuf> {
+    save_path(dir, dir.join(file_name_as(project_root, role)), project_root, saved)
+}
+
+fn save_path(dir: &Path, path: PathBuf, project_root: &Path, saved: &SavedTabs) -> std::io::Result<PathBuf> {
     create_state_dir(dir)?;
-    let path = dir.join(file_name(project_root));
     let tmp = temporary(&path);
     let written = agent::private_fs::write_private(&tmp, encode(saved, project_root).as_bytes())
         .and_then(|()| std::fs::rename(&tmp, &path));
@@ -351,7 +381,12 @@ pub fn save(dir: &Path, project_root: &Path, saved: &SavedTabs) -> std::io::Resu
 
 /// Moves this project's file, whole, to `<name>.json.unusable` beside it and returns where it went.
 pub fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
-    let path = dir.join(file_name(project_root));
+    set_aside_as(dir, project_root, Role::Main)
+}
+
+/// [`set_aside`] of the file of a window in `role`.
+pub fn set_aside_as(dir: &Path, project_root: &Path, role: Role) -> std::io::Result<PathBuf> {
+    let path = dir.join(file_name_as(project_root, role));
     let aside = path.with_extension("json.unusable");
     std::fs::rename(&path, &aside)?;
     Ok(aside)
@@ -361,8 +396,13 @@ pub fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
 /// nothing to offer (no state directory, no file, a file that lists no tab, or one that cannot be
 /// used -- which is set aside here, once, so the window's own later write does not replace it).
 pub fn startup(dir: Option<&Path>, project_root: &Path) -> (Option<SavedTabs>, Vec<String>) {
+    startup_as(dir, project_root, Role::Main)
+}
+
+/// [`startup`] of the file of a window in `role`.
+pub fn startup_as(dir: Option<&Path>, project_root: &Path, role: Role) -> (Option<SavedTabs>, Vec<String>) {
     let Some(dir) = dir else { return (None, Vec::new()) };
-    match load(dir, project_root) {
+    match load_as(dir, project_root, role) {
         Loaded::Saved(saved) if saved.is_empty() => (None, Vec::new()),
         Loaded::Saved(saved) => (Some(saved), Vec::new()),
         Loaded::Missing => (None, Vec::new()),
@@ -370,12 +410,284 @@ pub fn startup(dir: Option<&Path>, project_root: &Path) -> (Option<SavedTabs>, V
             let mut notes = vec![format!(
                 "[tabs] the saved tabs are unusable ({why}); starting without them"
             )];
-            match set_aside(dir, project_root) {
+            match set_aside_as(dir, project_root, role) {
                 Ok(aside) => notes.push(format!("[tabs] set aside as {}", aside.display())),
                 Err(e) => notes.push(format!("[tabs] could not set the unusable file aside: {e}")),
             }
             (None, notes)
         }
+    }
+}
+
+/// Another window's saved tabs offered by this one: the claim holding them (`<name>.json.offered`), renamed
+/// `taken` (`<name>.json.taken`) once this window's own file holds every tab of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Takeover {
+    pub path: PathBuf,
+    pub taken: PathBuf,
+    /// Each tab of the file, by agent and session.
+    pub sessions: Vec<(AgentId, String)>,
+}
+
+/// What a window offers back at launch: its own saved tabs ([`startup_as`]), then those of each window of
+/// `others` that has a usable file and is not this window's -- window 2's when window 1 takes back what window 2
+/// held, an unpaired window's when the pair's window is alone on the project. A tab listed by an earlier file is
+/// not offered twice. Which tab comes on screen is this window's own choice, or the first other file's when this
+/// window saved none. Each other window's tabs are claimed here ([`claim`]), and each claim that offered a tab
+/// comes back as a [`Takeover`], for the window's tab writer to rename once it has written them.
+pub fn startup_with(
+    dir: Option<&Path>,
+    project_root: &Path,
+    role: Role,
+    others: &[Role],
+) -> (Option<SavedTabs>, Vec<String>, Vec<Takeover>) {
+    let (own, mut notes) = startup_as(dir, project_root, role);
+    let Some(dir) = dir else {
+        return (own, notes, Vec::new());
+    };
+    let mut offer = own;
+    let mut takeovers = Vec::new();
+    for other in others.iter().copied().filter(|other| *other != role) {
+        let Some(saved) = claim(dir, project_root, other, &mut notes) else {
+            continue;
+        };
+        let name = file_name_as(project_root, other);
+        let path = dir.join(claim_name(&name));
+        notes.push(format!(
+            "[tabs] offering {} saved tab(s) of {} after this window's own",
+            saved.tabs.len(),
+            path.display()
+        ));
+        takeovers.push(Takeover {
+            path,
+            taken: dir.join(format!("{name}.taken")),
+            sessions: saved
+                .tabs
+                .iter()
+                .map(|t| (t.agent.clone(), t.provider_session_id.clone()))
+                .collect(),
+        });
+        offer = Some(match offer {
+            None => saved,
+            Some(first) => first.followed_by(saved),
+        });
+    }
+    (offer, notes, takeovers)
+}
+
+/// Where the offering window keeps another window's tabs it claimed: beside that window's file, a name no other
+/// window writes.
+fn claim_name(file_name: &str) -> String {
+    format!("{file_name}.offered")
+}
+
+/// Where the offering window moves another window's file before reading it: a name no other window writes, so the
+/// tabs read are exactly the tabs claimed, whatever that window writes meanwhile.
+fn staging_name(file_name: &str) -> String {
+    format!("{file_name}.claiming")
+}
+
+/// Another window's saved tabs, claimed for this window's offer: its file is moved to its claim
+/// ([`claim_name`]), so the window it belonged to can write its own file again, from its own tabs, without the
+/// claimed ones leaving every file while this window's offer is still pending. A claim an earlier launch left
+/// (its tabs never all came back) is offered again, and a file the other window wrote since is added after it.
+/// The other window's file is moved to [`staging_name`] before it is read, never read and then moved: that window
+/// may write a newer file between the two, and a read-then-move would claim tabs it never offered. A staged file an
+/// interrupted launch left is taken first.
+/// `None`: nothing to offer, or nothing that can be offered without writing over a file a person may want to read.
+fn claim(dir: &Path, project_root: &Path, other: Role, notes: &mut Vec<String>) -> Option<SavedTabs> {
+    let name = file_name_as(project_root, other);
+    let path = dir.join(&name);
+    let claimed = dir.join(claim_name(&name));
+    let staged = dir.join(staging_name(&name));
+    let mut offer = match load_path(&claimed, project_root) {
+        Loaded::Saved(saved) => Some(saved).filter(|s| !s.is_empty()),
+        Loaded::Missing => None,
+        Loaded::Unusable(why) => {
+            notes.push(format!(
+                "[tabs] the saved tabs claimed at an earlier launch are unusable ({why}); not offered"
+            ));
+            let aside = claimed.with_extension("offered.unusable");
+            match std::fs::rename(&claimed, &aside) {
+                Ok(()) => notes.push(format!("[tabs] set aside as {}", aside.display())),
+                Err(e) => {
+                    // Claiming again would write over the one copy of what a person may want to read.
+                    notes.push(format!(
+                        "[tabs] could not set them aside ({e}); {} is not offered",
+                        path.display()
+                    ));
+                    return None;
+                }
+            }
+            None
+        }
+    };
+    // A file staged by a launch that ended mid-claim is taken as it stands; the other window's current file is
+    // then moved onto the staged name, which is free again only once that one is dealt with.
+    for current_file in [false, true] {
+        if current_file {
+            if staged.exists() {
+                notes.push(format!(
+                    "[tabs] {} is still being claimed; {} is not claimed this time",
+                    staged.display(),
+                    path.display()
+                ));
+                break;
+            }
+            match std::fs::rename(&path, &staged) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => {
+                    notes.push(format!("[tabs] could not claim {} ({e}); not offered", path.display()));
+                    break;
+                }
+            }
+        }
+        let current = match load_path(&staged, project_root) {
+            Loaded::Saved(saved) if !saved.is_empty() => saved,
+            Loaded::Missing => continue,
+            Loaded::Saved(_) => {
+                put_back(&staged, &path, None, notes);
+                continue;
+            }
+            Loaded::Unusable(why) => {
+                notes.push(format!(
+                    "[tabs] another window's saved tabs are unusable ({why}); not offered"
+                ));
+                put_back(&staged, &path, Some(dir.join(format!("{name}.unusable"))), notes);
+                continue;
+            }
+        };
+        match offer.take() {
+            None => match std::fs::rename(&staged, &claimed) {
+                Ok(()) => offer = Some(current),
+                Err(e) => {
+                    notes.push(format!(
+                        "[tabs] could not claim {} ({e}); not offered",
+                        staged.display()
+                    ));
+                    break;
+                }
+            },
+            Some(earlier) => {
+                let both = earlier.clone().followed_by(current);
+                // Removed only once the claim holds its tabs; a staged file left by a failed removal is added
+                // again, once, at the next launch.
+                match save_path(dir, claimed.clone(), project_root, &both).and_then(|_| std::fs::remove_file(&staged)) {
+                    Ok(()) => offer = Some(both),
+                    Err(e) => {
+                        notes.push(format!(
+                            "[tabs] could not add {} to the tabs claimed earlier ({e}); offering those",
+                            staged.display()
+                        ));
+                        offer = Some(earlier);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    offer
+}
+
+/// A staged file that is not claimed goes back where the other window keeps it, unless that window wrote a newer
+/// file there meanwhile: the link fails rather than replace it. The staged one is then dropped if it held no tabs,
+/// or kept at `aside` for a person to read; when neither can be done it stays staged, and no later launch claims
+/// that window's file until a person moves it.
+fn put_back(staged: &Path, path: &Path, aside: Option<PathBuf>, notes: &mut Vec<String>) {
+    let back = match std::fs::hard_link(staged, path) {
+        Ok(()) => std::fs::remove_file(staged),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match &aside {
+            // Linked, not renamed: an earlier unusable file already there is kept too.
+            Some(aside) => std::fs::hard_link(staged, aside)
+                .and_then(|()| std::fs::remove_file(staged))
+                .map(|()| notes.push(format!("[tabs] set aside as {}", aside.display()))),
+            None => std::fs::remove_file(staged),
+        },
+        Err(e) => Err(e),
+    };
+    if let Err(e) = back {
+        notes.push(format!("[tabs] could not put {} back ({e})", staged.display()));
+    }
+}
+
+/// Which saved tabs a window offers back and which file it writes: its own role's, and after its own the files of
+/// `also_offer` (another window's, claimed, then renamed `.taken` once this window's file holds them). `offers_own` false: the
+/// window offers nothing at launch, though it writes its own file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabFiles {
+    pub role: Role,
+    pub also_offer: Vec<Role>,
+    pub offers_own: bool,
+}
+
+impl Default for TabFiles {
+    /// A window alone, or the pair's window 1 with nothing else to offer: today's file.
+    fn default() -> Self {
+        TabFiles {
+            role: Role::Main,
+            also_offer: Vec::new(),
+            offers_own: true,
+        }
+    }
+}
+
+impl TabFiles {
+    /// The launch's offer, its notes, and the other windows' files to take over once written
+    /// ([`startup_with`]).
+    pub fn startup(&self, dir: Option<&Path>, project_root: &Path) -> (Option<SavedTabs>, Vec<String>, Vec<Takeover>) {
+        if self.offers_own {
+            startup_with(dir, project_root, self.role, &self.also_offer)
+        } else {
+            (None, Vec::new(), Vec::new())
+        }
+    }
+
+    /// The window's tab writer: its own role's file, taking over `takeovers` once written.
+    pub fn writer(&self, dir: Option<PathBuf>, project_root: PathBuf, takeovers: Vec<Takeover>) -> TabWriter {
+        let mut writer = TabWriter::new_as(dir, project_root, self.role);
+        writer.take_over_when_written(takeovers);
+        writer
+    }
+}
+
+impl SavedTabs {
+    /// These tabs, then `later`'s that are not among them, each kind in order; the tab on screen stays this set's.
+    fn followed_by(self, later: SavedTabs) -> SavedTabs {
+        let on_screen = |set: &SavedTabs, index: Option<usize>| {
+            index
+                .and_then(|i| set.tabs.get(i))
+                .map(|t| (t.agent.clone(), t.provider_session_id.clone()))
+        };
+        let (active, claude_active) = (on_screen(&self, self.active), on_screen(&self, self.claude_active));
+        let mut all = self.tabs;
+        for tab in later.tabs {
+            if !all
+                .iter()
+                .any(|t| t.agent == tab.agent && t.provider_session_id == tab.provider_session_id)
+            {
+                all.push(tab);
+            }
+        }
+        let (claude, others): (Vec<SavedTab>, Vec<SavedTab>) = all.into_iter().partition(|t| !t.agent.is_external());
+        let at = |tabs: &[SavedTab], key: &Option<(AgentId, String)>| {
+            key.as_ref().and_then(|(agent, id)| {
+                tabs.iter()
+                    .position(|t| t.agent == *agent && t.provider_session_id == *id)
+            })
+        };
+        let claude_at = at(&claude, &claude_active).unwrap_or(0);
+        let others_at = at(&others, &active);
+        SavedTabs::from_parts(claude, claude_at, others, others_at)
+    }
+
+    /// Whether every one of `sessions` is listed here.
+    fn holds_all(&self, sessions: &[(AgentId, String)]) -> bool {
+        sessions.iter().all(|(agent, id)| {
+            self.tabs
+                .iter()
+                .any(|t| t.agent == *agent && t.provider_session_id == *id)
+        })
     }
 }
 
@@ -388,14 +700,22 @@ pub struct TabMemory {
     /// `None`: no state directory, or the feature is off -- nothing is ever written.
     dir: Option<PathBuf>,
     project_root: PathBuf,
+    /// Whose file in the pair this window writes.
+    role: Role,
     last: SavedTabs,
 }
 
 impl TabMemory {
     pub fn new(dir: Option<PathBuf>, project_root: PathBuf) -> Self {
+        Self::new_as(dir, project_root, Role::Main)
+    }
+
+    /// The memory of a window in `role`, which writes that role's file.
+    pub fn new_as(dir: Option<PathBuf>, project_root: PathBuf, role: Role) -> Self {
         TabMemory {
             dir,
             project_root,
+            role,
             last: SavedTabs::default(),
         }
     }
@@ -433,14 +753,14 @@ impl TabMemory {
         self.last = now.clone();
         // A file that cannot be moved aside is left where it is: writing over it would destroy the one
         // copy of what a person may want to read, so the write is given up and said.
-        let aside = match load(dir, &self.project_root) {
-            Loaded::Unusable(_) => match set_aside(dir, &self.project_root) {
+        let aside = match load_as(dir, &self.project_root, self.role) {
+            Loaded::Unusable(_) => match set_aside_as(dir, &self.project_root, self.role) {
                 Ok(aside) => Some(aside),
                 Err(e) => return Some(Err(e)),
             },
             _ => None,
         };
-        Some(save(dir, &self.project_root, &now).map(|path| Written { path, set_aside: aside }))
+        Some(save_as(dir, &self.project_root, self.role, &now).map(|path| Written { path, set_aside: aside }))
     }
 }
 
@@ -465,6 +785,10 @@ pub struct TabWriter {
     /// `None`: nothing is ever written (no state directory, or remembering is off).
     dir: Option<PathBuf>,
     project_root: PathBuf,
+    /// Whose file in the pair this window writes.
+    role: Role,
+    /// Other windows' files whose tabs this window offered, handed to the thread at its start.
+    takeovers: Vec<Takeover>,
     /// The last set handed over, to hand over only a change.
     last: SavedTabs,
     /// Started at the first write.
@@ -491,15 +815,24 @@ struct WriterQueue {
     writing: bool,
     /// No more sets come: the thread ends once `next` is written.
     finished: bool,
+    /// Other windows' files to rename `.taken` once a set written holds all their tabs.
+    takeovers: Vec<Takeover>,
     /// Remembering was turned off: what is queued is dropped and nothing more is written.
     off: bool,
 }
 
 impl TabWriter {
     pub fn new(dir: Option<PathBuf>, project_root: PathBuf) -> Self {
+        Self::new_as(dir, project_root, Role::Main)
+    }
+
+    /// The writer of a window in `role`, which writes that role's file.
+    pub fn new_as(dir: Option<PathBuf>, project_root: PathBuf, role: Role) -> Self {
         TabWriter {
             dir,
             project_root,
+            role,
+            takeovers: Vec::new(),
             last: SavedTabs::default(),
             worker: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -520,6 +853,19 @@ impl TabWriter {
 
     pub fn is_enabled(&self) -> bool {
         self.dir.is_some()
+    }
+
+    /// Other windows' tabs this window claimed and offered ([`startup_with`]): each claim is renamed `.taken` on
+    /// the writer thread right after a write of this window's own file that holds every tab of it, and not before.
+    /// One whose tabs never all come back here stays claimed, to be offered again.
+    pub fn take_over_when_written(&mut self, takeovers: Vec<Takeover>) {
+        match &self.worker {
+            Some(worker) => {
+                let mut queue = worker.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                queue.takeovers.extend(takeovers);
+            }
+            None => self.takeovers.extend(takeovers),
+        }
     }
 
     /// `now` is the window's tabs, or `None` while the window is closing and has none to show. Hands a
@@ -580,8 +926,9 @@ impl TabWriter {
     fn worker_for(&mut self, dir: PathBuf) -> Option<&WriterHandle> {
         if self.worker.is_none() {
             let shared = std::sync::Arc::new(WriterShared::default());
+            shared.queue.lock().unwrap_or_else(|e| e.into_inner()).takeovers = std::mem::take(&mut self.takeovers);
             let (done_tx, done_rx) = std::sync::mpsc::channel();
-            let memory = TabMemory::new(Some(dir), self.project_root.clone());
+            let memory = TabMemory::new_as(Some(dir), self.project_root.clone(), self.role);
             let thread_shared = shared.clone();
             #[cfg(any(test, feature = "test-support"))]
             let before_write = self.before_write.clone();
@@ -647,10 +994,32 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
             }
         };
         before_write();
+        let written = next.clone();
         // Not `observe`: the window's thread compared this set with the last one it handed over, and the set
         // in between may never have been taken here (replaced while queued), so this thread's own last set
         // can be stale. An emptied window, the set before it never taken, must still empty the file.
-        match memory.write(next) {
+        let result = memory.write(next);
+        if matches!(result, Some(Ok(_))) {
+            let due: Vec<Takeover> = {
+                let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                let (due, waiting) = std::mem::take(&mut queue.takeovers)
+                    .into_iter()
+                    .partition(|t| written.holds_all(&t.sessions));
+                queue.takeovers = waiting;
+                due
+            };
+            for takeover in due {
+                match std::fs::rename(&takeover.path, &takeover.taken) {
+                    Ok(()) => eprintln!(
+                        "[tabs] this window's file holds them now; {} kept as {}",
+                        takeover.path.display(),
+                        takeover.taken.display()
+                    ),
+                    Err(e) => eprintln!("[tabs] could not mark {} taken: {e}", takeover.path.display()),
+                }
+            }
+        }
+        match result {
             Some(Err(e)) => eprintln!("[tabs] could not save the open tabs: {e}"),
             Some(Ok(Written {
                 set_aside: Some(aside), ..
@@ -669,6 +1038,7 @@ fn write_loop(shared: &WriterShared, mut memory: TabMemory, before_write: impl F
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_paths::file_name;
     use crate::test_scratch_dir::ScratchDir;
 
     fn root() -> PathBuf {
@@ -1444,6 +1814,228 @@ mod tests {
             "only the Claude tabs, so no Codex thread resumes as Claude"
         );
         assert_eq!(older.active, 1, "and a Claude tab to fall back to as the active one");
+    }
+
+    fn one_tab(session: &str) -> SavedTabs {
+        SavedTabs::from_parts(vec![tab(session, None, SessionModeChoice::Auto)], 0, Vec::new(), None)
+    }
+
+    fn sessions_of(saved: &SavedTabs) -> Vec<&str> {
+        saved.tabs.iter().map(|t| t.provider_session_id.as_str()).collect()
+    }
+
+    #[test]
+    fn each_role_reads_and_writes_only_its_own_tabs_file() {
+        let dir = ScratchDir::new("nv-tabs-roles", "own");
+        save_as(&dir, &root(), Role::Main, &one_tab("s-main")).unwrap();
+        save_as(&dir, &root(), Role::Second, &one_tab("s-second")).unwrap();
+        save_as(&dir, &root(), Role::Unpaired, &one_tab("s-unpaired")).unwrap();
+        assert_eq!(load(&dir, &root()), Loaded::Saved(one_tab("s-main")));
+        assert_eq!(load_as(&dir, &root(), Role::Second), Loaded::Saved(one_tab("s-second")));
+        assert_eq!(
+            load_as(&dir, &root(), Role::Unpaired),
+            Loaded::Saved(one_tab("s-unpaired"))
+        );
+        assert!(dir.join(file_name(&root())).exists());
+        assert_eq!(file_name_as(&root(), Role::Main), file_name(&root()));
+    }
+
+    #[test]
+    fn window_restore_false_brings_window_2s_tabs_to_window_1_and_marks_them_taken_only_once_written() {
+        let dir = ScratchDir::new("nv-tabs-roles", "take-back");
+        save_as(&dir, &root(), Role::Main, &one_tab("s-main")).unwrap();
+        let second = and_others(
+            one_tab("s-second"),
+            vec![codex("thread-second", SessionModeChoice::Auto)],
+            None,
+        );
+        save_as(&dir, &root(), Role::Second, &second).unwrap();
+        let second_path = dir.join(file_name_as(&root(), Role::Second));
+        let main_path = dir.join(file_name(&root()));
+
+        let (offer, _notes, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        let offer = offer.expect("an offer");
+        assert_eq!(
+            sessions_of(&offer),
+            ["s-main", "s-second", "thread-second"],
+            "window 2's Claude and other agents' tabs follow window 1's own"
+        );
+        assert_eq!(offer.active_tab().unwrap().provider_session_id, "s-main");
+        assert_eq!(takeovers.len(), 1);
+        let claimed = dir.join(format!("{}.offered", file_name_as(&root(), Role::Second)));
+        assert!(!second_path.exists(), "window 2's file is claimed by the offer");
+        assert_eq!(
+            load_path(&claimed, &root()),
+            Loaded::Saved(second.clone()),
+            "the claim holds its tabs whole"
+        );
+
+        let mut writer = TabWriter::new_as(Some(dir.to_path_buf()), root(), Role::Main);
+        writer.take_over_when_written(takeovers);
+        // Only window 1's own tab back so far: window 2's file must stay, its tabs are in no other file.
+        writer.observe(Some(one_tab("s-main-again")));
+        assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+        assert!(claimed.exists(), "not taken while window 1's file lacks its tabs");
+        // Some of them, not all.
+        let some = and_others(one_tab("s-second"), Vec::new(), None);
+        writer.observe(Some(some));
+        assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+        assert!(claimed.exists(), "not taken while one of them is still missing");
+        writer.observe(Some(offer.clone()));
+        assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+        assert!(!claimed.exists(), "taken once window 1's file holds them all");
+        assert!(dir
+            .join(format!("{}.taken", file_name_as(&root(), Role::Second)))
+            .exists());
+        assert_eq!(
+            load(&dir, &root()),
+            Loaded::Saved(offer),
+            "window 1's own file holds them"
+        );
+        assert!(main_path.exists());
+    }
+
+    #[test]
+    fn a_lone_holder_offers_unpaired_tabs_then_marks_them_taken() {
+        let dir = ScratchDir::new("nv-tabs-roles", "lone");
+        save_as(&dir, &root(), Role::Unpaired, &one_tab("s-unpaired")).unwrap();
+        let unpaired = dir.join(file_name_as(&root(), Role::Unpaired));
+        // No file of its own yet: the unpaired window's tabs are the whole offer.
+        let (offer, _, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Unpaired]);
+        let offer = offer.expect("the unpaired window's tabs are offered");
+        assert_eq!(sessions_of(&offer), ["s-unpaired"]);
+        let mut writer = TabWriter::new_as(Some(dir.to_path_buf()), root(), Role::Main);
+        writer.take_over_when_written(takeovers);
+        writer.observe(Some(offer));
+        assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+        assert!(!unpaired.exists());
+        assert!(dir
+            .join(format!("{}.taken", file_name_as(&root(), Role::Unpaired)))
+            .exists());
+        // Taken files are not offered again.
+        let (again, _, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Unpaired]);
+        assert_eq!(
+            again.map(|s| sessions_of(&s).len()),
+            Some(1),
+            "window 1's own file only"
+        );
+        assert!(takeovers.is_empty());
+    }
+
+    #[test]
+    fn a_file_the_other_window_writes_after_the_offer_is_neither_lost_nor_taken() {
+        for (label, other) in [("w2", Role::Second), ("u", Role::Unpaired)] {
+            let dir = ScratchDir::new("nv-tabs-roles", &format!("rewritten-{label}"));
+            save_as(&dir, &root(), other, &one_tab("s-old")).unwrap();
+            let other_path = dir.join(file_name_as(&root(), other));
+            let taken = dir.join(format!("{}.taken", file_name_as(&root(), other)));
+            let (offer, _, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[other]);
+            let offer = offer.expect("the other window's tabs are offered");
+            // Before the offer is taken, the other window starts a session of its own and writes its file.
+            save_as(&dir, &root(), other, &one_tab("s-new")).unwrap();
+            let mut writer = TabWriter::new_as(Some(dir.to_path_buf()), root(), Role::Main);
+            writer.take_over_when_written(takeovers);
+            writer.observe(Some(offer));
+            assert!(writer.wait_written(std::time::Duration::from_secs(5)));
+            assert_eq!(
+                load_path(&taken, &root()),
+                Loaded::Saved(one_tab("s-old")),
+                "{label}: only the tabs this window offered and now holds are set aside"
+            );
+            assert_eq!(
+                load_as(&dir, &root(), other),
+                Loaded::Saved(one_tab("s-new")),
+                "{label}: the other window's new session stays in its own file"
+            );
+            assert!(other_path.exists());
+            // And it is offered at the next launch that takes the other window's tabs.
+            let (again, _, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[other]);
+            assert_eq!(sessions_of(&again.unwrap()), ["s-old", "s-new"], "{label}");
+            assert_eq!(takeovers.len(), 1);
+        }
+    }
+
+    #[test]
+    fn tabs_claimed_by_a_launch_that_never_took_them_are_offered_again_with_newer_ones_after() {
+        let dir = ScratchDir::new("nv-tabs-roles", "claimed-again");
+        save_as(&dir, &root(), Role::Second, &one_tab("s-old")).unwrap();
+        let (_, _, _) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        // That launch closed without taking the offer; a window 2 opened later wrote a file of its own.
+        save_as(&dir, &root(), Role::Second, &one_tab("s-new")).unwrap();
+        let (offer, _, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        assert_eq!(sessions_of(&offer.unwrap()), ["s-old", "s-new"]);
+        assert_eq!(takeovers.len(), 1);
+        assert!(!dir.join(file_name_as(&root(), Role::Second)).exists());
+        let claimed = dir.join(format!("{}.offered", file_name_as(&root(), Role::Second)));
+        let Loaded::Saved(both) = load_path(&claimed, &root()) else {
+            panic!("one claim holds both")
+        };
+        assert_eq!(sessions_of(&both), ["s-old", "s-new"]);
+    }
+
+    #[test]
+    fn a_file_staged_by_an_interrupted_claim_is_offered_before_the_current_one() {
+        let dir = ScratchDir::new("nv-tabs-roles", "staged");
+        let name = file_name_as(&root(), Role::Second);
+        // A launch moved window 2's file to its staged name and ended before it was claimed.
+        save_as(&dir, &root(), Role::Second, &one_tab("s-staged")).unwrap();
+        std::fs::rename(dir.join(&name), dir.join(format!("{name}.claiming"))).unwrap();
+        save_as(&dir, &root(), Role::Second, &one_tab("s-current")).unwrap();
+        let (offer, notes, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        assert_eq!(sessions_of(&offer.unwrap()), ["s-staged", "s-current"], "{notes:?}");
+        assert_eq!(takeovers.len(), 1);
+        assert!(!dir.join(format!("{name}.claiming")).exists(), "nothing is left staged");
+        assert!(!dir.join(&name).exists());
+        let Loaded::Saved(claimed) = load_path(&dir.join(format!("{name}.offered")), &root()) else {
+            panic!("one claim holds both")
+        };
+        assert_eq!(sessions_of(&claimed), ["s-staged", "s-current"]);
+    }
+
+    #[test]
+    fn another_windows_file_with_no_tabs_is_left_where_it_was() {
+        let dir = ScratchDir::new("nv-tabs-roles", "empty-other");
+        let second = dir.join(file_name_as(&root(), Role::Second));
+        save_as(
+            &dir,
+            &root(),
+            Role::Second,
+            &SavedTabs::from_parts(Vec::new(), 0, Vec::new(), None),
+        )
+        .unwrap();
+        let before = std::fs::read(&second).unwrap();
+        let (offer, notes, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        assert!(offer.is_none() && takeovers.is_empty(), "{notes:?}");
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            before,
+            "the other window's file is as it was"
+        );
+        let names: Vec<_> = std::fs::read_dir(&*dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "nothing staged or claimed beside it: {names:?}");
+    }
+
+    #[test]
+    fn a_tab_both_files_list_is_offered_once() {
+        let dir = ScratchDir::new("nv-tabs-roles", "dedupe");
+        save_as(&dir, &root(), Role::Main, &two()).unwrap();
+        save_as(&dir, &root(), Role::Second, &one_tab("s-two")).unwrap();
+        let (offer, _, _) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        assert_eq!(sessions_of(&offer.unwrap()), ["s-one", "s-two"]);
+    }
+
+    #[test]
+    fn an_unusable_file_of_another_window_is_not_offered_and_not_moved() {
+        let dir = ScratchDir::new("nv-tabs-roles", "unusable");
+        let second = dir.join(file_name_as(&root(), Role::Second));
+        std::fs::write(&second, "{").unwrap();
+        let (offer, notes, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
+        assert!(offer.is_none() && takeovers.is_empty());
+        assert!(notes.iter().any(|n| n.contains("unusable")), "{notes:?}");
+        assert!(second.exists(), "another window's file is left where it is");
     }
 }
 

@@ -314,7 +314,7 @@ impl Driver<Controller> {
     /// Saves `win`'s layouts now and waits for the write, cancelling a pending debounce timer: the close
     /// handler's call, the one synchronous save there is. It stays until the window's own teardown, decided
     /// here, saves as part of its batch. The window's settles still waiting for the idle are heard first. Whether
-    /// every write finished (see [`Controller::persist_now`]).
+    /// the file now holds the window's arrangement (see [`Controller::persist_now`]).
     pub fn persist_now(&self, win: WinId) -> bool {
         let settles = self.take_settles(win);
         let (finished, batches) = match self.decide.try_borrow_mut() {

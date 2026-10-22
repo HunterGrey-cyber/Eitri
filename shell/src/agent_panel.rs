@@ -157,6 +157,7 @@ pub(crate) fn build_agent_panel(
     backend_kind: BackendKind,
     unavailable: Option<&str>,
     related: Option<&WebView>,
+    tab_files: eitri_core::saved_tabs::TabFiles,
 ) -> (gtk4::Widget, AgentPanelHandle) {
     let init = PanelInit {
         project_dir,
@@ -164,6 +165,7 @@ pub(crate) fn build_agent_panel(
         scratch,
         backend_kind,
         document: &PANEL_DOCUMENT,
+        tab_files,
     };
     if let Some(notice) = unavailable {
         let handle = AgentPanelHandle::new(init, false, Rc::new(GtkPanelHost));

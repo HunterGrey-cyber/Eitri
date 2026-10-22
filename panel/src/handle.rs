@@ -116,6 +116,9 @@ pub struct PanelInit {
     pub scratch: Option<eitri_core::scratch::ScratchDir>,
     pub backend_kind: BackendKind,
     pub document: &'static PanelDocument,
+    /// Which saved tabs the panel offers back and which file it keeps them in: the window's role in the
+    /// project's pair decides it.
+    pub tab_files: eitri_core::saved_tabs::TabFiles,
 }
 
 impl AgentPanelHandle {

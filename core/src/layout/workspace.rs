@@ -13,6 +13,7 @@ use super::geometry::Frame;
 use super::kill::{kill, Reopen};
 use super::module::{declared_placement, ModuleDecl, ModuleId, ModuleKind, Placement};
 use super::tree::{Layout, LayoutError};
+use crate::window_link::base_tabs::MovedTabKey;
 
 /// The workspace every window has from its first launch, and the one a file from before workspaces
 /// is read into.
@@ -30,6 +31,9 @@ pub struct Workspaces {
     /// What a later build wrote that this one does not read: top-level keys, and each workspace's own
     /// keys.
     kept: Kept,
+    /// Per workspace, the base chat view's tabs that came into this window with that workspace, by agent and
+    /// session: moving the workspace back takes exactly those. A workspace with none has no entry.
+    moved_tabs: BTreeMap<String, Vec<MovedTabKey>>,
 }
 
 /// Keys of the state file this build does not know, carried verbatim so a save by this build does
@@ -188,6 +192,7 @@ impl Workspaces {
             current: MAIN.to_string(),
             last: None,
             kept: Kept::default(),
+            moved_tabs: BTreeMap::new(),
         }
     }
 
@@ -230,6 +235,7 @@ impl Workspaces {
             current,
             last: None,
             kept,
+            moved_tabs: BTreeMap::new(),
         })
     }
 
@@ -344,6 +350,7 @@ impl Workspaces {
         self.order.retain(|existing| existing != name);
         self.stored.remove(name);
         self.kept.per_workspace.remove(name);
+        self.moved_tabs.remove(name);
         if self.last.as_deref() == Some(name) {
             self.last = None;
         }
@@ -375,6 +382,9 @@ impl Workspaces {
         }
         if let Some(keys) = self.kept.per_workspace.remove(&self.current) {
             self.kept.per_workspace.insert(to.to_string(), keys);
+        }
+        if let Some(tabs) = self.moved_tabs.remove(&self.current) {
+            self.moved_tabs.insert(to.to_string(), tabs);
         }
         self.current = to.to_string();
         Ok(())
@@ -443,6 +453,23 @@ impl Workspaces {
     /// The kept keys of one workspace; `None` when it has none.
     pub fn kept_for(&self, name: &str) -> Option<&Map<String, Value>> {
         self.kept.per_workspace.get(name)
+    }
+
+    /// The base chat view's tabs that came in with workspace `name`, as the state file names them.
+    pub fn moved_tabs_of(&self, name: &str) -> &[MovedTabKey] {
+        self.moved_tabs.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every workspace's record of the tabs that came in with it, as the file keeps them.
+    pub fn moved_tabs(&self) -> &BTreeMap<String, Vec<MovedTabKey>> {
+        &self.moved_tabs
+    }
+
+    /// Replaces the record of the tabs that came in with each workspace. A workspace this window does not have
+    /// has nowhere to keep one, and an empty list is no record, so neither is kept.
+    pub fn set_moved_tabs(&mut self, mut tabs: BTreeMap<String, Vec<MovedTabKey>>) {
+        tabs.retain(|name, list| self.order.contains(name) && !list.is_empty());
+        self.moved_tabs = tabs;
     }
 
     /// Every module id a string anywhere in the kept keys names, by `ModuleId::parse`, each once: what

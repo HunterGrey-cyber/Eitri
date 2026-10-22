@@ -63,6 +63,14 @@ pub(crate) enum ToastKind {
     Attention,
     /// Anything else: a refusal's reason, a one-time notice, a restore's result.
     Other,
+    /// A note that stays up for as long as what it says holds ([`Toast::set_standing`]).
+    Standing,
+}
+
+/// What the toast shows once a timed line's time is up: the standing note when there is one, else nothing. A
+/// timed line covers the standing note for its seconds and then gives it back.
+pub(crate) fn after_timed(standing: Option<&str>) -> Option<(&str, ToastKind)> {
+    standing.map(|text| (text, ToastKind::Standing))
 }
 
 /// Whether a refused key may show its reason on the toast, given what the toast shows now. Never
@@ -79,6 +87,8 @@ pub(crate) struct Toast {
     hide: RefCell<Option<glib::SourceId>>,
     /// What the label says while it is up; `None` once it has hidden.
     showing: Cell<Option<ToastKind>>,
+    /// The note that stays up between timed lines, while what it says holds.
+    standing: RefCell<Option<String>>,
 }
 
 impl Toast {
@@ -100,6 +110,7 @@ impl Toast {
             bar: bar.clone(),
             hide: RefCell::new(None),
             showing: Cell::new(None),
+            standing: RefCell::new(None),
         })
     }
 
@@ -127,7 +138,27 @@ impl Toast {
         true
     }
 
-    fn show_kind(self: &Rc<Self>, text: &str, duration: Duration, kind: ToastKind) {
+    /// A note that stays up until it is set again: `Some` shows it now and after every timed line, `None` takes
+    /// it down (a timed line up now still runs its time).
+    pub(crate) fn set_standing(self: &Rc<Self>, text: Option<&str>) {
+        *self.standing.borrow_mut() = text.map(str::to_string);
+        match text {
+            Some(text) => {
+                if let Some(source) = self.hide.borrow_mut().take() {
+                    source.remove();
+                }
+                self.place(text, ToastKind::Standing);
+            }
+            None if self.showing.get() == Some(ToastKind::Standing) => {
+                self.showing.set(None);
+                self.label.set_visible(false);
+            }
+            None => {}
+        }
+    }
+
+    /// Puts `text` up, below the top bar while it is drawn.
+    fn place(&self, text: &str, kind: ToastKind) {
         // A toast raised while the window is still being built (the tmux import's notice) comes
         // before the bar has a height; its natural height is the one it is about to get.
         let bar_height = match self.bar.height() {
@@ -138,6 +169,10 @@ impl Toast {
         self.label.set_label(text);
         self.label.set_visible(true);
         self.showing.set(Some(kind));
+    }
+
+    fn show_kind(self: &Rc<Self>, text: &str, duration: Duration, kind: ToastKind) {
+        self.place(text, kind);
         if let Some(source) = self.hide.borrow_mut().take() {
             source.remove();
         }
@@ -145,8 +180,14 @@ impl Toast {
         let source = glib::timeout_add_local_once(duration, move || {
             if let Some(toast) = toast.upgrade() {
                 toast.hide.borrow_mut().take();
-                toast.showing.set(None);
-                toast.label.set_visible(false);
+                let standing = toast.standing.borrow().clone();
+                match after_timed(standing.as_deref()) {
+                    Some((text, kind)) => toast.place(text, kind),
+                    None => {
+                        toast.showing.set(None);
+                        toast.label.set_visible(false);
+                    }
+                }
             }
         });
         *self.hide.borrow_mut() = Some(source);
@@ -200,6 +241,21 @@ mod tests {
             "a refusal replaces another refusal or a notice"
         );
         assert!(refusal_may_show(None), "nothing showing");
+        assert!(
+            refusal_may_show(Some(ToastKind::Standing)),
+            "a refusal covers a standing note for its seconds"
+        );
+    }
+
+    /// A standing note outlasts every timed line: each covers it for its time and then gives it back, and with
+    /// no standing note the toast hides as it always has.
+    #[test]
+    fn a_standing_note_comes_back_after_each_timed_line() {
+        assert_eq!(
+            after_timed(Some("the editor window is closed")),
+            Some(("the editor window is closed", ToastKind::Standing))
+        );
+        assert_eq!(after_timed(None), None);
     }
 
     /// Below the top bar while it is drawn -- never over the `agent ⚑N` chip, `↻` or the window

@@ -1,4 +1,4 @@
-//! How window 2 comes to exist: window 1 starts it with `eitri linked-window <fd> 2 <root> [token]`, the link's other
+//! How window 2 comes to exist: window 1 starts it with `eitri linked-window [--legacy] <fd> 2 <root> [token]`, the link's other
 //! end placed at that descriptor number, and window 2's first acts check that end before anything else runs.
 //!
 //! The command line carries what window 2 needs because `main()`'s flags take no values and an environment variable
@@ -42,9 +42,17 @@ pub struct LinkedArgs {
     pub token: Option<String>,
 }
 
-/// Parses `<fd> <window> <root> [token]`, the arguments after `linked-window`.
+/// Window 1's `--legacy`, passed on to window 2 ahead of its other arguments: the flag picks a launch's chat
+/// backend, and window 2's chats are to run the backend window 1's run. `main()` reads it as on any launch.
+pub const LEGACY_FLAG: &str = "--legacy";
+
+/// Parses `[--legacy] <fd> <window> <root> [token]`, the arguments after `linked-window`.
 pub fn parse_args(args: &[OsString]) -> Result<LinkedArgs, String> {
-    let usage = format!("usage: eitri {SUBCOMMAND} <fd> {SECOND_WINDOW} <root> [token]");
+    let usage = format!("usage: eitri {SUBCOMMAND} [{LEGACY_FLAG}] <fd> {SECOND_WINDOW} <root> [token]");
+    let args = match args.split_first() {
+        Some((first, rest)) if first == LEGACY_FLAG => rest,
+        _ => args,
+    };
     let (fd, window, root, token) = match args {
         [fd, window, root] => (fd, window, root, None),
         [fd, window, root, token] => (fd, window, root, Some(token)),
@@ -125,7 +133,7 @@ pub fn first_acts(args: &LinkedArgs) -> Result<OwnedFd, String> {
 /// older one) and a new one is opened 0600, refusing a link in its place. The caller `dup2`s it onto 1 and 2.
 pub fn open_log(state_home: &Path, root: &Path) -> io::Result<File> {
     let dir = state_home.join("eitri").join("log");
-    crate::layout::persist::create_state_dir(&dir)?;
+    crate::state_paths::create_state_dir(&dir)?;
     let name = log_file_name(root);
     let path = dir.join(&name);
     match std::fs::rename(&path, dir.join(format!("{name}.{LOG_KEEP}"))) {
@@ -136,11 +144,18 @@ pub fn open_log(state_home: &Path, root: &Path) -> io::Result<File> {
 }
 
 /// Starts window 2 from `exe` (window 1's `/proc/self/exe`, so both windows are one build even after an upgrade
-/// replaced the installed file) as `linked-window 3 2 <root> [token]`, with `child_end` at descriptor 3 and not
+/// replaced the installed file) as `linked-window [--legacy] 3 2 <root> [token]` (`--legacy` when `legacy`), with
+/// `child_end` at descriptor 3 and not
 /// close-on-exec there, stdio on `/dev/null`, in its own process group. `child_end` itself stays close-on-exec in
 /// this process and is closed when the spawn returns, so window 1 keeps no copy of window 2's end.
-pub fn spawn_second(exe: &Path, child_end: OwnedFd, root: &Path, token: Option<&str>) -> io::Result<Child> {
-    let mut command = second_command(exe, root, token);
+pub fn spawn_second(
+    exe: &Path,
+    child_end: OwnedFd,
+    root: &Path,
+    token: Option<&str>,
+    legacy: bool,
+) -> io::Result<Child> {
+    let mut command = second_command(exe, root, token, legacy);
     let raw = child_end.as_raw_fd();
     // SAFETY: the closure runs in the forked child before `exec` and calls only `fcntl` and `dup2`, both
     // async-signal-safe; `raw` stays open in this process until the spawn has returned.
@@ -154,13 +169,13 @@ pub fn spawn_second(exe: &Path, child_end: OwnedFd, root: &Path, token: Option<&
 
 /// Window 2's command without its link end: the arguments, the stdio, the process group. Nothing is added to the
 /// environment.
-fn second_command(exe: &Path, root: &Path, token: Option<&str>) -> Command {
+fn second_command(exe: &Path, root: &Path, token: Option<&str>, legacy: bool) -> Command {
     let mut command = Command::new(exe);
-    command
-        .arg(SUBCOMMAND)
-        .arg(LINK_FD.to_string())
-        .arg(SECOND_WINDOW)
-        .arg(root);
+    command.arg(SUBCOMMAND);
+    if legacy {
+        command.arg(LEGACY_FLAG);
+    }
+    command.arg(LINK_FD.to_string()).arg(SECOND_WINDOW).arg(root);
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         command.arg(token);
     }
@@ -297,7 +312,7 @@ mod tests {
     #[test]
     fn the_command_carries_the_token_as_its_last_argument_and_sets_no_environment() {
         let token = "activation-token-5f3a91";
-        let command = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), Some(token));
+        let command = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), Some(token), false);
         assert_eq!(
             command.get_envs().count(),
             0,
@@ -308,8 +323,22 @@ mod tests {
             [SUBCOMMAND, "3", "2", "/p", token],
             "the token is the last argument"
         );
-        let without = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), None);
+        let without = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), None, false);
         assert_eq!(without.get_args().collect::<Vec<_>>(), [SUBCOMMAND, "3", "2", "/p"]);
+    }
+
+    #[test]
+    fn a_legacy_window_1_starts_window_2_with_the_same_flag_and_it_parses() {
+        let command = second_command(Path::new("/usr/bin/eitri"), Path::new("/p"), Some("tok"), true);
+        let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+        assert_eq!(args, os(&[SUBCOMMAND, LEGACY_FLAG, "3", "2", "/p", "tok"]));
+        let parsed = parse_args(&args[1..]).unwrap();
+        assert_eq!(
+            (parsed.fd, parsed.token.as_deref()),
+            (3, Some("tok")),
+            "the flag is not read as an argument"
+        );
+        assert!(parse_args(&os(&[LEGACY_FLAG, "3", "2", "/p", "tok", "more"])).is_err());
     }
 
     #[test]
