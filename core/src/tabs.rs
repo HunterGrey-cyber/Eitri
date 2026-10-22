@@ -273,6 +273,29 @@ pub fn close_prompt(facts: &CloseFacts) -> Vec<String> {
     lines
 }
 
+/// [`window_close_prompt`] for a window that also holds terminals: `jobs` is how many of them run a
+/// job in the foreground (a command the shell handed its terminal to; a job left in the background
+/// at a prompt is not one), which closing the window ends, so the window asks about those too. With
+/// no jobs it is exactly `window_close_prompt(running, queued)`.
+pub fn window_close_prompt_with_jobs(running: usize, queued: usize, jobs: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if queued > 0 {
+        parts.push(format!("{queued} queued"));
+    }
+    match jobs {
+        0 => {}
+        1 => parts.push("1 terminal job".to_string()),
+        n => parts.push(format!("{n} terminal jobs")),
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("close window? {} (y/n)", parts.join(", ")))
+}
+
 /// The window asks only if some tab is running or has a queued message. A message
 /// sent into a running turn and not yet read counts as queued here; the tab's own close prompt tells
 /// the two apart.
@@ -909,6 +932,20 @@ mod tests {
             window_close_prompt(0, 3).as_deref(),
             Some("close window? 3 queued (y/n)")
         );
+    }
+
+    #[test]
+    fn the_close_names_terminal_jobs_beside_turns() {
+        assert_eq!(window_close_prompt_with_jobs(0, 0, 0), None);
+        assert_eq!(
+            window_close_prompt_with_jobs(0, 0, 1).as_deref(),
+            Some("close window? 1 terminal job (y/n)")
+        );
+        assert_eq!(
+            window_close_prompt_with_jobs(1, 2, 2).as_deref(),
+            Some("close window? 1 running, 2 queued, 2 terminal jobs (y/n)")
+        );
+        assert_eq!(window_close_prompt_with_jobs(2, 1, 0), window_close_prompt(2, 1));
     }
 
     #[test]

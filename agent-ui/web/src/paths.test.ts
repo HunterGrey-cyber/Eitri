@@ -3,6 +3,38 @@ import { parsePath, pathsIn, viewText } from "./paths";
 import type { TimelineItem } from "./timeline";
 
 describe("N2 paths", () => {
+  const acpInput = (path = "notes.txt") => ({
+    diffs: [{ type: "diff", path, oldText: "one\ntwo\nthree\n", newText: "one\nTWO (edited)\nthree\nfour\n" }],
+  });
+  const editCard = (input = acpInput()): TimelineItem => ({
+    kind: "permission", seq: 1, key: "p-1",
+    request: { seq: 1, permissionId: "p", toolUseId: "t", toolName: "acp:edit", input },
+  });
+  const editRow = (input = acpInput()): TimelineItem => ({
+    kind: "tool", seq: 1, key: "t-1",
+    call: { seq: 1, toolUseId: "t", name: "acp:edit", input, result: { content: "", isError: false } },
+  });
+
+  it("an_acp_edit_card_offers_the_path_its_header_draws", () => {
+    expect(pathsIn(editCard())).toEqual([{ path: "notes.txt", line: null }]);
+  });
+
+  it("a_finished_edit_row_offers_its_changed_files", () => {
+    expect(pathsIn(editRow())).toEqual([{ path: "notes.txt", line: null }]);
+  });
+
+  it("a_path_with_a_control_character_is_never_offered", () => {
+    for (const item of [editCard(acpInput("notes\n.txt")), editRow(acpInput("notes\n.txt"))]) {
+      expect(pathsIn(item)).toEqual([]);
+    }
+  });
+
+  it("paths_are_offered_once", () => {
+    const input = { file_path: "notes.txt", ...acpInput() };
+    expect(pathsIn(editCard(input))).toEqual([{ path: "notes.txt", line: null }]);
+    expect(pathsIn(editRow(input))).toEqual([{ path: "notes.txt", line: null }]);
+  });
+
   it("reads a tool's own path field, with no guessing", () => {
     const read: TimelineItem = { kind: "tool", seq: 1, key: "t-1", call: { seq: 1, toolUseId: "t", name: "Read", input: { file_path: "/p/src/a.rs" }, result: null } };
     expect(pathsIn(read)).toEqual([{ path: "/p/src/a.rs", line: null }]);

@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=ae3c7b38a6be4b23d7cfeeff29859a551d43bc815d87c0c68726fffcc07e77c7 -->
+<!-- translated-from: markdown-preview.md sha256=77f71d4a7658692b1809f7c36e520581a5e3098588c00069536b1cde73afd4c0 -->
 
 # Markdown 预览
 
@@ -10,7 +10,7 @@ Eitri 可以把你正在编辑的 Markdown 文件渲染出来，显示在编辑�
 <a id="turn-it-on"></a>
 ## 打开这个插件
 
-在 `~/.config/eitri/init.lua` 里加一行，然后开一个新窗口：
+在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里加一行，然后开一个新窗口：
 
 ```lua
 eitri.plugin.load("markdown")

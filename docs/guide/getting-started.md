@@ -24,7 +24,8 @@ launch with a message instead of opening some other directory; to open a directo
 `-`, put `--` before it (`eitri -- -notes`).
 
 Each launch is its own window with its own Neovim, its own sessions and its own project root, so you can have
-several projects open at once.
+several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
+the one on screen: `myproject — Eitri · docs`), which is what a window switcher or a compositor's window rule reads.
 
 The window holds your editor on one side and the agent panel on the other. The editor is your own Neovim, with
 your configuration and plugins. The panel starts on an empty tab that shows the project directory, the Claude
@@ -47,8 +48,9 @@ to tell whether a problem comes from your own setup.
 
 ## Your first turn
 
-Press `i` (or `Ctrl+j`) in the panel and type your prompt. `Enter` sends it; `Shift+Enter` starts a new
-line, and so do `Alt+Enter` and a backslash followed by `Enter`. The session starts when you send the first
+Press `Ctrl+l` to focus the panel, then `i` (or `Ctrl+j`) to type your prompt. If your module-focus
+key is remapped, use that key instead of `Ctrl+l`. `Enter` sends it; `Shift+Enter` starts a new line, and
+so do `Alt+Enter` and a backslash followed by `Enter`. The session starts when you send the first
 message, not before, and in a project that ships its own Claude Code configuration (`.claude/`, `.mcp.json` or
 `CLAUDE.md`) not before you have answered a question: Eitri holds the start and asks whether to trust that
 configuration. `y` loads it, `n` starts the session without it, and `Esc` puts the start off and gives your
@@ -99,10 +101,11 @@ the next key or chord, as in tmux. These are the defaults; if Eitri has picked u
    tab into its own view beside the panel. The base view must keep at least one tab. In the new view,
    `<prefix> !` joins the tab back.
 7. To make a starting layout for projects without a saved one, put `eitri.layout.default(...)` in
-   `~/.config/eitri/init.lua`. Once the window is running, `eitri.layout.export()` returns the layout calls to
-   paste there, including workspaces and floats; [Configuration](configuration.md#layout-from-lua) shows how to
-   save that text from a Lua command. Numbered chat views are left out of the export: they need a saved tab
-   to survive startup, so use [open rules](configuration.md#where-a-new-module-opens) to place new views.
+   `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`). Once the window is running,
+   `eitri.layout.export()` returns the layout calls to paste there, including workspaces and floats;
+   [Configuration](configuration.md#layout-from-lua) shows how to save that text from a Lua command. Numbered chat
+   views are left out of the export: they need a saved tab to survive startup, so use [open
+   rules](configuration.md#where-a-new-module-opens) to place new views.
 
 See [Keys](keys.md#the-prefix) for tabbed and stacked containers, resizing and the rest of the layout keys.
 

@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=620d5ce64afe92541c435a6743ff12402d8acb1d4722e925615cde0dd5654d14 -->
+<!-- translated-from: README.md sha256=a84a13c7ba05719f0ba12f5795add51cfe5616d5822bf91c4e5668c4278dab48 -->
 
 <div align="center">
 
@@ -38,7 +38,7 @@
 - **读得下去的回复。** markdown、按你配色高亮的代码、可以折叠的工具调用，每一次编辑单独一行 diff。
 - **从头到尾用键盘。** 面板里用 vim 的按键，窗口用 tmux 的按键，`Ctrl+h/j/k/l` 在窗格之间移动。
 - **逐个回合审阅。** 按 `c` 列出 agent 这个回合期间磁盘上改了什么；可以撤销一个 hunk，也可以把评论发回去。
-- **用 Lua 配置。** `~/.config/eitri/init.lua`，和 Neovim 读你的配置的方式一样。
+- **用 Lua 配置。** `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`），和 Neovim 读你的配置的方式一样。
 - **也可以放在你自己的 nvim 旁边。** `:EitriPanel` 只把 agent 面板作为一个独立窗口，开在你终端里的 Neovim 旁边。
 
 **更想把 Neovim 留在终端里？** companion 模式把同一个 agent 面板作为一个独立窗口，开在你已经在用的 nvim 旁边（在 tmux 里或不在，上游 Neovide 或别的图形前端都行）。它通过 nvim 自己的 RPC socket 附着上去，把你打开的文件和选区送给 agent，agent 改完后重新加载缓冲区，并能按行号打开文件；面板一消失，它装进去的东西就全部撤掉，你的配置不会被碰。两个窗口怎么摆由你的窗口管理器决定，sway、Hyprland、niri 以及（装上随附扩展的）GNOME 还能用同样的 `Ctrl+h/j/k/l` 在它们之间移动焦点。装上 `eitri.nvim` 插件，运行 `:EitriPanel`，或者让 `eitri split` 把上游 Neovide 和面板一起打开：见[配合你自己的 nvim 使用](docs/guide/companion.zh-CN.md)。

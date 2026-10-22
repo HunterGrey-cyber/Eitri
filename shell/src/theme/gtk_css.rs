@@ -27,6 +27,9 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     // Use the module grid's CSS node name so its dividers match the rule below.
     // The grid is the only container with dividers.
     let grid = crate::module_grid::CSS_NAME;
+    // Where, inside a handle's allocation, the divider's painted line begins and ends.
+    let reach = crate::module_grid::DIVIDER_REACH_PX;
+    let reach_end = reach + 1;
     // A tabbed or stacked container's strip, and the class on the entry it draws.
     let strip = crate::module_grid::strips::CSS_NAME;
     let active = crate::module_grid::strips::ACTIVE_CLASS;
@@ -135,10 +138,23 @@ window {{
 }}
 
 {grid}.content-area > separator {{
-    background-color: {border};
+    background-color: transparent;
     background-image: none;
     min-width: 1px;
     min-height: 1px;
+}}
+
+/* The handle is allocated wider than the line it shows (`module_grid::DIVIDER_REACH_PX` on each
+   side, so a pointer a pixel or two off the line still takes the drag), and only the line in the
+   middle of that band is painted. */
+{grid}.content-area > separator.vertical {{
+    background-image: linear-gradient(to right, transparent {reach}px, {border} {reach}px,
+        {border} {reach_end}px, transparent {reach_end}px);
+}}
+
+{grid}.content-area > separator.horizontal {{
+    background-image: linear-gradient(to bottom, transparent {reach}px, {border} {reach}px,
+        {border} {reach_end}px, transparent {reach_end}px);
 }}
 
 /* A tabbed or stacked container's strip (`module_grid::strips`): the tray chip's quiet pair for
@@ -347,7 +363,28 @@ impl ThemeCss {
     /// `root` is the window containing every widget this stylesheet paints.
     pub(crate) fn update(&self, tokens: &ThemeTokens, root: &gtk4::Widget) {
         self.provider.load_from_string(&gtk_css(tokens));
+        apply_prefer_dark(prefers_dark(tokens));
         super::restyle::restyle_unrealized(root);
+    }
+}
+
+/// Whether the widgets GTK draws itself (menus, popovers, scrollbars, the file chooser) should use
+/// their dark variant: they follow the editor's background, not the desktop's preference, so a light
+/// colorscheme on a dark desktop does not leave dark dialogs beside a light window.
+pub(crate) fn prefers_dark(tokens: &ThemeTokens) -> bool {
+    tokens.color_scheme == "dark"
+}
+
+/// Sets `gtk-application-prefer-dark-theme` on the process's settings when it differs from what is
+/// set, and prints one line per change so a pass can read it. This runs on every theme packet, so
+/// an unchanged value must not write the property (each write re-resolves every widget's style).
+fn apply_prefer_dark(dark: bool) {
+    let Some(settings) = gtk4::Settings::default() else {
+        return;
+    };
+    if settings.is_gtk_application_prefer_dark_theme() != dark {
+        settings.set_gtk_application_prefer_dark_theme(dark);
+        eprintln!("[theme] prefer-dark={dark}");
     }
 }
 
@@ -375,6 +412,18 @@ mod tests {
                 cmdheight: None,
             },
         })
+    }
+
+    #[test]
+    fn prefers_dark_follows_nvims_background() {
+        assert!(
+            prefers_dark(&ThemeTokens::fallback()),
+            "the fallback is nvim's default dark scheme"
+        );
+        assert!(!prefers_dark(&dawn()), "a light background is not dark");
+        let mut dark = dawn();
+        dark.color_scheme = "dark";
+        assert!(prefers_dark(&dark));
     }
 
     #[test]
@@ -692,5 +741,30 @@ mod tests {
             &format!("{}.content-area > separator", crate::module_grid::CSS_NAME),
         );
         assert!(body.contains("\n    background-image: none;"), "{body}");
+    }
+
+    /// The handle is wider than the line it shows, so the line is painted by a gradient whose
+    /// stops sit where the handle's middle is, for both orientations alike.
+    #[test]
+    fn both_divider_orientations_paint_only_the_line_in_the_middle_of_the_handle() {
+        let css = gtk_css(&ThemeTokens::fallback());
+        let reach = crate::module_grid::DIVIDER_REACH_PX;
+        let border = ThemeTokens::fallback().border.hex();
+        for (orientation, direction) in [("vertical", "to right"), ("horizontal", "to bottom")] {
+            let body = rule(
+                &css,
+                &format!(
+                    "{}.content-area > separator.{orientation}",
+                    crate::module_grid::CSS_NAME
+                ),
+            );
+            let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = format!(
+                "linear-gradient({direction}, transparent {reach}px, {border} {reach}px, {border} {}px, transparent {}px)",
+                reach + 1,
+                reach + 1
+            );
+            assert!(flat.contains(&expected), "{orientation}: {flat}");
+        }
     }
 }

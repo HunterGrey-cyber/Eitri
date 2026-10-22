@@ -14,6 +14,8 @@ mod bell;
 mod gl;
 mod ime;
 mod input_queue;
+// Whether a terminal's shell is running a job, asked when the window closes.
+pub(crate) mod jobs;
 pub(crate) mod keys;
 mod pane;
 pub(crate) mod pointer;

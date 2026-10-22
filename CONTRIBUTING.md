@@ -146,8 +146,10 @@ path that is not a directory, or an unknown option, is a startup error rather th
 
 If you installed Eitri (see [INSTALL.md](INSTALL.md)), run it as `eitri [project directory]`.
 `./try-eitri.sh` in this repository launches a source build with the backend and account stated up
-front. Configuration lives in `~/.config/eitri/init.lua` (`EITRI_CONFIG_DIR` overrides it);
-per-project state (layout, history, saved permission rules) under `$XDG_STATE_HOME/eitri/`.
+front. On Linux, configuration lives in `$XDG_CONFIG_HOME/eitri/init.lua` when `XDG_CONFIG_HOME`
+is non-empty and absolute, else `~/.config/eitri/init.lua`; the Mac always uses the latter.
+A non-empty `EITRI_CONFIG_DIR` overrides that directory and must be absolute (a relative value refuses to start).
+Per-project state (layout, history, saved permission rules) lives under `$XDG_STATE_HOME/eitri/`.
 
 The editor component alone, without the shell: `cargo run -p neovide-editor --example standalone`.
 

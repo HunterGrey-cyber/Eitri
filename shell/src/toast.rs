@@ -5,7 +5,7 @@
 //! own height it covered the bar's right end -- the window controls, `↻`, and the `agent ⚑N` chip it
 //! announces, for exactly the seconds that chip matters.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -55,11 +55,30 @@ pub(crate) fn permission_toast_text(
     text
 }
 
+/// What the toast now showing announces. A waiting permission card's toast is the only word of the
+/// card in Immersive mode, so it is told apart from every other toast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToastKind {
+    /// A hidden chat holds a permission card ([`permission_toast_text`]).
+    Attention,
+    /// Anything else: a refusal's reason, a one-time notice, a restore's result.
+    Other,
+}
+
+/// Whether a refused key may show its reason on the toast, given what the toast shows now. Never
+/// over a waiting card's toast: a stray key would otherwise erase the one line saying a card waits,
+/// and the refusal still has its flash and its stdout line.
+pub(crate) fn refusal_may_show(showing: Option<ToastKind>) -> bool {
+    showing != Some(ToastKind::Attention)
+}
+
 pub(crate) struct Toast {
     label: gtk4::Label,
     /// The top bar: the toast goes below it while it is drawn ([`toast_top`]).
     bar: gtk4::Widget,
     hide: RefCell<Option<glib::SourceId>>,
+    /// What the label says while it is up; `None` once it has hidden.
+    showing: Cell<Option<ToastKind>>,
 }
 
 impl Toast {
@@ -80,6 +99,7 @@ impl Toast {
             label,
             bar: bar.clone(),
             hide: RefCell::new(None),
+            showing: Cell::new(None),
         })
     }
 
@@ -88,6 +108,26 @@ impl Toast {
     }
 
     pub(crate) fn show_for(self: &Rc<Self>, text: &str, duration: Duration) {
+        self.show_kind(text, duration, ToastKind::Other);
+    }
+
+    /// A hidden chat's waiting card ([`permission_toast_text`]): kept up against refusals for its
+    /// [`TOAST_FOR`].
+    pub(crate) fn show_attention(self: &Rc<Self>, text: &str) {
+        self.show_kind(text, TOAST_FOR, ToastKind::Attention);
+    }
+
+    /// A refused key's reason, unless a waiting card's toast is up ([`refusal_may_show`]); `false`
+    /// when it was not shown.
+    pub(crate) fn show_refusal(self: &Rc<Self>, text: &str) -> bool {
+        if !refusal_may_show(self.showing.get()) {
+            return false;
+        }
+        self.show_kind(text, TOAST_FOR, ToastKind::Other);
+        true
+    }
+
+    fn show_kind(self: &Rc<Self>, text: &str, duration: Duration, kind: ToastKind) {
         // A toast raised while the window is still being built (the tmux import's notice) comes
         // before the bar has a height; its natural height is the one it is about to get.
         let bar_height = match self.bar.height() {
@@ -97,6 +137,7 @@ impl Toast {
         self.label.set_margin_top(toast_top(self.bar.is_visible(), bar_height));
         self.label.set_label(text);
         self.label.set_visible(true);
+        self.showing.set(Some(kind));
         if let Some(source) = self.hide.borrow_mut().take() {
             source.remove();
         }
@@ -104,6 +145,7 @@ impl Toast {
         let source = glib::timeout_add_local_once(duration, move || {
             if let Some(toast) = toast.upgrade() {
                 toast.hide.borrow_mut().take();
+                toast.showing.set(None);
                 toast.label.set_visible(false);
             }
         });
@@ -146,6 +188,18 @@ mod tests {
             "agent 2 \u{2691}1 \u{2014} tab 3 \"x\" \u{00b7} the agent 2 chip",
             "an extra view's toast reads as its chip does"
         );
+    }
+
+    /// A refused key pressed while a hidden chat's card toast is up -- in Immersive mode the toast
+    /// is all that says a card waits -- leaves that toast alone; any other toast, or none, gives way.
+    #[test]
+    fn a_refusal_never_replaces_a_waiting_cards_toast() {
+        assert!(!refusal_may_show(Some(ToastKind::Attention)));
+        assert!(
+            refusal_may_show(Some(ToastKind::Other)),
+            "a refusal replaces another refusal or a notice"
+        );
+        assert!(refusal_may_show(None), "nothing showing");
     }
 
     /// Below the top bar while it is drawn -- never over the `agent ⚑N` chip, `↻` or the window

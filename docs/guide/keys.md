@@ -52,8 +52,8 @@ The keys marked "repeats" can be pressed again within half a second without the 
 | `<prefix> q` | draw a number on every module on screen; press that number (`1` to `9`, then `0`) to give that module the keys. `Esc` or any other key ends it, and so does one second without a key |
 | `<prefix> Ctrl+Up`, `Ctrl+Down`, `Ctrl+Left`, `Ctrl+Right` | move the nearest divider one cell that way (repeats) |
 | `<prefix> Alt+Up`, `Alt+Down`, `Alt+Left`, `Alt+Right` | the same, five cells (repeats) |
-| `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri |
-| `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal |
+| `<prefix> x` | close this module and end what runs in it, after a `y/n` question; closing the last one on screen closes Eitri, and then the question, like closing the window, also names the chat turns running or queued and the terminals running a command (`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`); a job left in the background at a shell prompt is not counted |
+| `<prefix> [` or `<prefix> PageUp` | scroll the bottom terminal back (copy mode); only while the terminal has the keys, elsewhere it flashes a refusal and the toast says `prefix [ scrolls the terminal` |
 | `<prefix> F11` | immersive: fullscreen without the top bar |
 | `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | text size larger / smaller / back in step, for the pane with the keys only (repeats: keep Ctrl down and press `=` or `-` again) |
 
@@ -61,6 +61,11 @@ Each of these arrangements ends a zoom when it changes something and leaves it o
 keys stay with the module that had them, and a hidden module stays hidden. With fewer than two modules on screen they
 change nothing and the refusal flashes; `Alt+3`, `Alt+4`, `Alt+5` and `Space` also refuse more than 20 modules on
 screen.
+
+A refused key flashes Eitri's name in the top bar, and the toast at the top right says why (`rotate: fewer than two
+modules on screen`, `no other module on screen`). A few refusals have nothing to say and only flash, such as a tab key
+with no tab that way. While the toast is telling you that a hidden chat has a permission card waiting, a refused key
+leaves that toast up and only flashes.
 
 **Actions with no key.** These are reached by name: from a Lua command with `eitri.layout.run` (see
 [Configuration](configuration.md#layout-from-lua)) and, once bound, in the list under `<prefix> ?`. To give one a key, add a line
@@ -130,6 +135,8 @@ as `$mod`, pressed after the prefix. A title is the module's name as the top bar
 | `<prefix> Alt+a` / `Alt+d` | select the parent container of what is selected / go back down to the child that has the keys (i3's `focus parent` and `focus child`) |
 | `<prefix> Alt+Enter` | open a new terminal to the right of the module that has the keys; its shell starts in the project root |
 
+If your i3 or sway `$mod` is Alt, the window manager takes those chords before Eitri sees them, and the rows never run. [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) moves the rows it grabs: each keeps its key with Ctrl added (`<prefix> Ctrl+Alt+w`, `Ctrl+Alt+Enter`, and so on). The rows whose key has Shift in it drop the Shift instead of keeping it: Eitri does not read Ctrl+Shift+<character> as a chord, so the four moves (`Alt+H`, `Alt+J`, `Alt+K`, `Alt+L`) become `<prefix> Ctrl+Alt+h`, `Ctrl+Alt+j`, `Ctrl+Alt+k`, `Ctrl+Alt+l`, and the move-to-scratchpad row (`Alt+_`) becomes `<prefix> _`; the float toggle (`Alt+Shift+Space`) becomes `<prefix> Ctrl+Alt+Space`, since Ctrl+Shift+Space switches the input method on many setups. Paste it into your `init.lua`.
+
 **Tabs and stacks.** Click a title, or press `f` and type the title's label (HINT labels every title), to bring
 that module forward and give it the keys. From the keyboard, `Ctrl+h` / `Ctrl+l` step to the tab on the left /
 right in a tabbed container and `Ctrl+k` / `Ctrl+j` to the one above / below in a stacked one; when there is no
@@ -175,7 +182,7 @@ hidden, and every view spends the window's one [account](configuration.md#accoun
   right of the base view, and the view takes the keys. With only one tab in the base view it refuses (the toast reads
   `can't break with only one tab`): the base view always keeps a tab. With the keys in an extra view, `!` does the
   opposite: the view is shown no more, its tab returns to the base view as the tab you are on, and the keys go there.
-  With the keys in the editor or a terminal it only flashes. A `set` of `!` in your `init.lua` needs
+  With the keys in the editor or a terminal it refuses (the toast reads `tab.break: the keys are in no chat view`). A `set` of `!` in your `init.lua` needs
   `k.del("prefix", "!")` before it, as for any default key (above).
 - **A new view with an empty tab.** `eitri.layout.run("instance.new", { kind = "agent" })`, `eitri.layout.open("agent")`
   and a split key then `a` with the keys in a chat view each make a new view holding a new, empty tab of the default
@@ -365,7 +372,7 @@ registered, the message is sent as typed: there is no list of held-back commands
 | `y` | copy the row (the message, command or path), or the code block HINT landed on |
 | `Y` | copy a tool row's whole output |
 | `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim |
-| `gf` | open the file path on this row in the editor (several: pick by letter) |
+| `gf` | open the file path on this row in the editor, including a card's or edit row's file headers (several: pick by letter) |
 | `gx` | open this row's web link in your browser (several: pick by letter) |
 | `/` | search the conversation; `Enter` keeps the match, `Esc` goes back |
 | `n` / `N` | the next / the previous match, wrapping |
@@ -479,8 +486,8 @@ Things Eitri has no equivalent of, and anything that would need tmux to run some
 An `unbind -a` in your tmux configuration removes Eitri's tmux-like defaults too, but Eitri's own keys (HINT,
 the module keys, `?`, the panel reload, immersive and the tab keys tmux has no command for) stay.
 
-To turn the import off, put `eitri.config.set("keymap.from_tmux", "off")` in `~/.config/eitri/init.lua`
-(`"on"` is the default; any other value stops the launch, naming the key). Your own `eitri.keymap` calls in
+To turn the import off, put `eitri.config.set("keymap.from_tmux", "off")` in your [`init.lua`](configuration.md#initlua)
+(or use Lua `false`; `true` and `"on"` enable it, the default; any other value stops the launch, naming the key). Your own `eitri.keymap` calls in
 that file always win over what came from tmux; for instance, with the import off, a `Ctrl+a` prefix is
 `eitri.keymap.prefix("C-a")`. The prefix must be a `Ctrl` or `Alt` chord or a function key. The calls
 themselves are in [Configuration](configuration.md).

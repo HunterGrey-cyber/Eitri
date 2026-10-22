@@ -2374,6 +2374,12 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     return document.querySelector<HTMLElement>(".tool-result-preview")!;
   }
 
+  it("tool_output_previews_are_mono_at_the_code_size", () => {
+    const line = foldedPreview().querySelector<HTMLElement>(".tool-result-preview-line")!;
+    expect(winningDeclarationOn(line, "font-family")).toMatch(/^var\(--nv-font-mono\b/);
+    expect(winningDeclarationOn(line, "font-size")).toBe("var(--fs-code)");
+  });
+
   it("cuts a folded result's lines at the edge with an ellipsis, so three lines stay three lines", () => {
     const line = foldedPreview().querySelector<HTMLElement>(".tool-result-preview-line")!;
     expect(winningDeclarationOn(line, "white-space")).toBe("pre");

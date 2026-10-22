@@ -12,6 +12,8 @@ pub mod agent_prefs;
 pub mod attention;
 pub mod buffer_reload;
 pub mod companion;
+pub mod config_dir;
+pub mod config_switch;
 pub mod editor_context;
 pub mod editor_feeds;
 pub mod editor_lines;

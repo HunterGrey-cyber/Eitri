@@ -21,11 +21,11 @@
 #   - $XDG_DATA_HOME/licenses/eitri, and $XDG_DATA_HOME/eitri (the private nvim, the sidecars, the
 #     AppArmor profile)
 #   - $XDG_CACHE_HOME/eitri: the downloads, the unpack and build directories, the lock
-#   - ~/.config/eitri and $XDG_STATE_HOME/eitri only as far as `--uninstall --purge` can reach
-#     them, which is deleting each whole: so whether the directory is there and what kind of entry
-#     it is, but not what is inside (the application writes there itself)
-# XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME are read from the caller's environment by
-# install.sh's own rule: an absolute value, else the default under HOME.
+#   - $XDG_CONFIG_HOME/eitri and $XDG_STATE_HOME/eitri only as far as `--uninstall --purge` can
+#     reach them, which is deleting each whole: so whether the directory is there and what kind of
+#     entry it is, but not what is inside (the application writes there itself)
+# XDG_DATA_HOME, XDG_CACHE_HOME, XDG_STATE_HOME and XDG_CONFIG_HOME are read from the caller's
+# environment by install.sh's own rule: an absolute value, else the default under HOME.
 #
 # POSIX sh and GNU find (-printf), as run-in-env.sh already needs.
 set -u
@@ -48,9 +48,11 @@ done
 DATA=$H/.local/share
 CACHE=$H/.cache
 STATE=$H/.local/state
+CONFIG=$H/.config
 case ${XDG_DATA_HOME-} in /*) DATA=$XDG_DATA_HOME ;; esac
 case ${XDG_CACHE_HOME-} in /*) CACHE=$XDG_CACHE_HOME ;; esac
 case ${XDG_STATE_HOME-} in /*) STATE=$XDG_STATE_HOME ;; esac
+case ${XDG_CONFIG_HOME-} in /*) CONFIG=$XDG_CONFIG_HOME ;; esac
 
 FMT='%p %y %s %T@\n'
 
@@ -96,5 +98,5 @@ exists() {
 	tree "$DATA/licenses/eitri" "$DATA/eitri" "$CACHE/eitri"
 	tree "$DATA/gnome-shell/extensions/eitri@huntergrey.cn"
 	exists "$DATA/gnome-shell" "$DATA/gnome-shell/extensions"
-	exists "$H/.config/eitri" "$STATE/eitri"
+	exists "$CONFIG/eitri" "$STATE/eitri"
 } | LC_ALL=C sort

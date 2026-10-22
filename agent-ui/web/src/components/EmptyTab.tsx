@@ -801,7 +801,7 @@ export function EmptyTab(props: EmptyTabProps) {
             // A tab that has not started has no reported list yet: Claude's built-ins, nothing for another agent.
             slashCommands={completionSource(props.tab.agent, null)}
             // The window's own key for the module to the right, which is where the panel sits.
-            idleHint={props.paneFocused || props.entryKey == null ? undefined : `${props.entryKey} to start typing`}
+            idleHint={props.paneFocused || props.entryKey == null ? undefined : `${props.entryKey}, then i to type`}
           />
         </div>
         {inDashboard && hello !== null && (

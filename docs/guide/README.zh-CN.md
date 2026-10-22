@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=60d7b467d6ff3bf07c4bc7a76c76dd889edb71f19c6bfcfce3dd502bcbe0dec8 -->
+<!-- translated-from: README.md sha256=1e7bcd9e7a2d22e0aa6c654ffb43591641ea8ad60ed3bc312e44629d6b25b95c -->
 
 # Eitri 文档
 
@@ -17,7 +17,7 @@ Eitri 是一个面向 Linux 的 Neovim 图形前端，把 agent、终端和网�
 - **[浮动窗口和便笺板](keys.zh-CN.md#浮动窗口便笺板和工作区)。** 让模块浮在其他模块上方，或者收起来再叫出来；它会一直运行。编辑器始终平铺。
 - **[工作区](keys.zh-CN.md#浮动窗口便笺板和工作区)。** 为同一组模块保留好几种排布，在它们之间切换。
 
-在 `~/.config/eitri/init.lua` 里设[打开规则](configuration.zh-CN.md#where-a-new-module-opens)，决定新模块放在哪里。用 [`eitri.layout.export()`](configuration.zh-CN.md#layout-from-lua) 把排好的布局变成可以写进这个文件的启动布局调用。
+在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里设[打开规则](configuration.zh-CN.md#where-a-new-module-opens)，决定新模块放在哪里。用 [`eitri.layout.export()`](configuration.zh-CN.md#layout-from-lua) 把排好的布局变成可以写进这个文件的启动布局调用。
 
 ## 它不是什么
 
@@ -28,7 +28,7 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [安装](../../INSTALL.zh-CN.md)：软件包、安装脚本、从源码构建，以及验证下载的文件。
 - [快速上手](getting-started.zh-CN.md)：打开一个项目、发送你的第一个提示，并熟悉各处。
 - [按键](keys.zh-CN.md)：前缀、面板的按键，以及在窗格之间移动。
-- [配置](configuration.zh-CN.md)：`~/.config/eitri/init.lua`、它读取的设置和按键映射。
+- [配置](configuration.zh-CN.md)：`$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）、它读取的设置和按键映射。
 - [Companion 模式](companion.zh-CN.md)：agent 面板作为独立窗口，放在你已经在用的 Neovim 旁边。
 - [回合审阅](turn-review.zh-CN.md)：查看一个回合期间磁盘上改了什么，还原一个 hunk，把评论发回去。
 - [Markdown 预览](markdown-preview.zh-CN.md)：在编辑器旁边显示渲染后的 Markdown 文件，和编辑器一起滚动，用 Vim 键阅读。

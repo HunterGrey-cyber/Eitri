@@ -2,14 +2,14 @@
 --
 -- `shell` loads `<config dir>/init.lua` once at startup, after its two built-in panels
 -- (the editor on the left, the agent-panel placeholder on the right) are already registered
--- but before the window is presented. The config dir defaults to `~/.config/eitri`; it can be
--- overridden with the `EITRI_CONFIG_DIR` environment variable (mainly useful for testing a
--- config without touching your real one).
+-- but before the window is presented. The config dir is `$XDG_CONFIG_HOME/eitri` (default
+-- `~/.config/eitri`); it can be overridden with the `EITRI_CONFIG_DIR` environment variable
+-- (mainly useful for testing a config without touching your real one).
 --
--- Copy this file to `~/.config/eitri/init.lua` and edit it to try the extension kernel
--- yourself, or use it as a starting point for your own plugin-style config. If no `init.lua` is
--- present at all, `shell` starts normally with just the two built-in panels -- nothing here is
--- required.
+-- Copy this file to `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`) and
+-- edit it to try the extension kernel yourself, or use it as a starting point for your own
+-- plugin-style config. If no `init.lua` is present at all, `shell` starts normally with just the
+-- two built-in panels -- nothing here is required.
 --
 -- This is a genuinely separate Lua runtime from Neovim's own `:lua`/`init.lua` -- it runs inside
 -- `shell`'s own embedded `mlua` interpreter, not inside the `nvim --embed` process the editor
@@ -79,7 +79,8 @@ eitri.command.register({
 -- `content` must currently be `{ type = "webview", url = "..." }` -- the only supported panel
 -- content model in this version is a WebKitGTK WebView pointed at a URL. `url` can be:
 --   - a bare relative filename, resolved under `<config dir>/panels/` (e.g. "my-panel.html"
---     loads `~/.config/eitri/panels/my-panel.html`);
+--     loads `$XDG_CONFIG_HOME/eitri/panels/my-panel.html`, default
+--     `~/.config/eitri/panels/my-panel.html`);
 --   - an absolute path (starting with `/`);
 --   - or anything already carrying a URI scheme (`http://`, `https://`, `file://`, `data:`, ...),
 --     used exactly as given. The `data:` URI below is the simplest possible way to try this

@@ -115,17 +115,9 @@ pub const USER_SETTINGS_KEY: &str = "agent.user_settings";
 /// The value of [`USER_SETTINGS_KEY`] as `init.lua` left it: unset or `true` means sessions load the
 /// user's own Claude Code configuration (`~/.claude`), as the CLI does in a terminal; `false` leaves
 /// that tier out and keeps project and local. The store holds text, so a Lua boolean arrives as
-/// `"true"` / `"false"`. Anything else is an error naming the key, as every other configuration key
-/// here is.
+/// `"true"` / `"false"`; `"on"` / `"off"` are also accepted. Anything else is an error naming the key.
 pub fn parse_user_settings(value: Option<&str>) -> Result<bool, String> {
-    match value.map(str::trim) {
-        None | Some("true") => Ok(true),
-        Some("false") => Ok(false),
-        Some(_) => Err(format!(
-            "eitri.config.set(\"{USER_SETTINGS_KEY}\", {:?}): must be true or false",
-            value.unwrap_or_default()
-        )),
-    }
+    crate::config_switch::parse_switch(USER_SETTINGS_KEY, value, true)
 }
 
 /// The `init.lua` key: `eitri.config.set("review.enabled", true | false)`.
@@ -134,30 +126,15 @@ pub const REVIEW_ENABLED_KEY: &str = "review.enabled";
 /// The `init.lua` key: `eitri.config.set("review.hint", true | false)`.
 pub const REVIEW_HINT_KEY: &str = "review.hint";
 
-/// A true/false switch as `init.lua` left it: unset is `default`, else exactly `true` or `false`
-/// (the store holds text, so a Lua boolean arrives as one of those words). Anything else is an
-/// error naming the key.
-fn parse_switch(key: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
-    match value.map(str::trim) {
-        None => Ok(default),
-        Some("true") => Ok(true),
-        Some("false") => Ok(false),
-        Some(_) => Err(format!(
-            "eitri.config.set(\"{key}\", {:?}): must be true or false",
-            value.unwrap_or_default()
-        )),
-    }
-}
-
 /// [`REVIEW_ENABLED_KEY`]: whether turn review runs at all. Unset means it does.
 pub fn parse_review_enabled(value: Option<&str>) -> Result<bool, String> {
-    parse_switch(REVIEW_ENABLED_KEY, value, true)
+    crate::config_switch::parse_switch(REVIEW_ENABLED_KEY, value, true)
 }
 
 /// [`REVIEW_HINT_KEY`]: whether a finished turn that edited files puts a hint in the status band.
 /// Unset means it stays quiet; the review is still one key away.
 pub fn parse_review_hint(value: Option<&str>) -> Result<bool, String> {
-    parse_switch(REVIEW_HINT_KEY, value, false)
+    crate::config_switch::parse_switch(REVIEW_HINT_KEY, value, false)
 }
 
 /// The `init.lua` key: `eitri.config.set("agent.thinking", "collapsed" | "preview" | "expanded" | "hidden")`.
@@ -637,16 +614,25 @@ mod tests {
     }
 
     #[test]
-    fn the_user_settings_key_reads_true_and_false_and_nothing_else() {
+    fn the_user_settings_key_reads_switch_spellings_and_refuses_other_values() {
         assert_eq!(parse_user_settings(None), Ok(true));
         assert_eq!(parse_user_settings(Some("true")), Ok(true));
         assert_eq!(parse_user_settings(Some(" false ")), Ok(false));
-        for bad in ["", "False", "TRUE", "yes", "0", "1", "off", "nil"] {
+        for bad in ["", "False", "TRUE", "yes", "0", "1", "nil"] {
             let err = parse_user_settings(Some(bad)).unwrap_err();
             assert!(
                 err.contains("agent.user_settings") && err.contains(&format!("{bad:?}")),
                 "{err}"
             );
+        }
+    }
+
+    #[test]
+    fn user_settings_and_review_accept_off_and_on() {
+        for (value, expected) in [("off", false), ("on", true)] {
+            assert_eq!(parse_user_settings(Some(value)), Ok(expected));
+            assert_eq!(parse_review_enabled(Some(value)), Ok(expected));
+            assert_eq!(parse_review_hint(Some(value)), Ok(expected));
         }
     }
 

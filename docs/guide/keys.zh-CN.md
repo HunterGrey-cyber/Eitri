@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=0f7a55a97360d36304c2bc57ddea17ab8ce054299ed0cc5317eec71a57e2bdaf -->
+<!-- translated-from: keys.md sha256=a81f2cdd07aa9676d117627fc02deba46d6770f968f8a88890a2db4c6855136d -->
 
 # 按键
 
@@ -47,12 +47,14 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> q` | 在屏幕上的每个模块上画一个数字；按下那个数字（`1` 到 `9`，然后是 `0`）就让那个模块拿到按键。`Esc` 或任何别的键会结束它，一秒钟没有按键也会结束 |
 | `<prefix> Ctrl+Up`、`Ctrl+Down`、`Ctrl+Left`、`Ctrl+Right` | 把最近的分隔线朝那个方向移一格（repeats） |
 | `<prefix> Alt+Up`、`Alt+Down`、`Alt+Left`、`Alt+Right` | 同上，五格（repeats） |
-| `<prefix> x` | 关闭这个模块并结束它里面运行的东西，会先问一个 `y/n`；关掉屏幕上的最后一个模块就关闭 Eitri |
-| `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式）；只在终端拿着按键时有效，在别处只会闪一下拒绝提示 |
+| `<prefix> x` | 关闭这个模块并结束它里面运行的东西，会先问一个 `y/n`；关掉屏幕上的最后一个模块就关闭 Eitri，这时的问题和关闭窗口时一样，还会列出正在运行或排队的聊天回合，以及正在运行命令的终端（`kill-pane editor? closes Eitri, 2 terminal jobs (y/n)`）；在 shell 提示符下放到后台的任务不算在内 |
+| `<prefix> [` 或 `<prefix> PageUp` | 把底部终端往回滚（复制模式）；只在终端拿着按键时有效，在别处会闪一下拒绝提示，提示框写着 `prefix [ scrolls the terminal` |
 | `<prefix> F11` | 沉浸模式：不带顶栏的全屏 |
 | `<prefix> Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 只放大 / 缩小 / 还原拿着按键的那个窗格的文字（repeats：按住 Ctrl 再按 `=` 或 `-` 继续调） |
 
 上面这些排布在真的改变了东西时会结束放大，什么都没做时则保持放大。按键仍留在原来拿着它的模块上，被隐藏的模块仍然隐藏。屏幕上少于两个模块时它们什么都不改，只闪一下拒绝提示；`Alt+3`、`Alt+4`、`Alt+5` 和 `Space` 在屏幕上超过 20 个模块时也会拒绝。
+
+按键被拒绝时，顶栏里 Eitri 的名字会闪一下，右上角的提示框会说明原因（`rotate: fewer than two modules on screen`、`no other module on screen`）。少数拒绝没有可说的，只闪一下，比如那个方向上没有标签页时按的标签页键。提示框正在告诉你某个隐藏的对话有权限卡片在等待时，被拒绝的按键不会盖掉这条提示，只闪一下。
 
 **没有按键的动作。** 这些按名字使用：在 Lua 命令里用 `eitri.layout.run`（见[配置](configuration.zh-CN.md#layout-from-lua)），绑上键之后才会出现在 `<prefix> ?` 的列表里。要给其中某个绑上键，在你的 `init.lua` 里加一行；这里的键只是示例，没有任何默认键用到它们：
 
@@ -105,6 +107,8 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<prefix> Alt+a` / `Alt+d` | 选中当前所选之物的父容器 / 回到拿着按键的那个子项（i3 的 `focus parent` 和 `focus child`） |
 | `<prefix> Alt+Enter` | 在拿着按键的模块右边打开一个新的终端；它的 shell 从项目根目录启动 |
 
+如果你的 i3 或 sway 的 `$mod` 是 Alt，这些组合键会先被窗口管理器拿走，Eitri 看不到，这些行就永远不会运行。[`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 会把被拿走的那些行移开：每一行保留原来的键并加上 Ctrl（`<prefix> Ctrl+Alt+w`、`Ctrl+Alt+Enter`，等等）。键里带 Shift 的那几行则去掉 Shift，而不是保留它：Eitri 不把 Ctrl+Shift+<字符> 当作组合键来读，所以四个移动键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`）变成 `<prefix> Ctrl+Alt+h`、`Ctrl+Alt+j`、`Ctrl+Alt+k`、`Ctrl+Alt+l`，移入便笺板那一行（`Alt+_`）变成 `<prefix> _`；浮动切换（`Alt+Shift+Space`）变成 `<prefix> Ctrl+Alt+Space`，因为在很多环境里 Ctrl+Shift+Space 是切换输入法的键。把它粘贴进你的 `init.lua`。
+
 **标签页和堆叠。** 点一下标题，或者按 `f` 再输入标题的标签（HINT 会给每个标题标上标签），就能把那个模块带到前面并让它拿到按键。用键盘的话，在标签页式容器里 `Ctrl+h` / `Ctrl+l` 移到左边 / 右边的标签页，在堆叠式容器里 `Ctrl+k` / `Ctrl+j` 移到上面 / 下面那一个；那个方向没有标签页时，它们就像在模块之间一样继续往外走。拿着按键的模块永远是显示出来的那个，所以隐藏或关闭它会把按键交给接着显示的标签页。没有显示的标签页照常运行：那里的终端继续输出，回来时能看到这些行；聊天保持着它的会话。不在显示中的标签页上的聊天，在有卡片等待时，标题上带着 `agent ⚑N`；`modules.chat.on_permission` 设为 `"reveal"` 时，新卡片会把它的标签页带到前面，除非按键正在同一容器的另一个标签页上：那时你只会看到提示，什么都不动。
 
 **选中一个容器。** `<prefix> Alt+a` 选中拿着按键的模块周围的容器，顶栏会这样显示：`selected: column (editor, terminal)`，即容器的种类和它里面显示着的模块的标题。再按一次会再往上一层（最外层是窗口自己的容器），`<prefix> Alt+d` 往下回去。选中一个容器时，用来排布的那些键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`、`Alt+w`、`Alt+s`、`Alt+e`、`z`、`H`、`J`、`K`、`E` 和翻转）作用于整个容器。必须针对单个模块的那些（`x`、隐藏模块、交换和标记）会拒绝，并闪一下 `acts on one module`。把按键交给别的模块、用分割键打开一个模块，以及前缀之后的 `Esc`，都会结束选中。选中的容器周围不画任何东西；顶栏的文字就是全部。
@@ -116,7 +120,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 
 **聊天视图**是 agent 面板的另一个页面，作为一个单独的模块显示，里面只放一个会话标签页。你一开始用的 agent 面板是**基础视图**（`agent`）；其余的是 `agent#2` 到 `agent#9`，一共最多九个（第十个会被拒绝，提示 `at most 9 chat views`）。每个视图都和终端一样是一个模块：它在布局里，可以移动、放大、浮动或隐藏，在每个工作区里都有，并且有自己的芯片（`agent 2`，有卡片等着时读作 `agent 2 ⚑1`）。它们的标签页属于窗口，所以视图被隐藏时标签页照常运行，所有视图用的都是窗口那一个[账号](configuration.zh-CN.md#accounts)。
 
-- **`<prefix> !` 把标签页拆出来。** 按键在基础视图里时，你正在用的标签页移进基础视图右边的一个新视图，并且这个视图拿到按键。基础视图只有一个标签页时它会拒绝（提示 `can't break with only one tab`）：基础视图永远留着一个标签页。按键在额外的视图里时，`!` 做相反的事：这个视图不再显示，它的标签页回到基础视图成为正在用的标签页，按键也回到那里。按键在编辑器或终端里时它只会闪一下。你的 `init.lua` 里要 `set` `!` 的话，要像其他默认键一样，在前面放 `k.del("prefix", "!")`（见上面）。
+- **`<prefix> !` 把标签页拆出来。** 按键在基础视图里时，你正在用的标签页移进基础视图右边的一个新视图，并且这个视图拿到按键。基础视图只有一个标签页时它会拒绝（提示 `can't break with only one tab`）：基础视图永远留着一个标签页。按键在额外的视图里时，`!` 做相反的事：这个视图不再显示，它的标签页回到基础视图成为正在用的标签页，按键也回到那里。按键在编辑器或终端里时它会拒绝（提示 `tab.break: the keys are in no chat view`）。你的 `init.lua` 里要 `set` `!` 的话，要像其他默认键一样，在前面放 `k.del("prefix", "!")`（见上面）。
 - **带一个空标签页的新视图。** `eitri.layout.run("instance.new", { kind = "agent" })`、`eitri.layout.open("agent")`，以及按键在聊天视图里时的分割键再按 `a`，都会建出一个新视图，里面是默认 agent 的一个新的空标签页（它的第一条消息要先在那个视图里过一遍通常的[信任问题](permissions.zh-CN.md#trusting-a-project)）。它开在哪里由你的[打开规则](configuration.zh-CN.md#where-a-new-module-opens)决定；默认是在拿着按键的模块右边。
 - **`<prefix> a`** 去你想要的那个聊天：按键在某个聊天视图里时，它隐藏这个视图，和现在隐藏基础视图一样；在别处时，它去有最早一张等待中的卡片的视图，否则去你最近用过的聊天视图，再否则去基础视图。视图默认没有自己的键；`eitri.keymap.set("prefix", "F4", "module.agent#2")` 能给那个视图配一个同样行为的键。
 - **关闭。** 在视图里按 `<prefix> x` 会问 `kill-pane agent 2? closes tab 3 <name> (y/n)`，按 `y` 就关闭那个标签页并移除这个视图。标签页被关掉或并回去之后，没有标签页的视图会自己消失。
@@ -243,7 +247,7 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 | `y` | 复制这一行（消息、命令或路径），或 HINT 落到的那个代码块 |
 | `Y` | 复制一个工具行的全部输出 |
 | `Ctrl+g` | 在 Neovim 的一个临时缓冲区里打开这一行的全部文字 |
-| `gf` | 在编辑器里打开这一行上的文件路径（有多个时按字母选） |
+| `gf` | 在编辑器里打开这一行上的文件路径，包括权限卡片或编辑行的文件标题里的路径（有多个时按字母选） |
 | `gx` | 在浏览器里打开这一行的网页链接（有多个时按字母选） |
 | `/` | 在对话里搜索；`Enter` 保留匹配，`Esc` 返回 |
 | `n` / `N` | 下一个 / 上一个匹配，循环 |
@@ -331,4 +335,4 @@ BROWSE 里的 `:`（或任何地方的 `<prefix> :`）在面板底部打开一�
 
 你 tmux 配置里的 `unbind -a` 也会去掉 Eitri 那些类似 tmux 的默认键，但 Eitri 自己的键（HINT、模块键、`?`、面板重新加载、沉浸模式，以及 tmux 里没有对应命令的标签页键）会保留。
 
-要关掉这个导入，在 `~/.config/eitri/init.lua` 里写上 `eitri.config.set("keymap.from_tmux", "off")`（默认是 `"on"`；任何其他值都会让启动停下，并点出这个设置的名字）。你在那个文件里写的 `eitri.keymap` 调用永远优先于从 tmux 拿来的东西；例如，导入关掉时，`Ctrl+a` 前缀就是 `eitri.keymap.prefix("C-a")`。前缀必须是 `Ctrl` 或 `Alt` 组合键，或者功能键。这些调用本身见[配置](configuration.zh-CN.md)。
+要关掉这个导入，在你的 [`init.lua`](configuration.zh-CN.md#initlua) 里写上 `eitri.config.set("keymap.from_tmux", "off")`（也可用 Lua `false`；`true` 和 `"on"` 表示开启，也是默认值；任何其他值都会让启动停下，并点出这个设置的名字）。你在那个文件里写的 `eitri.keymap` 调用永远优先于从 tmux 拿来的东西；例如，导入关掉时，`Ctrl+a` 前缀就是 `eitri.keymap.prefix("C-a")`。前缀必须是 `Ctrl` 或 `Alt` 组合键，或者功能键。这些调用本身见[配置](configuration.zh-CN.md)。

@@ -137,8 +137,9 @@ pub struct Paths {
 /// A `home` that is not absolute is refused. A relative `XDG_STATE_HOME` counts as unset, as it does for the
 /// rest of Eitri's state. A relative `EITRI_CONFIG_DIR` is refused: the project becomes the working
 /// directory, and a relative path would then read Neovide's settings (which can name the nvim to run) from
-/// the project. An empty one counts as unset. The configuration directory is not `$XDG_CONFIG_HOME/eitri`:
-/// `init.lua` is read from `~/.config/eitri` on every host, and Neovide's file must sit beside it.
+/// the project. An empty one counts as unset. Linux reads `$XDG_CONFIG_HOME/eitri` when that variable
+/// is set and absolute; the Mac always uses `~/.config/eitri` (there is no XDG convention there).
+/// Neovide's file must sit beside `init.lua`.
 pub fn paths(env: &dyn Fn(&str) -> Option<OsString>, home: &Path, run_dir: &Path) -> Result<Paths, String> {
     if !home.is_absolute() {
         return Err(format!("the home directory {home:?} is not an absolute path"));

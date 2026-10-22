@@ -447,7 +447,7 @@ def test_real_home_guard_sees_an_installer_creating_what_was_absent():
 
 def _xdg_env(home):
     return _guard_env(XDG_DATA_HOME=str(home / "data"), XDG_STATE_HOME=str(home / "st"),
-                      XDG_CACHE_HOME=str(home / "cch"))
+                      XDG_CACHE_HOME=str(home / "cch"), XDG_CONFIG_HOME=str(home / "cfg"))
 
 
 @pytest.mark.parametrize("rel", [
@@ -473,22 +473,34 @@ def test_real_home_guard_sees_purge_remove_the_state_directory_the_xdg_variable_
     assert real_home_state(home, _xdg_env(home)) != before
 
 
+def test_real_home_guard_sees_purge_remove_the_config_directory_the_xdg_variable_names():
+    home = fresh_scratch("guard-xdg")
+    _write(home / "cfg/eitri/init.lua")
+    before = real_home_state(home, _xdg_env(home))
+    shutil.rmtree(home / "cfg/eitri")
+    assert real_home_state(home, _xdg_env(home)) != before
+
+
 def test_real_home_guard_leaves_the_default_places_alone_when_xdg_names_others():
     home = fresh_scratch("guard-xdg")
     before = real_home_state(home, _xdg_env(home))
     _write(home / ".local/share/eitri/sidecar/ccccccc/BUILD")
     _write(home / ".local/share/licenses/eitri/NEW")
     _write(home / ".cache/eitri/NEW")
+    _write(home / ".config/eitri/init.lua")
     assert real_home_state(home, _xdg_env(home)) == before
 
 
 def test_real_home_guard_ignores_a_relative_or_empty_xdg_value_as_install_sh_does():
     home = _fake_home("guard-xdg-relative")
-    env = _guard_env(XDG_DATA_HOME="data", XDG_CACHE_HOME="", XDG_STATE_HOME="state")
+    env = _guard_env(XDG_DATA_HOME="data", XDG_CACHE_HOME="", XDG_STATE_HOME="state", XDG_CONFIG_HOME="cfg")
     before = real_home_state(home, env)
     _write(home / ".local/share/eitri/sidecar/ccccccc/BUILD")
     _write(home / ".cache/eitri/NEW")
     assert real_home_state(home, env) != before
+    settings_present = real_home_state(home, env)
+    shutil.rmtree(home / ".config/eitri")
+    assert real_home_state(home, env) != settings_present
     assert real_home_state(home, env) == real_home_state(home, _guard_env())
 
 

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 /// Every probe name a script may list, in the order a full run takes them. `cal` is the calibration
 /// loop that every cost comparison divides by.
-pub(super) const PROBES: &[&str] = &["cal", "p1", "p2", "p3", "p4", "p5", "p6", "p7"];
+pub(super) const PROBES: &[&str] = &["cal", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Script {

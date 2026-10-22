@@ -1059,6 +1059,45 @@ impl Probe {
         }
     }
 
+    // ---- A press near a divider reaches the divider ------------------------------------------
+
+    /// With the bottom terminal shown, the window holds a vertical divider (editor beside the chat) and a
+    /// horizontal one (the terminal under both). GTK's own pick, at the middle of each divider's line and one
+    /// pixel either side, must find that divider's handle and never a module: a terminal that gets the press
+    /// starts a text selection instead of the divider moving.
+    pub(super) async fn p8_divider_pick(&self) {
+        let term = ModuleId::terminal();
+        let shown = self.ctx.grid.show_module(&term).unwrap_or(false);
+        self.ctx.terminal.start();
+        self.sleep(900).await;
+        let dividers = self.ctx.grid.probe_dividers();
+        say(format!("p8 dividers={}", dividers.len()));
+        for (n, (axis, r, handle)) in dividers.iter().enumerate() {
+            let name = match axis {
+                Axis::Row => "vertical",
+                Axis::Column => "horizontal",
+            };
+            for off in [-1, 0, 1] {
+                let (x, y) = match axis {
+                    Axis::Row => (r.x + r.w / 2 + off, r.y + r.h / 2),
+                    Axis::Column => (r.x + r.w / 2, r.y + r.h / 2 + off),
+                };
+                let picked = self.ctx.grid.pick(x as f64, y as f64, gtk4::PickFlags::DEFAULT);
+                let owner = if picked.as_ref() == Some(handle) {
+                    "divider".to_owned()
+                } else {
+                    self.owner_of(picked)
+                };
+                say(format!(
+                    "p8 pick divider={n} axis={name} off={off} at={x},{y} owner={owner}"
+                ));
+            }
+        }
+        if shown {
+            let _ = self.ctx.grid.hide_module(&term, &|id| self.give_keys(id));
+        }
+    }
+
     /// Loads `uri` in `view` from the host and reports how it ended: `loaded`, or `failed=<error text>`
     /// (spaces turned into underscores so that the line stays one word per field).
     async fn load_outcome(&self, view: &WebView, uri: &str) -> String {

@@ -242,7 +242,8 @@ see Eitri's, so a project you trusted in a terminal asks once more here.
 ## What an agent session loads
 
 Like `claude` in a terminal, every session loads your own Claude Code settings: your hooks, plugins, skills,
-`CLAUDE.md` and permission rules. To leave them out, put this in `~/.config/eitri/init.lua`:
+`CLAUDE.md` and permission rules. To leave them out, put this in
+`$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`):
 
 ```lua
 eitri.config.set("agent.user_settings", false)    -- true (the default) or false

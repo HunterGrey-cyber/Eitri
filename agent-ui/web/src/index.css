@@ -402,6 +402,8 @@ pre {
   min-width: 0;
 }
 .tool-result-preview-line {
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
   white-space: pre;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=20f4c9b1f11a145238516f411b4008ca63515998ac7cd2fffe777ba00ef46e2f -->
+<!-- translated-from: configuration.md sha256=e47cdfad30d1e267cb630ad1bd7254c94e3e56b12c9f111db9fb44336170396e -->
 
 # 配置
 
@@ -7,7 +7,7 @@ Eitri 有一个配置文件，是一个在启动时运行一次的 Lua 脚本；
 
 ## init.lua
 
-窗口启动时，Eitri 读取 `~/.config/eitri/init.lua`。把 `EITRI_CONFIG_DIR` 设成一个目录，就改从那里读取 `init.lua`。不需要先创建文件：没有它，Eitri 用内置的默认值启动，并打印一行说明这一点。
+Linux 上，若 `XDG_CONFIG_HOME` 非空且为绝对路径，Eitri 读取 `$XDG_CONFIG_HOME/eitri/init.lua`，否则读取 `~/.config/eitri/init.lua`。Mac 始终使用 `~/.config/eitri/init.lua`。把 `EITRI_CONFIG_DIR` 设成绝对路径，就改从那里读取 `init.lua`；空值视为未设置，相对路径会拒绝启动。不需要先创建文件：没有它，Eitri 用内置的默认值启动，并打印一行说明这一点。
 
 设置用 `eitri.config.set(key, value)` 来做。值是字符串、数字或布尔值（`true` 或 `false`）；`nil` 会把这个键重新取消设置。Eitri 保存不了的值（比如表或函数）会导致启动失败。
 
@@ -22,7 +22,7 @@ eitri.config.set("review.hint", true)
 - Eitri 不认识的键不是错误，也不起任何作用。
 - 文件本身的 Lua 错误（比如代码里的笔误）会打印在你启动 Eitri 的那个终端里，不会让启动中止：Eitri 会带着文件在出错之前已经设好的内容打开。
 
-`require` 只在 `init.lua` 旁边的 `lua/` 目录下找模块：`require("mine")` 加载 `~/.config/eitri/lua/mine.lua` 或 `~/.config/eitri/lua/mine/init.lua`，`require("a.b")` 加载 `lua/a/b.lua` 或 `lua/a/b/init.lua`。它从不在你打开的项目或当前目录里找，改动 `package.path` 或 `package.cpath` 也没有效果。
+`require` 只在 `init.lua` 旁边的 `lua/` 目录下找模块：`require("mine")` 加载该配置目录下的 `lua/mine.lua` 或 `lua/mine/init.lua`，`require("a.b")` 加载 `lua/a/b.lua` 或 `lua/a/b/init.lua`。它从不在你打开的项目或当前目录里找，改动 `package.path` 或 `package.cpath` 也没有效果。
 
 两种窗口读的是同一个文件：单窗口模式和 [companion 窗口](companion.zh-CN.md)。
 
@@ -32,17 +32,17 @@ eitri.config.set("review.hint", true)
 |---|---|---|---|
 | `agent.account` | 一个账号名 | 未设置 | 这个窗口使用的 Claude 账号。见[账号](#accounts)。 |
 | `agent.font_size` | 9 到 32 之间的数字 | 编辑器的字号 | agent 面板的基础字号，单位是像素。对话按基础字号的 12/14 绘制（回复、工具行和代码），所以读起来比编辑器的文字略小；面板底部的状态行按基础字号本身绘制，这样它和编辑器的状态栏对齐。不设置时，基础字号就是编辑器（`guifont`）的字号。 |
-| `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
+| `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `false` / `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
 | `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
 | `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会让 Eitri 在启动时停下。 |
 | `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"` 或 `"off"` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`Ctrl+o` 都会完整显示每段思考。 |
-| `agent.user_settings` | `true` 或 `false` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
+| `agent.user_settings` | `true` / `"on"` 或 `false` / `"off"` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
-| `review.enabled` | `true` 或 `false` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
-| `review.hint` | `true` 或 `false` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
-| `keymap.from_tmux` | `"on"` 或 `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
+| `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
+| `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
+| `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |
 
 设置只在窗口启动时读取一次。改了 `init.lua` 之后，开一个新窗口才会生效。
@@ -238,7 +238,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_CODEX` | Codex 标签页运行的 `codex`：一个现有文件的绝对路径，否则 Eitri 会在启动时停下并点出这个变量。它优先于 `agent.codex.command` 和 `PATH`。空值算作未设置。Eitri 不为 Codex 标签页设置 `CODEX_HOME`；Codex 读的是你的，而相对的 `CODEX_HOME` 会让每一次 Codex 启动都被拒绝。 |
 | `EITRI_NEOVIDE` | `eitri split` 启动的那个 Neovide。它必须指向一个现有文件；没设置时用 `PATH` 上的 `neovide`。 |
 | `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。 |
-| `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，而不是 `~/.config/eitri`。 |
+| `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，覆盖 Linux 的 XDG 配置目录或 `~/.config/eitri`。空值视为未设置，相对路径会拒绝启动。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
 | `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |
 | `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个。不是文件的路径会在会话启动时报错。 |

@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=2d8b576b12346701ef0e9618548e716a2a5f48c09f6d6405202721e2b6a3377e -->
+<!-- translated-from: INSTALL.md sha256=4215a8e1f3ad38d7bb9cf15fc7460ee1fc61d1198860373e6e84778347b5cbec -->
 
 # 安装 Eitri
 
@@ -77,9 +77,11 @@ sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic
 ## 卸载
 
 ```sh
-sh install.sh --uninstall            # 保留 ~/.config/eitri 和 $XDG_STATE_HOME/eitri
+sh install.sh --uninstall            # 保留你的设置和 $XDG_STATE_HOME/eitri
 sh install.sh --uninstall --purge    # 这两个也删掉
 ```
+
+你的设置就是 Eitri 读取设置的那个目录：`XDG_CONFIG_HOME` 非空且是绝对路径时是 `$XDG_CONFIG_HOME/eitri`，否则是 `~/.config/eitri`。`--purge` 从不删除 `EITRI_CONFIG_DIR` 指向的目录，因为那里可能还放着别的程序的设置；它会提示这一点，需要的话你自己删。
 
 这会删除安装脚本放下的所有东西：程序、启动器、desktop 条目、图标、GNOME Shell 扩展、sidecar、私有 nvim 和下载缓存。你自己的 `nvim` 永远不会被动到。如果你启用过 GNOME Shell 扩展，先把它停用。
 
@@ -98,7 +100,7 @@ sh install.sh --uninstall --purge    # 这两个也删掉
 | agent sidecar | `$XDG_DATA_HOME/eitri/sidecar/<rev>/` | 同左，按用户（AUR：`/usr/lib/eitri/`） |
 | 私有 nvim（仅在你接受时） | `$XDG_DATA_HOME/eitri/nvim/<version>/` | 同左 |
 
-不管哪种方式，你的配置都是 `~/.config/eitri/init.lua`，各项目的状态（布局、已打开的标签页、提示词历史、权限规则、信任回答、回合审阅快照）都在 `$XDG_STATE_HOME/eitri/`。`$XDG_DATA_HOME` 和 `$XDG_STATE_HOME` 默认是 `~/.local/share` 和 `~/.local/state`。私有 nvim 永远不会被放上你的 `PATH`。
+Linux 上，不管哪种方式，若 `XDG_CONFIG_HOME` 非空且为绝对路径，你的配置是 `$XDG_CONFIG_HOME/eitri/init.lua`，否则是 `~/.config/eitri/init.lua`。Mac 使用 `~/.config/eitri/init.lua`。非空的 `EITRI_CONFIG_DIR` 会覆盖配置目录，且必须是绝对路径；相对路径会拒绝启动。各项目的状态（布局、已打开的标签页、提示词历史、权限规则、信任回答、回合审阅快照）都在 `$XDG_STATE_HOME/eitri/`。`$XDG_DATA_HOME` 和 `$XDG_STATE_HOME` 默认是 `~/.local/share` 和 `~/.local/state`。私有 nvim 永远不会被放上你的 `PATH`。
 
 <a id="troubleshooting"></a>
 ## 疑难排解

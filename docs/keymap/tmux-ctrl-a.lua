@@ -1,4 +1,5 @@
--- Reproduces ~/.config/tmux/base.conf's bindings in Eitri. Paste into ~/.config/eitri/init.lua.
+-- Reproduces ~/.config/tmux/base.conf's bindings in Eitri. Paste into
+-- $XDG_CONFIG_HOME/eitri/init.lua (default ~/.config/eitri/init.lua).
 -- Since 0.2.1 Eitri reads your tmux config itself (keymap.from_tmux, on unless init.lua sets it
 -- "off"), which gives these same keys; this snippet is only needed with the import off. Left in
 -- place with the import on, it still applies cleanly on top of it and changes nothing.

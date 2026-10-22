@@ -14,6 +14,15 @@ const msg = (seq: number): TimelineItem => ({ kind: "message", seq, key: `m-${se
 const opts = { expanded: {}, detailed: false, turnRunning: false };
 
 describe("P2 runs", () => {
+  it("a_run_of_an_unphrased_tool_keeps_its_name_as_written", () => {
+    expect(runSummary([call(1, "acp:read"), call(2, "acp:read"), call(3, "acp:read")])).toBe("acp:read ×3");
+    expect(runSummary([call(1, "Read"), call(2, "Read"), call(3, "acp:read")])).toBe("Read 2 files, acp:read ×1");
+  });
+
+  it("a_run_that_starts_with_a_phrase_is_capitalised", () => {
+    expect(runSummary([call(1, "Read"), call(2, "Bash")])).toBe("Read 1 file, ran 1 command");
+  });
+
   it("collapses two or more finished calls in a row into one summary row", () => {
     const items = [msg(1), tool(call(2, "Read")), tool(call(3, "Read")), tool(call(4, "Bash")), msg(5)];
     const shown = buildDisplay(items, opts);

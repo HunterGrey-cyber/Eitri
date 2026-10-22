@@ -88,9 +88,13 @@ Coming from 0.2.0: the desktop entry was renamed, so pin Eitri to your dock agai
 ## Uninstalling
 
 ```sh
-sh install.sh --uninstall            # keeps ~/.config/eitri and $XDG_STATE_HOME/eitri
+sh install.sh --uninstall            # keeps your settings and $XDG_STATE_HOME/eitri
 sh install.sh --uninstall --purge    # removes those too
 ```
+
+Your settings are the directory Eitri reads them from: `$XDG_CONFIG_HOME/eitri` when `XDG_CONFIG_HOME`
+is non-empty and absolute, else `~/.config/eitri`. `--purge` never removes a directory `EITRI_CONFIG_DIR`
+names, since that may hold another program's settings too; it says so, and you remove it yourself.
 
 This removes everything the installer put in place: the program, the launcher, the desktop entry, the
 icons, the GNOME Shell extension, the sidecars, the private nvim and the download cache. It never touches
@@ -112,7 +116,10 @@ per-user sidecar and private nvim, which the package does not own (this also rem
 | agent sidecar | `$XDG_DATA_HOME/eitri/sidecar/<rev>/` | the same, per user (AUR: `/usr/lib/eitri/`) |
 | private nvim, if you accepted it | `$XDG_DATA_HOME/eitri/nvim/<version>/` | the same |
 
-For every route, your config is `~/.config/eitri/init.lua`, and per-project state (layout, open tabs,
+For every route on Linux, your config is `$XDG_CONFIG_HOME/eitri/init.lua` when `XDG_CONFIG_HOME`
+is non-empty and absolute, else `~/.config/eitri/init.lua`. The Mac uses `~/.config/eitri/init.lua`.
+A non-empty `EITRI_CONFIG_DIR` overrides the directory and must be absolute; a relative value refuses
+to start. Per-project state (layout, open tabs,
 prompt history, permission rules, trust answers, turn review snapshots) is in `$XDG_STATE_HOME/eitri/`.
 `$XDG_DATA_HOME` and `$XDG_STATE_HOME` default to `~/.local/share` and `~/.local/state`. The private nvim
 is never put on your `PATH`.

@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=f4b499c8f2dccee064fbbb4a5bc9169ac02c2f7ad5e7b066a68a16a282cc709a -->
+<!-- translated-from: permissions.md sha256=11ebb26448be0f340acb65bc92457da6b052635440328b9f8698926185d3ee57 -->
 
 # 权限与信任
 
@@ -121,7 +121,7 @@ Eitri 放行一次调用之后，Claude Code 仍可能自己再就它提问。�
 <a id="what-an-agent-session-loads"></a>
 ## 一个 agent 会话会加载什么
 
-和终端里的 `claude` 一样，每个会话都会加载你自己的 Claude Code 设置：你的 hook、插件、skill、`CLAUDE.md` 和权限规则。不想加载它们，就在 `~/.config/eitri/init.lua` 里写上：
+和终端里的 `claude` 一样，每个会话都会加载你自己的 Claude Code 设置：你的 hook、插件、skill、`CLAUDE.md` 和权限规则。不想加载它们，就在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里写上：
 
 ```lua
 eitri.config.set("agent.user_settings", false)    -- true (the default) or false

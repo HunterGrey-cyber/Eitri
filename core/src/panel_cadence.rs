@@ -48,7 +48,7 @@ pub const TYPING_WINDOW: Duration = Duration::from_millis(500);
 pub const SELF_DRIVEN_STEP_MS: u32 = 300;
 
 /// The value of [`CADENCE_KEY`] as `init.lua` left it: `None` for unset (the default), else the
-/// text. `Ok(None)` is `"off"` (every envelope goes at full rate, always); `Ok(Some(hz))` is the
+/// text. `Ok(None)` is `false` or `"off"` (every envelope goes at full rate, always); `Ok(Some(hz))` is the
 /// cadence. Anything else is an error naming the key -- the repo's config rule, as
 /// `agent.font_size` follows.
 pub fn parse_config(value: Option<&str>) -> Result<Option<u32>, String> {
@@ -56,14 +56,14 @@ pub fn parse_config(value: Option<&str>) -> Result<Option<u32>, String> {
         return Ok(Some(DEFAULT_CADENCE_HZ));
     };
     let text = raw.trim();
-    if text == "off" {
+    if crate::config_switch::is_off(text) {
         return Ok(None);
     }
     match text.parse::<u32>() {
         Ok(hz) if CADENCE_HZ_RANGE.contains(&hz) => Ok(Some(hz)),
         _ => Err(format!(
             "eitri.config.set(\"{CADENCE_KEY}\", {raw:?}): must be a whole number from {} to {} \
-             (panel updates per second while typing in the editor) or \"off\"",
+             (panel updates per second while typing in the editor) or false or \"off\"",
             CADENCE_HZ_RANGE.start(),
             CADENCE_HZ_RANGE.end(),
         )),
@@ -347,6 +347,12 @@ mod tests {
     }
 
     #[test]
+    fn false_turns_the_cadence_off_as_off_does() {
+        assert_eq!(parse_config(Some("false")), Ok(None));
+        assert_eq!(parse_config(Some(" false ")), parse_config(Some("off")));
+    }
+
+    #[test]
     fn config_accepts_the_range_and_off() {
         assert_eq!(parse_config(Some("8")), Ok(Some(8)));
         assert_eq!(parse_config(Some("1")), Ok(Some(1)));
@@ -379,6 +385,7 @@ mod tests {
             // A Lua number is stored as its text.
             (r#"eitri.config.set("agent.typing_cadence_hz", 12)"#, Ok(Some(12))),
             (r#"eitri.config.set("agent.typing_cadence_hz", "off")"#, Ok(None)),
+            (r#"eitri.config.set("agent.typing_cadence_hz", false)"#, Ok(None)),
         ] {
             lua.load(script).exec().unwrap();
             assert_eq!(parse_config(store.borrow().get(CADENCE_KEY)), expected, "{script}");

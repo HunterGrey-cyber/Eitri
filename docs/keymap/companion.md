@@ -21,8 +21,8 @@ page lists only what differs or crosses between the two windows.
 
 Focus moves need a window-manager adapter: sway, Hyprland and niri have one, GNOME and KDE do not (use
 the desktop's own window keys). `eitri.config.set("companion.wm", "auto" | "hyprland" | "sway" |
-"niri" | "none")` in `~/.config/eitri/init.lua` picks it; `none` never asks the window manager for
-anything.
+"niri" | "none")` in `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`)
+picks it; `none` never asks the window manager for anything.
 
 ## The prefix in a companion window
 

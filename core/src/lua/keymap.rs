@@ -420,6 +420,81 @@ mod tests {
         assert_eq!(effect(&layered), effect(&snippet));
     }
 
+    const I3_ALT_MOD: &str = include_str!("../../../docs/keymap/i3-alt-mod.lua");
+
+    /// The Alt chords a stock i3 (`/etc/i3/config`) or sway (`/etc/sway/config`) grabs when `$mod` is Alt.
+    const GRABBED_BY_ALT_MOD: &[&str] = &[
+        "M-H",
+        "M-J",
+        "M-K",
+        "M-L",
+        "M-w",
+        "M-s",
+        "M-a",
+        "M-d",
+        "M-Enter",
+        "M-S-Space",
+        "M--",
+        "M-_",
+        "M-Up",
+        "M-Down",
+        "M-Left",
+        "M-Right",
+        "M-1",
+        "M-2",
+        "M-3",
+        "M-4",
+        "M-5",
+        "M-e",
+    ];
+
+    #[test]
+    fn the_i3_alt_mod_sample_applies_on_the_stock_keymap_without_a_collision() {
+        let stock = Keymap::defaults();
+        let map = Keymap::apply_user(&run(I3_ALT_MOD), &[]).unwrap_or_else(|e| panic!("{e}"));
+        let key = |s: &str| KeySpec::parse(s).unwrap();
+        let grabbed: Vec<KeySpec> = GRABBED_BY_ALT_MOD.iter().map(|s| key(s)).collect();
+        let tmux: Vec<KeySpec> = crate::keymap::stock::STOCK_TMUX_PREFIX
+            .iter()
+            .map(|(k, _, _)| key(k))
+            .collect();
+
+        // Every grabbed row is gone from its Alt chord, and its action (with its repeat) is bound elsewhere.
+        for old in &grabbed {
+            let was = stock
+                .lookup(old)
+                .unwrap_or_else(|| panic!("{old:?} is not a stock row"));
+            assert!(map.lookup(old).is_none(), "{old:?} is still bound");
+            let moved_to: Vec<&KeySpec> = map
+                .bindings()
+                .iter()
+                .filter(|b| b.action == was.action && b.repeatable == was.repeatable && stock.lookup(&b.key).is_none())
+                .map(|b| &b.key)
+                .collect();
+            assert_eq!(moved_to.len(), 1, "{old:?} ({:?}) moved to {moved_to:?}", was.action);
+        }
+
+        // Where the rows went: new keys only, none of them a chord the config grabs or a key stock tmux binds.
+        let added: Vec<&KeySpec> = map
+            .bindings()
+            .iter()
+            .map(|b| &b.key)
+            .filter(|k| stock.lookup(k).is_none())
+            .collect();
+        assert_eq!(added.len(), grabbed.len(), "{added:?}");
+        for new in &added {
+            assert!(!grabbed.contains(new), "{new:?} is a chord the config grabs");
+            assert!(!tmux.contains(new), "{new:?} is bound in stock tmux's prefix table");
+        }
+
+        // Nothing else changed: the prefix and every row that was not grabbed.
+        assert_eq!(map.prefix(), stock.prefix());
+        for b in stock.bindings().iter().filter(|b| !grabbed.contains(&b.key)) {
+            let now = map.lookup(&b.key).unwrap_or_else(|| panic!("{:?} was unbound", b.key));
+            assert_eq!((&now.action, now.repeatable), (&b.action, b.repeatable), "{:?}", b.key);
+        }
+    }
+
     /// Lua does not specify the iteration order of the snippet's `pairs` loops.
     #[test]
     fn the_snippet_applies_the_same_whatever_order_pairs_runs_in() {

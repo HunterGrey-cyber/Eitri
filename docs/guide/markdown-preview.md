@@ -12,7 +12,7 @@ the block you are reading and gives Neovim the keys.
 
 ## Turn it on
 
-Add one line to `~/.config/eitri/init.lua` and open a new window:
+Add one line to `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`) and open a new window:
 
 ```lua
 eitri.plugin.load("markdown")

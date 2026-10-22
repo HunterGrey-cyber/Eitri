@@ -84,14 +84,12 @@ const APP_ID: &str = "cn.huntergrey.eitri";
 ///.
 const REFUSAL_FLASH: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// `EITRI_CONFIG_DIR` overrides the config directory (used by sandboxed/manual verification
-/// runs so they don't touch a real `~/.config/eitri`); otherwise the real per-user config dir.
+/// Resolve the user's configuration independently of the project's working directory.
 fn config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("EITRI_CONFIG_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").expect("HOME must be set");
-    PathBuf::from(home).join(".config").join("eitri")
+    eitri_core::config_dir::resolve(&|k| std::env::var_os(k)).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(1);
+    })
 }
 
 fn main() -> glib::ExitCode {
@@ -904,7 +902,7 @@ fn build_ui(
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Eitri")
+        .title(chrome::window_title(&chrome::project_display_name(project_root), None))
         .default_width(1280)
         .default_height(760)
         // No HeaderBar: decorated(false) suppresses GTK's own CSD titlebar entirely -- the
@@ -1470,7 +1468,7 @@ fn build_ui(
             }
             if let Some((view, mine)) = toast_for {
                 if let Some((_, title, way_back)) = way_backs.iter().find(|(v, _, _)| *v == view) {
-                    toast.show(&toast::permission_toast_text(
+                    toast.show_attention(&toast::permission_toast_text(
                         title,
                         mine,
                         agent
@@ -1867,6 +1865,7 @@ fn build_ui(
         retire_editor: retire_editor.clone(),
         prompt: kill_prompt.clone(),
         agent: agent_panel_handle.clone(),
+        terminals: Rc::downgrade(&terminals),
         window: window.clone(),
         app_name: top_bar.app_name.clone(),
         toast: toast.clone(),
@@ -2970,6 +2969,7 @@ fn build_ui(
         let workspaces = workspaces.clone();
         let button = top_bar.workspace.clone();
         let label = top_bar.workspace_label.clone();
+        let project = chrome::project_display_name(project_root);
         Rc::new(move || {
             let Ok(workspaces) = workspaces.try_borrow() else {
                 eprintln!("[workspace] BUG: the workspaces were borrowed while the top bar was redrawn");
@@ -2977,7 +2977,7 @@ fn build_ui(
             };
             let text = chrome::workspace_text(workspaces.order(), workspaces.current());
             drop(workspaces);
-            chrome::show_workspace(&button, &label, text.as_deref());
+            chrome::show_workspace(&button, &label, &project, text.as_deref());
         })
     };
     {
@@ -3242,26 +3242,30 @@ fn build_ui(
                 }
                 Action::ToggleSplit => {
                     if !grid.toggle_split(&target()) {
-                        println!("[modules] toggle-split: no split around the module on screen");
-                        flash(&refused_name);
+                        let text = "toggle-split: no split around the module on screen";
+                        println!("[modules] {text}");
+                        refuse_said(&refused_name, &toast, text);
                     }
                 }
                 Action::Rotate { down } => {
                     if !grid.rotate(down) {
-                        println!("[modules] rotate: fewer than two modules on screen");
-                        flash(&refused_name);
+                        let text = "rotate: fewer than two modules on screen";
+                        println!("[modules] {text}");
+                        refuse_said(&refused_name, &toast, text);
                     }
                 }
                 Action::Flip(axis) => {
                     if !grid.flip(axis) {
-                        println!("[modules] flip: no split that way on screen");
-                        flash(&refused_name);
+                        let text = "flip: no split that way on screen";
+                        println!("[modules] {text}");
+                        refuse_said(&refused_name, &toast, text);
                     }
                 }
                 Action::Spread => {
                     if !grid.spread(&target()) {
-                        println!("[modules] spread: no split around the module on screen");
-                        flash(&refused_name);
+                        let text = "spread: no split around the module on screen";
+                        println!("[modules] {text}");
+                        refuse_said(&refused_name, &toast, text);
                     }
                 }
                 // `even-*` are presets too, so `layout.next` goes on from them.
@@ -3321,8 +3325,9 @@ fn build_ui(
                 Action::SelectNumber => {
                     let plan = eitri_core::layout::number_plan(&module_layout.borrow());
                     if plan.is_empty() {
-                        println!("[prefix] select.number: no module on screen to number");
-                        flash(&refused_name);
+                        let text = "select.number: no module on screen to number";
+                        println!("[prefix] {text}");
+                        refuse_said(&refused_name, &toast, text);
                         return;
                     }
                     let Some(prefix) = prefix_cell.get() else {
@@ -3364,8 +3369,9 @@ fn build_ui(
                             println!("[prefix] select.last -> {id} (grab_focus={grabbed})");
                         }
                         None => {
-                            println!("[prefix] no last module");
-                            flash(&refused_name);
+                            let text = "no last module";
+                            println!("[prefix] {text}");
+                            refuse_said(&refused_name, &toast, text);
                         }
                     }
                 }
@@ -3380,8 +3386,9 @@ fn build_ui(
                             println!("[prefix] select.next -> {id} (grab_focus={grabbed})");
                         }
                         None => {
-                            println!("[prefix] no other module on screen");
-                            flash(&refused_name);
+                            let text = "no other module on screen";
+                            println!("[prefix] {text}");
+                            refuse_said(&refused_name, &toast, text);
                         }
                     }
                 }
@@ -3415,8 +3422,9 @@ fn build_ui(
                 Action::Module(id) if id.kind() == ModuleKind::Terminal => {
                     let id = eitri_core::layout::module_target(&module_layout.borrow(), &id);
                     if !module_layout.borrow().contains(&id) {
-                        println!("[prefix] {id}: not in this window");
-                        flash(&refused_name);
+                        let text = format!("{id}: not in this window");
+                        println!("[prefix] {text}");
+                        refuse_said(&refused_name, &toast, &text);
                         return;
                     }
                     let has_keys = focused().as_ref() == Some(&id);
@@ -3457,8 +3465,9 @@ fn build_ui(
                     };
                     // `v` before the canvas exists, or a module this window has not got.
                     if !grid.has_host(&id) {
-                        println!("[prefix] {id}: not in this window yet");
-                        flash(&refused_name);
+                        let text = format!("{id}: not in this window yet");
+                        println!("[prefix] {text}");
+                        refuse_said(&refused_name, &toast, &text);
                         return;
                     }
                     let has_keys = focused().as_ref() == Some(&id);
@@ -3476,17 +3485,27 @@ fn build_ui(
                         }
                     };
                     let (running, queued) = (agent.running_count(), agent.queued_count());
+                    // Counted now, as the window close counts them, so the close compares like with like.
+                    let jobs = terminal::jobs::count_terminal_jobs(&terminals.borrow());
                     // An extra chat view's y/n names the one tab it closes, with that tab's own counts.
                     let text = match ViewId::of_module(&id).filter(|view| !view.is_base()) {
                         Some(view) if scope == KillScope::Module => {
                             let (running, queued) = agent.view_running_queued(view);
                             let tab = agent.view_tab_label(view);
-                            kill_pane::prompt_closing_tab(&id, &kill_title(&id), scope, tab.as_deref(), running, queued)
+                            kill_pane::prompt_closing_tab(
+                                &id,
+                                &kill_title(&id),
+                                scope,
+                                tab.as_deref(),
+                                running,
+                                queued,
+                                jobs,
+                            )
                         }
-                        _ => kill_pane::prompt(&id, &kill_title(&id), scope, running, queued),
+                        _ => kill_pane::prompt(&id, &kill_title(&id), scope, running, queued, jobs),
                     };
                     // What `y` also answers for the window close, if this kill closes it.
-                    let confirmed = eitri_core::tabs::window_close_prompt(running, queued);
+                    let confirmed = eitri_core::tabs::window_close_prompt_with_jobs(running, queued, jobs);
                     let Some(prompt) = kill_prompt.get() else {
                         return;
                     };
@@ -3649,8 +3668,9 @@ fn build_ui(
                         grid.focus_child()
                     };
                     if !moved {
-                        println!("[modules] {}: nothing to select", action.name());
-                        flash(&refused_name);
+                        let text = format!("{}: nothing to select", action.name());
+                        println!("[modules] {text}");
+                        refuse_said(&refused_name, &toast, &text);
                     }
                 }
                 // A new terminal where the open rules say -- by default right of the module with the
@@ -3713,8 +3733,9 @@ fn build_ui(
                             println!("[modules] focus.mode-toggle -> {id} (grab_focus={grabbed})");
                         }
                         None => {
-                            println!("[modules] focus.mode-toggle: nothing in view on the other layer");
-                            flash(&refused_name);
+                            let text = "focus.mode-toggle: nothing in view on the other layer";
+                            println!("[modules] {text}");
+                            refuse_said(&refused_name, &toast, text);
                         }
                     }
                 }
@@ -3763,8 +3784,9 @@ fn build_ui(
                             }
                         }
                         None => {
-                            println!("[workspace] {}: this window has one workspace", action.name());
-                            flash(&refused_name);
+                            let text = format!("{}: this window has one workspace", action.name());
+                            println!("[workspace] {text}");
+                            refuse_said(&refused_name, &toast, &text);
                         }
                     }
                 }
@@ -3805,8 +3827,9 @@ fn build_ui(
                 }
                 Action::WorkspaceRename => start_rename(),
                 Action::InstanceNew { .. } => {
-                    println!("[prefix] {}: not in this build yet", action.name());
-                    flash(&refused_name);
+                    let text = format!("{}: not in this build yet", action.name());
+                    println!("[prefix] {text}");
+                    refuse_said(&refused_name, &toast, &text);
                 }
                 // tmux's `break-pane`, on the chat view with the keys: from the base view its active tab
                 // goes out into a new view right of it; from an extra view that view's tab comes back
@@ -3847,8 +3870,9 @@ fn build_ui(
                         }
                     }
                     BreakPlan::Refuse => {
-                        println!("[prefix] {}: the keys are in no chat view", action.name());
-                        flash(&refused_name);
+                        let text = format!("{}: the keys are in no chat view", action.name());
+                        println!("[prefix] {text}");
+                        refuse_said(&refused_name, &toast, &text);
                     }
                 },
                 // `prefix [`/`prefix PageUp`: the terminal's own read-only copy
@@ -3861,8 +3885,9 @@ fn build_ui(
                             pane.enter_copy_mode(up);
                         }
                     } else {
-                        println!("[prefix] prefix [ scrolls the terminal");
-                        flash(&refused_name);
+                        let text = "prefix [ scrolls the terminal";
+                        println!("[prefix] {text}");
+                        refuse_said(&refused_name, &toast, text);
                     }
                 }
             }
@@ -3891,8 +3916,7 @@ fn build_ui(
             let gate = selection_gate(&action, module_layout.borrow().selection());
             if gate == SelectionGate::Refuse {
                 println!("[modules] {}: {one_module_text}", action.name());
-                flash(&refused_name);
-                toast.show(&one_module_text);
+                refuse_said(&refused_name, &toast, &one_module_text);
                 return;
             }
             let keys_on_a_float = {
@@ -3901,8 +3925,7 @@ fn build_ui(
             };
             if float_gate(&action, keys_on_a_float) == FloatGate::Refuse {
                 println!("[modules] {}: {no_split_text}", action.name());
-                flash(&refused_name);
-                toast.show(&no_split_text);
+                refuse_said(&refused_name, &toast, &no_split_text);
                 return;
             }
             run_verb(action, keycode);
@@ -4741,6 +4764,9 @@ struct ShellQuitHost {
     /// first); every call before that finds none.
     prompt: Rc<std::cell::OnceCell<Rc<close_prompt::ClosePrompt>>>,
     agent: agent_panel::AgentPanelHandle,
+    /// Every terminal pane the window holds, live or idle; weak, as the window's other holders of
+    /// the registry are, so the quit flow keeps no pane alive.
+    terminals: std::rc::Weak<RefCell<Terminals<terminal::TerminalPane>>>,
     window: ApplicationWindow,
     app_name: gtk4::Label,
     toast: Rc<toast::Toast>,
@@ -4813,7 +4839,18 @@ impl editor_quit::QuitHost for ShellQuitHost {
         self.prompt.get().is_some_and(|prompt| prompt.confirmed())
     }
     fn window_close_prompt(&self) -> Option<String> {
-        eitri_core::tabs::window_close_prompt(self.agent.running_count(), self.agent.queued_count())
+        // A registry held by a caller up the stack counts as no jobs rather than panicking the close.
+        let jobs = self
+            .terminals
+            .upgrade()
+            .and_then(|terminals| {
+                terminals
+                    .try_borrow()
+                    .ok()
+                    .map(|t| terminal::jobs::count_terminal_jobs(&t))
+            })
+            .unwrap_or(0);
+        eitri_core::tabs::window_close_prompt_with_jobs(self.agent.running_count(), self.agent.queued_count(), jobs)
     }
     fn ask_to_close_window(&self, text: &str) {
         match self.prompt.get() {
@@ -4836,8 +4873,7 @@ impl editor_quit::QuitHost for ShellQuitHost {
         self.window.close();
     }
     fn refuse(&self, text: &str) {
-        flash(&self.app_name);
-        self.toast.show(text);
+        refuse_said(&self.app_name, &self.toast, text);
     }
     fn toast(&self, text: &str) {
         self.toast.show(text);
@@ -5239,11 +5275,18 @@ impl ShellStart {
     }
 }
 
-/// A refusal that has its own words: the app name flashes and the toast says why.
+/// A refusal that has its own words: said on stdout, the app name flashes and the toast says why.
 fn refuse_text(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, text: &str) {
     println!("[modules] refused: {text}");
+    refuse_said(app_name, toast, text);
+}
+
+/// A worded refusal whose caller has printed its own stdout line, under its own prefix: the app name
+/// flashes and the toast says `text`. A waiting card's toast stays up instead
+/// ([`toast::Toast::show_refusal`]); the flash and the stdout line still say a key was refused.
+fn refuse_said(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, text: &str) {
     flash(app_name);
-    toast.show(text);
+    toast.show_refusal(text);
 }
 
 /// Whether what the prefix waits for can be answered only by reading the strip in the top bar: the
@@ -5531,16 +5574,22 @@ fn open_plugin_module(
     Ok(())
 }
 
-/// Logs a refused layout operation and flashes the top bar's app name for `REFUSAL_FLASH`. A
-/// separate CSS class preserves the prefix indicator if it is armed meanwhile. Another refusal
-/// restarts the flash timer. There is one window per process (`NON_UNIQUE`), so one timer per
-/// thread suffices. A killed editor's `Gone` error also shows a toast.
+/// A layout verb the layout refused -- the last module on screen hidden, a module placed next to
+/// itself: said on stdout, and the top bar's app name shows the prefix indicator's block for
+/// [`REFUSAL_FLASH`]. Its own class, so a prefix armed meanwhile keeps its indicator. A
+/// second refusal inside the flash restarts it rather than being cut short by the first one's timer
+///. One window per process (`NON_UNIQUE`), so one timer per thread.
+/// The toast says why ([`refusal_text`]), so a refused key is not a silent blink.
 fn refuse(app_name: &gtk4::Label, toast: &Rc<toast::Toast>, err: &LayoutError) {
     println!("[modules] refused: {err}");
-    flash(app_name);
-    if let Some(text) = gone_editor_toast_text(err) {
-        toast.show(&text);
-    }
+    refuse_said(app_name, toast, &refusal_text(err));
+}
+
+/// What the toast says for a layout refusal: a killed editor's own sentence, since that refusal
+/// recurs for the rest of the window's life and must say how to get the editor back; the layout's
+/// own words for every other one.
+fn refusal_text(err: &LayoutError) -> String {
+    gone_editor_toast_text(err).unwrap_or_else(|| err.to_string())
 }
 
 /// Installs Ctrl+h/j/k/l navigation on a web module host, both at startup and for modules added
@@ -6658,8 +6707,8 @@ mod tests {
         assert_eq!(taken, 4, "Ctrl+h/j/k/l, and nothing else");
     }
 
-    /// `refuse` shows this toast for a killed editor. Other refusals add no toast and keep only the
-    /// flash and stdout message.
+    /// `refuse` shows this toast for a killed editor. Other refusals with text show their own
+    /// message through `refusal_text`.
     #[test]
     /// The toast covers normal nvim exits and crashes. The editor cannot restart
     /// in this window; relaunching restores it.
@@ -6676,5 +6725,123 @@ mod tests {
             gone_editor_toast_text(&LayoutError::LastVisible(ModuleId::editor())),
             None
         );
+    }
+
+    /// A refused layout verb says why on the toast: the layout's own words, and for a killed editor
+    /// the sentence that says how to get it back.
+    #[test]
+    fn refuse_toasts_every_layout_error() {
+        for err in [
+            LayoutError::LastVisible(ModuleId::editor()),
+            LayoutError::NoScratch,
+            LayoutError::NothingToUndo,
+            LayoutError::Gone(ModuleId::agent()),
+        ] {
+            assert_eq!(
+                refusal_text(&err),
+                err.to_string(),
+                "{err:?} shows the layout's own words"
+            );
+        }
+        assert_eq!(refusal_text(&LayoutError::NoScratch), "the scratchpad is empty");
+        assert_eq!(
+            refusal_text(&LayoutError::Gone(ModuleId::editor())),
+            editor_quit::RETIRED_EDITOR_TEXT,
+            "a killed editor's refusal says how to get the editor back"
+        );
+    }
+
+    /// Every refused key in `build_ui` that has words for a person shows them on the toast, through
+    /// `refuse`, `refuse_text` or `refuse_said`. A bare `flash(` there is one of the few refusals
+    /// whose words are internal or absent, each listed with why it stays a blink; a new one fails
+    /// here until it says why on the toast or joins the list with a reason.
+    #[test]
+    fn no_refusal_in_build_ui_only_flashes() {
+        use eitri_core::source_scan as scan;
+        // (text in the arm before its `flash(`, how many such arms, why it only flashes)
+        const FLASH_ONLY: &[(&str, usize, &str)] = &[
+            (
+                "if !switched",
+                2,
+                "a tab verb that found no tab prints nothing; tmux's own answer to it is a flash",
+            ),
+            (
+                "step_to",
+                1,
+                "a terminal step with nowhere to go prints nothing, as the tab verbs",
+            ),
+            ("not killed:", 1, "the words are an internal error's text"),
+            ("no container around", 1, "the words name a module by its internal id"),
+            (
+                "made, and still not in the layout",
+                1,
+                "the words describe an internal state",
+            ),
+            ("no new instance of", 1, "the words print a module kind as debug text"),
+        ];
+        let sources = scan::rust_sources(&["shell/src"]);
+        scan::require_anchors(&sources, &["fn build_ui(", "fn flash(", "fn refuse_said("]);
+        let file = scan::file_with(&sources, "fn build_ui(");
+        let code_text = scan::code_only(&file.text);
+        let raw: Vec<char> = file.text.chars().collect();
+        let code: Vec<char> = code_text.chars().collect();
+        assert_eq!(
+            raw.len(),
+            code.len(),
+            "code_only keeps one char for every char it reads"
+        );
+        let bodies = scan::functions(&code_text, "build_ui");
+        assert_eq!(bodies.len(), 1, "one build_ui in {}", file.path);
+        let body_at = bodies[0].as_ptr() as usize - code_text.as_ptr() as usize;
+        let start = code_text[..body_at].chars().count();
+        let end = start + bodies[0].chars().count();
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        let word: Vec<char> = "flash".chars().collect();
+        let mut found = vec![0usize; FLASH_ONLY.len()];
+        let mut bare = Vec::new();
+        for at in start..end - word.len() {
+            if code[at..at + word.len()] != word[..]
+                || ident(code[at - 1])
+                || code[at - 1] == '.'
+                || ident(code[at + word.len()])
+                || code[at + word.len()..end].iter().find(|c| !c.is_whitespace()) != Some(&'(')
+            {
+                continue;
+            }
+            // The arm is the innermost block around the call together with what opens it (an `if`,
+            // a `match` arm, a closure), back to the statement before.
+            let mut depth = 0usize;
+            let mut open = at;
+            loop {
+                open -= 1;
+                match code[open] {
+                    '}' => depth += 1,
+                    '{' if depth == 0 => break,
+                    '{' => depth -= 1,
+                    _ => {}
+                }
+            }
+            let head = (start..open)
+                .rev()
+                .find(|&j| matches!(code[j], ';' | '{' | '}'))
+                .unwrap_or(start);
+            let arm: String = raw[head + 1..at].iter().collect();
+            let hits: Vec<usize> = (0..FLASH_ONLY.len())
+                .filter(|&k| arm.contains(FLASH_ONLY[k].0))
+                .collect();
+            match hits.as_slice() {
+                [one] => found[*one] += 1,
+                [] => bare.push(arm.split_whitespace().collect::<Vec<_>>().join(" ")),
+                many => panic!("an arm matches more than one flash-only entry {many:?}: {arm}"),
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "a refusal in build_ui only flashes; show its words with refuse_said (or refuse_text), \
+             or list it with its reason: {bare:#?}"
+        );
+        for (k, (needle, count, why)) in FLASH_ONLY.iter().enumerate() {
+            assert_eq!(found[k], *count, "flash-only arms holding {needle:?} ({why})");
+        }
     }
 }

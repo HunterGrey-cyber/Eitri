@@ -166,6 +166,7 @@ impl Probe {
                 "p5" => self.p5_web().await,
                 "p6" => self.p6_pooled().await,
                 "p7" => self.p7_second_chat().await,
+                "p8" => self.p8_divider_pick().await,
                 other => say(format!("skip {other} unknown")),
             }
             self.release_all();

@@ -42,7 +42,7 @@ Neovim configuration and the `claude` you have installed.
   edit as its own diff row.
 - **Keyboard end to end.** vim keys in the panel, tmux keys for the window, `Ctrl+h/j/k/l` across panes.
 - **Review each turn.** `c` lists what changed on disk during the agent's turn; revert a hunk, or send comments back.
-- **Configured in Lua.** `~/.config/eitri/init.lua`, the way Neovim reads yours.
+- **Configured in Lua.** `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`), the way Neovim reads yours.
 - **Or beside your own nvim.** `:EitriPanel` opens just the agent panel as its own window next to the Neovim in your terminal.
 
 **Prefer to keep Neovim in your terminal?** Companion mode runs the same agent panel as a window of its own,

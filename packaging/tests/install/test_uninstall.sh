@@ -160,10 +160,9 @@ t_malformed_system_release_stops() {
 TESTS="$TESTS t_purge_exact"
 t_purge_exact() {
 	populate
-	mkdir -p "$TH/other config" "$TH/xdgconf/eitri"
+	mkdir -p "$TH/other config"
 	echo keep >"$TH/other config/init.lua"
-	echo keep >"$TH/xdgconf/eitri/keep"
-	inst --set "EITRI_CONFIG_DIR=$TH/other config" --set "XDG_CONFIG_HOME=$TH/xdgconf" -- --uninstall --purge
+	inst --set "EITRI_CONFIG_DIR=$TH/other config" -- --uninstall --purge
 	expect_rc 0
 	expect_eq "$(tree "$TH")" "./.cache d
 ./.config d
@@ -174,11 +173,115 @@ t_purge_exact() {
 ./.local/share/applications d
 ./.local/state d
 ./other config d
-./other config/init.lua f
-./xdgconf d
-./xdgconf/eitri d
-./xdgconf/eitri/keep f" "the tree after --uninstall --purge"
+./other config/init.lua f" "the tree after --uninstall --purge"
 	expect_no_out 'kept your settings'
+}
+
+TESTS="$TESTS t_purge_removes_the_config_directory_xdg_config_home_names"
+t_purge_removes_the_config_directory_xdg_config_home_names() {
+	# Eitri reads its settings from $XDG_CONFIG_HOME/eitri when that variable is absolute, so that
+	# is the directory a purge removes; ~/.config/eitri is then some other copy and stays.
+	populate
+	mkdir -p "$TH/xdgconf/eitri"
+	echo 'print("xdg")' >"$TH/xdgconf/eitri/init.lua"
+	inst --set "XDG_CONFIG_HOME=$TH/xdgconf" -- --uninstall --purge
+	expect_rc 0
+	expect_out "removing $TH/xdgconf/eitri"
+	expect_absent "$TH/xdgconf/eitri"
+	expect_dir "$TH/xdgconf"
+	expect_eq "$(cat "$TH/.config/eitri/init.lua")" 'print("mine")' "the settings under ~/.config"
+	expect_absent "$TH/.local/state/eitri"
+}
+
+TESTS="$TESTS t_purge_trims_a_trailing_slash_from_xdg_config_home"
+t_purge_trims_a_trailing_slash_from_xdg_config_home() {
+	# An XDG_CONFIG_HOME ending in slashes names the same directory as one without them. Left in, the
+	# settings path held `//`, so it never matched EITRI_CONFIG_DIR naming that same directory: the
+	# purge removed it and still said it had left EITRI_CONFIG_DIR alone.
+	for trailing in / //; do
+		populate
+		mkdir -p "$TH/xdgconf/eitri"
+		echo 'print("xdg")' >"$TH/xdgconf/eitri/init.lua"
+		inst --set "XDG_CONFIG_HOME=$TH/xdgconf$trailing" -- --uninstall
+		expect_rc 0
+		expect_out "kept your settings ($TH/xdgconf/eitri) and state ($TH/.local/state/eitri)"
+		inst --set "XDG_CONFIG_HOME=$TH/xdgconf$trailing" --set "EITRI_CONFIG_DIR=$TH/xdgconf/eitri" -- --uninstall --purge
+		expect_rc 0
+		expect_out "removing $TH/xdgconf/eitri"
+		expect_no_out '//eitri'
+		expect_no_out 'alone: EITRI_CONFIG_DIR names it'
+		expect_absent "$TH/xdgconf/eitri"
+		expect_eq "$(cat "$TH/.config/eitri/init.lua")" 'print("mine")' "the settings under ~/.config"
+		rm -rf "$TH/xdgconf"
+	done
+}
+
+TESTS="$TESTS t_purge_ignores_a_relative_or_empty_xdg_config_home"
+t_purge_ignores_a_relative_or_empty_xdg_config_home() {
+	# A relative or empty XDG_CONFIG_HOME is ignored, as every XDG reader ignores one: the settings
+	# are ~/.config/eitri, never a directory under wherever the installer happens to run.
+	for v in '' xdgconf; do
+		populate
+		mkdir -p "$T/cwd/xdgconf/eitri"
+		echo keep >"$T/cwd/xdgconf/eitri/keep"
+		inst --set "XDG_CONFIG_HOME=$v" -- --uninstall --purge
+		expect_rc 0
+		expect_out "removing $TH/.config/eitri"
+		expect_absent "$TH/.config/eitri"
+		expect_file "$T/cwd/xdgconf/eitri/keep"
+		rm -rf "$T/cwd/xdgconf"
+	done
+}
+
+TESTS="$TESTS t_purge_never_removes_eitri_config_dir"
+t_purge_never_removes_eitri_config_dir() {
+	# EITRI_CONFIG_DIR may name a directory shared with another program, so a purge leaves it and
+	# says so -- unless it is the settings directory itself (or inside it), which goes as a whole.
+	populate
+	mkdir -p "$TH/shared"
+	echo keep >"$TH/shared/init.lua"
+	inst --set "EITRI_CONFIG_DIR=$TH/shared" -- --uninstall --purge
+	expect_rc 0
+	expect_file "$TH/shared/init.lua"
+	expect_absent "$TH/.config/eitri"
+	expect_out "left $TH/shared alone: EITRI_CONFIG_DIR names it"
+	populate
+	inst --set "EITRI_CONFIG_DIR=$TH/.config/eitri/" -- --uninstall --purge
+	expect_rc 0
+	expect_absent "$TH/.config/eitri"
+	expect_no_out 'alone: EITRI_CONFIG_DIR names it'
+}
+
+TESTS="$TESTS t_purge_outside_home_still_asks_first"
+t_purge_outside_home_still_asks_first() {
+	# A settings directory outside HOME is refused as any other path outside it is: nothing is
+	# removed until the user removes that one by hand.
+	populate
+	mkdir -p "$T/outside-conf/eitri"
+	echo keep >"$T/outside-conf/eitri/init.lua"
+	before=$(snap_but_lock "$TH")
+	inst --set "XDG_CONFIG_HOME=$T/outside-conf" -- --uninstall --purge
+	expect_fail "a settings directory outside HOME"
+	expect_out "refusing to uninstall: these paths are not inside $TH"
+	expect_out "'$T/outside-conf/eitri'"
+	expect_out 'Nothing was removed'
+	expect_file "$T/outside-conf/eitri/init.lua"
+	expect_eq "$(snap_but_lock "$TH")" "$before" "the home after a refused purge"
+	rm -rf "$T/outside-conf"
+}
+
+TESTS="$TESTS t_keep_message_names_the_directory_kept"
+t_keep_message_names_the_directory_kept() {
+	populate
+	mkdir -p "$TH/xdgconf/eitri"
+	inst --set "XDG_CONFIG_HOME=$TH/xdgconf" -- --uninstall
+	expect_rc 0
+	expect_out "kept your settings ($TH/xdgconf/eitri) and state ($TH/.local/state/eitri)"
+	expect_dir "$TH/xdgconf/eitri"
+	expect_dir "$TH/.config/eitri"
+	inst --set "XDG_CONFIG_HOME=xdgconf" -- --uninstall
+	expect_rc 0
+	expect_out "kept your settings ($TH/.config/eitri) and state ($TH/.local/state/eitri)"
 }
 
 TESTS="$TESTS t_purge_outside_home_refused"
@@ -246,11 +349,12 @@ t_xdg_newline_refused() {
 	# newline-joined target list: XDG_DATA_HOME="$HOME/Documents<NL>$HOME/y" removed ~/Documents,
 	# with nothing of Eitri installed at all. It is refused as a newline in HOME is -- never
 	# replaced by the default, where the Rust side, which takes the value as given, would disagree.
+	# XDG_CONFIG_HOME names the settings a purge removes, so it is refused the same way.
 	populate
 	mkdir -p "$TH/Documents" "$TH/y"
 	echo mine >"$TH/Documents/keep"
 	before=$(snap "$TH")
-	for v in XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do
+	for v in XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_CONFIG_HOME; do
 		for m in '--uninstall --dry-run' --uninstall '--uninstall --purge'; do
 			# shellcheck disable=SC2086 # $m is two words by design
 			inst_nl "$v" $m

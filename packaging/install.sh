@@ -203,7 +203,8 @@ usage: sh install.sh [options]
                                checked: they catch a corrupt download, not a release someone else
                                built. Where ssh-keygen is installed the signature is checked anyway
   --allow-root                 run as root anyway (containers)
-  --uninstall [--purge]        remove Eitri; --purge also removes ~/.config/eitri and its state
+  --uninstall [--purge]        remove Eitri; --purge also removes its settings, $XDG_CONFIG_HOME/eitri
+                               (else ~/.config/eitri; never $EITRI_CONFIG_DIR), and its state
   --dry-run                    print every action without doing it
   --keep-build                 keep the sidecar build directory
   --sidecar-only [--release-file FILE]
@@ -350,6 +351,32 @@ xdg_dir() {
 	esac
 }
 
+# settings_dir -- sets NV_CONFIG to the directory Eitri on Linux reads its settings from, by the
+# rule shell's config_dir follows with EITRI_CONFIG_DIR left out: $XDG_CONFIG_HOME/eitri when that
+# variable is absolute, else $HOME/.config/eitri (an unset, empty or relative value is ignored, as
+# every XDG reader ignores one). EITRI_CONFIG_DIR is left out because it may name a directory another
+# program keeps its own settings in, so nothing here ever removes it. A newline is not refused here,
+# since only the uninstall removes this directory: do_uninstall refuses it there, and an install,
+# which only names the directory in a message, goes on. Trailing slashes are trimmed as HOME's are:
+# left in, `$XDG_CONFIG_HOME/` gave a path holding `//`, which the purge's comparison with
+# EITRI_CONFIG_DIR (trimmed the same way) never matched, so it removed the directory and still said
+# it had left it alone. A value that is only slashes is the root directory, so the result is /eitri.
+settings_dir() {
+	case ${XDG_CONFIG_HOME-} in
+	/*)
+		_sd_x=$XDG_CONFIG_HOME
+		while :; do
+			case $_sd_x in
+			?*/) _sd_x=${_sd_x%/} ;;
+			*) break ;;
+			esac
+		done
+		NV_CONFIG=${_sd_x%/}/eitri
+		;;
+	*) NV_CONFIG=$NV_HOME/.config/eitri ;;
+	esac
+}
+
 set_paths() {
 	NV_LIBROOT=$NV_HOME/.local/lib
 	NV_LIB=$NV_LIBROOT/eitri
@@ -360,6 +387,7 @@ set_paths() {
 	NV_CACHE=$XD_DIR
 	xdg_dir state
 	NV_STATE=$XD_DIR
+	settings_dir
 	NV_CACHE_NV=$NV_CACHE/eitri
 	NV_DL=$NV_CACHE_NV/download
 	NV_STAGE=$NV_CACHE_NV/unpack
@@ -3194,7 +3222,7 @@ desktop_exec_quote() {
 # there, so --uninstall comes first; WHAT is what to install after it. The list says what --uninstall
 # (do_uninstall, without --purge) removes and keeps.
 before_icon_advice() {
-	printf '%s' "Installing it with its own installer would leave any desktop entry and icons this installer installed beside its own. Nothing was changed. To go back to it, first run: eitri setup --uninstall (or, with this installer: sh install.sh --uninstall). It removes the launcher, the program in $NV_LIB, the desktop entries and icons, the licences, the private nvim and the sidecars Eitri built, and keeps your settings ($NV_HOME/.config/eitri) and state ($NV_STATE/eitri); then install $1"
+	printf '%s' "Installing it with its own installer would leave any desktop entry and icons this installer installed beside its own. Nothing was changed. To go back to it, first run: eitri setup --uninstall (or, with this installer: sh install.sh --uninstall). It removes the launcher, the program in $NV_LIB, the desktop entries and icons, the licences, the private nvim and the sidecars Eitri built, and keeps your settings ($NV_CONFIG) and state ($NV_STATE/eitri); then install $1"
 }
 
 # old_desktop_text: the eitri.desktop an installer before the app icon wrote for this user, byte for
@@ -3678,6 +3706,11 @@ under_home() {
 }
 
 do_uninstall() {
+	# The settings directory is a removal target under --purge and named in every uninstall's
+	# messages, so a newline in it is refused here as xdg_dir refuses one in the other XDG variables.
+	case $NV_CONFIG in
+	*"$NV_NL"*) die "XDG_CONFIG_HOME contains a newline, so no path built from it can be trusted: set XDG_CONFIG_HOME to one absolute directory (or unset it) and re-run" ;;
+	esac
 	rev_of_release "$NV_SYSTEM_RELEASE" "$NV_SYSTEM_REMEDY"
 	_du_sys=$RR_REV7
 	_du_launcher_note=
@@ -3787,11 +3820,28 @@ do_uninstall() {
 		from-source-node from-source-skia; do
 		set -- "$@" "$NV_CACHE_NV/$_du_p"
 	done
+	_du_cfg_note=
 	if [ "$OPT_PURGE" = 1 ]; then
-		# Purge only the shell's fallback config directory and the state directory.
-		# The config override may point at another program's config, and the shell does not read
-		# XDG_CONFIG_HOME.
-		set -- "$@" "$NV_HOME/.config/eitri" "$NV_STATE/eitri"
+		# Exactly two: the settings directory Eitri reads when EITRI_CONFIG_DIR is unset (settings_dir:
+		# $XDG_CONFIG_HOME/eitri or ~/.config/eitri, so the copy Eitri actually reads goes and any other
+		# is left alone), and the state directory by xdg_dir's rule. Never EITRI_CONFIG_DIR itself: it
+		# may name a directory another program keeps its settings in, and the user is told it stays.
+		set -- "$@" "$NV_CONFIG" "$NV_STATE/eitri"
+		if [ -n "${EITRI_CONFIG_DIR-}" ]; then
+			_du_ecd=$EITRI_CONFIG_DIR
+			while :; do
+				case $_du_ecd in
+				?*/) _du_ecd=${_du_ecd%/} ;;
+				*) break ;;
+				esac
+			done
+			# One that is the settings directory, or inside it, goes with it; saying it stayed would
+			# be false.
+			case $_du_ecd in
+			"$NV_CONFIG" | "$NV_CONFIG"/*) ;;
+			*) _du_cfg_note="left $EITRI_CONFIG_DIR alone: EITRI_CONFIG_DIR names it, and that may be a directory another program keeps its settings in. Remove it yourself if it holds only Eitri's settings" ;;
+			esac
+		fi
 	fi
 
 	# Only what exists is removed, so only what exists is checked: a path not there needs nothing,
@@ -3846,6 +3896,7 @@ do_uninstall() {
 	if [ -n "$_du_link_note" ]; then say "$_du_link_note"; fi
 	if [ -n "$_du_sidecar_link_note" ]; then say "$_du_sidecar_link_note"; fi
 	if [ -n "$_du_ext_note" ]; then say "$_du_ext_note"; fi
+	if [ -n "$_du_cfg_note" ]; then say "$_du_cfg_note"; fi
 	# A profile this install's steps put under /etc/apparmor.d stays (this installer never runs
 	# sudo): it names a path nothing runs from any more, and removing it takes root.
 	_du_uid=$(id -u 2>/dev/null) || _du_uid=
@@ -3861,7 +3912,7 @@ do_uninstall() {
 		say "Eitri is uninstalled"
 	fi
 	if [ "$OPT_PURGE" != 1 ]; then
-		say "kept your settings ($NV_HOME/.config/eitri) and state ($NV_STATE/eitri); --uninstall --purge removes them too"
+		say "kept your settings ($NV_CONFIG) and state ($NV_STATE/eitri); --uninstall --purge removes them too"
 	fi
 }
 

@@ -62,11 +62,12 @@ same project, the panel attaches to that one instead, and the first Neovim loses
 run :EitriPanel to attach again`. The band's other texts are `no editor attached: run :EitriPanel in nvim`,
 `editor detached: another Eitri panel attached to it` and `could not attach: <reason>`.
 
-The panel window has the application id `cn.huntergrey.eitri.Panel` and the title `Eitri · <project directory
-name>`, so a window rule can pick it out. It reads the same `~/.config/eitri/init.lua` as the one-window mode
-(`agent.account` applies); Lua panels and commands registered there are not shown, and one line in the panel's
-output says how many were left out. It has no editor, no bottom terminal and no layout of its own: the tab keys, `?`,
-`:`, the text size keys and `f` work under the prefix, and the layout keys answer `not in a companion window`.
+The panel window has the application id `cn.huntergrey.eitri.Panel` and the title `Eitri · <project directory name>`,
+so a window rule can pick it out. It reads the same `$XDG_CONFIG_HOME/eitri/init.lua` (default
+`~/.config/eitri/init.lua`) as the one-window mode (`agent.account` applies); Lua panels and commands registered there
+are not shown, and one line in the panel's output says how many were left out. It has no editor, no bottom terminal
+and no layout of its own: the tab keys, `?`, `:`, the text size keys and `f` work under the prefix, and the layout
+keys answer `not in a companion window`.
 
 ### Moving between the two windows
 
@@ -145,7 +146,8 @@ opening another.
 ## Window managers
 
 Which window manager moves focus is detected from the session; to force one or turn it off, put this in
-`~/.config/eitri/init.lua` (any other value stops the panel at startup, naming the key):
+`$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`; any other value stops the panel at
+startup, naming the key):
 
 ```lua
 eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", "sway", "niri", "gnome" or "none"

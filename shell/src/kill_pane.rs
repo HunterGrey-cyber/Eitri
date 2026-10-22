@@ -57,9 +57,18 @@ use neovide_editor::CallWatch;
 /// messages (the window-close prompt's two counts). For [`KillScope::Module`] they are the agent's
 /// own consequences, ignored for any other module; for [`KillScope::Window`] -- the last module on
 /// screen, whose kill closes Eitri -- they are the window close's, for every module, so this one
-/// question stands in for that one too.
-pub(crate) fn prompt(id: &ModuleId, title: &str, scope: KillScope, running: usize, queued: usize) -> String {
-    prompt_closing_tab(id, title, scope, None, running, queued)
+/// question stands in for that one too. `jobs` is the window close's third count, its terminals
+/// running a job (`terminal::jobs`), named only for [`KillScope::Window`]: a module's own kill ends
+/// at most its own terminal, whose y/n is tmux's plain one.
+pub(crate) fn prompt(
+    id: &ModuleId,
+    title: &str,
+    scope: KillScope,
+    running: usize,
+    queued: usize,
+    jobs: usize,
+) -> String {
+    prompt_closing_tab(id, title, scope, None, running, queued, jobs)
 }
 
 /// [`prompt`] for a chat view that shows one tab (`agent#N`): the y/n names the tab it closes,
@@ -72,6 +81,7 @@ pub(crate) fn prompt_closing_tab(
     tab: Option<&str>,
     running: usize,
     queued: usize,
+    jobs: usize,
 ) -> String {
     let mut consequences = Vec::new();
     if scope == KillScope::Window {
@@ -81,6 +91,11 @@ pub(crate) fn prompt_closing_tab(
         }
         if queued > 0 {
             consequences.push(format!("{queued} queued"));
+        }
+        match jobs {
+            0 => {}
+            1 => consequences.push("1 terminal job".to_string()),
+            n => consequences.push(format!("{n} terminal jobs")),
         }
         return format!("kill-pane {title}? {} (y/n)", consequences.join(", "));
     }
@@ -310,7 +325,7 @@ pub(crate) fn retire_on_declined_close(nvim_exited: bool, editor_gone: bool) -> 
 }
 
 /// Whether a window close after a `y` to [`KillScope::Window`] may skip its own y/n. `confirmed` is
-/// the window close's prompt (`eitri_core::tabs::window_close_prompt`) as it stood when the kill
+/// the window close's prompt (`eitri_core::tabs::window_close_prompt_with_jobs`) as it stood when the kill
 /// was asked, `now` as it stands at the close: the editor's close waits for nvim, whose own
 /// `:confirm qall` may be answered much later. Nothing worth asking about now, or exactly what was
 /// said yes to: no second question. Anything else is asked.
@@ -629,11 +644,11 @@ mod tests {
     #[test]
     fn the_prompt_is_tmuxs_kill_pane_prompt() {
         assert_eq!(
-            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0),
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 0),
             "kill-pane terminal? (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::lua("notes"), "Notes", KillScope::Module, 3, 3),
+            prompt(&ModuleId::lua("notes"), "Notes", KillScope::Module, 3, 3, 0),
             "kill-pane Notes? (y/n)"
         );
     }
@@ -642,15 +657,15 @@ mod tests {
     fn the_agents_prompt_says_how_many_tabs_are_running_or_queued() {
         let agent = ModuleId::agent();
         assert_eq!(
-            prompt(&agent, "agent", KillScope::Module, 0, 0),
+            prompt(&agent, "agent", KillScope::Module, 0, 0, 0),
             "kill-pane agent? (y/n)"
         );
         assert_eq!(
-            prompt(&agent, "agent", KillScope::Module, 1, 0),
+            prompt(&agent, "agent", KillScope::Module, 1, 0, 0),
             "kill-pane agent? 1 running (y/n)"
         );
         assert_eq!(
-            prompt(&agent, "agent", KillScope::Module, 2, 1),
+            prompt(&agent, "agent", KillScope::Module, 2, 1, 0),
             "kill-pane agent? 2 running, 1 queued (y/n)"
         );
     }
@@ -658,7 +673,7 @@ mod tests {
     #[test]
     fn the_editors_prompt_says_it_will_not_come_back() {
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Module, 5, 5),
+            prompt(&ModuleId::editor(), "editor", KillScope::Module, 5, 5, 0),
             "kill-pane editor? nvim cannot be reopened in this window (y/n)"
         );
     }
@@ -668,20 +683,39 @@ mod tests {
     #[test]
     fn the_last_modules_prompt_says_it_closes_eitri_and_what_is_running() {
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0),
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0, 0),
             "kill-pane editor? closes Eitri (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::editor(), "editor", KillScope::Window, 2, 1),
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 2, 1, 0),
             "kill-pane editor? closes Eitri, 2 running, 1 queued (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0),
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0, 0),
             "kill-pane terminal? closes Eitri, 1 running (y/n)"
         );
         assert_eq!(
-            prompt(&ModuleId::agent(), "agent", KillScope::Window, 0, 3),
+            prompt(&ModuleId::agent(), "agent", KillScope::Window, 0, 3, 0),
             "kill-pane agent? closes Eitri, 3 queued (y/n)"
+        );
+    }
+
+    /// Closing Eitri ends every terminal's job too, so the last module's kill names them as the
+    /// window close does; a module's own kill does not.
+    #[test]
+    fn the_last_modules_kill_names_terminal_jobs() {
+        assert_eq!(
+            prompt(&ModuleId::editor(), "editor", KillScope::Window, 0, 0, 2),
+            "kill-pane editor? closes Eitri, 2 terminal jobs (y/n)"
+        );
+        assert_eq!(
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Window, 1, 0, 1),
+            "kill-pane terminal? closes Eitri, 1 running, 1 terminal job (y/n)"
+        );
+        assert_eq!(
+            prompt(&ModuleId::terminal(), "terminal", KillScope::Module, 0, 0, 1),
+            "kill-pane terminal? (y/n)",
+            "a module's own kill asks tmux's plain question"
         );
     }
 
@@ -748,20 +782,20 @@ mod tests {
     fn the_y_n_for_an_extra_view_names_its_tab() {
         let view = ModuleId::parse("agent#2").unwrap();
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 0, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 0, 0, 0),
             "kill-pane agent 2? closes tab 3 refactor (y/n)"
         );
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 1, 2),
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, Some("3 refactor"), 1, 2, 0),
             "kill-pane agent 2? closes tab 3 refactor, 1 running, 2 queued (y/n)"
         );
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Module, None, 0, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Module, None, 0, 0, 0),
             "kill-pane agent 2? (y/n)",
             "a view whose tab has gone names none"
         );
         assert_eq!(
-            prompt_closing_tab(&view, "agent 2", KillScope::Window, Some("3 refactor"), 1, 0),
+            prompt_closing_tab(&view, "agent 2", KillScope::Window, Some("3 refactor"), 1, 0, 0),
             "kill-pane agent 2? closes Eitri, 1 running (y/n)",
             "the last module's kill is the window close's question"
         );
@@ -771,6 +805,7 @@ mod tests {
                 "terminal",
                 KillScope::Module,
                 Some("3 refactor"),
+                0,
                 0,
                 0
             ),

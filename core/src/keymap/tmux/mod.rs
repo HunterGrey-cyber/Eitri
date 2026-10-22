@@ -128,16 +128,10 @@ pub(crate) fn read_regular(path: &Path, limit: u64) -> Result<String, String> {
     read_bounded(file, limit, path)
 }
 
-/// `keymap.from_tmux` as `init.lua` set it: unset or `"on"` imports, `"off"` does not, anything
+/// `keymap.from_tmux` as `init.lua` set it: unset, `true` or `"on"` imports; `false` or `"off"` does not, anything
 /// else is a startup failure naming the key -- the same discipline as Eitri's other settings.
 pub fn enabled(value: Option<&str>) -> Result<bool, String> {
-    match value {
-        None | Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        Some(other) => Err(format!(
-            "eitri.config.set(\"{SETTING}\", {other:?}): it is \"on\" (the default) or \"off\""
-        )),
-    }
+    crate::config_switch::parse_switch(SETTING, value, true)
 }
 
 /// What the import reads with: the home directory, the environment tmux would have, and where the
@@ -632,5 +626,25 @@ mod glob_tests {
         assert!(fnmatch("[a-c]x", "bx"));
         assert!(fnmatch("\\*", "*"));
         assert!(!fnmatch("\\*", "a"));
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    #[test]
+    fn from_tmux_accepts_false_and_true() {
+        use crate::lua::config::{install, ConfigStore};
+        use std::{cell::RefCell, rc::Rc};
+        let lua = mlua::Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        for (value, expected) in [("false", false), ("true", true), ("\"off\"", false), ("\"on\"", true)] {
+            lua.load(format!("eitri.config.set(\"keymap.from_tmux\", {value})"))
+                .exec()
+                .unwrap();
+            assert_eq!(super::enabled(store.borrow().get(super::SETTING)), Ok(expected));
+        }
     }
 }

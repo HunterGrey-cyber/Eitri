@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=164fc451facd5a8ce564edd9695d6db03bb87f1833ded60fc4f3213139907f24 -->
+<!-- translated-from: companion.md sha256=1e5517a5af3ed056e095d167a93ae0aa7f28bcf7743404f566439c28b44522ea -->
 
 # 配合你自己的 Neovim 使用
 
@@ -39,7 +39,7 @@ eitri panel [--nvim <addr>] [DIR]
 
 每个项目只有一个面板。第二次 `:EitriPanel` 会把正在运行的面板窗口带到前面，而不是再开一个。如果是从面板已经附着的那个 Neovim 里运行，它就只做这个；如果是从同一个项目里的另一个 Neovim 里运行，面板就改为附着到那一个，第一个 Neovim 里的胶水代码会被撤掉。如果 Neovim 退出了，面板会保留它的会话，状态条写 `editor detached: run :EitriPanel to attach again`。状态条的其他文字是 `no editor attached: run :EitriPanel in nvim`、`editor detached: another Eitri panel attached to it` 和 `could not attach: <reason>`。
 
-面板窗口的应用 id 是 `cn.huntergrey.eitri.Panel`，标题是 `Eitri · <项目目录名>`，所以窗口规则可以把它挑出来。它读取和单窗口模式相同的 `~/.config/eitri/init.lua`（`agent.account` 适用）；在那里注册的 Lua 面板和命令不会显示，面板的输出里会有一行说有多少个被略去。它没有编辑器、没有底部终端，也没有自己的布局：标签页键、`?`、`:`、文字大小键和 `f` 在前缀下可用，布局键则回答 `not in a companion window`。
+面板窗口的应用 id 是 `cn.huntergrey.eitri.Panel`，标题是 `Eitri · <项目目录名>`，所以窗口规则可以把它挑出来。它读取和单窗口模式相同的 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）（`agent.account` 适用）；在那里注册的 Lua 面板和命令不会显示，面板的输出里会有一行说有多少个被略去。它没有编辑器、没有底部终端，也没有自己的布局：标签页键、`?`、`:`、文字大小键和 `f` 在前缀下可用，布局键则回答 `not in a companion window`。
 
 ### 在两个窗口之间移动
 
@@ -93,7 +93,7 @@ Neovide 在你启动 `eitri split` 的那个 shell 的前台运行，和 Neovide
 
 ## 窗口管理器
 
-由哪个窗口管理器来移动焦点，是从会话里检测出来的；要强制指定一个，或者把它关掉，把下面这个写进 `~/.config/eitri/init.lua`（其他任何值都会让面板在启动时停下，并点出这个键）：
+由哪个窗口管理器来移动焦点，是从会话里检测出来的；要强制指定一个，或者把它关掉，把下面这个写进 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`；其他任何值都会让面板在启动时停下，并点出这个键）：
 
 ```lua
 eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", "sway", "niri", "gnome" or "none"

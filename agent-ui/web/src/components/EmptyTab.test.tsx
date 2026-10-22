@@ -97,7 +97,7 @@ describe("EmptyTab: the box is the dashboard's New session row", () => {
   /* 2026-10-16: without the keys the empty box was the brightest thing in the window and said nothing. */
   it("names the key that brings the keys here while the panel lacks them, and nothing once it has them", () => {
     const away = renderEmpty({ paneFocused: false, entryKey: "Ctrl+l" });
-    expect(away.container.querySelector("textarea")!.getAttribute("placeholder")).toBe("Ctrl+l to start typing");
+    expect(away.container.querySelector("textarea")!.getAttribute("placeholder")).toBe("Ctrl+l, then i to type");
     away.rerender(<EmptyTab {...away.props} paneFocused />);
     expect(away.container.querySelector("textarea")!.hasAttribute("placeholder")).toBe(false);
   });
@@ -112,7 +112,7 @@ describe("EmptyTab: the box is the dashboard's New session row", () => {
 
   it("names the key it was given, not a literal one, and names none when it has none", () => {
     const remapped = renderEmpty({ paneFocused: false, entryKey: "Alt+l" });
-    expect(remapped.container.querySelector("textarea")!.getAttribute("placeholder")).toBe("Alt+l to start typing");
+    expect(remapped.container.querySelector("textarea")!.getAttribute("placeholder")).toBe("Alt+l, then i to type");
     for (const entryKey of [null, undefined]) {
       const unknown = renderEmpty({ paneFocused: false, entryKey });
       expect(unknown.container.querySelector("textarea")!.hasAttribute("placeholder")).toBe(false);

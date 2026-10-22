@@ -60,11 +60,25 @@ pub(crate) fn workspace_text(order: &[String], current: &str) -> Option<String> 
     (order.len() > 1).then(|| current.to_string())
 }
 
-/// Shows `text` on the workspace button, or hides it. Plain text, never markup: a workspace name is
-/// whatever the user or a state file gave.
-pub(crate) fn show_workspace(button: &gtk4::Button, label: &gtk4::Label, text: Option<&str>) {
+/// The window's title: the project's name, then the product, then -- while the window has several
+/// workspaces -- the one on screen. The window has no title bar, so the title is what a window
+/// switcher, an overview and a compositor's window rules read to tell two windows apart.
+pub(crate) fn window_title(project: &str, workspace: Option<&str>) -> String {
+    match workspace {
+        Some(name) => format!("{project} \u{2014} Eitri \u{b7} {name}"),
+        None => format!("{project} \u{2014} Eitri"),
+    }
+}
+
+/// Shows `text` on the workspace button, or hides it, and gives the window holding the label the
+/// matching title ([`window_title`]), so the title and the label never disagree. Plain text, never
+/// markup: a workspace name is whatever the user or a state file gave.
+pub(crate) fn show_workspace(button: &gtk4::Button, label: &gtk4::Label, project: &str, text: Option<&str>) {
     label.set_text(text.unwrap_or(""));
     button.set_visible(text.is_some());
+    if let Some(window) = label.root().and_downcast::<gtk4::Window>() {
+        window.set_title(Some(&window_title(project, text)));
+    }
 }
 
 /// Opens the rename entry holding `current`, selected, so typing replaces it.
@@ -264,6 +278,36 @@ mod tests {
         assert_eq!(
             mark_text(Some(&ModuleId::agent()), &title),
             Some("marked: agent".to_string())
+        );
+    }
+
+    #[test]
+    fn the_title_is_the_project_then_eitri() {
+        assert_eq!(super::window_title("neovibe", None), "neovibe \u{2014} Eitri");
+    }
+
+    #[test]
+    fn a_second_workspace_joins_the_title() {
+        assert_eq!(
+            super::window_title("neovibe", Some("docs")),
+            "neovibe \u{2014} Eitri \u{b7} docs"
+        );
+    }
+
+    /// The title is the label's twin: whichever function sets the workspace label sets the title in
+    /// the same call, from the same text.
+    #[test]
+    fn the_workspace_text_and_the_title_are_set_together() {
+        use eitri_core::source_scan as scan;
+        let code = scan::code_only(&scan::read_required("shell/src/chrome.rs").text);
+        let code = scan::without(&code, &scan::modules(&code, "tests"));
+        let bodies = scan::functions(&code, "show_workspace");
+        assert_eq!(bodies.len(), 1, "show_workspace is defined once");
+        assert!(bodies[0].contains("label.set_text("), "the label is set: {}", bodies[0]);
+        assert!(
+            bodies[0].contains(".set_title(") && bodies[0].contains("window_title("),
+            "the same function sets the window title from window_title: {}",
+            bodies[0]
         );
     }
 

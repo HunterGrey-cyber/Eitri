@@ -9,9 +9,11 @@ to [Keys](keys.md).
 
 ## init.lua
 
-Eitri reads `~/.config/eitri/init.lua` when a window starts. Set `EITRI_CONFIG_DIR` to a directory to read
-`init.lua` from there instead. There is no file to create first: without one, Eitri starts with its built-in
-defaults and prints a line saying so.
+On Linux, Eitri reads `$XDG_CONFIG_HOME/eitri/init.lua` when `XDG_CONFIG_HOME` is non-empty and
+absolute, otherwise `~/.config/eitri/init.lua`. The Mac uses `~/.config/eitri/init.lua`.
+Set `EITRI_CONFIG_DIR` to an absolute directory to read `init.lua` from there instead.
+An empty override counts as unset; a relative override refuses to start. There is no file to create first:
+without one, Eitri starts with its built-in defaults and prints a line saying so.
 
 Settings are made with `eitri.config.set(key, value)`. A value is a string, a number or a boolean (`true` or
 `false`); `nil` unsets the key again. A value Eitri cannot keep (a table or a function, say) is a startup
@@ -31,7 +33,7 @@ Three rules hold for every setting below:
   and does not stop the launch: Eitri opens with whatever the file had set before the error.
 
 `require` finds modules only under the `lua/` directory next to `init.lua`: `require("mine")` loads
-`~/.config/eitri/lua/mine.lua` or `~/.config/eitri/lua/mine/init.lua`, and `require("a.b")` loads
+`lua/mine.lua` or `lua/mine/init.lua` in that configuration directory, and `require("a.b")` loads
 `lua/a/b.lua` or `lua/a/b/init.lua`. It never looks in the project you opened or in the current directory, and
 changes to `package.path` or `package.cpath` have no effect.
 
@@ -43,17 +45,17 @@ Both windows read the same file: the one-window mode and the [companion window](
 |---|---|---|---|
 | `agent.account` | an account name | unset | The Claude account the window uses. See [Accounts](#accounts). |
 | `agent.font_size` | a number from 9 to 32 | the editor's size | The agent panel's base text size, in pixels. The conversation is drawn at 12/14 of the base (a reply, tool lines and code), so it reads a little smaller than the editor's text; the status line at the bottom of the panel is drawn at the base itself, so it lines up with the editor's statusline. Unset, the base is the editor's own size (`guifont`). |
-| `agent.typing_cadence_hz` | a whole number from 1 to 60, or `"off"` | `5` | While you type in the editor, how many times a second the agent panel is allowed to update. A steady slower rate keeps the panel from redrawing under your typing; `"off"` lets it update at full speed. |
+| `agent.typing_cadence_hz` | a whole number from 1 to 60, or `false` / `"off"` | `5` | While you type in the editor, how many times a second the agent panel is allowed to update. A steady slower rate keeps the panel from redrawing under your typing; `"off"` lets it update at full speed. |
 | `agent.default` | `"claude"`, `"codex"` or the name of an agent registered with `eitri.agent.register` | `"claude"` | The agent a new tab runs, and the first tab of a fresh window. See [Codex and other agents](agents.md). |
 | `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`. A relative path with a directory part stops Eitri at startup. |
 | `agent.default_mode` | `"manual"`, `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
 | `agent.restore` | `"offer"`, `"auto"` or `"off"` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
 | `agent.thinking` | `"collapsed"`, `"preview"`, `"expanded"` or `"hidden"` | `"collapsed"` | How the agent panel shows the agent's thinking. `"collapsed"` draws one quiet row per thought, opened with `Enter` like a tool's output; `"preview"` also shows the newest lines of a thought while it is being written, in a box that does not grow; `"expanded"` shows every thought in full; `"hidden"` shows none. `Ctrl+o` shows every thought in full whatever this says. |
-| `agent.user_settings` | `true` or `false` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
+| `agent.user_settings` | `true` / `"on"` or `false` / `"off"` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
 | `modules.chat.on_permission` | `"badge"` or `"reveal"` | `"badge"` | What happens when a permission card arrives while the agent panel is hidden. `"badge"` shows `agent ⚑N` in the top bar and a toast; `"reveal"` brings the panel back where it was, without moving the keys. While another pane is zoomed `"reveal"` shows the badge instead, because showing the panel would not put it on screen. A companion window never hides its panel, so the key does nothing there. |
-| `review.enabled` | `true` or `false` | `true` | Whether [turn review](turn-review.md) runs at all. `false` takes no snapshots and offers no review. |
-| `review.hint` | `true` or `false` | `false` | Whether a finished turn that edited files adds a one-line hint to the status band, and a running turn's edits are counted on a line above the input box. The review is one key away either way. |
-| `keymap.from_tmux` | `"on"` or `"off"` | `"on"` | Whether Eitri reads your tmux prefix and prefix-table keys from your tmux configuration. See [Keys](#keys). |
+| `review.enabled` | `true` / `"on"` or `false` / `"off"` | `true` | Whether [turn review](turn-review.md) runs at all. `false` takes no snapshots and offers no review. |
+| `review.hint` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a finished turn that edited files adds a one-line hint to the status band, and a running turn's edits are counted on a line above the input box. The review is one key away either way. |
+| `keymap.from_tmux` | `true` / `"on"` or `false` / `"off"` | `"on"` | Whether Eitri reads your tmux prefix and prefix-table keys from your tmux configuration. See [Keys](#keys). |
 | `companion.wm` | `"auto"`, `"hyprland"`, `"sway"`, `"niri"`, `"gnome"` or `"none"` | `"auto"` | Which window-manager adapter moves focus between the [companion window](companion.md) and your editor. `"auto"` detects it from the session; `"none"` never asks the window manager for anything. |
 
 The settings are read once, when the window starts. Change `init.lua` and open a new window to apply a change.
@@ -408,7 +410,7 @@ not settings and are not listed.
 | `EITRI_CODEX` | The `codex` a Codex tab runs: an absolute path to an existing file, else Eitri stops at startup and names the variable. It wins over `agent.codex.command` and `PATH`. Empty counts as unset. Eitri sets no `CODEX_HOME` for a Codex tab; Codex reads yours, and a relative `CODEX_HOME` makes every Codex start refuse. |
 | `EITRI_NEOVIDE` | The Neovide that `eitri split` starts. It must name an existing file; unset, `neovide` on `PATH` is used. |
 | `EITRI_PROJECT_DIR` | The project to open when no directory is given on the command line. The command-line directory wins over it, and it wins over the current directory. The installed `eitri` command does not read it: it opens the current directory when you name none. |
-| `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, instead of `~/.config/eitri`. |
+| `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, overriding the Linux XDG directory or `~/.config/eitri`. Empty is unset; a relative value refuses to start. |
 | `EITRI_AGENT_TRACE` | Set to `1` to print one `[turn-trace]` line per turn on stderr, with the turn's timings. |
 | `EITRI_SUPERVISOR` | Set to `1`, `true` or `yes` to let a window start `eitri-supervisor`, a dashboard of the agent status of every open window, when none is running. Unset, a window only connects to one you started yourself. |
 | `EITRI_SIDECAR_BINARY` | The path of a sidecar program to run agent sessions with, instead of the one `eitri setup` built or the package installed. A path that is not a file is an error when a session starts. |

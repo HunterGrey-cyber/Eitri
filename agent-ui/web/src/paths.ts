@@ -1,6 +1,7 @@
 import type { TimelineItem } from "./timeline";
 import { formatResultContent } from "./toolRegistry";
 import { primaryText } from "./copyText";
+import { fileChangesOf } from "./diff";
 
 export type PathRef = { path: string; line: number | null };
 
@@ -29,12 +30,18 @@ export function parsePath(text: string): PathRef | null {
  *  path would turn into a second command. */
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
-function fieldPaths(input: unknown): PathRef[] {
+function fieldPaths(name: string, input: unknown): PathRef[] {
   if (!input || typeof input !== "object") return [];
   const fields = input as Record<string, unknown>;
-  return ["file_path", "path", "notebook_path"].flatMap((k) => {
-    const value = fields[k];
-    return typeof value === "string" && value !== "" && !CONTROL_RE.test(value) ? [{ path: value, line: null }] : [];
+  const candidates = [
+    ...["file_path", "path", "notebook_path"].map((key) => fields[key]),
+    ...fileChangesOf(name, input).map((change) => change.filePath),
+  ];
+  const seen = new Set<string>();
+  return candidates.flatMap((value) => {
+    if (typeof value !== "string" || value === "" || CONTROL_RE.test(value) || seen.has(value)) return [];
+    seen.add(value);
+    return [{ path: value, line: null }];
   });
 }
 
@@ -47,13 +54,13 @@ function prosePaths(text: string): PathRef[] {
   return out;
 }
 
-/** Paths `gf` can open on this row. */
+/** The paths `gf` can open on this row, including the file headers it draws. */
 export function pathsIn(item: TimelineItem): PathRef[] {
   switch (item.kind) {
     case "tool":
-      return fieldPaths(item.call.input);
+      return fieldPaths(item.call.name, item.call.input);
     case "permission":
-      return fieldPaths(item.request.input);
+      return fieldPaths(item.request.toolName, item.request.input);
     case "prompt":
     case "message":
       return prosePaths(item.text);

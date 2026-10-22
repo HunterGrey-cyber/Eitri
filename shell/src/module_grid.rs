@@ -1598,6 +1598,21 @@ impl ModuleGrid {
         }
     }
 
+    /// Each visible divider as the probe finds it: its axis, its rectangle in the grid, and the handle
+    /// widget that takes a press on it.
+    #[cfg(feature = "probe")]
+    pub(crate) fn probe_dividers(&self) -> Vec<(Axis, Rect, gtk4::Widget)> {
+        self.imp()
+            .handles
+            .borrow()
+            .iter()
+            .filter_map(|h| {
+                let divider = h.current.borrow().clone()?;
+                Some((divider.axis, divider.rect, h.widget.clone().upcast()))
+            })
+            .collect()
+    }
+
     fn place_handles(&self, dividers: &[Divider]) {
         for (i, handle) in self.imp().handles.borrow().iter().enumerate() {
             let Some(divider) = dividers.get(i) else {
@@ -1615,7 +1630,7 @@ impl ModuleGrid {
             }
             handle.widget.set_child_visible(true);
             *handle.current.borrow_mut() = Some(divider.clone());
-            let r = divider.rect;
+            let r = handle_allocation(divider);
             let _ = handle.widget.measure(gtk4::Orientation::Horizontal, -1);
             let _ = handle.widget.measure(gtk4::Orientation::Vertical, r.w);
             handle
@@ -1654,6 +1669,31 @@ impl ModuleGrid {
             }
             child = widget.next_sibling();
         }
+    }
+}
+
+/// How far a divider's handle reaches past the line it draws, on each side. A divider is one pixel
+/// thick, and a pointer a pixel or two off it would land on the module beside it (a terminal then
+/// starts a selection instead of the divider moving). The handle sits above the hosts in the child
+/// list ([`band_insert_index`]), so the pixels it covers beyond the line are its own.
+pub(crate) const DIVIDER_REACH_PX: i32 = 2;
+
+/// The rectangle a divider's handle is allocated: the divider's own, widened by [`DIVIDER_REACH_PX`]
+/// across its thickness, for either orientation alike. Only the middle of it is painted
+/// (`theme::gtk_css`); the layout's own rectangle for the divider is unchanged.
+fn handle_allocation(divider: &Divider) -> Rect {
+    let r = divider.rect;
+    match divider.axis {
+        Axis::Row => Rect {
+            x: r.x - DIVIDER_REACH_PX,
+            w: r.w + 2 * DIVIDER_REACH_PX,
+            ..r
+        },
+        Axis::Column => Rect {
+            y: r.y - DIVIDER_REACH_PX,
+            h: r.h + 2 * DIVIDER_REACH_PX,
+            ..r
+        },
     }
 }
 
@@ -2125,7 +2165,10 @@ mod tests {
             .rev()
             .find(|child| match child {
                 Child::Host(id) => arrangement.rect_of(id).is_some_and(contains),
-                Child::Handle(n) => arrangement.dividers.get(*n).is_some_and(|d| contains(d.rect)),
+                Child::Handle(n) => arrangement
+                    .dividers
+                    .get(*n)
+                    .is_some_and(|d| contains(handle_allocation(d))),
             })
             .cloned()
     }
@@ -2219,19 +2262,19 @@ mod tests {
             }
         }
 
-        // The model against what the GUI pass measured on the default window: one column either
-        // side of the two that grab belongs to the editor and the agent.
+        // The default window: the handle covers the divider's line and DIVIDER_REACH_PX pixels either
+        // side of it, and the module beside it owns everything past that.
         let (layout, ids) = layout_and_add_order(&[], false);
         let arrangement = arrange(&layout, &frame);
         let r = arrangement.dividers[0].rect;
         assert_eq!(r.x, 760, "the default divider, as measured");
         let children = stack_as_add_builds(&ids);
         assert_eq!(
-            pick(&children, &arrangement, r.x - 1, 300),
+            pick(&children, &arrangement, r.x - DIVIDER_REACH_PX - 1, 300),
             Some(Child::Host(ModuleId::editor()))
         );
         assert_eq!(
-            pick(&children, &arrangement, r.x + 2, 300),
+            pick(&children, &arrangement, r.x + r.w + DIVIDER_REACH_PX + 1, 300),
             Some(Child::Host(ModuleId::agent()))
         );
 
@@ -2243,6 +2286,101 @@ mod tests {
         assert_eq!(
             pick(&stack_appended(&ids), &arrangement, r.x, r.y + r.h / 2),
             Some(Child::Host(ModuleId::lua("main1")))
+        );
+    }
+
+    /// A pointer one pixel off the line of any divider, of either orientation, still lands on the
+    /// divider's handle and never on a module: a terminal under a horizontal divider starts a text
+    /// selection from a press that missed the one-pixel line, where the vertical divider between two
+    /// columns takes the same press.
+    #[test]
+    fn a_press_within_a_pixel_of_a_divider_line_reaches_its_handle_for_both_orientations() {
+        use eitri_core::layout::Placement::{BelowRoot, InPlaceOfEditor, RightOfRoot};
+        let layouts: &[&[(&str, eitri_core::layout::Placement)]] = &[
+            &[],
+            &[("side1", RightOfRoot)],
+            &[("bottom1", BelowRoot)],
+            &[
+                ("main1", InPlaceOfEditor),
+                ("side1", RightOfRoot),
+                ("bottom1", BelowRoot),
+            ],
+        ];
+        let frame = Frame::new(UNALLOCATED, 1);
+        let mut orientations = BTreeSet::new();
+        for (panels, terminal_shown) in layouts.iter().flat_map(|p| [(p, false), (p, true)]) {
+            let (layout, ids) = layout_and_add_order(panels, terminal_shown);
+            let arrangement = arrange(&layout, &frame);
+            let children = stack_as_add_builds(&ids);
+            for (n, divider) in arrangement.dividers.iter().enumerate() {
+                let r = divider.rect;
+                orientations.insert(format!("{:?}", divider.axis));
+                for off in [-1, 0, 1] {
+                    // Along the line's middle, away from where another divider meets it.
+                    let (x, y) = match divider.axis {
+                        Axis::Row => (r.x + r.w / 2 + off, r.y + r.h / 2),
+                        Axis::Column => (r.x + r.w / 2, r.y + r.h / 2 + off),
+                    };
+                    assert_eq!(
+                        pick(&children, &arrangement, x, y),
+                        Some(Child::Handle(n)),
+                        "{panels:?} (terminal shown: {terminal_shown}): a press {off} px off the line of \
+                         divider {n} ({:?}) at ({x}, {y})",
+                        divider.axis
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            orientations.len(),
+            2,
+            "the layouts must give a divider of each orientation"
+        );
+    }
+
+    /// The widened handle changes nothing the layout sees: the allocation is the divider's rectangle
+    /// plus the reach across its thickness only, centred on it.
+    #[test]
+    fn a_handle_is_the_divider_widened_across_its_thickness_only() {
+        let (layout, _) = layout_and_add_order(&[], false);
+        let any = arrange(&layout, &Frame::new(UNALLOCATED, 1)).dividers[0].clone();
+        let row = Divider {
+            axis: Axis::Row,
+            rect: Rect {
+                x: 100,
+                y: 200,
+                w: 1,
+                h: 300,
+            },
+            ..any
+        };
+        assert_eq!(
+            handle_allocation(&row),
+            Rect {
+                x: 100 - DIVIDER_REACH_PX,
+                y: 200,
+                w: 1 + 2 * DIVIDER_REACH_PX,
+                h: 300
+            }
+        );
+        let column = Divider {
+            axis: Axis::Column,
+            rect: Rect {
+                x: 10,
+                y: 50,
+                w: 400,
+                h: 1,
+            },
+            ..row
+        };
+        assert_eq!(
+            handle_allocation(&column),
+            Rect {
+                x: 10,
+                y: 50 - DIVIDER_REACH_PX,
+                w: 400,
+                h: 1 + 2 * DIVIDER_REACH_PX
+            }
         );
     }
 

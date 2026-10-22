@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=68f207cb77f9dd5c5e0a5ef921dd3ddd4ea5d8cdf7e98efbf71a8fefde7fe280 -->
+<!-- translated-from: getting-started.md sha256=f76b3760967635e7d07446f0a47609d7c6154523ee95ed6944728c93a7234873 -->
 
 # 快速上手
 
@@ -16,7 +16,7 @@ eitri [DIR]
 
 `DIR` 是项目目录。不写的话，Eitri 在设置了 `$EITRI_PROJECT_DIR` 时用它，否则用你运行命令时所在的目录。如果给的路径不是目录，或者给了 Eitri 不认识的选项，启动会直接带着一条消息停下，而不是去打开别的目录；要打开名字以 `-` 开头的目录，在它前面加 `--`（`eitri -- -notes`）。
 
-每次启动都是一个独立的窗口，有自己的 Neovim、自己的会话和自己的项目根目录，所以你可以同时打开好几个项目。
+每次启动都是一个独立的窗口，有自己的 Neovim、自己的会话和自己的项目根目录，所以你可以同时打开好几个项目。窗口标题写着项目名（`myproject — Eitri`；有两个工作区时再加上当前显示的那个：`myproject — Eitri · docs`），窗口切换器和合成器的窗口规则读的就是它。
 
 窗口一侧是你的编辑器，另一侧是 agent 面板。编辑器就是你自己的 Neovim，带着你的配置和插件。面板从一个空标签页开始，上面显示项目目录、配置了 Claude 账号时的账号名，以及一个简短的菜单：
 
@@ -36,7 +36,7 @@ eitri [DIR]
 <a id="your-first-turn"></a>
 ## 你的第一个回合
 
-在面板里按 `i`（或 `Ctrl+j`），输入你的提示。`Enter` 发送；`Shift+Enter` 换行，`Alt+Enter` 以及反斜杠加 `Enter` 也一样。会话在你发出第一条消息时才启动，不会更早；而且在一个自带 Claude Code 配置（`.claude/`、`.mcp.json` 或 `CLAUDE.md`）的项目里，要等你回答一个问题才会启动：Eitri 会先扣住这次启动，问是否信任那份配置。`y` 加载它，`n` 不加载它而启动会话，`Esc` 把这次启动推迟并把你的文字还给你。在你回答之前，面板会写 “Waiting for your answer to the trust question — nothing has started”。问题显示什么、每个回答意味着什么，见[信任一个项目](permissions.zh-CN.md#trusting-a-project)。每条消息还会带上编辑器里打开的文件名，或者你在那里用 Visual 模式选中的行。选区才是让 agent 指向某一段代码的方式，所以说“修好这个函数”之前，先在编辑器里把那个函数选上；光标位置本身不会被发送。
+按 `Ctrl+l` 把焦点移到面板，再按 `i`（或 `Ctrl+j`）输入你的提示。如果你重新绑定了模块焦点键，就用那个键代替 `Ctrl+l`。`Enter` 发送；`Shift+Enter` 换行，`Alt+Enter` 以及反斜杠加 `Enter` 也一样。会话在你发出第一条消息时才启动，不会更早；而且在一个自带 Claude Code 配置（`.claude/`、`.mcp.json` 或 `CLAUDE.md`）的项目里，要等你回答一个问题才会启动：Eitri 会先扣住这次启动，问是否信任那份配置。`y` 加载它，`n` 不加载它而启动会话，`Esc` 把这次启动推迟并把你的文字还给你。在你回答之前，面板会写 “Waiting for your answer to the trust question — nothing has started”。问题显示什么、每个回答意味着什么，见[信任一个项目](permissions.zh-CN.md#trusting-a-project)。每条消息还会带上编辑器里打开的文件名，或者你在那里用 Visual 模式选中的行。选区才是让 agent 指向某一段代码的方式，所以说“修好这个函数”之前，先在编辑器里把那个函数选上；光标位置本身不会被发送。
 
 Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示。agent 运行的每个工具是单独一行安静的文字，前面的标记说明它已完成（`✓`）、失败（`✗`）还是仍在运行（`◐`）：一条命令、一个读过的文件、一次搜索。每一次文件编辑是一张小卡片，写着文件名和增删的行数，diff 就在卡片里。
 
@@ -57,7 +57,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 4. 第二个终端拿着按键时，按 `<prefix> Alt+Shift+Space` 让它浮起来，再按 `<prefix> Alt+_` 把它收进便笺板。`<prefix> Alt+-` 把它叫回来；再按一遍这个序列，又把它收起来。
 5. 按 `<prefix> s`，再按 `c`，复制当前排布，建一个第二工作区并切过去。`<prefix> L` 回到之前的工作区。模块是同一批，每个工作区保留自己的排布。
 6. 移到基础 agent 面板。按 `<prefix> c` 添加第二个聊天标签页，再按 `<prefix> !` 把这个标签页拆进面板旁边独立的视图。基础视图必须至少留下一个标签页。在新视图里按 `<prefix> !`，就把标签页并回去。
-7. 要为还没有保存过布局的项目设置起始布局，在 `~/.config/eitri/init.lua` 里写 `eitri.layout.default(...)`。窗口运行起来之后，`eitri.layout.export()` 会返回能粘贴到那里的布局调用，包括工作区和浮动窗口；[配置](configuration.zh-CN.md#layout-from-lua)里有用 Lua 命令把这段文字存下来的例子。导出会略去编号聊天视图：它们要有保存的标签页才能在启动后留下来，所以用[打开规则](configuration.zh-CN.md#where-a-new-module-opens)安排新视图的位置。
+7. 要为还没有保存过布局的项目设置起始布局，在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里写 `eitri.layout.default(...)`。窗口运行起来之后，`eitri.layout.export()` 会返回能粘贴到那里的布局调用，包括工作区和浮动窗口；[配置](configuration.zh-CN.md#layout-from-lua)里有用 Lua 命令把这段文字存下来的例子。导出会略去编号聊天视图：它们要有保存的标签页才能在启动后留下来，所以用[打开规则](configuration.zh-CN.md#where-a-new-module-opens)安排新视图的位置。
 
 标签式、堆叠式容器、调整大小和其余布局按键，见[按键](keys.zh-CN.md#前缀)。
 

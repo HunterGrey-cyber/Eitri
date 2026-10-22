@@ -116,9 +116,10 @@ fn has_uri_scheme(raw: &str) -> bool {
 }
 
 /// Resolves a Lua-registered webview panel's `url` field against `<config_dir>/panels/`, per
-/// the plugin-loading convention (`~/.config/eitri/panels/*.html`). A bare relative filename
-/// resolves there; anything already carrying a URI scheme (`data:`, `file://`, `http://`,
-/// `https://`, ...) or starting with `/` is used exactly as given.
+/// the plugin-loading convention (`$XDG_CONFIG_HOME/eitri/panels/*.html`, default
+/// `~/.config/eitri/panels/*.html`). A bare relative filename resolves there; anything already
+/// carrying a URI scheme (`data:`, `file://`, `http://`, `https://`, ...) or starting with `/` is
+/// used exactly as given.
 pub fn resolve_panel_url(config_dir: &std::path::Path, raw: &str) -> String {
     if has_uri_scheme(raw) || raw.starts_with('/') {
         raw.to_string()

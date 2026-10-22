@@ -26,7 +26,9 @@ export function runSummary(calls: ToolCallRecord[]): string {
   const text = Array.from(counts, ([name, n]) =>
     Object.prototype.hasOwnProperty.call(RUN_PHRASES, name) ? RUN_PHRASES[name](n) : `${shortToolName(name)} ×${n}`,
   ).join(", ");
-  return text.charAt(0).toUpperCase() + text.slice(1);
+  return calls.length > 0 && Object.prototype.hasOwnProperty.call(RUN_PHRASES, calls[0].name)
+    ? text.charAt(0).toUpperCase() + text.slice(1)
+    : text;
 }
 
 /** `Write`, `Edit` and `NotebookEdit` can finish without a permission card under `acceptEdits`.

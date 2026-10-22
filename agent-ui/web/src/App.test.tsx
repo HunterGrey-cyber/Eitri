@@ -619,7 +619,7 @@ describe("App handshake", () => {
       kind: "keymap", prefix: "Ctrl+b", window: [{ keys: "Alt+h / Alt+l", what: "Module left / right" }],
       prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c",
     });
-    expect(hint(container)).toBe("Alt+l to start typing");
+    expect(hint(container)).toBe("Alt+l, then i to type");
     dispatch({ kind: "editor_link", state: "attached", text: "nvim" });
     expect(hint(container)).toBeNull();
   });
