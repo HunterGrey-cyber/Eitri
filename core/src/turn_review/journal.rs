@@ -169,8 +169,9 @@ impl Journal {
         };
         let json = serde_json::to_vec(&entry).map_err(|e| ShadowError::Io(std::io::Error::other(e)))?;
 
-        // Bounded: a collection holds the lock for as long as it runs, and a write waiting that
-        // long would only leave the user wondering; it fails before the file is touched.
+        // Bounded: a collection holds the lock exclusively while it deletes refs and objects, and
+        // a write waiting longer than this would only leave the user wondering; it fails before the
+        // file is touched.
         let _lock = shadow.lock_shared_until(Instant::now() + READ_TIMEOUT)?;
         shadow.pin_journal_locked(&id, note.pre.as_deref(), note.intended.as_deref())?;
         let temporary = self.dir.join(format!(".{id}.json.tmp"));

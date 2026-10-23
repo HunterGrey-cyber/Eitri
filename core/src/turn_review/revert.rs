@@ -1005,10 +1005,19 @@ fn restore_entry(
         .read_stored(pre_blob)
         .map_err(store_failed)?
         .ok_or(Refusal::Retained)?;
+    // Held from the store until the anchor exists: retention deletes objects only with the lock held
+    // exclusively, and a blob stored a moment ago whose old pack its repack had already looked at can
+    // be left looking old.
+    let anchoring = shadow
+        .lock_shared_until(Instant::now() + READ_TIMEOUT)
+        .map_err(store_failed)?;
     let now = save_current(shadow, &current)?;
+    #[cfg(test)]
+    super::test_hooks::run(&super::test_hooks::AFTER_RECOVERY_STORE);
     shadow
         .anchor_revert(&entry.session, &stamp(wall_clock_ms()), now.blob(), Some(pre_blob))
         .map_err(store_failed)?;
+    drop(anchoring);
     let content = Content::Bytes {
         bytes: pre_bytes,
         mode: entry.mode,
@@ -1809,5 +1818,177 @@ mod tests {
         editor.target.set(None);
         assert!(EmbeddedAsk(Some(&editor)).buffer_state(file, None).is_none());
         assert_eq!(editor.asked.borrow().len(), 2);
+    }
+
+    /// Sets every file directly in `dir` to have last changed `age` ago.
+    fn backdate_files_in(dir: &Path, age: Duration) {
+        let when = std::time::SystemTime::now() - age;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let file = std::fs::File::open(entry.unwrap().path()).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                .unwrap();
+        }
+    }
+
+    /// The race this pins. A collection's repack reads each old pack's time when it starts. A
+    /// recovery that then stores bytes the store already has in such a pack, reached by no ref,
+    /// only touches that pack; the repack writes the blob out loose with the time it read, and the
+    /// prune that follows would remove it unless the recovery's anchor exists by then. The test
+    /// stands in for the repack's early read by setting the pack's old time back once the recovery
+    /// has stored, and holds the recovery between its store and its anchor until the collection
+    /// either finished or waits for the store lock, so only the recovery's own hold keeps the
+    /// prune from running first.
+    #[test]
+    fn a_blob_a_recovery_stores_while_a_collection_repacks_survives_its_prune() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::sync::mpsc;
+
+        use super::super::test_hooks::{self, AFTER_RECOVERY_STORE, BEFORE_GC, BEFORE_PRUNE};
+
+        /// Only a guard against a hang: every wait below ends as soon as the other side acts.
+        const HANG: Duration = Duration::from_secs(120);
+
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let scratch = std::env::temp_dir().join(format!("eitri-revert-recovery-gc-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+        let scratch = RemoveOnDrop(scratch.canonicalize().unwrap());
+        let project = scratch.0.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let review_dir =
+            super::super::shadow::review_dir_for(Some(scratch.0.join("state").as_os_str()), None, &project).unwrap();
+        let shadow = Shadow::open_with_excludes(&review_dir, &project, None).unwrap();
+        let git = |args: &[&str]| {
+            let mut cmd = shadow.git(None);
+            cmd.args(args);
+            shadow.run_ok("test git", cmd, None, Instant::now() + HANG).unwrap();
+        };
+
+        // What the file holds when its window died halfway through a revert, already in the store
+        // from an earlier snapshot and packed, then left behind by every ref.
+        let left: &[u8] = b"what the file held when its window died\n";
+        let kept = shadow.store_blob(left).unwrap();
+        git(&["update-ref", "refs/test/earlier", &kept]);
+        let journal = Journal::open(&review_dir).unwrap();
+        let note = JournalNote {
+            session: "s1".into(),
+            path: PathBuf::from("a.txt"),
+            pre: Some(shadow.store_blob(b"before the revert\n").unwrap()),
+            pre_mode: 0o644,
+            intended: Some(shadow.store_blob(b"what the revert was writing\n").unwrap()),
+        };
+        // Dropping the hold without removing the entry is what a crash leaves.
+        let entry_id = journal.begin(&note, 0o644, &shadow).unwrap().id().to_owned();
+        let file = project.join("a.txt");
+        std::fs::write(&file, left).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        git(&["repack", "-a", "-d"]);
+        git(&["prune-packed"]);
+        git(&["update-ref", "-d", "refs/test/earlier"]);
+        let pack_dir = shadow.git_dir().join("objects/pack");
+        let loose = shadow.git_dir().join("objects").join(&kept[..2]).join(&kept[2..]);
+        assert!(!loose.exists(), "the blob is in a pack only");
+        backdate_files_in(&pack_dir, Duration::from_secs(2 * 3600));
+
+        let (in_gc_tx, in_gc_rx) = mpsc::channel::<()>();
+        let (stored_tx, stored_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (at_prune_tx, at_prune_rx) = mpsc::channel::<(bool, bool)>();
+
+        let collection = {
+            let shadow = shadow.clone();
+            let lock = review_dir.join("lock");
+            let loose = loose.clone();
+            std::thread::spawn(move || {
+                test_hooks::set(&BEFORE_GC, move || {
+                    in_gc_tx.send(()).unwrap();
+                    stored_rx
+                        .recv_timeout(HANG)
+                        .expect("the recovery stored the file's bytes");
+                    // The time the repack would have read before the recovery touched the pack.
+                    backdate_files_in(&pack_dir, Duration::from_secs(2 * 3600));
+                });
+                test_hooks::set(&BEFORE_PRUNE, move || {
+                    let old_and_loose = loose
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(3600));
+                    // Whether the prune would wait: an exclusive lock not taken within a moment
+                    // (another thread's fork can hold a copy of a lock just that long) is held.
+                    let waits = super::super::shadow::flock_file(
+                        &lock,
+                        libc::LOCK_EX,
+                        Some(Instant::now() + Duration::from_millis(500)),
+                    )
+                    .is_err();
+                    at_prune_tx.send((old_and_loose, waits)).unwrap();
+                });
+                shadow.trim(100, Duration::from_secs(30 * 24 * 3600), wall_clock_ms(), "1.hour.ago")
+            })
+        };
+
+        let recovery = {
+            let (review_dir, project) = (review_dir.clone(), project.clone());
+            std::thread::spawn(move || {
+                in_gc_rx.recv_timeout(HANG).expect("the collection reached its repack");
+                test_hooks::set(&AFTER_RECOVERY_STORE, move || {
+                    stored_tx.send(()).unwrap();
+                    let _ = go_rx.recv_timeout(HANG);
+                });
+                RecoverJob {
+                    spec: ShadowSpec {
+                        review_dir: Some(review_dir.clone()),
+                        root: project.clone(),
+                        excludes: Some(None),
+                    },
+                    guard: PresenceGuard::for_tests(&review_dir, std::process::id(), 0),
+                    entry: entry_id,
+                    answer: RecoverAnswer::Restore(EditorClear::for_tests(&project.join("a.txt"))),
+                    final_hook: None,
+                    fs_hooks: FsHooks::default(),
+                }
+                .run()
+            })
+        };
+
+        let Ok((old_and_loose, waits)) = at_prune_rx.recv_timeout(HANG) else {
+            panic!(
+                "the collection never reached its prune: collection {:?}, recovery {:?}",
+                collection.join().map_err(|_| "panicked"),
+                recovery.join().map_err(|_| "panicked")
+            );
+        };
+        assert!(
+            old_and_loose,
+            "the repack left the stored blob loose with its pack's old time, for the prune to remove"
+        );
+        // A prune that does not wait runs before the anchor, as it can whenever the store and the
+        // anchor are not under one hold.
+        let trimmed = if waits {
+            go_tx.send(()).unwrap();
+            collection.join().unwrap()
+        } else {
+            let trimmed = collection.join().unwrap();
+            go_tx.send(()).unwrap();
+            trimmed
+        };
+        let recovered = recovery.join().unwrap();
+        trimmed.unwrap();
+        assert_eq!(
+            recovered,
+            Ok(Recovered::Restored),
+            "the recovery anchored the bytes it stored"
+        );
+        assert_eq!(
+            shadow.read_stored(&kept).unwrap().as_deref(),
+            Some(left),
+            "the bytes the file held survive the collection"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"before the revert\n");
     }
 }

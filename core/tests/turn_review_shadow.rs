@@ -592,6 +592,210 @@ fn trim_waits_for_a_running_snapshot() {
     assert!(shadow.snapshot_refs().unwrap().is_empty());
 }
 
+/// Holds a real `git gc` at its very start. A FIFO stands in for the git directory's `gc.pid`,
+/// which gc opens for reading (to see whether another gc is running) before it does any work, and
+/// which nothing else reads. The open blocks until a writer comes, so [`entered`](Self::entered)
+/// knows gc is there; the read that follows blocks until the writer closes, so gc stays there until
+/// [`release`](Self::release).
+struct GcGate {
+    path: PathBuf,
+    writer: Option<std::fs::File>,
+}
+
+impl GcGate {
+    fn new(git_dir: &Path) -> GcGate {
+        use std::os::unix::ffi::OsStrExt;
+        let path = git_dir.join("gc.pid");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        GcGate { path, writer: None }
+    }
+
+    /// Waits until a gc has the FIFO open, and keeps it held there. A write-only open that does not
+    /// block fails with `ENXIO` for as long as no reader has the FIFO open.
+    fn entered(&mut self, what: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path)
+            {
+                Ok(writer) => {
+                    self.writer = Some(writer);
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+                Err(e) => panic!("the gc gate {}: {e}", self.path.display()),
+            }
+            assert!(std::time::Instant::now() < deadline, "{what} never reached git gc");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Lets the held gc go on: it reads an empty pid file, so no other gc is running.
+    fn release(&mut self) {
+        self.writer = None;
+    }
+}
+
+impl Drop for GcGate {
+    /// Lets a gc go on whatever became of the test, since git runs in a process group of its own and
+    /// would otherwise outlive the test binary, blocked. One held in its read sees the end of the
+    /// file once the writer closes. One still blocked in its open (the test gave up waiting for it,
+    /// or failed before it waited) is let through by an open for reading and writing, which never
+    /// blocks on a FIFO and counts as the writer that open waits for. The FIFO is then removed, so a
+    /// gc that comes later finds no pid file instead of blocking with nobody left to let it go.
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        self.writer = None;
+        let waker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.path);
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_fifo()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        drop(waker);
+    }
+}
+
+#[test]
+fn a_snapshot_never_waits_for_a_running_collection() {
+    let _env = environment();
+    let scratch = Scratch::new("gc-concurrent");
+    let project = scratch.project();
+    let shadow = scratch.shadow(&project);
+    for turn in 1..=3u32 {
+        write(&project.join("f"), format!("content of turn {turn}\n").as_bytes());
+        taken(shadow.snapshot(
+            SESSION,
+            &label(turn, SnapshotKind::End, u64::from(turn)),
+            &Limits::default(),
+        ));
+    }
+
+    let mut gate = GcGate::new(shadow.git_dir());
+    let (done_tx, done_rx) = mpsc::channel();
+    let trimmer = shadow.clone();
+    let collection = std::thread::spawn(move || {
+        // Only turn 3 is kept. `now` lets the collection remove every object no ref reaches, however
+        // new, so nothing but the order of its steps keeps a snapshot taken meanwhile whole.
+        let result = trimmer.trim(1, Duration::from_secs(3600), 10, "now");
+        // The test may have failed and gone already.
+        let _ = done_tx.send(());
+        result
+    });
+    gate.entered("the trim");
+
+    // Turn 1's content again: its objects lost their last ref a moment ago, and the snapshot that
+    // brings them back must not lose them to the collection running beside it.
+    write(&project.join("f"), b"content of turn 1\n");
+    let limits = Limits {
+        timeout: Duration::from_secs(20),
+        ..Limits::default()
+    };
+    let during = shadow.snapshot(SESSION, &label(4, SnapshotKind::End, 4), &limits);
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the collection finished while the gate still held it"
+    );
+    let during = match during {
+        SnapshotOutcome::Taken(snapshot) => snapshot,
+        SnapshotOutcome::Unavailable(why) => panic!("the snapshot waited for the running gc: {why}"),
+    };
+    gate.release();
+    collection.join().unwrap().unwrap();
+
+    assert_eq!(
+        shadow.read_blob(&during.commit, Path::new("f")).unwrap().as_deref(),
+        Some(&b"content of turn 1\n"[..])
+    );
+    sgit(&shadow, &["fsck", "--connectivity-only", "--no-dangling"]);
+    let names: Vec<String> = shadow
+        .snapshot_refs()
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            format!("refs/eitri/{SESSION}/3/end"),
+            format!("refs/eitri/{SESSION}/4/end"),
+        ]
+    );
+}
+
+/// What retention's step between its two deleting steps relies on git for: `repack -A -d` (what
+/// its `gc --no-prune` runs) writes an unreachable object of an old pack out loose with that pack's
+/// time, not the time of the repack, and the prune that follows removes it by that time. So a blob
+/// whose old pack was only touched after the repack started comes out looking old, and only a ref
+/// made before the prune keeps it.
+#[test]
+fn a_repack_writes_an_unreachable_packed_blob_out_loose_with_its_packs_time() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _env = environment();
+    let scratch = Scratch::new("loosened-old");
+    let project = scratch.project();
+    let shadow = scratch.shadow(&project);
+    let old = shadow.store_blob(b"in an old pack, reached by nothing\n").unwrap();
+    let recent = shadow.store_blob(b"loose, recent, reached by nothing\n").unwrap();
+    sgit(&shadow, &["update-ref", "refs/test/old", &old]);
+    sgit(&shadow, &["repack", "-a", "-d"]);
+    sgit(&shadow, &["prune-packed"]);
+    sgit(&shadow, &["update-ref", "-d", "refs/test/old"]);
+    let objects = shadow.git_dir().join("objects");
+    let loose = |id: &str| objects.join(&id[..2]).join(&id[2..]);
+    assert!(!loose(&old).exists(), "the blob is in a pack only");
+    assert!(
+        loose(&recent).exists(),
+        "an unreachable loose blob is left loose by a repack"
+    );
+
+    let pack_dir = objects.join("pack");
+    backdate(&pack_dir, Duration::from_secs(2 * 3600));
+    let pack_time = std::fs::read_dir(&pack_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension() == Some(OsStr::new("pack")))
+        .map(|p| std::fs::metadata(p).unwrap().mtime())
+        .expect("one pack");
+    sgit(&shadow, &["repack", "-A", "-d"]);
+    assert_eq!(
+        std::fs::metadata(loose(&old)).map(|m| m.mtime()).ok(),
+        Some(pack_time),
+        "the repack wrote the unreachable blob out loose with its pack's time"
+    );
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    shadow
+        .trim(100, Duration::from_secs(30 * 24 * 3600), now_ms, "1.hour.ago")
+        .unwrap();
+    assert!(
+        !shadow_has_object(&shadow, &old),
+        "the prune removed the blob written out with its pack's old time"
+    );
+    assert!(
+        shadow_has_object(&shadow, &recent),
+        "the prune keeps an unreachable blob newer than its expiry"
+    );
+}
+
 #[test]
 fn a_file_ignored_later_stops_being_copied() {
     let _env = environment();
@@ -1267,4 +1471,252 @@ fn only_git_rs_builds_git_commands() {
         }
     }
     assert!(scanned >= 3);
+}
+
+/// The variable naming the directory [`measure_a_large_collection`] builds its store in.
+const MEASURE_DIR: &str = "EITRI_GC_MEASURE_DIR";
+
+/// Removes a directory when dropped, a failed run's too.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A small fast generator, so the fixture is the same on every run without a crate for it.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn bytes(&mut self, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            out.extend_from_slice(&self.next().to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn line(&mut self) -> String {
+        format!("let value_{:016x} = compute({:016x});\n", self.next(), self.next())
+    }
+}
+
+/// Sets every file under `dir` to have last changed `age` ago, as a store whose objects were written
+/// that long before looks to `git prune`. git's object files are read-only to their owner, who may
+/// still set their times.
+fn backdate(dir: &Path, age: Duration) {
+    let when = std::time::SystemTime::now() - age;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else if entry.file_type().unwrap().is_file() {
+                let file = std::fs::File::open(entry.path()).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                    .unwrap();
+            }
+        }
+    }
+}
+
+/// One line of `git count-objects -v`, as `key=value` pairs.
+fn object_counts(shadow: &Shadow) -> String {
+    text(&sgit(shadow, &["count-objects", "-v"]))
+        .lines()
+        .map(|line| line.replace(": ", "="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Runs `trim` on `shadow` while two probes watch: one takes the store lock shared again and again
+/// and keeps the longest it had to wait (what any snapshot, read or write would wait), the other
+/// takes snapshots of the project one after another and keeps how long each took. Prints what it saw.
+fn measured_trim(shadow: &Shadow, what: &str, keep: usize, now_ms: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let limits = Limits {
+        timeout: Duration::from_secs(1800),
+        ..Limits::default()
+    };
+    // The probe's own session: one turn whose base it takes again and again (the ref is replaced
+    // each time), warmed first so its snapshots during the trim hash nothing new. Dated after every
+    // real turn, it is kept, and takes one of the `keep` places.
+    let probe_label = SnapshotLabel {
+        turn: 1,
+        kind: SnapshotKind::Base,
+        turn_id: "probe".into(),
+        tab: 9,
+        time_ms: u64::MAX / 4,
+    };
+    taken(shadow.snapshot("probe", &probe_label, &limits));
+    let before = object_counts(shadow);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let lock_probe = {
+        let (shadow, stop) = (shadow.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let (mut longest, mut tries) = (Duration::ZERO, 0u32);
+            while !stop.load(Ordering::SeqCst) {
+                let at = Instant::now();
+                let held = shadow.lock_shared().unwrap();
+                longest = longest.max(at.elapsed());
+                tries += 1;
+                drop(held);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (longest, tries)
+        })
+    };
+    let snapshot_probe = {
+        let (shadow, stop, limits) = (shadow.clone(), stop.clone(), limits.clone());
+        std::thread::spawn(move || {
+            let mut took = Vec::new();
+            let mut unavailable = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                let at = Instant::now();
+                if let SnapshotOutcome::Unavailable(why) = shadow.snapshot("probe", &probe_label, &limits) {
+                    eprintln!("measure: a probe snapshot was unavailable: {why}");
+                    unavailable += 1;
+                }
+                took.push(at.elapsed());
+            }
+            (took, unavailable)
+        })
+    };
+
+    let at = Instant::now();
+    shadow
+        .trim(keep, Duration::from_secs(30 * 24 * 3600), now_ms, "1.hour.ago")
+        .unwrap();
+    let trim_took = at.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    let (longest_wait, tries) = lock_probe.join().unwrap();
+    let (mut took, unavailable) = snapshot_probe.join().unwrap();
+    took.sort();
+    let after = object_counts(shadow);
+    println!("measure: {what}: trim took {trim_took:?}");
+    println!("measure: {what}: objects before: {before}");
+    println!("measure: {what}: objects after:  {after}");
+    println!("measure: {what}: longest wait for the store lock (shared), over {tries} takes: {longest_wait:?}");
+    println!(
+        "measure: {what}: {} snapshots taken during the trim ({unavailable} unavailable): fastest {:?}, median {:?}, slowest {:?}",
+        took.len(),
+        took.first().copied().unwrap_or_default(),
+        took.get(took.len() / 2).copied().unwrap_or_default(),
+        took.last().copied().unwrap_or_default(),
+    );
+}
+
+/// How long a collection of a large store takes, and how long snapshots wait while it runs. A
+/// measurement, not a check: it asserts no time. It does nothing unless `EITRI_GC_MEASURE_DIR` names
+/// a directory to build its store in (about 2 GiB at its largest), which it removes again. Run it
+/// alone (`--ignored --exact --nocapture`) and read the `measure:` lines.
+///
+/// The store: a project of 2,000 small text files in 40 directories and 20 binary files of 4 MiB.
+/// Each of 150 turns takes a base snapshot, changes 3 lines in each of 40 small files and rewrites
+/// 2 of the large ones with new bytes, and takes an end snapshot. Its objects are then dated two
+/// hours back, and a trim keeping 100 turns runs: the 50 oldest turns' objects are what `git prune`
+/// removes. Then 20 more turns, dated back the same way, and a second trim: the store as an hourly
+/// trim finds it, already packed once.
+#[test]
+#[ignore = "a measurement: set EITRI_GC_MEASURE_DIR and run it alone"]
+fn measure_a_large_collection() {
+    use std::time::Instant;
+    let Some(base) = std::env::var_os(MEASURE_DIR) else {
+        return;
+    };
+    const SMALL_DIRS: usize = 40;
+    const SMALL_PER_DIR: usize = 50;
+    const SMALL_LINES: usize = 64;
+    const LARGE: usize = 20;
+    const LARGE_BYTES: usize = 4 << 20;
+    const TURNS: u32 = 150;
+    const MORE_TURNS: u32 = 20;
+    const SMALL_CHANGED: usize = 40;
+    const LARGE_CHANGED: usize = 2;
+    const KEEP: usize = 100;
+
+    let root = PathBuf::from(base).join(format!("eitri-gc-measure-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _remove = RemoveOnDrop(root.clone());
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let review_dir = review_dir_for(Some(root.join("state").as_os_str()), None, &project).unwrap();
+    let shadow = Shadow::open_with_excludes(&review_dir, &project, None).unwrap();
+
+    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+    let mut small: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for d in 0..SMALL_DIRS {
+        for f in 0..SMALL_PER_DIR {
+            let lines: Vec<String> = (0..SMALL_LINES).map(|_| rng.line()).collect();
+            let path = project.join(format!("src/m{d:02}/f{f:02}.rs"));
+            write(&path, lines.concat().as_bytes());
+            small.push((path, lines));
+        }
+    }
+    for l in 0..LARGE {
+        write(&project.join(format!("assets/blob{l:02}.bin")), &rng.bytes(LARGE_BYTES));
+    }
+
+    let limits = Limits {
+        timeout: Duration::from_secs(600),
+        ..Limits::default()
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut turns_taken = 0u32;
+    let mut take_turns = |count: u32, rng: &mut XorShift| {
+        let at = Instant::now();
+        for _ in 0..count {
+            turns_taken += 1;
+            let turn = turns_taken;
+            // A turn a second, the newest a moment ago, all well inside the age limit.
+            let time_ms = now_ms - u64::from(TURNS + MORE_TURNS - turn) * 1_000;
+            taken(shadow.snapshot(SESSION, &label(turn, SnapshotKind::Base, time_ms), &limits));
+            for _ in 0..SMALL_CHANGED {
+                let (path, lines) = &mut small[rng.below(SMALL_DIRS * SMALL_PER_DIR)];
+                for _ in 0..3 {
+                    let at = rng.below(SMALL_LINES);
+                    lines[at] = rng.line();
+                }
+                write(path, lines.concat().as_bytes());
+            }
+            for _ in 0..LARGE_CHANGED {
+                let l = rng.below(LARGE);
+                write(&project.join(format!("assets/blob{l:02}.bin")), &rng.bytes(LARGE_BYTES));
+            }
+            taken(shadow.snapshot(SESSION, &label(turn, SnapshotKind::End, time_ms + 500), &limits));
+        }
+        at.elapsed()
+    };
+
+    let built = take_turns(TURNS, &mut rng);
+    println!("measure: built {TURNS} turns (two snapshots each) in {built:?}");
+    backdate(&shadow.git_dir().join("objects"), Duration::from_secs(2 * 3600));
+    measured_trim(&shadow, "first trim (all loose)", KEEP, now_ms);
+
+    let built = take_turns(MORE_TURNS, &mut rng);
+    println!("measure: built {MORE_TURNS} more turns in {built:?}");
+    backdate(&shadow.git_dir().join("objects"), Duration::from_secs(2 * 3600));
+    measured_trim(&shadow, "second trim (packed once)", KEEP, now_ms + 60_000);
+    sgit(&shadow, &["fsck", "--connectivity-only", "--no-dangling"]);
 }

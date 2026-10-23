@@ -36,6 +36,8 @@ pub mod message;
 pub mod presence;
 pub mod revert;
 pub mod shadow;
+#[cfg(test)]
+pub(crate) mod test_hooks;
 pub mod write;
 pub mod write_slot;
 

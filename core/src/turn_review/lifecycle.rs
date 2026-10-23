@@ -2599,8 +2599,10 @@ impl Worker {
         }
     }
 
-    /// Runs retention when no worker of this project has in the last period. Here, on the
-    /// worker, so the session's next base waits for it rather than racing it for the lock.
+    /// Starts retention when no worker of this project has in the last period, on a thread of its
+    /// own: its collection can take minutes on a large store, and neither the end snapshot that
+    /// started it nor the session's next base may wait for that. Retention holds the store lock
+    /// exclusively only to delete refs and objects (`Shadow::trim`), each a short step.
     fn retain(&self, shadow: &Shadow) {
         let now = wall_clock_ms();
         let last = self.trim_stamp.load(Ordering::Acquire);
@@ -2615,8 +2617,17 @@ impl Worker {
         {
             return;
         }
-        if let Err(e) = shadow.trim(self.options.keep, self.options.max_age, now, "1.hour.ago") {
-            eprintln!("[turn-review] retention could not run: {e}");
+        let shadow = shadow.clone();
+        let (keep, max_age) = (self.options.keep, self.options.max_age);
+        let spawned = std::thread::Builder::new()
+            .name("eitri-review-trim".into())
+            .spawn(move || {
+                if let Err(e) = shadow.trim(keep, max_age, now, "1.hour.ago") {
+                    eprintln!("[turn-review] retention could not run: {e}");
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("[turn-review] retention could not start: {e}");
         }
     }
 }

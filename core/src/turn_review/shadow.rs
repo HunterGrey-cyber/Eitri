@@ -16,9 +16,12 @@
 //!   `index-<session>.lock` or a lock on one of the session's refs provably stale: only a git run
 //!   that was killed before it could remove its lock leaves one there, and nothing else will.
 //! - `lock` -- an `flock` shared by everything that reads or writes objects and refs, and taken
-//!   exclusively only to delete refs and collect garbage, so a collection never removes an object a
+//!   exclusively only to delete refs and objects, so a collection never removes an object a
 //!   concurrent snapshot (in this window or another one on the same project) has written but not
-//!   yet referenced.
+//!   yet referenced. The slow part of a collection, repacking, deletes nothing and runs under the
+//!   lock shared, beside snapshots ([`Shadow::trim`]).
+//! - `collect.lock` -- an `flock` held exclusively by the one collection of the project that is
+//!   running; another window's waits for it.
 //!
 //! Each snapshot is a root commit under `refs/eitri/<session>/<turn>/<base|end|warm>`, its
 //! message the [`SnapshotLabel`] as `key: value` lines, then when it finished and the files it left
@@ -668,8 +671,8 @@ impl Shadow {
     }
 
     /// Holds `session`'s guard (see the module doc) exclusively, giving up at `deadline`. Taken
-    /// only while the store lock is held, so a collection, which holds that lock exclusively,
-    /// never meets a held guard and may remove the file.
+    /// only while the store lock is held, so a collection, which holds that lock exclusively while
+    /// it removes indexes, never meets a held guard and may remove the file.
     fn lock_session_until(&self, session: &str, deadline: Instant) -> Result<ShadowLock, ShadowError> {
         validate_session(session)?;
         flock_file(
@@ -1325,13 +1328,74 @@ impl Shadow {
     /// before its ref exists). An index whose session has no snapshot left is removed too, so it
     /// cannot point at objects the collection frees. Revert anchors (`refs/eitri-revert/`) older
     /// than `max_age` by their stamp go too, whatever `keep` says; a journal entry's pins
-    /// (`refs/eitri-journal/`) are never aged out and go only once their entry is gone. Holds the
-    /// lock exclusively throughout.
+    /// (`refs/eitri-journal/`) are never aged out and go only once their entry is gone.
+    ///
+    /// A snapshot never waits for the slow part. The work is done in three steps:
+    /// 1. With the lock held exclusively: the refs above are deleted and the indexes removed.
+    /// 2. With the lock held shared, so snapshots, reads and writes go on beside it: `git gc` that
+    ///    deletes nothing ([`collect_keeping_everything`](Self::collect_keeping_everything)).
+    /// 3. With the lock held exclusively again: `git prune` removes the loose objects no ref
+    ///    reaches that are older than `prune_expiry`, and the refs are packed.
+    ///
+    /// Objects and refs are deleted only in steps 1 and 3, when no other git run of any window is
+    /// using the store, so nothing is removed that a snapshot has written or brought back but not
+    /// yet referenced, exactly as when the whole collection held the lock exclusively.
+    ///
+    /// Only one collection of the project runs at a time: one that finds another window's running
+    /// waits for it on `collect.lock`, so two `git gc` never meet in the store.
     pub fn trim(&self, keep: usize, max_age: Duration, now_ms: u64, prune_expiry: &str) -> Result<(), ShadowError> {
-        let _lock = self.lock_exclusive()?;
+        let _collecting = flock_file(&self.review_dir.join("collect.lock"), libc::LOCK_EX, None)?;
         // Collection is not bounded by the snapshot timeout: it runs in the background, and
         // stopping it halfway only wastes the work.
         let deadline = Instant::now() + Duration::from_secs(600);
+        self.drop_expired(keep, max_age, now_ms, deadline)?;
+        {
+            let _lock = self.lock_shared()?;
+            #[cfg(test)]
+            super::test_hooks::run(&super::test_hooks::BEFORE_GC);
+            self.collect_keeping_everything(deadline)?;
+        }
+        #[cfg(test)]
+        super::test_hooks::run(&super::test_hooks::BEFORE_PRUNE);
+        let _lock = self.lock_exclusive()?;
+        let mut prune = self.git(None);
+        prune.arg("prune").arg(format!("--expire={prune_expiry}"));
+        self.run_ok("prune", prune, None, deadline)?;
+        let mut pack = self.git(None);
+        pack.args(["pack-refs", "--all", "--prune"]);
+        self.run_ok("pack-refs", pack, None, deadline)?;
+        Ok(())
+    }
+
+    /// `git gc` that deletes no object and writes no ref, so it can run while snapshots write
+    /// objects and refs; the caller holds the lock shared. What it does is repack: every object a
+    /// ref reaches goes into one new pack, and every other object of an old pack is written out as
+    /// a loose object (`repack -A`) before that pack is removed, for step 3 of
+    /// [`trim`](Self::trim) to judge by its age.
+    ///
+    /// - `--no-prune`: neither the repack nor a `git prune` removes an unreachable object. One a
+    ///   snapshot writes or brings back while this runs is still there afterwards, loose or
+    ///   packed, whatever this run decided about it.
+    /// - `gc.cruftPacks=false`: unreachable objects are written out loose, which `git prune` can
+    ///   remove one by one; in a cruft pack they could only go by repacking again.
+    /// - `gc.packRefs=false`: packing refs locks each loose ref it removes, and a snapshot removes
+    ///   a lock it finds on the ref it is about to write (only a killed run leaves one, when
+    ///   nothing else writes that ref). Refs are packed in step 3 instead.
+    ///
+    /// Its own lock files (`gc.pid.lock`, the commit graph's) are safe from the stale-lock sweep,
+    /// which runs only with the lock held exclusively.
+    fn collect_keeping_everything(&self, deadline: Instant) -> Result<(), ShadowError> {
+        let mut gc = self.git(None);
+        gc.args(["-c", "gc.cruftPacks=false", "-c", "gc.packRefs=false"])
+            .args(["gc", "--no-prune", "--quiet"]);
+        self.run_ok("gc", gc, None, deadline)?;
+        Ok(())
+    }
+
+    /// Step 1 of [`trim`](Self::trim): the expired refs and the indexes of sessions with nothing
+    /// left, with the lock held exclusively.
+    fn drop_expired(&self, keep: usize, max_age: Duration, now_ms: u64, deadline: Instant) -> Result<(), ShadowError> {
+        let _lock = self.lock_exclusive()?;
         // A ref lock or `packed-refs.lock` left by a killed snapshot or collection would make the
         // ref deletion below fail, and with it every collection from then on.
         self.clear_stale_locks()?;
@@ -1388,10 +1452,6 @@ impl Shadow {
                 remove_if_present(&self.review_dir.join(name))?;
             }
         }
-
-        let mut gc = self.git(None);
-        gc.arg("gc").arg(format!("--prune={prune_expiry}")).arg("--quiet");
-        self.run_ok("gc", gc, None, deadline)?;
         Ok(())
     }
 

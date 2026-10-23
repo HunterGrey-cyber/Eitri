@@ -2031,3 +2031,108 @@ fn a_partner_turn_whose_edges_arrive_together_marks_only_what_it_met() {
     ]);
     assert!(turn(&review.turns("s1"), "a1").overlapped_tab);
 }
+
+/// Holds a real `git gc` at its very start. A FIFO stands in for the git directory's `gc.pid`,
+/// which gc opens for reading (to see whether another gc is running) before it does any work, and
+/// which nothing else reads. The open blocks until a writer comes, so [`entered`](Self::entered)
+/// knows gc is there; the read that follows blocks until the writer closes, so gc stays there until
+/// the gate is dropped.
+struct GcGate {
+    path: PathBuf,
+    writer: Option<std::fs::File>,
+}
+
+impl GcGate {
+    fn new(git_dir: &Path) -> GcGate {
+        use std::os::unix::ffi::OsStrExt;
+        let path = git_dir.join("gc.pid");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        GcGate { path, writer: None }
+    }
+
+    /// Waits until a gc has the FIFO open, and keeps it held there. A write-only open that does not
+    /// block fails with `ENXIO` for as long as no reader has the FIFO open.
+    fn entered(&mut self, what: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path)
+            {
+                Ok(writer) => {
+                    self.writer = Some(writer);
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+                Err(e) => panic!("the gc gate {}: {e}", self.path.display()),
+            }
+            assert!(Instant::now() < deadline, "{what} never reached git gc");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for GcGate {
+    /// Lets a gc go on whatever became of the test, since git runs in a process group of its own and
+    /// would otherwise outlive the test binary, blocked. One held in its read sees the end of the
+    /// file once the writer closes. One still blocked in its open (the test gave up waiting for it,
+    /// or failed before it waited) is let through by an open for reading and writing, which never
+    /// blocks on a FIFO and counts as the writer that open waits for. The FIFO is then removed, so a
+    /// gc that comes later finds no pid file instead of blocking with nobody left to let it go.
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        self.writer = None;
+        let waker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.path);
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.file_type().is_fifo()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        drop(waker);
+    }
+}
+
+#[test]
+fn a_turns_end_and_the_next_base_never_wait_for_retention() {
+    let scratch = Scratch::new("retention-apart");
+    let jobs = Jobs::default();
+    // Retention may run after every end snapshot, so turn 1's end starts one.
+    let options = ReviewOptions {
+        trim_every: Duration::ZERO,
+        ..jobs.options()
+    };
+    let mut review = TurnReview::with_options(Some(scratch.review_dir()), &scratch.project(), options);
+    review.observe(1, "s1", &opened("s1"), now());
+    review.observe(1, "s1", &started("t1"), now());
+    poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
+
+    let mut gate = GcGate::new(&scratch.review_dir().join("git"));
+    std::fs::write(scratch.project().join("main.rs"), "fn main() { println!(); }\n").unwrap();
+    review.observe(1, "s1", &completed("t1"), now());
+    gate.entered("retention after turn 1's end");
+
+    // The collection is held at its start for as long as the gate lives: the turn's end and the
+    // session's next base must both come through meanwhile.
+    poll_until(&mut review, "s1", "turn 1's end while the collection runs", |t| {
+        is_ok(t, "t1")
+    });
+    review.observe(1, "s1", &started("t2"), now());
+    poll_until(&mut review, "s1", "turn 2's base while the collection runs", |t| {
+        has_base(t, "t2")
+    });
+    assert!(gate.writer.is_some());
+    drop(gate);
+}
