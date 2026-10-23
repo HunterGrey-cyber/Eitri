@@ -109,6 +109,18 @@ function idle(): Promise<void> {
 
 type Outcome = { svg: string } | { error: string; later: boolean };
 
+/** How many drawn outcomes the runner keeps, and how many characters of SVG and message they may hold together.
+ *  Every edit inside a diagram is a new source, so without a bound a long editing session kept every revision's
+ *  drawing for as long as the page lived. The bound counts only drawings of sources the document no longer holds:
+ *  the newest outcome and every diagram of the document last filled are always kept, however many or large, since
+ *  evicting one of those would draw it again on the next edit anywhere else. */
+export const CACHE_ENTRIES = 64;
+export const CACHE_CHARS = 4 * 1024 * 1024;
+
+function charsOf(outcome: Outcome): number {
+  return "svg" in outcome ? outcome.svg.length : outcome.error.length;
+}
+
 const SELECTOR = "[data-eitri-mermaid]";
 const PENDING = "mdp-diagram-pending";
 
@@ -118,13 +130,18 @@ async function loadMermaid(): Promise<MermaidApi> {
 
 /** The diagram runner. The library is loaded on the first diagram that needs drawing and never for a document
  *  without one; diagrams are drawn one at a time, each on an idle moment, so a page of them never freezes the
- *  view; and each outcome is kept by source and theme, so an edit elsewhere in the document redraws nothing. */
+ *  view; and the outcomes of the document's diagrams, and those used last before them (`CACHE_ENTRIES`,
+ *  `CACHE_CHARS`), are kept by source for the current theme, so an edit elsewhere in the document redraws nothing. */
 export function createMermaid(load: () => Promise<MermaidApi> = loadMermaid): MermaidRunner {
   let api: Promise<MermaidApi> | null = null;
   let generation = 0;
   let vars = themeVariables({});
   let configured = -1;
+  // In the order last used, oldest first.
   const done = new Map<string, Outcome>();
+  let doneChars = 0;
+  // The sources of the document last filled, whose outcomes the next render needs again.
+  let inDocument = new Set<string>();
   // A diagram's last drawn height by its position in the document, so the box that waits for an edited diagram
   // keeps the text below it from jumping.
   const heights = new Map<number, number>();
@@ -133,6 +150,32 @@ export function createMermaid(load: () => Promise<MermaidApi> = loadMermaid): Me
   let counter = 0;
 
   const keyOf = (gen: number, source: string) => `${gen}\u0000${source}`;
+  const sourceOfKey = (key: string) => key.slice(key.indexOf("\u0000") + 1);
+
+  function recall(key: string): Outcome | undefined {
+    const outcome = done.get(key);
+    if (outcome) {
+      done.delete(key);
+      done.set(key, outcome);
+    }
+    return outcome;
+  }
+
+  function remember(key: string, outcome: Outcome): void {
+    const old = done.get(key);
+    if (old) {
+      done.delete(key);
+      doneChars -= charsOf(old);
+    }
+    done.set(key, outcome);
+    doneChars += charsOf(outcome);
+    for (const [k, o] of done) {
+      if (done.size <= CACHE_ENTRIES && doneChars <= CACHE_CHARS) break;
+      if (k === key || inDocument.has(sourceOfKey(k))) continue;
+      done.delete(k);
+      doneChars -= charsOf(o);
+    }
+  }
 
   function draw(el: HTMLElement, key: string, outcome: Outcome): void {
     const source = el.getAttribute("data-mdp-source") ?? "";
@@ -193,7 +236,7 @@ export function createMermaid(load: () => Promise<MermaidApi> = loadMermaid): Me
         const source = el.getAttribute("data-mdp-source") ?? "";
         let gen = generation;
         let key = keyOf(gen, source);
-        let outcome = done.get(key);
+        let outcome = recall(key);
         if (!outcome) {
           try {
             const [m, configuredFor] = await mermaid();
@@ -204,9 +247,10 @@ export function createMermaid(load: () => Promise<MermaidApi> = loadMermaid): Me
             outcome = { error: messageOf(e), later: evalRefused(e) };
             trace("diagram", { state: outcome.later ? "eval-refused" : "error" });
           }
-          // Kept under the theme it was drawn in, which a theme change during the render may have moved past.
+          // Under the theme it was drawn in, which a theme change during the render may have moved past; a drawing
+          // in a theme already left is never looked up again, so it is not kept.
           key = keyOf(gen, source);
-          done.set(key, outcome);
+          if (gen === generation) remember(key, outcome);
         }
         // A drawing in colours the page has since left is not shown: the diagram stays waiting, and the next turn of
         // this loop draws it again in the current theme.
@@ -230,11 +274,13 @@ export function createMermaid(load: () => Promise<MermaidApi> = loadMermaid): Me
   return {
     fill(root) {
       let filled = 0;
+      inDocument = new Set<string>();
       root.querySelectorAll<HTMLElement>(SELECTOR).forEach((el, i) => {
         const source = el.getAttribute("data-mdp-source") ?? el.textContent ?? "";
         el.setAttribute("data-mdp-source", source);
+        inDocument.add(source);
         const key = keyOf(generation, source);
-        const outcome = done.get(key);
+        const outcome = recall(key);
         if (outcome) {
           draw(el, key, outcome);
           filled++;
@@ -260,6 +306,9 @@ export function createMermaid(load: () => Promise<MermaidApi> = loadMermaid): Me
       if (JSON.stringify(v) === JSON.stringify(vars)) return;
       vars = v;
       generation++;
+      // Every kept drawing is in the theme just left.
+      done.clear();
+      doneChars = 0;
     },
   };
 }

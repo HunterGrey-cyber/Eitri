@@ -242,6 +242,11 @@ pub struct Screen {
     /// for this (only `esu_count`, bumped by a real ESU); added to `esu_count` in [`Self::open_update`]
     /// so the ordinal changes exactly when an update ENDS, by either path.
     abort_count: u64,
+    /// [`Self::render`] ran while an update was open, so what it drew came from a snapshot (`frame`,
+    /// `pinned_frame`) that a change outside the byte stream -- a resize, a scroll -- may already have
+    /// left behind. The update's end then owes a frame even when the update itself drew nothing: the
+    /// render that ran inside it consumed the dirty flag that change set.
+    redraw_at_end: bool,
     /// Scrollback: how far back the window is, over `term`'s own retained history.
     scroll: ScrollView,
     /// The last window `render` computed while pinned or anchor-expired and no update was open --
@@ -300,6 +305,7 @@ impl Screen {
             published_revision: 0,
             published_inert: 0,
             abort_count: 0,
+            redraw_at_end: false,
             scroll: ScrollView::new(),
             pinned_frame: None,
             pending_selection: None,
@@ -458,6 +464,9 @@ impl Screen {
             if !was_in_sync && self.sync.barrier().in_sync() {
                 self.refresh_frame();
             }
+            if was_in_sync && !self.sync.barrier().in_sync() && std::mem::take(&mut self.redraw_at_end) {
+                self.dirty = true;
+            }
         }
         // Output can evict or reflow what a pinned view holds; re-align once per call, the same
         // cadence `RawViewport::observe`'s own doc asks for ("once per wakeup while pinned"). A
@@ -522,7 +531,8 @@ impl Screen {
     /// covers this even when an update IS open at resize time and goes on to publish nothing of its
     /// own (an ESU/abort with no dispatch in between never latches `SyncBarrier`'s `dirty` flag):
     /// both still clear `in_sync` unconditionally, so `open_update()` still reports `None` once it
-    /// ends, and the next `render()` picks up the resize regardless.
+    /// ends, and the next `render()` picks up the resize. That next render is owed even when one
+    /// already ran inside the update and drew the old snapshot (`redraw_at_end`).
     ///
     /// **Does re-align the scrollback anchor.** A resize reflows
     /// the grid -- how many logical lines/rows exist -- which can shift or evict what a pinned
@@ -577,6 +587,9 @@ impl Screen {
         self.sync.abort_sync(&mut self.term, |_term, _reason| published = true);
         if was_open {
             self.abort_count += 1;
+            if std::mem::take(&mut self.redraw_at_end) {
+                self.dirty = true;
+            }
         }
         if published && self.publication_is_visible() {
             self.dirty = true;
@@ -677,7 +690,9 @@ impl Screen {
     pub fn render(&mut self, focused: bool) -> PaintList {
         let (top_line, mode) = self.scroll.window(&self.term);
         let update_open = self.open_update().is_some();
-        if !update_open {
+        if update_open {
+            self.redraw_at_end = true;
+        } else {
             self.refresh_frame();
         }
         let frame: &TerminalFrame = match mode {
@@ -1410,6 +1425,45 @@ mod tests {
         }
     }
 
+    /// The same resize, with a frame rendered while the update is still open: that frame shows the
+    /// snapshot at the old size and takes the resize's dirty flag, and the update then ends with
+    /// nothing drawn inside it. Its end must still owe a frame, or the pane keeps the old grid until
+    /// the program next prints something.
+    #[test]
+    fn a_frame_rendered_inside_an_update_is_owed_again_when_the_update_ends() {
+        for end_with_esu in [true, false] {
+            let mut screen = Screen::new(SIZE, TerminalColors::default());
+            screen.feed(b"hello");
+            screen.feed(b"\x1b[?2026h");
+            screen.take_dirty();
+            screen.resize(PtySize {
+                cols: 40,
+                rows: 10,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            });
+            assert!(screen.take_dirty(), "a resize marks the screen dirty");
+            let inside = screen.render(true);
+            assert_eq!((inside.cols, inside.rows), (20, 5), "inside the update: the snapshot");
+            if end_with_esu {
+                screen.feed(b"\x1b[?2026l");
+            } else {
+                screen.abort_sync();
+            }
+            assert!(
+                screen.take_dirty(),
+                "end_with_esu={end_with_esu}: the frame drawn inside the update is owed again"
+            );
+            let after = screen.render(true);
+            assert_eq!((after.cols, after.rows), (40, 10), "end_with_esu={end_with_esu}");
+            screen.feed(b"\x1b[?2026h\x1b[?2026l");
+            assert!(
+                !screen.take_dirty(),
+                "an empty update no frame was rendered inside owes nothing"
+            );
+        }
+    }
+
     /// Snapshotting a full O(rows x cols) projection on every `FrameComplete` or end-of-read
     /// `Wakeup` makes a plain flood pay one projection per PTY read even without synchronized
     /// updates. Measured overhead was 2.6-7.6x. Feed 50,000 small (64-byte) chunks to mimic a
@@ -1498,6 +1552,102 @@ mod tests {
         );
         assert_eq!(screen.scroll.indicator(&screen.term), Some((3, 46)));
         assert!(screen.scrolled());
+    }
+
+    /// A line that wraps over more rows than a wheel notch moves: each step goes exactly as many
+    /// rows as asked, up through the line and back down through it, never stopping at the line's
+    /// first row. The window's top used to be the anchored line's first row, so a step down that
+    /// stayed inside the line landed on that same row again, and the wheel could not move down
+    /// past a line longer than a notch.
+    #[test]
+    fn scrolling_moves_row_by_row_through_a_line_that_wraps() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..10);
+        let long: String = ["a", "b", "c", "d", "e", "f"].iter().map(|c| c.repeat(20)).collect();
+        screen.feed(format!("{long}\r\n").as_bytes());
+        feed_numbered_lines(&mut screen, 10..20);
+        let top = |screen: &mut Screen| screen.render(true).row_text(0);
+        let mut up = Vec::new();
+        for _ in 0..12 {
+            screen.scroll(ScrollRequest::Lines(1));
+            up.push(top(&mut screen));
+        }
+        let want_up: Vec<String> = ["15", "14", "13", "12", "11", "10"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(["f", "e", "d", "c", "b", "a"].iter().map(|c| c.repeat(20)))
+            .collect();
+        assert_eq!(up, want_up, "one row a step, through the wrapped line too");
+        let mut down = Vec::new();
+        for _ in 0..6 {
+            screen.scroll(ScrollRequest::Lines(-1));
+            down.push(top(&mut screen));
+        }
+        let want_down: Vec<String> = ["b", "c", "d", "e", "f"]
+            .iter()
+            .map(|c| c.repeat(20))
+            .chain(["10".to_string()])
+            .collect();
+        assert_eq!(down, want_down, "and back down the same way");
+        screen.scroll(ScrollRequest::Lines(-3));
+        assert_eq!(top(&mut screen), "13", "a notch of three from inside goes three rows");
+    }
+
+    /// The offset into a wrapped line follows the line through a column resize: the text at the
+    /// window's top stays the text that was there.
+    #[test]
+    fn a_resize_keeps_the_text_at_the_top_inside_a_wrapped_line() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        feed_numbered_lines(&mut screen, 0..10);
+        let long: String = (0..12).map(|i| format!("{i:0>9}|")).collect();
+        screen.feed(format!("{long}\r\n").as_bytes());
+        feed_numbered_lines(&mut screen, 10..20);
+        // Up to the long line's fourth row of 20 columns: its 7th and 8th cells of ten.
+        screen.scroll(ScrollRequest::Lines(9));
+        assert_eq!(screen.render(true).row_text(0), "000000006|000000007|");
+        screen.resize(PtySize {
+            cols: 40,
+            ..SCROLL_SIZE
+        });
+        assert_eq!(
+            screen.render(true).row_text(0),
+            "000000004|000000005|000000006|000000007|",
+            "at 40 columns the row that holds cell 6 is at the top"
+        );
+    }
+
+    /// A full history evicts rows, not lines: with the window's top inside the oldest retained line,
+    /// output that evicts that line's first rows keeps the same text at the top. The view used to
+    /// count its place from the line's original first row, so the text drifted down by the rows
+    /// evicted.
+    #[test]
+    fn eviction_inside_the_oldest_line_keeps_the_text_at_the_top() {
+        let mut screen = Screen::new(SCROLL_SIZE, TerminalColors::default());
+        let long: String = ["a", "b", "c", "d", "e", "f"].iter().map(|c| c.repeat(20)).collect();
+        let history = term_config().scrolling_history;
+        let rows = usize::from(SCROLL_SIZE.rows);
+        // The long line's six rows, then enough one-row lines that the history is exactly full with
+        // the long line at its head (the cursor's empty row is the last screen row), in one read.
+        let mut bytes = format!("{long}\r\n");
+        for i in 0..history + rows - 6 - 1 {
+            bytes.push_str(&format!("{i}\r\n"));
+        }
+        screen.feed(bytes.as_bytes());
+        assert_eq!(max_scrollback(&screen.term), history, "the history is full");
+        screen.scroll(ScrollRequest::Pages(i32::MAX / 8));
+        assert_eq!(screen.render(true).row_text(0), "a".repeat(20), "at the oldest row");
+        screen.scroll(ScrollRequest::Lines(-3));
+        assert_eq!(screen.render(true).row_text(0), "d".repeat(20));
+        screen.feed(b"x\r\ny\r\n");
+        assert!(
+            screen.scroll.indicator(&screen.term).is_some(),
+            "the anchor is still held"
+        );
+        assert_eq!(
+            screen.render(true).row_text(0),
+            "d".repeat(20),
+            "two rows evicted from the line's head; the same text stays at the top"
+        );
     }
 
     /// (b) Output arriving while scrolled back must not move the pinned view -- the

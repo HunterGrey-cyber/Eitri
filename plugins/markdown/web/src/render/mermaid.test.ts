@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createMermaid, MERMAID_CONFIG, mermaidPlaceholder, themeVariables, type MermaidApi } from "./mermaid";
+import { CACHE_CHARS, CACHE_ENTRIES, createMermaid, MERMAID_CONFIG, mermaidPlaceholder, themeVariables, type MermaidApi } from "./mermaid";
 
 function fakeApi(render: (id: string, text: string) => Promise<{ svg: string }>) {
   const api = { initialize: vi.fn(), render: vi.fn(render) } satisfies MermaidApi;
@@ -111,6 +111,82 @@ describe("the diagram runner", () => {
     expect(api.render).toHaveBeenCalledTimes(2);
     expect(api.initialize).toHaveBeenCalledTimes(2);
     expect((api.initialize.mock.calls[1][0] as { themeVariables: { background: string } }).themeVariables.background).toBe("#fafafa");
+  });
+
+  it("keeps the diagrams used last, up to its entry cap", async () => {
+    const { api, load } = fakeApi(async (_id, text) => ({ svg: svg(text) }));
+    const runner = createMermaid(load);
+    const drawn = async (source: string) => {
+      const root = live(source);
+      runner.fill(root);
+      const onDone = vi.fn();
+      runner.renderPending(root, onDone);
+      await vi.waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
+      root.remove();
+    };
+    // An edit inside a diagram is a new source each time: typing one keeps CACHE_ENTRIES of them at most.
+    for (let i = 0; i < CACHE_ENTRIES; i++) await drawn(`D${i}`);
+    expect(runner.fill(live("D0"))).toBe(1);
+    await drawn(`D${CACHE_ENTRIES}`);
+    expect(runner.fill(live("D0"))).toBe(1);
+    expect(runner.fill(live("D1"))).toBe(0);
+    expect(runner.fill(live(`D${CACHE_ENTRIES}`))).toBe(1);
+    expect(api.render).toHaveBeenCalledTimes(CACHE_ENTRIES + 1);
+  });
+
+  it("keeps at most CACHE_CHARS of outcomes", async () => {
+    // Failed diagrams, whose message is kept as it is: the same count as an SVG's text, without parsing one this large.
+    const { load } = fakeApi(async (_id, text) => { throw { str: `${text} ${"x".repeat(CACHE_CHARS / 2)}` }; });
+    const runner = createMermaid(load);
+    for (const source of ["A", "B", "C"]) {
+      const root = live(source);
+      runner.fill(root);
+      const onDone = vi.fn();
+      runner.renderPending(root, onDone);
+      await vi.waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
+      root.remove();
+    }
+    expect(runner.fill(live("A"))).toBe(0);
+    expect(runner.fill(live("B"))).toBe(0);
+    expect(runner.fill(live("C"))).toBe(1);
+  });
+
+  it("never evicts a diagram of the document, however many it holds", async () => {
+    const { api, load } = fakeApi(async (_id, text) => ({ svg: svg(text) }));
+    const runner = createMermaid(load);
+    const count = CACHE_ENTRIES + 6;
+    const sources = Array.from({ length: count }, (_, i) => `D${i}`);
+    const render = async (list: string[]) => {
+      const root = live(...list);
+      const filled = runner.fill(root);
+      const onDone = vi.fn();
+      runner.renderPending(root, onDone);
+      await vi.waitFor(() => expect(root.querySelector(".mdp-diagram-pending")).toBeNull());
+      root.remove();
+      return filled;
+    };
+    // An edit outside the diagrams: the same diagrams, rendered again, are all drawn from the cache.
+    expect(await render(sources)).toBe(0);
+    expect(await render(sources)).toBe(count);
+    expect(await render(sources)).toBe(count);
+    expect(api.render).toHaveBeenCalledTimes(count);
+    // An edit inside one diagram: only that one is drawn, and its old revision is what the bound lets go.
+    const edited = ["D0 edited", ...sources.slice(1)];
+    expect(await render(edited)).toBe(count - 1);
+    expect(await render(edited)).toBe(count);
+    expect(api.render).toHaveBeenCalledTimes(count + 1);
+    expect(runner.fill(live("D0"))).toBe(0);
+  });
+
+  it("keeps a document's diagrams past CACHE_CHARS", async () => {
+    const { api, load } = fakeApi(async (_id, text) => { throw { str: `${text} ${"x".repeat(CACHE_CHARS / 2)}` }; });
+    const runner = createMermaid(load);
+    const root = live("A", "B", "C");
+    runner.fill(root);
+    runner.renderPending(root, vi.fn());
+    await vi.waitFor(() => expect(root.querySelector(".mdp-diagram-pending")).toBeNull());
+    expect(runner.fill(live("A", "B", "C"))).toBe(3);
+    expect(api.render).toHaveBeenCalledTimes(3);
   });
 
   it("draws a diagram again in the new theme when the theme changes while it renders", async () => {

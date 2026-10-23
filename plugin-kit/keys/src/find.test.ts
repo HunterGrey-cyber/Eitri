@@ -66,7 +66,15 @@ afterEach(() => {
 function useHighlights() {
   registry = new Map();
   (globalThis as Record<string, unknown>).CSS = { highlights: registry };
-  (globalThis as Record<string, unknown>).Highlight = class { ranges: Range[]; constructor(...r: Range[]) { this.ranges = r; } };
+  // JavaScriptCore refuses a call with more than 65,535 arguments; this stand-in refuses them the same way.
+  (globalThis as Record<string, unknown>).Highlight = class {
+    ranges: Range[];
+    constructor(...r: Range[]) {
+      if (r.length > 0xffff) throw new RangeError("Maximum call stack size exceeded.");
+      this.ranges = r;
+    }
+    add(r: Range) { this.ranges.push(r); return this; }
+  };
 }
 
 /** An article whose paragraphs sit at the given tops, each saying `text`. */
@@ -360,6 +368,21 @@ describe("highlights", () => {
     expect(registry.get("eitri-find")!.ranges.map((r) => r.startContainer.parentElement)).toEqual([...root.children]);
     expect(registry.get("eitri-find-current")!.ranges.map((r) => r.startContainer.parentElement)).toEqual([root.children[1]]);
     expect(document.getSelection()!.rangeCount).toBe(0);
+  });
+
+  it("highlights more matches than one call may take as arguments", async () => {
+    useHighlights();
+    const root = document.createElement("article");
+    const p = document.createElement("p");
+    p.textContent = "a ".repeat(70_000);
+    tops.set(p, 100);
+    root.append(p);
+    document.body.append(root);
+    await start();
+    search("a");
+    expect(registry.get("eitri-find")!.ranges.length).toBe(70_000);
+    expect(registry.get("eitri-find-current")!.ranges.length).toBe(1);
+    expect(hudMessage()).toBe("[1/70000]");
   });
 
   it("Esc in normal mode clears the highlights; n brings them back", async () => {

@@ -151,12 +151,17 @@ export function matchRanges(root: Element, query: string, exclude: string | unde
 
 type HighlightRegistry = { set(name: string, value: unknown): unknown; delete(name: string): unknown };
 
-function highlightApi(): { registry: HighlightRegistry; make: (...ranges: Range[]) => unknown } | null {
+function highlightApi(): { registry: HighlightRegistry; make: (ranges: readonly Range[]) => unknown } | null {
   const css = (globalThis as { CSS?: { highlights?: HighlightRegistry } }).CSS;
-  const ctor = (globalThis as { Highlight?: new (...ranges: Range[]) => unknown }).Highlight;
-  return css?.highlights && typeof ctor === "function"
-    ? { registry: css.highlights, make: (...ranges) => new ctor(...ranges) }
-    : null;
+  const ctor = (globalThis as { Highlight?: new () => { add(range: Range): unknown } }).Highlight;
+  // Built empty and filled one range at a time: a search for one letter in a long document has more matches than an
+  // engine takes as arguments to one call (JavaScriptCore stops at 65,535), and spreading them threw.
+  const make = (ranges: readonly Range[]) => {
+    const highlight = new ctor!();
+    for (const range of ranges) highlight.add(range);
+    return highlight;
+  };
+  return css?.highlights && typeof ctor === "function" ? { registry: css.highlights, make } : null;
 }
 
 type Options = {
@@ -247,8 +252,8 @@ function paint(): void {
   if (api) {
     if (shown && ranges.length) {
       ensureStyle();
-      api.registry.set("eitri-find", api.make(...ranges));
-      if (ranges[index]) api.registry.set("eitri-find-current", api.make(ranges[index]));
+      api.registry.set("eitri-find", api.make(ranges));
+      if (ranges[index]) api.registry.set("eitri-find-current", api.make([ranges[index]]));
       else api.registry.delete("eitri-find-current");
     } else {
       api.registry.delete("eitri-find");
