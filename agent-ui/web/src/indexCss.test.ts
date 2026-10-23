@@ -3248,6 +3248,23 @@ describe("the start screen's stage", () => {
   });
 });
 
+describe("the band's Ctrl+y segment", () => {
+  /* It names what the agent asked to run, in the agent's own text: right-to-left letters in it must not
+     reorder its words (`cp א ב` read as `cp ב א`) or the segments beside it. */
+  it("is drawn in storage order, left to right, and isolated", () => {
+    const rules = rulesMatching(withoutComments, ".band-approve").filter((rule) => rule.selector.trim() === ".band-approve");
+    expect(rules.length).toBe(1);
+    const body = rules[0].body;
+    expect(body).toMatch(/direction:\s*ltr\s*;/);
+    // The fallback first, the isolating override last, so an engine that knows it uses it.
+    const fallback = body.search(/unicode-bidi:\s*bidi-override\s*;/);
+    const isolating = body.search(/unicode-bidi:\s*isolate-override\s*;/);
+    expect(fallback).toBeGreaterThanOrEqual(0);
+    expect(isolating).toBeGreaterThan(fallback);
+    expect(body).not.toMatch(/unicode-bidi:\s*isolate\s*;/);
+  });
+});
+
 describe("thinking text", () => {
   /* A thought is the provider's text and may carry right-to-left runs or stray direction marks; its
      box is isolated so they cannot reorder the row's head or the rows around it, in both themes. */

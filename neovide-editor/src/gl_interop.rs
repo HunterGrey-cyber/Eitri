@@ -321,10 +321,11 @@ pub(crate) fn compute_content_region(fb_width: i32, fb_height: i32) -> PixelRect
 }
 
 /// The (cols, rows) grid size that fits inside `content_region`, using `harness`'s own current
-/// font-derived `grid_scale` (`LiveHarness::grid_scale`) -- floored, not rounded, so nvim's grid
-/// never claims more space than the host actually has, the same convention neovide's own
-/// `WinitWindowWrapper::get_grid_size_from_window` uses when deriving a grid size from a real OS
-/// window's pixel content area. `LiveHarness::resize_grid` clamps again internally
+/// font-derived `grid_scale` (`LiveHarness::grid_scale`) -- floored, not rounded, the convention
+/// neovide's own `WinitWindowWrapper::get_grid_size_from_window` uses when deriving a grid size from a
+/// real OS window's pixel content area, so nvim's grid never claims a cell the host does not have. The
+/// one allowance is `whole_cells`' slack: a side short of a whole cell by under a thousandth of one
+/// (float error, far below a pixel) counts that cell. `LiveHarness::resize_grid` clamps again internally
 /// (`settings::clamped_grid_size`), but flooring here first keeps this value an honest reflection
 /// of what was actually computed from `content_region`, for the caller's own dedup/log purposes.
 pub(crate) fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRect<f32>) -> GridSize<u32> {
@@ -729,7 +730,16 @@ mod snap_tests {
     /// many cell widths lands a hair under 39 -- and nvim's statusline sat a row above the bottom.
     #[test]
     fn a_snapped_region_gets_every_row_it_holds() {
-        for (fb_h, cell_h) in [(861, 22.0_f32), (1598, 44.0), (1080, 18.0), (777, 26.0), (900, 24.0)] {
+        // 22.5: a cell height with a fraction, as a fractional font size or scale gives.
+        for (fb_h, cell_h) in [
+            (861, 22.0_f32),
+            (1598, 44.0),
+            (1080, 18.0),
+            (777, 26.0),
+            (900, 24.0),
+            (861, 22.5),
+            (900, 22.5),
+        ] {
             let whole = (fb_h as f32 / cell_h).floor() as u32;
             let mut short = Vec::new();
             for step in 0..4000 {

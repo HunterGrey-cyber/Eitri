@@ -102,20 +102,26 @@ const CARD_SUMMARY_MAX = 40;
  *  character the card escapes drawn as its escape; cut to `CARD_SUMMARY_MAX` characters in the
  *  middle, head … tail, never inside an escape. A `Bash` card's `description` is the
  *  model's own words about the command, so the command itself comes first. An ACP agent's card is
- *  read inside its `rawInput`, then its first location, then its title. */
+ *  read inside its `rawInput` by the fields that name the call alone, then as that `rawInput` in compact
+ *  JSON, then by its first location, and by its title only when it sent none of those. */
 export function cardSummary(input: unknown): string {
   let text: string | null = null;
   if (input !== null && typeof input === "object") {
     const fields = input as Record<string, unknown>;
     text = actsOn(fields);
     // An ACP agent's card (`AcpCardInput`) wraps the call: what it acts on is in the agent's own
-    // `rawInput`, else its first location; its `title` is the agent's words about the call.
+    // `rawInput`, read only by the fields that name the call, else the raw input itself as compact JSON,
+    // else its first location. A `description`, `prompt` or `name` in an ACP raw input is the agent's
+    // account of the call, which could stand in front of the key that does the work (`{description:
+    // "Read notes", script: "rm -rf ~"}`), so it is shown only inside the JSON. The `title` and the
+    // locations are the agent's words about the call too, so they are named only when it sent no input.
     if (text === null && "rawInput" in fields) {
       const raw = fields.rawInput;
       const locations = Array.isArray(fields.locations) ? fields.locations : [];
       const first = locations[0] as { path?: unknown } | undefined;
       text =
-        (raw !== null && typeof raw === "object" && !Array.isArray(raw) ? actsOn(raw as Record<string, unknown>) : null) ??
+        (raw !== null && typeof raw === "object" && !Array.isArray(raw) ? actsOn(raw as Record<string, unknown>, CALL_KEYS) : null) ??
+        rawAsJson(raw) ??
         (typeof first?.path === "string" ? first.path : null) ??
         (typeof fields.title === "string" && fields.title !== "" ? fields.title : null);
     }
@@ -145,17 +151,41 @@ export function cardSummary(input: unknown): string {
   return `${head.join("")}…${tail.join("")}`;
 }
 
-/** The first of a call's fields a person checks before approving it, or `null`. A command given as an
- *  argument list (ACP and Codex agents send one) reads as its words joined by spaces. */
-function actsOn(fields: Record<string, unknown>): string | null {
-  for (const key of ["command", "file_path", "notebook_path", "path", "url", "pattern", "query", "description", "prompt", "name"]) {
+/** The fields that name what a call acts on: its command, file, path, URL or search. */
+const CALL_KEYS = ["command", "file_path", "notebook_path", "path", "url", "pattern", "query"] as const;
+
+/** `CALL_KEYS`, then the fields a Claude tool's own input names a call by when it has none of those (a
+ *  `Task`'s `description` and `prompt`, an MCP tool's `name`). */
+const SUMMARY_KEYS = [...CALL_KEYS, "description", "prompt", "name"] as const;
+
+/** The first of `keys` a call's fields hold, a person checks before approving it, or `null`. A command
+ *  given as an argument list (ACP and Codex agents send one) reads as its words joined by spaces, a word
+ *  that holds a space quoted (`argvWord`). */
+function actsOn(fields: Record<string, unknown>, keys: readonly string[] = SUMMARY_KEYS): string | null {
+  for (const key of keys) {
     const value = fields[key];
     if (typeof value === "string") return value;
     if (key === "command" && Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string")) {
-      return value.join(" ");
+      return value.map(argvWord).join(" ");
     }
   }
   return null;
+}
+
+/** One element of an argument list as a shell would have to be given it: as it is, or in single quotes
+ *  when it is empty or holds whitespace or a quote. Joined bare, `["rm", "a b"]` and `["rm", "a", "b"]`
+ *  both read `rm a b`, which are a different number of files. */
+function argvWord(word: string): string {
+  if (word !== "" && !/[\s'"\\]/u.test(word)) return word;
+  return `'${word.replace(/'/g, "'\\''")}'`;
+}
+
+/** An ACP agent's raw input as compact JSON, or `null` when it carries nothing (absent, `null`, an empty
+ *  object or list). */
+function rawAsJson(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === "object" && Object.keys(raw as object).length === 0) return null;
+  return JSON.stringify(raw) ?? null;
 }
 
 /** The band's usage segment as `usageSegment` words it: the text drawn, and the tooltip carrying

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isModifierKey, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
+import { isModifierKey, RELEASE_WAIT_MAX_MS, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 
 /* Every keydown reaches `onKey` first. `a`/`d`/`D` ask `defer`; Enter on a card button asks
    `mayAnswerNow`, then waits in `defer` and requires a focus landing. These rows model only the guard;
@@ -490,7 +490,7 @@ describe("TypingGuard: an answer that waits for its key's release (deferUntilRel
     const start = Date.now();
     expect(press("y")).toBe(true);
     vi.advanceTimersByTime(90);
-    guard.onKeyUp("y");
+    guard.onKeyUp("y", Date.now());
     vi.advanceTimersByTime(TYPING_GUARD_MS - 91);
     expect(answers).toEqual([]);
     vi.advanceTimersByTime(1);
@@ -500,17 +500,76 @@ describe("TypingGuard: an answer that waits for its key's release (deferUntilRel
   it("a key still down when the window ends answers nothing until it is let go", () => {
     const start = Date.now();
     press("y");
-    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    // Past the window, still inside RELEASE_WAIT_MAX_MS.
+    const held = TYPING_GUARD_MS + 100;
+    vi.advanceTimersByTime(held);
     expect(answers).toEqual([]);
-    guard.onKeyUp("y");
-    expect(answers).toEqual([{ key: "y", at: start + TYPING_GUARD_MS * 2 }]);
+    expect(guard.onKeyUp("y", Date.now())).toBeNull();
+    expect(answers).toEqual([{ key: "y", at: start + held }]);
+  });
+
+  it("a key down longer than RELEASE_WAIT_MAX_MS, with no repeat to cancel it, is refused at its release with the wait's flash", () => {
+    press("y", "Ctrl+y approves only on its own");
+    vi.advanceTimersByTime(RELEASE_WAIT_MAX_MS - 1);
+    expect(answers).toEqual([]);
+    vi.advanceTimersByTime(5000);
+    expect(guard.onKeyUp("y", Date.now())).toBe("Ctrl+y approves only on its own");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+    // Nothing is left waiting: the next press is judged afresh.
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    press("y");
+    guard.onKeyUp("y", Date.now());
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
+    expect(answers.length).toBe(1);
+  });
+
+  it("a held key is refused with its own held flash when the wait names one", () => {
+    const t = Date.now();
+    guard.onKey("y", t);
+    guard.deferUntilReleased(t, false, () => answers.push({ key: "y", at: Date.now() }), "typing", "y", "let go sooner");
+    vi.advanceTimersByTime(RELEASE_WAIT_MAX_MS + 1);
+    expect(guard.onKeyUp("y", Date.now())).toBe("let go sooner");
+    expect(answers).toEqual([]);
+  });
+
+  it("the hold is judged by the press's and the release's own times, not by how late the release is handled", () => {
+    // A quick press whose keyup is handled only after a stall of the page's main thread.
+    const t = Date.now();
+    press("y");
+    vi.advanceTimersByTime(RELEASE_WAIT_MAX_MS * 3);
+    expect(answers).toEqual([]);
+    expect(guard.onKeyUp("y", t + 100)).toBeNull();
+    expect(answers).toEqual([{ key: "y", at: t + RELEASE_WAIT_MAX_MS * 3 }]);
+    // And a long hold handled at once is refused, though no timer has run past the cap.
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    const u = Date.now();
+    press("y", "held");
+    vi.advanceTimersByTime(TYPING_GUARD_MS + 1);
+    expect(guard.onKeyUp("y", u + RELEASE_WAIT_MAX_MS + 1)).toBe("held");
+    expect(answers.length).toBe(1);
+  });
+
+  it("a key let go one millisecond inside RELEASE_WAIT_MAX_MS still answers at its release", () => {
+    press("y");
+    vi.advanceTimersByTime(RELEASE_WAIT_MAX_MS - 1);
+    expect(guard.onKeyUp("y", Date.now())).toBeNull();
+    expect(answers.length).toBe(1);
+  });
+
+  it("the cap is a release wait's alone: defer, which waits for no release, is unchanged", () => {
+    const t = Date.now();
+    guard.onKey("a", t);
+    expect(guard.defer(t, false, () => answers.push({ key: "a", at: Date.now() }), "f")).toBe(true);
+    vi.advanceTimersByTime(RELEASE_WAIT_MAX_MS * 2);
+    expect(answers.length).toBe(1);
   });
 
   it("a held key's first repeat, before any release, cancels it and says the wait's own flash", () => {
     press("y", "Ctrl+y approves only on its own");
     vi.advanceTimersByTime(600);
     expect(guard.onKey("y", Date.now())).toBe("Ctrl+y approves only on its own");
-    guard.onKeyUp("y");
+    guard.onKeyUp("y", Date.now());
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
   });
@@ -518,10 +577,10 @@ describe("TypingGuard: an answer that waits for its key's release (deferUntilRel
   it("another key's release does not end the wait, and another key's press cancels it", () => {
     press("y");
     vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
-    guard.onKeyUp("Control");
+    guard.onKeyUp("Control", Date.now());
     expect(answers).toEqual([]);
     expect(guard.onKey("x", Date.now())).toBe("held");
-    guard.onKeyUp("y");
+    guard.onKeyUp("y", Date.now());
     expect(answers).toEqual([]);
   });
 
@@ -529,19 +588,19 @@ describe("TypingGuard: an answer that waits for its key's release (deferUntilRel
     press("y");
     vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
     expect(guard.cancel()).toBe(true);
-    guard.onKeyUp("y");
+    guard.onKeyUp("y", Date.now());
     expect(answers).toEqual([]);
   });
 
   it("a release seen before a later press of the same key is not that press's release", () => {
     press("y");
-    guard.onKeyUp("y");
+    guard.onKeyUp("y", Date.now());
     vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
     expect(answers.length).toBe(1);
     press("y");
-    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    vi.advanceTimersByTime(TYPING_GUARD_MS + 100);
     expect(answers.length).toBe(1);
-    guard.onKeyUp("y");
+    guard.onKeyUp("y", Date.now());
     expect(answers.length).toBe(2);
   });
 
@@ -570,5 +629,28 @@ describe("TypingGuard.timeOf: when a keydown happened", () => {
   it("a repeat with a later stamp of its own keeps it", () => {
     guard.timeOf({ repeat: false, timeStamp: 1000 }, 50);
     expect(guard.timeOf({ repeat: true, timeStamp: 1700 }, 650)).toBe(1700);
+  });
+
+  it("a held motion key's first repeat, dated by timeOf, starts a new run, so the leader right after it may act", () => {
+    // Prose `x`, then `j` at once: one run that is not all motion keys.
+    guard.onKey("x", guard.timeOf({ repeat: false, timeStamp: 1000 }, 1000));
+    guard.onKey("j", guard.timeOf({ repeat: false, timeStamp: 1100 }, 1100));
+    // `j` held: GDK stamps its first repeat with the press's time; it comes after the repeat delay.
+    const repeatAt = guard.timeOf({ repeat: true, timeStamp: 1100 }, 1600);
+    expect(repeatAt).toBe(1600);
+    guard.onKey("j", repeatAt);
+    // More than the window after the press, the repeat does not continue the `x j` run: it begins a
+    // run of motion keys, and a Space right after it is a quick motion's leader, not prose.
+    const space = guard.timeOf({ repeat: false, timeStamp: 1650 }, 1650);
+    guard.onKey(" ", space);
+    expect(guard.mayActAfterMotion(space, false)).toBe(true);
+
+    // Dated by the stamp alone, the same repeat continued the run that began with `x`.
+    const stamps = new TypingGuard();
+    stamps.onKey("x", 1000);
+    stamps.onKey("j", 1100);
+    stamps.onKey("j", 1100);
+    stamps.onKey(" ", 1150);
+    expect(stamps.mayActAfterMotion(1150, false)).toBe(false);
   });
 });

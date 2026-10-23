@@ -319,9 +319,45 @@ describe("cardSummary on an ACP agent's card (`{title, rawInput, locations, diff
     );
   });
 
-  it("falls back to the first location, then to the agent's own title, never to the whole card as JSON", () => {
-    expect(cardSummary({ title: "Read it", rawInput: { odd: 1 }, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe("/p/b.md");
+  it("falls back to the raw input as JSON, then to the first location, then to the agent's own title, never to the whole card as JSON", () => {
+    // The title and the locations are the agent's words about the call; a raw input with no key the band
+    // knows is still the call.
+    expect(cardSummary({ title: "Read it", rawInput: { odd: 1 }, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe('{"odd":1}');
+    expect(cardSummary({ title: "Read notes", rawInput: { argv: ["rm", "-rf", "x"] }, locations: [], diffs: [] })).toBe('{"argv":["rm","-rf","x"]}');
+    expect(cardSummary({ title: "Read it", rawInput: {}, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe("/p/b.md");
+    expect(cardSummary({ title: "Read it", rawInput: null, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe("/p/b.md");
     expect(cardSummary({ title: "Fetch the page", rawInput: null, locations: [], diffs: [] })).toBe("Fetch the page");
+    expect(cardSummary({ title: "Fetch the page", rawInput: {}, locations: [], diffs: [] })).toBe("Fetch the page");
+  });
+
+  it("never lets the agent's prose in the raw input, or a location, stand in front of the key that does the work", () => {
+    // `description`, `prompt` and `name` name a Claude tool's call; in an ACP raw input they are the
+    // agent's account of it, shown only inside the JSON.
+    expect(cardSummary({ title: "t", rawInput: { description: "x", script: "rm -rf ~" }, locations: [], diffs: [] })).toBe(
+      '{"description":"x","script":"rm -rf ~"}',
+    );
+    // Too long for the band, the JSON is cut in the middle and its tail, the script, still shows.
+    expect(cardSummary({ title: "t", rawInput: { description: "Read notes", script: "rm -rf ~" }, locations: [], diffs: [] })).toBe(
+      '{"description":"…s","script":"rm -rf ~"}',
+    );
+    expect(cardSummary({ title: "t", rawInput: { prompt: "look", name: "notes" }, locations: [], diffs: [] })).toBe(
+      '{"prompt":"look","name":"notes"}',
+    );
+    expect(cardSummary({ title: "t", rawInput: { script: "rm -rf ~" }, locations: [{ path: "/p/notes.md" }], diffs: [] })).toBe(
+      '{"script":"rm -rf ~"}',
+    );
+    // A key that names the call still wins over the prose next to it.
+    expect(cardSummary({ title: "t", rawInput: { description: "Read notes", command: "rm -rf ~" }, locations: [], diffs: [] })).toBe("rm -rf ~");
+    // A Claude tool's own `description` (a `Task`) still names its call.
+    expect(cardSummary({ description: "Find the bug", prompt: "look at a.ts" })).toBe("Find the bug");
+  });
+
+  it("quotes an argument-list word that holds a space, so the words read as the call has them", () => {
+    expect(cardSummary({ title: "t", rawInput: { command: ["rm", "my notes.txt"] }, locations: [], diffs: [] })).toBe("rm 'my notes.txt'");
+    expect(cardSummary({ title: "t", rawInput: { command: ["bash", "-lc", "ls -la"] }, locations: [], diffs: [] })).toBe("bash -lc 'ls -la'");
+    expect(cardSummary({ title: "t", rawInput: { command: ["echo", "it's", ""] }, locations: [], diffs: [] })).toBe("echo 'it'\\''s' ''");
+    // A no-break space is whitespace to a reader: the word is quoted, and the space drawn as its escape.
+    expect(cardSummary({ title: "t", rawInput: { command: ["rm", "a b"] }, locations: [], diffs: [] })).toBe("rm 'a⟨U+00A0⟩b'");
   });
 });
 
@@ -354,6 +390,21 @@ describe("cardSummary shows the card's hidden characters as the card does", () =
     expect(Array.from(s).length).toBeLessThanOrEqual(40);
     expect(s).not.toMatch(/⟨U\+[0-9A-F]*…|…[0-9A-F]*⟩/);
     expect(s.endsWith("⟨U+202E⟩zz")).toBe(true);
+  });
+  it("draws a direction override as its escape on the band, from an ACP card and from a Claude Bash card", () => {
+    // Drawn raw, `notes‮fdp.exe` reads as `notesexe.pdf`.
+    const acp = cardSummary({ title: "Read notes", rawInput: { command: ["cat", "notes‮fdp.exe"] }, locations: [], diffs: [] });
+    expect(acp).toBe("cat notes⟨U+202E⟩fdp.exe");
+    const bash = cardSummary({ command: "cat notes‮fdp.exe", description: "Read notes" });
+    expect(bash).toBe("cat notes⟨U+202E⟩fdp.exe");
+    for (const [tool, summary] of [
+      ["shell", acp],
+      ["Bash", bash],
+    ]) {
+      const seg = bandLayout({ ...idle, cards: 1, approve: { tool, summary } }, 2000, 7.2).find((s) => s.id === "approve");
+      expect(seg?.text).toBe(`Ctrl+y approves ${tool}: cat notes⟨U+202E⟩fdp.exe`);
+      expect(seg?.text).not.toContain("‮");
+    }
   });
   it("draws the tool name's hidden characters as escapes too", () => {
     const seg = bandLayout({ ...idle, approve: { tool: "mcp__x__\u202Eevil", summary: "ok" } }, 2000, 7.2).find((s) => s.id === "approve");

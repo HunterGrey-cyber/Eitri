@@ -22,8 +22,18 @@ export type Caret = { node: Node; offset: number };
  *  caret; `"char"` VISUAL; `"line"` V-LINE), and the goal column -- the
  *  x coordinate of the first vertical move, kept until a horizontal one resets it (`null`). `kind`
  *  replaced a plain `line: boolean` once CARET needed its own third state alongside charwise and
- *  linewise. */
-export type VisualModel = { anchor: Caret; cursor: Caret; kind: "caret" | "char" | "line"; goalX: number | null };
+ *  linewise. `pastEnd` is set only while VISUAL's `$` has put `cursor` after its line's last character,
+ *  where vim's charwise `$` puts it: the inclusive rebuild then takes the line break, and going back to
+ *  CARET steps back onto the last character (`caretModelOf`). `anchorPastEnd` is the same for `anchor`,
+ *  which `o` (`swapEnds`) trades with `cursor`. */
+export type VisualModel = {
+  anchor: Caret;
+  cursor: Caret;
+  kind: "caret" | "char" | "line";
+  goalX: number | null;
+  pastEnd?: true;
+  anchorPastEnd?: true;
+};
 
 /** The subset of `Selection` this module needs. A real `Selection` satisfies this structurally;
  *  tests fake it, since jsdom has no `modify`. */
@@ -700,7 +710,8 @@ export function runMotion(
   motion: CharMotion,
   goalX: number | null,
   root?: Element,
-): { caret: Caret; goalX: number | null } {
+  dollarPastEnd = false,
+): { caret: Caret; goalX: number | null; pastEnd?: true } {
   sel.collapse(cursor.node, cursor.offset);
   switch (motion) {
     case "h":
@@ -758,9 +769,14 @@ export function runMotion(
       // caret is drawn as would hold the line break and show nothing; vim's `$` is on the last
       // character, so step back one. Not when the boundary did not move (an empty line): back
       // from there is the line above.
+      //
+      // In VISUAL (`dollarPastEnd`) `$` stays on the boundary: vim's charwise `v$` takes the line
+      // through its line break (`v$y` yanks "line\n", `v$d` joins the next line on), and the
+      // inclusive rebuild's one character past the boundary is that line break.
       sel.modify("move", "forward", "paragraphboundary");
       const boundary = readCaret(sel, cursor);
       if (caretsEqual(boundary, cursor)) return { caret: boundary, goalX: null };
+      if (dollarPastEnd) return { caret: boundary, goalX: null, pastEnd: true };
       sel.modify("move", "backward", "character");
       return { caret: readCaret(sel, boundary), goalX: null };
     }
@@ -777,8 +793,26 @@ const MAX_CHROME_SKIP = 64;
  *  VISUAL/V-LINE, `anchor` staying put. Shared by every `stepOnce` return path so none of them can
  *  forget it -- a CARET model whose `anchor` drifted from its `cursor` would rebuild as a
  *  multi-character selection instead of a one-character block. */
-function landBothEnds(model: VisualModel, cursor: Caret, goalX: number | null): VisualModel {
-  return model.kind === "caret" ? { ...model, anchor: cursor, cursor, goalX } : { ...model, cursor, goalX };
+function landBothEnds(model: VisualModel, cursor: Caret, goalX: number | null, pastEnd = false): VisualModel {
+  const { pastEnd: _was, anchorPastEnd, ...rest } = model;
+  const landed: VisualModel =
+    model.kind === "caret"
+      ? { ...rest, anchor: cursor, cursor, goalX }
+      : { ...rest, cursor, goalX, ...(anchorPastEnd ? { anchorPastEnd } : {}) };
+  return pastEnd ? { ...landed, pastEnd: true } : landed;
+}
+
+/** The CARET model `v`/`V`/`Esc` go back to from VISUAL or V-LINE: one character on the moving end. An end
+ *  VISUAL's `$` left after its line's last character steps back onto that character, as vim's cursor does
+ *  on leaving Visual mode -- a block there would hold the line break and draw nothing. */
+export function caretModelOf(sel: SelectionLike, model: VisualModel): VisualModel {
+  let cursor = model.cursor;
+  if (model.pastEnd) {
+    sel.collapse(cursor.node, cursor.offset);
+    sel.modify("move", "backward", "character");
+    cursor = readCaret(sel, cursor);
+  }
+  return { anchor: cursor, cursor, kind: "caret", goalX: null };
 }
 
 /** One motion step, with the boundary rule applied: a step that would leave `root` is undone
@@ -797,7 +831,7 @@ export function stepOnce(sel: SelectionLike, model: VisualModel, motion: VisualM
   let cursor = model.cursor;
   let goalX = model.goalX;
   for (let attempt = 0; attempt < MAX_CHROME_SKIP; attempt++) {
-    let result = runMotion(sel, cursor, motion, goalX, root);
+    let result = runMotion(sel, cursor, motion, goalX, root, model.kind === "char");
     if (!root.contains(result.caret.node) && (motion === "j" || motion === "k")) {
       // A `j`/`k` step that left `.message-list` is
       // retried by `stepByLinePoint`'s real-geometry probe, anchored at the CURRENT caret and kept
@@ -826,7 +860,13 @@ export function stepOnce(sel: SelectionLike, model: VisualModel, motion: VisualM
     // after every `j`/`k` step, which jumped the view on every key and never told `follow.ts`;
     // the snap and the probe now reveal what they measure by the least scroll themselves, and
     // `App.tsx` announces whatever the key moved.
-    return { model: landBothEnds(model, landed, result.goalX), moved: !caretsEqual(landed, model.cursor) };
+    // A `$` from an end already past its line's last character finds the boundary where it is and does
+    // not move; the end stays past it, or the CARET block it goes back to would sit on the line break.
+    const stillPastEnd = motion === "$" && model.pastEnd === true && caretsEqual(landed, model.cursor);
+    return {
+      model: landBothEnds(model, landed, result.goalX, (result.pastEnd === true && landed === result.caret) || stillPastEnd),
+      moved: !caretsEqual(landed, model.cursor),
+    };
   }
   return { model, moved: false };
 }
@@ -847,7 +887,15 @@ export function repeatMotion(sel: SelectionLike, model: VisualModel, motion: Vis
 /** `o` (`nvim: visual.txt, v_o`): swap which end moves next. No `Selection.modify` involved --
  *  the next key's `stepOnce` rebuilds from the new `cursor`. */
 export function swapEnds(model: VisualModel): VisualModel {
-  return { ...model, anchor: model.cursor, cursor: model.anchor, goalX: null };
+  const { pastEnd, anchorPastEnd, ...rest } = model;
+  return {
+    ...rest,
+    anchor: model.cursor,
+    cursor: model.anchor,
+    goalX: null,
+    ...(anchorPastEnd ? { pastEnd: anchorPastEnd } : {}),
+    ...(pastEnd ? { anchorPastEnd: pastEnd } : {}),
+  };
 }
 
 /** What `rebuildSelection` actually set on the live selection, so a later check (the check that the live

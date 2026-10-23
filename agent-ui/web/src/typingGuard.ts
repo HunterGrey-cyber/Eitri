@@ -35,7 +35,10 @@
  *   ends `TYPING_GUARD_MS` after the press only if the key is up by then, else at its release, and
  *   the key's first repeat, like any key, cancels it. A key's repeat begins only after the
  *   compositor's delay (500-600 ms by default), well after the window, so the repeat alone cannot
- *   tell a held key from a pressed one in time.
+ *   tell a held key from a pressed one in time; with key repeat off it never comes at all. So a key
+ *   down longer than `RELEASE_WAIT_MAX_MS` is refused at its release, with its own flash. How long it
+ *   was down is read from the press's and the release's own event times, not from a timer: a timer
+ *   counts a stall of the page's main thread as holding, and refused a quick press made during one.
  * - **A GUI pass (2026-09-27) found two more ways typed prose acts after an arrival**, and
  *   `mayActAfterMotion` closes both. The leader (Space by default) starts a sequence wherever the
  *   row cursor has the keys, so "set up my" ran `<leader>m` (the mode flipped to bypass, which on a
@@ -70,6 +73,13 @@
 /** The guard window, both sides. Typed prose at 60 wpm is ~200 ms a key; a
  *  deliberate single `a` waits well over this for the next key. A tunable, not a key. */
 export const TYPING_GUARD_MS = 250;
+
+/** How long a key that must be let go (`deferUntilReleased`) may stay down and still answer at its
+ *  release. A held key is otherwise refused by its first repeat, but with key repeat off there is none,
+ *  and a key held for seconds answered when let go. Below the compositor's repeat delay (500-600 ms by
+ *  default), so the cap, not the repeat, is what refuses a held key in either case; well above a
+ *  deliberate press, which is up within about 150 ms. */
+export const RELEASE_WAIT_MAX_MS = 450;
 
 /** The keys that walk onto a card button, so Enter at the end of a run made only of them is not
  *  typing. Shift+Tab arrives as `Tab` (the caller normalizes WebKitGTK's `Unidentified`/
@@ -165,8 +175,19 @@ const GLOBAL_TIMERS: GuardTimers = {
 type Keydown = { key: string; t: number };
 
 /** A waiting action. `heldKey` is the key whose release it also waits for (`deferUntilReleased`), and
- *  `released` whether that release has come; `due` whether the window after the press has ended. */
-type Pending = { handle: unknown; flash: string; run: () => void; heldKey: string | null; released: boolean; due: boolean };
+ *  `released` whether that release has come; `due` whether the window after the press has ended;
+ *  `pressedAt` the press's own time, which the release's is compared with; `heldFlash` what the band
+ *  says when the key was down longer than `RELEASE_WAIT_MAX_MS`. */
+type Pending = {
+  handle: unknown;
+  flash: string;
+  run: () => void;
+  heldKey: string | null;
+  released: boolean;
+  due: boolean;
+  pressedAt: number;
+  heldFlash: string;
+};
 
 export class TypingGuard {
   /** The key `onKey` recorded last -- the one being handled right now. */
@@ -211,6 +232,13 @@ export class TypingGuard {
       return stamp;
     }
     return Math.max(stamp, this.fresh.typed + Math.max(0, perfNow - this.fresh.perf));
+  }
+
+  /** When a keyup happened, on the keydowns' clock (`event.timeStamp`, or `perfNow` where a page gives
+   *  none), for `onKeyUp`. A release is a real event of its own, never a synthesized repeat, so its
+   *  stamp is its own time; it changes nothing `timeOf` keeps. */
+  timeOfRelease(event: { timeStamp: number }, perfNow: number = performance.now()): number {
+    return event.timeStamp > 0 ? event.timeStamp : perfNow;
   }
 
   /** Every keydown the panel sees, FIRST, before anything acts on it. A bare modifier is ignored.
@@ -305,19 +333,34 @@ export class TypingGuard {
 
   /** `defer`, for a key that must also have been let go: `run` runs `TYPING_GUARD_MS` after the
    *  press if `onKeyUp(heldKey)` came by then, else at that release -- unless another key (`onKey`,
-   *  the held key's own repeat included) or `cancel` comes first. `heldKey` is the key as the
-   *  caller names it to `onKeyUp` (its `code`). */
-  deferUntilReleased(t: number, repeat: boolean, run: () => void, cancelledFlash: string, heldKey: string): boolean {
-    return this.wait(t, repeat, run, cancelledFlash, "", heldKey);
+   *  the held key's own repeat included) or `cancel` comes first, or the release came more than
+   *  `RELEASE_WAIT_MAX_MS` after the press `t`, which it then refuses with `heldFlash`. `heldKey` is
+   *  the key as the caller names it to `onKeyUp` (its `code`). */
+  deferUntilReleased(
+    t: number,
+    repeat: boolean,
+    run: () => void,
+    cancelledFlash: string,
+    heldKey: string,
+    heldFlash: string = cancelledFlash,
+  ): boolean {
+    return this.wait(t, repeat, run, cancelledFlash, "", heldKey, heldFlash);
   }
 
-  /** A key let go, named as `deferUntilReleased` was given it. Ends a wait that is waiting for this
-   *  key's release; any other release changes nothing. */
-  onKeyUp(heldKey: string): void {
+  /** A key let go at `t` (`timeOfRelease`), named as `deferUntilReleased` was given it. Ends a wait
+   *  that is waiting for this key's release: it runs, or, when the key was down longer than
+   *  `RELEASE_WAIT_MAX_MS`, is dropped and this returns its `heldFlash` for the band. Any other
+   *  release changes nothing and returns `null`. */
+  onKeyUp(heldKey: string, t: number): string | null {
     const waiting = this.pending;
-    if (waiting === null || waiting.heldKey !== heldKey || waiting.released) return;
+    if (waiting === null || waiting.heldKey !== heldKey || waiting.released) return null;
     waiting.released = true;
+    if (t - waiting.pressedAt > RELEASE_WAIT_MAX_MS) {
+      this.drop();
+      return waiting.heldFlash;
+    }
     if (waiting.due) this.fire(waiting);
+    return null;
   }
 
   private wait(
@@ -327,10 +370,20 @@ export class TypingGuard {
     cancelledFlash: string,
     key: string,
     heldKey: string | null,
+    heldFlash: string = cancelledFlash,
   ): boolean {
     this.cancel();
     if (!this.mayAnswerNow(key, t, repeat)) return false;
-    const waiting: Pending = { handle: null, flash: cancelledFlash, run, heldKey, released: heldKey === null, due: false };
+    const waiting: Pending = {
+      handle: null,
+      flash: cancelledFlash,
+      run,
+      heldKey,
+      released: heldKey === null,
+      due: false,
+      pressedAt: t,
+      heldFlash,
+    };
     waiting.handle = this.timers.setTimeout(() => {
       if (this.pending !== waiting) return;
       waiting.handle = null;

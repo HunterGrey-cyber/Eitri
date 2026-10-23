@@ -255,3 +255,15 @@ it("names the panel-entry key in the dim mode block's title, and leaves the clau
   // With the keys there is no title at all.
   expect(title({ entryKey: "Ctrl+l", paneFocused: true })).toBeNull();
 });
+
+it("draws the Ctrl+y segment in its own `.band-approve` element, the one `index.css` draws in storage order", () => {
+  // `index.css` gives `.band-approve` its direction rule; the class comes from the segment's id, so a
+  // renamed id would leave the agent's right-to-left text drawn by the bidi algorithm.
+  const { container } = renderWide({ ...RUNNING, warn: null, approve: { tool: "shell", summary: "cp א ב" } });
+  const segs = Array.from(container.querySelectorAll<HTMLElement>(".band-seg")).filter((el) =>
+    (el.textContent ?? "").startsWith("Ctrl+y approves"),
+  );
+  expect(segs.length).toBe(1);
+  expect(segs[0].classList.contains("band-approve")).toBe(true);
+  expect(segs[0].textContent).toBe("Ctrl+y approves shell: cp א ב");
+});

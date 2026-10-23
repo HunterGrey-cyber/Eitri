@@ -13,7 +13,7 @@ import App from "./App";
 import { initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 import { EMPTY_PANEL_TABLE } from "./keymap";
-import { TYPING_GUARD_MS } from "./typingGuard";
+import { RELEASE_WAIT_MAX_MS, TYPING_GUARD_MS } from "./typingGuard";
 
 afterEach(cleanup);
 
@@ -174,6 +174,15 @@ const ctrlY = (box: HTMLElement, init: Record<string, unknown> = {}) => {
 };
 
 const TYPING_FLASH = "Ctrl+y approves only on its own — pause, then press it again";
+const HELD_FLASH = "Ctrl+y held down approves nothing — tap it to approve";
+
+/** A key event for `y` with `Ctrl` whose `timeStamp` is `stamp`, as a page handling it late still sees
+ *  the time it happened. */
+function stampedCtrlY(type: "keydown" | "keyup", stamp: number): KeyboardEvent {
+  const event = new KeyboardEvent(type, { key: "y", code: "KeyY", ctrlKey: true, bubbles: true, cancelable: true });
+  Object.defineProperty(event, "timeStamp", { value: stamp });
+  return event;
+}
 
 describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
   beforeEach(() => {
@@ -228,6 +237,54 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       ctrlYDown(box);
       wait(400);
       expect(answered()).toEqual([]);
+      ctrlYUp(box);
+      expect(answered()).toEqual([
+        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
+      ]);
+    });
+
+    it("with key repeat off, a Ctrl+y held past RELEASE_WAIT_MAX_MS approves nothing at its release, and says why", () => {
+      const { container, box } = inInput(1);
+      ctrlYDown(box);
+      // No repeat ever comes (GNOME's "Repeat Keys" off): only the release.
+      wait(2000);
+      expect(answered()).toEqual([]);
+      ctrlYUp(box);
+      wait(1000);
+      expect(answered()).toEqual([]);
+      expect(bandMessage(container)).toBe(HELD_FLASH);
+    });
+
+    it("a quick press whose release the page handles late, after a stall, still approves: the hold is read from the events' own times", () => {
+      const { box } = inInput(1);
+      // The events' clock, whatever it counts from.
+      const pressedAt = new Event("probe").timeStamp;
+      fireEvent(box, stampedCtrlY("keydown", pressedAt));
+      // The page's main thread stalls well past RELEASE_WAIT_MAX_MS; the keyup it then handles happened
+      // 100 ms after the press.
+      wait(RELEASE_WAIT_MAX_MS * 3);
+      expect(answered()).toEqual([]);
+      fireEvent(box, stampedCtrlY("keyup", pressedAt + 100));
+      expect(answered()).toEqual([
+        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
+      ]);
+    });
+
+    it("a held Ctrl+y whose release the page handles at once is refused by the events' times too", () => {
+      const { container, box } = inInput(1);
+      const pressedAt = new Event("probe").timeStamp;
+      fireEvent(box, stampedCtrlY("keydown", pressedAt));
+      wait(TYPING_GUARD_MS + 10);
+      fireEvent(box, stampedCtrlY("keyup", pressedAt + RELEASE_WAIT_MAX_MS + 1));
+      wait(1000);
+      expect(answered()).toEqual([]);
+      expect(bandMessage(container)).toBe(HELD_FLASH);
+    });
+
+    it("a press let go just inside RELEASE_WAIT_MAX_MS still approves at its release", () => {
+      const { box } = inInput(1);
+      ctrlYDown(box);
+      wait(RELEASE_WAIT_MAX_MS - 1);
       ctrlYUp(box);
       expect(answered()).toEqual([
         expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),

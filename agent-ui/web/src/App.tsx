@@ -28,6 +28,7 @@ import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
+  caretModelOf,
   compareCarets,
   copySelectionText,
   entrySelectableCaret,
@@ -257,6 +258,9 @@ const CTRL_Y_TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, 
 /** What the band says when INPUT's `Ctrl+y` came right after a kill in the
  *  box (`Ctrl+u`, `Ctrl+w`, `Ctrl+k`), however long the pause -- readline's yank, never an answer. */
 const CTRL_Y_YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
+/** What the band says when INPUT's `Ctrl+y` was let go more than `RELEASE_WAIT_MAX_MS` after it was
+ *  pressed: a held key, which approves nothing even where no repeat came to refuse it. */
+const CTRL_Y_HELD_FLASH = "Ctrl+y held down approves nothing — tap it to approve";
 /** What the band says when `a` or INPUT's `Ctrl+y` would approve a card whose Approve is disabled: an ACP card
  *  whose agent offered no allow-once option, or one Eitri held back because the card cannot show the whole
  *  call. Nothing is sent; sending would only bring back the agent's refusal under a misleading reason. */
@@ -1635,7 +1639,10 @@ export default function App() {
   // phase on the window, so a keyup another handler stops from bubbling still arrives.
   useEffect(() => {
     function released(event: globalThis.KeyboardEvent) {
-      typingGuard.onKeyUp(heldKeyName(event));
+      // A key held too long to count as a press is refused at its release, with the flash its wait named.
+      // `showFlash` reads only a ref and a state setter, so this listener's first copy of it stays right.
+      const refused = typingGuard.onKeyUp(heldKeyName(event), typingGuard.timeOfRelease(event));
+      if (refused !== null) showFlash(refused);
     }
     window.addEventListener("keyup", released, true);
     return () => window.removeEventListener("keyup", released, true);
@@ -4322,6 +4329,7 @@ export default function App() {
       },
       CTRL_Y_TYPING_FLASH,
       heldKeyName(event.nativeEvent),
+      CTRL_Y_HELD_FLASH,
     );
     if (!waiting) showFlash(CTRL_Y_TYPING_FLASH);
   }
@@ -4665,7 +4673,7 @@ export default function App() {
         // region and its freeze stay on (Esc from VISUAL is not an exit). A
         // repeated `v`/`V`/`Esc` does nothing.
         if (event.repeat || sel === null) return;
-        const caretModel: VisualModel = { anchor: model.cursor, cursor: model.cursor, kind: "caret", goalX: null };
+        const caretModel = caretModelOf(sel as unknown as SelectionLike, model);
         visualModelRef.current = caretModel;
         visualBuiltRef.current = rebuildSelection(sel as unknown as SelectionLike, caretModel);
         modeRef.current = "caret";

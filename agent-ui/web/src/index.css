@@ -1852,6 +1852,16 @@ input::placeholder {
 .band-seg {
   white-space: nowrap;
 }
+/* The `Ctrl+y approves <tool>: <summary>` segment carries the agent's text. Its hidden characters are drawn
+   as escapes (`band.ts`), but right-to-left letters are ordinary text and stay. Drawn by the bidi algorithm,
+   `cp א ב` reads `cp ב א` -- source and destination swapped -- where Ctrl+y approves without the card in
+   view; so it is drawn in storage order, as the permission card draws the command, and isolated from the
+   segments beside it. `bidi-override` first for an engine without `isolate-override`, which then keeps it. */
+.band-approve {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  unicode-bidi: isolate-override;
+}
 /* A sandbox GUI pass on 2026-09-27 at WebKit zoom 1.5 measured a 47-column
    band, where the bypass prompt (`Switch to bypass and approve the 1 waiting card? (y/n)`), the
    empty-tab bypass prompt (`Switch to bypass? New sessions in this window start in bypass too (y/n)`)

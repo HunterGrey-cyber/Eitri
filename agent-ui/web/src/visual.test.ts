@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import {
+  caretModelOf,
   compareCarets,
   copySelectionText,
   fallbackGraphemeStarts,
@@ -502,6 +503,70 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
     const endOfFirst = stepOnce(fakeSelection([textCaret(first, 0), textCaret(first, 5), textCaret(first, 4)]), onFirst, "$", root);
     expect(endOfFirst.model.cursor).toEqual(textCaret(first, 4));
     expect(endOfFirst.moved).toBe(true);
+  });
+
+  it("VISUAL's $ stays after the line's last character, so v$y takes the line break as vim's does; CARET's does not", () => {
+    const root = document.createElement("div");
+    root.innerHTML = '<div class="row-body">first</div><div class="row-body">last</div>';
+    const [first, second] = Array.from(root.querySelectorAll(".row-body")).map((el) => el.firstChild as Text);
+    const start = textCaret(first!, 0);
+    const visual: VisualModel = { anchor: start, cursor: start, kind: "char", goalX: null };
+    const sel = fakeSelection([start, textCaret(first!, 5), textCaret(first!, 4)]);
+    const { model, moved } = stepOnce(sel, visual, "$", root);
+    expect(moved).toBe(true);
+    // On the paragraph boundary, not stepped back from it.
+    expect(sel.calls).toEqual(["move forward paragraphboundary"]);
+    expect(model.cursor).toEqual(textCaret(first!, 5));
+    expect(model.pastEnd).toBe(true);
+    // The inclusive rebuild's one character past that end is the line break.
+    const build = fakeSelection([textCaret(first!, 5), textCaret(second!, 0)]);
+    rebuildSelection(build, model);
+    expect(build.calls).toEqual(["extend forward character"]);
+
+    // Back to CARET (`v`/`Esc`), the block steps back onto the last character, as vim's cursor does on
+    // leaving Visual mode.
+    const back = fakeSelection([textCaret(first!, 5), textCaret(first!, 4)]);
+    const caret = caretModelOf(back, model);
+    expect(caret).toEqual({ anchor: textCaret(first!, 4), cursor: textCaret(first!, 4), kind: "caret", goalX: null });
+    expect(back.calls).toEqual(["move backward character"]);
+
+    // A second `$` (`v$$`, or a counted `v2$`) finds the boundary where the end already is: it stays past
+    // the line's last character, and going back to CARET still steps onto that character.
+    const again = stepOnce(fakeSelection([textCaret(first!, 5)]), model, "$", root);
+    expect(again.moved).toBe(false);
+    expect(again.model.cursor).toEqual(textCaret(first!, 5));
+    expect(again.model.pastEnd).toBe(true);
+    expect(caretModelOf(fakeSelection([textCaret(first!, 5), textCaret(first!, 4)]), again.model).cursor).toEqual(textCaret(first!, 4));
+    expect(repeatMotion(fakeSelection([start, textCaret(first!, 5)]), visual, "$", 2, root).pastEnd).toBe(true);
+    // An end that is not past its line's last character gains nothing from a `$` that does not move.
+    const emptyLine: VisualModel = { anchor: start, cursor: start, kind: "char", goalX: null };
+    expect(stepOnce(fakeSelection([start]), emptyLine, "$", root).model.pastEnd).toBeUndefined();
+
+    // Any other motion from there clears it; `o` hands it to the other end and back.
+    const left = stepOnce(fakeSelection([textCaret(first!, 5), textCaret(first!, 4)]), model, "h", root).model;
+    expect(left.pastEnd).toBeUndefined();
+    const swapped = swapEnds(model);
+    expect(swapped.pastEnd).toBeUndefined();
+    expect(swapped.anchorPastEnd).toBe(true);
+    expect(caretModelOf(fakeSelection([start]), swapped).cursor).toEqual(start);
+    expect(swapEnds(swapped).pastEnd).toBe(true);
+
+    // CARET keeps its own `$`: on the last character.
+    const onCaret: VisualModel = { anchor: start, cursor: start, kind: "caret", goalX: null };
+    const caretDollar = stepOnce(fakeSelection([start, textCaret(first!, 5), textCaret(first!, 4)]), onCaret, "$", root).model;
+    expect(caretDollar.cursor).toEqual(textCaret(first!, 4));
+    expect(caretDollar.pastEnd).toBeUndefined();
+  });
+
+  it("VISUAL's $ on the list's last line lands on its last character, with no line break after it to take", () => {
+    const root = document.createElement("div");
+    root.innerHTML = '<div class="row-body">only</div>';
+    const only = root.querySelector(".row-body")?.firstChild as Text;
+    const start = textCaret(only, 0);
+    const visual: VisualModel = { anchor: start, cursor: start, kind: "char", goalX: null };
+    const { model } = stepOnce(fakeSelection([start, textCaret(only, 4)]), visual, "$", root);
+    expect(model.cursor).toEqual(textCaret(only, 3));
+    expect(model.pastEnd).toBeUndefined();
   });
 
   // Re-centering the caret's parent after every j/k step was
