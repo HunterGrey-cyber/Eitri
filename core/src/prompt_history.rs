@@ -193,7 +193,9 @@ pub fn startup(dir: Option<&Path>, project_root: &Path) -> (Vec<String>, Vec<Str
 /// a text the window already shows. Texts a write could not put in (the lock held by another window for
 /// every try, or any other failure) are held by the thread and tried again by themselves after a pause
 /// and with the next batch; while the lock is what keeps them out, the batch stays unreported, so
-/// [`is_busy`](Self::is_busy) stays true and the window polls until they are written. Held texts live
+/// [`is_busy`](Self::is_busy) stays true and the window polls until they are written; after any other
+/// failure, which is reported, the write that succeeds raises the window's wake ([`set_wake`](Self::set_wake)).
+/// Held texts live
 /// only in this process until written, so a crash meanwhile loses them. [`finish`](Self::finish) at the
 /// window's close hands over nothing more; the thread finishes the round under way, makes one more for
 /// what it still holds, and ends ([`CLOSE_WAIT`] bounds both); what that last round cannot write is given
@@ -211,6 +213,8 @@ pub struct HistoryWriter {
     answered: u64,
     /// Rounds the thread found the lock held for every try, counted for a test that must wait for one.
     refused: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Raised by the thread when a write succeeds after a failed one; `None` for a window that polls anyway.
+    wake: Option<agent::UiWake>,
 }
 
 struct Worker {
@@ -237,7 +241,16 @@ impl HistoryWriter {
             handed: 0,
             answered: 0,
             refused: std::sync::Arc::default(),
+            wake: None,
         }
+    }
+
+    /// The window's wake, raised when the thread writes texts after a failure it had reported: that report
+    /// let the window stop polling, so without the wake the file's entries, other windows' prompts among
+    /// them, would wait for whatever ticks the window next. Set before the first batch: the thread takes
+    /// it when it starts.
+    pub fn set_wake(&mut self, wake: agent::UiWake) {
+        self.wake = Some(wake);
     }
 
     /// How many write rounds have found the lock held for every try so far.
@@ -345,8 +358,9 @@ impl HistoryWriter {
             let root = self.project_root.clone();
             let tries = self.tries;
             let refused = self.refused.clone();
+            let wake = self.wake.clone();
             let spawned = std::thread::Builder::new().name("eitri-history".into()).spawn(move || {
-                write_loop(&dir, &root, tries, &batches_rx, &reports_tx, &refused);
+                write_loop(&dir, &root, tries, &batches_rx, &reports_tx, &refused, wake.as_ref());
                 let _ = done_tx.send(());
             });
             if let Err(e) = spawned {
@@ -401,6 +415,7 @@ fn write_loop(
     batches: &std::sync::mpsc::Receiver<(u64, Vec<String>)>,
     reports: &std::sync::mpsc::Sender<Report>,
     refused: &std::sync::atomic::AtomicU64,
+    wake: Option<&agent::UiWake>,
 ) {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     let mut held: Vec<String> = Vec::new();
@@ -447,7 +462,6 @@ fn write_loop(
         let failure = match append_with(dir, root, &held, tries) {
             Ok(entries) => {
                 held.clear();
-                failing = false;
                 failed_pause = FAILED_RETRY_FIRST;
                 pause = None;
                 // A writer that went away reads no more reports; what is still to come is written all the same.
@@ -455,6 +469,14 @@ fn write_loop(
                     batch,
                     entries: Some(entries),
                 });
+                // After a failure other than a held lock the window was told and stopped polling; the
+                // wake has it take this report now.
+                if failing {
+                    if let Some(wake) = wake {
+                        wake();
+                    }
+                }
+                failing = false;
                 None
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -845,6 +867,47 @@ mod tests {
         assert_eq!(
             load(&dir, &root()),
             Loaded::Entries(texts(&["while it failed", "after"]))
+        );
+    }
+
+    /// A failure other than a held lock is reported, so the window stops polling; the retry that later
+    /// writes the texts raises the window's wake, so the file's entries are taken then and not whenever
+    /// the window next ticks. A write with no failure before it wakes nothing: the window polls for it.
+    #[test]
+    fn a_write_after_a_reported_failure_raises_the_wake() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = scratch("wake");
+        let blocker = crate::state_paths::lock_path(&path(&dir, &root()));
+        std::fs::create_dir(&blocker).unwrap();
+        let wakes = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut writer = HistoryWriter::new(Some(dir.to_path_buf()), root());
+        {
+            let wakes = wakes.clone();
+            writer.set_wake(std::sync::Arc::new(move || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        writer.submit(&texts(&["while it failed"]));
+        assert_eq!(writer.wait_answered(), None);
+        assert!(!writer.is_busy(), "the failure was reported: the window stops polling");
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir(&blocker).unwrap();
+        // The thread tries again by itself; the guard only stops a retry that never comes.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while wakes.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the retry wrote the texts and woke nothing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(writer.poll(), Some(texts(&["while it failed"])));
+        writer.submit(&texts(&["after"]));
+        assert_eq!(writer.wait_answered(), Some(texts(&["while it failed", "after"])));
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "a write with no failure before it wakes nothing"
         );
     }
 

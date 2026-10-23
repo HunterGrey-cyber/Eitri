@@ -441,6 +441,10 @@ impl AgentPanelState {
         let wake = panel_wake(&mut tabs);
         let titles =
             eitri_core::transcript_titles::TitleCache::new(wake.as_ref().map(crate::panel_wake::PanelWake::waker));
+        let mut history_writer = history_writer;
+        if let Some(wake) = &wake {
+            history_writer.set_wake(wake.waker());
+        }
         AgentPanelState {
             document,
             host,
