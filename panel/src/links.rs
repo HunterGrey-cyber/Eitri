@@ -5,7 +5,7 @@
 /// holding a control character is refused outright: the path reaches the editor, where a newline
 /// in a name has been able to end one command and start another, and no real file name the agent
 /// shows needs one.
-pub(super) fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+pub fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
     if path.chars().any(|c| c.is_ascii_control()) {
         return Err(format!("refused to open a path holding a control character: {path:?}"));
     }

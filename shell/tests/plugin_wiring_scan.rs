@@ -67,6 +67,13 @@ fn let_block<'a>(code: &'a str, anchor: &str) -> &'a str {
     scan::braced(code, at + code[at..].find('{').unwrap())
 }
 
+/// What the innermost block around `at` says before `at`: the bindings a closure made there captures, wherever among
+/// them they stand.
+fn enclosing_lets(code: &str, at: usize) -> &str {
+    let open = code[..at].rfind('{').expect("a block around the call");
+    &code[open..at]
+}
+
 #[test]
 fn plugins_are_installed_before_the_lua_panels_are_read() {
     let code = build_ui_code();
@@ -80,8 +87,9 @@ fn plugins_are_installed_before_the_lua_panels_are_read() {
 #[test]
 fn the_theme_listener_feeds_every_plugin_page() {
     let code = build_ui_code();
-    let at = code.find("feed_pump.listen_theme(feed,").expect("the theme listener");
-    let body = scan::braced(&code, at + code[at..].find('{').unwrap());
+    // One consumer of nvim's theme, whether this window's own feed or the link from the window with the editor
+    // reports it.
+    let body = let_block(&code, "letapply_theme:");
     let terminal = body
         .find("pane.set_colors(colors);")
         .expect("every terminal follows the theme");
@@ -90,6 +98,20 @@ fn the_theme_listener_feeds_every_plugin_page() {
         .find("plugin_panels.set_theme(&tokens);")
         .expect("every plugin page follows the theme");
     assert!(terminal < pages);
+    let at = code.find("feed_pump.listen_theme(feed,").expect("the theme listener");
+    let listener = scan::braced(&code, at + code[at..].find('{').unwrap());
+    assert!(
+        enclosing_lets(&code, at).contains("letapply=apply_theme.clone();"),
+        "the feed's listener takes the shared consumer"
+    );
+    assert!(
+        listener.contains("apply(payload);"),
+        "the feed's theme reaches the consumer: {listener}"
+    );
+    assert!(
+        code.contains("two.on_theme(apply_theme.clone());"),
+        "the theme told over the link reaches the same consumer"
+    );
 }
 
 #[test]
@@ -157,8 +179,24 @@ fn a_killed_plugin_module_stops_and_a_closing_window_shuts_plugins_down() {
 #[test]
 fn a_plugin_hears_its_focus_and_the_editors_timeoutlen() {
     let code = build_ui_code();
+    // One consumer of nvim's keys, whether this window's own feed or the link from the window with the editor
+    // reports them.
+    let consumer = let_block(&code, "letapply_nvim_keys:");
+    assert!(consumer.contains("plugin_panels.set_timeoutlen(report.timeoutlen);"));
     let listen = code.find("feed_pump.listen_keys(feed,").expect("the keys feed");
-    assert!(code[listen..].contains("plugin_panels.set_timeoutlen(report.timeoutlen);"));
+    let listener = scan::braced(&code, listen + code[listen..].find('{').unwrap());
+    assert!(
+        enclosing_lets(&code, listen).contains("letapply=apply_nvim_keys.clone();"),
+        "the feed's listener takes the shared consumer"
+    );
+    assert!(
+        listener.contains("apply(report);"),
+        "the feed's keys reach the consumer: {listener}"
+    );
+    assert!(
+        code.contains("two.on_keys(apply_nvim_keys.clone());"),
+        "the keys told over the link reach the same consumer"
+    );
 }
 
 #[test]

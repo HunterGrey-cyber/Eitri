@@ -507,6 +507,31 @@ fn a_partner_that_reported_held_false_counts_as_another_window_until_held_true()
 }
 
 #[test]
+fn a_partner_counted_as_another_window_refuses_even_before_its_own_file_exists() {
+    let scratch = Scratch::new("partner-no-file");
+    let dir = scratch.review_dir();
+    let partner = PartnerProcess::start();
+    let _mine = Presence::open(&dir, ME).unwrap();
+    let guard = PresenceGuard::for_tests(&dir, ME, 0);
+    let (linked, counts_as_other) = partner.partner();
+    guard.set_partner(Some(linked));
+    assert_eq!(
+        guard.check(),
+        Ok(()),
+        "no file and nothing said: the partner is not another window"
+    );
+    // A partner whose presence thread never got as far as its own file says it cannot mark its turns.
+    counts_as_other.store(true, Ordering::SeqCst);
+    assert_eq!(
+        guard.check(),
+        Err(Blocked::Busy(Busy::OtherWindow { pid: partner.pid() })),
+        "it is another window though nothing of it is on disk"
+    );
+    counts_as_other.store(false, Ordering::SeqCst);
+    assert_eq!(guard.check(), Ok(()));
+}
+
+#[test]
 fn the_running_check_is_unchanged_and_sees_a_partner_turn() {
     let scratch = Scratch::new("partner-turn");
     let dir = scratch.review_dir();
@@ -629,6 +654,32 @@ fn with_no_ack_the_prompt_is_not_sent_and_says_why() {
         ),
         other => panic!("no acknowledgement must leave the prompt unsent: {other:?}"),
     }
+}
+
+#[test]
+fn a_prompt_waiting_when_its_window_closes_the_link_is_not_sent() {
+    use eitri_core::turn_review::{Decision, Held, PresenceFallback, CLOSING_NOTE};
+    let start = Instant::now();
+    let mut confirming = PresenceFallback::start(start);
+    assert_eq!(confirming.on_closing(), Decision::NotSent(CLOSING_NOTE.to_string()));
+    assert_eq!(
+        confirming.on_confirmed(Held::Yes, start),
+        Decision::Wait,
+        "decided once"
+    );
+    let mut awaiting = PresenceFallback::start(start);
+    assert_eq!(
+        awaiting.on_confirmed(Held::No("full".into()), start),
+        Decision::SendPresenceFalse
+    );
+    assert_eq!(awaiting.on_closing(), Decision::NotSent(CLOSING_NOTE.to_string()));
+    let mut confirmed = PresenceFallback::start(start);
+    assert_eq!(confirmed.on_confirmed(Held::Yes, start), Decision::SendPrompt);
+    assert_eq!(
+        confirmed.on_closing(),
+        Decision::Wait,
+        "a prompt already sent is not taken back"
+    );
 }
 
 #[test]

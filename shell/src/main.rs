@@ -495,9 +495,13 @@ fn build_ui(
     // formatter, or an edit made anywhere else never reaches the buffer.
     nvim_extra_args.extend(eitri_core::buffer_reload::nvim_args());
     // The two nvim round trips: env and `--cmd` reach nvim only at spawn.
-    let scratch_dir = owns_editor.then(eitri_core::scratch::ScratchDir::new).flatten();
-    nvim_child_env.extend(scratch_dir.as_ref().map(|dir| dir.child_env()).unwrap_or_default());
-    nvim_extra_args.extend(scratch_dir.as_ref().map(|dir| dir.nvim_args()).unwrap_or_default());
+    // Window 2 has no nvim but keeps a scratch directory too: its panel writes a draft there for window 1's editor
+    // to edit, and reads the edit's end back from it.
+    let scratch_dir = eitri_core::scratch::ScratchDir::new();
+    if owns_editor {
+        nvim_child_env.extend(scratch_dir.as_ref().map(|dir| dir.child_env()).unwrap_or_default());
+        nvim_extra_args.extend(scratch_dir.as_ref().map(|dir| dir.nvim_args()).unwrap_or_default());
+    }
     let scratch_path = scratch_dir.as_ref().map(|dir| dir.path().to_path_buf());
 
     // What the editor is launched with: the feeds' env and `--cmd`, the project root, `--clean`. The
@@ -596,10 +600,30 @@ fn build_ui(
 
     // A feed that failed to start yields a source that always answers `None`, so the panel needs no
     // branch: turns simply go out as the user typed them, exactly as before wire 1 existed.
-    let editor_context_source = match context_feed.as_mut() {
-        Some(feed) => feed_pump.listen_context(feed, scratch_path.clone()).0,
-        None => std::rc::Rc::new(|| None),
+    // The editor's services across the pair: window 1 tells window 2 what its editor feeds parse and carries out
+    // window 2's editor operations and requests; window 2 takes all of it from the link. Each side is wired to a
+    // link when one comes up (the pair's `linked` hook below).
+    let editor_repeat: linked_window::editor::Repeat =
+        Rc::new(|every: std::time::Duration, step: Box<dyn Fn() -> bool>| {
+            glib::timeout_add_local(every, move || {
+                if step() {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
+        });
+    let window1_editor = owns_editor
+        .then(|| linked_window::editor::Window1Editor::new(project_root, scratch_path.clone(), editor_repeat.clone()));
+    let window2_editor = (!owns_editor)
+        .then(|| linked_window::editor::Window2Editor::new(project_root, scratch_path.clone(), editor_repeat.clone()));
+    let editor_context_source = match (context_feed.as_mut(), &window2_editor) {
+        (Some(feed), _) => feed_pump.listen_context(feed, scratch_path.clone()).0,
+        // Window 1's editor context, as window 1 last told it; none while unlinked.
+        (None, Some(two)) => two.context_source(),
+        (None, None) => std::rc::Rc::new(|| None),
     };
+    let context_for_link = editor_context_source.clone();
     // The pair file, read once by the window that holds the pair, before any other file of the pair: which modules
     // it gives to window 2 and whether this window takes them back. Window 2 is not started again at a launch, so
     // what it held comes back here, and its saved tabs are offered after this window's own.
@@ -660,8 +684,48 @@ fn build_ui(
         None,
         tab_files,
     );
-    // The panel reads the context when its tick runs, and its tick runs only when woken.
-    crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
+    // The panel reads the context when its tick runs, and its tick runs only when woken. Window 1 also tells
+    // window 2 each new context, which wakes window 2's panel there.
+    if let Some(one) = &window1_editor {
+        let panel = agent_panel_handle.clone();
+        let one = one.clone();
+        feed_pump.on_context(move || {
+            panel.wake();
+            one.context_changed(context_for_link().as_ref());
+        });
+    } else {
+        crate::editor_feeds::wake_panel_on_context(&feed_pump, &agent_panel_handle);
+    }
+    if let Some(two) = &window2_editor {
+        let panel = agent_panel_handle.clone();
+        two.on_context(Rc::new(move || panel.wake()));
+    }
+    // Turn review across the pair, in a window that can be one of a pair: one presence with the other window, the
+    // overlap notes across both, and window 2's review in window 1's editor. Wired to each link as it comes up.
+    let pair_review = match (&window1_editor, &window2_editor) {
+        (Some(one), _) if pair.holds_pair() => Some(linked_window::review::Role::One(one.clone())),
+        (None, Some(two)) => Some(linked_window::review::Role::Two(two.ops())),
+        _ => None,
+    }
+    .map(|role| {
+        let side: Rc<dyn linked_window::review::ReviewSide> = Rc::new(agent_panel_handle.clone());
+        linked_window::review::PairReview::new(project_root, side, role, editor_repeat.clone())
+    });
+    if let Some(review) = &pair_review {
+        let outbound = Rc::downgrade(review);
+        agent_panel_handle.on_pair_outbound(move |out| {
+            if let Some(review) = outbound.upgrade() {
+                review.outbound(out);
+            }
+        });
+        let running = Rc::downgrade(review);
+        pair.set_running_turns(Rc::new(move || {
+            running
+                .upgrade()
+                .map(|review| review.running_turns())
+                .unwrap_or_default()
+        }));
+    }
 
     // `init.lua`: its Lua panels and the plugins it loads are registered before the config is read.
     driver.start(WinId::MAIN, StartStep::Kernel);
@@ -832,16 +896,31 @@ fn build_ui(
         eitri_panel::keys_help::HelpScope::Window,
     );
     keys_help.send();
-    if let Some(feed) = nvim_keys_feed.as_mut() {
+    // nvim's keys, from this window's own feed or, in window 2, as window 1 tells them.
+    let apply_nvim_keys: Rc<dyn Fn(eitri_core::nvim_keys::NvimReport)> = {
         let keys_help = keys_help.clone();
         let plugin_panels = plugin_panels.clone();
-        feed_pump.listen_keys(feed, move |report| {
+        Rc::new(move |report: eitri_core::nvim_keys::NvimReport| {
             // A page's multi-key sequences wait as long as the editor's do.
             plugin_panels.set_timeoutlen(report.timeoutlen);
             keys_help.nvim_report(report);
+        })
+    };
+    if let Some(feed) = nvim_keys_feed.as_mut() {
+        let apply = apply_nvim_keys.clone();
+        let plugin_panels = plugin_panels.clone();
+        let one = window1_editor.clone();
+        feed_pump.listen_keys(feed, move |report| {
+            if let Some(one) = &one {
+                one.keys_changed(&report);
+            }
+            apply(report);
             // The feed reports at nvim's VimEnter: a new editor session may be ready for the plugins' snippets.
             plugin_panels.editor_session();
         });
+    }
+    if let Some(two) = &window2_editor {
+        two.on_keys(apply_nvim_keys.clone());
     }
     driver.start(
         WinId::MAIN,
@@ -1393,12 +1472,27 @@ fn build_ui(
     if let Some(pane) = &pane {
         let editor_row = editor_row.clone();
         let agent_panel_handle = agent_panel_handle.clone();
+        let one = window1_editor.clone();
         pane.connect_cell_size_changed(move |_, h| {
             let mut row = editor_row.get();
             let css_px = row.set_cell_height(h as f32);
             editor_row.set(row);
             agent_panel_handle.set_editor_row_px(css_px);
+            if let Some(one) = &one {
+                one.cell_height_changed(h as f32);
+            }
         });
+    }
+    // Window 2's panel rows match the editor's, whose cell window 1 measures.
+    if let Some(two) = &window2_editor {
+        let editor_row = editor_row.clone();
+        let agent_panel_handle = agent_panel_handle.clone();
+        two.on_cell_height(Rc::new(move |h: f32| {
+            let mut row = editor_row.get();
+            let css_px = row.set_cell_height(h);
+            editor_row.set(row);
+            agent_panel_handle.set_editor_row_px(css_px);
+        }));
     }
     // A key the user pressed in the editor reached nvim: the typing window that paces the agent
     // panel's stream (`AgentPanelHandle::note_editor_key`). A notification only.
@@ -1436,7 +1530,8 @@ fn build_ui(
         panel_base,
         panel_px,
     );
-    if let Some(feed) = theme_feed.as_mut() {
+    // nvim's theme, from this window's own feed or, in window 2, as window 1 tells it.
+    let apply_theme: Rc<dyn Fn(eitri_core::theme::payload::NvimThemePayload)> = {
         let theme_css = theme_css.clone();
         // What the stylesheet paints, for the widgets GTK leaves on the old one (`theme::restyle`).
         let window_for_theme = window.clone();
@@ -1448,7 +1543,7 @@ fn build_ui(
         let editor_font = editor_font.clone();
         let text_size_controller = text_size_controller.clone();
         let follows_editor = config.panel_font_follows_editor;
-        feed_pump.listen_theme(feed, move |payload| {
+        Rc::new(move |payload: eitri_core::theme::payload::NvimThemePayload| {
             // The editor's font first, so the theme sent below already carries the panel's new size.
             if follows_editor {
                 let mut font = editor_font.get();
@@ -1479,9 +1574,23 @@ fn build_ui(
             // The derived tokens, not the panel's sized ones: a page's set carries no size, so a size-only
             // change leaves it equal and sends the pages nothing.
             plugin_panels.set_theme(&tokens);
+        })
+    };
+    if let Some(feed) = theme_feed.as_mut() {
+        let apply = apply_theme.clone();
+        let plugin_panels = plugin_panels.clone();
+        let one = window1_editor.clone();
+        feed_pump.listen_theme(feed, move |payload| {
+            if let Some(one) = &one {
+                one.theme_changed(&payload);
+            }
+            apply(payload);
             // The feed reports at nvim's VimEnter: a new editor session may be ready for the plugins' snippets.
             plugin_panels.editor_session();
         });
+    }
+    if let Some(two) = &window2_editor {
+        two.on_theme(apply_theme.clone());
     }
 
     // The desktop's text scaling moved WebKit's page zoom, so the editor's size is a different number of
@@ -2028,23 +2137,42 @@ fn build_ui(
             focus_module: focus_module.clone(),
         };
         let plugin_panels = plugin_panels.clone();
+        let one = window1_editor.clone();
         feed_pump.listen_follow(socket, move |batch| {
+            // The lines for a page window 2 holds go there; nvim's side of them stays here.
+            let batch = match &one {
+                Some(one) => one.route_follow(batch),
+                None => batch,
+            };
             plugin_panels::apply_follow_commands(&window, plugin_panels.route_follow(batch, std::time::Instant::now()));
         });
     }
+    // Window 2's pages follow window 1's editor through the lines window 1 sends them.
+    if let Some(two) = &window2_editor {
+        let window = GridFollowWindow {
+            module_layout: module_layout.clone(),
+            grid: grid.downgrade(),
+            show_on_screen: show_on_screen.clone(),
+            focus_module: focus_module.clone(),
+        };
+        let plugin_panels = plugin_panels.clone();
+        two.on_follow(Rc::new(move |batch: eitri_core::plugin::follow_feed::FollowBatch| {
+            plugin_panels::apply_follow_commands(&window, plugin_panels.route_follow(batch, std::time::Instant::now()));
+        }));
+    }
     // The scratch round trips (`Ctrl+g`, `gf`): the editor is shown and given the keys before nvim
-    // is handed the request, and an edit that came back returns the keys to the chat.
-    {
+    // is handed the request, and an edit that came back returns the keys to the chat. With no request, only the
+    // editor shown and given the keys.
+    let drive_editor: Rc<dyn Fn(Option<&eitri_core::scratch::ScratchRequest>) -> Result<(), String>> = {
         let pane = pane.clone();
         let show_on_screen = show_on_screen.clone();
         let give_keys = give_keys.clone();
         let module_layout = module_layout.clone();
-        panel_hooks.on_editor_request = Some(Box::new(move |request: &eitri_core::scratch::ScratchRequest| {
+        Rc::new(move |request| {
             // `prefix x` quit it, and it cannot come back in this window (`kill_pane`).
             if module_layout.borrow().is_gone(&ModuleId::editor()) {
                 return Err(LayoutError::Gone(ModuleId::editor()).to_string());
             }
-            // Window 2's editor is window 1's, and nothing here can drive it.
             let Some(pane) = &pane else {
                 return Err(linked_window::NO_EDITOR_HERE.to_string());
             };
@@ -2055,8 +2183,76 @@ fn build_ui(
             }
             show_on_screen(&ModuleId::editor()).map_err(|e| e.to_string())?;
             give_keys(&ModuleId::editor());
-            pane.send_keys(&request.input_keys());
+            if let Some(request) = request {
+                pane.send_keys(&request.input_keys());
+            }
             Ok(())
+        })
+    };
+    {
+        let drive_editor = drive_editor.clone();
+        let two = window2_editor.clone();
+        let asking = window.downgrade();
+        panel_hooks.on_editor_request = Some(Box::new(move |request: &eitri_core::scratch::ScratchRequest| {
+            match &two {
+                // Window 2's editor is window 1's: the request goes there, with a token that lets window 1 come
+                // forward from this window, which has the keys.
+                Some(two) => two.request(request, &|| activation_token(&asking)),
+                None => drive_editor(Some(request)),
+            }
+        }));
+    }
+    // How either window of the pair comes forward from the other, the compositor's way.
+    let pair_raise = PairRaise::new(config.companion_wm);
+    // Window 2's editor requests, carried out here once window 1 has checked them: this window comes forward with
+    // the token window 2 sent, then its editor is driven as for a request of its own.
+    if let Some(one) = &window1_editor {
+        let drive_editor = drive_editor.clone();
+        let raised = window.downgrade();
+        let pair_raise = pair_raise.clone();
+        one.set_drive(Rc::new(
+            move |act: linked_window::editor::EditorAct<'_>, token: Option<String>| {
+                if let Some(raised) = raised.upgrade() {
+                    pair_raise.raise(&raised, token.as_deref());
+                }
+                match act {
+                    linked_window::editor::EditorAct::Request(request) => drive_editor(Some(request)),
+                    linked_window::editor::EditorAct::Focus => drive_editor(None),
+                }
+            },
+        ));
+        // A draft's end goes back with a token from here, where the keys are while it is edited.
+        let asking = window.downgrade();
+        one.set_token_source(Rc::new(move || activation_token(&asking)));
+        let panel = agent_panel_handle.clone();
+        one.set_own_session(Rc::new(move |session: &str| panel.holds_session(session)));
+        let panel = agent_panel_handle.clone();
+        one.set_draft_here(Rc::new(
+            move |session: Option<String>, result: eitri_core::scratch::EditDone| {
+                // A chat that came here while its draft was out in nvim takes the edit's end as its own.
+                let taken = session
+                    .as_deref()
+                    .is_some_and(|session| panel.finish_moved_draft_edit(session, &result));
+                if !taken {
+                    eprintln!(
+                        "[scratch] a draft edit for {} ended, but no tab here has it out: {result:?}",
+                        session.as_deref().unwrap_or("a chat")
+                    );
+                }
+            },
+        ));
+    }
+    if let Some(two) = &window2_editor {
+        let panel = agent_panel_handle.clone();
+        two.set_draft_tab(Rc::new(move |edit: u64| panel.draft_edit_tab(edit)));
+        // A draft edited in window 1's editor ended there: this window comes forward, and its panel gives the keys
+        // back to the chat.
+        let raised = window.downgrade();
+        let pair_raise = pair_raise.clone();
+        two.set_raise(Rc::new(move |token: Option<String>| {
+            if let Some(raised) = raised.upgrade() {
+                pair_raise.raise(&raised, token.as_deref());
+            }
         }));
     }
     // Turn review's questions to the editor, with the same two refusals: the editor quit for good,
@@ -2072,15 +2268,31 @@ fn build_ui(
             None => Rc::new(linked_window::NoEditor),
         };
         panel_hooks.set_editor_rpc = Some(editor_rpc.clone());
+        if let Some(one) = &window1_editor {
+            one.set_rpc(editor_rpc.clone());
+        }
         plugin_panels.set_editor(editor_rpc);
     }
     // The review overlay in this window's own nvim: the module goes with the window, and a file the
-    // review opened there is shown and given the keys, as a draft being edited is.
+    // review opened there is shown and given the keys, as a draft being edited is. Window 2 has no nvim: its
+    // overlay is window 1's, and a file the review opened there is window 1's editor's to show, window 1 coming
+    // forward with this window's token.
     {
-        panel_hooks.set_review_owner = Some(Box::new(|| Some(eitri_core::review_editor::Owner::Embedded)));
+        let own_editor = window2_editor.is_none();
+        panel_hooks.set_review_owner = Some(Box::new(move || {
+            own_editor.then_some(eitri_core::review_editor::Owner::Embedded)
+        }));
         let give_keys = give_keys.clone();
         let show_on_screen = show_on_screen.clone();
+        let two = window2_editor.clone();
+        let asking = window.downgrade();
         panel_hooks.on_review_open = Some(Box::new(move || {
+            if let Some(two) = &two {
+                if let Err(err) = two.focus_editor(activation_token(&asking)) {
+                    eprintln!("[review] could not bring the editor window forward: {err}");
+                }
+                return;
+            }
             if let Err(err) = show_on_screen(&ModuleId::editor()) {
                 eprintln!("[review] could not show the editor: {err}");
                 return;
@@ -4509,6 +4721,9 @@ fn build_ui(
         let ever_linked = Rc::new(std::cell::Cell::new(false));
         let linked: linked_window::spawn::OnLinked = {
             let ever_linked = ever_linked.clone();
+            let window1_editor = window1_editor.clone();
+            let window2_editor = window2_editor.clone();
+            let pair_review = pair_review.clone();
             let toast = toast.clone();
             let pair_weak = Rc::downgrade(&pair);
             Rc::new(move |link| {
@@ -4526,18 +4741,25 @@ fn build_ui(
                 // The window at this link's end has heard nothing yet, whatever an earlier window 2 was told.
                 said.new_link();
                 say_held(link);
+                if let Some(one) = &window1_editor {
+                    one.linked(link);
+                }
+                if let Some(two) = &window2_editor {
+                    two.linked(link);
+                }
+                if let Some(review) = &pair_review {
+                    review.linked(link);
+                }
             })
         };
         // The same raise as the supervisor's request, after the window's first show: the startup's show stays the
         // controller's present phase.
         let raise: Rc<dyn Fn(Option<String>)> = {
             let raised = window.downgrade();
+            let pair_raise = pair_raise.clone();
             Rc::new(move |token: Option<String>| {
                 let Some(raised) = raised.upgrade() else { return };
-                if let Some(token) = token.as_deref() {
-                    raised.set_startup_id(token);
-                }
-                raised.present();
+                pair_raise.raise(&raised, token.as_deref());
             })
         };
         let ended: linked_window::spawn::OnEnded = {
@@ -4550,7 +4772,21 @@ fn build_ui(
             let plugin_panels = plugin_panels.clone();
             let lua_pages = lua_pages.clone();
             let pair_weak = Rc::downgrade(&pair);
+            let window1_editor = window1_editor.clone();
+            let window2_editor = window2_editor.clone();
+            let pair_review = pair_review.clone();
             Rc::new(move |link, end| {
+                // The partner counts as another window from here on: it may have died, and this window cannot see
+                // its state.
+                if let Some(review) = &pair_review {
+                    review.unlinked();
+                }
+                if let Some(one) = &window1_editor {
+                    one.unlinked();
+                }
+                if let Some(two) = &window2_editor {
+                    two.unlinked();
+                }
                 let who = link
                     .partner()
                     .map_or_else(|| "the other window".to_string(), |p| format!("process {}", p.pid));
@@ -4825,6 +5061,50 @@ fn flash(app_name: &gtk4::Label) {
     if let Some(earlier) = REFUSAL_ENDS.with(|slot| slot.borrow_mut().replace(ends)) {
         earlier.remove();
     }
+}
+
+/// Brings a window of the pair forward after its first show, when the other window had the keys. GNOME lets a
+/// window take the keys from another only with an activation token naming that other window's surface, which the
+/// other window sends. sway, Hyprland and niri turn a token activation into an urgency hint, so there the window also
+/// has the compositor's own tool focus it, on a worker thread (the adapter is started on first use).
+#[derive(Clone)]
+struct PairRaise {
+    wm: eitri_core::compositor::Wm,
+    adapter: Rc<std::cell::OnceCell<Rc<companion::wm_runner::WmRunner>>>,
+}
+
+impl PairRaise {
+    fn new(choice: eitri_core::compositor::WmChoice) -> PairRaise {
+        PairRaise {
+            wm: eitri_core::compositor::resolve(choice, &|name| std::env::var_os(name)),
+            adapter: Rc::default(),
+        }
+    }
+
+    fn raise(&self, window: &ApplicationWindow, token: Option<&str>) {
+        if let Some(token) = token {
+            window.set_startup_id(token);
+        }
+        window.present();
+        use eitri_core::compositor::Wm;
+        if matches!(self.wm, Wm::Sway | Wm::Hyprland | Wm::Niri) {
+            let wm = self.wm;
+            self.adapter
+                .get_or_init(|| companion::wm_runner::WmRunner::new(wm))
+                .raise_pid(std::process::id());
+        }
+    }
+}
+
+/// An activation token from `window`'s display, for the other window of the pair to come forward with: GDK asks the
+/// compositor for one naming the surface with the keys and the seat's last input. `None` when none is given.
+fn activation_token(window: &glib::WeakRef<ApplicationWindow>) -> Option<String> {
+    let window = window.upgrade()?;
+    let context = WidgetExt::display(&window).app_launch_context();
+    context
+        .startup_notify_id(None::<&gtk4::gio::AppInfo>, &[])
+        .map(|token| token.to_string())
+        .filter(|token| !token.is_empty())
 }
 
 /// What a plugin's nvim commands do to its module in this window: a show puts it on screen (opening a start-hidden

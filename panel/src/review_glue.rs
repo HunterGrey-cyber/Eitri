@@ -523,25 +523,63 @@ pub(super) fn poll_scratch_edits(state: &mut AgentPanelState, out: &mut Outbox) 
     }
     let mut keys_to = ViewId::BASE;
     for (edit, result) in finished {
-        let returned = state.tabs.finish_scratch_edit(edit.id, &result);
+        let returned = finish_scratch_edit(state, edit.id, &result, out);
         edit.cleanup();
-        let Some((tab, draft)) = returned else { continue };
-        let (shown, view) = (state.shown_in(tab), state.tabs.view_of(tab));
-        keys_to = view;
-        if let Some(shown) = shown {
-            if let Some(text) = &draft {
-                out.send(shown, eitri_core::agent_bridge::serialize_draft_for_js(tab, text));
-            }
-            out.send(shown, eitri_core::agent_bridge::serialize_scratch_for_js(tab, false));
-        }
-        if let eitri_core::scratch::EditDone::Failed(why) = &result {
-            out.send(
-                view,
-                eitri_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
-            );
+        if let Some(view) = returned {
+            keys_to = view;
         }
     }
     out.effect(Effect::EditorDone(keys_to));
+}
+
+/// Ends the draft edit `id` with `result`: the tab's draft as it came back, told to the page that shows it, with a
+/// failure's reason. The view the tab is in, or `None` when no tab has that edit out.
+fn finish_scratch_edit(
+    state: &mut AgentPanelState,
+    id: u64,
+    result: &eitri_core::scratch::EditDone,
+    out: &mut Outbox,
+) -> Option<ViewId> {
+    let (tab, draft) = state.tabs.finish_scratch_edit(id, result)?;
+    let (shown, view) = (state.shown_in(tab), state.tabs.view_of(tab));
+    if let Some(shown) = shown {
+        if let Some(text) = &draft {
+            out.send(shown, eitri_core::agent_bridge::serialize_draft_for_js(tab, text));
+        }
+        out.send(shown, eitri_core::agent_bridge::serialize_scratch_for_js(tab, false));
+    }
+    if let eitri_core::scratch::EditDone::Failed(why) = result {
+        out.send(
+            view,
+            eitri_core::agent_bridge::serialize_notice_for_js(&format!("the nvim scratch buffer failed: {why}")),
+        );
+    }
+    Some(view)
+}
+
+/// A draft edit that a chat brought with it from the other window of a pair ended in this window's editor: the
+/// tab holding `session` takes the result as it takes one of its own, and the keys return to its chat view.
+/// `false` when no tab here holds that session with an edit out.
+pub(super) fn finish_moved_scratch_edit(
+    state: &mut AgentPanelState,
+    session: &str,
+    result: &eitri_core::scratch::EditDone,
+    out: &mut Outbox,
+) -> bool {
+    let edit = state
+        .tabs
+        .tabs()
+        .iter()
+        .find(|tab| tab.editing_draft.is_some() && tab.provider_session_id().as_deref() == Some(session))
+        .and_then(|tab| tab.editing_draft);
+    let Some(id) = edit else { return false };
+    match finish_scratch_edit(state, id, result, out) {
+        Some(view) => {
+            out.effect(Effect::EditorDone(view));
+            true
+        }
+        None => false,
+    }
 }
 
 /// Ends every draft edit still out in nvim, for an editor that went away: the body file's text
@@ -928,6 +966,82 @@ mod tests {
             "the scratch files are removed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chat that came from the other window while its draft was out in this window's editor: the edit's end
+    /// reaches the tab by its session, and a failed one leaves the draft as it was.
+    #[test]
+    fn a_draft_edit_brought_by_a_moved_chat_ends_in_the_tab_that_holds_it() {
+        use eitri_core::scratch::EditDone;
+        let mut set = TabSet::new(BackendKind::Sidecar, eitri_core::agent_bridge::SessionModeChoice::Auto);
+        let moved = set.active();
+        let other = set.open(eitri_core::tab_set::AgentId::Claude);
+        let mut senders = Vec::new();
+        for (tab, session) in [(moved, "s-moved"), (other, "s-other")] {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            set.start(
+                tab,
+                eitri_core::tab_set::PendingStart {
+                    request_id: format!("r-{session}"),
+                    result_rx: rx,
+                    first_turn: None,
+                    resume: Some(session.into()),
+                    resumed_title: None,
+                    resumed_name: None,
+                },
+            );
+        }
+        set.set_draft(moved, "before");
+        set.set_draft(other, "untouched");
+        // The edit's number is the other window's: this window never handed it out.
+        set.begin_scratch_edit(moved, 41).unwrap();
+        let state = state_for_hooks(set);
+        let mut out = Outbox::default();
+
+        assert!(!finish_moved_scratch_edit(
+            &mut state.borrow_mut(),
+            "s-other",
+            &EditDone::Written("x".into()),
+            &mut out
+        ));
+        assert!(finish_moved_scratch_edit(
+            &mut state.borrow_mut(),
+            "s-moved",
+            &EditDone::Written("edited in nvim".into()),
+            &mut out
+        ));
+        {
+            let state = state.borrow();
+            assert_eq!(state.tabs.get(moved).unwrap().draft(), "edited in nvim");
+            assert_eq!(state.tabs.get(other).unwrap().draft(), "untouched");
+            assert_eq!(
+                state.tabs.get(moved).unwrap().editing_draft,
+                None,
+                "its next Ctrl+g works"
+            );
+        }
+        assert!(
+            !finish_moved_scratch_edit(
+                &mut state.borrow_mut(),
+                "s-moved",
+                &EditDone::Written("again".into()),
+                &mut out
+            ),
+            "an edit ends once"
+        );
+
+        state.borrow_mut().tabs.begin_scratch_edit(moved, 42).unwrap();
+        assert!(finish_moved_scratch_edit(
+            &mut state.borrow_mut(),
+            "s-moved",
+            &EditDone::Failed("E212".into()),
+            &mut out
+        ));
+        let state = state.borrow();
+        assert_eq!(state.tabs.get(moved).unwrap().draft(), "edited in nvim");
+        assert_eq!(state.tabs.get(moved).unwrap().editing_draft, None);
+        drop(senders);
     }
 
     #[test]

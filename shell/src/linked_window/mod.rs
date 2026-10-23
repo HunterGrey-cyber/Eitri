@@ -9,7 +9,9 @@
 //! without a display; the GTK wiring is `build_ui`'s.
 
 pub mod driver;
+pub mod editor;
 pub mod pair_files;
+pub mod review;
 pub mod spawn;
 
 use std::collections::BTreeSet;

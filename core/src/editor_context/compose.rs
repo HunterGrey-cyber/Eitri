@@ -10,7 +10,7 @@
 /// `checkDocumentDirty` occur **zero** times in the 2.1.272 binary -- so on a buffer with unsaved
 /// changes a line range is not merely stale, it is unfalsifiable: nothing downstream can discover
 /// that the file on disk says something else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Selection {
     pub start_line: u32,
     pub end_line: u32,
@@ -25,7 +25,7 @@ pub struct Selection {
 /// `getregion` first and infers from its answer cannot tell "one character" from "nothing". Two
 /// surveyed plugins degrade an unset selection into *the whole buffer*; here that would fire on
 /// every turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditorContext {
     /// Absolute path of the focused buffer's file. Empty for a buffer with no file, which is why
     /// [`compose_turn_text`] checks it rather than assuming a name exists.

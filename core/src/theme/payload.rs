@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the Lua snippet and this parser change shape together. A mismatch rejects the
 /// whole payload rather than guessing at a partial reading.
@@ -10,7 +10,7 @@ pub const PAYLOAD_VERSION: u32 = 1;
 
 /// The subset of one `nvim_get_hl(0, {name = ..., link = false})` result that derivation reads.
 /// Everything else nvim reports (`bold`, `ctermfg`, ...) is ignored by serde's default.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct HlAttrs {
     pub fg: Option<u32>,
     pub bg: Option<u32>,
@@ -18,7 +18,7 @@ pub struct HlAttrs {
     pub reverse: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NvimOptions {
     /// `"light"` or `"dark"`: nvim's `'background'`.
     pub background: String,
@@ -32,7 +32,7 @@ pub struct NvimOptions {
     pub cmdheight: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NvimThemePayload {
     pub v: u32,
     /// Only groups nvim reported as non-empty are present.

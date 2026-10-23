@@ -1169,6 +1169,9 @@ pub struct TabSet {
     /// Whether this window is linked to another one (`TabSet::set_partner`): then a prompt waits for
     /// its presence file before it goes out.
     linked: bool,
+    /// While linked with no turn review installed: the turns running here as the partner was last told of them,
+    /// by tab, with each one's session and `CLOCK_MONOTONIC` start ([`TabSet::take_untracked_turn_edges`]).
+    untracked_turns: BTreeMap<u64, (String, u64)>,
     /// A prompt's file could not be confirmed: the partner is to be told `presence{held: false}`
     /// ([`TabSet::take_presence_false_owed`]).
     presence_false_owed: bool,
@@ -1258,6 +1261,7 @@ impl TabSet {
             starting_since: BTreeMap::new(),
             pending_sends: BTreeMap::new(),
             linked: false,
+            untracked_turns: BTreeMap::new(),
             presence_false_owed: false,
             moving: BTreeSet::new(),
             unbound_since: BTreeMap::new(),
@@ -1464,6 +1468,12 @@ impl TabSet {
     /// The installed turn review, for building review jobs.
     pub fn turn_review(&self) -> Option<&crate::turn_review::TurnReview> {
         self.turn_review.as_ref()
+    }
+
+    /// The installed turn review, for what a linked partner tells it (its turns' starts and ends) and what this
+    /// window keeps for the partner.
+    pub fn turn_review_mut(&mut self) -> Option<&mut crate::turn_review::TurnReview> {
+        self.turn_review.as_mut()
     }
 
     /// The session `tab` reviews under and the review itself, or why there is neither.

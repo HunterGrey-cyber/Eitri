@@ -30,7 +30,8 @@ const CLOSE_FLUSH: Duration = Duration::from_secs(1);
 const READS_PER_TURN: usize = 64;
 
 /// Whether the partner counts as another window for turn review: set while the partner says it could not confirm its
-/// own presence (`presence{held: false}`), cleared when it says it holds it again.
+/// own presence (`presence{held: false}`), cleared when it says it holds it again, and set for good once the
+/// partner says `bye` or the link ends: a window that can no longer be heard is never skipped.
 #[derive(Debug, Clone, Default)]
 pub struct PresenceFlag(pub Arc<AtomicBool>);
 
@@ -310,7 +311,10 @@ struct LinkThread {
 
 impl LinkThread {
     fn run(mut self) {
-        if let Ended::PeerGone = self.serve() {
+        let ended = self.serve();
+        // Before anything is told of the end: from here on nothing the partner does can be heard.
+        self.presence.0.store(true, Ordering::SeqCst);
+        if let Ended::PeerGone = ended {
             self.deliver(Inbound::Closed);
         }
         let queued = {
@@ -470,6 +474,15 @@ impl LinkThread {
     fn take(&mut self, packet: fdpass::Received) {
         match decode(packet) {
             Ok((msg, fds)) => {
+                // A window that has not confirmed its own presence when it says hello or welcome counts as another
+                // window until its `presence{held: true}`; set here, in order with that message.
+                if let Msg::Hello { presence_ready, .. } | Msg::Welcome { presence_ready, .. } = &msg {
+                    self.presence.0.store(!presence_ready, Ordering::SeqCst);
+                }
+                // A partner on its way out is counted from its `bye` on, before its socket closes.
+                if let Msg::Bye { .. } = &msg {
+                    self.presence.0.store(true, Ordering::SeqCst);
+                }
                 if let Msg::Presence { held } = msg {
                     // The flag is set before the acknowledgement can leave, so the partner may rely on it once
                     // the ack arrives.
@@ -869,6 +882,58 @@ mod tests {
             );
             assert_eq!(from_json(&got.bytes).unwrap(), Msg::PresenceAck { held });
         }
+    }
+
+    #[test]
+    fn a_partner_that_says_bye_or_goes_is_counted_as_another_window_at_once() {
+        for says_bye in [true, false] {
+            let (a, peer) = fdpass::seqpacket_pair().unwrap();
+            let flag = PresenceFlag::default();
+            let (_link, rx) = LinkHandle::start(a, flag.clone()).unwrap();
+            raw_send(&peer, &Msg::Presence { held: true });
+            assert!(matches!(next(&rx), Inbound::Msg { .. }));
+            assert!(
+                !flag.0.load(Ordering::SeqCst),
+                "a partner that holds its presence is skipped"
+            );
+            if says_bye {
+                raw_send(&peer, &Msg::Bye { why: "closing".into() });
+                assert!(matches!(next(&rx), Inbound::Msg { .. }));
+                assert!(
+                    flag.0.load(Ordering::SeqCst),
+                    "counted from its bye, before its socket closes"
+                );
+            } else {
+                drop(peer);
+                assert!(matches!(next(&rx), Inbound::Closed));
+                assert!(flag.0.load(Ordering::SeqCst), "counted once the link is gone");
+            }
+        }
+    }
+
+    #[test]
+    fn a_handshake_not_yet_ready_counts_its_sender_as_another_window_until_it_says_so() {
+        let (a, peer) = fdpass::seqpacket_pair().unwrap();
+        let flag = PresenceFlag::default();
+        let (_link, rx) = LinkHandle::start(a, flag.clone()).unwrap();
+        let hello = |presence_ready| Msg::Hello {
+            build: "b".into(),
+            window: "2".into(),
+            pid: 1,
+            start: 1,
+            presence_ready,
+            running: Vec::new(),
+            summary: Default::default(),
+        };
+        raw_send(&peer, &hello(false));
+        assert!(matches!(next(&rx), Inbound::Msg { .. }));
+        assert!(flag.0.load(Ordering::SeqCst), "not ready: counted as another window");
+        raw_send(&peer, &Msg::Presence { held: true });
+        assert!(matches!(next(&rx), Inbound::Msg { .. }));
+        assert!(!flag.0.load(Ordering::SeqCst), "its presence confirmed: no longer");
+        raw_send(&peer, &hello(true));
+        assert!(matches!(next(&rx), Inbound::Msg { .. }));
+        assert!(!flag.0.load(Ordering::SeqCst), "a ready hello leaves it skipped");
     }
 
     #[test]

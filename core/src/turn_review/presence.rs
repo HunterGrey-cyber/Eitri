@@ -511,6 +511,16 @@ impl PresenceGuard {
         *self.partner.lock().unwrap_or_else(|e| e.into_inner()) = partner;
     }
 
+    /// The partner that has asked to be counted as another window: it is one whether or not its own file is
+    /// there, since a window that cannot mark its turns may not have been able to take that file either.
+    fn partner_counted(&self) -> Option<u32> {
+        let partner = self.partner.lock().unwrap_or_else(|e| e.into_inner());
+        partner
+            .as_ref()
+            .filter(|p| p.counts_as_other.load(Ordering::SeqCst))
+            .map(|p| p.pid)
+    }
+
     /// The partner to skip, if it has not asked to be counted as another window.
     fn partner_to_skip(&self) -> Option<(u32, u64)> {
         let partner = self.partner.lock().unwrap_or_else(|e| e.into_inner());
@@ -548,7 +558,10 @@ impl PresenceGuard {
             return Err(Blocked::TurnRunningHere);
         }
         match busy_elsewhere_beside(&self.review_dir, self.own_pid, self.partner_to_skip()) {
-            Ok(None) => Ok(()),
+            Ok(None) => match self.partner_counted() {
+                Some(pid) => Err(Blocked::Busy(Busy::OtherWindow { pid })),
+                None => Ok(()),
+            },
             Ok(Some(busy)) => Err(Blocked::Busy(busy)),
             // Not knowing is not the same as nobody being there.
             Err(e) => Err(Blocked::NotHeld(format!("the other windows could not be listed: {e}"))),
@@ -595,6 +608,10 @@ enum WaitStage {
     Decided,
 }
 
+/// What a prompt still waiting for its presence when its window closes the link says, at the head of its queue.
+pub const CLOSING_NOTE: &str =
+    "not sent: the link to the other window was closed before turn review could mark the turn as running";
+
 /// The wait of one prompt in a linked window, from the presence thread's confirmation through the
 /// acknowledged fallback, decided by the clock it is given and nothing else.
 ///
@@ -640,6 +657,16 @@ impl PresenceFallback {
         match self.stage {
             WaitStage::Decided => Decision::Wait,
             _ => self.decide(Decision::SendPrompt),
+        }
+    }
+
+    /// This window is closing its link while the prompt waits: the prompt is not sent. The partner may still
+    /// be skipping this window's `windows/` file until it hears the link close, and this window's own file has
+    /// not been confirmed to mark the turn, so nothing would stop the partner's revert while that turn runs.
+    pub fn on_closing(&mut self) -> Decision {
+        match self.stage {
+            WaitStage::Decided => Decision::Wait,
+            _ => self.decide(Decision::NotSent(CLOSING_NOTE.to_string())),
         }
     }
 

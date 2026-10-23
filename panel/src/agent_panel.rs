@@ -54,6 +54,8 @@ mod links;
 mod outbox;
 #[path = "pages.rs"]
 mod pages;
+#[path = "pair_review.rs"]
+mod pair_review;
 #[path = "restore.rs"]
 mod restore;
 #[path = "review_glue.rs"]
@@ -107,9 +109,11 @@ pub use handle::{AgentPanelHandle, PanelInit, SupervisorLink};
 pub use handoffs::PanelTabHandoff;
 use handoffs::*;
 use inbound::*;
-pub use links::clicked_link_url;
 use links::*;
+pub use links::{clicked_link_url, open_path_target};
 use pages::*;
+use pair_review::pair_outbound;
+pub use pair_review::{take_pair_outbound, PairOutbound, ReviewSettled, ReviewStep};
 use restore::*;
 pub use review_glue::ReviewConfig;
 use review_glue::*;
@@ -272,6 +276,9 @@ struct AgentPanelState {
     /// What the window gives the flow's editor overlay: who owns the module in its nvim, and what to
     /// do once a file opened there.
     review_editor: crate::review_editor::ReviewEditor,
+    /// Where what the link owes the other window of a linked pair goes after each tick; `None` in a window with no
+    /// partner, where nothing is taken for one.
+    pair_outbound_hook: Option<Rc<dyn Fn(PairOutbound)>>,
     /// An edit came back (or was discarded): the keys return to the chat, in INPUT, in the view of the
     /// edit's tab.
     editor_done_hook: Option<Rc<dyn Fn(ViewId)>>,
@@ -498,6 +505,7 @@ impl AgentPanelState {
             editor_rpc: None,
             review_flow: eitri_core::turn_review::ReviewFlow::new(),
             review_editor: crate::review_editor::ReviewEditor::default(),
+            pair_outbound_hook: None,
             editor_done_hook: None,
             retiring: Retiring::default(),
             resume_after: std::collections::HashMap::new(),

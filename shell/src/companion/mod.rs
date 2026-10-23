@@ -15,7 +15,7 @@ mod link;
 mod prefix;
 mod requests;
 pub(crate) mod window;
-mod wm_runner;
+pub(crate) mod wm_runner;
 
 use std::cell::Cell;
 use std::ffi::OsString;

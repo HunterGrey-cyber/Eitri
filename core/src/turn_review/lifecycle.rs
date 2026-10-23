@@ -1515,6 +1515,12 @@ impl TurnReview {
         self.moved_away.contains(session)
     }
 
+    /// Every session that moved from here to another window and has not come back: those whose jobs still
+    /// finishing here owe their results to the holder.
+    pub fn moved_away_sessions(&self) -> Vec<String> {
+        self.moved_away.iter().cloned().collect()
+    }
+
     /// Whether a worker still owes an answer for a snapshot or a mark it was handed. A session's
     /// numbering is read by its worker before its first task and sent ahead of that task's answer, so it
     /// is covered too. Until this is false, [`poll`](Self::poll) has to be called again.

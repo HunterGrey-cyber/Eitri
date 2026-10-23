@@ -10,12 +10,12 @@ pub mod feed;
 
 pub use classify::{classify, translate_lhs};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One nvim Normal-mode mapping (`vim.api.nvim_get_keymap("n")`): `lhs` already through
 /// `vim.fn.keytrans`, `rhs` absent for a Lua callback, `desc` optional, and `callback` true exactly
 /// when there is no `rhs` because a Lua function runs it instead.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NvimMap {
     pub lhs: String,
     pub rhs: Option<String>,
@@ -26,7 +26,7 @@ pub struct NvimMap {
 
 /// One report from the `nvim_keys` feed. `mapleader` is already `keytrans`'d
 /// (`"<Space>"`, never a raw `" "`) and absent when nvim's own `g:mapleader` is unset or empty.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NvimReport {
     pub v: u32,
     pub mapleader: Option<String>,

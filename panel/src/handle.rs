@@ -518,6 +518,7 @@ impl AgentPanelHandle {
             }
         }
         self.run(|state, out| tick_send(state, &screen, pumped, attention_before, out));
+        self.run(pair_outbound);
         true
     }
 
@@ -1706,6 +1707,35 @@ impl AgentPanelHandle {
         };
         let running = matches!(tab.backend(), TabBackend::Starting(_)) || tab.turn_running();
         (usize::from(running), tab.session.queue.len())
+    }
+
+    /// Whether a tab of this window holds the agent session `session` (live, starting or waiting on trust): a
+    /// session the other window of a linked pair may not name as one of its own.
+    pub fn holds_session(&self, session: &str) -> bool {
+        self.wake();
+        let state = self.state.borrow();
+        state
+            .tabs
+            .tabs()
+            .iter()
+            .any(|tab| tab.provider_session_id().as_deref() == Some(session))
+    }
+
+    /// A draft edit that the chat holding `session` brought from the other window of its pair ended in this
+    /// window's editor: the tab takes it as it takes an edit of its own (the new draft, or the failure's reason),
+    /// and the keys return to its chat. `false` when no tab here holds that session with an edit out.
+    pub fn finish_moved_draft_edit(&self, session: &str, result: &eitri_core::scratch::EditDone) -> bool {
+        self.wake();
+        self.run(|state, out| super::review_glue::finish_moved_scratch_edit(state, session, result, out))
+    }
+
+    /// The tab the draft edit `edit` is out for, with the agent session that tab holds: what a window whose
+    /// editor is in the other window of its pair names when it hands the draft over.
+    pub fn draft_edit_tab(&self, edit: u64) -> Option<(TabId, Option<String>)> {
+        self.wake();
+        let state = self.state.borrow();
+        let tab = state.tabs.tabs().iter().find(|tab| tab.editing_draft == Some(edit))?;
+        Some((tab.id, tab.provider_session_id()))
     }
 
     /// The extra chat views the window's layout holds, in any workspace, told before any restore so a

@@ -1045,6 +1045,91 @@ fn an_unlinked_window_sends_at_once_as_today() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+#[test]
+fn a_prompt_held_when_this_window_closes_its_link_stays_unsent_in_its_queue() {
+    let scratch = scratch("move-closing");
+    let dir = scratch.join("project");
+    let mut set = set();
+    // The presence thread never answers: the prompt waits for it.
+    let (holder, _parked) = PresenceHolder::start_parked(scratch.join("state/eitri/review/0123456789abcdef"), 4249);
+    set.hold_presence(holder);
+    let (provider, tab) = live_tab(&mut set, &dir);
+    let _ = set.set_partner(Some(partner()));
+    set.queue_message(tab, "held", "held".into(), 1, true).unwrap();
+    assert!(set.flush_queue(tab).is_none(), "linked, it waits");
+
+    let sent = set.close_link();
+    assert!(
+        matches!(&sent[..], [Sent::NotSent { note, .. }] if note == crate::turn_review::CLOSING_NOTE),
+        "one prompt, not sent, with the closing note ({} decided)",
+        sent.len()
+    );
+    assert!(provider.turns().is_empty(), "nothing went to the agent");
+    assert!(!set.is_linked());
+    assert!(
+        !set.starting.contains(&tab.0),
+        "the tab no longer counts as starting a turn"
+    );
+    let t = set.get(tab).unwrap();
+    assert_eq!(
+        t.session.queue[0].text, "held",
+        "the prompt waits at the head of the queue"
+    );
+    assert_eq!(t.session.queue_error.as_deref(), Some(crate::turn_review::CLOSING_NOTE));
+    shut_down(&mut set);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_linked_window_without_turn_review_still_announces_its_turns() {
+    use crate::window_link::EdgeKind;
+    let dir = workspace("move-untracked-edges");
+    let mut set = set();
+    let (provider, tab) = live_tab(&mut set, &dir);
+    provider.queue(opened(&dir));
+    pump_until(&mut set, &dir, "the session", |s| {
+        s.get(tab).unwrap().provider_session_id().is_some()
+    });
+    provider.queue(started("t0"));
+    pump_until(&mut set, &dir, "a turn", |s| s.get(tab).unwrap().turn_running());
+    assert!(
+        set.take_untracked_turn_edges(5).is_empty(),
+        "an unlinked window announces nothing"
+    );
+
+    // Linked while that turn runs: it is named as running, and not announced again as a new start.
+    let _ = set.set_partner(Some(partner()));
+    let running = set.untracked_running_turn_edges();
+    assert!(
+        matches!(&running[..], [edge] if edge.session == "sess-move" && edge.edge == EdgeKind::Started),
+        "{running:?}"
+    );
+    assert!(set.take_untracked_turn_edges(10).is_empty());
+    provider.queue(completed("t0"));
+    pump_until(&mut set, &dir, "its end", |s| !s.get(tab).unwrap().turn_running());
+    let ended = set.take_untracked_turn_edges(20);
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(
+        (ended[0].session.as_str(), ended[0].edge, ended[0].at_ns),
+        ("sess-move", EdgeKind::Ended, 20)
+    );
+
+    provider.queue(started("t1"));
+    pump_until(&mut set, &dir, "the next turn", |s| s.get(tab).unwrap().turn_running());
+    let started_edges = set.take_untracked_turn_edges(crate::turn_review::monotonic_ns());
+    assert!(
+        matches!(&started_edges[..], [edge] if edge.edge == EdgeKind::Started && edge.at_ns > 20),
+        "{started_edges:?}"
+    );
+    assert!(set.take_untracked_turn_edges(40).is_empty(), "each edge once");
+    let _ = set.set_partner(None);
+    assert!(
+        set.take_untracked_turn_edges(50).is_empty(),
+        "nothing after the link ends"
+    );
+    shut_down(&mut set);
+}
+
 fn typed(text: &str) -> FirstTurn {
     FirstTurn {
         wire: text.into(),

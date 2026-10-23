@@ -18,7 +18,7 @@ use eitri_core::window_link::fdpass;
 use eitri_core::window_link::link::{LinkHandle, PresenceFlag};
 use eitri_core::window_link::pair::PairLock;
 use eitri_core::window_link::start::{spawn_second, SECOND_WINDOW};
-use eitri_core::window_link::{FocusTarget, Msg, Summary};
+use eitri_core::window_link::{FocusTarget, Msg, Summary, TurnEdge};
 
 use super::driver::{LinkDriver, Partner, HANDSHAKE_WITHIN};
 use super::pair_files::PairWriter;
@@ -72,7 +72,8 @@ pub fn check_hello(msg: &Msg, expected: &Expected) -> Result<Partner, String> {
 }
 
 /// Window 2's `hello`: its build, its process, and nothing confirmed yet about its own presence (the partner
-/// counts it as another window until it says so).
+/// counts it as another window until it says so). It is said before the window's panel exists, so no turn of it
+/// runs yet.
 pub fn hello(build: String, pid: u32, start: u64) -> Msg {
     Msg::Hello {
         build,
@@ -85,13 +86,15 @@ pub fn hello(build: String, pid: u32, start: u64) -> Msg {
     }
 }
 
-/// Window 1's `welcome`. The feeds' payloads, the holders and the counts are filled in by what owns them; a
-/// window that has none yet sends none.
-pub fn welcome(holders: BTreeMap<String, String>) -> Msg {
+/// Window 1's `welcome`, with the turns running here now (`running`, as started edges). The feeds' payloads, the
+/// holders and the counts are filled in by what owns them; a window that has none yet sends none. Its presence is
+/// confirmed afterwards, as `presence{held: true}`, once its presence thread has answered for the turns running
+/// then: nothing here waits for that thread.
+pub fn welcome(holders: BTreeMap<String, String>, running: Vec<TurnEdge>) -> Msg {
     Msg::Welcome {
         window: FIRST_WINDOW.to_string(),
         presence_ready: false,
-        running: Vec::new(),
+        running,
         summary: Summary::default(),
         holders,
         context: None,
@@ -113,6 +116,8 @@ pub struct PairHooks {
 
 /// What runs once the link is made.
 pub type OnLinked = Rc<dyn Fn(&LinkDriver)>;
+/// The turns running in this window now, as started edges, for its `welcome`.
+pub type RunningTurns = Rc<dyn Fn() -> Vec<TurnEdge>>;
 /// What runs once the link ended without this window asking.
 pub type OnEnded = Rc<dyn Fn(&LinkDriver, &LinkEnd)>;
 
@@ -132,6 +137,8 @@ pub struct Pair {
     pair_writer: Rc<RefCell<Option<PairWriter>>>,
     /// Whether this window's chats run the legacy backend, so a window 2 it starts is told to run it too.
     legacy_backend: std::cell::Cell<bool>,
+    /// The turns running here, for the `welcome` of a window 2 this window starts.
+    running: Rc<RefCell<Option<RunningTurns>>>,
 }
 
 impl Pair {
@@ -165,6 +172,7 @@ impl Pair {
             activation: RefCell::new(None),
             pair_writer: Rc::default(),
             legacy_backend: std::cell::Cell::new(false),
+            running: Rc::default(),
         });
         if let Some(link) = pair.link() {
             pair.wire(&link);
@@ -179,6 +187,11 @@ impl Pair {
 
     pub fn take_activation(&self) -> Option<String> {
         self.activation.borrow_mut().take()
+    }
+
+    /// Where the turns running in this window are read when it welcomes a window 2.
+    pub fn set_running_turns(&self, running: RunningTurns) {
+        *self.running.borrow_mut() = Some(running);
     }
 
     /// What the window does on the link's events, from here on.
@@ -286,6 +299,7 @@ impl Pair {
                     self.legacy_backend.get(),
                     lock,
                     linked_hook(&self.hooks),
+                    self.running.clone(),
                 )
                 .map_err(|e| format!("the second window could not be started: {e}"))?;
                 self.wire(&link);
@@ -337,6 +351,7 @@ pub fn start_second(
     legacy: bool,
     lock: Rc<PairLock>,
     linked: OnLinked,
+    running: Rc<RefCell<Option<RunningTurns>>>,
 ) -> io::Result<LinkDriver> {
     let (mine, theirs) = fdpass::seqpacket_pair()?;
     // The running executable, not the installed path: an upgrade that replaced the file still starts this build.
@@ -357,15 +372,19 @@ pub fn start_second(
             Ok(status) => println!("[window] window 2 (process {pid}) ended: {status}"),
             Err(err) => eprintln!("[window] window 2 (process {pid}) could not be waited for: {err}"),
         })?;
-    let (handle, inbound) = LinkHandle::start(mine, PresenceFlag::default())?;
+    let presence = not_yet_confirmed();
+    let (handle, inbound) = LinkHandle::start(mine, presence.clone())?;
     let link = LinkDriver::new(handle, inbound);
+    link.set_presence(presence);
     let expected = Expected {
         build: crate::version::fingerprint(),
         pid,
         start,
     };
     link.on("hello", move |link, msg, _| {
-        answer_hello(link, &msg, &expected, &lock, &linked)
+        let running = running.borrow().clone();
+        let running = move || running.as_ref().map(|running| running()).unwrap_or_default();
+        answer_hello(link, &msg, &expected, &lock, &linked, &running)
     });
     link.watch();
     // A window 2 that never says hello (it hung before its toolkit came up, or died in a way the link does not
@@ -381,7 +400,20 @@ pub fn start_second(
     Ok(link)
 }
 
-fn answer_hello(link: &LinkDriver, msg: &Msg, expected: &Expected, lock: &PairLock, linked: &OnLinked) {
+/// The other window's presence flag before it has said anything: it counts as another window until it says it holds
+/// its presence.
+fn not_yet_confirmed() -> PresenceFlag {
+    PresenceFlag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+}
+
+fn answer_hello(
+    link: &LinkDriver,
+    msg: &Msg,
+    expected: &Expected,
+    lock: &PairLock,
+    linked: &OnLinked,
+    running: &dyn Fn() -> Vec<TurnEdge>,
+) {
     if link.linked() {
         eprintln!("[link] a second hello on a linked link; ignored");
         return;
@@ -404,7 +436,10 @@ fn answer_hello(link: &LinkDriver, msg: &Msg, expected: &Expected, lock: &PairLo
         }
     };
     link.set_partner(partner);
-    if let Err(err) = link.send(welcome(BTreeMap::new()), vec![shared]) {
+    if let Msg::Hello { running, .. } = msg {
+        link.set_partner_running(running.clone());
+    }
+    if let Err(err) = link.send(welcome(BTreeMap::new(), running()), vec![shared]) {
         let why = format!("welcome could not be sent ({err})");
         eprintln!("[link] {why}; the link is closed");
         link.close(&why);
@@ -423,8 +458,10 @@ pub fn link_second(sock: OwnedFd, linked: OnLinked) -> io::Result<LinkDriver> {
     let (pid, parent) = unsafe { (libc::getpid(), libc::getppid()) };
     let (pid, parent) = (pid as u32, parent as u32);
     let start = agent::child::start_time(pid)?;
-    let (handle, inbound) = LinkHandle::start(sock, PresenceFlag::default())?;
+    let presence = not_yet_confirmed();
+    let (handle, inbound) = LinkHandle::start(sock, presence.clone())?;
     let link = LinkDriver::new(handle, inbound);
+    link.set_presence(presence);
     let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
     {
         let lock = lock.clone();
@@ -450,7 +487,9 @@ fn take_welcome(
         eprintln!("[link] a second welcome on a linked link; ignored");
         return;
     }
-    let Msg::Welcome { window, .. } = msg else { return };
+    let Msg::Welcome { window, running, .. } = msg else {
+        return;
+    };
     if window != FIRST_WINDOW {
         let why = format!("welcome came from window {window:?}");
         eprintln!("[link] {why}; the link is closed");
@@ -470,6 +509,7 @@ fn take_welcome(
     }
     let start = agent::child::start_time(parent).unwrap_or(0);
     link.set_partner(Partner { pid: parent, start });
+    link.set_partner_running(running.clone());
     link.set_linked();
     println!("[link] linked to window 1 (process {parent})");
     linked(link);
@@ -528,7 +568,7 @@ mod tests {
         };
         let exp = expected();
         driver.on("hello", move |link, msg, _| {
-            answer_hello(link, &msg, &exp, &lock, &linked)
+            answer_hello(link, &msg, &exp, &lock, &linked, &Vec::new)
         });
         theirs.send(hello("0.9.9+zzz".into(), 4242, 99), Vec::new()).unwrap();
         assert!(pump_until(&driver, || !driver.is_up()));
@@ -565,7 +605,7 @@ mod tests {
         {
             let lock = lock.clone();
             driver.on("hello", move |link, msg, _| {
-                answer_hello(link, &msg, &exp, &lock, &linked)
+                answer_hello(link, &msg, &exp, &lock, &linked, &Vec::new)
             });
         }
         theirs.send(hello("0.4.0+abc".into(), 4242, 99), Vec::new()).unwrap();

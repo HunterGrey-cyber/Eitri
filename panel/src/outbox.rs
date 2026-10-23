@@ -105,6 +105,8 @@ pub(super) enum Effect {
     /// A request for nvim: the window shows the editor and hands it the request. What the window answers
     /// decides `then`, which is a step of its own.
     AskEditor { request: ScratchRequest, then: EditorThen },
+    /// What the link owes the other window of a linked pair, for the window's link.
+    PairOutbound(super::PairOutbound),
 }
 
 /// What one step owes, in order. A trust step also keeps its toast and whether it started a restore apart
@@ -272,6 +274,12 @@ impl Outbox {
                     let hook = state.borrow().editor_done_hook.clone();
                     if let Some(hook) = hook {
                         hook(view);
+                    }
+                }
+                Effect::PairOutbound(outbound) => {
+                    let hook = state.borrow().pair_outbound_hook.clone();
+                    if let Some(hook) = hook {
+                        hook(outbound);
                     }
                 }
                 Effect::EditorOpened => {

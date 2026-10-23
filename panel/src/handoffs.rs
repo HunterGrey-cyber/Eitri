@@ -145,6 +145,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         editor_rpc: _,
         review_flow: _,
         review_editor: _,
+        pair_outbound_hook: _,
         editor_done_hook: _,
         retiring: _,
         history_dir: _,

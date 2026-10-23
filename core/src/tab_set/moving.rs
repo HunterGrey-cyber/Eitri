@@ -339,6 +339,14 @@ impl SendGate {
         }
     }
 
+    /// This window is closing its link: a prompt still waiting is not sent.
+    pub fn on_closing(&mut self) -> Decision {
+        match self.wait.as_mut() {
+            Some(wait) => wait.fallback.on_closing(),
+            None => Decision::SendPrompt,
+        }
+    }
+
     /// The link ended: the partner counts this window's own file again, or is gone.
     pub fn on_link_end(&mut self) -> Decision {
         match self.wait.as_mut() {
@@ -570,9 +578,102 @@ impl TabSet {
         }
         self.linked = partner.is_some();
         if self.linked {
+            self.untracked_turns = self.untracked_running(crate::turn_review::monotonic_ns());
             return Vec::new();
         }
+        self.untracked_turns.clear();
         self.decide_every(|gate, _| gate.on_link_end())
+    }
+
+    /// The turns running in this window's tabs that have a session, each with its session and its start on the
+    /// `CLOCK_MONOTONIC` clock (from the turn's wall-clock start, as long ago as that was), for a window with no
+    /// turn review; none for a window that has one, whose review keeps its own.
+    fn untracked_running(&self, now_ns: u64) -> BTreeMap<u64, (String, u64)> {
+        if self.turn_review.is_some() {
+            return BTreeMap::new();
+        }
+        let now_ms = super::wall_clock_ms();
+        self.tabs
+            .iter()
+            .filter(|tab| tab.turn_running())
+            .filter_map(|tab| {
+                let session = tab.provider_session_id()?;
+                let ago_ms = tab.turn_started_at_ms().map_or(0, |at| now_ms.saturating_sub(at));
+                Some((
+                    tab.id.0,
+                    (session, now_ns.saturating_sub(ago_ms.saturating_mul(1_000_000))),
+                ))
+            })
+            .collect()
+    }
+
+    /// The turns running here now, as `started` edges, for a linked window with no turn review: what its `hello`
+    /// or `welcome` names. A window with turn review names them from its review instead.
+    pub fn untracked_running_turn_edges(&self) -> Vec<crate::window_link::TurnEdge> {
+        self.untracked_running(crate::turn_review::monotonic_ns())
+            .into_values()
+            .map(|(session, at_ns)| crate::window_link::TurnEdge {
+                session,
+                edge: crate::window_link::EdgeKind::Started,
+                at_ns,
+            })
+            .collect()
+    }
+
+    /// For a linked window with no turn review: the turn starts and ends since the last call (an end at `now_ns`, a
+    /// start at the turn's own start), so the partner's overlap notes still count this window's turns. A window with turn review announces them from its
+    /// review, with the exact times; an unlinked one announces nothing.
+    pub fn take_untracked_turn_edges(&mut self, now_ns: u64) -> Vec<crate::window_link::TurnEdge> {
+        use crate::window_link::{EdgeKind, TurnEdge};
+        if !self.linked || self.turn_review.is_some() {
+            self.untracked_turns.clear();
+            return Vec::new();
+        }
+        let running = self.untracked_running(now_ns);
+        let mut edges = Vec::new();
+        let told = std::mem::take(&mut self.untracked_turns);
+        for (tab, (session, _)) in &told {
+            if running.get(tab).is_none_or(|(now, _)| now != session) {
+                edges.push(TurnEdge {
+                    session: session.clone(),
+                    edge: EdgeKind::Ended,
+                    at_ns: now_ns,
+                });
+            }
+        }
+        for (tab, (session, started)) in &running {
+            if told.get(tab).is_none_or(|(was, _)| was != session) {
+                edges.push(TurnEdge {
+                    session: session.clone(),
+                    edge: EdgeKind::Started,
+                    at_ns: *started,
+                });
+            }
+        }
+        self.untracked_turns = running
+            .into_iter()
+            .map(|(tab, (session, started))| {
+                let started = told
+                    .get(&tab)
+                    .filter(|(was, _)| *was == session)
+                    .map_or(started, |(_, at)| *at);
+                (tab, (session, started))
+            })
+            .collect();
+        edges
+    }
+
+    /// This window is closing its link: as [`set_partner(None)`](Self::set_partner), except that a prompt still
+    /// waiting for its presence is not sent but held at the head of its tab's queue with a note. The partner learns
+    /// of the close only once it reads it, and until then it may skip this window's file, which was not confirmed
+    /// to mark that prompt's turn. Returns what those prompts did.
+    pub fn close_link(&mut self) -> Vec<Sent> {
+        if let Some(guard) = self.presence_guard() {
+            guard.set_partner(None);
+        }
+        self.linked = false;
+        self.untracked_turns.clear();
+        self.decide_every(|gate, _| gate.on_closing())
     }
 
     /// Whether this window is linked to another one.

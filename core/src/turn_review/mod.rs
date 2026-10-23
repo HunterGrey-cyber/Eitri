@@ -59,7 +59,7 @@ pub use lifecycle::{
 pub use message::{compose, Preview};
 pub use presence::{
     busy_elsewhere, Blocked, Busy, Decision, Held, Partner, Presence, PresenceFallback, PresenceGuard, PresenceHolder,
-    CONFIRM_WAIT,
+    CLOSING_NOTE, CONFIRM_WAIT,
 };
 pub use revert::{
     buffer_state_args, parse_buffer_state, AnchorJob, AppliedRevert, BufferAsk, BufferState, EditorCheck, EditorClear,

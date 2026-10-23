@@ -14,9 +14,9 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use eitri_core::window_link::link::{Inbound, LinkHandle};
+use eitri_core::window_link::link::{Inbound, LinkHandle, PresenceFlag};
 use eitri_core::window_link::msg::KINDS;
-use eitri_core::window_link::{LinkError, Msg};
+use eitri_core::window_link::{LinkError, Msg, TurnEdge};
 use gtk4::glib;
 
 use super::LinkEnd;
@@ -36,13 +36,22 @@ pub struct Partner {
 
 type Handler = Rc<dyn Fn(&LinkDriver, Msg, Vec<OwnedFd>)>;
 type EndHandler = Rc<dyn Fn(&LinkDriver, &LinkEnd)>;
+type ClosingHandler = Rc<dyn Fn(&LinkDriver)>;
+type DrainedHandler = Rc<dyn Fn(&LinkDriver)>;
 
 struct Inner {
     handle: RefCell<Option<LinkHandle>>,
     inbound: Receiver<Inbound>,
     handlers: RefCell<BTreeMap<&'static str, Handler>>,
     on_end: RefCell<Vec<EndHandler>>,
+    on_closing: RefCell<Vec<ClosingHandler>>,
+    on_drained: RefCell<Vec<DrainedHandler>>,
     partner: Cell<Option<Partner>>,
+    /// The flag the link thread sets while the other window counts as another window for turn review: the one given
+    /// to [`LinkHandle::start`], so what the thread sets is what this window's revert checks read.
+    presence: RefCell<PresenceFlag>,
+    /// The turns the other window said were running when it said hello or welcome, until they are taken.
+    partner_running: RefCell<Vec<TurnEdge>>,
     /// The handshake is done: the other window's `hello` was checked and `welcome` sent (window 1), or `welcome`
     /// arrived (window 2).
     linked: Cell<bool>,
@@ -71,7 +80,11 @@ impl LinkDriver {
                 inbound,
                 handlers: RefCell::default(),
                 on_end: RefCell::default(),
+                on_closing: RefCell::default(),
+                on_drained: RefCell::default(),
                 partner: Cell::new(None),
+                presence: RefCell::new(PresenceFlag::default()),
+                partner_running: RefCell::default(),
                 linked: Cell::new(false),
                 bye: RefCell::new(None),
                 ended: RefCell::new(None),
@@ -120,6 +133,38 @@ impl LinkDriver {
         self.inner.handlers.borrow_mut().insert(kind, Rc::new(handler));
     }
 
+    /// Registers what runs as this window closes the link, before its `bye` is queued.
+    pub fn on_closing(&self, handler: impl Fn(&LinkDriver) + 'static) {
+        self.inner.on_closing.borrow_mut().push(Rc::new(handler));
+    }
+
+    /// Registers what runs after each drain that handed any message over, before the link's end is reported: for a
+    /// handler that keeps what arrived together and acts on it as one.
+    pub fn on_drained(&self, handler: impl Fn(&LinkDriver) + 'static) {
+        self.inner.on_drained.borrow_mut().push(Rc::new(handler));
+    }
+
+    /// The flag the link thread was started with ([`LinkHandle::start`]); see [`LinkDriver::presence_flag`].
+    pub fn set_presence(&self, flag: PresenceFlag) {
+        *self.inner.presence.borrow_mut() = flag;
+    }
+
+    /// Whether the other window counts as another window for turn review, as the link thread keeps it: set from
+    /// the handshake when the other window had not confirmed its presence, and from each `presence{held}` it
+    /// sends, before the acknowledgement leaves.
+    pub fn presence_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.inner.presence.borrow().0.clone()
+    }
+
+    /// The turns the other window's `hello` or `welcome` said were running.
+    pub fn set_partner_running(&self, running: Vec<TurnEdge>) {
+        *self.inner.partner_running.borrow_mut() = running;
+    }
+
+    pub fn take_partner_running(&self) -> Vec<TurnEdge> {
+        std::mem::take(&mut *self.inner.partner_running.borrow_mut())
+    }
+
     /// Registers what runs once when the link ends without this window having closed it.
     pub fn on_end(&self, handler: impl Fn(&LinkDriver, &LinkEnd) + 'static) {
         self.inner.on_end.borrow_mut().push(Rc::new(handler));
@@ -131,16 +176,35 @@ impl LinkDriver {
         if let Some(handle) = self.inner.handle.borrow().as_ref() {
             handle.drain_wake();
         }
+        let mut handed = false;
         loop {
             match self.inner.inbound.try_recv() {
-                Ok(Inbound::Msg { msg, fds }) => self.dispatch(msg, fds),
+                Ok(Inbound::Msg { msg, fds }) => {
+                    handed = true;
+                    self.dispatch(msg, fds);
+                }
                 Ok(Inbound::Refused(err)) => eprintln!("[link] a packet from the other window was refused: {err}"),
                 Ok(Inbound::Closed) | Err(TryRecvError::Disconnected) => {
+                    if handed {
+                        self.drained();
+                    }
                     self.end_of_link();
                     return;
                 }
-                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Empty) => {
+                    if handed {
+                        self.drained();
+                    }
+                    return;
+                }
             }
+        }
+    }
+
+    fn drained(&self) {
+        let handlers: Vec<DrainedHandler> = self.inner.on_drained.borrow().clone();
+        for handler in handlers {
+            handler(self);
         }
     }
 
@@ -194,6 +258,12 @@ impl LinkDriver {
     /// Says `bye{why}` and closes the link; the other window sees a clean close. This window's own handlers for
     /// the end do not run: it asked for it.
     pub fn close(&self, why: &str) {
+        if !self.inner.closed_here.get() && self.is_up() {
+            let handlers: Vec<ClosingHandler> = self.inner.on_closing.borrow().clone();
+            for handler in handlers {
+                handler(self);
+            }
+        }
         self.inner.closed_here.set(true);
         self.inner.linked.set(false);
         // The watch goes first: closing the link closes the descriptor it watches.

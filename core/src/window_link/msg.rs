@@ -19,6 +19,20 @@ pub const MAX_MOVE_FDS: usize = 16;
 
 const MIB: usize = 1024 * 1024;
 
+/// How a draft edit in the editor ended, as the window that waits for it is told: its own end of the edit takes
+/// each as it takes the same end from an editor of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "how", rename_all = "snake_case")]
+pub enum DraftEnd {
+    /// Saved: the message's text is the new draft.
+    #[default]
+    Written,
+    /// Quit without saving: the tab keeps the draft it had.
+    Discarded,
+    /// The edit could not be finished; `why` is shown, and the tab keeps the draft it had.
+    Failed { why: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
@@ -69,8 +83,13 @@ pub enum FocusTarget {
 #[serde(tag = "what", rename_all = "snake_case")]
 pub enum EditorRequest {
     /// `Ctrl+g` from a chat tab: the scratch draft opens in the editor and is written back to the tab's holder.
-    Scratch { tab: u64, session: Option<String> },
-    /// A path click or `gf`; `path` is relative to the project root.
+    /// `text` is the draft as the tab holds it: the window with the editor has no copy of the other window's tabs.
+    Scratch {
+        tab: u64,
+        session: Option<String>,
+        text: String,
+    },
+    /// A path click or `gf`; `path` is relative to the project root, or absolute, as the window's own `gf` takes it.
     OpenPath {
         path: String,
         line: Option<u32>,
@@ -80,6 +99,16 @@ pub enum EditorRequest {
     ReviewOpen { path: String, line: Option<u32> },
     /// The editor key pressed in window 2.
     Focus,
+    /// A read-only view (`Ctrl+g` on a chat row): `text` in a read-only buffer named after `title`. The text travels,
+    /// as a draft's does, so no file of the other window's scratch directory is ever named to the editor.
+    View { title: String, text: String },
+    /// A pending edit's proposal as a read-only diff: the file as it is (`base`) and as the edit would leave it
+    /// (`proposed`); `name` is the real file's name, which the buffers' filetype comes from.
+    Diff {
+        name: String,
+        base: String,
+        proposed: String,
+    },
 }
 
 /// The answer to one editor operation. A Lua call that returns nil is `Ok { value: Null }`: an `Option<Value>`
@@ -181,10 +210,17 @@ pub enum Msg {
         request: EditorRequest,
         token: Option<String>,
     },
+    /// A draft edit window 1's nvim ended. `text` is the new draft when `end` is `Written`, and empty otherwise.
     DraftBack {
         tab: u64,
         session: Option<String>,
         text: String,
+        #[serde(default)]
+        end: DraftEnd,
+        /// An activation token from the window that had the keys while the draft was edited, so the window whose
+        /// tab it is may come forward to take them back.
+        #[serde(default)]
+        token: Option<String>,
     },
     Follow {
         owner: String,
@@ -357,6 +393,9 @@ pub fn body_cap(kind: &str) -> usize {
         "review_events" => 8 * MIB,
         "move" => 128 * MIB,
         "context" | "theme" | "keys" => MIB,
+        // A chat draft, out to the editor and back: any text a user pastes into a prompt, held to the bound of
+        // an editor operation.
+        "editor" | "draft_back" => 16 * MIB,
         "welcome" => 3 * MIB,
         _ => 0,
     }
@@ -584,6 +623,8 @@ mod tests {
                 tab: 3,
                 session: Some("s".into()),
                 text: "hi".into(),
+                end: DraftEnd::Written,
+                token: Some("t".into()),
             },
             Msg::Follow {
                 owner: "markdown".into(),
@@ -666,6 +707,42 @@ mod tests {
     }
 
     #[test]
+    fn every_editor_request_round_trips_with_its_token() {
+        for request in [
+            EditorRequest::Scratch {
+                tab: 2,
+                session: Some("s".into()),
+                text: "draft".into(),
+            },
+            EditorRequest::OpenPath {
+                path: "src/a.rs".into(),
+                line: Some(3),
+                col: Some(1),
+            },
+            EditorRequest::ReviewOpen {
+                path: "src/a.rs".into(),
+                line: None,
+            },
+            EditorRequest::Focus,
+            EditorRequest::View {
+                title: "notes".into(),
+                text: "a row\nof text".into(),
+            },
+            EditorRequest::Diff {
+                name: "src/a.rs".into(),
+                base: "old\n".into(),
+                proposed: "new\n".into(),
+            },
+        ] {
+            let msg = Msg::Editor {
+                request,
+                token: Some("t".into()),
+            };
+            assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
+        }
+    }
+
+    #[test]
     fn every_kind_round_trips_and_carries_its_version_and_kind() {
         let all = one_of_each();
         assert_eq!(all.len(), KINDS.len());
@@ -700,6 +777,75 @@ mod tests {
             from_json(br#"{"v":1,"k":"bye"}"#),
             Err(LinkError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn a_draft_longer_than_a_packet_goes_out_and_back_as_a_body() {
+        let long = "pasted log line\n".repeat(10_000);
+        let out = Msg::Editor {
+            request: EditorRequest::Scratch {
+                tab: 1,
+                session: Some("s".into()),
+                text: long.clone(),
+            },
+            token: None,
+        };
+        let back = Msg::DraftBack {
+            tab: 1,
+            session: Some("s".into()),
+            text: long,
+            end: DraftEnd::Written,
+            token: None,
+        };
+        for msg in [out, back] {
+            let kind = msg.kind();
+            let Frame::Body { header, json } = frame(&msg).unwrap() else {
+                panic!("a {kind} of 160 KB travels as a body");
+            };
+            assert_eq!(
+                read_header(&header).unwrap(),
+                Header::Body {
+                    kind: kind.into(),
+                    len: json.len()
+                }
+            );
+            assert_eq!(from_json(&json).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn each_end_of_a_draft_edit_round_trips() {
+        for end in [
+            DraftEnd::Written,
+            DraftEnd::Discarded,
+            DraftEnd::Failed {
+                why: "nvim went".into(),
+            },
+        ] {
+            let msg = Msg::DraftBack {
+                tab: 3,
+                session: None,
+                text: String::new(),
+                end,
+                token: None,
+            };
+            assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn a_draft_back_from_an_older_window_reads_as_written() {
+        let msg = from_json(br#"{"v":1,"k":"draft_back","tab":2,"session":null,"text":"x"}"#).unwrap();
+        assert_eq!(
+            msg,
+            Msg::DraftBack {
+                tab: 2,
+                session: None,
+                text: "x".into(),
+                end: DraftEnd::Written,
+                token: None,
+            }
+        );
     }
 
     #[test]
