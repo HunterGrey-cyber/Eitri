@@ -905,7 +905,7 @@ pub fn serialize_display_for_js(thinking: crate::agent_prefs::ThinkingDisplay) -
 }
 
 /// `{"kind":"pane_focus","focused":bool}`: whether the agent panel's pane holds the window's
-/// keyboard focus, as `shell`'s GTK focus tracking decides it (`shell::pane_focus`). The panel dims
+/// keyboard focus, as `shell`'s GTK focus tracking decides it (`crate::wm::focus`). The panel dims
 /// its mode block when this is `false`. `shell` is the source rather than the page's own
 /// `window` focus/blur because `shell` decides Ctrl+h/Ctrl+l, and because the same answer also
 /// drives the status bar and the pane outline, so the three cannot disagree.

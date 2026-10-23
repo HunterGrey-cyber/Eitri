@@ -260,9 +260,9 @@ type InboundHandler = (
      *  Window-level, sent on every `ready` before the tabs and again when `init.lua`'s values arrive. */
     | { kind: "review_settings"; enabled: boolean; hint: boolean }
     /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from
-     *  GTK's focus widget (`shell/src/pane_focus.rs`). It is not decided from this page's own
-     *  `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the same answer drives the
-     *  status bar and the pane outline, so the three agree. */
+     *  GTK's focus widget (the window controller's report, `eitri_core::wm::focus`). It is not
+     *  decided from this page's own `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the
+     *  same answer drives the status bar and the pane outline, so the three agree. */
     | { kind: "pane_focus"; focused: boolean }
     /** Whether the user is typing in the editor, and the gap between the panel's stream pushes
      *  while they do (`typingCadence.ts`; `serialize_editor_typing_for_js`, `core/src/agent_bridge.rs`).

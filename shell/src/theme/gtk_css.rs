@@ -267,7 +267,7 @@ window {{
     color: {chrome};
 }}
 
-/* The `Ctrl+a` prefix is waiting for its next key (shell::prefix). The same solid block as the top
+/* The `Ctrl+a` prefix is waiting for its next key (`eitri_core::wm::keys`). The same solid block as the top
    bar's own cursor -- the pair is chrome_fg behind chrome text, guarded at 4.5:1 -- as a
    tmux theme highlights its session name while the prefix is down. */
 .topbar-app-name.prefix-armed {{
@@ -611,7 +611,7 @@ mod tests {
         }
     }
 
-    /// The `Ctrl+a` prefix's indicator: the app-name label goes solid
+    /// The `Ctrl+a` prefix's indicator (`eitri_core::wm::keys`): the app-name label goes solid
     /// while it waits, the same pair as the top bar's own focus cursor. Placed after the base
     /// `.topbar-app-name` rule so it wins the cascade (equal specificity, later wins).
     #[test]

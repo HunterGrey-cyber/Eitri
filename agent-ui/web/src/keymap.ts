@@ -257,7 +257,7 @@ export type VisualMotion = "h" | "l" | "j" | "k" | "w" | "e" | "b" | "0" | "$" |
  *  is deliberately untouched, a previously accepted exception scoped to that lookup alone (2026-09-27), not to permission answers. (A `FIXED_PAIRS` second key does
  *  not read them either, as the `g`/`z`/`[`/`]` that armed it never did; `resolvePendingSecond`.)
  *  `getModifierState`: Super and Hyper are a
- *  THIRD GDK modifier, not a spelling of Meta -- `shell/src/prefix.rs`'s own
+ *  THIRD GDK modifier, not a spelling of Meta -- `shell/src/gtk_host/keys.rs`'s own
  *  `SUPER_MASK | HYPER_MASK | META_MASK` treats all three as distinct, and a first version of this
  *  comment (and of an `App.test.tsx` test) wrongly claimed "Linux's Super arrives as `metaKey`
  *  too". `KeyboardEvent.getModifierState("Super"/"Hyper")` (the UI Events names for the key)
@@ -832,7 +832,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       // Super/Hyper is a THIRD, separate GDK
       // modifier -- it does not "arrive as metaKey", the claim an earlier version of this comment
       // made and this project's own shell-side code (`SUPER_MASK`/`HYPER_MASK`/`META_MASK` as three
-      // distinct masks, `shell/src/prefix.rs`) disproves. `isPlainAnswerKey` is the shared check for
+      // distinct masks, `shell/src/gtk_host/keys.rs`) disproves. `isPlainAnswerKey` is the shared check for
       // this (2026-09-28); see `KeyLike`'s own doc comment for the honest caveat that
       // Super may be a no-op on WebKitGTK if it never surfaces as a DOM modifier at all, in which case
       // a real fix needs a shell-side key controller (not built here).

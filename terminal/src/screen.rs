@@ -650,7 +650,7 @@ impl Screen {
     }
 
     /// The whole visible screen. `focused` picks a solid or a hollow cursor -- Eitri's rule that a
-    /// solid cursor means the keys go here (`shell/src/pane_focus.rs`).
+    /// solid cursor means the keys go here (`eitri_core::wm::focus`).
     ///
     /// Outside an open synchronized update, `term` is always quiescent (`open_update() == None`
     /// means `terminal-sync` is not mid-tear), so this reprojects it fresh, at most once per call

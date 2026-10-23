@@ -51,7 +51,8 @@ fn printed_text_paints_ink_in_every_cell_on_the_themes_background() {
     assert!(r.ink(&m, 1, 0, 1, bg) > 0, "the cursor on row 1");
 }
 
-/// Solid when the terminal holds the keys, hollow when it does not (`shell/src/pane_focus.rs`'s rule).
+/// Solid when the terminal holds the keys, hollow when it does not (the window controller's rule,
+/// `eitri_core::wm::focus`).
 #[test]
 fn an_unfocused_cursor_is_hollow() {
     let mut h = start("exec sleep 5", true);

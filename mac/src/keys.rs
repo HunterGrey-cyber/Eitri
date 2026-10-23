@@ -4,7 +4,7 @@
 //!
 //! The AppKit half only describes the event ([`KeyDown`]) and acts on the answer ([`KeyAction`]); every
 //! decision is here, so the Linux workstation tests the whole table. The translation into the prefix's
-//! [`Press`] follows the GDK one in `shell/src/prefix.rs` rule for rule, on AppKit's fields.
+//! [`Press`] follows the GDK one (`classify` in `shell/src/gtk_host/keys.rs`) rule for rule, on AppKit's fields.
 
 use std::rc::Rc;
 use std::time::Instant;

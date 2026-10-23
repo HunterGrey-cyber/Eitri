@@ -12,7 +12,7 @@ pub(super) struct PageState {
     /// `Other` on every `ready` (`PanelKeys::Other`'s own doc says why, `reset_nav_mode_for_ready`
     /// is where the reset happens) -- see `AgentPanelHandle::panel_keys`.
     pub(super) nav_mode: Cell<PanelKeys>,
-    /// Whether this page's pane holds the window's keyboard focus, as `crate::pane_focus` last
+    /// Whether this page's pane holds the window's keyboard focus, as the window's focus tracking last
     /// reported it. It is held here so that a freshly loaded document (first load or a
     /// `prefix r` reload) is told on `ready`. A document is otherwise told only when focus
     /// changes, and a reload does not change focus.
