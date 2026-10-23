@@ -4,8 +4,10 @@ use super::host::*;
 use super::module::SurfaceDecl;
 use super::window::{ActivationToken, EditorPresence, WinId, WindowParts, WindowSpec};
 use super::Controller;
-use crate::layout::ModuleId;
+use crate::keymap::Keymap;
+use crate::layout::{ModuleId, ModuleKeys};
 use crate::tabs::ViewId;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartPhase {
@@ -45,7 +47,11 @@ pub enum StartStep {
     },
     Editor,
     Kernel,
-    Config,
+    /// The window's config is read: the keymap and the module keys it built.
+    Config {
+        keymap: Rc<Keymap>,
+        module_keys: Rc<ModuleKeys>,
+    },
     Layout {
         parts: WindowParts,
     },
@@ -68,7 +74,7 @@ impl StartStep {
             Self::Window { .. } => StartPhase::Window,
             Self::Editor => StartPhase::Editor,
             Self::Kernel => StartPhase::Kernel,
-            Self::Config => StartPhase::Config,
+            Self::Config { .. } => StartPhase::Config,
             Self::Layout { .. } => StartPhase::Layout,
             Self::Surfaces { .. } => StartPhase::Surfaces,
             Self::Chrome => StartPhase::Chrome,
@@ -116,7 +122,8 @@ impl Controller {
                 }
             }
             StartStep::Kernel => batch.push_lua(LuaOp::LoadInit),
-            StartStep::Config | StartStep::Chrome => {}
+            StartStep::Config { keymap, module_keys } => self.set_keymap(win, keymap, module_keys),
+            StartStep::Chrome => {}
             StartStep::Layout { parts } => self.attach_parts(win, parts),
             StartStep::Surfaces { decls } => return self.create_surfaces(win, &decls),
             StartStep::Present {
@@ -130,7 +137,13 @@ impl Controller {
                     to: FocusTo::Module(first),
                     on_grab: arrive
                         .into_iter()
-                        .map(|view| HostOp::Chat(ChatOp::Arrive { win, view }))
+                        .map(|view| {
+                            HostOp::Chat(ChatOp::Arrive {
+                                win,
+                                view,
+                                card_first: true,
+                            })
+                        })
                         .collect(),
                 });
             }
@@ -156,6 +169,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::Declared { win, .. }
         | HostEvent::SurfaceEnded { win, .. }
         | HostEvent::TopBarEntry { win, .. }
+        | HostEvent::TopBarLeft { win }
         | HostEvent::Refused {
             surface: Some((win, _)),
             ..
@@ -244,6 +258,12 @@ mod tests {
         }
     }
 
+    fn config() -> StartStep {
+        let keymap = Rc::new(crate::keymap::Keymap::defaults());
+        let module_keys = Rc::new(ModuleKeys::build(&[], &keymap).unwrap());
+        StartStep::Config { keymap, module_keys }
+    }
+
     fn parts() -> WindowParts {
         WindowParts {
             layout: Rc::new(RefCell::new(
@@ -281,7 +301,7 @@ mod tests {
             },
             StartStep::Editor,
             StartStep::Kernel,
-            StartStep::Config,
+            config(),
             StartStep::Layout { parts: parts() },
             StartStep::Surfaces {
                 decls: vec![SurfaceDecl {
@@ -351,13 +371,15 @@ mod tests {
                 to: FocusTo::Module(ModuleId::agent()),
                 on_grab: vec![HostOp::Chat(ChatOp::Arrive {
                     win: WinId::MAIN,
-                    view: ViewId::BASE
+                    view: ViewId::BASE,
+                    card_first: true,
                 })],
             }
         );
         assert!(ops.contains(&HostOp::Chat(ChatOp::Arrive {
             win: WinId::MAIN,
-            view: ViewId::BASE
+            view: ViewId::BASE,
+            card_first: true,
         })));
         assert_eq!(
             ops.last(),
@@ -446,7 +468,7 @@ mod tests {
             driver.start(WinId::MAIN, StartStep::Editor);
             assert_eq!(ops(&host).len(), if presence == EditorPresence::Owned { 2 } else { 1 });
             driver.start(WinId::MAIN, StartStep::Kernel);
-            driver.start(WinId::MAIN, StartStep::Config);
+            driver.start(WinId::MAIN, config());
             driver.start(WinId::MAIN, StartStep::Layout { parts: parts() });
             driver.start(
                 WinId::MAIN,

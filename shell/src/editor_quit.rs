@@ -36,12 +36,11 @@ pub(crate) enum AskedNvim {
 pub(crate) const UNREACHABLE_NVIM: &str = "nvim's launcher exited and nvim still runs where the editor can no \
      longer reach it \u{2014} close the window or kill-pane the editor to end it (its swap file keeps your changes)";
 
-/// Text for a retired editor: nvim has ended and the shell starts no second nvim in this
-/// window (`Reopen::Never`). The pane could start one on its widget, but the shell never
-/// asks it to. A relaunch shows the editor again. The cause is unknown, so the message
-/// must also be accurate after a crash.
-pub(crate) const RETIRED_EDITOR_TEXT: &str =
-    "nvim exited and cannot restart in this window \u{2014} relaunch Eitri to get the editor back";
+/// What a retired editor's refusals say (its toast, and the decline path's): the controller's own
+/// sentence, so a refusal decided in the core and one decided here read the same. The shell starts no
+/// second nvim in this window (`eitri_core::layout::kill`'s `Reopen::Never`; the editor pane could start
+/// one on its own widget, but nothing in the shell asks it to).
+pub(crate) use eitri_core::wm::feedback::RETIRED_EDITOR_TEXT;
 
 /// What nvim's quit-cancelled letter did ([`EditorQuitting::cancelled`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

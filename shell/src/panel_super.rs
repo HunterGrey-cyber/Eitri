@@ -5,43 +5,25 @@
 //! The page tracks Super keydown and keyup, but that misses a modifier held across
 //! a focus change or a press consumed by GTK's HINT controller. GDK receives the
 //! current modifiers when focus arrives and can catch these cases.
-//! A capture-phase controller on each web module's host drops key presses carrying
-//! `SUPER_MASK` or `HYPER_MASK` before WebKit gets them. The panel binds neither
-//! modifier, and `keys.declare` refuses them for plugin pages, so page bindings are
-//! unaffected. Window shortcuts run earlier in the window's capture phase.
-//! Lua and plugin pages use the same filter to avoid seeing only part of a chord.
+//! `gtk_host::keys::key_press` sets `super_or_hyper` for `SUPER_MASK` or `HYPER_MASK`.
+//! The window controller's module stage consumes the chord before WebKit receives it,
+//! via `gtk_host::keys::module_key`. If the window is gone or has no layout yet,
+//! `wire_host` still keeps the chord from the page.
+//! The panel binds neither modifier, and `keys.declare` refuses them for plugin pages.
+//! Window shortcuts run earlier in the window's capture phase. Lua and plugin pages
+//! use the same filter to avoid seeing only part of a chord.
 //!
 //! When GDK does not report Super, this filter cannot detect it. The page-side
 //! tracker remains necessary for that case.
 
-use gtk4::gdk::ModifierType;
-use gtk4::glib;
-use gtk4::prelude::*;
-
-/// Whether a key press with this modifier state must not reach a web module's page.
-pub fn withheld_from_panel(state: ModifierType) -> bool {
-    state.intersects(ModifierType::SUPER_MASK | ModifierType::HYPER_MASK)
-}
-
-/// Installs the filter on a web module's host -- the agent panel's, and every Lua or plugin page's: the
-/// `WebHost` around its `WebView` (`web_host`), whose capture phase runs before anything on the `WebView`
-/// itself.
-pub fn install(host: &gtk4::Widget) {
-    let controller = gtk4::EventControllerKey::new();
-    controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    controller.connect_key_pressed(|_controller, _key, _keycode, state| {
-        if withheld_from_panel(state) {
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    host.add_controller(controller);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use gtk4::gdk::{Key, ModifierType};
+
+    /// What the module stage reads as a system modifier held, from GDK's state.
+    fn withheld_from_panel(state: ModifierType) -> bool {
+        crate::gtk_host::keys::key_press(Key::a, 38, state).super_or_hyper
+    }
 
     #[test]
     fn super_or_hyper_held_is_withheld_and_nothing_else_is() {

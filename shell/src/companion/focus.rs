@@ -1,25 +1,15 @@
-//! Tracks keyboard focus and updates the pane indicators from GTK's focus widget.
+//! Tracks keyboard focus in the companion window. The panel's current row has a solid sign cell
+//! while it receives keys and a hollow one otherwise. The companion has no window controller,
+//! so its tracker lives here; the main window uses the controller's focus tracking.
 //!
-//! `Ctrl+l` enters the panel in BROWSE without a textarea caret. Cursor indicators make the
-//! focused pane visible while keeping the three-mode keyboard model.
+//! GTK's focus widget identifies the focused module. Cursors are solid only when that module
+//! contains the focus widget and the window is active, so switching windows makes them hollow.
+//! Changes to the focus widget and `notify::is-active` run the same update function.
+//! The focus callback reports the module holding the focus widget even when the window is inactive.
 //!
-//! The editor forwards focus through `NeovideEditorPane::set_focused`, which also sends nvim
-//! `FocusGained`/`FocusLost`. `neovide_editor::HIDE_UNFOCUSED_CURSOR_CMD` hides the editor cursor
-//! when unfocused. The panel receives a `pane_focus` envelope through
-//! `AgentPanelHandle::set_pane_focused`. Its current row's sign cell is solid with focus and
-//! hollow without, so the panel still shows where focus will return.
-//! The cursors provide the focus indicators.
-//!
-//! Changes to `GtkWindow:focus-widget` update all indicators through one function so they agree.
-//! A pane has the keys only when it holds the focus widget and the window is active.
-//! `notify::is-active` runs the same function, so switching to another application clears that state.
-//! The last focused module is written to the layout's `focus` even while the window is inactive.
-//! The top bar's `Ctrl+j` returns to it, and the `Ctrl+a` prefix zooms it.
-//! `Layout::set_focus` rejects hidden modules. Visual behavior has not been checked on screen.
-//!
-//! Modules are keyed by `ModuleId` rather than fixed slot indices, so identity survives layout changes.
-//! `install` reads `ModuleGrid::live_hosts` on every focus change and remembers each module's
-//! state by id. Modules added after the window appears are tracked from their first focus change.
+//! Tracking uses `ModuleId` because positions in a dynamic layout do not identify modules.
+//! On every focus change, `install` reads `ModuleGrid::live_hosts` and keeps each module's
+//! last focus state by id. Modules added after startup are tracked from their first focus change.
 
 use std::collections::BTreeMap;
 

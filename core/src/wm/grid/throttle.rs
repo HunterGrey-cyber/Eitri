@@ -1,50 +1,67 @@
-//! The grid's web host resize throttle decides allocations without querying widgets.
-//! Resizing a WebView reflows its page and can consume more than one CPU core during a divider sweep.
+//! The web host resize throttle. Pure: it decides what size to give a web host this allocation pass,
+//! and has no way to ask a widget anything. The grid carries out the allocation, the clip and the quiet
+//! timer.
 //!
-//! An overlay using `halign = Start` gives the WebView its natural width, which remembers its
-//! widest allocation. After a zoom, maximize or hidden neighbour makes the WebView wider than
-//! its slot, an overlay-based debounce can therefore resize it on every frame again.
+//! **Why web hosts are throttled at all.** `WebKitWebProcess` was measured at about 108% CPU -- over one
+//! full core -- while a divider was dragged, because every size change reflows the page; inside the
+//! grid, with the WebView following every frame, it measured 115-126%.
 //!
-//! A visible host whose target size changes keeps its last allocated size at the new position,
-//! clipped to the target rectangle. It receives the target size after [`QUIET`] with no further
-//! change. A newly appearing host receives its target immediately. Moves that keep the size
-//! are never held. No input or stored field here is a natural size.
+//! **Why a natural size is never an input.** An earlier throttle put the WebView in a `GtkOverlay` at
+//! `halign = Start` over a `DrawingArea` sensor and resized it by `set_size_request` about 70 ms after
+//! the sensor stopped moving. `halign = Start` makes the overlay give the WebView its **natural**
+//! width, and `WebKitWebView`'s natural width sticks at the widest allocation it has ever had. So once
+//! the web host had been wider than its slot -- its neighbour hidden, a zoom, a maximise -- the WebView
+//! followed the overlay every frame again: 56.7-57.7% WebKit CPU in a drag after 50 editor hides,
+//! against 0% from a fresh start, and 442 WebView resizes in one drag against 1.
 //!
-//! GTK hit-tests real allocations (`gtk_widget_do_pick`), so a paint clip alone cannot prevent
-//! an oversized held host from taking a sibling's clicks. On each oversized axis, the held
-//! allocation extends beyond a grid edge touched by the target. If the target touches the far
-//! edge, its position is kept; otherwise it is shifted so its far edge matches the target's
-//! far edge. The grid's hidden overflow prevents clicks outside the grid from reaching the host.
-//! Only a host with siblings on both sides of an axis is capped to its target on that axis.
-//! Capping every shrinking allocation would resize and reflow the WebView on every pass,
-//! losing the benefit of holding its size.
+//! **The rule here.** A web host that was on screen last pass and whose target size changed keeps the
+//! size it was last really given, at its new position, clipped to its new rectangle, and gets the
+//! target once the grid has seen [`QUIET`] with no further change. A host appearing (first allocation,
+//! or shown again) gets its target at once. A move that keeps the size is not a resize and is never
+//! held. Nothing here -- no input, no field -- is a natural size.
+//!
+//! **A held size never reaches over a sibling.** GTK hit-tests a widget by its own real allocation
+//! (`gtk_widget_do_pick`), never by `snapshot_children`'s paint clip, so a held size bigger than the
+//! target -- a host that was just unzoomed, settled at the whole window, is the clearest case -- would
+//! reach past its target over the sibling that settled into the space and take a click that visibly
+//! lands on that sibling. On each axis where the held size is bigger than the target, the overflow is
+//! pointed past the edge of the grid the target touches, where there is no sibling: past the far edge
+//! when the target touches it (the target's own position), else past the near edge (the held size ends
+//! where the target ends). The grid sets `overflow: hidden`, which makes GTK's pick return nothing for
+//! a point outside the grid, so an allocation reaching past the grid's edge can take no click from the
+//! top bar or anything else outside it. Only a host with a sibling on both sides of an axis is clamped
+//! to its target there, trading a WebView resize per pass for correctness.
+//!
+//! Clamping every held size to its target instead would make every pass of every shrinking gesture a
+//! WebView resize -- 100 widths for a 100-pass drag of a web host on the window's right, against one --
+//! and a WebView that follows every frame costs over a full core, as above.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use eitri_core::layout::{ModuleId, Rect, Size};
+use crate::layout::{ModuleId, Rect, Size};
 
-/// A web host receives its target size this long after the last size change.
-pub(crate) const QUIET: Duration = Duration::from_millis(70);
+/// The debounce interval: a web host gets its real size this long after the last change.
+pub const QUIET: Duration = Duration::from_millis(70);
 
 /// What to give one web host this pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WebAllocation {
+pub struct WebAllocation {
     /// The allocation: the target's position, and either the target's size or the settled one.
-    pub(crate) rect: Rect,
+    pub rect: Rect,
     /// `true` when `rect` is not the target yet: the grid must clip the host to its target and
     /// settle once it is quiet.
-    pub(crate) held: bool,
+    pub held: bool,
     /// `true` when this pass holds the host for a target it was not held for last pass: the
     /// quiet period starts again. A pass that holds it for the same target -- the grid allocated
     /// again for some other reason (a `queue_resize` anywhere under it) -- is not a change, and
     /// restarting the timer on it would let a stream of such passes keep the host at its old size
     /// indefinitely.
-    pub(crate) restart_quiet: bool,
+    pub restart_quiet: bool,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct WebThrottle {
+pub struct WebThrottle {
     /// The size each web host was last really given.
     settled: HashMap<ModuleId, (i32, i32)>,
     /// The target each held host was held for in the pass that last held it.
@@ -54,7 +71,7 @@ pub(crate) struct WebThrottle {
 impl WebThrottle {
     /// What to allocate web host `id`, whose rectangle this pass is `target` inside a grid of size
     /// `bounds`. `was_on_screen`: it was allocated in the previous pass too.
-    pub(crate) fn allocate(&mut self, id: &ModuleId, target: Rect, was_on_screen: bool, bounds: Size) -> WebAllocation {
+    pub fn allocate(&mut self, id: &ModuleId, target: Rect, was_on_screen: bool, bounds: Size) -> WebAllocation {
         match self.settled.get(id) {
             Some(&(w, h)) if was_on_screen && (w, h) != (target.w, target.h) => {
                 let (x, w) = held_span(target.x, target.w, w, bounds.w);
@@ -78,7 +95,7 @@ impl WebThrottle {
     }
 
     /// The grid has been quiet for [`QUIET`]: every host gets its target on the next pass.
-    pub(crate) fn settle(&mut self) {
+    pub fn settle(&mut self) {
         self.settled.clear();
         self.held_for.clear();
     }
@@ -86,8 +103,7 @@ impl WebThrottle {
 
 /// One axis of a held allocation, as `(start, length)`: the target's span is `start..start + len`,
 /// the settled length `held`, the grid's length on this axis `bound`. See the module doc's
-/// sw-layout-2 paragraph: an overflow goes past a grid edge the target touches, never over a
-/// sibling.
+/// allocation rule: an overflow goes past a grid edge the target touches, never over a sibling.
 fn held_span(start: i32, len: i32, held: i32, bound: i32) -> (i32, i32) {
     if held <= len || start + len >= bound {
         // Nothing overflows, or it overflows past the grid's far edge: the target's own position.
@@ -167,9 +183,8 @@ mod tests {
         assert!(!t.allocate(&agent, rect(400, 797), true, WINDOW).held);
     }
 
-    /// After a host has been wider because its neighbour was hidden, a divider sweep still gives
-    /// it one size throughout the sweep. Following the WebView's natural width would instead resize
-    /// it on every frame because that width remembers the widest allocation, 1600 pixels here.
+    /// A host that was once wider still receives one size throughout a divider sweep. Its
+    /// natural width can remember its widest allocation, so the policy uses only settled sizes.
     #[test]
     fn the_throttle_never_follows_a_width_the_host_once_had() {
         let mut t = WebThrottle::default();
@@ -231,11 +246,11 @@ mod tests {
             "notes only moved"
         );
     }
-    /// The agent starts at width 797 on the right of `Row(editor | agent)` in a
-    /// 1280-wide window, then shrinks over 100 divider steps. Its held size extends
-    /// past the right window edge, where it cannot cover a sibling, so keep that
-    /// size for the whole sweep. Clamping to each target width would resize the
-    /// WebView on all 100 steps instead of holding one width.
+    /// The agent settled at 797 on the right of
+    /// `Row(editor | agent)` in a 1280-wide window, then a 100-pass divider sweep SHRINKING it. Its
+    /// held size overflows past the window's right edge, where there is no sibling to cover, so the
+    /// hold must stand for the whole sweep. Clamping every held size to its
+    /// target made every pass of every shrink a WebView resize (100 widths, not 1).
     #[test]
     fn a_host_shrinking_toward_the_window_edge_is_still_held_at_one_size() {
         let mut t = WebThrottle::default();
@@ -259,7 +274,7 @@ mod tests {
     /// The same sweep with the agent on the LEFT of `Row(agent | editor)`: its far edge faces the
     /// editor, so the held size ends where the target ends and overflows past the window's left
     /// edge instead -- still one size for the whole sweep, and never a pixel over the editor. This
-    /// is sw-layout-2's own shape (a host shrinking with its sibling beyond its far edge).
+    /// keeps a shrinking host away from the sibling beyond its far edge.
     #[test]
     fn a_host_shrinking_away_from_the_window_edge_is_held_without_covering_its_sibling() {
         let mut t = WebThrottle::default();

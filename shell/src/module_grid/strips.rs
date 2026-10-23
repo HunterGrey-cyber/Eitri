@@ -165,51 +165,8 @@ fn set_entry_text(label: &gtk4::Label, text: &str) {
     label.set_text(text);
 }
 
-/// How the arrangement's `strips` strips are drawn by a pool of `pool` strip widgets: how many new
-/// widgets to make first, and for each strip in arrangement order, the pool slot that draws it. The
-/// pool grows only when a pass needs more strips than it has ever drawn at once; slots past the
-/// last strip are hidden.
-pub(super) fn strip_assignments(pool: usize, strips: usize) -> (usize, Vec<usize>) {
-    (strips.saturating_sub(pool), (0..strips).collect())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_assignments_grow_the_pool_only_when_needed() {
-        assert_eq!(strip_assignments(0, 0), (0, vec![]));
-        assert_eq!(strip_assignments(0, 2), (2, vec![0, 1]), "the first two containers");
-        assert_eq!(
-            strip_assignments(2, 2),
-            (0, vec![0, 1]),
-            "the same two again: nothing new"
-        );
-        assert_eq!(
-            strip_assignments(3, 1),
-            (0, vec![0]),
-            "fewer: the rest are hidden, none dropped"
-        );
-        assert_eq!(
-            strip_assignments(1, 3),
-            (2, vec![0, 1, 2]),
-            "only the missing ones are made"
-        );
-        // Every slot named exists once the new ones are made, and no slot draws two strips.
-        for pool in 0..5 {
-            for strips in 0..5 {
-                let (create, slots) = strip_assignments(pool, strips);
-                assert_eq!(slots.len(), strips);
-                assert!(slots.iter().all(|&s| s < pool + create));
-                let mut seen = slots.clone();
-                seen.dedup();
-                assert_eq!(seen.len(), slots.len());
-                assert_eq!(create, strips.saturating_sub(pool));
-            }
-        }
-    }
-
     /// A session label is the user's text: an entry shows `<b>x</b>` as those characters. Read off
     /// this file's code (comments, literals and this test module blanked): no markup setter at all,
     /// markup never switched on, and the text set in exactly one place, `set_entry_text`, which is

@@ -52,8 +52,8 @@
 //! `ModuleGrid::focus_target` hands it back. A grab that reaches the host anyway -- code handed only
 //! the grid's hosts -- lands on the `WebView` too, because the host forwards it to its one child as
 //! `GtkPopoverBin` does. What else is keyed on the host holds with the
-//! host an ancestor of the `WebView`: `pane_focus` walks up from the focus widget; the capture-phase
-//! key and scroll controllers (`main.rs`'s `install_module_nav`, `panel_super`, `wheel_zoom`) run on
+//! host an ancestor of the `WebView`: the focus report walks up from the focus widget; the capture-phase
+//! key and scroll controllers (`gtk_host::wire`'s module stage, `panel_super`, `wheel_zoom`) run on
 //! every ancestor of the target, top down, before anything on the target itself
 //! (`gtk_propagate_event_internal`, `gtkmain.c`, 4.22.5), WebKit's own second delivery of a key the page
 //! did not handle included (`pane_switch::LetThrough`); and HINT labels the host's rectangle, which is

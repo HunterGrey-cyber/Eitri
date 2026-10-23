@@ -24,15 +24,12 @@ pub(crate) mod registry;
 
 pub(crate) use pane::TerminalPane;
 
-use eitri_core::layout::ModuleKind;
 #[cfg(test)]
 use eitri_core::layout::{Layout, LayoutError, ModuleDecl};
 use eitri_core::theme::ThemeTokens;
 use eitri_terminal::{ExitInfo, TerminalColors};
-use gtk4::gdk::{Key, ModifierType};
 use terminal_render::RgbColor;
 
-use crate::layout::Direction;
 use std::path::{Path, PathBuf};
 
 /// Keeps a directory read from `/proc/<pid>/cwd` only if it still is one. The kernel names a directory that has
@@ -193,44 +190,6 @@ pub(crate) fn on_exit(scope: eitri_core::layout::KillScope) -> OnExit {
     }
 }
 
-/// Where `Ctrl+a Ctrl+a` hands its literal `Ctrl+a`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiteralTarget {
-    Editor,
-    Panel,
-    Terminal,
-    Neither,
-}
-
-/// Routes a literal by the kind of module holding the keys (`pane_focus::focused_module`).
-/// The editor, agent and terminal can receive it. Lua panels and other focus targets cannot.
-pub(crate) fn literal_target(focused: Option<ModuleKind>) -> LiteralTarget {
-    match focused {
-        Some(ModuleKind::Editor) => LiteralTarget::Editor,
-        Some(ModuleKind::Agent) => LiteralTarget::Panel,
-        Some(ModuleKind::Terminal) => LiteralTarget::Terminal,
-        _ => LiteralTarget::Neither,
-    }
-}
-
-/// `Ctrl+h/j/k/l` with no other modifiers are claimed before the terminal's key controller.
-/// They are consumed even with no destination in that direction, so the shell's input
-/// never depends on the layout. With `Shift`, `Alt`, `Super` or `Meta` held, these chords
-/// are left to the terminal.
-///
-/// `pane_switch::nav_direction` supplies the same modifier and direction handling used by
-/// the web modules, keeping all four navigation chords consistent.
-pub(crate) fn navigation(key: Key, state: ModifierType) -> Option<Direction> {
-    crate::pane_switch::nav_direction(key, state)
-}
-
-/// `prefix [`/`prefix PageUp`: the terminal's own copy mode asks exactly the
-/// same question [`literal_target`] already answers for a literal chord -- does this pane hold the
-/// keys right now -- so this names that check rather than adding a second rule beside it.
-pub(crate) fn copy_mode_entry(focused: Option<ModuleKind>) -> bool {
-    matches!(literal_target(focused), LiteralTarget::Terminal)
-}
-
 /// Phase 1 takes two colours from the window's theme -- background and foreground -- so a light
 /// colorscheme does not get a dark box under it. The sixteen ANSI colours follow nvim in phase 4.
 ///
@@ -251,6 +210,7 @@ pub(crate) fn colors_from(tokens: &ThemeTokens) -> TerminalColors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Direction;
     use crate::module_grid::UNALLOCATED;
     use eitri_core::layout::{arrange, hide, navigate, Frame, ModuleId, Nav, Placement, Rect, ZoomChange};
 
@@ -518,54 +478,6 @@ mod tests {
         );
         assert_eq!(ToggleAction::Focus.steps(), &[Unzoom, FocusTerminal]);
         assert_eq!(ToggleAction::HideAndReturn.steps(), &[Unzoom, Hide]);
-    }
-
-    #[test]
-    fn ctrl_a_ctrl_a_reaches_the_terminal_only_when_it_holds_the_keys() {
-        assert_eq!(literal_target(Some(ModuleKind::Terminal)), LiteralTarget::Terminal);
-        assert_eq!(
-            literal_target(Some(ModuleKind::LuaWebview)),
-            LiteralTarget::Neither,
-            "a Lua panel, bottom or not"
-        );
-        assert_eq!(literal_target(Some(ModuleKind::Editor)), LiteralTarget::Editor);
-        assert_eq!(literal_target(Some(ModuleKind::Agent)), LiteralTarget::Panel);
-        assert_eq!(literal_target(Some(ModuleKind::Canvas)), LiteralTarget::Neither);
-        assert_eq!(literal_target(None), LiteralTarget::Neither, "the top bar");
-    }
-
-    #[test]
-    fn copy_mode_entry_is_exactly_holding_the_keys() {
-        assert!(copy_mode_entry(Some(ModuleKind::Terminal)));
-        assert!(!copy_mode_entry(Some(ModuleKind::Editor)));
-        assert!(!copy_mode_entry(Some(ModuleKind::Agent)));
-        assert!(!copy_mode_entry(Some(ModuleKind::LuaWebview)));
-        assert!(!copy_mode_entry(Some(ModuleKind::Canvas)));
-        assert!(!copy_mode_entry(None), "the top bar");
-    }
-
-    #[test]
-    fn exactly_ctrl_hjkl_are_taken_from_the_terminal() {
-        let ctrl = ModifierType::CONTROL_MASK;
-        assert_eq!(navigation(Key::h, ctrl), Some(Direction::Left));
-        assert_eq!(navigation(Key::j, ctrl), Some(Direction::Down));
-        assert_eq!(navigation(Key::k, ctrl), Some(Direction::Up));
-        assert_eq!(navigation(Key::l, ctrl), Some(Direction::Right));
-        assert_eq!(
-            navigation(Key::k, ctrl | ModifierType::LOCK_MASK),
-            Some(Direction::Up),
-            "CapsLock is not a chord"
-        );
-        // GDK delivers the UPPERCASE keyval under CapsLock, not `Key::k` with `LOCK_MASK` alone --
-        // the case above never reached `.to_lower()` at all.
-        assert_eq!(
-            navigation(Key::K, ctrl | ModifierType::LOCK_MASK),
-            Some(Direction::Up),
-            "CapsLock delivers the uppercase keyval"
-        );
-        assert_eq!(navigation(Key::l, ctrl | ModifierType::SHIFT_MASK), None);
-        assert_eq!(navigation(Key::a, ctrl), None, "the prefix is the prefix's");
-        assert_eq!(navigation(Key::k, ModifierType::empty()), None);
     }
 
     #[test]

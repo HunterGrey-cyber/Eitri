@@ -1,38 +1,39 @@
-//! The terminal's input method and the text it sends to the shell.
+//! The terminal's input method: composition, focus gating, and text sent to the shell.
 //!
-//! A `GtkIMMulticontext` uses the pane as its client widget and is attached to the key
-//! controller with `set_im_context`. GTK offers each key to it before `key-pressed`, so
-//! consumed keys never reach the terminal's key path. Composed text arrives through `commit`.
-//! The pane draws unfinished composition through `preedit-changed` and `layout_preedit`,
-//! and positions the candidate window with `set_cursor_location`. GTK wiring lives in
-//! `pane.rs`; this module's logic is pure and tested with synthetic signals.
+//! A `GtkIMMulticontext` uses the pane as its client widget and is attached to the key controller
+//! with `set_im_context`. GTK runs it before `key-pressed`, so keys consumed by composition never
+//! reach the terminal's key handler. Composed text arrives through `commit`; `preedit-changed`
+//! updates the composition drawn by the pane, and `set_cursor_location` positions the candidates.
+//! GTK wiring lives in `pane.rs`; the pure logic here is tested with synthetic signals.
 //!
-//! A commit reaches the shell only while the terminal has focus and never during a pane reset.
-//! The `Ctrl+a` prefix, `Ctrl+h/j/k/l`, HINT and app accelerators run in capture phase,
-//! so they can interrupt composition before the input method sees them. GTK can focus the
-//! input method out before `pane_focus` learns that focus has left. fcitx5-gtk can commit
-//! unfinished composition synchronously during that focus change. [`ImeGate::commit`] checks
-//! both the last reported pane focus and [`GtkFocus`], the widget's `has_focus` and the
-//! window's `is_active`. If any is false, the commit is dropped so unfinished input cannot
-//! become shell input. A paste or `Ctrl+a` literal also discards composition before being
-//! sent; commits emitted by the input method's `reset` are dropped.
+//! A commit reaches the shell only while the terminal has the keys and is not resetting its input
+//! method. The prefix, navigation keys, HINT, and app accelerators run in capture phase and can move
+//! focus before the input method sees a key. GTK focuses the input method out during the focus
+//! change, before notifying focus listeners. fcitx5-gtk can synchronously commit unfinished text
+//! there, so `nihao` followed by `Ctrl+k` can produce a commit of `ni hao`.
 //!
-//! These checks cover focus changes GTK starts, including navigation, clicks and alt-tab.
-//! They cannot detect a server-initiated `NotifyFocusOut` while GTK still reports focus,
-//! or a stale notification arriving just after focus returns and new composition begins.
+//! [`ImeGate::commit`] checks [`GtkFocus`], the widget's `has_focus` and its window's `is_active`,
+//! as well as the last focus report. Any false value drops the commit, preventing unfinished pinyin
+//! or an unchosen candidate from reaching the shell. A reset can also emit a commit, so a paste
+//! or literal `Ctrl+a` discards the composition during reset before sending its own input.
 //!
-//! A single-line commit keeps its bytes through `keys::normalize_commit` and is never bracketed.
-//! A commit with a line break uses `keys::normalize_paste`, just like `Ctrl+Shift+V`:
-//! it is bracketed when requested by the program, and otherwise its line breaks become Enter.
-//! This prevents multiline clipboard-history commits from bypassing bracketed-paste handling.
-//! With an input method attached, printable keys it does not compose also arrive as commits.
-//! They retain text but lose key-only information such as releases and keypad codes.
-//! Keys bound by the input method never reach the shell.
+//! GTK state catches focus changes initiated by GTK, including navigation, clicks, and switching
+//! applications. It cannot detect a focus-out initiated by the fcitx5 server while GTK still reports
+//! focus. Such a commit can pass the gate, including a stale focus-out arriving just after focus
+//! returns and new composition begins within one D-Bus exchange.
 //!
-//! The pane follows the input method's caret. On Linux, fcitx5-rime defaults to the first
-//! composition cell through `PreeditCursorPositionAtBeginning`, keeping the candidate window
-//! in place while typing. Preedit Pango attributes, including the converted segment's
-//! `HighLight`, are not drawn.
+//! Single-line commits keep their bytes unchanged and are not bracketed (`keys::normalize_commit`).
+//! A commit containing a line break is treated as a paste (`keys::normalize_paste`): bracketed when
+//! the program requests it, otherwise with line breaks sent as Enter, like `Ctrl+Shift+V`.
+//! This also covers fcitx5's `Ctrl+;` clipboard history, whose unbracketed lines could execute in zsh.
+//!
+//! With an input method attached, printable keys it does not compose arrive as text commits even
+//! if fcitx5 is not running. Text commits lose information available only in key events; keys bound
+//! by the input method never reach the shell.
+//!
+//! The pane follows the input method's caret. fcitx5-rime defaults to the first composition cell on
+//! Linux (`PreeditCursorPositionAtBeginning`), keeping the beam and candidate window there while
+//! typing. Pango preedit attributes, including rime's `HighLight` on the converted segment, are not drawn.
 
 use gtk4::gdk::Rectangle;
 use terminal_input::NormalizedInput;
@@ -84,7 +85,7 @@ pub(crate) enum FocusChange {
 /// Holds what the input method has said and decides what reaches the shell.
 #[derive(Debug, Default)]
 pub(crate) struct ImeGate {
-    /// The terminal holds the keys, as `pane_focus` last reported it ("has the keys": focus AND an
+    /// The terminal holds the keys, as the focus report last said ("has the keys": focus AND an
     /// active window). It hears of a change AFTER GTK's own focus-out, so a commit is also checked
     /// against GTK's answer at that moment ([`Self::commit`]'s [`GtkFocus`]).
     focused: bool,
@@ -98,7 +99,7 @@ impl ImeGate {
         Self::default()
     }
 
-    /// `pane_focus`'s report for the terminal. Losing the keys discards the composition here too, so
+    /// The focus report for the terminal. Losing the keys discards the composition here too, so
     /// it is off the screen even if the input method never says it ended.
     pub(crate) fn set_focused(&mut self, focused: bool) -> FocusChange {
         if focused == self.focused {
@@ -115,7 +116,7 @@ impl ImeGate {
 
     /// The input method committed `text`. `gtk` is GTK's own answer at this moment ([`GtkFocus`]),
     /// half of which is already "no" when the commit comes out of GTK's focus-out of the input
-    /// method, before `pane_focus` reports (the module doc). That, or the last report saying no,
+    /// method, before the focus report (the module doc). That, or the last report saying no,
     /// drops the commit. Any commit ends the composition.
     pub(crate) fn commit(&mut self, text: &str, gtk: GtkFocus) -> Commit {
         self.preedit = None;
@@ -306,7 +307,7 @@ mod tests {
         assert_eq!(gate.set_focused(false), FocusChange::Out, "the report comes after");
     }
 
-    /// The other half: once `pane_focus` has reported the keys gone, a commit that comes later still
+    /// The other half: once the focus report has said the keys are gone, a commit that comes later still
     /// (an input method that commits asynchronously) is dropped on that report alone, and a late
     /// preedit is not drawn. Back in, typing works.
     #[test]

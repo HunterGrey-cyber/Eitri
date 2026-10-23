@@ -406,6 +406,17 @@ mod tests {
         workspaces: Rc<RefCell<Workspaces>>,
     }
 
+    /// Whether `op` tells a module whether it has the keys.
+    fn is_cursor_signal(op: &HostOp) -> bool {
+        matches!(
+            op,
+            HostOp::Editor(EditorCall::SetFocused { .. })
+                | HostOp::Chat(ChatOp::EditorHasKeys { .. } | ChatOp::PaneFocused { .. })
+                | HostOp::Terminal(TermOp::SetFocused { .. })
+                | HostOp::Plugin(PluginOp::HasKeys { .. })
+        )
+    }
+
     impl Driven {
         fn open(decls: &[SurfaceDecl], hidden: &[ModuleId], presence: EditorPresence) -> Self {
             let extras: Vec<_> = decls
@@ -488,12 +499,14 @@ mod tests {
                 .query(|c| c.lifecycle(WIN).and_then(|l| l.state(module)).cloned())
         }
 
+        /// The lifecycle's ops. The "has the keys" signals a lifecycle event also brings are the focus family's,
+        /// whose own tests hold them, so they are left out here.
         fn ops(&self) -> Vec<HostOp> {
             self.host
                 .log()
                 .into_iter()
                 .filter_map(|entry| match entry {
-                    Logged::Op(op, _) => Some(op),
+                    Logged::Op(op, _) if !is_cursor_signal(&op) => Some(op),
                     _ => None,
                 })
                 .collect()
@@ -501,6 +514,33 @@ mod tests {
 
         fn since(&self, count: usize) -> Vec<HostOp> {
             self.ops().into_iter().skip(count).collect()
+        }
+
+        /// The window's first layout batch over `hosted`, as the shell's startup runs it.
+        fn first_apply(&self, hosted: Vec<SurfaceDecl>) {
+            self.driver.first_apply(WIN, hosted);
+        }
+
+        /// The ops but those that lay out or redraw the window: the first layout batch's maps, its restack and
+        /// allocation and its chrome hooks, around the lifecycle's effects.
+        fn effects(&self) -> Vec<HostOp> {
+            self.ops()
+                .into_iter()
+                .filter(|op| {
+                    !matches!(
+                        op,
+                        HostOp::Map { .. }
+                            | HostOp::Unmap { .. }
+                            | HostOp::Restack { .. }
+                            | HostOp::Allocate { .. }
+                            | HostOp::ChromeHooks { .. }
+                    )
+                })
+                .collect()
+        }
+
+        fn effects_since(&self, count: usize) -> Vec<HostOp> {
+            self.effects().into_iter().skip(count).collect()
         }
 
         fn shell(&self, arm: impl Fn(&mut Layout) + 'static) {
@@ -749,12 +789,15 @@ mod tests {
     fn a_deferred_plugin_page_is_built_on_its_first_show() {
         let p = page("plugin", true, true);
         let d = Driven::open(&[p.clone()], &[p.module.clone()], EditorPresence::Owned);
-        d.driver.startup_applied(WIN, vec![p.clone()]);
-        assert_eq!(d.ops(), vec![on_screen(&p.module, false)]);
+        d.first_apply(vec![p.clone()]);
+        assert_eq!(d.effects(), vec![on_screen(&p.module, false)]);
         d.show(&p.module);
-        assert_eq!(d.since(1), vec![plugin(&p.module, "build"), on_screen(&p.module, true)]);
+        assert_eq!(
+            d.effects_since(1),
+            vec![plugin(&p.module, "build"), on_screen(&p.module, true)]
+        );
         d.changed();
-        assert_eq!(d.since(3), vec![on_screen(&p.module, true)]);
+        assert_eq!(d.effects_since(3), vec![on_screen(&p.module, true)]);
     }
 
     #[test]
@@ -774,9 +817,9 @@ mod tests {
             .borrow_mut()
             .create("two", d.layout.borrow().clone())
             .unwrap();
-        d.driver.startup_applied(WIN, decls);
+        d.first_apply(decls);
         assert_eq!(
-            d.ops(),
+            d.effects(),
             vec![
                 start(&shown.module),
                 plugin(&built.module, "build"),
@@ -789,7 +832,7 @@ mod tests {
         d.started(&shown.module);
         d.show(&hidden.module);
         assert_eq!(
-            d.since(4),
+            d.effects_since(4),
             vec![
                 start(&hidden.module),
                 on_screen(&built.module, true),
@@ -817,7 +860,10 @@ mod tests {
             module: t.module.clone(),
         };
         d.driver.test_batch(|c| {
-            assert!(c.handle(ended).is_empty(), "a killed chat has nothing to stop");
+            assert!(
+                c.handle(ended).ops().all(is_cursor_signal),
+                "a killed chat has nothing to stop"
+            );
             let mut batch = c.handle(HostEvent::LayoutChangedByShell { win: WIN });
             // Layout ops joined after the change's effects were decided still apply before them.
             batch.push_layout(map);
@@ -919,10 +965,9 @@ mod tests {
         let d = Driven::open(&[first.clone(), second.clone(), p.clone()], &[], EditorPresence::Owned);
         d.layout.borrow_mut().toggle_zoom(&ModuleId::editor());
         // Declaration order differs from the layout; zoom changes drawing, not a module's shown state.
-        d.driver
-            .startup_applied(WIN, vec![p.clone(), second.clone(), first.clone()]);
+        d.first_apply(vec![p.clone(), second.clone(), first.clone()]);
         assert_eq!(
-            d.ops(),
+            d.effects(),
             vec![
                 start(&first.module),
                 start(&second.module),
@@ -997,15 +1042,18 @@ mod tests {
     fn redeclaring_a_deferred_page_forgets_its_previous_build() {
         let p = page("plugin", true, true);
         let d = Driven::open(&[p.clone()], &[], EditorPresence::Owned);
-        d.driver.startup_applied(WIN, vec![p.clone()]);
-        assert_eq!(d.ops(), vec![plugin(&p.module, "build"), on_screen(&p.module, true)]);
+        d.first_apply(vec![p.clone()]);
+        assert_eq!(
+            d.effects(),
+            vec![plugin(&p.module, "build"), on_screen(&p.module, true)]
+        );
         d.ended(&p.module, Reopen::Remove);
-        let before = d.ops().len();
+        let before = d.effects().len();
         let decls = [p.clone()];
         d.driver.test_batch(|c| c.create_surfaces(WIN, &decls));
         d.changed();
         assert_eq!(
-            d.since(before),
+            d.effects_since(before),
             vec![
                 HostOp::CreateSurface {
                     win: WIN,

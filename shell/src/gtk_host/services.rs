@@ -3,6 +3,11 @@
 //! module lifecycle decides when each happens, from the layout after a change; this only carries the
 //! op out on the module's own service, so no change hook in `build_ui` decides any of them.
 //!
+//! The keys' effects come here too: every module's "has the keys" signal (the editor's and each
+//! terminal's cursor, each chat page's mode block, a plugin page's `focus` event), derived by the
+//! controller from where GTK reports the keys; the literal key `send-prefix` and `send-keys` hand to
+//! the module with the keys; the terminal's copy mode; and the navigation key a chat page claimed.
+//!
 //! Given to the GTK host once, before the startup layout's first batch (`GtkHost::set_services`).
 //! An op this shell does not carry out yet is answered with the host's refusal.
 //!
@@ -14,8 +19,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use eitri_core::layout::ModuleId;
-use eitri_core::wm::{ChatOp, LuaOp, PluginOp, TermOp};
+use eitri_core::wm::{ChatOp, EditorCall, LuaOp, PluginOp, TermOp};
 use gtk4::prelude::*;
+use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::AgentPanelHandle;
 use crate::gtk_host::{LuaRunner, ServiceSet, NOT_CARRIED_OUT};
@@ -70,22 +76,73 @@ pub(crate) fn start_pane<P: ShellPane>(terminals: &RefCell<Terminals<P>>, module
 
 /// The window's services, as the host's ops reach them.
 pub(crate) struct Services {
+    /// `None` in a window with no editor, where an editor op has nothing to reach.
+    pub(crate) editor: Option<Rc<NeovideEditorPane>>,
     pub(crate) terminals: Rc<RefCell<Terminals<TerminalPane>>>,
     pub(crate) plugin_panels: Rc<PluginPanels>,
     pub(crate) agent: AgentPanelHandle,
     pub(crate) lua_pages: LuaPages,
 }
 
+impl Services {
+    /// `module`'s live pane, with the registry released before anything is asked of it.
+    fn pane(&self, module: &ModuleId) -> Result<TerminalPane, String> {
+        let pane = match self.terminals.try_borrow() {
+            Ok(terminals) => terminals.get(module).cloned(),
+            Err(_) => return Err(format!("{module}: the terminal registry was borrowed")),
+        };
+        pane.ok_or_else(|| format!("{module} has no live pane"))
+    }
+}
+
 impl ServiceSet for Services {
+    fn editor(&self, op: &EditorCall) -> Result<(), String> {
+        match op {
+            // Neovide draws the cursor, or none, and tells nvim `FocusGained`/`FocusLost`.
+            EditorCall::SetFocused { focused, .. } => {
+                if let Some(editor) = &self.editor {
+                    editor.set_focused(*focused);
+                }
+                Ok(())
+            }
+            EditorCall::SendKeys { keys, .. } => {
+                if let Some(editor) = &self.editor {
+                    editor.send_keys(keys);
+                }
+                Ok(())
+            }
+            EditorCall::Quit { .. }
+            | EditorCall::End { .. }
+            | EditorCall::Shutdown { .. }
+            | EditorCall::SetScale { .. }
+            | EditorCall::Reveal { .. }
+            | EditorCall::Restart { .. } => Err(NOT_CARRIED_OUT.into()),
+        }
+    }
+
     fn terminal(&self, op: &TermOp) -> Result<(), String> {
         match op {
             TermOp::Start { module, .. } => start_pane(&self.terminals, module).map(drop),
-            TermOp::SetFocused { .. }
-            | TermOp::HangUp { .. }
-            | TermOp::CopyMode { .. }
-            | TermOp::SendKeys { .. }
-            | TermOp::Detach { .. }
-            | TermOp::ShutdownAll { .. } => Err(NOT_CARRIED_OUT.into()),
+            TermOp::SetFocused { module, focused, .. } => {
+                self.pane(module)?.set_focused(*focused);
+                Ok(())
+            }
+            TermOp::CopyMode { module, up, .. } => {
+                self.pane(module)?.enter_copy_mode(*up);
+                Ok(())
+            }
+            // The terminal's engine encodes the key, or the key has no encoding there: said, and nothing sent.
+            TermOp::LiteralKey { module, key, .. } => {
+                let pane = self.pane(module)?;
+                match crate::terminal::keys::literal(key) {
+                    Some(inputs) => inputs.into_iter().for_each(|input| pane.send(input)),
+                    None => println!("[prefix] {key}: the terminal takes C-<letter> or one character"),
+                }
+                Ok(())
+            }
+            TermOp::HangUp { .. } | TermOp::SendKeys { .. } | TermOp::Detach { .. } | TermOp::ShutdownAll { .. } => {
+                Err(NOT_CARRIED_OUT.into())
+            }
         }
     }
 
@@ -131,6 +188,11 @@ impl ServiceSet for Services {
                 self.plugin_panels.stop(module);
                 Ok(())
             }
+            // A page hears this as its `focus` event; a Lua page that is no plugin's has no page to tell.
+            PluginOp::HasKeys { module, has_keys, .. } => {
+                self.plugin_panels.set_has_keys(module, *has_keys);
+                Ok(())
+            }
         }
     }
 
@@ -144,17 +206,33 @@ impl ServiceSet for Services {
                 self.agent.open_chooser(*view);
                 Ok(())
             }
-            // Into a chat view: the oldest card among that view's tabs (the base view switches to the tab holding it
-            // first), else the view's own arrival.
-            ChatOp::Arrive { view, .. } => {
-                if !self.agent.focus_oldest_card(*view) {
+            // Into a chat view: when asked, the oldest card among that view's tabs (the base view switches to the tab
+            // holding it first), else the view's own arrival.
+            ChatOp::Arrive { view, card_first, .. } => {
+                if !(*card_first && self.agent.focus_oldest_card(*view)) {
                     self.agent.arrive(*view);
                 }
                 Ok(())
             }
-            ChatOp::PaneFocused { .. }
-            | ChatOp::PageShown { .. }
-            | ChatOp::NavKey { .. }
+            // Each chat view's page is told for itself, so exactly one is told it has the keys.
+            ChatOp::PaneFocused { view, focused, .. } => {
+                self.agent.set_pane_focused(*view, *focused);
+                Ok(())
+            }
+            ChatOp::NavKey { view, direction, .. } => {
+                self.agent.nav_key(*view, *direction);
+                Ok(())
+            }
+            ChatOp::LiteralKey { view, key, .. } => {
+                self.agent.literal_key(*view, key);
+                Ok(())
+            }
+            // The typing window that paces the panel's stream only counts while the editor holds the keys.
+            ChatOp::EditorHasKeys { has_keys, .. } => {
+                self.agent.set_editor_has_keys(*has_keys);
+                Ok(())
+            }
+            ChatOp::PageShown { .. }
             | ChatOp::CloseTabs { .. }
             | ChatOp::BreakOut { .. }
             | ChatOp::JoinBack { .. }

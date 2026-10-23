@@ -27,11 +27,15 @@ use gtk4::prelude::*;
 #[path = "support/own_x_server.rs"]
 mod own_x_server;
 
-// `close_prompt.rs` reads `crate::toast::TOAST_MARGIN`: the real module, so Immersive's corner is
-// the product's own.
-#[allow(dead_code, unused_imports)]
-#[path = "../src/toast.rs"]
-mod toast;
+// `close_prompt.rs` reads its keys through `crate::gtk_host::keys::key_press`: the real translator,
+// so the prompt answers the keys the product's capture hands it.
+// The directory is named on the outer module: a path through a `tests/gtk_host/` that does not
+// exist would not resolve.
+#[path = "../src/gtk_host"]
+mod gtk_host {
+    #[allow(dead_code, unused_imports)]
+    pub(crate) mod keys;
+}
 
 // `unused_imports`: the module's own `#[cfg(test)] mod tests` comes along, its `#[test]`s dropped for
 // want of a harness, and its `use super::*` with them.

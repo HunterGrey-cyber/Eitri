@@ -52,10 +52,29 @@ pub struct Script {
 
 #[derive(Debug)]
 pub enum Expect {
-    Answer { op: usize, applied: Applied },
-    PostedDuring { op: usize, event: EventMatch },
+    Answer {
+        op: usize,
+        applied: Applied,
+    },
+    PostedDuring {
+        op: usize,
+        event: EventMatch,
+    },
     NotPosted(EventMatch),
     NoCloseRequest,
+    /// The script's ops asked the window's grid for this many allocations.
+    AllocationsAsked(usize),
+    /// The window's module hosts are stacked so once the ops have applied, bottom first.
+    Stacking(Vec<ModuleId>),
+}
+
+/// What a host's grid did that no event reports, read around a script: the expectations on allocations and
+/// stacking need one ([`run_observed`]).
+pub trait GridObserve {
+    /// How many allocations `win`'s grid has been asked for since the host was set up.
+    fn allocations_asked(&self, win: WinId) -> usize;
+    /// `win`'s module hosts as its grid stacks them, bottom first.
+    fn stacking(&self, win: WinId) -> Vec<ModuleId>;
 }
 
 #[derive(Debug)]
@@ -252,6 +271,7 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                     on_grab: vec![HostOp::Chat(ChatOp::Arrive {
                         win: f.win,
                         view: ViewId::BASE,
+                        card_first: true,
                     })],
                 },
             ],
@@ -300,6 +320,122 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                 event: EventMatch::NativeFocusAwayFrom(f.a.clone()),
             }],
         },
+        // A change that moves the keys off a module leaving the screen: the arriving module is mapped and given
+        // them before the leaving one is unmapped, so the keys never sit on a host going off screen.
+        Script {
+            name: "map_then_focus_then_unmap_moves_the_keys_to_the_mapped_module",
+            ops: vec![
+                focus(&f.a),
+                HostOp::Map {
+                    win: f.win,
+                    module: f.hidden.clone(),
+                },
+                focus(&f.hidden),
+                HostOp::Unmap {
+                    win: f.win,
+                    module: f.a.clone(),
+                },
+            ],
+            expect: vec![
+                Expect::Answer {
+                    op: 1,
+                    applied: Applied::Done,
+                },
+                Expect::Answer {
+                    op: 2,
+                    applied: Applied::Done,
+                },
+                Expect::PostedDuring {
+                    op: 2,
+                    event: EventMatch::NativeFocusOn(Some(f.hidden.clone())),
+                },
+                Expect::Answer {
+                    op: 3,
+                    applied: Applied::Done,
+                },
+                Expect::NotPosted(EventMatch::Refused(OpTag::Focus)),
+                Expect::NotPosted(EventMatch::NativeFocusOn(None)),
+            ],
+        },
+        // A module on a tab its container does not draw: its tab is chosen as a layout change, so its host is
+        // mapped, given the keys and only then is the tab it replaces unmapped. The grab comes right after the map,
+        // in the same batch, and answers as a grab of any module on screen does, its tail carried for the driver.
+        Script {
+            name: "a_focus_on_a_tab_not_drawn_after_its_map_is_answered_done",
+            ops: vec![
+                focus(&f.a),
+                HostOp::Map {
+                    win: f.win,
+                    module: f.hidden.clone(),
+                },
+                HostOp::Focus {
+                    win: f.win,
+                    to: FocusTo::Module(f.hidden.clone()),
+                    on_grab: vec![HostOp::Chat(ChatOp::Arrive {
+                        win: f.win,
+                        view: ViewId::BASE,
+                        card_first: true,
+                    })],
+                },
+                HostOp::Unmap {
+                    win: f.win,
+                    module: f.a.clone(),
+                },
+            ],
+            expect: vec![
+                Expect::Answer {
+                    op: 2,
+                    applied: Applied::Done,
+                },
+                Expect::PostedDuring {
+                    op: 2,
+                    event: EventMatch::NativeFocusOn(Some(f.hidden.clone())),
+                },
+                Expect::Answer {
+                    op: 3,
+                    applied: Applied::Done,
+                },
+                Expect::NotPosted(EventMatch::Refused(OpTag::Focus)),
+            ],
+        },
+        // The grid allocates once per op, whatever else is queued: the toolkit coalesces what it is asked.
+        Script {
+            name: "allocate_queues_one_allocation",
+            ops: vec![HostOp::Allocate { win: f.win }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::AllocationsAsked(1),
+                Expect::NotPosted(EventMatch::Refused(OpTag::Allocate)),
+            ],
+        },
+        // Two floats put on top in the op's order, bottom first; the tiled host keeps its place below them.
+        Script {
+            name: "restack_orders_the_float_band_only",
+            ops: vec![HostOp::Restack {
+                win: f.win,
+                moves: vec![
+                    RestackMove {
+                        module: f.b.clone(),
+                        after: None,
+                    },
+                    RestackMove {
+                        module: f.a.clone(),
+                        after: Some(f.b.clone()),
+                    },
+                ],
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::Stacking(vec![f.hidden.clone(), f.b.clone(), f.a.clone()]),
+                Expect::NotPosted(EventMatch::Refused(OpTag::Restack)),
+            ],
+        },
         Script {
             name: "close_window_never_asks",
             ops: vec![HostOp::CloseWindow { win: f.win }],
@@ -308,9 +444,34 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
     ]
 }
 
+/// The window whose grid an op acts on.
+fn grid_win(op: &HostOp) -> Option<WinId> {
+    match op {
+        HostOp::Allocate { win }
+        | HostOp::Restack { win, .. }
+        | HostOp::Map { win, .. }
+        | HostOp::Unmap { win, .. } => Some(*win),
+        _ => None,
+    }
+}
+
 pub fn run(host: &dyn Host, sink: &RecordingSink, script: &Script) -> Result<(), String> {
+    run_observed(host, sink, script, None)
+}
+
+/// [`run`], with what the host's grid did read through `grid`; a script that expects allocations or a
+/// stacking fails without one.
+pub fn run_observed(
+    host: &dyn Host,
+    sink: &RecordingSink,
+    script: &Script,
+    grid: Option<&dyn GridObserve>,
+) -> Result<(), String> {
     let start = sink.events.borrow().len();
     let close_requests = sink.close_requests();
+    let win = script.ops.iter().find_map(grid_win);
+    let allocations = |grid: &dyn GridObserve| win.map_or(0, |win| grid.allocations_asked(win));
+    let allocations_before = grid.map(&allocations);
     let answers: Vec<_> = script
         .ops
         .iter()
@@ -330,6 +491,19 @@ pub fn run(host: &dyn Host, sink: &RecordingSink, script: &Script) -> Result<(),
             Expect::PostedDuring { op, event } => events.iter().any(|(i, e)| *i == Some(*op) && event.matches(e)),
             Expect::NotPosted(event) => !events.iter().any(|(_, e)| event.matches(e)),
             Expect::NoCloseRequest => sink.close_requests() == close_requests,
+            Expect::AllocationsAsked(count) => match (grid, allocations_before) {
+                (Some(grid), Some(before)) => allocations(grid) - before == *count,
+                _ => return Err(format!("{}: {expect:?} needs a grid observer", script.name)),
+            },
+            Expect::Stacking(order) => match (grid, win) {
+                (Some(grid), Some(win)) => grid.stacking(win) == *order,
+                _ => {
+                    return Err(format!(
+                        "{}: {expect:?} needs a grid observer and a window",
+                        script.name
+                    ))
+                }
+            },
         };
         if !met {
             return Err(format!("{}: unmet expectation {expect:?}", script.name));
@@ -406,7 +580,7 @@ mod tests {
             for (m, mapped) in [(&f.a, true), (&f.b, true), (&f.hidden, false)] {
                 host.with_surface(f.win, m.clone(), SurfaceKind::Chat { view: ViewId::BASE }, mapped);
             }
-            run(host.as_ref(), &sink, &script).unwrap();
+            run_observed(host.as_ref(), &sink, &script, Some(host.as_ref())).unwrap();
         }
     }
 }

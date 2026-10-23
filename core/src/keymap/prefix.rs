@@ -182,6 +182,12 @@ impl Prefix {
         }
     }
 
+    /// Whether `keycode` is the key this machine consumed last and has not seen released: the one release
+    /// [`Prefix::release`] acts on, so a host need report no other.
+    pub fn holds(&self, keycode: u32) -> bool {
+        self.held == Some(keycode)
+    }
+
     fn repeatable(&self, press: Press) -> Option<Action> {
         let Press::Key(key) = press else { return None };
         self.keymap

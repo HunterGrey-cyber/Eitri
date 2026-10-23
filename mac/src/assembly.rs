@@ -385,7 +385,18 @@ pub fn assemble(
         keys_report: RefCell::new(KeysReport::default()),
     });
     install_hooks(&shared);
-    let keys = Keys::new(config.keymap.clone(), module_keys, panel.nav_intercept(ViewId::BASE));
+    // The chat page keeps a `Ctrl+j`/`Ctrl+k` for its composer when its mode says so; a kept one is handed to it.
+    let intercept: Rc<dyn Fn(eitri_core::layout::Direction) -> bool> = {
+        let panel = panel.clone();
+        Rc::new(move |direction| {
+            let kept = panel.nav_claims(ViewId::BASE, direction);
+            if kept {
+                panel.nav_key(ViewId::BASE, direction);
+            }
+            kept
+        })
+    };
+    let keys = Keys::new(config.keymap.clone(), module_keys, intercept);
     Ok(Assembly {
         panel,
         keys: RefCell::new(keys),

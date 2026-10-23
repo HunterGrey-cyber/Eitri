@@ -26,16 +26,32 @@
 //!
 //! **Starting a window.** `OpenWindow` builds the window (created, not shown) for the application
 //! set with [`GtkHost::set_application`] and adopts it; `Present` shows it. `Lua` ops go to the
-//! [`LuaRunner`] the shell sets (`init.lua` and the events it emits are the binary's). `Focus` goes
-//! through the shell's own focus function when one is set ([`GtkHost::set_focus`]), since the shell
-//! knows what a bare grab does not: whether the layout shows the module, a page still to be built,
-//! the editor's grab that also tells the input method. Without one it is the bare grab.
+//! [`LuaRunner`] the shell sets (`init.lua` and the events it emits are the binary's).
+//!
+//! **Focus, keys and the prefix's chrome.** A module's `Focus` goes through the shell's own grab when
+//! one is set ([`GtkHost::set_focus`]), since the shell knows what a bare grab does not: a page still
+//! to be built, the editor's grab that also tells the input method; whether the module is on screen
+//! is the controller's to know before it asks. Without one it is the bare grab. A top-bar item's
+//! `Focus` goes through [`GtkHost::set_top_bar`], which brings a hidden bar out first. The
+//! `select.number` digits and HINT's toggle go to the window's [`HintPort`]; a `Chrome` op is redrawn
+//! by the function [`GtkHost::set_chrome`] gives, which reads the controller's model. The cursor
+//! signals, the literal keys and a chat page's claimed navigation key are service ops
+//! ([`ServiceSet`]), and whether a chat page claims a key is the read [`GtkHost::set_chat_claims`]
+//! gives.
+//!
+//! **The grid and the editor.** Each window's grid is reached through a [`GridPort`] and its editor
+//! through [`EditorReads`] ([`GtkHost::set_grid`], [`GtkHost::set_editor`]): `Allocate` asks the grid
+//! for a new allocation, `Restack` puts its float band in the op's order, `ChromeHooks` runs the
+//! grid's chrome hooks, and `Map`/`Unmap` leave alone a host the grid's probe places by hand. The
+//! host also answers the controller's [`HostReads`] from them, and with [`NoReads`]' values for a
+//! window that has given neither yet. `Refuse` flashes and toasts through the shell's refusal
+//! function ([`GtkHost::set_refusal`]).
 //!
 //! **Lifetime.** The host holds its windows weakly. GTK drops its own reference when a window
 //! closes, and only then does the window dispose and emit `destroy`, which is where the host
 //! forgets the window and its surfaces; a strong reference here would keep every closed window.
 
-// Nothing runs the driver's shell verbs on this host yet, so part of the host is still unused.
+// The conformance test compiles this module alone, without the binary's callers of some of it.
 #![allow(dead_code)]
 
 pub(crate) mod keys;
@@ -45,21 +61,45 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
 
-use eitri_core::keymap::Action;
-use eitri_core::layout::{ModuleId, Rect};
+use eitri_core::layout::{Direction, ModuleId, Rect, Size};
+use eitri_core::tabs::ViewId;
 use eitri_core::wm::{
-    ActivationToken, Applied, ChatOp, CloseBy, CloseVerdict, DropWhy, FocusChain, FocusOwner, FocusTo, Host, HostEvent,
-    HostOp, HostSink, LuaOp, Monitor, MonitorId, OpTag, PluginOp, SurfaceKind, TermOp, WinId, WindowSpec,
+    ActivationToken, Applied, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorCall, FocusChain, FocusOwner, FocusTo,
+    HintOp, Host, HostEvent, HostOp, HostReads, HostSink, LuaOp, Monitor, MonitorId, NoReads, OpTag, PluginOp,
+    ShellCall, SurfaceKind, TermOp, WinId, WindowSpec,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-/// What a shell verb runs on: the window, the action and the keycode that carried it (zero when no
-/// key did).
-type ShellVerbArm = dyn Fn(WinId, &Action, u32);
+/// What a shell verb runs on: the window, the call (an action, a split's placement or a chooser's pick)
+/// and the keycode that carried it (zero when no key did).
+type ShellVerbArm = dyn Fn(WinId, &ShellCall, u32);
 
 /// What gives a module the keys when the shell knows more than a bare grab: whether it took.
 type FocusFn = dyn Fn(&ModuleId) -> bool;
+
+/// What gives a top-bar item the keys: the first item showing from that index on, the bar brought out
+/// first if it is hidden. Whether one took them.
+type TopBarFn = dyn Fn(WinId, u32) -> bool;
+
+/// What redraws a window's chrome once the controller announced a new revision of it.
+type ChromeFn = dyn Fn(WinId, u64);
+
+/// Whether a chat page keeps a navigation key for itself: read only, it never calls back.
+type ChatClaimsFn = dyn Fn(ViewId, Direction) -> bool;
+
+/// The window's `select.number` digits and HINT's session, which stays the shell's.
+pub(crate) trait HintPort {
+    /// Draws each module's digit, the tenth module's as `0`.
+    fn show_digits(&self, win: WinId, digits: &[(ModuleId, u8)]);
+    /// Takes the digits down; nothing if none are up.
+    fn hide_digits(&self, win: WinId);
+    /// Starts or ends a HINT from the prefix; `keycode` is the key still held down that ran it.
+    fn toggle(&self, win: WinId, keycode: u32);
+}
+
+/// What says a refusal in the window: its name flashes and, when `text` is not empty, the toast says it.
+pub(crate) type RefusalFn = dyn Fn(WinId, &str);
 
 /// The answer to every op this shell does not carry out through the host yet; its own code still
 /// does those, so a controller that emits one learns it went nowhere.
@@ -78,6 +118,7 @@ pub(crate) trait SurfaceMaker {
 
 /// The window's services the controller's effect ops call. `Err` says why an op was not carried out.
 pub(crate) trait ServiceSet {
+    fn editor(&self, op: &EditorCall) -> Result<(), String>;
     fn terminal(&self, op: &TermOp) -> Result<(), String>;
     fn plugin(&self, op: &PluginOp) -> Result<(), String>;
     fn chat(&self, op: &ChatOp) -> Result<(), String>;
@@ -86,6 +127,48 @@ pub(crate) trait ServiceSet {
 /// What the `Lua` ops run on: the window's Lua kernel. `Err` says why an op was not carried out.
 pub(crate) trait LuaRunner {
     fn run(&self, op: &LuaOp) -> Result<(), String>;
+}
+
+/// A window's grid, as the host reads and drives it. A trait because the grid belongs to the shell's
+/// binary, and this module is also compiled alone by its conformance test, which hands it a stub.
+pub(crate) trait GridPort {
+    /// The grid's allocation, or the stand-in content size before its first one.
+    fn size(&self) -> Size;
+    /// The divider thickness, as the grid's dividers measure.
+    fn handle_px(&self) -> i32;
+    /// A container strip's row height, as the grid's strips measure.
+    fn strip_px(&self) -> i32;
+    /// `module`'s minimum size, as its host measures.
+    fn module_min(&self, module: &ModuleId) -> Size;
+    /// Asks for one new measure and allocation of the grid.
+    fn queue_allocation(&self);
+    /// Puts the floats' hosts in `order`, bottom first, above everything tiled; nothing else moves.
+    fn restack_floats(&self, order: &[ModuleId]);
+    /// Runs the grid's chrome hooks: the selection, the tray, the mark and the workspace text.
+    fn notify_chrome_changed(&self);
+    /// Whether the grid's probe places `module`'s host by hand, so no map or unmap may touch it.
+    fn probe_places(&self, module: &ModuleId) -> bool;
+}
+
+/// What the host reads of a window's editor.
+pub(crate) trait EditorReads {
+    /// The editor's cell size in logical pixels, when it can tell.
+    fn cell(&self) -> Option<(f64, f64)>;
+    /// Whether the editor's child is running.
+    fn running(&self) -> bool;
+}
+
+/// The `Map` and `Unmap` ops of `ops` the grid carries out, as each module and whether it is to be shown:
+/// a host the grid's probe places by hand is left where the probe put it, as the grid's own apply leaves it.
+pub(crate) fn hosts_to_map(ops: &[HostOp], probe_places: impl Fn(&ModuleId) -> bool) -> Vec<(WinId, ModuleId, bool)> {
+    ops.iter()
+        .filter_map(|op| match op {
+            HostOp::Map { win, module } => Some((*win, module.clone(), true)),
+            HostOp::Unmap { win, module } => Some((*win, module.clone(), false)),
+            _ => None,
+        })
+        .filter(|(_, module, _)| !probe_places(module))
+        .collect()
 }
 
 pub(crate) struct GtkHost {
@@ -105,6 +188,13 @@ pub(crate) struct GtkHost {
     /// The application `OpenWindow` builds windows for; held weakly, as GTK holds its windows.
     application: RefCell<Option<glib::WeakRef<gtk4::Application>>>,
     focus_fn: RefCell<Option<Rc<FocusFn>>>,
+    top_bar_fn: RefCell<Option<Rc<TopBarFn>>>,
+    chrome_fn: RefCell<Option<Rc<ChromeFn>>>,
+    chat_claims_fn: RefCell<Option<Rc<ChatClaimsFn>>>,
+    hints: RefCell<Option<Rc<dyn HintPort>>>,
+    grids: RefCell<BTreeMap<WinId, Rc<dyn GridPort>>>,
+    editors: RefCell<BTreeMap<WinId, Rc<dyn EditorReads>>>,
+    refusal: RefCell<Option<Rc<RefusalFn>>>,
     /// How many native focus reports have been posted, so a grab that GTK did not notify (the
     /// widget already held the keys) can still report where they are.
     focus_reports: Cell<u64>,
@@ -125,6 +215,13 @@ impl GtkHost {
             lua: RefCell::new(None),
             application: RefCell::new(None),
             focus_fn: RefCell::new(None),
+            top_bar_fn: RefCell::new(None),
+            chrome_fn: RefCell::new(None),
+            chat_claims_fn: RefCell::new(None),
+            hints: RefCell::new(None),
+            grids: RefCell::new(BTreeMap::new()),
+            editors: RefCell::new(BTreeMap::new()),
+            refusal: RefCell::new(None),
             focus_reports: Cell::new(0),
         })
     }
@@ -195,6 +292,8 @@ impl GtkHost {
                 host.windows.borrow_mut().remove(&win);
                 host.asking.borrow_mut().remove(&win);
                 host.surfaces.borrow_mut().retain(|(w, _), _| *w != win);
+                host.grids.borrow_mut().remove(&win);
+                host.editors.borrow_mut().remove(&win);
             }
         });
     }
@@ -236,6 +335,50 @@ impl GtkHost {
         *self.focus_fn.borrow_mut() = Some(focus);
     }
 
+    /// What a top-bar item's `Focus` goes through. Until it is set, such a `Focus` is not carried out.
+    pub(crate) fn set_top_bar(&self, top_bar: Rc<TopBarFn>) {
+        *self.top_bar_fn.borrow_mut() = Some(top_bar);
+    }
+
+    /// What redraws the chrome a `Chrome` op announces. Until it is set, a `Chrome` is not carried out.
+    pub(crate) fn set_chrome(&self, chrome: Rc<ChromeFn>) {
+        *self.chrome_fn.borrow_mut() = Some(chrome);
+    }
+
+    /// Whether a chat page claims a navigation key, as the controller reads it while it decides that key.
+    /// Until it is set, no page claims one.
+    pub(crate) fn set_chat_claims(&self, claims: Rc<ChatClaimsFn>) {
+        *self.chat_claims_fn.borrow_mut() = Some(claims);
+    }
+
+    /// What the `Hint` ops draw and toggle through. Until it is set, they are not carried out.
+    pub(crate) fn set_hints(&self, hints: Rc<dyn HintPort>) {
+        *self.hints.borrow_mut() = Some(hints);
+    }
+
+    /// `win`'s grid: what `Allocate`, `Restack` and `ChromeHooks` act on and what the grid reads answer from.
+    pub(crate) fn set_grid(&self, win: WinId, grid: Rc<dyn GridPort>) {
+        self.grids.borrow_mut().insert(win, grid);
+    }
+
+    /// `win`'s editor: what the editor reads answer from.
+    pub(crate) fn set_editor(&self, win: WinId, editor: Rc<dyn EditorReads>) {
+        self.editors.borrow_mut().insert(win, editor);
+    }
+
+    /// What `Refuse` says a refusal through. Until it is set, a `Refuse` is not carried out.
+    pub(crate) fn set_refusal(&self, refusal: Rc<RefusalFn>) {
+        *self.refusal.borrow_mut() = Some(refusal);
+    }
+
+    fn grid(&self, win: WinId) -> Option<Rc<dyn GridPort>> {
+        self.grids.borrow().get(&win).cloned()
+    }
+
+    fn editor(&self, win: WinId) -> Option<Rc<dyn EditorReads>> {
+        self.editors.borrow().get(&win).cloned()
+    }
+
     /// The window the host holds as `win`, while it exists.
     pub(crate) fn window(&self, win: WinId) -> Option<gtk4::Window> {
         self.windows.borrow().get(&win).and_then(|w| w.upgrade())
@@ -250,12 +393,9 @@ impl GtkHost {
         self.surfaces.borrow().get(&(win, module.clone())).cloned()
     }
 
-    /// Posts where `win`'s keys are now: the registered surfaces around the focus widget, innermost
-    /// first, the innermost one owning the keys.
-    fn report_focus(&self, win: WinId) {
-        let Some(window) = self.window(win) else {
-            return;
-        };
+    /// The registered surfaces of `win` around its focus widget, innermost first; empty for a window
+    /// with no focus widget, or one in no module.
+    fn focus_chain(&self, window: &gtk4::Window, win: WinId) -> Vec<ModuleId> {
         let surfaces: Vec<(ModuleId, gtk4::Widget)> = self
             .surfaces
             .borrow()
@@ -264,13 +404,31 @@ impl GtkHost {
             .map(|((_, m), widget)| (m.clone(), widget.clone()))
             .collect();
         let mut chain = Vec::new();
-        let mut at = GtkWindowExt::focus(&window);
+        let mut at = GtkWindowExt::focus(window);
         while let Some(widget) = at {
             if let Some((module, _)) = surfaces.iter().find(|(_, s)| *s == widget) {
                 chain.push(module.clone());
             }
             at = widget.parent();
         }
+        chain
+    }
+
+    /// The module holding `win`'s keys right now, as GTK has them: where a key typed now would go. `None`
+    /// for the top bar, the rename entry, no focus widget, or a window the host does not hold. For the arms
+    /// still in the shell, which act on the module with the keys.
+    pub(crate) fn focused_module(&self, win: WinId) -> Option<ModuleId> {
+        let window = self.window(win)?;
+        self.focus_chain(&window, win).into_iter().next()
+    }
+
+    /// Posts where `win`'s keys are now: the registered surfaces around the focus widget, innermost
+    /// first, the innermost one owning the keys.
+    fn report_focus(&self, win: WinId) {
+        let Some(window) = self.window(win) else {
+            return;
+        };
+        let chain = self.focus_chain(&window, win);
         self.focus_reports.set(self.focus_reports.get() + 1);
         self.post(HostEvent::NativeFocus {
             win,
@@ -291,12 +449,14 @@ impl GtkHost {
     }
 
     fn focus(&self, op: &HostOp, win: WinId, to: &FocusTo) -> Applied {
-        let FocusTo::Module(module) = to else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
         if self.window(win).is_none() {
             return self.refuse(op, "no such window");
         }
+        let module = match to {
+            FocusTo::Module(module) => module,
+            FocusTo::TopBarItem(item) => return self.focus_top_bar(op, win, *item),
+            FocusTo::RenameEntry | FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
+        };
         // Cloned out first: the function grabs, and GTK notifies the focus change from inside it.
         let focus_fn = self.focus_fn.borrow().clone();
         let reports = self.focus_reports.get();
@@ -320,6 +480,74 @@ impl GtkHost {
         if self.focus_reports.get() == reports {
             self.report_focus(win);
         }
+        Applied::Done
+    }
+
+    fn focus_top_bar(&self, op: &HostOp, win: WinId, item: u32) -> Applied {
+        // Cloned out first: the grab notifies the focus change from inside it.
+        let top_bar = self.top_bar_fn.borrow().clone();
+        let Some(top_bar) = top_bar else {
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        if top_bar(win, item) {
+            Applied::Done
+        } else {
+            self.refuse(op, "no top-bar item took the keys")
+        }
+    }
+
+    fn chrome(&self, op: &HostOp, win: WinId, rev: u64) -> Applied {
+        // Cloned out first: the redraw reads the controller and moves widgets.
+        let chrome = self.chrome_fn.borrow().clone();
+        let Some(chrome) = chrome else {
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        chrome(win, rev);
+        Applied::Done
+    }
+
+    fn hint(&self, op: &HostOp, call: &HintOp) -> Applied {
+        // Cloned out first: the digits draw into the window, and a HINT adds its controllers.
+        let hints = self.hints.borrow().clone();
+        let Some(hints) = hints else {
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        match call {
+            HintOp::ShowDigits(digits) => hints.show_digits(WinId::MAIN, digits),
+            HintOp::Hide => hints.hide_digits(WinId::MAIN),
+            HintOp::Toggle { keycode } => hints.toggle(WinId::MAIN, *keycode),
+        }
+        Applied::Done
+    }
+
+    /// A `Map` or an `Unmap`: nothing for a host the grid's probe places by hand.
+    fn map_or_unmap(&self, op: &HostOp, win: WinId) -> Applied {
+        // Cloned out first: the probe's answer reads the grid, and nothing it calls should find the host borrowed.
+        let grid = self.grid(win);
+        let probe_places = |module: &ModuleId| grid.as_ref().is_some_and(|grid| grid.probe_places(module));
+        match hosts_to_map(std::slice::from_ref(op), probe_places).pop() {
+            Some((win, module, mapped)) => self.set_mapped(op, win, &module, mapped),
+            None => Applied::Done,
+        }
+    }
+
+    /// Runs `f` on `win`'s grid; refused for a window that has given none.
+    fn on_grid(&self, op: &HostOp, win: WinId, f: impl FnOnce(&dyn GridPort)) -> Applied {
+        // Cloned out first: the grid allocates, restacks and runs hooks that may call back into the host.
+        let Some(grid) = self.grid(win) else {
+            return self.refuse(op, "the window has no grid");
+        };
+        f(grid.as_ref());
+        Applied::Done
+    }
+
+    fn say_refusal(&self, op: &HostOp, win: WinId, text: &str) -> Applied {
+        // Cloned out first: the flash and the toast draw, and GTK may call back into the host meanwhile.
+        let refusal = self.refusal.borrow().clone();
+        let Some(refusal) = refusal else {
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        refusal(win, text);
         Applied::Done
     }
 
@@ -464,11 +692,21 @@ impl Host for GtkHost {
         // Every variant is named, so a new op is a compile error here until this shell decides.
         match op {
             HostOp::Focus { win, to, on_grab: _ } => self.focus(op, *win, to),
-            HostOp::Map { win, module } => self.set_mapped(op, *win, module, true),
-            HostOp::Unmap { win, module } => self.set_mapped(op, *win, module, false),
+            HostOp::Map { win, .. } | HostOp::Unmap { win, .. } => self.map_or_unmap(op, *win),
+            HostOp::Allocate { win } => self.on_grid(op, *win, |grid| grid.queue_allocation()),
+            // The floats only, bottom first: each move places its float after the one below it.
+            HostOp::Restack { win, moves } => {
+                let order: Vec<ModuleId> = moves.iter().map(|step| step.module.clone()).collect();
+                self.on_grid(op, *win, |grid| grid.restack_floats(&order))
+            }
+            HostOp::ChromeHooks { win } => self.on_grid(op, *win, |grid| grid.notify_chrome_changed()),
+            HostOp::Refuse { win, text } => self.say_refusal(op, *win, text),
             HostOp::CloseWindow { win } => self.close_window(op, *win),
             HostOp::CreateSurface { win, module, kind } => self.create_surface(op, *win, module, kind),
             HostOp::DropSurface { win, module, why } => self.drop_surface(op, *win, module, why),
+            HostOp::Chrome { win, rev } => self.chrome(op, *win, *rev),
+            HostOp::Hint(call) => self.hint(op, call),
+            HostOp::Editor(call) => self.service(op, |s| s.editor(call)),
             HostOp::Terminal(call) => self.service(op, |s| s.terminal(call)),
             HostOp::Plugin(call) => self.service(op, |s| s.plugin(call)),
             HostOp::Chat(call) => self.service(op, |s| s.chat(call)),
@@ -479,21 +717,16 @@ impl Host for GtkHost {
             | HostOp::MoveToMonitor { .. }
             | HostOp::Quit
             | HostOp::PrepareSurface { .. }
-            | HostOp::Allocate { .. }
-            | HostOp::Restack { .. }
-            | HostOp::Chrome { .. }
-            | HostOp::Hint(..)
-            | HostOp::Editor(..)
             | HostOp::Cleanup(..) => self.refuse(op, NOT_CARRIED_OUT),
         }
     }
 
-    fn run_shell_verb(&self, win: WinId, action: &Action, keycode: u32) {
+    fn run_shell_verb(&self, win: WinId, call: &ShellCall, keycode: u32) {
         // Cloned out first: the arm may set a new arm, or apply ops, from inside.
         let arm = self.shell_verb_arm.borrow().clone();
         match arm {
-            Some(arm) => arm(win, action, keycode),
-            None => eprintln!("[wm] no shell verb arm is set: {action:?} in {win:?} dropped"),
+            Some(arm) => arm(win, call, keycode),
+            None => eprintln!("[wm] no shell verb arm is set: {call:?} in {win:?} dropped"),
         }
     }
 
@@ -526,5 +759,97 @@ impl Host for GtkHost {
                 }
             })
             .collect()
+    }
+}
+
+/// Every read answers at once from the window's grid and editor, and calls nothing that could reach the
+/// controller; a window that has given neither answers as [`NoReads`] does.
+impl HostReads for GtkHost {
+    fn grid_size(&self, win: WinId) -> Size {
+        match self.grid(win) {
+            Some(grid) => grid.size(),
+            None => NoReads.grid_size(win),
+        }
+    }
+    fn handle_px(&self, win: WinId) -> i32 {
+        match self.grid(win) {
+            Some(grid) => grid.handle_px(),
+            None => NoReads.handle_px(win),
+        }
+    }
+    fn strip_px(&self, win: WinId) -> i32 {
+        match self.grid(win) {
+            Some(grid) => grid.strip_px(),
+            None => NoReads.strip_px(win),
+        }
+    }
+    fn module_min(&self, win: WinId, module: &ModuleId) -> Size {
+        match self.grid(win) {
+            Some(grid) => grid.module_min(module),
+            None => NoReads.module_min(win, module),
+        }
+    }
+    fn editor_cell(&self, win: WinId) -> Option<(f64, f64)> {
+        self.editor(win).and_then(|editor| editor.cell())
+    }
+    fn editor_running(&self, win: WinId) -> bool {
+        self.editor(win).is_some_and(|editor| editor.running())
+    }
+    /// The chat page's own answer, read from what the page last reported; none is claimed before the shell
+    /// gives the read.
+    fn chat_claims(&self, view: ViewId, direction: Direction) -> bool {
+        let claims = self.chat_claims_fn.borrow().clone();
+        match claims {
+            Some(claims) => claims(view, direction),
+            None => NoReads.chat_claims(view, direction),
+        }
+    }
+}
+
+// Only the probe places hosts by hand, so only a build with it has a host to leave alone.
+#[cfg(all(test, feature = "probe"))]
+mod tests {
+    use super::*;
+
+    /// The probe's hosts stay where it put them: a map or an unmap of one reaches nothing, every other host's
+    /// op is carried out as it came, and no other op is a map.
+    #[test]
+    fn map_and_unmap_skip_a_host_the_probe_places() {
+        let placed = ModuleId::terminal();
+        let laid_out = ModuleId::agent();
+        let win = WinId::MAIN;
+        let ops = vec![
+            HostOp::Map {
+                win,
+                module: placed.clone(),
+            },
+            HostOp::Map {
+                win,
+                module: laid_out.clone(),
+            },
+            HostOp::Allocate { win },
+            HostOp::Unmap {
+                win,
+                module: placed.clone(),
+            },
+            HostOp::Unmap {
+                win,
+                module: laid_out.clone(),
+            },
+        ];
+        assert_eq!(
+            hosts_to_map(&ops, |module| *module == placed),
+            vec![(win, laid_out.clone(), true), (win, laid_out.clone(), false)]
+        );
+        assert_eq!(
+            hosts_to_map(&ops, |_| false),
+            vec![
+                (win, placed.clone(), true),
+                (win, laid_out.clone(), true),
+                (win, placed, false),
+                (win, laid_out, false),
+            ],
+            "without the probe every map and unmap is carried out"
+        );
     }
 }

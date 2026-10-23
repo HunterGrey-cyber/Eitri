@@ -1,8 +1,12 @@
 //! The value contract between window decisions and native host services.
 
 use super::window::*;
-use crate::keymap::{action::Action, key::KeyName, prefix::Press};
-use crate::layout::{kill::Reopen, Con, Direction, ModuleId, Size};
+use crate::keymap::{
+    action::{Action, SplitCwd},
+    key::{KeyName, KeySpec},
+    prefix::{Press, WorkspacePick},
+};
+use crate::layout::{kill::Reopen, Arrangement, Axis, Con, Direction, Frame, ModuleId, Size};
 use crate::tabs::ViewId;
 use std::any::Any;
 use std::fmt;
@@ -16,8 +20,8 @@ use std::time::{Duration, Instant};
 pub trait Host {
     /// Performs an operation without blocking; refusals also post a refusal event.
     fn apply(&self, op: &HostOp) -> Applied;
-    /// Runs a remaining shell action with no batch applying or controller borrow held.
-    fn run_shell_verb(&self, win: WinId, action: &Action, keycode: u32);
+    /// Runs a remaining shell call with no batch applying or controller borrow held.
+    fn run_shell_verb(&self, win: WinId, call: &ShellCall, keycode: u32);
     /// Returns the host's current outputs.
     fn monitors(&self) -> Vec<Monitor>;
 }
@@ -119,12 +123,15 @@ pub struct KeyPress {
     pub keycode: u32,
     /// The prefix machine interpretation.
     pub press: Press,
-    /// The translated key before prefix folding.
-    pub key: KeyName,
+    /// The translated key before prefix folding, absent for unnamed keys.
+    pub key: Option<KeyName>,
     /// The ordinary modifiers.
     pub mods: Mods,
-    /// Whether a system modifier is held.
+    /// Whether a system modifier is held: Super or Hyper, which a page never sees on its own key events.
     pub super_or_hyper: bool,
+    /// Whether Super or Meta is held: the system modifiers that keep `Ctrl+h/j/k/l` from moving the keys. Hyper
+    /// alone does not.
+    pub super_or_meta: bool,
 }
 
 /// The ordinary keyboard modifiers.
@@ -193,15 +200,100 @@ pub enum Origin {
     Peer,
 }
 
-/// An action still carried out by the shell after the batch.
+/// A call still carried out by the shell after the batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShellVerb {
     /// The target window.
     pub win: WinId,
-    /// The shared runner action.
-    pub action: Action,
+    /// What the shell's arm is asked to do.
+    pub call: ShellCall,
     /// The originating hardware code, or zero.
     pub keycode: u32,
+}
+
+/// What a shell verb asks the shell's arm to do. The prefix's split and chooser commands are not actions, and
+/// they still need the shell's arms once the prefix is decided here; each of those two goes when its family's
+/// verbs move into the controller.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShellCall {
+    /// An action whose family the shell still carries out.
+    Action(Action),
+    /// A split key's placement: a new module of the key's kind beside `module` along `axis`.
+    Place {
+        module: ModuleId,
+        axis: Axis,
+        cwd: SplitCwd,
+    },
+    /// A digit or command answered to the workspace chooser.
+    WorkspacePick(WorkspacePick),
+}
+
+/// Reads the controller makes of the shell directly, because each answers at once and none can call back into
+/// the controller: the grid's size and measures, the editor's cell and whether it runs, and whether a chat page
+/// claims a navigation key.
+pub trait HostReads {
+    /// The grid's allocation, or the stand-in content size before its first one.
+    fn grid_size(&self, win: WinId) -> Size;
+    /// The divider thickness as the grid's dividers measure.
+    fn handle_px(&self, win: WinId) -> i32;
+    /// A container strip's row height as the grid's strips measure.
+    fn strip_px(&self, win: WinId) -> i32;
+    /// A module's minimum size as its host measures.
+    fn module_min(&self, win: WinId, module: &ModuleId) -> Size;
+    /// The editor's cell size in logical pixels, when it can tell.
+    fn editor_cell(&self, win: WinId) -> Option<(f64, f64)>;
+    /// Whether the editor's child is running.
+    fn editor_running(&self, win: WinId) -> bool;
+    /// Whether the chat page `view` keeps a navigation key for itself.
+    fn chat_claims(&self, view: ViewId, direction: Direction) -> bool;
+}
+
+/// What a controller reads before the shell gives it its reads: the stand-in grid of a window not yet
+/// allocated, the thinnest divider, the default strip, no minimums, no editor and no claims.
+pub struct NoReads;
+
+impl HostReads for NoReads {
+    fn grid_size(&self, _: WinId) -> Size {
+        super::grid::UNALLOCATED
+    }
+    fn handle_px(&self, _: WinId) -> i32 {
+        1
+    }
+    fn strip_px(&self, _: WinId) -> i32 {
+        super::grid::DEFAULT_STRIP_PX
+    }
+    fn module_min(&self, _: WinId, _: &ModuleId) -> Size {
+        Size::default()
+    }
+    fn editor_cell(&self, _: WinId) -> Option<(f64, f64)> {
+        None
+    }
+    fn editor_running(&self, _: WinId) -> bool {
+        false
+    }
+    fn chat_claims(&self, _: ViewId, _: Direction) -> bool {
+        false
+    }
+}
+
+/// Runs `f` with the frame `win`'s geometry is computed in at `size`, its measures read from the shell.
+pub fn frame_with<R>(reads: &dyn HostReads, win: WinId, size: Size, f: impl FnOnce(&Frame) -> R) -> R {
+    let min = |module: &ModuleId| reads.module_min(win, module);
+    f(&Frame {
+        size,
+        handle_px: reads.handle_px(win),
+        strip_px: reads.strip_px(win),
+        min: &min,
+    })
+}
+
+/// The grid's way to its window's arrangement: the size the toolkit just gave it in, the arrangement out,
+/// computed at once inside the allocation, and the minimum it reports when measured.
+pub trait Allocator {
+    /// Settles the pinned splits shown for the first time and arranges the layout at `size`.
+    fn allocate(&self, win: WinId, size: Size) -> Rc<Arrangement>;
+    /// What the layout needs at the least.
+    fn min_size(&self, win: WinId) -> Size;
 }
 
 /// One complete native or service operation.
@@ -232,6 +324,12 @@ pub enum HostOp {
     DropSurface { win: WinId, module: ModuleId, why: DropWhy },
     /// Lays out a destination off screen.
     PrepareSurface { win: WinId, module: ModuleId },
+    /// Flashes the window's name and shows `text` as a refusal's toast; an empty `text` flashes alone. It
+    /// stays until the chrome model carries the flash and the toast itself.
+    Refuse { win: WinId, text: String },
+    /// Runs the shell's remaining change hooks (selection, tray, mark and workspace text) after a change the
+    /// controller made; it goes with those hooks, once the chrome model draws what they draw.
+    ChromeHooks { win: WinId },
     /// Makes a module available on screen.
     Map { win: WinId, module: ModuleId },
     /// Hides a module after its keys have moved.
@@ -333,6 +431,8 @@ pub enum HintOp {
     ShowDigits(Vec<(ModuleId, u8)>),
     /// Hides the digits.
     Hide,
+    /// Starts or ends the hint session from the prefix, with the code of the key still held down.
+    Toggle { keycode: u32 },
 }
 
 /// Commands sent to the editor service.
@@ -352,6 +452,8 @@ pub enum EditorCall {
     Reveal { win: WinId },
     /// Restarts with complete launch settings.
     Restart { win: WinId, spawn: EditorSpawn },
+    /// Types keys into the editor, in the editor's own key notation.
+    SendKeys { win: WinId, keys: String },
 }
 
 /// Commands sent to the chat service.
@@ -361,8 +463,10 @@ pub enum ChatOp {
     PaneFocused { win: WinId, view: ViewId, focused: bool },
     /// Notifies a shown page.
     PageShown { win: WinId, view: ViewId },
-    /// Completes arrival in a view.
-    Arrive { win: WinId, view: ViewId },
+    /// Completes arrival in a view. With `card_first` (a module key, a strip entry, a HINT landing, the window's
+    /// first focus) the view's oldest pending card takes the keys if one waits; without it (`Ctrl+h/j/k/l`,
+    /// `select.last`, `select.next`, a digit) the view lands where its reader left it, card or not.
+    Arrive { win: WinId, view: ViewId, card_first: bool },
     /// Delivers directional navigation.
     NavKey {
         win: WinId,
@@ -389,6 +493,10 @@ pub enum ChatOp {
     ShutdownAll { win: WinId, hold: bool },
     /// Opens the tab chooser.
     OpenChooser { win: WinId, view: ViewId },
+    /// Delivers one key, as the key itself, to a view's page.
+    LiteralKey { win: WinId, view: ViewId, key: KeySpec },
+    /// Tells the panel whether the editor holds the keys of its typing window.
+    EditorHasKeys { win: WinId, has_keys: bool },
 }
 
 /// Commands sent to terminal services.
@@ -404,10 +512,12 @@ pub enum TermOp {
     },
     /// Hangs up the terminal.
     HangUp { win: WinId, module: ModuleId },
-    /// Enters copy mode.
-    CopyMode { win: WinId, module: ModuleId },
+    /// Enters copy mode, scrolled up a page when `up`.
+    CopyMode { win: WinId, module: ModuleId, up: bool },
     /// Sends terminal keys.
     SendKeys { win: WinId, module: ModuleId, keys: String },
+    /// Delivers one key, as the key itself; the terminal's engine encodes it, or says it has no encoding.
+    LiteralKey { win: WinId, module: ModuleId, key: KeySpec },
     /// Detaches for a handoff.
     Detach { win: WinId, module: ModuleId },
     /// Shuts down every terminal.
@@ -429,6 +539,12 @@ pub enum PluginOp {
     Build { win: WinId, module: ModuleId },
     /// Reports page visibility.
     OnScreen { win: WinId, module: ModuleId, on: bool },
+    /// Tells a page whether it holds the keys.
+    HasKeys {
+        win: WinId,
+        module: ModuleId,
+        has_keys: bool,
+    },
 }
 
 /// Process-wide resources to remove.
@@ -506,6 +622,8 @@ pub enum HostEvent {
     Hint(HintEvent),
     /// An event from the rename entry.
     TopBarEntry { win: WinId, ev: EntryEv },
+    /// The top bar gave the keys up by its own key: they go back to the module that last had them.
+    TopBarLeft { win: WinId },
     /// A linked process event.
     Peer(PeerEvent),
     /// The output list changed.
@@ -651,8 +769,13 @@ pub enum ChatEvent {
     Hint { win: WinId, message: String },
     /// A chat supplied a toast.
     Toast { win: WinId, text: String },
-    /// A keymap sheet closed.
-    KeymapClosed { win: WinId, view: ViewId, forced: bool },
+    /// A keymap sheet closed; `opening` names the opening it closes, so a close of an earlier one is dropped.
+    KeymapClosed {
+        win: WinId,
+        view: ViewId,
+        opening: u64,
+        forced: bool,
+    },
     /// A view requested editor focus.
     EditorRequest { win: WinId, view: ViewId },
 }
@@ -757,6 +880,10 @@ pub enum OpTag {
     DropSurface,
     /// Identifies PrepareSurface operations.
     PrepareSurface,
+    /// Identifies Refuse operations.
+    Refuse,
+    /// Identifies ChromeHooks operations.
+    ChromeHooks,
     /// Identifies Map operations.
     Map,
     /// Identifies Unmap operations.
@@ -798,6 +925,8 @@ impl OpTag {
             HostOp::CreateSurface { .. } => Self::CreateSurface,
             HostOp::DropSurface { .. } => Self::DropSurface,
             HostOp::PrepareSurface { .. } => Self::PrepareSurface,
+            HostOp::Refuse { .. } => Self::Refuse,
+            HostOp::ChromeHooks { .. } => Self::ChromeHooks,
             HostOp::Map { .. } => Self::Map,
             HostOp::Unmap { .. } => Self::Unmap,
             HostOp::Allocate { .. } => Self::Allocate,
@@ -816,15 +945,21 @@ impl OpTag {
 }
 
 impl HostOp {
-    /// The window and module whose surface the op creates, drops, prepares, maps or unmaps; `None` for every
-    /// other op.
+    /// The window and module whose surface the op creates, drops, prepares, maps, unmaps or gives the keys to;
+    /// `None` for every other op. A refused grab names its module, so its refusal withdraws that one request and
+    /// no other the same batch made.
     pub fn surface(&self) -> Option<(WinId, ModuleId)> {
         match self {
             HostOp::CreateSurface { win, module, .. }
             | HostOp::DropSurface { win, module, .. }
             | HostOp::PrepareSurface { win, module }
             | HostOp::Map { win, module }
-            | HostOp::Unmap { win, module } => Some((*win, module.clone())),
+            | HostOp::Unmap { win, module }
+            | HostOp::Focus {
+                win,
+                to: FocusTo::Module(module),
+                ..
+            } => Some((*win, module.clone())),
             _ => None,
         }
     }
@@ -959,7 +1094,7 @@ mod tests {
         second.push_effect(HostOp::Lua(emit("second")));
         let verb = ShellVerb {
             win: WinId::MAIN,
-            action: crate::keymap::Action::FocusParent,
+            call: ShellCall::Action(crate::keymap::Action::FloatToggle),
             keycode: 4,
         };
         second.set_shell_verb(verb.clone());
@@ -1042,6 +1177,8 @@ mod tests {
             },
             Unmap
         );
+        tag!(HostOp::Refuse { win, text: "no".into() }, Refuse);
+        tag!(HostOp::ChromeHooks { win }, ChromeHooks);
         tag!(HostOp::Allocate { win }, Allocate);
         tag!(HostOp::Restack { win, moves: vec![] }, Restack);
         tag!(

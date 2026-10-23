@@ -418,7 +418,7 @@ fn write_if_changed(path: &Path, text: &str) -> Result<(), String> {
 /// The agent panel's place when [`Decision::Unavailable`]: `text` in a plain, selectable label (so
 /// the commands can be copied), themed like the chrome by the window's own stylesheet
 /// (`.pane-placeholder`). The box itself takes focus, so `Ctrl+h/j/k/l`, `prefix a` and a click land
-/// here and leave again like any module (`main.rs`'s `install_module_nav`).
+/// here and leave again like any module (the module stage `gtk_host::wire` puts on its host).
 pub(crate) fn notice_widget(text: &str) -> gtk4::Widget {
     use gtk4::prelude::*;
     let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);

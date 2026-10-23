@@ -128,26 +128,15 @@ impl WindowRole {
 /// What an editor request answers in a window with no editor of its own.
 pub const NO_EDITOR_HERE: &str = "this window has no editor: it is in the first window";
 
-/// The window's own editor, where it has one: what a verb that only reads the editor's cell or sends it keys
-/// holds, so it does nothing in a window with no editor rather than needing an editor to exist.
+/// The window's own editor, where it has one: what a verb that only reads the editor's cell holds, so it does
+/// nothing in a window with no editor rather than needing an editor to exist. The keys and the editor's focus go
+/// through the window controller's services, which hold the same `Option`.
 #[derive(Clone)]
 pub struct OwnEditor(pub Option<Rc<NeovideEditorPane>>);
 
 impl OwnEditor {
     pub fn cell_size(&self) -> Option<(f64, f64)> {
         self.0.as_ref().and_then(|pane| pane.cell_size())
-    }
-
-    pub fn send_keys(&self, keys: &str) {
-        if let Some(pane) = &self.0 {
-            pane.send_keys(keys);
-        }
-    }
-
-    pub fn set_focused(&self, focused: bool) {
-        if let Some(pane) = &self.0 {
-            pane.set_focused(focused);
-        }
     }
 }
 

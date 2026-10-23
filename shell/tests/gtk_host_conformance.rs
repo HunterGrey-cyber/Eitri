@@ -21,7 +21,10 @@
 //! The scripts that create and drop surfaces run with a stub surface maker and a stub service set
 //! (what the shell's binary gives the host): the stub builds a focusable widget in the window, off
 //! screen, and registers it, so what is checked is the host's half -- the answer, the registration,
-//! and a dropped surface still being the module's.
+//! and a dropped surface still being the module's. The scripts that allocate and restack run with a
+//! stub grid, which counts the allocations it is asked for and stacks its hosts with the grid's own
+//! rule (`eitri_core::wm::grid::restack_moves`) over a child list shaped as the grid's: hosts below a
+//! strip and a divider.
 //!
 //! Needs a display, and never the real desktop: **it starts its own** (`support/own_x_server.rs`) --
 //! an `Xvfb` with a 1024x768 screen, pointed to before GTK initialises, with any inherited
@@ -31,15 +34,16 @@
 //!
 //! A plain `main` (`harness = false`), because GTK must own the main thread. About 2s.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use eitri_core::layout::ModuleId;
-use eitri_core::wm::conformance::{self, EventMatch, Expect, Fixture, RecordingSink, Script};
+use eitri_core::layout::{ModuleId, Size};
+use eitri_core::wm::conformance::{self, EventMatch, Expect, Fixture, GridObserve, RecordingSink, Script};
+use eitri_core::wm::grid::{restack_moves, Slot};
 use eitri_core::wm::{
-    Applied, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorPresence, FocusTo, Host, HostOp, HostSink, PluginOp,
-    SurfaceKind, TermOp, WinId, WindowRole, WindowSpec,
+    Applied, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorCall, EditorPresence, FocusTo, Host, HostOp, HostSink,
+    PluginOp, SurfaceKind, TermOp, WinId, WindowRole, WindowSpec,
 };
 use gtk4::prelude::*;
 
@@ -89,6 +93,9 @@ impl gtk_host::SurfaceMaker for StubMaker {
 struct StubServices;
 
 impl gtk_host::ServiceSet for StubServices {
+    fn editor(&self, _op: &EditorCall) -> Result<(), String> {
+        Ok(())
+    }
     fn terminal(&self, _op: &TermOp) -> Result<(), String> {
         Ok(())
     }
@@ -100,12 +107,84 @@ impl gtk_host::ServiceSet for StubServices {
     }
 }
 
+/// The window's grid as the host drives it: its children as slots, the fixture's hosts first, then a strip and
+/// a divider, as the grid puts every host below them.
+struct StubGrid {
+    children: RefCell<Vec<Slot>>,
+    allocations: Cell<usize>,
+}
+
+impl StubGrid {
+    fn new(f: &Fixture) -> Rc<StubGrid> {
+        let mut children: Vec<Slot> = [&f.a, &f.b, &f.hidden]
+            .into_iter()
+            .map(|module| Slot::Host(module.clone()))
+            .collect();
+        children.extend([Slot::Strip(0), Slot::Handle(0)]);
+        Rc::new(StubGrid {
+            children: RefCell::new(children),
+            allocations: Cell::new(0),
+        })
+    }
+}
+
+impl gtk_host::GridPort for StubGrid {
+    fn size(&self) -> Size {
+        eitri_core::wm::grid::UNALLOCATED
+    }
+    fn handle_px(&self) -> i32 {
+        1
+    }
+    fn strip_px(&self) -> i32 {
+        eitri_core::wm::grid::DEFAULT_STRIP_PX
+    }
+    fn module_min(&self, _module: &ModuleId) -> Size {
+        Size::default()
+    }
+    fn queue_allocation(&self) {
+        self.allocations.set(self.allocations.get() + 1);
+    }
+    /// Each move puts its slot right after the one it names, the first child for none.
+    fn restack_floats(&self, order: &[ModuleId]) {
+        let mut children = self.children.borrow_mut();
+        for step in restack_moves(&children, order, &[]) {
+            children.retain(|slot| *slot != step.slot);
+            let at = match &step.after {
+                Some(after) => children.iter().position(|slot| slot == after).map_or(0, |i| i + 1),
+                None => 0,
+            };
+            children.insert(at, step.slot);
+        }
+    }
+    fn notify_chrome_changed(&self) {}
+    fn probe_places(&self, _module: &ModuleId) -> bool {
+        false
+    }
+}
+
+impl GridObserve for StubGrid {
+    fn allocations_asked(&self, _win: WinId) -> usize {
+        self.allocations.get()
+    }
+    fn stacking(&self, _win: WinId) -> Vec<ModuleId> {
+        self.children
+            .borrow()
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Host(module) => Some(module.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// A presented window holding three focusable widgets, registered as the fixture's modules, the
 /// `hidden` one child-invisible; nothing holds the keys when it is handed back, so the first grab
 /// changes focus and GTK notifies it.
 struct Stage {
     host: Rc<gtk_host::GtkHost>,
     sink: Rc<RecordingSink>,
+    grid: Rc<StubGrid>,
     window: gtk4::Window,
     /// The fixture's widgets in order: `a`, `b`, `hidden`.
     widgets: Vec<gtk4::Widget>,
@@ -134,6 +213,8 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
         column: column.downgrade(),
     }));
     host.set_services(Rc::new(StubServices));
+    let grid = StubGrid::new(f);
+    host.set_grid(f.win, grid.clone());
     window.set_child(Some(&column));
     host.adopt_window(f.win, &window);
     window.present();
@@ -153,6 +234,7 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
     Ok(Stage {
         host,
         sink,
+        grid,
         window,
         widgets,
     })
@@ -320,6 +402,7 @@ fn closed_windows_are_forgotten(f: &Fixture) -> Result<(), String> {
         let Stage {
             host,
             sink,
+            grid: _,
             window,
             widgets,
         } = stage(f)?;
@@ -463,6 +546,82 @@ fn focus_goes_through_the_shells_function(f: &Fixture) -> Result<(), String> {
     Ok(())
 }
 
+/// What the controller's top-bar focus, chrome and digit ops reach: each the function the shell set for it,
+/// answering what that function answered, and nothing before one is set.
+fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Result<(), String> {
+    struct Hints(RefCell<Vec<String>>);
+    impl gtk_host::HintPort for Hints {
+        fn show_digits(&self, _win: WinId, digits: &[(ModuleId, u8)]) {
+            self.0.borrow_mut().push(format!("show {}", digits.len()));
+        }
+        fn hide_digits(&self, _win: WinId) {
+            self.0.borrow_mut().push("hide".into());
+        }
+        fn toggle(&self, _win: WinId, keycode: u32) {
+            self.0.borrow_mut().push(format!("toggle {keycode}"));
+        }
+    }
+    let s = stage(f)?;
+    let top_bar = HostOp::Focus {
+        win: f.win,
+        to: FocusTo::TopBarItem(0),
+        on_grab: vec![],
+    };
+    let chrome = HostOp::Chrome { win: f.win, rev: 3 };
+    let ops = [
+        top_bar.clone(),
+        chrome.clone(),
+        HostOp::Hint(eitri_core::wm::HintOp::Hide),
+    ];
+    for op in &ops {
+        if s.host.apply(op) != Applied::Refused {
+            return Err(format!("{op:?} was carried out with no function to carry it"));
+        }
+    }
+    let grants = Rc::new(Cell::new(true));
+    {
+        let grants = grants.clone();
+        let item = s.widgets[1].clone();
+        s.host
+            .set_top_bar(Rc::new(move |_, index| grants.get() && index == 0 && item.grab_focus()));
+    }
+    let drawn: Rc<RefCell<Vec<u64>>> = Rc::default();
+    {
+        let drawn = drawn.clone();
+        s.host.set_chrome(Rc::new(move |_, rev| drawn.borrow_mut().push(rev)));
+    }
+    let hints = Rc::new(Hints(RefCell::new(Vec::new())));
+    s.host.set_hints(hints.clone());
+    if s.host.apply(&top_bar) != Applied::Done {
+        return Err("a top-bar Focus the shell's function granted was refused".into());
+    }
+    grants.set(false);
+    if s.host.apply(&top_bar) != Applied::Refused {
+        return Err("a top-bar Focus the shell's function refused was carried out".into());
+    }
+    if s.host.apply(&chrome) != Applied::Done || *drawn.borrow() != vec![3] {
+        return Err(format!("the chrome was drawn for {:?}", drawn.borrow()));
+    }
+    for op in [
+        HostOp::Hint(eitri_core::wm::HintOp::ShowDigits(vec![
+            (f.a.clone(), 1),
+            (f.b.clone(), 2),
+        ])),
+        HostOp::Hint(eitri_core::wm::HintOp::Hide),
+        HostOp::Hint(eitri_core::wm::HintOp::Toggle { keycode: 41 }),
+    ] {
+        if s.host.apply(&op) != Applied::Done {
+            return Err(format!("{op:?} was refused"));
+        }
+    }
+    let heard = hints.0.borrow().clone();
+    if heard != ["show 2", "hide", "toggle 41"] {
+        return Err(format!("the hints heard {heard:?}"));
+    }
+    finish(s);
+    Ok(())
+}
+
 fn run_all() -> Result<Vec<String>, String> {
     let f = Fixture {
         win: WinId::MAIN,
@@ -473,7 +632,7 @@ fn run_all() -> Result<Vec<String>, String> {
     let mut passed = Vec::new();
     for script in conformance::scripts(&f).into_iter().chain(own_scripts(&f)) {
         let s = stage(&f)?;
-        let result = conformance::run(s.host.as_ref(), &s.sink, &script);
+        let result = conformance::run_observed(s.host.as_ref(), &s.sink, &script, Some(s.grid.as_ref()));
         let events = s.sink.events();
         finish(s);
         result.map_err(|e| format!("{e}; events posted: {events:?}"))?;
@@ -493,6 +652,8 @@ fn run_all() -> Result<Vec<String>, String> {
     passed.push("open_window_builds_it_unshown_and_present_shows_it".into());
     focus_goes_through_the_shells_function(&f)?;
     passed.push("focus_goes_through_the_shells_focus_function_once_set".into());
+    top_bar_chrome_and_hints_go_through_the_shells_functions(&f)?;
+    passed.push("the_top_bar_chrome_and_hints_go_through_the_shells_functions_once_set".into());
     Ok(passed)
 }
 

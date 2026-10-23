@@ -1057,34 +1057,28 @@ impl AgentPanelHandle {
             .map_or(PanelKeys::Other, |record| record.nav_mode.get())
     }
 
-    /// Tells the page that `Ctrl+j` was claimed in BROWSE, or
-    /// `Ctrl+k` claimed in INPUT. Safe before the page loads for the same reason `arrive` is --
-    /// there is no live mirror yet, so `main.rs`'s intercept never calls this before one exists.
-    pub fn nav_key(&self, view: ViewId, direction: NavKeyDirection) {
-        self.wake();
-        self.drop_bypass_prompt_in(view);
-        self.dispatch(view, serialize_nav_key_for_js(direction));
+    /// Whether `view`'s page keeps `direction`'s `Ctrl+h/j/k/l` for its own use (`Ctrl+j` in BROWSE, `Ctrl+k` in
+    /// INPUT, `claims`), read from the `panel_keys` mirror alone: the window controller asks this while it decides a
+    /// key, so it changes nothing and sends the page nothing.
+    pub fn nav_claims(&self, view: ViewId, direction: Direction) -> bool {
+        claims(self.panel_keys(view), direction)
     }
 
-    /// The agent host's `Ctrl+j`/`Ctrl+k` intercept for a module-navigation controller: a chord the
-    /// panel's own `panel_keys` mirror claims goes to the panel as a nav key and the closure answers
-    /// `true`; every other direction answers `false`, so the host moves focus as it would without one.
-    pub fn nav_intercept(&self, view: ViewId) -> Rc<dyn Fn(Direction) -> bool> {
-        let agent = self.clone();
-        Rc::new(move |direction: Direction| {
-            if !claims(agent.panel_keys(view), direction) {
-                return false;
+    /// Hands `view`'s page the navigation key it claimed: `Ctrl+j` in BROWSE, or `Ctrl+k` in INPUT. Safe before the
+    /// page loads for the same reason `arrive` is: with no live mirror yet nothing is claimed, so nothing sends one.
+    /// A sideways direction is never claimed, so it has no key to send.
+    pub fn nav_key(&self, view: ViewId, direction: Direction) {
+        self.wake();
+        let direction = match direction {
+            Direction::Down => NavKeyDirection::Down,
+            Direction::Up => NavKeyDirection::Up,
+            Direction::Left | Direction::Right => {
+                eprintln!("[panel] BUG: a {direction:?} nav key for {view:?}, which no page claims");
+                return;
             }
-            let direction = match direction {
-                Direction::Down => NavKeyDirection::Down,
-                Direction::Up => NavKeyDirection::Up,
-                Direction::Left | Direction::Right => {
-                    unreachable!("claims() only claims Down (in Browse) or Up (in Input)")
-                }
-            };
-            agent.nav_key(view, direction);
-            true
-        })
+        };
+        self.drop_bypass_prompt_in(view);
+        self.dispatch(view, serialize_nav_key_for_js(direction));
     }
 
     /// The `?` overlay's rows (`serialize_keymap_for_js`): recorded for every later `ready`, and
@@ -1769,6 +1763,43 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
 
+    /// The window controller asks a chat page whether it keeps a navigation key while it decides that key: the
+    /// question reads the page's mode and changes nothing, sends the page nothing, and only the key itself, once
+    /// decided, reaches the page, as one message.
+    #[test]
+    fn the_chat_intercept_query_mutates_nothing() {
+        let (handle, page) = settled_panel();
+        let directions = [Direction::Left, Direction::Down, Direction::Up, Direction::Right];
+        for (mode, kept) in [
+            (PanelKeys::Browse, vec![Direction::Down]),
+            (PanelKeys::Input, vec![Direction::Up]),
+            (PanelKeys::Other, vec![]),
+        ] {
+            handle.state.borrow().page(ViewId::BASE).unwrap().nav_mode.set(mode);
+            let sent = page.sent.borrow().len();
+            let claimed: Vec<Direction> = directions
+                .into_iter()
+                .filter(|direction| handle.nav_claims(ViewId::BASE, *direction))
+                .collect();
+            assert_eq!(claimed, kept, "{mode:?}");
+            assert_eq!(
+                page.sent.borrow().len(),
+                sent,
+                "asking sent the page nothing in {mode:?}"
+            );
+            assert_eq!(
+                handle.panel_keys(ViewId::BASE),
+                mode,
+                "asking left the mirror as it was"
+            );
+        }
+        let sent = page.sent.borrow().len();
+        handle.nav_key(ViewId::BASE, Direction::Down);
+        let after: Vec<String> = page.sent.borrow()[sent..].to_vec();
+        assert_eq!(after.len(), 1, "the key is one message: {after:?}");
+        assert_eq!(kind_of(&after[0]), "nav_key");
+    }
+
     /// Every `y` in the panel (a row, a code block, the handoff command, the `prefix i` popover's
     /// line) calls `navigator.clipboard.writeText`, and none of them can reach the clipboard.
     /// `load_html(.., None)` gives the document an opaque origin, which is not
@@ -1956,7 +1987,7 @@ mod tests {
             "poll_activate",
             "supervisor_link",
             "panel_keys",
-            "nav_intercept",
+            "nav_claims",
             "newest_card_label_in",
             "running_count",
             "queued_count",
@@ -2052,7 +2083,7 @@ mod tests {
         handle.set_pane_focused(ViewId::BASE, true);
         handle.arrive(ViewId::BASE);
         handle.enter_input(ViewId::BASE);
-        handle.nav_key(ViewId::BASE, NavKeyDirection::Down);
+        handle.nav_key(ViewId::BASE, Direction::Down);
         handle.literal_key(ViewId::BASE, &eitri_core::keymap::KeySpec::parse("C-b").unwrap());
         handle.open_keymap(ViewId::BASE, None, 0);
         handle.open_command_line(ViewId::BASE);

@@ -9,8 +9,10 @@
 //! private nvim socket, attaches to that, and closes when that Neovide exits ([`run_split`]).
 
 mod close_watch;
+mod focus;
 mod gnome_shell;
 mod link;
+mod prefix;
 mod requests;
 pub(crate) mod window;
 mod wm_runner;

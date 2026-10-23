@@ -18,14 +18,18 @@
 //! - `focus_now` is for a shell verb's arm, which still moves keys itself between a map and an unmap: it applies the
 //!   decider's focus batch at once and answers whether the grab took. It is refused while a batch's ops apply.
 //! - The decider is never borrowed while the host runs an op or an arm, and `query` copies its answer out.
+//! - The grid's allocation ([`Allocator`]) is answered at once from inside the toolkit's allocation, and may come
+//!   while a batch applies: it borrows the decider for its own duration only, and what it causes (a pin settled)
+//!   is posted deferred.
 
 use super::controller::Controller;
 use super::host::*;
 use super::window::WinId;
 use crate::keymap::action::Action;
-use crate::layout::ModuleId;
+use crate::layout::{Arrangement, ModuleId, Size};
+use crate::lua::layout::LayoutRequest;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 /// One pending item: an event still to be decided, or a batch already decided that waits its turn.
@@ -47,6 +51,8 @@ pub struct Driver<C: Decide = Controller> {
     deferred: RefCell<VecDeque<HostEvent>>,
     idle_armed: Cell<bool>,
     nested_keys: Cell<u64>,
+    /// Each window's last arrangement, answered again when an allocation finds the decider busy.
+    arranged: RefCell<BTreeMap<WinId, Rc<Arrangement>>>,
     /// The lines the driver printed, kept so tests can read what a run would have logged.
     #[cfg(test)]
     notes: RefCell<Vec<String>>,
@@ -66,6 +72,7 @@ impl<C: Decide> Driver<C> {
             deferred: RefCell::new(VecDeque::new()),
             idle_armed: Cell::new(false),
             nested_keys: Cell::new(0),
+            arranged: RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             notes: RefCell::new(vec![]),
         })
@@ -97,8 +104,9 @@ impl<C: Decide> Driver<C> {
         }
     }
 
-    /// Decides a key at one capture stage and answers at once, as the toolkit's handler needs.
-    pub fn key(&self, win: WinId, stage: KeyStage, press: KeyPress) -> Verdict {
+    /// Decides a key at one capture stage and answers at once, as the toolkit's handler needs. The stage is borrowed:
+    /// a module's host builds its own once, so no key on its way into a module copies the module's name.
+    pub fn key(&self, win: WinId, stage: &KeyStage, press: KeyPress) -> Verdict {
         if self.busy.get() {
             let count = self.nested_keys.get() + 1;
             self.nested_keys.set(count);
@@ -106,7 +114,7 @@ impl<C: Decide> Driver<C> {
                 self.note("[wm] BUG: nested key: answered from the state as it stands, its batch queued".into());
             }
         }
-        let (verdict, batch) = self.decide.borrow_mut().key(win, &stage, &press);
+        let (verdict, batch) = self.decide.borrow_mut().key(win, stage, &press);
         self.submit(batch);
         verdict
     }
@@ -259,7 +267,7 @@ impl<C: Decide> Driver<C> {
         }
         self.op_index.set(outer);
         if let Some(verb) = batch.shell_verb() {
-            self.host.run_shell_verb(verb.win, &verb.action, verb.keycode);
+            self.host.run_shell_verb(verb.win, &verb.call, verb.keycode);
             // Behind everything the arm caused, so the decider hears where the keys went before it re-reads.
             self.queue
                 .borrow_mut()
@@ -298,11 +306,38 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
-    /// Runs startup effects for the hosts the shell has already placed. This entry stays until the controller
-    /// owns the initial grid allocation and declares those hosts through its own launch batch.
-    pub fn startup_applied(&self, win: WinId, hosted: Vec<super::module::SurfaceDecl>) {
-        let batch = self.decide.borrow_mut().startup_applied(win, &hosted);
+    /// The window's first layout batch over the hosts the shell placed ([`Controller::first_apply`]).
+    pub fn first_apply(&self, win: WinId, hosted: Vec<super::module::SurfaceDecl>) {
+        let batch = self.decide.borrow_mut().first_apply(win, &hosted);
         self.submit(batch);
+    }
+
+    /// One `eitri.layout.*` request whose family has moved into the controller ([`Controller::lua_request`]).
+    pub fn lua_request(&self, win: WinId, request: LayoutRequest) {
+        let batch = self.decide.borrow_mut().lua_request(win, request);
+        self.submit(batch);
+    }
+
+    /// The workspace chooser was drawn by an arm still in the shell: the window's prefix waits for its key
+    /// ([`Controller::await_workspace`]).
+    pub fn await_workspace(&self, win: WinId) {
+        let batch = self.decide.borrow_mut().await_workspace(win);
+        self.submit(batch);
+    }
+
+    /// The `?` sheet opened ([`Controller::keymap_opened`]); its opening's number, for the page to quote back.
+    pub fn keymap_opened(
+        &self,
+        win: WinId,
+        view: crate::tabs::ViewId,
+        opened: crate::keymap::keys_return::Opened,
+    ) -> u64 {
+        self.decide.borrow_mut().keymap_opened(win, view, opened)
+    }
+
+    /// A newer request took over from an open `?` sheet ([`Controller::keymap_superseded`]).
+    pub fn keymap_superseded(&self, win: WinId) {
+        self.decide.borrow_mut().keymap_superseded(win);
     }
 
     #[cfg(test)]
@@ -345,6 +380,36 @@ impl Driver<Controller> {
             .partition(|event| matches!(event, HostEvent::Settled { win: of, .. } if *of == win));
         *deferred = rest;
         settles.into()
+    }
+}
+
+impl Allocator for Driver<Controller> {
+    fn allocate(&self, win: WinId, size: Size) -> Rc<Arrangement> {
+        let answer = match self.decide.try_borrow_mut() {
+            Ok(mut controller) => controller.allocate(win, size),
+            Err(_) => {
+                self.note(
+                    "[wm] BUG: the grid allocated while the controller decides; its last arrangement kept".into(),
+                );
+                None
+            }
+        };
+        let Some((arrangement, settled)) = answer else {
+            return self.arranged.borrow().get(&win).cloned().unwrap_or_default();
+        };
+        if let Some(root) = settled {
+            // Heard from the idle: no batch is computed inside an allocation.
+            self.post_deferred(HostEvent::Settled { win, root });
+        }
+        self.arranged.borrow_mut().insert(win, arrangement.clone());
+        arrangement
+    }
+
+    fn min_size(&self, win: WinId) -> Size {
+        match self.decide.try_borrow() {
+            Ok(controller) => controller.min_size(win),
+            Err(_) => Size::default(),
+        }
     }
 }
 
@@ -553,15 +618,16 @@ mod tests {
         KeyPress {
             keycode: 38,
             press: Press::Other,
-            key: KeyName::Char('a'),
+            key: Some(KeyName::Char('a')),
             mods: Mods::default(),
             super_or_hyper: false,
+            super_or_meta: false,
         }
     }
     fn verb(keycode: u32) -> ShellVerb {
         ShellVerb {
             win: WIN,
-            action: Action::FocusParent,
+            call: ShellCall::Action(Action::FloatToggle),
             keycode,
         }
     }
@@ -631,7 +697,7 @@ mod tests {
         let weak = r.weak();
         r.host.on_apply(move |_, i, _| {
             if i == 0 {
-                weak.upgrade().unwrap().key(WIN, KeyStage::Window, press());
+                weak.upgrade().unwrap().key(WIN, &KeyStage::Window, press());
             }
         });
         r.driver.run(WIN, Action::FocusParent, Origin::Lua);
@@ -661,7 +727,7 @@ mod tests {
             if i == 0 {
                 let driver = weak.upgrade().unwrap();
                 for _ in 0..2 {
-                    let verdict = driver.key(WIN, KeyStage::Window, press());
+                    let verdict = driver.key(WIN, &KeyStage::Window, press());
                     out.borrow_mut()
                         .push((verdict, driver.nested_keys(), driver.notes().len()));
                 }
@@ -674,7 +740,7 @@ mod tests {
             "each nested key is answered at once and counted; only the first is logged"
         );
         assert!(r.driver.notes()[0].starts_with("[wm] BUG: nested key"));
-        assert_eq!(r.driver.key(WIN, KeyStage::Window, press()), Verdict::PassThrough);
+        assert_eq!(r.driver.key(WIN, &KeyStage::Window, press()), Verdict::PassThrough);
         assert_eq!(r.driver.nested_keys(), 2, "a key outside any batch is not nested");
     }
 
@@ -690,7 +756,7 @@ mod tests {
         let weak = r.weak();
         r.host.on_apply(move |_, i, _| {
             if i == 0 {
-                weak.upgrade().unwrap().key(WIN, KeyStage::Window, press());
+                weak.upgrade().unwrap().key(WIN, &KeyStage::Window, press());
             }
         });
         r.driver.run(WIN, Action::FocusParent, Origin::Lua);
@@ -706,6 +772,7 @@ mod tests {
         let arrive = HostOp::Chat(ChatOp::Arrive {
             win: WIN,
             view: ViewId::BASE,
+            card_first: true,
         });
         let r = rig(|d| {
             d.then_run(layout(vec![
@@ -739,6 +806,7 @@ mod tests {
         let arrive = HostOp::Chat(ChatOp::Arrive {
             win: WIN,
             view: ViewId::BASE,
+            card_first: true,
         });
         let from_tail = HostOp::Lua(LuaOp::Emit {
             event: "from_tail".into(),
@@ -921,15 +989,182 @@ mod tests {
     #[test]
     fn a_controller_shell_verb_carries_the_keys_keycode() {
         let mut c = Controller::new(FakeScheduler::new());
-        let from_key = c.run(WIN, Action::FocusParent, Origin::Key { keycode: 38 });
+        let from_key = c.run(WIN, Action::FloatToggle, Origin::Key { keycode: 38 });
         assert_eq!(from_key.shell_verb(), Some(&verb(38)));
         assert_eq!(
             from_key.ops().count() + from_key.lua().len(),
             0,
             "the shell verb is the whole batch"
         );
-        let from_lua = c.run(WIN, Action::FocusParent, Origin::Lua);
+        let from_lua = c.run(WIN, Action::FloatToggle, Origin::Lua);
         assert_eq!(from_lua.shell_verb(), Some(&verb(0)));
+    }
+
+    /// A driver over the controller holding `layout` as the main window, every module of it hosted and its first
+    /// layout batch applied, the fake host's reads given to the controller.
+    fn driven(
+        layout: crate::layout::Layout,
+    ) -> (
+        Rc<Driver>,
+        Rc<FakeHost>,
+        Rc<FakeScheduler>,
+        Rc<RefCell<crate::layout::Layout>>,
+    ) {
+        use crate::wm::window::{EditorPresence, WindowParts, WindowRole, WindowSpec};
+        let host = FakeHost::new();
+        let scheduler = FakeScheduler::new();
+        let mut controller = Controller::new(scheduler.clone());
+        controller.set_reads(host.clone());
+        let hosted: Vec<_> = layout.modules().iter().map(crate::wm::verbs::rig::decl).collect();
+        let layout = Rc::new(RefCell::new(layout));
+        controller.open_window(
+            WIN,
+            WindowSpec {
+                role: WindowRole::Main,
+                presence: EditorPresence::Owned,
+                title: "project".into(),
+            },
+            WindowParts {
+                layout: layout.clone(),
+                workspaces: Rc::new(RefCell::new(crate::layout::Workspaces::single())),
+                saver: None,
+            },
+        );
+        let driver = Driver::new(controller, host.clone(), scheduler.clone());
+        let sink: Rc<dyn HostSink> = driver.clone();
+        host.attach(Rc::downgrade(&sink));
+        scheduler.attach(Rc::downgrade(&sink));
+        driver.first_apply(WIN, hosted);
+        (driver, host, scheduler, layout)
+    }
+
+    /// `editor | agent` tiled under the float `x`, which holds the keys.
+    fn under_a_float() -> crate::layout::Layout {
+        use crate::layout::{Axis, Float, FloatRect, Node};
+        crate::layout::Layout::from_parts_floating(
+            Node::split(Axis::Row, 0.5, Node::Leaf(ModuleId::editor()), Node::Leaf(a())),
+            vec![Float {
+                id: x(),
+                rect: FloatRect {
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 300,
+                    h: 200,
+                },
+                scratch: false,
+            }],
+            Default::default(),
+            x(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    fn frame(size: Size) -> crate::layout::Frame<'static> {
+        crate::layout::Frame::new(size, 1)
+    }
+
+    #[test]
+    fn a_pinned_row_is_settled_in_the_allocation_that_first_shows_it() {
+        let (driver, _host, scheduler, layout) = driven(under_a_float());
+        // Docked along the bottom edge, the float becomes a pinned row that has never been on screen.
+        driver.run(WIN, Action::MoveFar(crate::layout::Direction::Down), Origin::Lua);
+        assert!(
+            layout.borrow().has_pin_to_settle(),
+            "the premise: a pin waits for its first length"
+        );
+        let size = Size { w: 1920, h: 1040 };
+        let want = {
+            let mut settled = layout.borrow().clone();
+            assert!(crate::layout::settle_pins(&mut settled, &frame(size)));
+            crate::layout::arrange(&settled, &frame(size))
+        };
+        let arrangement = driver.allocate(WIN, size);
+        assert_eq!(
+            *arrangement, want,
+            "the pinned row has the length its ratio gives at this size"
+        );
+        assert!(!layout.borrow().has_pin_to_settle());
+        let settles = |driver: &Driver| {
+            driver
+                .deferred
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, HostEvent::Settled { win, .. } if *win == WIN))
+                .count()
+        };
+        assert_eq!(
+            settles(&driver),
+            1,
+            "the settle is posted for the idle, not handled inside the allocation"
+        );
+        scheduler.advance(Duration::ZERO);
+        assert_eq!(settles(&driver), 0, "the idle hands it to the controller");
+        driver.allocate(WIN, size);
+        assert_eq!(settles(&driver), 0, "a pin settles once");
+    }
+
+    #[test]
+    fn a_resize_allocates_with_the_new_size_in_the_same_pass() {
+        let (driver, _host, _scheduler, layout) = driven(under_a_float());
+        let small = Size { w: 1280, h: 721 };
+        let large = Size { w: 1920, h: 1040 };
+        let first = driver.allocate(WIN, small);
+        assert_eq!(*first, crate::layout::arrange(&layout.borrow(), &frame(small)));
+        let second = driver.allocate(WIN, large);
+        assert_eq!(*second, crate::layout::arrange(&layout.borrow(), &frame(large)));
+        assert_ne!(first, second);
+        assert_eq!(driver.query(|c| c.allocated(WIN)), Some(large));
+        assert_eq!(
+            driver.min_size(WIN),
+            crate::layout::min_size(&layout.borrow(), &frame(crate::wm::grid::UNALLOCATED)),
+            "the minimum is measured in the frame the grid reports"
+        );
+    }
+
+    #[test]
+    fn an_allocation_while_the_controller_decides_keeps_the_last_arrangement() {
+        let (driver, _host, _scheduler, _layout) = driven(under_a_float());
+        let size = Size { w: 1280, h: 721 };
+        let first = driver.allocate(WIN, size);
+        let held = driver.decide.borrow_mut();
+        let again = driver.allocate(WIN, Size { w: 1920, h: 1040 });
+        drop(held);
+        assert!(Rc::ptr_eq(&first, &again));
+        assert!(driver
+            .notes()
+            .iter()
+            .any(|line| line.starts_with("[wm] BUG: the grid allocated")));
+    }
+
+    #[test]
+    fn a_shell_arm_change_resets_what_the_controller_thinks_is_mapped() {
+        let terminal = ModuleId::terminal();
+        let (driver, host, _scheduler, layout) = driven(crate::layout::fixture::fixture(
+            "row(editor focus, column(agent, terminal hidden))",
+        ));
+        let shown = layout.clone();
+        let t = terminal.clone();
+        // An arm that shows the terminal and tells nobody but the layout, as a shell arm does.
+        host.on_shell_verb(move |_, _, _, _| {
+            shown.borrow_mut().show(&t).unwrap();
+        });
+        driver.run(WIN, Action::FloatToggle, Origin::Lua);
+        assert!(layout.borrow().is_visible(&terminal), "the premise: the arm showed it");
+        let from = host.log().len();
+        driver.run(WIN, Action::Rotate { down: true }, Origin::Lua);
+        let later: Vec<HostOp> = host.log()[from..]
+            .iter()
+            .filter_map(|entry| match entry {
+                Logged::Op(op, _) => Some(op.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(later.contains(&HostOp::Allocate { win: WIN }), "{later:#?}");
+        assert!(
+            !later.contains(&map(terminal)),
+            "the shell's apply already mapped it: {later:#?}"
+        );
     }
 
     #[test]
@@ -940,7 +1175,7 @@ mod tests {
         let sink: Rc<dyn HostSink> = driver.clone();
         host.attach(Rc::downgrade(&sink));
         scheduler.attach(Rc::downgrade(&sink));
-        driver.run(WIN, Action::FocusParent, Origin::Lua);
+        driver.run(WIN, Action::FloatToggle, Origin::Lua);
         assert_eq!(host.log(), vec![Logged::ShellVerb(verb(0))]);
         assert_eq!(
             driver.query(|c| c.shell_revision(WIN)),

@@ -2,7 +2,8 @@
 
 use super::{host::*, window::*};
 use crate::keymap::action::Action;
-use crate::layout::ModuleId;
+use crate::layout::{Direction, ModuleId, Size};
+use crate::tabs::ViewId;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::RawFd;
@@ -14,7 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 type ApplyHook = Rc<dyn Fn(&FakeHost, usize, &HostOp)>;
-type ShellArm = Rc<dyn Fn(&FakeHost, WinId, &Action, u32)>;
+type ShellArm = Rc<dyn Fn(&FakeHost, WinId, &ShellCall, u32)>;
 type RefuseKind = Rc<dyn Fn(&SurfaceKind) -> bool>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +41,33 @@ pub struct FakeHost {
     apply_hook: RefCell<Option<ApplyHook>>,
     apply_index: Cell<usize>,
     refuse_kind: RefCell<Option<RefuseKind>>,
+    reads: RefCell<Reads>,
+    /// Each window's module hosts as its grid would stack them, bottom first: in the order they were made,
+    /// until a restack moves its floats to the top.
+    stacking: RefCell<BTreeMap<WinId, Vec<ModuleId>>>,
+    /// How many allocations each window's grid was asked for.
+    allocations: RefCell<BTreeMap<WinId, usize>>,
+}
+
+/// What the fake answers as [`HostReads`]: [`NoReads`]' values until a test sets one.
+struct Reads {
+    grid_size: Size,
+    editor_cell: Option<(f64, f64)>,
+    editor_running: bool,
+    chat_claims: Vec<(ViewId, Direction)>,
+    module_min: BTreeMap<ModuleId, Size>,
+}
+
+impl Default for Reads {
+    fn default() -> Self {
+        Reads {
+            grid_size: super::grid::UNALLOCATED,
+            editor_cell: None,
+            editor_running: false,
+            chat_claims: Vec::new(),
+            module_min: BTreeMap::new(),
+        }
+    }
 }
 
 impl FakeHost {
@@ -55,12 +83,39 @@ impl FakeHost {
             apply_hook: RefCell::new(None),
             apply_index: Cell::new(0),
             refuse_kind: RefCell::new(None),
+            reads: RefCell::new(Reads::default()),
+            stacking: RefCell::new(BTreeMap::new()),
+            allocations: RefCell::new(BTreeMap::new()),
         })
+    }
+    pub fn set_grid_size(&self, size: Size) {
+        self.reads.borrow_mut().grid_size = size;
+    }
+    pub fn set_editor_cell(&self, cell: Option<(f64, f64)>) {
+        self.reads.borrow_mut().editor_cell = cell;
+    }
+    pub fn set_editor_running(&self, running: bool) {
+        self.reads.borrow_mut().editor_running = running;
+    }
+    pub fn set_chat_claims(&self, view: ViewId, direction: Direction, claims: bool) {
+        let mut reads = self.reads.borrow_mut();
+        reads.chat_claims.retain(|claim| *claim != (view, direction));
+        if claims {
+            reads.chat_claims.push((view, direction));
+        }
+    }
+    pub fn set_module_min(&self, module: ModuleId, min: Size) {
+        self.reads.borrow_mut().module_min.insert(module, min);
     }
     pub fn attach(&self, sink: Weak<dyn HostSink>) {
         *self.sink.borrow_mut() = Some(sink);
     }
     pub fn with_surface(&self, win: WinId, module: ModuleId, kind: SurfaceKind, mapped: bool) {
+        let mut stacking = self.stacking.borrow_mut();
+        let hosts = stacking.entry(win).or_default();
+        if !hosts.contains(&module) {
+            hosts.push(module.clone());
+        }
         self.surfaces
             .borrow_mut()
             .insert((win, module), Surface { kind, mapped });
@@ -68,7 +123,7 @@ impl FakeHost {
     pub fn set_model(&self, on: bool) {
         self.model.set(on);
     }
-    pub fn on_shell_verb(&self, arm: impl Fn(&FakeHost, WinId, &Action, u32) + 'static) {
+    pub fn on_shell_verb(&self, arm: impl Fn(&FakeHost, WinId, &ShellCall, u32) + 'static) {
         *self.shell_arm.borrow_mut() = Some(Rc::new(arm));
     }
     pub fn on_apply(&self, f: impl Fn(&FakeHost, usize, &HostOp) + 'static) {
@@ -183,6 +238,21 @@ impl FakeHost {
             HostOp::CloseWindow { win } => {
                 self.closed.borrow_mut().insert(*win);
             }
+            HostOp::Allocate { win } => {
+                *self.allocations.borrow_mut().entry(*win).or_default() += 1;
+            }
+            // The floats named go to the top in the op's order; every other host keeps its place below them.
+            HostOp::Restack { win, moves } => {
+                let mut stacking = self.stacking.borrow_mut();
+                let hosts = stacking.entry(*win).or_default();
+                let floats: Vec<ModuleId> = moves
+                    .iter()
+                    .map(|step| step.module.clone())
+                    .filter(|module| hosts.contains(module))
+                    .collect();
+                hosts.retain(|module| !floats.contains(module));
+                hosts.extend(floats);
+            }
             _ => {}
         }
         Applied::Done
@@ -208,19 +278,52 @@ impl Host for FakeHost {
         }
         applied
     }
-    fn run_shell_verb(&self, win: WinId, action: &Action, keycode: u32) {
+    fn run_shell_verb(&self, win: WinId, call: &ShellCall, keycode: u32) {
         self.log.borrow_mut().push(Logged::ShellVerb(ShellVerb {
             win,
-            action: action.clone(),
+            call: call.clone(),
             keycode,
         }));
         let arm = self.shell_arm.borrow().clone();
         if let Some(arm) = arm {
-            arm(self, win, action, keycode);
+            arm(self, win, call, keycode);
         }
     }
     fn monitors(&self) -> Vec<Monitor> {
         vec![]
+    }
+}
+
+impl super::conformance::GridObserve for FakeHost {
+    fn allocations_asked(&self, win: WinId) -> usize {
+        self.allocations.borrow().get(&win).copied().unwrap_or(0)
+    }
+    fn stacking(&self, win: WinId) -> Vec<ModuleId> {
+        self.stacking.borrow().get(&win).cloned().unwrap_or_default()
+    }
+}
+
+impl HostReads for FakeHost {
+    fn grid_size(&self, _: WinId) -> Size {
+        self.reads.borrow().grid_size
+    }
+    fn handle_px(&self, _: WinId) -> i32 {
+        1
+    }
+    fn strip_px(&self, _: WinId) -> i32 {
+        super::grid::DEFAULT_STRIP_PX
+    }
+    fn module_min(&self, _: WinId, module: &ModuleId) -> Size {
+        self.reads.borrow().module_min.get(module).copied().unwrap_or_default()
+    }
+    fn editor_cell(&self, _: WinId) -> Option<(f64, f64)> {
+        self.reads.borrow().editor_cell
+    }
+    fn editor_running(&self, _: WinId) -> bool {
+        self.reads.borrow().editor_running
+    }
+    fn chat_claims(&self, view: ViewId, direction: Direction) -> bool {
+        self.reads.borrow().chat_claims.contains(&(view, direction))
     }
 }
 
@@ -542,12 +645,13 @@ mod tests {
         h.on_shell_verb(|host, win, _, _| {
             host.apply(&HostOp::CloseWindow { win });
         });
-        h.run_shell_verb(WinId::MAIN, &Action::FocusParent, 42);
+        let call = ShellCall::Action(Action::FloatToggle);
+        h.run_shell_verb(WinId::MAIN, &call, 42);
         assert!(h.is_closed(WinId::MAIN));
         assert_eq!(sink.close_requests(), 0);
         assert!(h.log().contains(&Logged::ShellVerb(ShellVerb {
             win: WinId::MAIN,
-            action: Action::FocusParent,
+            call,
             keycode: 42
         })));
     }
@@ -681,9 +785,10 @@ mod tests {
         let key = KeyPress {
             keycode: 42,
             press: Press::Other,
-            key: KeyName::Char('x'),
+            key: Some(KeyName::Char('x')),
             mods: Mods::default(),
             super_or_hyper: false,
+            super_or_meta: false,
         };
         assert_eq!(d.handle(HostEvent::Wake), batch);
         assert!(d.handle(HostEvent::MonitorsChanged).is_empty());

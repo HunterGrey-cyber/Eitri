@@ -68,7 +68,7 @@ fn run_tab(
     toast: &Rc<Toast>,
 ) {
     use eitri_core::tabs::{plan, TabVerb};
-    let keys_in = crate::pane_focus::focused_module(window, &grid.hosts())
+    let keys_in = super::focus::focused_module(window, &grid.hosts())
         .as_ref()
         .map(ModuleId::kind);
     // One terminal does not exist here, so the count is zero: `n`/`p` step the chat's tabs.
@@ -317,7 +317,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // keys are in it, hollow when the window manager moves focus to another window.
     {
         let agent = agent.clone();
-        crate::pane_focus::install(
+        super::focus::install(
             &window,
             grid.live_hosts(),
             |_| {},
@@ -443,25 +443,25 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let strip_keymap = config.keymap.clone();
         let strip = strip.clone();
         let strip_frame = strip_frame.clone();
-        crate::prefix::install(
+        super::prefix::install(
             &window,
             keymap.clone(),
             module_keys,
             move |command, keycode| {
                 let action = match command {
-                    crate::prefix::PrefixCommand::Number(digit) => {
+                    super::prefix::PrefixCommand::Number(digit) => {
                         println!("[companion] prefix: number {digit} refused");
                         toast.show(companion_prefix::REFUSED_TEXT);
                         return;
                     }
-                    crate::prefix::PrefixCommand::Workspace(pick) => {
+                    super::prefix::PrefixCommand::Workspace(pick) => {
                         println!("[companion] prefix: workspace {pick:?} refused");
                         toast.show(companion_prefix::REFUSED_TEXT);
                         return;
                     }
-                    crate::prefix::PrefixCommand::Run(action) => action,
+                    super::prefix::PrefixCommand::Run(action) => action,
                     // A module key after a split key: there is nothing to place.
-                    crate::prefix::PrefixCommand::Place { module, axis, cwd: _ } => {
+                    super::prefix::PrefixCommand::Place { module, axis, cwd: _ } => {
                         println!("[companion] prefix: place {module} {axis:?} refused");
                         toast.show(companion_prefix::REFUSED_TEXT);
                         return;
@@ -481,7 +481,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                     CompanionVerb::Text(change) => text_size.apply_panel(change.into()),
                     CompanionVerb::Hint => hint.toggle_from_prefix(keycode),
                     CompanionVerb::Literal => {
-                        if let Some(key) = crate::prefix::literal_for(&action, &keymap) {
+                        if let Some(key) = super::prefix::literal_for(&action, &keymap) {
                             agent.literal_key(ViewId::BASE, &key);
                         }
                     }
@@ -515,17 +515,41 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // The panel's own `Ctrl+h/j/k/l`: claimed for the composer where the panel says so, else a move
     // toward the neighbouring window (`move_focus`, which the panel's fallthrough hook also takes).
-    // The panel's host gets what every chat host gets (`wire`): its `Ctrl+h/j/k/l`, the
-    // Super filter that keeps a Super chord off its page, and `Ctrl`+wheel zoom.
+    // The panel's host gets what every chat host gets (`wire`): its `Ctrl+h/j/k/l`, no Super chord
+    // on its page, and `Ctrl`+wheel zoom. This window has no window controller, so its stage is its
+    // own, by the controller's rules: a move with nothing that way goes on to the page.
     crate::wire::wire_host(
         crate::wire::WireKind::Chat,
         &ModuleId::agent(),
         &agent_host,
         &crate::wire::WireDeps {
-            move_focus: move_focus.clone(),
-            nav_intercept: {
+            module_stage: {
                 let agent = agent.clone();
-                Rc::new(move |view| agent.nav_intercept(view))
+                let move_focus = move_focus.clone();
+                Rc::new(
+                    move |stage: &eitri_core::wm::KeyStage, press: eitri_core::wm::KeyPress| {
+                        use eitri_core::wm::{keys, KeyStage, Verdict};
+                        // `wire_host` only ever asks with its host's module stage.
+                        let KeyStage::Module(id) = stage else {
+                            return Verdict::PassThrough;
+                        };
+                        if let Some(direction) = keys::nav_direction(&press) {
+                            if agent.nav_claims(ViewId::BASE, direction) {
+                                agent.nav_key(ViewId::BASE, direction);
+                                return Verdict::Consumed;
+                            }
+                            return match keys::nav_outcome(move_focus(id, direction), false) {
+                                keys::NavOutcome::Stop => Verdict::Consumed,
+                                keys::NavOutcome::LetThrough => Verdict::LetThrough,
+                            };
+                        }
+                        if press.super_or_hyper {
+                            Verdict::Consumed
+                        } else {
+                            Verdict::PassThrough
+                        }
+                    },
+                )
             },
             text_size: text_size.clone(),
         },

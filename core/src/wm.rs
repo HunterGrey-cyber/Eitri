@@ -1,3 +1,5 @@
+pub mod chrome;
+pub mod close;
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 pub mod controller;
@@ -5,11 +7,22 @@ pub mod driver;
 pub mod end_signals;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+pub mod feedback;
 pub mod feeds;
+pub mod focus;
+pub mod grid;
 pub mod host;
+pub mod keys;
+pub mod lua;
+pub mod modes;
 pub mod module;
 pub mod persist;
+pub mod prefix_strip;
 pub mod start;
+pub mod titles;
+pub mod toasts;
+pub mod tray;
+pub mod verbs;
 pub mod window;
 pub use controller::Controller;
 pub use driver::Driver;

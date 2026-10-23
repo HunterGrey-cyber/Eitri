@@ -315,8 +315,8 @@ impl State {
         self.copy_mode = false;
     }
 
-    /// `prefix [`/`prefix PageUp`, once `main.rs` has already established this
-    /// pane holds the keys (`super::copy_mode_entry`): does nothing without a running shell -- a
+    /// `prefix [`/`prefix PageUp`, once the controller has already established this pane holds the
+    /// keys (`eitri_core::wm::keys::copy_mode_entry`): does nothing without a running shell -- a
     /// prompt or a message frame with none holds no copy to scroll back through. `up` also asks for
     /// one page up at once, the one difference between `prefix [` and `prefix PageUp`.
     fn enter_copy_mode(&mut self, up: bool) {
@@ -514,10 +514,10 @@ impl TerminalPane {
         self.state.borrow().generation
     }
 
-    /// Whether the pane holds the keys: a solid cursor or a hollow one (`pane_focus`'s rule).
+    /// Whether the pane holds the keys, as the focus report says: a solid cursor or a hollow one.
     ///
     /// **This is not what focuses the input method in or out: GTK's key controller did, before
-    /// `pane_focus` could report** (`ime.rs`'s module doc), and a composition fcitx5 committed on the
+    /// the focus report could say so** (`ime.rs`'s module doc), and a composition fcitx5 committed on the
     /// way out was dropped by the commit handler asking GTK, not by this. What is left here: gaining
     /// the keys points the input method at the cursor before the first key; losing them resets it,
     /// which discards what survives a focus-out in the client (a dead-key sequence in GTK's simple
@@ -541,8 +541,8 @@ impl TerminalPane {
             (was, state.ime.set_focused(focused))
         };
         // Submit the focus report after dropping the borrow above: `submit` mutably borrows `state`,
-        // and a nested borrow would panic the GTK thread. `pane_focus.rs` already suppresses duplicate
-        // reports, so `was != focused` is an additional guard.
+        // and a nested borrow would panic the GTK thread. The focus report already sends only changes,
+        // so `was != focused` is an additional guard.
         if was != focused {
             submit(&self.state, PaneInput::Focus(focused));
         }
@@ -574,8 +574,8 @@ impl TerminalPane {
         submit(&self.state, PaneInput::Key(input));
     }
 
-    /// `prefix [`/`prefix PageUp`: `main.rs`'s own prefix arm calls this only
-    /// once `super::copy_mode_entry` has already said this pane holds the keys.
+    /// `prefix [`/`prefix PageUp`: the controller's `TermOp::CopyMode` reaches this only once
+    /// `eitri_core::wm::keys::copy_mode_entry` has already said this pane holds the keys.
     ///
     /// A composition in progress is thrown away first, as a paste or a `Ctrl+a` literal throws it
     /// away: copy mode has nowhere to commit it, and it must not reach the shell once copy mode ends.
@@ -1493,8 +1493,8 @@ fn connect_ime(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
         let state = state.clone();
         let area = area.downgrade();
         im.connect_commit(move |_, text| {
-            // GTK focuses the input method out from inside a focus change, before `pane_focus`
-            // reports it, and fcitx5-gtk commits its composition right there (`ime.rs`'s module
+            // GTK focuses the input method out from inside a focus change, before the focus
+            // report says so, and fcitx5-gtk commits its composition right there (`ime.rs`'s module
             // doc). GTK's own state is already updated by then, so ask it, not only the gate. Keep
             // BOTH halves (`GtkFocus`'s doc): a focus move clears `has_focus` before that commit,
             // but alt-tab clears only `is_active` -- `has_focus` alone would type `ni hao` there.

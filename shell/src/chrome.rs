@@ -5,23 +5,8 @@
 
 use std::path::Path;
 
-use eitri_core::layout::ModuleId;
+pub(crate) use eitri_core::wm::titles::{mark_text, project_display_name, step_item, window_title, workspace_text};
 use gtk4::{prelude::*, ApplicationWindow};
-
-/// The top bar's project label shows the directory's own last path component, never the whole
-/// resolved path -- which would run long and, for a project under the user's home directory,
-/// would publish it in every screenshot/screen-share.
-///
-/// `Path::file_name` already does the real work (it strips a trailing slash and any bare `.`/`..`
-/// components on its own), so this exists mainly to give that behaviour a name and a fallback:
-/// the root `/` has no file name at all, and a host that ever hands this a non-canonicalized or
-/// otherwise degenerate path (this crate's own caller always canonicalizes first, but this
-/// function does not assume that) gets the path back verbatim rather than an empty label.
-pub(crate) fn project_display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
-}
 
 /// The top bar and the parts of it other modules act on.
 pub(crate) struct TopBar {
@@ -54,22 +39,6 @@ pub(crate) struct TopBar {
     pub(crate) rename: gtk4::Entry,
 }
 
-/// What the top bar says about the workspaces: the current one's name while there are several, and
-/// nothing while there is one -- a window that never made a second workspace shows no word for it.
-pub(crate) fn workspace_text(order: &[String], current: &str) -> Option<String> {
-    (order.len() > 1).then(|| current.to_string())
-}
-
-/// The window's title: the project's name, then the product, then -- while the window has several
-/// workspaces -- the one on screen. The window has no title bar, so the title is what a window
-/// switcher, an overview and a compositor's window rules read to tell two windows apart.
-pub(crate) fn window_title(project: &str, workspace: Option<&str>) -> String {
-    match workspace {
-        Some(name) => format!("{project} \u{2014} Eitri \u{b7} {name}"),
-        None => format!("{project} \u{2014} Eitri"),
-    }
-}
-
 /// Shows `text` on the workspace button, or hides it, and gives the window holding the label the
 /// matching title ([`window_title`]), so the title and the label never disagree. Plain text, never
 /// markup: a workspace name is whatever the user or a state file gave.
@@ -89,30 +58,11 @@ pub(crate) fn start_rename(entry: &gtk4::Entry, current: &str) {
     entry.select_region(0, -1);
 }
 
-/// What the top bar says about the mark `swap.marked` swaps with: nothing without one. The mark
-/// is shown only as this text -- a frame or outline on the marked module would take layout space
-/// from it, or be one more kind of chrome around a pane where focus is shown by cursors alone.
-pub(crate) fn mark_text(mark: Option<&ModuleId>, title: &dyn Fn(&ModuleId) -> String) -> Option<String> {
-    mark.map(|id| format!("marked: {}", title(id)))
-}
-
 /// Shows `text` on the mark label, or hides it. Plain text, never markup: a Lua panel's title is
 /// the user's own string.
 pub(crate) fn show_mark(label: &gtk4::Label, text: Option<&str>) {
     label.set_text(text.unwrap_or(""));
     label.set_visible(text.is_some());
-}
-
-/// `h`/`l` on the top bar: the visible item `step` away from `current`, stopping at either end, or
-/// `None` when no item is visible. A tray chip whose module is on screen is not visible, and is
-/// stepped over. From no current item, the first visible one.
-pub(crate) fn step_item(visible: &[bool], current: Option<usize>, step: isize) -> Option<usize> {
-    let shown: Vec<usize> = (0..visible.len()).filter(|&i| visible[i]).collect();
-    let Some(current) = current.and_then(|c| shown.iter().position(|&i| i == c)) else {
-        return shown.first().copied();
-    };
-    let next = (current as isize + step).clamp(0, shown.len() as isize - 1) as usize;
-    Some(shown[next])
 }
 
 /// Builds the top bar and returns the parts other modules use (`TopBar`).
@@ -266,33 +216,6 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
 
 #[cfg(test)]
 mod tests {
-    use super::project_display_name;
-    use eitri_core::layout::ModuleId;
-    use std::path::Path;
-
-    #[test]
-    fn the_mark_reads_as_text_naming_its_module_and_is_absent_without_one() {
-        use super::mark_text;
-        let title = |id: &ModuleId| id.as_str().to_string();
-        assert_eq!(mark_text(None, &title), None);
-        assert_eq!(
-            mark_text(Some(&ModuleId::agent()), &title),
-            Some("marked: agent".to_string())
-        );
-    }
-
-    #[test]
-    fn the_title_is_the_project_then_eitri() {
-        assert_eq!(super::window_title("neovibe", None), "neovibe \u{2014} Eitri");
-    }
-
-    #[test]
-    fn a_second_workspace_joins_the_title() {
-        assert_eq!(
-            super::window_title("neovibe", Some("docs")),
-            "neovibe \u{2014} Eitri \u{b7} docs"
-        );
-    }
 
     /// The title is the label's twin: whichever function sets the workspace label sets the title in
     /// the same call, from the same text.
@@ -308,26 +231,6 @@ mod tests {
             bodies[0].contains(".set_title(") && bodies[0].contains("window_title("),
             "the same function sets the window title from window_title: {}",
             bodies[0]
-        );
-    }
-
-    #[test]
-    fn the_top_bar_names_the_workspace_only_while_there_are_several() {
-        use super::workspace_text;
-        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            workspace_text(&names(&["main"]), "main"),
-            None,
-            "one workspace: no word for it"
-        );
-        assert_eq!(
-            workspace_text(&names(&["main", "study"]), "study"),
-            Some("study".to_string())
-        );
-        assert_eq!(
-            workspace_text(&names(&["main", "study", "review"]), "main"),
-            Some("main".to_string()),
-            "main is named too once there are several"
         );
     }
 
@@ -512,49 +415,5 @@ mod tests {
                    let other = gtk::Label::builder().use_markup(false).build(); }"
                 .into(),
         }]);
-    }
-
-    #[test]
-    fn a_normal_path_shows_its_last_component() {
-        assert_eq!(
-            project_display_name(Path::new("/home/user/src/neovibe")),
-            "neovibe"
-        );
-    }
-
-    #[test]
-    fn a_trailing_slash_does_not_change_the_answer() {
-        assert_eq!(
-            project_display_name(Path::new("/home/user/src/neovibe/")),
-            "neovibe"
-        );
-    }
-
-    #[test]
-    fn the_root_directory_has_no_last_component_so_it_falls_back_to_itself() {
-        assert_eq!(project_display_name(Path::new("/")), "/");
-    }
-
-    /// `h` and `l` skip tray chips that are hidden and stop at either end.
-    #[test]
-    fn h_and_l_step_over_items_that_are_not_shown() {
-        use super::step_item;
-        // [editor chip (hidden), terminal chip, agent chip (hidden), ↻]
-        let visible = [false, true, false, true];
-        assert_eq!(
-            step_item(&visible, None, 1),
-            Some(1),
-            "Ctrl+k lands on the first shown item"
-        );
-        assert_eq!(step_item(&visible, Some(1), 1), Some(3));
-        assert_eq!(step_item(&visible, Some(3), 1), Some(3), "stops at the end");
-        assert_eq!(step_item(&visible, Some(3), -1), Some(1));
-        assert_eq!(step_item(&visible, Some(1), -1), Some(1), "stops at the start");
-        assert_eq!(
-            step_item(&visible, Some(0), 1),
-            Some(1),
-            "from a hidden item: the first shown"
-        );
-        assert_eq!(step_item(&[false, false], None, 1), None);
     }
 }

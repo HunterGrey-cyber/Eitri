@@ -4,8 +4,7 @@
 //! pane's widget is already in the module grid. Install the hidden label when adding the
 //! editor module so the callback can show the cause, minimum version, and where to get nvim.
 
-use eitri_core::layout::{Direction, ModuleId};
-use gtk4::gdk::{Key, ModifierType};
+use eitri_core::layout::ModuleId;
 use gtk4::glib;
 use gtk4::prelude::*;
 
@@ -73,18 +72,6 @@ pub(crate) fn keys_after_failure(focused: Option<&ModuleId>) -> KeysAfterFailure
     }
 }
 
-/// Routes `Ctrl+h/j/k/l` between modules at the shell level while nvim is absent: startup
-/// may have failed, may still be pending, or nvim may have exited. Otherwise nvim's
-/// navigator or the embedded fallback handles these keys and calls the shell only at a
-/// window edge. Without shell navigation, revisiting a failed editor by shortcut or click
-/// would leave the keys trapped in a pane that cannot handle them.
-pub(crate) fn navigation(key: Key, state: ModifierType, nvim_running: bool) -> Option<Direction> {
-    if nvim_running {
-        return None;
-    }
-    crate::pane_switch::nav_direction(key, state)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,24 +83,5 @@ mod tests {
         assert_eq!(keys_after_failure(Some(&ModuleId::agent())), KeysAfterFailure::Stay);
         assert_eq!(keys_after_failure(Some(&ModuleId::terminal())), KeysAfterFailure::Stay);
         assert_eq!(keys_after_failure(None), KeysAfterFailure::Stay);
-    }
-
-    /// T7-1: with no nvim, the four chords move at the shell's level; with nvim running they are
-    /// nvim's; anything else is never claimed.
-    #[test]
-    fn an_editor_without_nvim_lets_ctrl_hjkl_out() {
-        let ctrl = ModifierType::CONTROL_MASK;
-        for (key, direction) in [
-            (Key::h, Direction::Left),
-            (Key::j, Direction::Down),
-            (Key::k, Direction::Up),
-            (Key::l, Direction::Right),
-        ] {
-            assert_eq!(navigation(key, ctrl, false), Some(direction), "{key:?}");
-            assert_eq!(navigation(key, ctrl, true), None, "{key:?} is nvim's while it runs");
-        }
-        assert_eq!(navigation(Key::h, ModifierType::empty(), false), None, "a plain h");
-        assert_eq!(navigation(Key::h, ctrl | ModifierType::SHIFT_MASK, false), None);
-        assert_eq!(navigation(Key::a, ctrl, false), None);
     }
 }

@@ -22,9 +22,17 @@ fn file_code(path: &str) -> String {
         .collect()
 }
 
-/// What each `grid.connect_changed(` in `code` (whitespace removed) is handed: the text up to its closing `)`.
+/// What each `grid.connect_changed(` and `grid.connect_chrome_changed(` in `code` (whitespace removed) is
+/// handed: the text up to its closing `)`.
 fn change_hooks(code: &str) -> Vec<&str> {
-    code.match_indices("grid.connect_changed(")
+    let mut hooks = call_texts(code, "grid.connect_changed(");
+    hooks.extend(call_texts(code, "grid.connect_chrome_changed("));
+    hooks
+}
+
+/// Each call of `call` (ending in its `(`) in `code` (whitespace removed): its parenthesised arguments.
+fn call_texts<'a>(code: &'a str, call: &str) -> Vec<&'a str> {
+    code.match_indices(call)
         .map(|(at, call)| {
             let open = at + call.len() - 1;
             let mut depth = 0usize;
@@ -149,7 +157,6 @@ fn a_killed_plugin_module_stops_and_a_closing_window_shuts_plugins_down() {
 #[test]
 fn a_plugin_hears_its_focus_and_the_editors_timeoutlen() {
     let code = build_ui_code();
-    assert!(code.contains("ModuleKind::LuaWebview=>plugin_panels.set_has_keys(id,has_keys),"));
     let listen = code.find("feed_pump.listen_keys(feed,").expect("the keys feed");
     assert!(code[listen..].contains("plugin_panels.set_timeoutlen(report.timeoutlen);"));
 }
@@ -174,9 +181,7 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
     let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
     let body = &code[arm..];
     let show = body.find("show_on_screen(&chat)").expect("the chat is put on screen");
-    let kept = body
-        .find("keys_return.borrow_mut().opened(")
-        .expect("what it opened from is kept");
+    let kept = body.find("driver.keymap_opened(").expect("what it opened from is kept");
     let focus = body.find("give_keys(&chat);").expect("the chat takes the keys");
     assert!(
         show < kept && kept < focus,
@@ -198,45 +203,6 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
         .expect("the sheet opens in that view's page");
     assert!(view < chat && chat < show && show < covered && covered < kept && kept < open);
 
-    // Reported only for a move the layout accepted: inside the `Ok(())` arm of `layout.set_focus`.
-    let install = code.find("pane_focus::install(").expect("the focus tracker");
-    let accept = "layout.set_focus(id){Ok(())=>";
-    let accepted = code[install..].find(accept).expect("the layout's accepted-move arm") + install;
-    let arm = scan::braced(&code, accepted + accept.len());
-    assert!(
-        arm.contains("keys_return.borrow_mut().focus_moved("),
-        "a focus move is reported from the arm that the layout accepted"
-    );
-    assert_eq!(
-        code.matches("keys_return.borrow_mut().focus_moved(").count(),
-        1,
-        "and nowhere else, so a refused move is not reported"
-    );
-
-    // The close hook's own body asks what to give back.
-    let hook = code
-        .find("panel_hooks.on_keymap_closed=Some(Box::new({")
-        .expect("the close hook is installed");
-    let hook_body = scan::braced(&code, hook + "panel_hooks.on_keymap_closed=Some(Box::new(".len());
-    assert!(
-        hook_body.contains("keys_return.borrow_mut().closed("),
-        "the hook asks KeysReturn what to give back"
-    );
-    // The zoom goes back after the keys: giving them to a page on a tab not drawn chooses that tab,
-    // which ends any zoom, so a zoom put back first would be lost. Either kind goes back whole.
-    let give = hook_body.find("give_keys(&ret.focus)").expect("the keys go back");
-    let zoom = hook_body
-        .find("grid.restore_zoom(zoom,&ret.focus)")
-        .expect("the zoom goes back through restore_zoom");
-    assert!(give < zoom, "the keys go back before the zoom");
-    assert!(
-        !hook_body.contains("toggle_zoom("),
-        "a toggle reads the selection and the tab"
-    );
-    assert!(
-        hook_body.contains("zoom:layout.zoom(),"),
-        "the close reads either kind of zoom"
-    );
     let arm = code.find("Action::PanelKeymap=>{").expect("the prefix ? arm");
     let arm_body = scan::braced(&code, arm + "Action::PanelKeymap=>".len());
     assert!(
@@ -248,10 +214,82 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
     let line = code.find("Action::PanelCommandLine=>{").expect("the prefix : arm");
     let line_body = scan::braced(&code, line + "Action::PanelCommandLine=>".len());
     let forget = line_body
-        .find("keys_return.borrow_mut().superseded();")
+        .find("driver.keymap_superseded(WinId::MAIN);")
         .expect("the newer request forgets the sheet's pending return");
     let take = line_body.find("give_keys(&chat);").expect("the chat takes the keys");
     assert!(forget < take);
+}
+
+/// The sheet's close is the controller's: the hook posts the opening it closes, and whether its own keys closed it.
+#[test]
+fn the_keymap_closed_hook_posts_its_opening() {
+    let code = build_ui_code();
+    let hook = code
+        .find("panel_hooks.on_keymap_closed=Some(Box::new({")
+        .expect("the close hook is installed");
+    let body = scan::braced(&code, hook + "panel_hooks.on_keymap_closed=Some(Box::new(".len());
+    assert!(body.contains("move|opening:u64,return_keys:bool|"), "{body}");
+    assert!(
+        body.contains("ChatEvent::KeymapClosed{"),
+        "the hook posts the close: {body}"
+    );
+    assert!(body.contains("opening,"), "with the opening it closes: {body}");
+    assert!(
+        body.contains("forced:!return_keys,"),
+        "and whether its own keys closed it: {body}"
+    );
+    for decided in ["keys_return", "give_keys(", "hide_module(", "restore_zoom("] {
+        assert!(
+            !body.contains(decided),
+            "the hook decides nothing itself: `{decided}` in {body}"
+        );
+    }
+}
+
+/// The window's construction has no cell filled in later to break a cycle: the prompt, the text size and the
+/// prefix exist before what asks them.
+#[test]
+fn no_late_bound_cell_is_left_in_build_ui() {
+    let code = build_ui_code();
+    for cell in ["prefix_cell", "kill_prompt", "text_size_slot", "OnceCell<"] {
+        assert!(!code.contains(cell), "`{cell}` in build_ui");
+    }
+}
+
+/// Focus and both key stages are the controller's: `build_ui` installs no focus tracker, no prefix and no key
+/// capture that navigates, and nvim's edge letter is posted to the controller as a navigation.
+#[test]
+fn no_focus_or_key_decision_is_left_in_build_ui() {
+    let code = build_ui_code();
+    for decision in [
+        "pane_focus::install(",
+        "prefix::install(",
+        "grid.navigate(",
+        "editor_start_failure::navigation(",
+        "move_focus(",
+    ] {
+        assert!(!code.contains(decision), "`{decision}` in build_ui");
+    }
+    let listener = code
+        .find("feed_pump.listen_pane_switch(ps,")
+        .expect("the editor's edge letters are listened to");
+    let body = &code[listener..];
+    let letter = body
+        .find("pane_switch::PaneMessage::Direction(letter)=>")
+        .expect("a direction letter");
+    let quit = body
+        .find("pane_switch::PaneMessage::QuitCancelled(g)=>")
+        .expect("a cancelled quit");
+    assert!(
+        body[letter..quit].contains("EditorEvent::Navigate{"),
+        "a direction letter posts the editor's navigation"
+    );
+    assert!(
+        body[quit..].contains("editor_quitting.cancelled(g)"),
+        "a cancelled quit stays the editor quit's"
+    );
+    let layers = code.matches("gtk_host::keys::install_window_layers(").count();
+    assert_eq!(layers, 1, "the window's key layers are installed by one call");
 }
 
 /// The non-test code of every shell source (comments and literals blanked), with each file's path.
@@ -273,13 +311,11 @@ fn bound_block<'a>(code: &'a str, anchor: &str) -> &'a str {
 }
 
 /// How many times `code` calls each controller installer a host gets.
-fn installer_calls(code: &str) -> [(&'static str, usize); 4] {
+fn installer_calls(code: &str) -> [(&'static str, usize); 2] {
     let plain: String = code.split_whitespace().collect();
     [
-        ("install_module_nav", scan::calls(code, "install_module_nav")),
-        ("panel_super::install", plain.matches("panel_super::install(").count()),
+        ("module_key", scan::calls(code, "module_key")),
         ("wheel_zoom::install", plain.matches("wheel_zoom::install(").count()),
-        ("terminal::navigation", plain.matches("terminal::navigation(").count()),
     ]
 }
 
@@ -292,6 +328,14 @@ fn every_host_gets_its_controllers_from_wire_host() {
         .expect("the wiring's file");
     let wire_host = scan::functions(wire, "wire_host");
     assert_eq!(wire_host.len(), 1, "one wire_host");
+
+    // The installers each host once had of its own are gone: the module stage holds their rules.
+    for (path, code) in &files {
+        let plain: String = code.split_whitespace().collect();
+        for gone in ["install_module_nav(", "panel_super::install(", "terminal::navigation("] {
+            assert!(!plain.contains(gone), "`{gone}` in {path}");
+        }
+    }
 
     // Every controller a host gets is installed from inside wire_host and nowhere else.
     let inside = installer_calls(wire_host[0]);
@@ -474,11 +518,13 @@ fn every_answer_of_the_scheme_carries_nosniff() {
 #[test]
 fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
     let code = build_ui_code();
-    let apply = code.find("grid.apply();").expect("the startup apply");
-    let startup = code
-        .find("driver.startup_applied(WinId::MAIN,hosted);")
-        .expect("the startup layout's lifecycle effects");
-    assert!(apply < startup, "the startup layout's effects follow its apply");
+    let off_screen = code
+        .find("grid.take_every_host_off_screen();")
+        .expect("every host starts off screen");
+    let apply = code
+        .find("driver.first_apply(WinId::MAIN,")
+        .expect("the startup layout is the controller's first layout batch");
+    assert!(off_screen < apply, "the first batch maps what the layout shows");
     let builds: Vec<usize> = code
         .match_indices("plugin_panels.build_page(")
         .map(|(at, _)| at)
@@ -500,10 +546,11 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
         code.contains("eitri_core::layout::persist::load_for_role(dir,project_root,pair.pair_role(),&decls,&deferred)")
     );
     assert!(code.contains("layout_saver.set_deferred(deferred.clone());"));
-    // A switch or an open gives the keys before the change hooks run: the grab builds the page first.
+    // A switch or an open gives the keys before the change hooks run: the grab, the controller's and the shell
+    // arms' alike, builds the page first.
     let focus = code
-        .find("letfocus_module:Rc<dynFn(&ModuleId)->bool>=")
-        .expect("focus_module");
+        .find("letgrab_module:Rc<dynFn(&ModuleId)->bool>=")
+        .expect("grab_module");
     let focus = scan::braced(&code, focus + code[focus..].find('{').unwrap());
     assert!(
         focus.contains("plugin_panels.build_page("),
@@ -766,5 +813,99 @@ fn build_ui_walks_the_start_plan() {
         ".open_window(",
     ] {
         assert!(!raw.contains(gone), "build_ui still has `{gone}`");
+    }
+}
+
+/// Every key action, Lua run and panel tab verb reaches the controller's runner, and only through it: no
+/// shell runner of its own is left, the shell's arms are reached only as the runner's shell verbs, and
+/// each call of the runner names where it came from as one of the routes the shell has. A new route is a
+/// deliberate edit of this list.
+#[test]
+fn the_runner_is_the_only_door() {
+    const ROUTES: &[&str] = &["Key", "PanelTab", "Lua"];
+    let mut runs = 0;
+    for (path, code) in shell_code() {
+        let flat: String = code.split_whitespace().collect();
+        assert!(!flat.contains("run_action"), "{path} still has a runner of its own");
+        // `Origin` itself, not a name that ends in it (`SurfaceOrigin::`).
+        let origins: Vec<&str> = flat
+            .match_indices("Origin::")
+            .filter(|(at, _)| {
+                !flat[..*at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .map(|(at, found)| {
+                let rest = &flat[at + found.len()..];
+                let end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        for origin in &origins {
+            assert!(
+                ROUTES.contains(origin),
+                "{path}: the runner is called from Origin::{origin}"
+            );
+        }
+        for call in call_texts(&flat, "driver.run(") {
+            assert!(
+                ROUTES.iter().any(|route| call.contains(&format!("Origin::{route}"))),
+                "{path}: a runner call that names no route: {call}"
+            );
+            runs += 1;
+        }
+        if !path.ends_with("shell/src/main.rs") {
+            assert!(!flat.contains("run_verb("), "{path} calls the shell's arms");
+        }
+    }
+    assert!(
+        runs >= 2,
+        "the chooser's new workspace and the tab verbs call the runner"
+    );
+    // The prefix's commands run inside the controller, through the same runner as a key's.
+    let controller = file_code("core/src/wm/controller.rs");
+    assert!(
+        controller.contains("PrefixCommand::Run(action)=>returnself.run(win,action,Origin::Key{keycode}),"),
+        "the prefix's command runs through the runner as a key's"
+    );
+    let code = build_ui_code();
+    let arm = call_texts(&code, "wm_host.set_shell_verb_arm(");
+    assert_eq!(arm.len(), 1, "one shell verb arm");
+    assert_eq!(code.matches("run_verb(").count(), 1, "the shell's arms are called once");
+    assert!(
+        arm[0].contains("run_verb("),
+        "and that call is the shell verb arm: {}",
+        arm[0]
+    );
+}
+
+/// The tiling verbs are the controller's: no arm in `build_ui` changes the tiled tree, the mark, the zoom or
+/// the selection through the grid's own verbs any more.
+#[test]
+fn a_scan_finds_no_tiling_arm_in_run_verb() {
+    let code = build_ui_code();
+    for verb in [
+        "grid.move_far(",
+        "grid.toggle_split(",
+        "grid.rotate(",
+        "grid.flip(",
+        "grid.preset(",
+        "grid.cycle_preset(",
+        "grid.spread(",
+        "grid.swap_marked(",
+        "grid.undo(",
+        "grid.move_dir(",
+        "grid.container_mode(",
+        "grid.focus_parent(",
+        "grid.focus_child(",
+        "grid.toggle_zoom(",
+        "grid.resize(",
+        "grid.swap_modules(",
+        "grid.swap_adjacent(",
+    ] {
+        assert!(!code.contains(verb), "build_ui still calls `{verb}`");
     }
 }
