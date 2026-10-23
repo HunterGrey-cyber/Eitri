@@ -825,6 +825,12 @@ mod tests {
 
     /// Two opens of one lock file exclude each other, in one process too: the second try fails while the
     /// first holds it and succeeds once that one is dropped. The file is 0600 and never truncated.
+    ///
+    /// "Once dropped" is not "at the same instant": the lib tests run on many threads and some spawn a
+    /// process, and a child forked while the first lock is held shares its open file description until
+    /// the child's `exec` closes it (`O_CLOEXEC`), so the lock can stay held for a moment after the drop.
+    /// The test therefore tries again until the lock is free, within a hang guard that only stops a lock
+    /// that never frees; it asserts no wall-clock bound on how soon.
     #[test]
     fn a_private_lock_excludes_another_open_of_the_same_file_until_dropped() {
         let base = scratch("lock");
@@ -836,9 +842,37 @@ mod tests {
         let second = PrivateLock::open(&path).unwrap();
         assert!(!second.try_lock().unwrap(), "held by the first open");
         drop(first);
-        assert!(second.try_lock().unwrap(), "free once the first is dropped");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut free = second.try_lock().unwrap();
+        while !free && std::time::Instant::now() < give_up {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            free = second.try_lock().unwrap();
+        }
+        assert!(free, "free once the first is dropped");
         assert_eq!(mode(&path), 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A forked child shares every open file description it is given until its `exec`, and a lock lives as
+    /// long as its description does, so the lock file's descriptor must close on exec -- whether the file
+    /// was there or is made by this open -- or a spawned program would hold a store locked for as long
+    /// as it ran.
+    #[test]
+    fn a_private_lock_descriptor_closes_on_exec() {
+        use std::os::fd::AsRawFd;
+        let base = scratch("lock-cloexec");
+        let path = base.join("store.json.lock");
+        for round in ["made by the open", "already there"] {
+            let lock = PrivateLock::open(&path).unwrap();
+            // SAFETY: the descriptor is the lock's own and open; `F_GETFD` takes no pointers.
+            let flags = unsafe { libc::fcntl(lock.file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "{round}: F_GETFD failed");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "{round}: the lock descriptor is inherited across exec"
+            );
+        }
         std::fs::remove_dir_all(&base).unwrap();
     }
 
