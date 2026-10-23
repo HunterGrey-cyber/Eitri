@@ -775,6 +775,68 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
     Ok(())
 }
 
+/// `window.new` goes through the pair the shell gives the host, its answer the host's; `window.other`'s raise answers
+/// with the activation token this window's display gave, posted while it applies, for the controller to send on.
+fn the_pair_starts_and_raises_through_the_shell(f: &Fixture) -> Result<(), String> {
+    use eitri_core::wm::{HostEvent, PeerEvent, PeerId};
+    struct Pair {
+        opened: RefCell<Vec<WinId>>,
+        answer: RefCell<Result<(), String>>,
+    }
+    impl gtk_host::LinkedWindows for Pair {
+        fn open(&self, win: WinId, _token: Option<String>) -> Result<(), String> {
+            self.opened.borrow_mut().push(win);
+            self.answer.borrow().clone()
+        }
+    }
+    let s = stage(f)?;
+    let pair = Rc::new(Pair {
+        opened: RefCell::default(),
+        answer: RefCell::new(Ok(())),
+    });
+    s.host.set_linked_windows(pair.clone());
+    let open = HostOp::OpenLinkedWindow { win: f.win };
+    if s.host.apply(&open) != Applied::Done {
+        return Err("an OpenLinkedWindow the pair carried out was refused".into());
+    }
+    *pair.answer.borrow_mut() = Err("this window cannot start a second window".into());
+    if s.host.apply(&open) != Applied::Refused {
+        return Err("an OpenLinkedWindow the pair refused was answered done".into());
+    }
+    if *pair.opened.borrow() != [f.win, f.win] {
+        return Err(format!("the pair was asked for {:?}", pair.opened.borrow()));
+    }
+    let refused = s.sink.events().into_iter().any(|(_, event)| {
+        matches!(event, HostEvent::Refused { why, .. } if why == "this window cannot start a second window")
+    });
+    if !refused {
+        return Err("the pair's refusal did not reach the sink with its reason".into());
+    }
+    let before = s.sink.events().len();
+    let raise = HostOp::RaisePeer {
+        win: f.win,
+        peer: PeerId(2),
+    };
+    s.sink.applying(Some(0));
+    let answer = s.host.apply(&raise);
+    s.sink.applying(None);
+    if answer != Applied::Done {
+        return Err(format!("RaisePeer answered {answer:?}"));
+    }
+    let raised: Vec<_> = s.sink.events()[before..]
+        .iter()
+        .filter(|(at, event)| {
+            *at == Some(0) && matches!(event, HostEvent::Peer(PeerEvent::Raised { peer: PeerId(2), .. }))
+        })
+        .cloned()
+        .collect();
+    if raised.len() != 1 {
+        return Err(format!("RaisePeer posted {:?}", &s.sink.events()[before..]));
+    }
+    finish(s);
+    Ok(())
+}
+
 fn run_all() -> Result<Vec<String>, String> {
     let f = Fixture {
         win: WinId::MAIN,
@@ -783,7 +845,12 @@ fn run_all() -> Result<Vec<String>, String> {
         hidden: ModuleId::editor(),
     };
     let mut passed = Vec::new();
-    for script in conformance::scripts(&f).into_iter().chain(own_scripts(&f)) {
+    // This host is given no pair here, and no kind of module can arrive in it yet: the pair's ops are refused.
+    let scripts = conformance::scripts(&f)
+        .into_iter()
+        .chain(conformance::pair_refusal_scripts(&f))
+        .chain(own_scripts(&f));
+    for script in scripts {
         let s = stage(&f)?;
         let result = conformance::run_observed(s.host.as_ref(), &s.sink, &script, Some(s.grid.as_ref()));
         let events = s.sink.events();
@@ -807,6 +874,8 @@ fn run_all() -> Result<Vec<String>, String> {
     passed.push("focus_goes_through_the_shells_focus_function_once_set".into());
     top_bar_chrome_and_hints_go_through_the_shells_functions(&f)?;
     passed.push("the_top_bar_chrome_and_hints_go_through_the_shells_functions_once_set".into());
+    the_pair_starts_and_raises_through_the_shell(&f)?;
+    passed.push("the_pair_starts_and_raises_through_the_shell".into());
     Ok(passed)
 }
 

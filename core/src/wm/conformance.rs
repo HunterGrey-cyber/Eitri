@@ -85,6 +85,8 @@ pub enum EventMatch {
     /// An unmap may clear focus or move it directly to another native destination.
     NativeFocusAwayFrom(ModuleId),
     Refused(OpTag),
+    /// A refusal of an op on `module`'s surface, naming it, so the controller knows which module it was for.
+    RefusedSurface(OpTag, ModuleId),
     PageShown(ViewId),
 }
 
@@ -100,6 +102,9 @@ impl EventMatch {
                 owner.as_ref() != Some(&FocusOwner::Module(module.clone()))
             }
             (Self::Refused(expected), HostEvent::Refused { what, .. }) => expected == what,
+            (Self::RefusedSurface(expected, module), HostEvent::Refused { what, surface, .. }) => {
+                expected == what && surface.as_ref().is_some_and(|(_, m)| m == module)
+            }
             (Self::PageShown(expected), HostEvent::Chat(ChatEvent::PageShown { view, .. })) => expected == view,
             _ => false,
         }
@@ -519,6 +524,51 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
     ]
 }
 
+/// What a host that can start no second window, and builds no arriving terminal yet, answers the pair's ops: each
+/// refused while it applies, so the controller hears why. A host whose shell has no pair at all, and one whose kind
+/// code for an arrival has not landed, run these; a host that carries the ops out does not.
+pub fn pair_refusal_scripts(f: &Fixture) -> Vec<Script> {
+    let arriving = ModuleId::instance(ModuleKind::Terminal, 3).expect("a terminal's number");
+    vec![
+        // The toast says why no second window opened; nothing else of the window changes.
+        Script {
+            name: "a_refused_open_linked_window_is_posted_refused",
+            ops: vec![HostOp::OpenLinkedWindow { win: f.win }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::Refused(OpTag::OpenLinkedWindow),
+                },
+            ],
+        },
+        // A terminal offered by the other window is refused before anything of it is built: the offer is turned
+        // down while the source still holds it whole.
+        Script {
+            name: "a_terminal_prepare_is_refused_until_its_kind_lands",
+            ops: vec![HostOp::PrepareSurface {
+                win: f.win,
+                module: arriving.clone(),
+                shape: crate::window_link::Shape::Tiled,
+                size: (640, 480),
+            }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::RefusedSurface(OpTag::PrepareSurface, arriving),
+                },
+            ],
+        },
+    ]
+}
+
 /// The window whose grid an op acts on.
 fn grid_win(op: &HostOp) -> Option<WinId> {
     match op {
@@ -666,5 +716,42 @@ mod tests {
             }
             run_observed(host.as_ref(), &sink, &script, Some(host.as_ref())).unwrap();
         }
+    }
+
+    /// The fake stands for a host with no pair and no arriving terminal by refusing those ops, as such a host does.
+    #[test]
+    fn the_fake_host_refusing_the_pairs_ops_passes_their_scripts() {
+        let f = Fixture {
+            win: WinId::MAIN,
+            a: ModuleId::agent(),
+            b: ModuleId::terminal(),
+            hidden: ModuleId::editor(),
+        };
+        for script in pair_refusal_scripts(&f) {
+            let host = FakeHost::new();
+            host.refuse_op(|op| matches!(op, HostOp::OpenLinkedWindow { .. } | HostOp::PrepareSurface { .. }));
+            let sink = Rc::new(RecordingSink::default());
+            let erased: Rc<dyn HostSink> = sink.clone();
+            host.attach(Rc::downgrade(&erased));
+            host.with_surface(f.win, f.a.clone(), SurfaceKind::Chat { view: ViewId::BASE }, true);
+            run_observed(host.as_ref(), &sink, &script, Some(host.as_ref())).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    #[test]
+    fn a_refusal_naming_another_module_does_not_match_the_surface_expected() {
+        let refused = |module: ModuleId| HostEvent::Refused {
+            what: OpTag::PrepareSurface,
+            why: "no".into(),
+            surface: Some((WinId::MAIN, module)),
+        };
+        let expected = EventMatch::RefusedSurface(OpTag::PrepareSurface, ModuleId::terminal());
+        assert!(expected.matches(&refused(ModuleId::terminal())));
+        assert!(!expected.matches(&refused(ModuleId::agent())));
+        assert!(!expected.matches(&HostEvent::Refused {
+            what: OpTag::PrepareSurface,
+            why: "no".into(),
+            surface: None,
+        }));
     }
 }

@@ -20,8 +20,13 @@ pub enum ModuleState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TermRun {
     NotStarted,
-    Running { pid: u32 },
+    Running {
+        pid: u32,
+    },
     Exited,
+    /// Its shell was started in the other window of the pair and came here with the move: it runs, and nothing
+    /// here starts another.
+    Moved,
 }
 
 /// The surface a window needs, including pages whose construction waits for their first show.
@@ -63,6 +68,23 @@ impl Lifecycle {
         } else {
             self.modules.push(module);
         }
+    }
+
+    /// A module that arrived from the other window, its surface built from what the move carried: hosted, and a
+    /// terminal's shell already running, so no effect starts another.
+    pub fn declare_moved(&mut self, decl: &SurfaceDecl) {
+        self.declare(decl, true);
+        if let Some(module) = self.modules.iter_mut().find(|m| m.decl.module == decl.module) {
+            module.terminal = TermRun::Moved;
+        }
+    }
+
+    /// The surface `module` was declared with.
+    pub fn kind(&self, module: &ModuleId) -> Option<&SurfaceKind> {
+        self.modules
+            .iter()
+            .find(|m| &m.decl.module == module)
+            .map(|m| &m.decl.kind)
     }
 
     pub fn state(&self, module: &ModuleId) -> Option<&ModuleState> {

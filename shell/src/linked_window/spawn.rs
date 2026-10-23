@@ -290,7 +290,6 @@ impl Pair {
     /// `window.new`: in window 1, starts window 2 (or raises it when it is up); `token` is the activation token
     /// the key press gave, so the window that opens gets the keys. Refused in an unpaired window and in one that
     /// cannot pair.
-    #[cfg_attr(not(test), allow(dead_code))] // Called by the window controller's window verbs.
     pub fn window_new(&self, token: Option<String>) -> Result<WindowNew, String> {
         let plan = self.role.borrow().window_new();
         match &plan {
@@ -318,8 +317,9 @@ impl Pair {
         Ok(plan)
     }
 
-    /// `window.other`: raises the other window and gives it the keys.
-    #[cfg_attr(not(test), allow(dead_code))] // Called by the window controller's window verbs.
+    /// Raises the other window and gives it the keys. The window controller's `window.other` sends the same
+    /// `focus{window}` itself, once the host has asked the activation token; this stays for the tests of the pair.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn window_other(&self, token: Option<String>) -> Result<(), String> {
         self.focus_other(token)
     }
@@ -337,6 +337,16 @@ impl Pair {
             Vec::new(),
         )
         .map_err(|e| format!("the other window could not be asked: {e}"))
+    }
+}
+
+/// The window controller's `window.new`, carried out by the GTK host: what the pair started or raised is not the
+/// controller's to know, since a window 2 it starts becomes its peer only once its `hello` links it.
+impl crate::gtk_host::LinkedWindows for Pair {
+    fn open(&self, _win: eitri_core::wm::WinId, token: Option<String>) -> Result<(), String> {
+        let plan = self.window_new(token)?;
+        println!("[window] window.new: {plan:?}");
+        Ok(())
     }
 }
 

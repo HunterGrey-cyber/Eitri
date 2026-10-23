@@ -123,6 +123,8 @@ pub struct Window {
     /// What the module verbs wait for: the y/n's module, the new instances whose surface was asked for, the
     /// splits waiting for a terminal's directory.
     pub(super) modules: super::verbs::modules::ModuleVerbs,
+    /// The link to the other window of the pair and the moves on it, while a peer is attached.
+    pub(super) peer: Option<super::moves::PeerMoves>,
     /// What the window's chrome shows, as the controller decided it.
     pub(super) chrome: ChromeModel,
     /// Bumped by every change of `chrome`, so the shell can tell an announced model from one it drew.
@@ -150,6 +152,7 @@ impl Window {
             focus: FocusState::default(),
             keys: KeyState::default(),
             modules: Default::default(),
+            peer: None,
             chrome: ChromeModel::default(),
             chrome_rev: 0,
             chrome_state: ChromeState::default(),

@@ -6,20 +6,27 @@
 //! takes cannot hold a descriptor open. The end is reported after every message the other window wrote before
 //! it, as the link thread passes them: `bye{why}` first means a clean close, an end without one means the other
 //! window died or the link broke.
+//!
+//! The move protocol's messages are the window controller's: [`LinkDriver::attach_controller`] hands them to it as
+//! its peer events, posts one wake event after each drain (a confirmed send's answer comes on a wake with no message),
+//! and detaches the peer when the link ends.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eitri_core::window_link::link::{Inbound, LinkHandle, PresenceFlag};
 use eitri_core::window_link::msg::KINDS;
 use eitri_core::window_link::{LinkError, Msg, TurnEdge};
+use eitri_core::wm::{Controller, Driver, PeerId, WinId};
 use gtk4::glib;
 
 use super::LinkEnd;
+use crate::gtk_host::peer::{self, LinkPort, LinkSend};
 
 /// How long a window started here has to finish the handshake. Its `hello` comes once its toolkit is up, which a
 /// loaded machine can take several seconds for; past this the start has failed, and a window that never says hello
@@ -38,6 +45,7 @@ type Handler = Rc<dyn Fn(&LinkDriver, Msg, Vec<OwnedFd>)>;
 type EndHandler = Rc<dyn Fn(&LinkDriver, &LinkEnd)>;
 type ClosingHandler = Rc<dyn Fn(&LinkDriver)>;
 type DrainedHandler = Rc<dyn Fn(&LinkDriver)>;
+type WakeHandler = Rc<dyn Fn(&LinkDriver)>;
 
 struct Inner {
     handle: RefCell<Option<LinkHandle>>,
@@ -46,6 +54,7 @@ struct Inner {
     on_end: RefCell<Vec<EndHandler>>,
     on_closing: RefCell<Vec<ClosingHandler>>,
     on_drained: RefCell<Vec<DrainedHandler>>,
+    on_wake: RefCell<Vec<WakeHandler>>,
     partner: Cell<Option<Partner>>,
     /// The flag the link thread sets while the other window counts as another window for turn review: the one given
     /// to [`LinkHandle::start`], so what the thread sets is what this window's revert checks read.
@@ -82,6 +91,7 @@ impl LinkDriver {
                 on_end: RefCell::default(),
                 on_closing: RefCell::default(),
                 on_drained: RefCell::default(),
+                on_wake: RefCell::default(),
                 partner: Cell::new(None),
                 presence: RefCell::new(PresenceFlag::default()),
                 partner_running: RefCell::default(),
@@ -144,6 +154,12 @@ impl LinkDriver {
         self.inner.on_drained.borrow_mut().push(Rc::new(handler));
     }
 
+    /// Registers what runs once after each drain, whether or not anything arrived, before the link's end is
+    /// reported: a confirmed send's answer wakes the link without a message.
+    pub fn on_wake(&self, handler: impl Fn(&LinkDriver) + 'static) {
+        self.inner.on_wake.borrow_mut().push(Rc::new(handler));
+    }
+
     /// The flag the link thread was started with ([`LinkHandle::start`]); see [`LinkDriver::presence_flag`].
     pub fn set_presence(&self, flag: PresenceFlag) {
         *self.inner.presence.borrow_mut() = flag;
@@ -188,6 +204,7 @@ impl LinkDriver {
                     if handed {
                         self.drained();
                     }
+                    self.woke();
                     self.end_of_link();
                     return;
                 }
@@ -195,6 +212,7 @@ impl LinkDriver {
                     if handed {
                         self.drained();
                     }
+                    self.woke();
                     return;
                 }
             }
@@ -203,6 +221,13 @@ impl LinkDriver {
 
     fn drained(&self) {
         let handlers: Vec<DrainedHandler> = self.inner.on_drained.borrow().clone();
+        for handler in handlers {
+            handler(self);
+        }
+    }
+
+    fn woke(&self) {
+        let handlers: Vec<WakeHandler> = self.inner.on_wake.borrow().clone();
         for handler in handlers {
             handler(self);
         }
@@ -253,6 +278,59 @@ impl LinkDriver {
             Some(handle) => handle.send(msg, fds),
             None => Ok(()),
         }
+    }
+
+    /// As [`LinkDriver::send`], and the receiver answers once the packet is on the socket. After the link ended it
+    /// answers at once that it never will be.
+    pub fn send_confirmed(&self, msg: Msg, fds: Vec<OwnedFd>) -> Result<Receiver<io::Result<()>>, LinkError> {
+        match self.inner.handle.borrow().as_ref() {
+            Some(handle) => handle.send_confirmed(msg, fds),
+            None => {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the link ended before this was written",
+                )));
+                Ok(rx)
+            }
+        }
+    }
+
+    /// Makes the window controller's `win` the link's end toward `peer`: the move protocol's messages reach it as
+    /// peer events, each drain as one wake event, and the link's end detaches the peer. The controller sends on the
+    /// link through a [`LinkPort`]. An offer this window cannot read is refused on the link at once, never posted.
+    /// The controller is held weakly: the link must not keep the window's controller alive.
+    pub fn attach_controller(&self, win: WinId, peer: PeerId, controller: &Rc<Driver<Controller>>) {
+        let weak = Rc::downgrade(controller);
+        for kind in peer::MOVE_KINDS {
+            let weak = weak.clone();
+            self.on(kind, move |link, msg, fds| {
+                if let Some(refusal) = peer::unreadable_offer(&msg) {
+                    if let Err(err) = link.send(refusal, Vec::new()) {
+                        eprintln!("[link] the refusal of an offer could not be sent: {err}");
+                    }
+                    return;
+                }
+                let event = peer::inbound_event(peer, Inbound::Msg { msg, fds });
+                if let (Some(event), Some(controller)) = (event, weak.upgrade()) {
+                    controller.post(event);
+                }
+            });
+        }
+        {
+            let weak = weak.clone();
+            self.on_wake(move |_| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.post(peer::woke(peer));
+                }
+            });
+        }
+        self.on_end(move |_, _| {
+            if let Some(controller) = weak.upgrade() {
+                controller.detach_peer(win);
+            }
+        });
+        controller.attach_peer(win, peer, Rc::new(LinkPort::new(self.clone())));
     }
 
     /// Says `bye{why}` and closes the link; the other window sees a clean close. This window's own handlers for
@@ -328,6 +406,16 @@ impl LinkDriver {
     /// How the link ended, once it has.
     pub fn ended(&self) -> Option<LinkEnd> {
         self.inner.ended.borrow().clone()
+    }
+}
+
+impl LinkSend for LinkDriver {
+    fn send(&self, msg: Msg, fds: Vec<OwnedFd>) -> Result<(), LinkError> {
+        LinkDriver::send(self, msg, fds)
+    }
+
+    fn send_confirmed(&self, msg: Msg, fds: Vec<OwnedFd>) -> Result<Receiver<io::Result<()>>, LinkError> {
+        LinkDriver::send_confirmed(self, msg, fds)
     }
 }
 
@@ -531,6 +619,159 @@ pub(crate) mod tests {
             "a hello that arrived in time is handed over before the deadline is judged"
         );
         assert!(driver.linked(), "and it links instead of being dropped");
+    }
+
+    #[test]
+    fn a_wake_with_no_message_still_runs_the_wake_handlers() {
+        let (driver, _theirs, _their_inbound) = pair();
+        let (wakes, drains): (Rc<Cell<u32>>, Rc<Cell<u32>>) = Default::default();
+        {
+            let wakes = wakes.clone();
+            driver.on_wake(move |_| wakes.set(wakes.get() + 1));
+            let drains = drains.clone();
+            driver.on_drained(move |_| drains.set(drains.get() + 1));
+        }
+        let answer = driver.send_confirmed(Msg::Presence { held: true }, Vec::new()).unwrap();
+        assert!(
+            answer.recv_timeout(Duration::from_secs(5)).unwrap().is_ok(),
+            "the packet was written"
+        );
+        assert!(wait_queued(&driver), "the answer woke the link");
+        driver.pump();
+        assert_eq!(
+            (wakes.get(), drains.get()),
+            (1, 0),
+            "the wake is reported though nothing arrived"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_send_after_the_end_answers_that_it_was_never_written() {
+        let (driver, theirs, _their_inbound) = pair();
+        drop(theirs);
+        assert!(pump_until(&driver, || !driver.is_up()));
+        let answer = driver.send_confirmed(Msg::MoveDone { mv: 1 }, Vec::new()).unwrap();
+        assert!(answer.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+    }
+
+    /// A window controller holding one window, on the fake host, for the link to attach to.
+    fn controller() -> (Rc<Driver<Controller>>, Rc<eitri_core::wm::fake::FakeHost>) {
+        use eitri_core::layout::{Layout, ModuleDecl, ModuleId, ModuleKeys, Placement, Workspaces};
+        use eitri_core::wm::fake::{FakeHost, FakeScheduler};
+        use eitri_core::wm::start::StartStep;
+        use eitri_core::wm::{EditorPresence, HostSink, WindowParts, WindowRole, WindowSpec};
+        let host = FakeHost::new();
+        let scheduler = FakeScheduler::new();
+        let driver = Driver::new(Controller::new(scheduler.clone()), host.clone(), scheduler.clone());
+        let sink: Rc<dyn HostSink> = driver.clone();
+        host.attach(Rc::downgrade(&sink));
+        scheduler.attach(Rc::downgrade(&sink));
+        let keymap = Rc::new(eitri_core::keymap::Keymap::defaults());
+        let module_keys = Rc::new(ModuleKeys::build(&[], &keymap).unwrap());
+        for step in [
+            StartStep::Feeds {
+                spawn: eitri_core::wm::EditorSpawn {
+                    env: vec![],
+                    args: vec![],
+                    cwd: None,
+                    clean: true,
+                },
+            },
+            StartStep::Window {
+                spec: WindowSpec {
+                    role: WindowRole::Main,
+                    presence: EditorPresence::Owned,
+                    title: "project".into(),
+                },
+            },
+            StartStep::Editor,
+            StartStep::Kernel,
+            StartStep::Config { keymap, module_keys },
+            StartStep::Layout {
+                parts: WindowParts {
+                    layout: Rc::new(RefCell::new(
+                        Layout::initial(&[ModuleDecl {
+                            id: ModuleId::terminal(),
+                            placement: Placement::BelowRoot,
+                        }])
+                        .unwrap(),
+                    )),
+                    workspaces: Rc::new(RefCell::new(Workspaces::single())),
+                    saver: None,
+                },
+            },
+        ] {
+            driver.start(WinId::MAIN, step);
+        }
+        (driver, host)
+    }
+
+    fn raises(host: &eitri_core::wm::fake::FakeHost) -> usize {
+        host.log()
+            .iter()
+            .filter(|logged| {
+                matches!(
+                    logged,
+                    eitri_core::wm::fake::Logged::Op(eitri_core::wm::HostOp::RaisePeer { .. }, _)
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_link_is_the_controllers_peer_until_it_ends() {
+        use eitri_core::keymap::Action;
+        use eitri_core::wm::Origin;
+        let (wm, host) = controller();
+        let (driver, theirs, _their_inbound) = pair();
+        driver.attach_controller(WinId::MAIN, PeerId(2), &wm);
+        wm.run(WinId::MAIN, Action::WindowOther, Origin::Key { keycode: 0 });
+        assert_eq!(
+            raises(&host),
+            1,
+            "with the link attached, window.other raises the other window"
+        );
+
+        drop(theirs);
+        assert!(pump_until(&driver, || !driver.is_up()));
+        wm.run(WinId::MAIN, Action::WindowOther, Origin::Key { keycode: 0 });
+        assert_eq!(
+            raises(&host),
+            1,
+            "once the link has ended there is no other window to raise"
+        );
+    }
+
+    #[test]
+    fn an_offer_this_window_cannot_read_is_refused_on_the_link() {
+        let (wm, _host) = controller();
+        let (driver, theirs, their_inbound) = pair();
+        driver.attach_controller(WinId::MAIN, PeerId(2), &wm);
+        theirs
+            .send(
+                Msg::MoveOffer {
+                    mv: 4,
+                    module: "terminal#2".into(),
+                    kind: "spreadsheet".into(),
+                    shape: eitri_core::window_link::Shape::Tiled,
+                    size: (10, 10),
+                    session: None,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut refused = None;
+        while refused.is_none() && Instant::now() < deadline {
+            driver.pump();
+            if let Ok(Inbound::Msg { msg, .. }) = their_inbound.recv_timeout(Duration::from_millis(20)) {
+                refused = Some(msg);
+            }
+        }
+        assert!(
+            matches!(refused, Some(Msg::MoveRefused { mv: 4, .. })),
+            "the other window hears the refusal: {refused:?}"
+        );
     }
 
     #[test]

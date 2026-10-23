@@ -17,6 +17,7 @@ pub mod keys;
 pub mod lua;
 pub mod modes;
 pub mod module;
+pub mod moves;
 pub mod persist;
 pub mod prefix_strip;
 pub mod start;

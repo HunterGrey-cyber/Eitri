@@ -1,19 +1,22 @@
 use crate::layout::{Layout, ModuleId, ModuleKind};
+use crate::window_link::ids;
 
-/// Choose the lowest instance number absent from every layout and every held or reserved id.
+/// Choose the lowest instance number absent from every layout and every held or reserved id. The numbers this
+/// window cannot take (its layouts' modules and the reserved ids) and the ones the other window of a pair holds go
+/// through the pair's one allocator, so a number is never handed out twice across the two windows. Running out
+/// keeps the window's own words, which say the limit a person hits with one window open.
 pub fn plan_new_instance(
     kind: ModuleKind,
     here: &[&Layout],
     reserved: &[ModuleId],
     other_held: &[ModuleId],
 ) -> Result<ModuleId, String> {
-    let taken: Vec<_> = here
+    let here_and_reserved: Vec<_> = here
         .iter()
         .flat_map(|layout| layout.modules())
         .chain(reserved.iter().cloned())
-        .chain(other_held.iter().cloned())
         .collect();
-    ModuleId::lowest_free(kind, &taken).ok_or_else(|| match kind {
+    ids::new_instance(kind, &here_and_reserved, other_held).map_err(|_| match kind {
         ModuleKind::Terminal => "at most 9 terminals".to_string(),
         ModuleKind::Agent => "at most 9 chat views".to_string(),
         _ => format!("no new instance of {kind:?} can be made"),

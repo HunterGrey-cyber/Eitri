@@ -27,6 +27,7 @@ use super::super::grid::order;
 use super::super::host::*;
 use super::super::instances::plan_new_instance;
 use super::super::module::{ModuleState, SurfaceDecl};
+use super::super::moves;
 use super::super::window::{WinId, Window};
 use crate::keymap::action::{Action, SplitCwd};
 use crate::keymap::Keymap;
@@ -76,7 +77,7 @@ pub struct ModuleVerbs {
 
 impl ModuleVerbs {
     /// The new instances whose surface was asked for and has not come yet; their numbers are not free.
-    fn pending_ids(&self) -> Vec<ModuleId> {
+    pub(crate) fn pending_ids(&self) -> Vec<ModuleId> {
         self.opens.iter().map(|open| open.id.clone()).collect()
     }
 }
@@ -811,6 +812,7 @@ pub fn instance_new(
                 .reserved()
                 .into_iter()
                 .chain(w.modules.pending_ids())
+                .chain(moves::arriving(w))
                 .collect();
             Some(match kind {
                 ModuleKind::Terminal | ModuleKind::Agent => plan_new_instance(kind, &here, &reserved, &[]),
@@ -902,6 +904,8 @@ pub fn scratch_new(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &m
             Some(format!("{id}: another workspace holds it"))
         } else if pending {
             Some(format!("{id}: it is being made"))
+        } else if moves::arriving(w).contains(id) {
+            Some(format!("{id}: it is arriving from the other window"))
         } else {
             None
         }),
@@ -1164,6 +1168,11 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
     let Some(id) = target(w) else {
         return Ran::Done;
     };
+    if moves::moving(w, &id) {
+        w.say(format!("[modules] {id}: not killed: {}", feedback::MOVING_TEXT));
+        w.refuse(win, feedback::MOVING_TEXT.to_owned(), batch);
+        return Ran::Done;
+    }
     let scope = w.layout.try_borrow().map(|layout| layout::can_kill(&layout, &id));
     let scope = match scope {
         Ok(Ok(scope)) => scope,
@@ -1229,9 +1238,16 @@ pub fn prompt_answer(w: &mut Window, cx: &Cx, win: WinId, answer: PromptKey, bat
 /// plugin's runs stop and its page ends, to load afresh when it is next shown. A chat view's tabs close (the base
 /// view's own tabs only; a tab shown in another view is that view's), and a numbered view leaves every workspace,
 /// its page idle for the next view of that number. Refused if the layout would refuse it now, and a chat's kill while
-/// one of its tabs cannot close (handed off to a terminal, or moving to the other window); the last module on screen
-/// is the window close.
+/// one of its tabs cannot close (handed off to a terminal, or moving to the other window), and any module while this
+/// window is moving it to the other window; the last module on screen is the window close.
 fn kill_now(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) -> Ran {
+    if moves::moving(w, id) {
+        // The other window may already be taking the session over: what runs in it is not this window's to end
+        // until the move does.
+        w.say(format!("[modules] {id}: not killed: {}", feedback::MOVING_TEXT));
+        w.refuse(win, feedback::MOVING_TEXT.to_owned(), batch);
+        return Ran::Done;
+    }
     let scope = w.layout.try_borrow().map(|layout| layout::can_kill(&layout, id));
     match scope {
         Ok(Ok(KillScope::Module)) => {}

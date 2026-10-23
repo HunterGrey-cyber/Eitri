@@ -808,6 +808,27 @@ fn no_module_verb_is_left_in_run_verb() {
     assert!(follow.contains("driver.follow(WinId::MAIN,module,show);"), "{follow}");
 }
 
+/// The window verbs are the controller's: the shell's arm answers them only as a bug, and no longer refuses them
+/// itself. Starting the second window and raising it are the host's ops, carried out through the pair.
+#[test]
+fn no_window_verb_is_left_in_run_verb() {
+    let code = build_ui_code();
+    let body = let_block(&code, "letrun_verb:Rc<dynFn(Action)>=");
+    let bug_arm = "Action::WindowNew|Action::WindowOther|Action::MoveToWindow{..}|Action::WorkspaceToWindow{..}|Action::WorkspaceSwapWindow=>{eprintln!(";
+    assert_eq!(body.matches(bug_arm).count(), 1, "one arm, which reports a bug");
+    for verb in [
+        "Action::WindowNew",
+        "Action::WindowOther",
+        "Action::MoveToWindow",
+        "Action::WorkspaceToWindow",
+        "Action::WorkspaceSwapWindow",
+    ] {
+        assert_eq!(body.matches(verb).count(), 1, "`{verb}` only in the bug arm");
+    }
+    assert!(code.contains("wm_host.set_linked_windows(pair.clone());"));
+    assert!(code.contains("link.attach_controller(WinId::MAIN,peer,&wm);"));
+}
+
 /// The answer gate the panel asks at each card answer is the controller's query, and its refusal is posted for the
 /// toast: the shell reads no layout to judge it.
 #[test]

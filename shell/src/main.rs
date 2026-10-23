@@ -541,6 +541,8 @@ fn build_ui(
     // The window, created and not shown, so no later op names a window that does not exist; its close requests,
     // focus changes and activation reach the controller from here on.
     wm_host.set_application(app);
+    // `window.new` starts the second window through the pair; the link it makes reaches the controller once linked.
+    wm_host.set_linked_windows(pair.clone());
     let (wm_role, editor_presence) = pair.wm_spec_role();
     driver.start(
         WinId::MAIN,
@@ -3433,7 +3435,7 @@ fn build_ui(
                 | Action::MoveToWindow { .. }
                 | Action::WorkspaceToWindow { .. }
                 | Action::WorkspaceSwapWindow => {
-                    refuse_text(&refusal, "this window has no second window yet");
+                    eprintln!("[wm] BUG: the window verb {} reached the shell", action.name())
                 }
             }
         })
@@ -3850,6 +3852,9 @@ fn build_ui(
         let ever_linked = Rc::new(std::cell::Cell::new(false));
         let linked: linked_window::spawn::OnLinked = {
             let ever_linked = ever_linked.clone();
+            let wm = Rc::downgrade(&driver);
+            // Window 1's other window is window 2, and window 2's is window 1.
+            let peer = eitri_core::wm::PeerId(if pair.is_second() { 1 } else { 2 });
             let window1_editor = window1_editor.clone();
             let window2_editor = window2_editor.clone();
             let pair_review = pair_review.clone();
@@ -3878,6 +3883,10 @@ fn build_ui(
                 }
                 if let Some(review) = &pair_review {
                     review.linked(link);
+                }
+                // The move protocol is the controller's: its messages, the link's wakes and its end reach it from here.
+                if let Some(wm) = wm.upgrade() {
+                    link.attach_controller(WinId::MAIN, peer, &wm);
                 }
             })
         };

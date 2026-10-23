@@ -1,6 +1,6 @@
-//! Text feedback for the tiling, focus, keys, chrome and module verbs. For the tiling verbs, the caller retains effects
-//! requiring values absent from [`VerbOutcome`]: successful preset cycling, mark toggling, marked swaps and zoom
-//! changes.
+//! Text feedback for the tiling, focus, keys, chrome, module and window verbs. For the tiling verbs, the caller
+//! retains effects requiring values absent from [`VerbOutcome`]: successful preset cycling, mark toggling, marked
+//! swaps and zoom changes.
 //! Container no-ops also flash without a toast; their [`Feedback::Log`] carries only the line,
 //! so the caller must retain that flash separately.
 //!
@@ -502,4 +502,41 @@ pub fn workspaces(alone: bool, text: String) -> Feedback {
         format!("[modules] refused: {text}")
     };
     Feedback::Refuse { log, text }
+}
+
+// The window verbs' words.
+
+/// What a window verb says while the half of the pair it needs is not there: no other window attached, a module
+/// the other window holds asked for here, a workspace sent across, or a kind of module the other window cannot
+/// take yet.
+pub const NO_SECOND_WINDOW_TEXT: &str = "this window has no second window yet";
+/// A move toward another window of the same process: the pair is two processes, and nothing else was chosen.
+pub const LOCAL_MOVE_TEXT: &str = "windows of one process were not chosen";
+/// A move of the editor, which stays with the nvim it runs.
+pub const EDITOR_MOVE_TEXT: &str = "the editor stays in the window that runs nvim";
+/// A move of a module already on its way.
+pub const MOVING_TEXT: &str = "the module is already moving to the other window";
+/// A move of a module this window does not hold.
+pub const NOT_HELD_TEXT: &str = "the module is not in this window";
+/// The destination's answer to an offer it cannot take as one: a number that is not the other window's, or one
+/// already taken.
+pub const NOT_AN_OFFER_TEXT: &str = "not an offer this window can take";
+
+/// What the source says, once, when the other window has neither committed nor given back a move it was sent.
+pub fn not_answering_text(other: u8) -> String {
+    format!("window {other} is not answering")
+}
+
+#[cfg(test)]
+mod window_tests {
+    #[test]
+    fn the_window_verbs_say_what_they_said_before_the_pair_was_wired() {
+        assert_eq!(super::NO_SECOND_WINDOW_TEXT, "this window has no second window yet");
+    }
+
+    #[test]
+    fn a_silent_destination_is_named_by_its_window_number() {
+        assert_eq!(super::not_answering_text(2), "window 2 is not answering");
+        assert_eq!(super::not_answering_text(1), "window 1 is not answering");
+    }
 }

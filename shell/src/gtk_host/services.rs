@@ -237,7 +237,11 @@ impl ServiceSet for Services {
             }
             TermOp::ReadCwd { win, module, read } => self.read_cwd(*win, module, *read),
             TermOp::SetStartDir { module, dir, .. } => revive_pane(&self.terminals, module, dir.clone()),
-            TermOp::SendKeys { .. } | TermOp::Detach { .. } | TermOp::ShutdownAll { .. } => Err(NOT_CARRIED_OUT.into()),
+            TermOp::SendKeys { .. }
+            | TermOp::Detach { .. }
+            | TermOp::Forget { .. }
+            | TermOp::Resume { .. }
+            | TermOp::ShutdownAll { .. } => Err(NOT_CARRIED_OUT.into()),
         }
     }
 

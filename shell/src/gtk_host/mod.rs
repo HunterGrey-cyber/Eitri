@@ -48,6 +48,12 @@
 //! [`HostReads`] from them, and with [`NoReads`]' values for a window that has given neither yet;
 //! a chat view's attention is the read [`GtkHost::set_view_attention`] gives.
 //!
+//! **The pair.** `OpenLinkedWindow` starts or raises the project's second window through the [`LinkedWindows`] the
+//! shell sets ([`GtkHost::set_linked_windows`]), with an activation token from the window's display; `RaisePeer` asks
+//! that token and answers with `PeerEvent::Raised`, on which the controller asks the other window to come forward.
+//! The controller's way onto the link itself is [`peer::LinkPort`], attached by the link's own code, not the host's.
+//! An arriving module's `PrepareSurface` and `AdoptMoved` are refused: no kind's arrival is built here yet.
+//!
 //! **Lifetime.** The host holds its windows weakly. GTK drops its own reference when a window
 //! closes, and only then does the window dispose and emit `destroy`, which is where the host
 //! forgets the window and its surfaces; a strong reference here would keep every closed window.
@@ -58,6 +64,7 @@
 pub(crate) mod chrome;
 pub(crate) mod instance_pool;
 pub(crate) mod keys;
+pub(crate) mod peer;
 pub(crate) mod scheduler;
 
 use std::cell::{Cell, RefCell};
@@ -71,7 +78,7 @@ use eitri_core::wm::chrome::ChromeModel;
 use eitri_core::wm::{
     ActivationToken, Applied, ChatKillCounts, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorCall, FocusChain,
     FocusOwner, FocusTo, HintOp, Host, HostEvent, HostOp, HostReads, HostSink, LuaOp, Monitor, MonitorId, NoReads,
-    OpTag, PluginOp, ShellCall, SurfaceKind, TermOp, WinId, WindowSpec,
+    OpTag, PeerEvent, PeerId, PluginOp, ShellCall, SurfaceKind, TermOp, WinId, WindowSpec,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
@@ -124,6 +131,14 @@ pub(crate) trait HintPort {
 /// does those, so a controller that emits one learns it went nowhere.
 pub(crate) const NOT_CARRIED_OUT: &str = "not carried out by this shell yet";
 
+/// What starts the project's second window for `OpenLinkedWindow`: the pair's own code, which belongs to the shell's
+/// binary. A host without it cannot start one.
+pub(crate) trait LinkedWindows {
+    /// Starts the second window, or raises it when it runs; `token` is the activation token this window's display
+    /// gave, so the window that comes forward gets the keys. `Err` says why nothing was started.
+    fn open(&self, win: WinId, token: Option<String>) -> Result<(), String>;
+}
+
 /// What builds a module's surface for `CreateSurface` and releases it for `DropSurface`.
 pub(crate) trait SurfaceMaker {
     /// Builds `module`'s host for `kind` as the window's startup builds one, places it off screen,
@@ -165,6 +180,11 @@ pub(crate) trait GridPort {
     fn restack_floats(&self, order: &[ModuleId]);
     /// Whether the grid's probe places `module`'s host by hand, so no map or unmap may touch it.
     fn probe_places(&self, module: &ModuleId) -> bool;
+    /// `module`'s host as the grid last allocated it; nothing for a host not laid out.
+    fn module_size(&self, module: &ModuleId) -> Option<Size> {
+        let _ = module;
+        None
+    }
 }
 
 /// What the host reads of a window's editor.
@@ -222,6 +242,7 @@ pub(crate) struct GtkHost {
     kill_counts_fn: RefCell<Option<Rc<KillCountsFn>>>,
     first_tab_fn: RefCell<Option<Rc<FirstTabFn>>>,
     hints: RefCell<Option<Rc<dyn HintPort>>>,
+    linked_windows: RefCell<Option<Rc<dyn LinkedWindows>>>,
     grids: RefCell<BTreeMap<WinId, Rc<dyn GridPort>>>,
     editors: RefCell<BTreeMap<WinId, Rc<dyn EditorReads>>>,
     /// How many native focus reports have been posted, so a grab that GTK did not notify (the
@@ -254,6 +275,7 @@ impl GtkHost {
             kill_counts_fn: RefCell::new(None),
             first_tab_fn: RefCell::new(None),
             hints: RefCell::new(None),
+            linked_windows: RefCell::new(None),
             grids: RefCell::new(BTreeMap::new()),
             editors: RefCell::new(BTreeMap::new()),
             focus_reports: Cell::new(0),
@@ -446,6 +468,11 @@ impl GtkHost {
     /// What the `Hint` ops draw and toggle through. Until it is set, they are not carried out.
     pub(crate) fn set_hints(&self, hints: Rc<dyn HintPort>) {
         *self.hints.borrow_mut() = Some(hints);
+    }
+
+    /// What `OpenLinkedWindow` starts the second window through. Until it is set, none can be started.
+    pub(crate) fn set_linked_windows(&self, linked: Rc<dyn LinkedWindows>) {
+        *self.linked_windows.borrow_mut() = Some(linked);
     }
 
     /// `win`'s grid: what `Allocate` and `Restack` act on and what the grid reads answer from.
@@ -728,6 +755,45 @@ impl GtkHost {
         Applied::Done
     }
 
+    /// An activation token from `win`'s display, naming the surface with the keys and the seat's last input, for the
+    /// other window of the pair to come forward with. `None` when the compositor gives none.
+    fn activation_token(&self, win: WinId) -> Option<String> {
+        let window = self.window(win)?;
+        let context = WidgetExt::display(&window).app_launch_context();
+        context
+            .startup_notify_id(None::<&gtk4::gio::AppInfo>, &[])
+            .map(|token| token.to_string())
+            .filter(|token| !token.is_empty())
+    }
+
+    fn open_linked_window(&self, op: &HostOp, win: WinId) -> Applied {
+        if self.window(win).is_none() {
+            return self.refuse(op, "no such window");
+        }
+        // Cloned out first: the start wires the new link and may call back into GTK.
+        let linked = self.linked_windows.borrow().clone();
+        let Some(linked) = linked else {
+            return self.refuse(op, eitri_core::wm::feedback::NO_SECOND_WINDOW_TEXT);
+        };
+        match linked.open(win, self.activation_token(win)) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
+    /// The other window comes forward by its own raise once it hears `focus{window}` with this token: under GNOME
+    /// the token lets it take the keys from this window, and under sway, Hyprland and niri, which turn a token into
+    /// an urgency hint, it also has the compositor focus it by its pid. The controller sends that message on the
+    /// answer posted here.
+    fn raise_peer(&self, op: &HostOp, win: WinId, peer: PeerId) -> Applied {
+        if self.window(win).is_none() {
+            return self.refuse(op, "no such window");
+        }
+        let token = self.activation_token(win);
+        self.post(HostEvent::Peer(PeerEvent::Raised { peer, token }));
+        Applied::Done
+    }
+
     fn lua(&self, op: &HostOp, call: &LuaOp) -> Applied {
         // Cloned out first: the kernel runs Lua, which may post to the sink or call into GTK.
         let lua = self.lua.borrow().clone();
@@ -799,11 +865,14 @@ impl Host for GtkHost {
             HostOp::OpenWindow { win, spec } => self.open_window(op, *win, spec),
             HostOp::Present { win, activation } => self.present(op, *win, activation.as_ref()),
             HostOp::Lua(call) => self.lua(op, call),
-            HostOp::SetMode { .. }
-            | HostOp::MoveToMonitor { .. }
-            | HostOp::Quit
-            | HostOp::PrepareSurface { .. }
-            | HostOp::Cleanup(..) => self.refuse(op, NOT_CARRIED_OUT),
+            HostOp::OpenLinkedWindow { win } => self.open_linked_window(op, *win),
+            HostOp::RaisePeer { win, peer } => self.raise_peer(op, *win, *peer),
+            // An arriving module is built by its kind's own code, which no kind has here yet: a refused prepare makes
+            // this window refuse the offer before the other window has frozen anything.
+            HostOp::PrepareSurface { .. } | HostOp::AdoptMoved { .. } => self.refuse(op, NOT_CARRIED_OUT),
+            HostOp::SetMode { .. } | HostOp::MoveToMonitor { .. } | HostOp::Quit | HostOp::Cleanup(..) => {
+                self.refuse(op, NOT_CARRIED_OUT)
+            }
         }
     }
 
@@ -877,6 +946,10 @@ impl HostReads for GtkHost {
     }
     fn editor_cell(&self, win: WinId) -> Option<(f64, f64)> {
         self.editor(win).and_then(|editor| editor.cell())
+    }
+    /// The module's host as the grid last allocated it; nothing before its first allocation.
+    fn module_size(&self, win: WinId, module: &ModuleId) -> Option<Size> {
+        self.grid(win)?.module_size(module)
     }
     fn editor_running(&self, win: WinId) -> bool {
         self.editor(win).is_some_and(|editor| editor.running())

@@ -7,6 +7,7 @@ pub mod focus;
 pub mod keys;
 pub mod modules;
 pub mod tiling;
+pub mod windows;
 pub mod workspaces;
 
 use crate::keymap::action::{Action, FloatRule, SelectionRule};
@@ -110,8 +111,14 @@ pub fn family_of(action: &Action, keys_on_a_float: bool, keys_on_the_editor: boo
 /// Whether the controller decides `family`'s verbs itself; the others go to the shell as its verb.
 pub fn moved(family: Family) -> bool {
     match family {
-        Family::Tiling | Family::Focus | Family::Keys | Family::Chrome | Family::Modules | Family::Workspaces => true,
-        Family::Windows | Family::Floats | Family::Panel | Family::Close | Family::TextSize => false,
+        Family::Tiling
+        | Family::Focus
+        | Family::Keys
+        | Family::Chrome
+        | Family::Modules
+        | Family::Workspaces
+        | Family::Windows => true,
+        Family::Floats | Family::Panel | Family::Close | Family::TextSize => false,
     }
 }
 

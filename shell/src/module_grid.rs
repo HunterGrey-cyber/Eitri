@@ -1487,6 +1487,15 @@ impl GridPort for glib::WeakRef<ModuleGrid> {
     fn probe_places(&self, module: &ModuleId) -> bool {
         self.upgrade().is_some_and(|grid| grid.probe_places_host(module))
     }
+    fn module_size(&self, module: &ModuleId) -> Option<Size> {
+        let grid = self.upgrade()?;
+        let (_, host) = grid.hosts().into_iter().find(|(id, _)| id == module)?;
+        let size = Size {
+            w: host.width(),
+            h: host.height(),
+        };
+        (size.w > 0 && size.h > 0).then_some(size)
+    }
 }
 
 /// The arrangement the grid allocates at `size`: its allocator's, which settles the pinned splits shown for

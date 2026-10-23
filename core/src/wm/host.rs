@@ -1,5 +1,6 @@
 //! The value contract between window decisions and native host services.
 
+use super::moves::MoveKind;
 use super::window::*;
 use crate::keymap::{
     action::Action,
@@ -8,11 +9,16 @@ use crate::keymap::{
 };
 use crate::layout::{kill::Reopen, Arrangement, Con, Direction, Frame, ModuleId, Size};
 use crate::tabs::ViewId;
+use crate::window_link::moves::MoveId;
+use crate::window_link::{FocusTarget, Msg, Shape, Summary};
 use std::any::Any;
+use std::cell::RefCell;
 use std::fmt;
-use std::os::fd::RawFd;
+use std::io;
+use std::os::fd::{OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -254,6 +260,12 @@ pub trait HostReads {
     fn editor_running(&self, win: WinId) -> bool;
     /// Whether the chat page `view` keeps a navigation key for itself.
     fn chat_claims(&self, view: ViewId, direction: Direction) -> bool;
+    /// The size `module`'s host has on screen now, which a move offers so the other window lays it out at that
+    /// size; `None` when the host cannot tell (no host, not laid out yet).
+    fn module_size(&self, win: WinId, module: &ModuleId) -> Option<Size> {
+        let _ = (win, module);
+        None
+    }
     /// What the chat view `view` holds for the user (cards waiting, a turn finished unseen), as its chip and its
     /// strip entry show it. A host whose chats report none answers nothing held.
     fn view_attention(&self, view: ViewId) -> crate::attention::Attention {
@@ -371,8 +383,29 @@ pub enum HostOp {
     /// Releases a module surface. A terminal's pane or a chat view's page is left idle in the host's pool under its
     /// id, its host kept, for the next instance of its number, which comes back with no create.
     DropSurface { win: WinId, module: ModuleId, why: DropWhy },
-    /// Lays out a destination off screen.
-    PrepareSurface { win: WinId, module: ModuleId },
+    /// Lays out a module arriving from the other window off screen, at the size and shape it has there, before
+    /// anything of it is moved: made before it is mapped. Carried out, the driver answers it with
+    /// [`HostEvent::Prepared`].
+    PrepareSurface {
+        win: WinId,
+        module: ModuleId,
+        shape: Shape,
+        size: (u32, u32),
+    },
+    /// Starts the project's second window, or raises it when it runs.
+    OpenLinkedWindow { win: WinId },
+    /// Brings the other window of the pair forward through the compositor; answered with [`PeerEvent::Raised`]
+    /// carrying the activation token the host got for it, if any.
+    RaisePeer { win: WinId, peer: PeerId },
+    /// Builds the prepared surface `module` from the descriptors and the record a committed move carried. The
+    /// descriptors are the op's alone: the host takes them out of `fds` and owns them from then on.
+    AdoptMoved {
+        win: WinId,
+        module: ModuleId,
+        kind: MoveKind,
+        record: serde_json::Value,
+        fds: Descriptors,
+    },
     /// Makes a module available on screen.
     Map { win: WinId, module: ModuleId },
     /// Hides a module after its keys have moved.
@@ -443,6 +476,8 @@ pub enum DropWhy {
     Killed,
     /// The module is no longer needed.
     Retired,
+    /// A move from the other window was given up before it committed: what was prepared for it goes.
+    MoveGivenUp,
 }
 
 /// One sibling insertion that preserves native parentage.
@@ -574,8 +609,16 @@ pub enum TermOp {
     SendKeys { win: WinId, module: ModuleId, keys: String },
     /// Delivers one key, as the key itself; the terminal's engine encodes it, or says it has no encoding.
     LiteralKey { win: WinId, module: ModuleId, key: KeySpec },
-    /// Detaches for a handoff.
-    Detach { win: WinId, module: ModuleId },
+    /// Freezes a terminal for move `mv`: the session stops reading and writing, its pane stays on screen as it is,
+    /// and the host answers with [`TermEvent::Detached`] carrying the same `mv`, its record and its handoff. The
+    /// move's id goes both ways because one module may be frozen for a move that has ended and again for the next
+    /// before the first answer arrives, and only the id tells the answers apart.
+    Detach { win: WinId, module: ModuleId, mv: MoveId },
+    /// The other window holds the terminal now: the local copy is dropped without hanging up its shell or
+    /// closing anything the handoff passed on.
+    Forget { win: WinId, module: ModuleId },
+    /// The move did not happen: the frozen terminal reads and writes again.
+    Resume { win: WinId, module: ModuleId },
     /// Shuts down every terminal.
     ShutdownAll { win: WinId },
 }
@@ -659,6 +702,9 @@ pub enum HostEvent {
     /// A `CreateSurface` op the host carried out: `module`'s surface exists now. Posted by the driver, which is
     /// the one other place besides a `Focus` op's tail where an op's answer is read.
     Created { win: WinId, module: ModuleId },
+    /// A `PrepareSurface` op the host carried out: the arriving module's place exists off screen. Posted by the
+    /// driver, as [`HostEvent::Created`] is.
+    Prepared { win: WinId, module: ModuleId },
     /// The answer gate refused a card answer from a chat view (`Controller::answer_gate`); `text` is why, for the
     /// toast.
     AnswerRefused { win: WinId, text: String },
@@ -850,6 +896,18 @@ pub enum ChatEvent {
 #[derive(Clone)]
 pub struct Handoff(Rc<dyn Any>);
 
+impl Handoff {
+    /// Wraps what the terminal's host hands the link; nothing on the way reads it.
+    pub fn new(inner: Rc<dyn Any>) -> Handoff {
+        Handoff(inner)
+    }
+
+    /// What the terminal's host put in, for the link that sends it.
+    pub fn inner(&self) -> &Rc<dyn Any> {
+        &self.0
+    }
+}
+
 impl fmt::Debug for Handoff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Handoff(..)")
@@ -880,10 +938,14 @@ pub enum TermEvent {
         read: u64,
         dir: Result<PathBuf, String>,
     },
-    /// A terminal detached for transfer.
+    /// A terminal froze for a move ([`TermOp::Detach`]): `record` is what the destination rebuilds its screen and
+    /// session from, and `handoff` holds the descriptors, which nothing here reads.
     Detached {
         win: WinId,
         module: ModuleId,
+        /// The move the freeze was asked for ([`TermOp::Detach`]'s `mv`).
+        mv: MoveId,
+        record: serde_json::Value,
         handoff: Handoff,
     },
 }
@@ -917,21 +979,122 @@ pub enum HintTarget {
     TopBarItem(u32),
 }
 
-/// Notifications from linked processes.
+/// What the other window of the pair said, as the link's thread decoded it, and the link's own news.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PeerEvent {
-    /// A peer is arriving.
-    Arriving { peer: PeerId },
-    /// A peer completed a move.
-    MoveDone { peer: PeerId },
-    /// A peer could not move.
-    MoveFailed { peer: PeerId },
-    /// A peer sent its summary.
-    Summary { peer: PeerId },
-    /// A peer intends to focus.
-    FocusIntent { peer: PeerId },
-    /// A peer disconnected.
+    /// The other window offers a module.
+    MoveOffer {
+        peer: PeerId,
+        id: MoveId,
+        module: ModuleId,
+        kind: MoveKind,
+        shape: Shape,
+        size: (u32, u32),
+        session: Option<String>,
+    },
+    /// The destination has the module's place ready.
+    MoveReady { peer: PeerId, id: MoveId },
+    /// The destination will not take the module.
+    MoveRefused { peer: PeerId, id: MoveId, why: String },
+    /// The source's module, with its record and descriptors.
+    Move {
+        peer: PeerId,
+        id: MoveId,
+        record: serde_json::Value,
+        fds: Descriptors,
+    },
+    /// The destination holds the module.
+    MoveDone { peer: PeerId, id: MoveId },
+    /// The other window gave a move up, as its source before `move` or as its destination after it.
+    MoveAbort { peer: PeerId, id: MoveId, why: String },
+    /// The link's wake was drained: a confirmed send may have been answered.
+    Woke { peer: PeerId },
+    /// The host's answer to [`HostOp::RaisePeer`]: the activation token it got, if any.
+    Raised { peer: PeerId, token: Option<String> },
+    /// The other window's counts and workspace names.
+    Summary { peer: PeerId, summary: Summary },
+    /// The other window gives this one the keys.
+    FocusIntent {
+        peer: PeerId,
+        target: FocusTarget,
+        token: Option<String>,
+    },
+    /// The other window said it is closing.
     Bye { peer: PeerId },
+    /// The link ended.
+    LinkClosed { peer: PeerId },
+}
+
+impl PeerEvent {
+    /// The window of the pair the event came from.
+    pub fn peer(&self) -> PeerId {
+        match self {
+            PeerEvent::MoveOffer { peer, .. }
+            | PeerEvent::MoveReady { peer, .. }
+            | PeerEvent::MoveRefused { peer, .. }
+            | PeerEvent::Move { peer, .. }
+            | PeerEvent::MoveDone { peer, .. }
+            | PeerEvent::MoveAbort { peer, .. }
+            | PeerEvent::Woke { peer }
+            | PeerEvent::Raised { peer, .. }
+            | PeerEvent::Summary { peer, .. }
+            | PeerEvent::FocusIntent { peer, .. }
+            | PeerEvent::Bye { peer }
+            | PeerEvent::LinkClosed { peer } => *peer,
+        }
+    }
+}
+
+/// The controller's way to the other window: pushing a message onto the link thread's channel, which never calls
+/// back into the controller, so it is called directly.
+pub trait PeerPort {
+    /// Queues `msg`, with a terminal's handoff when it carries one; an error is the link's, as text.
+    fn send(&self, msg: Msg, handoff: Option<Handoff>) -> Result<(), String>;
+    /// `LinkHandle::send_confirmed`: the receiver answers once the packet is on the socket (or never will be).
+    fn send_confirmed(&self, msg: Msg) -> Result<Receiver<io::Result<()>>, String>;
+}
+
+/// Descriptors that arrived with a move. One place owns them at a time -- the event, then the move's machine, then
+/// the op that adopts them -- and each takes them out with [`Descriptors::take`]; a copy of the value is the same
+/// descriptors, compared by identity.
+#[derive(Clone, Default)]
+pub struct Descriptors(Rc<RefCell<Vec<OwnedFd>>>);
+
+impl Descriptors {
+    pub fn new(fds: Vec<OwnedFd>) -> Descriptors {
+        Descriptors(Rc::new(RefCell::new(fds)))
+    }
+
+    /// Takes the descriptors out, leaving none.
+    pub fn take(&self) -> Vec<OwnedFd> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+
+    /// Puts descriptors back in, after the ones already held.
+    pub fn put(&self, fds: Vec<OwnedFd>) {
+        self.0.borrow_mut().extend(fds);
+    }
+
+    /// How many descriptors are held now.
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl fmt::Debug for Descriptors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Descriptors({})", self.len())
+    }
+}
+
+impl PartialEq for Descriptors {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// The operation kind carried by a refusal.
@@ -955,6 +1118,12 @@ pub enum OpTag {
     DropSurface,
     /// Identifies PrepareSurface operations.
     PrepareSurface,
+    /// Identifies OpenLinkedWindow operations.
+    OpenLinkedWindow,
+    /// Identifies RaisePeer operations.
+    RaisePeer,
+    /// Identifies AdoptMoved operations.
+    AdoptMoved,
     /// Identifies Map operations.
     Map,
     /// Identifies Unmap operations.
@@ -996,6 +1165,9 @@ impl OpTag {
             HostOp::CreateSurface { .. } => Self::CreateSurface,
             HostOp::DropSurface { .. } => Self::DropSurface,
             HostOp::PrepareSurface { .. } => Self::PrepareSurface,
+            HostOp::OpenLinkedWindow { .. } => Self::OpenLinkedWindow,
+            HostOp::RaisePeer { .. } => Self::RaisePeer,
+            HostOp::AdoptMoved { .. } => Self::AdoptMoved,
             HostOp::Map { .. } => Self::Map,
             HostOp::Unmap { .. } => Self::Unmap,
             HostOp::Allocate { .. } => Self::Allocate,
@@ -1014,14 +1186,17 @@ impl OpTag {
 }
 
 impl HostOp {
-    /// The window and module whose surface the op creates, drops, prepares, maps, unmaps or gives the keys to;
-    /// `None` for every other op. A refused grab names its module, so its refusal withdraws that one request and
-    /// no other the same batch made.
+    /// The window and module whose surface the op creates, drops, prepares, adopts, maps, unmaps, gives the keys
+    /// to or freezes for a move (`Terminal(Detach)`); `None` for every other op. A refused grab names its module, so
+    /// its refusal withdraws that one request and no other the same batch made, and a refused freeze names the
+    /// terminal whose move is given up.
     pub fn surface(&self) -> Option<(WinId, ModuleId)> {
         match self {
             HostOp::CreateSurface { win, module, .. }
             | HostOp::DropSurface { win, module, .. }
-            | HostOp::PrepareSurface { win, module }
+            | HostOp::PrepareSurface { win, module, .. }
+            | HostOp::AdoptMoved { win, module, .. }
+            | HostOp::Terminal(TermOp::Detach { win, module, .. })
             | HostOp::Map { win, module }
             | HostOp::Unmap { win, module }
             | HostOp::Focus {
@@ -1234,9 +1409,23 @@ mod tests {
         tag!(
             HostOp::PrepareSurface {
                 win,
-                module: module.clone()
+                module: module.clone(),
+                shape: Shape::Tiled,
+                size: (640, 480),
             },
             PrepareSurface
+        );
+        tag!(HostOp::OpenLinkedWindow { win }, OpenLinkedWindow);
+        tag!(HostOp::RaisePeer { win, peer: PeerId(2) }, RaisePeer);
+        tag!(
+            HostOp::AdoptMoved {
+                win,
+                module: module.clone(),
+                kind: MoveKind::Terminal,
+                record: serde_json::Value::Null,
+                fds: Descriptors::default(),
+            },
+            AdoptMoved
         );
         tag!(map(module.clone()), Map);
         tag!(

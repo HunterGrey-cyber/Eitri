@@ -26,7 +26,7 @@ use super::host::*;
 use super::module::{Lifecycle, SurfaceDecl};
 use super::verbs::modules::{self as module_verbs, ModuleSetup};
 use super::verbs::{self, FloatGate, SelectionGate};
-use super::window::{EditorPresence, Timers, WinId, Window, WindowParts, WindowSpec};
+use super::window::{EditorPresence, PeerId, Timers, WinId, Window, WindowParts, WindowSpec};
 use crate::keymap::action::Action;
 use crate::keymap::prefix::{Prefix, PrefixCommand};
 use crate::keymap::Keymap;
@@ -117,6 +117,82 @@ impl Controller {
         }
         self.settle_chrome(&mut batch);
         batch
+    }
+
+    /// `win` is linked to the other window of the pair, `peer`, reached through `port`; its moves start from here.
+    /// A window already linked keeps its old link's moves only as far as the link's end leaves them.
+    pub fn attach_peer(&mut self, win: WinId, peer: PeerId, port: Rc<dyn PeerPort>) -> Batch {
+        let mut batch = Batch::default();
+        if self.windows.get(&win).is_some_and(|w| w.peer.is_some()) {
+            batch = self.detach_peer(win);
+        }
+        let Some(window) = self.windows.get_mut(&win) else {
+            eprintln!("[wm] BUG: a peer attached to {win:?}, which is not held");
+            return batch;
+        };
+        let side = super::moves::side_of(window.role());
+        window.peer = Some(super::moves::PeerMoves::new(peer, port, side));
+        window.say(format!("[window] linked to the other window ({peer:?})"));
+        batch
+    }
+
+    /// `win`'s link has gone: every move on it ends as the link's end ends it (a module not yet sent stays here,
+    /// an arrival not yet committed is dropped), and the window verbs refuse until a peer is attached again.
+    pub fn detach_peer(&mut self, win: WinId) -> Batch {
+        let mut batch = Batch::default();
+        let (reads, keymap, setup) = self.module_parts(win);
+        if let Some(window) = self.windows.get_mut(&win) {
+            let cx = module_verbs::Cx {
+                reads: &*reads,
+                keymap: &keymap,
+                setup: &setup,
+            };
+            super::moves::detach(window, &cx, win, &mut batch);
+        }
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// The window a peer is attached to.
+    fn window_of_peer(&self, peer: PeerId) -> Option<WinId> {
+        self.windows
+            .iter()
+            .find(|(_, window)| window.peer.as_ref().is_some_and(|p| p.peer() == peer))
+            .map(|(win, _)| *win)
+    }
+
+    /// A fact from the other window or the link, decided on the window it is attached to.
+    fn peer_event(&mut self, event: PeerEvent, batch: &mut Batch) {
+        let Some(win) = self.window_of_peer(event.peer()) else {
+            eprintln!("[wm] {event:?}: no window is linked to that peer");
+            return;
+        };
+        let (reads, keymap, setup) = self.module_parts(win);
+        if let Some(window) = self.windows.get_mut(&win) {
+            let cx = module_verbs::Cx {
+                reads: &*reads,
+                keymap: &keymap,
+                setup: &setup,
+            };
+            super::moves::peer_event(window, &cx, win, event, batch);
+        }
+    }
+
+    /// The host could not start or raise the other window. The refusal names no window: a raise's goes to the
+    /// window that asked for one, a start's to every window that can have a second one (one per process).
+    fn window_op_refused(&mut self, what: OpTag, why: &str, batch: &mut Batch) {
+        for (win, window) in &mut self.windows {
+            let asked = match what {
+                OpTag::RaisePeer => super::moves::raise_refused(window),
+                _ => !matches!(window.role(), super::window::WindowRole::Companion),
+            };
+            if asked {
+                verbs::windows::refused(window, *win, &what, why, batch);
+                if what == OpTag::RaisePeer {
+                    return;
+                }
+            }
+        }
     }
 
     /// What `win`'s module verbs read: the shell's answers, the keymap and the module setup.
@@ -793,6 +869,7 @@ impl Controller {
         }
         for (win, window) in &mut self.windows {
             if super::focus::raise_timer_fired(window, *win, token, batch)
+                || super::moves::deadline_fired(window, *win, token, batch)
                 || super::keys::number_timer_fired(window, token, batch)
                 || chrome::toast_timer_fired(window, token)
                 || chrome::resize_idle_fired(window, token)
@@ -986,6 +1063,56 @@ impl Decide for Controller {
                     module_verbs::cwd_read(window, cx, win, &module, read, dir, batch)
                 })
             }
+            HostEvent::Peer(event) => self.peer_event(event, &mut batch),
+            HostEvent::Terminal(TermEvent::Detached {
+                win,
+                module,
+                mv,
+                record,
+                handoff,
+            }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::detached(window, win, &module, mv, record, handoff, &mut batch);
+                }
+            }
+            HostEvent::Prepared { win, module } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::prepared(window, &module);
+                }
+            }
+            HostEvent::Refused {
+                what: OpTag::PrepareSurface,
+                why,
+                surface: Some((win, module)),
+            } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::prepare_refused(window, &module, why);
+                }
+            }
+            // Of the terminal's ops only a freeze names its module when refused.
+            HostEvent::Refused {
+                what: OpTag::Terminal,
+                why,
+                surface: Some((win, module)),
+            } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::detach_refused(window, win, &module, why, &mut batch);
+                }
+            }
+            HostEvent::Refused {
+                what: OpTag::AdoptMoved,
+                why,
+                surface: Some((win, module)),
+            } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::moves::adopt_refused(window, win, &module, why, &mut batch);
+                }
+            }
+            HostEvent::Refused {
+                what: what @ (OpTag::OpenLinkedWindow | OpTag::RaisePeer),
+                why,
+                ..
+            } => self.window_op_refused(what, &why, &mut batch),
             // A refusal from an arm still in the shell flashes and toasts through the model, as the runner's do.
             HostEvent::ShellRefused { win, text } => {
                 if let Some(window) = self.windows.get_mut(&win) {
@@ -1182,6 +1309,15 @@ impl Controller {
             verbs::Family::Keys => verbs::keys::run(window, win, &action, keycode, &keymap(), &mut batch),
             verbs::Family::Chrome => verbs::chrome::run(window, win, &action, &mut batch),
             verbs::Family::Workspaces => verbs::workspaces::run(window, &*reads, win, &action, &setup, &mut batch),
+            verbs::Family::Windows => {
+                let keymap = keymap();
+                let cx = module_verbs::Cx {
+                    reads: &*reads,
+                    keymap: &keymap,
+                    setup: &setup,
+                };
+                verbs::windows::run(window, &cx, win, &action, &mut batch);
+            }
             verbs::Family::Modules => {
                 let keymap = keymap();
                 let cx = module_verbs::Cx {

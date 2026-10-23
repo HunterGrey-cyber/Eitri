@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 type ApplyHook = Rc<dyn Fn(&FakeHost, usize, &HostOp)>;
 type ShellArm = Rc<dyn Fn(&FakeHost, WinId, &ShellCall, u32)>;
 type RefuseKind = Rc<dyn Fn(&SurfaceKind) -> bool>;
+type RefuseOp = Rc<dyn Fn(&HostOp) -> bool>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Logged {
@@ -41,6 +42,7 @@ pub struct FakeHost {
     apply_hook: RefCell<Option<ApplyHook>>,
     apply_index: Cell<usize>,
     refuse_kind: RefCell<Option<RefuseKind>>,
+    refuse_op: RefCell<Option<RefuseOp>>,
     reads: RefCell<Reads>,
     /// Each window's module hosts as its grid would stack them, bottom first: in the order they were made,
     /// until a restack moves its floats to the top.
@@ -60,6 +62,7 @@ struct Reads {
     oldest_card_view: Option<ViewId>,
     kill_counts: BTreeMap<ViewId, ChatKillCounts>,
     first_tab_refused: Option<String>,
+    module_size: BTreeMap<ModuleId, Size>,
 }
 
 impl Default for Reads {
@@ -74,6 +77,7 @@ impl Default for Reads {
             oldest_card_view: None,
             kill_counts: BTreeMap::new(),
             first_tab_refused: None,
+            module_size: BTreeMap::new(),
         }
     }
 }
@@ -91,6 +95,7 @@ impl FakeHost {
             apply_hook: RefCell::new(None),
             apply_index: Cell::new(0),
             refuse_kind: RefCell::new(None),
+            refuse_op: RefCell::new(None),
             reads: RefCell::new(Reads::default()),
             stacking: RefCell::new(BTreeMap::new()),
             allocations: RefCell::new(BTreeMap::new()),
@@ -157,6 +162,14 @@ impl FakeHost {
     pub fn refuse_kind(&self, f: impl Fn(&SurfaceKind) -> bool + 'static) {
         *self.refuse_kind.borrow_mut() = Some(Rc::new(f));
     }
+    /// Refuses, from now on, every op `f` picks, as a native host refuses what it cannot carry out.
+    pub fn refuse_op(&self, f: impl Fn(&HostOp) -> bool + 'static) {
+        *self.refuse_op.borrow_mut() = Some(Rc::new(f));
+    }
+    /// The size `module`'s host has on screen from now on.
+    pub fn set_module_size(&self, module: ModuleId, size: Size) {
+        self.reads.borrow_mut().module_size.insert(module, size);
+    }
     pub fn log(&self) -> Vec<Logged> {
         self.log.borrow().clone()
     }
@@ -211,6 +224,10 @@ impl FakeHost {
         Applied::Refused
     }
     fn model_apply(&self, op: &HostOp) -> Applied {
+        let refuse = self.refuse_op.borrow().clone();
+        if refuse.is_some_and(|f| f(op)) {
+            return self.refuse(op);
+        }
         match op {
             HostOp::Focus { win, to, .. } => {
                 let owner = match to {
@@ -237,6 +254,18 @@ impl FakeHost {
                     return self.refuse(op);
                 }
                 self.with_surface(*win, module.clone(), kind.clone(), false);
+            }
+            // The arriving module's place, made off screen as a host of its kind.
+            HostOp::PrepareSurface { win, module, .. } => {
+                if !self.surfaces.borrow().contains_key(&(*win, module.clone())) {
+                    let kind = match module.kind() {
+                        crate::layout::ModuleKind::Agent => SurfaceKind::Chat {
+                            view: ViewId::of_module(module).unwrap_or(ViewId::BASE),
+                        },
+                        _ => SurfaceKind::Terminal { cwd: ".".into() },
+                    };
+                    self.with_surface(*win, module.clone(), kind, false);
+                }
             }
             HostOp::Map { win, module } => {
                 let kind = {
@@ -368,6 +397,85 @@ impl HostReads for FakeHost {
     }
     fn chat_first_tab(&self, _: ViewId, _: bool) -> Result<(), String> {
         self.reads.borrow().first_tab_refused.clone().map_or(Ok(()), Err)
+    }
+    fn module_size(&self, _: WinId, module: &ModuleId) -> Option<Size> {
+        self.reads.borrow().module_size.get(module).copied()
+    }
+}
+
+/// One message the controller handed the fake link, in the order it handed them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentMsg {
+    pub msg: crate::window_link::Msg,
+    pub handoff: Option<Handoff>,
+    /// Sent with `send_confirmed`, whose answer the test gives.
+    pub confirmed: bool,
+}
+
+/// The link to the other window as a recording: every message kept, a confirmed send answered when the test
+/// says, and a send refused while the test says the link refuses.
+#[derive(Default)]
+pub struct FakePeerPort {
+    sent: RefCell<Vec<SentMsg>>,
+    answers: RefCell<Vec<std::sync::mpsc::Sender<std::io::Result<()>>>>,
+    refuse: RefCell<Option<String>>,
+    refuse_confirmed: RefCell<Option<String>>,
+}
+
+impl FakePeerPort {
+    pub fn new() -> Rc<Self> {
+        Rc::new(Self::default())
+    }
+    /// Every message handed over so far.
+    pub fn sent(&self) -> Vec<SentMsg> {
+        self.sent.borrow().clone()
+    }
+    /// The kinds of the messages handed over so far, in order.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        self.sent.borrow().iter().map(|s| s.msg.kind()).collect()
+    }
+    /// Plain sends fail with `why` from now on (`None`: they go through again).
+    pub fn refuse_sends(&self, why: Option<&str>) {
+        *self.refuse.borrow_mut() = why.map(str::to_owned);
+    }
+    /// Confirmed sends fail with `why` from now on.
+    pub fn refuse_confirmed_sends(&self, why: Option<&str>) {
+        *self.refuse_confirmed.borrow_mut() = why.map(str::to_owned);
+    }
+    /// Answers the `n`th confirmed send (from 0), as the link thread does once the packet is on the socket or
+    /// will never be.
+    pub fn answer(&self, n: usize, answer: std::io::Result<()>) {
+        let _ = self.answers.borrow()[n].send(answer);
+    }
+}
+
+impl PeerPort for FakePeerPort {
+    fn send(&self, msg: crate::window_link::Msg, handoff: Option<Handoff>) -> Result<(), String> {
+        if let Some(why) = self.refuse.borrow().clone() {
+            return Err(why);
+        }
+        self.sent.borrow_mut().push(SentMsg {
+            msg,
+            handoff,
+            confirmed: false,
+        });
+        Ok(())
+    }
+    fn send_confirmed(
+        &self,
+        msg: crate::window_link::Msg,
+    ) -> Result<std::sync::mpsc::Receiver<std::io::Result<()>>, String> {
+        if let Some(why) = self.refuse_confirmed.borrow().clone() {
+            return Err(why);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.answers.borrow_mut().push(tx);
+        self.sent.borrow_mut().push(SentMsg {
+            msg,
+            handoff: None,
+            confirmed: true,
+        });
+        Ok(rx)
     }
 }
 

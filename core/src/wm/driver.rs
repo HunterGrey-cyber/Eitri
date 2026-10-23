@@ -12,8 +12,9 @@
 //!   the driver posts `LayoutChangedByShell` last, so everything the arm caused is heard before the layout is re-read.
 //!   A `Focus` op's `on_grab` ops run right after it, and only when the grab took; a `HostOp::Lua` among them waits
 //!   for the end of the batch's Lua ops, so Lua never runs in the middle of a batch.
-//! - A `CreateSurface` op the host carried out is answered with `Created`, queued behind what the op itself caused:
-//!   besides a `Focus` op's tail, the one place an op's answer is read.
+//! - A `CreateSurface` op the host carried out is answered with `Created`, and a `PrepareSurface` with `Prepared`,
+//!   each queued behind what the op itself caused: besides a `Focus` op's tail, the one place an op's answer is
+//!   read.
 //! - `key` and `close_requested` answer synchronously. A key that arrives while the driver is busy is answered from
 //!   the decider as it stands, its batch queued, and counted; every close request prints the count, so a run's log
 //!   shows whether a key ever arrived re-entrantly.
@@ -303,6 +304,14 @@ impl<C: Decide> Driver<C> {
                 module: module.clone(),
             }));
         }
+        // An arriving module's place is answered the same way: the other window may freeze the module only once
+        // the place exists.
+        if let (HostOp::PrepareSurface { win, module, .. }, Applied::Done) = (op, applied) {
+            self.queue.borrow_mut().push_back(Item::Event(HostEvent::Prepared {
+                win: *win,
+                module: module.clone(),
+            }));
+        }
         if let HostOp::Focus { on_grab, .. } = op {
             if applied == Applied::Done {
                 for tail in on_grab {
@@ -359,6 +368,18 @@ impl Driver<Controller> {
     /// `tab.break`'s new chat view ([`Controller::tab_break`]).
     pub fn tab_break(&self, win: WinId) {
         let batch = self.decide.borrow_mut().tab_break(win);
+        self.submit(batch);
+    }
+
+    /// `win` is linked to the other window of the pair ([`Controller::attach_peer`]).
+    pub fn attach_peer(&self, win: WinId, peer: super::window::PeerId, port: Rc<dyn PeerPort>) {
+        let batch = self.decide.borrow_mut().attach_peer(win, peer, port);
+        self.submit(batch);
+    }
+
+    /// `win`'s link has gone ([`Controller::detach_peer`]).
+    pub fn detach_peer(&self, win: WinId) {
+        let batch = self.decide.borrow_mut().detach_peer(win);
         self.submit(batch);
     }
 

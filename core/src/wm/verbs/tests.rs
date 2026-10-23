@@ -208,13 +208,13 @@ fn decided_here(action: &Action) -> bool {
         | Action::WorkspaceNew
         | Action::WorkspaceSwitch { .. }
         | Action::WorkspaceChoose
-        | Action::WorkspaceRename => true,
-        Action::WindowNew
+        | Action::WorkspaceRename
+        | Action::WindowNew
         | Action::WindowOther
         | Action::MoveToWindow { .. }
         | Action::WorkspaceToWindow { .. }
-        | Action::WorkspaceSwapWindow
-        | Action::FloatToggle
+        | Action::WorkspaceSwapWindow => true,
+        Action::FloatToggle
         | Action::FocusModeToggle
         | Action::ScratchpadMove
         | Action::ScratchpadShow { .. }

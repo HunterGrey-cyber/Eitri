@@ -417,6 +417,34 @@ fn ctrl_l_at_the_right_edge_of_a_lua_page_is_swallowed_and_of_the_chat_let_throu
 }
 
 #[test]
+fn ctrl_hyper_l_at_the_chats_right_edge_is_let_through_as_every_move_there_is() {
+    // Hyper alone hides nothing a move reads, so the chord is a move, and at the edge a move is the page's.
+    let hyper_l = KeyPress {
+        press: Press::Other,
+        super_or_hyper: true,
+        super_or_meta: false,
+        ..key("C-l", K1)
+    };
+    let r = driven(pair(editor(), agent(), agent()));
+    let mark = r.mark();
+    assert_eq!(r.module_key(&agent(), hyper_l.clone()), Verdict::LetThrough);
+    assert!(
+        focus_to(&r.ops_since(mark)).is_empty(),
+        "nothing that way: nothing moves"
+    );
+    let hyper_h = KeyPress {
+        key: Some(KeyName::Char('h')),
+        ..hyper_l
+    };
+    assert_eq!(
+        r.module_key(&agent(), hyper_h),
+        Verdict::Consumed,
+        "a move that goes ends at the host"
+    );
+    assert_eq!(focus_to(&r.ops_since(mark)), vec![editor()]);
+}
+
+#[test]
 fn a_super_chord_never_reaches_a_web_module() {
     let layout = Layout::new(
         Node::split(

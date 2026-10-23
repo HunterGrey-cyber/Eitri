@@ -166,6 +166,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::MinSize { win, .. }
         | HostEvent::Settled { win, .. }
         | HostEvent::LayoutChangedByShell { win }
+        | HostEvent::Prepared { win, .. }
         | HostEvent::ShellRefused { win, .. }
         | HostEvent::AnswerRefused { win, .. }
         | HostEvent::PromptWithdrawn { win }
