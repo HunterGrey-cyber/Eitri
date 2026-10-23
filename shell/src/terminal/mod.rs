@@ -95,61 +95,6 @@ pub(crate) fn initial_layout(decls: &[ModuleDecl]) -> Result<Layout, LayoutError
     eitri_core::wm::persist::first_launch_layout(decls)
 }
 
-/// What `Ctrl+a t` does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToggleAction {
-    /// Hidden: show it and focus it. The first time, this is what starts the shell.
-    ShowAndFocus,
-    /// Shown, but the keys are elsewhere: focus it.
-    Focus,
-    /// It holds the keys: give them back to a module next to it, then hide it. The shell keeps
-    /// running.
-    HideAndReturn,
-}
-
-pub(crate) fn toggle_action(shown: bool, has_keys: bool) -> ToggleAction {
-    match (shown, has_keys) {
-        (false, _) => ToggleAction::ShowAndFocus,
-        (true, false) => ToggleAction::Focus,
-        (true, true) => ToggleAction::HideAndReturn,
-    }
-}
-
-/// One thing `main.rs` does for a [`ToggleAction`], in the order [`ToggleAction::steps`] gives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToggleStep {
-    /// `ModuleGrid::unzoom`.
-    Unzoom,
-    /// `ModuleGrid::show_module`: back where it was hidden from, at the ratio it had (the first
-    /// time, `BELOW_ROOT_SHARE`'s third of the height).
-    Show,
-    /// `TerminalPane::start`: the first time, this starts the shell.
-    Start,
-    /// Focus to the terminal.
-    FocusTerminal,
-    /// `ModuleGrid::hide_module` transfers focus before unmapping a focused terminal.
-    /// It chooses the adjacent module that most recently had focus, which may be the editor,
-    /// agent, a Lua `bottom` panel below it, or a Lua `side` panel beside it.
-    /// `module_grid::hide_then_unmap` implements and tests that order.
-    Hide,
-}
-
-impl ToggleAction {
-    /// Ordered toggle actions. Unzoom first so hiding a zoomed terminal leaves visible panes
-    /// and a visible focus destination. Show before focusing, since a hidden module cannot
-    /// receive the keys. Move focus before hiding the terminal, since a hidden widget holding
-    /// focus leaves the window with keys going nowhere. That move happens inside
-    /// [`ToggleStep::Hide`], rather than as a separate step.
-    pub(crate) fn steps(self) -> &'static [ToggleStep] {
-        use ToggleStep::*;
-        match self {
-            ToggleAction::ShowAndFocus => &[Unzoom, Show, Start, FocusTerminal],
-            ToggleAction::Focus => &[Unzoom, FocusTerminal],
-            ToggleAction::HideAndReturn => &[Unzoom, Hide],
-        }
-    }
-}
-
 /// Whether the shell's end closes the terminal module,
 /// as tmux closes a pane whose process exits. A real end does -- `exit`, `Ctrl+d`, a
 /// signal -- and `main.rs` then kills the module as `prefix x` does, without asking. What does not,
@@ -382,8 +327,9 @@ mod tests {
         assert_eq!(arrange(&layout, &frame()).rect_of(&term()), dragged);
     }
 
-    /// Hiding a zoomed terminal must end the zoom, leave visible panes and transfer focus.
-    /// The layout must handle this even when the caller has not run `ToggleStep::Unzoom`.
+    /// Hiding the terminal while it is itself the zoomed module must leave something on screen. The
+    /// terminal's key ends a zoom first anyway; this is the layout holding it without that, as every
+    /// other hide needs.
     #[test]
     fn hiding_the_zoomed_terminal_ends_the_zoom_and_hands_the_keys_up() {
         let mut layout = initial_layout(&[]).unwrap();
@@ -431,53 +377,6 @@ mod tests {
         use eitri_core::layout::KillScope;
         assert_eq!(on_exit(KillScope::Module), OnExit::CloseModule);
         assert_eq!(on_exit(KillScope::Window), OnExit::CloseWindow);
-    }
-
-    #[test]
-    fn ctrl_a_t_shows_then_focuses_then_hides() {
-        assert_eq!(toggle_action(false, false), ToggleAction::ShowAndFocus);
-        assert_eq!(toggle_action(true, false), ToggleAction::Focus);
-        assert_eq!(toggle_action(true, true), ToggleAction::HideAndReturn);
-    }
-
-    /// Every toggle unzooms first so hiding a zoomed terminal leaves content visible.
-    /// The terminal must also be shown before it receives focus.
-    /// Focus transfer before unmapping is tested where it happens:
-    /// `module_grid::tests::hiding_the_module_with_the_keys_gives_them_away_before_it_unmaps`.
-    #[test]
-    fn every_toggle_unzooms_first_and_shows_before_it_focuses() {
-        for action in [
-            ToggleAction::ShowAndFocus,
-            ToggleAction::Focus,
-            ToggleAction::HideAndReturn,
-        ] {
-            assert_eq!(action.steps().first(), Some(&ToggleStep::Unzoom), "{action:?}");
-        }
-        let show = ToggleAction::ShowAndFocus.steps();
-        let at = |step| show.iter().position(|s| *s == step);
-        assert!(
-            at(ToggleStep::Show) < at(ToggleStep::FocusTerminal),
-            "a hidden widget cannot take focus"
-        );
-    }
-
-    /// The ordering assertion above passes even if `Show` is missing. `at(step)` returns
-    /// `Option<usize>`, and Rust orders `None < Some(_)`, so a missing step can compare before
-    /// a present step. `ShowAndFocus => &[Unzoom, Start, FocusTerminal]` therefore passes it.
-    /// Comparing each complete sequence with `assert_eq!` catches missing and reordered steps
-    /// without relying on `Option` ordering.
-    ///
-    /// This checks the list `main.rs` executes. Focus transfer before unmapping happens inside
-    /// `Hide` and is tested by `module_grid::hide_then_unmap`.
-    #[test]
-    fn each_actions_full_step_sequence_is_pinned() {
-        use ToggleStep::*;
-        assert_eq!(
-            ToggleAction::ShowAndFocus.steps(),
-            &[Unzoom, Show, Start, FocusTerminal]
-        );
-        assert_eq!(ToggleAction::Focus.steps(), &[Unzoom, FocusTerminal]);
-        assert_eq!(ToggleAction::HideAndReturn.steps(), &[Unzoom, Hide]);
     }
 
     #[test]

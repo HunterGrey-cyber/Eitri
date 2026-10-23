@@ -6,7 +6,8 @@
 //! alone. Also, from `plugin_page.rs`: the kit's reserved path is answered before the plugin's site is looked up,
 //! and a page build applies and logs its policy and proxy plan, and every answer of the scheme carries `nosniff`.
 //! And the pair's wiring: the startup host check asserts the hosts `hosted_at_start` says the controller makes, the
-//! link's end loads again every page that comes back, and window 2's path clicks are checked by the panel's own rule.
+//! link's end loads again every page that comes back, window 2's path clicks are checked by the panel's own rule,
+//! and window 2's follow lines are carried out by the follow window over the controller.
 
 use eitri_core::source_scan as scan;
 
@@ -24,11 +25,11 @@ fn file_code(path: &str) -> String {
         .collect()
 }
 
-/// What each `grid.connect_changed(` and `grid.connect_chrome_changed(` in `code` (whitespace removed) is
-/// handed: the text up to its closing `)`.
+/// What each `grid.connect_changed(` and `grid.connect_changed_by_controller(` in `code` (whitespace removed) is
+/// handed: the text up to its closing `)`. Both lists run after a layout change, so neither may hold what moved.
 fn change_hooks(code: &str) -> Vec<&str> {
     let mut hooks = call_texts(code, "grid.connect_changed(");
-    hooks.extend(call_texts(code, "grid.connect_chrome_changed("));
+    hooks.extend(call_texts(code, "grid.connect_changed_by_controller("));
     hooks
 }
 
@@ -153,23 +154,24 @@ fn plugins_share_the_windows_editor_handle_and_get_the_layout() {
 #[test]
 fn a_killed_plugin_module_stops_and_a_closing_window_shuts_plugins_down() {
     let code = build_ui_code();
-    let at = code
-        .find("ModuleKind::LuaWebview=>{grid.kill_module(")
-        .expect("the Lua panel kill arm");
-    let kill_arm = scan::braced(&code, at + "ModuleKind::LuaWebview=>".len());
-    let killed = kill_arm.find("grid.kill_module(").unwrap();
-    let told = kill_arm
-        .find("HostEvent::SurfaceEnded{")
-        .expect("the kill is told to the controller");
+    // The kill is the controller's: off screen first, then its lifecycle hears the kill.
+    let verbs = file_code("core/src/wm/verbs/modules.rs");
+    assert!(verbs.contains("ModuleKind::LuaWebview=>leave_killed(w,cx,win,id,reopen,batch),"));
+    let (_, leave) = scan::function_in(&scan::rust_sources(&["core/src/wm/verbs"]), "leave_killed");
+    let leave: String = leave.split_whitespace().collect();
+    let killed = leave.find("layout::kill(").expect("off screen first");
+    let told = leave
+        .find("Ended::Killed{reopen}")
+        .expect("the lifecycle hears the kill");
     assert!(killed < told, "told once the module is off screen");
-    assert!(kill_arm.contains("why:Ended::Killed{reopen}"), "{kill_arm}");
     // What the kill ends is the controller's batch: the stop, then the web process's end.
-    assert!(!kill_arm.contains(".stop("), "{kill_arm}");
-    assert!(!kill_arm.contains("terminate_web_process()"), "{kill_arm}");
     let services = file_code("shell/src/gtk_host/services.rs");
     assert!(arm(&services, "PluginOp::Terminate{", "PluginOp::").contains("self.plugin_panels.stop(module);"));
     let surfaces = file_code("shell/src/gtk_host/surfaces.rs");
-    assert!(arm(&surfaces, "DropWhy::Killed=>", "DropWhy::").contains("self.surfaces.end_web_process(module)"));
+    assert!(surfaces.contains("_if*why==DropWhy::Killed=>DropRoute::EndWebProcess,"));
+    assert!(
+        arm(&surfaces, "DropRoute::EndWebProcess=>", "DropRoute::").contains("self.surfaces.end_web_process(module)")
+    );
     let raw = scan::code_only(&scan::read_required("shell/src/gtk_host/surfaces.rs").text);
     let end = scan::functions(&raw, "end_web_process");
     assert_eq!(end.len(), 1, "one end of a killed page's web process");
@@ -236,7 +238,7 @@ fn prefix_question_mark_keeps_what_it_opened_from() {
         .find("letchat=view.module();")
         .expect("the sheet's module is that view's");
     let covered = body
-        .find("chat_covered_refusal(view)")
+        .find("chat_covered(view)")
         .expect("the covered check asks about that view");
     let open = body
         .find("agent.open_keymap(view,plugin,opening);")
@@ -344,12 +346,6 @@ fn shell_code() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The block bound by `anchor` (whitespace removed) in `code` (whitespace removed), from its first `{`.
-fn bound_block<'a>(code: &'a str, anchor: &str) -> &'a str {
-    let at = code.find(anchor).unwrap_or_else(|| panic!("`{anchor}`"));
-    scan::braced(code, at + code[at..].find('{').unwrap())
-}
-
 /// How many times `code` calls each controller installer a host gets.
 fn installer_calls(code: &str) -> [(&'static str, usize); 2] {
     let plain: String = code.split_whitespace().collect();
@@ -385,22 +381,10 @@ fn every_host_gets_its_controllers_from_wire_host() {
         assert_eq!(everywhere, *count, "`{name}` is called outside wire_host");
     }
 
-    // Each host-creating site wires its host once: the runtime terminal and chat view, the startup loop over every
-    // host, the companion's window, the controller's surface maker. Nothing else calls wire_host.
+    // Each host-creating site wires its host once: the startup loop over every host, the companion's window, the
+    // controller's surface maker (every module made at run time). Nothing else calls wire_host.
     let (_, build_ui) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
-    assert_eq!(
-        scan::calls(&build_ui, "wire_host"),
-        3,
-        "two runtime paths and the startup loop"
-    );
-    let build_ui: String = build_ui.split_whitespace().collect();
-    for anchor in ["lethost_terminal:", "lethost_chat_view:"] {
-        assert_eq!(
-            bound_block(&build_ui, anchor).matches("wire_host(").count(),
-            1,
-            "`{anchor}` wires the host it makes, once"
-        );
-    }
+    assert_eq!(scan::calls(&build_ui, "wire_host"), 1, "the startup loop alone");
     let (_, companion) = files
         .iter()
         .find(|(path, _)| path.ends_with("companion/window.rs"))
@@ -421,7 +405,7 @@ fn every_host_gets_its_controllers_from_wire_host() {
         "the surface maker wires a terminal and a chat view"
     );
     let total: usize = files.iter().map(|(_, code)| scan::calls(code, "wire_host")).sum();
-    assert_eq!(total, 6, "no other path wires a host");
+    assert_eq!(total, 4, "no other path wires a host");
 
     // A plugin page built on its first show fills a slot whose host was wired at startup.
     let (_, build_page) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_page");
@@ -596,8 +580,10 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
         focus.contains("plugin_panels.build_page("),
         "the keys never go to a slot with no page"
     );
+    // A workspace made by name is the controller's, which keeps a start-hidden module its definition names.
+    let workspaces = file_code("core/src/wm/verbs/workspaces.rs");
     assert!(
-        code.contains("new_workspace_layout(template,&live,&decls,&deferred)"),
+        workspaces.contains("new_workspace_layout(template,&live,&setup.decls,&deferred)"),
         "a workspace made from a definition keeps a start-hidden module it names"
     );
 
@@ -609,20 +595,17 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
         show.contains("open_plugin_module("),
         "show_on_screen opens a hidden plugin by its rule"
     );
-    let arm = code
-        .find("LayoutRequest::Show(id)if")
-        .expect("eitri.layout.show's own arm");
-    let arm = scan::braced(&code, arm + code[arm..].find('{').unwrap());
+    // `eitri.layout.show` and its module key are the controller's, which opens it by its rule too.
+    let verbs = scan::rust_sources(&["core/src/wm/verbs"]);
+    let (_, lua_show) = scan::function_in(&verbs, "lua_show");
     assert!(
-        arm.contains("open_plugin_module("),
+        lua_show.contains("open_plugin_module("),
         "eitri.layout.show opens it by its rule"
     );
-    let open = code
-        .find("letopen_module:Rc<dynFn(&ModuleId,KeyAction)>=")
-        .expect("open_module");
-    let open = scan::braced(&code, open + code[open..].find('{').unwrap());
+    let (_, open) = scan::function_in(&verbs, "open_module");
+    let open: String = open.split_whitespace().collect();
     assert!(
-        open.contains("KeyAction::Place|KeyAction::ShowAndFocusifplugin_panels.starts_hidden(id)=>{"),
+        open.contains("KeyAction::Place|KeyAction::ShowAndFocusifstarts_hidden(cx,id)=>{open_plugin_module("),
         "its module key opens it by its rule"
     );
 
@@ -725,44 +708,166 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
     assert!(code.contains("ifletSome(slot)=&doc_slot{host.set_doc_slot(slot.clone());}"));
 }
 
-/// A runtime open says it hosts the module only once the open has succeeded, after every refusal and rollback:
-/// a refused open declares nothing, and the controller never holds a module whose host went back.
+/// Every module the window makes at run time is the controller's to make: a new terminal or chat view, a split's,
+/// a named one made for the scratchpad and a broken-out tab's view alike, through its `CreateSurface`; no maker of
+/// the shell's own is left, and nothing tells the controller of a module the shell made.
 #[test]
-fn a_runtime_open_declares_only_after_it_succeeded() {
+fn a_runtime_open_is_the_runners() {
     let code = build_ui_code();
-    for anchor in [
-        "letnew_chat_view:Rc<dynFn(OpenHow,NewViewTab)->Result<ModuleId,String>>=",
-        "letnew_scratch_chat_view:Rc<dynFn(&ModuleId)->Result<(),String>>=",
+    for maker in [
+        "new_terminal",
+        "new_chat_view",
+        "new_scratch_terminal",
+        "new_scratch_chat_view",
     ] {
-        let body = let_block(&code, anchor);
-        let declared: Vec<usize> = body.match_indices("HostEvent::Declared{").map(|(at, _)| at).collect();
-        assert_eq!(declared.len(), 1, "`{anchor}` declares once");
-        let rollback = body.rfind("retire_chat_page(").expect("a refused placement rolls back");
-        let placed = body.rfind("add_everywhere_at(").expect("added to the other workspaces");
-        assert!(rollback < declared[0] && placed < declared[0], "`{anchor}`: {body}");
-        assert!(body.contains("kind:SurfaceKind::Chat{view},"), "{anchor}");
-    }
-    for anchor in [
-        "letnew_terminal:Rc<dynFn(OpenHow,PathBuf)->Result<ModuleId,String>>=",
-        "letnew_scratch_terminal:Rc<dynFn(&ModuleId,PathBuf)->Result<(),String>>=",
-    ] {
-        let body = let_block(&code, anchor);
-        let declared: Vec<usize> = body.match_indices("HostEvent::Declared{").map(|(at, _)| at).collect();
-        assert_eq!(declared.len(), 1, "`{anchor}` declares once");
-        let refusals = ["returnErr(", "?;", "?)"].iter().filter_map(|r| body.rfind(r)).max();
-        let last = refusals.expect("the open can be refused");
         assert!(
-            last < declared[0],
-            "`{anchor}`: the declaration comes after its last refusal"
+            !code.contains(&format!("let{maker}:")),
+            "build_ui still makes instances itself: {maker}"
         );
-        let placed = body.rfind("add_everywhere_at(").expect("added to the other workspaces");
-        assert!(placed < declared[0], "{anchor}");
-        assert!(body.contains("kind:SurfaceKind::Terminal{cwd:dir},"), "{anchor}");
+        assert!(!code.contains(&format!("{maker}(")), "build_ui still calls {maker}");
     }
-    // A plugin module is hosted from startup: its open declares nothing.
+    for source in scan::rust_sources(&["shell/src", "core/src"]) {
+        let flat: String = scan::code_only(&source.text).split_whitespace().collect();
+        assert!(
+            !flat.contains("HostEvent::Declared"),
+            "{} posts or reads a shell's declaration",
+            source.path
+        );
+    }
+    // The two arms still in the shell that need a new instance ask the controller for it.
+    assert!(
+        code.contains("driver.scratch_new(WinId::MAIN,&id);"),
+        "scratchpad.show's missing instance"
+    );
+    assert!(code.contains("driver.tab_break(WinId::MAIN);"), "tab.break's new view");
+    // A plugin module is hosted from startup: its open makes nothing.
     let sources = scan::rust_sources(&["shell/src"]);
     let (_, opener) = scan::function_in(&sources, "open_plugin_module");
-    assert!(!opener.contains("Declared"));
+    assert!(!opener.contains("CreateSurface"));
+}
+
+/// The module verbs are the controller's: the shell's arm answers a module key, a hide, a new instance or a split
+/// key only as a bug, and its kill only for the editor (its quit) and the last module (the window close).
+#[test]
+fn no_module_verb_is_left_in_run_verb() {
+    let code = build_ui_code();
+    let body = let_block(&code, "letrun_verb:Rc<dynFn(Action)>=");
+    let bug_arm = "Action::Module(_)|Action::ModuleHide|Action::InstanceNew{..}|Action::Split{..}=>{eprintln!(";
+    assert_eq!(body.matches(bug_arm).count(), 1, "one arm, which reports a bug");
+    for verb in [
+        "Action::Module(",
+        "Action::ModuleHide",
+        "Action::InstanceNew",
+        "Action::Split",
+    ] {
+        assert_eq!(body.matches(verb).count(), 1, "`{verb}` only in the bug arm");
+    }
+    for call in [
+        "open_module(",
+        "place_and_arrive(",
+        "place_split(",
+        "kill_terminal(",
+        "grid.show_module(",
+        "toggle_action(",
+        "prompt_closing_tab(",
+    ] {
+        assert!(!body.contains(call), "run_verb still calls `{call}`");
+    }
+    let kill = let_block(
+        &code,
+        "letkill_now:Rc<dynFn(&ModuleId,Option<String>)->Result<(),String>>=",
+    );
+    for call in [
+        "grid.kill_module(",
+        "close_view_tabs(",
+        ".retire(",
+        "HostEvent::SurfaceEnded{",
+    ] {
+        assert!(!kill.contains(call), "the shell's kill still does `{call}`");
+    }
+    assert!(kill.contains(
+        "(KillScope::Window,ModuleKind::Editor)=>editor_quitting.kill_editor(KillScope::Window,confirmed)?,"
+    ));
+    assert!(kill.contains("(KillScope::Window,_)=>editor_quitting.close_after(confirmed),"));
+    assert!(
+        kill.contains("(KillScope::Module,ModuleKind::Editor)=>editor_quitting.kill_editor(KillScope::Module,None)?,")
+    );
+    assert!(
+        !code.contains("ShellCall::Place"),
+        "the split's placement is the controller's"
+    );
+    // The follow commands and a chip are the controller's too.
+    assert!(code.contains("tray.on_activate("));
+    let chip = call_texts(&code, "tray.on_activate(");
+    assert!(chip[0].contains("driver.run(WinId::MAIN,Action::Module(id.clone()),Origin::Chip);"));
+    let main = file_code("shell/src/main.rs");
+    let at = main
+        .find("fnfollow(&self,module:&ModuleId,show:bool){")
+        .expect("the follow window's commands");
+    let follow = scan::braced(&main, at + main[at..].find('{').unwrap());
+    assert!(follow.contains("driver.follow(WinId::MAIN,module,show);"), "{follow}");
+}
+
+/// The answer gate the panel asks at each card answer is the controller's query, and its refusal is posted for the
+/// toast: the shell reads no layout to judge it.
+#[test]
+fn the_answer_gate_is_the_controllers_query() {
+    let code = build_ui_code();
+    let gate = call_texts(&code, "panel_hooks.set_answer_gate=Some(");
+    assert_eq!(gate.len(), 1);
+    let gate = gate[0];
+    assert!(gate.contains("driver.query("), "{gate}");
+    assert!(gate.contains("c.answer_gate(WinId::MAIN,view)"), "{gate}");
+    assert!(gate.contains("HostEvent::AnswerRefused{"), "{gate}");
+    assert!(!gate.contains("module_layout"), "{gate}");
+    assert!(!gate.contains("view_covering("), "{gate}");
+}
+
+/// The callers of the grid's own hide and kill outside the grid: each an arm still in the shell, whose layout write
+/// the controller re-reads. A new one is a deliberate edit of this list.
+#[test]
+fn every_remaining_hide_or_kill_caller_is_named() {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for source in scan::rust_sources(&["shell/src"]) {
+        let path = source.path.replace('\\', "/");
+        if path.ends_with("shell/src/module_grid.rs") {
+            continue;
+        }
+        let code = scan::code_only(&source.text);
+        let flat: String = scan::without(&code, &scan::modules(&code, "tests"))
+            .split_whitespace()
+            .collect();
+        let file = path.rsplit("shell/src/").next().unwrap_or(&path).to_string();
+        for method in [".hide_module(", ".kill_module("] {
+            for call in call_texts(&flat, method) {
+                found.push((file.clone(), format!("{}{call}", &method[1..method.len() - 1])));
+            }
+        }
+    }
+    found.sort();
+    let mut named: Vec<(String, String)> = [
+        // The editor's quit: its hide in place and its kill once nvim is gone.
+        ("main.rs", "hide_module(&ModuleId::editor(),&*self.focus_module)"),
+        (
+            "main.rs",
+            "kill_module(&ModuleId::editor(),Reopen::InPlace,&*self.focus_module)",
+        ),
+        (
+            "main.rs",
+            "kill_module(&ModuleId::editor(),Reopen::Never,&*focus_module)",
+        ),
+        // An extra chat view the panel says holds no tab.
+        ("main.rs", "kill_module(id,Reopen::Remove,&*focus_module)"),
+        // `prefix ?`'s rollback of the chat it showed when a float still covers it.
+        ("main.rs", "hide_module(&chat,&*focus_module)"),
+        // The grid probe's own driving.
+        ("grid_probe/probes.rs", "hide_module(&term,&|id|self.give_keys(id))"),
+    ]
+    .iter()
+    .map(|(file, call)| (file.to_string(), call.to_string()))
+    .collect();
+    named.sort();
+    assert_eq!(found, named);
 }
 
 /// What starts a terminal's shell, builds a deferred page, tells a plugin it is drawn and brings a killed module
@@ -777,10 +882,11 @@ fn no_lifecycle_hook_is_left_in_build_ui() {
             assert!(!hook.contains(call), "a change hook calls `{call}`: {hook}");
         }
     }
-    // The kills and the retirement tell the controller after the grid's kill.
+    // The editor's retirement and an empty chat view's removal, still the shell's, tell the controller after the
+    // grid's kill.
     for anchor in [
-        "letkill_terminal:Rc<dynFn(&ModuleId)->Result<(),LayoutError>>=",
         "letretire_editor:Rc<dynFn()->Result<(),LayoutError>>=",
+        "letdrop_chat_view:Rc<dynFn(&ModuleId)->Result<bool,LayoutError>>=",
     ] {
         let body = let_block(&code, anchor);
         let killed = body.find("grid.kill_module(").expect("the grid's kill");
@@ -792,6 +898,46 @@ fn no_lifecycle_hook_is_left_in_build_ui() {
     assert!(arm(&services, "ChatOp::OpenChooser{", "ChatOp::").contains("self.agent.open_chooser(*view);"));
     let reload = arm(&services, "PluginOp::Reload{", "PluginOp::");
     assert!(reload.contains("webview.load_uri(url);") && reload.contains("crash_guard.borrow_mut().reset();"));
+}
+
+/// The selection, the tray, the mark and the workspace's name are the controller's chrome model, drawn when its
+/// `Chrome` op announces a change: `build_ui` registers no change hook that redraws one, the closures that did are
+/// gone, and the grid has no second list of hooks for them.
+#[test]
+fn no_chrome_hook_is_left_in_build_ui() {
+    let code = build_ui_code();
+    for hook in change_hooks(&code) {
+        for call in [
+            "refresh_selection(",
+            "tray.refresh(",
+            "refresh_mark(",
+            "refresh_workspace(",
+        ] {
+            assert!(!hook.contains(call), "a change hook calls `{call}`: {hook}");
+        }
+    }
+    for closure in ["letrefresh_selection", "letrefresh_mark", "letrefresh_workspace"] {
+        assert!(!code.contains(closure), "`{closure}` is still made in build_ui");
+    }
+    for redraw in [
+        "refresh_selection(",
+        "tray.refresh(",
+        "refresh_mark(",
+        "refresh_workspace(",
+        "refresh_strips(",
+    ] {
+        assert!(
+            !code.contains(redraw),
+            "build_ui still redraws the chrome itself: `{redraw}`"
+        );
+    }
+    assert!(!code.contains("connect_chrome_changed("));
+    let grid = file_code("shell/src/module_grid.rs");
+    assert!(!grid.contains("fnconnect_chrome_changed(") && !grid.contains("fnnotify_chrome_changed("));
+    // What draws it instead: the model, read by the host's `Chrome` arm onto the window's widgets.
+    assert!(code.contains("wm_host.set_chrome_model(") && code.contains("wm_host.set_chrome_widgets("));
+    let host = file_code("shell/src/gtk_host/mod.rs");
+    assert!(arm(&host, "HostOp::Chrome{", "HostOp::").contains("self.chrome(op,*win)"));
 }
 
 /// The window's start is the controller's start plan, walked in its order from `build_ui`: each phase one
@@ -862,7 +1008,7 @@ fn build_ui_walks_the_start_plan() {
 /// deliberate edit of this list.
 #[test]
 fn the_runner_is_the_only_door() {
-    const ROUTES: &[&str] = &["Key", "PanelTab", "Lua"];
+    const ROUTES: &[&str] = &["Key", "PanelTab", "Lua", "Follow", "Chip"];
     let mut runs = 0;
     for (path, code) in shell_code() {
         let flat: String = code.split_whitespace().collect();
@@ -1010,5 +1156,117 @@ fn window_2s_paths_follow_the_panels_own_rule() {
             !code.contains(own),
             "the editor proxy keeps no path rule of its own (`{own}`)"
         );
+    }
+}
+
+/// Window 2's follow lines, which window 1 sends it, are carried out as the lines of a window's own socket are: by
+/// the follow window over the controller, so a plugin's `show` or `hide` in window 2 passes the same gates.
+#[test]
+fn window_2s_follow_lines_go_through_the_controllers_follow_window() {
+    let code = build_ui_code();
+    let follow_window = "letwindow=GridFollowWindow{driver:Rc::downgrade(&driver),};";
+    for listener in ["feed_pump.listen_follow(", "two.on_follow("] {
+        let at = code.find(listener).unwrap_or_else(|| panic!("`{listener}`"));
+        let made = code[..at]
+            .rfind(follow_window)
+            .unwrap_or_else(|| panic!("`{listener}` has a follow window over the controller"));
+        let between = &code[made + follow_window.len()..at];
+        assert!(
+            !between.contains("letwindow=") && between.len() < 200,
+            "the follow window `{listener}` applies is that one: {between}"
+        );
+        let handed = call_texts(&code[at..], listener)[0];
+        assert!(
+            handed.contains("plugin_panels::apply_follow_commands(&window,"),
+            "{handed}"
+        );
+    }
+}
+
+/// The workspace verbs are the controller's: `build_ui` makes no closure that switches, makes, renames or deletes a
+/// workspace, reads no chooser pick, and its shell verb arm answers a workspace verb only as a bug; the grid has no
+/// switch of its own, and the shell keeps no second copy of the pick's or the made workspace's rules.
+#[test]
+fn no_workspace_verb_is_left_in_build_ui() {
+    let code = build_ui_code();
+    for closure in [
+        "letswitch_workspace",
+        "letswitch_or_make",
+        "letstart_rename",
+        "letpick_workspace",
+        "letworkspaces_changed",
+    ] {
+        assert!(!code.contains(closure), "`{closure}` is still made in build_ui");
+    }
+    for call in [
+        "grid.switch_workspace(",
+        "Pick::",
+        "resolve_pick(",
+        "new_workspace_layout(",
+        "rename_current(",
+        "create_copy(",
+        ".delete(&name)",
+        "ShellCall::WorkspacePick",
+        "start_rename(",
+    ] {
+        assert!(!code.contains(call), "build_ui still does `{call}`");
+    }
+    let body = let_block(&code, "letrun_verb:Rc<dynFn(Action)>=");
+    let bug_arm = "Action::WorkspaceStep{..}|Action::WorkspaceLast|Action::WorkspaceNew|Action::WorkspaceSwitch{..}|Action::WorkspaceChoose|Action::WorkspaceRename=>{eprintln!(";
+    assert_eq!(body.matches(bug_arm).count(), 1, "one arm, which reports a bug");
+    // `eitri.layout.switch` goes whole to the controller, as every request but a float's.
+    assert!(code.contains("ifeitri_core::wm::lua::moved(&request){driver.lua_request(WinId::MAIN,request);continue;}"));
+    assert!(eitri_core::wm::lua::moved(
+        &eitri_core::lua::layout::LayoutRequest::Switch("study".into())
+    ));
+    // A defined name is made from `init.lua`'s definitions, given to the controller once, after `init.lua` ran.
+    let config = code.find("StartStep::Config{").expect("the config phase");
+    let setups = call_texts(&code, "driver.set_module_setup(");
+    assert_eq!(setups.len(), 1, "one module setup for the window");
+    assert!(setups[0].contains("workspaces:lua_engine.layout.borrow().defined_workspaces().to_vec(),"));
+    assert!(config < code.find("driver.set_module_setup(").unwrap());
+    let grid = file_code("shell/src/module_grid.rs");
+    assert!(!grid.contains("fnswitch_workspace(") && !grid.contains("fnswitch_then_unmap"));
+    let main = file_code("shell/src/main.rs");
+    for helper in ["fnresolve_pick(", "fnnew_workspace_layout(", "enumPick{"] {
+        assert!(!main.contains(helper), "main.rs keeps `{helper}`");
+    }
+}
+
+/// The rename entry only reports: its wiring posts what happened to it to the controller and renames, hides or
+/// refills nothing, and `build_ui` wires it through that one function.
+#[test]
+fn the_rename_entry_reports_and_never_renames_itself() {
+    let chrome = file_code("shell/src/chrome.rs");
+    let at = chrome.find("fnwire_rename_entry(").expect("the rename entry's wiring");
+    let wiring = scan::braced(&chrome, at + chrome[at..].find('{').unwrap());
+    for posts in [
+        "HostEvent::TopBarEntry{win:WinId::MAIN,ev}",
+        "EntryEv::Enter(entry.text().to_string())",
+        "EntryEv::Escape",
+        "EntryEv::LostKeys",
+    ] {
+        assert!(wiring.contains(posts), "the entry reports `{posts}`: {wiring}");
+    }
+    for call in [
+        "rename_current(",
+        "Workspaces",
+        "workspaces",
+        ".set_visible(",
+        ".set_text(",
+        "select_region(",
+        "return_to_pane",
+        "grab_focus(",
+    ] {
+        assert!(!wiring.contains(call), "the entry's wiring does `{call}` itself");
+    }
+    let code = build_ui_code();
+    assert_eq!(code.matches("chrome::wire_rename_entry(&top_bar.rename,").count(), 1);
+    for call in [
+        "rename.connect_activate(",
+        "entry.connect_activate(",
+        "rename.add_controller(",
+    ] {
+        assert!(!code.contains(call), "build_ui wires the entry itself: `{call}`");
     }
 }

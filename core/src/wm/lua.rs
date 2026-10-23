@@ -24,17 +24,35 @@ pub fn lua_request_action(request: &LayoutRequest) -> Option<Action> {
     }
 }
 
-/// Whether the controller decides `request` itself ([`Controller::lua_request`](super::Controller::lua_request));
-/// the shell's loop keeps its own arm for the rest.
-pub fn moved(request: &LayoutRequest) -> bool {
+/// Whether [`Controller::lua_request`](super::Controller::lua_request) can carry `request` out: every request but
+/// `float`, which is the floats' and still the shell's. What the shell's loop sends it is [`moved`]'s choice.
+pub fn decided(request: &LayoutRequest) -> bool {
     match request {
-        LayoutRequest::Run(_) | LayoutRequest::Mark(_) => true,
-        LayoutRequest::Open(..)
-        | LayoutRequest::Switch(_)
+        LayoutRequest::Run(_)
+        | LayoutRequest::Mark(_)
+        | LayoutRequest::Open(..)
         | LayoutRequest::Show(_)
         | LayoutRequest::Hide(_)
         | LayoutRequest::Focus(_)
         | LayoutRequest::Split(..)
-        | LayoutRequest::Float(..) => false,
+        | LayoutRequest::Switch(_) => true,
+        LayoutRequest::Float(..) => false,
+    }
+}
+
+/// Whether the shell's loop sends `request` whole to the controller
+/// ([`Controller::lua_request`](super::Controller::lua_request)): every request it decides, a workspace's switch
+/// included; the shell's loop keeps its own arm only for a float's.
+pub fn moved(request: &LayoutRequest) -> bool {
+    match request {
+        LayoutRequest::Run(_)
+        | LayoutRequest::Mark(_)
+        | LayoutRequest::Open(..)
+        | LayoutRequest::Show(_)
+        | LayoutRequest::Hide(_)
+        | LayoutRequest::Focus(_)
+        | LayoutRequest::Split(..)
+        | LayoutRequest::Switch(_) => true,
+        LayoutRequest::Float(..) => false,
     }
 }

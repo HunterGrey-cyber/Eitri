@@ -3,9 +3,10 @@
 //! them.
 //!
 //! Every action from a key, a Lua call or a panel tab verb goes through one runner, [`Decide::run`]: the
-//! container selection's gate and the float's first, then the action's family. A family that has moved here (the
-//! tiling verbs, [`super::verbs::tiling`], the focus verbs, [`super::verbs::focus`], and the keys verbs,
-//! [`super::verbs::keys`]) is decided on the window's layout and answered with the batch that shows its change;
+//! container selection's gate and the float's first (a tray chip meets neither), then the action's family. A
+//! family that has moved here (the tiling verbs, [`super::verbs::tiling`], the focus verbs,
+//! [`super::verbs::focus`], the keys verbs, [`super::verbs::keys`], and the module verbs,
+//! [`super::verbs::modules`]) is decided on the window's layout and answered with the batch that shows its change;
 //! every other action goes back to the shell as the batch's [`ShellVerb`], and the controller counts how often the
 //! shell changed the layout behind it.
 //!
@@ -16,10 +17,14 @@
 //! the scheduler. The timer writes through the window's [`Saver`](super::persist::Saver), and the close's save is
 //! [`Controller::persist_now`]. Each family that moves adds its state and its decisions here and deletes the shell
 //! code that made them.
+//!
+//! What each window's chrome shows is derived here too ([`super::chrome`]): every entry that returns a batch ends
+//! by deriving the fields whose inputs moved, and announces the model once when a value changed.
 
-use super::chrome::ChromeModel;
+use super::chrome::{self, ChromeModel, ChromeTitles, Derivations};
 use super::host::*;
 use super::module::{Lifecycle, SurfaceDecl};
+use super::verbs::modules::{self as module_verbs, ModuleSetup};
 use super::verbs::{self, FloatGate, SelectionGate};
 use super::window::{EditorPresence, Timers, WinId, Window, WindowParts, WindowSpec};
 use crate::keymap::action::Action;
@@ -40,6 +45,9 @@ pub struct Controller {
     windows: BTreeMap<WinId, Window>,
     /// Each window's keymap and module keys, from its config phase on; the refusals name keys from them.
     keymaps: BTreeMap<WinId, (Rc<Keymap>, Rc<ModuleKeys>)>,
+    /// Each window's open rules, module declarations, start-hidden plugins and project root, which its module
+    /// verbs place and kill by.
+    setups: BTreeMap<WinId, Rc<ModuleSetup>>,
     /// How many `LayoutChangedByShell` reports each window had: a verb arm's, the grid's change hook's and a
     /// workspace rename's or delete's alike, so an arm that changes the grid is counted twice.
     shell_revisions: BTreeMap<WinId, u64>,
@@ -63,6 +71,7 @@ impl Controller {
             reads: Rc::new(NoReads),
             windows: BTreeMap::new(),
             keymaps: BTreeMap::new(),
+            setups: BTreeMap::new(),
             shell_revisions: BTreeMap::new(),
             declared: BTreeMap::new(),
             starts: BTreeMap::new(),
@@ -81,8 +90,150 @@ impl Controller {
     pub fn set_keymap(&mut self, win: WinId, keymap: Rc<Keymap>, module_keys: Rc<ModuleKeys>) {
         if let Some(window) = self.windows.get_mut(&win) {
             window.keys.prefix = Some(Prefix::new(keymap.clone(), module_keys.clone()));
+            // The prefix strip lists the keys this keymap binds.
+            window.chrome_state.dirty.prefix += 1;
         }
         self.keymaps.insert(win, (keymap, module_keys));
+    }
+
+    /// What `win`'s module verbs place and kill by, from its config on; before it, no rules, no declarations and
+    /// the current directory as the project root.
+    pub fn set_module_setup(&mut self, win: WinId, setup: ModuleSetup) {
+        self.setups.insert(win, Rc::new(setup));
+    }
+
+    /// A chooser pick, by the key `keycode` that made it, uses the same workspace decisions as the action runner.
+    pub fn workspace_pick(&mut self, win: WinId, choice: crate::keymap::prefix::WorkspacePick, keycode: u32) -> Batch {
+        let mut batch = Batch::default();
+        if self.awaiting_layout(win, ("workspace_pick", choice)) {
+            return batch;
+        }
+        if choice == crate::keymap::prefix::WorkspacePick::New {
+            return self.run(win, Action::WorkspaceNew, Origin::Key { keycode });
+        }
+        let (reads, _, setup) = self.module_parts(win);
+        if let Some(window) = self.windows.get_mut(&win) {
+            verbs::workspaces::pick(window, &*reads, win, choice, &setup, &mut batch);
+        }
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// What `win`'s module verbs read: the shell's answers, the keymap and the module setup.
+    pub(super) fn module_parts(&self, win: WinId) -> (Rc<dyn HostReads>, Rc<Keymap>, Rc<ModuleSetup>) {
+        (
+            self.reads.clone(),
+            self.keymap(win),
+            self.setups.get(&win).cloned().unwrap_or_default(),
+        )
+    }
+
+    /// Whether a card answer from chat view `view` may be taken, read and nothing else: `Ok` only when the
+    /// controller can tell nothing covers the view. A layout being written right now, a window it does not hold, or
+    /// a view the window's layout does not hold answer `Err` with the refusal's text, which the caller posts as
+    /// [`HostEvent::AnswerRefused`] for the toast.
+    pub fn answer_gate(&self, win: WinId, view: ViewId) -> Result<(), String> {
+        let (reads, keymap, setup) = self.module_parts(win);
+        let cx = module_verbs::Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        module_verbs::answer_gate(self.windows.get(&win), &cx, win, view)
+    }
+
+    /// The covered chat view `view` revealed before something opens in it with the keys: the scratch floats over it
+    /// that do not hold the keys stowed, the keys staying where they are; with the refusal's text when a float still
+    /// covers it.
+    pub fn reveal_chat(&mut self, win: WinId, view: ViewId) -> (Batch, Option<String>) {
+        let mut batch = Batch::default();
+        if self.awaiting_layout(win, ("reveal_chat", view)) {
+            return (batch, Some(super::feedback::LAYOUT_CHANGING_TEXT.into()));
+        }
+        let (reads, keymap, setup) = self.module_parts(win);
+        let Some(window) = self.windows.get_mut(&win) else {
+            // A window it does not hold is one it cannot judge, so the card waits as the answer gate's would.
+            return (batch, Some(super::feedback::LAYOUT_CHANGING_TEXT.into()));
+        };
+        let cx = module_verbs::Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        let still = module_verbs::reveal_chat(window, &cx, win, view, &mut batch);
+        self.settle_chrome(&mut batch);
+        (batch, still)
+    }
+
+    /// A plugin's follow command for `module`, through the runner's gates as the module key (a show) or
+    /// `module.hide` (a hide) meets them, then shown with the keys where they are or hidden as any hide is.
+    pub fn follow(&mut self, win: WinId, module: &ModuleId, show: bool) -> Batch {
+        let action = if show {
+            Action::Module(module.clone())
+        } else {
+            Action::ModuleHide
+        };
+        let mut batch = self.run_gated(win, action, Origin::Follow, Some(module));
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// Whether `module` is shown in `win`'s layout, and whether it is on screen too (not behind a zoom, not on a tab
+    /// its container does not draw): what a plugin's follow commands read before they show or hide it. Neither for
+    /// a window it does not hold, or a layout being written right now.
+    pub fn module_shown(&self, win: WinId, module: &ModuleId) -> (bool, bool) {
+        self.windows
+            .get(&win)
+            .and_then(|window| window.layout.try_borrow().ok())
+            .map_or((false, false), |layout| {
+                (layout.is_shown(module), layout.is_visible(module))
+            })
+    }
+
+    /// `scratchpad.show` named the terminal or chat view `module`, which does not exist yet: it is made under that
+    /// number and put straight into the scratchpad, shown and given the keys.
+    pub fn scratch_new(&mut self, win: WinId, module: &ModuleId) -> Batch {
+        let mut batch = Batch::default();
+        if self.awaiting_layout(win, ("scratch_new", module)) {
+            return batch;
+        }
+        self.modules_event(win, &mut batch, |window, cx, batch| {
+            module_verbs::scratch_new(window, cx, win, module, batch)
+        });
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// `tab.break` from the base view: a new chat view, where the open rules put a broken-out tab, holding the
+    /// base view's active tab.
+    pub fn tab_break(&mut self, win: WinId) -> Batch {
+        let mut batch = Batch::default();
+        if self.awaiting_layout(win, "tab_break") {
+            return batch;
+        }
+        self.modules_event(win, &mut batch, |window, cx, batch| {
+            module_verbs::tab_break(window, cx, win, batch)
+        });
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// Kills `module` with no y/n, as a `y` to its kill's question would: a terminal whose shell ended by itself.
+    /// The last module on screen is the window close, which is the caller's, and is left alone here.
+    pub fn kill_confirmed(&mut self, win: WinId, module: &ModuleId) -> Batch {
+        let mut batch = Batch::default();
+        if self.awaiting_layout(win, ("kill_confirmed", module)) {
+            return batch;
+        }
+        self.modules_event(win, &mut batch, |window, cx, batch| {
+            if module_verbs::kill_confirmed(window, cx, win, module, batch) == module_verbs::Ran::Shell {
+                window.say(format!(
+                    "[modules] {module}: the last module on screen; its close is the window's"
+                ));
+            }
+        });
+        self.settle_chrome(&mut batch);
+        batch
     }
 
     /// Records a window the shell opened, with the layouts it shares and its saver. Opening it again replaces
@@ -178,8 +329,8 @@ impl Controller {
     }
 
     /// The window's first layout batch, with the hosts the shell placed declared: every visible hosted module
-    /// mapped, the float band restacked, the grid allocated, then the modules' lifecycle effects and the shell's
-    /// change hooks. Never the saver: a launch is not a change.
+    /// mapped, the float band restacked, the grid allocated, then the modules' lifecycle effects and the chrome
+    /// derived from it all. Never the saver: a launch is not a change.
     pub fn first_apply(&mut self, win: WinId, hosted: &[SurfaceDecl]) -> Batch {
         let mut batch = Batch::default();
         let Some(window) = self.windows.get_mut(&win) else {
@@ -194,7 +345,8 @@ impl Controller {
             Ok(layout) => window.lifecycle.after_change(win, &layout, &mut batch),
             Err(_) => window.warn("[wm] BUG: the layout was borrowed at the first apply; no lifecycle effect".into()),
         }
-        batch.push_effect(HostOp::ChromeHooks { win });
+        window.layout_touched();
+        self.settle_chrome(&mut batch);
         batch
     }
 
@@ -204,23 +356,21 @@ impl Controller {
     /// runner, as a key does.
     pub fn lua_request(&mut self, win: WinId, request: LayoutRequest) -> Batch {
         let mut batch = Batch::default();
-        if !super::lua::moved(&request) {
-            self.verb_note(win, format!("[wm] BUG: lua_request for an unmoved {request:?}"));
+        if !super::lua::decided(&request) {
+            self.verb_note(win, format!("[wm] BUG: lua_request for the shell's {request:?}"));
             return batch;
         }
         if self.awaiting_layout(win, ("lua_request", &request)) {
             return batch;
         }
-        let keymap = self.keymap(win);
+        let (reads, keymap, setup) = self.module_parts(win);
         let Some(window) = self.windows.get_mut(&win) else {
             return batch;
         };
         window.say(format!("[lua] layout: {request:?}"));
-        let id = match request {
-            LayoutRequest::Run(action) => return self.run(win, action, Origin::Lua),
-            LayoutRequest::Mark(ref id) => id.clone(),
-            _ => unreachable!("only the moved requests get here"),
-        };
+        if let LayoutRequest::Run(action) = request {
+            return self.run(win, action, Origin::Lua);
+        }
         let Ok(selection) = window.layout.try_borrow().map(|layout| layout.selection()) else {
             window.warn(format!("[wm] BUG: the layout was borrowed when {request:?} arrived"));
             return batch;
@@ -231,16 +381,64 @@ impl Controller {
             window.warn(format!("[lua] layout: {request:?} refused: {text}"));
             return batch;
         }
-        let marked = window.layout.try_borrow_mut().map(|mut layout| layout.set_mark(&id));
-        match marked {
-            // A mark changes only the chrome's text: nothing moves, and the state file does not keep it.
-            Ok(Ok(())) => push_chrome_hooks(&mut batch, win),
-            Ok(Err(err)) => window.warn(format!("[lua] layout: {request:?} refused: {err}")),
-            Err(_) => window.warn(format!("[wm] BUG: the layout was borrowed when {request:?} ran")),
+        let cx = module_verbs::Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        let refused = |err: &dyn std::fmt::Display| format!("[lua] layout: {request:?} refused: {err}");
+        let result: Result<(), String> = match &request {
+            LayoutRequest::Mark(id) => match window.layout.try_borrow_mut().map(|mut layout| layout.set_mark(id)) {
+                // A mark changes only the chrome's text: nothing moves, and the state file does not keep it.
+                Ok(Ok(())) => {
+                    window.layout_touched();
+                    Ok(())
+                }
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => {
+                    window.warn(format!("[wm] BUG: the layout was borrowed when {request:?} ran"));
+                    Ok(())
+                }
+            },
+            LayoutRequest::Show(id) => {
+                module_verbs::lua_show(window, &cx, win, id, &mut batch).map_err(|err| err.to_string())
+            }
+            LayoutRequest::Hide(id) => {
+                module_verbs::hide(window, &cx, win, id, &mut batch).map_err(|err| err.to_string())
+            }
+            LayoutRequest::Focus(id) => {
+                super::focus::focus_and_arrive(window, win, id, &mut batch).map_err(|err| err.to_string())
+            }
+            LayoutRequest::Split(id, axis) => {
+                module_verbs::place_and_arrive(window, &cx, win, id, *axis, &mut batch).map_err(|err| err.to_string())
+            }
+            // Its refusals, now or once its surface is asked for, are logged under the request's own words.
+            LayoutRequest::Open(kind, explicit) => {
+                module_verbs::lua_open(
+                    window,
+                    &cx,
+                    win,
+                    *kind,
+                    explicit.clone(),
+                    format!("{request:?}"),
+                    &mut batch,
+                );
+                Ok(())
+            }
+            LayoutRequest::Switch(name) => {
+                verbs::workspaces::switch_or_make(window, win, name, &setup, &*reads, &mut batch).map(|_| ())
+            }
+            LayoutRequest::Run(_) | LayoutRequest::Float(..) => {
+                unreachable!("only the requests decided here get here")
+            }
+        };
+        if let Err(err) = result {
+            window.warn(refused(&err));
         }
         if gate == Some(SelectionGate::Run { reset: true }) && window.clear_selection() {
-            push_chrome_hooks(&mut batch, win);
+            window.layout_touched();
         }
+        self.settle_chrome(&mut batch);
         batch
     }
 
@@ -268,7 +466,15 @@ impl Controller {
             return None;
         };
         let arrangement = frame_with(&*reads, win, size, |frame| crate::layout::arrange(&layout, frame));
-        window.allocated = Some(size);
+        drop(layout);
+        if settled.is_some() {
+            // The settle wrote the pins' lengths: its `Settled` event, heard from the idle, derives what they move.
+            window.layout_touched();
+        }
+        if window.allocated != Some(size) {
+            window.allocated = Some(size);
+            chrome::resized(window);
+        }
         Some((Rc::new(arrangement), settled))
     }
 
@@ -280,6 +486,79 @@ impl Controller {
             .unwrap_or_default()
     }
 
+    /// What `win`'s chrome names things by: the project, the Lua panels' titles, the tray's modules. The fields
+    /// that read them are derived again, and the batch announces what changed.
+    pub fn set_titles(&mut self, win: WinId, titles: ChromeTitles) -> Batch {
+        let mut batch = Batch::default();
+        if let Some(window) = self.windows.get_mut(&win) {
+            chrome::set_titles(window, titles);
+        }
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// How many times each of `win`'s chrome fields was derived; nothing for a window never opened.
+    pub fn chrome_derivations(&self, win: WinId) -> Derivations {
+        self.windows
+            .get(&win)
+            .map(|window| window.chrome_state.derivations)
+            .unwrap_or_default()
+    }
+
+    /// Every window's chrome fields whose inputs moved, derived, and the model announced once per window whose
+    /// values changed. Every entry that returns a batch ends here; a window with nothing moved allocates nothing.
+    fn settle_chrome(&mut self, batch: &mut Batch) {
+        let reads = self.reads.clone();
+        for (win, window) in &mut self.windows {
+            chrome::settle(window, *win, &*reads, self.keymaps.get(win), batch);
+        }
+    }
+
+    /// The shell's host refused a window mode the controller asked for: a shell that does not carry out
+    /// `SetMode` yet toggles its own mode through its arm, as before the chrome's verb moved here.
+    fn mode_refused(&mut self, batch: &mut Batch) {
+        let Some((win, window)) = self
+            .windows
+            .iter_mut()
+            .find(|(_, window)| window.chrome_state.mode_asked)
+        else {
+            return;
+        };
+        window.chrome_state.mode_asked = false;
+        window.say("[window_mode] the host refused the mode; the shell's arm sets it".into());
+        batch.set_shell_verb(ShellVerb {
+            win: *win,
+            call: ShellCall::Action(Action::WindowImmersive),
+            keycode: 0,
+        });
+    }
+
+    /// The chat facts the chrome shows: a view's attention or busy state, a page that came on screen (judged once
+    /// the queue has drained), and a toast a chat asked for.
+    fn chat_chrome(&mut self, event: &HostEvent) {
+        let HostEvent::Chat(chat) = event else {
+            return;
+        };
+        let win = match chat {
+            ChatEvent::Attention { win, .. }
+            | ChatEvent::Busy { win, .. }
+            | ChatEvent::PageShown { win, .. }
+            | ChatEvent::Toast { win, .. } => *win,
+            _ => return,
+        };
+        let Some(window) = self.windows.get_mut(&win) else {
+            return;
+        };
+        match chat {
+            ChatEvent::Attention { view, .. } | ChatEvent::Busy { view, .. } => {
+                chrome::attention_changed(window, *view)
+            }
+            ChatEvent::PageShown { view, .. } => chrome::page_shown(window, *view),
+            ChatEvent::Toast { text, kind, .. } => chrome::show_toast(window, text.clone(), *kind),
+            _ => {}
+        }
+    }
+
     /// Whether the release of `keycode` in `win` is to be reported as [`HostEvent::KeyReleased`]: only the key
     /// the window's prefix consumed and has not seen released is. Asked on every release, so it allocates nothing.
     pub fn watches_release(&self, win: WinId, keycode: u32) -> bool {
@@ -288,13 +567,13 @@ impl Controller {
             .is_some_and(|window| super::keys::watches_release(window, keycode))
     }
 
-    /// The workspace chooser was drawn: `win`'s prefix waits for its key. The chooser's own arm calls this while
-    /// the workspace verbs are still the shell's.
+    /// The workspace chooser was drawn: `win`'s prefix waits for its key, including a top-bar click.
     pub fn await_workspace(&mut self, win: WinId) -> Batch {
         let mut batch = Batch::default();
         if let Some(window) = self.windows.get_mut(&win) {
-            super::keys::await_workspace(window, win, &mut batch);
+            super::keys::await_workspace(window, &mut batch);
         }
+        self.settle_chrome(&mut batch);
         batch
     }
 
@@ -318,30 +597,50 @@ impl Controller {
     }
 
     /// A command the window's prefix finished: an action through the runner as a key's, a digit landing in what
-    /// `select.number` numbered, and a split's placement or a chooser's pick as the shell's verb, whose families
-    /// are still the shell's.
+    /// `select.number` numbered, a split's placement, and a chooser's pick against the workspace order.
     fn prefix_command(&mut self, win: WinId, command: PrefixCommand, keycode: u32) -> Batch {
         let mut batch = Batch::default();
-        let call = match command {
+        match command {
             PrefixCommand::Run(action) => return self.run(win, action, Origin::Key { keycode }),
             PrefixCommand::Number(digit) => {
                 if let Some(window) = self.windows.get_mut(&win) {
                     super::keys::land_digit(window, win, digit, &mut batch);
                 }
-                return batch;
+                batch
             }
             PrefixCommand::Place { module, axis, cwd } => {
-                // A split ends a container selection, as `split.*`'s rule says; it is put back after the arm's
-                // re-read, as for every shell verb that resets it.
+                let (reads, keymap, setup) = self.module_parts(win);
                 if let Some(window) = self.windows.get_mut(&win) {
-                    window.after_verb = Some(true);
+                    let cx = module_verbs::Cx {
+                        reads: &*reads,
+                        keymap: &keymap,
+                        setup: &setup,
+                    };
+                    module_verbs::place(window, &cx, win, &module, axis, cwd, &mut batch);
                 }
-                ShellCall::Place { module, axis, cwd }
+                batch
             }
-            PrefixCommand::Workspace(pick) => ShellCall::WorkspacePick(pick),
+            PrefixCommand::Workspace(pick) => self.workspace_pick(win, pick, keycode),
+        }
+    }
+
+    /// A module fact `f` decides on `win`'s record with the module verbs' reads; nothing for a window never opened.
+    fn modules_event(
+        &mut self,
+        win: WinId,
+        batch: &mut Batch,
+        f: impl FnOnce(&mut Window, &module_verbs::Cx<'_>, &mut Batch),
+    ) {
+        let (reads, keymap, setup) = self.module_parts(win);
+        let Some(window) = self.windows.get_mut(&win) else {
+            return;
         };
-        batch.set_shell_verb(ShellVerb { win, call, keycode });
-        batch
+        let cx = module_verbs::Cx {
+            reads: &*reads,
+            keymap: &keymap,
+            setup: &setup,
+        };
+        f(window, &cx, batch);
     }
 
     /// The keys' facts: a watched release, and the window losing activation or being clicked, which end a wait of
@@ -360,7 +659,7 @@ impl Controller {
                 ..
             } => {
                 if let Some(window) = self.windows.get_mut(win) {
-                    super::keys::cancel(window, *win, batch);
+                    super::keys::cancel(window, batch);
                 }
             }
             _ => {}
@@ -463,22 +762,26 @@ impl Controller {
     }
 
     /// The shell changed `win`'s layout or workspaces: what its apply left on screen is the grid's state now, a
-    /// shell verb the runner handed over gets its selection reset (redrawn when it ended one), and the saver says
-    /// whether the save's debounce is to be armed.
-    fn layout_changed(&mut self, win: WinId, batch: &mut Batch) {
+    /// shell verb the runner handed over gets its selection reset, the chrome is derived again from it all, and the
+    /// saver says whether the save's debounce is to be armed.
+    fn layout_changed(&mut self, win: WinId) {
         let Some(window) = self.windows.get_mut(&win) else {
             return;
         };
-        // The arm's own grid changes ran the hooks already; a selection put back here is a change they missed.
-        if window.after_verb.take() == Some(true) && window.clear_selection() {
-            batch.push_effect(HostOp::ChromeHooks { win });
+        // The arm may have changed the layout and the workspaces in any way the chrome shows.
+        window.layout_touched();
+        window.chrome_state.dirty.workspaces += 1;
+        // A selection the verb ended is put back here, after its arm; the chrome derived below reads it.
+        if window.after_verb.take() == Some(true) {
+            window.clear_selection();
         }
         window.reset_mapped();
         window.saver_changed();
     }
 
     /// A timer fired: the save's debounce of whichever window armed it, armed again or written, a window's
-    /// restack after a float took the keys, or the end of a window's digit wait.
+    /// restack after a float took the keys, the end of a window's digit wait, a toast's time up, or the idle that
+    /// derives what a resize changed.
     fn timer_fired(&mut self, token: TimerToken, batch: &mut Batch) {
         if let Some(window) = self
             .windows
@@ -490,7 +793,9 @@ impl Controller {
         }
         for (win, window) in &mut self.windows {
             if super::focus::raise_timer_fired(window, *win, token, batch)
-                || super::keys::number_timer_fired(window, *win, token, batch)
+                || super::keys::number_timer_fired(window, token, batch)
+                || chrome::toast_timer_fired(window, token)
+                || chrome::resize_idle_fired(window, token)
             {
                 return;
             }
@@ -579,6 +884,14 @@ impl Controller {
         self.windows.get_mut(&win)
     }
 
+    /// What the window's chrome was last told the prefix waits for, and the digits it drew, for tests.
+    #[cfg(test)]
+    pub(crate) fn prefix_shown(&self, win: WinId) -> Option<(crate::keymap::prefix::Waiting, Vec<(char, ModuleId)>)> {
+        self.windows
+            .get(&win)
+            .map(|window| (window.keys.waiting, window.keys.plan.clone()))
+    }
+
     /// The window's focus state, for tests.
     #[cfg(test)]
     pub(crate) fn focus_state(&self, win: WinId) -> Option<&super::focus::FocusState> {
@@ -624,7 +937,6 @@ impl Decide for Controller {
         }
         match &event {
             HostEvent::LayoutChangedByShell { win }
-            | HostEvent::Declared { win, .. }
             | HostEvent::SurfaceEnded { win, .. }
             | HostEvent::Terminal(TermEvent::Started { win, .. } | TermEvent::Exited { win, .. })
             | HostEvent::Refused {
@@ -643,16 +955,60 @@ impl Decide for Controller {
             HostEvent::LayoutChangedByShell { win } => {
                 // A verb run before the window was declared still changed its layout, so the count starts there.
                 *self.shell_revisions.entry(win).or_insert(0) += 1;
-                self.layout_changed(win, &mut batch);
+                self.layout_changed(win);
             }
             HostEvent::Timer(token) => self.timer_fired(token, &mut batch),
             HostEvent::Settled { win, root } => self.settled(win, &root),
             HostEvent::Wake => self.collect_saves(),
+            HostEvent::Refused {
+                what: OpTag::SetMode, ..
+            } => self.mode_refused(&mut batch),
+            HostEvent::Created { win, module } => self.modules_event(win, &mut batch, |window, cx, batch| {
+                module_verbs::created(window, cx, win, &module, batch);
+            }),
+            HostEvent::TopBarEntry { win, ev } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    verbs::workspaces::entry(window, win, ev, &mut batch);
+                }
+            }
+            HostEvent::AnswerRefused { win, text } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    window.say(format!("[modules] refused: {text}"));
+                    window.refuse(win, text, &mut batch);
+                }
+            }
+            HostEvent::PromptWithdrawn { win } => self.modules_event(win, &mut batch, |window, cx, batch| {
+                // A `no` kills nothing, so nothing is left for the shell.
+                module_verbs::prompt_answer(window, cx, win, super::close::PromptKey::No, batch);
+            }),
+            HostEvent::Terminal(TermEvent::Cwd { win, module, read, dir }) => {
+                self.modules_event(win, &mut batch, |window, cx, batch| {
+                    module_verbs::cwd_read(window, cx, win, &module, read, dir, batch)
+                })
+            }
+            // A refusal from an arm still in the shell flashes and toasts through the model, as the runner's do.
+            HostEvent::ShellRefused { win, text } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    chrome::refused(window, &text);
+                }
+            }
             event => {
+                if let HostEvent::Refused {
+                    what: OpTag::CreateSurface,
+                    why,
+                    surface: Some((win, module)),
+                } = &event
+                {
+                    if let Some(window) = self.windows.get_mut(win) {
+                        module_verbs::create_refused(window, *win, module, why, &mut batch);
+                    }
+                }
                 self.keys_event(&event, &mut batch);
                 self.focus_event(&event, &mut batch);
+                self.chat_chrome(&event);
             }
         }
+        self.settle_chrome(&mut batch);
         batch
     }
 
@@ -664,6 +1020,34 @@ impl Decide for Controller {
             return (Verdict::PassThrough, batch);
         }
         let reads = self.reads.clone();
+        if *stage == KeyStage::Window {
+            let answer = self
+                .windows
+                .get(&win)
+                .and_then(|window| super::keys::prompt_press(window, press));
+            if let Some(answer) = answer {
+                let (reads, keymap, setup) = self.module_parts(win);
+                if let Some(window) = self.windows.get_mut(&win) {
+                    let cx = module_verbs::Cx {
+                        reads: &*reads,
+                        keymap: &keymap,
+                        setup: &setup,
+                    };
+                    // The kill the y/n asked about turned out to be the last module's: the window close's own
+                    // question is the shell's.
+                    if module_verbs::prompt_answer(window, &cx, win, answer, &mut batch) == module_verbs::Ran::Shell {
+                        window.after_verb = Some(false);
+                        batch.set_shell_verb(ShellVerb {
+                            win,
+                            call: ShellCall::Action(Action::ModuleKill),
+                            keycode: press.keycode,
+                        });
+                    }
+                }
+                self.settle_chrome(&mut batch);
+                return (Verdict::Consumed, batch);
+            }
+        }
         let Some(window) = self.windows.get_mut(&win) else {
             return (Verdict::PassThrough, batch);
         };
@@ -674,10 +1058,12 @@ impl Decide for Controller {
                     let more = self.prefix_command(win, command, press.keycode);
                     batch.append(more);
                 }
+                self.settle_chrome(&mut batch);
                 (verdict, batch)
             }
             KeyStage::Module(module) => {
                 let verdict = super::keys::module_press(window, &*reads, win, module, press, &mut batch);
+                self.settle_chrome(&mut batch);
                 (verdict, batch)
             }
         }
@@ -688,12 +1074,54 @@ impl Decide for Controller {
         (CloseVerdict::Proceed, Batch::default())
     }
 
+    /// The one runner ([`Controller::run_action`]), and the chrome its batch leaves.
+    fn run(&mut self, win: WinId, action: Action, origin: Origin) -> Batch {
+        let mut batch = self.run_action(win, action, origin);
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch {
+        let mut batch = Batch::default();
+        if self.awaiting_layout(win, ("focus", module)) {
+            return batch;
+        }
+        batch.push_layout(HostOp::Focus {
+            win,
+            to: FocusTo::Module(module.clone()),
+            on_grab: vec![],
+        });
+        batch
+    }
+
+    /// The coverage the batches the queue held left, judged when the layout or the size moved or a chat page came
+    /// on screen; a window's answer from the host to a mode it asked for has come by now, if the host gave one.
+    fn after_drain(&mut self) -> Batch {
+        let mut batch = Batch::default();
+        let reads = self.reads.clone();
+        for (win, window) in &mut self.windows {
+            window.chrome_state.mode_asked = false;
+            if chrome::coverage_due(window) {
+                chrome::reconcile_coverage(window, *win, &*reads, &mut batch);
+            }
+        }
+        batch
+    }
+}
+
+impl Controller {
     /// The one runner: the selection's gate (a refusal says how to get back to one module), then the float's (a
     /// refusal says how to sink the float), then the action's family, decided here when it has moved and handed
-    /// to the shell otherwise, then the gate's selection reset and the change hooks that redraw the selection.
+    /// to the shell otherwise, then the gate's selection reset, whose text the chrome derives again.
     /// A shell verb's reset waits for its re-read, so it comes after the arm as it comes after a verb decided
-    /// here.
-    fn run(&mut self, win: WinId, action: Action, origin: Origin) -> Batch {
+    /// here. [`Decide::run`] derives the chrome once the whole batch is built.
+    fn run_action(&mut self, win: WinId, action: Action, origin: Origin) -> Batch {
+        self.run_gated(win, action, origin, None)
+    }
+
+    /// [`Controller::run_action`], with `subject` the module a follow command names: its gates are the action's,
+    /// and its operation is the follow's own on `subject`.
+    fn run_gated(&mut self, win: WinId, action: Action, origin: Origin, subject: Option<&ModuleId>) -> Batch {
         let mut batch = Batch::default();
         if self.awaiting_layout(win, ("run", &action, &origin)) {
             return batch;
@@ -712,6 +1140,7 @@ impl Decide for Controller {
             batch.set_shell_verb(shell_verb(action));
             return batch;
         }
+        let setup = self.setups.get(&win).cloned().unwrap_or_default();
         let keymap = self.keymaps.get(&win).map(|(keymap, _)| keymap.clone());
         let keymap = || keymap.unwrap_or_else(|| Rc::new(Keymap::defaults()));
         let reads = self.reads.clone();
@@ -727,17 +1156,23 @@ impl Decide for Controller {
             window.warn(format!("[wm] BUG: the layout was borrowed when {} ran", action.name()));
             return batch;
         };
-        let gate = verbs::selection_gate(&action, selection);
+        // A chip is a module key from the top bar, which never holds the keys: neither gate is about it.
+        let gated = origin != Origin::Chip;
+        let gate = if gated {
+            verbs::selection_gate(&action, selection)
+        } else {
+            SelectionGate::Run { reset: false }
+        };
         if gate == SelectionGate::Refuse {
             let text = verbs::one_module_text(&keymap());
             window.say(format!("[modules] {}: {text}", action.name()));
-            batch.push_effect(HostOp::Refuse { win, text });
+            window.refuse(win, text, &mut batch);
             return batch;
         }
-        if verbs::float_gate(&action, keys_on_a_float) == FloatGate::Refuse {
+        if gated && verbs::float_gate(&action, keys_on_a_float) == FloatGate::Refuse {
             let text = verbs::no_split_text(&keymap());
             window.say(format!("[modules] {}: {text}", action.name()));
-            batch.push_effect(HostOp::Refuse { win, text });
+            window.refuse(win, text, &mut batch);
             return batch;
         }
         let reset = gate == SelectionGate::Run { reset: true };
@@ -745,6 +1180,30 @@ impl Decide for Controller {
             verbs::Family::Tiling => verbs::tiling::run(window, &*reads, win, &action, &mut batch),
             verbs::Family::Focus => verbs::focus::run(window, &*reads, win, &action, &mut batch),
             verbs::Family::Keys => verbs::keys::run(window, win, &action, keycode, &keymap(), &mut batch),
+            verbs::Family::Chrome => verbs::chrome::run(window, win, &action, &mut batch),
+            verbs::Family::Workspaces => verbs::workspaces::run(window, &*reads, win, &action, &setup, &mut batch),
+            verbs::Family::Modules => {
+                let keymap = keymap();
+                let cx = module_verbs::Cx {
+                    reads: &*reads,
+                    keymap: &keymap,
+                    setup: &setup,
+                };
+                let ran = match subject {
+                    Some(module) => {
+                        let show = matches!(action, Action::Module(_));
+                        module_verbs::follow(window, &cx, win, module, show, &mut batch);
+                        module_verbs::Ran::Done
+                    }
+                    None => module_verbs::run(window, &cx, win, &action, &origin, &mut batch),
+                };
+                if ran == module_verbs::Ran::Shell {
+                    // The last module's kill is the window close, whose question the shell asks.
+                    batch.set_shell_verb(shell_verb(action));
+                    window.after_verb = Some(reset);
+                    return batch;
+                }
+            }
             family => {
                 debug_assert!(!verbs::moved(family), "{family:?} has moved but has no runner arm");
                 batch.set_shell_verb(shell_verb(action));
@@ -753,30 +1212,9 @@ impl Decide for Controller {
             }
         }
         if reset && window.clear_selection() {
-            push_chrome_hooks(&mut batch, win);
+            window.layout_touched();
         }
         batch
-    }
-
-    fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch {
-        let mut batch = Batch::default();
-        if self.awaiting_layout(win, ("focus", module)) {
-            return batch;
-        }
-        batch.push_layout(HostOp::Focus {
-            win,
-            to: FocusTo::Module(module.clone()),
-            on_grab: vec![],
-        });
-        batch
-    }
-}
-
-/// The shell's change hooks once per batch: they read the layout as the whole batch leaves it.
-fn push_chrome_hooks(batch: &mut Batch, win: WinId) {
-    let hooks = HostOp::ChromeHooks { win };
-    if !batch.ops().any(|op| *op == hooks) {
-        batch.push_effect(hooks);
     }
 }
 
@@ -813,8 +1251,13 @@ mod tests {
         );
         assert_eq!(c.window_spec(win).map(|spec| spec.title.as_str()), Some("main"));
         assert_eq!(c.shell_revision(win), 0);
-        assert!(c.handle(HostEvent::LayoutChangedByShell { win }).is_empty());
-        assert!(c.handle(HostEvent::LayoutChangedByShell { win }).is_empty());
+        // The shell's change may change what the chrome shows, so its batch may announce the model; nothing else.
+        let announce_only = |batch: Batch| batch.ops().all(|op| matches!(op, HostOp::Chrome { .. }));
+        assert!(announce_only(c.handle(HostEvent::LayoutChangedByShell { win })));
+        assert!(
+            c.handle(HostEvent::LayoutChangedByShell { win }).is_empty(),
+            "the same layout again changes no chrome value"
+        );
         assert_eq!(c.shell_revision(win), 2);
         assert!(c.handle(HostEvent::MonitorsChanged).is_empty());
         assert_eq!(c.shell_revision(win), 2, "other facts change nothing yet");

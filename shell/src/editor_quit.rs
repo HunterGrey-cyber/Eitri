@@ -1,15 +1,15 @@
-//! Coordinates editor quits from `prefix x` and every window close, including nvim's exit,
-//! cancellation, and a declined close. Window closes ask nvim to confirm unsaved changes.
+//! Coordinates every editor quit, including `prefix x` and window closes, and handles nvim's
+//! exit, cancellation, and declined window closes without silently discarding unsaved changes.
 //!
-//! [`EditorQuitting`] owns the decisions and their order so they can be tested with a fake
-//! [`QuitHost`]. `main.rs` implements the host over the pane, layout, grid, confirmation prompt,
-//! and toast. The GTK calls in that layer still need GUI verification.
+//! [`EditorQuitting`] owns each decision and its order so tests can exercise the flow with a
+//! fake [`QuitHost`]. `main.rs` implements the host over the pane, layout, grid, window prompt,
+//! and toast. The GTK calls in that adapter still need GUI checks.
 //!
-//! The quit path uses `:confirm qall`, never `:qa!`. If nvim stops answering or is unreachable,
-//! [`QuitHost::end_nvim`] sends SIGTERM and closes stdin, then sends SIGKILL by pid after the
-//! timeout. SIGTERM goes first because nvim may still be in its prompt. Closing stdin lets nvim
-//! exit while keeping swap files. The editor host's shutdown sends no quit command.
-//! Close and retirement actions run once, after the pane reports the process gone.
+//! Quits use nvim's `:confirm qall`. If nvim stops answering or becomes unreachable,
+//! [`QuitHost::end_nvim`] sends SIGTERM and closes stdin, then sends SIGKILL by pid after
+//! the timeout if necessary. Swap files are kept. No path sends `:qa!`, including shutdown.
+//! Nothing closes or retires twice, and exit handling waits until nvim's own process is gone.
+//! The pane reports the exit only after that process ends.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -18,7 +18,8 @@ use std::time::Instant;
 use eitri_core::layout::{KillScope, LayoutError};
 use neovide_editor::CallWatch;
 
-use crate::kill_pane::{self, Asked, EditorQuit, QuitInFlight, QuitRequest, Reveal};
+use crate::kill_pane::nvim_answer;
+use eitri_core::wm::close::{self as kill_rules, Asked, EditorQuit, QuitInFlight, QuitRequest, Reveal};
 
 /// What [`EditorQuitting::ask`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +27,7 @@ pub(crate) enum AskedNvim {
     /// nvim was sent `:confirm qall` (or had exited already); its exit, or a cancel, answers.
     Asked,
     /// nvim is being ended ([`QuitHost::end_nvim`]): its loop had not answered the quit for
-    /// `kill_pane::NVIM_QUIT_PATIENCE`, or it is out of reach. Its exit closes what the quit was for.
+    /// `kill_rules::NVIM_QUIT_PATIENCE`, or it is out of reach. Its exit closes what the quit was for.
     Ending,
 }
 
@@ -47,7 +48,7 @@ pub(crate) use eitri_core::wm::feedback::RETIRED_EDITOR_TEXT;
 pub(crate) enum Cancel {
     /// It was the quit in flight: nothing is in flight now.
     Cleared,
-    /// It was the window close a kill of the editor carries ([`kill_pane::Asked::lent_by`]): the
+    /// It was the window close a kill of the editor carries ([`kill_rules::Asked::lent_by`]): the
     /// close is taken back out, and nvim's exit retires the editor only.
     CloseWithdrawn,
     /// Neither: a letter from a quit already superseded, or with nothing in flight.
@@ -86,7 +87,7 @@ pub(crate) trait QuitHost {
     /// first while the quit's request has not come back), then SIGKILL by pid on the pane's
     /// schedule. Idempotent.
     fn end_nvim(&self) -> bool;
-    /// `kill_pane::reveal_for_prompt` over the layout as it stands.
+    /// `kill_rules::reveal_for_prompt` over the layout as it stands.
     fn reveal(&self) -> Reveal;
     /// The editor is retired for this window (`Layout::is_gone`).
     fn editor_gone(&self) -> bool;
@@ -167,7 +168,11 @@ impl EditorQuitting {
             return Ok(AskedNvim::Asked);
         }
         let watch = host.watched_call();
-        let request = kill_pane::quit_request(self.in_flight.borrow().as_ref(), watch.as_ref(), Instant::now());
+        let request = kill_rules::quit_request(
+            self.in_flight.borrow().as_ref(),
+            watch.as_ref().map(nvim_answer).as_ref(),
+            Instant::now(),
+        );
         match request {
             QuitRequest::Ask => {}
             QuitRequest::Kill => {
@@ -180,7 +185,7 @@ impl EditorQuitting {
                 self.join(quit);
                 let _ = host.show_editor();
                 host.focus_editor();
-                return Err(kill_pane::answer_there_text(state).into());
+                return Err(kill_rules::answer_there_text(state).into());
             }
         }
         if reveal.show {
@@ -196,7 +201,7 @@ impl EditorQuitting {
             sent: true,
             lent_by: None,
         });
-        if !host.send_quit(&kill_pane::editor_quit_lua(g)) {
+        if !host.send_quit(&kill_rules::editor_quit_lua(g)) {
             self.in_flight.borrow_mut().take();
             return Err("nvim could not be asked to quit \u{2014} quit it in the editor (:qa)".into());
         }
@@ -234,7 +239,7 @@ impl EditorQuitting {
     /// A request that sends nothing to nvim gets a fresh in-flight entry and generation, whether
     /// nvim has just exited or is out of reach. Reusing an older request's generation and `sent`
     /// state could let a delayed cancellation erase the new request or close the wrong scope.
-    /// An unanswered older request is merged through `kill_pane::merge`, with a window close taking
+    /// An unanswered older request is merged through `kill_rules::merge`, with a window close taking
     /// precedence over an editor kill. An answered request and its confirmation are dropped.
     ///
     /// A kill that carries a window close must still allow that close to be withdrawn.
@@ -283,7 +288,7 @@ impl EditorQuitting {
         *in_flight = Some(Asked {
             generation: g,
             quit: match &older {
-                Some(older) => kill_pane::merge(&older.quit, quit),
+                Some(older) => kill_rules::merge(&older.quit, quit),
                 None => quit,
             },
             revealed: older.as_ref().is_some_and(|o| o.revealed) || rehide,
@@ -295,7 +300,7 @@ impl EditorQuitting {
     /// A second request joining the quit in flight.
     fn join(&self, quit: EditorQuit) {
         if let Some(asked) = self.in_flight.borrow_mut().as_mut() {
-            asked.quit = kill_pane::merge(&asked.quit, quit);
+            asked.quit = kill_rules::merge(&asked.quit, quit);
         }
     }
 
@@ -311,13 +316,13 @@ impl EditorQuitting {
             return false;
         };
         let watch = self.host.watched_call();
-        match kill_pane::nvim_state(watch.as_ref(), now) {
-            kill_pane::NvimState::NotAnswering => {
+        match kill_rules::nvim_state(watch.as_ref().map(nvim_answer).as_ref(), now) {
+            kill_rules::NvimState::NotAnswering => {
                 println!("[modules] editor: nvim has not answered since quit {g} was sent");
-                self.host.toast(kill_pane::not_answering_text(&quit));
+                self.host.toast(kill_rules::not_answering_text(&quit));
                 false
             }
-            kill_pane::NvimState::Returned => {
+            kill_rules::NvimState::Returned => {
                 self.settle(watch.as_ref());
                 false
             }
@@ -382,7 +387,7 @@ impl EditorQuitting {
     /// which leaves the kill.
     pub(crate) fn cancelled(&self, g: u32) -> Cancel {
         let mut in_flight = self.in_flight.borrow_mut();
-        if kill_pane::clear_if_cancelled(&mut in_flight, g).is_some() {
+        if kill_rules::clear_if_cancelled(&mut in_flight, g).is_some() {
             return Cancel::Cleared;
         }
         match in_flight.as_mut().filter(|asked| asked.lent_by == Some(g)) {
@@ -447,10 +452,10 @@ impl EditorQuitting {
 
     /// The window close once what it would ask was already asked (`confirmed`, the window close's
     /// prompt as it stood then): no second question unless what is running changed meanwhile
-    /// (`kill_pane::close_is_confirmed`).
+    /// (`kill_rules::close_is_confirmed`).
     pub(crate) fn close_after(&self, confirmed: Option<String>) {
         let now = self.host.window_close_prompt();
-        if kill_pane::close_is_confirmed(confirmed.as_deref(), now.as_deref()) {
+        if kill_rules::close_is_confirmed(confirmed.as_deref(), now.as_deref()) {
             println!("[window] closing: what the close would ask was already answered");
             self.host.close_window_confirmed();
         } else {
@@ -528,7 +533,7 @@ impl EditorQuitting {
     /// visible module.
     pub(crate) fn window_close_declined(&self) {
         let host = &self.host;
-        if !kill_pane::retire_on_declined_close(host.nvim_exited(), host.editor_gone()) {
+        if !kill_rules::retire_on_declined_close(host.nvim_exited(), host.editor_gone()) {
             return;
         }
         let retired = match host.retire_editor() {
@@ -891,7 +896,7 @@ mod tests {
         quitting.window_close();
         // Not answered since the send, for longer than the patience.
         *fake.watch.borrow_mut() = Some(CallWatch {
-            sent_at: Instant::now() - kill_pane::NVIM_QUIT_PATIENCE - Duration::from_secs(1),
+            sent_at: Instant::now() - kill_rules::NVIM_QUIT_PATIENCE - Duration::from_secs(1),
             done: false,
             returned: false,
             last_answer: None,

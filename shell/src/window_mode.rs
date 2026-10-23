@@ -13,7 +13,7 @@ use neovide_editor::NeovideEditorPane;
 
 use crate::chrome::TopBar;
 
-pub(crate) use eitri_core::wm::modes::{
+use eitri_core::wm::modes::{
     classify_window_notify, is_our_echo, setting_to_write, ModeEvent, WindowMode, WindowNotify,
 };
 

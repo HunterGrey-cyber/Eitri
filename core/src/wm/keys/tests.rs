@@ -1,6 +1,5 @@
 use super::*;
 use crate::alloc_count::bytes_allocated_by;
-use crate::keymap::prefix::WorkspacePick;
 use crate::keymap::{Action, KeySpec, Keymap};
 use crate::layout::{Axis, Layout, ModuleKeys, Node, Size};
 use crate::wm::chrome::ChromeModel;
@@ -198,7 +197,7 @@ impl Rig {
     }
 
     fn module_key(&self, module: &ModuleId, press: KeyPress) -> Verdict {
-        self.driver.key(WIN, &KeyStage::Module(module.clone()), press)
+        self.driver.key(WIN, &KeyStage::Module(module), press)
     }
 
     /// The prefix pressed and released: armed.
@@ -220,6 +219,16 @@ impl Rig {
 
     fn chrome(&self) -> ChromeModel {
         self.driver.query(|c| c.chrome(WIN))
+    }
+
+    /// What the chrome was last told the prefix waits for.
+    fn waiting(&self) -> Waiting {
+        self.driver.query(|c| c.prefix_shown(WIN)).expect("the window").0
+    }
+
+    /// The digits the last `select.number` drew.
+    fn plan(&self) -> Vec<(char, ModuleId)> {
+        self.driver.query(|c| c.prefix_shown(WIN)).expect("the window").1
     }
 
     fn notes(&self) -> Vec<String> {
@@ -494,16 +503,16 @@ fn a_pass_through_key_allocates_nothing_in_either_stage_or_on_release() {
     let r = driven(three(editor()));
     r.host.set_editor_running(true);
     let plain = key("a", K1);
-    let window_stage = KeyStage::Window;
-    let module_stage = KeyStage::Module(agent());
-    let editor_stage = KeyStage::Module(editor());
+    // Each stage is built inside the measured call, as a host builds it for every key: a stage that copied the
+    // module's name would allocate there.
+    let (agent, editor) = (agent(), editor());
     let driver = r.driver.clone();
-    let (verdict, bytes) = bytes_allocated_by(|| driver.key(WIN, &window_stage, plain.clone()));
+    let (verdict, bytes) = bytes_allocated_by(|| driver.key(WIN, &KeyStage::Window, plain.clone()));
     assert_eq!((verdict, bytes), (Verdict::PassThrough, 0), "the window stage");
-    let (verdict, bytes) = bytes_allocated_by(|| driver.key(WIN, &module_stage, plain.clone()));
+    let (verdict, bytes) = bytes_allocated_by(|| driver.key(WIN, &KeyStage::Module(&agent), plain.clone()));
     assert_eq!((verdict, bytes), (Verdict::PassThrough, 0), "the module stage");
     let chord = key("C-l", K2);
-    let (verdict, bytes) = bytes_allocated_by(|| driver.key(WIN, &editor_stage, chord));
+    let (verdict, bytes) = bytes_allocated_by(|| driver.key(WIN, &KeyStage::Module(&editor), chord));
     assert_eq!((verdict, bytes), (Verdict::PassThrough, 0), "nvim's own chord");
     let (watched, bytes) = bytes_allocated_by(|| driver.query(|c| c.watches_release(WIN, K1)));
     assert_eq!((watched, bytes), (false, 0), "a release nobody watches");
@@ -541,7 +550,7 @@ fn the_prefix_runs_its_command_through_the_runner_with_the_keycode() {
 }
 
 #[test]
-fn a_split_key_and_a_chooser_pick_go_to_the_shell_until_their_families_move() {
+fn a_split_key_places_here_and_a_chooser_pick_is_answered_here() {
     let keymap = Keymap::defaults();
     let split = keymap
         .bindings()
@@ -549,9 +558,6 @@ fn a_split_key_and_a_chooser_pick_go_to_the_shell_until_their_families_move() {
         .find(|b| matches!(b.action, Action::Split { axis: Axis::Row, .. }))
         .expect("a default split.right key")
         .clone();
-    let Action::Split { cwd, .. } = split.action else {
-        unreachable!()
-    };
     let module_keys = ModuleKeys::build(&[], &keymap).unwrap();
     assert_eq!(
         module_keys.module('t'),
@@ -562,36 +568,34 @@ fn a_split_key_and_a_chooser_pick_go_to_the_shell_until_their_families_move() {
     let r = driven(three(editor()));
     let mark = r.mark();
     assert_eq!(r.prefix_then(&split.key.to_string(), K1), Verdict::Consumed);
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Module(Axis::Row));
+    assert_eq!(r.waiting(), Waiting::Module(Axis::Row));
     assert_eq!(r.window_key(key("t", K2)), Verdict::Consumed);
-    assert_eq!(
-        r.shell_verbs_since(mark),
-        vec![ShellVerb {
-            win: WIN,
-            call: ShellCall::Place {
-                module: terminal(),
-                axis: Axis::Row,
-                cwd,
-            },
-            keycode: K2,
-        }]
-    );
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No);
+    assert!(r.shell_verbs_since(mark).is_empty(), "the split is decided here");
+    {
+        let layout = r.layout.borrow();
+        assert_eq!(layout.focus(), &terminal(), "the placed module takes the keys");
+        assert_eq!(
+            crate::layout::navigate(
+                &layout,
+                &editor(),
+                Direction::Right,
+                &crate::layout::Frame::new(GRID, 1)
+            ),
+            crate::layout::Nav::Module(terminal()),
+            "the terminal is placed right of the module that had the keys"
+        );
+    }
+    assert_eq!(r.waiting(), Waiting::No);
 
     r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K2 });
     r.driver.test_batch(|c| c.await_workspace(WIN));
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Workspace { deleting: false });
+    assert_eq!(r.waiting(), Waiting::Workspace { deleting: false });
     let mark = r.mark();
     assert_eq!(r.window_key(key("2", K3)), Verdict::Consumed);
-    assert_eq!(
-        r.shell_verbs_since(mark),
-        vec![ShellVerb {
-            win: WIN,
-            call: ShellCall::WorkspacePick(WorkspacePick::Switch(1)),
-            keycode: K3,
-        }]
-    );
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No);
+    assert!(r.shell_verbs_since(mark).is_empty());
+    assert_eq!(r.chrome().toast.unwrap().text, "no workspace 2");
+    assert!(r.notes().contains(&"[modules] refused: no workspace 2".into()));
+    assert_eq!(r.waiting(), Waiting::No);
 }
 
 #[test]
@@ -599,7 +603,7 @@ fn a_waiting_change_bumps_the_chrome_revision_and_announces_it() {
     let r = driven(three(editor()));
     let mark = r.mark();
     assert_eq!(r.window_key(key("C-b", PREFIX)), Verdict::Consumed);
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Command);
+    assert_eq!(r.waiting(), Waiting::Command);
     let ops = r.ops_since(mark);
     let revs: Vec<u64> = ops
         .iter()
@@ -608,14 +612,17 @@ fn a_waiting_change_bumps_the_chrome_revision_and_announces_it() {
             _ => None,
         })
         .collect();
-    assert_eq!(revs, vec![1], "the first change is the window's first revision");
+    assert_eq!(revs.len(), 1, "one announcement for the change: {ops:?}");
     let mark = r.mark();
     assert_eq!(r.window_key(escape_key(K1)), Verdict::Consumed);
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No);
+    assert_eq!(r.waiting(), Waiting::No);
     assert_eq!(
         r.ops_since(mark),
-        vec![HostOp::Chrome { win: WIN, rev: 2 }],
-        "no selection to put back: the change alone"
+        vec![HostOp::Chrome {
+            win: WIN,
+            rev: revs[0] + 1
+        }],
+        "no selection to put back: the change alone, the next revision"
     );
 }
 
@@ -630,7 +637,8 @@ fn the_prefixs_escape_puts_a_selected_container_back_on_the_module() {
         r.layout.borrow().selection(),
         crate::layout::Selection::Module
     ));
-    assert!(r.ops_since(mark).contains(&HostOp::ChromeHooks { win: WIN }));
+    assert!(chrome_ops(&r.ops_since(mark)) > 0, "the selection's text went");
+    assert_eq!(r.chrome().top_bar.selection, None);
     r.host.post(HostEvent::KeyReleased { win: WIN, keycode: K1 });
     let mark = r.mark();
     assert_eq!(
@@ -662,18 +670,18 @@ fn select_number_shows_the_digits_waits_and_ends_on_its_timer() {
         .unwrap();
     let last_chrome = ops.iter().rposition(|op| matches!(op, HostOp::Chrome { .. })).unwrap();
     assert!(shown < last_chrome, "the digits go up before the wait is announced");
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Number);
-    assert_eq!(r.chrome().prefix.plan, plan);
+    assert_eq!(r.waiting(), Waiting::Number);
+    assert_eq!(r.plan(), plan);
 
     let mark = r.mark();
     r.scheduler.advance(DISPLAY_PANES_TIME - Duration::from_millis(1));
     assert!(r.ops_since(mark).is_empty(), "nothing before the deadline");
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Number);
+    assert_eq!(r.waiting(), Waiting::Number);
     r.scheduler.advance(Duration::from_millis(1));
     let ops = r.ops_since(mark);
     assert_eq!(ops[0], HostOp::Hint(HintOp::Hide), "{ops:?}");
     assert_eq!(chrome_ops(&ops), 1);
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No);
+    assert_eq!(r.waiting(), Waiting::No);
     assert!(r
         .notes()
         .contains(&"[prefix] armed=false waiting=No (no digit in time)".to_string()));
@@ -694,7 +702,7 @@ fn a_digit_on_the_zoomed_module_keeps_the_zoom_and_arrives_only_if_the_grab_took
     let r = driven(layout);
     r.prefix_then(&bound(&Action::SelectNumber), K1);
     assert_eq!(
-        r.chrome().prefix.plan,
+        r.plan(),
         vec![('1', agent())],
         "zoomed, only the zoomed module is numbered"
     );
@@ -773,11 +781,7 @@ fn a_digit_for_a_module_gone_during_the_wait_moves_nothing() {
     );
     let r = driven(Layout::new(root, editor()).unwrap());
     r.prefix_then(&bound(&Action::SelectNumber), K1);
-    assert_eq!(
-        r.chrome().prefix.plan[2],
-        ('3', agent2()),
-        "the premise: the plan names agent#2"
-    );
+    assert_eq!(r.plan()[2], ('3', agent2()), "the premise: the plan names agent#2");
     {
         let layout = r.layout.clone();
         r.host.on_shell_verb(move |_, _, _, _| {
@@ -787,18 +791,14 @@ fn a_digit_for_a_module_gone_during_the_wait_moves_nothing() {
     // An agent's close while the digits show, through an arm the shell still runs.
     r.driver.run(WIN, Action::ModuleKill, Origin::Lua);
     assert!(!r.layout.borrow().contains(&agent2()));
-    assert_eq!(
-        r.chrome().prefix.waiting,
-        Waiting::Number,
-        "the kill does not end the wait"
-    );
+    assert_eq!(r.waiting(), Waiting::Number, "the kill does not end the wait");
     let mark = r.mark();
     assert_eq!(r.window_key(key("3", K2)), Verdict::Consumed);
     let ops = r.ops_since(mark);
     assert!(focus_to(&ops).is_empty(), "nothing gets the keys: {ops:?}");
     assert!(!ops.iter().any(|op| matches!(op, HostOp::Chat(ChatOp::Arrive { .. }))));
     assert!(ops.contains(&HostOp::Hint(HintOp::Hide)));
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No, "the wait is over");
+    assert_eq!(r.waiting(), Waiting::No, "the wait is over");
     assert!(!r.notes().iter().any(|line| line.contains("BUG")), "{:?}", r.notes());
 }
 
@@ -806,7 +806,7 @@ fn a_digit_for_a_module_gone_during_the_wait_moves_nothing() {
 fn losing_activation_or_a_click_during_a_wait_ends_it_and_hides_the_digits() {
     let r = driven(three(editor()));
     r.prefix_then(&bound(&Action::SelectNumber), K1);
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Number);
+    assert_eq!(r.waiting(), Waiting::Number);
     let mark = r.mark();
     r.host.post(HostEvent::Active {
         win: WIN,
@@ -815,11 +815,11 @@ fn losing_activation_or_a_click_during_a_wait_ends_it_and_hides_the_digits() {
     let ops = r.ops_since(mark);
     assert!(ops.contains(&HostOp::Hint(HintOp::Hide)), "{ops:?}");
     assert_eq!(chrome_ops(&ops), 1);
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No);
+    assert_eq!(r.waiting(), Waiting::No);
 
     r.host.post(HostEvent::Active { win: WIN, active: true });
     r.driver.test_batch(|c| c.await_workspace(WIN));
-    assert_eq!(r.chrome().prefix.waiting, Waiting::Workspace { deleting: false });
+    assert_eq!(r.waiting(), Waiting::Workspace { deleting: false });
     let mark = r.mark();
     r.host.post(HostEvent::Pointer {
         win: WIN,
@@ -833,7 +833,7 @@ fn losing_activation_or_a_click_during_a_wait_ends_it_and_hides_the_digits() {
     let ops = r.ops_since(mark);
     assert_eq!(chrome_ops(&ops), 1, "{ops:?}");
     assert!(!ops.contains(&HostOp::Hint(HintOp::Hide)), "the chooser drew no digits");
-    assert_eq!(r.chrome().prefix.waiting, Waiting::No, "the chooser's wait is over");
+    assert_eq!(r.waiting(), Waiting::No, "the chooser's wait is over");
 
     let mark = r.mark();
     r.host.post(HostEvent::Active {
@@ -976,13 +976,15 @@ fn copy_mode_outside_a_terminal_refuses() {
     r.native(&editor());
     let mark = r.mark();
     r.driver.run(WIN, Action::CopyMode { up: false }, Origin::Lua);
+    let ops = r.ops_since(mark);
+    assert!(
+        ops.iter().all(|op| matches!(op, HostOp::Chrome { .. })),
+        "the refusal moves nothing: {ops:#?}"
+    );
+    assert_eq!(chrome_ops(&ops), 1, "and announces the chrome it flashed");
     assert_eq!(
-        r.ops_since(mark),
-        vec![HostOp::Refuse {
-            win: WIN,
-            text: "prefix [ scrolls the terminal".into(),
-        }],
-        "the refusal alone"
+        r.chrome().toast.map(|toast| toast.text).as_deref(),
+        Some("prefix [ scrolls the terminal")
     );
 }
 

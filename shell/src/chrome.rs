@@ -4,8 +4,10 @@
 //! There is no bottom status bar. The pane cursors indicate keyboard focus.
 
 use std::path::Path;
+use std::rc::Rc;
 
-pub(crate) use eitri_core::wm::titles::{mark_text, project_display_name, step_item, window_title, workspace_text};
+use eitri_core::wm::titles::{project_display_name, window_title};
+use eitri_core::wm::{EntryEv, HostEvent, WinId};
 use gtk4::{prelude::*, ApplicationWindow};
 
 /// The top bar and the parts of it other modules act on.
@@ -23,13 +25,13 @@ pub(crate) struct TopBar {
     /// Where the tray goes, left of `↻` (`tray`). Its chips precede the other top-bar items;
     /// `main.rs` joins the two lists.
     pub(crate) tray: gtk4::Box,
-    /// `marked: <title>`, left of the tray, shown only while a module is marked ([`mark_text`]).
+    /// `marked: <title>`, left of the tray, shown only while a module is marked (the chrome model's `mark`).
     pub(crate) mark: gtk4::Label,
     /// `selected: <kind> (<titles>)`, beside the mark, shown only while a container is selected
-    /// (`tray::selection_text`). Set with [`show_mark`]: the same plain-text segment.
+    /// (the chrome model's `selection`). Set with [`show_mark`]: the same plain-text segment.
     pub(crate) selection: gtk4::Label,
     /// The current workspace's name, left of the selection and the mark, shown only while the window
-    /// has more than one workspace ([`workspace_text`], [`show_workspace`]). A top-bar item, ahead of
+    /// has more than one workspace (the chrome model's `workspace`, [`show_workspace`]). A top-bar item, ahead of
     /// the tray's chips: `h`/`l` and HINT reach it, and activating it opens the workspace chooser.
     pub(crate) workspace: gtk4::Button,
     /// The workspace button's text, set with [`show_workspace`] as plain text.
@@ -50,12 +52,46 @@ pub(crate) fn show_workspace(button: &gtk4::Button, label: &gtk4::Label, project
     }
 }
 
-/// Opens the rename entry holding `current`, selected, so typing replaces it.
-pub(crate) fn start_rename(entry: &gtk4::Entry, current: &str) {
+/// Shows the rename entry holding `current` as plain text, selected, so typing replaces it: what opening it and a
+/// new name while it is open both draw. The keys are given to it on their own, not here.
+pub(crate) fn fill_rename(entry: &gtk4::Entry, current: &str) {
     entry.set_text(current);
     entry.set_visible(true);
-    entry.grab_focus();
     entry.select_region(0, -1);
+}
+
+/// Hides the rename entry, holding nothing, so the next rename never shows what was typed before.
+pub(crate) fn close_rename(entry: &gtk4::Entry) {
+    entry.set_visible(false);
+    entry.set_text("");
+}
+
+/// The rename entry's own events, told to the controller and nothing else: `Enter` with the text typed, `Esc`, and
+/// the keys leaving it any other way (a click elsewhere, a key that moved them). What is renamed, where the keys go
+/// back to and when the entry closes are the controller's to decide, so the entry never renames, hides or refills
+/// itself.
+pub(crate) fn wire_rename_entry(entry: &gtk4::Entry, post: Rc<dyn Fn(HostEvent)>) {
+    let report: Rc<dyn Fn(EntryEv)> = Rc::new(move |ev| post(HostEvent::TopBarEntry { win: WinId::MAIN, ev }));
+    {
+        let report = report.clone();
+        entry.connect_activate(move |entry| report(EntryEv::Enter(entry.text().to_string())));
+    }
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let report = report.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk4::gdk::Key::Escape {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            report(EntryEv::Escape);
+            gtk4::glib::Propagation::Stop
+        });
+    }
+    entry.add_controller(keys);
+    let left = gtk4::EventControllerFocus::new();
+    left.connect_leave(move |_| report(EntryEv::LostKeys));
+    entry.add_controller(left);
 }
 
 /// Shows `text` on the mark label, or hides it. Plain text, never markup: a Lua panel's title is
@@ -235,8 +271,8 @@ mod tests {
     }
 
     /// A workspace name is the user's or a state file's text: the workspace button's label and the
-    /// rename entry are given it with `set_text`, only in `show_workspace` and `start_rename` (the
-    /// window's code sets no widget's text itself).
+    /// rename entry are given it with `set_text`, only in `show_workspace` and `fill_rename`, and the
+    /// entry is emptied only in `close_rename` (the window's code sets no widget's text itself).
     #[test]
     fn a_workspace_name_is_set_as_text_never_markup() {
         use eitri_core::source_scan as scan;
@@ -247,7 +283,8 @@ mod tests {
         let chrome = without_tests("shell/src/chrome.rs");
         for (setter, writes) in [
             ("show_workspace", "label.set_text("),
-            ("start_rename", "entry.set_text("),
+            ("fill_rename", "entry.set_text("),
+            ("close_rename", "entry.set_text("),
         ] {
             let bodies = scan::functions(&chrome, setter);
             assert_eq!(bodies.len(), 1, "{setter} is defined once");
@@ -272,7 +309,7 @@ mod tests {
             );
         }
         let outside_setters = {
-            let bodies: Vec<&str> = ["show_workspace", "start_rename"]
+            let bodies: Vec<&str> = ["show_workspace", "fill_rename", "close_rename"]
                 .iter()
                 .flat_map(|name| scan::functions(&chrome, name))
                 .collect();
@@ -283,7 +320,7 @@ mod tests {
                 let call = format!("{widget}{setter}");
                 assert!(
                     !outside_setters.contains(&call),
-                    "chrome.rs calls {call} outside show_workspace and start_rename"
+                    "chrome.rs calls {call} outside show_workspace, fill_rename and close_rename"
                 );
             }
         }

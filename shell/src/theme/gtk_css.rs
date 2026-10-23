@@ -276,8 +276,8 @@ window {{
 }}
 
 /* A layout verb was refused -- `Ctrl+a x` on the last module on screen: the
-   same block, for 200ms (`main.rs`'s `refuse`). Its own class, so the prefix's own indicator is
-   never switched off by the flash ending. */
+   same block, for 200ms (`main.rs`'s `show_flash`, when the controller's chrome model asks for the
+   flash). Its own class, so the prefix's own indicator is never switched off by the flash ending. */
 .topbar-app-name.refused {{
     background-color: {chrome_fg};
     color: {chrome};
@@ -297,7 +297,7 @@ window {{
 
 /* The window-close y/n and `prefix x`'s kill y/n:
    `.module-toast`'s own colours, `shell::close_prompt`'s own widget. Sized to sit inside
-   the top bar's own strip, where the prefix strip just drew (`close_prompt::prompt_origin`). */
+   the top bar's own strip, where the prefix strip just drew (`eitri_core::wm::close::prompt_origin`). */
 .close-prompt {{
     background-color: {chrome};
     color: {chrome_fg};

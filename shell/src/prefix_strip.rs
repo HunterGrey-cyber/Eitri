@@ -1,7 +1,6 @@
 //! The top bar draws core's prefix strip pieces as plain labels separated by dots.
 
 use eitri_core::wm::prefix_strip::StripPiece;
-pub(crate) use eitri_core::wm::prefix_strip::{number_pieces, strip_pieces, workspace_digit, workspace_pieces};
 use gtk4::prelude::*;
 
 /// The separator between two runs.

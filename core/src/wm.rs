@@ -12,6 +12,7 @@ pub mod feeds;
 pub mod focus;
 pub mod grid;
 pub mod host;
+pub mod instances;
 pub mod keys;
 pub mod lua;
 pub mod modes;

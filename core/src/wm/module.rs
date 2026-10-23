@@ -149,17 +149,8 @@ impl Lifecycle {
     }
 
     /// Host facts never mutate the layout; the shell has already placed or removed the surface.
-    pub fn on_event(&mut self, win: WinId, event: &HostEvent, layout: &Layout, batch: &mut Batch) {
+    pub fn on_event(&mut self, win: WinId, event: &HostEvent, _layout: &Layout, batch: &mut Batch) {
         self.record_event(win, event);
-        if let HostEvent::Declared {
-            win: event_win, module, ..
-        } = event
-        {
-            if *event_win == win {
-                self.declared(win, module, layout, batch);
-            }
-            return;
-        }
         if let HostEvent::SurfaceEnded {
             win: event_win,
             module,
@@ -194,58 +185,9 @@ impl Lifecycle {
         }
     }
 
-    /// A module is declared once the shell has placed it, after the change that showed it was heard, so
-    /// a terminal already on screen gets its shell from the layout as it stands; nothing else of a
-    /// declared module waits on its first show.
-    fn declared(&self, win: WinId, id: &ModuleId, layout: &Layout, batch: &mut Batch) {
-        let Some(module) = self.modules.iter().find(|m| &m.decl.module == id && m.hosted()) else {
-            return;
-        };
-        if layout.is_shown(id)
-            && matches!(module.decl.kind, SurfaceKind::Terminal { .. })
-            && module.terminal == TermRun::NotStarted
-        {
-            batch.push_effect(HostOp::Terminal(TermOp::Start {
-                win,
-                module: id.clone(),
-            }));
-        }
-    }
-
     /// These facts remain valid even when a shell closure still holds the layout's borrow.
     pub(super) fn record_event(&mut self, win: WinId, event: &HostEvent) {
         let (event_win, id) = match event {
-            HostEvent::Declared {
-                win: event_win,
-                module,
-                kind,
-            } => {
-                if *event_win != win {
-                    return;
-                }
-                // A kill already forgot the old shell, so a shell running in a hosted entry is this
-                // instance's own, started before its declaration arrived: forgetting it would start it again.
-                let running = self
-                    .modules
-                    .iter()
-                    .find(|m| &m.decl.module == module && m.hosted())
-                    .map(|m| m.terminal.clone())
-                    .filter(|run| matches!(run, TermRun::Running { .. }));
-                self.declare(
-                    &SurfaceDecl {
-                        module: module.clone(),
-                        kind: kind.clone(),
-                        deferred: false,
-                    },
-                    true,
-                );
-                if let Some(run) = running.filter(|_| matches!(kind, SurfaceKind::Terminal { .. })) {
-                    if let Some(entry) = self.modules.iter_mut().find(|m| &m.decl.module == module) {
-                        entry.terminal = run;
-                    }
-                }
-                return;
-            }
             HostEvent::Terminal(TermEvent::Started { win, module, .. } | TermEvent::Exited { win, module })
             | HostEvent::SurfaceEnded { win, module, .. }
             | HostEvent::Refused {
@@ -486,11 +428,12 @@ mod tests {
             driven
         }
 
+        /// Declared afresh, as a new instance's placement declares it.
         fn declare(&self, decl: &SurfaceDecl) {
-            self.driver.post(HostEvent::Declared {
-                win: WIN,
-                module: decl.module.clone(),
-                kind: decl.kind.clone(),
+            let decl = decl.clone();
+            self.driver.test_batch(move |c| {
+                c.lifecycle_mut(WIN).unwrap().declare(&decl, true);
+                Batch::default()
             });
         }
 
@@ -500,13 +443,14 @@ mod tests {
         }
 
         /// The lifecycle's ops. The "has the keys" signals a lifecycle event also brings are the focus family's,
-        /// whose own tests hold them, so they are left out here.
+        /// and the chrome's announcements are the chrome model's, whose own tests hold them, so both are left out
+        /// here.
         fn ops(&self) -> Vec<HostOp> {
             self.host
                 .log()
                 .into_iter()
                 .filter_map(|entry| match entry {
-                    Logged::Op(op, _) if !is_cursor_signal(&op) => Some(op),
+                    Logged::Op(op, _) if !is_cursor_signal(&op) && !matches!(op, HostOp::Chrome { .. }) => Some(op),
                     _ => None,
                 })
                 .collect()
@@ -521,19 +465,15 @@ mod tests {
             self.driver.first_apply(WIN, hosted);
         }
 
-        /// The ops but those that lay out or redraw the window: the first layout batch's maps, its restack and
-        /// allocation and its chrome hooks, around the lifecycle's effects.
+        /// The ops but those that lay out the window: the first layout batch's maps, its restack and its
+        /// allocation, around the lifecycle's effects.
         fn effects(&self) -> Vec<HostOp> {
             self.ops()
                 .into_iter()
                 .filter(|op| {
                     !matches!(
                         op,
-                        HostOp::Map { .. }
-                            | HostOp::Unmap { .. }
-                            | HostOp::Restack { .. }
-                            | HostOp::Allocate { .. }
-                            | HostOp::ChromeHooks { .. }
+                        HostOp::Map { .. } | HostOp::Unmap { .. } | HostOp::Restack { .. } | HostOp::Allocate { .. }
                     )
                 })
                 .collect()
@@ -546,7 +486,7 @@ mod tests {
         fn shell(&self, arm: impl Fn(&mut Layout) + 'static) {
             let layout = self.layout.clone();
             self.host.on_shell_verb(move |_, _, _, _| arm(&mut layout.borrow_mut()));
-            self.driver.run(WIN, Action::Module(ModuleId::terminal()), Origin::Lua);
+            self.driver.run(WIN, Action::PanelReload, Origin::Lua);
         }
 
         fn show(&self, module: &ModuleId) {
@@ -740,49 +680,6 @@ mod tests {
         assert_eq!(d.state(&t.module), Some(ModuleState::Hosted));
         d.show(&t.module);
         assert_eq!(d.ops(), vec![start(&t.module)]);
-    }
-
-    #[test]
-    fn a_reused_terminal_whose_shell_started_before_its_declaration_is_not_started_again() {
-        let t = terminal("terminal#2");
-        let d = Driven::hosted(&[t.clone()], &[]);
-        d.started(&t.module);
-        let id = t.module.clone();
-        d.shell(move |layout| {
-            kill(layout, &id, Reopen::At(Placement::BelowEditor), &frame()).unwrap();
-        });
-        d.ended(&t.module, Reopen::At(Placement::BelowEditor));
-        d.show(&t.module);
-        assert_eq!(d.ops(), vec![start(&t.module)]);
-        d.started(&t.module);
-        d.declare(&t);
-        d.changed();
-        assert_eq!(
-            d.ops(),
-            vec![start(&t.module)],
-            "its running shell needs no second start"
-        );
-    }
-
-    #[test]
-    fn a_terminal_declared_after_the_change_that_showed_it_starts_its_shell() {
-        let shown = terminal("terminal#2");
-        let hidden = terminal("terminal#3");
-        let d = Driven::open(
-            &[shown.clone(), hidden.clone()],
-            &[hidden.module.clone()],
-            EditorPresence::Owned,
-        );
-        // The open's own change came first and found nothing declared.
-        d.changed();
-        assert!(d.ops().is_empty());
-        d.declare(&shown);
-        d.declare(&hidden);
-        assert_eq!(d.ops(), vec![start(&shown.module)]);
-        // Its shell runs: the next change starts nothing more, and a show of the other starts that one.
-        d.started(&shown.module);
-        d.show(&hidden.module);
-        assert_eq!(d.since(1), vec![start(&hidden.module)]);
     }
 
     #[test]

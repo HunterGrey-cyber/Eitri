@@ -10,8 +10,8 @@
 //! terminal's session thread. One small procfs read per terminal, made only when a close or a kill
 //! asks, never on a timer, so it is cheap enough for the GTK thread.
 
-use super::registry::Terminals;
 use super::TerminalPane;
+use crate::gtk_host::instance_pool::InstancePool;
 
 /// Reads one `/proc/<pid>/stat` line: `Some(true)` when the controlling terminal's foreground group
 /// is set and differs from the process's own group, `Some(false)` when it is the process's own group
@@ -49,7 +49,7 @@ pub(crate) fn has_foreground_job(shell_pid: u32) -> bool {
 
 /// How many of the window's terminals run a job: every pane it holds, the base terminal, each live
 /// instance and the idle pool alike, since a hidden terminal's job ends with the window too.
-pub(crate) fn count_terminal_jobs(terminals: &Terminals<TerminalPane>) -> usize {
+pub(crate) fn count_terminal_jobs(terminals: &InstancePool<TerminalPane>) -> usize {
     terminals
         .each()
         .filter_map(TerminalPane::shell_pid)

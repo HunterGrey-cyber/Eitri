@@ -221,7 +221,7 @@ pub enum KeyAction {
 }
 
 /// `Ctrl+a <key>` on `id` (its four cases). The terminal's own `Ctrl+a t` is the same rule
-/// (`shell::terminal::toggle_action`), with its shell started on the way.
+/// (`wm::verbs::modules`' terminal key), with its shell started on the way.
 pub fn key_action(layout: &Layout, id: &ModuleId, has_keys: bool) -> KeyAction {
     if !layout.contains(id) {
         KeyAction::Place

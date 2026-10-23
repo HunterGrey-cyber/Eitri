@@ -67,14 +67,13 @@ fn a_refused_verb_emits_no_allocate_and_is_no_change_for_the_saver() {
     let scratch = Scratch::new("refused-verb");
     let mut r = rig_with(fixture("row(editor, agent hidden)"), saving(&scratch));
     let before = r.layout.borrow().clone();
+    let said = r.said();
     let batch = r.run(Action::ToggleSplit);
-    assert_eq!(
-        ops(&batch),
-        vec![refuse("toggle-split: no split around the module on screen")]
-    );
+    r.assert_refused(&batch, &said, "toggle-split: no split around the module on screen");
     assert!(batch.lua().is_empty() && batch.shell_verb().is_none());
     assert_eq!(*r.layout.borrow(), before);
-    assert!(r.scheduler.armed().is_empty(), "no save is armed for a refusal");
+    let save_armed = r.controller.window_mut(WIN).map(|w| w.save_timer.is_some());
+    assert_eq!(save_armed, Some(false), "no save is armed for a refusal");
     assert!(r
         .controller
         .notes(WIN)
@@ -86,17 +85,27 @@ fn a_verb_that_changes_the_layout_arms_the_save_and_redraws_after_its_layout_ops
     let scratch = Scratch::new("changed-verb");
     let mut r = rig_with(fixture("row(editor, agent)"), saving(&scratch));
     assert!(r.scheduler.armed().is_empty(), "the first apply is not a change");
+    let derived = r.controller.chrome_derivations(WIN);
     let batch = r.run(Action::ToggleSplit);
-    let ops = ops(&batch);
     assert_eq!(
         moves(&batch),
         vec![allocate()],
         "nothing comes or goes; the grid allocates"
     );
-    let allocated = ops.iter().position(|op| *op == allocate()).unwrap();
-    let hooks = ops.iter().position(|op| *op == chrome_hooks()).unwrap();
-    assert!(allocated < hooks, "the change hooks follow the layout ops: {ops:#?}");
+    assert!(
+        r.controller.chrome_derivations(WIN).tray > derived.tray,
+        "what the layout shows is derived again"
+    );
     assert_eq!(r.scheduler.armed().len(), 1, "the save's debounce is armed");
+    // A change the chrome shows announces it after the layout ops.
+    let batch = r.run(Action::Zoom);
+    let all: Vec<HostOp> = batch.ops().cloned().collect();
+    let allocated = all.iter().position(|op| *op == allocate()).unwrap();
+    let chrome = all
+        .iter()
+        .position(|op| matches!(op, HostOp::Chrome { .. }))
+        .expect("the zoom put the other module's chip up, so the chrome changed");
+    assert!(allocated < chrome, "the chrome follows the layout ops: {all:#?}");
 }
 
 #[test]
@@ -126,7 +135,10 @@ fn the_first_apply_maps_every_visible_hosted_module_and_restacks_the_floats() {
             allocate(),
         ]
     );
-    assert_eq!(ops(&r.first).last(), Some(&chrome_hooks()));
+    assert!(
+        matches!(r.first.ops().last(), Some(HostOp::Chrome { .. })),
+        "the chrome is announced after the layout ops"
+    );
 }
 
 #[test]
@@ -244,8 +256,9 @@ fn a_resize_steps_by_the_editors_cell_or_the_fallback_cell() {
 #[test]
 fn a_container_verb_with_no_container_flashes_without_a_toast() {
     let mut r = rig(fixture("row(editor, agent hidden)"));
+    let said = r.said();
     let batch = r.run(Action::ContainerTabbed);
-    assert_eq!(ops(&batch), vec![refuse("")]);
+    r.assert_refused(&batch, &said, "");
     assert!(r
         .controller
         .notes(WIN)
@@ -257,25 +270,34 @@ fn a_focus_parent_redraws_the_selection_and_is_no_change_for_the_grid() {
     let mut r = rig(fixture("row(editor, column(agent focus, terminal))"));
     let batch = r.run(Action::FocusParent);
     assert!(matches!(r.layout.borrow().selection(), Selection::Con(_)));
-    assert_eq!(ops(&batch), vec![chrome_hooks()]);
+    assert!(ops(&batch).is_empty() && announced(&batch), "{batch:?}");
+    assert!(r.controller.chrome(WIN).top_bar.selection.is_some());
     // Up to the root, then nothing above it.
-    let mut last = Batch::default();
-    for _ in 0..3 {
-        last = r.run(Action::FocusParent);
+    for _ in 0..2 {
+        r.run(Action::FocusParent);
     }
-    assert_eq!(ops(&last), vec![refuse("focus.parent: nothing to select")]);
+    let said = r.said();
+    let last = r.run(Action::FocusParent);
+    r.assert_refused(&last, &said, "focus.parent: nothing to select");
 }
 
 #[test]
 fn the_mark_verbs_redraw_the_mark_without_moving_a_host() {
     let mut r = rig(fixture("row(editor, agent)"));
     let marked = r.run(Action::MarkToggle);
-    assert_eq!(ops(&marked), vec![chrome_hooks()]);
+    assert!(ops(&marked).is_empty() && announced(&marked), "{marked:?}");
     assert_eq!(r.layout.borrow().mark(), Some(&ModuleId::editor()));
+    assert!(r.controller.chrome(WIN).top_bar.mark.is_some());
     let cleared = r.run(Action::MarkClear);
-    assert_eq!(ops(&cleared), vec![chrome_hooks()]);
+    assert!(ops(&cleared).is_empty() && announced(&cleared), "{cleared:?}");
+    assert_eq!(r.controller.chrome(WIN).top_bar.mark, None);
+    let derived = r.controller.chrome_derivations(WIN).top_bar;
     let none = r.run(Action::MarkClear);
-    assert_eq!(ops(&none), vec![chrome_hooks()], "the mark's text is redrawn as before");
+    assert!(ops(&none).is_empty() && !announced(&none), "nothing changed: {none:?}");
+    assert!(
+        r.controller.chrome_derivations(WIN).top_bar > derived,
+        "the mark's text is derived again as before"
+    );
     assert!(r
         .controller
         .notes(WIN)

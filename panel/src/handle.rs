@@ -1588,22 +1588,11 @@ impl AgentPanelHandle {
         }
         let ids: Vec<TabId> = {
             let state = self.state.borrow();
-            let ids: Vec<TabId> = if view.is_base() {
-                state.tabs.base_tabs()
-            } else {
-                state.tabs.tab_in(view).into_iter().collect()
-            };
-            if ids
-                .iter()
-                .any(|id| state.tabs.get(*id).is_some_and(|t| t.pending_handoff.is_some()))
-            {
-                return Err("a tab is still being handed off to a terminal; kill the chat once that finishes");
+            // Checked for every tab first, so a refusal closes none of them.
+            if let Some(why) = tabs_cannot_close(&state, view) {
+                return Err(why);
             }
-            // Checked for every tab first, as above, so a refusal closes none of them.
-            if ids.iter().any(|id| state.tabs.is_moving(*id)) {
-                return Err("a tab is moving to the other window; kill the chat once that finishes");
-            }
-            ids
+            view_tabs(&state, view)
         };
         self.run(|state, out| {
             for id in &ids {
@@ -1617,6 +1606,42 @@ impl AgentPanelHandle {
             tell_emptied_views(state, out);
             Ok(ids.len())
         })
+    }
+
+    /// Why `view`'s tabs cannot close now, in the words [`Self::close_view_tabs`] refuses with: one is being handed
+    /// off to a terminal, or moving to the other window. `None` when they can, as a kill of the view asks first.
+    pub fn tabs_cannot_close(&self, view: ViewId) -> Option<&'static str> {
+        self.wake();
+        tabs_cannot_close(&self.state.borrow(), view)
+    }
+
+    /// Whether `prefix !` from the base view can break a tab out now, asked before a new view is made for it: the
+    /// base view keeps a tab of its own, so it needs two. The refusal's words when it cannot.
+    pub fn can_break_out(&self) -> Result<(), String> {
+        self.wake();
+        if self.closing() {
+            return Err("the window is closing".to_string());
+        }
+        if self.state.borrow().tabs.base_tabs().len() < 2 {
+            return Err(eitri_core::tab_set::ViewError::OneTabLeft.to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::open_in`] can give the extra view `view` a new empty tab now, asked before a new view is
+    /// placed for it. The refusal's words when it cannot.
+    pub fn can_open_in(&self, view: ViewId) -> Result<(), String> {
+        self.wake();
+        if self.closing() {
+            return Err("the window is closing".to_string());
+        }
+        if view.is_base() {
+            return Err(eitri_core::tab_set::ViewError::NotAnExtraView.to_string());
+        }
+        if self.state.borrow().tabs.tab_in(view).is_some() {
+            return Err(eitri_core::tab_set::ViewError::Taken(view).to_string());
+        }
+        Ok(())
     }
 
     /// `prefix !` (tmux's `break-pane`) with the keys in the base view: its active tab moves to the
@@ -1786,6 +1811,30 @@ impl AgentPanelHandle {
         }
         state.tabs.queued_count()
     }
+}
+
+/// The tabs a kill of `view` closes: every base-view tab for the base view, else the one tab it shows.
+fn view_tabs(state: &AgentPanelState, view: ViewId) -> Vec<TabId> {
+    if view.is_base() {
+        state.tabs.base_tabs()
+    } else {
+        state.tabs.tab_in(view).into_iter().collect()
+    }
+}
+
+/// Why `view`'s tabs cannot close now: one is being handed off to a terminal, or moving to the other window.
+fn tabs_cannot_close(state: &AgentPanelState, view: ViewId) -> Option<&'static str> {
+    let ids = view_tabs(state, view);
+    if ids
+        .iter()
+        .any(|id| state.tabs.get(*id).is_some_and(|t| t.pending_handoff.is_some()))
+    {
+        return Some("a tab is still being handed off to a terminal; kill the chat once that finishes");
+    }
+    if ids.iter().any(|id| state.tabs.is_moving(*id)) {
+        return Some("a tab is moving to the other window; kill the chat once that finishes");
+    }
+    None
 }
 
 #[cfg(test)]

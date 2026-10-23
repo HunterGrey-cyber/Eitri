@@ -12,12 +12,16 @@
 //!   the driver posts `LayoutChangedByShell` last, so everything the arm caused is heard before the layout is re-read.
 //!   A `Focus` op's `on_grab` ops run right after it, and only when the grab took; a `HostOp::Lua` among them waits
 //!   for the end of the batch's Lua ops, so Lua never runs in the middle of a batch.
+//! - A `CreateSurface` op the host carried out is answered with `Created`, queued behind what the op itself caused:
+//!   besides a `Focus` op's tail, the one place an op's answer is read.
 //! - `key` and `close_requested` answer synchronously. A key that arrives while the driver is busy is answered from
 //!   the decider as it stands, its batch queued, and counted; every close request prints the count, so a run's log
 //!   shows whether a key ever arrived re-entrantly.
 //! - `focus_now` is for a shell verb's arm, which still moves keys itself between a map and an unmap: it applies the
 //!   decider's focus batch at once and answers whether the grab took. It is refused while a batch's ops apply.
 //! - The decider is never borrowed while the host runs an op or an arm, and `query` copies its answer out.
+//! - Each time the queue empties the decider is asked what it judges against the state the batches left
+//!   ([`Decide::after_drain`]); its batch applies like any other, and the queue drains again after it.
 //! - The grid's allocation ([`Allocator`]) is answered at once from inside the toolkit's allocation, and may come
 //!   while a batch applies: it borrows the decider for its own duration only, and what it causes (a pin settled)
 //!   is posted deferred.
@@ -104,9 +108,9 @@ impl<C: Decide> Driver<C> {
         }
     }
 
-    /// Decides a key at one capture stage and answers at once, as the toolkit's handler needs. The stage is borrowed:
-    /// a module's host builds its own once, so no key on its way into a module copies the module's name.
-    pub fn key(&self, win: WinId, stage: &KeyStage, press: KeyPress) -> Verdict {
+    /// Decides a key at one capture stage and answers at once, as the toolkit's handler needs. A module's stage
+    /// borrows the module's name, so no key on its way into a module copies it.
+    pub fn key(&self, win: WinId, stage: &KeyStage<'_>, press: KeyPress) -> Verdict {
         if self.busy.get() {
             let count = self.nested_keys.get() + 1;
             self.nested_keys.set(count);
@@ -235,7 +239,15 @@ impl<C: Decide> Driver<C> {
             // The queue's borrow ends with this statement, so whatever the item causes may queue more.
             let next = self.queue.borrow_mut().pop_front();
             match next {
-                None => break,
+                None => {
+                    // What is judged against the state every batch before it left; what that causes is queued
+                    // and drained as anything else, and judged again once it has.
+                    let batch = self.decide.borrow_mut().after_drain();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    self.apply(batch);
+                }
                 Some(Item::Event(event)) => {
                     let batch = self.decide.borrow_mut().handle(event);
                     self.apply(batch);
@@ -283,6 +295,14 @@ impl<C: Decide> Driver<C> {
         self.op_index.set(Some(*index));
         *index += 1;
         let applied = self.host.apply(op);
+        // A surface made at run time is added to the layout only once it exists: the batch that adds it is decided
+        // after this one, from the event, which waits its turn behind whatever this batch causes.
+        if let (HostOp::CreateSurface { win, module, .. }, Applied::Done) = (op, applied) {
+            self.queue.borrow_mut().push_back(Item::Event(HostEvent::Created {
+                win: *win,
+                module: module.clone(),
+            }));
+        }
         if let HostOp::Focus { on_grab, .. } = op {
             if applied == Applied::Done {
                 for tail in on_grab {
@@ -318,7 +338,51 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
-    /// The workspace chooser was drawn by an arm still in the shell: the window's prefix waits for its key
+    /// A plugin's follow command for its module ([`Controller::follow`]): shown with the keys where they are, or
+    /// hidden as any hide is, through the runner's gates.
+    pub fn follow(&self, win: WinId, module: &ModuleId, show: bool) {
+        let batch = self.decide.borrow_mut().follow(win, module, show);
+        self.submit(batch);
+    }
+
+    /// What `win`'s module verbs place and kill by ([`Controller::set_module_setup`]).
+    pub fn set_module_setup(&self, win: WinId, setup: super::verbs::modules::ModuleSetup) {
+        self.decide.borrow_mut().set_module_setup(win, setup);
+    }
+
+    /// A named terminal or chat view made straight into the scratchpad ([`Controller::scratch_new`]).
+    pub fn scratch_new(&self, win: WinId, module: &ModuleId) {
+        let batch = self.decide.borrow_mut().scratch_new(win, module);
+        self.submit(batch);
+    }
+
+    /// `tab.break`'s new chat view ([`Controller::tab_break`]).
+    pub fn tab_break(&self, win: WinId) {
+        let batch = self.decide.borrow_mut().tab_break(win);
+        self.submit(batch);
+    }
+
+    /// A kill with no y/n ([`Controller::kill_confirmed`]).
+    pub fn kill_confirmed(&self, win: WinId, module: &ModuleId) {
+        let batch = self.decide.borrow_mut().kill_confirmed(win, module);
+        self.submit(batch);
+    }
+
+    /// The covered chat view `view` revealed ([`Controller::reveal_chat`]): the scratch floats over it put away,
+    /// and what still covers it, as the refusal's text, when one does.
+    pub fn reveal_chat(&self, win: WinId, view: crate::tabs::ViewId) -> Option<String> {
+        let (batch, still) = self.decide.borrow_mut().reveal_chat(win, view);
+        self.submit(batch);
+        still
+    }
+
+    /// What the window's chrome names things by ([`Controller::set_titles`]).
+    pub fn set_titles(&self, win: WinId, titles: super::chrome::ChromeTitles) {
+        let batch = self.decide.borrow_mut().set_titles(win, titles);
+        self.submit(batch);
+    }
+
+    /// The workspace chooser opened from the top bar's workspace name: the window's prefix waits for its key
     /// ([`Controller::await_workspace`]).
     pub fn await_workspace(&self, win: WinId) {
         let batch = self.decide.borrow_mut().await_workspace(win);
@@ -486,7 +550,7 @@ mod tests {
         }
         fn key(&mut self, win: WinId, stage: &KeyStage, press: &KeyPress) -> (Verdict, Batch) {
             self.trace
-                .mark(Seen::Asked(Call::Key(win, stage.clone(), press.clone())));
+                .mark(Seen::Asked(Call::Key(win, stage.module().cloned(), press.clone())));
             self.inner.key(win, stage, press)
         }
         fn close_requested(&mut self, win: WinId, by: CloseBy) -> (CloseVerdict, Batch) {

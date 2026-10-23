@@ -20,8 +20,8 @@
 //!   saved shown, so a relaunch opens with it where it was ([`Layout::saved_hidden`]; it used to be
 //!   saved hidden, and a relaunch opened without the editor until `prefix e`). One the user had
 //!   hidden stays hidden. The
-//!   precedent is this project's own rule for nvim's quit prompt (`shell`'s `kill_pane::Reveal::
-//!   rehide`): what the window saves is the user's arrangement, not what a close or a quit did to
+//!   precedent is this project's own rule for nvim's quit prompt ([`crate::wm::close::Reveal::
+//!   rehide`]): what the window saves is the user's arrangement, not what a close or a quit did to
 //!   it -- and a first launch, which is what `Reopen::At` restores for every other module, shows the
 //!   editor.
 //!
@@ -35,7 +35,7 @@ use super::tree::{place_new, Layout, LayoutError};
 
 /// The Lua `shell` has nvim run to quit the editor -- `prefix x` on it, and every window close
 /// -- carrying `generation`, the quit's own number, bumped by `shell` before
-/// each send (`kill_pane::QuitInFlight`), so a cancel can be told apart from a later, different
+/// each send ([`crate::wm::close::QuitInFlight`]), so a cancel can be told apart from a later, different
 /// quit of the same editor.
 ///
 /// **Sent as an RPC request (`nvim_exec_lua`), never typed.** It used to go

@@ -28,11 +28,14 @@ use gtk4::prelude::*;
 mod own_x_server;
 
 // `close_prompt.rs` reads its keys through `crate::gtk_host::keys::key_press`: the real translator,
-// so the prompt answers the keys the product's capture hands it.
+// so the prompt answers the keys the product's capture hands it; and it measures itself as the
+// chrome's reconcile reads it (`gtk_host::chrome::PromptMeasures`).
 // The directory is named on the outer module: a path through a `tests/gtk_host/` that does not
 // exist would not resolve.
 #[path = "../src/gtk_host"]
 mod gtk_host {
+    #[allow(dead_code, unused_imports)]
+    pub(crate) mod chrome;
     #[allow(dead_code, unused_imports)]
     pub(crate) mod keys;
 }

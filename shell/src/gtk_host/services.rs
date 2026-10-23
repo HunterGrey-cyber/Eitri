@@ -8,6 +8,10 @@
 //! controller from where GTK reports the keys; the literal key `send-prefix` and `send-keys` hand to
 //! the module with the keys; the terminal's copy mode; and the navigation key a chat page claimed.
 //!
+//! A module's kill and a new instance end and begin here as well: a terminal's shell hung up, its directory read for
+//! a split, an idle pane's next start directory; a chat view's tabs closed, its first tab opened or broken out of the
+//! base view, and the views the workspaces still hold told to the panel.
+//!
 //! Given to the GTK host once, before the startup layout's first batch (`GtkHost::set_services`).
 //! An op this shell does not carry out yet is answered with the host's refusal.
 //!
@@ -15,19 +19,22 @@
 //! kernel phase, and the events the start emits.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use eitri_core::layout::ModuleId;
-use eitri_core::wm::{ChatOp, EditorCall, LuaOp, PluginOp, TermOp};
+use eitri_core::tabs::ViewId;
+use eitri_core::wm::{ChatOp, EditorCall, HostEvent, HostSink, LuaOp, PluginOp, TermEvent, TermOp, WinId};
 use gtk4::prelude::*;
 use neovide_editor::NeovideEditorPane;
 
 use crate::agent_panel::AgentPanelHandle;
+use crate::gtk_host::instance_pool::InstancePool;
 use crate::gtk_host::{LuaRunner, ServiceSet, NOT_CARRIED_OUT};
 use crate::lua::LuaEngine;
 use crate::plugin_panels::PluginPanels;
-use crate::terminal::registry::{Pane, Terminals};
+use crate::terminal::registry::Pane;
 use crate::terminal::TerminalPane;
 use crate::webview_crash_guard::WebViewCrashGuard;
 
@@ -55,7 +62,10 @@ impl ShellPane for TerminalPane {
 
 /// Starts `module`'s pane unless a shell already runs in it; whether it started one. The registry is
 /// released before the start, which may spawn and report from inside.
-pub(crate) fn start_pane<P: ShellPane>(terminals: &RefCell<Terminals<P>>, module: &ModuleId) -> Result<bool, String> {
+pub(crate) fn start_pane<P: ShellPane>(
+    terminals: &RefCell<InstancePool<P>>,
+    module: &ModuleId,
+) -> Result<bool, String> {
     let pane = match terminals.try_borrow() {
         Ok(terminals) => terminals.get(module).cloned(),
         Err(_) => {
@@ -74,14 +84,39 @@ pub(crate) fn start_pane<P: ShellPane>(terminals: &RefCell<Terminals<P>>, module
     Ok(true)
 }
 
+/// Takes `module`'s idle pane back live, its next shell to start in `dir`: a new instance under a number a kill left
+/// idle asks no create, so this is where its directory comes from. A live pane only gets the directory.
+pub(crate) fn revive_pane(
+    terminals: &RefCell<InstancePool<TerminalPane>>,
+    module: &ModuleId,
+    dir: PathBuf,
+) -> Result<(), String> {
+    let pane = match terminals.try_borrow_mut() {
+        Ok(mut terminals) => terminals.revive(module),
+        Err(_) => return Err(format!("{module}: the terminal registry was borrowed")),
+    };
+    let pane = pane.ok_or_else(|| format!("{module} has no pane to take back"))?;
+    pane.set_start_dir(dir);
+    Ok(())
+}
+
+/// The chat views whose removal is their caller's own while their tabs close or open: the panel's word that such a
+/// view holds no tab is then not a request to remove it.
+pub(crate) type ChatBusy = Rc<RefCell<BTreeSet<ViewId>>>;
+
 /// The window's services, as the host's ops reach them.
 pub(crate) struct Services {
     /// `None` in a window with no editor, where an editor op has nothing to reach.
     pub(crate) editor: Option<Rc<NeovideEditorPane>>,
-    pub(crate) terminals: Rc<RefCell<Terminals<TerminalPane>>>,
+    pub(crate) terminals: Rc<RefCell<InstancePool<TerminalPane>>>,
     pub(crate) plugin_panels: Rc<PluginPanels>,
     pub(crate) agent: AgentPanelHandle,
     pub(crate) lua_pages: LuaPages,
+    pub(crate) chat_busy: ChatBusy,
+    /// Where a terminal's shell starts when its directory cannot be read.
+    pub(crate) project_dir: PathBuf,
+    /// Where a directory read off the toolkit's thread is reported; weak, as every host's sink is.
+    pub(crate) sink: Weak<dyn HostSink>,
 }
 
 impl Services {
@@ -92,6 +127,61 @@ impl Services {
             Err(_) => return Err(format!("{module}: the terminal registry was borrowed")),
         };
         pane.ok_or_else(|| format!("{module} has no live pane"))
+    }
+
+    /// Reads the directory `module`'s shell is in now, on a worker thread (a slow or hung filesystem must never
+    /// stall the window), and reports it as [`TermEvent::Cwd`]: the project root, with one log line, where it cannot
+    /// be read or no shell runs; a refusal when the terminal was killed while it was read, since its number may
+    /// name a new terminal by then.
+    fn read_cwd(&self, win: WinId, module: &ModuleId, read: u64) -> Result<(), String> {
+        let pane = self.pane(module)?;
+        let captured = crate::ShellStart::of(pane.generation(), pane.shell_pid());
+        let terminals = Rc::downgrade(&self.terminals);
+        let root = self.project_dir.clone();
+        let sink = self.sink.clone();
+        let module = module.clone();
+        gtk4::glib::spawn_future_local(async move {
+            let found = match captured.pid {
+                // The stat that tells a removed directory runs here too, off the GTK thread.
+                Some(pid) => gtk4::gio::spawn_blocking(move || {
+                    crate::terminal::usable_dir(std::fs::read_link(format!("/proc/{pid}/cwd")))
+                })
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::other("the reading thread panicked"))),
+                None => Err(std::io::Error::other("its shell is not running")),
+            };
+            let now = terminals.upgrade().and_then(|terminals| {
+                terminals.try_borrow().ok().and_then(|terminals| {
+                    terminals
+                        .get(&module)
+                        .map(|pane| crate::ShellStart::of(pane.generation(), pane.shell_pid()))
+                })
+            });
+            let dir = if captured.still(now) {
+                let (dir, note) = crate::terminal::start_dir(found, &root);
+                if let Some(note) = note {
+                    println!("[terminal] {note}");
+                }
+                Ok(dir)
+            } else {
+                Err(format!(
+                    "{module} closed while its directory was read; no terminal was opened"
+                ))
+            };
+            if let Some(sink) = sink.upgrade() {
+                sink.post(HostEvent::Terminal(TermEvent::Cwd { win, module, read, dir }));
+            }
+        });
+        Ok(())
+    }
+
+    /// Runs `f` on the panel with `view` marked busy, so the view's tabs closing or opening is not taken for the
+    /// view holding none.
+    fn busy<T>(&self, view: ViewId, f: impl FnOnce() -> T) -> T {
+        self.chat_busy.borrow_mut().insert(view);
+        let out = f();
+        self.chat_busy.borrow_mut().remove(&view);
+        out
     }
 }
 
@@ -140,9 +230,14 @@ impl ServiceSet for Services {
                 }
                 Ok(())
             }
-            TermOp::HangUp { .. } | TermOp::SendKeys { .. } | TermOp::Detach { .. } | TermOp::ShutdownAll { .. } => {
-                Err(NOT_CARRIED_OUT.into())
+            // The shell is hung up and the pane forgets it, so its next start is a fresh shell on a blank pane.
+            TermOp::HangUp { module, .. } => {
+                self.pane(module)?.close();
+                Ok(())
             }
+            TermOp::ReadCwd { win, module, read } => self.read_cwd(*win, module, *read),
+            TermOp::SetStartDir { module, dir, .. } => revive_pane(&self.terminals, module, dir.clone()),
+            TermOp::SendKeys { .. } | TermOp::Detach { .. } | TermOp::ShutdownAll { .. } => Err(NOT_CARRIED_OUT.into()),
         }
     }
 
@@ -232,15 +327,42 @@ impl ServiceSet for Services {
                 self.agent.set_editor_has_keys(*has_keys);
                 Ok(())
             }
+            // A float left these views. Each page is told it is on screen once the change that moved the float is
+            // over, never inside it: the panel's attention hook reads the layout and the grid again, and checks then
+            // that the page is mapped and clear, so a view that left the screen with its float sees nothing.
+            ChatOp::TellUncovered { views, .. } => {
+                let agent = self.agent.clone();
+                let views = views.clone();
+                gtk4::glib::idle_add_local_once(move || {
+                    for view in views {
+                        agent.page_shown(view);
+                    }
+                });
+                Ok(())
+            }
+            // A kill's: the base view's own tabs, or an extra view's one tab. A tab shown in another view is that
+            // view's.
+            ChatOp::CloseTabs { view, .. } => {
+                let closed = self.busy(*view, || self.agent.close_view_tabs(*view))?;
+                println!("[modules] {}: {closed} session tab(s) closed", view.module());
+                Ok(())
+            }
+            // A new chat view's first tab: a new empty tab of the window's default agent, or the base view's active
+            // tab brought out of it.
+            ChatOp::OpenTab { view, .. } => self.busy(*view, || self.agent.open_in(*view)).map(drop),
+            ChatOp::BreakOut { view, .. } => self.busy(*view, || self.agent.break_out(*view)).map(drop),
+            // A restore still to come must not bring a tab back into a view that has left: its page is idle, so the
+            // tab would show nowhere.
+            ChatOp::LayoutViews { views, .. } => {
+                self.agent.set_layout_views(views.clone());
+                Ok(())
+            }
             ChatOp::PageShown { .. }
-            | ChatOp::CloseTabs { .. }
-            | ChatOp::BreakOut { .. }
             | ChatOp::JoinBack { .. }
             | ChatOp::OpenKeymap { .. }
             | ChatOp::CommandLine { .. }
             | ChatOp::Reload { .. }
             | ChatOp::SetCoverage { .. }
-            | ChatOp::TellUncovered { .. }
             | ChatOp::ShutdownAll { .. } => Err(NOT_CARRIED_OUT.into()),
         }
     }
@@ -301,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_start_op_starts_a_shown_pane_once() {
-        let terminals = RefCell::new(Terminals::new());
+        let terminals = RefCell::new(InstancePool::new());
         let id = ModuleId::instance(ModuleKind::Terminal, 2).unwrap();
         let (pane, _) = terminals.borrow_mut().take_or_make(&id, FakePane::default);
         assert_eq!(start_pane(&terminals, &id), Ok(true));

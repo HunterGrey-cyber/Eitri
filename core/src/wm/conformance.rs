@@ -66,6 +66,8 @@ pub enum Expect {
     AllocationsAsked(usize),
     /// The window's module hosts are stacked so once the ops have applied, bottom first.
     Stacking(Vec<ModuleId>),
+    /// The window's grid holds this many hosts of the module once the ops have applied.
+    HostsOf(ModuleId, usize),
 }
 
 /// What a host's grid did that no event reports, read around a script: the expectations on allocations and
@@ -184,6 +186,7 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
     }
     create_expect.push(Expect::NotPosted(EventMatch::Refused(OpTag::CreateSurface)));
     let panel = ModuleId::lua("panel");
+    let instance = ModuleId::instance(ModuleKind::Terminal, 3).expect("a terminal's number");
     vec![
         Script {
             name: "create_surface_of_each_kind_answers_done_and_registers_it",
@@ -240,6 +243,65 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                     event: EventMatch::NativeFocusOn(Some(panel.clone())),
                 },
                 Expect::NotPosted(EventMatch::Refused(OpTag::DropSurface)),
+            ],
+        },
+        // A new instance made at run time, then made again under its number (a kill left its host idle): one host,
+        // mapped and given the keys each time. What this holds is the host's side of a re-create: its maps and its
+        // focus. That a held host is kept and wired with its controllers only once is the maker's, which a host's
+        // conformance stage stands in for, so the GTK shell holds it in the maker's own tests and in the scan that
+        // every host's controllers come from `wire_host`.
+        Script {
+            name: "create_surface_of_a_runtime_instance_is_built_and_wired_once",
+            ops: vec![
+                HostOp::CreateSurface {
+                    win: f.win,
+                    module: instance.clone(),
+                    kind: SurfaceKind::Terminal { cwd: ".".into() },
+                },
+                HostOp::Map {
+                    win: f.win,
+                    module: instance.clone(),
+                },
+                focus(&instance),
+                HostOp::Unmap {
+                    win: f.win,
+                    module: instance.clone(),
+                },
+                HostOp::CreateSurface {
+                    win: f.win,
+                    module: instance.clone(),
+                    kind: SurfaceKind::Terminal { cwd: "..".into() },
+                },
+                HostOp::Map {
+                    win: f.win,
+                    module: instance.clone(),
+                },
+                focus(&instance),
+            ],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::PostedDuring {
+                    op: 2,
+                    event: EventMatch::NativeFocusOn(Some(instance.clone())),
+                },
+                Expect::Answer {
+                    op: 4,
+                    applied: Applied::Done,
+                },
+                Expect::Answer {
+                    op: 6,
+                    applied: Applied::Done,
+                },
+                Expect::PostedDuring {
+                    op: 6,
+                    event: EventMatch::NativeFocusOn(Some(instance.clone())),
+                },
+                Expect::HostsOf(instance.clone(), 1),
+                Expect::NotPosted(EventMatch::Refused(OpTag::CreateSurface)),
+                Expect::NotPosted(EventMatch::Refused(OpTag::Focus)),
             ],
         },
         Script {
@@ -436,6 +498,19 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                 Expect::NotPosted(EventMatch::Refused(OpTag::Restack)),
             ],
         },
+        // The chrome's announcement is carried out by reading the window's model and redrawing from it: a host
+        // that holds the window's chrome answers it done, and never refuses it.
+        Script {
+            name: "chrome_reads_the_model_and_answers_done",
+            ops: vec![HostOp::Chrome { win: f.win, rev: 1 }],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Done,
+                },
+                Expect::NotPosted(EventMatch::Refused(OpTag::Chrome)),
+            ],
+        },
         Script {
             name: "close_window_never_asks",
             ops: vec![HostOp::CloseWindow { win: f.win }],
@@ -497,6 +572,15 @@ pub fn run_observed(
             },
             Expect::Stacking(order) => match (grid, win) {
                 (Some(grid), Some(win)) => grid.stacking(win) == *order,
+                _ => {
+                    return Err(format!(
+                        "{}: {expect:?} needs a grid observer and a window",
+                        script.name
+                    ))
+                }
+            },
+            Expect::HostsOf(module, count) => match (grid, win) {
+                (Some(grid), Some(win)) => grid.stacking(win).iter().filter(|host| *host == module).count() == *count,
                 _ => {
                     return Err(format!(
                         "{}: {expect:?} needs a grid observer and a window",

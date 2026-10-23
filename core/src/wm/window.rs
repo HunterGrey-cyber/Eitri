@@ -1,7 +1,7 @@
 //! Window identities and native window descriptions shared with the host, and the controller's own record of
 //! each window.
 
-use super::chrome::ChromeModel;
+use super::chrome::{ChromeModel, ChromeState};
 use super::focus::FocusState;
 use super::grid::{floats_need_restack, shown_floats};
 use super::host::{Batch, FocusTo, HostOp, RestackMove, Scheduler, TimerToken};
@@ -120,10 +120,15 @@ pub struct Window {
     pub(super) focus: FocusState,
     /// The window's prefix and the timer of its digit wait.
     pub(super) keys: KeyState,
+    /// What the module verbs wait for: the y/n's module, the new instances whose surface was asked for, the
+    /// splits waiting for a terminal's directory.
+    pub(super) modules: super::verbs::modules::ModuleVerbs,
     /// What the window's chrome shows, as the controller decided it.
     pub(super) chrome: ChromeModel,
     /// Bumped by every change of `chrome`, so the shell can tell an announced model from one it drew.
     pub(super) chrome_rev: u64,
+    /// What the chrome's fields are derived from, and when each was last derived.
+    pub(super) chrome_state: ChromeState,
     #[cfg(test)]
     notes: Vec<String>,
 }
@@ -144,8 +149,10 @@ impl Window {
             after_verb: None,
             focus: FocusState::default(),
             keys: KeyState::default(),
+            modules: Default::default(),
             chrome: ChromeModel::default(),
             chrome_rev: 0,
+            chrome_state: ChromeState::default(),
             #[cfg(test)]
             notes: vec![],
         }
@@ -226,18 +233,19 @@ impl Window {
         }
         batch.push_layout(HostOp::Allocate { win });
         self.mapped = visible.into_iter().collect();
+        self.layout_touched();
     }
 
     /// A change the controller made to the layout: its layout ops, then as effects the modules' lifecycle
-    /// effects and the shell's remaining change hooks, and the save's debounce armed when the arrangement
+    /// effects, the chrome derived again at the batch's end, and the save's debounce armed when the arrangement
     /// differs from what was last written.
     pub fn changed_by_controller(&mut self, win: WinId, batch: &mut Batch) {
         self.changed_with_focus(win, None, batch);
     }
 
     /// [`Window::changed_by_controller`] for a change that also gives the keys: `focus` gets them, with its
-    /// grab's tail, between the maps and the unmaps. The change hooks run once however many changes the batch
-    /// holds, since they read the layout as the whole batch leaves it.
+    /// grab's tail, between the maps and the unmaps. The chrome is derived once however many changes the batch
+    /// holds, since it reads the layout as the whole batch leaves it.
     pub fn changed_with_focus(&mut self, win: WinId, focus: Option<(ModuleId, Vec<HostOp>)>, batch: &mut Batch) {
         self.layout_ops(win, focus, batch);
         let layout = self.layout.clone();
@@ -245,11 +253,21 @@ impl Window {
             Ok(layout) => self.lifecycle.after_change(win, &layout, batch),
             Err(_) => self.warn("[wm] BUG: the layout was borrowed after a change; no lifecycle effect".into()),
         }
-        let hooks = HostOp::ChromeHooks { win };
-        if !batch.ops().any(|op| *op == hooks) {
-            batch.push_effect(hooks);
-        }
+        self.layout_touched();
         self.saver_changed();
+    }
+
+    /// The layout may have changed in a way the chrome shows (the selection, the mark, the tray, the strips): its
+    /// fields that read the layout are derived again once, at the end of the batch, however many changes the
+    /// batch holds, since they read the layout as the whole batch leaves it.
+    pub(super) fn layout_touched(&mut self) {
+        self.chrome_state.dirty.layout += 1;
+    }
+
+    /// A refusal in `batch`: the app name flashes and the toast gives the reason (an empty `text` flashes alone),
+    /// both in the chrome model, which the batch announces at its end. Nothing else goes into the batch for it.
+    pub(super) fn refuse(&mut self, _win: WinId, text: String, _batch: &mut Batch) {
+        super::chrome::refused(self, &text);
     }
 
     /// The float band put in the layout's z-order now, as one restack.
@@ -263,6 +281,8 @@ impl Window {
             moves: restack_order(&floats),
         });
         self.float_band = floats.into_iter().collect();
+        // A float raised over another changes what each covers and the order of their bars.
+        self.layout_touched();
     }
 
     /// Arms an idle below painting on the window's scheduler, with a token no other timer of the process has.
@@ -289,7 +309,14 @@ impl Window {
         self.timers.scheduler.now()
     }
 
-    /// The chrome changed: its revision bumped and announced with the new revision.
+    /// The prefix's part of the chrome changed: its fields that read the prefix are derived again, and the batch
+    /// announces the model once at its end.
+    pub(super) fn prefix_changed(&mut self) {
+        self.chrome_state.dirty.prefix += 1;
+        super::chrome::touched(self);
+    }
+
+    /// The chrome changed: its revision bumped and announced with the new revision, once per batch.
     pub(super) fn chrome_changed(&mut self, win: WinId, batch: &mut Batch) {
         self.chrome_rev += 1;
         batch.push_effect(HostOp::Chrome {

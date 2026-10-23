@@ -41,8 +41,8 @@ pub struct FocusState {
     pub has_keys: BTreeMap<ModuleId, bool>,
     /// The idle that restacks the float band after a float took the keys, while one is armed.
     pub raise_timer: Option<TimerToken>,
-    /// Whether the armed restack follows a raise, which changed the layout's z-order: the change hooks hear of
-    /// that, since what the float covers changed.
+    /// Whether the armed restack follows a raise, which changed the layout's z-order: the chrome is derived
+    /// again for that, since what the float covers changed.
     pub raised: bool,
     /// The modules this window's batches asked to take the keys, whose report has not been heard yet. Each was
     /// on screen when it was asked for; the report of one is judged by that.
@@ -269,7 +269,7 @@ pub fn return_to_pane(w: &mut Window, win: WinId, batch: &mut Batch) {
 /// The host reports who holds the keys. For a module: the history and the sheet's way back hear of it if the
 /// layout allowed it at the moment of the grab, the layout's `focus` follows only if the layout allows it now,
 /// a float that took the keys is restacked from an idle (never inside the report). Then every module's cursor
-/// follows the report and `active`, and last the change hooks redraw a selection the move ended.
+/// follows the report and `active`, and last the chrome's text is derived again for a selection the move ended.
 pub fn on_native_focus(
     w: &mut Window,
     win: WinId,
@@ -292,10 +292,7 @@ pub fn on_native_focus(
     zoom_after_report(w, win, op_index, batch);
     // The keys moving to another module ended any selection; the top bar says so.
     if refresh {
-        let hooks = HostOp::ChromeHooks { win };
-        if !batch.ops().any(|op| *op == hooks) {
-            batch.push_effect(hooks);
-        }
+        w.layout_touched();
     }
 }
 
@@ -366,8 +363,8 @@ fn owner_moved(w: &mut Window, owner: &ModuleId, op_index: Option<u32>, moved: b
     moved || previous != keeps
 }
 
-/// The raise's idle fired: the float band restacked, and after a raise the change hooks and the saver hear of
-/// the new z-order. `false` when `token` is not this window's raise.
+/// The raise's idle fired: the float band restacked, and after a raise the chrome and the saver hear of the new
+/// z-order. `false` when `token` is not this window's raise.
 pub fn raise_timer_fired(w: &mut Window, win: WinId, token: TimerToken, batch: &mut Batch) -> bool {
     if w.focus.raise_timer != Some(token) {
         return false;
@@ -375,7 +372,7 @@ pub fn raise_timer_fired(w: &mut Window, win: WinId, token: TimerToken, batch: &
     w.focus.raise_timer = None;
     w.restack(win, batch);
     if std::mem::take(&mut w.focus.raised) {
-        batch.push_effect(HostOp::ChromeHooks { win });
+        w.layout_touched();
         w.saver_changed();
     }
     true

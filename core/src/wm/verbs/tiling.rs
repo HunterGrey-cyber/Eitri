@@ -3,7 +3,7 @@
 //! feedback the shell's arms gave.
 
 use super::super::feedback::{self, Feedback, VerbOutcome};
-use super::super::host::{frame_with, Batch, HostOp, HostReads};
+use super::super::host::{frame_with, Batch, HostReads};
 use super::super::window::{WinId, Window};
 use crate::keymap::{Action, SwapTarget};
 use crate::layout::{self, Axis, ConLayout, Direction, Layout, LayoutError, ModuleId, Preset, ZoomChange};
@@ -27,8 +27,8 @@ enum Ran {
     Changed {
         said: Option<String>,
     },
-    /// Only the selection or the mark changed, which nothing in the grid draws: the shell's change hooks
-    /// redraw them, and the state file is not written for it.
+    /// Only the selection or the mark changed, which nothing in the grid draws: the top bar's text is derived
+    /// again, and the state file is not written for it.
     Marked {
         said: Option<String>,
     },
@@ -62,15 +62,12 @@ pub fn run(w: &mut Window, reads: &dyn HostReads, win: WinId, action: &Action, b
         Some(Feedback::Log(line)) => {
             w.say(line);
             if flash_alone {
-                batch.push_effect(HostOp::Refuse {
-                    win,
-                    text: String::new(),
-                });
+                w.refuse(win, String::new(), batch);
             }
         }
         Some(Feedback::Refuse { log, text }) => {
             w.say(log);
-            batch.push_effect(HostOp::Refuse { win, text });
+            w.refuse(win, text, batch);
         }
         None => {}
     }
@@ -85,13 +82,13 @@ pub fn run(w: &mut Window, reads: &dyn HostReads, win: WinId, action: &Action, b
             if let Some(line) = said {
                 w.say(line);
             }
-            batch.push_effect(HostOp::ChromeHooks { win });
+            w.layout_touched();
         }
         Ran::Failed(_) if matches!(action, Action::MarkToggle) => {
             // The mark's text is redrawn whether or not the toggle took, as the shell's arm did.
-            batch.push_effect(HostOp::ChromeHooks { win });
+            w.layout_touched();
         }
-        Ran::Nothing if matches!(action, Action::MarkClear) => batch.push_effect(HostOp::ChromeHooks { win }),
+        Ran::Nothing if matches!(action, Action::MarkClear) => w.layout_touched(),
         Ran::Nothing | Ran::Failed(_) => {}
     }
 }

@@ -47,7 +47,7 @@ fn select_number(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch)
     }
     batch.push_effect(show_digits(&plan));
     w.say(format!("[prefix] select.number: {} numbered", plan.len()));
-    await_number(w, win, plan, batch);
+    await_number(w, plan, batch);
 }
 
 /// The literal key goes to the module that holds the keys now: the editor in its own key notation, the chat view's
@@ -78,7 +78,7 @@ fn refuse(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch) {
     match feedback::keys(action, VerbOutcome::Nothing) {
         Some(Feedback::Refuse { log, text }) => {
             w.say(log);
-            batch.push_effect(HostOp::Refuse { win, text });
+            w.refuse(win, text, batch);
         }
         Some(Feedback::Log(line)) => w.say(line),
         None => {}

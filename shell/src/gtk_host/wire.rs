@@ -134,8 +134,8 @@ fn withhold_from_page(withheld: bool, verdict: Verdict) -> Verdict {
     }
 }
 
-/// What a key on its way into a module is answered with: the module's own stage, built once per host so a key
-/// copies nothing, and the key as the controller reads it.
+/// What a key on its way into a module is answered with: the module's own stage, which borrows the module's name so
+/// a key copies nothing, and the key as the controller reads it.
 pub(crate) type ModuleStage = Rc<dyn Fn(&KeyStage, KeyPress) -> Verdict>;
 
 /// What the controllers act through.
@@ -159,7 +159,8 @@ pub(crate) fn wire_host(kind: WireKind, id: &ModuleId, host: &gtk4::Widget, deps
         // Capture phase on the host, so the stage answers before the module's own key handling: the terminal's
         // key controller, which hands every key to its shell, and a `WebView`, which consumes a key before a
         // bubble-phase controller on the same widget would run.
-        let at = KeyStage::Module(id.clone());
+        // The stage borrows the host's own copy of the name, so a key copies nothing on its way.
+        let at = id.clone();
         let stage = deps.module_stage.clone();
         let super_filter = wired.super_filter;
         let let_through = RefCell::new(LetThrough::new());
@@ -169,7 +170,9 @@ pub(crate) fn wire_host(kind: WireKind, id: &ModuleId, host: &gtk4::Widget, deps
             let event = controller.current_event().map(SameEvent);
             let press = key_press(key, keycode, state);
             let withheld = super_filter && press.super_or_hyper;
-            module_key(&let_through, event, || withhold_from_page(withheld, stage(&at, press)))
+            module_key(&let_through, event, || {
+                withhold_from_page(withheld, stage(&KeyStage::Module(&at), press))
+            })
         });
         host.add_controller(controller);
     }
@@ -187,12 +190,6 @@ mod tests {
     fn build_ui_code() -> String {
         let (_, code) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
         code.split_whitespace().collect()
-    }
-
-    /// The body of the block bound by `anchor` (whitespace removed), from its first `{`.
-    fn bound_block<'a>(code: &'a str, anchor: &str) -> &'a str {
-        let at = code.find(anchor).unwrap_or_else(|| panic!("`{anchor}` in build_ui"));
-        scan::braced(code, at + code[at..].find('{').unwrap())
     }
 
     /// A Super chord on a page's host is kept from the page when the stage could not decide it, and nothing else
@@ -276,8 +273,13 @@ mod tests {
     #[test]
     fn a_chat_view_opened_at_runtime_swallows_super_chords() {
         assert!(plan_host(WireKind::Chat).super_filter);
-        let code = build_ui_code();
-        let body = bound_block(&code, "lethost_chat_view:");
+        // Every chat view made at run time is the controller's `CreateSurface`, whose maker wires its host.
+        let source = scan::read_required("shell/src/gtk_host/surfaces.rs");
+        let code: String = scan::code_only(&source.text).split_whitespace().collect();
+        let at = code
+            .find("CreateRoute::ChatView=>{")
+            .expect("the runtime chat view's route");
+        let body = scan::braced(&code, at + "CreateRoute::ChatView=>".len());
         assert_eq!(
             body.matches("wire_host(WireKind::Chat,").count(),
             1,
@@ -290,18 +292,11 @@ mod tests {
         let plugin = plan_host(WireKind::PluginPage);
         assert!(plugin.nav && plugin.swallow_at_edge && plugin.super_filter);
 
-        let code = build_ui_code();
-        let runtime: Vec<&str> = ["lethost_terminal:", "lethost_chat_view:"]
-            .iter()
-            .map(|anchor| bound_block(&code, anchor))
-            .collect();
-        let startup = scan::without(&code, &runtime);
+        // A host made at run time is the controller's `CreateSurface`'s, wired by its maker: build_ui wires only its
+        // startup hosts, from one place.
+        let startup = build_ui_code();
         let calls: Vec<usize> = startup.match_indices("wire_host(").map(|(at, _)| at).collect();
-        assert_eq!(
-            calls.len(),
-            1,
-            "outside the runtime paths, build_ui wires its hosts from one place"
-        );
+        assert_eq!(calls.len(), 1, "build_ui wires its hosts from one place");
         let head = "for(id,host)ingrid.hosts(){";
         let loops: Vec<usize> = startup.match_indices(head).map(|(at, _)| at).collect();
         let body = loops

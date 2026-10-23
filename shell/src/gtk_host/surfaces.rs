@@ -13,8 +13,9 @@
 //! [`SurfaceOps`] is the GTK host's `CreateSurface` and `DropSurface` from then on: a constructor plus `wire_host`
 //! for a module with no host yet, the host left as it is for one that has one (a killed terminal's pane
 //! or a dropped chat view's page taken back out of its pool), and the end of what a kill or a
-//! retirement ends. Where WebKit cannot start, a chat view's place is the notice the base
-//! view shows, as at startup, and it is answered as built.
+//! retirement ends: a numbered terminal's pane and a numbered chat view's page left idle in their pools, a web
+//! module's web process ended. Where WebKit cannot start, a chat view the window already holds keeps the notice
+//! the base view shows, as at startup, and a new one is refused: it would hold nothing but the notice.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -29,18 +30,22 @@ use gtk4::prelude::*;
 use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 
 use crate::agent_panel::{self, AgentPanelHandle};
-use crate::chat_views::{self, ChatViews};
+use crate::gtk_host::instance_pool::InstancePool;
+use crate::gtk_host::instance_pool::Reused;
 use crate::gtk_host::{GtkHost, SurfaceMaker};
 use crate::gtk_host_services::LuaPages;
 use crate::module_grid::{HostKind, ModuleGrid};
 use crate::plugin_panels::PluginPanels;
-use crate::terminal::registry::{Pane, Reused, Terminals};
+use crate::terminal::registry::Pane;
 use crate::terminal::TerminalPane;
 use crate::web_host::WebHost;
 use crate::wire::{wire_host, WireDeps, WireKind};
 
 /// Every extra chat view's page, keyed by its module id (`chat_views`'s module doc).
-pub(crate) type ChatPool = Rc<RefCell<ChatViews<(webkit6::WebView, Rc<PanelPage>)>>>;
+pub(crate) type ChatPool = Rc<RefCell<InstancePool<(webkit6::WebView, Rc<PanelPage>)>>>;
+
+/// Why a new chat view is refused where WebKit cannot start.
+pub(crate) const CHAT_VIEWS_NEED_WEBKIT: &str = "chat views need WebKit, which cannot start here";
 
 /// What `build_ui` gives every terminal pane once, when it is made.
 pub(crate) type WireTerminal = Rc<dyn Fn(&ModuleId, &TerminalPane)>;
@@ -53,7 +58,7 @@ pub(crate) struct Surfaces {
     pub(crate) grid: glib::WeakRef<ModuleGrid>,
     /// How a web module's host is allocated (`webkit_sandbox`).
     pub(crate) web_host: HostKind,
-    pub(crate) terminals: Rc<RefCell<Terminals<TerminalPane>>>,
+    pub(crate) terminals: Rc<RefCell<InstancePool<TerminalPane>>>,
     pub(crate) make_terminal_pane: Rc<dyn Fn() -> TerminalPane>,
     pub(crate) chat_views: ChatPool,
     pub(crate) agent: AgentPanelHandle,
@@ -271,15 +276,6 @@ impl Surfaces {
         Ok(())
     }
 
-    /// An extra chat view the layout opens with: its page from the pool, the base view's page as its
-    /// related one, or, where WebKit cannot start, the notice the base view shows.
-    pub(crate) fn startup_chat_view(&self, id: &ModuleId) -> Result<gtk4::Widget, String> {
-        match &self.base_webview {
-            Some(base) => self.chat_page_host(id, base),
-            None => self.chat_notice_host(id),
-        }
-    }
-
     /// An extra chat view's page from the pool, the base view's page its related one, at (0,0) of its host.
     fn chat_page_host(&self, id: &ModuleId, base: &webkit6::WebView) -> Result<gtk4::Widget, String> {
         let grid = self.grid()?;
@@ -355,13 +351,9 @@ impl Surfaces {
         // Says which of the pool's two answers this was, so a log shows a page reused rather than built.
         println!(
             "[chat] {id}: page {}",
-            if reused == chat_views::Reused::Yes {
-                "reused"
-            } else {
-                "built"
-            }
+            if reused == Reused::Yes { "reused" } else { "built" }
         );
-        if reused == chat_views::Reused::Yes && !was_live {
+        if reused == Reused::Yes && !was_live {
             // The same page, still answering for this view only: it starts again from an empty record
             // and a fresh document.
             self.agent.attach_page(view, page);
@@ -370,7 +362,7 @@ impl Surfaces {
         if grid.has_host(id) {
             return Ok(None);
         }
-        if reused == chat_views::Reused::Yes {
+        if reused == Reused::Yes {
             eprintln!("[chat] BUG: {id} reused a page the grid has no host for; giving it one");
         }
         let host = WebHost::new(&webview);
@@ -408,7 +400,7 @@ impl Surfaces {
 
 /// Whether `id`'s pane or page is in use. A killed terminal's pane and a dropped chat view's page wait
 /// idle in their pools; every other module's host is its whole surface.
-fn in_use<T: Pane + Clone, C: Clone>(id: &ModuleId, terminals: &Terminals<T>, chat_views: &ChatViews<C>) -> bool {
+fn in_use<T: Pane + Clone, C: Clone>(id: &ModuleId, terminals: &InstancePool<T>, chat_views: &InstancePool<C>) -> bool {
     match id.kind() {
         ModuleKind::Terminal => terminals.get(id).is_some(),
         ModuleKind::Agent if ViewId::of_module(id).is_some_and(|view| !view.is_base()) => chat_views.get(id).is_some(),
@@ -429,8 +421,8 @@ enum CreateRoute {
     ChatView,
     /// A held chat view where WebKit cannot start: the notice is the whole view and nothing waits in the pool.
     HeldNotice,
-    /// A new chat view where WebKit cannot start: a notice host, hidden until placed.
-    NewNotice,
+    /// A new chat view where WebKit cannot start: refused, since it would hold nothing but the notice.
+    NoWebKit,
     /// The terminal's constructor, which takes an idle pane back out with a fresh start directory, or builds one.
     Terminal,
 }
@@ -449,7 +441,7 @@ fn create_route(kind: &SurfaceKind, held: bool, live: bool, webviews: bool) -> C
         SurfaceKind::Chat { view } if view.is_base() => CreateRoute::Refuse,
         SurfaceKind::Chat { .. } if webviews => CreateRoute::ChatView,
         SurfaceKind::Chat { .. } if held => CreateRoute::HeldNotice,
-        SurfaceKind::Chat { .. } => CreateRoute::NewNotice,
+        SurfaceKind::Chat { .. } => CreateRoute::NoWebKit,
         SurfaceKind::Terminal { .. } => CreateRoute::Terminal,
     }
 }
@@ -482,15 +474,9 @@ impl SurfaceMaker for SurfaceOps {
                 SurfaceKind::Chat { .. } => "the base chat view's host is made at startup".into(),
                 _ => format!("{module} is not a Lua panel this window registered"),
             }),
-            route @ (CreateRoute::ChatView | CreateRoute::NewNotice) => {
-                let host = if route == CreateRoute::ChatView {
-                    self.surfaces.chat_view(module, &self.surfaces.chat_notice)?
-                } else {
-                    let host = self.surfaces.startup_chat_view(module)?;
-                    host.set_child_visible(false);
-                    Some(host)
-                };
-                if let Some(host) = host {
+            CreateRoute::NoWebKit => Err(CHAT_VIEWS_NEED_WEBKIT.into()),
+            CreateRoute::ChatView => {
+                if let Some(host) = self.surfaces.chat_view(module, CHAT_VIEWS_NEED_WEBKIT)? {
                     wire_host(WireKind::Chat, module, &host, &self.wire_deps);
                 }
                 Ok(())
@@ -512,11 +498,45 @@ impl SurfaceMaker for SurfaceOps {
     }
 
     fn drop_surface(&self, _win: WinId, module: &ModuleId, why: &DropWhy) -> Result<(), String> {
-        match why {
-            DropWhy::Killed => self.surfaces.end_web_process(module),
-            DropWhy::Retired => self.surfaces.retire_chat_page(module),
+        match drop_route(module, why) {
+            DropRoute::IdlePane => {
+                // Retiring hangs the pane's shell up, if it still runs, as it goes idle.
+                let retired = match self.surfaces.terminals.try_borrow_mut() {
+                    Ok(mut terminals) => terminals.retire(module),
+                    Err(_) => return Err(format!("{module}: the terminal registry was borrowed")),
+                };
+                if !retired {
+                    println!("[terminal] {module}: its pane was idle already");
+                }
+            }
+            DropRoute::IdlePage => self.surfaces.retire_chat_page(module),
+            DropRoute::EndWebProcess => self.surfaces.end_web_process(module),
+            DropRoute::Nothing => {}
         }
         Ok(())
+    }
+}
+
+/// What a `DropSurface` ends for one module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropRoute {
+    /// A numbered terminal's pane waits idle for the next terminal of its number.
+    IdlePane,
+    /// A numbered chat view's page waits idle for the next view of its number.
+    IdlePage,
+    /// A killed web module's web process ends; its page loads afresh when it is next shown.
+    EndWebProcess,
+    /// The base terminal and the base chat view keep what they have: only their kill's own ops end anything.
+    Nothing,
+}
+
+fn drop_route(module: &ModuleId, why: &DropWhy) -> DropRoute {
+    match module.kind() {
+        ModuleKind::Terminal if module.number() >= 2 => DropRoute::IdlePane,
+        ModuleKind::Agent if module.number() >= 2 => DropRoute::IdlePage,
+        ModuleKind::Terminal | ModuleKind::Agent => DropRoute::Nothing,
+        _ if *why == DropWhy::Killed => DropRoute::EndWebProcess,
+        _ => DropRoute::Nothing,
     }
 }
 
@@ -577,8 +597,8 @@ mod tests {
 
     #[test]
     fn a_killed_pane_or_a_dropped_page_is_not_in_use_while_its_host_stays() {
-        let mut terminals = Terminals::new();
-        let mut chat_views = ChatViews::new();
+        let mut terminals = InstancePool::new();
+        let mut chat_views = InstancePool::new();
         let terminal = instance(ModuleKind::Terminal, 2);
         let chat = instance(ModuleKind::Agent, 2);
         terminals.take_or_make(&terminal, || Idle);
@@ -607,6 +627,25 @@ mod tests {
         }
     }
 
+    /// A dropped numbered terminal or chat view leaves its pane or page idle for the next instance of its number,
+    /// whatever ended it; the base ones keep theirs; a killed web module's web process ends and a retired one's stays.
+    #[test]
+    fn a_drop_idles_a_numbered_pane_or_page_and_ends_a_killed_web_process() {
+        let cases = [
+            (instance(ModuleKind::Terminal, 2), DropWhy::Killed, DropRoute::IdlePane),
+            (instance(ModuleKind::Terminal, 2), DropWhy::Retired, DropRoute::IdlePane),
+            (instance(ModuleKind::Agent, 3), DropWhy::Killed, DropRoute::IdlePage),
+            (instance(ModuleKind::Agent, 3), DropWhy::Retired, DropRoute::IdlePage),
+            (ModuleId::terminal(), DropWhy::Killed, DropRoute::Nothing),
+            (ModuleId::agent(), DropWhy::Killed, DropRoute::Nothing),
+            (ModuleId::lua("panel"), DropWhy::Killed, DropRoute::EndWebProcess),
+            (ModuleId::lua("panel"), DropWhy::Retired, DropRoute::Nothing),
+        ];
+        for (module, why, want) in cases {
+            assert_eq!(drop_route(&module, &why), want, "{module} {why:?}");
+        }
+    }
+
     /// A `CreateSurface` for a module whose host the grid holds: kept while its pane or page is live, otherwise sent to
     /// its constructor, which takes the idle one back out. Keeping a killed terminal's host would leave its pane idle
     /// and the next show's start refused; sending a live one to its constructor would wire its host twice.
@@ -626,7 +665,7 @@ mod tests {
             (&chat, true, false, true, CreateRoute::ChatView, "dropped chat view"),
             (&chat, false, false, true, CreateRoute::ChatView, "a new chat view"),
             (&chat, true, false, false, CreateRoute::HeldNotice, "held, no WebKit"),
-            (&chat, false, false, false, CreateRoute::NewNotice, "new, no WebKit"),
+            (&chat, false, false, false, CreateRoute::NoWebKit, "new, no WebKit"),
         ];
         for (kind, held, live, webviews, want, what) in cases {
             assert_eq!(create_route(kind, held, live, webviews), want, "{what}");

@@ -56,6 +56,10 @@ struct Reads {
     editor_running: bool,
     chat_claims: Vec<(ViewId, Direction)>,
     module_min: BTreeMap<ModuleId, Size>,
+    attention: BTreeMap<ViewId, crate::attention::Attention>,
+    oldest_card_view: Option<ViewId>,
+    kill_counts: BTreeMap<ViewId, ChatKillCounts>,
+    first_tab_refused: Option<String>,
 }
 
 impl Default for Reads {
@@ -66,6 +70,10 @@ impl Default for Reads {
             editor_running: false,
             chat_claims: Vec::new(),
             module_min: BTreeMap::new(),
+            attention: BTreeMap::new(),
+            oldest_card_view: None,
+            kill_counts: BTreeMap::new(),
+            first_tab_refused: None,
         }
     }
 }
@@ -106,6 +114,22 @@ impl FakeHost {
     }
     pub fn set_module_min(&self, module: ModuleId, min: Size) {
         self.reads.borrow_mut().module_min.insert(module, min);
+    }
+    /// What chat view `view` holds for the user from now on, as its panel would report it.
+    pub fn set_attention(&self, view: ViewId, attention: crate::attention::Attention) {
+        self.reads.borrow_mut().attention.insert(view, attention);
+    }
+    /// The chat view holding the oldest waiting card from now on, as the panel would report it.
+    pub fn set_oldest_card_view(&self, view: Option<ViewId>) {
+        self.reads.borrow_mut().oldest_card_view = view;
+    }
+    /// What killing chat view `view` would end from now on, as the panel would count it.
+    pub fn set_chat_kill_counts(&self, view: ViewId, counts: ChatKillCounts) {
+        self.reads.borrow_mut().kill_counts.insert(view, counts);
+    }
+    /// Why no new chat view can be given its first tab from now on, as the panel would refuse it; `None`, it can.
+    pub fn set_chat_first_tab_refused(&self, why: Option<String>) {
+        self.reads.borrow_mut().first_tab_refused = why;
     }
     pub fn attach(&self, sink: Weak<dyn HostSink>) {
         *self.sink.borrow_mut() = Some(sink);
@@ -155,13 +179,14 @@ impl FakeHost {
             Some(FocusOwner::Module(m)) => vec![m.clone()],
             _ => vec![],
         };
-        {
+        let left_the_entry = {
             let mut focus = self.focus.borrow_mut();
-            focus.remove(&win);
+            let before = focus.remove(&win);
             if let Some(owner) = &owner {
                 focus.insert(win, owner.clone());
             }
-        }
+            before == Some(FocusOwner::RenameEntry) && owner != Some(FocusOwner::RenameEntry)
+        };
         self.post(HostEvent::NativeFocus {
             win,
             owner,
@@ -169,6 +194,13 @@ impl FakeHost {
             active: true,
             op_index: None,
         });
+        // A native rename entry hears the keys leave it whatever moved them, and says so as it would.
+        if left_the_entry {
+            self.post(HostEvent::TopBarEntry {
+                win,
+                ev: EntryEv::LostKeys,
+            });
+        }
     }
     fn refuse(&self, op: &HostOp) -> Applied {
         self.post(HostEvent::Refused {
@@ -325,6 +357,18 @@ impl HostReads for FakeHost {
     fn chat_claims(&self, view: ViewId, direction: Direction) -> bool {
         self.reads.borrow().chat_claims.contains(&(view, direction))
     }
+    fn view_attention(&self, view: ViewId) -> crate::attention::Attention {
+        self.reads.borrow().attention.get(&view).copied().unwrap_or_default()
+    }
+    fn oldest_card_view(&self, _: WinId) -> Option<ViewId> {
+        self.reads.borrow().oldest_card_view
+    }
+    fn chat_kill_counts(&self, view: ViewId) -> ChatKillCounts {
+        self.reads.borrow().kill_counts.get(&view).cloned().unwrap_or_default()
+    }
+    fn chat_first_tab(&self, _: ViewId, _: bool) -> Result<(), String> {
+        self.reads.borrow().first_tab_refused.clone().map_or(Ok(()), Err)
+    }
 }
 
 fn attached(sink: &RefCell<Option<Weak<dyn HostSink>>>, event: &HostEvent) -> Rc<dyn HostSink> {
@@ -449,7 +493,8 @@ impl Scheduler for FakeScheduler {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Call {
     Handle(HostEvent),
-    Key(WinId, KeyStage, KeyPress),
+    /// A key at a capture stage: the module whose stage it was, `None` for the window's.
+    Key(WinId, Option<ModuleId>, KeyPress),
     Run(WinId, Action, Origin),
     Focus(WinId, ModuleId),
     Close(WinId, CloseBy),
@@ -492,7 +537,7 @@ impl Decide for ScriptedDecide {
         self.handles.pop_front().unwrap_or_default()
     }
     fn key(&mut self, win: WinId, stage: &KeyStage, press: &KeyPress) -> (Verdict, Batch) {
-        self.calls.push(Call::Key(win, stage.clone(), press.clone()));
+        self.calls.push(Call::Key(win, stage.module().cloned(), press.clone()));
         self.keys
             .pop_front()
             .unwrap_or((Verdict::PassThrough, Batch::default()))
@@ -801,7 +846,7 @@ mod tests {
             vec![
                 Call::Handle(HostEvent::Wake),
                 Call::Handle(HostEvent::MonitorsChanged),
-                Call::Key(w, KeyStage::Window, key.clone()),
+                Call::Key(w, None, key.clone()),
                 Call::Run(w, Action::FocusParent, Origin::Lua),
                 Call::Focus(w, m.clone()),
                 Call::Close(w, CloseBy::User)
@@ -809,7 +854,7 @@ mod tests {
         );
         assert!(d.handle(HostEvent::Wake).is_empty());
         assert_eq!(
-            d.key(w, &KeyStage::Module(m.clone()), &key),
+            d.key(w, &KeyStage::Module(&m), &key),
             (Verdict::PassThrough, Batch::default())
         );
         assert!(d.run(w, Action::FocusChild, Origin::Chip).is_empty());

@@ -2,11 +2,11 @@
 
 use super::window::*;
 use crate::keymap::{
-    action::{Action, SplitCwd},
+    action::Action,
     key::{KeyName, KeySpec},
-    prefix::{Press, WorkspacePick},
+    prefix::Press,
 };
-use crate::layout::{kill::Reopen, Arrangement, Axis, Con, Direction, Frame, ModuleId, Size};
+use crate::layout::{kill::Reopen, Arrangement, Con, Direction, Frame, ModuleId, Size};
 use crate::tabs::ViewId;
 use std::any::Any;
 use std::fmt;
@@ -65,13 +65,19 @@ pub trait Decide {
     /// Converts an event into a complete batch.
     fn handle(&mut self, event: HostEvent) -> Batch;
     /// Decides key routing at one capture stage.
-    fn key(&mut self, win: WinId, stage: &KeyStage, press: &KeyPress) -> (Verdict, Batch);
+    fn key(&mut self, win: WinId, stage: &KeyStage<'_>, press: &KeyPress) -> (Verdict, Batch);
     /// Decides whether a native close may proceed.
     fn close_requested(&mut self, win: WinId, by: CloseBy) -> (CloseVerdict, Batch);
     /// Runs an action through the shared action runner.
     fn run(&mut self, win: WinId, action: Action, origin: Origin) -> Batch;
     /// Plans a focus transfer to a module.
     fn focus(&mut self, win: WinId, module: &ModuleId) -> Batch;
+    /// The driver's queue has drained: what is judged against the state every batch before it left (a chat page
+    /// that came on screen during one, against the coverage they left). Asked each time the queue empties, so a
+    /// decider with nothing to judge answers an empty batch and allocates nothing.
+    fn after_drain(&mut self) -> Batch {
+        Batch::default()
+    }
 }
 
 /// The result of a native operation.
@@ -145,13 +151,24 @@ pub struct Mods {
     pub shift: bool,
 }
 
-/// Where a captured key is being considered.
-#[derive(Debug, Clone, PartialEq)]
-pub enum KeyStage {
+/// Where a captured key is being considered. A module's stage borrows the module's name, so a key on its way into
+/// a module copies nothing, wherever the stage is built.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeyStage<'a> {
     /// The window capture stage.
     Window,
     /// A module capture stage.
-    Module(ModuleId),
+    Module(&'a ModuleId),
+}
+
+impl KeyStage<'_> {
+    /// The module whose stage this is; `None` for the window's.
+    pub fn module(&self) -> Option<&ModuleId> {
+        match self {
+            KeyStage::Window => None,
+            KeyStage::Module(module) => Some(module),
+        }
+    }
 }
 
 /// How the host routes the key after deciding.
@@ -211,21 +228,12 @@ pub struct ShellVerb {
     pub keycode: u32,
 }
 
-/// What a shell verb asks the shell's arm to do. The prefix's split and chooser commands are not actions, and
-/// they still need the shell's arms once the prefix is decided here; each of those two goes when its family's
-/// verbs move into the controller.
+/// What a shell verb asks the shell's arm to do: an action of a family the controller does not decide yet. The
+/// prefix's own commands (the chooser's picks, the split keys' placements) are decided here and never reach it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShellCall {
     /// An action whose family the shell still carries out.
     Action(Action),
-    /// A split key's placement: a new module of the key's kind beside `module` along `axis`.
-    Place {
-        module: ModuleId,
-        axis: Axis,
-        cwd: SplitCwd,
-    },
-    /// A digit or command answered to the workspace chooser.
-    WorkspacePick(WorkspacePick),
 }
 
 /// Reads the controller makes of the shell directly, because each answers at once and none can call back into
@@ -246,6 +254,45 @@ pub trait HostReads {
     fn editor_running(&self, win: WinId) -> bool;
     /// Whether the chat page `view` keeps a navigation key for itself.
     fn chat_claims(&self, view: ViewId, direction: Direction) -> bool;
+    /// What the chat view `view` holds for the user (cards waiting, a turn finished unseen), as its chip and its
+    /// strip entry show it. A host whose chats report none answers nothing held.
+    fn view_attention(&self, view: ViewId) -> crate::attention::Attention {
+        let _ = view;
+        crate::attention::Attention::default()
+    }
+    /// The chat view whose tabs hold the oldest card waiting for an answer, which the chat's key reaches when the
+    /// keys are in no chat view. A host whose chats report none answers none.
+    fn oldest_card_view(&self, win: WinId) -> Option<ViewId> {
+        let _ = win;
+        None
+    }
+    /// What killing the chat view `view` ends, as its y/n names it. A host whose chats report none answers that
+    /// nothing runs.
+    fn chat_kill_counts(&self, view: ViewId) -> ChatKillCounts {
+        let _ = view;
+        ChatKillCounts::default()
+    }
+    /// Whether the new chat view `view` can be given its first tab now -- a new empty one, or the base view's active
+    /// tab brought out when `breaks` -- asked before the view is placed, so a refusal places nothing. The refusal's
+    /// words when it cannot. A host whose chats report none answers that it can.
+    fn chat_first_tab(&self, view: ViewId, breaks: bool) -> Result<(), String> {
+        let _ = (view, breaks);
+        Ok(())
+    }
+}
+
+/// What a chat view's kill ends: the turns running and the messages queued (for the base view, every tab's,
+/// since its kill closes them all; for an extra view, its one tab's), an extra view's tab label, which its y/n
+/// names, and whether its tabs can close now.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChatKillCounts {
+    pub running: usize,
+    pub queued: usize,
+    pub tab: Option<String>,
+    /// Why the view's tabs cannot close now (one is being handed off to a terminal, or moving to the other window),
+    /// in the words the kill is refused with: a kill that left the view's tabs open would not be a kill, so the
+    /// view stays where it is.
+    pub blocked: Option<String>,
 }
 
 /// What a controller reads before the shell gives it its reads: the stand-in grid of a window not yet
@@ -314,22 +361,18 @@ pub enum HostOp {
     CloseWindow { win: WinId },
     /// Ends the application.
     Quit,
-    /// Creates a module surface.
+    /// Creates a module surface. Carried out, the driver answers it with [`HostEvent::Created`]: a new instance is
+    /// placed in the layout only once its surface exists.
     CreateSurface {
         win: WinId,
         module: ModuleId,
         kind: SurfaceKind,
     },
-    /// Releases a module surface.
+    /// Releases a module surface. A terminal's pane or a chat view's page is left idle in the host's pool under its
+    /// id, its host kept, for the next instance of its number, which comes back with no create.
     DropSurface { win: WinId, module: ModuleId, why: DropWhy },
     /// Lays out a destination off screen.
     PrepareSurface { win: WinId, module: ModuleId },
-    /// Flashes the window's name and shows `text` as a refusal's toast; an empty `text` flashes alone. It
-    /// stays until the chrome model carries the flash and the toast itself.
-    Refuse { win: WinId, text: String },
-    /// Runs the shell's remaining change hooks (selection, tray, mark and workspace text) after a change the
-    /// controller made; it goes with those hooks, once the chrome model draws what they draw.
-    ChromeHooks { win: WinId },
     /// Makes a module available on screen.
     Map { win: WinId, module: ModuleId },
     /// Hides a module after its keys have moved.
@@ -475,6 +518,12 @@ pub enum ChatOp {
     },
     /// Closes tabs in a view.
     CloseTabs { win: WinId, view: ViewId },
+    /// Opens a new empty tab of the window's default agent in a view: a new chat view's first tab, before the
+    /// view is placed.
+    OpenTab { win: WinId, view: ViewId },
+    /// The extra chat views the window's workspaces still hold, after one left them: a restore still to come must
+    /// not bring a tab back into a view that has gone.
+    LayoutViews { win: WinId, views: Vec<ViewId> },
     /// Breaks a tab out of its view.
     BreakOut { win: WinId, view: ViewId },
     /// Joins a tab back.
@@ -504,6 +553,9 @@ pub enum ChatOp {
 pub enum TermOp {
     /// Starts a terminal.
     Start { win: WinId, module: ModuleId },
+    /// Sets the directory the next shell of a terminal whose pane a kill left idle starts in: a new instance on that
+    /// pane asks no create, which is what carries a new terminal's directory, so this does.
+    SetStartDir { win: WinId, module: ModuleId, dir: PathBuf },
     /// Sets terminal focus.
     SetFocused {
         win: WinId,
@@ -512,6 +564,10 @@ pub enum TermOp {
     },
     /// Hangs up the terminal.
     HangUp { win: WinId, module: ModuleId },
+    /// Reads the directory the terminal's shell is in now, off the toolkit's thread, for a split that starts its
+    /// new shell there; answered with [`TermEvent::Cwd`] carrying the same `read`, since reads of one module (a
+    /// number reused meanwhile, two splits in a row) may come back in any order.
+    ReadCwd { win: WinId, module: ModuleId, read: u64 },
     /// Enters copy mode, scrolled up a page when `up`.
     CopyMode { win: WinId, module: ModuleId, up: bool },
     /// Sends terminal keys.
@@ -600,12 +656,18 @@ pub enum HostEvent {
     Settled { win: WinId, root: Con },
     /// A remaining shell action changed the layout.
     LayoutChangedByShell { win: WinId },
-    /// Reports a surface built by a shell arm until the runner owns creation.
-    Declared {
-        win: WinId,
-        module: ModuleId,
-        kind: SurfaceKind,
-    },
+    /// A `CreateSurface` op the host carried out: `module`'s surface exists now. Posted by the driver, which is
+    /// the one other place besides a `Focus` op's tail where an op's answer is read.
+    Created { win: WinId, module: ModuleId },
+    /// The answer gate refused a card answer from a chat view (`Controller::answer_gate`); `text` is why, for the
+    /// toast.
+    AnswerRefused { win: WinId, text: String },
+    /// The shell asked its own y/n (the window close) over the controller's on the window's one overlay: the
+    /// controller's question is withdrawn, as a `no` answers it, so no later key answers it unseen.
+    PromptWithdrawn { win: WinId },
+    /// An arm still in the shell refused: the window's name flashes and, when `text` is not empty, the toast says
+    /// it, drawn from the chrome model as every refusal is. It goes once the last such arm has moved here.
+    ShellRefused { win: WinId, text: String },
     /// A process termination signal arrived.
     EndSignal { name: &'static str },
     /// A module surface ended.
@@ -767,8 +829,12 @@ pub enum ChatEvent {
     EditorDone { win: WinId, view: ViewId },
     /// A chat supplied hint text.
     Hint { win: WinId, message: String },
-    /// A chat supplied a toast.
-    Toast { win: WinId, text: String },
+    /// A chat supplied a toast: `Attention` for a hidden chat's waiting card, which a refusal does not erase.
+    Toast {
+        win: WinId,
+        text: String,
+        kind: super::toasts::ToastKind,
+    },
     /// A keymap sheet closed; `opening` names the opening it closes, so a close of an earlier one is dropped.
     KeymapClosed {
         win: WinId,
@@ -805,6 +871,15 @@ pub enum TermEvent {
     Exited { win: WinId, module: ModuleId },
     /// A terminal rang its bell.
     Bell { win: WinId, module: ModuleId },
+    /// The directory a [`TermOp::ReadCwd`] read: the shell's directory, or the project root where it could not be
+    /// read; `Err` with the refusal's text when the terminal it was read for ended meanwhile. `read` is the
+    /// request's own.
+    Cwd {
+        win: WinId,
+        module: ModuleId,
+        read: u64,
+        dir: Result<PathBuf, String>,
+    },
     /// A terminal detached for transfer.
     Detached {
         win: WinId,
@@ -880,10 +955,6 @@ pub enum OpTag {
     DropSurface,
     /// Identifies PrepareSurface operations.
     PrepareSurface,
-    /// Identifies Refuse operations.
-    Refuse,
-    /// Identifies ChromeHooks operations.
-    ChromeHooks,
     /// Identifies Map operations.
     Map,
     /// Identifies Unmap operations.
@@ -925,8 +996,6 @@ impl OpTag {
             HostOp::CreateSurface { .. } => Self::CreateSurface,
             HostOp::DropSurface { .. } => Self::DropSurface,
             HostOp::PrepareSurface { .. } => Self::PrepareSurface,
-            HostOp::Refuse { .. } => Self::Refuse,
-            HostOp::ChromeHooks { .. } => Self::ChromeHooks,
             HostOp::Map { .. } => Self::Map,
             HostOp::Unmap { .. } => Self::Unmap,
             HostOp::Allocate { .. } => Self::Allocate,
@@ -1177,8 +1246,6 @@ mod tests {
             },
             Unmap
         );
-        tag!(HostOp::Refuse { win, text: "no".into() }, Refuse);
-        tag!(HostOp::ChromeHooks { win }, ChromeHooks);
         tag!(HostOp::Allocate { win }, Allocate);
         tag!(HostOp::Restack { win, moves: vec![] }, Restack);
         tag!(

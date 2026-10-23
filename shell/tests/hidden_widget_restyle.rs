@@ -25,11 +25,10 @@
 //! Checking only `GDK_BACKEND=x11` would also accept a desktop's XWayland display.
 //! Takes about 8s.
 
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use eitri_core::attention::Attention;
-use eitri_core::layout::{Axis, Layout, ModuleId, Node};
+use eitri_core::layout::ModuleId;
+use eitri_core::wm::chrome::Chip;
 use gtk4::prelude::*;
 
 // The display this test runs on: its own Xvfb, never an inherited one (2026-09-29).
@@ -115,20 +114,15 @@ struct Read {
     beside: String,
 }
 
-/// Three leaves, `terminal` below `editor | agent`, with `hidden` off screen.
-fn layout(hidden: &[ModuleId], focus: ModuleId) -> Layout {
-    let root = Node::split(
-        Axis::Column,
-        0.7,
-        Node::split(
-            Axis::Row,
-            0.5,
-            Node::Leaf(ModuleId::editor()),
-            Node::Leaf(ModuleId::agent()),
-        ),
-        Node::Leaf(ModuleId::terminal()),
-    );
-    Layout::from_parts(root, hidden.iter().cloned().collect::<BTreeSet<_>>(), focus).expect("a valid layout")
+/// `module`'s chip as the window's chrome model shows one for a module off screen.
+fn chip(module: ModuleId, label: &str) -> Chip {
+    Chip {
+        module,
+        label: label.into(),
+        shown: true,
+        attention: false,
+        stowed: false,
+    }
 }
 
 fn tray_chip(with_fix: bool) -> Result<Read, String> {
@@ -142,11 +136,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     let (editor_chip, terminal_chip) = (items[0].clone(), items[2].clone());
     let (window, provider) = window_with(tray.widget());
     // The first launch: the terminal hidden, so its chip alone shows.
-    tray.refresh(
-        &layout(&[ModuleId::terminal()], ModuleId::editor()),
-        &|_| Attention::default(),
-        &[],
-    );
+    tray.set_chip(&chip(ModuleId::terminal(), "terminal"));
     window.present();
     pump(600);
     if !terminal_chip.is_mapped() || editor_chip.is_realized() {
@@ -164,11 +154,7 @@ fn tray_chip(with_fix: bool) -> Result<Read, String> {
     reload(&provider, &window, with_fix);
     pump(300);
     // `Ctrl+a x` in the editor: its chip shows.
-    tray.refresh(
-        &layout(&[ModuleId::terminal(), ModuleId::editor()], ModuleId::agent()),
-        &|_| Attention::default(),
-        &[],
-    );
+    tray.set_chip(&chip(ModuleId::editor(), "editor"));
     pump(900);
     if !editor_chip.is_mapped() {
         return Err("did not exercise the trigger: the editor's chip never got on screen".into());

@@ -4,7 +4,7 @@
 
 use super::super::feedback::{self, Feedback, VerbOutcome};
 use super::super::focus::{land_by_key, move_focus};
-use super::super::host::{Batch, HostOp, HostReads};
+use super::super::host::{Batch, HostReads};
 use super::super::window::{WinId, Window};
 use crate::keymap::Action;
 use crate::layout::{next_on_screen, ModuleId};
@@ -49,7 +49,7 @@ fn refuse(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch) {
     match feedback::focus(action, VerbOutcome::Nothing) {
         Some(Feedback::Refuse { log, text }) => {
             w.say(log);
-            batch.push_effect(HostOp::Refuse { win, text });
+            w.refuse(win, text, batch);
         }
         Some(Feedback::Log(line)) => w.say(line),
         None => {}

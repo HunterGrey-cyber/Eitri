@@ -17,7 +17,6 @@ use crate::agent_panel::{AgentPanelHandle, ViewId};
 use crate::module_grid::HostKind;
 use crate::terminal::TerminalPane;
 use crate::web_host::WebHost;
-use crate::NewViewTab;
 use eitri_core::layout::Axis;
 
 /// The pooled page's view number in the window's panel. Keep it outside 2 through 4,
@@ -758,10 +757,10 @@ impl Probe {
         say("mark none");
     }
 
-    /// Opens a chat view as `instance.new { kind = "agent" }` does, beside the base chat, and counts its
+    /// Opens a chat view as `instance.new { kind = "agent" }` does, where the open rules put it, and counts its
     /// host from now on. `None` when the window refused.
     fn open_view(&self, tracked: &mut Vec<ModuleId>) -> Option<ModuleId> {
-        match (self.ctx.new_chat_view)(crate::OpenHow::Beside(ModuleId::agent(), Axis::Row), NewViewTab::Empty) {
+        match (self.ctx.new_chat_view)() {
             Ok(id) => {
                 if !tracked.contains(&id) {
                     if let Some(host) = self.host(&id) {

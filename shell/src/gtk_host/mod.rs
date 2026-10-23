@@ -32,20 +32,21 @@
 //! one is set ([`GtkHost::set_focus`]), since the shell knows what a bare grab does not: a page still
 //! to be built, the editor's grab that also tells the input method; whether the module is on screen
 //! is the controller's to know before it asks. Without one it is the bare grab. A top-bar item's
-//! `Focus` goes through [`GtkHost::set_top_bar`], which brings a hidden bar out first. The
-//! `select.number` digits and HINT's toggle go to the window's [`HintPort`]; a `Chrome` op is redrawn
-//! by the function [`GtkHost::set_chrome`] gives, which reads the controller's model. The cursor
+//! `Focus` goes through [`GtkHost::set_top_bar`], which brings a hidden bar out first, and the rename entry's
+//! through [`GtkHost::set_rename_entry`], which does the same and shows the entry so it can take them. The
+//! `select.number` digits and HINT's toggle go to the window's [`HintPort`]; a `Chrome` op reads the
+//! window's model through [`GtkHost::set_chrome_model`] and redraws what changed on the widgets
+//! [`GtkHost::set_chrome_widgets`] gives ([`chrome::reconcile`]), every flash and toast included. The cursor
 //! signals, the literal keys and a chat page's claimed navigation key are service ops
 //! ([`ServiceSet`]), and whether a chat page claims a key is the read [`GtkHost::set_chat_claims`]
 //! gives.
 //!
 //! **The grid and the editor.** Each window's grid is reached through a [`GridPort`] and its editor
 //! through [`EditorReads`] ([`GtkHost::set_grid`], [`GtkHost::set_editor`]): `Allocate` asks the grid
-//! for a new allocation, `Restack` puts its float band in the op's order, `ChromeHooks` runs the
-//! grid's chrome hooks, and `Map`/`Unmap` leave alone a host the grid's probe places by hand. The
-//! host also answers the controller's [`HostReads`] from them, and with [`NoReads`]' values for a
-//! window that has given neither yet. `Refuse` flashes and toasts through the shell's refusal
-//! function ([`GtkHost::set_refusal`]).
+//! for a new allocation, `Restack` puts its float band in the op's order, and `Map`/`Unmap` leave
+//! alone a host the grid's probe places by hand. The host also answers the controller's
+//! [`HostReads`] from them, and with [`NoReads`]' values for a window that has given neither yet;
+//! a chat view's attention is the read [`GtkHost::set_view_attention`] gives.
 //!
 //! **Lifetime.** The host holds its windows weakly. GTK drops its own reference when a window
 //! closes, and only then does the window dispose and emit `destroy`, which is where the host
@@ -54,6 +55,8 @@
 // The conformance test compiles this module alone, without the binary's callers of some of it.
 #![allow(dead_code)]
 
+pub(crate) mod chrome;
+pub(crate) mod instance_pool;
 pub(crate) mod keys;
 pub(crate) mod scheduler;
 
@@ -61,18 +64,20 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
 
+use eitri_core::attention::Attention;
 use eitri_core::layout::{Direction, ModuleId, Rect, Size};
 use eitri_core::tabs::ViewId;
+use eitri_core::wm::chrome::ChromeModel;
 use eitri_core::wm::{
-    ActivationToken, Applied, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorCall, FocusChain, FocusOwner, FocusTo,
-    HintOp, Host, HostEvent, HostOp, HostReads, HostSink, LuaOp, Monitor, MonitorId, NoReads, OpTag, PluginOp,
-    ShellCall, SurfaceKind, TermOp, WinId, WindowSpec,
+    ActivationToken, Applied, ChatKillCounts, ChatOp, CloseBy, CloseVerdict, DropWhy, EditorCall, FocusChain,
+    FocusOwner, FocusTo, HintOp, Host, HostEvent, HostOp, HostReads, HostSink, LuaOp, Monitor, MonitorId, NoReads,
+    OpTag, PluginOp, ShellCall, SurfaceKind, TermOp, WinId, WindowSpec,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
-/// What a shell verb runs on: the window, the call (an action, a split's placement or a chooser's pick)
-/// and the keycode that carried it (zero when no key did).
+/// What a shell verb runs on: the window, the call (an action of a family the shell still carries out) and the
+/// keycode that carried it (zero when no key did).
 type ShellVerbArm = dyn Fn(WinId, &ShellCall, u32);
 
 /// What gives a module the keys when the shell knows more than a bare grab: whether it took.
@@ -82,11 +87,28 @@ type FocusFn = dyn Fn(&ModuleId) -> bool;
 /// first if it is hidden. Whether one took them.
 type TopBarFn = dyn Fn(WinId, u32) -> bool;
 
-/// What redraws a window's chrome once the controller announced a new revision of it.
-type ChromeFn = dyn Fn(WinId, u64);
+/// What gives the top bar's rename entry the keys: the bar brought out first if it is hidden, the entry shown so it
+/// can take them, its text left to the `Chrome` op that follows. Whether it took them.
+type RenameEntryFn = dyn Fn(WinId) -> bool;
+
+/// What reads a window's chrome model from the controller; nothing for a window it does not hold.
+type ChromeModelFn = dyn Fn(WinId) -> Option<ChromeModel>;
+
+/// What a chat view holds for the user, as its chip and its strip entry show it: read only, it never calls back.
+type ViewAttentionFn = dyn Fn(ViewId) -> Attention;
 
 /// Whether a chat page keeps a navigation key for itself: read only, it never calls back.
 type ChatClaimsFn = dyn Fn(ViewId, Direction) -> bool;
+
+/// The chat view holding the oldest card waiting for an answer: read only, it never calls back.
+type OldestCardFn = dyn Fn(WinId) -> Option<ViewId>;
+
+/// What a chat view's kill would end, and whether its tabs can close now: read only, it never calls back.
+type KillCountsFn = dyn Fn(ViewId) -> ChatKillCounts;
+
+/// Whether a new chat view can be given its first tab now (a break-out when the flag is set): read only, it never
+/// calls back.
+type FirstTabFn = dyn Fn(ViewId, bool) -> Result<(), String>;
 
 /// The window's `select.number` digits and HINT's session, which stays the shell's.
 pub(crate) trait HintPort {
@@ -97,9 +119,6 @@ pub(crate) trait HintPort {
     /// Starts or ends a HINT from the prefix; `keycode` is the key still held down that ran it.
     fn toggle(&self, win: WinId, keycode: u32);
 }
-
-/// What says a refusal in the window: its name flashes and, when `text` is not empty, the toast says it.
-pub(crate) type RefusalFn = dyn Fn(WinId, &str);
 
 /// The answer to every op this shell does not carry out through the host yet; its own code still
 /// does those, so a controller that emits one learns it went nowhere.
@@ -144,8 +163,6 @@ pub(crate) trait GridPort {
     fn queue_allocation(&self);
     /// Puts the floats' hosts in `order`, bottom first, above everything tiled; nothing else moves.
     fn restack_floats(&self, order: &[ModuleId]);
-    /// Runs the grid's chrome hooks: the selection, the tray, the mark and the workspace text.
-    fn notify_chrome_changed(&self);
     /// Whether the grid's probe places `module`'s host by hand, so no map or unmap may touch it.
     fn probe_places(&self, module: &ModuleId) -> bool;
 }
@@ -171,6 +188,12 @@ pub(crate) fn hosts_to_map(ops: &[HostOp], probe_places: impl Fn(&ModuleId) -> b
         .collect()
 }
 
+/// A window's chrome as the host draws it: its widgets, and the model last drawn on them.
+struct ChromeDrawn {
+    widgets: chrome::ChromeWidgets,
+    last: RefCell<Option<ChromeModel>>,
+}
+
 pub(crate) struct GtkHost {
     me: Weak<GtkHost>,
     sink: RefCell<Option<Weak<dyn HostSink>>>,
@@ -189,12 +212,18 @@ pub(crate) struct GtkHost {
     application: RefCell<Option<glib::WeakRef<gtk4::Application>>>,
     focus_fn: RefCell<Option<Rc<FocusFn>>>,
     top_bar_fn: RefCell<Option<Rc<TopBarFn>>>,
-    chrome_fn: RefCell<Option<Rc<ChromeFn>>>,
+    rename_entry_fn: RefCell<Option<Rc<RenameEntryFn>>>,
+    chrome_model: RefCell<Option<Rc<ChromeModelFn>>>,
+    /// Each window's chrome widgets, with the model last drawn on them.
+    chrome: RefCell<BTreeMap<WinId, Rc<ChromeDrawn>>>,
     chat_claims_fn: RefCell<Option<Rc<ChatClaimsFn>>>,
+    view_attention_fn: RefCell<Option<Rc<ViewAttentionFn>>>,
+    oldest_card_fn: RefCell<Option<Rc<OldestCardFn>>>,
+    kill_counts_fn: RefCell<Option<Rc<KillCountsFn>>>,
+    first_tab_fn: RefCell<Option<Rc<FirstTabFn>>>,
     hints: RefCell<Option<Rc<dyn HintPort>>>,
     grids: RefCell<BTreeMap<WinId, Rc<dyn GridPort>>>,
     editors: RefCell<BTreeMap<WinId, Rc<dyn EditorReads>>>,
-    refusal: RefCell<Option<Rc<RefusalFn>>>,
     /// How many native focus reports have been posted, so a grab that GTK did not notify (the
     /// widget already held the keys) can still report where they are.
     focus_reports: Cell<u64>,
@@ -216,12 +245,17 @@ impl GtkHost {
             application: RefCell::new(None),
             focus_fn: RefCell::new(None),
             top_bar_fn: RefCell::new(None),
-            chrome_fn: RefCell::new(None),
+            rename_entry_fn: RefCell::new(None),
+            chrome_model: RefCell::new(None),
+            chrome: RefCell::new(BTreeMap::new()),
             chat_claims_fn: RefCell::new(None),
+            view_attention_fn: RefCell::new(None),
+            oldest_card_fn: RefCell::new(None),
+            kill_counts_fn: RefCell::new(None),
+            first_tab_fn: RefCell::new(None),
             hints: RefCell::new(None),
             grids: RefCell::new(BTreeMap::new()),
             editors: RefCell::new(BTreeMap::new()),
-            refusal: RefCell::new(None),
             focus_reports: Cell::new(0),
         })
     }
@@ -294,6 +328,7 @@ impl GtkHost {
                 host.surfaces.borrow_mut().retain(|(w, _), _| *w != win);
                 host.grids.borrow_mut().remove(&win);
                 host.editors.borrow_mut().remove(&win);
+                host.chrome.borrow_mut().remove(&win);
             }
         });
     }
@@ -340,9 +375,50 @@ impl GtkHost {
         *self.top_bar_fn.borrow_mut() = Some(top_bar);
     }
 
-    /// What redraws the chrome a `Chrome` op announces. Until it is set, a `Chrome` is not carried out.
-    pub(crate) fn set_chrome(&self, chrome: Rc<ChromeFn>) {
-        *self.chrome_fn.borrow_mut() = Some(chrome);
+    /// What the rename entry's `Focus` goes through. Until it is set, such a `Focus` is not carried out.
+    pub(crate) fn set_rename_entry(&self, rename: Rc<RenameEntryFn>) {
+        *self.rename_entry_fn.borrow_mut() = Some(rename);
+    }
+
+    /// Where a `Chrome` op reads the window's model. Until it is set, a `Chrome` is not carried out.
+    pub(crate) fn set_chrome_model(&self, model: Rc<ChromeModelFn>) {
+        *self.chrome_model.borrow_mut() = Some(model);
+    }
+
+    /// The widgets `win`'s chrome is drawn on, nothing drawn on them yet. Until they are set, a `Chrome` for `win`
+    /// is not carried out.
+    pub(crate) fn set_chrome_widgets(&self, win: WinId, widgets: chrome::ChromeWidgets) {
+        let drawn = Rc::new(ChromeDrawn {
+            widgets,
+            last: RefCell::new(None),
+        });
+        self.chrome.borrow_mut().insert(win, drawn);
+    }
+
+    /// Draws what changed in `win`'s chrome model since it was last drawn, as a `Chrome` op does: the first draw
+    /// once the widgets are set, and every announcement after it. `Err` says why nothing was drawn.
+    pub(crate) fn draw_chrome(&self, win: WinId) -> Result<(), &'static str> {
+        // Cloned out first: the widgets' setters move widgets, and GTK may call back into the host meanwhile.
+        let model = self.chrome_model.borrow().clone();
+        let drawn = self.chrome.borrow().get(&win).cloned();
+        let (Some(model), Some(drawn)) = (model, drawn) else {
+            return Err(NOT_CARRIED_OUT);
+        };
+        let Some(now) = model(win) else {
+            return Err("the controller holds no such window");
+        };
+        // Taken while it draws, so a draw that comes back here meanwhile draws everything rather than finding it
+        // borrowed.
+        let mut last = drawn.last.take();
+        chrome::reconcile(&drawn.widgets, &mut last, &now);
+        *drawn.last.borrow_mut() = last;
+        Ok(())
+    }
+
+    /// What a chat view holds for the user, as the controller reads it for the chips and the strips. Until it is
+    /// set, every view holds nothing.
+    pub(crate) fn set_view_attention(&self, attention: Rc<ViewAttentionFn>) {
+        *self.view_attention_fn.borrow_mut() = Some(attention);
     }
 
     /// Whether a chat page claims a navigation key, as the controller reads it while it decides that key.
@@ -351,12 +427,28 @@ impl GtkHost {
         *self.chat_claims_fn.borrow_mut() = Some(claims);
     }
 
+    /// Which chat view holds the oldest waiting card, as the chat's key reads it. Until it is set, none does.
+    pub(crate) fn set_oldest_card(&self, oldest: Rc<OldestCardFn>) {
+        *self.oldest_card_fn.borrow_mut() = Some(oldest);
+    }
+
+    /// What a chat view's kill would end, as its y/n names it, and whether its tabs can close now. Until it is set,
+    /// nothing runs in any view and every tab can close.
+    pub(crate) fn set_chat_kill_counts(&self, counts: Rc<KillCountsFn>) {
+        *self.kill_counts_fn.borrow_mut() = Some(counts);
+    }
+
+    /// Whether a new chat view can be given its first tab, asked before it is placed. Until it is set, it can.
+    pub(crate) fn set_chat_first_tab(&self, first_tab: Rc<FirstTabFn>) {
+        *self.first_tab_fn.borrow_mut() = Some(first_tab);
+    }
+
     /// What the `Hint` ops draw and toggle through. Until it is set, they are not carried out.
     pub(crate) fn set_hints(&self, hints: Rc<dyn HintPort>) {
         *self.hints.borrow_mut() = Some(hints);
     }
 
-    /// `win`'s grid: what `Allocate`, `Restack` and `ChromeHooks` act on and what the grid reads answer from.
+    /// `win`'s grid: what `Allocate` and `Restack` act on and what the grid reads answer from.
     pub(crate) fn set_grid(&self, win: WinId, grid: Rc<dyn GridPort>) {
         self.grids.borrow_mut().insert(win, grid);
     }
@@ -364,11 +456,6 @@ impl GtkHost {
     /// `win`'s editor: what the editor reads answer from.
     pub(crate) fn set_editor(&self, win: WinId, editor: Rc<dyn EditorReads>) {
         self.editors.borrow_mut().insert(win, editor);
-    }
-
-    /// What `Refuse` says a refusal through. Until it is set, a `Refuse` is not carried out.
-    pub(crate) fn set_refusal(&self, refusal: Rc<RefusalFn>) {
-        *self.refusal.borrow_mut() = Some(refusal);
     }
 
     fn grid(&self, win: WinId) -> Option<Rc<dyn GridPort>> {
@@ -455,7 +542,8 @@ impl GtkHost {
         let module = match to {
             FocusTo::Module(module) => module,
             FocusTo::TopBarItem(item) => return self.focus_top_bar(op, win, *item),
-            FocusTo::RenameEntry | FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
+            FocusTo::RenameEntry => return self.focus_rename_entry(op, win),
+            FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
         };
         // Cloned out first: the function grabs, and GTK notifies the focus change from inside it.
         let focus_fn = self.focus_fn.borrow().clone();
@@ -496,14 +584,24 @@ impl GtkHost {
         }
     }
 
-    fn chrome(&self, op: &HostOp, win: WinId, rev: u64) -> Applied {
-        // Cloned out first: the redraw reads the controller and moves widgets.
-        let chrome = self.chrome_fn.borrow().clone();
-        let Some(chrome) = chrome else {
+    fn focus_rename_entry(&self, op: &HostOp, win: WinId) -> Applied {
+        // Cloned out first: the grab notifies the focus change from inside it.
+        let rename = self.rename_entry_fn.borrow().clone();
+        let Some(rename) = rename else {
             return self.refuse(op, NOT_CARRIED_OUT);
         };
-        chrome(win, rev);
-        Applied::Done
+        if rename(win) {
+            Applied::Done
+        } else {
+            self.refuse(op, "the rename entry did not take the keys")
+        }
+    }
+
+    fn chrome(&self, op: &HostOp, win: WinId) -> Applied {
+        match self.draw_chrome(win) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, why),
+        }
     }
 
     fn hint(&self, op: &HostOp, call: &HintOp) -> Applied {
@@ -533,21 +631,11 @@ impl GtkHost {
 
     /// Runs `f` on `win`'s grid; refused for a window that has given none.
     fn on_grid(&self, op: &HostOp, win: WinId, f: impl FnOnce(&dyn GridPort)) -> Applied {
-        // Cloned out first: the grid allocates, restacks and runs hooks that may call back into the host.
+        // Cloned out first: the grid allocates and restacks, which may call back into the host.
         let Some(grid) = self.grid(win) else {
             return self.refuse(op, "the window has no grid");
         };
         f(grid.as_ref());
-        Applied::Done
-    }
-
-    fn say_refusal(&self, op: &HostOp, win: WinId, text: &str) -> Applied {
-        // Cloned out first: the flash and the toast draw, and GTK may call back into the host meanwhile.
-        let refusal = self.refusal.borrow().clone();
-        let Some(refusal) = refusal else {
-            return self.refuse(op, NOT_CARRIED_OUT);
-        };
-        refusal(win, text);
         Applied::Done
     }
 
@@ -699,12 +787,10 @@ impl Host for GtkHost {
                 let order: Vec<ModuleId> = moves.iter().map(|step| step.module.clone()).collect();
                 self.on_grid(op, *win, |grid| grid.restack_floats(&order))
             }
-            HostOp::ChromeHooks { win } => self.on_grid(op, *win, |grid| grid.notify_chrome_changed()),
-            HostOp::Refuse { win, text } => self.say_refusal(op, *win, text),
             HostOp::CloseWindow { win } => self.close_window(op, *win),
             HostOp::CreateSurface { win, module, kind } => self.create_surface(op, *win, module, kind),
             HostOp::DropSurface { win, module, why } => self.drop_surface(op, *win, module, why),
-            HostOp::Chrome { win, rev } => self.chrome(op, *win, *rev),
+            HostOp::Chrome { win, .. } => self.chrome(op, *win),
             HostOp::Hint(call) => self.hint(op, call),
             HostOp::Editor(call) => self.service(op, |s| s.editor(call)),
             HostOp::Terminal(call) => self.service(op, |s| s.terminal(call)),
@@ -802,6 +888,38 @@ impl HostReads for GtkHost {
         match claims {
             Some(claims) => claims(view, direction),
             None => NoReads.chat_claims(view, direction),
+        }
+    }
+    /// The panel's own count for the view; nothing held before the shell gives the read.
+    fn view_attention(&self, view: ViewId) -> Attention {
+        let attention = self.view_attention_fn.borrow().clone();
+        match attention {
+            Some(attention) => attention(view),
+            None => NoReads.view_attention(view),
+        }
+    }
+    /// The panel's own answer; none before the shell gives the read.
+    fn oldest_card_view(&self, win: WinId) -> Option<ViewId> {
+        let oldest = self.oldest_card_fn.borrow().clone();
+        match oldest {
+            Some(oldest) => oldest(win),
+            None => NoReads.oldest_card_view(win),
+        }
+    }
+    /// The panel's own counts for the view; nothing running before the shell gives the read.
+    fn chat_kill_counts(&self, view: ViewId) -> ChatKillCounts {
+        let counts = self.kill_counts_fn.borrow().clone();
+        match counts {
+            Some(counts) => counts(view),
+            None => NoReads.chat_kill_counts(view),
+        }
+    }
+    /// The panel's own answer; a view can be given its tab before the shell gives the read.
+    fn chat_first_tab(&self, view: ViewId, breaks: bool) -> Result<(), String> {
+        let first_tab = self.first_tab_fn.borrow().clone();
+        match first_tab {
+            Some(first_tab) => first_tab(view, breaks),
+            None => NoReads.chat_first_tab(view, breaks),
         }
     }
 }

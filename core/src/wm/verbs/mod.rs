@@ -2,9 +2,12 @@
 //! belongs to and whether that family's verbs are decided here yet, the container selection's gate and the
 //! float's, and the words of their refusals.
 
+pub mod chrome;
 pub mod focus;
 pub mod keys;
+pub mod modules;
 pub mod tiling;
+pub mod workspaces;
 
 use crate::keymap::action::{Action, FloatRule, SelectionRule};
 use crate::keymap::Keymap;
@@ -107,15 +110,8 @@ pub fn family_of(action: &Action, keys_on_a_float: bool, keys_on_the_editor: boo
 /// Whether the controller decides `family`'s verbs itself; the others go to the shell as its verb.
 pub fn moved(family: Family) -> bool {
     match family {
-        Family::Tiling | Family::Focus | Family::Keys => true,
-        Family::Chrome
-        | Family::Modules
-        | Family::Workspaces
-        | Family::Windows
-        | Family::Floats
-        | Family::Panel
-        | Family::Close
-        | Family::TextSize => false,
+        Family::Tiling | Family::Focus | Family::Keys | Family::Chrome | Family::Modules | Family::Workspaces => true,
+        Family::Windows | Family::Floats | Family::Panel | Family::Close | Family::TextSize => false,
     }
 }
 

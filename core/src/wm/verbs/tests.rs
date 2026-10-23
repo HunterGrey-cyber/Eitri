@@ -196,8 +196,8 @@ fn decided_here(action: &Action) -> bool {
         | Action::Hint
         | Action::SendPrefix
         | Action::SendKeys(_)
-        | Action::CopyMode { .. } => true,
-        Action::WindowImmersive
+        | Action::CopyMode { .. }
+        | Action::WindowImmersive
         | Action::Module(_)
         | Action::ModuleHide
         | Action::ModuleKill
@@ -208,8 +208,8 @@ fn decided_here(action: &Action) -> bool {
         | Action::WorkspaceNew
         | Action::WorkspaceSwitch { .. }
         | Action::WorkspaceChoose
-        | Action::WorkspaceRename
-        | Action::WindowNew
+        | Action::WorkspaceRename => true,
+        Action::WindowNew
         | Action::WindowOther
         | Action::MoveToWindow { .. }
         | Action::WorkspaceToWindow { .. }
@@ -314,8 +314,9 @@ fn every_action_is_answered_by_the_runner_or_shell_verb() {
         let batch = r.run(action.clone());
         if decided_here(&action) {
             assert_eq!(batch.shell_verb(), None, "{action:?} is decided by the runner");
+            let toast = r.controller.chrome(WIN).toast.map(|toast| toast.text);
             assert!(
-                !ops(&batch).iter().any(|op| matches!(op, HostOp::Refuse { text, .. } if text.starts_with("a float") || text.starts_with("acts on"))),
+                !toast.is_some_and(|text| text.starts_with("a float") || text.starts_with("acts on")),
                 "{action:?} met no gate"
             );
         } else {
@@ -384,12 +385,13 @@ fn a_selection_reset_clears_it_after_the_verb_and_refreshes() {
     );
     let batch = r.run(action);
     assert_eq!(r.layout.borrow().selection(), Selection::Module);
-    let ops = ops(&batch);
-    assert_eq!(ops.last(), Some(&chrome_hooks()), "{ops:#?}");
+    assert_eq!(r.controller.chrome(WIN).top_bar.selection, None);
+    let all: Vec<HostOp> = batch.ops().cloned().collect();
+    assert!(matches!(all.last(), Some(HostOp::Chrome { .. })), "{all:#?}");
     assert_eq!(
-        ops.iter().filter(|op| **op == chrome_hooks()).count(),
+        all.iter().filter(|op| matches!(op, HostOp::Chrome { .. })).count(),
         1,
-        "one redraw reads the whole batch's state"
+        "one announcement reads the whole batch's state"
     );
 }
 
@@ -397,9 +399,10 @@ fn a_selection_reset_clears_it_after_the_verb_and_refreshes() {
 fn a_selection_refusal_says_how_to_get_back_and_runs_nothing() {
     let mut r = rig(three_with_a_container_selected());
     let before = r.layout.borrow().clone();
+    let said = r.said();
     let batch = r.run(Action::ModuleKill);
     let text = one_module_text(&Keymap::defaults());
-    assert_eq!(ops(&batch), vec![refuse(&text)]);
+    r.assert_refused(&batch, &said, &text);
     assert_eq!(batch.shell_verb(), None);
     assert_eq!(*r.layout.borrow(), before, "a refused action leaves the selection too");
     assert!(
@@ -423,16 +426,17 @@ fn a_shell_verbs_selection_reset_waits_for_its_re_read() {
     );
     let reread = r.controller.handle(HostEvent::LayoutChangedByShell { win: WIN });
     assert_eq!(r.layout.borrow().selection(), Selection::Module);
-    assert!(ops(&reread).contains(&chrome_hooks()));
+    assert!(announced(&reread), "the selection's text went");
+    assert_eq!(r.controller.chrome(WIN).top_bar.selection, None);
     let again = r.controller.handle(HostEvent::LayoutChangedByShell { win: WIN });
     assert!(
-        !ops(&again).contains(&chrome_hooks()),
+        !announced(&again),
         "a later change of the shell's own is not the verb's"
     );
-    // With no container selected, the reset changes nothing and the arm's own changes ran the hooks.
+    // With no container selected, the reset changes nothing.
     r.run(Action::Tab(TabAction::Next));
     let quiet = r.controller.handle(HostEvent::LayoutChangedByShell { win: WIN });
-    assert!(!ops(&quiet).contains(&chrome_hooks()));
+    assert!(!announced(&quiet));
 }
 
 #[test]
@@ -441,8 +445,9 @@ fn the_config_phases_keymap_names_the_keys_of_its_refusals() {
     let keymap = std::rc::Rc::new(Keymap::defaults());
     let module_keys = std::rc::Rc::new(crate::layout::ModuleKeys::build(&[], &keymap).unwrap());
     r.controller.set_keymap(WIN, keymap.clone(), module_keys);
+    let said = r.said();
     let batch = r.run(Action::SwapMarked);
-    assert_eq!(ops(&batch), vec![refuse(&one_module_text(&keymap))]);
+    r.assert_refused(&batch, &said, &one_module_text(&keymap));
 }
 
 #[test]
@@ -451,11 +456,11 @@ fn a_lua_mark_marks_the_module_it_names_not_the_one_with_the_keys() {
     let batch = r.controller.lua_request(WIN, LayoutRequest::Mark(terminal()));
     assert_eq!(r.layout.borrow().mark(), Some(&terminal()));
     assert_eq!(r.layout.borrow().focus(), &editor(), "the keys stay where they are");
-    assert_eq!(
-        ops(&batch),
-        vec![chrome_hooks()],
-        "a mark only redraws its text, as the key's mark does: nothing is arranged again"
+    assert!(
+        ops(&batch).is_empty() && announced(&batch),
+        "a mark only redraws its text, as the key's mark does: nothing is arranged again: {batch:?}"
     );
+    assert!(r.controller.chrome(WIN).top_bar.mark.is_some());
     r.controller.lua_request(WIN, LayoutRequest::Mark(terminal()));
     assert_eq!(
         r.layout.borrow().mark(),
@@ -480,25 +485,48 @@ fn a_lua_request_meets_the_selection_gate_only_and_logs_its_refusal() {
         r.controller.notes(WIN)
     );
     // `run` meets the runner's gates exactly as the key does.
+    let said = r.said();
     let by_lua = r.controller.lua_request(WIN, LayoutRequest::Run(Action::ModuleKill));
+    r.assert_refused(&by_lua, &said, &text);
+    let said = r.said();
     let by_key = r.run(Action::ModuleKill);
-    assert_eq!(ops(&by_lua), vec![refuse(&text)]);
-    assert_eq!(ops(&by_lua), ops(&by_key));
+    r.assert_refused(&by_key, &said, &text);
 }
 
+/// The Lua requests the controller decides (the runner's actions, marks, the module requests and a workspace switch)
+/// are moved here; only a float's is still the shell's, and one handed here anyway changes nothing and is logged as a
+/// bug.
 #[test]
-fn an_unmoved_lua_request_is_left_to_the_shell() {
+fn lua_requests_are_the_controllers_but_a_float() {
     let mut r = rig(three(editor()));
     let before = r.layout.borrow().clone();
-    let batch = r.controller.lua_request(WIN, LayoutRequest::Hide(terminal()));
+    let batch = r.controller.lua_request(WIN, LayoutRequest::Float(terminal(), None));
     assert!(batch.is_empty());
     assert_eq!(*r.layout.borrow(), before);
     assert!(r
         .controller
         .notes(WIN)
         .iter()
-        .any(|line| line.starts_with("[wm] BUG: lua_request for an unmoved")));
+        .any(|line| line.starts_with("[wm] BUG: lua_request for the shell's")));
     assert!(crate::wm::lua::moved(&LayoutRequest::Run(Action::Zoom)));
     assert!(crate::wm::lua::moved(&LayoutRequest::Mark(terminal())));
-    assert!(!crate::wm::lua::moved(&LayoutRequest::Switch("two".into())));
+    // The module requests and a switch are decided here, and the shell's loop sends them here.
+    for request in [
+        LayoutRequest::Show(terminal()),
+        LayoutRequest::Hide(terminal()),
+        LayoutRequest::Focus(terminal()),
+        LayoutRequest::Split(terminal(), Axis::Row),
+        LayoutRequest::Open(ModuleKind::Terminal, None),
+        LayoutRequest::Switch("two".into()),
+    ] {
+        assert!(crate::wm::lua::decided(&request), "{request:?}");
+        assert!(crate::wm::lua::moved(&request), "{request:?}");
+    }
+    // A float's request is the floats' family, still the shell's.
+    let float = LayoutRequest::Float(terminal(), None);
+    assert!(!crate::wm::lua::decided(&float) && !crate::wm::lua::moved(&float));
+    let batch = r.controller.lua_request(WIN, LayoutRequest::Switch("two".into()));
+    assert_eq!(batch.shell_verb(), None);
+    assert_eq!(r.controller.chrome(WIN).top_bar.workspace.as_deref(), Some("two"));
+    assert!(r.controller.notes(WIN).contains(&"[workspace] made two".into()));
 }

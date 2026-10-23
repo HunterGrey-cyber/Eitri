@@ -33,7 +33,7 @@ use eitri_panel::panel_page::PanelPage;
 use webkit6::WebView;
 
 use crate::agent_panel::AgentPanelHandle;
-use crate::chat_views::ChatViews;
+use crate::gtk_host::instance_pool::InstancePool;
 use crate::module_grid::{ModuleGrid, ProbePlace};
 use crate::terminal::TerminalPane;
 
@@ -52,13 +52,14 @@ pub(crate) struct Context {
     /// The window's own panel: every page the probe builds is attached to it, through the one
     /// constructor the window's chat views use, so what it measures is the window's routing.
     pub(crate) panel: AgentPanelHandle,
-    /// The window's own chat-view maker, as `instance.new { kind = "agent" }` runs it.
-    pub(crate) new_chat_view: Rc<dyn Fn(crate::OpenHow, crate::NewViewTab) -> Result<ModuleId, String>>,
+    /// A new chat view, as `instance.new { kind = "agent" }` makes one through the window's runner: the view made,
+    /// or why none was.
+    pub(crate) new_chat_view: Rc<dyn Fn() -> Result<ModuleId, String>>,
     /// The confirmed half of the window's kill of a chat module: what `prefix x` then `y` runs, with no
     /// key pressed.
     pub(crate) kill_chat_view: Rc<dyn Fn(&ModuleId)>,
     /// The window's pool of extra chat pages, read only.
-    pub(crate) chat_views: Rc<RefCell<ChatViews<(WebView, Rc<PanelPage>)>>>,
+    pub(crate) chat_views: Rc<RefCell<InstancePool<(WebView, Rc<PanelPage>)>>>,
 }
 
 /// Runs the script named by `EITRI_GRID_PROBE`, if the variable is set. Called once, after the window is

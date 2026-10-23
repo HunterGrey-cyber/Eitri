@@ -1,5 +1,6 @@
-//! Text feedback for the tiling, focus and keys verbs. For the tiling verbs, the caller retains effects requiring
-//! values absent from [`VerbOutcome`]: successful preset cycling, mark toggling, marked swaps and zoom changes.
+//! Text feedback for the tiling, focus, keys, chrome and module verbs. For the tiling verbs, the caller retains effects
+//! requiring values absent from [`VerbOutcome`]: successful preset cycling, mark toggling, marked swaps and zoom
+//! changes.
 //! Container no-ops also flash without a toast; their [`Feedback::Log`] carries only the line,
 //! so the caller must retain that flash separately.
 //!
@@ -11,7 +12,7 @@
 //! are silent on no change as well.
 
 use crate::keymap::{Action, SwapTarget};
-use crate::layout::{LayoutError, ModuleId};
+use crate::layout::{LayoutError, ModuleId, ModuleKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Feedback {
@@ -123,6 +124,49 @@ pub fn keys(action: &Action, outcome: VerbOutcome<'_>) -> Option<Feedback> {
     })
 }
 
+/// Feedback from the chrome's verbs. `window.immersive` always toggles and its line is its own, so nothing here
+/// flashes or toasts.
+pub fn chrome(action: &Action, outcome: VerbOutcome<'_>) -> Option<Feedback> {
+    let _ = (action, outcome);
+    None
+}
+
+/// What the answer gate and a covered chat's reveal say when the layout is being written as they ask, or the
+/// window is not one the controller holds: the answer waits on its card, to be given again.
+pub const LAYOUT_CHANGING_TEXT: &str = "the layout is changing: answer again";
+
+/// A terminal key for a terminal this window's layout does not hold, and a card answer from a chat view it does not
+/// hold.
+pub fn not_in_window_text(id: &ModuleId) -> String {
+    format!("{id}: not in this window")
+}
+
+/// A module key for a module this window has no host for (the canvas before it exists, a module of the other
+/// window), and a kill of one.
+pub fn not_here_yet_text(id: &ModuleId) -> String {
+    format!("{id}: not in this window yet")
+}
+
+/// A split's new terminal or chat view whose neighbour left the layout before it could be placed beside it.
+pub fn left_the_layout_text(beside: &ModuleId, noun: &str) -> String {
+    format!("{beside} has left the layout; no {noun} was opened")
+}
+
+/// A new instance of a kind that has none: only terminals and chat views have numbered instances.
+pub fn no_new_instance_text(kind: ModuleKind) -> String {
+    format!("no new instance of {kind:?} can be made")
+}
+
+/// What a card answer, `prefix ?` or `prefix :` from a covered chat view says: `{chat} is under {float}: {key} from
+/// {float} stows it` for a scratch float, which the scratchpad's key puts away, or `... sinks it` for another, which
+/// only sinking clears. Both keys act on the float only while it holds the keys: pressed in the chat, where an
+/// answer comes from, the scratchpad's key first moves the keys into a shown scratch float, and `float.toggle` would
+/// float the chat itself. So the text says where to press it. `key` is how the keymap reaches that action.
+pub fn covered_text(chat: &str, float: &str, key: &str, scratch: bool) -> String {
+    let verb = if scratch { "stows" } else { "sinks" };
+    format!("{chat} is under {float}: {key} from {float} {verb} it")
+}
+
 /// A killed editor cannot return in this window, so its toast explains how to get it back.
 /// Other modules keep their own error text even if they are also marked gone.
 pub fn layout_refusal_text(err: &LayoutError) -> String {
@@ -146,9 +190,15 @@ fn gone_editor_toast_text(err: &LayoutError) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{focus, keys, layout_refusal_text, tiling, Feedback, VerbOutcome};
+    use super::{chrome, focus, keys, layout_refusal_text, tiling, Feedback, VerbOutcome};
     use crate::keymap::{Action, SwapTarget};
     use crate::layout::{Axis, Direction, LayoutError, ModuleId};
+
+    #[test]
+    fn feedback_window_immersive_says_nothing_on_screen() {
+        assert_eq!(chrome(&Action::WindowImmersive, VerbOutcome::Done), None);
+        assert_eq!(chrome(&Action::WindowImmersive, VerbOutcome::Nothing), None);
+    }
 
     macro_rules! silent_done {
         ($($name:ident: $action:expr),* $(,)?) => {$(
@@ -392,4 +442,64 @@ mod tests {
             assert_eq!(focus(&Action::Select(Direction::Left), outcome), None);
         }
     }
+    #[test]
+    fn a_terminal_key_for_a_terminal_the_window_lacks_says_so() {
+        let id = crate::layout::ModuleId::parse("terminal#3").unwrap();
+        assert_eq!(super::not_in_window_text(&id), "terminal#3: not in this window");
+    }
+
+    #[test]
+    fn a_module_key_with_no_host_here_says_not_yet() {
+        let canvas = crate::layout::ModuleId::parse("canvas").unwrap();
+        assert_eq!(super::not_here_yet_text(&canvas), "canvas: not in this window yet");
+    }
+
+    #[test]
+    fn a_split_whose_neighbour_left_names_it_and_what_was_not_opened() {
+        let target = crate::layout::ModuleId::terminal();
+        assert_eq!(
+            super::left_the_layout_text(&target, "terminal"),
+            "terminal has left the layout; no terminal was opened"
+        );
+        assert_eq!(
+            super::left_the_layout_text(&target, "chat view"),
+            "terminal has left the layout; no chat view was opened"
+        );
+    }
+
+    #[test]
+    fn a_kind_with_no_instances_has_no_new_instance() {
+        assert_eq!(
+            super::no_new_instance_text(crate::layout::ModuleKind::Editor),
+            "no new instance of Editor can be made"
+        );
+    }
+
+    #[test]
+    fn a_covered_chat_names_the_float_and_the_key_that_clears_it() {
+        assert_eq!(
+            super::covered_text("agent", "notes", "C-b -", true),
+            "agent is under notes: C-b - from notes stows it"
+        );
+        assert_eq!(
+            super::covered_text("agent 2", "terminal", "C-b f", false),
+            "agent 2 is under terminal: C-b f from terminal sinks it"
+        );
+    }
+
+    #[test]
+    fn an_answer_the_gate_cannot_judge_is_asked_again() {
+        assert_eq!(super::LAYOUT_CHANGING_TEXT, "the layout is changing: answer again");
+    }
+}
+
+/// A workspace verb's refusal: a step with only one workspace logs under the workspaces' own prefix, every other
+/// refusal as the modules' refusals do.
+pub fn workspaces(alone: bool, text: String) -> Feedback {
+    let log = if alone {
+        format!("[workspace] {text}")
+    } else {
+        format!("[modules] refused: {text}")
+    };
+    Feedback::Refuse { log, text }
 }

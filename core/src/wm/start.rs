@@ -166,7 +166,9 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::MinSize { win, .. }
         | HostEvent::Settled { win, .. }
         | HostEvent::LayoutChangedByShell { win }
-        | HostEvent::Declared { win, .. }
+        | HostEvent::ShellRefused { win, .. }
+        | HostEvent::AnswerRefused { win, .. }
+        | HostEvent::PromptWithdrawn { win }
         | HostEvent::SurfaceEnded { win, .. }
         | HostEvent::TopBarEntry { win, .. }
         | HostEvent::TopBarLeft { win }
@@ -203,10 +205,13 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             TermEvent::Started { win, .. }
             | TermEvent::Exited { win, .. }
             | TermEvent::Bell { win, .. }
+            | TermEvent::Cwd { win, .. }
             | TermEvent::Detached { win, .. },
         )
         | HostEvent::Hint(HintEvent::Active { win, .. } | HintEvent::Landed { win, .. }) => win,
-        HostEvent::EndSignal { .. }
+        // The editor's surface is made before the window's layout exists; its creation waits for nothing.
+        HostEvent::Created { .. }
+        | HostEvent::EndSignal { .. }
         | HostEvent::Lua(_)
         | HostEvent::Peer(_)
         | HostEvent::MonitorsChanged

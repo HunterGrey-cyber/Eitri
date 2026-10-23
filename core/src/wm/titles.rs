@@ -255,8 +255,8 @@ mod tests {
         assert_eq!(strip_label(&ModuleId::terminal(), "terminal", one), "terminal");
         assert_eq!(strip_label(&ModuleId::editor(), "editor", one), "editor");
     }
-    /// The window relabels the strips on every change of attention (`refresh_strips` beside the
-    /// tray's refresh); what each refresh shows is this function over the attention it is given.
+    /// The chrome model derives the strips' labels again on every change of a drawn chat's attention, beside
+    /// the tray's chips; what each derivation shows is this function over the attention it is given.
     #[test]
     fn a_card_arriving_relabels_the_strip_entry() {
         let none = Attention::default();

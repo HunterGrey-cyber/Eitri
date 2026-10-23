@@ -363,16 +363,14 @@ fn native_focus_not_the_request_drives_the_cursors() {
     assert!(!ops.iter().any(|op| signals(op, &a)), "nothing for a: {ops:?}");
 }
 
-/// A new terminal is given the keys while the shell places it, before its declaration arrives, so the host's
-/// report finds it untracked; its declaration is what tells it, or its input method would stay shut until the keys
-/// left and came back.
+/// A module the host already reports with the keys before the lifecycle holds it, untracked then: declaring it is
+/// what tells it, or its input method would stay shut until the keys left and came back.
 #[test]
 fn a_module_given_the_keys_before_its_declaration_hears_them_once_declared() {
     let r = driven(two());
     r.native(&editor());
     let t2 = ModuleId::parse("terminal#2").unwrap();
-    let kind = decl(&t2).kind;
-    r.host.with_surface(WIN, t2.clone(), kind.clone(), true);
+    r.host.with_surface(WIN, t2.clone(), decl(&t2).kind, true);
     crate::layout::place(&mut r.layout.borrow_mut(), &t2, &editor(), Axis::Column).unwrap();
     r.post(HostEvent::LayoutChangedByShell { win: WIN });
     let mark = r.mark();
@@ -382,12 +380,15 @@ fn a_module_given_the_keys_before_its_declaration_hears_them_once_declared() {
         !ops.iter().any(|op| signals(op, &t2)),
         "an undeclared module is no tracked module yet: {ops:?}"
     );
+    let declare = {
+        let decl = decl(&t2);
+        move |w: &mut Window, _: &dyn HostReads, batch: &mut Batch| {
+            w.lifecycle.declare(&decl, true);
+            crate::wm::focus::modules_changed(w, WIN, batch);
+        }
+    };
     let mark = r.mark();
-    r.post(HostEvent::Declared {
-        win: WIN,
-        module: t2.clone(),
-        kind: kind.clone(),
-    });
+    r.batch(declare.clone());
     let ops = r.ops_since(mark);
     let told: Vec<_> = ops.iter().filter(|op| signals(op, &t2)).collect();
     assert_eq!(
@@ -405,11 +406,7 @@ fn a_module_given_the_keys_before_its_declaration_hears_them_once_declared() {
     );
     // A second declaration of the same instance (an idle one taken again) changes no answer.
     let mark = r.mark();
-    r.post(HostEvent::Declared {
-        win: WIN,
-        module: t2.clone(),
-        kind,
-    });
+    r.batch(declare);
     assert!(!r.ops_since(mark).iter().any(|op| signals(op, &t2)));
 }
 
@@ -674,15 +671,13 @@ fn a_plugin_page_and_the_editors_typing_window_hear_has_keys() {
 fn an_owner_change_refreshes_the_selection_chrome() {
     let r = driven(three(editor()));
     r.native(&editor());
-    let mark = r.mark();
+    let derived = || r.driver.query(|c| c.chrome_derivations(WIN)).top_bar;
+    let before = derived();
     r.native(&agent());
-    assert_eq!(r.ops_since(mark).last(), Some(&rig::chrome_hooks()));
-    let mark = r.mark();
+    assert!(derived() > before, "the selection's text is derived again");
+    let before = derived();
     r.native(&agent());
-    assert!(
-        !r.ops_since(mark).contains(&rig::chrome_hooks()),
-        "a report of the same owner moved nothing"
-    );
+    assert_eq!(derived(), before, "a report of the same owner moved nothing");
 }
 
 #[test]
@@ -720,25 +715,26 @@ fn taking_the_keys_raises_a_lower_float_from_an_idle_not_inside_the_signal() {
     );
     let mark = r.mark();
     r.scheduler.advance(Duration::ZERO);
-    let ops = r.ops_since(mark);
+    let ops: Vec<HostOp> = r
+        .ops_since(mark)
+        .into_iter()
+        .filter(|op| !matches!(op, HostOp::Chrome { .. }))
+        .collect();
     assert_eq!(
         ops,
-        vec![
-            HostOp::Restack {
-                win: WIN,
-                moves: vec![
-                    RestackMove {
-                        module: y.clone(),
-                        after: None,
-                    },
-                    RestackMove {
-                        module: x,
-                        after: Some(y),
-                    },
-                ],
-            },
-            rig::chrome_hooks(),
-        ]
+        vec![HostOp::Restack {
+            win: WIN,
+            moves: vec![
+                RestackMove {
+                    module: y.clone(),
+                    after: None,
+                },
+                RestackMove {
+                    module: x,
+                    after: Some(y),
+                },
+            ],
+        },]
     );
 }
 
@@ -871,14 +867,12 @@ fn up_with_nothing_above_goes_to_the_top_bar_and_its_way_back_returns_the_keys()
 #[test]
 fn select_last_and_select_next_refuse_with_todays_texts() {
     let mut r = rig::rig(Layout::new(leaf(editor()), editor()).unwrap());
-    assert_eq!(
-        rig::ops(&r.run(Action::SelectLast)),
-        vec![rig::refuse("no last module")]
-    );
-    assert_eq!(
-        rig::ops(&r.run(Action::SelectNext)),
-        vec![rig::refuse("no other module on screen")]
-    );
+    let said = r.said();
+    let batch = r.run(Action::SelectLast);
+    r.assert_refused(&batch, &said, "no last module");
+    let said = r.said();
+    let batch = r.run(Action::SelectNext);
+    r.assert_refused(&batch, &said, "no other module on screen");
     let notes = r.controller.notes(rig::WIN);
     assert!(notes.contains(&"[prefix] no last module".to_string()));
     assert!(notes.contains(&"[prefix] no other module on screen".to_string()));

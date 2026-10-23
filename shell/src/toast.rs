@@ -5,20 +5,17 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+// The toast's distance from the edge of what it sits over is core's, because `close_prompt`'s corner margin in
+// Immersive is the same one: the two overlay labels share it. How long a toast stays up is core's too, since the
+// window's chrome model times the toasts it shows.
+use eitri_core::wm::chrome::TOAST_FOR;
+use eitri_core::wm::close::TOAST_MARGIN;
+use eitri_core::wm::toasts::{after_timed, toast_top, ToastKind};
 use gtk4::glib;
 use gtk4::prelude::*;
 
-/// How long a toast stays up; a new one restarts it.
-pub(crate) const TOAST_FOR: Duration = Duration::from_secs(4);
-
 /// How long a one-time notice stays up: it is a sentence read once, not a glance at a count.
 pub(crate) const NOTICE_FOR: Duration = Duration::from_secs(12);
-
-/// The toast's distance from the edge of what it sits over. Core owns the value because
-/// `close_prompt`'s corner margin in Immersive is the same one: the two overlay labels share it.
-pub(crate) use eitri_core::wm::close::TOAST_MARGIN;
-
-pub(crate) use eitri_core::wm::toasts::{after_timed, permission_toast_text, refusal_may_show, toast_top, ToastKind};
 
 pub(crate) struct Toast {
     label: gtk4::Label,
@@ -62,20 +59,10 @@ impl Toast {
         self.show_kind(text, duration, ToastKind::Other);
     }
 
-    /// A hidden chat's waiting card ([`permission_toast_text`]): kept up against refusals for its
-    /// [`TOAST_FOR`].
+    /// A hidden chat's waiting card (`eitri_core::wm::toasts::permission_toast_text`), for its [`TOAST_FOR`]. The
+    /// window's chrome model keeps it up against refusals: a refusal meanwhile shows no toast.
     pub(crate) fn show_attention(self: &Rc<Self>, text: &str) {
         self.show_kind(text, TOAST_FOR, ToastKind::Attention);
-    }
-
-    /// A refused key's reason, unless a waiting card's toast is up ([`refusal_may_show`]); `false`
-    /// when it was not shown.
-    pub(crate) fn show_refusal(self: &Rc<Self>, text: &str) -> bool {
-        if !refusal_may_show(self.showing.get()) {
-            return false;
-        }
-        self.show_kind(text, TOAST_FOR, ToastKind::Other);
-        true
     }
 
     /// A note that stays up until it is set again: `Some` shows it now and after every timed line, `None` takes

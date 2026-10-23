@@ -66,22 +66,36 @@ fn pump(ms: u64) {
     }
 }
 
-/// Builds each surface as a focusable button in the window's column, off screen until a `Map`.
+/// Builds each surface as a focusable button in the window's column, off screen until a `Map`, and adds its host
+/// to the grid. A module whose host the grid already holds keeps it, as the shell's own maker keeps one: a host never
+/// gets a second set of controllers.
 struct StubMaker {
     host: Weak<gtk_host::GtkHost>,
     column: gtk4::glib::WeakRef<gtk4::Box>,
+    grid: Weak<StubGrid>,
 }
 
 impl gtk_host::SurfaceMaker for StubMaker {
     fn create(&self, win: WinId, module: &ModuleId, _kind: &SurfaceKind) -> Result<(), String> {
-        let (Some(host), Some(column)) = (self.host.upgrade(), self.column.upgrade()) else {
+        let (Some(host), Some(column), Some(grid)) = (self.host.upgrade(), self.column.upgrade(), self.grid.upgrade())
+        else {
             return Err("the stage is gone".into());
         };
+        let slot = Slot::Host(module.clone());
+        if grid.children.borrow().contains(&slot) {
+            return Ok(());
+        }
         let button = gtk4::Button::with_label(module.as_str());
         button.set_focusable(true);
         column.append(&button);
         button.set_child_visible(false);
         host.register_surface(win, module.clone(), button.upcast_ref());
+        let mut children = grid.children.borrow_mut();
+        let at = children
+            .iter()
+            .position(|slot| !matches!(slot, Slot::Host(_)))
+            .unwrap_or(children.len());
+        children.insert(at, slot);
         Ok(())
     }
     fn drop_surface(&self, _win: WinId, _module: &ModuleId, _why: &DropWhy) -> Result<(), String> {
@@ -156,7 +170,6 @@ impl gtk_host::GridPort for StubGrid {
             children.insert(at, step.slot);
         }
     }
-    fn notify_chrome_changed(&self) {}
     fn probe_places(&self, _module: &ModuleId) -> bool {
         false
     }
@@ -188,6 +201,107 @@ struct Stage {
     window: gtk4::Window,
     /// The fixture's widgets in order: `a`, `b`, `hidden`.
     widgets: Vec<gtk4::Widget>,
+    /// What the window's chrome widgets were told, one line per setter called.
+    chrome: Rc<RefCell<Vec<String>>>,
+}
+
+/// The model every `Chrome` op on the stage reads: the project's name, a chip up, and one toast.
+fn stage_model() -> eitri_core::wm::chrome::ChromeModel {
+    eitri_core::wm::chrome::ChromeModel {
+        top_bar: eitri_core::wm::chrome::TopBar {
+            project: "conformance".into(),
+            ..Default::default()
+        },
+        tray: vec![eitri_core::wm::chrome::Chip {
+            module: ModuleId::terminal(),
+            label: "terminal".into(),
+            shown: true,
+            attention: false,
+            stowed: false,
+        }],
+        toast: Some(eitri_core::wm::chrome::Toast {
+            text: "no last module".into(),
+            kind: eitri_core::wm::toasts::ToastKind::Other,
+            serial: 1,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Chrome widgets that write down each setter called, the way the stage reads them back.
+fn recording_widgets(heard: &Rc<RefCell<Vec<String>>>) -> gtk_host::chrome::ChromeWidgets {
+    let say = |heard: &Rc<RefCell<Vec<String>>>| {
+        let heard = heard.clone();
+        move |line: String| heard.borrow_mut().push(line)
+    };
+    gtk_host::chrome::ChromeWidgets {
+        workspace: Box::new({
+            let say = say(heard);
+            move |project, workspace| say(format!("workspace {project} {workspace:?}"))
+        }),
+        selection: Box::new({
+            let say = say(heard);
+            move |text| say(format!("selection {text:?}"))
+        }),
+        mark: Box::new({
+            let say = say(heard);
+            move |text| say(format!("mark {text:?}"))
+        }),
+        flash: Box::new({
+            let say = say(heard);
+            move || say("flash".into())
+        }),
+        chip: Box::new({
+            let say = say(heard);
+            move |chip| say(format!("chip {} shown={}", chip.label, chip.shown))
+        }),
+        strips: Box::new({
+            let say = say(heard);
+            move |strips| say(format!("strips {}", strips.len()))
+        }),
+        float_bars: Box::new({
+            let say = say(heard);
+            move |bars| say(format!("float bars {}", bars.len()))
+        }),
+        prefix_strip: Box::new({
+            let say = say(heard);
+            move |pieces| say(format!("prefix strip {}", pieces.is_some()))
+        }),
+        toast: Box::new({
+            let say = say(heard);
+            move |toast| say(format!("toast {} {}", toast.serial, toast.text))
+        }),
+        top_bar_revealed: Box::new({
+            let say = say(heard);
+            move |revealed| say(format!("revealed {revealed}"))
+        }),
+        prompt: gtk_host::chrome::PromptWidgets {
+            show: Box::new({
+                let say = say(heard);
+                move |text| say(format!("prompt {text}"))
+            }),
+            measures: Box::new(gtk_host::chrome::PromptMeasures::default),
+            place: Box::new(|_, _| {}),
+            hide: Box::new({
+                let say = say(heard);
+                move || say("prompt hidden".into())
+            }),
+        },
+        rename: gtk_host::chrome::RenameWidgets {
+            open: Box::new({
+                let say = say(heard);
+                move |text| say(format!("rename {text}"))
+            }),
+            refill: Box::new({
+                let say = say(heard);
+                move |text| say(format!("rename refilled {text}"))
+            }),
+            close: Box::new({
+                let say = say(heard);
+                move || say("rename closed".into())
+            }),
+        },
+    }
 }
 
 fn stage(f: &Fixture) -> Result<Stage, String> {
@@ -208,13 +322,17 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
         buttons.push(button);
     }
     buttons[2].set_child_visible(false);
+    let grid = StubGrid::new(f);
     host.set_surface_maker(Rc::new(StubMaker {
         host: Rc::downgrade(&host),
         column: column.downgrade(),
+        grid: Rc::downgrade(&grid),
     }));
     host.set_services(Rc::new(StubServices));
-    let grid = StubGrid::new(f);
     host.set_grid(f.win, grid.clone());
+    let chrome: Rc<RefCell<Vec<String>>> = Rc::default();
+    host.set_chrome_model(Rc::new(|_| Some(stage_model())));
+    host.set_chrome_widgets(f.win, recording_widgets(&chrome));
     window.set_child(Some(&column));
     host.adopt_window(f.win, &window);
     window.present();
@@ -237,6 +355,7 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
         grid,
         window,
         widgets,
+        chrome,
     })
 }
 
@@ -405,6 +524,7 @@ fn closed_windows_are_forgotten(f: &Fixture) -> Result<(), String> {
             grid: _,
             window,
             widgets,
+            chrome: _,
         } = stage(f)?;
         drop(widgets);
         if by_op {
@@ -546,8 +666,10 @@ fn focus_goes_through_the_shells_function(f: &Fixture) -> Result<(), String> {
     Ok(())
 }
 
-/// What the controller's top-bar focus, chrome and digit ops reach: each the function the shell set for it,
-/// answering what that function answered, and nothing before one is set.
+/// What the controller's top-bar focus and digit ops reach: each the function the shell set for it, answering
+/// what that function answered, and nothing before one is set. A `Chrome` op reads the window's model and draws
+/// it on the window's widgets: everything the first time, then only what changed, which for the same model is
+/// nothing.
 fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Result<(), String> {
     struct Hints(RefCell<Vec<String>>);
     impl gtk_host::HintPort for Hints {
@@ -567,10 +689,14 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
         to: FocusTo::TopBarItem(0),
         on_grab: vec![],
     };
-    let chrome = HostOp::Chrome { win: f.win, rev: 3 };
+    let rename = HostOp::Focus {
+        win: f.win,
+        to: FocusTo::RenameEntry,
+        on_grab: vec![],
+    };
     let ops = [
         top_bar.clone(),
-        chrome.clone(),
+        rename.clone(),
         HostOp::Hint(eitri_core::wm::HintOp::Hide),
     ];
     for op in &ops {
@@ -585,11 +711,6 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
         s.host
             .set_top_bar(Rc::new(move |_, index| grants.get() && index == 0 && item.grab_focus()));
     }
-    let drawn: Rc<RefCell<Vec<u64>>> = Rc::default();
-    {
-        let drawn = drawn.clone();
-        s.host.set_chrome(Rc::new(move |_, rev| drawn.borrow_mut().push(rev)));
-    }
     let hints = Rc::new(Hints(RefCell::new(Vec::new())));
     s.host.set_hints(hints.clone());
     if s.host.apply(&top_bar) != Applied::Done {
@@ -599,8 +720,40 @@ fn top_bar_chrome_and_hints_go_through_the_shells_functions(f: &Fixture) -> Resu
     if s.host.apply(&top_bar) != Applied::Refused {
         return Err("a top-bar Focus the shell's function refused was carried out".into());
     }
-    if s.host.apply(&chrome) != Applied::Done || *drawn.borrow() != vec![3] {
-        return Err(format!("the chrome was drawn for {:?}", drawn.borrow()));
+    let entry_grants = Rc::new(Cell::new(true));
+    {
+        let grants = entry_grants.clone();
+        let entry = s.widgets[0].clone();
+        s.host
+            .set_rename_entry(Rc::new(move |_| grants.get() && entry.grab_focus()));
+    }
+    if s.host.apply(&rename) != Applied::Done {
+        return Err("a rename entry Focus the shell's function granted was refused".into());
+    }
+    entry_grants.set(false);
+    if s.host.apply(&rename) != Applied::Refused {
+        return Err("a rename entry Focus the shell's function refused was carried out".into());
+    }
+    let chrome = HostOp::Chrome { win: f.win, rev: 3 };
+    if s.host.apply(&chrome) != Applied::Done {
+        return Err("a Chrome op for a window with its widgets was refused".into());
+    }
+    let first = std::mem::take(&mut *s.chrome.borrow_mut());
+    let expected = [
+        "workspace conformance None",
+        "selection None",
+        "mark None",
+        "chip terminal shown=true",
+        "strips 0",
+        "float bars 0",
+        "prefix strip false",
+        "toast 1 no last module",
+    ];
+    if first != expected {
+        return Err(format!("the first Chrome drew {first:?}"));
+    }
+    if s.host.apply(&chrome) != Applied::Done || !s.chrome.borrow().is_empty() {
+        return Err(format!("the same model drawn again touched {:?}", s.chrome.borrow()));
     }
     for op in [
         HostOp::Hint(eitri_core::wm::HintOp::ShowDigits(vec![
