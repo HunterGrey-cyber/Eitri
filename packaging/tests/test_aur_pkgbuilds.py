@@ -308,5 +308,58 @@ class EitriGitPackage(_PackageCase):
         self.assertIn("plugins/markdown/web/dist/index.html", proc.stderr)
 
 
+class EitriGitNodePin(unittest.TestCase):
+    """prepare()'s reader of the pinned Verdandi's Node version, apps/claude-sidecar/node-pin.json."""
+
+    pkgbuild = os.path.join(_PACKAGING, "aur", "eitri-git", "PKGBUILD")
+
+    def setUp(self):
+        if shutil.which("node") is None:
+            self.skipTest("node (a makedepend of eitri-git) is not installed here")
+        os.makedirs(_SCRATCH_ROOT, exist_ok=True)
+        self.scratch = tempfile.mkdtemp(dir=_SCRATCH_ROOT)
+        self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
+
+    def read_pin(self, text):
+        checkout = os.path.join(self.scratch, "verdandi")
+        shutil.rmtree(checkout, ignore_errors=True)
+        os.makedirs(checkout)
+        if text is not None:
+            _touch(os.path.join(checkout, "apps", "claude-sidecar", "node-pin.json"), text.encode())
+        script = f'set -euo pipefail; source "{self.pkgbuild}"; _verdandi_node_pin "{checkout}"'
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_it_reads_the_version_out_of_node_pin_json(self):
+        text = (
+            '{\n  "//": "the runtime v1.2.3 is only an example in prose",\n  "version": "v22.23.2",\n'
+            '  "tarball_sha256": {"linux-x64": "' + "a" * 64 + '"}\n}\n'
+        )
+        self.assertEqual(self.read_pin(text), "v22.23.2")
+
+    def test_a_missing_or_malformed_pin_reads_as_nothing(self):
+        for text in (None, "", "not json", "[]", '{"version": "22.23.2"}', '{"version": 22}', "{}"):
+            with self.subTest(text=text):
+                self.assertEqual(self.read_pin(text), "")
+
+    def test_the_old_build_script_literal_is_not_read(self):
+        checkout = os.path.join(self.scratch, "verdandi")
+        _touch(os.path.join(checkout, "apps", "claude-sidecar", "scripts", "buildBinary.mjs"),
+               b"const NODE_VERSION = 'v22.23.2';\n")
+        script = f'set -euo pipefail; source "{self.pkgbuild}"; _verdandi_node_pin "{checkout}"'
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)
+
+    def test_prepare_compares_the_pin_with_the_node_in_source(self):
+        # The tarball prepare() checks against is the one source= downloads.
+        with open(self.pkgbuild) as f:
+            body = f.read()
+        self.assertIn('_node_pin=$(_verdandi_node_pin "$srcdir/verdandi")', body)
+        self.assertIn('"node-v22.23.2-linux-x64.tar.xz::https://nodejs.org/dist/v22.23.2/', body)
+        self.assertIn('if [ "$_node_pin" != "v22.23.2" ]; then', body)
+        self.assertNotIn("buildBinary.mjs)", body)
+
+
 if __name__ == "__main__":
     unittest.main()

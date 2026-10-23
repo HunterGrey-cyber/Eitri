@@ -60,6 +60,19 @@ pkgver() {
 	git describe --long --tags | sed 's/^v//; s/-/./g'
 }
 
+# _verdandi_node_pin <verdandi checkout>: the Node version the checkout's sidecar build pins
+# (apps/claude-sidecar/node-pin.json's "version"), or nothing when the file is missing, is not JSON or
+# names no vX.Y.Z version. node is a makedepend, so the JSON is read as JSON rather than by pattern.
+_verdandi_node_pin() {
+	node -e '
+		const fs = require("fs");
+		let pin;
+		try { pin = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(0); }
+		const v = pin && pin.version;
+		if (typeof v === "string" && /^v[0-9]+\.[0-9]+\.[0-9]+$/.test(v)) process.stdout.write(v);
+	' "$1/apps/claude-sidecar/node-pin.json"
+}
+
 prepare() {
 	cd "$srcdir/$pkgname"
 
@@ -85,15 +98,15 @@ prepare() {
 	cd "$srcdir/verdandi"
 	git checkout --quiet "$_verdandi_rev"
 
-	# Require buildBinary.mjs to pin the Node version listed in source=.
-	# A mismatch means this PKGBUILD needs a Node version update.
-	_node_pin=$(sed -n "s/^const NODE_VERSION = '\\(v[0-9.]*\\)';.*/\\1/p" apps/claude-sidecar/scripts/buildBinary.mjs)
+	# The sidecar build downloads exactly the Node its node-pin.json names and refuses any other
+	# tarball, so a Verdandi that pins another Node than source= would fail much later, mid-build.
+	_node_pin=$(_verdandi_node_pin "$srcdir/verdandi")
 	if [ -z "$_node_pin" ]; then
-		printf '==> ERROR: %s\n' "could not read NODE_VERSION out of Verdandi $_verdandi_rev's apps/claude-sidecar/scripts/buildBinary.mjs: the sidecar build recipe may have moved" >&2
+		printf '==> ERROR: %s\n' "could not read the Node version out of Verdandi $_verdandi_rev's apps/claude-sidecar/node-pin.json: the sidecar build recipe may have moved" >&2
 		return 1
 	fi
 	if [ "$_node_pin" != "v22.23.2" ]; then
-		printf '==> ERROR: %s\n' "this PKGBUILD needs a Node bump: Verdandi $_verdandi_rev's buildBinary.mjs pins $_node_pin, not the v22.23.2 in this PKGBUILD's source=" >&2
+		printf '==> ERROR: %s\n' "this PKGBUILD needs a Node bump: Verdandi $_verdandi_rev's node-pin.json pins $_node_pin, not the v22.23.2 in this PKGBUILD's source=" >&2
 		return 1
 	fi
 

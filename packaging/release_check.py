@@ -18,7 +18,7 @@ Usage (release.sh calls these):
     python3 release_check.py rebuild-env SOURCE
     python3 release_check.py lock-package-sources CARGO_LOCK NAME
     python3 release_check.py make-scan-view SRC_DIR DEST_DIR
-    python3 release_check.py check-node-pin BUILD_BINARY_MJS PINS_ENV
+    python3 release_check.py check-node-pin NODE_PIN_JSON PINS_ENV
     python3 release_check.py check-assets OUT_DIR CHECK_DIR VERSION VERDANDI_REV SRC_REPO VERDANDI_REPO \
         SKIA_ARCHIVE SKIA_SHA256
     python3 release_check.py check-release-signers INSTALL_SH RELEASE_SIGNERS
@@ -1110,23 +1110,38 @@ def check_verdandi_source_tree(root: str, verdandi_repo: str, verdandi_rev: str)
 
 
 VERDANDI_SENTINEL_HOME = "apps/claude-sidecar/scripts/buildBinary.mjs"
-_NODE_VERSION_JS_RE = re.compile(r"^const NODE_VERSION = '(v[0-9]+\.[0-9]+\.[0-9]+)';$", re.M)
-_NODE_SHA_JS_RE = re.compile(r"^\s*'(linux-x64|linux-arm64)': '([0-9a-f]{64})',$", re.M)
+NODE_PIN_HOME = "apps/claude-sidecar/node-pin.json"
+_NODE_PIN_PLATFORMS = ("linux-x64", "linux-arm64")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def check_node_pin(build_binary_text: str, pins: dict[str, str]) -> None:
-    """buildBinary.mjs's NODE_VERSION and linux tarball sha256s equal pins.env's:
-    the release's RELEASE hands users pins.env's pair, and the sidecar build re-checks against
-    buildBinary.mjs's own, so the two must agree."""
-    version = _NODE_VERSION_JS_RE.findall(build_binary_text)
-    shas = dict(_NODE_SHA_JS_RE.findall(build_binary_text))
-    want = {"linux-x64": pins.get("NODE_SHA256_linux_x64"), "linux-arm64": pins.get("NODE_SHA256_linux_arm64")}
+def check_node_pin(node_pin_text: str, pins: dict[str, str]) -> None:
+    """The pinned Verdandi's node-pin.json (its sidecar build's only Node pin) names the same version
+    and linux tarball sha256s as pins.env: the release's RELEASE hands users pins.env's pair, and the
+    sidecar build re-checks the tarball against node-pin.json's own, so the two must agree. A file that is not that JSON shape is refused rather than read loosely."""
+    try:
+        doc = json.loads(node_pin_text)
+    except ValueError as e:
+        raise ReleaseCheckError(f"{NODE_PIN_HOME} is not JSON ({e})") from None
+    if not isinstance(doc, dict):
+        raise ReleaseCheckError(f"{NODE_PIN_HOME} is not a JSON object")
+    version = doc.get("version")
+    shas = doc.get("tarball_sha256")
     problems = []
-    if version != [pins.get("NODE_VERSION")]:
-        problems.append(f"buildBinary.mjs pins Node {version}, pins.env {pins.get('NODE_VERSION')!r}")
-    for platform, sha in want.items():
-        if shas.get(platform) != sha:
-            problems.append(f"buildBinary.mjs's {platform} sha256 {shas.get(platform)!r} != pins.env's {sha!r}")
+    if not isinstance(version, str) or not _NODE_VERSION_RE.fullmatch(version):
+        problems.append(f"{NODE_PIN_HOME} has no vX.Y.Z version (got {version!r})")
+    elif version != pins.get("NODE_VERSION"):
+        problems.append(f"{NODE_PIN_HOME} pins Node {version!r}, pins.env {pins.get('NODE_VERSION')!r}")
+    if not isinstance(shas, dict):
+        problems.append(f"{NODE_PIN_HOME} has no tarball_sha256 map")
+        shas = {}
+    want = {"linux-x64": pins.get("NODE_SHA256_linux_x64"), "linux-arm64": pins.get("NODE_SHA256_linux_arm64")}
+    for platform in _NODE_PIN_PLATFORMS:
+        got = shas.get(platform)
+        if not isinstance(got, str) or not _SHA256_RE.fullmatch(got):
+            problems.append(f"{NODE_PIN_HOME} has no well-formed {platform} sha256 (got {got!r})")
+        elif got != want[platform]:
+            problems.append(f"{NODE_PIN_HOME}'s {platform} sha256 {got!r} != pins.env's {want[platform]!r}")
     if problems:
         raise ReleaseCheckError("; ".join(problems))
 
@@ -1529,7 +1544,7 @@ def main(argv: list[str]) -> int:
             return 0
         if cmd == "check-node-pin":
             check_node_pin(_read(rest[0]), parse_release_text(_read(rest[1])))
-            print("release_check: buildBinary.mjs pins the same Node as pins.env", file=sys.stderr)
+            print(f"release_check: {NODE_PIN_HOME} pins the same Node as pins.env", file=sys.stderr)
             return 0
         if cmd == "check-assets":
             for line in check_release_assets(*rest[:8]):

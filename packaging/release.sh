@@ -972,10 +972,13 @@ ctr_phase_f() {
 		1) ctr_die "no branch of the public Verdandi ($url) contains $RS_VERDANDI_REV: publish it first (a commit an earlier --verdandi-mirror rehearsal left in this cache does not count)" ;;
 		*) ctr_die "cannot fetch $url" ;;
 	esac
-	git -C /build/verdandi show "$RS_VERDANDI_REV:apps/claude-sidecar/scripts/buildBinary.mjs" > /build/check/buildBinary.mjs
-	python3 packaging/release_check.py check-node-pin /build/check/buildBinary.mjs packaging/pins.env \
+	# The sidecar build reads its Node pin from this one file; a Verdandi without it keeps the pin
+	# somewhere this check cannot see, so the release stops rather than ship an unchecked runtime.
+	git -C /build/verdandi show "$RS_VERDANDI_REV:apps/claude-sidecar/node-pin.json" > /build/check/node-pin.json \
+		|| ctr_die "the pinned Verdandi $RS_VERDANDI_REV has no apps/claude-sidecar/node-pin.json: its Node pin moved, and check-node-pin must learn where"
+	python3 packaging/release_check.py check-node-pin /build/check/node-pin.json packaging/pins.env \
 		|| ctr_die "the pinned Verdandi's Node pin differs from pins.env"
-	rm -f /build/check/buildBinary.mjs
+	rm -f /build/check/node-pin.json
 	step "phase F done"
 }
 

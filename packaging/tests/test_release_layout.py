@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -1243,25 +1244,77 @@ class BinaryAssetTreeTests(unittest.TestCase):
         self.assertTrue(rc.check_same_bytes({"a": j("a"), "gone": j("gone")}))
 
 
-_BUILD_BINARY = b"""const NODE_VERSION = 'v22.23.2';
-const NODE_TARBALL_SHA256 = {
-  'linux-x64': '""" + b"a" * 64 + b"""',
-  'linux-arm64': '""" + b"b" * 64 + b"""',
-};
+# Verdandi's apps/claude-sidecar/scripts/buildBinary.mjs as it is now: the Node pin comes from node-pin.json,
+# and the file still defines the SEA fuse sentinel.
+_BUILD_BINARY = b"""import { loadNodePin } from './nodePin.mjs';
+const { version: NODE_VERSION, tarballSha256: NODE_TARBALL_SHA256 } = loadNodePin(workspaceRoot);
 const SEA_FUSE = '""" + rc.SEA_SENTINEL.encode() + b"""';
 """
+
+
+# The shape of Verdandi's apps/claude-sidecar/node-pin.json, the one file its sidecar build reads the Node
+# runtime's version and tarball checksums from.
+_NODE_PIN = {
+    "//": "The Node runtime the packaged artifact carries.",
+    "version": "v22.23.2",
+    "tarball_sha256": {"linux-x64": "a" * 64, "linux-arm64": "b" * 64},
+}
+
+
+def _node_pin_text(**changes):
+    doc = json.loads(json.dumps(_NODE_PIN))
+    for key, value in changes.items():
+        if value is None:
+            doc.pop(key, None)
+        else:
+            doc[key] = value
+    return json.dumps(doc, indent=2) + "\n"
 
 
 class NodePinTests(unittest.TestCase):
     PINS = {"NODE_VERSION": "v22.23.2", "NODE_SHA256_linux_x64": "a" * 64, "NODE_SHA256_linux_arm64": "b" * 64}
 
     def test_equal_pins_pass(self):
-        rc.check_node_pin(_BUILD_BINARY.decode(), self.PINS)
+        rc.check_node_pin(_node_pin_text(), self.PINS)
 
     def test_a_different_version_or_hash_fails(self):
-        for change in ({"NODE_VERSION": "v22.23.3"}, {"NODE_SHA256_linux_x64": "c" * 64}):
-            with self.assertRaises(rc.ReleaseCheckError):
-                rc.check_node_pin(_BUILD_BINARY.decode(), dict(self.PINS, **change))
+        for change in ({"NODE_VERSION": "v22.23.3"}, {"NODE_SHA256_linux_x64": "c" * 64},
+                       {"NODE_SHA256_linux_arm64": "c" * 64}):
+            with self.subTest(change=change), self.assertRaises(rc.ReleaseCheckError):
+                rc.check_node_pin(_node_pin_text(), dict(self.PINS, **change))
+
+    def test_a_malformed_pin_file_fails(self):
+        for text in ("", "not json", "[]", _node_pin_text(version=None), _node_pin_text(version="22.23.2"),
+                     _node_pin_text(tarball_sha256=None), _node_pin_text(tarball_sha256=["a" * 64]),
+                     _node_pin_text(tarball_sha256={"linux-x64": "a" * 64}),
+                     _node_pin_text(version="v22.23.2\n"),
+                     _node_pin_text(tarball_sha256={"linux-x64": "a" * 64 + "\n", "linux-arm64": "b" * 64})):
+            with self.subTest(text=text), self.assertRaises(rc.ReleaseCheckError):
+                rc.check_node_pin(text, self.PINS)
+
+    def test_the_old_build_script_literals_are_not_a_pin(self):
+        # Verdandi's build script no longer spells the pin out; a file that does is not where it lives now.
+        old = "const NODE_VERSION = 'v22.23.2';\nconst NODE_TARBALL_SHA256 = {\n  'linux-x64': '" + "a" * 64 + \
+            "',\n  'linux-arm64': '" + "b" * 64 + "',\n};\n"
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.check_node_pin(old, self.PINS)
+
+    def test_the_cli_reads_the_pin_file_and_pins_env(self):
+        scratch = _scratch_dir()
+        pin = os.path.join(scratch, "node-pin.json")
+        with open(pin, "w") as f:
+            f.write(_node_pin_text())
+        pins = os.path.join(scratch, "pins.env")
+        with open(pins, "w") as f:
+            f.write("".join(f"{k}={v}\n" for k, v in self.PINS.items()))
+        script = os.path.join(_PACKAGING, "release_check.py")
+        ok = subprocess.run([sys.executable, script, "check-node-pin", pin, pins], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        with open(pins, "w") as f:
+            f.write("".join(f"{k}={v}\n" for k, v in dict(self.PINS, NODE_VERSION="v22.23.3").items()))
+        bad = subprocess.run([sys.executable, script, "check-node-pin", pin, pins], capture_output=True, text=True)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("node-pin.json", bad.stderr)
 
 
 def _extract_archive_of(repo, rev, dest, paths=()):
