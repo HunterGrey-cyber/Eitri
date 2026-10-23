@@ -434,12 +434,16 @@ preflight() {
 			|| die "--verdandi-mirror $RS_VERDANDI_MIRROR does not have $RS_VERDANDI_REV"
 	fi
 
-	# packaging/install.sh's embedded release-signers block must match the tracked
-	# packaging/release-signers for every version. A release candidate may embed no key
-	# and use a throwaway --release-signers file, provided the tracked and embedded blocks agree.
-	# This prevents shipping a stale or foreign embedded key while the tracked file looks correct.
-	# The final-version check below rejects an empty key list before signers_list_blob
-	# checks whether --sign's key is listed.
+	# packaging/install.sh's embedded
+	# release-signers block must never drift from the tracked packaging/release-signers, for
+	# every version -- an rc's embedded block may stay empty (it signs with a throwaway
+	# --release-signers file instead), as long as the tracked file agrees with what install.sh
+	# actually ships. What this check closes is the drift itself: a hand-kept copy of the block
+	# that silently stops matching the tracked file, so an installer built from this tree could
+	# ship a stale or foreign key while packaging/release-signers looks fine. It is not what stops
+	# a final version from building with no key: signers_list_blob (below, for --sign's own key)
+	# stopped that already, since no key is listed in a file with no key line; the
+	# final-only check just below, added with this one, stops it first and says so by name.
 	signers_file="$RS_SOURCE/packaging/release-signers"
 	install_sh_path="$RS_SOURCE/packaging/install.sh"
 	[ -f "$signers_file" ] || die "$RS_SOURCE has no packaging/release-signers"
@@ -720,17 +724,21 @@ fill_notes() {
 	nvim_rs="$(awk '/^\[\[package\]\]/ { n = 0 } /^name = "nvim-rs"$/ { n = 1 }
 		n && /^version = / { gsub(/"/, "", $3); print $3; exit }' "$RS_SOURCE/Cargo.lock")"
 	[ -n "$nvim_rs" ] || die "cannot read nvim-rs's version from $RS_SOURCE/Cargo.lock"
-	# The Verify section depends on both the embedded keys and whether this build signed.
-	# preflight checks that install.sh's embedded block equals packaging/release-signers;
-	# RS_SIGN_KEY indicates whether this run produced SHA256SUMS.sig.
-	# With no embedded key, install.sh checks SHA256SUMS only; a signature alone adds no trust.
-	# With an embedded key and a signed build, preflight and verify_release_signature
-	# ensure the signing key matches, so install.sh verifies the signature itself.
-	# With an embedded key and an unsigned rehearsal, install.sh refuses the missing signature.
-	# test_release_sh.py's ReleaseNotes covers all three cases.
-	# Each English variant has an equivalent Chinese variant in @VERIFY_SECTION_ZH@,
-	# so both languages describe the same build. The page puts English first
-	# and the Simplified Chinese section after it.
+	# The Verify section describes what THIS BUILD's shipped
+	# install.sh can check, which takes two facts, never one. preflight has refused unless
+	# install.sh's embedded block equals packaging/release-signers, so reading that file is reading
+	# what install.sh embeds; and RS_SIGN_KEY says whether this run made a SHA256SUMS.sig at all.
+	#   - no key embedded (every rc so far, signed with a throwaway key or --unsigned): install.sh
+	#     checks SHA256SUMS only, and a SHA256SUMS.sig is no trust anchor;
+	#   - a key embedded and this run signed: preflight and verify_release_signature have held the
+	#     signing key to the embedded one, so install.sh verifies the signature itself;
+	#   - a key embedded and this run unsigned (preflight allows it only for --rehearsal, never
+	#     published): no signature, and this build's install.sh refuses a release without one.
+	# rc.1's notes went by RS_SIGN_KEY alone and called the key "built into it" with none embedded;
+	# an earlier version read only release-signers. test_release_sh.py's ReleaseNotes holds all three.
+	# The same three facts, translated -- one Chinese variant per English
+	# one, filled into @VERIFY_SECTION_ZH@ so the two languages can never describe a different build
+	# (one page, English first, then Simplified Chinese).
 	if signers_has_key "$RS_SOURCE/packaging/release-signers" && [ -n "$RS_SIGN_KEY" ]; then
 		verify_section="$(cat <<'NV_VERIFY'
     sha256sum -c --ignore-missing SHA256SUMS
@@ -889,7 +897,7 @@ ctr_env() {
 	export npm_config_cache=/build/npm
 	export npm_config_update_notifier=false
 	export EITRI_BUILD_COMMIT="$RS_COMMIT"
-	# "A release always rebuilds clean": shell/build.rs's own npm ci +
+	# A release always rebuilds clean: shell/build.rs's own npm ci +
 	# npm run build run unconditionally, never trusting a fingerprint (or a node_modules/) left over
 	# from an earlier, unrelated build in this tree. Shared by phase F and phase B via this function;
 	# ctr_proof deliberately does not call ctr_env and so never sets this -- its whole point is
@@ -908,7 +916,7 @@ ctr_fetch_pinned() {
 }
 
 # ctr_copy_source SRC DEST: phase F's copy of the clone, every copied file's mtime then set to now
-#. `cp -a` keeps the clone's own mtimes -- its checkout time -- while
+# `cp -a` keeps the clone's own mtimes -- its checkout time -- while
 # $RS_ROOT/target is kept across runs, and cargo takes a path crate as fresh when none of its sources
 # is newer than its last build there: a tree checked out before some later build in the same --out
 # root would ship that build's code under this commit's RELEASE, and proof (a) could not tell, since
@@ -1084,11 +1092,12 @@ ctr_phase_b() {
 	cargo tree --locked --offline -e features -p shell -p agent -p supervisor -i agent > "$logs/feature-tree.txt"
 	if grep -n 'legacy-backend' "$logs/feature-tree.txt" >&2; then ctr_die "the resolved graph enables legacy-backend"; fi
 
-	# shell/build.rs writes agent-ui/web/dist/index.html, plugin-kit/keys/dist/keys.js and
-	# the preview site under plugins/markdown/web/dist into a fresh source copy while
-	# /build/target is retained. Unchanged inputs can make cargo skip the build script
-	# on a retry, leaving bundles absent and causing include_str! to fail.
-	# Cleaning shell makes its build script run against the fresh copy every time.
+	# shell/build.rs writes agent-ui/web/dist/index.html (and plugin-kit/keys/dist/keys.js and the Markdown
+	# preview plugin's site under plugins/markdown/web/dist) into the source tree, which this run copied
+	# afresh, while /build/target is kept. A rerun of the same commit (a retry after a failure, or a
+	# rehearsal then the real build) leaves every input shell/build.rs watches unchanged, so cargo
+	# would not run it, the fresh copy would have no bundle, and include_str! would fail.
+	# Cleaning shell alone makes its build script run against this copy every time.
 	step "cargo clean --release -p shell (its build script writes the web bundle into this fresh copy)"
 	cargo clean --release --locked --offline -p shell
 	step "cargo build --release --locked -p shell -p agent -p supervisor --bins (no --features)"

@@ -29,7 +29,7 @@ here=$(cd "$(dirname "$0")" && pwd) || exit 1
 # these straight through instead; the default (none of them given, or --from-source itself, which
 # set_mode accepts twice) is unchanged: build and install this checkout from source.
 # packaging/tests/install/test_root_wrapper.sh reads the list of modes out of packaging/install.sh
-# itself, so a mode added there and not here fails a test.
+# itself, so a mode added there and not here fails a test (--nvim-offer was once added there without it).
 # -h/--help first says what this script does with no option, since packaging/install.sh's own usage
 # describes a release install there.
 for _nv_a in "$@"; do

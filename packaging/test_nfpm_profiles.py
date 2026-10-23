@@ -361,7 +361,7 @@ class DescriptionsCiteNoInternalRulingOrSpec(unittest.TestCase):
             self.assertIsNone(match, (path, match and match.group(0), description))
 
 
-# --- the AppArmor profile, .deb only ---
+# --- the AppArmor profile, .deb only -----------------------------------------------------------
 
 APPARMOR_DST = "/etc/apparmor.d/eitri"
 APPARMOR_SRC = "./packaging/apparmor/eitri"

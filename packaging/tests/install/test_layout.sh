@@ -108,7 +108,7 @@ t_fresh_layout() {
 
 TESTS="$TESTS t_symlinked_bindir_launches"
 t_symlinked_bindir_launches() {
-	# a symlinked ~/.local/bin -- e.g. GNU stow folding it into a
+	# A symlinked ~/.local/bin -- e.g. GNU stow folding it into a
 	# dotfiles repo -- is a directory symlink, not a symlink on the launcher file itself. The
 	# install still lands a real ~/.local/lib/eitri (untouched here), but the launcher's old
 	# `readlink -f "$0"` canonicalized straight through the symlinked bindir, landing LIBDIR next
@@ -404,8 +404,8 @@ t_dry_run_upgrade() {
 
 TESTS="$TESTS t_prune_sidecars"
 t_prune_sidecars() {
-	# Keep the new rev, the replaced install's rev, and any rev another installed RELEASE names.
-	# Remove other revision-shaped entries and leave unrelated names alone.
+	# Kept are the new rev, the replaced install's rev, and a rev another installed
+	# RELEASE names; anything else named like a rev goes, and anything else is left alone.
 	serve 1.0.0
 	inst_net
 	expect_rc 0

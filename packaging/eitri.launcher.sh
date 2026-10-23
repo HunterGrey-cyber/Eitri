@@ -138,13 +138,14 @@ PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "eitri: no 
 # the shell exports this for Verdandi and the window inherited a different `CLAUDE_CONFIG_DIR`.
 [[ -n "$ACCOUNT" ]] && export VERDANDI_CLAUDE_ACCOUNT="$ACCOUNT"
 
-# Print a missing-sidecar hint before opening the window. Backend selection remains in
-# resolve_sidecar_program; this check neither selects a backend nor exports variables.
-# Check the explicit binary override, the packaged sibling and the per-user revision path
-# so a missing sidecar is reported before session startup fails. Checkout-based discovery
-# is omitted because this launcher ships only with installed release builds.
-# Unset, empty or relative XDG_DATA_HOME uses $HOME/.local/share, matching the builder.
-# A plain ${XDG_DATA_HOME:-default} would incorrectly accept a relative path.
+# Print an early hint when no sidecar is found. Backend selection and actual discovery stay
+# in agent::providers::claude_sidecar::spawn::resolve_sidecar_program.
+# Check an explicit binary override, a packaged sibling and the revision-keyed per-user path
+# written by user_sidecar_path. Checkout-based discovery is for development builds and does
+# not apply to this installed release launcher.
+#
+# Unset, empty or relative XDG_DATA_HOME falls back to $HOME/.local/share, matching the
+# installer. A simple default expansion would incorrectly accept a relative value.
 xdg_data_home() {
 	case "${XDG_DATA_HOME:-}" in
 		/*) printf '%s\n' "$XDG_DATA_HOME" ;;

@@ -96,9 +96,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEXTS = os.path.join(REPO, "packaging", "license-texts")
 TARGET = "x86_64-unknown-linux-gnu"
 
-# Release binaries are installed from target/release. Their Cargo packages are built with
-# `-p shell -p agent -p supervisor --bins` by publish.sh and release.sh.
-# Exclude agent-hook because it belongs to the legacy backend, which release builds omit.
+# The five binaries every release (public or private) installs from target/release, and the cargo
+# packages whose bin targets they are (publish.sh / release.sh build exactly
+# `-p shell -p agent -p supervisor --bins`). No `agent-hook`: it is the legacy backend's permission
+# hook, and no release build compiles the legacy backend at all, in either
+# profile.
 SHIPPED_BINARIES = ["shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard"]
 SHIPPED_CARGO_PACKAGES = ["shell", "agent", "supervisor"]
 
@@ -835,9 +837,13 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
     return comps
 
 
-# The source asset redistributes the whole prebuilt Skia archive, including code that
-# --gc-sections removes from shipped binaries. Enumerate the archive's contents separately
-# from native_components(), which only detects code actually linked into shell.
+# ---------------------------------------------------------------------------------------------
+# The prebuilt Skia archive's own contents (a review found the gap): the public source asset redistributes the WHOLE archive, not just
+# whatever a shipped binary ends up linking after --gc-sections discards the rest. That is a
+# different question from native_components() above, which only ever sees what `shell` itself
+# actually links -- measured (2026-09-27) at 0 for every one of expat/libjpeg-turbo/Wuffs/HarfBuzz/
+# ICU despite all five being compiled into the archive's .a files.
+# ---------------------------------------------------------------------------------------------
 
 # Every object member's name is "<rust-skia build_support target>.<source file>.o", except
 # skia-bindings' own generated C++ bridge objects, named "<16 hex content hash>-<name>.o". The part

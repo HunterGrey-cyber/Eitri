@@ -1,21 +1,15 @@
-//! Embeds a live `nvim --embed` connection in a GTK4 window using `GtkGLArea` and Skia.
-//! `LiveHarness` renders into the wrapped framebuffer, with a resizable content viewport
-//! and frame-pacing logs.
-//!
-//! `GtkEventControllerKey` forwards printable characters and Escape/Return/BackSpace/Tab
-//! to `LiveHarness::send_text_input`. The GLArea is focusable and grabs focus on startup.
-//! Ctrl/Alt/Super combinations are ignored instead of sending a bare character such as c for Ctrl+C;
-//! this input path does not provide full key and modifier translation.
-//!
-//! `LiveHarness::with_options` calls `NeovimRuntime::launch` synchronously, spawning nvim and
-//! waiting for its msgpack-rpc connection. Present a "starting nvim..." frame first and construct
-//! the harness on the next callback so the user sees that message before the blocking startup.
-//! The per-frame pump uses `NON_BLOCKING = Duration::ZERO`.
-//!
-//! Window close calls `LiveHarness::shutdown()` and logs the result to clean up the child process.
-//! The tick callback also calls window.close() when `LiveHarness::has_neovim_exited()` is true,
-//! including when nvim exits itself through :qa!. Otherwise the last frame would remain visible
-//! with no process to receive input.
+//! GTK4 probe embedding `LiveHarness` in a focusable `GtkGLArea` backed by a Skia surface.
+//! `LiveHarness` connects to a real `nvim --embed` child. `GtkEventControllerKey` forwards
+//! printable characters and Escape, Return, BackSpace, and Tab through `send_text_input`.
+//! Ctrl, Alt, and Super combinations are ignored to avoid sending bare characters for shortcuts.
+//! `LiveHarness::with_options` blocks while launching nvim and establishing the RPC session.
+//! A starting placeholder is painted and presented before construction on the next callback,
+//! so the user sees an explanation while the GTK main loop is blocked. The per-frame pump
+//! inside `render_frame` uses `Duration::ZERO` and does not need that mitigation.
+//! The close-request handler calls `LiveHarness::shutdown()` and logs the result to clean up
+//! the embedded child when the window closes.
+//! The tick callback also closes the window when `has_neovim_exited()` becomes true,
+//! so quitting nvim directly does not leave an unresponsive window displaying the last frame.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

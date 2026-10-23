@@ -1,24 +1,32 @@
 #!/bin/sh
-# Runs one installer invocation in an allowlisted environment.
+# Runs one installer invocation in an allowlisted environment (every installer run, harness or real,
+# goes through this wrapper).
 #
 #   run-in-env.sh --home DIR --stubs DIR [--stubs DIR]... [--path-tail PATH] [--cwd DIR]
 #                 [--set NAME=VALUE]... [--unset NAME]... [--guard-real-home DIR] -- COMMAND [ARG]...
 #
-# The command runs under `env -i`. PATH contains the --stubs directories in order, then
-# --path-tail (default /usr/bin:/bin). The harness supplies forbidden-command and `claude` stubs.
-# HOME is --home, with XDG_DATA_HOME / XDG_CACHE_HOME / XDG_STATE_HOME / XDG_CONFIG_HOME under it.
-# Each XDG directory can be overridden with --set or dropped with --unset.
-# LANG is the caller's value, or C.UTF-8. --set accepts only allowlisted variables.
-# CARGO_TARGET_DIR can be set to test that --from-source still builds in <src>/target/release.
-# Nothing else is inherited, so unrelated CLI paths and credentials cannot reach the installer.
+# The command runs under `env -i` with only:
+#   PATH       the --stubs directories (in the order given; the harness's first one holds the
+#              forbidden-command and `claude` stubs), then --path-tail (default /usr/bin:/bin);
+#   HOME       --home, and XDG_DATA_HOME / XDG_CACHE_HOME / XDG_STATE_HOME / XDG_CONFIG_HOME under
+#              it (each overridable with --set, or dropped with --unset);
+#   LANG       the caller's, else C.UTF-8;
+#   whatever --set names, which must be EITRI_INSTALL_TEST or an EITRI_INSTALL_TEST_* variable,
+#              an XDG_*_HOME, LANG, EITRI_CONFIG_DIR (the purge test's), or CARGO_TARGET_DIR (F3's
+#              own reproduction: a caller's CARGO_TARGET_DIR must not move where --from-source's
+#              build lands, since staging always reads <src>/target/release).
+# Nothing else is inherited: this host exports VERDANDI_CLAUDE_CLI_PATH and VERDANDI_CLAUDE_ACCOUNT,
+# and neither may reach an installer run.
 #
-# Two guards fail with exit 98 / 97:
-#   - `claude` must resolve to a stub under the new PATH, preventing a real CLI invocation.
-#   - With --guard-real-home DIR, real-home-state.sh lists installer-managed files under DIR.
-#     Names, types, sizes and mtimes are hashed before and after the command and must not change.
-#     Runtime state, settings and file contents are excluded. Only the two hashes are kept in memory.
+# Two guards, each fatal (exit 98 / 97) rather than a failure a caller could overlook:
+#   - `claude` must resolve to a stub under the new PATH, so the host's real claude can never run;
+#   - with --guard-real-home DIR, real-home-state.sh's listing (names, types, sizes and mtimes,
+#     never contents) of what an installer can touch in DIR -- its own files, not the
+#     application's runtime state or settings -- is hashed before and after the command and must
+#     not change. Only the two hashes are kept, in memory.
 #
-# stdin passes through for piped installs. The wrapper uses POSIX sh syntax.
+# stdin passes through (the piped-install test feeds the script on it). POSIX sh: it runs under
+# bash on the host and dash in the Ubuntu image.
 set -u
 
 die() {

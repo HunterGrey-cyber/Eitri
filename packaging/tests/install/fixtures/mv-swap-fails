@@ -1,8 +1,9 @@
 #!/bin/sh
-# Test double for mv: fail the second rename of the install swap, after the old
-# installation has moved aside. All other calls use real mv. When installed as
-# <scratch>/stubs-mvterm/mv, send SIGTERM to the installer before failing.
-# Both failure and interruption must restore the working old installation.
+# Test double for mv: the swap's second rename (.local/lib/eitri.new -> .local/lib/eitri) fails,
+# after the first has already moved the old install to eitri.old; every other call runs the real
+# mv. Installed as <scratch>/stubs-mvterm/mv it first sends SIGTERM to the installer, as an interrupt
+# at that moment would. Either way the old install must come back (a failed or
+# interrupted upgrade leaves the old install working).
 src=
 for a do
 	case $a in

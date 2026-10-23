@@ -380,9 +380,10 @@ t_xdg_newline_refused() {
 
 TESTS="$TESTS t_uninstall_through_foreign_symlink"
 t_uninstall_through_foreign_symlink() {
-	# Point the application's data-directory symlink at ~/.config.
-	# Uninstall must leave ~/.config/nvim and the sidecar files there alone when the link target
-	# has the wrong directory name, report the skipped path, and remove the rest of the install.
+	# $XDG_DATA_HOME/eitri made a link to ~/.config: removing its nvim once removed ~/.config/nvim,
+	# the user's own editor config (uninstall never touches anything named nvim outside
+	# Eitri's own directory). What is under a link that does not lead to a directory named
+	# eitri is left alone, and said so; the rest is uninstalled.
 	serve 1.0.0
 	inst_net
 	expect_rc 0
@@ -413,7 +414,7 @@ t_uninstall_through_foreign_symlink() {
 
 TESTS="$TESTS t_uninstall_symlinked_sidecar_root"
 t_uninstall_symlinked_sidecar_root() {
-	# unlike $NV_DATA/eitri itself (the test just
+	# Unlike $NV_DATA/eitri itself (the test just
 	# above), $NV_SIDECAR_ROOT ($NV_DATA/eitri/sidecar) had no link check of its own at all -- a
 	# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed with no
 	# check, so a 7-hex-named directory BEHIND the link (a user's own, unrelated directory that

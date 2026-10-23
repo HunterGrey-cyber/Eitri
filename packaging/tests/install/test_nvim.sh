@@ -34,7 +34,7 @@ old_nvim_stubs() {
 	printf '%s\n' "$_ons_dir"
 }
 
-# nvim_private_bin VERSION: the path where the offer installs nvim.
+# nvim_private_bin VERSION: the path the offer installs nvim to, an exact layout contract.
 nvim_private_bin() { printf '%s\n' "$(data_of)/eitri/nvim/$1/bin/nvim"; }
 
 # ---------------------------------------------------------------------------------------------
@@ -50,9 +50,9 @@ t_nvim_offer_with_nvim_flag_installs() {
 	expect_exec "$bin"
 	have=$("$bin" --version)
 	expect_eq "$have" "NVIM v$NVIM_FIXTURE_VERSION" "the installed nvim's own --version"
-	# The private nvim is never added to PATH or linked into ~/.local/bin.
-	# No other nvim/vim/vi is created, replaced or removed. after_each checks the planted
-	# ~/.local/bin/nvim and vim byte for byte after every test.
+	# Never on PATH, never linked into ~/.local/bin, and no other nvim/vim/vi is created, replaced or
+	# removed (the planted ~/.local/bin/nvim and vim are checked byte-identical by
+	# after_each on every test in this suite).
 	expect_absent "$TH/.local/bin/nvim.new"
 	if [ -e "$TH/.local/bin/nvim" ]; then
 		if ! grep -q 'planted nvim' "$TH/.local/bin/nvim"; then fail "the planted .local/bin/nvim was replaced"; fi
@@ -73,8 +73,9 @@ t_nvim_offer_yes_flag_also_installs() {
 
 TESTS="$TESTS t_nvim_offer_no_tty_reports_only"
 t_nvim_offer_no_tty_reports_only() {
-	# With no affirmative flag and no controlling terminal, report nvim's version without fetching it.
-	# The suite has no controlling terminal, like a piped install or a CI runner.
+	# No flag, and no controlling terminal (this whole suite runs with none -- `tty` reports "not a
+	# tty" for every test here, the same shape a `curl | sh` pipe or a CI runner has): the rule
+	# is "nvim is only reported, never fetched".
 	serve 1.0.0
 	PRE_STUBS=$(old_nvim_stubs)
 	nv_inst_net
@@ -275,9 +276,12 @@ t_nvim_offer_mode_with_yes_installs() {
 
 TESTS="$TESTS t_nvim_offer_mode_aarch64_no_x86_64_nvim_offered"
 t_nvim_offer_mode_aarch64_no_x86_64_nvim_offered() {
-	# The pinned nvim is x86_64 only, so maybe_offer_nvim needs its own architecture guard.
-	# --from-source rejects other architectures before reaching it, but do_nvim_offer calls it
-	# without check_platform. Exercise --nvim-offer to test the guard inside maybe_offer_nvim.
+	# The aarch64 nvim-offer regression (the pinned nvim is x86_64 only, and this best-effort offer
+	# had no architecture guard) used to be exercised through --from-source, the only mode that
+	# reached maybe_offer_nvim with no check_platform gate anywhere above it. a later change made --from-source itself refuse up front on non-x86_64, which
+	# moved this coverage here: --nvim-offer reaches maybe_offer_nvim just as directly (do_nvim_offer
+	# calls no check_platform either), so the architecture guard inside maybe_offer_nvim itself stays
+	# under test.
 	sc_setup_release 1.0.0 "$REV_A"
 	d_stubs=$T/stubs-aarch64-nvim-offer
 	rm -rf "$d_stubs"
@@ -307,10 +311,13 @@ t_nvim_offer_mode_no_nvim_flag_skips() {
 
 TESTS="$TESTS t_nvim_offer_mode_skips_when_private_copy_present"
 t_nvim_offer_mode_skips_when_private_copy_present() {
-	# --nvim-offer must check nvim_private_state before offering an install.
-	# An older PATH nvim does not require a download when the pinned private copy is already present;
-	# core/src/nvim_bin.rs selects that copy. --dry-run --with-nvim must report it as already
-	# installed, just as --nvim-only does, without replacing the same version.
+	# --nvim-offer never checked nvim_private_state, so on the flagship
+	# flagship case -- a PATH nvim older than the floor (Ubuntu 24.04's apt 0.9.5) with Eitri's own
+	# private copy of the pinned version already installed -- every later plain `eitri setup`
+	# warned "install a newer nvim" (Eitri does not use that one: core/src/nvim_bin.rs picks the
+	# private copy), asked again, and with --with-nvim downloaded and replaced the very same version.
+	# The reproduction: `--dry-run --with-nvim` printed "would install nvim 0.11.2", where
+	# --nvim-only on the same state printed "already installed".
 	sc_setup_release 1.0.0 "$REV_A"
 	PRE_STUBS=$(old_nvim_stubs)
 	bin=$(nvim_private_bin "$NVIM_FIXTURE_VERSION")
@@ -364,7 +371,7 @@ t_nvim_offer_upgrade_skips_when_private_copy_present() {
 
 TESTS="$TESTS t_nvim_offer_up_to_date_still_offers"
 t_nvim_offer_up_to_date_still_offers() {
-	# the "up to date" branch used to return before
+	# The "up to date" branch used to return before
 	# maybe_offer_nvim ever ran at all, so re-running the same installer with --with-nvim/--yes
 	# after a --no-nvim install fetched nothing and said nothing. Reproduced (the
 	# verifier's t_vprobe_with_nvim_when_up_to_date): "nvim 0.9.5 is older...", then "Eitri 1.0.0
@@ -415,7 +422,7 @@ t_nvim_offer_mode_network_failure_warns_not_fatal() {
 # after --uninstall has no eitri/ under .local/share at all). Nothing further to add here.
 
 # ---------------------------------------------------------------------------------------------
-# SH-3: a real controlling terminal exists while stdin still carries the script itself
+# A real controlling terminal exists while stdin still carries the script itself
 # (`cat install.sh | sh -s -- ...` under `script -qc`). Answering 'y' on that terminal runs the
 # offer, and the rest of the script still executes -- proving the prompt reads /dev/tty and never
 # tests whether stdin (fd 0, here entirely the script's own text) is a terminal.

@@ -169,8 +169,9 @@ t_launcher_foreign_backed_up() {
 
 TESTS="$TESTS t_launcher_old_install_sh_replaced"
 t_launcher_old_install_sh_replaced() {
-	# fixtures/old-install-sh-launcher contains the launcher written by the old root install.sh.
-	# Its second line identifies it as installer-managed, so it can be replaced without a backup.
+	# The launcher the old root install.sh wrote (fixtures/old-install-sh-launcher, copied out of
+	# its heredoc before that script became a wrapper), recognised by its second
+	# line.
 	cp "$FIXTURES/old-install-sh-launcher" "$TH/.local/bin/eitri"
 	expect_eq "$(sed -n 2p "$TH/.local/bin/eitri")" \
 		'# neovibe, installed by install.sh. Everything it decides is printed before the window opens.' \
@@ -222,7 +223,7 @@ t_old_glibc() {
 TESTS="$TESTS t_bad_options_and_help"
 t_bad_options_and_help() {
 	# --nvim-only, --from-source and --with-nvim used to exit 2 here, "not in this installer yet"
-	#.
+	# (they are implemented for real now; test_nvim.sh and test_from_source.sh exercise them).
 	inst -- --bogus
 	expect_rc 1
 	expect_out 'unknown option: --bogus'
@@ -237,7 +238,8 @@ t_bad_options_and_help() {
 
 TESTS="$TESTS t_help_has_no_internal_references"
 t_help_has_no_internal_references() {
-	# --help must describe installer behavior without internal document references.
+	# --help used to show a design-doc section number and a ruling id for the
+	# development loop -- internal references with no meaning to a user running this installer.
 	inst -- --help
 	expect_rc 0
 	expect_no_out 'spec §'

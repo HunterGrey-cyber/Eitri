@@ -121,8 +121,9 @@ out=$(run_wrapper -h)
 assert_contains "$out" "STUB_ARG:-h" "-h reached the stub"
 assert_not_contains "$out" "STUB_ARG:--from-source" "--from-source was not prepended for -h"
 
-# Pass --nvim-offer through without prepending --from-source or --checkout.
-# Otherwise the installer rejects the two modes as incompatible.
+# --nvim-offer was added to packaging/install.sh (and to the usage
+# text `./install.sh --help` prints) without adding it here, so `./install.sh --nvim-offer` still
+# died "--from-source and --nvim-offer cannot be combined".
 echo "== './install.sh --nvim-offer' passes straight through =="
 out=$(run_wrapper --nvim-offer)
 assert_contains "$out" "STUB_ARG:--nvim-offer" "--nvim-offer reached the stub"
@@ -165,8 +166,9 @@ for mode in $modes; do
 	assert_not_contains "$out" "STUB_ARG:--checkout" "'./install.sh $mode' prepended no --checkout"
 done
 
-# The root wrapper builds this checkout when called without options.
-# Its help must describe that default before showing packaging/install.sh's release-install usage.
+# `./install.sh --help` printed only packaging/install.sh's usage, whose
+# "(no option)" line ("install or upgrade to the latest release") is not what this script does with
+# no option. It now says so first, in plain words.
 echo "== './install.sh --help' first says what this script does with no option =="
 out=$(run_wrapper --help)
 assert_contains "$out" "With no option, it builds and installs this checkout from source" \

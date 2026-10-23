@@ -318,7 +318,7 @@ class NoScratchDiskPathShipsInPinsEnv(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
-# The pinned public source-asset archive: tag 0.153.3,
+# The pinned public source-asset archive (the pin in packaging/pins.env): tag 0.153.3,
 # sha256 ef41a8ff...0caf10. rust-skia's build script caches it under a skia-bindings-* build
 # directory's out/.cache/ -- never modified in place, only ever copied out of, by every test below
 # that reads it.
@@ -328,8 +328,7 @@ _PINNED_SKIA_ARCHIVE_SHA256 = "ef41a8ff85bebeb06238df88e144eb04778a368fc1672a631
 # Where a pinned archive is cached, at fixed depths: release.sh's own checked cache,
 # then a skia-bindings build dir under some target/<profile>/build/. The recursive glob this
 # replaced walked every build and release tree under the cargo target root -- millions of files
-# once release.sh kept its work/, proof/ and target/ there -- and took more than ten minutes
-#. Two entries once named a developer's own scratch disk explicitly
+# once release.sh kept its work/, proof/ and target/ there -- and took more than ten minutes. Two entries once named a developer's own scratch disk explicitly
 # and were dropped because
 # `target/` (repo-relative, below) and a `~/.cache/eitri-release` symlink already reach the same
 # cache through paths this file never has to spell.

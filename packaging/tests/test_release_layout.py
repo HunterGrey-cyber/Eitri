@@ -690,7 +690,7 @@ class LegacySymbolTests(unittest.TestCase):
 
 # --- 8. rewrites.sed is a no-op, and the sentinel never appears literally --------
 
-# --- Helpers used by release.sh ----------------------------------------------------------------
+# --- What release.sh itself needs from this module -----------------------------------------------
 
 def _load_collector():
     spec = importlib.util.spec_from_file_location("collect_licenses", os.path.join(_PACKAGING, "collect-licenses.py"))
@@ -819,8 +819,8 @@ class RelinkRecipeTests(unittest.TestCase):
             rc.parse_relink_recipe("nothing here\n")
 
     def test_the_rebuild_env_the_collector_writes_parses(self):
-        # The offline rebuild sets these variables so its --version reports the same fork commit
-        # as the shipped binary instead of "unknown".
+        # Proof (a) sets exactly these before its offline rebuild, so
+        # the rebuilt --version names the fork commit the shipped one does, not "unknown".
         self.assertEqual(rc.parse_rebuild_env(self.source_text()),
                          {"EITRI_BUILD_COMMIT": "a" * 40, "EITRI_BUILD_FORK_COMMIT": "c" * 40})
 
@@ -1355,8 +1355,9 @@ class EitriSourceTreeTests(unittest.TestCase):
             "SOURCE": b"source\n",
             "agent-ui/web/dist/index.html": b"<html></html>\n",
         })
-        # shell/build_web.rs writes .inputs-sha256 beside the bundle after a successful build.
-        # Compute it from the fixture's web sources so the source-tree check can verify the bundle's inputs.
+        # shell/build_web.rs writes this beside the bundle after a successful build
+        # -- a fresh fingerprint over the fixture's own web sources, exactly as a real
+        # release build would compute it, is what check_eitri_source_tree now requires matches.
         self.web_dir = os.path.join(self.root, "agent-ui/web")
         _plant(self.root, {"agent-ui/web/dist/.inputs-sha256": rc.web_bundle_fingerprint(self.web_dir).encode()})
         # The plugin keyboard kit is shipped the same way: its bundle and the fingerprint of its sources.
@@ -1799,8 +1800,10 @@ class TwinsCheckTests(unittest.TestCase):
             rc.check_twins(self.root)
 
     def test_a_missing_required_english_file_is_reported(self):
-        # Neither README.md nor README.zh-CN.md is planted.
-        # The error must say both are absent instead of implying that a Chinese file has no English twin.
+        # No README.md and no README.zh-CN.md planted at all: the required pair's English side is
+        # entirely absent, distinct from "present but its twin is missing" above. This used to read "README.zh-CN.md: no README.md beside
+        # it (a missing English file)", which implies README.zh-CN.md exists when it does not --
+        # the message must say neither file exists.
         self.plant_text(self.fresh_install())
         with self.assertRaisesRegex(rc.ReleaseCheckError, r"README\.md: neither it nor its twin README\.zh-CN\.md exists"):
             rc.check_twins(self.root)

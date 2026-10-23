@@ -140,9 +140,10 @@ assert_contains "$out" "STUB_SELF:$ROOT/lib/eitri/shell" "invoked through a syml
 assert_contains "$out" "STUB_VERSION:" "--version reached the stub through the symlink"
 
 echo "== LIBDIR resolves through a RELATIVE symlink target (GNU stow's own shape) =="
-# The preceding test uses an absolute symlink target. This one uses a relative target
-# to exercise resolve_launcher_path's relative branch, which must resolve the target
-# relative to the symlink's directory.
+# The test above only ever used an ABSOLUTE
+# `ln -s "$ROOT/bin/eitri" ...` target. `resolve_launcher_path`'s relative branch
+# (`path="$(dirname "$path")/$target"`) is what a real GNU stow tree actually produces --
+# `~/bin/eitri -> ../.local/bin/eitri` -- and was never exercised until now.
 reset_state
 RELSYM_ENTRY_DIR="$SCRATCH_ROOT/relsym-bin"
 mkdir -p "$RELSYM_ENTRY_DIR"
@@ -189,10 +190,14 @@ assert_contains "$out" "STUB_SELF:$SYMDIR_ROOT/lib/eitri/shell" "a symlinked bin
 assert_not_contains "$out" "No such file or directory" "no broken cd through the symlinked bindir under POSIXLY_CORRECT=1"
 
 echo "== an exported CDPATH does not corrupt LIBDIR through a RELATIVE invocation =="
-# With a relative launcher path, the cd used to resolve LIBDIR receives a relative
-# directory. An exported CDPATH with a matching entry can make cd print its destination,
-# adding a line before pwd's output and producing an invalid LIBDIR.
-# Set CDPATH='' for that cd so exec receives a single directory path.
+# Reproduced on the launcher as first written: with $0 relative (an unpacked
+# release directory's own bin/eitri run in place, or any PATH entry that is itself relative --
+# both real shapes this launcher ships in, see its header comment),
+# `cd "$(dirname "$EITRI_LAUNCHER_PATH")/../lib/eitri"` without `CDPATH=''` handed `cd` a
+# relative directory, so an exported CDPATH containing a matching entry (here, `.`) made `cd` print
+# its destination to stdout on top of `pwd`'s own line -- two lines glued into one LIBDIR, and the
+# final `exec "$LIBDIR/shell"` died "No such file or directory". `CDPATH=''` on that one `cd`
+# closes it.
 reset_state
 CDPATH_ENTRY_DIR="$SCRATCH_ROOT/cdpath-relative"
 rm -rf "$CDPATH_ENTRY_DIR"
@@ -304,13 +309,21 @@ EXTRA_ENV=("XDG_DATA_HOME=$elsewhere")
 out="$(run_launcher "$PROJECT_DIR")"
 assert_contains "$out" "no sidecar built yet" "an absolute XDG_DATA_HOME is honoured, and the sidecar built under the old one is not found there"
 
-# Explicit setup modes must pass through without a prepended --sidecar-only, which
-# would conflict with --nvim-only or --uninstall and break recovery commands.
-# These tests check launcher dispatch through a stub that only reports its arguments.
-# Plain setup runs --sidecar-only followed by --nvim-offer, the normal conditional offer.
-# Using --nvim-only would force a download even with an adequate nvim on PATH and make
-# a download failure fatal. The stub cannot check this installer behavior;
-# packaging/tests/install/test_nvim.sh checks do_nvim_offer itself.
+# `eitri setup` used to force
+# `--sidecar-only` onto every call, so `eitri setup --nvim-only`/`--uninstall`/`--sidecar-only`
+# all died "--sidecar-only and X cannot be combined" in the real installer -- exactly the recovery
+# command install.sh itself prints on a failed nvim download. These tests never reach
+# packaging/install.sh's own logic (the stub above just records its argv), so they hold the
+# launcher's own dispatch to account regardless of what install.sh does with it.
+#
+# Plain `eitri setup` used to run --sidecar-only and then --nvim-only for
+# its second call -- do_nvim_only is the EXPLICIT ask (packaging/install.sh's own comment on it:
+# "an already-adequate PATH nvim does not suppress it ... a download failure is fatal"), so a plain
+# `eitri setup` with an adequate nvim already on PATH, or no network right now, turned "nothing to
+# do" into a hard failure. The second call is now --nvim-offer, the SAME conditional offer a normal
+# install runs (packaging/install.sh's own do_nvim_offer/maybe_offer_nvim); these argv-recording
+# tests cannot see that installer-side difference (the stub does not distinguish the two modes'
+# behaviour), so packaging/tests/install/test_nvim.sh holds do_nvim_offer itself to account.
 echo "== plain 'eitri setup' builds the sidecar and then runs the nvim offer =="
 EXTRA_ENV=()
 out="$(run_launcher setup)"
@@ -362,9 +375,10 @@ out="$(run_launcher setup --sidecar-only)"
 assert_count "$out" "STUB_SETUP_CALL" 1 "eitri-setup ran once"
 assert_count "$out" "STUB_SETUP_ARG:--sidecar-only" 1 "--sidecar-only appears exactly once"
 
-# --nvim-offer is an explicit installer mode and must pass through unchanged.
-# Prepending --sidecar-only would create conflicting modes, even with --dry-run.
-# Keep dispatch consistent with the modes exposed by the installer's help text.
+# --nvim-offer was added to packaging/install.sh (and to its usage
+# text, which `eitri setup --help` prints) but not to the pass-through list above, so
+# `eitri setup --nvim-offer --dry-run` died "--sidecar-only and --nvim-offer cannot be combined" --
+# the very defect class this dispatch exists to close, recreated by a hand-kept subset.
 echo "== 'eitri setup --nvim-offer' passes straight through as its own mode =="
 out="$(run_launcher setup --nvim-offer --dry-run)"
 assert_count "$out" "STUB_SETUP_CALL" 1 "eitri-setup ran once"

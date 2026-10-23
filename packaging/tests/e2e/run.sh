@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
-# packaging/tests/e2e/run.sh exercises the installer in clean containers.
-# Run it by hand or from a workflow. It needs docker and network access and builds
-# a real sidecar per distribution, so it stays outside python3 -m pytest packaging.
-# Serve a signed release directory on 127.0.0.1, where the installer permits plain HTTP.
-# Check both curl-piped and saved-then-sh installs as a non-root user with --with-nvim.
-# Each image has openssh-client, and the log must show a good SHA256SUMS signature;
-# removing signature verification support must fail instead of accepting checksums alone.
-# Check the installed layout, launcher version and sidecar version, protocol and runtime.
-# On the image with nvim 0.9.5, fetch and use the application's nvim without changing
-# /usr/bin/nvim. A second install must report up to date, and legacy mode must fail.
-# Uninstall must leave only configuration and state. Images contain no sudo.
-# Install the .deb or .rpm as root, then run setup --yes as the created non-root user.
-# Setup must read only the installed RELEASE: its mirror has no SHA256SUMS, so an
-# attempt to fetch that file would fail. Packages must run no maintainer scripts,
-# and setup must refuse to run as root.
+# Run installer end-to-end checks in clean containers. This needs Docker, internet access
+# and a real sidecar build per distro, so run it manually or from a workflow rather than pytest.
+# Serve a finished release over loopback HTTP, the only address where the installer accepts plain http.
+# Check piped and saved installers as a non-root user with --with-nvim, install layout,
+# application version and the sidecar's version.
+# Check that the real `ssh-keygen -Y verify` path runs: every image has openssh-client, and the
+# script requires the "signature on SHA256SUMS: good" line, so losing openssh-client fails
+# loudly instead of silently degrading to checksum-only verification.
+# Check that an old distro nvim causes a private nvim to be installed without changing /usr/bin/nvim.
+# Check that reinstall reports up to date, legacy backend selection fails with a reason,
+# and uninstall preserves only config and state. Containers have no sudo, so attempts to use it fail.
+# For package installs, install as root and run setup as a non-root user. The setup mirror has
+# no SHA256SUMS, so successful setup shows it uses the installed RELEASE without fetching checksums.
+# Check that package installation runs no maintainer script and setup refuses to run as root.
+#
 # Usage: packaging/tests/e2e/run.sh --release-dir DIR [--release-signers FILE]
 #                                   [--only NAME[,NAME...]] [--out DIR]
-# --release-dir is required and read only. It contains RELEASE, SHA256SUMS,
-# SHA256SUMS.sig and the assets listed in RELEASE.
-# --release-signers supplies the allowed_signers file mounted read only in install
-# containers. It defaults to DIR/release-signers, which release.sh does not write;
-# pass the file for the key used to sign the release.
-# --only selects ubuntu-no-nvim, ubuntu-0.9.5, ubuntu-piped, ubuntu-pkg, fedora,
-# fedora-pkg or arch, separated by commas. The default runs all images.
-# --out selects the log and summary directory.
+# --release-dir names a finished signed release directory and is read only. It is required.
+# --release-signers names the allowed_signers file used to check SHA256SUMS.sig, mounted read only.
+# It defaults to DIR/release-signers; release.sh does not write that file, so supply it for a release.
+# --only selects ubuntu-no-nvim, ubuntu-0.9.5, ubuntu-piped, ubuntu-pkg, fedora, fedora-pkg or arch.
+# --out sets the directory for logs and the summary.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

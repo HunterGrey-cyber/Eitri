@@ -68,8 +68,8 @@ _IMAGE_ID_RE = re.compile(r"^(sha256:)?[0-9a-f]{12}([0-9a-f]{52})?$")
 _VERDANDI_SOURCE_RE = re.compile(r"^verdandi-[0-9a-f]{7}-source\.tar\.gz$")
 _SKIA_ARCHIVE_RE = re.compile(r"^skia-binaries-\S+\.tar\.gz$")
 
-# Allowed RELEASE keys and their value patterns, including source asset checksums
-# and the binary archive name/checksum pair also used in packaging/pins.env.
+# Validate the RELEASE keys, including VERDANDI_SOURCE_SHA256 and the Skia archive/hash pair.
+# packaging/pins.env uses the same SKIA_BINARIES_ARCHIVE and SKIA_BINARIES_SHA256 names.
 RELEASE_FIELDS: dict[str, re.Pattern] = {
     "EITRI_VERSION": VERSION_RE,
     "EITRI_COMMIT": _HEX40,
@@ -106,8 +106,9 @@ def parse_release_text(text: str) -> dict[str, str]:
     return fields
 
 
-# Only release.sh --rehearsal may omit the nvim pin fields.
-# It must include REHEARSAL=1, which is forbidden in a publishable RELEASE.
+# A rehearsal (release.sh --rehearsal) is the one RELEASE allowed to leave out the
+# nvim pin -- a rehearsal against a pins.env that does not carry the pin yet still has to be
+# able to run -- and it must say what it is: REHEARSAL=1, a field no real RELEASE ever carries.
 REHEARSAL_OPTIONAL_FIELDS = ("NVIM_VERSION", "NVIM_SHA256_linux_x86_64")
 REHEARSAL_FIELD = "REHEARSAL"
 
@@ -448,8 +449,9 @@ def git_archive_hashes(repo_dir: str, rev: str) -> dict[str, str]:
     return hashes
 
 
-# Allowed additions to the source asset beyond git archive HEAD.
-# Every extra path in the extracted tree must fall under one of these entries.
+# The known additions to the Eitri source asset: every
+# path in the extracted tree not covered by `git archive HEAD` must fall under one of these, or it
+# is unexpected.
 KNOWN_EITRI_SOURCE_ADDITIONS = (
     "vendor/",
     "skia/",
@@ -864,9 +866,10 @@ def tarball_roles(version: str) -> dict[str, str]:
     return {role: f"{top}/{rel}" for role, rel in {**_TARBALL_ROLES, **_TARBALL_ONLY_ROLES}.items()}
 
 
-# The .deb alone carries the profile needed to start the sandbox under user-namespace
-# restrictions. check_release_assets compares it byte for byte with the source asset's
-# copy. The .rpm carries no profile.
+# The .deb alone also carries the AppArmor profile Ubuntu 23.10+'s user-namespace restriction needs
+# before WebKit's sandbox can start (packaging/nfpm-public.yaml's `packager: deb` entry;
+# the profile is packaging/apparmor/eitri, byte for
+# byte (check_release_assets compares it with the source asset's copy). The .rpm carries none.
 _DEB_ONLY_ROLES = {
     "apparmor": "etc/apparmor.d/eitri",
 }
@@ -1214,12 +1217,12 @@ def check_release_assets(out_dir: str, check_dir: str, version: str, verdandi_re
     return [f"extracted and checked: {', '.join(names[:7])}"]
 
 
-# --- 14. The embedded release-signers block --------
+# --- 14. The embedded release-signers block ------------------------------------------------------
 #
 # packaging/install.sh's embedded_release_signers() carries packaging/release-signers verbatim
 # inside a heredoc, between its own two marker lines (`cat <<'EITRI_RELEASE_SIGNERS'` and a bare
 # `EITRI_RELEASE_SIGNERS` line). A hand-kept copy that drifts from the tracked file is exactly
-# the risk here: release.sh checks `--sign`'s key against release-signers,
+# the defect this check exists for: release.sh checks `--sign`'s key against release-signers,
 # never against what install.sh actually ships, so the two can disagree with no error.
 
 _SIGNERS_HEREDOC_MARKER = "EITRI_RELEASE_SIGNERS"
@@ -1289,8 +1292,9 @@ def check_release_signers_agree(install_sh_text: str, signers_text: str) -> None
     )
 
 
-# Required English/Chinese documentation pairs. check_twins also recursively pairs
-# every other X.zh-CN.md with X.md in the same directory.
+# The required English/Chinese doc pairs -- every other X.zh-CN.md found at any depth under the tree
+# (the search recurses) is paired with the X.md its own name implies, in
+# the same directory (check_twins, below).
 TWIN_REQUIRED_PAIRS: tuple[tuple[str, str], ...] = (
     ("README.md", "README.zh-CN.md"),
     ("INSTALL.md", "INSTALL.zh-CN.md"),

@@ -41,8 +41,10 @@ _DOCKER_EXIT = 97
 # The identity every public commit carries: release.sh's RS_PUBLIC_NAME/RS_PUBLIC_EMAIL.
 _PUBLIC_NAME = "Hunter Grey"
 _PUBLIC_EMAIL = "71165939+HunterGrey-cyber@users.noreply.github.com"
-# Keep the fixture's release-signers text and the block embedded in install.sh in one constant.
-# Agreement and refusal cases start from the same text so independent copies cannot drift.
+# The fixture's packaging/release-signers, and the matching block a
+# fixture packaging/install.sh embeds -- kept as one constant so a test that wants them to agree
+# (the positive controls) and one that wants them to differ (Refusals) both start from the same
+# text rather than two copies that could quietly drift from each other.
 _SIGNERS_BLOCK = "# no key line in the fixture's committed signers file\n"
 
 
@@ -164,8 +166,8 @@ def _build_template(env, dest):
     env.git(fork, "add", "-A")
     env.git(fork, "commit", "-q", "-m", "fork")
 
-    # Remove every NVIM_* line from pins.env before adding _NVIM_PIN.
-    # This keeps the fixture pin from shadowing a real pin and lets the no-pin case remove it entirely.
+    # The fixture's nvim pin is _NVIM_PIN alone: every NVIM_* line of the real pins.env is dropped first, so RehearsalRule's "no nvim pin" fixture really has none,
+    # and the pin under test is never a second, shadowed copy of the real one.
     with open(_PINS, encoding="utf-8") as f:
         pins = "".join(line for line in f if not line.startswith("NVIM_"))
     files = {
@@ -209,8 +211,8 @@ def _build_template(env, dest):
     for rel, text in files.items():
         _write(os.path.join(dest, rel), text)
     shutil.copy2(_RELEASE_SH, os.path.join(dest, "packaging", "release.sh"))
-    # The embedded release-signers agreement check runs the clone's copy of release_check.py.
-    # Copy it into the fixture alongside release.sh.
+    # The preflight check (embedded release-signers agreement) shells out to this, exactly as
+    # a real clone's release.sh would ("run the copy the clone carries", same as release.sh itself).
     shutil.copy2(_RELEASE_CHECK_PY, os.path.join(dest, "packaging", "release_check.py"))
     subprocess.run(["git", "init", "-q", dest], check=True, env=env.vars)
     env.git(dest, "submodule", "add", "-q", fork, "neovide")
@@ -322,8 +324,8 @@ class Refusals(ReleaseShTestCase):
         self.assertRefused(self.run_release("--unsigned"), "is not clean")
 
     def test_a_stray_file_hidden_by_status_show_untracked_files_no(self):
-        # A global or clone config can hide untracked and ignored files from a plain `git status`
-        #; the check must not follow it.
+        # A global or clone config can hide untracked and ignored files from a plain `git status`;
+        # the check must not follow it.
         self.env.git(self.clone, "config", "status.showUntrackedFiles", "no")
         for rel in ("stray.txt", "dist/index.html"):
             with self.subTest(rel):
@@ -500,7 +502,7 @@ class EmbeddedSignersRule(ReleaseShTestCase):
         self.assertRefused(self.run_release("--sign", key, version="1.0.0"), "embedded release-signers block")
 
     def test_a_final_version_with_no_key_anywhere_refuses_by_name(self):
-        # Both sides agree and both are empty: the final-release-
+        # Both sides agree (the drift check passes) and both are empty: the final-release-
         # specific rule, not the general "is not listed in" one below.
         key, _ = self.env.keypair("release-key")
         self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
@@ -509,8 +511,8 @@ class EmbeddedSignersRule(ReleaseShTestCase):
                            "packaging/release-signers holds no key line")
 
     def test_a_final_version_whose_key_is_not_the_one_signing_refuses_as_a_foreign_key(self):
-        # Both signer lists agree and contain a key, but it is not --sign's key.
-        # signers_list_blob must still refuse it as an unlisted signing key.
+        # Both sides agree and both hold a key -- but not --sign's key: the existing
+        # signers_list_blob refusal, which stays working.
         key, _ = self.env.keypair("release-key")
         _, other_pub = self.env.keypair("other-key")
         self.edit("Cargo.toml", 'version = "1.0.0-rc.1"', 'version = "1.0.0"')
@@ -829,8 +831,9 @@ class PublicCommitsRule(ReleaseShTestCase):
         new = git_out("hash-object", "-t", "commit", "-w", "--stdin", stdin=text).strip()
         self.env.git(self.clone, "update-ref", ref_base + sha, new)
 
-    # git replacement objects change what log, rev-list and cat-file read, but not what push sends.
-    # Scanning a stand-in created with git replace --edit would leave the original commit unscanned.
+    # A replacement changes what git log, rev-list and cat-file read, never what
+    # a push sends, so a commit "fixed" with `git replace --edit` was scanned as its stand-in and pushed
+    # as the original.
     def test_a_replacement_hiding_a_leaky_commit_is_refused(self):
         self.commit_as(f"Tidy up {self.LEAK}")
         self.stand_in("HEAD", "Tidy up")
@@ -1615,7 +1618,8 @@ class ReleaseNotes(unittest.TestCase):
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 
     def test_no_release_signers_file_at_all_renders_the_no_key_variant(self):
-        # A missing packaging/release-signers file produces the same no-key notes as an empty file.
+        # No packaging/release-signers in the fixture (the default rc.1 shape before the
+        # drift check would even let a real build reach this far): treated the same as an empty one.
         notes = self.render()
         self.assertIn("carries no release key", notes)
         self.assertNotIn("built into it", notes)
@@ -1633,7 +1637,7 @@ class ReleaseNotes(unittest.TestCase):
         # (--sign with a throwaway key, checked against --release-signers), but the block
         # install.sh embeds holds no key. rc.1's notes said "install.sh does both itself, with the
         # release key built into it" -- a condition reading only RS_SIGN_KEY renders that again,
-        # and this is the test that says so.
+        # and this is the test that says so (no other test does).
         for signers_text in ("# no key line yet\n", None):
             with self.subTest(release_signers="comment only" if signers_text else "absent"):
                 notes = self.render(signers_text=signers_text, RS_SIGN_KEY="/a/throwaway/key")

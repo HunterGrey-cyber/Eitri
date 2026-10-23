@@ -250,9 +250,10 @@ t_from_source_tarball_option_conflict_refuses() {
 	expect_out 'Use one or the other'
 }
 
-# --from-source must apply semver_cmp's downgrade refusal too.
-# A valid signature authenticates an older release but does not prevent a mirror from rolling
-# an installed version backward.
+# semver_cmp's downgrade refusal used to be called
+# only from do_install -- --from-source never refused a downgrade at all, so a mirror serving an
+# older, genuinely signed release rolled a from-source user silently backward, which is exactly the
+# rollback case a signature does not cover.
 TESTS="$TESTS t_from_source_older_version_refused"
 t_from_source_older_version_refused() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
@@ -292,7 +293,7 @@ t_from_source_older_version_refused() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# --from-source --checkout DIR
+# --from-source --checkout DIR (the development loop)
 
 TESTS="$TESTS t_from_source_checkout_public_rev_builds_and_installs"
 t_from_source_checkout_public_rev_builds_and_installs() {
@@ -389,10 +390,18 @@ t_from_source_checkout_target_dir_pinned_against_stale_binary() {
 	expect_absent "$_elsewhere"
 }
 
-# A relative --checkout must be made absolute before run_in changes into it.
-# Otherwise cargo resolves the relative --target-dir against the checkout a second time,
-# placing the build one directory too deep while staging still reads the original target path.
-# This exercises --checkout as a relative path from the harness's sibling working directory.
+# Regression:
+# NV_FROM_SOURCE_DIR used to stay exactly what --checkout was given. run_in cds into it before
+# exec'ing cargo, but --target-dir's own value is expanded here, in the caller, before that cd ever
+# happens -- so a relative --checkout resolved "$NV_FROM_SOURCE_DIR/target" against the ORIGINAL
+# cwd (correct) everywhere except inside that one cargo argument, which then resolved a second time
+# against the POST-cd cwd (the checkout itself), landing the real build one directory too deep. The
+# pre-build rm loop (which runs outside run_in, so it still resolves correctly against the original
+# cwd) had already deleted the one place staging looks, so what used to be a working invocation
+# died with "did not produce target/release/shell" even though the build itself succeeded --
+# reproduced here exactly as reported: --checkout given as a relative path, run from that checkout's
+# own parent directory (which is where $T/cwd, this harness's fixed installer cwd, and $FS_DIR, a
+# sibling of it under $T, put every test by construction).
 TESTS="$TESTS t_from_source_checkout_relative_path_from_its_parent_directory"
 t_from_source_checkout_relative_path_from_its_parent_directory() {
 	FS_FORK_REV=eeeeeee111111111111111111111111111111111
@@ -413,7 +422,7 @@ t_from_source_checkout_relative_path_from_its_parent_directory() {
 	expect_eq "$(installed_version)" 1.0.0 "the version installed from a relative --checkout"
 }
 
-# F3 minor follow-up: nothing exercised the
+# Nothing exercised the
 # rm loop's own reason for existing -- a build that runs and exits 0 but writes nothing into
 # <src>/target/release (redirected elsewhere by a caller's own cargo config, or genuinely skipped)
 # used to leave staging free to pick up whatever binary was already on disk from an earlier run,
@@ -477,7 +486,7 @@ t_from_source_checkout_setup_refuses_honestly_not_as_a_mismatch() {
 	expect_no_out 'tampered'
 }
 
-# both tests below used to build most of the way
+# Both tests below used to build most of the way
 # through a --from-source run on aarch64 (the GTK-detection fix and
 # the nvim-offer fix, each real bugs in code only --from-source could reach without
 # check_platform's gate). F4 found that the whole attempt was pointless even when those two bugs were

@@ -25,7 +25,7 @@ members = [
 # The Neovide fork is a submodule with its own workspace; it is a path dependency, not a member.
 exclude = ["neovide"]
 # `poc/` keeps `gtk4`'s `v4_18` feature (frozen) while the product crates below
-# hold the v4.14 floor. Cargo's resolver 2
+# hold the v4.14 floor (the floor the release binaries are built against). Cargo's resolver 2
 # unifies features across every package in one invocation, so a bare `cargo build --workspace`
 # would re-enable v4_18 on `gtk4` for everyone and need GTK 4.18 at pkg-config time; listing the
 # product crates here means a bare `cargo build`/`cargo test` (no `-p`, no `--workspace`) builds
@@ -47,10 +47,9 @@ default-members = [
 ]
 
 [workspace.package]
-# one `[workspace.package] version`
-# inherited by every product crate; `release.sh` refuses when its argument and this
-# disagree.
-# The first public release is 0.2.0. Release candidates are
+# One `[workspace.package] version` inherited by every product crate; `release.sh` refuses when its
+# argument and this disagree. The first public release is 0.2.0, not 1.0.0 (an earlier plan said
+# 1.0.0 and was reversed on 2026-09-29). Release candidates are
 # `0.2.0-rc.N`. "v1" stays the internal milestone name; this field only ever carries the public
 # SemVer.
 version = "0.2.2"

@@ -1,22 +1,35 @@
 #!/bin/sh
-# Download and verify a release, install or upgrade it for this user, or uninstall it.
-# Missing dependencies produce installation commands and stop the script. No package manager
-# or sudo command is run here. `sh install.sh --help` lists the options.
+# Eitri's installer: download a release, verify it, install it for this user, upgrade it, or
+# uninstall it. Nothing here runs sudo
+# or a package manager: when something is missing it prints the command and stops.
 #
-# The installer needs three safeguards beyond plain `set -eu`:
-# 1. Keep everything in one brace group, with `main "$@"` inside and the closing brace last.
-#    The shell parses the whole group before executing it, so a truncated download cannot
-#    run removal, directory swaps or uninstall logic. Calling main after the group would
-#    let a download cut after the command name run main without its arguments.
-# 2. Check fallible commands explicitly with `|| die "..."` or `|| return 1`.
-#    Functions called from if, &&, || or ! contexts can run with errexit suppressed.
-#    Call functions as plain statements or assignments; predicates set result variables.
-#    ShellCheck's check-set-e-suppressed checks these calls. Bash outside POSIX mode also
-#    disables errexit in command substitutions. A function running inside $(...) must not
-#    capture another fallible function with a nested assignment, which can lose its die.
-#    Use a plain call that sets a variable instead, as rev_of_release and lib_dirs_for do.
-# 3. Under `curl | sh`, stdin contains the script. Run main with stdin from /dev/null.
-#    Prompts read /dev/tty and check that terminal directly; stdin is a pipe for these users.
+#   curl --proto '=https' --tlsv1.2 -fsSL https://github.com/HunterGrey-cyber/eitri/releases/latest/download/install.sh | sh
+#   curl --proto '=https' --tlsv1.2 -fsSL .../install.sh | sh -s -- --version 0.2.0 --yes
+#   eitri setup        (this same file, installed as lib/eitri/eitri-setup)
+#
+# `sh install.sh --help` lists the options.
+#
+# Three rules plain `set -eu` does not give; packaging/tests/install/ holds each:
+#
+# 1. Nothing runs until the whole script has arrived. Everything below is one `{ ... }` group
+#    whose last command is `main "$@"` and whose `}` is the file's last line. A shell parses a
+#    whole compound command before running any of it, so a truncated `curl | sh` download -- cut
+#    anywhere before that `}` -- is a syntax error that runs nothing at all: this file holds
+#    `rm -rf`, `mv` swaps and uninstall logic. (With `}; main "$@"` as the last line, a cut right
+#    after `}; main` ran main with none of its arguments.)
+# 2. `set -e` is never relied on inside a function. POSIX (dash included) ignores it in any
+#    function called from an `if`, `&&`, `||` or `!` context, where a failed `tar` or `mv` would
+#    carry on. So every fallible command ends in `|| die "..."` (or `|| return 1`), and every
+#    function is called only as a plain statement or a plain assignment `x=$(f)` -- predicates
+#    report through a variable, never through their exit status. `shellcheck -s sh -o
+#    check-set-e-suppressed` (SC2310/SC2311) holds this. One case it cannot see: bash outside
+#    POSIX mode (`bash install.sh`, `curl | bash`) turns errexit off inside $(...), so a function
+#    that runs inside $(...) never itself assigns `x=$(g)` from a function g that can die -- g's
+#    die would be lost there. Such a function sets a variable instead and runs as a plain
+#    statement (rev_of_release, lib_dirs_for).
+# 3. stdin is the script under `curl | sh`, so it is never read: `main` runs with stdin from
+#    /dev/null, and a prompt may only ever read /dev/tty (`read ans </dev/tty`), never decide
+#    whether to prompt by testing if stdin is a terminal (it is a pipe for every curl user).
 {
 set -eu
 
@@ -328,15 +341,17 @@ check_home() {
 	esac
 }
 
-# xdg_dir data|cache|state: sets XD_DIR using the same paths as the Rust resolvers.
-# Unset, empty or relative XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME use
-# $HOME/.local/share, $HOME/.cache and $HOME/.local/state respectively. This keeps setup
-# and runtime sidecar discovery aligned. ${VAR:-default} would accept relative values.
-# Use $HOME in defaults because a quoted tilde is literal.
-# Reject newlines: paths containing them can split the uninstall target list and cause
-# unintended deletion. Do not silently replace an absolute value containing a newline
-# with a default, since the Rust resolver would use that absolute value.
-# Return through a variable and call as a plain statement so failures remain fatal.
+# xdg_dir data|cache|state. Sets XD_DIR. An unset, empty or relative XDG_DATA_HOME/
+# XDG_CACHE_HOME/XDG_STATE_HOME means $HOME/.local/share, $HOME/.cache or $HOME/.local/state: the rule
+# the Rust side uses (core/src/layout/persist.rs::state_subdir, behind state_dir, and
+# user_sidecar_path), so `eitri setup` and `eitri` never disagree about where the sidecar is. A
+# plain ${VAR:-default} would pass a relative value through. Defaults are spelled with $HOME, never
+# `~`, which is not expanded inside quotes and would create a directory literally named `~`.
+# A value holding a newline is refused, as check_home refuses one in HOME: every path built from it
+# would hold one too, and one once split the uninstall's target list so that
+# XDG_DATA_HOME="$HOME/Documents<newline>..." removed ~/Documents. It is never
+# replaced by the default instead, which the Rust side (taking an absolute value as given) would
+# not agree with. A variable, not output, and a plain statement: rule 2 above.
 xdg_dir() {
 	case $1 in
 	data) _xd_n=XDG_DATA_HOME _xd_v=${XDG_DATA_HOME-} _xd_d=$NV_HOME/.local/share ;;
@@ -443,11 +458,14 @@ loopback_http() {
 	esac
 }
 
-# check_data_home: reject data paths outside $HOME before writing under NV_DATA.
-# Uninstall refuses its entire target list if any path is outside $HOME, so such a data
-# path would also prevent removal of the library and cache inside $HOME.
-# Apply this check to install, source builds and sidecar or nvim setup. Exempt uninstall
-# so older installations still reach the existing refusal that names manual cleanup paths.
+# check_data_home: an absolute XDG_DATA_HOME outside $HOME makes
+# install write the desktop entry, icon, licences, private nvim and sidecar somewhere --uninstall can
+# never remove: under_home (below) refuses every target outside $HOME as a whole, so the in-$HOME
+# parts (NV_LIB, the cache) were left uninstallable too, with only a by-hand remedy. Refused here
+# instead, before anything is written, for every mode that writes under NV_DATA (do_install,
+# do_from_source, do_sidecar_only, do_nvim_only). --uninstall itself is deliberately exempt: an
+# install made before this check existed must still be removable by its own existing refusal (which
+# names exactly what to delete by hand).
 check_data_home() {
 	_cdh_ok=$(under_home "$NV_DATA")
 	if [ "$_cdh_ok" != 1 ]; then
@@ -590,11 +608,14 @@ parse_release() {
 	parse_release_text "$_pl_text" "$1"
 }
 
-# parse_release_text TEXT NAME: parse an already-read RELEASE; NAME labels error messages.
-# Set the source archive, Node version and checksum fields needed by the sidecar build,
-# along with checkout commits and the nvim version and checksum. release.sh copies the
-# pinned build inputs from packaging/pins.env. Check the source archive against REL_REV7
-# so it cannot name a different revision. Missing required fields mean a damaged release.
+# parse_release_text TEXT NAME: parse_release, for a RELEASE already read; NAME is what messages
+# call it. Also sets the fields the sidecar build reads: REL_VERDANDI_SOURCE
+# (checked against REL_REV7's own prefix, since a mismatch there means the release was assembled
+# wrong), REL_VERDANDI_SOURCE_SHA256, REL_NODE_VERSION, REL_NODE_SHA256_LINUX_X64 and
+# REL_NODE_SHA256_LINUX_ARM64 -- copied from packaging/pins.env into every real RELEASE (release.sh) -- and the
+# fields of the from-source and nvim paths: REL_EITRI_COMMIT, REL_NEOVIDE_FORK_COMMIT (the
+# from-source clone check reads the first), REL_NVIM_VERSION and REL_NVIM_SHA256_LINUX_X86_64 (the
+# nvim offer). A RELEASE missing any of them is as damaged as one missing VERDANDI_REV.
 parse_release_text() {
 	REL_VERSION=$(kv_value "$1" EITRI_VERSION)
 	REL_EITRI_COMMIT=$(kv_value "$1" EITRI_COMMIT)
@@ -713,7 +734,7 @@ check_platform() {
 	_cp=$(uname -sm) || die "uname failed"
 	case $_cp in
 	'Linux x86_64') ;;
-	# this used to send a non-x86_64 user to
+	# This used to send a non-x86_64 user to
 	# --from-source, which always failed later at the Skia fetch (the only pinned archive is
 	# x86_64) -- v1 builds x86_64 only, full stop, and do_from_source now refuses the same
 	# architectures up front for the same reason, so this no longer points anywhere that works.
@@ -765,7 +786,7 @@ ldconfig_output() {
 # directories for that architecture. A variable, not output, since ldconfig_output can die (rule 2
 # above). This used to hardcode the x86-64 marker `ldconfig -p` prints and the
 # Debian/Ubuntu x86_64 lib directory, so it found nothing at all on aarch64 (ldconfig prints
-# "AArch64" there, not "x86-64"). F4 made this aarch64
+# "AArch64" there, not "x86-64"). A later change made this aarch64
 # branch unreachable altogether: check_platform already refused a prebuilt install off x86_64
 # before this was ever called, and do_from_source now refuses --from-source off x86_64 too (no
 # aarch64 Skia archive is pinned), so nothing in this installer can reach check_gtk_webkit on
@@ -858,9 +879,10 @@ check_gtk_webkit() {
 	say "GTK $_gw_ver and WebKitGTK 6.0: ok"
 }
 
-# nvim_check: report the PATH nvim and set NV_NVIM_OK=1 if it meets NV_NVIM_FLOOR (0.10).
-# maybe_offer_nvim uses this result to skip its offer when the existing nvim is adequate,
-# even with --with-nvim, so a working system nvim is preserved.
+# nvim_check: reports which nvim is on PATH and why, and sets NV_NVIM_OK=1 when it
+# already satisfies NV_NVIM_FLOOR (0.10, the fork's own floor). maybe_offer_nvim reads NV_NVIM_OK to
+# decide whether the nvim offer runs at all -- an adequate PATH nvim always wins, whatever flag was
+# given, so --with-nvim never *replaces* a perfectly good system nvim.
 nvim_check() {
 	NV_NVIM_OK=0
 	if ! command -v nvim >/dev/null 2>&1; then
@@ -896,9 +918,10 @@ nvim_dist_base() {
 	fi
 }
 
-# nvim_private_state VERSION: set NV_NVIM_PRIVATE_PRESENT=1 when the version's binary
-# exists and is executable in the per-user nvim directory used by the runtime resolver.
-# This keeps --nvim-only and repeated offers from fetching the same version again.
+# nvim_private_state VERSION: sets NV_NVIM_PRIVATE_PRESENT=1 when
+# $XDG_DATA_HOME/eitri/nvim/VERSION/bin/nvim already exists and is executable (the layout contract
+# shared with Eitri's own nvim resolver) -- --nvim-only and a re-run of the offer are both
+# idempotent against an already-fetched version.
 nvim_private_state() {
 	NV_NVIM_PRIVATE_PRESENT=0
 	NV_NVIM_PRIVATE_BIN=$NV_DATA/eitri/nvim/$1/bin/nvim
@@ -966,12 +989,14 @@ links_stay_inside() {
 	fi
 }
 
-# install_nvim_version VERSION SHA256 TOLERANT: download nvim-linux-x86_64.tar.gz for
-# VERSION and verify it against SHA256 from the parsed RELEASE. Strip the top directory
-# with --strip-components=1 and install into the per-user version directory.
-# Keep this copy off PATH and leave other nvim, vim and vi binaries untouched.
-# A network failure warns and returns with TOLERANT=1; with TOLERANT=0 it is fatal.
-# Call as a plain statement so conditional contexts cannot suppress errexit.
+# install_nvim_version VERSION SHA256 TOLERANT: download the official
+# nvim-linux-x86_64.tar.gz of VERSION, verify it against SHA256 (which the caller always reads off a
+# checked RELEASE, never re-derives here), and extract it with --strip-components=1 (the tarball's
+# own top directory is nvim-linux-x86_64/) into $XDG_DATA_HOME/eitri/nvim/VERSION/. Never placed on
+# PATH, never linked into ~/.local/bin, and nothing named nvim/vim/vi anywhere else is created,
+# replaced or removed. TOLERANT=1 (the install path's own best-effort offer) warns and returns on a
+# network failure; TOLERANT=0 (--nvim-only, the explicit ask) dies. A plain statement always (rule 2:
+# this can die, so it is never called from if/&&/||).
 install_nvim_version() {
 	_inv_version=$1
 	_inv_sha=$2
@@ -1015,19 +1040,18 @@ install_nvim_version() {
 	say "installed nvim $_inv_version into $_inv_dest (never on PATH; Eitri finds it on its own)"
 }
 
-# maybe_offer_nvim: offer nvim after unpack_new or from_source_stage has provided a parsed
-# RELEASE with REL_NVIM_VERSION and REL_NVIM_SHA256_LINUX_X86_64.
-# Skip when PATH already has an adequate nvim or --no-nvim was given. --with-nvim and
-# --yes accept automatically; otherwise prompt through /dev/tty if it can be opened.
-# Without a terminal, report the offer without installing. Never read script input on stdin.
+# Offer nvim after unpack_new or from_source_stage has parsed RELEASE, since the offer
+# needs REL_NVIM_VERSION and REL_NVIM_SHA256_LINUX_X86_64. Skip it for an adequate PATH nvim
+# or --no-nvim. --with-nvim and --yes accept without prompting. Otherwise try /dev/tty,
+# since stdin may contain the script. Without a tty, report the offer without installing.
 maybe_offer_nvim() {
 	if [ "$NV_NVIM_OK" = 1 ]; then return 0; fi
 	if [ "$OPT_NVIM" = no ]; then return 0; fi
 	# The pinned nvim is x86_64 only (install_nvim_version always fetches
 	# nvim-linux-x86_64.tar.gz); do_nvim_only's own explicit ask guards with check_platform, but
 	# this best-effort offer did not, so --with-nvim or --yes on aarch64 installed the wrong
-	# architecture's binary and nvim_bin.rs then preferred it over a perfectly good system nvim. F4
-	# made the --from-source route here unreachable off
+	# architecture's binary and nvim_bin.rs then preferred it over a perfectly good system nvim. A later
+	# change made the --from-source route here unreachable off
 	# x86_64 too (do_from_source now refuses non-x86_64 up front, before this is ever called), so
 	# --nvim-offer (a real caller: Eitri's own post-install "run eitri setup" path) is the only
 	# way left to reach this function on another architecture -- this check still guards it.
@@ -1036,10 +1060,12 @@ maybe_offer_nvim() {
 		say "no prebuilt nvim for $_mon_uname (only x86_64 is offered): install nvim $NV_NVIM_FLOOR or newer yourself"
 		return 0
 	fi
-	# Skip the offer when the pinned nvim version is already installed for this user.
-	# core/src/nvim_bin.rs prefers that copy over the inadequate PATH nvim, so prompting
-	# or downloading it again would repeat work on upgrades and repeated setup runs.
-	# If a dry run could not read RELEASE, NV_NEW_REV7 is empty and no version can be checked.
+	# The pinned version already installed privately (an upgrade whose new
+	# RELEASE pins the same nvim, or a second `eitri setup`) is nothing to offer -- Eitri's own
+	# resolver (core/src/nvim_bin.rs) already prefers it over the inadequate PATH nvim that got us
+	# here. Without this, --with-nvim/--yes re-downloaded and replaced the very same version and a
+	# tty was asked again, the idempotence do_nvim_only has always had. A dry run that could not read
+	# the new RELEASE (NV_NEW_REV7 empty, see below) has no version to look for.
 	if [ -n "$NV_NEW_REV7" ]; then
 		nvim_private_state "$REL_NVIM_VERSION"
 		if [ "$NV_NVIM_PRIVATE_PRESENT" = 1 ]; then
@@ -1150,9 +1176,11 @@ check_base_url() {
 	NV_BASE=$_bu
 }
 
-# require_curl: use curl for every download so --proto-redir can enforce HTTPS on each hop.
-# Release assets are served through redirects. wget's --https-only applies to recursive
-# downloads and does not provide this protection for the downloads used here.
+# require_curl: every download goes through curl. The design also calls for `wget --https-only` for a
+# system without curl, but wget's manual scopes --https-only to recursive downloads, and measured
+# (GNU Wget 1.25.0) it follows an https -> http redirect -- and fetches a plain
+# http:// URL -- with exit 0. curl's --proto-redir holds every hop to HTTPS, and GitHub serves every
+# release asset through a redirect, so wget is not used at all (an Eitri-only deviation from the design).
 require_curl() {
 	if command -v curl >/dev/null 2>&1; then return 0; fi
 	read_os_release
@@ -1222,10 +1250,11 @@ download_verified() {
 	mv -- "$NV_DL/$1.part" "$NV_DL/$1" || die "cannot rename $NV_DL/$1.part"
 }
 
-# curl_get URL DEST: report failure through CG_OK and CG_ERR instead of exiting.
-# This lets the caller tolerate a failed initial Node download and install without a sidecar;
-# the panel explains how to build one later. Enforce HTTPS through redirects as fetch does.
-# Plain HTTP is only for loopback tests and follows no redirects.
+# curl_get URL DEST: like fetch, but reports failure through CG_OK/CG_ERR instead of dying (rule 2:
+# a predicate reports through a variable), because the sidecar build's own first download (Node) is
+# the one place in this installer where "the network is not reachable" is not fatal (a
+# release with no sidecar still installs; the panel says how to get one). HTTPS is held across every
+# redirect, exactly like fetch; a bare http:// URL (only ever a loopback test override) follows none.
 curl_get() {
 	CG_OK=0
 	CG_ERR=
@@ -1276,9 +1305,9 @@ node_dist_base() {
 	fi
 }
 
-# check_sidecar_build_space DIR: require about 600 MiB free on the build filesystem.
-# Measured use includes 356 MB for node_modules, 123 MB for the npm cache and 110 MB for
-# the artifact. If df cannot report free space, allow the build to proceed.
+# check_sidecar_build_space DIR: about 600 MiB free before starting (npm ci's
+# node_modules measured at 356 MB, its own cache at 123 MB, the built artifact at 110 MB, all in
+# DIR's filesystem). A df that cannot be read degrades rather than blocking a build over it.
 check_sidecar_build_space() {
 	_csb_kib=$(df -Pk "$1" 2>/dev/null | awk 'NR==2 { print $4 }') || _csb_kib=
 	case $_csb_kib in
@@ -1321,7 +1350,7 @@ EITRI_RELEASE_SIGNERS
 # unreadable --release-signers then switched signature checking off -- even in an installer with a
 # key built in, even with a --sig given. A --release-signers that lists no key is
 # refused too: it would switch checking off the same way, and supplying a key is the option's only
-# use.
+# use (an Eitri-only rule).
 prepare_signers() {
 	if [ -n "$OPT_SIGNERS" ]; then
 		warn "checking signatures against $OPT_SIGNERS (--release-signers) instead of the key built into this installer: do this only for a release candidate or a test"
@@ -1379,9 +1408,9 @@ require_ssh_keygen() {
 	die "ssh-keygen was not found, so the release signature cannot be checked, and this installer carries a release key to check it against: refusing, because without that check a release someone else built would install unnoticed. Install OpenSSH's client$_rsk and re-run; or, to install with only the checksums checked, re-run with --insecure-skip-signature"
 }
 
-# verify_signature SUMS SIG: when a key is listed, reject missing or invalid signatures.
-# A missing ssh-keygen also fails unless --insecure-skip-signature was given.
-# Use key verification rather than no-validate mode, which accepts signatures from any key.
+# verify_signature SUMS SIG: with a listed key, reject missing, unfetchable or bad signatures.
+# require_ssh_keygen also rejects a missing verifier unless --insecure-skip-signature is set.
+# Use key-based verification; no-validate check mode accepts a signature from any key.
 verify_signature() {
 	if [ "$NV_SIGNERS_HAVE_KEY" != 1 ]; then
 		warn "this installer carries no release key: checksums only detect corruption, they do not show who made the release"
@@ -1394,8 +1423,8 @@ verify_signature() {
 	if [ "$RSK" != 1 ]; then return 0; fi
 	if [ "$OPT_DRY_RUN" = 1 ] && [ -z "$OPT_SIGNERS" ]; then
 		# prepare_signers writes the embedded key to $NV_SIGNERS only in a real run, and a dry run
-		# writes nothing: ssh-keygen would find no file and report a good signature as a bad one
-		#. Said as the network dry run says it.
+		# writes nothing: ssh-keygen would find no file and report a good signature as a bad one.
+		# Said as the network dry run says it.
 		say "would check $2 with ssh-keygen -Y verify against the release key built into this installer (not checked in a dry run)"
 		return 0
 	fi
@@ -1711,7 +1740,7 @@ acquire_lock() {
 	# A parent (<cache> itself) that anyone can write to, without the sticky bit, lets another user
 	# rename this directory away and put their own "eitri" in its place between any two checks --
 	# the two checks above only ever looked at NV_CACHE_NV's own permissions.
-	# that check alone still missed three cases --
+	# That check alone still missed three cases --
 	# a group-writable (0770) non-sticky <cache> (only ever checked -perm -0002, other-write); a
 	# sticky 1777 <cache> owned by ANOTHER user, whose owner can rename our directory away regardless
 	# of the sticky bit (sticky only stops non-owners, never the directory's own owner); and this
@@ -1749,9 +1778,12 @@ acquire_lock() {
 			if [ "$OPG" = 1 ]; then _al_parent_bad=; fi
 		fi
 		if [ -n "$_al_parent_bad" ]; then
-			# Check group and other write permissions even when NV_CACHE belongs to this user or root.
-			# Umask 002 can leave a self-owned cache at 0775. Removing unnecessary group write access
-			# is suitable for an unshared cache; a shared writable directory needs the sticky bit.
+			# This check applies
+			# regardless of who owns $NV_CACHE (the ownership check above already requires it be us
+			# or root), and "chmod +t" was the only remedy offered even when $NV_CACHE is our own --
+			# a user-private-group system's umask 002 routinely leaves a self-owned ~/.cache at 0775,
+			# where the natural fix is removing the group-write bit we do not need, not adding a
+			# sticky bit meant for a directory shared with others.
 			die "$_al_d is writable by its group or by anyone, and not sticky, so another user could replace $NV_CACHE_NV between checks: if you own $_al_d and do not need to share write access to it, run chmod g-w '$_al_d'; if it is meant to be shared, run chmod +t '$_al_d' instead (or set XDG_CACHE_HOME to a directory of your own) and re-run"
 		fi
 		if [ "$_al_d" = / ]; then break; fi
@@ -1759,7 +1791,7 @@ acquire_lock() {
 		if [ -z "$_al_d" ]; then _al_d=/; fi
 	done
 	if ! mkdir -- "$NV_LOCK" 2>/dev/null; then
-		# the stale-lock takeover below is now
+		# The stale-lock takeover below is now
 		# serialized by its own mkdir-based sub-lock, so at most one run at a time ever reaches it.
 		# Before this, two runs that both saw the same dead pid could both reach it at once: A takes
 		# over and mkdirs a fresh, still-pid-less NV_LOCK; B -- mid-takeover itself, nothing yet
@@ -1773,8 +1805,10 @@ acquire_lock() {
 		if ! mkdir -- "$_al_takeover" 2>/dev/null; then
 			_al_tk_pid=$(cat -- "$_al_takeover/pid" 2>/dev/null) || _al_tk_pid=
 			if [ -z "$_al_tk_pid" ]; then
-				# The holder may have created $_al_takeover without writing its pid yet.
-				# Wait and read again, as for NV_LOCK below, before diagnosing a stuck lock.
+				# The holder may
+				# have just mkdir'd $_al_takeover and not yet written its pid -- the same allowance
+				# NV_LOCK's own pid read gets below, extended here so a run that loses this exact
+				# race is not misdiagnosed as permanently stuck.
 				sleep 1
 				_al_tk_pid=$(cat -- "$_al_takeover/pid" 2>/dev/null) || _al_tk_pid=
 			fi
@@ -1796,11 +1830,17 @@ acquire_lock() {
 			fi
 		fi
 		printf '%s\n' "$$" >"$_al_takeover/pid" 2>/dev/null || :
-		# Two runs can both find the same abandoned $_al_takeover and remove and recreate it.
-		# Read the pid back after writing it and stop if another run's pid is present, before
-		# touching NV_LOCK under the assumption that this run holds the sub-lock alone.
-		# This narrows the race but cannot eliminate it: a read before the other run's later
-		# write can still miss the collision. A detected mismatch exits and requires a manual rerun.
+		# The recovery above
+		# still has a narrow window of its own -- two runs that both found the same abandoned
+		# $_al_takeover dead can both pass the checks above and both rm -rf + mkdir it in turn
+		# (the same unserialized recovery NV_LOCK's takeover once had, one level down, since a sub-lock has
+		# nothing lower to serialize its own recovery with). Reading the pid back does not make that
+		# mkdir atomic across the two runs, but only the write that lands last is what is on disk
+		# afterwards: whichever run does NOT see its own pid here bails below, instead of proceeding
+		# to touch NV_LOCK under a false belief that it alone holds $_al_takeover. This does not
+		# close the race outright -- a read landing before the other run's later write would still
+		# miss it -- it shrinks the window from the whole block above down to the gap between this
+		# write and this read, turning a rare double-hold into a rare, safe, spurious failure.
 		_al_tk_owner=$(cat -- "$_al_takeover/pid" 2>/dev/null) || _al_tk_owner=
 		if [ "$_al_tk_owner" != "$$" ]; then
 			# Worded like the other collisions on $_al_takeover above, not "recovering the stale
@@ -1889,19 +1929,27 @@ on_exit() {
 		if [ -n "${NV_SIDECAR_TMP-}" ]; then rm -f -- "$NV_SIDECAR_TMP" 2>/dev/null || :; fi
 		if [ -n "${NV_NVIM_TMP_DEST-}" ]; then rm -rf -- "$NV_NVIM_TMP_DEST" 2>/dev/null || :; fi
 		rm -rf -- "$NV_DL" "$NV_STAGE" 2>/dev/null || :
-		# Remove the nvim work directory, source checkouts and downloaded build archives on exit
-		# unless --keep-build was given, matching the sidecar build's retention option.
-		# Cover failures before do_from_source finishes, including failures inside finish_install.
-		# The synthesized RELEASE also belongs to this run and has its pid in the filename.
+		# install_nvim_version's own workdir (always transient: never kept, unlike the
+		# sidecar's) and --from-source's own scratch (the cloned Eitri source, the Verdandi source
+		# it archived or cloned, the downloaded Node and Skia archives): kept with --keep-build, the
+		# same knob the sidecar build honours. The from-source-
+		# node (about 200 MB) and from-source-skia used to be removed only by an ad-hoc `rm -rf` at
+		# the very end of a successful do_from_source, so any earlier death (including inside
+		# finish_install) left them behind for good; every exit path is covered here now, and the
+		# synthesized RELEASE a --checkout run writes belongs to that run alone,
+		# with a filename containing its own pid.
 		if [ "$OPT_KEEP_BUILD" != 1 ]; then
 			rm -rf -- "$NV_CACHE_NV/nvim-build" "$NV_CACHE_NV/src" "$NV_CACHE_NV/verdandi-src" \
 				"$NV_CACHE_NV/verdandi-src-build" "$NV_CACHE_NV/from-source-node" \
 				"$NV_CACHE_NV/from-source-skia" 2>/dev/null || :
 			rm -f -- "$NV_CACHE_NV/from-source-RELEASE.$$" 2>/dev/null || :
 		fi
-		# Remove this run's sidecar work directory unless --keep-build was given.
-		# Only install_sidecar_for_rev and do_build_sidecar_into set it, under this same lock.
-		# Remove the sidecar-build parent only if empty, preserving other revisions' retained builds.
+		# The sidecar build's own work directory (removed after success, kept with
+		# --keep-build). Set only by install_sidecar_for_rev/do_build_sidecar_into, which run under
+		# this same lock, so nothing else's work directory is ever named here. Its parent
+		# (sidecar-build/, made by this same run's mkdir -p) is removed too, but only if it is now
+		# empty -- never disturbing a sibling rev directory a --keep-build run of a different rev
+		# left behind.
 		if [ -n "${NV_SIDECAR_WORKDIR-}" ] && [ "$OPT_KEEP_BUILD" != 1 ]; then
 			rm -rf -- "$NV_SIDECAR_WORKDIR" 2>/dev/null || :
 			rmdir -- "$NV_CACHE_NV/sidecar-build" 2>/dev/null || :
@@ -1914,9 +1962,9 @@ on_exit() {
 	exit "$_oe_rc"
 }
 
-# recover_interrupted: remove NV_LIB.new and restore NV_LIB.old if NV_LIB is missing.
-# If both NV_LIB and NV_LIB.old exist, remove the old tree before swapping, or mv would
-# nest the current tree inside the old one.
+# recover_interrupted: a stale eitri.new goes; a missing eitri with a
+# eitri.old comes back; with both present, eitri.old goes -- otherwise the swap's
+# `mv eitri eitri.old` would move the tree inside it.
 recover_interrupted() {
 	if [ -e "$NV_LIB.new" ] || [ -L "$NV_LIB.new" ]; then
 		say "removing $NV_LIB.new, left by an interrupted run"
@@ -1938,9 +1986,9 @@ recover_interrupted() {
 	run mkdir -m 0700 -- "$NV_DL"
 }
 
-# sidecar_state REV7: set NV_SIDECAR_PRESENT=1 only when the binary is executable,
-# BUILD exists and its nonempty SIDECAR_VERSION_LINE matches the binary's first --version line.
-# This checks the installed artifact against its saved build metadata.
+# sidecar_state REV7: NV_SIDECAR_PRESENT=1 when that rev's sidecar is *present*:
+# the binary and BUILD both exist, and the binary's first --version line equals BUILD's
+# SIDECAR_VERSION_LINE.
 sidecar_state() {
 	NV_SIDECAR_PRESENT=0
 	NV_SIDECAR_BIN=$NV_SIDECAR_ROOT/$1/verdandi-claude-sidecar
@@ -1951,19 +1999,26 @@ sidecar_state() {
 	if [ -n "$_ss_want" ] && [ "$_ss_have" = "$_ss_want" ]; then NV_SIDECAR_PRESENT=1; fi
 }
 
-# Build the sidecar before swapping installations so a fatal build failure preserves the old one.
-# On a first install, ensure_sidecar tolerates a failed initial Node download with a warning.
-# The release can run without a sidecar, and the panel explains how to finish setup later.
-# When upgrading a working sidecar, the same failure is fatal: swapping without a replacement
-# would break a working agent panel. Once Node is downloaded and verified, source checksum
-# failures, npm failures and unacceptable artifacts are fatal on both install and upgrade.
-# --sidecar-only and --build-sidecar-into require a sidecar build, so even an initial
-# download failure is fatal. The callers select this behavior through TOLERANT.
+# ---------------------------------------------------------------------------------------------
+# Building the sidecar, run before the swap so a failed build leaves the old install intact.
+# Every state-changing step below is fatal on failure except the first network call, Node's
+# download, and only on a first install: there ensure_sidecar's best-effort call warns and the
+# install continues, because a release with no sidecar is still better than no release, and the
+# runtime "no sidecar" error already tells the user to run `eitri setup` later. On an upgrade
+# that replaces a working sidecar the same failure is fatal (TOLERANT=0): swapping in an install
+# with no sidecar would silently break a working agent panel. Once Node is downloaded and
+# checksum-verified, every later failure (a source checksum mismatch, a failed npm ci, a build
+# with no acceptable artifact) is fatal on either path, because a silent partial attempt is worse
+# than stopping.
+# --sidecar-only and --build-sidecar-into treat every failure as fatal, the first download
+# included, because building the sidecar is their whole job (the TOLERANT parameter of
+# install_sidecar_for_rev and sidecar_download_node).
 
-# sidecar_download_node WORKDIR TOLERANT: set SDN_TARBALL and SDN_OK.
-# Call as a plain statement, outside if, && and || contexts, so failures in this function
-# and file_sha256 command substitutions are not hidden by suppressed errexit.
-# A download failure with TOLERANT=1 warns and leaves SDN_OK=0; TOLERANT=0 exits.
+# sidecar_download_node WORKDIR TOLERANT: the Node download. Sets SDN_TARBALL and SDN_OK (rule 2:
+# a predicate reports through a variable; this function is always called as a plain statement, never
+# from if/&&/||, so its own die calls -- and any inside file_sha256, called through $(...) here -- are
+# never at risk of running with set -e disabled). On failure, TOLERANT=1 warns and leaves SDN_OK=0
+# (see the note above); TOLERANT=0 dies.
 sidecar_download_node() {
 	SDN_OK=0
 	SDN_TARBALL=
@@ -1994,9 +2049,9 @@ sidecar_download_node() {
 	SDN_OK=1
 }
 
-# sidecar_download_verdandi_source WORKDIR: fetch the source archive from NV_REL_URL,
-# set by the caller that resolved the release. Node has already been downloaded, so a
-# failure here is fatal.
+# sidecar_download_verdandi_source WORKDIR: the Verdandi source download, from the release's own asset URL
+# (NV_REL_URL, set by whichever caller resolved a release). Reached only once Node is already down
+# (see above), so this is always fatal on failure -- never tolerant.
 sidecar_download_verdandi_source() {
 	# --from-source has no release page to fetch this from: resolve_verdandi_source
 	# has already produced the tarball itself (a `git archive`, local or of a fresh clone) and set
@@ -2039,9 +2094,9 @@ sidecar_download_verdandi_source() {
 	SDV_TARBALL=$_sdv_out
 }
 
-# sidecar_sdk_notice REPO: after npm ci and before the build, report the installed SDK's
-# version and license terms from package.json and LICENSE.md. Read the downloaded files
-# so the notice reflects the non-open-source dependency being built on this machine.
+# sidecar_sdk_notice REPO: after npm ci and before the build, print the installed SDK's
+# version and LICENSE.md terms. Read both from the installed files so the notice matches
+# what was downloaded and tells the user about the non-open-source SDK before building.
 sidecar_sdk_notice() {
 	_ssn_pkg=$1/node_modules/@anthropic-ai/claude-agent-sdk/package.json
 	_ssn_lic=$1/node_modules/@anthropic-ai/claude-agent-sdk/LICENSE.md
@@ -2056,9 +2111,9 @@ sidecar_sdk_notice() {
 	say "downloading Anthropic's claude-agent-sdk${_ssn_ver:+ $_ssn_ver} to this machine to build the sidecar -- it is not open source: ${_ssn_terms:-see its LICENSE.md once built}"
 }
 
-# accept_sidecar_artifact PATH: require --version to report the pinned Node version,
-# protocol NV_SIDECAR_PROTOCOL_MAJOR and host_cli only, never sdk_bundled.
-# A runnable file alone is insufficient. Set AA_VERSION_LINE for the accepted artifact.
+# accept_sidecar_artifact PATH: refuses unless the artifact's own --version says
+# the pinned Node version, protocol NV_SIDECAR_PROTOCOL_MAJOR, and host_cli only (never sdk_bundled):
+# a build that produced a runnable file is not enough on its own. Sets AA_VERSION_LINE.
 accept_sidecar_artifact() {
 	_aa_out=$("$1" --version 2>&1) || die "the built artifact ($1) does not run (--version failed): $_aa_out. Report it at $NV_ISSUES"
 	_aa_l1=$(printf '%s\n' "$_aa_out" | sed -n 1p)
@@ -2073,10 +2128,11 @@ accept_sidecar_artifact() {
 	AA_VERSION_LINE=$_aa_l1
 }
 
-# sidecar_build_core WORKDIR NODE_TARBALL VERDANDI_SOURCE_TARBALL: create the build layout
-# and Node cache, run npm ci, print the SDK notice, build and validate the selected artifact.
-# Both callers provide verified tarballs, downloaded or supplied with --build-sidecar-into.
-# Set SB_ARTIFACT, SB_VERSION_LINE, SB_SDK_LICENSE and SB_NODE_LICENSE.
+# sidecar_build_core WORKDIR NODE_TARBALL VERDANDI_SOURCE_TARBALL: the work-directory layout, the
+# node-cache placement, npm ci, the SDK notice, npm run build:binary, and the artifact pick +
+# acceptance. Both callers below hand it already-downloaded-and-verified tarballs, whether fetched
+# over the network or given as local files (--build-sidecar-into). Sets SB_ARTIFACT, SB_VERSION_LINE,
+# SB_SDK_LICENSE and SB_NODE_LICENSE.
 sidecar_build_core() {
 	_sbc_workdir=$1
 	_sbc_node_tar=$2
@@ -2216,8 +2272,8 @@ resolve_setup_release() {
 	parse_release "$NV_RELEASE_PATH"
 }
 
-# do_sidecar_only: builds the sidecar for --sidecar-only or `eitri setup`.
-# No SHA256SUMS is fetched; each input is checked against the resolved RELEASE.
+# do_sidecar_only: --sidecar-only / `eitri setup`. No SHA256SUMS is fetched: every input
+# is checked against the resolved RELEASE alone.
 do_sidecar_only() {
 	resolve_setup_release
 	if [ "$OPT_DRY_RUN" = 1 ]; then
@@ -2239,10 +2295,13 @@ do_sidecar_only() {
 	report_claude "$NV_SIDECAR_BIN"
 }
 
-# do_nvim_only: installs the pinned nvim for an existing installation when explicitly requested.
-# resolve_setup_release uses RELEASE beside this script or --release-file, keeping setup tied
-# to this installation. An adequate PATH nvim does not suppress installation, and a download
-# failure is fatal (TOLERANT=0).
+# do_nvim_only: --nvim-only -- the nvim offer alone, for an already-installed Eitri.
+# Reuses resolve_setup_release (--sidecar-only's own "RELEASE beside this script, or --release-file"
+# rule): a .deb/.rpm/tarball install's own eitri-setup never reads another install's RELEASE lying
+# around. Unlike the install path's own best-effort offer, this is the explicit ask: an already
+# -adequate PATH nvim does not suppress it (it works on an existing install), and a
+# download failure is fatal (TOLERANT=0), the same asymmetry --sidecar-only has over ensure_sidecar's
+# own best-effort call.
 do_nvim_only() {
 	resolve_setup_release
 	check_platform
@@ -2260,15 +2319,21 @@ do_nvim_only() {
 	install_nvim_version "$REL_NVIM_VERSION" "$REL_NVIM_SHA256_LINUX_X86_64" 0
 }
 
-# do_nvim_offer: offers nvim after do_sidecar_only during `eitri setup`.
-# Reuses nvim_check and maybe_offer_nvim, so an adequate PATH nvim suppresses the offer.
-# The tty, --yes, --with-nvim and --no-nvim behavior and tolerance of network failures match
-# finish_install. Skip require_curl and acquire_lock when nvim_check or --no-nvim means no
-# download is needed; acquire_lock also handles --dry-run.
+# do_nvim_offer: the plain `eitri setup` ("build the sidecar (and offer nvim)") -- the
+# conditional half the launcher runs after do_sidecar_only. The launcher used to run --nvim-only here instead, which is do_nvim_only above -- the explicit,
+# unconditional ask that ignores an already-adequate PATH nvim, skips the tty/--yes/--with-nvim
+# prompt entirely and dies on a download failure. This reruns nvim_check (so an adequate PATH nvim
+# suppresses the offer, exactly as it does on a fresh install) and then maybe_offer_nvim itself --
+# same tty/--yes/--with-nvim/--no-nvim rules, same tolerance of a network failure -- the identical
+# offer finish_install runs, pointed at an already-installed Eitri instead of a fresh unpack.
+# require_curl/acquire_lock are skipped entirely when nvim_check or --no-nvim already means nothing
+# will be fetched, the same "cheap checks before the lock" order do_nvim_only and do_sidecar_only
+# both hold to above; acquire_lock is --dry-run-safe on its own besides.
 do_nvim_offer() {
 	resolve_setup_release
-	# Check the pinned nvim copy first. If it is installed, there is nothing to offer:
-	# the application uses it, so nvim_check must not warn about an older nvim on PATH.
+	# Checked first, as do_nvim_only does -- with the pinned version already
+	# installed privately there is nothing to offer, and nvim_check's "install a newer nvim" warning
+	# about an older PATH nvim would be wrong (Eitri uses the private copy instead of that one).
 	nvim_private_state "$REL_NVIM_VERSION"
 	if [ "$NV_NVIM_PRIVATE_PRESENT" = 1 ]; then
 		say "nvim $REL_NVIM_VERSION: already installed at $NV_NVIM_PRIVATE_BIN"
@@ -2283,9 +2348,10 @@ do_nvim_offer() {
 	maybe_offer_nvim
 }
 
-# do_build_sidecar_into: builds into DIR with --node TARBALL and --verdandi-source TARBALL.
-# makepkg has already fetched both inputs, but each is still checked against the resolved
-# RELEASE before use.
+# do_build_sidecar_into: the AUR entry point -- `eitri-setup --build-sidecar-into DIR
+# --node TARBALL --verdandi-source TARBALL`. Both inputs are already on disk (makepkg's own
+# source=/sha256sums already fetched them); this still checks them against the resolved RELEASE
+# before using either, the same discipline as every other input this installer trusts.
 do_build_sidecar_into() {
 	resolve_setup_release
 	if [ "$OPT_DRY_RUN" = 1 ]; then
@@ -2305,12 +2371,19 @@ do_build_sidecar_into() {
 	mkdir -p -- "$_bsi_workdir" || die "cannot create $_bsi_workdir"
 	NV_SIDECAR_WORKDIR=$_bsi_workdir
 	check_sidecar_build_space "$_bsi_workdir"
-	# Copy the archives into the work directory, then hash and unpack only those copies.
-	# This avoids reading different bytes if an input archive is replaced after hashing.
-	# The archives and running script share makepkg's $srcdir, so this does not protect against
-	# a caller who can rewrite the script. Keep the versioned runtime archive basename: cache priming
-	# preserves it, and buildBinary.mjs looks for that name. A generic name causes a second download
-	# instead of using the verified archive.
+	# Copied into the work directory first, then
+	# hashed and unpacked from the copies alone -- the same discipline --tarball already holds
+	# (obtain_release: hashed where it lay and unpacked from a second read is a TOCTOU; hashed and
+	# used from one copy is not). Consistent with --tarball, not a new boundary: the AUR `build()`
+	# caller's archives and this running script both sit in the same makepkg $srcdir, so anyone able
+	# to swap the archives between the hash and the extract can already rewrite the script itself.
+	# The copy used
+	# to keep the generic basename node.tar.xz. sidecar_build_core's own node-cache priming
+	# (immediately below) preserves whatever basename it is given, but Verdandi's buildBinary.mjs
+	# looks in that cache only for the versioned name -- the same one sidecar_download_node's own
+	# network path already writes (see its $_sdn_name). A generic basename here meant the AUR
+	# build() path found nothing under the name buildBinary.mjs actually checks and downloaded Node a
+	# second time from nodejs.org, discarding the byte-verified copy sitting right next to it.
 	_bsi_node_copy=$_bsi_workdir/node-$REL_NODE_VERSION-linux-$NV_NODE_ARCH.tar.xz
 	cp -- "$OPT_NODE_TARBALL" "$_bsi_node_copy" || die "cannot copy $OPT_NODE_TARBALL into $_bsi_workdir: check that it is readable and the disk is not full"
 	_bsi_verdandi_copy=$_bsi_workdir/verdandi-source.tar.gz
@@ -2357,8 +2430,8 @@ build_hint() {
 	esac
 }
 
-# check_build_tools: check the dependencies needed by --from-source and print distro hints.
-# For missing rustc or cargo, also print the rustup command. Leave installation to the user.
+# check_build_tools: the build-tools row of the system checks. Refuses with the distro hint (and,
+# for rustc/cargo, the rustup one-liner -- printed, never run) rather than running a package manager.
 check_build_tools() {
 	read_os_release
 	_cbt_hint=$(build_hint)
@@ -2413,10 +2486,15 @@ verdandi_repo_url() {
 	fi
 }
 
-# checkout_version DIR: reads the version from shell/Cargo.toml, or the root Cargo.toml's
-# [workspace.package] when the package inherits its version. Match both version.workspace = true
-# and version = { workspace = true } so either form reaches the workspace lookup.
-# A plain statement: this can die.
+# checkout_version DIR: the version DIR's own tree builds: shell/Cargo.toml's
+# own `version = "..."` line, or -- as the real tree has had since the version moved to
+# `version.workspace = true` there -- the root Cargo.toml's [workspace.package] version, whichever
+# the tree actually uses. The first grep used to match only the plain
+# `version = "..."` string form, so `version.workspace = true` (no `=` right after `version`, a `.`
+# instead) was never even captured into _cv_line, and the *workspace* dispatch below -- which does
+# fire correctly for the inline-table form `version = { workspace = true }`, since that line DOES
+# start with `version *=` -- never got the chance to run. Reproduced on this repo's own
+# shell/Cargo.toml. A plain statement (rule 2: this can die).
 checkout_version() {
 	_cv_shell=$1/shell/Cargo.toml
 	if [ ! -f "$_cv_shell" ]; then die "$1 has no shell/Cargo.toml: not an Eitri checkout"; fi
@@ -2430,9 +2508,10 @@ checkout_version() {
 	fi
 }
 
-# lockfile_rev DIR PACKAGE: read the 40-hex commit from PACKAGE's git source in Cargo.lock.
-# Use the same approach as shell/build.rs because no binary from this tree exists yet
-# whose --version could be queried. Call as a plain statement because this can fail fatally.
+# lockfile_rev DIR PACKAGE: the 40-hex commit DIR/Cargo.lock's `source = "git+...#<sha>"` line names
+# for PACKAGE -- the same technique shell/build.rs uses for its own --version line,
+# reproduced here because this runs before any binary of DIR's own tree exists to ask. A plain
+# statement (rule 2: this can die).
 lockfile_rev() {
 	_lr_lock=$1/Cargo.lock
 	if [ ! -f "$_lr_lock" ]; then die "$1 has no Cargo.lock: not an Eitri checkout, or it has not been resolved (run cargo generate-lockfile first)"; fi
@@ -2450,12 +2529,11 @@ lockfile_rev() {
 	fi
 }
 
-# checkout_fork_rev DIR: set CFR_REV to the fork commit used by --from-source --checkout.
-# For a git dependency, read its Cargo.lock source with lockfile_rev. For a path dependency
-# in neovide/, read the gitlink recorded by HEAD with git ls-tree HEAD neovide and require
-# the checked-out submodule to match, so RELEASE describes the code actually compiled.
-# shell/build.rs resolves its --version commit in the same order: lockfile, then submodule.
-# Call as a plain statement because a missing or mismatched revision is fatal.
+# checkout_fork_rev DIR: sets CFR_REV to the fork commit linked by --from-source --checkout.
+# For a git dependency, read the commit from Cargo.lock's source line via lockfile_rev.
+# For the neovide/ path dependency, use the gitlink in HEAD and require the checked-out submodule
+# to match it: the build compiles that checkout, so a mismatch would make RELEASE inaccurate.
+# shell/build.rs resolves its --version fork commit from the lockfile, then the submodule checkout.
 checkout_fork_rev() {
 	_cfr_dir=$1
 	_cfr_lock=$_cfr_dir/Cargo.lock
@@ -2495,10 +2573,10 @@ checkout_fork_rev() {
 	fi
 }
 
-# agent_toml_verdandi DIR: sets AT_GIT_URL and AT_REV from the claude-runtime-protocol
-# dependency in DIR/agent/Cargo.toml. AT_REV must be 40 hex digits: a synthesized RELEASE
-# has no independent value to check VERDANDI_REV against, so a short prefix is insufficient.
-# A plain statement: this can die.
+# agent_toml_verdandi DIR: sets AT_GIT_URL and AT_REV from DIR/agent/Cargo.toml's own
+# claude-runtime-protocol dependency line. Asserts AT_REV is 40 hex (a 7-char rev in
+# agent/Cargo.toml refuses) -- a synthesized RELEASE has nothing else to check VERDANDI_REV
+# against, so a short prefix here is not enough to trust. A plain statement (rule 2: this can die).
 agent_toml_verdandi() {
 	_atv_file=$1/agent/Cargo.toml
 	if [ ! -f "$_atv_file" ]; then die "$1 has no agent/Cargo.toml: not an Eitri checkout"; fi
@@ -2548,8 +2626,10 @@ resolve_verdandi_source() {
 		_rvs_rev7=$(first7 "$_rvs_head")
 		mkdir -p -- "$NV_CACHE_NV/verdandi-src-build" || die "cannot create $NV_CACHE_NV/verdandi-src-build"
 		_rvs_out=$NV_CACHE_NV/verdandi-src-build/verdandi-$_rvs_rev7-source.tar.gz
-		# Archive DIR without building in place. buildBinary.mjs writes build/, dist/ and dist-bin/,
-		# and npm ci replaces node_modules. git archive only reads the checkout.
+		# Archived from DIR without ever building in place (never in place, because
+		# buildBinary.mjs writes build/, dist/ and dist-bin/ and npm ci replaces node_modules). git
+		# archive only reads the checkout; the caller's own before/after snapshot proves it changed
+		# nothing.
 		( cd "$_rvs_dir" && git archive --format=tar.gz -o "$_rvs_out" HEAD ) ||
 			die "git archive failed in --verdandi-checkout $_rvs_dir"
 		REL_VERDANDI_SOURCE_SHA256=$(file_sha256 "$_rvs_out")
@@ -2574,13 +2654,13 @@ resolve_verdandi_source() {
 	fi
 }
 
-# use_verdandi_source_beside_tarball: runs after unpack_new has parsed RELEASE for --tarball.
-# If REL_VERDANDI_SOURCE exists beside the tarball, copy it into this run's 0700 $NV_DL and
-# set NV_VERDANDI_SOURCE_TARBALL_OVERRIDE. sidecar_download_verdandi_source checks the copy
-# against REL_VERDANDI_SOURCE_SHA256, avoiding a network fetch for this asset. Without the
-# adjacent archive, it falls back to NV_REL_URL set by obtain_release.
-# Copy before hashing and extracting: rereading an archive from a shared directory could
-# execute unverified source and npm scripts if the archive were replaced between those reads.
+# use_verdandi_source_beside_tarball: after unpack_new reads RELEASE, look beside --tarball
+# for the source archive named by REL_VERDANDI_SOURCE. If present, set
+# NV_VERDANDI_SOURCE_TARBALL_OVERRIDE so the existing checksum check uses the trusted
+# REL_VERDANDI_SOURCE_SHA256 without downloading this asset. Otherwise use NV_REL_URL.
+# Copy the archive into this run's 0700 $NV_DL before hashing and extracting it.
+# Hashing in a shared directory and reopening it there would allow a swap between the two
+# reads to run unverified source and npm scripts despite a successful checksum check.
 use_verdandi_source_beside_tarball() {
 	if [ -z "$OPT_TARBALL" ] || [ -z "${REL_VERDANDI_SOURCE-}" ]; then return 0; fi
 	_uvsbt_dir=$(dirname -- "$OPT_TARBALL")
@@ -2594,9 +2674,12 @@ use_verdandi_source_beside_tarball() {
 	fi
 }
 
-# synthesize_release_from_checkout DIR: builds RELEASE from DIR's tree for --from-source
-# --checkout. parse_release validates it with the same field checks as a downloaded RELEASE.
-# Sets NV_VERSION, NV_RELEASE_PATH and all REL_* fields before returning.
+# synthesize_release_from_checkout DIR: --from-source --checkout (the development loop)
+# -- builds a RELEASE this installer trusts the same way it trusts a downloaded one (every
+# field validated identically by parse_release_text), from DIR's own tree instead of a checksummed
+# release asset. Sets NV_VERSION and NV_RELEASE_PATH; parse_release has been called on the result by
+# the time this returns, so every REL_* field (the from-source ones included) is set exactly as it
+# would be after a real download.
 synthesize_release_from_checkout() {
 	_src_dir=$1
 	if [ ! -e "$_src_dir/.git" ]; then die "--checkout $_src_dir is not a git checkout (no .git)"; fi
@@ -2656,10 +2739,11 @@ synthesize_release_from_checkout() {
 	parse_release "$_src_release"
 }
 
-# Clone the public repository with submodules at tag v<VERSION> into $NV_CACHE_NV/src.
-# obtain_release has verified SHA256SUMS and its signature, and fetch_verified_release has
-# checked RELEASE. Refuse unless HEAD matches the commit in RELEASE, so the source being built
-# matches the verified release. Sets NV_FROM_SOURCE_DIR.
+# clone_public_eitri VERSION: --from-source (without --checkout), the clone step --
+# obtain_release has already fetched and verified SHA256SUMS/.sig and REL_* comes from a checked
+# RELEASE asset (fetch_verified_release, below). Clones the public repo with submodules at tag
+# v<VERSION> into <cache>/eitri/src/, and refuses unless HEAD equals REL_EITRI_COMMIT -- the
+# release the checksums vouch for and the source tree being built must be the same commit.
 clone_public_eitri() {
 	_cpn_url=$(eitri_repo_url)
 	_cpn_dir=$NV_CACHE_NV/src
@@ -2673,9 +2757,9 @@ clone_public_eitri() {
 	NV_FROM_SOURCE_DIR=$_cpn_dir
 }
 
-# fetch_verified_release: obtain_release has set NV_SUMS_TEXT, NV_VERSION and NV_REL_URL.
-# Fetch RELEASE, check its hash against SHA256SUMS, parse it and require its version to match
-# NV_VERSION before using its fields for the source build.
+# fetch_verified_release: --from-source (without --checkout) -- obtain_release has already
+# set NV_SUMS_TEXT/NV_VERSION/NV_REL_URL; this fetches and checks the RELEASE asset itself the same
+# way dry_run_new_rev's network branch does for a dry run, then parses it for real.
 fetch_verified_release() {
 	_fvr_want=$(sums_hash RELEASE)
 	fetch "$NV_REL_URL/RELEASE" "$NV_DL/RELEASE.part" RELEASE
@@ -2692,12 +2776,13 @@ fetch_verified_release() {
 	NV_RELEASE_PATH=$NV_DL/RELEASE
 }
 
-# from_source_stage SRC RELEASE_PATH: stages the binaries from SRC/target/release with the
-# matching RELEASE_PATH. Produces the same NV_STAGE_TOP and NV_LIB.new layout as unpack_new,
-# so source builds and downloaded tarballs share finish_install's sidecar, nvim, file staging,
-# swap and pruning steps. THIRD-PARTY-LICENSES and SOURCE are generated by release.sh;
-# this path does not generate them because it lacks the Skia dependency pin needed for accurate
-# licence attribution.
+# from_source_stage SRC RELEASE_PATH: SRC is the tree that was just built (target/release/ holds the
+# five binaries); RELEASE_PATH is the RELEASE this build matches. Builds the same on-disk shape
+# unpack_new produces from a downloaded tarball (NV_STAGE_TOP, NV_LIB.new), so ensure_sidecar,
+# maybe_offer_nvim, stage_files, swap_in, commit_files and prune_sidecars -- finish_install's own
+# body -- are the one path both a prebuilt install and a from-source one share from here on. There
+# is no THIRD-PARTY-LICENSES/SOURCE generation here (release.sh generates those, from the pinned Skia archive): a from-source build says plainly what it is rather
+# than inventing licence attribution it cannot yet produce correctly.
 from_source_stage() {
 	_fss_src=$1
 	_fss_release=$2
@@ -2801,7 +2886,7 @@ from_source_stage() {
 }
 
 # finish_install: shared by do_install and do_from_source from the point each has produced NV_LIB.new
-#. Factored out so the two never drift on what happens after the binaries
+# onward. Factored out so the two never drift on what happens after the binaries
 # themselves are in hand.
 finish_install() {
 	ensure_sidecar
@@ -2965,11 +3050,14 @@ apparmor_note() {
 	say "$_an_hatch"
 }
 
-# fetch_skia_binaries WORKDIR PINS_FILE: downloads SKIA_BINARIES_URL_UPSTREAM and verifies
-# SKIA_BINARIES_SHA256 before building. The default skia-bindings downloader does not verify
-# archive content. Sets NV_SKIA_ARCHIVE to the checked local copy.
-# The caller passes SKIA_BINARIES_URL=file://$NV_SKIA_ARCHIVE to cargo build so the dependency
-# uses that verified archive without downloading it again.
+# fetch_skia_binaries WORKDIR PINS_FILE: `cargo build` on a
+# --from-source tree otherwise leaves skia-bindings to download its own prebuilt Skia archive
+# straight off GitHub with no content check at all (its own vendored downloader carries a literal
+# `// TODO: verify key` comment); this fetches the exact archive PINS_FILE pins
+# (SKIA_BINARIES_URL_UPSTREAM) and checks it against SKIA_BINARIES_SHA256 first. Sets
+# NV_SKIA_ARCHIVE to the checked local copy; the caller passes it to `cargo build` as
+# SKIA_BINARIES_URL=file://$NV_SKIA_ARCHIVE, skia-bindings' own documented escape hatch for a pinned
+# local copy, so the build never touches the network for this file at all.
 fetch_skia_binaries() {
 	_fsb_workdir=$1
 	_fsb_pins=$2
@@ -2999,9 +3087,12 @@ fetch_skia_binaries() {
 	NV_SKIA_ARCHIVE=$_fsb_out
 }
 
-# do_from_source: skips check_glibc so source builds can run below the glibc-2.39 requirement
-# of prebuilt binaries. check_platform is also skipped; a separate check still requires x86_64.
-# check_gtk_webkit runs because the built application needs a GTK 4.14+/WebKitGTK 6.0 runtime.
+# do_from_source: --from-source. check_glibc is deliberately not called -- building from
+# source is this installer's own escape hatch off the glibc-2.39 floor prebuilt binaries are held to.
+# check_platform itself is not called either (the x86_64 check below is not a call to it: unlike
+# check_platform, it names v1's own architecture ceiling, not the reason prebuilt releases refuse).
+# check_gtk_webkit still runs: whatever built the binary, it still needs a GTK 4.14+/WebKitGTK 6.0
+# runtime to start.
 do_from_source() {
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		# Every other mode's --dry-run only ever prints network fetches and file moves (each behind
@@ -3041,16 +3132,27 @@ do_from_source() {
 
 	if [ -n "$OPT_CHECKOUT" ]; then
 		synthesize_release_from_checkout "$OPT_CHECKOUT"
-		# Resolve --checkout to an absolute path before run_in changes directory. A relative
-		# NV_FROM_SOURCE_DIR would make cargo's --target-dir resolve inside the checkout while
-		# cleanup and from_source_stage resolve it from the caller's directory, causing staging to fail.
+		# NV_FROM_SOURCE_DIR used to stay exactly what --checkout was given, so a relative --checkout
+		# resolved against run_in's post-cd cwd (the checkout itself) at every later use, not against
+		# the caller's own cwd -- "--checkout eitri", run from eitri's parent directory,
+		# expanded "$NV_FROM_SOURCE_DIR/target" to the plain string "eitri/target" here, but by the
+		# time run_in's cargo call actually saw that string it had already cd'd into eitri, so the
+		# build landed at eitri/eitri/target while the rm loop and from_source_stage (which run
+		# outside run_in, still against the caller's own cwd) kept reading eitri/target: a working
+		# invocation started failing staging with "did not produce target/release/shell" once
+		# --target-dir started pinning that path (this same F3). synthesize_release_from_checkout
+		# above already confirmed $OPT_CHECKOUT/.git exists, so this cannot fail on a directory that
+		# is not there.
 		NV_FROM_SOURCE_DIR=$(CDPATH='' cd -P -- "$OPT_CHECKOUT" && pwd -P) || die "cannot resolve --checkout $OPT_CHECKOUT to an absolute path"
 	else
 		check_base_url "${OPT_BASE_URL:-$NV_DEFAULT_BASE_URL}"
 		obtain_release
-		# Refuse an implicit downgrade for a downloaded source release, as do_install does.
-		# A valid signature does not prevent a mirror from serving an older signed release.
-		# --checkout uses a local tree rather than a release server, so this check belongs here.
+		# do_install's own downgrade refusal
+		# (semver_cmp, below) used to be the only caller -- --from-source never refused a downgrade
+		# at all, so a mirror (--base-url) serving an older, genuinely signed release rolled a
+		# from-source user silently backward, which is exactly the rollback case a
+		# signature does not cover. --checkout has no release server to roll back from, so this sits
+		# only in the else branch above.
 		if [ -n "$NV_INSTALLED_VERSION" ]; then
 			_dfs_c=$(semver_cmp "$NV_VERSION" "$NV_INSTALLED_VERSION")
 			if [ "$_dfs_c" = -1 ] && [ -z "$OPT_VERSION" ]; then
@@ -3080,11 +3182,27 @@ do_from_source() {
 	fetch_skia_binaries "$_dfs_skia_workdir" "$NV_FROM_SOURCE_DIR/packaging/pins.env"
 
 	say "building Eitri $NV_VERSION from source in $NV_FROM_SOURCE_DIR"
-	# from_source_stage reads <src>/target/release. --target-dir overrides CARGO_TARGET_DIR and
-	# the build.target-dir configuration so cargo writes where staging expects. Remove each shipped
-	# binary before building to prevent a skipped build from staging stale binaries under a new RELEASE.
-	# A configured build.target or CARGO_BUILD_TARGET still nests outputs under target/<triple>/release.
-	# In that case staging fails because target/release has no binaries; it cannot ship stale ones.
+	# from_source_stage always reads
+	# <src>/target/release, but cargo honours the caller's own CARGO_TARGET_DIR, [build] target-dir
+	# or target -- a fresh clone with any of those set died staging ("did not produce
+	# target/release/shell"), and a --checkout tree with an OLDER target/release already present
+	# (e.g. the development loop, ./install.sh run twice against two different pins) silently
+	# staged the stale binaries under a RELEASE naming the CURRENT HEAD. --target-dir here beats both
+	# the env var and the config key (cargo's own precedence), so staging's own assumption holds for
+	# both of those; removing each shipped binary first means a build that is skipped entirely
+	# (nothing rebuilt, cargo exits 0) can never leave a stale one for staging to find.
+	# "Always true"
+	# above overstated it -- a caller's own `[build] target` (in cargo's config, not this script's)
+	# or a CARGO_BUILD_TARGET in the environment is neither the env var nor the config key
+	# --target-dir beats; cargo still nests a target/<triple>/release under whatever --target-dir
+	# names once a target triple is in play, which this from-source build never passes. On such a
+	# host the rm loop above still does its job (no stale binary can survive to be staged), but the
+	# build itself is not neutralised: staging dies honestly with "did not produce
+	# target/release/shell" rather than shipping anything wrong. Not fixed here: pinning an explicit
+	# `--target x86_64-unknown-linux-gnu` (matching the x86_64-only refusal above) and staging from
+	# target/<triple>/release instead would neutralise it, at the cost of changing the layout this
+	# from-source build produces for every caller, not only the ones with build.target set; left as
+	# a known, narrow gap rather than risked here.
 	for _dfs_b in $NV_BINARIES; do
 		rm -f -- "$NV_FROM_SOURCE_DIR/target/release/$_dfs_b" || die "cannot remove the stale $NV_FROM_SOURCE_DIR/target/release/$_dfs_b"
 	done
@@ -3099,11 +3217,12 @@ do_from_source() {
 	# anywhere above (including inside finish_install) left both behind for good.
 }
 
-# dry_run_new_rev: reads RELEASE without extracting files to disk, so ensure_sidecar and
-# prune_sidecars can report the new revision. Read it from the --tarball archive checked against
-# --sums, or fetch the RELEASE asset and check it against SHA256SUMS. Sets NV_NEW_REV7;
-# it stays empty, with a corresponding report, if no RELEASE is listed or the tarball cannot
-# supply it.
+# dry_run_new_rev: a dry run unpacks nothing, but which sidecar the new install uses decides what
+# ensure_sidecar and prune_sidecars report, so the same RELEASE is read without writing anything:
+# out of the --tarball file (already checked against --sums), or as the release's own RELEASE asset
+# checked against SHA256SUMS -- the installer trusts a RELEASE that passed SHA256SUMS,
+# and the asset is the file the tarball carries. Sets NV_NEW_REV7; it stays empty, and the reports
+# say so, only when SHA256SUMS lists no RELEASE or the tarball cannot be read that way.
 dry_run_new_rev() {
 	NV_NEW_REV7=
 	_dr_text=
@@ -3198,7 +3317,7 @@ unpack_new() {
 	cp -R -- "$_un_top/lib/eitri" "$NV_LIB.new" || die "cannot copy the new install to $NV_LIB.new (is the disk full?)"
 }
 
-# swap_in: move the current install aside, put the staged tree in place, then remove the old tree.
+# swap_in: the swap of the new install into place.
 swap_in() {
 	if [ -e "$NV_LIB.old" ] || [ -L "$NV_LIB.old" ]; then run rm -rf -- "$NV_LIB.old"; fi
 	if [ -e "$NV_LIB" ] || [ -L "$NV_LIB" ]; then run mv -- "$NV_LIB" "$NV_LIB.old"; fi
@@ -3207,10 +3326,11 @@ swap_in() {
 	if [ -e "$NV_LIB.old" ] || [ -L "$NV_LIB.old" ]; then run rm -rf -- "$NV_LIB.old"; fi
 }
 
-# desktop_exec_quote PATH: returns PATH as one quoted desktop Exec argument.
-# Escape double quotes, backticks, dollar signs and backslashes, then double every backslash
-# for string-value parsing. Both layers are needed for GLib to accept the value.
-# Double each percent sign to preserve it as a literal.
+# desktop_exec_quote PATH: PATH as one quoted Exec argument, by the Desktop Entry Specification's
+# rules. Inside double quotes `"`, `` ` ``, `$` and `\` take a backslash; then the string-value
+# escape rule applies on top, doubling every backslash (the Desktop Entry rules' "\\\\" for a literal
+# backslash). GLib refuses a single `\$` outright, measured: "Key file contains key Exec which has
+# a value that cannot be interpreted". A literal `%` is `%%`.
 desktop_exec_quote() {
 	_dq=$(printf '%s\n' "$1" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g') || die "sed failed"
 	printf '"%s"\n' "$_dq"
@@ -3340,7 +3460,7 @@ desktop_exec_line() {
 # The GNOME Shell extension's directory, $NV_DATA/gnome-shell/extensions/$NV_EXT_ID, follows the same
 # rule: a symlink there is the user's own checkout of the extension and is not written, removed or
 # counted by install_complete.
-# stage_files: the launcher, the desktop entries (their Exec
+# stage_files: the launcher (with its marker line), the desktop entries (their Exec
 # escaped), the nvim plugin, the icon (every size) and the licences, each written to a temporary name in its destination
 # directory. This runs before the swap, so a directory that cannot be written stops the run while the
 # old install is still in place and untouched: written after it, an unwritable ~/.local/bin left the
@@ -3414,9 +3534,9 @@ stage_files() {
 	done
 }
 
-# commit_files: renames stage_files' files into place after the swap. Executables outside
-# $NV_LIB are written to temporary names, chmodded, then moved. A launcher with neither the
-# installer marker nor the old root install.sh signature is moved aside before replacement.
+# commit_files: after the swap, stage_files' files are renamed into place (every executable outside
+# $NV_LIB goes in by temporary name, chmod, then mv). A launcher that is not
+# Eitri's -- no marker, not the old root install.sh's -- is moved aside, never overwritten.
 commit_files() {
 	_cf_dst=$NV_BINDIR/eitri
 	if [ -L "$_cf_dst" ] || [ -e "$_cf_dst" ]; then
@@ -3518,13 +3638,13 @@ install_complete() {
 	NV_COMPLETE=1
 }
 
-# prune_sidecars: removes a <rev7> directory only when no installed RELEASE needs it and it
-# matches neither the new revision nor the one just replaced. Keep the replaced revision until
-# the next successful upgrade because running windows may still use it and installations share
-# this directory. Leave names that do not match a revision alone.
+# prune_sidecars: a sidecar <rev7> directory goes only when no installed RELEASE
+# names it, it is not the new install's rev, and it is not the rev of the install just replaced
+# (kept until the next successful upgrade: a .deb and a tarball install share this directory, and
+# running windows still use the replaced one). Anything not named like a rev is not ours to judge.
 prune_sidecars() {
 	if [ ! -d "$NV_SIDECAR_ROOT" ]; then return 0; fi
-	# a symlinked $NV_SIDECAR_ROOT (planted by the
+	# A symlinked $NV_SIDECAR_ROOT (planted by the
 	# user, in their own $XDG_DATA_HOME -- nothing this installer would make) used to be followed
 	# with no check at all, so a 7-hex-named directory BEHIND the link -- a user's own, unrelated
 	# directory that merely happens to be named like a short git sha -- was removed as if it were
@@ -3620,7 +3740,7 @@ do_install() {
 			install_complete
 			if [ "$NV_SIDECAR_PRESENT" = 1 ] && [ "$NV_COMPLETE" = 1 ]; then
 				say "Eitri $NV_VERSION is up to date"
-				# this branch used to `return 0`
+				# This branch used to `return 0`
 				# straight after, so re-running the same installer with --with-nvim/--yes after a
 				# --no-nvim install (or simply once an adequate nvim's absence is noticed, or
 				# network access to github.com came back) fetched nothing and said nothing --
@@ -3657,8 +3777,9 @@ do_install() {
 		if [ "$OPT_DRY_RUN" = 1 ]; then
 			NV_TARBALL=$OPT_TARBALL
 		else
-			# Copy first, then hash and unpack only the copy. Reading the original path again after
-			# hashing could install different bytes if the tarball were replaced between the reads.
+			# Copied first, then hashed and unpacked from the copy alone: hashed where it lay and
+			# unpacked from a second read, a tarball swapped in between was installed (see
+			# obtain_release).
 			NV_TARBALL=$NV_DL/$NV_TARBALL_NAME
 			cp -- "$OPT_TARBALL" "$NV_TARBALL" || die "cannot copy $OPT_TARBALL into $NV_DL: check that the disk is not full, then re-run"
 		fi
@@ -3719,7 +3840,7 @@ do_uninstall() {
 	_du_ext_note=
 	# The targets are this function's positional parameters, one path each: never joined into one
 	# string and split again, which once let a newline in an XDG variable name any directory in
-	# $HOME.
+	# $HOME (xdg_dir now refuses one as well).
 	set -- "$NV_LIB" "$NV_LIB.new" "$NV_LIB.old"
 	if [ -L "$NV_BINDIR/eitri" ] || [ -e "$NV_BINDIR/eitri" ]; then
 		if [ ! -L "$NV_BINDIR/eitri" ] && [ -f "$NV_BINDIR/eitri" ] && grep -Fqx -- "$NV_LAUNCHER_MARKER" "$NV_BINDIR/eitri"; then
@@ -3757,9 +3878,11 @@ do_uninstall() {
 	else
 		set -- "$@" "$_du_ext"
 	fi
-	# Remove nvim and sidecars only when the resolved data directory has the expected basename.
-	# Follow links to allow a data directory moved to another disk, but leave the contents untouched
-	# if a link resolves to a directory with a different name.
+	# What Eitri keeps under $NV_DATA/eitri (a private nvim, the sidecars) goes only when that
+	# really is a directory named eitri, wherever a link puts it (moved to another disk, say). A
+	# link to anything else -- ~/.config, once, whose nvim went with it -- was not made by this
+	# installer, and nothing behind it is removed (nothing named nvim outside Eitri's
+	# own directory).
 	_du_ours=1
 	if [ -d "$NV_DATA/eitri" ]; then
 		_du_real=$(cd -P -- "$NV_DATA/eitri" 2>/dev/null && pwd -P) || _du_real=
@@ -3781,7 +3904,7 @@ do_uninstall() {
 		else
 			_du_link_note="$_du_link_note$NV_DATA/eitri/eitri.nvim is a symlink, so it was left alone: this installer never made that link"
 		fi
-		# the check just above only ever verified
+		# The check just above only ever verified
 		# $NV_DATA/eitri itself, not $NV_SIDECAR_ROOT (its own "sidecar" subdirectory) -- a
 		# symlinked sidecar root, planted by the user in their own $XDG_DATA_HOME, was followed
 		# with no check at all, so a 7-hex-named directory BEHIND the link (a user's own,
@@ -3846,7 +3969,7 @@ do_uninstall() {
 
 	# Only what exists is removed, so only what exists is checked: a path not there needs nothing,
 	# and once the user has removed an outside-$HOME one by hand, as the refusal asks, a re-run
-	# goes through.
+	# goes through (it never could).
 	_du_i=$#
 	while [ "$_du_i" -gt 0 ]; do
 		_du_p=$1
@@ -3928,10 +4051,10 @@ main() {
 	set_paths
 	check_root
 	# check_data_home applies to modes that write under NV_DATA: do_install, do_from_source,
-	# do_sidecar_only, do_nvim_only and do_nvim_offer. --uninstall is exempt on purpose, as its
-	# own comment explains. --build-sidecar-into uses NV_CACHE_NV for its workdir and the caller's
-	# DIR for output, so it neither reads nor writes NV_DATA/XDG_DATA_HOME. Package builds may
-	# therefore run this mode with XDG_DATA_HOME outside $HOME.
+	# do_sidecar_only, do_nvim_only and do_nvim_offer. --uninstall has its own path checks.
+	# --build-sidecar-into uses NV_CACHE_NV for its workdir and the caller's DIR for output,
+	# so it neither reads nor writes NV_DATA/XDG_DATA_HOME. Package builds may therefore use
+	# this mode with XDG_DATA_HOME outside $HOME.
 	case $OPT_MODE in
 	uninstall | build-sidecar-into) ;;
 	*) check_data_home ;;

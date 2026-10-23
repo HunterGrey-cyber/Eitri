@@ -1,31 +1,17 @@
 #!/usr/bin/env bash
-# packaging/aur/test-in-container.sh: builds, checks and installs both eitri-bin and eitri-git
-# in clean archlinux:latest containers and runs --version in each.
+# Build, check and install the binary and source packages in clean archlinux:latest
+# containers, then run --version for each installed package.
 #
-# Every source= in both PKGBUILDs points at a GitHub location that may not exist yet (the AUR
-# entries track published releases and tags), so every run overrides source= with a local,
-# test-only location that is never committed:
+# Override source= entries in temporary recipes to use local release assets and repositories.
+# Serve release assets from --release-dir on 127.0.0.1 with python3 -m http.server;
+# --network host lets the binary-package container reach that server.
+# Bind-mount source repositories read-only under /mirrors/ and use git+file:// sources.
+# Tag a throwaway clone with --tag so pkgver() also exercises prerelease tags without
+# changing the input checkout. Validate that the mirrors contain the pinned revisions.
+# Node downloads and cargo registry access still use the network. Cargo fetches the
+# pinned git dependency from its public URL.
 #
-#   eitri-bin   the two release assets (the tarball and the verdandi source archive) are served
-#                 from --release-dir by a `python3 -m http.server` on 127.0.0.1, reached with
-#                 --network host. Node still comes from the real nodejs.org.
-#   eitri-git   the three git sources (Eitri, neovide, verdandi) come from local repositories,
-#                 bind-mounted read-only at /mirrors/ with source= rewritten to
-#                 git+file:///mirrors/...: --eitri-checkout (tagged with --tag in a throwaway
-#                 clone, since the public repository may carry no tag yet), --neovide-mirror (must
-#                 carry neovibe-integration with the checkout's submodule commit on it) and
-#                 --verdandi-mirror (must hold agent/Cargo.toml's pinned rev). Neither mirror needs
-#                 a tag; both are checked before the container starts. Node is the same nodejs.org
-#                 download as -bin's, and cargo still fetches the pinned Verdandi crate from its
-#                 public URL.
-#
-# Usage:
-#   test-in-container.sh --release-dir DIR --eitri-checkout DIR --neovide-mirror DIR \
-#       --verdandi-mirror DIR [--tag TAG] [--work DIR] [--only bin|git] [--jobs N]
-#
-# To test a later release, change only --release-dir (release.sh's default --out, for example
-# ~/.cache/eitri-release/v0.2.0/) and keep --eitri-checkout, --neovide-mirror and
-# --verdandi-mirror pointed at the public clone and mirrors that match that release.
+# To test another release, select its asset directory and matching checkout and mirrors.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,7 +95,7 @@ HOST_GID="$(id -g)"
 # first-run outcome), bash has already torn that function's local variables down by the time the
 # EXIT trap runs at top level, so a `local` pid reads as unset there -- reproduced against this
 # script with a stub `docker` whose `run` fails: "http_pid: unbound variable", and the server left
-# bound to its port for the next run to trip over. A RETURN trap is no
+# bound to its port for the next run to trip over (found when the script was hardened). A RETURN trap is no
 # better: it does not fire at all on a `set -e` unwind.
 HTTP_PID=""
 stop_http_server() {
@@ -251,9 +237,11 @@ test_git() {
 		echo "note: --eitri-checkout HEAD $head is not $RELEASE_DIR's EITRI_COMMIT" >&2
 	fi
 
-	# Mount the three git sources read-only and rewrite source= to their container paths.
-	# makepkg runs inside the container and cannot clone from unmounted paths on the machine
-	# running this script.
+	# The three git sources are bind-mounted read-only into the container and source= is rewritten
+	# to those container paths: makepkg runs *inside* the container, where a host path such as
+	# $WORK/eitri-tagged.git does not exist. (An earlier revision rewrote source= to the host
+	# paths and mounted nothing but /build, so makepkg's first clone could never have succeeded --
+	# this half had never been run until the script was hardened.)
 	mkdir -p -- "$WORK/build/eitri-git"
 	cp -- "$SCRIPT_DIR/eitri-git/PKGBUILD" "$WORK/build/eitri-git/PKGBUILD"
 	sed -i \

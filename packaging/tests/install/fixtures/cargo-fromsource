@@ -1,14 +1,23 @@
 #!/bin/sh
-# Test double for the cargo build --release --locked command used by --from-source.
-# Log arguments to <scratch>/logs/cargo.log and write the four NV_BINARIES outputs
-# to <target-dir>/release/ without compiling. The test mode defaults to "ok".
-# "fail" exits 1 on build, stopping do_from_source. "skip" exits 0 without outputs,
-# simulating a redirected or skipped build. This checks that do_from_source removes
-# old shipped binaries before building, so staging fails instead of reusing stale files.
-# Honor --target-dir before CARGO_TARGET_DIR, then default to the workspace's target/.
-# This lets tests check that do_from_source's explicit flag overrides the environment.
-# "no-plugin-site" writes binaries but omits the site from plugins/markdown/web,
-# simulating a build whose shell/build.rs never built that site.
+# Test double for `cargo`, standing in for the whole `cargo build --release --locked -p shell -p
+# agent -p supervisor --bins` recipe --from-source runs: no test here ever runs a real multi-crate release compile. Records its argv (one line per
+# call) to <scratch>/logs/cargo.log and, on a `build` call, writes the four binaries install.sh's own
+# NV_BINARIES names into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
+# behaviour (default "ok"): "fail" makes the build call exit 1, so nothing after it in
+# do_from_source ever runs. "skip" (a coverage gap for the --target-dir case, found 2026-09-28) exits 0 without writing anything at all into
+# <target-dir> -- standing in for a build genuinely redirected elsewhere (build.target,
+# CARGO_BUILD_TARGET) or one cargo decided needed no work, so a test can prove do_from_source's own
+# pre-build rm loop (which deletes each shipped binary from <src>/target/release before this stub
+# ever runs) is what makes staging fail honestly afterwards, rather than silently shipping whatever
+# was already on disk from an earlier run.
+# "no-plugin-site" writes the binaries but not the plugin's site, standing in for a tree whose
+# shell/build.rs did not build plugins/markdown/web (a build that never reached it).
+#
+# Real cargo (checked 2026-09-28) honours --target-dir first, then
+# CARGO_TARGET_DIR, then falls back to target/ under the workspace root (run_in's cwd, the
+# cloned/checked-out source tree) -- this stub follows the same first two, so a test can prove
+# do_from_source's own --target-dir flag really does win over a caller's CARGO_TARGET_DIR rather
+# than just recording it and writing to cwd regardless.
 S=$(cd "$(dirname "$0")/.." && pwd)
 {
 	printf 'cargo'

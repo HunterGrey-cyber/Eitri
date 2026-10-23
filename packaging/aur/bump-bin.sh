@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# Updates version fields and sha256sums in the binary PKGBUILD from RELEASE and SHA256SUMS,
-# then regenerates .SRCINFO. AUR commit authorship is public, so the commit command is printed
-# for manual execution.
+# Fill the binary package's pkgver, source archive, Node version and checksums from
+# RELEASE and SHA256SUMS, then regenerate .SRCINFO. Print the suggested commit command
+# for manual use so the operator can choose the public author identity.
 #
 # Usage: packaging/aur/bump-bin.sh <release-dir> [--allow-prerelease] [--pkgbuild-dir DIR]
 #
-#   <release-dir>        Holds RELEASE and SHA256SUMS produced by release.sh.
-#   --allow-prerelease   Fill PKGBUILD and .SRCINFO for a version containing "-rc.".
-#                       Use only for packaging/aur/test-in-container.sh. The binary package
-#                       is not published to the AUR for prereleases: converting '-' to '_'
-#                       makes a prerelease pkgver sort above the final release under pacman,
-#                       preventing normal upgrades to that final release.
-#   --pkgbuild-dir DIR   Use DIR instead of the default binary package directory for tests,
-#                       keeping prerelease changes out of the tracked PKGBUILD.
+# <release-dir> holds RELEASE and SHA256SUMS produced by release.sh.
+# --allow-prerelease permits a version containing "-rc." for container tests only.
+# Publishing that pkgver would sort above the final release in pacman's version comparison
+# and prevent an automatic upgrade to the final version.
+# --pkgbuild-dir DIR selects a test directory so prerelease bumps leave the tracked recipe clean.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

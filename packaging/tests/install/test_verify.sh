@@ -671,7 +671,7 @@ t_cache_parent_writable_without_sticky_refused() {
 
 TESTS="$TESTS t_cache_parent_group_writable_without_sticky_refused"
 t_cache_parent_group_writable_without_sticky_refused() {
-	# the parent check only ever tested the
+	# The parent check only ever tested the
 	# other-write bit (-perm -0002), the same gap already closed on
 	# NV_CACHE_NV's own permissions (t_cache_group_writable_refused) but never on its parent's -- a
 	# group-writable (0770), non-sticky XDG_CACHE_HOME lets any member of that group rename
@@ -1047,9 +1047,13 @@ t_cache_other_writable_own_private_group_still_refused() {
 
 TESTS="$TESTS t_cache_owned_by_another_user_refused"
 t_cache_owned_by_another_user_refused() {
-	# mkdir -p does not validate an existing cache directory's ownership.
-	# Write bits alone cannot prevent another user who owns the directory from reading or replacing
-	# downloads. The find stub simulates a foreign-owned application cache without requiring chown.
+	# `mkdir -p` is a silent no-op on a
+	# <cache>/eitri that already exists, so one planted in advance by another user (in a shared
+	# XDG_CACHE_HOME) was never checked for who owns it, only for its own write bits -- which say
+	# nothing about whether that owner can already read, or later replace, whatever a download
+	# writes inside it. This sandbox cannot chown a real directory to another uid without root (an installer test
+	# never uses sudo), so find-fake-owner reports $TH/.cache/eitri itself as
+	# not ours, exactly as the real find would for one actually owned by someone else.
 	serve 1.0.0
 	mkdir -p "$TH/.cache/eitri"
 	chmod 0700 "$TH/.cache/eitri"
@@ -1066,7 +1070,7 @@ t_cache_owned_by_another_user_refused() {
 
 TESTS="$TESTS t_cache_parent_owned_by_another_user_refused"
 t_cache_parent_owned_by_another_user_refused() {
-	# a sticky 1777 <cache> owned by another user
+	# A sticky 1777 <cache> owned by another user
 	# passed the old check (which only ever looked at write bits): the sticky bit stops other
 	# non-owner users from renaming entries away, but never stops the directory's OWN owner from
 	# doing exactly that -- so a shared, sticky XDG_CACHE_HOME owned by someone else is still unsafe.
@@ -1118,7 +1122,7 @@ t_release_member_outside_refused() {
 		"link $top/share/out /etc" "link $top/share/up ../../../../../.." "link $top/lib/eitri/far ../../../../x"; do
 		serve 1.0.0
 		d=$(served 1.0.0)
-		# shellcheck disable=SC2086 # split the member description into arguments
+		# shellcheck disable=SC2086 # the words of $spec are the arguments
 		add_member "$d/$top.tar.gz" $spec
 		resign "$d"
 		relatest 1.0.0

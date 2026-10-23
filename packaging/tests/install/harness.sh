@@ -1,5 +1,5 @@
 #!/bin/sh
-# The test harness for packaging/install.sh. POSIX sh, run twice
+# The test harness for packaging/install.sh POSIX sh, run twice
 # by packaging/test_install.py: under bash on the host, and under dash inside the Ubuntu 24.04
 # image (Dockerfile.dash), where /bin/sh -- and so the installer's shell -- is dash.
 #
@@ -209,13 +209,14 @@ setup_libs() {
 	mkdir -p "$S/system"
 }
 
-# setup_sidecar_fixtures builds inputs shared by mk_release and test_sidecar.sh.
-# An xz-compressed archive contains fixtures/npm-sidecar as bin/npm and an executable
-# bin/node stub, so tests exercise real extraction. sidecar_build_core only checks
-# that the runtime stub exists and is executable; it never runs it.
-# mk_release embeds the fixture's actual checksum in RELEASE.
-# NODE_FIXTURE_SHA256_ARM64 also hashes a real fixture for the aarch64 tests.
-# Only those tests override uname -m to select and check that fixture.
+# setup_sidecar_fixtures: the sidecar build's own inputs -- built once, shared by every mk_release call and by test_sidecar.sh directly. A real
+# `bin/npm` (fixtures/npm-sidecar) and `bin/node` (a stub -- nothing here ever runs it, sidecar_build_core
+# only checks it exists and is executable) inside a real, xz-compressed tarball shaped like the real
+# nodejs.org one, so tar's own extraction is exercised for real. NODE_FIXTURE_SHA256_X64 is this
+# fixture's own real hash, embedded by mk_release into RELEASE -- never the real pinned Node's hash,
+# since no test unpacks the real Node. NODE_FIXTURE_SHA256_ARM64 is a matching real fixture too
+# (for the aarch64 tests): every other test's own `uname -m` is the real one
+# (x86_64 on this host), so nothing but those ever downloads or checks it.
 setup_sidecar_fixtures() {
 	NODE_FIXTURE_VERSION=v22.23.2
 	rm -rf "$S/fix/node-build"
@@ -237,11 +238,12 @@ setup_sidecar_fixtures() {
 	NODE_FIXTURE_TARBALL=$S/fix/node-$NODE_FIXTURE_VERSION-linux-x64.tar.xz
 }
 
-# setup_skia_fixture supplies the pinned binary archive for --from-source tests.
-# fetch_skia_binaries checks its SHA256; tests never unpack or link it, so any file
-# with a verifiable checksum suffices. fs_scaffold writes SKIA_FIXTURE_URL into pins.env
-# as SKIA_BINARIES_URL_UPSTREAM. In test mode, only its basename is used to fetch from
-# the configured test base URL, so the placeholder upstream URL is never contacted.
+# setup_skia_fixture: --from-source's own pinned Skia input -- fetch_skia_binaries checks its download against a sha256, never
+# skia-bindings' own unauthenticated one, so a test double only needs to be a real, checksummable
+# file; nothing here ever unpacks or links it. SKIA_FIXTURE_URL is a fixed, made-up upstream URL
+# (never actually fetched: fetch_skia_binaries only ever reads its basename in test mode and fetches
+# that basename from EITRI_INSTALL_TEST_SKIA_BASE_URL instead) that fs_scaffold writes into every
+# from-source fixture's own pins.env as SKIA_BINARIES_URL_UPSTREAM.
 SKIA_FIXTURE_URL='https://example.invalid/skia-binaries-test.tar.gz'
 setup_skia_fixture() {
 	mkdir -p "$S/fix" "$S/srv/skia"
@@ -305,9 +307,10 @@ mk_plugin_tree() {
 	printf 'wOF2' >"$1/web/dist/katex/fonts/KaTeX_Main-Regular.woff2"
 }
 
-# mk_release VERSION REV creates $S/fix/v$VERSION from stub binaries, the real launcher,
-# desktop file and icons, the installer, a fixture sidecar source asset and shared runtime pins.
-# Each fixture's RELEASE then has the inputs needed to attempt a sidecar build.
+# mk_release VERSION REV: a release directory $S/fix/v$VERSION laid out as a real release is, from stub
+# binaries, the real launcher, desktop file and icons, this installer as eitri-setup, and a real (fake)
+# Verdandi source asset + the shared fake Node's pins, so every release's RELEASE is one a sidecar
+# build can actually be attempted against.
 mk_release() {
 	v=$1
 	rev=$2
@@ -555,9 +558,11 @@ snap_but_lock() {
 	snap "$1" | sed -E 's#^(\./\.cache(/eitri)? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
 
-# snap_but_staging DIR: snap, except directory mtimes changed by staging or a failed install.
-# This includes .local/lib, the launcher, desktop entry, plugin, icon and licence staging directories,
-# and .local itself when unpack_new first creates .local/lib. File metadata and contents remain checked.
+# snap_but_staging DIR: snap, except the mtimes of the directories a fresh install or an upgrade
+# that fails creates and removes its own entries in, leaving every file as it was: .local/lib
+# (eitri.new, a swap's renames), the ones the launcher, desktop entries, plugin, icons and licences are staged in
+# before the swap, and -- for a run against a HOME with no prior install at all -- .local itself,
+# whose own mtime changes the moment unpack_new's mkdir -p makes .local/lib the first time (reached once a fatal sidecar-build failure could die there too).
 snap_but_staging() {
 	snap "$1" | sed -E 's#^(\./\.local(/(lib|bin|share/applications|share/licenses/eitri|share/eitri(/eitri.nvim(/[^/]+(/eitri)?)?)?|share/gnome-shell(/extensions(/eitri@huntergrey.cn)?)?|share/icons(/hicolor(/[^/]+(/apps)?)?)?))? d [0-7]+ [0-9]+) [0-9.]+ #\1 - #'
 }
@@ -583,7 +588,7 @@ use_home() {
 
 data_of() { printf '%s\n' "$TH/.local/share"; }
 
-# plant_sidecar REV7 [DATA]: a sidecar that is *present* for REV7.
+# plant_sidecar REV7 [DATA]: a sidecar that is *present* (a build matching its binary) for REV7.
 plant_sidecar() {
 	_ps_dir=${2:-$TH/.local/share}/eitri/sidecar/$1
 	mkdir -p "$_ps_dir"

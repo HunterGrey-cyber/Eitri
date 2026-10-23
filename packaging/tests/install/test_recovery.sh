@@ -91,7 +91,7 @@ t_lock_dead_taken_over() {
 
 TESTS="$TESTS t_lock_takeover_blocked_while_live"
 t_lock_takeover_blocked_while_live() {
-	# the stale-lock takeover dance is now serialized
+	# The stale-lock takeover dance is serialized
 	# by its own mkdir-based sub-lock ($NV_LOCK.takeover) -- a second run that finds the same stale
 	# lock while another run is already mid-takeover must wait, never race it. Before this, both
 	# runs could reach the takeover dance at once: see the comment above the sub-lock in
@@ -111,8 +111,10 @@ t_lock_takeover_blocked_while_live() {
 	kill "$holder" 2>/dev/null
 	wait "$holder" 2>/dev/null
 	expect_fail "a stale lock whose own takeover another run is already mid-way through"
-	# Contention for lock.takeover only shows that another run is checking the lock.
-	# The message must not claim the outer lock is stale before this run has checked it.
+	# Reworded away from
+	# "already recovering the stale lock" -- this message fires on ordinary contention for
+	# lock.takeover too, whether or not the outer lock actually turns out to be stale, and used to
+	# claim staleness before this run had checked.
 	expect_out "another Eitri installer (pid $holder) is already checking the lock $TH/.cache/eitri/lock"
 	expect_absent "$TH/.local/lib/eitri"
 	# Neither lock was disturbed: the stale one still has its own original (dead) pid, and the
@@ -124,7 +126,7 @@ t_lock_takeover_blocked_while_live() {
 
 TESTS="$TESTS t_lock_takeover_self_heals_abandoned_sub_lock"
 t_lock_takeover_self_heals_abandoned_sub_lock() {
-	# the takeover sub-lock is recoverable by the same
+	# The takeover sub-lock is recoverable by the same
 	# dead-pid check as the main lock -- a run that died mid-takeover (SIGKILL, say) must not
 	# permanently block every later run from ever recovering the stale lock behind it.
 	serve 1.0.0
@@ -148,9 +150,11 @@ t_lock_takeover_self_heals_abandoned_sub_lock() {
 
 TESTS="$TESTS t_lock_takeover_sub_lock_without_pid_refused"
 t_lock_takeover_sub_lock_without_pid_refused() {
-	# A run killed after creating lock.takeover but before writing its pid leaves a sub-lock
-	# that cannot be recovered automatically. Report the missing pid and name lock.takeover
-	# as the directory to remove by hand, rather than reporting ordinary live contention.
+	# A run killed between
+	# mkdir "$NV_LOCK.takeover" and writing its own pid leaves a sub-lock no later run can ever
+	# recover (nothing will ever write a pid into it) -- this used to fall through to the same
+	# generic "already recovering the stale lock" message ordinary live contention gets, never
+	# telling a human that lock.takeover itself, not lock, is what has to be removed by hand.
 	serve 1.0.0
 	mkdir -p "$TH/.cache/eitri/lock"
 	sh -c 'exit 0' &
@@ -372,9 +376,10 @@ t_upgrade_unwritable_bindir() {
 
 TESTS="$TESTS t_interrupted_after_swap_rerun_finishes"
 t_interrupted_after_swap_rerun_finishes() {
-	# Interrupt just after the swap's second rename, with the new lib and its sidecar in place.
-	# The launcher, desktop entry and licences are still missing, so a rerun must finish installing
-	# them instead of treating the matching release and sidecar as a complete installation.
+	# An interrupt right after the swap's second rename: the new lib is in place and nothing after it
+	# was done. A sidecar for its rev is already present (a .deb install's `eitri setup` can have
+	# built it, and the install builds it before the swap), so the re-run once said "up to date"
+	# and left the install without a launcher, desktop entry or licences for good.
 	plant_sidecar aaaaaaa
 	serve 1.0.0
 	inst_net --stubs "$S/stubs-mvafterswap" --

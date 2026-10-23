@@ -69,10 +69,10 @@ fi
 echo "log         $LOG"
 echo
 
-# The legacy backend requires the `legacy-backend` feature, disabled by default and in release
-# builds. A default build rejects the legacy backend at startup, so `--legacy` enables the
-# feature for development. Switching backends rebuilds the shell, agent, and core crates once
-# each way.
+# The legacy backend is compiled only with the `legacy-backend` feature, off by default and in every
+# release (it is development-only); a default build refuses EITRI_AGENT_BACKEND=legacy at startup.
+# So `--legacy` builds with the feature, the development route that stays available. Switching between the two
+# rebuilds shell, agent and eitri-core once each way.
 FEATURES=()
 [[ "$BACKEND" == legacy ]] && FEATURES=(--features shell/legacy-backend)
 cargo build -p shell "${FEATURES[@]}" 2>&1 | tail -1

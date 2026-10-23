@@ -25,7 +25,7 @@ t_http_tricky_hosts_refused() {
 		inst --stubs "$S/stubs-net" -- --base-url "$u" --release-signers "$SIGNERS"
 		expect_fail "--base-url $u"
 		expect_out "eitri: error: --base-url $u: "
-		# Reject `@` anywhere in an HTTP authority before checking the hostname.
+		# The rule: no `@` anywhere in an http authority, checked before the host.
 		case $u in *@*) expect_out "may not carry a user part ('@')" ;; esac
 	done
 	if [ -s "$S/logs/curl.log" ]; then fail "a refused base URL was fetched: $(cat "$S/logs/curl.log")"; fi
@@ -87,10 +87,10 @@ t_downloads_bounded() {
 
 TESTS="$TESTS t_wget_never_used"
 t_wget_never_used() {
-	# wget's --https-only applies to recursive downloads. GNU Wget 1.25.0 can still follow an
-	# https-to-http redirect or fetch a plain http URL successfully without recursive mode.
-	# Without curl the installer refuses before downloading, regardless of the base URL;
-	# the logging wget stub must never run.
+	# The design names `wget --https-only` for a system without curl, but wget scopes --https-only to
+	# recursive downloads: measured (GNU Wget 1.25.0), it follows an https -> http redirect, and
+	# fetches a plain http:// URL, with exit 0. So without curl the installer refuses, for any base
+	# URL, before any download; wget (a logging stub, first on PATH) is never run.
 	serve 1.0.0
 	for u in https://mirror.example "http://127.0.0.1:$PORT"; do
 		inst --stubs "$S/stubs-wget" --path-tail "$S/path-no-curl" -- --base-url "$u" --release-signers "$SIGNERS"
