@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=2767b33067601a4ed73719f2c4663192dd931f4aa5af410d4ae11da72217b28f -->
+<!-- translated-from: configuration.md sha256=33183ad6f87fd4da004fcaa5daee2a4201af86a067c83abad744e5d6c7e833b0 -->
 
 # 配置
 
@@ -60,7 +60,7 @@ eitri.config.set("review.hint", true)
 ```lua
 local k = eitri.keymap
 k.prefix("C-a")                               -- the prefix key
-k.set("prefix", "m", "zoom")                  -- bind m after the prefix to an action
+k.set("prefix", "g", "zoom")                  -- bind g (free by default) after the prefix to an action
 k.del("prefix", "%")                          -- remove a default binding
 ```
 
@@ -161,7 +161,7 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- 终端
 <a id="plugins"></a>
 ## 插件
 
-插件是窗口里一个自己的页面，作为模块和其他模块放在一起，只拿到它自己的清单里列出的能力。Eitri 自带一个，[Markdown 预览](markdown-preview.zh-CN.md)；你也可以自己写或安装别的。每个插件都是一个含有 `eitri-plugin.toml` 的目录，在 `init.lua` 加载它之前，它的任何部分都不会运行：
+插件是窗口里一个自己的页面，作为模块和其他模块放在一起，只拿到它自己的清单里列出的能力。Eitri 自带一个，[Markdown 预览](markdown-preview.zh-CN.md)；你也可以自己写或安装别的（[你自己做的页面](pages.zh-CN.md)讲了怎么写，以及怎么把一个普通的 HTML 页面作为 Lua 面板加进来）。每个插件都是一个含有 `eitri-plugin.toml` 的目录，在 `init.lua` 加载它之前，它的任何部分都不会运行：
 
 ```lua
 eitri.plugin.load("markdown")                          -- 按名字

@@ -74,7 +74,7 @@ Keys are set with `eitri.keymap` in the same file:
 ```lua
 local k = eitri.keymap
 k.prefix("C-a")                               -- the prefix key
-k.set("prefix", "m", "zoom")                  -- bind m after the prefix to an action
+k.set("prefix", "g", "zoom")                  -- bind g (free by default) after the prefix to an action
 k.del("prefix", "%")                          -- remove a default binding
 ```
 
@@ -296,7 +296,8 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
 ## Plugins
 
 A plugin is a page of its own in the window, as a module beside the others, given only the powers its own manifest
-lists. Eitri ships one, the [Markdown preview](markdown-preview.md); you may also write or install your own. Each is a
+lists. Eitri ships one, the [Markdown preview](markdown-preview.md); you may also write or install your own
+([Pages you build](pages.md) shows how, and how to add a plain HTML page as a Lua panel). Each is a
 directory holding an `eitri-plugin.toml`, and nothing of it runs until `init.lua` loads it:
 
 ```lua

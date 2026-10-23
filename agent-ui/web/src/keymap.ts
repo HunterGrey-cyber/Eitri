@@ -952,7 +952,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "r", what: "Once this session has ended: resume it, or start a new one (its last row says which)" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
   { keys: "/", what: "Search the conversation (Enter keeps the match, Esc goes back)" },
-  { keys: ":", what: "A command line, as in vim: :trust and :untrust" },
+  { keys: ":", what: "A command line, as in vim: :tabnew, :trust and :untrust" },
   { keys: "n / N", what: "Next / previous match, wrapping" },
   { keys: "Ctrl+o", what: "Detailed view: every result, longer cuts, no collapsed runs" },
   { keys: "zh / zl", what: "Scroll this row's table left / right" },

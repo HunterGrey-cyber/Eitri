@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=1066b38c3b2def4f5e2e2cfd1b118e9666eaa4c074e9592c77c21f590fa5ebd6 -->
+<!-- translated-from: README.md sha256=a72ec4bff61b1cdc5091a72dc9a3aec40fbdb0b91b4199d1f4e304e79fc1d18a -->
 
 <div align="center">
 
@@ -23,7 +23,7 @@
 
 </div>
 
-一个 Linux 上的 Neovim 图形前端。一个真正好读的 Claude Code：排好版的回复和 diff，一张张权限卡片，全程不用碰鼠标。Eitri 是一个桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
+一个 Linux 上的 Neovim 图形前端。Eitri 是一个桌面窗口（MIT 许可），包在你自己的 Neovim 配置外面，你监督的 agent（Claude Code、Codex，或任何讲 ACP 的 agent）、终端和你自己的网页平铺在它旁边。回复是排好版的 markdown 和 diff，带一张张权限卡片，全程不用碰鼠标。
 
 键盘驱动的平铺：分屏、标签、堆叠、浮窗和工作区，用的是 tmux 的前缀键。如果你在桌面上用 i3、sway、Hyprland 或 AeroSpace 平铺窗口，你已经知道它怎么用了。
 
@@ -32,12 +32,14 @@
 > [!NOTE]
 > **早期版本。** 已经能用，但难免有粗糙的地方，0.x 期间 `init.lua` 的 API 和默认按键还可能改动。遇到问题欢迎在
 > [Issues](https://github.com/HunterGrey-cyber/eitri/issues) 或 [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions)
-> 告诉我们。0.3 的目标：稳定到能当我们自己日常的主力编辑器。
+> 告诉我们。它还没有稳定到可以日常使用：这要等真实硬件和一周的日常使用，而不是等某个版本号。
 
 ![Eitri：左边是打开着 Python 文件的 Neovim；右边是排好版的 Claude Code 回复，带一个高亮代码块，以及按下 leader 键后弹出的 which-key 提示](docs/images/hero.webp)
 
 - **你自己的 Neovim。** 一个真正的 `nvim --embed`，加载你的 `init.lua`、插件、LSP 和按键映射，由 Neovide 渲染器的一个 fork 在 GPU 上绘制。
 - **读得下去的回复。** markdown、按你配色高亮的代码、可以折叠的工具调用，每一次编辑单独一行 diff。
+- **你监督的 agent。** Claude Code、Codex，或者你通过 ACP 注册的 agent，每个标签页一个，可以是 manual、auto 或 bypass 模式（ACP agent 没有 manual）；回合进行中按 `Enter` 会把消息插进这个回合。见 [Codex 与其他 agent](docs/guide/agents.zh-CN.md)。
+- **你自己做的页面。** Eitri 随附一个 Markdown 预览，你自己的 HTML 页面或插件也能成为窗口里的一个模块（实验性）：[你自己做的页面](docs/guide/pages.zh-CN.md)。
 - **从头到尾用键盘。** 面板里用 vim 的按键，窗口用 tmux 的按键，`Ctrl+h/j/k/l` 在窗格之间移动。
 - **逐个回合审阅。** 按 `c` 列出 agent 这个回合期间磁盘上改了什么；可以撤销一个 hunk，也可以把评论发回去。
 - **用 Lua 配置。** `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`），和 Neovim 读你的配置的方式一样。

@@ -94,7 +94,7 @@ screen changes, and the change before the close can no longer be undone.
 **Setting a key that already has an action.** The keys in this section are defaults, and `eitri.keymap.set` on a key
 that has an action stops Eitri at startup with a message that names the call and says to run
 `eitri.keymap.del("prefix", "<key>")` first. If your `init.lua` sets `m`, `M`, `q`, `E`, `H`, `J`, `K`, `Space`, `C-o`, `M-o`, `M-e`, `M-3`, `M-4`, `M-5`, `M-H`,
-`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d`, `M-Enter`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$` or `!` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
+`M-J`, `M-K`, `M-L`, `M-w`, `M-s`, `M-a`, `M-d`, `M-Enter`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`, `C-=`, `C-+`, `C--` or `C-0` (the spelling `eitri.keymap` takes), put `k.del("prefix", "<key>")` before that `set`. When the tmux import is on and your
 tmux configuration binds the key, the key already counts as yours and your `set` replaces it with no `del`. A `del`
 of a key that nothing is bound to also stops startup, so a `del` line works only from this version on, or when the
 import and your tmux configuration bind that key.
@@ -123,8 +123,9 @@ difference until `Ctrl+0` or `<prefix> Ctrl+0` on it, and the page keeps its siz
 sees these keys.
 
 A companion window (see [Companion mode](companion.md)) has no layout of its own, so there the prefix keeps
-the tab keys, `r`, `?`, `:`, `f`, sending the prefix itself and the arrow keys, which move toward the
-neighbouring window; every layout key answers `not in a companion window`.
+the tab keys, `r`, `?`, `:`, `f`, the text size keys (`Ctrl+=`, `Ctrl+-`, `Ctrl+0`), sending the prefix itself
+or a `Ctrl+h/j/k/l` chord, and the arrow keys, which move toward the neighbouring window; every layout key answers
+`not in a companion window`.
 
 ### Containers and terminals
 

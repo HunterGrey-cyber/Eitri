@@ -1,5 +1,5 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=3b174a8cbbc0474c7ceafb976216f63a21298394b8635f4b71919313f2e66ac2 -->
+<!-- translated-from: INSTALL.md sha256=2228107c2e135affc4d62fceb25d40dac836ab85b3d49673cb57716a3fcde03a -->
 
 # 安装 Eitri
 
@@ -70,6 +70,8 @@ sidecar 打包了 Anthropic 的 `@anthropic-ai/claude-agent-sdk`（"© Anthropic
 再走一遍同样的安装方式就行。如果已经是最新版本，`sh install.sh` 什么都不做；否则它先构建新的 sidecar，成功了才切换，所以更新失败不会动到你现有的安装。更新之后，重启已经打开的 Eitri 窗口。
 
 `.deb` 或 `.rpm` 用包管理器升级，然后再运行一次 `eitri setup`（sidecar 已经构建好时，它什么都不做）。
+
+从 0.2.2 升级上来：这次更新会重新构建 agent sidecar，因为 0.3.0 固定了一个更新的版本；另外，`XDG_CONFIG_HOME` 设为绝对路径时，Eitri 现在从 `$XDG_CONFIG_HOME/eitri` 读取设置（0.2.2 总是读 `~/.config/eitri`），两者不同时请把设置挪过去。
 
 从 0.2.0 升级上来：desktop 条目改了名字，所以要把 Eitri 重新固定到 dock 上一次。
 

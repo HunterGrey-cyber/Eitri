@@ -66,8 +66,9 @@ The panel window has the application id `cn.huntergrey.eitri.Panel` and the titl
 so a window rule can pick it out. It reads the same `$XDG_CONFIG_HOME/eitri/init.lua` (default
 `~/.config/eitri/init.lua`) as the one-window mode (`agent.account` applies); Lua panels and commands registered there
 are not shown, and one line in the panel's output says how many were left out. It has no editor, no bottom terminal
-and no layout of its own: the tab keys, `?`, `:`, the text size keys and `f` work under the prefix, and the layout
-keys answer `not in a companion window`.
+and no layout of its own: the tab keys, `r`, `?`, `:`, the text size keys, `f`, sending the prefix itself and the
+arrow keys (toward the neighbouring window) work under the prefix, and the layout keys answer
+`not in a companion window`.
 
 ### Moving between the two windows
 

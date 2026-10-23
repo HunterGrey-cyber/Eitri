@@ -464,8 +464,8 @@ describe("resolveKey: sequences, counts, search and the command line", () => {
     expect(resolveKey("visual", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "vend", key: ":" });
   });
 
-  it("lists the : command line's two commands in the help", () => {
-    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :trust and :untrust");
+  it("lists the : command line's three commands in the help", () => {
+    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :tabnew, :trust and :untrust");
   });
 
   it("toggles the detailed view on Ctrl+o in both modes, and scrolls a table on zh / zl", () => {

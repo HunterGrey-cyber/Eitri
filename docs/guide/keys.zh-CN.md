@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=131aca8b79d44e938e4ee2ab9e35ab6958d3e3bd454b7577baf022e85347779a -->
+<!-- translated-from: keys.md sha256=c1a74bd457790c296cc2dd586810f3fe6d946d2d0a7901374f304634a3da8fe3 -->
 
 # 按键
 
@@ -73,7 +73,7 @@ end
 
 `layout.undo` 在内存里保留一步，从不保存：它把当前排布和上一次改动之前的排布对调（之后移动过的分隔线会一起被撤销），所以再按一次就是重做。显示或隐藏模块不算它看得到的改动。用 `<prefix> x` 关闭终端或 Lua 面板会把它的位置放回下次打开的地方，这本身就成了上一次改动：紧接着执行 `layout.undo` 只会把被关闭模块的位置挪回去，屏幕上什么都不变，而关闭之前的那次改动再也撤销不了。
 
-**给已经有动作的键再 `set`。** 本节的这些键是默认键，对一个已有动作的键调用 `eitri.keymap.set` 会让 Eitri 在启动时停下，信息里点名那次调用，并说要先执行 `eitri.keymap.del("prefix", "<key>")`。如果你的 `init.lua` 设置了 `m`、`M`、`q`、`E`、`H`、`J`、`K`、`Space`、`C-o`、`M-o`、`M-e`、`M-3`、`M-4`、`M-5`、`M-H`、`M-J`、`M-K`、`M-L`、`M-w`、`M-s`、`M-a`、`M-d`、`M-Enter`、`M-S-Space`、`M--`、`M-_`、`(`、`)`、`L`、`s`、`$` 或 `!`（`eitri.keymap` 接受的写法），就在那个 `set` 之前放一行 `k.del("prefix", "<key>")`。tmux 导入开着、并且你的 tmux 配置绑定了这个键时，这个键已经算是你的，你的 `set` 直接替换它，不需要 `del`。对一个没有绑定任何东西的键执行 `del` 同样会让启动停下，所以 `del` 这一行只有在这个版本及之后才能用，或者导入开着、并且你的 tmux 配置绑定了那个键。
+**给已经有动作的键再 `set`。** 本节的这些键是默认键，对一个已有动作的键调用 `eitri.keymap.set` 会让 Eitri 在启动时停下，信息里点名那次调用，并说要先执行 `eitri.keymap.del("prefix", "<key>")`。如果你的 `init.lua` 设置了 `m`、`M`、`q`、`E`、`H`、`J`、`K`、`Space`、`C-o`、`M-o`、`M-e`、`M-3`、`M-4`、`M-5`、`M-H`、`M-J`、`M-K`、`M-L`、`M-w`、`M-s`、`M-a`、`M-d`、`M-Enter`、`M-S-Space`、`M--`、`M-_`、`(`、`)`、`L`、`s`、`$`、`!`、`C-=`、`C-+`、`C--` 或 `C-0`（`eitri.keymap` 接受的写法），就在那个 `set` 之前放一行 `k.del("prefix", "<key>")`。tmux 导入开着、并且你的 tmux 配置绑定了这个键时，这个键已经算是你的，你的 `set` 直接替换它，不需要 `del`。对一个没有绑定任何东西的键执行 `del` 同样会让启动停下，所以 `del` 这一行只有在这个版本及之后才能用，或者导入开着、并且你的 tmux 配置绑定了那个键。
 
 **窗口和面板。**
 
@@ -95,7 +95,7 @@ end
 
 插件页面（学习插件、Markdown 预览）整页缩放，版面随文字一起变，并跟着编辑器的大小走：`Ctrl+=` 让编辑器和所有页面一起变大；单独放大或缩小过的页面会一直保持这个差别，直到按 `Ctrl+0`，或在它上面按 `<prefix> Ctrl+0`；页面重新加载后大小不变。这些键页面本身收不到。
 
-companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的布局，所以那里的前缀只保留标签页键、`r`、`?`、`:`、`f`、发送前缀本身，以及方向键（它们朝相邻的窗口移动）；每个布局键都回答 `not in a companion window`。
+companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的布局，所以那里的前缀只保留标签页键、`r`、`?`、`:`、`f`、文字大小键（`Ctrl+=`、`Ctrl+-`、`Ctrl+0`）、发送前缀本身或某个 `Ctrl+h/j/k/l` 组合键，以及方向键（它们朝相邻的窗口移动）；每个布局键都回答 `not in a companion window`。
 
 <a id="containers-and-terminals"></a>
 ### 容器和终端

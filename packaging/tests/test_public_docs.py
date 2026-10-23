@@ -483,7 +483,8 @@ class PublicDocsTwinsAreFresh(unittest.TestCase):
 _GUIDE_DIR = os.path.join(_PUBLISH_FILES, "docs", "guide")
 # The guide's pages, so a page may link a sibling written in another branch before both are merged; the
 # check that every one of them (and its twin) exists runs on the merged tree (GuideCompleteTests).
-_GUIDE_PAGE_NAMES = ("README", "getting-started", "keys", "configuration", "companion", "turn-review", "permissions", "markdown-preview")
+_GUIDE_PAGE_NAMES = ("README", "getting-started", "keys", "configuration", "companion", "turn-review", "permissions", "markdown-preview",
+                     "agents", "pages")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _LINK_RE = re.compile(r"\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 

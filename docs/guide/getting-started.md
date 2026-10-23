@@ -73,7 +73,7 @@ and removes, with the diff inside it.
   Claude Code and Codex: the agent reads it at its next step, and it shows above the box as `↪ <message>` until
   then, when it appears in the conversation where the agent read it. A tab whose agent cannot take messages
   mid-turn holds it instead, as `⧗ <message>`, and sends it when the turn ends; the empty box says which one
-  Enter does in that tab. Today Codex tabs take messages mid-turn; Claude and ACP tabs hold them. A message the
+  Enter does in that tab. Claude and Codex tabs take messages mid-turn; ACP tabs hold them. A message the
   agent did not read before the turn ended (an interrupt, for one) is held again with a line saying why.
   `Ctrl+Enter` sends now: it interrupts the running turn, then sends what is held and this message.
 - `Ctrl+g` in the box edits your draft in Neovim; `:wq` brings it back.

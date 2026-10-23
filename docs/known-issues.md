@@ -28,6 +28,8 @@ bug, and tell us if something here is wrong or has changed. The requirements are
   disk space; it fetches Node.js and npm packages). The AUR package `eitri-bin` does the same inside its build, so
   it takes minutes, not seconds. Why: [INSTALL.md](../INSTALL.md#why-the-sidecar-is-built-on-your-machine).
 - **`.deb` and `.rpm` need one `eitri setup`** afterwards, as your own user; neither package builds the sidecar.
+- **Upgrading from 0.2.2 builds the sidecar again**, because 0.3.0 pins a newer one: the same download and disk
+  space as a first install, and after a `.deb` or `.rpm` upgrade one more `eitri setup`.
 - **Ubuntu 23.10 and later, 24.04 included:** AppArmor blocks WebKit's sandbox by default. Eitri checks at
   startup; the editor and the terminal still work, and the agent panel shows the one-time fix in its place. The
   fix needs `sudo` and has a cost, both spelled out in
@@ -41,15 +43,52 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 ## Speed and drawing
 
-- Below GTK 4.16 the editor draws another way, and its typing latency has not been measured there.
-- While an agent reply streams, about 6-9 % of key presses in the editor took two refreshes instead of one
-  (Intel laptop, GTK 4.22.5, a stand-in stream at the default 5 updates a second, 165 Hz and 60 Hz). A real reply
-  has not been measured. If you see lag while typing during a reply, say so in the "Testing feedback" form, with
-  your GPU and monitor refresh rate.
+These were measured on development builds shortly before 0.3.0, in an isolated, headless test session on an AMD
+desktop, unless a bullet names another machine. None of them has been measured on a real display yet.
+
+- **On GTK 4.24, typing is one refresh slower than native Neovide.** GTK 4.23 and 4.24 changed the frame clock,
+  so the redraw after a key waits for the next frame. In the headless session, which runs at GTK's 60 Hz default,
+  typing added 17.15 ms at the median and 21.75 ms at the 99th percentile. On a real display the wait should be at
+  most one of its refreshes (about 6 ms at 165 Hz). The same build with GTK 4.22.5 added 0.13 ms at the median.
+  Eitri cannot work around it without an interface GTK does not have.
+- **On GTK 4.24, scrolling with a held `j` at 165 Hz drops frames.** It drew 85 % of the frames native Neovide drew,
+  and its 99th-percentile frame interval was twice native's (12 ms against 6 ms). The cause has not been traced yet.
+- **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
+  at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
+  WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
+  reply, say so in the "Testing feedback" form, with your GPU and monitor refresh rate.
+- **Memory:** one tab uses 253 to 283 MiB more than native Neovide, more than the 256 MiB we aim for, and each
+  extra chat view about 28 MB more.
 - **At high refresh rates under load the editor drops frames.** At 165 Hz on an Intel laptop, with other work
   keeping the machine 17-28 % busy, it drew 137-149 frames a second where native Neovide drew 160, and 111 at 34 %
   busy, with one 83.6 ms frame in four runs. That was measured before 0.2.0's typing-latency fix and not since.
-  Typing itself is within 1 ms of native Neovide on the machines measured.
+- Below GTK 4.16 the editor draws another way, and its typing latency has not been measured there.
+
+## The window
+
+- **A second Eitri window on the same project keeps its own layout and saved tabs.** It starts from the first
+  window's layout, then saves only its own, so the first window always opens with what you left in it.
+- **Under a light colourscheme the window starts dark for a moment**, then turns light: the top bar, the panel,
+  plugin pages, the terminal and the editor's placeholder.
+- **`<prefix> ?` pressed in the editor** moves the keys to the panel without drawing the key sheet; `?` in the
+  panel then shows it.
+- **A relative link in a reply** is underlined like a link, but `gx` and HINT do not offer it.
+- **On i3 or sway with `$mod = Alt`** the window manager takes the prefix's `Alt` rows before Eitri sees them;
+  [`docs/keymap/i3-alt-mod.lua`](keymap/i3-alt-mod.lua) moves them.
+
+## Pages you build
+
+Lua panels and plugin pages ([Pages you build](guide/pages.md)) are **experimental**: the plugin manifest and the
+page bridge may change during 0.x.
+
+- **Loading a plugin trusts it.** There is no consent screen yet: `eitri.plugin.load` in your `init.lua` gives the
+  plugin every power its manifest lists, and one with tasks runs programs as you. Load only plugins you trust, as you
+  would run only programs you trust. A change in a plugin's list of powers is logged at the next start, nothing more.
+- **A Lua panel is an ordinary web view.** It loads the address you give it, runs its scripts and may reach the
+  network; it gets no bridge to Eitri, no colours and no keys kit. Give it only pages you trust.
+- **A page that handles a key itself** and moves the keys to the editor (`layout.focus`) lets the key reach the
+  editor too, unless it calls `preventDefault()`. Keys handled through the keys kit are not affected.
+- Plugin pages and Lua panels are not shown in the companion window.
 
 ## Reaching eitri.cc and GitHub from mainland China
 
@@ -191,12 +230,12 @@ file in your nvim.
 
 ## Stability
 
-0.2.0 was the first public release. Much of what 0.2.1 adds (companion mode, `eitri split`, the GNOME extension,
-turn review, the trust question, Auto tabs on Claude Code's own auto mode) has been seen working only in an
-isolated, headless test session, and restoring the last session's tabs, the tmux key import and the new `j`/`k`
-movement only in automated tests; reports from real desktops are especially welcome. The `init.lua` API and the
-default keys may change during 0.x; the goal for 0.3 is a version stable enough to be our own everyday editor,
-after real hardware and a week of daily use.
+0.3.0 is the tiling release. Eitri is not yet stable enough for everyday use: that waits for real hardware, a
+person's hands and a week of daily use, not for a version number. Much of it has been seen working only in an
+isolated, headless test session (the tiling window, chat views, the Markdown preview, companion mode, `eitri split`,
+the GNOME extension, turn review, the trust question), and steering a running turn, the redesigned chat page in a
+real window and input methods have not been seen on a screen at all; reports from real desktops are especially
+welcome. The `init.lua` API and the default keys may change during 0.x.
 
 ## Not on this list?
 

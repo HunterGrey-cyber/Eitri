@@ -2,221 +2,99 @@ Eitri @VERSION@ -- Your Neovim, tiled with your agents, terminals and the web pa
 Built from commit @COMMIT@ in the Ubuntu 24.04 release container. It runs on glibc 2.39, GTK 4.14
 and WebKitGTK 2.40 (the webkitgtk-6.0 API) or newer.
 
-0.2.2 is a small release: bypass tabs now approve every question Claude Code asks, the trust question says what
-a project's allow rules still need, two hardening fixes, and a user guide. Much of the work since 0.2.1 is
-groundwork for a macOS app and is not meant to change anything on Linux.
+0.3.0 is the tiling release. The window becomes a keyboard-driven tiling manager, Codex and any agent that speaks
+ACP join Claude Code, and you can put web pages of your own in the window. Your Neovim stays the editor: a real
+`nvim --embed` with your own `init.lua`, plugins, LSP and keymaps.
 
-## What's new in 0.2.2
+## What's new in 0.3.0
 
-**The agent**
+**Your Neovim**
 
-- **Bypass approves every question Claude Code asks itself.** In 0.2.1 a question that your own
-  `permissions.ask` rule forced, or one that gave no reason, stayed a card even in a bypass tab. Now a bypass tab
-  answers all of them with no card, and the tool's row says `allowed in bypass`; entering bypass approves such
-  waiting questions with the other cards. So in bypass an ask rule stops nothing (known issues). Auto tabs are
-  unchanged: there those questions are still cards of their own.
-- **The trust question says what a project's allow rules still need.** When it lists `permissions.allow`
-  entries, it now adds that Claude Code applies them only if the folder is also trusted in terminal `claude`
-  (Eitri never sets that). Hooks, MCP servers and deny or ask rules load with `y` either way.
+- Unchanged at the core: Eitri draws your own Neovim with a fork of Neovide's renderer and never replaces it. The
+  editor is one module of the window, and every other module sits beside it.
+- The window title names the project (`myproject — Eitri · docs`).
 
-**Hardening**
+**Keyboard-driven tiling**
 
-- `VERDANDI_CLAUDE_EXTRA_MCP_SERVERS`, a variable that newer agent backends read to add MCP servers to every
-  session, is removed from the backend's environment, so a value in your shell cannot reach an Eitri session.
-  Eitri adds no MCP servers of its own; those your settings and a trusted project's configuration name still load.
-- The agent panel loads its page only when it is sure where the page's script policy goes; otherwise it shows a
-  short page saying the panel could not be built. A release build always passes this check.
-- The panel's text fields no longer auto-capitalise, autocorrect or spell-check what you type.
+- Splits, tabbed and stacked containers (`<prefix> Alt+w` / `Alt+s`), floats (`<prefix> Alt+Shift+Space`), a
+  scratchpad (`<prefix> Alt+_` puts a module away, `Alt+-` brings it back) and named workspaces (`<prefix> (`, `)`,
+  `L`, `s`, `$`; `main` always stays). If you tile your desktop with i3, sway or Hyprland, you already know how it
+  works.
+- tmux's prefix keys, with `Ctrl+b` as the prefix and 36 new keys after it: layouts (`Alt+3` to `Alt+5`, `Space`,
+  `E`), rotate (`Ctrl+o`, `Alt+o`), mark and swap (`m`, `M`), move to an edge (`H`, `J`, `K`), pane numbers (`q`),
+  moving a module (`Alt+H/J/K/L`), selecting a container (`Alt+a`, `Alt+d`), breaking a chat tab out into a view of
+  its own (`!`), and each pane's own text size (`Ctrl+=` / `Ctrl+-` / `Ctrl+0`). With `keymap.from_tmux` on, Eitri
+  reads more of your `~/.tmux.conf` than before: the layout commands, `rotate-window`, `display-panes`,
+  `break-pane`, `switch-client -n/-p/-l`, `choose-tree -s`, `select-pane -m/-M`, `swap-pane` and
+  `split-window -c "#{pane_current_path}"`.
+- Up to nine terminals (`<prefix> Alt+Enter`), each with its own shell, and up to nine chat views side by side.
+- In Lua: `eitri.layout.default`, `.workspace`, `.rule` (where a new module opens), `.open`, `.float`, `.run`, and
+  `eitri.layout.export()`, which returns the window you arranged as the `init.lua` calls that make it.
+- The layout file is now version 2. The old file is read once and left as it was, so going back to 0.2.2 is safe.
+- For i3 or sway with `$mod = Alt`, `docs/keymap/i3-alt-mod.lua` moves the rows your window manager would take.
 
-**Documentation**
+**Pages you build** (experimental)
 
-- A user guide in the repository, `docs/guide/` (in English and Chinese): getting started, keys,
-  configuration, permissions, turn review and companion mode.
-- INSTALL is shorter, and the AUR package comes right after the quick install.
+- A Markdown preview ships with Eitri, off until you add `eitri.plugin.load("markdown")` to `init.lua`. It
+  renders as you type (GitHub-flavoured Markdown, KaTeX, Mermaid, alerts) and scrolls in step with Neovim both
+  ways. `https` images in a document load unless you set `remote_images = "off"`.
+- Your own pages: a Lua panel (`eitri.panel.register`) shows an HTML file from `~/.config/eitri/panels/`, or any
+  address such as your development server, as a module of the window. A plugin is a directory with an
+  `eitri-plugin.toml`; its page gets only the host powers the manifest lists, Eitri's colours and the same keys as
+  the Markdown preview. The guide's new "Pages you build" page shows both, with a complete small plugin.
+- **Experimental:** the manifest and the page bridge may change during 0.x, and there is no consent screen yet:
+  loading a plugin trusts it as you trust any program you run.
 
-**Under the hood**
+**Agents you supervise**
 
-- The agent panel's logic moved into a library of its own with no GUI toolkit, and the Neovide fork gained hooks
-  for an application that hosts Neovide's own window. Both are groundwork for a macOS app, which is not usable
-  yet. On Linux nothing is meant to change.
+- Claude Code as before; **Codex tabs** (`:tabnew codex`, with `codex` 0.160.0 or newer, always in Codex's
+  `workspace-write` sandbox); and **any ACP agent** you register with `eitri.agent.register{...}`. Each kind asks its
+  own trust question about the project files it would load.
+- **Manual mode**: every file edit is a card you answer, and your saved rules still apply. `Shift+Tab` cycles
+  Manual, Auto and Bypass; `agent.default_mode` sets where a new tab starts.
+- **Enter while a turn runs steers it** in Claude Code and Codex tabs: the agent reads your message at its next
+  step. An ACP tab holds the message until the turn ends. `Ctrl+Enter` interrupts the turn and sends at once.
+- The chat page is redone: one quiet column, frames only around what you review or answer, the agent's thinking
+  shown as you choose (`agent.thinking`), `Worked for 8s` under each finished turn, and a `/` menu with the
+  agent's own commands.
+- Turn review counts Codex and ACP edits, reverts a single hunk by checking only that hunk's lines, and `y` on a
+  file row copies its path.
+- The trust question shows everything whole, and also covers `CLAUDE.md`, `.mcp.json` and rules in the
+  directories above the repository.
 
-## Window layout: new keys and verbs (added after 0.2.2)
+**Lighter at rest**
 
-The layout gains verbs that tmux, vim and i3 users expect, with the same keys after the prefix:
-
-| key after the prefix | action | from |
-|---|---|---|
-| `H` `J` `K` | `move.far-left`, `move.far-down`, `move.far-up` | vim `Ctrl+w H/J/K` |
-| `M-e` | `container.toggle-split` | i3 `layout toggle split` |
-| `C-o` / `M-o` | `rotate.up` / `rotate.down` | tmux `rotate-window` |
-| `M-3` `M-4` `M-5` | `layout.main-horizontal`, `layout.main-vertical`, `layout.tiled` | tmux `select-layout` |
-| `Space` | `layout.next` | tmux `next-layout` |
-| `E` | `layout.spread` | tmux `select-layout -E` |
-| `m` / `M` | `mark.toggle` / `mark.clear` | tmux `select-pane -m` / `-M` |
-| `q` | `select.number` | tmux `display-panes` |
-
-Without a key, by name only: `move.far-right`, `layout.flip-horizontal`, `layout.flip-vertical`, `layout.previous`,
-`swap.marked` and `layout.undo` (one step, kept in memory). In Lua, `eitri.layout.run(name, options)` runs any layout
-action by its `eitri.keymap` name, `eitri.layout.mark(id)` marks a module and `eitri.layout.get()` reads the layout.
-The layout file's format is unchanged by this section (the next one changes it).
-
-**What this can break:**
-- **A `set` over any of these keys stops startup,** as every `set` over a default does: the message names the key and
-  says to `del` it first. If your `init.lua` sets `H`, `J`, `K`, `M-e`, `C-o`, `M-o`, `M-3`, `M-4`, `M-5`, `Space`,
-  `E`, `m`, `M` or `q`, put `k.del("prefix", "<key>")` before that `set`. With the tmux import on and your tmux
-  configuration binding the key, no `del` is needed, because your `set` replaces the imported binding. A `del` of a key
-  that is not bound also stops startup, so a `del` line works only on this version or later, or with the import on and
-  the key bound in your tmux configuration. `docs/keymap/tmux-ctrl-a.lua` carries the `del` lines for its `m`, `q`,
-  `H`, `J` and `K`.
-- **A Lua panel keyed `H`, `J` or `K`** now fails at startup with `Bound`; these three were free to panels before.
-  Pick another key from the documented free list.
-- `L` is not bound by this section; the floats and workspaces section below binds it to the last workspace.
-
-## Window layout: containers and terminals (added after 0.2.2)
-
-The window is now an i3-style tree of containers: a container can be split, **tabbed** (one module shown, with a
-row of titles) or **stacked** (a row of title for each module), and a window can hold up to nine terminals, each
-with its own shell. New keys, after the prefix (Alt is i3's `$mod`):
-
-| key after the prefix | action | from |
-|---|---|---|
-| `M-H` `M-J` `M-K` `M-L` (repeat) | `move.left`, `move.down`, `move.up`, `move.right`: one step | i3 `move` |
-| `M-w` / `M-s` | `container.tabbed` / `container.stacked` on this module's container; again, back to the split | i3 `layout tabbed` / `stacking` |
-| `M-a` / `M-d` | `focus.parent` / `focus.child`: select a container (the top bar reads `selected: ...`) and go back down | i3 `focus parent` / `focus child` |
-| `M-Enter` | `instance.new` with `kind=terminal`: a new terminal right of the module with the keys | i3 `exec` a terminal |
-
-A split key with the keys in a terminal (`<prefix> %` or `"`, then `t`) opens a new terminal, and `<prefix> n` / `p` in
-a terminal step through its tabs or the terminals on screen. A split binding takes `{ cwd = "pane" }`, so the new shell
-starts in the directory of the terminal you split (`k.set("prefix", "|", "split.right", { cwd = "pane" })`); with the
-tmux import on, `split-window -c "#{pane_current_path}"` becomes that, and any other `-c` value is not imported (the
-binding still works and starts in the project root). In Lua, the layout grammar accepts `'tabbed'` and `'stacked'`
-with `active = n` and the instance ids `terminal#2` to `terminal#9`, and
-`eitri.layout.run("instance.new", { kind = "terminal" })` opens a terminal. Chat views (`agent#2` and up) come in the
-chat views section below; a Lua panel whose id is `terminal#2` to `terminal#9` or `agent#2` to `agent#9` is refused at
-registration.
+- An idle window draws nothing, and the panel wakes only when it has something to draw. The bottom terminal echoes
+  a key without waiting for a frame, and a long scrollback costs far less to draw.
 
 **What this can break:**
-- **A `set` over any of these keys stops startup.** If your `init.lua` sets `M-H`, `M-J`, `M-K`, `M-L`, `M-w`,
-  `M-s`, `M-a`, `M-d` or `M-Enter` in the prefix table, put `k.del("prefix", "<key>")` before that `set`, as for the
-  keys in the section above. With the tmux import on and your tmux configuration binding the key, no `del` is needed.
-  A `del` of a key that is not bound also stops startup, so on a version without these defaults the `del` lines
-  stop the launch (the key is not bound there): add them when you upgrade, not before.
-- **The layout is kept in a new file.** `<hash>.v2.json` (under `eitri/layout/` in `XDG_STATE_HOME`) holds every
-  workspace of the window. An existing `<hash>.json` is read once, when no `.v2.json` exists yet, and is never
-  written, renamed or deleted, so an older Eitri on the same project keeps its own file and the two do not overwrite
-  each other. The window you upgrade into opens as it was. Two things appear beside the new file when this version
-  could not use a file in full: `<hash>.v2.json.partial` (a copy of the original, made before the first save, when
-  part of it was left out or read differently) and `<hash>.v2.json.unusable` (a file it could not use at all, set
-  aside before a new one is written). Keys it does not know are written back unchanged, so a later build's data
-  survives a save here. Downgrading is safe for the same reason; what you arranged with containers is not seen by
-  the older version.
 
-## Window layout: floats, the scratchpad and workspaces (added after 0.2.2)
+- **Your `init.lua` may stop Eitri at startup** if it `set`s one of the new prefix keys, as every `set` over a
+  default does; the message names the key. The new keys, in the spelling `eitri.keymap` takes: `m`, `M`, `q`, `E`,
+  `H`, `J`, `K`, `L`, `s`, `Space`, `(`, `)`, `$`, `!`, `C-o`, `C-=`, `C-+`, `C--`, `C-0`, `M-3`, `M-4`, `M-5`,
+  `M-e`, `M-o`, `M-w`, `M-s`, `M-a`, `M-d`, `M-H`, `M-J`, `M-K`, `M-L`, `M-Enter`, `M-S-Space`, `M--` and `M-_`. Put
+  `k.del("prefix", "<key>")` before that `set`. With the tmux import on and your tmux configuration binding the
+  key, no `del` is needed. A `del` of a key that is not bound also stops startup, so add these lines when you
+  upgrade, not before. A Lua panel or plugin keyed `H`, `J` or `K` now stops startup too.
+- **`init.lua` is read from `$XDG_CONFIG_HOME/eitri`** when that variable is set to an absolute path, and from
+  `~/.config/eitri` otherwise (`EITRI_CONFIG_DIR` still comes first); 0.2.2 read `~/.config/eitri` whatever
+  `XDG_CONFIG_HOME` said. If your `XDG_CONFIG_HOME` points elsewhere, move your configuration there.
+- **`Shift+Tab` cycles three modes**: Manual, Auto, Bypass, then Manual again. Bypass is entered only from Auto,
+  so leaving it lands in Manual.
+- **Every project you trusted asks once more**, because the question now shows more than it did.
+- **In the message box, `Ctrl+a` and `Ctrl+e` move to the start and end of the line**, as in a shell; they no
+  longer select everything.
+- The panel's typing mode is now called INSERT (it was INPUT).
+- **A second Eitri window on the same project keeps its own layout and saved tabs.** It starts from the first
+  window's layout and then saves only its own, so closing it no longer changes what the first window opens with.
 
-- **Floats.** A module can float over the others, in a rectangle of its own with a bar across its top edge and a grip
-  at its corner: drag the bar to move it, the grip to size it. The editor never floats. `<prefix> M-S-Space` floats
-  the module with the keys or, on a float, puts it back into the tiling.
-- **The scratchpad.** `<prefix> M-_` sends a module there and `<prefix> M--` shows it, puts it away or cycles through
-  several. `eitri.keymap.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })` makes a drop-down terminal.
-- **Workspaces.** A window holds several named arrangements of the same modules: `(` and `)` step through them, `L`
-  goes to the last one (tmux's `switch-client -l`), `s` chooses (digits, `c` to make a copy, `x` to delete), `$`
-  renames. `eitri.layout.workspace(name, tree)` defines one in `init.lua`, `eitri.layout.switch(name)` goes to one,
-  and `eitri.layout.float(id, rect?)` floats a module from Lua.
-- **A chat under a float** shows its `agent ⚑N` chip and refuses card answers until the float is put away or moved;
-  the message names the float and the key.
-- Without a key, by name only: `focus.mode-toggle`, `workspace.new`, `workspace.switch`.
+## Upgrading from 0.2.2
 
-| key after the prefix | action | from |
-|---|---|---|
-| `M-S-Space` | `float.toggle` | i3 `floating toggle` |
-| `M--` | `scratchpad.show` | i3 `scratchpad show` |
-| `M-_` | `scratchpad.move` | i3 `move scratchpad` |
-| `(` / `)` | `workspace.prev` / `workspace.next` | tmux `switch-client -p` / `-n` |
-| `L` | `workspace.last` | tmux `switch-client -l` |
-| `s` | `workspace.choose` | tmux `choose-tree -s` |
-| `$` | `workspace.rename` | tmux's `rename-session` prompt |
-
-**What this can break:**
-- **A `set` over any of these keys stops startup.** If your `init.lua` sets `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`,
-  `s` or `$` in the prefix table, put `k.del("prefix", "<key>")` before that `set` (a loop that sets `H`, `J`, `K`
-  and `L` to the swaps needs `k.del("prefix", "L")` as well as the three it already has). With the tmux import on and
-  your tmux configuration binding the key, no `del` is needed. A `del` of a key that is not bound also stops startup,
-  so on a version without these defaults the `del` lines stop the launch: add them when you upgrade, not before.
-- **`L` now switches workspaces.** It was free before; with one workspace it flashes.
-- **The layout file gains two keys**, `floating` and `float_memory`, written inside a workspace only when they are not
-  empty, so a layout without floats writes the file the version before floats wrote. That version keeps a one-workspace
-  file's floats of numbered terminals (`terminal#2` and so on) as they were. A stowed scratch float comes back
-  shown: that version drops the hidden mark of a module it does not place. When a float names a module it places
-  itself -- the base terminal, the chat, or, with two or more workspaces, any floating terminal -- it drops the floats,
-  opens those modules tiled and copies the file to `<hash>.v2.json.partial` first: float positions can be lost that way,
-  never a module.
-- **A workspace defined by `eitri.layout.workspace` comes back** from its definition at the next launch if you delete
-  or rename it in the window; remove its call from `init.lua` to remove it for good.
-
-## Window layout: chat views and open rules (added after 0.2.2)
-
-- **Chat views.** The agent panel can be shown in more than one place: `agent#2` to `agent#9` are further pages of
-  the same panel, each holding one session tab, each a module you can move, float, zoom or hide. `<prefix> !` (tmux's
-  `break-pane`) breaks the tab you are on out into a view of its own, and from that view joins it back. A new view
-  with an empty tab comes from `eitri.layout.run("instance.new", { kind = "agent" })` or from a split key then `a`
-  with the keys in a chat view. A card is answered only from the page that shows its tab, and a view a float covers
-  refuses answers like the covered chat does, so the trust question from a covered page is refused and asked again
-  in the same page. Every view spends the window's one account.
-- **Open rules.** `eitri.layout.rule(target, opts)`, in `init.lua`, says where the window puts a module it opens by
-  itself (`at`, `float`, `size`, `scratchpad`, `focus`), for a kind (`"terminal"`, `"agent"`) or one module;
-  `eitri.layout.open(kind, opts?)` opens a new terminal or chat view from Lua, with a rule's options for that one
-  opening. A split key, a move or a drag never reads a rule, and a saved layout is never changed by one.
-
-| key after the prefix | action | from |
-|---|---|---|
-| `!` | `tab.break` | tmux `break-pane` |
-
-**What this can break:**
-- **`!` is a new default key, so a `set` over it stops startup.** If your `init.lua` sets `!` in the prefix table,
-  put `k.del("prefix", "!")` before that `set`. With the tmux import on and your tmux configuration binding `!`, no
-  `del` is needed. A `del` of a key that is not bound also stops startup, so on a version without this default the
-  `del` line stops the launch: add it when you upgrade, not before. A flagless `break-pane` in your tmux
-  configuration is imported as `tab.break` on the key you bound it to; one with flags is not.
-- **The layout file gains `agent#N` entries,** in a workspace's tree or `floating` list, and the saved tabs file gains
-  a `view` number on a tab shown in a view. The version before chat views leaves an `agent#N` out of the layout with a
-  note and copies the file to `<hash>.v2.json.partial` first, so no view is lost; it ignores `view`, so those tabs come
-  back in its single chat.
-
-## Markdown preview (added after 0.2.2)
-
-- **A Markdown preview, as a plugin that ships with Eitri, off until you turn it on.** Add
-  `eitri.plugin.load("markdown")` to `init.lua`; then `:MarkdownPreview`, `:MarkdownPreviewToggle` and
-  `:MarkdownPreviewStop` in Neovim show and hide it to the right of the editor, keys left in Neovim. It renders the
-  buffer as you type (GitHub-flavoured Markdown, highlighted code, KaTeX math, Mermaid diagrams, GitHub alerts and
-  Obsidian callouts, front matter), in your colourscheme's colours, and scrolls in step with Neovim both ways. With the
-  keys in the preview it reads with Vim-style keys (`j`/`k`, `d`/`u`, `]]`/`[[`, `/` with `n`/`N`, `f`, `yy`), and
-  `Enter` moves Neovim's cursor there and gives Neovim the keys. Options: `key`, `auto`, `remote_images`, `sync`.
-  The guide's "Markdown preview" page has the rest.
-- **Remote images and privacy.** As in VS Code, `https` images in a document load and `http` images do not; loading
-  one tells its server your address and the time. `remote_images = "off"` loads none, and the preview then makes no
-  network request at all.
-- **Plugins are found by name.** `eitri.plugin.load("<name>")` looks in `~/.local/share/eitri/plugins/<name>/` (your
-  own, `$XDG_DATA_HOME` if set), then in the copy installed with Eitri, then under the system data directories
-  (`/usr/share/eitri/plugins/<name>/` for the packages), and prints which directory it loaded. A path still works as
-  before.
-
-**What this can break:**
-- **A `:MarkdownPreview` you defined yourself** (another preview plugin, or a lazy-loading stub for one) is left alone,
-  and Eitri prints a line saying so; the other two commands are still defined.
-- **The packages and the tarball gain a plugin directory** (`/usr/share/eitri/plugins/markdown`,
-  `lib/eitri/plugins/markdown`); the install script refuses a tarball without it.
-
-## The GNOME Shell extension, version 2 (added after 0.2.2)
-
-- Eitri's GNOME Shell extension is now version 2: it adds `MoveOwnToMonitor`, which puts the calling Eitri
-  window, and no other application's, back on the monitor it was on. With version 1 still enabled, Eitri leaves the
-  window where GNOME places it; GNOME loads the new version at your next login.
-
-## Upgrading from 0.2.1
-
-- **Nothing to rebuild.** The agent backend is pinned to the same revision as in 0.2.1, so `install.sh` keeps
-  the one you have, and after a `.deb`/`.rpm` upgrade `eitri setup` has nothing to do.
-- **If you relied on an ask rule inside a bypass tab,** it no longer stops anything there; use an Auto tab.
+- **The agent backend is built again, once.** 0.3.0 pins a newer Verdandi (@VERDANDI_REV@), so `install.sh`
+  builds the new backend before it switches over, and after a `.deb`/`.rpm` upgrade you run `eitri setup` before
+  your first turn. It downloads Node.js and the Claude Agent SDK from npm again (about 600 MiB of disk).
+- Your window opens as you left it. Its 0.2.2 layout file is read once into the new one and left as it was, so
+  0.2.2 still opens with it.
 
 **`v0.2.0` will stop building from git.** The public history of the Neovide fork was rewritten after 0.2.0
 (only commit metadata changed; the files are the same), so the `v0.2.0` tag and every earlier public commit
@@ -228,27 +106,38 @@ for good; later releases' `install.sh` cannot build 0.2.0 from source. The 0.2.0
 
 ## How much of this has been tried
 
-Everything new has automated tests, and the bypass change was also run against the real `claude` (2.1.288).
-The panel after its move was seen working in an isolated, headless test session (scripted keys, not a person
-at a real desktop): the page, streaming, reload, the trust question, turn review, the keys, links, the
-companion window and recovery from a crashed web process. The bypass change and the trust question's new note
-have not been seen on a screen yet.
+Everything new has automated tests. The tiling window (containers, floats, the scratchpad, workspaces, chat
+views and open rules) and the Markdown preview passed every row of their checks in an isolated, headless test
+session: scripted keys, not a person at a real desktop. The Claude Code backend's conformance suites passed
+against the real `claude` (2.1.302). Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
+newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
+Steering, the redesigned chat page in a real window, input methods, and companion mode on Hyprland, niri, KDE or
+a real GNOME login have not been seen on a screen yet.
 
-What the 0.2.1 notes said about its own features still holds: companion mode, `eitri split`, the GNOME Shell
-extension, turn review, the trust question and Auto tabs on Claude Code's own auto mode have been seen working
-only in that kind of isolated session, and Hyprland, niri, KDE and a real GNOME login with the extension have
-not been tried. None of it has been through real hardware and a person's hands yet; 0.3.0 waits for that and
-for a week of daily use. What you may run into is listed in the known issues (`docs/known-issues.md` in the
+None of 0.3.0 has been through real hardware and a person's hands yet, so it is not yet stable enough for everyday
+use. That waits for real hardware and a week of daily use, not for a version number; reports from real desktops
+are especially welcome. What you may run into is listed in the known issues (`docs/known-issues.md` in the
 repository).
 
 ## Performance, against native Neovide
 
-Typing is within 1 ms of native Neovide at the median and at the 99th percentile on the two machines
-measured (an Intel laptop and an AMD desktop, GTK 4.22.5, 60 and 165 Hz; measured just before 0.2.0). Below
-GTK 4.16, and while a reply is streaming, see the known issues. **One known gap:** at 165 Hz on the Intel
-laptop, with other work keeping the machine 17-28 % busy, the editor drew 137-149 frames a second where
-native Neovide drew 160 (86-93 %), and 111 (69 %) at 34 % busy, with one 83.6 ms frame in four runs. That was
-measured before 0.2.0's typing-latency fix and has not been measured again since.
+Measured on development builds shortly before this release, in an isolated, headless test session on an AMD
+desktop, and on an Intel laptop where it says so:
+
+- **Typing on GTK 4.24 (current Arch) is one refresh slower than native Neovide.** GTK 4.23 and 4.24 changed the
+  frame clock, so the redraw after a key waits for the next frame. In the headless session, which runs at GTK's
+  60 Hz default, typing added 17.15 ms at the median and 21.75 ms at the 99th percentile. On a real display the
+  wait should be at most one of its refreshes (about 6 ms at 165 Hz); that has not been measured. The same build
+  with GTK 4.22.5 added 0.13 ms at the median. Eitri cannot work around it without an interface GTK does not have.
+- **Scrolling with a held `j` on GTK 4.24 at 165 Hz** drew 85 % of the frames native Neovide drew, and its 99th
+  percentile frame interval was twice native's. The cause has not been traced yet.
+- **While a reply streams**, a key's redraw took 11.2 ms at the median with WebKitGTK 2.54 (a stand-in reply),
+  against about 2.3 ms with WebKitGTK 2.52.
+- **Memory:** one tab used 253 to 283 MiB more than native Neovide, against a goal of 256 MiB, and each extra
+  chat view about 28 MB.
+- **Idle:** no frames drawn, about 13 ms of CPU a minute. **Startup:** 260 ms, against native's 253 ms.
+- **Under load at high refresh rates** the Intel laptop drew 86-93 % of native Neovide's frames at 165 Hz while
+  other work kept it 17-28 % busy. That was measured before 0.2.0's typing-latency fix and not since.
 
 ## Install
 
@@ -257,7 +146,8 @@ measured before 0.2.0's typing-latency fix and has not been measured again since
 or install `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` and run `eitri setup`
 once, or install from `eitri-@VERSION@-x86_64-linux.tar.gz` with
 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig`
-(or unpack it and run its own `bin/eitri setup` from inside the extracted directory).
+(or unpack it and run its own `bin/eitri setup` from inside the extracted directory). A `.deb`/`.rpm` upgrade
+from 0.2.2 needs that `eitri setup` again: it builds the new agent backend.
 
 Eitri needs `nvim` >= 0.10 somewhere it can find one -- either on `PATH`, or its own private copy
 under `XDG_DATA_HOME/eitri/nvim` (never placed on `PATH`; none of the packages depend on a system
@@ -293,52 +183,82 @@ notice.
 
 Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。基于提交 @COMMIT@，在 Ubuntu 24.04 发布容器中构建。运行环境需要 glibc 2.39、GTK 4.14 以及 WebKitGTK 2.40（webkitgtk-6.0 API）或更新版本。
 
-0.2.2 是一个小版本：bypass 标签页现在会批准 Claude Code 提出的每一个问题，信任提问会说明项目的放行规则还需要什么，两处加固修复，以及一份用户指南。0.2.1 之后的大部分工作是为 macOS 应用打基础，在 Linux 上不应有任何变化。
+0.3.0 是平铺的版本。窗口变成一个用键盘操作的平铺管理器，Codex 和任何讲 ACP 的 agent 加入到 Claude Code 旁边，你还可以把自己的网页放进窗口。编辑器仍然是你的 Neovim：一个真正的 `nvim --embed`，用你自己的 `init.lua`、插件、LSP 和按键映射。
 
-### 0.2.2 的新内容
+### 0.3.0 的新内容
 
-**Agent**
+**你的 Neovim**
 
-- **Bypass 会批准 Claude Code 自己提出的每一个问题。** 在 0.2.1 里，由你自己的 `permissions.ask` 规则强制提出的问题，或者没有说明原因的问题，即使在 bypass 标签页里也会保留为卡片。现在 bypass 标签页会全部回答，不出卡片，工具那一行会写 `allowed in bypass`；进入 bypass 时，正在等待的这类问题也和其他卡片一起批准。所以在 bypass 下 ask 规则什么也拦不住（见已知问题）。Auto 标签页不变：在那里这些问题仍然各自是一张卡片。
-- **信任提问会说明项目的放行规则还需要什么。** 当它列出 `permissions.allow` 条目时，现在会补充一句：只有这个文件夹也在终端 `claude` 里被信任过，Claude Code 才会应用它们（Eitri 从不设置这一项）。hook、MCP server 以及 deny 和 ask 规则，回答 `y` 后照常加载。
+- 核心不变：Eitri 用 Neovide 渲染器的一个 fork 画出你自己的 Neovim，从不替换它。编辑器是窗口里的一个模块，其余每个模块都在它旁边。
+- 窗口标题写出项目名（`myproject — Eitri · docs`）。
 
-**加固**
+**键盘驱动的平铺**
 
-- `VERDANDI_CLAUDE_EXTRA_MCP_SERVERS` 是较新的 agent 后端会读取、用来给每个会话额外加上 MCP server 的变量，现在它会从后端的环境里移除，所以你 shell 里设的值进不了 Eitri 的会话。Eitri 自己不额外加任何 MCP server；你的设置和被信任项目的配置里写的 MCP server 照常加载。
-- agent 面板只在确定页面的脚本策略该放在哪里时才加载页面；否则显示一个简短的页面，说明面板无法构建。正式发布的构建总能通过这项检查。
-- 面板的文本框不再对你输入的内容自动大写、自动更正或做拼写检查。
+- 分屏、标签式和堆叠式容器（`<prefix> Alt+w` / `Alt+s`）、浮动窗口（`<prefix> Alt+Shift+Space`）、便笺板（`<prefix> Alt+_` 把一个模块收起来，`Alt+-` 把它叫回来），以及带名字的工作区（`<prefix> (`、`)`、`L`、`s`、`$`；`main` 始终保留）。如果你在桌面上用 i3、sway 或 Hyprland 平铺窗口，你已经知道它怎么用了。
+- tmux 的前缀键：前缀是 `Ctrl+b`，后面新增了 36 个键：布局（`Alt+3` 到 `Alt+5`、`Space`、`E`）、旋转（`Ctrl+o`、`Alt+o`）、标记与交换（`m`、`M`）、移到边上（`H`、`J`、`K`）、窗格编号（`q`）、移动模块（`Alt+H/J/K/L`）、选中容器（`Alt+a`、`Alt+d`）、把一个聊天标签页拆出来放进单独的视图（`!`），以及每个窗格自己的字号（`Ctrl+=` / `Ctrl+-` / `Ctrl+0`）。打开 `keymap.from_tmux` 时，Eitri 能从你的 `~/.tmux.conf` 里读懂比以前更多的命令：各条布局命令、`rotate-window`、`display-panes`、`break-pane`、`switch-client -n/-p/-l`、`choose-tree -s`、`select-pane -m/-M`、`swap-pane` 和 `split-window -c "#{pane_current_path}"`。
+- 最多九个终端（`<prefix> Alt+Enter`），各有自己的 shell；最多九个并排的聊天视图。
+- Lua 里有 `eitri.layout.default`、`.workspace`、`.rule`（新模块在哪里打开）、`.open`、`.float`、`.run`，以及 `eitri.layout.export()`：它把你排好的窗口返回成能排出这个窗口的 `init.lua` 调用。
+- 布局文件升到第 2 版。旧文件只读一次、原样保留，所以退回 0.2.2 是安全的。
+- i3 或 sway 的 `$mod` 是 Alt 时，`docs/keymap/i3-alt-mod.lua` 会把会被窗口管理器拿走的那些行移开。
 
-**文档**
+**你自己做的网页**（实验性）
 
-- 仓库里新增了一份用户指南 `docs/guide/`（英文和中文）：入门、按键、配置、权限、回合审阅和 companion 模式。
-- INSTALL 变短了，AUR 包紧跟在快速安装之后。
+- Eitri 随附一个 Markdown 预览，在 `init.lua` 里加上 `eitri.plugin.load("markdown")` 之前不会启用。它边打字边渲染（GitHub 风格的 Markdown、KaTeX、Mermaid、提示块），并和 Neovim 双向同步滚动。文档里的 `https` 图片会加载，除非你设置 `remote_images = "off"`。
+- 你自己的页面：Lua 面板（`eitri.panel.register`）把 `~/.config/eitri/panels/` 里的一个 HTML 文件，或者任何一个地址（比如你的开发服务器），显示成窗口里的一个模块。插件是一个带 `eitri-plugin.toml` 的目录；它的页面只拿到清单里列出的那些宿主能力、Eitri 的配色，以及和 Markdown 预览一样的按键。指南新增的"你自己做的页面"一页讲了这两种，还有一个完整的小插件。
+- **实验性：** 0.x 期间清单格式和页面桥接都可能改变，而且还没有同意界面：加载一个插件，就像运行任何程序一样，意味着信任它。
 
-**内部改动**
+**你监督的 agent**
 
-- agent 面板的逻辑移进了一个不依赖任何 GUI 工具包的独立库，Neovide fork 增加了一组钩子，供承载 Neovide 自身窗口的应用使用。两者都是为 macOS 应用打的基础，那个应用还不能用。在 Linux 上不应有任何变化。
+- Claude Code 照旧；**Codex 标签页**（`:tabnew codex`，需要 `codex` 0.160.0 或更新版本，始终在 Codex 的 `workspace-write` 沙箱里运行）；以及用 `eitri.agent.register{...}` 注册的**任何 ACP agent**。每一种都会就它要加载的项目文件单独问一次信任。
+- **Manual 模式**：每一次文件编辑都是一张由你回答的卡片，你保存的规则照样适用。`Shift+Tab` 在 manual、auto 和 bypass 之间轮换；`agent.default_mode` 决定新标签页从哪个模式开始。
+- **回合进行中按 Enter 会把消息插进这个回合**（Claude Code 和 Codex 标签页）：agent 在下一步读到它。ACP 标签页会把消息留到回合结束。`Ctrl+Enter` 打断回合并立即发送。
+- 聊天页面重做了：安静的一栏，只在你要审阅或回答的内容周围加框，agent 的思考按你选的方式显示（`agent.thinking`），每个结束的回合下面写着 `Worked for 8s`，还有一个列出 agent 自己命令的 `/` 菜单。
+- 回合审阅也统计 Codex 和 ACP 的编辑；撤销单个 hunk 时只检查这个 hunk 自己的行；在文件行上按 `y` 复制它的路径。
+- 信任提问把内容完整显示，并且也覆盖仓库上层目录里的 `CLAUDE.md`、`.mcp.json` 和规则。
 
-### 从 0.2.1 升级
+**闲置时更省**
 
-- **不需要重新构建。** agent 后端固定的版本和 0.2.1 相同，所以 `install.sh` 会保留你现有的那个；`.deb`/`.rpm` 升级之后，`eitri setup` 也无事可做。
-- **如果你曾经依靠 ask 规则在 bypass 标签页里拦住某些操作**，现在它在那里什么也拦不住了；请改用 Auto 标签页。
+- 闲置的窗口什么都不画，面板只在有东西要画时才醒来。底部终端回显按键不再等一帧，很长的回滚内容画起来也便宜得多。
+
+**可能受影响的地方：**
+
+- **如果你的 `init.lua` `set` 了新的前缀键之一，Eitri 会在启动时停下**，和 `set` 任何默认键时一样；提示里写着是哪个键。新增的键（按 `eitri.keymap` 的写法）：`m`、`M`、`q`、`E`、`H`、`J`、`K`、`L`、`s`、`Space`、`(`、`)`、`$`、`!`、`C-o`、`C-=`、`C-+`、`C--`、`C-0`、`M-3`、`M-4`、`M-5`、`M-e`、`M-o`、`M-w`、`M-s`、`M-a`、`M-d`、`M-H`、`M-J`、`M-K`、`M-L`、`M-Enter`、`M-S-Space`、`M--` 和 `M-_`。在那条 `set` 前面加上 `k.del("prefix", "<key>")`。如果打开了 tmux 导入、你的 tmux 配置也绑定了这个键，就不需要 `del`。`del` 一个没有绑定的键同样会让启动停下，所以这些行要在升级时加，不要提前加。键设为 `H`、`J` 或 `K` 的 Lua 面板或插件，现在也会让启动停下。
+- **`init.lua` 从 `$XDG_CONFIG_HOME/eitri` 读取**（这个变量设为绝对路径时），否则从 `~/.config/eitri` 读取（`EITRI_CONFIG_DIR` 仍然最优先）；0.2.2 不管 `XDG_CONFIG_HOME` 是什么都读 `~/.config/eitri`。如果你的 `XDG_CONFIG_HOME` 指向别处，请把配置挪过去。
+- **`Shift+Tab` 在三种模式之间轮换**：manual、auto、bypass，然后回到 manual。bypass 只能从 auto 进入，所以离开它会落到 manual。
+- **你信任过的每个项目都会再问一次**，因为这个问题现在显示的内容比以前多。
+- **在输入框里，`Ctrl+a` 和 `Ctrl+e` 移到行首和行尾**，和 shell 里一样；它们不再全选。
+- 面板的输入模式现在叫 INSERT（原来叫 INPUT）。
+- **同一个项目上的第二个 Eitri 窗口保存它自己的布局和标签页。** 它从第一个窗口的布局开始，之后只保存自己的，所以关掉它不再改变第一个窗口打开时的样子。
+
+### 从 0.2.2 升级
+
+- **agent 后端要重新构建一次。** 0.3.0 固定了一个更新的 Verdandi（@VERDANDI_REV@），所以 `install.sh` 会先构建新的后端再切换过去；`.deb`/`.rpm` 升级之后，在第一次对话之前运行 `eitri setup`。它会再从 npm 下载一次 Node.js 和 Claude Agent SDK（大约需要 600 MiB 磁盘空间）。
+- 你的窗口会照你离开时的样子打开。它 0.2.2 的布局文件只读一次、读进新的文件，旧文件原样保留，所以 0.2.2 仍然用它打开。
 
 **`v0.2.0` 将无法再从 git 构建。** 0.2.0 之后，Neovide fork 的公开历史被改写了（只改了提交的元数据，文件内容没有变），所以 `v0.2.0` 这个 tag 以及之前所有的公开提交，指向的都是已经没有任何分支持有的 fork 提交。请从 git 构建 0.2.1 或更新的版本。至于 0.2.0 本身：用它自己的 `install.sh`（0.2.0 的发布资源）加 `--from-source`，只在 GitHub 还提供那些旧对象时才能成功；用 0.2.0 发布页上的 `eitri-0.2.0-source.tar.gz` 则可以一直重新构建它，里面带着 fork 的文件。之后版本的 `install.sh` 都没法从源码构建 0.2.0。0.2.0 的安装包、tar 包和 `install.sh` 不受影响。
 
 ### 哪些已经试过
 
-所有新内容都有自动化测试，bypass 的改动还在真实的 `claude`（2.1.288）上跑过。面板搬家之后，在一个隔离的、无界面的测试会话里见过它正常工作（用脚本按键，不是一个人坐在真实桌面前）：页面、流式输出、重新加载、信任提问、回合审阅、按键、链接、companion 窗口，以及 web 进程崩溃后的恢复。bypass 的改动和信任提问新加的那句说明，还没有在屏幕上见过。
+所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端的一致性测试在真实的 `claude`（2.1.302）上通过。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。插话引导、真实窗口里的新聊天页面、输入法，以及在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，都还没有在屏幕上见过。
 
-0.2.1 的发布说明里关于它自己那些功能的说法仍然成立：companion 模式、`eitri split`、GNOME Shell 扩展、回合审阅、信任提问，以及使用 Claude Code 自己 auto 模式的 Auto 标签页，都只在那种隔离会话里见过它正常工作；Hyprland、niri、KDE 以及在真实 GNOME 登录会话里的扩展都还没试过。这些都还没有经过真实硬件和真人的手；0.3.0 要等这一步，再加上一周的日常使用。你可能遇到的问题列在已知问题里（仓库中的 `docs/known-issues.zh-CN.md`）。
+0.3.0 的所有内容都还没有经过真实硬件和真人的手，所以它还没有稳定到可以日常使用。这要等真实硬件和一周的日常使用，而不是等某个版本号；特别欢迎来自真实桌面的反馈。你可能遇到的问题列在已知问题里（仓库中的 `docs/known-issues.zh-CN.md`）。
 
 ### 性能：与原生 Neovide 对比
 
-在测过的两台机器上（一台 Intel 笔记本和一台 AMD 台式机，GTK 4.22.5，60 Hz 和 165 Hz；在 0.2.0 发布前不久测的），打字延迟的中位数和第 99 百分位都与原生 Neovide 相差不到 1 ms。GTK 低于 4.16 时，以及回复正在流式输出时，见已知问题。**一个已知差距：** 在那台 Intel 笔记本上，165 Hz、有其他工作让机器保持 17-28 % 繁忙时，编辑器每秒画 137-149 帧，而原生 Neovide 是 160 帧（86-93 %）；繁忙度 34 % 时是 111 帧（69 %），四次测量里出现过一帧 83.6 ms。这是在 0.2.0 的打字延迟修复之前测的，之后还没有重测。
+在本次发布前不久的开发构建上，于一台 AMD 台式机上的隔离无界面测试会话里测得；注明的地方是在一台 Intel 笔记本上测的：
+
+- **在 GTK 4.24（目前的 Arch）上，打字比原生 Neovide 慢一个刷新周期。** GTK 4.23 和 4.24 改了帧时钟，按键之后的重绘要等下一帧。在无界面会话里（它按 GTK 默认的 60 Hz 运行），打字的中位数多 17.15 ms，第 99 百分位多 21.75 ms。在真实显示器上，这个等待应该最多是它的一个刷新周期（165 Hz 下约 6 ms），但还没有测过。同一个构建用 GTK 4.22.5 时，中位数只多 0.13 ms。GTK 没有提供能让 Eitri 绕开它的接口。
+- **在 GTK 4.24、165 Hz 下按住 `j` 滚动**时，画出的帧数是原生 Neovide 的 85 %，第 99 百分位的帧间隔是原生的两倍。原因还没有查明。
+- **回复正在输出时**，在 WebKitGTK 2.54 上一次按键的重绘中位数是 11.2 ms（替身回复），WebKitGTK 2.52 上约为 2.3 ms。
+- **内存：** 一个标签页比原生 Neovide 多用 253 到 283 MiB，目标是 256 MiB；每多一个聊天视图约多 28 MB。
+- **闲置：** 不画任何帧，每分钟约 13 ms CPU。**启动：** 260 ms，原生为 253 ms。
+- **高刷新率下有负载时**，那台 Intel 笔记本在 165 Hz、其他工作让机器保持 17-28 % 繁忙时，画出的帧数是原生 Neovide 的 86-93 %。这是在 0.2.0 的打字延迟修复之前测的，之后还没有重测。
 
 ### 安装
 
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL https://github.com/HunterGrey-cyber/eitri/releases/download/v@VERSION@/install.sh | sh -s -- --version @VERSION@
 
-或者安装 `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` 并运行一次 `eitri setup`；或者用 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig` 从 `eitri-@VERSION@-x86_64-linux.tar.gz` 安装（或者解压后，在解压出的目录里运行它自己的 `bin/eitri setup`）。
+或者安装 `eitri_@VERSION@_amd64.deb` / `eitri-@VERSION@-1.x86_64.rpm` 并运行一次 `eitri setup`；或者用 `sh install.sh --tarball eitri-@VERSION@-x86_64-linux.tar.gz --sums SHA256SUMS --sig SHA256SUMS.sig` 从 `eitri-@VERSION@-x86_64-linux.tar.gz` 安装（或者解压后，在解压出的目录里运行它自己的 `bin/eitri setup`）。从 0.2.2 用 `.deb`/`.rpm` 升级时，要再运行一次 `eitri setup`：它会构建新的 agent 后端。
 
 Eitri 需要能找到 `nvim` >= 0.10 -- 既可以是 `PATH` 上的，也可以是它自己的私有副本，位于 `XDG_DATA_HOME/eitri/nvim`（这个私有副本从不会被放进 `PATH`；所有安装包都不依赖系统自带的 nvim）。Ubuntu 24.04 自带的包是 0.9.5，低于这个下限。`install.sh`（上面的 curl 命令）在安装时如果没有找到足够新的版本，会主动提出为你获取官方 nvim 发行版；之后任何时候单独运行 `eitri setup --nvim-only`（不论是在 `.deb`/`.rpm`/tar 包安装之后，还是再次运行）都能得到同样的提示。
 

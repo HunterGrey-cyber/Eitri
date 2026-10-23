@@ -22,9 +22,9 @@ English | [简体中文](README.zh-CN.md)
 
 </div>
 
-A Neovim GUI for Linux. A Claude Code you'd actually want to read: rendered markdown and diffs,
-permission cards, all without reaching for the mouse. Eitri is a desktop window (MIT) around your own
-Neovim configuration and the `claude` you have installed.
+A Neovim GUI for Linux. Eitri is a desktop window (MIT) around your own Neovim configuration, with the agents you
+supervise (Claude Code, Codex, or any agent that speaks ACP), terminals and web pages of your own tiled beside it.
+Replies come as rendered markdown and diffs with permission cards, all without reaching for the mouse.
 
 Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys. If you tile your desktop with i3, sway, Hyprland or AeroSpace, you already know how it works.
 
@@ -32,9 +32,9 @@ Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's
 
 > [!NOTE]
 > **Early release.** Eitri works, but expect rough edges, and the `init.lua` API and default keys may still change in
-> 0.x. Tell us in [Issues](https://github.com/HunterGrey-cyber/eitri/issues) or
-> [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions). The goal for 0.3: stable enough to be our own
-> everyday editor.
+> 0.x. It is not yet stable enough for everyday use: that waits for real hardware and a week of daily use, not for a
+> version number. Tell us in [Issues](https://github.com/HunterGrey-cyber/eitri/issues) or
+> [Discussions](https://github.com/HunterGrey-cyber/eitri/discussions).
 
 ![Eitri: Neovim on the left with a Python file open; on the right, Claude Code's rendered reply with a highlighted code block, and the which-key box open from the leader key](docs/images/hero.webp)
 
@@ -42,6 +42,10 @@ Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's
   fork of Neovide's GPU renderer.
 - **Replies you can read.** Markdown, code in your colorscheme's colours, foldable tool calls, and each
   edit as its own diff row.
+- **Agents you supervise.** Claude Code, Codex, or an agent you register over ACP, one per tab, in Manual, Auto
+  or Bypass mode (an ACP agent has no Manual); `Enter` while a turn runs steers it. See [Codex and other agents](docs/guide/agents.md).
+- **Pages you build.** A Markdown preview ships with Eitri, and your own HTML page or plugin becomes a module of the
+  window (experimental): [Pages you build](docs/guide/pages.md).
 - **Keyboard end to end.** vim keys in the panel, tmux keys for the window, `Ctrl+h/j/k/l` across panes.
 - **Review each turn.** `c` lists what changed on disk during the agent's turn; revert a hunk, or send comments back.
 - **Configured in Lua.** `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`), the way Neovim reads yours.

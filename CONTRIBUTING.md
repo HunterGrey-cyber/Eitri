@@ -34,9 +34,15 @@ One Cargo workspace at the repository root.
 |---|---|
 | `shell/` | **the application binary.** Window, chrome, focus, the module grid, the Lua kernel, theme following |
 | `neovide-editor/` | library: `NeovideEditorPane`, the forked Neovide renderer, input and runtime on a `GtkGLArea` |
-| `agent/` | library: Claude session backends (no GTK). Also builds `agent-hook` and `eitri-claude-handoff` |
+| `agent/` | library: the agent backends, Claude Code, Codex and ACP, and the permission policy (no GTK). Also builds `agent-hook` and `eitri-claude-handoff` |
 | `core/` | library, package **`eitri-core`**: the GTK-free half of the shell — backend selection, the Lua kernel, theme tokens, the per-window sockets, layout, keymap, session tabs |
+| `panel/` | library, package **`eitri-panel`**: the agent panel's logic, with no GUI toolkit |
+| `mac/` | package **`eitri-mac`**: the macOS host, not usable yet. On Linux its shared modules build and are tested, and its binary only says it runs on macOS |
 | `agent-ui/web/` | the panel's React/TypeScript frontend. Not a crate: `shell/build.rs` builds it with npm and embeds the single-file result |
+| `plugin-kit/keys/` | the keyboard kit every plugin page loads (TypeScript). Not a crate: `shell/build.rs` builds and embeds it |
+| `plugins/markdown/` | the Markdown preview, a plugin directory that ships with Eitri (its manifest and its page's source) |
+| `nvim/eitri.nvim/` | the Neovim plugin behind `:EitriPanel` |
+| `gnome-extension/` | the GNOME Shell extension companion mode uses on GNOME |
 | `supervisor/` | `eitri-supervisor`, a read-only cross-window agent-status dashboard |
 | `terminal/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
 | `terminal-render/`, `terminal-frame/`, `terminal-sync/`, `terminal-input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
@@ -72,7 +78,7 @@ cargo build --locked
 ```
 
 `cargo build --locked` — **not** `--workspace` — is the product: the workspace's `default-members`
-(`shell`, `neovide-editor`, `agent`, `core`, `supervisor` and the terminal crates) at the GTK 4.14
+(`shell`, `neovide-editor`, `agent`, `core`, `panel`, `mac`, `supervisor` and the terminal crates) at the GTK 4.14
 floor. `cargo build --workspace` also builds the frozen `poc/` crates below, which need GTK 4.18 and
 are not part of what ships — don't reach for it just to build Eitri itself.
 
@@ -80,13 +86,13 @@ are not part of what ships — don't reach for it just to build Eitri itself.
 
 ```sh
 cargo test                                                                    # GTK 4.14 floor
-cargo test -p agent -p eitri-core -p shell --features shell/legacy-backend  # the legacy-backend pass
+cargo test -p agent -p eitri-core -p eitri-panel -p shell --features shell/legacy-backend  # the legacy-backend pass
 (cd agent-ui/web && npm ci && npx vitest run && npx tsc -b)
 python3 -m pytest packaging
 ```
 
-Both `cargo test` invocations must stay green: the default build's shape, and the same three crates
-built with the legacy backend compiled in (below) — a change to `agent`/`core`/`shell` can compile
+Both `cargo test` invocations must stay green: the default build's shape, and the same four crates
+built with the legacy backend compiled in (below) — a change to `agent`/`core`/`panel`/`shell` can compile
 and pass on one and not the other. Point `XDG_STATE_HOME` at a scratch directory first; the tests
 write project state there. `cargo test --workspace` additionally builds and tests the frozen `poc/`
 crates and needs GTK 4.18+ for them. Tests marked `#[ignore]` need a display, a real `nvim`, or a

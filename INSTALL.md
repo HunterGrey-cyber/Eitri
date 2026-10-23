@@ -83,6 +83,10 @@ as it was. Restart open Eitri windows afterwards.
 For a `.deb` or `.rpm`, upgrade with your package manager, then run `eitri setup` again (it does nothing
 when the sidecar is already built).
 
+Coming from 0.2.2: the update builds the agent sidecar again, since 0.3.0 pins a newer one, and Eitri now reads
+its settings from `$XDG_CONFIG_HOME/eitri` when `XDG_CONFIG_HOME` is set to an absolute path (0.2.2 always read
+`~/.config/eitri`), so move them there if the two differ.
+
 Coming from 0.2.0: the desktop entry was renamed, so pin Eitri to your dock again once.
 
 ## Uninstalling
