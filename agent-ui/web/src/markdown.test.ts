@@ -336,7 +336,7 @@ describe("renderMarkdown: dialogs, entities in image links, and mixed image/text
       expect(span, classes.join(".")).not.toBeNull();
       for (const cls of classes) expect(span!.classList.contains(cls), `${classes.join(".")}: ${cls}`).toBe(true);
     }
-    // And the real highlighter's `function_`.
+    // And the real highlighter's `function_` (the Rust `class_` case is the test above).
     expect(renderMarkdown("```javascript\nfunction add(a, b) { return a + b; }\n```")).toContain(
       'class="hljs-title function_"',
     );

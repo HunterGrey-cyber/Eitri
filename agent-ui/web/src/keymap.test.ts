@@ -1276,14 +1276,28 @@ describe("isPlainAnswerKey", () => {
   });
 });
 
-/** Check that the a/d cases and Shift+D agree with `isPlainAnswerKey` for each modifier.
- *  Test Super and Hyper separately because the `superKey` helper reports both together.
- *  Ctrl+Shift+D must use key "D" to reach the Shift+D arm; lowercase "d" does not exercise it.
- *  Ctrl+d is excluded because it scrolls half a page before the answer switch is reached.
+/** Nothing so far
+ *  actually held `resolveKey`'s own `case "a"/"d":` and the `Shift+D` arm to routing their decision
+ *  through `isPlainAnswerKey`, clause by clause, rather than a same-shaped hand-written check --
+ *  three mutations at those two call sites (reverting `case "a"/"d":` to its earlier form,
+ *  `if (event.altKey || event.metaKey || hasSuperOrHyper(event)) return null;`; reverting the
+ *  `Shift+D` arm to its earlier hand-written list; or dropping just the Ctrl clause from the
+ *  `Shift+D` arm) each left every test above, and `App.test.tsx`'s h3/h3b, green. This computes
+ *  `isPlainAnswerKey` on the exact event `resolveKey` is given and checks the two never disagree,
+ *  modifier by modifier -- Super and Hyper each alone (the `superKey` shorthand above reports BOTH
+ *  at once, so it alone cannot tell a Super-only regression from a Hyper-only one), and a real
+ *  Ctrl+Shift+D (`key: "D"`, `ctrlKey: true` -- not the existing `key("d", { ctrlKey: true, shiftKey:
+ *  true })` case above, whose lowercase `key` never reaches the `Shift+D` arm's own `event.key ===
+ *  "D"` check at all, so it never exercised this). `d`'s own `Ctrl` case is left out of its list on
+ *  purpose: Ctrl+d is a different, deliberate chord (half-page scroll, pinned above) claimed before
+ *  the switch is ever reached, not a modifier the switch itself refuses.
  *
- *  This matrix derives expectations from `isPlainAnswerKey`, so a bug in that predicate can
- *  make both sides agree incorrectly. Its direct tests use hardcoded false expectations,
- *  and `App.test.tsx` separately checks that no `confirm_bypass` is sent. */
+ *  What this matrix cannot catch, confirmed by mutation: it derives its own "expected" value from
+ *  calling the real `isPlainAnswerKey`, so a bug inside `isPlainAnswerKey` itself (e.g.
+ *  `hasSuperOrHyper` narrowed to check only "Super") computes the same wrong answer on both sides and
+ *  the row still agrees with itself. `isPlainAnswerKey`'s own describe block above pins that directly
+ *  with a hardcoded `false`, not derived from anything under test; `App.test.tsx`'s h3 table pins it a
+ *  third way, against a hardcoded absence of `confirm_bypass`. */
 type ModifierCase = [
   string,
   Partial<{

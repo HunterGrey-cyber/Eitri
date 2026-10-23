@@ -2644,8 +2644,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `.rev` value shorter than the expected revision also gives no warning when it is
-    /// a prefix of that revision.
+    /// The other direction: a `.rev` file shorter than `EXPECTED_VERDANDI_REVISION` that is still a
+    /// genuine prefix of it also gives no warning ("and vice versa" in the original wording of the rule).
     #[test]
     fn sibling_rev_skew_warning_is_empty_when_the_rev_file_is_a_shorter_prefix_of_the_expected_revision() {
         let dir = std::env::temp_dir().join(format!("nv-sibling-rev-short-{}", uuid::Uuid::new_v4()));

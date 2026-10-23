@@ -5372,11 +5372,18 @@ describe("App global HINT: the panel's half", () => {
   });
 
   it("f on the empty tab asks shell for a HINT too, once the composer stops taking the keys", () => {
-    // A `starting` tab's composer can queue behind the connection, so `f` types text in INPUT. Outside
-    // INPUT, `EmptyTab` handles `f` as HINT after `TYPING_GUARD_MS`, as in the live conversation.
-    // It has no Escape handler, so this test uses blur to leave INPUT. The composer's first `f`
-    // still reaches `typingGuard.onKey` before the mode check, so the second `f` needs a gap to
-    // avoid being treated as typing.
+    // a `starting` tab's composer is live now (it can queue behind the connect), so `f` there is
+    // a character like any other, same as the ordinary NotStarted case -- only once the box is out
+    // of INPUT does `f` mean HINT (`EmptyTab`'s own `onKeyDown`), the same as the ended/lost
+    // banners' `r`. Deviation from the originally requested "pressing Escape first": `EmptyTab`
+    // has no `Escape` handling of its own (only `keymap.ts`'s conversation-root table does), so this
+    // uses the same blur `Composer`'s own BROWSE/INPUT split already relies on everywhere else.
+    // `f` there now defers `TYPING_GUARD_MS` too, the
+    // same as the live conversation's own `f` (`typingGuard.ts`'s own doc comment) -- a lone `f`
+    // still asks, just that much later. The composer's own `f` still reaches `typingGuard.onKey`
+    // (called unconditionally, ahead of the mode check, this file's own doc comment) even though
+    // the mode gate swallows it, so the SECOND `f` below needs a real gap behind it too, or the
+    // guard reads it as arriving too soon after the first -- the thing it exists to catch.
     vi.useFakeTimers();
     try {
       const { container } = render(<App />);

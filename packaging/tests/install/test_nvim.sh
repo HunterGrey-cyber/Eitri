@@ -87,7 +87,8 @@ t_nvim_offer_no_tty_reports_only() {
 
 TESTS="$TESTS t_nvim_offer_no_tty_explicit_setsid"
 t_nvim_offer_no_tty_explicit_setsid() {
-	# Repeat the no-terminal case explicitly with setsid, stdin from /dev/null, and no flag.
+	# The same thing, spelled as the acceptance criterion words it: setsid, no controlling
+	# terminal, stdin from /dev/null, no flag.
 	serve 1.0.0
 	PRE_STUBS=$(old_nvim_stubs)
 	"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$PRE_STUBS" --stubs "$S/stubs" \

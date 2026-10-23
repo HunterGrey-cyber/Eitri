@@ -17,7 +17,8 @@ extern "C" {
     #[cfg_attr(docsrs, doc(cfg(feature = "v4_16")))]
     pub fn gtk_fake_v4_16_fn();
 
-    // Exercises the `cfg(any(feature = "...", docsrs))` shape the parser must handle.
+    // Exercises the `cfg(any(feature = "...", docsrs))` shape the parser must also handle (not
+    // seen in the real crates as of 2026-09-27, but the parser is meant to handle it defensively).
     #[cfg(any(feature = "v4_18", docsrs))]
     pub fn gtk_fake_v4_18_fn();
 }
