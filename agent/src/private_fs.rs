@@ -407,6 +407,156 @@ pub fn read_private_to_string(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
+/// A lock file of this user's whose exclusive `flock` stands for one store file's read-modify-write.
+/// The lock, when [`try_lock`](Self::try_lock) took it, is held until this is dropped: closing the
+/// descriptor releases it, and so does the process ending, however it ends, so a crashed window never
+/// leaves a store locked.
+///
+/// The lock is a file beside the store, never the store itself: a store is replaced by a rename, and a
+/// lock on the inode a writer opened would not exclude one that opened the file renamed over it.
+/// `flock` belongs to the open file description, so two opens of one lock file exclude each other even
+/// inside one process (two threads, each with its own `PrivateLock`); over NFS Linux takes it as a
+/// byte-range lock, which excludes other processes only, so there each store must keep a single writer
+/// per process (each window has one per store). A child forked while it is held
+/// shares the description until its `exec` closes it (`O_CLOEXEC`), so it may hold a moment longer.
+pub struct PrivateLock {
+    file: std::fs::File,
+}
+
+impl PrivateLock {
+    /// Opens `path`, creating it 0600, without truncating it. As with [`open_private`], a symlink is
+    /// refused (`O_NOFOLLOW`), a FIFO cannot hold the open up (`O_NONBLOCK`), and anything but a regular
+    /// file of this user is refused before it is locked or changed. Opened for writing as well, though
+    /// nothing is written: on NFS, Linux takes an `flock` as a byte-range lock, and an exclusive one on a
+    /// descriptor open only for reading fails.
+    ///
+    /// A missing lock file is made under a name of this process's own, set to 0600 there, and only then
+    /// linked into place, so it never appears with another mode. Created in place, it would be what the
+    /// umask makes it until its mode is set -- 0400 under a umask such as 0277 -- and another window
+    /// opening it for writing in that moment would be refused, and its write with it. When another
+    /// window links its own first, that one is opened. A file system without hard links gets the file
+    /// created in place.
+    pub fn open(path: &Path) -> std::io::Result<PrivateLock> {
+        // Each round either opens what is there or puts a file there; only a lock file removed again
+        // between the two, every time, runs out of rounds.
+        for _ in 0..8 {
+            match open_lock_file(path, false) {
+                Ok(file) => return PrivateLock::checked(file, path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(file) = create_lock_file(path)? {
+                return PrivateLock::checked(file, path);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} kept disappearing while it was opened", path.display()),
+        ))
+    }
+
+    fn checked(file: std::fs::File, path: &Path) -> std::io::Result<PrivateLock> {
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != euid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} is not a regular file of this user", path.display()),
+            ));
+        }
+        fchmod(&file, PRIVATE_FILE_MODE)?;
+        Ok(PrivateLock { file })
+    }
+
+    /// One try at the exclusive lock, never waiting: `true` when this now holds it (or already did),
+    /// `false` when another open of the file holds it.
+    pub fn try_lock(&self) -> std::io::Result<bool> {
+        loop {
+            // SAFETY: the descriptor is `self.file`'s own and open for the call; `flock` takes no pointers.
+            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(true);
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EWOULDBLOCK) => return Ok(false),
+                _ => return Err(err),
+            }
+        }
+    }
+}
+
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Numbers this process's temporary lock files, so two threads making one at once never share a name.
+static LOCK_FILE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Puts a 0600 lock file at `path` (see [`PrivateLock::open`]): the file made, or `None` when another
+/// window's was linked there first.
+fn create_lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let mut name = path.as_os_str().to_os_string();
+    let serial = LOCK_FILE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    name.push(format!(".{}.{serial}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(name);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        // Left by a process that ended with this one's id; the next round takes another name.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    #[cfg(test)]
+    lock_test_hooks::after_create();
+    let linked = fchmod(&file, PRIVATE_FILE_MODE).and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EOPNOTSUPP | libc::ENOSYS)) => {
+            // No hard links here: made in place, as the only way left.
+            drop(file);
+            open_lock_file(path, true).map(Some)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A hook a test sets on its own thread to stop [`PrivateLock::open`] right after the open that creates
+/// a lock file and before its mode is set, so a second open can be made at that moment.
+#[cfg(test)]
+mod lock_test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_CREATE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn set_after_create(hook: impl FnOnce() + 'static) {
+        AFTER_CREATE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_create() {
+        let hook = AFTER_CREATE.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +820,113 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("open_private blocked on a FIFO");
         assert!(refused, "a FIFO is not a regular file");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Two opens of one lock file exclude each other, in one process too: the second try fails while the
+    /// first holds it and succeeds once that one is dropped. The file is 0600 and never truncated.
+    #[test]
+    fn a_private_lock_excludes_another_open_of_the_same_file_until_dropped() {
+        let base = scratch("lock");
+        let path = base.join("store.json.lock");
+        std::fs::write(&path, b"kept").unwrap();
+        let first = PrivateLock::open(&path).unwrap();
+        assert!(first.try_lock().unwrap());
+        assert!(first.try_lock().unwrap(), "the holder trying again still holds it");
+        let second = PrivateLock::open(&path).unwrap();
+        assert!(!second.try_lock().unwrap(), "held by the first open");
+        drop(first);
+        assert!(second.try_lock().unwrap(), "free once the first is dropped");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Under a umask that takes the owner's own bits away (0277) a file is created 0400, and stays so until
+    /// its mode is set. A second window opening the lock file at that moment must get it all the same, and
+    /// the two opens must be of the one file, or a window's write would be refused (or not excluded) only
+    /// because another was creating the lock. The umask is process-wide, so the body runs in a child copy
+    /// of the test binary.
+    #[test]
+    fn a_lock_file_being_created_under_a_narrow_umask_never_refuses_another_window() {
+        if current_uid() == 0 {
+            return;
+        }
+        crate::test_umask::with_umask(
+            concat!(
+                module_path!(),
+                "::a_lock_file_being_created_under_a_narrow_umask_never_refuses_another_window"
+            ),
+            0o277,
+            || {
+                let base = scratch("lock-umask");
+                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let path = base.join("store.json.lock");
+                let (created_tx, created) = std::sync::mpsc::channel();
+                let (go_tx, go) = std::sync::mpsc::channel::<()>();
+                let a = {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        lock_test_hooks::set_after_create(move || {
+                            created_tx.send(()).unwrap();
+                            go.recv().unwrap();
+                        });
+                        PrivateLock::open(&path)
+                    })
+                };
+                created.recv().unwrap();
+                let b = PrivateLock::open(&path);
+                go_tx.send(()).unwrap();
+                let a = a.join().unwrap().expect("window A's open");
+                let b = b.expect("window B's open, while window A was creating the lock file");
+                assert!(a.try_lock().unwrap());
+                assert!(!b.try_lock().unwrap(), "both opened the one lock file");
+                drop(a);
+                assert!(b.try_lock().unwrap());
+                assert_eq!(mode(&path), 0o600);
+                drop(b);
+                std::fs::remove_dir_all(&base).unwrap();
+            },
+        );
+    }
+
+    /// A directory where the lock file goes is refused, not locked or replaced, and so is any later open
+    /// while it stays. A lock file made in an empty place leaves no temporary name behind.
+    #[test]
+    fn a_private_lock_refuses_a_directory_and_leaves_no_temporary_file() {
+        let base = scratch("lock-dir");
+        let dir = base.join("store.json.lock");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(PrivateLock::open(&dir).is_err());
+        assert!(PrivateLock::open(&dir).is_err(), "still refused, never replaced");
+        assert!(dir.is_dir());
+        let path = base.join("other.json.lock");
+        let lock = PrivateLock::open(&path).unwrap();
+        assert!(lock.try_lock().unwrap());
+        let mut names: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["other.json.lock", "store.json.lock"]);
+        drop(lock);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A lock file is opened as a private file is: a symlink or a FIFO in its place is refused.
+    #[test]
+    fn a_private_lock_refuses_a_symlink_and_a_fifo() {
+        let base = scratch("lock-planted");
+        let link = base.join("link.lock");
+        std::os::unix::fs::symlink(base.join("elsewhere"), &link).unwrap();
+        assert!(PrivateLock::open(&link).is_err());
+        assert!(!base.join("elsewhere").exists(), "nothing created through the link");
+        let fifo = base.join("fifo.lock");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // `O_NONBLOCK`: a FIFO with no writer opens at once, so this returns and is then refused by type.
+        assert!(PrivateLock::open(&fifo).is_err());
         std::fs::remove_dir_all(&base).unwrap();
     }
 

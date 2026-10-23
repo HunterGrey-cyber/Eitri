@@ -2713,7 +2713,17 @@ mod tests {
         for sub in ["layout", "history", "permissions", "agent"] {
             assert_eq!(mode(&state.join(sub)), 0o700, "{sub}/");
         }
-        for file in [&layout_file, &partial_file, &history_file, &rules_file, &mode_file] {
+        let history_lock = crate::state_paths::lock_path(&history_file);
+        let rules_lock = crate::state_paths::lock_path(&rules_file);
+        for file in [
+            &layout_file,
+            &partial_file,
+            &history_file,
+            &rules_file,
+            &mode_file,
+            &history_lock,
+            &rules_lock,
+        ] {
             assert_eq!(mode(file), 0o600, "{}", file.display());
         }
     }

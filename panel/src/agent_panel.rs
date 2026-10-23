@@ -289,10 +289,12 @@ struct AgentPanelState {
     /// let go only when the old backend is gone, so a start resuming that session waits for it. Taken by the
     /// tab's next external start whatever it is, and dropped when the start is put off or the tab closes.
     resume_after: std::collections::HashMap<TabId, (String, mpsc::Receiver<()>)>,
-    /// `$XDG_STATE_HOME/eitri/history` and `.../permissions`; `None` with no state directory.
-    history_dir: Option<PathBuf>,
+    /// Writes the project's prompts to `$XDG_STATE_HOME/eitri/history` off this thread (disabled with no
+    /// state directory). `rules_dir` is `.../permissions`, `None` with no state directory.
+    history_writer: eitri_core::prompt_history::HistoryWriter,
     rules_dir: Option<PathBuf>,
-    /// The project's prompts, oldest first, as last read or written.
+    /// The project's prompts, oldest first: as read at the start, with this window's own appended at once,
+    /// and replaced by the file's entries each time the history's writer reports a write.
     history: Vec<String>,
     /// The last `editor_link` envelope (companion mode), kept so a fresh document is told on
     /// `ready`. `None` in a window with no companion, which never sends one.
@@ -401,7 +403,7 @@ struct StateParts {
     supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
     scratch: Option<eitri_core::scratch::ScratchDir>,
     review_roots: ReviewRoots,
-    history_dir: Option<PathBuf>,
+    history_writer: eitri_core::prompt_history::HistoryWriter,
     rules_dir: Option<PathBuf>,
     history: Vec<String>,
     tab_memory: TabWriter,
@@ -429,7 +431,7 @@ impl AgentPanelState {
             supervisor_pending,
             scratch,
             review_roots,
-            history_dir,
+            history_writer,
             rules_dir,
             history,
             tab_memory,
@@ -509,7 +511,7 @@ impl AgentPanelState {
             editor_done_hook: None,
             retiring: Retiring::default(),
             resume_after: std::collections::HashMap::new(),
-            history_dir,
+            history_writer,
             rules_dir,
             history,
             editor_link: None,
@@ -550,6 +552,7 @@ fn panel_state(
     for note in notes {
         eprintln!("{note}");
     }
+    let history_writer = eitri_core::prompt_history::HistoryWriter::new(history_dir, project_dir.clone());
     let (rules, notes) = eitri_core::permission_store::startup(rules_dir.as_deref(), &project_dir);
     for note in notes {
         eprintln!("{note}");
@@ -598,7 +601,7 @@ fn panel_state(
         supervisor_pending,
         scratch,
         review_roots,
-        history_dir,
+        history_writer,
         rules_dir,
         history,
         restore_source,
@@ -634,7 +637,7 @@ fn bare_state(
             home: None,
             canonical_root: PathBuf::new(),
         },
-        history_dir: None,
+        history_writer: eitri_core::prompt_history::HistoryWriter::new(None, PathBuf::new()),
         rules_dir: None,
         history: Vec::new(),
         tab_memory: TabWriter::new(None, PathBuf::new()),

@@ -562,19 +562,14 @@ impl AgentPanelHandle {
     /// the watch keeps alive belongs to the application that owns the loop this panel's timers run on.
     pub fn shutdown(&self) -> ShutdownWatch {
         self.wake();
-        // Queued words outlive the window as history.
-        let texts = self.state.borrow_mut().tabs.take_every_queued_text();
-        if !texts.is_empty() {
-            let (dir, root) = {
-                let s = self.state.borrow();
-                (s.history_dir.clone(), s.project_dir.clone())
-            };
-            if let Some(dir) = dir {
-                if let Err(e) = eitri_core::prompt_history::append(&dir, &root, &texts) {
-                    eprintln!("[history] the queue could not be kept: {e}");
-                }
-            }
-        }
+        // Queued words outlive the window as history: handed to the history's writer with whatever it
+        // still holds, and its last write watched like the saved tabs' below.
+        let history_write = {
+            let mut state = self.state.borrow_mut();
+            let texts = state.tabs.take_every_queued_text();
+            state.history_writer.submit(&texts);
+            state.history_writer.finish()
+        };
         // The tabs as they are now, whatever the last tick saw: the writer's last set, written before the
         // close lets the process go.
         remember_tabs(&mut self.state.borrow_mut());
@@ -609,6 +604,15 @@ impl AgentPanelHandle {
             }
         }
         entries.extend(tear_down_all("every session tab's teardown", backends));
+        if let Some(rx) = history_write {
+            entries.push(watched_abandoning(
+                "the prompt history's last write",
+                rx,
+                HISTORY_BACKSTOP,
+                "the prompts it still held are not kept: the history file stays the one before them, whole",
+                |()| Vec::new(),
+            ));
+        }
         if let Some(rx) = last_write {
             entries.push(watched_abandoning(
                 "the saved tabs' last write",

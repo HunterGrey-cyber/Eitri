@@ -125,21 +125,36 @@ pub(super) fn send_context_if_changed(state: &mut AgentPanelState, out: &mut Out
     }
 }
 
-/// Appends `texts` to the project's history and tells every ready page (the history is the
-/// window's). Best-effort: a failed write is logged and the pages keep the list they had.
+/// Appends `texts` to the window's copy of the project's history at once, hands them to the history's
+/// writer (the file is written off this thread), and tells every ready page (the history is the
+/// window's). Best-effort: a failed write is logged by the writer and the pages keep this window's copy.
 pub(super) fn remember_prompts(state: &mut AgentPanelState, texts: &[String], out: &mut Outbox) {
-    let Some(dir) = state.history_dir.clone() else { return };
-    match eitri_core::prompt_history::append(&dir, &state.project_dir, texts) {
-        Ok(entries) => {
-            state.history = entries;
-            let payload = eitri_core::agent_bridge::serialize_history_for_js(&state.history);
-            for view in live_views(state) {
-                if state.ready(view) {
-                    out.send(view, payload.clone());
-                }
-            }
+    if !state.history_writer.is_enabled() {
+        return;
+    }
+    state.history = eitri_core::prompt_history::appended(&state.history, texts);
+    state.history_writer.submit(texts);
+    send_history(state, out);
+}
+
+/// What the history's writer read back after its newest write -- other windows' prompts among them --
+/// in place of the window's copy, told to every ready page when it differs.
+pub(super) fn collect_history(state: &mut AgentPanelState, out: &mut Outbox) {
+    let Some(entries) = state.history_writer.poll() else {
+        return;
+    };
+    if entries != state.history {
+        state.history = entries;
+        send_history(state, out);
+    }
+}
+
+fn send_history(state: &AgentPanelState, out: &mut Outbox) {
+    let payload = eitri_core::agent_bridge::serialize_history_for_js(&state.history);
+    for view in live_views(state) {
+        if state.ready(view) {
+            out.send(view, payload.clone());
         }
-        Err(e) => eprintln!("[history] could not append: {e}"),
     }
 }
 

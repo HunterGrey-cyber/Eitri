@@ -1,7 +1,9 @@
 //! The rules saved from a card's third button, per project: `$XDG_STATE_HOME/eitri/permissions/<16 hex>.json`.
 //! Claude Code writes `.claude/settings.local.json` into the repository; Eitri writes nothing into
 //! the project. Removing a rule is editing this file; `prefix i` shows its path. An unusable file is
-//! set aside as `.json.unusable` and read as no rules, which fails toward more cards.
+//! set aside as `.json.unusable` and read as no rules, which fails toward more cards. Two windows of
+//! one project save into the same file, so every rewrite holds the store lock beside it
+//! (`<file>.lock`) from its read to its rename.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -113,8 +115,19 @@ fn read(dir: &Path, project_root: &Path) -> Read {
 /// file is set aside first, so the new rule is not lost behind it. A line the loader refused is
 /// written back exactly as it was, in its place: it applies to nothing, but it is the user's text,
 /// and a later build, or the user fixing it by hand, may still want it.
+///
+/// Another window of the project may save a rule at the same moment, so the whole read-modify-write
+/// holds the store lock beside the file (`state_paths::lock_store`). This runs on the window's thread
+/// and the card needs its answer at once, so the lock is tried only as
+/// [`ON_THE_WINDOW_THREAD`](crate::state_paths::ON_THE_WINDOW_THREAD) allows: when another window
+/// holds it throughout, the save fails with `WouldBlock` and nothing is written (the card stays, and
+/// pressing it again saves the rule).
 pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Result<PrefixRules> {
     crate::state_paths::create_state_dir(dir)?;
+    let file = path(dir, project_root);
+    // Held until the rename below is done: another window's save between this read and that rename
+    // would be replaced by a file made without it.
+    let _lock = crate::state_paths::lock_store(&file, crate::state_paths::ON_THE_WINDOW_THREAD)?;
     let lines = match read(dir, project_root) {
         Read::Lines(lines) => lines,
         Read::Missing => Vec::new(),
@@ -124,6 +137,8 @@ pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Resul
             Vec::new()
         }
     };
+    #[cfg(test)]
+    crate::state_paths::test_hooks::after_read();
     let mut rules = PrefixRules::default();
     let mut texts = Vec::new();
     for line in lines {
@@ -141,7 +156,6 @@ pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Resul
         texts.push(rule.to_rule_string());
         rules = rules.with(rule.clone());
     }
-    let file = path(dir, project_root);
     let body = RulesFile {
         version: VERSION,
         project_root: project_root.to_string_lossy().into_owned(),
@@ -158,29 +172,48 @@ pub fn add(dir: &Path, project_root: &Path, rule: &PrefixRule) -> std::io::Resul
     Ok(rules)
 }
 
-pub fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
+/// Renames the rules file aside as `.json.unusable`. The caller holds the store lock, or the file it
+/// moves may be one another window has just written.
+fn set_aside(dir: &Path, project_root: &Path) -> std::io::Result<PathBuf> {
     let file = path(dir, project_root);
     let aside = file.with_extension("json.unusable");
     std::fs::rename(&file, &aside)?;
     Ok(aside)
 }
 
+/// The rules a window starts with, and what to log. An unusable file is set aside only under the store
+/// lock and only if it is still unusable when read again there; when another window holds the lock it
+/// is left in place (this runs on the window's thread, which does not wait), and the next save that
+/// still finds it unusable sets it aside.
 pub fn startup(dir: Option<&Path>, project_root: &Path) -> (PrefixRules, Vec<String>) {
     let Some(dir) = dir else {
         return (PrefixRules::default(), Vec::new());
     };
-    match load(dir, project_root) {
-        LoadedRules::Rules(rules) => (rules, Vec::new()),
-        LoadedRules::Missing => (PrefixRules::default(), Vec::new()),
-        LoadedRules::Unusable(why) => {
-            let mut notes = vec![format!("[permissions] unusable ({why}); no rules this launch")];
-            match set_aside(dir, project_root) {
-                Ok(aside) => notes.push(format!("[permissions] set aside as {}", aside.display())),
-                Err(e) => notes.push(format!("[permissions] could not set it aside: {e}")),
-            }
-            (PrefixRules::default(), notes)
+    let why = match load(dir, project_root) {
+        LoadedRules::Rules(rules) => return (rules, Vec::new()),
+        LoadedRules::Missing => return (PrefixRules::default(), Vec::new()),
+        LoadedRules::Unusable(why) => why,
+    };
+    let mut notes = vec![format!("[permissions] unusable ({why}); no rules this launch")];
+    let file = path(dir, project_root);
+    let _lock = match crate::state_paths::lock_store(&file, crate::state_paths::ON_THE_WINDOW_THREAD) {
+        Ok(lock) => lock,
+        Err(e) => {
+            notes.push(format!("[permissions] left in place: {e}"));
+            return (PrefixRules::default(), notes);
         }
+    };
+    match load(dir, project_root) {
+        // Another window replaced it between the two reads.
+        LoadedRules::Rules(rules) => return (rules, Vec::new()),
+        LoadedRules::Missing => return (PrefixRules::default(), Vec::new()),
+        LoadedRules::Unusable(_) => {}
     }
+    match set_aside(dir, project_root) {
+        Ok(aside) => notes.push(format!("[permissions] set aside as {}", aside.display())),
+        Err(e) => notes.push(format!("[permissions] could not set it aside: {e}")),
+    }
+    (PrefixRules::default(), notes)
 }
 
 #[cfg(test)]
@@ -338,6 +371,122 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path(&dir, &root)).unwrap()).unwrap();
         assert_eq!(again["rules"], written["rules"]);
         assert_eq!(load(&dir, &root), LoadedRules::Rules(rules));
+    }
+
+    /// Holds `file`'s store lock through a descriptor of its own, as another window's process would.
+    fn held_by_another_window(file: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(format!("{}.lock", file.display()))
+            .unwrap();
+        // SAFETY: the descriptor is `lock`'s own and open for the call.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lock
+    }
+
+    /// Two windows of one project save a rule at about the same time. Window A stops right after it read
+    /// the file; window B runs until it first finds the lock held (or, with nothing to stop it, to the
+    /// end); only then does A go on. A save B was told succeeded must be in the file afterwards; one it was
+    /// told failed leaves its card up, and pressing it again saves the rule.
+    #[test]
+    fn a_save_racing_another_windows_never_loses_a_rule_it_reported_saved() {
+        use std::sync::mpsc;
+        let dir = scratch("race");
+        let (a_read_tx, a_read) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<()>();
+        let a = {
+            let dir = dir.to_path_buf();
+            std::thread::spawn(move || {
+                crate::state_paths::test_hooks::set_after_read(move || {
+                    a_read_tx.send(()).unwrap();
+                    go.recv().unwrap();
+                });
+                add(&dir, &root(), &rule("Bash(cargo test *)")).map(|_| ())
+            })
+        };
+        a_read.recv().unwrap();
+        let (b_tx, b_seen) = mpsc::channel();
+        let b = {
+            let dir = dir.to_path_buf();
+            std::thread::spawn(move || {
+                let busy = b_tx.clone();
+                crate::state_paths::test_hooks::set_on_busy(move || {
+                    let _ = busy.send("found the lock held");
+                });
+                let saved = add(&dir, &root(), &rule("Bash(git log *)")).map(|_| ());
+                let _ = b_tx.send("done");
+                saved
+            })
+        };
+        let first = b_seen.recv().unwrap();
+        go_tx.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        let b_saved = b.join().unwrap();
+        let LoadedRules::Rules(after) = load(&dir, &root()) else {
+            panic!("usable")
+        };
+        let texts = |rules: &PrefixRules| rules.rules().iter().map(|r| r.to_rule_string()).collect::<Vec<_>>();
+        match b_saved {
+            Ok(()) => assert_eq!(
+                texts(&after),
+                vec!["Bash(cargo test *)", "Bash(git log *)"],
+                "window B was told its rule was saved (B, while A's write was under way: {first})"
+            ),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+                assert_eq!(texts(&after), vec!["Bash(cargo test *)"]);
+                let again = add(&dir, &root(), &rule("Bash(git log *)")).unwrap();
+                assert_eq!(texts(&again), vec!["Bash(cargo test *)", "Bash(git log *)"]);
+            }
+        }
+    }
+
+    /// A save made while another window holds the lock throughout: a few quick tries, never a wait, then
+    /// a refusal that leaves the file alone (the card stays and can be pressed again).
+    #[test]
+    fn a_save_while_another_window_holds_the_lock_is_refused_after_a_few_tries() {
+        let dir = scratch("busy");
+        add(&dir, &root(), &rule("Bash(npm ci *)")).unwrap();
+        let file = path(&dir, &root());
+        let before = std::fs::read_to_string(&file).unwrap();
+        let held = held_by_another_window(&file);
+        let tries = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = tries.clone();
+        crate::state_paths::test_hooks::set_on_busy(move || counted.set(counted.get() + 1));
+        let refused = add(&dir, &root(), &rule("Bash(git log *)")).expect_err("saved under another window's lock");
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock, "{refused}");
+        assert_eq!(
+            tries.get(),
+            crate::state_paths::ON_THE_WINDOW_THREAD.attempts,
+            "tries before the refusal"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        drop(held);
+        let rules = add(&dir, &root(), &rule("Bash(git log *)")).unwrap();
+        assert_eq!(rules.rules().len(), 2);
+    }
+
+    /// A file another window is writing is not set aside at a launch (the rename would move away what it
+    /// is about to put in place); the next save that still finds it unusable does that.
+    #[test]
+    fn a_launch_leaves_an_unusable_file_another_window_is_writing() {
+        let dir = scratch("startup-busy");
+        let file = path(&dir, &root());
+        std::fs::write(&file, "{ not json").unwrap();
+        let held = held_by_another_window(&file);
+        let (rules, notes) = startup(Some(&dir), &root());
+        assert!(rules.is_empty());
+        assert!(file.exists(), "set aside while another window held it: {notes:?}");
+        assert!(!notes.iter().any(|n| n.contains("set aside as")), "{notes:?}");
+        drop(held);
+        assert_eq!(add(&dir, &root(), &rule("Bash(git log *)")).unwrap().rules().len(), 1);
     }
 
     #[test]

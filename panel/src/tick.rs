@@ -27,6 +27,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     for tab in state.retiring.poll() {
         state.tabs.retire_done(tab);
     }
+    collect_history(state, out);
     // A supervisor this window had to start itself finishes connecting here rather than
     // during `build_ui`, where waiting for it would have delayed the window appearing.
     if state.supervisor.is_none() {
@@ -266,8 +267,8 @@ pub(super) fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate
 
 /// Whether something the tick acts on can become ready without raising the wake, so the tick has to run on
 /// its steady cadence: a worker reporting through a channel (a connect, a teardown, the supervisor's
-/// connect, the trust check, a review or scratch job), a backend that does not announce its folds, or the
-/// review flow waiting on the editor.
+/// connect, the trust check, a review or scratch job, the history's writer), a backend that does not announce
+/// its folds, or the review flow waiting on the editor.
 pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
     state.wake.is_none()
         || state.tabs.needs_polling()
@@ -278,6 +279,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.proposal_jobs.is_empty()
         || !state.review_flow.is_idle()
         || state.trust.is_busy()
+        || state.history_writer.is_busy()
 }
 
 /// One stream payload for a page's pacer: the envelope, whose first text it carries, and its class.
@@ -522,7 +524,8 @@ mod tests {
     }
 
     /// Each pending thing the tick polls keeps it on its steady cadence: a closed tab's teardown, the
-    /// supervisor's connect, the trust check, a review job, a scratch edit. None of them, nothing to poll.
+    /// supervisor's connect, the trust check, a review job, a scratch edit, the history's write. None of
+    /// them, nothing to poll.
     #[test]
     fn every_unannounced_pending_job_keeps_the_tick_polling() {
         let (handle, _page) = settled_panel();
@@ -579,6 +582,59 @@ mod tests {
             edit.cleanup();
         }
         assert!(!polls(&handle));
+
+        let history = agent::state_dirs::test_workspace_dir("panel-history-polls").join("eitri");
+        std::fs::create_dir_all(&history).unwrap();
+        let mut writer =
+            eitri_core::prompt_history::HistoryWriter::new(Some(history.join("history")), "/projects/polls".into());
+        writer.submit(&["a prompt".to_string()]);
+        handle.state.borrow_mut().history_writer = writer;
+        assert!(polls(&handle), "the history's write");
+        handle.state.borrow_mut().history_writer.wait_answered();
+        assert!(!polls(&handle));
+    }
+
+    /// A prompt reaches the window's copy and its page at once, with no disk touched on this thread; the
+    /// history's writer writes it, the tick polls while that is out, and the writer's report brings in the
+    /// prompt another window of the project had appended meanwhile.
+    #[test]
+    fn a_remembered_prompt_shows_at_once_and_the_writers_report_brings_in_another_windows() {
+        let (handle, page) = settled_panel();
+        let state_root = agent::state_dirs::test_workspace_dir("panel-history").join("eitri");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let dir = state_root.join("history");
+        let root = std::path::PathBuf::from("/projects/panel-history");
+        eitri_core::prompt_history::append(&dir, &root, &["from the other window".to_string()]).unwrap();
+        handle.state.borrow_mut().history_writer =
+            eitri_core::prompt_history::HistoryWriter::new(Some(dir.clone()), root.clone());
+        page.sent.borrow_mut().clear();
+
+        handle.run(|state, out| remember_prompts(state, &["mine".to_string()], out));
+        assert_eq!(handle.state.borrow().history, vec!["mine".to_string()]);
+        assert_eq!(kinds(&page.sent.borrow()), vec!["history"], "told at once");
+        assert!(needs_polling(&handle.state.borrow()), "the write is out");
+
+        let mut at = std::time::Instant::now();
+        while handle.state.borrow().history_writer.is_busy() {
+            at += AgentPanelHandle::TICK;
+            handle.run_tick(at);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle.run_tick(at + AgentPanelHandle::TICK);
+        assert_eq!(
+            handle.state.borrow().history,
+            vec!["from the other window".to_string(), "mine".to_string()]
+        );
+        assert_eq!(
+            kinds(&page.sent.borrow()),
+            vec!["history", "history"],
+            "told again with the file's"
+        );
+        assert!(!needs_polling(&handle.state.borrow()));
+        assert_eq!(
+            eitri_core::prompt_history::load(&dir, &root),
+            eitri_core::prompt_history::Loaded::Entries(vec!["from the other window".to_string(), "mine".to_string()])
+        );
     }
 
     /// The review flow's work (here: the recovery journal read it starts once a document is ready and a

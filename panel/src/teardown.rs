@@ -49,6 +49,12 @@ pub(super) const CONNECT_CLOSE_BACKSTOP: std::time::Duration = std::time::Durati
 /// last the previous file stays whole.
 pub(super) const SAVED_TABS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a close waits for the prompt history's last write: as long as its writer can take, the round
+/// of tries under way when the window closes and one more for what it still holds
+/// (`prompt_history::CLOSE_WAIT`). A write is a small file renamed over the old one, so the previous file
+/// stays whole if the process leaves first.
+pub(super) const HISTORY_BACKSTOP: std::time::Duration = eitri_core::prompt_history::CLOSE_WAIT;
+
 /// How often the main loop looks at a close that is running on a worker. A `try_recv` and an
 /// `Instant::elapsed`, so the interval only sets how long the process lingers past a teardown that
 /// has already finished -- not how much work the main loop does.

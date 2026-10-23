@@ -44,6 +44,99 @@ pub fn temporary(path: &Path) -> PathBuf {
     path.with_extension(format!("json.{}.tmp", std::process::id()))
 }
 
+/// How many times a store write tries its lock, and how long it pauses between two tries. Counted in
+/// tries, so what a caller may be held for is fixed when it is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockTries {
+    pub attempts: u32,
+    pub pause: std::time::Duration,
+}
+
+/// For a write the window's own thread makes and needs the answer to at once. Another window holds the
+/// lock only across one small read and rewrite (no `fsync`), well under a millisecond, so a few tries a
+/// millisecond apart see it free; past that, the write is refused, not waited for, and the window's
+/// thread was held for three 1 ms pauses (about 3 ms) and the four tries.
+pub const ON_THE_WINDOW_THREAD: LockTries = LockTries {
+    attempts: 4,
+    pause: std::time::Duration::from_millis(1),
+};
+
+/// For a writer thread, which nothing waits on: about two seconds of tries, enough for a disk that is
+/// slow for a moment. A window holding it longer is stopped or hung; the writer keeps what it has and
+/// tries again with its next write.
+pub const ON_A_WRITER_THREAD: LockTries = LockTries {
+    attempts: 500,
+    pause: std::time::Duration::from_millis(4),
+};
+
+/// The lock file that stands for `file`'s read-modify-write: `<file's name>.lock` beside it.
+pub fn lock_path(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes `file`'s store lock (an `flock` on [`lock_path`], through `agent::private_fs::PrivateLock`),
+/// trying as `tries` says and never blocking in between. Every writer of a store that more than one
+/// window writes holds this from before it reads the file until after its rename, so a write never
+/// starts from a file another window is about to replace. Fails with `WouldBlock`, naming the file,
+/// when every try found it held.
+pub fn lock_store(file: &Path, tries: LockTries) -> std::io::Result<agent::private_fs::PrivateLock> {
+    let path = lock_path(file);
+    let lock = agent::private_fs::PrivateLock::open(&path)?;
+    for attempt in 1..=tries.attempts.max(1) {
+        if lock.try_lock()? {
+            return Ok(lock);
+        }
+        #[cfg(test)]
+        test_hooks::on_busy();
+        if attempt < tries.attempts {
+            std::thread::sleep(tries.pause);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!("another window is writing {}", file.display()),
+    ))
+}
+
+/// Hooks a test sets on its own thread to stop a store write at a chosen point, so two writers can be
+/// interleaved on purpose. Thread-local: a test running beside it never trips them.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_READ: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static ON_BUSY: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    /// Runs `hook` once, the next time a store write on this thread has read its file.
+    pub(crate) fn set_after_read(hook: impl FnOnce() + 'static) {
+        AFTER_READ.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Runs `hook` each time a store write on this thread finds its lock held by someone else.
+    pub(crate) fn set_on_busy(hook: impl FnMut() + 'static) {
+        ON_BUSY.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn after_read() {
+        let hook = AFTER_READ.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(crate) fn on_busy() {
+        ON_BUSY.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
