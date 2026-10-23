@@ -1,9 +1,9 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=1e7bcd9e7a2d22e0aa6c654ffb43591641ea8ad60ed3bc312e44629d6b25b95c -->
+<!-- translated-from: README.md sha256=a4437dd19232cedf746fd85724d79360e1c34e3ad0dd6a2d451085ae951540a7 -->
 
 # Eitri 文档
 
-Eitri 是一个面向 Linux 的 Neovim 图形前端，把 agent、终端和网页放在编辑器旁边，装进一个平铺式“窗口”管理器。它是一个围绕你自己的 Neovim 配置和你已经装好的 `claude` 的桌面窗口：Neovim 由 Neovide 的 GPU 渲染器的一个 fork 绘制，agent 的回复则以渲染好的 markdown、diff 和权限卡片的形式出现在旁边的面板里，一切都靠键盘驱动。
+Eitri 是一个面向 Linux 的 Neovim 图形前端，把 agent、终端和你自己做的网页放在编辑器旁边，平铺在一个窗口里。它是一个围绕你自己的 Neovim 配置和你已经装好的 `claude` 的桌面窗口：Neovim 由 Neovide 的 GPU 渲染器的一个 fork 绘制，agent 的回复则以渲染好的 markdown、diff 和权限卡片的形式出现在旁边的面板里，一切都靠键盘驱动。
 
 ## 窗口
 

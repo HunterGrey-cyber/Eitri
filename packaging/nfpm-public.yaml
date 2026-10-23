@@ -5,7 +5,7 @@ release: 1
 version_schema: semver
 maintainer: Hunter Grey <71165939+HunterGrey-cyber@users.noreply.github.com>
 description: |
-  Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager.
+  Your Neovim, tiled with your agents, terminals and the web pages you build, in one window.
   It runs the Claude Code you installed; run `eitri setup` after installing to build the agent
   backend (it downloads and builds Anthropic's Agent SDK on your own machine -- the SDK is not
   ours to redistribute, so this package never contains it).

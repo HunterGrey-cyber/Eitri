@@ -414,8 +414,8 @@ GNOME_EXT_FILES = ["metadata.json", "extension.js", "direction.js", "policy.js"]
 OLD_DESKTOP_DST = "/usr/share/applications/eitri.desktop"
 ICON_NAME = "cn.huntergrey.eitri"
 # The tagline, as the README, the desktop entry, the package description and the release notes give it.
-TAGLINE = "Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager."
-TAGLINE_ZH = "你的 Neovim，加上一堆 agent、终端和网页，放进一个平铺式“窗口”管理器。"
+TAGLINE = "Your Neovim, tiled with your agents, terminals and the web pages you build, in one window."
+TAGLINE_ZH = "你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。"
 # Every file under packaging/icons/hicolor, as the package path it must land at.
 ICON_FILES = {
     "16x16/apps/cn.huntergrey.eitri.png",

@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=a84a13c7ba05719f0ba12f5795add51cfe5616d5822bf91c4e5668c4278dab48 -->
+<!-- translated-from: README.md sha256=1066b38c3b2def4f5e2e2cfd1b118e9666eaa4c074e9592c77c21f590fa5ebd6 -->
 
 <div align="center">
 
@@ -7,7 +7,7 @@
 
 <h1>Eitri</h1>
 
-<p><b>你的 Neovim，加上一堆 agent、终端和网页，放进一个平铺式“窗口”管理器。</b></p>
+<p><b>你的 Neovim，和 agent、终端、你自己做的网页一起，平铺在一个窗口里。</b></p>
 
 <p>
 <a href="https://eitri.cc/zh/">官网</a> ·
@@ -24,6 +24,8 @@
 </div>
 
 一个 Linux 上的 Neovim 图形前端。一个真正好读的 Claude Code：排好版的回复和 diff，一张张权限卡片，全程不用碰鼠标。Eitri 是一个桌面窗口（MIT 许可），包在你自己的 Neovim 配置和你已安装的 `claude` 外面。
+
+键盘驱动的平铺：分屏、标签、堆叠、浮窗和工作区，用的是 tmux 的前缀键。如果你在桌面上用 i3、sway、Hyprland 或 AeroSpace 平铺窗口，你已经知道它怎么用了。
 
 **[eitri.cc](https://eitri.cc/zh/)** 上有截图、按键、和其他方案的对比，以及环境要求和限制。
 

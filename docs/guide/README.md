@@ -2,8 +2,8 @@ English | [简体中文](README.zh-CN.md)
 
 # Eitri documentation
 
-Eitri is a Neovim GUI for Linux that puts agents, terminals and web pages beside your editor, in a tiling “window”
-manager. It is a desktop window around your own Neovim configuration and the `claude` you have installed: Neovim is
+Eitri is a Neovim GUI for Linux that puts agents, terminals and the web pages you build beside your editor, tiled in one
+window. It is a desktop window around your own Neovim configuration and the `claude` you have installed: Neovim is
 drawn by a fork of Neovide's GPU renderer, and the agent's replies appear as rendered markdown, diffs and permission
 cards in a panel next to it, all driven from the keyboard.
 

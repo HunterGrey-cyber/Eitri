@@ -6,7 +6,7 @@ English | [简体中文](README.zh-CN.md)
 
 <h1>Eitri</h1>
 
-<p><b>Your Neovim, with a bunch of agents, terminals and web pages, in a tiling “window” manager.</b></p>
+<p><b>Your Neovim, tiled with your agents, terminals and the web pages you build, in one window.</b></p>
 
 <p>
 <a href="https://eitri.cc">Website</a> ·
@@ -25,6 +25,8 @@ English | [简体中文](README.zh-CN.md)
 A Neovim GUI for Linux. A Claude Code you'd actually want to read: rendered markdown and diffs,
 permission cards, all without reaching for the mouse. Eitri is a desktop window (MIT) around your own
 Neovim configuration and the `claude` you have installed.
+
+Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys. If you tile your desktop with i3, sway, Hyprland or AeroSpace, you already know how it works.
 
 **[eitri.cc](https://eitri.cc)** has the screenshots, the keys, how it compares, and the requirements and limits.
 
