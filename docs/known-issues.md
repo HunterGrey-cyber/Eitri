@@ -52,7 +52,8 @@ desktop, unless a bullet names another machine. None of them has been measured o
   most one of its refreshes (about 6 ms at 165 Hz). The same build with GTK 4.22.5 added 0.13 ms at the median.
   Eitri cannot work around it without an interface GTK does not have.
 - **On GTK 4.24, scrolling with a held `j` at 165 Hz drops frames.** It drew 85 % of the frames native Neovide drew,
-  and its 99th-percentile frame interval was twice native's (12 ms against 6 ms). The cause has not been traced yet.
+  and its 99th-percentile frame interval was twice native's (12 ms against 6 ms). The same build with GTK 4.22.5
+  scrolls as native does (165 frames a second, p99 6 ms), so this too is GTK 4.24's frame clock.
 - **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
   at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
   WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a

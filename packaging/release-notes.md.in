@@ -50,7 +50,9 @@ ACP join Claude Code, and you can put web pages of your own in the window. Your 
 - Claude Code as before; **Codex tabs** (`:tabnew codex`, with `codex` 0.160.0 or newer, always in Codex's
   `workspace-write` sandbox); and **any ACP agent** you register with `eitri.agent.register{...}`. Each kind asks its
   own trust question about the project files it would load.
-- **Manual mode**: every file edit is a card you answer, and your saved rules still apply. `Shift+Tab` cycles
+- **Manual mode**: in a Claude Code tab every file edit is a card you answer, and your saved rules still apply.
+  In a Codex tab, Manual makes each request to leave Codex's sandbox a card, while edits and commands inside the
+  sandbox still run without asking (the agents guide says more); ACP tabs have no Manual. `Shift+Tab` cycles
   Manual, Auto and Bypass; `agent.default_mode` sets where a new tab starts.
 - **Enter while a turn runs steers it** in Claude Code and Codex tabs: the agent reads your message at its next
   step. An ACP tab holds the message until the turn ends. `Ctrl+Enter` interrupts the turn and sends at once.
@@ -79,8 +81,9 @@ ACP join Claude Code, and you can put web pages of your own in the window. Your 
 - **`init.lua` is read from `$XDG_CONFIG_HOME/eitri`** when that variable is set to an absolute path, and from
   `~/.config/eitri` otherwise (`EITRI_CONFIG_DIR` still comes first); 0.2.2 read `~/.config/eitri` whatever
   `XDG_CONFIG_HOME` said. If your `XDG_CONFIG_HOME` points elsewhere, move your configuration there.
+  `EITRI_CONFIG_DIR` must now be an absolute path: a relative one stops startup, and an empty one counts as unset.
 - **`Shift+Tab` cycles three modes**: Manual, Auto, Bypass, then Manual again. Bypass is entered only from Auto,
-  so leaving it lands in Manual.
+  so leaving it lands in Manual (in Auto in an ACP tab, which has no Manual).
 - **Every project you trusted asks once more**, because the question now shows more than it did.
 - **In the message box, `Ctrl+a` and `Ctrl+e` move to the start and end of the line**, as in a shell; they no
   longer select everything.
@@ -109,7 +112,7 @@ for good; later releases' `install.sh` cannot build 0.2.0 from source. The 0.2.0
 Everything new has automated tests. The tiling window (containers, floats, the scratchpad, workspaces, chat
 views and open rules) and the Markdown preview passed every row of their checks in an isolated, headless test
 session: scripted keys, not a person at a real desktop. The Claude Code backend's conformance suites passed
-against the real `claude` (2.1.302). Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
+against the real `claude` (2.1.302) on a development build shortly before this release. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
 newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
 Steering, the redesigned chat page in a real window, input methods, and companion mode on Hyprland, niri, KDE or
 a real GNOME login have not been seen on a screen yet.
@@ -130,7 +133,8 @@ desktop, and on an Intel laptop where it says so:
   wait should be at most one of its refreshes (about 6 ms at 165 Hz); that has not been measured. The same build
   with GTK 4.22.5 added 0.13 ms at the median. Eitri cannot work around it without an interface GTK does not have.
 - **Scrolling with a held `j` on GTK 4.24 at 165 Hz** drew 85 % of the frames native Neovide drew, and its 99th
-  percentile frame interval was twice native's. The cause has not been traced yet.
+  percentile frame interval was twice native's. The same build with GTK 4.22.5 scrolls as native does (165 frames
+  a second, p99 6 ms), so this too is GTK 4.24's frame clock; a real display has not been measured.
 - **While a reply streams**, a key's redraw took 11.2 ms at the median with WebKitGTK 2.54 (a stand-in reply),
   against about 2.3 ms with WebKitGTK 2.52.
 - **Memory:** one tab used 253 to 283 MiB more than native Neovide, against a goal of 256 MiB, and each extra
@@ -210,7 +214,7 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 **你监督的 agent**
 
 - Claude Code 照旧；**Codex 标签页**（`:tabnew codex`，需要 `codex` 0.160.0 或更新版本，始终在 Codex 的 `workspace-write` 沙箱里运行）；以及用 `eitri.agent.register{...}` 注册的**任何 ACP agent**。每一种都会就它要加载的项目文件单独问一次信任。
-- **Manual 模式**：每一次文件编辑都是一张由你回答的卡片，你保存的规则照样适用。`Shift+Tab` 在 manual、auto 和 bypass 之间轮换；`agent.default_mode` 决定新标签页从哪个模式开始。
+- **Manual 模式**：在 Claude Code 标签页里，每一次文件编辑都是一张由你回答的卡片，你保存的规则照样适用。在 Codex 标签页里，Manual 让 Codex 每一次要离开沙箱的请求都成为一张卡片，而沙箱里面的编辑和命令仍然不经询问就运行（agent 指南里有详细说明）；ACP 标签页没有 Manual。`Shift+Tab` 在 manual、auto 和 bypass 之间轮换；`agent.default_mode` 决定新标签页从哪个模式开始。
 - **回合进行中按 Enter 会把消息插进这个回合**（Claude Code 和 Codex 标签页）：agent 在下一步读到它。ACP 标签页会把消息留到回合结束。`Ctrl+Enter` 打断回合并立即发送。
 - 聊天页面重做了：安静的一栏，只在你要审阅或回答的内容周围加框，agent 的思考按你选的方式显示（`agent.thinking`），每个结束的回合下面写着 `Worked for 8s`，还有一个列出 agent 自己命令的 `/` 菜单。
 - 回合审阅也统计 Codex 和 ACP 的编辑；撤销单个 hunk 时只检查这个 hunk 自己的行；在文件行上按 `y` 复制它的路径。
@@ -223,8 +227,8 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 **可能受影响的地方：**
 
 - **如果你的 `init.lua` `set` 了新的前缀键之一，Eitri 会在启动时停下**，和 `set` 任何默认键时一样；提示里写着是哪个键。新增的键（按 `eitri.keymap` 的写法）：`m`、`M`、`q`、`E`、`H`、`J`、`K`、`L`、`s`、`Space`、`(`、`)`、`$`、`!`、`C-o`、`C-=`、`C-+`、`C--`、`C-0`、`M-3`、`M-4`、`M-5`、`M-e`、`M-o`、`M-w`、`M-s`、`M-a`、`M-d`、`M-H`、`M-J`、`M-K`、`M-L`、`M-Enter`、`M-S-Space`、`M--` 和 `M-_`。在那条 `set` 前面加上 `k.del("prefix", "<key>")`。如果打开了 tmux 导入、你的 tmux 配置也绑定了这个键，就不需要 `del`。`del` 一个没有绑定的键同样会让启动停下，所以这些行要在升级时加，不要提前加。键设为 `H`、`J` 或 `K` 的 Lua 面板或插件，现在也会让启动停下。
-- **`init.lua` 从 `$XDG_CONFIG_HOME/eitri` 读取**（这个变量设为绝对路径时），否则从 `~/.config/eitri` 读取（`EITRI_CONFIG_DIR` 仍然最优先）；0.2.2 不管 `XDG_CONFIG_HOME` 是什么都读 `~/.config/eitri`。如果你的 `XDG_CONFIG_HOME` 指向别处，请把配置挪过去。
-- **`Shift+Tab` 在三种模式之间轮换**：manual、auto、bypass，然后回到 manual。bypass 只能从 auto 进入，所以离开它会落到 manual。
+- **`init.lua` 从 `$XDG_CONFIG_HOME/eitri` 读取**（这个变量设为绝对路径时），否则从 `~/.config/eitri` 读取（`EITRI_CONFIG_DIR` 仍然最优先）；0.2.2 不管 `XDG_CONFIG_HOME` 是什么都读 `~/.config/eitri`。如果你的 `XDG_CONFIG_HOME` 指向别处，请把配置挪过去。`EITRI_CONFIG_DIR` 现在必须是绝对路径：相对路径会让启动停下，空值当作没有设置。
+- **`Shift+Tab` 在三种模式之间轮换**：manual、auto、bypass，然后回到 manual。bypass 只能从 auto 进入，所以离开它会落到 manual（ACP 标签页没有 manual，会落到 auto）。
 - **你信任过的每个项目都会再问一次**，因为这个问题现在显示的内容比以前多。
 - **在输入框里，`Ctrl+a` 和 `Ctrl+e` 移到行首和行尾**，和 shell 里一样；它们不再全选。
 - 面板的输入模式现在叫 INSERT（原来叫 INPUT）。
@@ -239,7 +243,7 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 
 ### 哪些已经试过
 
-所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端的一致性测试在真实的 `claude`（2.1.302）上通过。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。插话引导、真实窗口里的新聊天页面、输入法，以及在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，都还没有在屏幕上见过。
+所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端的一致性测试在本次发布前不久的一个开发构建上，对着真实的 `claude`（2.1.302）通过。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。插话引导、真实窗口里的新聊天页面、输入法，以及在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，都还没有在屏幕上见过。
 
 0.3.0 的所有内容都还没有经过真实硬件和真人的手，所以它还没有稳定到可以日常使用。这要等真实硬件和一周的日常使用，而不是等某个版本号；特别欢迎来自真实桌面的反馈。你可能遇到的问题列在已知问题里（仓库中的 `docs/known-issues.zh-CN.md`）。
 
@@ -248,7 +252,7 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 在本次发布前不久的开发构建上，于一台 AMD 台式机上的隔离无界面测试会话里测得；注明的地方是在一台 Intel 笔记本上测的：
 
 - **在 GTK 4.24（目前的 Arch）上，打字比原生 Neovide 慢一个刷新周期。** GTK 4.23 和 4.24 改了帧时钟，按键之后的重绘要等下一帧。在无界面会话里（它按 GTK 默认的 60 Hz 运行），打字的中位数多 17.15 ms，第 99 百分位多 21.75 ms。在真实显示器上，这个等待应该最多是它的一个刷新周期（165 Hz 下约 6 ms），但还没有测过。同一个构建用 GTK 4.22.5 时，中位数只多 0.13 ms。GTK 没有提供能让 Eitri 绕开它的接口。
-- **在 GTK 4.24、165 Hz 下按住 `j` 滚动**时，画出的帧数是原生 Neovide 的 85 %，第 99 百分位的帧间隔是原生的两倍。原因还没有查明。
+- **在 GTK 4.24、165 Hz 下按住 `j` 滚动**时，画出的帧数是原生 Neovide 的 85 %，第 99 百分位的帧间隔是原生的两倍。同一个构建用 GTK 4.22.5 时滚动和原生一样（每秒 165 帧，第 99 百分位 6 ms），所以这同样是 GTK 4.24 的帧时钟造成的；还没有在真实显示器上测过。
 - **回复正在输出时**，在 WebKitGTK 2.54 上一次按键的重绘中位数是 11.2 ms（替身回复），WebKitGTK 2.52 上约为 2.3 ms。
 - **内存：** 一个标签页比原生 Neovide 多用 253 到 283 MiB，目标是 256 MiB；每多一个聊天视图约多 28 MB。
 - **闲置：** 不画任何帧，每分钟约 13 ms CPU。**启动：** 260 ms，原生为 253 ms。

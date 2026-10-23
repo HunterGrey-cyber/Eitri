@@ -76,7 +76,11 @@ export type Landing = {
  *
  *  - A row already inside both margins moves nothing.
  *  - A row that fits (shorter than the view less both margins) is brought in by the least scroll that
- *    leaves it a margin on each side -- whichever way it lies from the view, whatever key came.
+ *    leaves it a margin on each side -- whichever way it lies from the view, whatever key came -- unless a
+ *    `j`/`k` would then move the view more than two thirds of itself toward a row too long to fit below the
+ *    reading line: that row is entered as a taller one is. A 750px reply whose head is just inside the
+ *    bottom of an 876px view would otherwise take 774px in one press, leaving only the one line just read
+ *    on screen; entered at the reading line, the view moves 567px and the rest comes three lines a press.
  *  - A taller row is entered at the end nearest the reader: going down its head goes to the reading
  *    line (a third of the way down), going up its tail goes to the mirrored line. It only ever scrolls
  *    in the direction of travel, so a head already above the reading line stays where it is.
@@ -103,8 +107,17 @@ export function decideLanding(input: {
 
   if (row.top >= top + margin - SLACK_PX && row.bottom <= bottom - margin + SLACK_PX) return stay;
 
-  if (row.bottom - row.top <= view.height - 2 * margin + SLACK_PX) {
-    return row.bottom > bottom - margin ? to(row.bottom - view.height + margin, "nearest") : to(row.top - margin, "nearest");
+  const height = row.bottom - row.top;
+  if (height <= view.height - 2 * margin + SLACK_PX) {
+    const nearest = to(row.bottom > bottom - margin ? row.bottom - view.height + margin : row.top - margin, "nearest");
+    const move = nearest.scrollTop - top;
+    const enterAsTall =
+      direction !== 0 &&
+      !head &&
+      Math.sign(move) === direction &&
+      Math.abs(move) > view.height * (1 - READING_LINE) + SLACK_PX &&
+      height > view.height * (1 - READING_LINE) - margin;
+    if (!enterAsTall) return nearest;
   }
 
   if (head) return Math.round(row.top - margin) === top ? stay : to(row.top - margin, "head");

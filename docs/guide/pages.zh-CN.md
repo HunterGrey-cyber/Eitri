@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=f8dacb8467e891b61cfb3dcb3d95e6179ccf9d77170e4423511987880fe39b3e -->
+<!-- translated-from: pages.md sha256=9c2a1d5061919265784f8bb991817db04315e7a57a82dbf288f3d2f1f4b911d5 -->
 
 # 你自己做的页面
 
@@ -20,7 +20,7 @@ Lua 面板会运行你指给它的任何页面，拥有任何网页都有的网�
 <a id="a-lua-panel"></a>
 ## Lua 面板
 
-把一个 HTML 文件放进 `~/.config/eitri/panels/`（设置了 `$XDG_CONFIG_HOME` 时是 `$XDG_CONFIG_HOME/eitri/panels/`），然后在 `init.lua` 里注册它：
+把一个 HTML 文件放进 `<config>/panels/`，然后在 `init.lua` 里注册它。`<config>` 就是读取 `init.lua` 的目录：`$EITRI_CONFIG_DIR`；没有设置时，如果 `$XDG_CONFIG_HOME` 是绝对路径，就是 `$XDG_CONFIG_HOME/eitri`；否则是 `~/.config/eitri`。
 
 ```lua
 eitri.panel.register{
@@ -188,7 +188,7 @@ start();
 <a id="what-the-page-runs-in"></a>
 ### 页面运行在什么里面
 
-- 页面从 `eitri-plugin://<id>/` 提供，只提供 `site` 下的文件（HTML、CSS、JavaScript、JSON、图片和字体），内容安全策略很严：脚本和样式表只能来自站点，没有内联脚本，没有 `eval`，允许 `style` 属性，图片只能来自站点或 `data:`，网络请求只能发往 `[net]` 的 origin。站点之外的 `https`、`http` 或 `mailto` 链接，在你按下它时会在 Eitri 之外打开；脚本没法打开它。
+- 页面从 `eitri-plugin://<id>/` 提供，只提供 `site` 下的文件（HTML、CSS、JavaScript、JSON、图片和字体），内容安全策略很严：脚本只能来自站点，没有内联脚本，没有 `eval`；样式表来自站点，另外允许内联样式（`<style>` 元素和 `style` 属性）；图片来自站点或 `data:`，`[net]` 的 `images` 为（或者它的设置取值为）`"https"` 时也可以来自任何 `https` 地址；网络请求只能发往 `[net]` 的 origin。站点之外的 `https`、`http` 或 `mailto` 链接，在你按下它时会在 Eitri 之外打开；脚本没法打开它。
 - **桥**是 `window.eitriPlugin`：`call(verb, args)` 返回一个结果的 promise，或者以一个错误拒绝，错误的 `code` 说明原因（`not_declared`、`bad_request`、`outside_roots`、`too_large` 等等）；`on(event, fn)` 用来监听。先调用 `host.hello`：它的结果里有页面的设置、主题、窗口的前缀和 `timeoutlen`，以及它还在运行的任务。一条消息最大 256 KiB，一个保存的值最大 192 KiB，一个插件最多保存 64 个键。
 - **配色和字体**以 `--nv-*` CSS 变量的形式出现在页面的根元素上（`--nv-bg`、`--nv-fg`、`--nv-surface`、`--nv-border`、`--nv-link`、`--nv-font-mono`、`--nv-font-prose`、`--nv-syn-*` 语法配色等等），并随你的配色实时变化。`prefers-color-scheme` 跟随 Eitri 的浅色或深色。
 - **按键工具包**在 `/.eitri/keys.js`，给页面所有插件页面共用的按键：`j`/`k` 和 `d`/`u` 滚动，`gg`/`G`，`/` 查找，`f` 给能按的东西标上标签，`?` 列出按键，`H`/`L` 后退和前进。`window.eitriKeys.install({rows, run, initial})` 加上你自己的行；`run(action)` 处理了这个键就返回 `true`。文本框拿着按键时，除了 `Esc`，每个键都交给它。你可以在 `init.lua` 里用 `eitri.keymap.set("plugin:<id>", "<key>", "<action>")` 改一个页面的按键。

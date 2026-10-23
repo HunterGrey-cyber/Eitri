@@ -5,10 +5,12 @@
 //! - A single `j` or `k` moves the view by at most two thirds of its height.
 //!   `G`, `gg`, `Ctrl+f` and `Ctrl+b` are not checked.
 //! - After each press, the cursor row keeps at least two lines on screen. A row that fits
-//!   keeps a two-line margin on both sides.
+//!   keeps a two-line margin on both sides unless bringing it fully into view would
+//!   move the view by more than two thirds; such a row is entered like a tall row.
 //! - The same press sequence at zoom 1.0 and 1.5 visits the same rows in the same order,
 //!   landing in the same place.
 //! - `k` enters a tall row near its end, two thirds down; `j` enters near its head, one third down.
+//!   In the 900px runs, the 750px prose row and unfolded 618px result are also entered this way.
 //! - Counts move that many steps inside a row. A tool result is entered at the end nearest
 //!   the reader and moves three of its own lines per press.
 //! - A lone press eases the view over about 150ms without the scroll listener pulling
@@ -23,6 +25,8 @@
 //! Keys arrive as XTEST events through `xdotool`, using the harness from `panel_visual_mode.rs`.
 //! Needs `Xvfb` and `xdotool`. Run one GUI test at a time on the machine.
 //! Prints one `JKS` line per run with the worst single move as a fraction of the view.
+//! `JKS_RUNS=<name,...>` selects configurations. `JKS_TRACE=1` prints every press,
+//! the source and target rows, `scrollTop` before and after, and every row's extent.
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
@@ -712,11 +716,16 @@ fn check_press(rep: &mut Report, run: &str, n: usize, p: &Press) {
     let limit = st.vh * 2.0 / 3.0 + 2.0;
     rep.check(p.moved().abs() <= limit, || {
         format!(
-            "{}: moved the view {:+.0}px of {:.0} (limit {:.0})",
+            "{}: moved the view {:+.0}px of {:.0} (limit {:.0}), row {} -> {}, scrollTop {:.0} -> {:.0} of {:.0}",
             tag(),
             p.moved(),
             st.vh,
-            limit
+            limit,
+            p.before.cur,
+            st.cur,
+            p.before.top,
+            st.top,
+            st.max
         )
     });
     // The cursor row keeps two lines on screen, or all of it when it is shorter than two lines.
@@ -738,9 +747,23 @@ fn check_press(rep: &mut Report, run: &str, n: usize, p: &Press) {
     if !p.row_changed() {
         return;
     }
-    // A row move: where did the row land?
+    // A row move: where did the row land? A row taller than the view less its margins is entered at its near
+    // end; so is one that fits but is too long to fit below the reading line, when bringing it in whole would
+    // have moved the view more than two thirds of itself from where the press started.
     let margin = 2.0 * st.line;
-    let tall = r.h > st.vh - 2.0 * margin;
+    let row_top = r.top + st.top;
+    let row_bottom = r.bottom + st.top;
+    let nearest = if row_bottom > p.before.top + st.vh - margin {
+        row_bottom - st.vh + margin
+    } else {
+        row_top - margin
+    }
+    .clamp(0.0, st.max.max(0.0));
+    let whole_move = nearest - p.before.top;
+    let long = r.h > st.vh * 2.0 / 3.0 - margin
+        && whole_move.abs() > st.vh * 2.0 / 3.0 + 1.0
+        && (whole_move > 0.0) == (p.key == 'j');
+    let tall = r.h > st.vh - 2.0 * margin || long;
     let at_end = st.top <= 0.5 || st.top >= st.max - 0.5;
     let moved = p.moved().abs() > 1.0;
     if tall && p.key == 'j' {
@@ -847,6 +870,26 @@ fn walk(h: &Harness, rep: &mut Report, run: &str, key: char, cap: usize) -> Resu
             h.focus()?;
         }
         let p = press(h, key)?;
+        if std::env::var_os("JKS_TRACE").is_some() {
+            let rows: Vec<String> = p
+                .after
+                .rows
+                .iter()
+                .map(|r| format!("{:.0}..{:.0}", r.top + p.after.top, r.bottom + p.after.top))
+                .collect();
+            eprintln!(
+                "JKS_TRACE {run} {key}{n}: row {} -> {}, top {:.0} -> {:.0}, max {:.0}, vh {:.0}, line {:.2}, box {:?}, rows {}",
+                p.before.cur,
+                p.after.cur,
+                p.before.top,
+                p.after.top,
+                p.after.max,
+                p.after.vh,
+                p.after.line,
+                p.after.boxed.as_ref().map(|b| (b.top, b.max)),
+                rows.join(" ")
+            );
+        }
         check_press(rep, run, n, &p);
         let still = !p.row_changed()
             && p.moved().abs() < 0.5

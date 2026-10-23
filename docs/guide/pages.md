@@ -28,8 +28,8 @@ trust.
 
 ## A Lua panel
 
-Put an HTML file in `~/.config/eitri/panels/` (`$XDG_CONFIG_HOME/eitri/panels/` when that is set) and register it
-in `init.lua`:
+Put an HTML file in `<config>/panels/` and register it in `init.lua`. `<config>` is the directory `init.lua` is
+read from: `$EITRI_CONFIG_DIR`, else `$XDG_CONFIG_HOME/eitri` when that is an absolute path, else `~/.config/eitri`.
 
 ```lua
 eitri.panel.register{
@@ -209,10 +209,11 @@ The capabilities:
 ### What the page runs in
 
 - The page is served from `eitri-plugin://<id>/`, only the files under `site` (HTML, CSS, JavaScript, JSON, images
-  and fonts), with a strict content security policy: scripts and style sheets only from the site, no inline script and
-  no `eval`, `style` attributes allowed, images from the site or `data:`, and network requests only to the `[net]`
-  origins. An `https`, `http` or `mailto` link outside the site opens outside Eitri when you press it; a script cannot
-  open one.
+  and fonts), with a strict content security policy: scripts only from the site, no inline script and no `eval`; style
+  sheets from the site, plus inline styles (`<style>` elements and `style` attributes); images from the site or
+  `data:`, and from any `https` address when `[net]` `images` is (or its setting resolves to) `"https"`; and network
+  requests only to the `[net]` origins. An `https`, `http` or `mailto` link outside the site opens outside Eitri when
+  you press it; a script cannot open one.
 - **The bridge** is `window.eitriPlugin`: `call(verb, args)` returns a promise of the result, or rejects with an
   error whose `code` says why (`not_declared`, `bad_request`, `outside_roots`, `too_large` and a few more), and
   `on(event, fn)` listens. Call `host.hello` first: its result holds the page's settings, the theme, the window's

@@ -87,9 +87,62 @@ describe("decideLanding -- a row that fits is brought in by the least scroll, ke
 
   it("a row exactly as tall as the margins leave room for still fits", () => {
     const room = 400 - 2 * MARGIN; // 320
-    const landing = decideLanding({ direction: 1, view: view(0), row: span(380, 380 + room), line: LINE });
+    const landing = decideLanding({ direction: 1, view: view(0), row: span(100, 100 + room), line: LINE });
     expect(landing.how).toBe("nearest");
-    expect(landing.scrollTop).toBe(380 + room - 400 + MARGIN); // top margin line == row top
+    expect(landing.scrollTop).toBe(100 + room - 400 + MARGIN); // top margin line == row top
+  });
+});
+
+describe("decideLanding -- a row that fits but would take most of a view to bring in is entered as a tall one", () => {
+  /* The geometry of the real-WebKit test's fixture at a 900px window: a 876px view, a 20.4px line, a one-line
+     reply followed by a 750px one whose head is just inside the bottom edge, and going up, a 618px tool
+     result whose end is just inside the top edge. Bringing either in whole moved the view 0.88 and 0.73 of
+     itself in one press. */
+  const line = 20.4;
+
+  it("j: the head goes to the reading line instead, moving at most two thirds of the view", () => {
+    const landing = decideLanding({ direction: 1, view: view(2662, 876, 3443), row: span(3521, 4271), line });
+    expect(landing).toEqual({ scrollTop: Math.round(3521 - 876 / 3), how: "head" }); // 3229
+    expect(landing.scrollTop - 2662).toBeLessThanOrEqual(Math.ceil((876 * 2) / 3));
+  });
+
+  it("k: the end goes to the line two thirds down instead", () => {
+    const landing = decideLanding({ direction: -1, view: view(718, 876, 3963), row: span(117, 735), line });
+    expect(landing).toEqual({ scrollTop: Math.round(735 - (876 * 2) / 3), how: "tail" }); // 151
+    expect(718 - landing.scrollTop).toBeLessThanOrEqual(Math.ceil((876 * 2) / 3));
+  });
+
+  it("the press after it steps through the rest of the row, three lines at a time", () => {
+    const press = decidePress({
+      direction: 1,
+      view: view(3229, 876, 3443),
+      row: span(3521, 4271),
+      line,
+      box: null,
+      boxLine: line,
+    });
+    expect(press).toEqual({ kind: "row", scrollTop: Math.round(3229 + 3 * line) });
+  });
+
+  it("the same row already mostly on screen is still brought in whole by the least scroll", () => {
+    const landing = decideLanding({ direction: 1, view: view(3300, 876, 3443), row: span(3521, 4271), line });
+    expect(landing).toEqual({ scrollTop: Math.round(4271 - 876 + 2 * line), how: "nearest" }); // 3436
+  });
+
+  it("a short row far away (a count) still lands by the least scroll: the reading line would move further", () => {
+    expect(decideLanding({ direction: 1, view: view(0), row: span(2000, 2100), line: LINE })).toEqual({
+      scrollTop: 2100 - 400 + MARGIN,
+      how: "nearest",
+    });
+  });
+
+  it("a move no j/k made, and a row read from its head, keep the least scroll", () => {
+    expect(decideLanding({ direction: 0, view: view(2662, 876, 3443), row: span(3521, 4271), line }).how).toBe(
+      "nearest",
+    );
+    expect(
+      decideLanding({ direction: 1, view: view(2662, 876, 3443), row: span(3521, 4271), line, head: true }).how,
+    ).toBe("nearest");
   });
 });
 

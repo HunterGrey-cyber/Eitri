@@ -28,6 +28,12 @@ use std::time::{Duration, Instant};
 const LONG_PROMPT: &str = "Write about 800 words on the history of version control, from SCCS to modern distributed \
      systems. Continuous prose, no headings, no bullet points.";
 
+/// The interrupt test's prompt: a reply still streaming after its first 300 characters and the test's 8s stall
+/// that follows. The 800 words of `LONG_PROMPT` can be over within 20s of the send. The turn is interrupted at
+/// the end of the stall whatever its length, so the longer ask adds no output past that point.
+const INTERRUPT_PROMPT: &str = "Write about 2000 words on the history of version control, from SCCS to modern \
+     distributed systems. Continuous prose, no headings, no bullet points.";
+
 fn connect() -> ClaudeSidecarProvider {
     ClaudeSidecarProvider::connect(&uuid::Uuid::new_v4().to_string())
         .expect("connecting to a real sidecar should succeed")
@@ -284,15 +290,43 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
     provider
         .send_turn(SendTurnRequest {
             session_id: session_id.clone(),
-            text: LONG_PROMPT.to_string(),
+            text: INTERRUPT_PROMPT.to_string(),
         })
         .unwrap();
 
-    // Let a real backlog build without draining it, then interrupt on top of it. 25s, not 12:
-    // at 12s the first run of this test interrupted during the thinking phase, before a single text
-    // delta existed, and passed on 5 total events -- proving nothing about ordering under backlog.
-    // The sibling stall test measured ~213 events accumulating in 20s on this same prompt.
-    std::thread::sleep(Duration::from_secs(25));
+    // Drain until the reply's text is streaming, then stop draining for 8s so a real backlog builds, and
+    // interrupt on top of it. A fixed wait from the send cannot place the interrupt: how long the model
+    // thinks first and how fast it writes both vary run to run. At 12s the interrupt once landed before any
+    // text existed; at 25s an 800-word reply had often already finished, and the turn rightly ended
+    // `Completed`.
+    let mut all = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline
+        && text_of(&all).len() < 300
+        && !all.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. }))
+    {
+        all.extend(provider.pump());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if text_of(&all).len() < 300 {
+        summarize("no text yet", &all);
+        let ended = all.iter().find_map(|e| match e {
+            AgentDomainEvent::TurnCompleted {
+                outcome, result_text, ..
+            } => Some(format!("{outcome:?}: {result_text:?}")),
+            _ => None,
+        });
+        panic!(
+            "the reply had no 300 characters of text within 120s; text {:?}, turn ended {ended:?}",
+            text_of(&all)
+        );
+    }
+    assert!(
+        !all.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })),
+        "the turn ended before its text was 300 characters long"
+    );
+    let drained = all.len();
+    std::thread::sleep(Duration::from_secs(8));
     provider
         .interrupt_turn(InterruptTurnRequest {
             session_id: session_id.clone(),
@@ -300,7 +334,6 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
         .unwrap();
     eprintln!("interrupted with an undrained backlog");
 
-    let mut all = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentDomainEvent::TurnCompleted { .. })) {
         all.extend(provider.pump());
@@ -308,23 +341,30 @@ fn interrupting_with_an_undrained_backlog_still_terminates_the_turn_correctly() 
     }
     summarize("interrupt with backlog", &all);
 
-    // Guards the test's own premise. Without this it passes vacuously whenever the interrupt lands
-    // before streaming starts, which is exactly what happened the first time it was run.
-    let content_events = all
+    // Guards the test's own premise: the content queued behind the interrupt, not counting what was
+    // drained before the stall. Without it the test passes vacuously when the interrupt lands before
+    // there is anything to order.
+    let content_events = all[drained..]
         .iter()
         .filter(|e| matches!(e, AgentDomainEvent::ContentDelta { .. }))
         .count();
     assert!(
         content_events > 50,
-        "only {content_events} content events -- no real backlog existed, so this run is not \
-         evidence about ordering under backlog. Re-run."
+        "only {content_events} content events after the stall -- no real backlog existed, so this run is \
+         not evidence about ordering under backlog. Re-run."
     );
 
     let outcome = all.iter().find_map(|e| match e {
         AgentDomainEvent::TurnCompleted { outcome, .. } => Some(*outcome),
         _ => None,
     });
-    assert_eq!(outcome, Some(TurnOutcome::Interrupted), "got: {outcome:?}");
+    assert_eq!(
+        outcome,
+        Some(TurnOutcome::Interrupted),
+        "got: {outcome:?} after {} characters of text -- `Completed` with a whole reply means the reply finished \
+         before the interrupt was sent, and INTERRUPT_PROMPT is too short for the model's speed",
+        text_of(&all).len()
+    );
 
     // Exactly one terminal event, and it is last among the turn's events -- not delivered early
     // because the client asked for it.
