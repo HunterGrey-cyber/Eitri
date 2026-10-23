@@ -303,6 +303,25 @@ describe("Chooser", () => {
     expect(container.querySelector(".chooser-rename")).toBeNull();
   });
 
+  /** The field starts from the tab's own name, as the tab bar's rename does: the row's label also carries the
+   *  tab's number (and, in an extra view, ` · agent N`), and Enter on it unchanged saved `1 notes` as the name,
+   *  so the tab read `1 1 notes`. */
+  it("Ctrl+r starts the rename from the tab's own name, not its row label", () => {
+    const named = { ...TAB1, label: "1 notes", name: "notes" };
+    const envelope = { ...ENVELOPE, open: [{ ...ENVELOPE.open[0], label: "1 notes · agent 2" }, ENVELOPE.open[1]] };
+    const { root, container, props } = renderChooser({ active: 1, tabs: [named, TAB2], envelope });
+    fireEvent.keyDown(root, { key: "r", ctrlKey: true });
+    const field = container.querySelector<HTMLInputElement>(".chooser-rename")!;
+    expect(field.value).toBe("notes");
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(props.onRenameTab).toHaveBeenCalledWith(1, "notes");
+    cleanup();
+    // A tab with no name of its own (its label is its title) starts empty, as the tab bar's does.
+    const unnamed = renderChooser({ active: 1 });
+    fireEvent.keyDown(unnamed.root, { key: "r", ctrlKey: true });
+    expect(unnamed.container.querySelector<HTMLInputElement>(".chooser-rename")!.value).toBe("");
+  });
+
   it("Ctrl+r on a record does nothing", () => {
     const { root, container, props } = renderChooser();
     fireEvent.keyDown(root, { key: "j" }); // tab 1

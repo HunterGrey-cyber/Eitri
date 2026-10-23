@@ -518,6 +518,21 @@ describe("Composer history and queue (C5)", () => {
   });
 });
 
+/** A `Ctrl+r` search left open when the panel leaves INPUT another way than its own Esc (a tab switch, a
+ *  trip to the editor and back, which both land BROWSE) ends with INPUT: the next `i` opens the box, not a
+ *  search line nobody asked for, which would take what is typed next. */
+describe("the Ctrl+r search ends with INPUT", () => {
+  it("is gone after BROWSE and back, and the box has the keys", () => {
+    const { container, textarea, rerender } = renderComposerWithRerender({ history: ["fix the parser"] });
+    fireEvent.keyDown(textarea, { key: "r", ctrlKey: true });
+    expect(container.querySelector(".history-search")).not.toBeNull();
+    rerender({ history: ["fix the parser"], mode: "browse" });
+    rerender({ history: ["fix the parser"], mode: "input" });
+    expect(container.querySelector(".history-search")).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector("textarea"));
+  });
+});
+
 describe("Composer keys", () => {
   it("interrupts on Ctrl+c while a turn runs, keeping the draft", () => {
     const onInterrupt = vi.fn();

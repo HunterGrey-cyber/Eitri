@@ -351,7 +351,12 @@ export function Chooser({
     if (event.ctrlKey && key === "r") {
       event.preventDefault();
       event.stopPropagation();
-      if (current?.kind === "tab") setRenaming({ tab: current.tab.tab, value: current.tab.label });
+      // From the tab's own name, as the tab bar's rename starts: the row's label carries its number too (and
+      // ` · agent N` in an extra view), which Enter would otherwise save as part of the name.
+      if (current?.kind === "tab") {
+        const id = current.tab.tab;
+        setRenaming({ tab: id, value: tabs.find((t) => t.id === id)?.name ?? "" });
+      }
       return;
     }
     if (!["j", "k", "Enter", "x", "/", "Escape", "q"].includes(key)) return;

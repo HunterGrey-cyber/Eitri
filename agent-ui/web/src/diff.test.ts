@@ -37,6 +37,44 @@ describe("lineDiff", () => {
   });
 });
 
+/** A line break at the end of one side and not the other is a change: an `Edit` from `# check\n` to `# check`
+ *  joins the next line onto the comment, and a card that drew both as the same context line, `+0 −0`, would
+ *  have a person approve a change it hid. */
+describe("a line break only one side ends with", () => {
+  it("shows the last line as removed and added, the side without the break marked", () => {
+    expect(lineDiff("# safety check\n", "# safety check")).toEqual([
+      { kind: "removed", text: "# safety check" },
+      { kind: "added", text: "# safety check", noNewline: true },
+    ]);
+    expect(lineDiff("a\nb", "a\nb\n")).toEqual([
+      { kind: "context", text: "a" },
+      { kind: "removed", text: "b", noNewline: true },
+      { kind: "added", text: "b" },
+    ]);
+    const preview = editPreview("Edit", { file_path: "/f", old_string: "x\n", new_string: "x" })!;
+    expect([preview.added, preview.removed]).toEqual([1, 1]);
+  });
+  it("marks nothing when both sides end the same way", () => {
+    expect(lineDiff("a", "b")).toEqual([
+      { kind: "removed", text: "a" },
+      { kind: "added", text: "b" },
+    ]);
+    expect(lineDiff("a\nb", "a\nc")).toEqual([
+      { kind: "context", text: "a" },
+      { kind: "removed", text: "b" },
+      { kind: "added", text: "c" },
+    ]);
+  });
+  it("keeps a Codex diff's own no-newline line as the mark on the line before it", () => {
+    const preview = codexChangePreview({ path: "f", kind: "update", diff: "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+a\n" });
+    expect(preview.diff).toEqual([
+      { kind: "context", text: "@@ -1 +1 @@" },
+      { kind: "removed", text: "a", noNewline: true },
+      { kind: "added", text: "a" },
+    ]);
+  });
+});
+
 describe("editPreview", () => {
   it("reads an Edit's real fields", () => {
     const preview = editPreview("Edit", {

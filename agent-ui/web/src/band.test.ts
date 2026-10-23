@@ -337,6 +337,30 @@ describe("cardSummary keeps the tail", () => {
   });
 });
 
+/** The band's `Ctrl+y` segment names the call that key approves, often while the card itself is out of view,
+ *  so it must show what the card shows: no character that reorders, hides or fakes text gets through raw. */
+describe("cardSummary shows the card's hidden characters as the card does", () => {
+  it("draws a direction override, a zero-width space and a no-break space as escapes", () => {
+    // U+202E reverses what follows it: drawn raw, `echo ok \u202Efr- mr` reads as `echo ok rm -rf`.
+    expect(cardSummary({ command: "echo ok \u202Efr- mr" })).toBe("echo ok ⟨U+202E⟩fr- mr");
+    expect(cardSummary({ command: "r\u200Bm x" })).toBe("r⟨U+200B⟩m x");
+    // A no-break space is not one the shell splits at, so it is not collapsed into a plain one.
+    expect(cardSummary({ command: "rm\u00A0-rf x" })).toBe("rm⟨U+00A0⟩-rf x");
+    // Plain spaces, tabs and line breaks still collapse to one space.
+    expect(cardSummary({ command: "a \t\n b" })).toBe("a b");
+  });
+  it("never cuts an escape in half, and keeps the cut within the same length", () => {
+    const s = cardSummary({ command: `${"a".repeat(14)}\u202E${"b".repeat(60)}\u202Ezz` });
+    expect(Array.from(s).length).toBeLessThanOrEqual(40);
+    expect(s).not.toMatch(/⟨U\+[0-9A-F]*…|…[0-9A-F]*⟩/);
+    expect(s.endsWith("⟨U+202E⟩zz")).toBe(true);
+  });
+  it("draws the tool name's hidden characters as escapes too", () => {
+    const seg = bandLayout({ ...idle, approve: { tool: "mcp__x__\u202Eevil", summary: "ok" } }, 2000, 7.2).find((s) => s.id === "approve");
+    expect(seg?.text).toBe("Ctrl+y approves mcp__x__⟨U+202E⟩evil: ok");
+  });
+});
+
 /** How the latest turn ended, while it is still the latest news: left side, muted, and one of the last
  *  things a narrow band lets go. */
 describe("turn ending", () => {

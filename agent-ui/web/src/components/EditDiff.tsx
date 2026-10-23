@@ -107,7 +107,19 @@ export function EditDiff({
                 <Revealed pieces={linePieces[i]} />
               </span>
             </div>
-          ))}
+          )).flatMap((row, i) =>
+            diff[i].noNewline === true
+              ? [
+                  row,
+                  <div key={`${i}-noeol`} className="diff-line diff-noeol">
+                    <span className="diff-gutter" aria-hidden="true">
+                      {" "}
+                    </span>
+                    <span className="diff-text">\ no line break at the end</span>
+                  </div>,
+                ]
+              : [row],
+          )}
         </pre>
       )}
     </div>

@@ -645,6 +645,10 @@ pre {
 .diff-removed .diff-gutter {
   color: var(--nv-error);
 }
+/* The note under a line one side ends without a line break: set apart by its slant, in the line's own ink. */
+.diff-noeol .diff-text {
+  font-style: italic;
+}
 /* Approval has a clear title, readable evidence, then the decision. */
 .permission-card {
   background: var(--nv-warn-tint);

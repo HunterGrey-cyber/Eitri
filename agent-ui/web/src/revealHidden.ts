@@ -36,6 +36,14 @@ export function escapeText(ch: string): string {
   return escapeOf(ch);
 }
 
+/** `text` with each character `revealHidden` escapes written as its escape, for a line that draws plain text
+ *  only (the band's `Ctrl+y` segment, the activity line's waiting card). */
+export function revealedText(text: string): string {
+  let out = "";
+  for (const ch of text) out += isHiddenChar(ch) ? escapeOf(ch) : ch;
+  return out;
+}
+
 /** `text` as plain runs and escapes, in order; adjacent plain characters share one piece. */
 export function revealHidden(text: string): RevealedPiece[] {
   const pieces: RevealedPiece[] = [];

@@ -258,6 +258,12 @@ export function Composer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRequest, mode]);
 
+  // The `Ctrl+r` search belongs to the INPUT it was opened in. Leaving INPUT another way than its own Esc (a
+  // tab switch or an arrival lands BROWSE) ends it, so the next `i` opens the box rather than the search line.
+  useEffect(() => {
+    if (mode !== "input") setSearching(false);
+  }, [mode]);
+
   // A box that becomes enabled while the panel is in INPUT takes the keys back.
   const wasDisabled = useRef(disabled);
   useEffect(() => {

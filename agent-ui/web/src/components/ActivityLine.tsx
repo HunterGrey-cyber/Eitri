@@ -2,6 +2,7 @@ import type { AgentUiState, TurnClock } from "../types";
 import type { PanelMode } from "../keymap";
 import { phaseOf } from "../turnPhase";
 import { TurnActivity } from "./TurnActivity";
+import { revealedText } from "../revealHidden";
 
 type Props = {
   state: AgentUiState;
@@ -71,7 +72,7 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
               user who followed it literally, cursor elsewhere, or `a` a beat too soon after `Esc`,
               got "no card here" or the typing flash with no clue why. "j to it" points at the
               route back (`j`/`k`/`G` onto the card); "alone" is `TYPING_FLASH`'s own word for that rule. */}
-          ⚑ {pendingTool} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
+          ⚑ {revealedText(pendingTool)} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
         </span>
       ) : (
         queued > 0 && <span className="activity-keys">{queued} queued · </span>

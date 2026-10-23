@@ -17,6 +17,9 @@ export type DiffLineKind = "context" | "added" | "removed";
 export interface DiffLine {
   kind: DiffLineKind;
   text: string;
+  /** The line ends its side with no line break while the other side's last line has one (git's "\ No newline
+   *  at end of file"). Set only when the two sides disagree, since an `Edit`'s strings rarely end in one. */
+  noNewline?: true;
 }
 
 /** Beyond this many lines on either side the diff is summarised instead of computed.
@@ -56,33 +59,44 @@ export function lineDiff(before: string, after: string): DiffLine[] | null {
   const a = lines(before);
   const b = lines(after);
   if (a.length > MAX_DIFF_LINES || b.length > MAX_DIFF_LINES) return null;
+  // A line break at the end of one side and not the other is a change -- taking it away joins the next line of
+  // the file onto this one -- so the two last lines must not match as context. The side without it is compared,
+  // and drawn, as its line plus a mark.
+  const aOpen = a.length > 0 && !before.endsWith("\n");
+  const bOpen = b.length > 0 && !after.endsWith("\n");
+  const openDiffers = aOpen !== bOpen;
+  const key = (side: string[], i: number, open: boolean) => (openDiffers && open && i === side.length - 1 ? `${side[i]}\u0000` : side[i]);
+  const ka = a.map((_, i) => key(a, i, aOpen));
+  const kb = b.map((_, i) => key(b, i, bOpen));
+  const mark = (side: string[], i: number, open: boolean): { noNewline: true } | Record<string, never> =>
+    openDiffers && open && i === side.length - 1 ? { noNewline: true } : {};
 
   // lcs[i][j] = length of the longest common subsequence of a[i..] and b[j..]
   const lcs: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
   for (let i = a.length - 1; i >= 0; i--) {
     for (let j = b.length - 1; j >= 0; j--) {
-      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      lcs[i][j] = ka[i] === kb[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
     }
   }
 
   const out: DiffLine[] = [];
+  const removed = (i: number): DiffLine => ({ kind: "removed", text: a[i], ...mark(a, i, aOpen) });
+  const added = (j: number): DiffLine => ({ kind: "added", text: b[j], ...mark(b, j, bOpen) });
   let i = 0;
   let j = 0;
   while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) {
+    if (ka[i] === kb[j]) {
       out.push({ kind: "context", text: a[i] });
       i++;
       j++;
     } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
-      out.push({ kind: "removed", text: a[i] });
-      i++;
+      out.push(removed(i++));
     } else {
-      out.push({ kind: "added", text: b[j] });
-      j++;
+      out.push(added(j++));
     }
   }
-  while (i < a.length) out.push({ kind: "removed", text: a[i++] });
-  while (j < b.length) out.push({ kind: "added", text: b[j++] });
+  while (i < a.length) out.push(removed(i++));
+  while (j < b.length) out.push(added(j++));
   return out;
 }
 
@@ -274,7 +288,11 @@ export function codexChangePreview(
         if (!FILE_HEADER.test(text)) diff.push({ kind: "context", text });
       } else if (text.startsWith("+")) diff.push({ kind: "added", text: text.slice(1) });
       else if (text.startsWith("-")) diff.push({ kind: "removed", text: text.slice(1) });
-      else if (text.startsWith("\\")) continue;
+      // `\ No newline at end of file` belongs to the line before it.
+      else if (text.startsWith("\\")) {
+        const last = diff[diff.length - 1];
+        if (last !== undefined && last.kind !== "context") diff[diff.length - 1] = { ...last, noNewline: true };
+      }
       else diff.push({ kind: "context", text: text.startsWith(" ") ? text.slice(1) : text });
     }
   }

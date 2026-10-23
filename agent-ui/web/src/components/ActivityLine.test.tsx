@@ -118,3 +118,12 @@ it("keeps ctrl+c interrupt as the Stop button's own text, even while a card wait
   );
   expect(container.querySelector("button.stop")!.textContent).toBe("ctrl+c interrupt");
 });
+
+/** The tool name is the agent's text (an MCP server names its own tools): drawn raw, a direction override
+ *  in it reorders the words after it on the line that says which card waits. */
+it("draws a hidden character in the waiting card's tool name as an escape", () => {
+  const { container } = render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool={"mcp__x__‮evil"} />,
+  );
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ mcp__x__⟨U+202E⟩evil needs approval — j to it, a / d alone");
+});
