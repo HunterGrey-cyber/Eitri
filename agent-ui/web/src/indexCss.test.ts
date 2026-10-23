@@ -22,6 +22,7 @@ import { EMPTY_PANEL_TABLE } from "./keymap";
 import { VISUAL_CHROME } from "./visual";
 import { Composer } from "./components/Composer";
 import { Row } from "./components/Row";
+import { THINKING_PREVIEW_LINES } from "./components/MessageList";
 import type { ToolCallRecord } from "./types";
 
 /** Strip CSS comments, but never a `/*` that is inside a string.
@@ -3255,5 +3256,53 @@ describe("thinking text", () => {
       const bodies = rulesMatching(withoutComments, cls).map((rule) => rule.body);
       expect(bodies.some((body) => /unicode-bidi:\s*isolate\s*;/.test(body)), cls).toBe(true);
     }
+  });
+});
+
+describe("the thinking preview's box", () => {
+  /** Every declaration `.thinking-preview` gets (its own rule and the one it shares with
+   *  `.thinking-text`), later ones winning. */
+  function previewDeclarations(): Map<string, string> {
+    const decls = new Map<string, string>();
+    for (const rule of splitRules(stripComments(css))) {
+      if (!rule.selector.split(",").some((s) => s.trim() === ".thinking-preview")) continue;
+      for (const decl of rule.declarations.split(";")) {
+        const m = decl.match(/^\s*([\w-]+)\s*:\s*(.+?)\s*$/s);
+        if (m) decls.set(m[1], m[2]);
+      }
+    }
+    return decls;
+  }
+
+  /** A length of the shapes this rule uses (`Nem`, `Npx`, `calc()` of sums and products of
+   *  them) at a font size of `fontPx`. */
+  function px(value: string, fontPx: number): number {
+    const expr = value
+      .replace(/^calc\((.*)\)$/s, "$1")
+      .replace(/(\d+(?:\.\d+)?)em\b/g, (_, n) => `(${n}*${fontPx})`)
+      .replace(/(\d+(?:\.\d+)?)px\b/g, "$1");
+    if (!/^[\d\s.+*()-]+$/.test(expr)) throw new Error(`not a length this test reads: ${value}`);
+    return Function(`return (${expr});`)() as number;
+  }
+
+  it("holds exactly the lines it shows, so the newest is never cut by the box's own padding", () => {
+    const decls = previewDeclarations();
+    const lineHeight = Number(decls.get("line-height"));
+    const [padTop, , padBottom] = (decls.get("padding") ?? "").split(/\s+/).concat(["", ""]);
+    const vertical = px(padTop, 1) + px(padBottom || padTop, 1);
+    for (const font of [11, 14, 18]) {
+      expect(px(decls.get("max-height") ?? "0", font)).toBeCloseTo(
+        THINKING_PREVIEW_LINES * lineHeight * font + vertical,
+        3,
+      );
+    }
+  });
+
+  it("keeps its bottom: lines that wrap past the box are cut at the top, the oldest end", () => {
+    const decls = previewDeclarations();
+    expect(decls.get("overflow")).toBe("hidden");
+    expect(decls.get("display")).toBe("flex");
+    expect(decls.get("flex-direction")).toBe("column");
+    expect(decls.get("justify-content")).toBe("flex-end");
   });
 });

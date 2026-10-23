@@ -156,10 +156,22 @@ function inInput(cards: 0 | 1 | 2, tabs: readonly Record<string, unknown>[] = [T
   return { ...rendered, box: box! };
 }
 
-/** Ctrl+y on the composer, as a real keyboard delivers the `y` (the bare Control keydown before it
- *  is a modifier, which the guard ignores). Returns whether its default survived. */
-const ctrlY = (box: HTMLElement, init: Record<string, unknown> = {}) =>
-  fireEvent.keyDown(box, { key: "y", ctrlKey: true, ...init });
+/** Ctrl+y pressed on the composer and held: only its keydown, as a real keyboard delivers the `y`
+ *  (the bare Control keydown before it is a modifier, which the guard ignores). Returns whether its
+ *  default survived. */
+const ctrlYDown = (box: HTMLElement, init: Record<string, unknown> = {}) =>
+  fireEvent.keyDown(box, { key: "y", code: "KeyY", ctrlKey: true, ...init });
+
+/** The `y` of a Ctrl+y let go. */
+const ctrlYUp = (box: HTMLElement) => fireEvent.keyUp(box, { key: "y", code: "KeyY", ctrlKey: true });
+
+/** Ctrl+y tapped on the composer: pressed and let go at once. Returns whether the keydown's default
+ *  survived. */
+const ctrlY = (box: HTMLElement, init: Record<string, unknown> = {}) => {
+  const kept = ctrlYDown(box, init);
+  ctrlYUp(box);
+  return kept;
+};
 
 const TYPING_FLASH = "Ctrl+y approves only on its own — pause, then press it again";
 
@@ -194,6 +206,32 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       ]);
       expect(document.activeElement).toBe(textarea(container));
       expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("INSERT");
+    });
+
+    it("a held Ctrl+y approves nothing: still down when the wait ends, then its first repeat refuses it", () => {
+      const { container, box } = inInput(1);
+      expect(ctrlYDown(box)).toBe(false);
+      // GTK's first repeat comes after its delay (600 ms on sway, 500 on GNOME), well past the wait.
+      wait(600);
+      expect(answered()).toEqual([]);
+      ctrlYDown(box, { repeat: true });
+      wait(40);
+      ctrlYDown(box, { repeat: true });
+      ctrlYUp(box);
+      wait(1000);
+      expect(answered()).toEqual([]);
+      expect(bandMessage(container)).toBe(TYPING_FLASH);
+    });
+
+    it("a slow press let go after the wait, with no repeat, approves at its release", () => {
+      const { box } = inInput(1);
+      ctrlYDown(box);
+      wait(400);
+      expect(answered()).toEqual([]);
+      ctrlYUp(box);
+      expect(answered()).toEqual([
+        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
+      ]);
     });
 
     it("two cards: the OLDEST, even with the row cursor left on the newer one; the next Ctrl+y the other", () => {

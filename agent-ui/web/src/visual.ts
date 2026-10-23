@@ -753,9 +753,17 @@ export function runMotion(
     case "0":
       sel.modify("move", "backward", "paragraphboundary");
       return { caret: readCaret(sel, cursor), goalX: null };
-    case "$":
+    case "$": {
+      // The paragraph boundary is AFTER the last character, where the one-character block the
+      // caret is drawn as would hold the line break and show nothing; vim's `$` is on the last
+      // character, so step back one. Not when the boundary did not move (an empty line): back
+      // from there is the line above.
       sel.modify("move", "forward", "paragraphboundary");
-      return { caret: readCaret(sel, cursor), goalX: null };
+      const boundary = readCaret(sel, cursor);
+      if (caretsEqual(boundary, cursor)) return { caret: boundary, goalX: null };
+      sel.modify("move", "backward", "character");
+      return { caret: readCaret(sel, boundary), goalX: null };
+    }
     default: {
       const _exhaustive: never = motion;
       return _exhaustive;

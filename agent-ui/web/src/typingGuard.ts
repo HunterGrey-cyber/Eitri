@@ -30,7 +30,12 @@
  *   HINT landing with no key since. That landing is recorded where focus moves, never guessed from
  *   a key's name: this guard decides no landing, it only counts keys (`keyCount`), so `App.tsx` can
  *   tie the landing it saw to the key that made it.
- * - A held key's repeat (`event.repeat`) never answers.
+ * - A held key's repeat (`event.repeat`) never answers. An answer that must not come from a held key
+ *   at all -- INPUT's `Ctrl+y` -- also waits for its key's release (`deferUntilReleased`): the wait
+ *   ends `TYPING_GUARD_MS` after the press only if the key is up by then, else at its release, and
+ *   the key's first repeat, like any key, cancels it. A key's repeat begins only after the
+ *   compositor's delay (500-600 ms by default), well after the window, so the repeat alone cannot
+ *   tell a held key from a pressed one in time.
  * - **A GUI pass (2026-09-27) found two more ways typed prose acts after an arrival**, and
  *   `mayActAfterMotion` closes both. The leader (Space by default) starts a sequence wherever the
  *   row cursor has the keys, so "set up my" ran `<leader>m` (the mode flipped to bypass, which on a
@@ -131,6 +136,13 @@ export function tableKeyTypingFlash(key: string, desc: string): string {
   return `${key} (${desc}) runs only on its own — i or Ctrl+j to type`;
 }
 
+/** How a press and its release name the same key for `deferUntilReleased`/`onKeyUp`: its `code` (the
+ *  physical key, the same on its keydown and keyup whatever modifiers changed meanwhile), or, where
+ *  there is none, its `key` in lower case (Shift or Caps Lock let go first changes the case). */
+export function heldKeyName(event: { code?: string; key: string }): string {
+  return event.code || event.key.toLowerCase();
+}
+
 export function isModifierKey(key: string): boolean {
   return MODIFIER_KEYS.has(key);
 }
@@ -152,6 +164,10 @@ const GLOBAL_TIMERS: GuardTimers = {
 
 type Keydown = { key: string; t: number };
 
+/** A waiting action. `heldKey` is the key whose release it also waits for (`deferUntilReleased`), and
+ *  `released` whether that release has come; `due` whether the window after the press has ended. */
+type Pending = { handle: unknown; flash: string; run: () => void; heldKey: string | null; released: boolean; due: boolean };
+
 export class TypingGuard {
   /** The key `onKey` recorded last -- the one being handled right now. */
   private latest: Keydown | null = null;
@@ -168,7 +184,7 @@ export class TypingGuard {
   private previousRunIsMotion = false;
   /** The waiting action's timer, boxed so a timer handle that happens to be falsy still counts, and
    *  what the band says should a key cancel it (`defer`'s `cancelledFlash`). */
-  private pending: { handle: unknown; flash: string } | null = null;
+  private pending: Pending | null = null;
   /** How many keys `onKey` has recorded (bare modifiers excepted, the cancelling ones counted),
    *  so `App.tsx` can tie a landing it saw to the key that made it -- never a guess from a key's
    *  name. */
@@ -176,7 +192,26 @@ export class TypingGuard {
   /** When a BROWSE `y` last copied (its keydown's timestamp), for `afterCopy`. */
   private copiedAt: number | null = null;
 
+  /** The last keydown that was not a repeat: its own time and `performance.now()` when it was handled,
+   *  for `timeOf`. */
+  private fresh: { typed: number; perf: number } | null = null;
+
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
+
+  /** When a keydown happened, on the keydowns' own clock (`event.timeStamp`, or `perfNow` where a
+   *  page gives none): what `onKey` and the rest are handed. A repeat is not dated by its own stamp
+   *  alone. GDK synthesizes a held key's repeats itself and stamps every one with the press's time,
+   *  which WebKitGTK passes on as `timeStamp`, so that clock stands still for as long as a key is
+   *  held, and a key pressed just after letting go of one looked as if it came long after it. A
+   *  repeat is at least as late as the last fresh press plus the time since, on `performance.now()`. */
+  timeOf(event: { repeat: boolean; timeStamp: number }, perfNow: number = performance.now()): number {
+    const stamp = event.timeStamp > 0 ? event.timeStamp : perfNow;
+    if (!event.repeat || this.fresh === null) {
+      this.fresh = { typed: stamp, perf: perfNow };
+      return stamp;
+    }
+    return Math.max(stamp, this.fresh.typed + Math.max(0, perfNow - this.fresh.perf));
+  }
 
   /** Every keydown the panel sees, FIRST, before anything acts on it. A bare modifier is ignored.
    *  Any other key cancels a waiting action ("the key that cancelled it still does whatever it
@@ -265,16 +300,51 @@ export class TypingGuard {
    *  this wait. `key` is what `mayAnswerNow` judges: only `"Enter"` takes its walk exception, so
    *  every caller but Enter's leaves it out. */
   defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string, key = ""): boolean {
+    return this.wait(t, repeat, run, cancelledFlash, key, null);
+  }
+
+  /** `defer`, for a key that must also have been let go: `run` runs `TYPING_GUARD_MS` after the
+   *  press if `onKeyUp(heldKey)` came by then, else at that release -- unless another key (`onKey`,
+   *  the held key's own repeat included) or `cancel` comes first. `heldKey` is the key as the
+   *  caller names it to `onKeyUp` (its `code`). */
+  deferUntilReleased(t: number, repeat: boolean, run: () => void, cancelledFlash: string, heldKey: string): boolean {
+    return this.wait(t, repeat, run, cancelledFlash, "", heldKey);
+  }
+
+  /** A key let go, named as `deferUntilReleased` was given it. Ends a wait that is waiting for this
+   *  key's release; any other release changes nothing. */
+  onKeyUp(heldKey: string): void {
+    const waiting = this.pending;
+    if (waiting === null || waiting.heldKey !== heldKey || waiting.released) return;
+    waiting.released = true;
+    if (waiting.due) this.fire(waiting);
+  }
+
+  private wait(
+    t: number,
+    repeat: boolean,
+    run: () => void,
+    cancelledFlash: string,
+    key: string,
+    heldKey: string | null,
+  ): boolean {
     this.cancel();
     if (!this.mayAnswerNow(key, t, repeat)) return false;
-    const waiting: { handle: unknown; flash: string } = { handle: null, flash: cancelledFlash };
+    const waiting: Pending = { handle: null, flash: cancelledFlash, run, heldKey, released: heldKey === null, due: false };
     waiting.handle = this.timers.setTimeout(() => {
       if (this.pending !== waiting) return;
-      this.pending = null;
-      run();
+      waiting.handle = null;
+      waiting.due = true;
+      if (waiting.released) this.fire(waiting);
     }, TYPING_GUARD_MS);
     this.pending = waiting;
     return true;
+  }
+
+  private fire(waiting: Pending): void {
+    if (this.pending !== waiting) return;
+    this.pending = null;
+    waiting.run();
   }
 
   /** Drops a waiting action, if any, and says whether there was one. Also called for the non-key
@@ -286,8 +356,8 @@ export class TypingGuard {
   /** Drops a waiting action, returning its `cancelledFlash`, or `null` when none was waiting. */
   private drop(): string | null {
     if (this.pending === null) return null;
-    const { flash } = this.pending;
-    this.timers.clearTimeout(this.pending.handle);
+    const { flash, handle } = this.pending;
+    if (handle !== null) this.timers.clearTimeout(handle);
     this.pending = null;
     return flash;
   }

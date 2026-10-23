@@ -308,6 +308,23 @@ describe("#39: the Ctrl+y segment", () => {
   });
 });
 
+describe("cardSummary on an ACP agent's card (`{title, rawInput, locations, diffs}`)", () => {
+  it("names what the call acts on from the agent's raw input, as for a Claude card", () => {
+    expect(cardSummary({ title: "Run `touch card-marker`", rawInput: { command: ["touch", "card-marker"] }, locations: [], diffs: [] })).toBe(
+      "touch card-marker",
+    );
+    expect(cardSummary({ title: "Run a script", rawInput: { command: "make   test" }, locations: [], diffs: [] })).toBe("make test");
+    expect(cardSummary({ title: "Edit a.ts", rawInput: { path: "/p/a.ts", newText: "x" }, locations: [{ path: "/p/a.ts" }], diffs: [] })).toBe(
+      "/p/a.ts",
+    );
+  });
+
+  it("falls back to the first location, then to the agent's own title, never to the whole card as JSON", () => {
+    expect(cardSummary({ title: "Read it", rawInput: { odd: 1 }, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe("/p/b.md");
+    expect(cardSummary({ title: "Fetch the page", rawInput: null, locations: [], diffs: [] })).toBe("Fetch the page");
+  });
+});
+
 /** A long command is cut in the middle, not at the end, so its tail -- often
  *  the dangerous part (`| sudo bash`, `--force`) -- still shows on the band. */
 describe("cardSummary keeps the tail", () => {

@@ -111,7 +111,28 @@ describe("visual.ts: motion modify() calls", () => {
 
     const dollar = fakeSelection(path);
     runMotion(dollar, cursor, "$", null);
-    expect(dollar.calls).toEqual(["move forward paragraphboundary"]);
+    expect(dollar.calls).toEqual(["move forward paragraphboundary", "move backward character"]);
+  });
+
+  it("$ lands ON the paragraph's last character, as vim's does, never past it where no block can be drawn", () => {
+    const text = document.createTextNode("English words.");
+    const start = textCaret(text, 0);
+    // WebKit's paragraph boundary is after the last character; one character back is the `.`.
+    const fromStart = runMotion(fakeSelection([start, textCaret(text, 14), textCaret(text, 13)]), start, "$", null);
+    expect(fromStart.caret).toEqual(textCaret(text, 13));
+
+    // Already on the last character: the boundary is one past it, and back is where it started.
+    const onLast = textCaret(text, 13);
+    const again = runMotion(fakeSelection([onLast, textCaret(text, 14), onLast]), onLast, "$", null);
+    expect(again.caret).toEqual(onLast);
+
+    // A paragraph boundary that does not move (an empty line in a code block) is not stepped back
+    // from: that would leave the line for the one above.
+    const empty = document.createTextNode("a\n\nb");
+    const onEmpty = textCaret(empty, 2);
+    const stay = fakeSelection([onEmpty]);
+    expect(runMotion(stay, onEmpty, "$", null).caret).toEqual(onEmpty);
+    expect(stay.calls).toEqual(["move forward paragraphboundary"]);
   });
 
   it("j/k issue one line-granularity modify() and clear the goal column on every OTHER motion", () => {
@@ -475,11 +496,11 @@ describe("visual.ts: gg/G and CARET's dual-end motion", () => {
     const pastEnd = stepOnce(fakeSelection([textCaret(last, 3), textCaret(last, 4)]), onT, "$", root);
     expect(pastEnd.model.cursor).toEqual(textCaret(last, 3));
     expect(pastEnd.moved).toBe(false);
-    // The same end of a text node with more text after it in the list is left alone (`$`).
+    // `$` on a paragraph with more text after it in the list lands on its last character.
     const first = root.querySelector(".row-body")?.firstChild as Text;
     const onFirst: VisualModel = { anchor: textCaret(first, 0), cursor: textCaret(first, 0), kind: "caret", goalX: null };
-    const endOfFirst = stepOnce(fakeSelection([textCaret(first, 0), textCaret(first, 5)]), onFirst, "$", root);
-    expect(endOfFirst.model.cursor).toEqual(textCaret(first, 5));
+    const endOfFirst = stepOnce(fakeSelection([textCaret(first, 0), textCaret(first, 5), textCaret(first, 4)]), onFirst, "$", root);
+    expect(endOfFirst.model.cursor).toEqual(textCaret(first, 4));
     expect(endOfFirst.moved).toBe(true);
   });
 

@@ -540,7 +540,7 @@ export function EmptyTab(props: EmptyTabProps) {
     if (props.overlayOpen) return;
     // Every other keydown is "a key" to the typing guard, first, as `App.tsx`'s own `onKeyDown` does:
     // the leader below asks it whether it stood alone.
-    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    const typedAt = typingGuard.timeOf(event);
     // A key that cancelled a waiting `f`, `H`/`L`, `r` or `w` says so, with that key's own words --
     // this used to be dropped, so the dashboard said nothing at all.
     const cancelled = typingGuard.onKey(event.key, typedAt);

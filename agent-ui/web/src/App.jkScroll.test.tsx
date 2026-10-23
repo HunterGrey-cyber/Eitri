@@ -12,7 +12,7 @@
  * `shell/tests/panel_jk_scroll.rs` does.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { initialState } from "./reducer";
 import type { AgentUiState, Hello } from "./types";
@@ -774,6 +774,48 @@ describe("a held j or k glides", () => {
     const steps = seen.slice(1).map((f, i) => f.scrollTop - seen[i].scrollTop);
     for (const step of steps) expect(Math.abs(step - PER_FRAME)).toBeLessThanOrEqual(3);
     letGo("j");
+  });
+
+  it("a key right after letting go of a held j waits, when the repeats carry the press's own time as GTK's do", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { container } = started();
+    prompts("a", "b");
+    events(
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input: { command: "ls" } },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input: { command: "ls" } },
+    );
+    prompts("c", "d", "e");
+    const rows = Array.from(container.querySelectorAll('.message-list [data-nav-stop="row"]'));
+    const list = fakeLayout(container, rows.map((row) => (row.classList.contains("row-permission") ? 300 : 120)));
+    press("g");
+    press("g");
+    advance(300);
+    /** A keydown whose `timeStamp` is `stamp` (ms on the page's clock), not the moment it is made. */
+    const stamped = (key: string, stamp: number, repeat: boolean) => {
+      const target = document.activeElement ?? document.body;
+      const event = createEvent.keyDown(target, { key, repeat });
+      Object.defineProperty(event, "timeStamp", { value: stamp });
+      fireEvent(target, event);
+    };
+    // GDK synthesizes a held key's repeats itself and stamps every one with the press's time, which
+    // WebKitGTK hands on as `timeStamp`: the clock of the keydowns stands still while the key is held.
+    const pressedAt = now;
+    stamped("j", pressedAt, false);
+    advance(600);
+    let guard = 0;
+    while (!container.querySelector(".row-current.row-permission") && guard++ < 200) {
+      stamped("j", pressedAt, true);
+      advance(REPEAT_MS);
+    }
+    expect(container.querySelector(".row-current.row-permission")).not.toBeNull();
+    fireEvent.keyUp(document.activeElement ?? document.body, { key: "j" });
+    advance(60);
+    // `a` 60 ms after the release, stamped with its real time, as a fresh press is.
+    stamped("a", now, false);
+    act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    void list;
   });
 
   it("a key that ends a hold is judged from the release, even when the repeats stopped arriving well before it", () => {

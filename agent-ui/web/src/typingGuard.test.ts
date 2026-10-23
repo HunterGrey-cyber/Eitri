@@ -477,3 +477,98 @@ describe("TypingGuard.onRelease: a held key counts until it is let go", () => {
     expect(guard.keyCount()).toBe(1);
   });
 });
+
+describe("TypingGuard: an answer that waits for its key's release (deferUntilReleased)", () => {
+  /** A press of `held` at the fake clock's current time, answered through `deferUntilReleased`. */
+  function press(held: string, flash = "held") {
+    const t = Date.now();
+    guard.onKey(held, t);
+    return guard.deferUntilReleased(t, false, () => answers.push({ key: held, at: Date.now() }), flash, held);
+  }
+
+  it("a tap let go inside the window answers when the window ends, as defer does", () => {
+    const start = Date.now();
+    expect(press("y")).toBe(true);
+    vi.advanceTimersByTime(90);
+    guard.onKeyUp("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS - 91);
+    expect(answers).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(answers).toEqual([{ key: "y", at: start + TYPING_GUARD_MS }]);
+  });
+
+  it("a key still down when the window ends answers nothing until it is let go", () => {
+    const start = Date.now();
+    press("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    expect(answers).toEqual([]);
+    guard.onKeyUp("y");
+    expect(answers).toEqual([{ key: "y", at: start + TYPING_GUARD_MS * 2 }]);
+  });
+
+  it("a held key's first repeat, before any release, cancels it and says the wait's own flash", () => {
+    press("y", "Ctrl+y approves only on its own");
+    vi.advanceTimersByTime(600);
+    expect(guard.onKey("y", Date.now())).toBe("Ctrl+y approves only on its own");
+    guard.onKeyUp("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+  });
+
+  it("another key's release does not end the wait, and another key's press cancels it", () => {
+    press("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    guard.onKeyUp("Control");
+    expect(answers).toEqual([]);
+    expect(guard.onKey("x", Date.now())).toBe("held");
+    guard.onKeyUp("y");
+    expect(answers).toEqual([]);
+  });
+
+  it("cancel() drops a wait that is waiting for the release", () => {
+    press("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    expect(guard.cancel()).toBe(true);
+    guard.onKeyUp("y");
+    expect(answers).toEqual([]);
+  });
+
+  it("a release seen before a later press of the same key is not that press's release", () => {
+    press("y");
+    guard.onKeyUp("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    expect(answers.length).toBe(1);
+    press("y");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 2);
+    expect(answers.length).toBe(1);
+    guard.onKeyUp("y");
+    expect(answers.length).toBe(2);
+  });
+
+  it("refused like defer: a key inside the window before it, or a repeat", () => {
+    const t = Date.now();
+    guard.onKey("u", t);
+    guard.onKey("y", t + 100);
+    expect(guard.deferUntilReleased(t + 100, false, () => answers.push({ key: "y", at: 0 }), "f", "y")).toBe(false);
+    guard.onKey("y", t + 1000);
+    expect(guard.deferUntilReleased(t + 1000, true, () => answers.push({ key: "y", at: 0 }), "f", "y")).toBe(false);
+  });
+});
+
+describe("TypingGuard.timeOf: when a keydown happened", () => {
+  it("a fresh press is its own stamp", () => {
+    expect(guard.timeOf({ repeat: false, timeStamp: 1000 }, 50)).toBe(1000);
+    expect(guard.timeOf({ repeat: false, timeStamp: 0 }, 70)).toBe(70);
+  });
+
+  it("a repeat stamped with the press's time, as GDK's are, is dated by the time since that press", () => {
+    guard.timeOf({ repeat: false, timeStamp: 1000 }, 50);
+    expect(guard.timeOf({ repeat: true, timeStamp: 1000 }, 650)).toBe(1600);
+    expect(guard.timeOf({ repeat: true, timeStamp: 1000 }, 1050)).toBe(2000);
+  });
+
+  it("a repeat with a later stamp of its own keeps it", () => {
+    guard.timeOf({ repeat: false, timeStamp: 1000 }, 50);
+    expect(guard.timeOf({ repeat: true, timeStamp: 1700 }, 650)).toBe(1700);
+  });
+});

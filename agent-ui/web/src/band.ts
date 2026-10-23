@@ -99,16 +99,23 @@ const CARD_SUMMARY_MAX = 40;
  *  file, path or URL, the fields a person checks before approving), else `summarizeInput`'s own
  *  order's remaining fields, else compact JSON; whitespace collapsed; cut to `CARD_SUMMARY_MAX`
  *  characters in the middle, head … tail. A `Bash` card's `description` is the
- *  model's own words about the command, so the command itself comes first. */
+ *  model's own words about the command, so the command itself comes first. An ACP agent's card is
+ *  read inside its `rawInput`, then its first location, then its title. */
 export function cardSummary(input: unknown): string {
   let text: string | null = null;
   if (input !== null && typeof input === "object") {
     const fields = input as Record<string, unknown>;
-    for (const key of ["command", "file_path", "notebook_path", "path", "url", "pattern", "query", "description", "prompt", "name"]) {
-      if (typeof fields[key] === "string") {
-        text = fields[key] as string;
-        break;
-      }
+    text = actsOn(fields);
+    // An ACP agent's card (`AcpCardInput`) wraps the call: what it acts on is in the agent's own
+    // `rawInput`, else its first location; its `title` is the agent's words about the call.
+    if (text === null && "rawInput" in fields) {
+      const raw = fields.rawInput;
+      const locations = Array.isArray(fields.locations) ? fields.locations : [];
+      const first = locations[0] as { path?: unknown } | undefined;
+      text =
+        (raw !== null && typeof raw === "object" && !Array.isArray(raw) ? actsOn(raw as Record<string, unknown>) : null) ??
+        (typeof first?.path === "string" ? first.path : null) ??
+        (typeof fields.title === "string" && fields.title !== "" ? fields.title : null);
     }
   }
   const line = (text ?? JSON.stringify(input) ?? "").replace(/\s+/g, " ").trim();
@@ -119,6 +126,19 @@ export function cardSummary(input: unknown): string {
   const tail = Math.floor((CARD_SUMMARY_MAX - 1) / 2) + 4;
   const head = CARD_SUMMARY_MAX - 1 - tail;
   return `${chars.slice(0, head).join("")}…${chars.slice(chars.length - tail).join("")}`;
+}
+
+/** The first of a call's fields a person checks before approving it, or `null`. A command given as an
+ *  argument list (ACP and Codex agents send one) reads as its words joined by spaces. */
+function actsOn(fields: Record<string, unknown>): string | null {
+  for (const key of ["command", "file_path", "notebook_path", "path", "url", "pattern", "query", "description", "prompt", "name"]) {
+    const value = fields[key];
+    if (typeof value === "string") return value;
+    if (key === "command" && Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string")) {
+      return value.join(" ");
+    }
+  }
+  return null;
 }
 
 /** The band's usage segment as `usageSegment` words it: the text drawn, and the tooltip carrying

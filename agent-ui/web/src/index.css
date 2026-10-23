@@ -471,9 +471,16 @@ pre {
   line-height: 1.65;
   padding: 10px 0;
 }
+/* Room for exactly the lines the preview shows (`THINKING_PREVIEW_LINES`, 4, at the line height
+   above) plus the padding, which `box-sizing: border-box` counts inside the height. Anchored at its
+   bottom, so when those lines wrap to more than fit, the oldest text is cut at the top and the line
+   being written stays whole. */
 .thinking-preview {
-  max-height: 5em;
+  max-height: calc(4 * 1.65em + 20px);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
 }
 .turn-time {
   margin: 18px 0 24px;

@@ -26,7 +26,7 @@ import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, star
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
+import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   compareCarets,
   copySelectionText,
@@ -1631,6 +1631,15 @@ export default function App() {
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
+  // Releases, for an answer that waits for its key to be let go (`approveOldestByKey`). Capture
+  // phase on the window, so a keyup another handler stops from bubbling still arrives.
+  useEffect(() => {
+    function released(event: globalThis.KeyboardEvent) {
+      typingGuard.onKeyUp(heldKeyName(event));
+    }
+    window.addEventListener("keyup", released, true);
+    return () => window.removeEventListener("keyup", released, true);
+  }, [typingGuard]);
   /* The review overlay ends wherever something else takes the conversation area or the keys, whichever route
      brought it: another overlay or prompt opening (the envelopes that open them also close it directly), a
      click into the composer (INPUT is not BROWSE, and the overlay would swallow what is typed there), a
@@ -1809,7 +1818,7 @@ export default function App() {
       // every other overlay this table would otherwise open over it.
       if (isRegionMode(modeRef.current)) {
         event.stopPropagation();
-        const cancelled = typingGuard.onKey("Tab", event.timeStamp > 0 ? event.timeStamp : performance.now());
+        const cancelled = typingGuard.onKey("Tab", typingGuard.timeOf(event));
         showFlash(cancelled ?? `Esc first: Shift+Tab does not act in ${regionModeName(modeRef.current)}`);
         return;
       }
@@ -1826,7 +1835,7 @@ export default function App() {
       // `y` then Shift+Tab used to post `cycle_mode` (flipping auto and bypass) right after a copy. The
       // key is claimed and recorded like any other (so a wait it cancels says so), and only a Shift+Tab
       // after a pause cycles the mode.
-      const modeKeyAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+      const modeKeyAt = typingGuard.timeOf(event);
       if (modeRef.current === "browse" && typingGuard.afterCopy(modeKeyAt)) {
         event.stopPropagation();
         showFlash(typingGuard.onKey("Tab", modeKeyAt) ?? TYPE_HINT_FLASH);
@@ -1856,13 +1865,13 @@ export default function App() {
       // asymmetry `answerConfirm` (below) does not have, since it already calls `onKey` for this same
       // key. `onKey`'s own return is the flash for whatever it cancelled (mirroring the bubble-phase
       // `onKeyDown`'s own `typingGuard.onKey` call), so a deferred `f`/`L` cancelled by a Shift+Tab
-      // now says so instead of leaving the band silent about a swallowed `a`. The `event.timeStamp >
-      // 0 ? ... : performance.now()` fallback matches every other `onKey`/`defer` call site in this
-      // file (`onKeyDown`, `answerConfirm`) -- the two clocks are NOT interchangeable under a test's
+      // now says so instead of leaving the band silent about a swallowed `a`. Dating the key with
+      // `typingGuard.timeOf` matches every other `onKey`/`defer` call site in this file (`onKeyDown`,
+      // `answerConfirm`), which reads `event.timeStamp` first -- the two clocks are NOT interchangeable under a test's
       // faked timers (`event.timeStamp` tracks the faked `Date`; `performance.now()` does not), so
       // using the wrong one here would silently compare a real timestamp against a faked one and
       // always read as "long ago".
-      const cancelled = typingGuard.onKey("Tab", event.timeStamp > 0 ? event.timeStamp : performance.now());
+      const cancelled = typingGuard.onKey("Tab", typingGuard.timeOf(event));
       if (cancelled !== null) showFlash(cancelled);
       if (route === "cycle") post({ type: "cycle_mode" });
       // "r" (not a rebindable panel-table action, so nothing on the wire names it): reaching
@@ -3505,7 +3514,7 @@ export default function App() {
   function noteLineKey(event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
     // A key, and not a kill -- so a `Ctrl+y` after it is judged on its own.
     lastKeyWasKillRef.current = false;
-    const cancelled = typingGuard.onKey(event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
+    const cancelled = typingGuard.onKey(event.key, typingGuard.timeOf(event));
     if (cancelled !== null) showFlash(cancelled);
   }
 
@@ -3682,7 +3691,7 @@ export default function App() {
     if (!isModifierKey(event.key)) {
       event.preventDefault();
       promptSwallowKeyRef.current = event.key;
-      typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, event.timeStamp > 0 ? event.timeStamp : performance.now());
+      typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, typingGuard.timeOf(event));
       if (confirm.kind === "bypass") {
         if (event.key === "y" || event.key === "Y") {
           // A y with Ctrl/Alt/Meta held, or one an input
@@ -4251,7 +4260,9 @@ export default function App() {
    *  Otherwise the key is claimed (so the box never acts on it: its text, caret and history stay as
    *  they were) and runs the typing guard's rule as `a` does (`TypingGuard.defer`, no new clock): only a Ctrl+y
    *  with no key within `TYPING_GUARD_MS` before it -- so readline's `Ctrl+u`/`Ctrl+w` then `Ctrl+y`
-   *  yank never approves -- and none within it after, and never a held key's repeat. At fire time the
+   *  yank never approves -- and none within it after, and never a held key: it also waits for the `y`
+   *  to be let go (`TypingGuard.deferUntilReleased`), so a Ctrl+y still down when the window ends
+   *  approves only at its release, and its first repeat refuses it. At fire time the
    *  same card must still wait in the same tab, the session still live and the panel still in INPUT;
    *  it is answered by its own `permissionId` through `answerPermission`, the path its buttons and
    *  `a` take, never by pressing a button a DOM query found. */
@@ -4286,7 +4297,7 @@ export default function App() {
       showFlash(CTRL_Y_TARGET_FLASH);
       return;
     }
-    const waiting = typingGuard.defer(
+    const waiting = typingGuard.deferUntilReleased(
       typedAt,
       event.repeat,
       () => {
@@ -4310,6 +4321,7 @@ export default function App() {
         answerPermission(permissionId, "allow");
       },
       CTRL_Y_TYPING_FLASH,
+      heldKeyName(event.nativeEvent),
     );
     if (!waiting) showFlash(CTRL_Y_TYPING_FLASH);
   }
@@ -4542,7 +4554,7 @@ export default function App() {
       event.stopPropagation();
       return;
     }
-    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    const typedAt = typingGuard.timeOf(event);
     // The typing guard sees every region key too, the same as every other keydown this panel
     // claims -- a card `a`/`d`/`D` deferred moments before the region started stays cancellable by
     // it.
@@ -4837,7 +4849,7 @@ export default function App() {
     // below so a key typed into one still counts. It cancels a waiting `a`/`d`/`D` -- which says
     // so in the band -- and this key still does whatever it does. Shift+Tab as WebKitGTK delivers
     // it (`isShiftTab`) is the walk key `Tab`, like the standard shape.
-    const typedAt = event.timeStamp > 0 ? event.timeStamp : performance.now();
+    const typedAt = typingGuard.timeOf(event);
     // A held `j`/`k` glides (`./jkHold`, started with the other motions below). A repeat of its key only
     // keeps it going -- still a key to the guard below, and still the user's own scroll to the list. Any
     // other key ends it first, as letting go would, and then acts on the panel as that leaves it. The

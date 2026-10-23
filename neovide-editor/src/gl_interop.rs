@@ -8,7 +8,7 @@ use skia_safe::gpu::{backend_render_targets, surfaces, Budgeted, DirectContext, 
 use skia_safe::{AlphaType, Canvas, Color4f, ColorType, ImageInfo, Paint, Rect, Surface};
 
 use neovide::live_harness::LiveHarness;
-use neovide::units::{GridScale, GridSize, PixelRect, PixelSize};
+use neovide::units::{GridScale, GridSize, PixelRect};
 
 /// Inset (device pixels) between the GtkGLArea's own framebuffer edge and the content region.
 ///
@@ -328,15 +328,27 @@ pub(crate) fn compute_content_region(fb_width: i32, fb_height: i32) -> PixelRect
 /// (`settings::clamped_grid_size`), but flooring here first keeps this value an honest reflection
 /// of what was actually computed from `content_region`, for the caller's own dedup/log purposes.
 pub(crate) fn grid_size_for_content_region(harness: &LiveHarness, content_region: &PixelRect<f32>) -> GridSize<u32> {
-    let pixel_size = PixelSize::new(
-        content_region.max.x - content_region.min.x,
-        content_region.max.y - content_region.min.y,
-    );
-    let grid_size = pixel_size / harness.grid_scale();
+    grid_size_in(content_region, harness.grid_scale())
+}
+
+/// `grid_size_for_content_region`'s arithmetic, without the harness. Each side is divided by its own
+/// cell size, not through `PixelSize / GridScale`: that multiplies by the inverse of the scale's 2x2
+/// matrix, which for many cell widths puts a region of exactly 39 rows at 38.99999 -- and
+/// `snap_region_to_grid` makes the region a whole number of rows on purpose, so the floor then lost
+/// the last row, and nvim's statusline sat one row above the pane's bottom.
+pub(crate) fn grid_size_in(content_region: &PixelRect<f32>, grid_scale: GridScale) -> GridSize<u32> {
     GridSize::new(
-        grid_size.width.floor().max(1.0) as u32,
-        grid_size.height.floor().max(1.0) as u32,
+        whole_cells(content_region.max.x - content_region.min.x, grid_scale.width()),
+        whole_cells(content_region.max.y - content_region.min.y, grid_scale.height()),
     )
+}
+
+/// How many whole cells of `cell` px fit in `length` px, at least one. A length that is a whole
+/// number of cells but for float error counts as that number: a thousandth of a cell is far below a
+/// pixel at any font size.
+fn whole_cells(length: f32, cell: f32) -> u32 {
+    const SLACK: f32 = 1e-3;
+    (length / cell + SLACK).floor().max(1.0) as u32
 }
 
 /// Converts a widget-local *logical*-pixel position -- exactly what GTK4's `GestureClick`/
@@ -482,6 +494,7 @@ pub(crate) fn fill_content_region(canvas: &Canvas, content_region: &PixelRect<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neovide::units::PixelSize;
 
     /// `glGetIntegerv` is looked up once, not on every frame, and the answer is the one the
     /// per-call lookup gives: the slot's current value under libepoxy, else the plain export. No GL
@@ -599,6 +612,7 @@ mod tests {
 #[cfg(test)]
 mod snap_tests {
     use super::*;
+    use neovide::units::PixelSize;
 
     /// A 1598px pane with 44px cells holds 36 rows and a 14px remainder. Snapping moves that
     /// remainder to the top without losing a row, placing it beside matching buffer background.
@@ -706,6 +720,32 @@ mod snap_tests {
             );
             assert_eq!(layout.band_top_px, 1598.0 % cell.1);
             assert!(layout.band_top_px < cell.1);
+        }
+    }
+
+    /// The snapped region is a whole number of cells by construction, so the row count must come
+    /// out whole too. A 1500x900 window's editor (891x861 px at a 22 px cell) once got 38 rows
+    /// where 39 fit -- `PixelSize / GridScale` multiplies by the inverse of a 2x2 matrix, which for
+    /// many cell widths lands a hair under 39 -- and nvim's statusline sat a row above the bottom.
+    #[test]
+    fn a_snapped_region_gets_every_row_it_holds() {
+        for (fb_h, cell_h) in [(861, 22.0_f32), (1598, 44.0), (1080, 18.0), (777, 26.0), (900, 24.0)] {
+            let whole = (fb_h as f32 / cell_h).floor() as u32;
+            let mut short = Vec::new();
+            for step in 0..4000 {
+                let cell_w = 9.0_f32 + step as f32 * 0.001;
+                let scale = GridScale::new(PixelSize::new(cell_w, cell_h));
+                let layout = grid_layout(891, fb_h, scale, |r| grid_size_in(r, scale));
+                if layout.grid.height != whole {
+                    short.push((cell_w, layout.grid.height));
+                }
+            }
+            assert!(
+                short.is_empty(),
+                "fb height {fb_h}, cell height {cell_h}: {} cell widths lose a row, e.g. {:?}",
+                short.len(),
+                &short[..short.len().min(3)]
+            );
         }
     }
 
