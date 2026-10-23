@@ -184,8 +184,11 @@ impl EditorContextReader {
     }
 }
 
+/// A line that is not UTF-8 (nvim sends a file name's bytes as they are) is read with each bad byte as
+/// U+FFFD: the update still says which file is open, close enough for a person or an agent to know it,
+/// where dropping it would leave the file open before it named as the current one.
 fn parse_bytes(line: &[u8]) -> Result<EditorContext, String> {
-    std::str::from_utf8(line).map_err(|e| e.to_string()).and_then(parse)
+    parse(&String::from_utf8_lossy(line))
 }
 
 /// The last line that parses. A malformed line is logged and skipped; it never discards an earlier
@@ -295,6 +298,15 @@ mod tests {
             r#"{"v":1,"file":"/second.rs"}"#.to_string(),
         ];
         assert_eq!(latest_context(lines).unwrap().file, "/second.rs");
+    }
+
+    /// An update naming a file whose name is not UTF-8 is still news: the file it names replaces the
+    /// one before, its odd bytes shown as U+FFFD, rather than the update being dropped and the next turn
+    /// naming the file that was open before it.
+    #[test]
+    fn an_update_with_bytes_that_are_not_utf8_still_names_its_file() {
+        let context = parse_bytes(b"{\"v\":1,\"file\":\"/p/caf\xe9.rs\"}").expect("the update is read");
+        assert_eq!(context.file, "/p/caf\u{fffd}.rs");
     }
 
     /// No lines means "no news". The caller keeps its last known state; returning a context here

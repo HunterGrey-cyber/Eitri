@@ -243,10 +243,18 @@ fn install_with_log(
     search: SearchEnv,
     log: Rc<dyn Fn(&str)>,
 ) -> mlua::Result<()> {
-    registry.borrow_mut().init_refusals = Some(super::kernel::init_refusals(lua));
+    let refusals = super::kernel::init_refusals(lua);
+    registry.borrow_mut().init_refusals = Some(refusals.clone());
     let table = lua.create_table()?;
     // Plain values let validation name the argument that cannot be loaded.
     let load = super::kernel::registering_function(lua, "eitri.plugin.load", move |_, (arg, opts): (Value, Value)| {
+        // The window reads the loaded plugins once, when `init.lua` has run: a load after that would say it
+        // loaded and show nothing.
+        if !refusals.borrow().in_init() {
+            return Err(mlua::Error::RuntimeError(format!(
+                "{PREFIX}: only in init.lua, before the window exists"
+            )));
+        }
         let outcome = register(arg, opts, state_root.as_deref(), home.as_deref(), &search, &*log).and_then(
             |(registration, label)| {
                 let twice = registry

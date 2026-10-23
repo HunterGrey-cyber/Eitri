@@ -42,12 +42,34 @@ pub(crate) fn conversations_dir() -> std::io::Result<PathBuf> {
     if let Some(root) = test_root() {
         return Ok(root.join("conversations"));
     }
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(state_home).join("eitri/conversations"));
+    state_kind_dir(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        "conversations",
+    )
+}
+
+/// `<state home>/eitri/<kind>` from the two variables that decide it, by the rule
+/// `eitri_core::state_paths` follows for the rest of Eitri's state: an absolute `XDG_STATE_HOME`,
+/// else an absolute `HOME`'s `.local/state`. An empty or relative value is ignored (the XDG spec
+/// says a relative one is invalid): taken as given, it resolved against the working directory,
+/// which can be the project itself, so conversation records and histories landed in the checkout
+/// and were lost to a launch from anywhere else.
+fn state_kind_dir(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    kind: &str,
+) -> std::io::Result<PathBuf> {
+    match (xdg_state_home, home) {
+        (Some(state), _) if Path::new(state).is_absolute() => Ok(PathBuf::from(state).join("eitri").join(kind)),
+        (_, Some(home)) if Path::new(home).is_absolute() => {
+            Ok(PathBuf::from(home).join(".local/state/eitri").join(kind))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "neither XDG_STATE_HOME nor HOME is an absolute path",
+        )),
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
-    Ok(PathBuf::from(home).join(".local/state/eitri/conversations"))
 }
 
 /// `$XDG_STATE_HOME/eitri/history/`, beside `conversations_dir()` and resolved the same way.
@@ -63,12 +85,11 @@ pub(crate) fn history_dir() -> std::io::Result<PathBuf> {
     if let Some(root) = test_root() {
         return Ok(root.join("history"));
     }
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(state_home).join("eitri/history"));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_STATE_HOME nor HOME is set"))?;
-    Ok(PathBuf::from(home).join(".local/state/eitri/history"))
+    state_kind_dir(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        "history",
+    )
 }
 
 /// Where session-lease lock files live. Two platforms, two answers, and every process of one user
@@ -105,9 +126,25 @@ pub(crate) fn leases_dir() -> std::io::Result<PathBuf> {
 
 #[cfg(not(target_os = "macos"))]
 fn platform_leases_dir() -> std::io::Result<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
-    Ok(PathBuf::from(runtime_dir).join("eitri/session-leases"))
+    runtime_leases_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
+}
+
+/// `$XDG_RUNTIME_DIR/eitri/session-leases`, only for an absolute `XDG_RUNTIME_DIR`: an empty or
+/// relative one would put the locks under the working directory, where two windows started in
+/// different directories each take "the" lock for one session.
+#[cfg(not(target_os = "macos"))]
+fn runtime_leases_dir(xdg_runtime_dir: Option<&std::ffi::OsStr>) -> std::io::Result<PathBuf> {
+    match xdg_runtime_dir {
+        Some(dir) if Path::new(dir).is_absolute() => Ok(PathBuf::from(dir).join("eitri/session-leases")),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not an absolute path",
+        )),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not set",
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -322,6 +359,41 @@ mod tests {
             "{history:?} is inside {conversations:?}"
         );
         assert_eq!(history.parent(), conversations.parent());
+    }
+
+    /// An empty or relative `XDG_STATE_HOME` is ignored, as `eitri_core::state_paths` ignores it:
+    /// taken as given it put records and histories under the working directory.
+    #[test]
+    fn an_empty_or_relative_state_home_is_ignored() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/home/u"));
+        for state in ["", "state", "./state"] {
+            assert_eq!(
+                state_kind_dir(Some(OsStr::new(state)), home, "conversations").unwrap(),
+                Path::new("/home/u/.local/state/eitri/conversations"),
+                "XDG_STATE_HOME={state:?}"
+            );
+        }
+        assert_eq!(
+            state_kind_dir(Some(OsStr::new("/s")), home, "history").unwrap(),
+            Path::new("/s/eitri/history")
+        );
+        assert!(state_kind_dir(Some(OsStr::new("")), Some(OsStr::new("")), "history").is_err());
+        assert!(state_kind_dir(None, Some(OsStr::new("rel")), "history").is_err());
+        assert!(state_kind_dir(None, None, "history").is_err());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_empty_or_relative_runtime_dir_gives_no_lease_dir() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            runtime_leases_dir(Some(OsStr::new("/run/user/1000"))).unwrap(),
+            Path::new("/run/user/1000/eitri/session-leases")
+        );
+        assert!(runtime_leases_dir(Some(OsStr::new(""))).is_err());
+        assert!(runtime_leases_dir(Some(OsStr::new("run"))).is_err());
+        assert!(runtime_leases_dir(None).is_err());
     }
 
     #[test]

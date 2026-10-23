@@ -96,7 +96,7 @@ use eitri_core::tab_set::{
 };
 pub use eitri_core::tab_set::{TabPlace, ViewId};
 use eitri_core::tabs::TabId;
-use outbox::{ask_gate, Dest, Effect, Outbox, Payload, Screen, Strip};
+use outbox::{ask_gate, Dest, Effect, Outbox, Screen, Strip};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

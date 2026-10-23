@@ -205,35 +205,40 @@ pub(super) fn command_prompt_is_in(state: &AgentPanelState, view: ViewId) -> boo
 /// trust question again when the tab on screen waits for one: routing away took the old one off. A
 /// `:trust` question typed in the base page goes with any move there, answered as not trusted, and so
 /// does one whose tab has left the view it was typed in.
-pub(super) fn switch_payloads(state: &mut AgentPanelState) -> Vec<Payload> {
+///
+/// Asking again can put the tab's start off instead (a question too large to show); what that owes
+/// goes into `out` whole -- its toast, and an answer to the page that asked for the start, which need
+/// not be the base page -- after the base page's own payloads.
+pub(super) fn switch_payloads(state: &mut AgentPanelState, out: &mut Outbox) {
     if command_prompt_is_in(state, ViewId::BASE) {
         state.trust.drop_command_prompt();
     }
-    let mut payloads = vec![Payload::from(tabs_payload_recorded(state, ViewId::BASE))];
-    payloads.extend(state.tabs.active_state_payloads().into_iter().map(Payload::from));
+    let strip = tabs_payload_recorded(state, ViewId::BASE);
+    out.send(ViewId::BASE, strip);
+    out.send_all(ViewId::BASE, state.tabs.active_state_payloads());
     let active = state.tabs.active();
     if state.trust.current_route(&waiting_profile(state, active)) == Some(Route::Ask) {
-        payloads.extend(reroute_or_ask(state, active).payloads_for(state, ViewId::BASE));
+        out.extend(reroute_or_ask(state, active));
     }
-    payloads
 }
 
-/// What `view`'s page is owed when the tab it shows arrived or changed state: for the base view,
-/// [`switch_payloads`]; for an extra view, its `tabs`, its tab's own state and its tab's trust question
-/// asked again. An extra view with no tab gets only its (empty) `tabs`.
-pub(super) fn view_payloads(state: &mut AgentPanelState, view: ViewId) -> Vec<Payload> {
+/// What `view`'s page is owed when the tab it shows arrived or changed state, put in `out`: for the
+/// base view, [`switch_payloads`]; for an extra view, its `tabs`, its tab's own state and its tab's
+/// trust question asked again (or, as there, all a start put off instead owes). An extra view with no
+/// tab gets only its (empty) `tabs`.
+pub(super) fn view_payloads(state: &mut AgentPanelState, view: ViewId, out: &mut Outbox) {
     if view.is_base() {
-        return switch_payloads(state);
+        return switch_payloads(state, out);
     }
-    let mut payloads = vec![Payload::from(tabs_payload_recorded(state, view))];
+    let strip = tabs_payload_recorded(state, view);
+    out.send(view, strip);
     let Some(tab) = state.tabs.tab_in(view) else {
-        return payloads;
+        return;
     };
-    payloads.extend(state.tabs.state_payloads(tab).into_iter().map(Payload::from));
+    out.send_all(view, state.tabs.state_payloads(tab));
     if state.trust.current_route(&waiting_profile(state, tab)) == Some(Route::Ask) {
-        payloads.extend(reroute_or_ask(state, tab).payloads_for(state, view));
+        out.extend(reroute_or_ask(state, tab));
     }
-    payloads
 }
 
 /// After the base view's active tab changed: `mark_seen` if the base page is on screen, then its
@@ -255,19 +260,19 @@ pub(super) fn send_view(state: &mut AgentPanelState, screen: &Screen, view: View
             state.tabs.mark_seen(tab);
         }
     }
-    let payloads = view_payloads(state, view);
-    out.send_all(view, payloads);
+    view_payloads(state, view, out);
     report_attention(state, before, out);
 }
 
-/// The payloads a page shows for tab `tab` once it changed state: the whole view's when the tab is on
-/// screen in some page ([`view_payloads`]), else only the `tabs` of its view, to that view's page.
-pub(super) fn shown_payloads(state: &mut AgentPanelState, tab: TabId) -> (ViewId, Vec<Payload>) {
+/// What a page shows for tab `tab` once it changed state, put in `out`: the whole view's when the tab
+/// is on screen in some page ([`view_payloads`]), else only the `tabs` of its view, to that view's page.
+pub(super) fn shown_payloads(state: &mut AgentPanelState, tab: TabId, out: &mut Outbox) {
     let view = state.tabs.view_of(tab);
     if state.tabs.is_shown(tab) && (view.is_base() || state.ready(view)) {
-        (view, view_payloads(state, view))
+        view_payloads(state, view, out);
     } else {
-        (view, vec![tabs_payload_recorded(state, view).into()])
+        let strip = tabs_payload_recorded(state, view);
+        out.send(view, strip);
     }
 }
 

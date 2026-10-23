@@ -910,6 +910,39 @@ fn a_request_the_provider_does_not_know_gets_method_not_found() {
         .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })));
 }
 
+/// An agent that ends right after answering `session/new`: the link's end can be read in the same pass
+/// that took the answer, before the session is open. It must still end the session; dropped there, the
+/// tab looked open and its first turn never ended.
+#[test]
+fn an_agent_that_ends_right_after_opening_the_session_ends_the_session() {
+    for round in 0..5 {
+        let mut script = handshake(false);
+        script.extend([
+            expect_request(2, "session/new", json!({"cwd": "/work", "mcpServers": []})),
+            sleep_ms(20),
+            reply(
+                2,
+                json!({"sessionId": "s1", "modes": {"currentModeId": "agent", "availableModes": []}}),
+            ),
+            json!({"exit": 0}),
+        ]);
+        let provider = connect(script, None).expect("connects");
+        if provider.start(start_request(None)).is_err() {
+            // The end was seen before the answer: the start failed, which is honest too.
+            continue;
+        }
+        let events = pump_until(&provider, "the session's end", |e| {
+            matches!(e, AgentDomainEvent::SessionUnavailable { .. })
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. })),
+            "round {round}: {events:#?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- modes
 
 #[test]

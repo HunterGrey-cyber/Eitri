@@ -350,9 +350,10 @@ impl ScratchDir {
     }
 
     pub fn in_dir(tmp: &Path) -> Option<Self> {
-        use std::os::unix::fs::DirBuilderExt;
         let dir = crate::instance_dir::instance_dir_path(tmp, DIR_PREFIX);
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        // Exactly 0700 whatever the umask, like the other per-instance directories: one that takes the
+        // owner's own bits away would leave a directory the snippet cannot be written into.
+        if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
                 "[scratch] could not create {}: {e} -- Ctrl+g is unavailable",
                 dir.display()

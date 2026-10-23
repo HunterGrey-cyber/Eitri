@@ -1536,8 +1536,21 @@ pub(crate) fn stop_child(child: &mut Child, grace: Duration) -> std::io::Result<
             None => break,
         }
     }
-    child.kill()?;
+    kill_group_or_child(child)?;
     child.wait()
+}
+
+/// SIGKILL to the group `child` leads, which the sidecar does (it is started in a group of its own):
+/// a sidecar killed alone would leave the `claude` it runs, and that CLI's own children, running
+/// with nobody to end them. A child that leads no group of its own is killed alone. The child is not
+/// reaped yet, so its pid, and the group named by it, are still its own.
+fn kill_group_or_child(child: &mut Child) -> std::io::Result<()> {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: `kill` takes plain integers; `-pid` names the process group whose id is the child's pid.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    child.kill()
 }
 
 impl Drop for SpawnedSidecar {
@@ -1580,7 +1593,8 @@ impl Drop for SpawnedSidecar {
 #[cfg(target_os = "linux")]
 pub(crate) fn end_adopted(pidfd: &crate::child::PidFd, grace: Duration) {
     if !pidfd.wait_exited(grace) {
-        let _ = pidfd.signal(libc::SIGKILL);
+        // The group, as for a sidecar this process started, so its CLI goes with it.
+        let _ = pidfd.signal_group(libc::SIGKILL);
         let _ = pidfd.wait_exited(Duration::from_secs(1));
     }
 }
@@ -1734,6 +1748,43 @@ mod tests {
         let status = super::stop_child(&mut child, Duration::from_millis(200)).unwrap();
         assert_eq!(status.signal(), Some(9));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A sidecar that will not end is killed with its group, so what it started goes too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_killed_after_the_grace_takes_its_group_with_it() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30 & echo $!; read _; sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: libc::pid_t = line.trim().parse().unwrap();
+        drop(child.stdin.take());
+        super::stop_child(&mut child, Duration::from_millis(200)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit(')').next().map(|rest| rest.trim_start().chars().next()))
+                .flatten();
+            if matches!(state, None | Some('Z') | Some('X')) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sidecar's own child {grandchild} still runs"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     use super::*;

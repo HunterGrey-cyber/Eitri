@@ -77,7 +77,7 @@ pub(super) fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: Defe
     let mut out = Outbox::default();
     let view = state.tabs.view_of(tab);
     out.push(Dest::Page(view), tabs_payload_recorded(state, view));
-    out.push(Dest::Tab(tab), eitri_core::agent_bridge::serialize_notice_for_js(why));
+    out.push(Dest::Tab(tab), tab_notice(state, tab, why));
     match start {
         DeferredStart::FirstSend {
             request_id: sent,
@@ -97,6 +97,18 @@ pub(super) fn put_off_start(state: &mut AgentPanelState, tab: TabId, start: Defe
     out
 }
 
+/// A notice about `tab`, for the page of its view. That page shows a notice over whichever tab is on
+/// screen there, so one about a tab it does not show (a background tab of the base view) begins
+/// `tab N: `, and is not read as being about the tab in front.
+pub(super) fn tab_notice(state: &AgentPanelState, tab: TabId, text: &str) -> String {
+    let in_front = state.tab_of_page(state.tabs.view_of(tab)) == Some(tab);
+    let text = match state.tabs.get(tab) {
+        Some(t) if !in_front => format!("tab {}: {text}", t.number),
+        _ => text.to_string(),
+    };
+    eitri_core::agent_bridge::serialize_notice_for_js(&text)
+}
+
 /// A restore whose start will not happen keeps its sessions as failed tabs
 /// ([`TabSet::keep_put_off_restore`]). The base page is shown its tabs again, and a view a kept tab
 /// came back into is shown that tab.
@@ -105,14 +117,13 @@ pub(super) fn put_off_restore(state: &mut AgentPanelState, from: TabId, go: Rest
     if !state.tabs.keep_put_off_restore(from, go, why) {
         state.restore_source = None;
     }
-    out.push_all(Dest::Page(ViewId::BASE), switch_payloads(state));
+    switch_payloads(state, out);
     for view in state.tabs.views() {
         if held_before.contains(&view) {
             continue;
         }
         if let Some(tab) = state.tabs.tab_in(view) {
-            let (view, payloads) = shown_payloads(state, tab);
-            out.push_all(Dest::Page(view), payloads);
+            shown_payloads(state, tab, out);
         }
     }
 }
@@ -228,12 +239,12 @@ pub(super) fn trust_events(state: &mut AgentPanelState) -> Outbox {
                 if let Some(start) = state.tabs.take_recorded(tab) {
                     out.extend(start_deferred(state, tab, start, ProjectTrust::Trusted));
                     if let Some(notice) = notice {
-                        out.push(Dest::Tab(tab), serialize_notice_for_js(&notice));
+                        out.push(Dest::Tab(tab), tab_notice(state, tab, &notice));
                     }
                 }
             }
             GateEvent::RecordRefused { tab, notice } => {
-                out.push(Dest::Tab(tab), serialize_notice_for_js(&notice));
+                out.push(Dest::Tab(tab), tab_notice(state, tab, &notice));
                 // The `y` is spent; the tab waits for a new answer, asked by the sweep below.
                 if state.tabs.ask_trust(tab).is_ok() {
                     state.trust.hide(tab);
@@ -871,6 +882,62 @@ mod tests {
             state.borrow().tabs.get(tab).unwrap().backend(),
             TabBackend::NotStarted
         ));
+    }
+
+    /// A switch shows a tab whose resume waits for its trust question, and that question cannot be shown
+    /// (its prompt was lost, as with one too large to show): the start is put off, and everything that
+    /// says so goes out -- the toast too, not only what the base page is sent.
+    #[test]
+    fn a_start_a_switch_puts_off_says_so_in_full() {
+        let (state, fx) = trust_panel("trust-switch-put-off");
+        fx.write("AGENTS.md", b"codex instructions\n");
+        let tab = {
+            let mut s = state.borrow_mut();
+            let shown = s.tabs.active();
+            let tab = s.tabs.open(AgentId::Codex);
+            s.tabs.select(shown);
+            tab
+        };
+        resume_in(&mut state.borrow_mut(), tab, "r1", "thread-1".into(), false).unwrap();
+        tick_until(&state, |_| {
+            state.borrow().trust.current_route(&Profile::Codex) == Some(Route::Ask)
+        });
+        state.borrow_mut().trust.lose_prompts();
+        let mut out = Outbox::default();
+        {
+            let mut s = state.borrow_mut();
+            s.tabs.select(tab);
+            send_switch(&mut s, &Screen::nothing_shown(), &mut out);
+        }
+        let toast = out.toast.clone().expect("the put-off resume's toast is kept");
+        assert_eq!(toast, crate::trust_gate::UNAVAILABLE_START);
+        assert!(notices(&out.payloads()).contains(&toast), "{:?}", out.payloads());
+        assert!(fx.external.borrow().is_empty());
+    }
+
+    /// A notice about a tab its page does not show (a background tab of the base view) names the tab, so it
+    /// is not read as being about the tab on screen; one about the tab on screen is as it was.
+    #[test]
+    fn a_notice_about_a_tab_not_on_screen_names_it() {
+        let (state, _fx) = trust_panel("trust-notice-background");
+        let mut s = state.borrow_mut();
+        let shown = s.tabs.active();
+        let background = s.tabs.open(AgentId::Claude);
+        s.tabs.select(shown);
+        let number = s.tabs.get(background).unwrap().number;
+        for (tab, said) in [
+            (background, format!("tab {number}: not started: no")),
+            (shown, "not started: no".to_string()),
+        ] {
+            gate_start(&mut s, tab, first_send("r1", "hello")).unwrap();
+            let start = s.tabs.take_deferred(tab).unwrap();
+            let out = put_off_start(&mut s, tab, start, "not started: no");
+            assert!(
+                notices(&out.payloads()).contains(&said),
+                "{said:?}: {:?}",
+                out.payloads()
+            );
+        }
     }
 
     /// A project whose trust question would be larger than the page is ever sent (here one hook of

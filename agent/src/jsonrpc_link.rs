@@ -1144,9 +1144,17 @@ impl JsonRpcLink {
 
     /// Answers a request the agent made, by its own id.
     pub fn respond(&self, id: Value, result: Value) {
-        if let Err(e) = self.shared.respond(&id, &result) {
+        if let Err(e) = self.try_respond(id, result) {
             link_log!("an answer to the agent was not sent: {e}");
         }
+    }
+
+    /// [`respond`](Self::respond), saying whether the answer was queued. Nothing is queued when it
+    /// fails (`Busy` while the agent is not reading its input, `Closed` once the link ended), so the
+    /// same answer may be given again: what a card's answer needs, since a dropped one would leave the
+    /// agent waiting with nothing on screen.
+    pub fn try_respond(&self, id: Value, result: Value) -> Result<(), LinkError> {
+        self.shared.respond(&id, &result)
     }
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) {
@@ -2169,6 +2177,25 @@ mod tests {
 
     /// Long enough for a loaded machine; it only turns a hang into a failure.
     const PATIENCE: Duration = Duration::from_secs(30);
+
+    /// An answer the writer cannot take is reported to the caller, which can keep the card it answers:
+    /// an agent that does not read its input fills the pipe and then the queue.
+    #[test]
+    fn an_answer_the_writer_cannot_take_is_reported_not_dropped() {
+        let link = stand_in("exec sleep 30");
+        let filler = Value::String("x".repeat(4096));
+        let mut refused = None;
+        for i in 0..(WRITE_QUEUE * 4) {
+            if let Err(e) = link.try_respond(Value::from(i as u64), filler.clone()) {
+                refused = Some(e);
+                break;
+            }
+        }
+        assert!(
+            matches!(refused, Some(LinkError::Busy)),
+            "a full writer must refuse an answer: {refused:?}"
+        );
+    }
 
     fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let end = Instant::now() + PATIENCE;

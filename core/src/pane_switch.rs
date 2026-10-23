@@ -284,13 +284,27 @@ impl PaneSwitchChannel {
     /// `EITRI_NAV_LUA` names the nav fallback's snippet, which [`Self::nvim_args`]'s loader runs;
     /// it is absent when the snippet could not be written, and the loader is then a no-op.
     pub fn child_env(&self) -> Vec<(String, String)> {
+        self.child_env_over(std::env::var("PATH"))
+    }
+
+    /// [`Self::child_env`] over the host's `PATH` as `std::env::var` read it. The environment handed on
+    /// is text, so a `PATH` that is not UTF-8 cannot be put after the shim's `bin/`: put alone in its
+    /// place it would hide every program the user's config runs. The child then keeps the `PATH` it
+    /// inherits and gets no fake `tmux` (it could not find it), and Ctrl+h/j/k/l out of nvim go through
+    /// the nav fallback, as without the shim.
+    fn child_env_over(&self, host_path: Result<String, std::env::VarError>) -> Vec<(String, String)> {
         let mut env = Vec::new();
-        if self.shim {
-            let bin_dir = self.dir.join("bin");
-            let path = match std::env::var("PATH") {
-                Ok(existing) => format!("{}:{}", bin_dir.display(), existing),
-                Err(_) => bin_dir.display().to_string(),
-            };
+        let bin_dir = self.dir.join("bin");
+        let path = match host_path {
+            _ if !self.shim => None,
+            Ok(existing) => Some(format!("{}:{}", bin_dir.display(), existing)),
+            Err(std::env::VarError::NotPresent) => Some(bin_dir.display().to_string()),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eprintln!("[pane_switch] PATH is not UTF-8 -- no fake tmux for nvim; Ctrl+h/j/k/l use the fallback");
+                None
+            }
+        };
+        if let Some(path) = path {
             env.push((
                 "TMUX".to_string(),
                 format!("{},{},0", self.socket_path.display(), std::process::id()),
@@ -801,6 +815,38 @@ mod tests {
         };
         assert!(channel.child_env().iter().all(|(k, _)| k != "EITRI_NAV_LUA"));
         assert!(channel.nvim_args().is_empty());
+        std::mem::forget(channel);
+    }
+
+    /// A host `PATH` that is not UTF-8 is never replaced by the shim's `bin/` alone, which would hide every
+    /// program nvim's config runs: the child keeps its own `PATH` and gets no fake `tmux` with it. An unset
+    /// `PATH` still gets the shim's `bin/`.
+    #[test]
+    fn a_path_that_is_not_utf8_is_left_to_the_child() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = std::env::temp_dir().join("nv-ps-unit-test-path");
+        let channel = PaneSwitchChannel {
+            socket_path: dir.join(SOCKET_NAME),
+            nav_lua: Some(dir.join(NAV_LUA_NAME)),
+            dir: dir.clone(),
+            listener: None,
+            shim: true,
+        };
+        let odd = std::ffi::OsString::from_vec(b"/usr/bin:/opt/caf\xe9/bin".to_vec());
+        let env: std::collections::HashMap<String, String> = channel
+            .child_env_over(Err(std::env::VarError::NotUnicode(odd)))
+            .into_iter()
+            .collect();
+        for name in ["TMUX", "TMUX_PANE", "PATH"] {
+            assert!(!env.contains_key(name), "{name} must not be set: {env:?}");
+        }
+        assert!(env.contains_key("EITRI_PANE_SWITCH_SOCKET") && env.contains_key("EITRI_NAV_LUA"));
+        let unset: std::collections::HashMap<String, String> = channel
+            .child_env_over(Err(std::env::VarError::NotPresent))
+            .into_iter()
+            .collect();
+        assert_eq!(unset["PATH"], dir.join("bin").display().to_string());
+        assert!(unset.contains_key("TMUX"));
         std::mem::forget(channel);
     }
 

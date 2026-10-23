@@ -74,6 +74,16 @@ impl Drop for Scratch {
     }
 }
 
+/// This process's umask, from `/proc/self/status` (setting it to read it would race the other tests).
+fn umask() -> u32 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))
+        .expect("a Umask line");
+    u32::from_str_radix(value.trim(), 8).expect("an octal umask")
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -636,7 +646,11 @@ fn whole_file_delete_restore_replace() {
     let restored = w.revert_file(n, "bin/run.sh").unwrap();
     assert_eq!(restored.kind, RevertKind::Restore);
     assert_eq!(w.read("bin/run.sh"), b"#!/bin/sh\necho base\n");
-    assert_eq!(mode_of(&w.file("bin/run.sh")), 0o755, "the base's mode");
+    assert_eq!(
+        mode_of(&w.file("bin/run.sh")),
+        0o755 & !umask(),
+        "the base's mode, under the umask"
+    );
     assert_eq!(restored.pre, Saved::Absent);
 
     let replaced = w.revert_file(n, "modified.txt").unwrap();
@@ -1223,7 +1237,11 @@ fn undo_of_a_regular_turned_symlink() {
     let applied = w.revert_file(n, "thing").unwrap();
     assert!(meta(&w.file("thing")).file_type().is_file());
     assert_eq!(w.read("thing"), b"regular\n");
-    assert_eq!(mode_of(&w.file("thing")), 0o644);
+    assert_eq!(
+        mode_of(&w.file("thing")),
+        0o644 & !umask(),
+        "git's mode, under the umask"
+    );
     w.undo(&applied).unwrap();
     assert_eq!(std::fs::read_link(w.file("thing")).unwrap(), Path::new("target.txt"));
     assert_eq!(fingerprint(&w.file("target.txt")), target);

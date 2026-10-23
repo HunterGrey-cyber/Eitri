@@ -93,6 +93,10 @@ pub struct ClosingNotice {
     pub reason: String,
     /// When the notice stops waiting for stderr and goes without it.
     pub until: Instant,
+    /// The notice's stderr tail as it stood when the end was read: what the child wrote before. The
+    /// notice goes early only once the tail differs from it, so earlier log lines alone never stand in
+    /// for the reason the child is about to give.
+    pub stderr_at_close: String,
 }
 
 impl ClosingNotice {
@@ -101,6 +105,15 @@ impl ClosingNotice {
         ClosingNotice {
             reason: reason.to_string(),
             until: now + CLOSING_NOTICE_WAIT,
+            stderr_at_close: String::new(),
+        }
+    }
+
+    /// [`ClosingNotice::new`] for the child on `link`, remembering what its stderr said so far.
+    pub(crate) fn after(reason: &str, now: Instant, link: &Mutex<Option<JsonRpcLink>>) -> ClosingNotice {
+        ClosingNotice {
+            stderr_at_close: current_tail(link),
+            ..ClosingNotice::new(reason, now)
         }
     }
 
@@ -119,11 +132,9 @@ pub(crate) fn finish_closing_notice(
     link: &Mutex<Option<JsonRpcLink>>,
 ) -> Option<String> {
     let waiting = notice.as_ref()?;
-    let tail = lock(link)
-        .as_ref()
-        .map(|l| notice_tail(&l.stderr_tail()))
-        .unwrap_or_default();
-    if tail.is_empty() && !waiting.due(Instant::now()) {
+    let tail = current_tail(link);
+    let fresh = !tail.is_empty() && tail != waiting.stderr_at_close;
+    if !fresh && !waiting.due(Instant::now()) {
         return None;
     }
     let reason = notice.take()?.reason;
@@ -133,6 +144,14 @@ pub(crate) fn finish_closing_notice(
         format!(": {tail}")
     };
     Some(format!("{agent} ended unexpectedly ({reason}){suffix}"))
+}
+
+/// The link's stderr tail as a notice shows it, empty without a link.
+fn current_tail(link: &Mutex<Option<JsonRpcLink>>) -> String {
+    lock(link)
+        .as_ref()
+        .map(|l| notice_tail(&l.stderr_tail()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -160,6 +179,7 @@ mod tests {
         let mut over = Some(ClosingNotice {
             reason: "end of output".to_string(),
             until: Instant::now(),
+            stderr_at_close: String::new(),
         });
         assert_eq!(
             finish_closing_notice(&mut over, "Codex", &link).as_deref(),
@@ -167,6 +187,54 @@ mod tests {
         );
         assert!(over.is_none(), "a finished notice is taken");
         assert_eq!(finish_closing_notice(&mut over, "Codex", &link), None);
+    }
+
+    /// A child that logged to stderr before it ended: the notice waits for what it says after its end,
+    /// rather than going at once with the earlier lines.
+    #[test]
+    fn a_notice_waits_for_stderr_written_after_the_end_even_when_earlier_stderr_exists() {
+        fn refuse(_: &str) -> crate::jsonrpc_link::OverCapReply {
+            crate::jsonrpc_link::OverCapReply::Error {
+                code: -32600,
+                message: "too large",
+            }
+        }
+        let link = JsonRpcLink::spawn(crate::jsonrpc_link::LinkSpec {
+            program: std::path::PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "echo early >&2; sleep 0.2; exec 1>&-; sleep 0.03; echo final-reason >&2; sleep 1".into(),
+            ],
+            cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            framing: crate::jsonrpc_link::Framing::Bare,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            over_cap: refuse,
+        })
+        .expect("the stand-in starts");
+        let slot = Mutex::new(Some(link));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reason = loop {
+            if let Some(Incoming::Closed { reason }) = try_recv(&slot) {
+                break reason;
+            }
+            assert!(Instant::now() < deadline, "the link never ended");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // A long wait, so only the stderr that comes after the end can let the notice go early.
+        let mut notice = Some(ClosingNotice {
+            until: Instant::now() + Duration::from_secs(8),
+            ..ClosingNotice::after(&reason, Instant::now(), &slot)
+        });
+        let said = loop {
+            if let Some(said) = finish_closing_notice(&mut notice, "Codex", &slot) {
+                break said;
+            }
+            assert!(Instant::now() < deadline, "the notice never went");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(said.contains("final-reason"), "{said}");
+        stop_linked_child(&slot);
     }
 
     #[test]

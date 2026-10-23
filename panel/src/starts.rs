@@ -153,8 +153,7 @@ pub(super) fn start_deferred(
                 },
             );
             // The command_result is owed once the connect finishes.
-            let (view, payloads) = shown_payloads(state, tab);
-            out.push_all(Dest::Page(view), payloads);
+            shown_payloads(state, tab, &mut out);
         }
         DeferredStart::Restore { go } => {
             let result = match &state.spawner {
@@ -175,7 +174,7 @@ pub(super) fn start_deferred(
                     start_restore(state, tab, go, &mut spawn, project)
                 }
             };
-            out.push_all(Dest::Page(ViewId::BASE), switch_payloads(state));
+            switch_payloads(state, &mut out);
             out.restored = Some(match result {
                 RestoreResult::Started { notice } => notice,
                 _ => None,
@@ -290,8 +289,7 @@ pub(super) fn start_external_tab(
     );
     let mut out = Outbox::default();
     if resuming {
-        let (view, payloads) = shown_payloads(state, tab);
-        out.push_all(Dest::Page(view), payloads);
+        shown_payloads(state, tab, &mut out);
     } else {
         let view = state.tabs.view_of(tab);
         out.push(Dest::Page(view), tabs_payload_recorded(state, view));
@@ -588,12 +586,9 @@ pub(super) fn collect_pending_starts(state: &mut AgentPanelState, screen: &Scree
                 let restored = part_of_a_restore != RestoreStart::NotPartOfOne;
                 // The page has been showing this tab as starting; give it the real projection at
                 // once rather than making it wait for the first event.
-                let shown = match state.shown_in(tab) {
-                    Some(view) if view.is_base() || state.ready(view) => Some((view, view_payloads(state, view))),
-                    _ => None,
-                };
-                if let Some((view, payloads)) = shown {
-                    out.send_all(view, payloads);
+                match state.shown_in(tab) {
+                    Some(view) if view.is_base() || state.ready(view) => view_payloads(state, view, out),
+                    _ => {}
                 }
                 if !restored {
                     match first_turn {

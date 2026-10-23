@@ -1414,6 +1414,20 @@ impl CodexProvider {
         }
     }
 
+    /// A card's answer, sent or refused as a whole: `Err` when it was not queued, so the card can stay.
+    fn respond_to_card(&self, id: Value, result: Value) -> Result<(), ProviderError> {
+        let sent = match lock(&self.link).as_ref() {
+            Some(link) => link.try_respond(id, result),
+            None => Err(LinkError::Closed),
+        };
+        sent.map_err(|e| {
+            provider_error(
+                ProviderErrorCode::ProviderUnavailable,
+                format!("the answer did not reach Codex: {e}; the card is still waiting"),
+            )
+        })
+    }
+
     // ------------------------------------------------------------ requests
 
     fn on_request(&self, st: &mut State, id: Value, method: String, params: Value) {
@@ -1744,7 +1758,7 @@ impl CodexProvider {
         // The end of the output stream can be read a moment before the last of stderr; the notice waits a
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls take.
-        st.closing_notice = Some(ClosingNotice::new(reason, Instant::now()));
+        st.closing_notice = Some(ClosingNotice::after(reason, Instant::now(), &self.link));
         self.finish_closing_notice(st);
     }
 
@@ -3073,9 +3087,12 @@ impl CodexProvider {
             start_abandoned,
             user_reviewed,
             steers,
+            // What the child said before its end is not carried; the moved notice goes at its first
+            // stderr or its deadline, as one made with no earlier stderr does.
             closing_notice: closing_notice.map(|(reason, ms)| ClosingNotice {
                 reason,
                 until: at_offset(ms, now),
+                stderr_at_close: String::new(),
             }),
             closed: false,
             dead: false,
@@ -3254,8 +3271,10 @@ impl AgentProvider for CodexProvider {
                 "no permission request is waiting",
             ));
         };
+        // Sent before the card goes, as in the ACP provider: an answer the link did not take leaves the
+        // card waiting, to be answered again.
+        self.respond_to_card(st.cards[at].1.request_id.clone(), st.cards[at].1.form.reply(answer))?;
         let (permission_id, card) = st.cards.remove(at);
-        self.respond(card.request_id.clone(), card.form.reply(answer));
         let outcome = match answer {
             CardAnswer::Approve => PermissionOutcome::Allowed,
             _ => PermissionOutcome::Denied,

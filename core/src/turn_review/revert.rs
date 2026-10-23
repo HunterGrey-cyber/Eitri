@@ -1266,9 +1266,15 @@ fn plan_file(rel: &Path, base: Option<Entry>, end: Option<Entry>, current: &Curr
     let (kind, content) = match (&base, &end) {
         (None, None) => return Err(unchanged()),
         (None, Some(_)) => (RevertKind::Delete, Content::Absent),
-        (Some(b), None) => (RevertKind::Restore, entry_content(b, b.mode)),
+        (Some(b), None) => (
+            RevertKind::Restore,
+            entry_content(b, restored_mode(b.mode, process_umask())),
+        ),
         (Some(b), Some(e)) if b == e => return Err(unchanged()),
-        (Some(b), Some(e)) => (RevertKind::Replace, entry_content(b, replace_mode(b, e, current))),
+        (Some(b), Some(e)) => (
+            RevertKind::Replace,
+            entry_content(b, replace_mode(b, e, current, process_umask())),
+        ),
     };
     Ok(Planned {
         kind,
@@ -1292,11 +1298,34 @@ fn entry_content(entry: &Entry, mode: u32) -> Content {
     }
 }
 
+/// The mode a regular file put back where none is gets. Git records only 0644 or 0755, wider than
+/// what the user's umask makes (077 makes 0600), so the umask is applied to it, as `git checkout`
+/// applies it; with no umask known, only the owner's bits are kept.
+fn restored_mode(base: u32, umask: Option<u32>) -> u32 {
+    match umask {
+        Some(mask) => base & !mask,
+        None => base & 0o700,
+    }
+}
+
+/// This process's umask, read without changing it: `umask(2)` reads it only by setting it, and a file
+/// another thread created meanwhile would be made under the value set. `None` where `/proc` does not
+/// say (macOS).
+fn process_umask() -> Option<u32> {
+    umask_in_status(&std::fs::read_to_string("/proc/self/status").ok()?) // containment-scan: procfs, not the project
+}
+
+/// The `Umask:` line of a `/proc/<pid>/status` text, in octal.
+fn umask_in_status(status: &str) -> Option<u32> {
+    let value = status.lines().find_map(|line| line.strip_prefix("Umask:"))?;
+    u32::from_str_radix(value.trim(), 8).ok().filter(|mask| *mask <= 0o777)
+}
+
 /// The mode a whole-file replace gives a regular file. Git records only 0644 or 0755, so the
 /// base's mode would widen a file the user had made 0600: the file keeps its own bits, and only
 /// an execute bit the turn changed is changed back. Where no regular file is (the turn left a
-/// link), the base's mode is all there is.
-fn replace_mode(base: &Entry, end: &Entry, current: &Current) -> u32 {
+/// link), the base's mode with `umask` applied, as for a restore ([`restored_mode`]).
+fn replace_mode(base: &Entry, end: &Entry, current: &Current, umask: Option<u32>) -> u32 {
     match current {
         Current::Regular { mode, .. } if end.kind == EntryKind::Blob => {
             if base.mode == end.mode {
@@ -1308,7 +1337,7 @@ fn replace_mode(base: &Entry, end: &Entry, current: &Current) -> u32 {
                 mode & !0o111
             }
         }
-        _ => base.mode,
+        _ => restored_mode(base.mode, umask),
     }
 }
 
@@ -1551,6 +1580,42 @@ mod tests {
         assert_eq!(splice_hunk(&base, &end, &end, (1, 2), (1, 2)).unwrap().bytes, b"a\nb");
     }
 
+    /// A file the turn deleted comes back with the umask applied to git's 0644/0755, never wider than the
+    /// user's umask makes files; with no umask known, the owner's bits only.
+    #[test]
+    fn a_restored_file_gets_the_umask_not_gits_mode() {
+        assert_eq!(restored_mode(0o644, Some(0o077)), 0o600);
+        assert_eq!(restored_mode(0o755, Some(0o077)), 0o700);
+        assert_eq!(restored_mode(0o644, Some(0o022)), 0o644);
+        assert_eq!(restored_mode(0o755, Some(0o027)), 0o750);
+        assert_eq!(restored_mode(0o644, None), 0o600);
+        assert_eq!(restored_mode(0o755, None), 0o700);
+        let status = "Name:\tcat\nUmask:\t0077\nState:\tR (running)\n";
+        assert_eq!(umask_in_status(status), Some(0o077));
+        assert_eq!(umask_in_status("Name:\tcat\n"), None);
+        #[cfg(target_os = "linux")]
+        assert!(process_umask().is_some(), "Linux says the umask in /proc/self/status");
+        let planned = plan_file(
+            Path::new("gone.txt"),
+            Some(Entry {
+                mode: 0o644,
+                kind: EntryKind::Blob,
+                bytes: b"base\n".to_vec(),
+            }),
+            None,
+            &Current::Absent,
+        )
+        .unwrap();
+        assert_eq!(planned.kind, RevertKind::Restore);
+        assert_eq!(
+            planned.content,
+            Content::Bytes {
+                bytes: b"base\n".to_vec(),
+                mode: restored_mode(0o644, process_umask()),
+            }
+        );
+    }
+
     #[test]
     fn replace_mode_keeps_the_files_own_bits() {
         let entry = |mode| Entry {
@@ -1562,19 +1627,34 @@ mod tests {
             bytes: Vec::new(),
             mode,
         };
-        assert_eq!(replace_mode(&entry(0o644), &entry(0o644), &regular(0o600)), 0o600);
-        assert_eq!(replace_mode(&entry(0o644), &entry(0o755), &regular(0o755)), 0o644);
-        assert_eq!(replace_mode(&entry(0o644), &entry(0o755), &regular(0o700)), 0o600);
-        assert_eq!(replace_mode(&entry(0o755), &entry(0o644), &regular(0o644)), 0o755);
-        assert_eq!(replace_mode(&entry(0o755), &entry(0o644), &regular(0o600)), 0o700);
+        assert_eq!(replace_mode(&entry(0o644), &entry(0o644), &regular(0o600), None), 0o600);
+        assert_eq!(replace_mode(&entry(0o644), &entry(0o755), &regular(0o755), None), 0o644);
+        assert_eq!(replace_mode(&entry(0o644), &entry(0o755), &regular(0o700), None), 0o600);
+        assert_eq!(replace_mode(&entry(0o755), &entry(0o644), &regular(0o644), None), 0o755);
+        assert_eq!(replace_mode(&entry(0o755), &entry(0o644), &regular(0o600), None), 0o700);
         let link = Entry {
             mode: 0o777,
             kind: EntryKind::Symlink,
             bytes: b"t".to_vec(),
         };
         assert_eq!(
-            replace_mode(&entry(0o755), &link, &Current::Symlink { target: b"t".to_vec() }),
+            replace_mode(
+                &entry(0o755),
+                &link,
+                &Current::Symlink { target: b"t".to_vec() },
+                Some(0o022)
+            ),
             0o755
+        );
+        assert_eq!(
+            replace_mode(
+                &entry(0o644),
+                &link,
+                &Current::Symlink { target: b"t".to_vec() },
+                Some(0o077)
+            ),
+            0o600,
+            "a file put back where a link was gets the umask"
         );
     }
 

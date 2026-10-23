@@ -511,8 +511,7 @@ pub(super) fn close_tab(state: &mut AgentPanelState, tab: TabId, out: &mut Outbo
         }
     }
     if view.is_base() {
-        let payloads = switch_payloads(state);
-        out.send_all(ViewId::BASE, payloads);
+        switch_payloads(state, out);
     } else {
         let payload = tabs_payload_recorded(state, view);
         out.send(view, payload);

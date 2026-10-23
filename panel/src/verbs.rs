@@ -56,7 +56,7 @@ pub(super) fn cycle_tab_mode(
 }
 
 /// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default on
-/// `Changed(Auto)` only -- bypass is never written, and a `Confirm` is not persisted here
+/// `Changed(mode)`, which is manual or auto -- bypass is never written, and a `Confirm` is not persisted here
 /// either (only actually entering bypass, via `apply_confirm_bypass` below, ever could -- and that is
 /// forbidden too). A failure to write is logged, not refused, since the mode itself did change.
 /// Never touches the WebView, so it is tested directly; the arm above owns `send_tabs` and

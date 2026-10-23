@@ -28,6 +28,12 @@ impl Default for InitRefusals {
 }
 
 impl InitRefusals {
+    /// Whether `init.lua` is running (or has not run yet): once it has, the window has read what it
+    /// registered, and a call that only registers for the window to read then has nothing to act on.
+    pub(crate) fn in_init(&self) -> bool {
+        self.accepting
+    }
+
     pub(crate) fn message(&self, name: &str) -> Option<String> {
         self.entries
             .iter()
@@ -487,6 +493,23 @@ mod tests {
         assert_eq!(kernel.init_refusal(), None);
         assert_eq!(kernel.commands.borrow().refused(), None);
         assert_eq!(kernel.layout.borrow().default_tree(), None);
+    }
+
+    /// Plugins are read once, when `init.lua` has run: a load after that would report success and show
+    /// nothing, so it is refused and loads nothing.
+    #[test]
+    fn a_plugin_load_after_init_is_refused() {
+        let scratch = crate::plugin::test_support::Scratch::new("lua-late-plugin-load");
+        let kernel = Kernel::new(scratch.0.clone(), |_, _| Ok(())).unwrap();
+        assert_eq!(kernel.run_and_check_init_file(&scratch.0.join("missing.lua")), Ok(()));
+        let error: String = kernel
+            .lua
+            .load("local ok, e = pcall(eitri.plugin.load, '/nonexistent/plugin'); assert(not ok); return tostring(e)")
+            .eval()
+            .unwrap();
+        assert!(error.contains("eitri.plugin.load: only in init.lua"), "{error}");
+        assert!(kernel.plugins.borrow().plugins().is_empty());
+        assert_eq!(kernel.init_refusal(), None);
     }
 
     #[test]

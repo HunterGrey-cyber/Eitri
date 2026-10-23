@@ -186,6 +186,9 @@ struct Boot {
     /// The latest command list the agent sent before the session was open.
     commands: Option<Vec<SlashCommand>>,
     history: Option<History>,
+    /// The link's end, read while the start was still being served. The link says it only once, so a
+    /// start that went on to succeed hands it to the open session, which then ends at once.
+    closed: Option<String>,
 }
 
 pub struct AcpProvider {
@@ -355,6 +358,23 @@ impl AcpProvider {
         }
     }
 
+    /// A card's answer, sent or refused as a whole: `Err` when it was not queued, so the card can stay.
+    fn respond_to_card(&self, id: Value, result: Value) -> Result<(), ProviderError> {
+        let sent = match lock(&self.link).as_ref() {
+            Some(link) => link.try_respond(id, result),
+            None => Err(LinkError::Closed),
+        };
+        sent.map_err(|e| {
+            provider_error(
+                ProviderErrorCode::ProviderUnavailable,
+                format!(
+                    "the answer did not reach {}: {e}; the card is still waiting",
+                    self.agent
+                ),
+            )
+        })
+    }
+
     fn require_session(&self, st: &State, session_id: &str) -> Result<(), ProviderError> {
         if st.session_id.as_deref() != Some(session_id) {
             return Err(provider_error(
@@ -414,6 +434,7 @@ impl AcpProvider {
                     link.respond_error(id, METHOD_NOT_FOUND, "method not found");
                 }
             }
+            Incoming::Closed { reason } => boot.closed = Some(reason),
             _ => {}
         }
     }
@@ -442,12 +463,19 @@ impl AcpProvider {
             mode: None,
             commands: None,
             history: Some(History::default()),
+            closed: None,
         };
         let pending = self.request(method::SESSION_LOAD, wire::session_load_params(&saved, &req.cwd))?;
         let answer = match self.serve(pending, LOAD_TIMEOUT, &mut boot) {
             Ok(answer) => answer,
             // The agent's own words are what the user needs, shown as the verdict on the resume.
-            Err(LinkError::Rpc { message, .. }) => return Ok(self.resume_refused(&req, &saved, message)),
+            Err(LinkError::Rpc { message, .. }) => {
+                let opened = self.resume_refused(&req, &saved, message);
+                if let Some(reason) = boot.closed.take() {
+                    self.on_closed(&mut lock(&self.state), &reason);
+                }
+                return Ok(opened);
+            }
             Err(e) => return Err(self.failure(e, "loading the session")),
         };
         let setup = wire::SessionSetup::parse(&answer);
@@ -519,6 +547,9 @@ impl AcpProvider {
         }
         if let Some((requested, reported)) = mismatch {
             self.trip(&mut st, requested, reported);
+        }
+        if let Some(reason) = boot.closed.take() {
+            self.on_closed(&mut st, &reason);
         }
         Ok(session_id)
     }
@@ -649,7 +680,7 @@ impl AcpProvider {
         // The end of the output stream can be read a moment before the last of stderr; the notice waits a
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls (a card's answer, Esc, a send, the gauge) take.
-        st.closing_notice = Some(ClosingNotice::new(reason, Instant::now()));
+        st.closing_notice = Some(ClosingNotice::after(reason, Instant::now(), &self.link));
         self.finish_closing_notice(st);
     }
 
@@ -1315,8 +1346,10 @@ impl AgentProvider for AcpProvider {
                 format!("{} offers no way for this request to be {what}", self.agent),
             ));
         };
-        let (permission_id, card) = st.cards.remove(at);
-        self.respond(card.request_id, wire::selected_outcome(&option));
+        // Sent before the card goes: an answer the link did not take leaves the card waiting, to be
+        // answered again, rather than an agent waiting for an answer no card can give.
+        self.respond_to_card(st.cards[at].1.request_id.clone(), wire::selected_outcome(&option))?;
+        let (permission_id, _card) = st.cards.remove(at);
         let outcome = if approve {
             PermissionOutcome::Allowed
         } else {

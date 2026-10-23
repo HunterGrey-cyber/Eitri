@@ -163,19 +163,6 @@ impl Outbox {
         }
     }
 
-    /// The payloads bound for `view`'s page as the state is now, in order; every other payload, every
-    /// call into the window, the toast and the restore are dropped. For a caller that already sends to
-    /// that page alone.
-    pub(super) fn payloads_for(self, state: &AgentPanelState, view: ViewId) -> Vec<Payload> {
-        self.effects
-            .into_iter()
-            .filter_map(|effect| match effect {
-                Effect::Send(dest, payload) if super::dest_view(state, dest) == view => Some(payload),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The toast and the restore this outbox kept apart, made effects after the rest, in the order a trust
     /// step owes them: the toast, then each extra page shown the tab a restore brought back into its view,
     /// the restore's own line in the base page's band, and its one message once it is over.
@@ -348,6 +335,12 @@ impl Screen {
             .map(|(view, _)| view)
             .collect();
         Screen { shown }
+    }
+
+    /// No page on screen.
+    #[cfg(test)]
+    pub(super) fn nothing_shown() -> Screen {
+        Screen { shown: Vec::new() }
     }
 
     /// Whether `view`'s page is on screen.

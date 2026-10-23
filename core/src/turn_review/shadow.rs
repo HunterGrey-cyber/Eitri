@@ -520,6 +520,37 @@ pub struct Shadow {
     excludes_file: Option<PathBuf>,
 }
 
+/// The most of a project's `info/exclude` a snapshot copies; a larger one fails the snapshot.
+const MAX_PROJECT_EXCLUDE_BYTES: u64 = 1 << 20;
+
+/// Reads the project's `info/exclude`, which the project (and so the agent) controls: only a regular
+/// file, opened without blocking and read within [`MAX_PROJECT_EXCLUDE_BYTES`]. A FIFO put in its place
+/// would hold the snapshot (and the store's lock with it) for good, and a link to `/dev/zero` would
+/// read until memory ran out; either fails the snapshot instead.
+fn read_project_exclude(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROJECT_EXCLUDE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROJECT_EXCLUDE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is larger than {MAX_PROJECT_EXCLUDE_BYTES} bytes", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
 impl Shadow {
     /// Opens (creating on first use) the store in `review_dir` for the project at `work_tree`,
     /// honouring the user's global excludes file.
@@ -679,7 +710,7 @@ impl Shadow {
         let target = self.git_dir.join("info/exclude");
         let source = self.project_exclude_file(deadline)?;
         let wanted = match source {
-            Some(path) => match std::fs::read(&path) {
+            Some(path) => match read_project_exclude(&path) {
                 Ok(bytes) => Some(bytes),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e.into()),

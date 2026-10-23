@@ -19,9 +19,13 @@ pub fn resolve(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, String
     {
         return Ok(dir.join("eitri"));
     }
-    env("HOME")
-        .map(|home| PathBuf::from(home).join(".config/eitri"))
-        .ok_or_else(|| "HOME must be set".to_string())
+    // An empty or relative HOME would resolve against the working directory, which can be the
+    // project: its own `.config/eitri/init.lua` would then run as the user's configuration.
+    match env("HOME") {
+        Some(home) if PathBuf::from(&home).is_absolute() => Ok(PathBuf::from(home).join(".config/eitri")),
+        Some(home) => Err(format!("HOME={home:?} is not an absolute path")),
+        None => Err("HOME must be set".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -35,6 +39,18 @@ mod tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| OsString::from(value))
         })
+    }
+
+    #[test]
+    fn an_empty_or_relative_home_gives_no_config_dir() {
+        for home in ["", "rel", "./x"] {
+            assert!(resolve_with(&[("HOME", home)]).is_err(), "HOME={home:?}");
+        }
+        assert!(resolve_with(&[("XDG_CONFIG_HOME", "rel"), ("HOME", "")]).is_err());
+        assert_eq!(
+            resolve_with(&[("HOME", "/home/u")]),
+            Ok(PathBuf::from("/home/u/.config/eitri"))
+        );
     }
 
     #[test]

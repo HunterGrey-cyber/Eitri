@@ -528,6 +528,13 @@ impl TrustGate {
         self.jobs = None;
     }
 
+    /// Every prompt the gate holds is forgotten, as if each check had come without one: asking then
+    /// shows nothing ([`Asked::Unavailable`]).
+    #[cfg(test)]
+    pub(crate) fn lose_prompts(&mut self) {
+        self.prompts.clear();
+    }
+
     /// A gate with no worker: the test reads the jobs it queues and hands it the results itself.
     #[cfg(any(test, feature = "test-support"))]
     fn detached(root: PathBuf) -> (TrustGate, mpsc::Receiver<Job>, DoneSender) {

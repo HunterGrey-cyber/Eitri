@@ -790,8 +790,7 @@ pub(super) fn handle_inbound_message(
                         );
                     }
                     // `tabs` and the (empty) tab's own state, in the page that shows it.
-                    let (shown_in, payloads) = shown_payloads(state, tab);
-                    out.send_all(shown_in, payloads);
+                    shown_payloads(state, tab, &mut out);
                     send_hello_if_open_sessions_changed(state, &mut out);
                     report_attention(state, before, &mut out);
                     match resumed {

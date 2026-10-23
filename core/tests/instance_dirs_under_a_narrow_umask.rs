@@ -63,6 +63,12 @@ fn every_instance_directory_is_exactly_private_under_umask_0277() {
     let shim = Path::new("/bin/sh");
     let switch = PaneSwitchChannel::bind(shim).expect("the pane switch binds under umask 0277");
 
+    let scratch =
+        eitri_core::scratch::ScratchDir::in_dir(&tmp).expect("the scratch directory is made under umask 0277");
+    assert_eq!(mode(scratch.path()), 0o700, "scratch");
+    std::fs::write(scratch.path().join("probe"), b"x").expect("a draft can be written in it");
+    std::fs::remove_dir_all(scratch.path()).unwrap();
+
     usable("editor context", editor.socket_path());
     usable("nvim keys", keys.socket_path());
     usable("theme", theme.socket_path());

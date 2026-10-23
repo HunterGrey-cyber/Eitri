@@ -22,7 +22,7 @@
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -118,6 +118,13 @@ mod test_override {
         pub(super) fn path(&self) -> &std::path::Path {
             &self.0
         }
+
+        /// The same redirect on another thread, for a test that runs an acquire there; it leaves the
+        /// directory to the guard that made it.
+        pub(super) fn at(dir: PathBuf) -> SharedLeasesDir {
+            LEASES_DIR.with(|slot| *slot.borrow_mut() = Some(dir));
+            SharedLeasesDir
+        }
     }
 
     impl Drop for IsolatedLeasesDir {
@@ -125,6 +132,30 @@ mod test_override {
             LEASES_DIR.with(|slot| *slot.borrow_mut() = None);
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    pub(super) struct SharedLeasesDir;
+
+    impl Drop for SharedLeasesDir {
+        fn drop(&mut self) {
+            LEASES_DIR.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+}
+
+/// Refuses anything but a regular file owned by this process's effective user, read from the open
+/// handle, so what is checked is what is locked and written.
+fn require_own_regular_file(file: &File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if meta.is_file() && meta.uid() == unsafe { libc::geteuid() } {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a regular file of this user", path.display()),
+        ))
     }
 }
 
@@ -161,12 +192,18 @@ impl SessionLease {
         let key = lease_key_hash(provider, canonical_cwd, provider_session_id);
         let path = dir.join(format!("{key}.lock"));
 
+        // The file is truncated and written once locked, so it must be this user's own regular file:
+        // a link in its place is not followed (it would truncate whatever it names), and a FIFO fails
+        // at once rather than blocking the open.
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
+            .mode(crate::private_fs::PRIVATE_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&path)
             .map_err(LeaseError::Io)?;
+        require_own_regular_file(&file, &path).map_err(LeaseError::Io)?;
 
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -232,7 +269,11 @@ impl SessionLease {
             "{}.lock",
             lease_key_hash(provider, canonical_cwd, provider_session_id)
         ));
-        let file = match OpenOptions::new().read(true).open(&path) {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
@@ -432,6 +473,49 @@ mod tests {
         let mode = std::fs::metadata(isolated.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "lease directory mode was {mode:o}");
         drop(lease);
+    }
+
+    /// A link planted at a lease's path is not followed: the file it names is neither locked nor
+    /// truncated.
+    #[test]
+    fn a_link_in_a_leases_place_is_refused_and_its_target_left_alone() {
+        let isolated = IsolatedLeasesDir::new();
+        let target = isolated.path().join("victim.txt");
+        std::fs::write(&target, b"keep me").unwrap();
+        let key = lease_key_hash("claude", "/tmp/project", "prov-link");
+        std::os::unix::fs::symlink(&target, isolated.path().join(format!("{key}.lock"))).unwrap();
+        let err = SessionLease::try_acquire("claude", "/tmp/project", "prov-link").unwrap_err();
+        assert!(matches!(err, LeaseError::Io(_)), "{err:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert!(SessionLease::is_held("claude", "/tmp/project", "prov-link").is_err());
+    }
+
+    /// A FIFO at a lease's path fails at once instead of blocking the thread that asked.
+    #[test]
+    fn a_fifo_in_a_leases_place_fails_at_once() {
+        let isolated = IsolatedLeasesDir::new();
+        let key = lease_key_hash("claude", "/tmp/project", "prov-fifo");
+        let fifo = std::ffi::CString::new(
+            isolated
+                .path()
+                .join(format!("{key}.lock"))
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = isolated.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _isolated_here = test_override::IsolatedLeasesDir::at(dir);
+            let _ = tx.send(SessionLease::try_acquire("claude", "/tmp/project", "prov-fifo").is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true),
+            "the acquire must fail, and at once"
+        );
     }
 
     #[test]

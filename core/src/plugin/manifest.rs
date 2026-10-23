@@ -555,10 +555,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
 
     let mut settings = BTreeMap::new();
     for (name, setting) in &raw.settings {
-        if !name_ok(name) || name == "plugin" {
+        // `key` and `position` are options `eitri.plugin.load` reads itself, so a setting of either name
+        // could never be given a value.
+        if !name_ok(name) || matches!(name.as_str(), "plugin" | "key" | "position") {
             return fail(
                 &format!("settings.{name}"),
-                "a setting name is [a-z][a-z0-9_]*, at most 32, not plugin".into(),
+                "a setting name is [a-z][a-z0-9_]*, at most 32, not plugin, key or position".into(),
             );
         }
         let kind = match setting.kind.as_str() {
@@ -1050,7 +1052,24 @@ mod tests {
                 "origin",
             ),
             ("[vars.exercise]", "[vars.work]", "work"),
-            ("[settings]\nwork", "[settings]\nplugin", "plugin"),
+            // Added beside `work`, so the error can only be about the name ("plugin" alone is in every error's
+            // `eitri-plugin.toml`). `eitri.plugin.load` reads `key` and `position` itself, so a setting of
+            // either name could never be set.
+            (
+                "[settings]\nwork",
+                "[settings]\nplugin = { default = false, kind = \"bool\" }\nwork",
+                "settings.plugin",
+            ),
+            (
+                "[settings]\nwork",
+                "[settings]\nkey = { default = false, kind = \"bool\" }\nwork",
+                "settings.key",
+            ),
+            (
+                "[settings]\nwork",
+                "[settings]\nposition = { default = false, kind = \"bool\" }\nwork",
+                "settings.position",
+            ),
         ];
         for (from, to, named) in cases {
             assert!(EXAMPLE.contains(from), "the example has no {from:?}");

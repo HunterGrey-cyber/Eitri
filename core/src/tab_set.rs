@@ -1113,6 +1113,9 @@ pub struct TabSet {
     next_id: u64,
     kind: BackendKind,
     default_mode: SessionModeChoice,
+    /// The agent a tab the set opens by itself runs (the base view's fresh tab once its last one
+    /// left): Claude until `agent.default` is applied ([`TabSet::apply_configured_agent`]).
+    configured_agent: AgentId,
     /// An "enter bypass" prompt on screen, if any: at most one at a time, a fresh press on the
     /// mode key (or any tab-switching call) superseding or dropping whatever was open.
     pending_bypass: Option<BypassPlan>,
@@ -1244,6 +1247,7 @@ impl TabSet {
             next_id: 1,
             kind,
             default_mode,
+            configured_agent: AgentId::Claude,
             pending_bypass: None,
             next_nonce: 1,
             next_steer: 1,
@@ -1790,7 +1794,7 @@ impl TabSet {
             self.pending_bypass = None;
         }
         if !self.tabs.iter().any(|t| t.view.is_base()) {
-            self.open(AgentId::Claude);
+            self.open(self.configured_agent.clone());
             self.last_active = None;
         } else if self.active == id {
             let fallback = self
@@ -4277,6 +4281,7 @@ impl TabSet {
     /// startup to the tabs that exist by then and have not started: a tab's agent is fixed from the
     /// first message on, so a started or named tab keeps its own.
     pub fn apply_configured_agent(&mut self, agent: AgentId) {
+        self.configured_agent = agent.clone();
         let empty: Vec<usize> = self
             .tabs
             .iter()
@@ -5437,6 +5442,23 @@ mod tests {
         }
         assert_eq!(set.tabs().len(), 1, "the panel is never tab-less");
         assert_eq!(set.active_tab().number, 1);
+    }
+
+    /// The fresh tab the last close opens runs the configured `agent.default`, as every other tab made
+    /// without naming an agent does.
+    #[test]
+    fn the_last_close_opens_a_tab_of_the_configured_agent() {
+        let mut set = set();
+        set.apply_configured_agent(AgentId::Codex);
+        let one = set.active();
+        assert_eq!(set.active_tab().agent(), &AgentId::Codex);
+        set.remove(one).unwrap();
+        assert_eq!(set.tabs().len(), 1);
+        assert_eq!(
+            set.active_tab().agent(),
+            &AgentId::Codex,
+            "the fresh tab runs the default agent"
+        );
     }
 
     #[test]

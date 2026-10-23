@@ -678,6 +678,41 @@ fn limits_fail_visibly() {
     );
 }
 
+/// The project's `info/exclude` is the project's to shape: a FIFO in its place fails the snapshot at
+/// once instead of holding it (and the store's lock) for good, and a link to an endless file fails it
+/// instead of reading until memory runs out.
+#[test]
+fn a_project_exclude_that_is_no_regular_file_fails_the_snapshot_at_once() {
+    let _env = environment();
+    for (name, make) in [("fifo", "fifo"), ("dev-zero", "link")] {
+        let scratch = Scratch::new(&format!("exclude-{name}"));
+        let project = scratch.project();
+        tgit(&project, &["init", "-q"]);
+        write(&project.join("a.txt"), b"one\n");
+        let exclude = project.join(".git/info/exclude");
+        let _ = std::fs::remove_file(&exclude);
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        if make == "fifo" {
+            let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(exclude.as_os_str())).unwrap();
+            // SAFETY: a valid NUL-terminated path for the call.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        } else {
+            std::os::unix::fs::symlink("/dev/zero", &exclude).unwrap();
+        }
+        let shadow = scratch.shadow(&project);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = shadow.snapshot(SESSION, &label(1, SnapshotKind::Base, 1), &Limits::default());
+            let _ = tx.send(matches!(outcome, SnapshotOutcome::Unavailable(_)));
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(30)),
+            Ok(true),
+            "{name}: the snapshot must fail, and at once"
+        );
+    }
+}
+
 #[test]
 fn a_non_git_project_and_a_linked_worktree() {
     let _env = environment();
