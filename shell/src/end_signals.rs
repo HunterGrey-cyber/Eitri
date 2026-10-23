@@ -14,9 +14,9 @@
 //! it marks the signal answered and calls the window's handler, which starts the close. A watchdog thread with a
 //! context of its own listens too, so a signal still ends the process when the GTK thread cannot answer (blocked
 //! in a call that does not return, for one): [`decide`] ends it with `_exit(128 + signal)` when the window has not
-//! answered the first signal within [`ANSWER_WITHIN`], or when a second signal arrives while the first is still
+//! answered the first signal within [`ANSWER_WITHIN`](eitri_core::wm::end_signals::ANSWER_WITHIN), or when a second signal arrives while the first is still
 //! unanswered or a close is already under way -- the second `Ctrl+C` forces, as in most programs -- or when a
-//! close the window started for one answered signal is still running [`CLOSE_WITHIN`] after it (a GTK thread that
+//! close the window started for one answered signal is still running [`CLOSE_WITHIN`](eitri_core::wm::end_signals::CLOSE_WITHIN) after it (a GTK thread that
 //! blocked in the close, writing to a pipe whose reader stopped, for one). That hard path runs no teardown: nvim
 //! is not ended by its pid, the agent's children are not shut down, and an nvim that was in the state above stays
 //! behind, as it does after `SIGKILL` or a crash. One signal answered in time takes the close and nothing else
@@ -26,7 +26,7 @@
 //!
 //! **Order.** GLib hands a signal only to the sources that exist when it arrives, so [`install`] starts the
 //! watchdog and waits until its sources are attached before it adds the window's. A signal in between reaches the
-//! watchdog alone and ends the process after [`ANSWER_WITHIN`] -- no worse than the instant end the default action
+//! watchdog alone and ends the process after [`ANSWER_WITHIN`](eitri_core::wm::end_signals::ANSWER_WITHIN) -- no worse than the instant end the default action
 //! gave -- and every signal after `install` reaches both. The other order could hand a signal to the window's
 //! listener alone, and a GTK thread that then blocked before running it would never end.
 //!
@@ -48,7 +48,7 @@
 //! `g_unix_signal_add_full` and `g_unix_signal_source_new` itself, as `neovide_editor`'s `fd_watch` calls
 //! `g_unix_fd_add_full`; the window's closure is wrapped in a [`ThreadGuard`] for the same reason it gives.
 
-use eitri_core::wm::end_signals::{decide, Outcome, Watch, ANSWER_WITHIN, CLOSE_WITHIN};
+use eitri_core::wm::end_signals::{decide, Outcome, Watch};
 
 use std::io::Write;
 use std::os::fd::RawFd;

@@ -26,26 +26,6 @@ pub enum V1Node {
 }
 
 impl V1Node {
-    pub fn split(axis: Axis, ratio: f32, first: V1Node, second: V1Node) -> V1Node {
-        V1Node::Split {
-            axis,
-            ratio,
-            pin: None,
-            first: Box::new(first),
-            second: Box::new(second),
-        }
-    }
-
-    pub fn pinned(axis: Axis, ratio: f32, side: Branch, first: V1Node, second: V1Node) -> V1Node {
-        V1Node::Split {
-            axis,
-            ratio,
-            pin: Some(V1Pin { side, px: None }),
-            first: Box::new(first),
-            second: Box::new(second),
-        }
-    }
-
     pub fn leaves(&self) -> Vec<ModuleId> {
         let mut out = Vec::new();
         self.collect_leaves(&mut out);
@@ -59,25 +39,6 @@ impl V1Node {
                 first.collect_leaves(out);
                 second.collect_leaves(out);
             }
-        }
-    }
-
-    fn ratios(&self, out: &mut Vec<f32>) {
-        if let V1Node::Split {
-            ratio, first, second, ..
-        } = self
-        {
-            out.push(*ratio);
-            first.ratios(out);
-            second.ratios(out);
-        }
-    }
-
-    fn pins(&self, out: &mut Vec<V1Pin>) {
-        if let V1Node::Split { pin, first, second, .. } = self {
-            out.extend(*pin);
-            first.pins(out);
-            second.pins(out);
         }
     }
 
@@ -107,70 +68,6 @@ impl V1Node {
                 Branch::Second => second.at_path_mut(rest),
             },
             (Some(_), V1Node::Leaf(_)) => None,
-        }
-    }
-
-    pub(crate) fn without(self, id: &ModuleId) -> Option<V1Node> {
-        match self {
-            V1Node::Leaf(leaf) if leaf == *id => None,
-            V1Node::Leaf(leaf) => Some(V1Node::Leaf(leaf)),
-            V1Node::Split {
-                axis,
-                ratio,
-                pin,
-                first,
-                second,
-            } => match (first.without(id), second.without(id)) {
-                (Some(first), Some(second)) => Some(V1Node::Split {
-                    axis,
-                    ratio,
-                    pin,
-                    first: Box::new(first),
-                    second: Box::new(second),
-                }),
-                (Some(only), None) | (None, Some(only)) => Some(only),
-                (None, None) => None,
-            },
-        }
-    }
-
-    pub(crate) fn swap_leaves(&mut self, a: &ModuleId, b: &ModuleId) {
-        match self {
-            V1Node::Leaf(id) if id == a => *id = b.clone(),
-            V1Node::Leaf(id) if id == b => *id = a.clone(),
-            V1Node::Leaf(_) => {}
-            V1Node::Split { first, second, .. } => {
-                first.swap_leaves(a, b);
-                second.swap_leaves(a, b);
-            }
-        }
-    }
-
-    pub(crate) fn map_leaves(&mut self, f: &dyn Fn(&ModuleId) -> ModuleId) {
-        match self {
-            V1Node::Leaf(id) => *id = f(id),
-            V1Node::Split { first, second, .. } => {
-                first.map_leaves(f);
-                second.map_leaves(f);
-            }
-        }
-    }
-
-    pub(crate) fn replace_leaf(&mut self, id: &ModuleId, with: impl FnOnce(V1Node) -> V1Node) -> bool {
-        match self {
-            V1Node::Leaf(leaf) if leaf == id => {
-                let old = std::mem::replace(self, V1Node::Leaf(id.clone()));
-                *self = with(old);
-                true
-            }
-            V1Node::Leaf(_) => false,
-            V1Node::Split { first, second, .. } => {
-                if first.leaves().contains(id) {
-                    first.replace_leaf(id, with)
-                } else {
-                    second.replace_leaf(id, with)
-                }
-            }
         }
     }
 }
