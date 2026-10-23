@@ -103,14 +103,12 @@ fn claude_resolved_from_inherited_path_accepts_the_products_gate_bearing_setting
         output.status.success(),
         "the `claude` this environment's inherited PATH resolves to REFUSED the product's own \
          gate-bearing --settings flag (exit {:?}).\nstderr: {}\nstdout: {}\n\n\
-         This is exactly the 2026-09-18 launcher-collision bug: something on PATH ahead of the \
+         This is a launcher collision: something on PATH ahead of the \
          real CLI owns --settings for its own purposes and refuses a caller's use of it. Every \
          Auto-mode session on this host will die before opening until that is resolved -- see \
          agent::process's preflight check (`preflight_gate_flag_is_accepted`), which exists to \
-         catch this before a real spawn rather than let a session fail silently, and \
-         agent/tests/environment_conformance.rs's module doc, which \
-         carries the note on the production/PATH binary split that poc/tools/work-claude.sh \
-         (deleted 2026-09-19) used to carry.",
+         catch this before a real spawn rather than let a session fail silently. Run the \
+         production binary by its resolved path, not whatever PATH finds first.",
         output.status,
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),

@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(keys.module('e'), Some(&ModuleId::editor()));
         assert_eq!(keys.module('a'), Some(&ModuleId::agent()));
         assert_eq!(keys.module('t'), Some(&ModuleId::terminal()));
-        assert_eq!(keys.module('v'), None, "the canvas's key arrives with the canvas (P3)");
+        assert_eq!(keys.module('v'), None, "the canvas's key arrives with the canvas");
         assert!(keys.lua_keys().is_empty());
     }
 

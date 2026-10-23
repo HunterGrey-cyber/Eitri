@@ -293,7 +293,7 @@ class ReleaseFieldsTests(unittest.TestCase):
 # --- 2. Asset names --------------------------------------------------------------------
 
 class AssetNameTests(unittest.TestCase):
-    def test_the_nine_names_of_spec_section_4_3(self):
+    def test_the_nine_release_asset_names(self):
         names = rc.asset_names("1.0.0-rc.1", "a2f194a")
         self.assertEqual(names, [
             "eitri-1.0.0-rc.1-x86_64-linux.tar.gz",
@@ -2047,7 +2047,7 @@ class RewritesNoOpTests(unittest.TestCase):
             self.assertNotIn(
                 rc.SEA_SENTINEL.encode("ascii"), content,
                 f"the joined SEA sentinel literal must not appear in {os.path.relpath(path, _PACKAGING)} "
-                "(M5) -- it would flag the Eitri source asset's own copy of this file",
+                "-- it would flag the Eitri source asset's own copy of this file",
             )
 
 

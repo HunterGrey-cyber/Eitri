@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn w1_every_workspace_gains_and_loses_an_instance() {
+    fn every_workspace_gains_and_loses_an_instance() {
         let id = ModuleId::parse("terminal#2").unwrap();
         let mut ws = Workspaces::from_parts(
             names(&["main", "study"]),

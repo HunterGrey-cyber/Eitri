@@ -218,8 +218,8 @@ fn main() {
         assert_eq!(
             harness.scale_factor_resyncs(),
             resyncs_before_idle,
-            "apply_scale_factor_setting resynced the renderer with nothing assigned -- the P11-class \
-             idle-cost regression the change gate exists to prevent"
+            "apply_scale_factor_setting resynced the renderer with nothing assigned -- the idle-cost \
+             regression the change gate exists to prevent"
         );
     }
     println!("ok: an unchanged variable leaves the editor alone (resync counter held at {resyncs_before_idle})");

@@ -2503,7 +2503,8 @@ mod tests {
         assert_eq!(
             REMAP_RENDER_DELAY,
             Duration::from_millis(50),
-            "S3's measured fix; another delay, or a frame-clock tick, needs the same 50-cycle check first"
+            "the measured fix (50 re-shows of 50 right); another delay, or a frame-clock tick, needs the same \
+             50-cycle check first"
         );
         let _serial = crate::DEFAULT_CONTEXT_TEST_LOCK
             .lock()
@@ -2527,7 +2528,7 @@ mod tests {
         assert_eq!(
             renders.get(),
             0,
-            "nothing in the turn the show happens in: it would coalesce into the first frame (S3: 6/8)"
+            "nothing in the turn the show happens in: it would coalesce into the first frame (6 of 8 right)"
         );
         while renders.get() == 0 && start.elapsed() < Duration::from_secs(2) {
             context.iteration(true);

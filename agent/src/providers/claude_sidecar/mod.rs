@@ -1733,7 +1733,7 @@ mod tests {
             assert_eq!(
                 policy.permissions,
                 ProtoPermissionMode::Interactive as i32,
-                "{shape}: every session is gated (R07)"
+                "{shape}: every session is gated"
             );
             assert!(
                 !policy.permission_mode_switchable,
@@ -2128,11 +2128,11 @@ mod tests {
         );
         assert!(
             capabilities.bypass_permission_mode,
-            "bypass is advertised -- a reported fact only, never requested since R07"
+            "bypass is advertised -- a reported fact only, never requested"
         );
         assert!(
             capabilities.interactive_permission_mode,
-            "interactive is advertised, and is the only policy any session is created under (R07)"
+            "interactive is advertised, and is the only policy any session is created under"
         );
         assert!(
             capabilities.resume,

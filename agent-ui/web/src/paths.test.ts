@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parsePath, pathsIn, viewText } from "./paths";
 import type { TimelineItem } from "./timeline";
 
-describe("N2 paths", () => {
+describe("the paths a card or row offers to open", () => {
   const acpInput = (path = "notes.txt") => ({
     diffs: [{ type: "diff", path, oldText: "one\ntwo\nthree\n", newText: "one\nTWO (edited)\nthree\nfour\n" }],
   });
@@ -76,7 +76,7 @@ describe("N2 paths", () => {
     expect(view.text).toBe(`$ make\n\n\`\`\`\n${long}\n\`\`\``);
   });
 
-  it("fences a tool's output, so the markdown scratch buffer shows it as it was (GUI pass 2026-09-25)", () => {
+  it("fences a tool's output, so the markdown scratch buffer shows it as it was", () => {
     // Seen in the sandbox: `crate_1` ... `crate_2` across lines drew as italics in nvim's markdown
     // highlighting, because the output went into the `.md` buffer bare. A fence longer than any
     // backtick run inside keeps the output literal, backticks included.

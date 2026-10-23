@@ -326,7 +326,7 @@ describe("installDispatch", () => {
     });
   });
 
-  it("passes every phase 3 envelope through the whitelist", () => {
+  it("passes every queue, draft, history, rule-offer, editor and scratch envelope through the whitelist", () => {
     const handler = vi.fn();
     installDispatch(handler);
     const envelopes = [
@@ -348,7 +348,7 @@ describe("installDispatch", () => {
 /* The exact wire strings `panel_keys`/`nav_fallthrough`
    serialise to, byte for byte -- a core test pins the same five, so the two sides can
    never silently drift apart on field order or spelling. */
-describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly (Interfaces block)", () => {
+describe("OutboundMessage: panel_keys and nav_fallthrough serialise exactly", () => {
   it.each<[OutboundMessage, string]>([
     [{ type: "panel_keys", request_id: "req-7", mode: "browse" }, '{"type":"panel_keys","request_id":"req-7","mode":"browse"}'],
     [{ type: "panel_keys", request_id: "req-8", mode: "input" }, '{"type":"panel_keys","request_id":"req-8","mode":"input"}'],

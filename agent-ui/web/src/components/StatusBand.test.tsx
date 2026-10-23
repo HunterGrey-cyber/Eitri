@@ -185,7 +185,7 @@ function renderNarrow(facts: BandFacts) {
   return rendered;
 }
 
-it("defect 1: a bypass prompt too wide for the band wraps instead of truncating, (y/n) intact", () => {
+it("a bypass prompt too wide for the band wraps instead of truncating, (y/n) intact", () => {
   const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
   const { container } = renderNarrow({ ...RUNNING, prompt: R06_PROMPT, message: null });
   expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(true);
@@ -194,7 +194,7 @@ it("defect 1: a bypass prompt too wide for the band wraps instead of truncating,
   expect(prompt.textContent).not.toContain("…");
 });
 
-it("the flash is not truncated either, and wraps the band", () => {
+it("the flash that explains y is not truncated either, and wraps the band", () => {
   const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
   const { container } = renderNarrow({ ...RUNNING, prompt: null, message: D11_FLASH });
   expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(true);
@@ -203,7 +203,7 @@ it("the flash is not truncated either, and wraps the band", () => {
   expect(message.textContent).not.toContain("…");
 });
 
-it("defect 1: a short prompt does not switch the band into wrap mode -- it still fits one row", () => {
+it("a short prompt does not switch the band into wrap mode -- it still fits one row", () => {
   const { container } = renderNarrow({ ...RUNNING, prompt: 'close 1 "docs"? (y/n)', message: null });
   expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(false);
   expect(container.querySelector(".band-prompt")!.textContent).toBe('close 1 "docs"? (y/n)');

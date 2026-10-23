@@ -6219,7 +6219,7 @@ mod tests {
         }
         assert!(
             parse_inbound_message(r#"{"type":"start_session","request_id":"a","mode":"auto"}"#).is_none(),
-            "start_session is gone"
+            "start_session is gone: the first message starts the session"
         );
     }
 

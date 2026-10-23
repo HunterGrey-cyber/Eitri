@@ -35,7 +35,7 @@ it("draws a trailing Continue in a terminal row only when onHandoff is given, an
   expect(onHandoff).toHaveBeenCalledTimes(1);
 });
 
-it("keeps the current row in view as j/k move it (the phase-3 GUI pass, 2026-09-25)", () => {
+it("keeps the current row in view as j/k move it", () => {
   // When the table outgrows a short panel, `j` must keep the selected row visible rather than walking the
   // highlight off the bottom with nothing scrolling after it.
   const calls: Element[] = [];

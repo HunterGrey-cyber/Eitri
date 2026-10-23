@@ -399,7 +399,7 @@ fn a_users_own_ask_rule_still_stops_an_edit_the_gate_allowed() {
     assert!(
         !target.exists(),
         "{} exists: the CLI took the hook's allow over the user's own ask rule `Edit(probe-asked.txt)`, \
-         so under item 4A that rule no longer protects an in-project edit on the legacy backend",
+         so that rule no longer protects an in-project edit on the legacy backend",
         target.display()
     );
     let _ = std::fs::remove_dir_all(&workspace);

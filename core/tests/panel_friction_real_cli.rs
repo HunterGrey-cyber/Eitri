@@ -189,7 +189,7 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
     // Auto offers Bash, so an inconclusive probe here means the model chose not to call it.
     assert!(
         ran_bash,
-        "no Bash call reached the gate, so a rule was not shown answering anything \
+        "no Bash call reached the gate, so a project rule was not shown answering anything \
          (check agent::disallowed_tools() still offers Bash)"
     );
 

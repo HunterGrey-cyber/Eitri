@@ -134,11 +134,10 @@ fn no_toolkit_in_the_normal_dependency_closure_of_the_toolkit_free_crates() {
 
     assert!(
         failures.is_empty(),
-        "F1 (\"no toolkit below the shell\"): the normal-dependency closure of a toolkit-free crate \
+        "no toolkit below the shell: the normal-dependency closure of a toolkit-free crate \
          reaches a GTK/GDK/GLib/WebKit package:\n{}\n\
          eitri-core, agent, eitri-terminal and the four terminal-{{render,frame,sync,input}} \
-         crates must build and link on a host with no GTK (the macOS track's M1/M2 depend on this; \
-         the macOS host is built from these crates).",
+         crates must build and link on a host with no GTK (the macOS host depends on this).",
         {
             let mut sorted: Vec<&String> = failures.iter().collect();
             sorted.sort();

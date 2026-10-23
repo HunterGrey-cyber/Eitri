@@ -184,7 +184,7 @@ function stampedCtrlY(type: "keydown" | "keyup", stamp: number): KeyboardEvent {
   return event;
 }
 
-describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
+describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     widen = stubBandWidth();
@@ -377,7 +377,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
     });
   });
 
-  describe("rule 3: the S1 typing guard", () => {
+  describe("the typing guard", () => {
     it.each([
       ["Ctrl+u", "u"],
       ["Ctrl+w", "w"],
@@ -485,7 +485,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
   });
 
   /* Cases where a delayed approval must refuse a changed target or preserve a yank. */
-  describe("Ctrl+y guards against changed cards and recent yanks", () => {
+  describe("the answer window and the yank guard", () => {
     const TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, then press again";
     const YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
 
@@ -656,7 +656,7 @@ describe("#39: INPUT Ctrl+y approves the active tab's oldest waiting card", () =
       expect(answered()).toEqual([]);
     });
 
-    it("A8: the card resolved by the provider and a new one arriving inside the window approves nothing", () => {
+    it("the card resolved by the provider and a new one arriving inside the window approves nothing", () => {
       const { box } = inInput(1);
       ctrlY(box);
       wait(100);

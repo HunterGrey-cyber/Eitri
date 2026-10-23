@@ -14,7 +14,7 @@ const rows: TimelineItem[] = [
   { kind: "permission", seq: 4, key: "p-4", request: { seq: 4, permissionId: "p", toolUseId: null, toolName: "Write", input: { file_path: "src/parser.rs" } } },
 ];
 
-describe("R4 search", () => {
+describe("search", () => {
   it("reads what each row shows: text, a tool's input and result, a card's tool and input", () => {
     expect(rowSearchText(rows[0])).toBe("Fix the parser");
     expect(rowSearchText(rows[2])).toContain("cargo test");

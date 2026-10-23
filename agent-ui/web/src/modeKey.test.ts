@@ -25,7 +25,7 @@ describe("isModeCycleKey", () => {
   });
 });
 
-describe("modeKeyRoute (no canSwitch; ended/failed tabs stay fixed unless in bypass)", () => {
+describe("modeKeyRoute (no canSwitch; an ended or failed tab already in bypass is the exception)", () => {
   const base = { confirmOpen: false, chooserOpen: false, tabState: "not_started" as const, tabMode: "auto" as const };
 
   it("always cycles a not_started, starting, awaiting_trust or live tab", () => {

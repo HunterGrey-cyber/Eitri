@@ -121,7 +121,7 @@ describe("EmptyTab: the box is the dashboard's New session row", () => {
   });
 });
 
-describe("EmptyTab: requests are edges, not levels (GUI pass 2026-09-26, r2-gui)", () => {
+describe("EmptyTab: requests are edges, not levels", () => {
   it("an arrival counted before it mounted is not one: it mounts where it was landed", () => {
     // The window's counters outlive any one tab: a new tab mounts with whatever `arrive` count the
     // window reached long ago, and that count is not a request to this tab.
@@ -148,7 +148,7 @@ describe("EmptyTab: requests are edges, not levels (GUI pass 2026-09-26, r2-gui)
   });
 });
 
-describe("EmptyTab (F3)", () => {
+describe("EmptyTab", () => {
   it("is Claude Code's fresh prompt: a live composer, with the dashboard drawn under it", () => {
     // The mode pill moved into the footer `App.tsx` draws; see `App.test.tsx`'s
     // "draws the empty tab's close prompt in the footer" for where it is covered now.
@@ -310,7 +310,7 @@ describe("EmptyTab (F3)", () => {
 
     /** This screen had never grown `o`, the live tab's own
      *  exact alias of `i` (`keymap.ts:284-292`) -- only `i` opened the composer here. */
-    it("o is an exact alias of i (C1a)", () => {
+    it("o is an exact alias of i", () => {
       const rendered = renderEmpty();
       const { props, container } = rendered;
       const root = toBrowse(rendered, props);
@@ -324,7 +324,7 @@ describe("EmptyTab (F3)", () => {
      *  the very first screen a new user sees. Round trip mirrors `Composer`'s own suite: `i` leaves
      *  the caret at 3 of "hello world", `Escape` returns to BROWSE, and `A` must move it to 11
      *  regardless of where it was left (never simply "kept", which `i` already covers above). */
-    it("A opens the composer with the caret forced to the end, not wherever i last left it (C1a)", () => {
+    it("A opens the composer with the caret forced to the end, not wherever i last left it", () => {
       const rendered = renderEmpty();
       const { props, container } = rendered;
       const root = toBrowse(rendered, props);
@@ -439,7 +439,7 @@ describe("EmptyTab (F3)", () => {
       });
     });
 
-    it("w opens the chooser, TYPING_GUARD_MS later", () => {
+    it("w opens the chooser (All sessions), TYPING_GUARD_MS later", () => {
       vi.useFakeTimers();
       try {
         const onChooseSessions = vi.fn();
@@ -642,7 +642,7 @@ describe("EmptyTab (F3)", () => {
        *  intercepted every keydown unconditionally, ahead of the pending-sequence check -- so once
        *  `<leader>` (Space) armed a sequence, the very next `f` was stolen by HINT instead of
        *  continuing it, and the advertised `<leader>fn` (new tab) binding could never complete. */
-      it("codex-release-p1 #5: Space f n completes <leader>fn instead of f stealing HINT mid-sequence", () => {
+      it("Space f n completes <leader>fn instead of f stealing HINT mid-sequence", () => {
         const onPanelAction = vi.fn();
         const onHint = vi.fn();
         const rendered = renderEmpty({ panelTable: TABLE, onPanelAction, onHint });
@@ -741,7 +741,7 @@ describe("EmptyTab (F3)", () => {
         fireEvent.keyDown(root, { key: "b" });
         expect(onPanelAction).toHaveBeenCalledTimes(2);
       });
-      it("K01: a reserved prefix swallows a key with no pair: g then i opens no composer", () => {
+      it("a reserved prefix swallows a key with no pair: g then i opens no composer", () => {
         const rendered = renderEmpty({ panelTable: TABLE, onPanelAction: vi.fn() });
         const root = toBrowse(rendered, rendered.props);
         fireEvent.keyDown(root, { key: "g" });
@@ -755,7 +755,7 @@ describe("EmptyTab (F3)", () => {
          window's document-capture router stops before this handler, an overlay, a tab switch --
          left its prefix and leader waiting, so `g`, Shift+Tab, `i` swallowed the `i`. The window
          now says so through `dropKeysRequest`. */
-      it("K01: dropKeysRequest drops a waiting prefix and a leader sequence", () => {
+      it("dropKeysRequest drops a waiting prefix and a leader sequence", () => {
         vi.useFakeTimers();
         try {
           const onPanelAction = vi.fn();
@@ -786,7 +786,7 @@ describe("EmptyTab (F3)", () => {
           vi.useRealTimers();
         }
       });
-      it("K01: g, a pause, then f starts no HINT, and an input method's key drops the prefix", () => {
+      it("g, a pause, then f starts no HINT, and an input method's key drops the prefix", () => {
         vi.useFakeTimers();
         try {
           const onHint = vi.fn();
@@ -968,7 +968,7 @@ describe("EmptyTab (F3)", () => {
        *  wait), so it still ran once `TYPING_GUARD_MS` elapsed. The same cancellation is needed
        *  on `App.tsx`'s copy: replacing the table must prevent a delayed single-key callback
        *  from running a stale binding. */
-      it("replacing the table mid-guard-window drops the deferred H binding entirely (P2-A6)", () => {
+      it("replacing the table mid-guard-window drops the deferred H binding entirely", () => {
         vi.useFakeTimers();
         try {
           const onPanelAction = vi.fn();
@@ -1063,7 +1063,7 @@ describe("EmptyTab (F3)", () => {
    *  a bare `m`, with none of the typed-text guard the rest of the panel now has around a move
    *  into bypass. `App.tsx`'s document-capture Shift+Tab router is the only way in now; this screen
    *  never dispatches on the letter at all any more, at any timing. */
-  describe("v1 mode: S2 via the prompt", () => {
+  describe("mode change goes through the prompt, with no bare m on the dashboard", () => {
     it("m in the menu posts nothing", () => {
       const rendered = renderEmpty();
       const { props } = rendered;
@@ -1409,7 +1409,7 @@ describe("EmptyTab: navKeyRequest", () => {
 /* A tab failing while its composer holds the keys hands them to this screen's own
    root, in BROWSE, rather than leaving them in a disabled textarea for WebKit's focus fix-up to drop
    on <body>. */
-describe("EmptyTab: K04, a failure while the composer has the keys", () => {
+describe("EmptyTab: a failure while the composer has the keys", () => {
   it("focuses the root and reports BROWSE when the tab turns failed", () => {
     const onModeChange = vi.fn();
     const rendered = renderEmpty({ tab: { ...TAB, state: "starting" }, onModeChange, focusRequest: 1 });
@@ -1437,7 +1437,7 @@ describe("EmptyTab: K04, a failure while the composer has the keys", () => {
    stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a `y` that
    copied the handoff command is typing. This happened right here: "expla" typed on the empty tab lost
    its first letters to the `i` inside "explain". Time is vitest's fake clock. */
-describe("EmptyTab: #26, typing in BROWSE never starts INPUT mid-word", () => {
+describe("EmptyTab: typing in BROWSE never starts INPUT mid-word", () => {
   const HINT = "i or Ctrl+j to type";
   const at = (ms: number) => act(() => vi.advanceTimersByTime(ms));
   function inBrowse(over: Partial<EmptyTabProps> = {}) {

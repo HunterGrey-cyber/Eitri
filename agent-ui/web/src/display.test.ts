@@ -13,7 +13,7 @@ const tool = (c: ToolCallRecord): TimelineItem => ({ kind: "tool", seq: c.seq, k
 const msg = (seq: number): TimelineItem => ({ kind: "message", seq, key: `m-${seq}`, text: "m" });
 const opts = { expanded: {}, detailed: false, turnRunning: false };
 
-describe("P2 runs", () => {
+describe("run summaries", () => {
   it("a_run_of_an_unphrased_tool_keeps_its_name_as_written", () => {
     expect(runSummary([call(1, "acp:read"), call(2, "acp:read"), call(3, "acp:read")])).toBe("acp:read ×3");
     expect(runSummary([call(1, "Read"), call(2, "Read"), call(3, "acp:read")])).toBe("Read 2 files, acp:read ×1");
@@ -49,7 +49,7 @@ describe("P2 runs", () => {
     expect(buildDisplay([tool(call(1, "Read")), tool(call(2, "Bash")), card, msg(4)], opts).map((i) => i.kind)).toEqual(["tool", "tool", "permission", "message"]);
   });
 
-  it("sw-panel-render-5: never folds a failing call behind a run's ✓ sign", () => {
+  it("never folds a failing call behind a run's ✓ sign", () => {
     // Probe lifted from the verdict: `toolCalls [Bash isError:true, Read ok]` followed by a
     // message. Before the fix, buildDisplay's kinds were `['run', 'message']` -- the failing Bash
     // call folded into a run row that draws a fixed `✓` sign (`MessageList.tsx`) and a count-only
@@ -68,7 +68,7 @@ describe("P2 runs", () => {
     expect(shown.map((i) => i.kind)).toEqual(["run", "tool", "message"]);
   });
 
-  it("v1 trial item 7: an edit between reads is never counted into a fold, on either side", () => {
+  it("an edit between reads is never counted into a fold, on either side", () => {
     // 4A (the acceptEdits fast path) auto-allows in-project Write/Edit/NotebookEdit with no card,
     // so nothing else marks an edit as different from an ordinary finished, ungated call -- without
     // this rule it would have folded into "Read 4 files, Edit ×1" and the change would have vanished
@@ -82,14 +82,14 @@ describe("P2 runs", () => {
     expect(runSummary(after.calls)).toBe("Read 2 files");
   });
 
-  it("v1 trial item 7: Write, Edit and NotebookEdit never fold into a count-only run", () => {
+  it("Write, Edit and NotebookEdit never fold into a count-only run", () => {
     const items = [tool(call(1, "Edit")), tool(call(2, "Edit")), tool(call(3, "Edit")), tool(call(4, "Edit")), tool(call(5, "Edit"))];
     const shown = buildDisplay(items, opts);
     expect(shown.map((i) => i.kind)).toEqual(["tool", "tool", "tool", "tool", "tool"]);
     expect(shown.map((i) => (i as Extract<TimelineItem, { kind: "tool" }>).call.toolUseId)).toEqual(["t1", "t2", "t3", "t4", "t5"]);
   });
 
-  it("v1 trial item 7: Write and NotebookEdit stop a fold the same way Edit does", () => {
+  it("Write and NotebookEdit stop a fold the same way Edit does", () => {
     const items = [tool(call(1, "Read")), tool(call(2, "Write")), tool(call(3, "Read")), tool(call(4, "NotebookEdit")), tool(call(5, "Read"))];
     expect(buildDisplay(items, opts).map((i) => i.kind)).toEqual(["tool", "tool", "tool", "tool", "tool"]);
   });

@@ -154,7 +154,7 @@ describe("permissionTarget", () => {
     expect(permissionTarget([{ kind: "tool", toolUseId: "" }, { kind: "permission", toolUseId: "" }], 0)).toBeNull();
   });
 
-  it("never answers the only card from another row", () => {
+  it("never answers the only card from another row (there is no any-row exception)", () => {
     const card: AnswerableItem = { kind: "permission", toolUseId: null };
     const other: AnswerableItem = { kind: "other" };
     expect(permissionTarget([other, card, other], 0)).toBeNull();

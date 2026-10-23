@@ -1090,8 +1090,8 @@ mod tests {
         };
         let unsettled = bottom_tree();
         assert_eq!(height_at(&unsettled, 721), 240, "a third of the default window");
-        assert_eq!(height_at(&unsettled, 1041), 347, "F11 on 1080p, as P1 measured");
-        assert_eq!(height_at(&unsettled, 1080), 360, "immersive, as P1 measured");
+        assert_eq!(height_at(&unsettled, 1041), 347, "F11 on 1080p, as measured");
+        assert_eq!(height_at(&unsettled, 1080), 360, "immersive, as measured");
 
         let mut layout = bottom_tree();
         assert!(settle_pins(&mut layout, &frame()));

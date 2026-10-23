@@ -159,7 +159,7 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
         .expect("an empty tab can always start a bypass entry")
     {
         ModeCycle::Confirm(plan) => plan,
-        ModeCycle::Changed(mode) => panic!("a fresh auto tab must ask first, got Changed({mode:?})"),
+        ModeCycle::Changed(mode) => panic!("a fresh auto tab must ask before bypass, got Changed({mode:?})"),
     };
     assert_eq!(plan.approve.len(), 0, "an empty tab has no cards to approve yet");
     match set
@@ -172,7 +172,7 @@ fn bypass_tab(kind: BackendKind, dir: &std::path::Path) -> (LiveSet, TabId) {
     assert_eq!(
         set.get(tab).unwrap().mode(),
         SessionModeChoice::Bypass,
-        "confirmed before the backend even exists"
+        "bypass confirmed before the backend even exists"
     );
     // Trusted: this measures the real CLI with the project tiers loaded, as it always has.
     let backend = AgentBackend::start(kind, dir, None, agent::setting_sources::ProjectTrust::Trusted)
@@ -600,7 +600,7 @@ fn drive_turn(
         if let Some(t) = out.tripped.into_iter().next() {
             let reason = t.reason.clone();
             t.retired.into_backend().shutdown();
-            panic!("{label}: the tripwire fired before the turn even started: {reason}");
+            panic!("{label}: the CLI-mode tripwire fired before the turn even started: {reason}");
         }
         if set.get(tab).unwrap().turn_running() {
             break;
@@ -617,7 +617,7 @@ fn drive_turn(
         if let Some(t) = out.tripped.into_iter().next() {
             let reason = t.reason.clone();
             t.retired.into_backend().shutdown();
-            panic!("{label}: the tripwire fired mid-turn: {reason}");
+            panic!("{label}: the CLI-mode tripwire fired mid-turn: {reason}");
         }
         if !set.get(tab).unwrap().turn_running() {
             break;
@@ -648,7 +648,7 @@ fn effects_turn(
 fn assert_no_permission_requested(events: &[serde_json::Value], label: &str) {
     assert!(
         !events.iter().any(|e| e["type"] == "permission_requested"),
-        "{label}: bypass must answer every request itself; the panel must never see one (R07/S2): {events:#?}"
+        "{label}: bypass must answer every request itself; the panel must never see one: {events:#?}"
     );
 }
 
@@ -970,7 +970,7 @@ fn host_answer_latency_in_bypass() {
     assert_eq!(
         pairs.len(),
         5,
-        "every Read must be paired with its OWN resolution, by id (Codex finding 2); unpaired Reads mean \
+        "every Read must be paired with its OWN resolution, by id; unpaired Reads mean \
          the measurement is incomplete -- read the raw line above"
     );
     for (tool_use_id, _, _, outcome) in &pairs {
@@ -1625,7 +1625,7 @@ fn protected_paths_under_default_with_hook_allow() {
         );
         assert!(
             ran,
-            "O3: bypass must run a Write to {rel} as a real bypassPermissions session does; results {:?}",
+            "bypass must run a Write to {rel} as a real bypassPermissions session does; results {:?}",
             bypass_trace.completed
         );
         assert_eq!(
@@ -2037,8 +2037,8 @@ fn run_default_mode_probe(kind: BackendKind, default_mode: &str, label: &str) {
         );
     } else if matches!(branch, DefaultModeBranch::Tripped) {
         eprintln!(
-            "[v1-mode] note: {label} tripped the tripwire rather than staying gated -- worth \
-             reporting even though this is the correct fail-closed behaviour, not a bug"
+            "[v1-mode] note: {label} tripped the CLI-mode tripwire rather than staying gated -- worth \
+             reporting even though tripping is the correct fail-closed behaviour, not a bug"
         );
     }
 }

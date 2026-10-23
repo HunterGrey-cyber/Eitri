@@ -622,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn describe_matches_spec_7_wording_for_a_private_win() {
+    fn a_private_win_is_described_as_eitris_own_copy_with_what_path_has() {
         let chosen = Choice::Private {
             path: PathBuf::from("/home/x/.local/share/eitri/nvim/0.11.4/bin/nvim"),
             version: (0, 11, 4),

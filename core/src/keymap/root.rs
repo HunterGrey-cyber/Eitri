@@ -359,14 +359,14 @@ mod tests {
             }
         );
         for (chord, what) in chords() {
-            assert_ne!(chord, ctrl_y, "{what} would take the agent panel's INPUT Ctrl+y (#39)");
+            assert_ne!(chord, ctrl_y, "{what} would take the agent panel's INPUT Ctrl+y");
         }
         let prefix = Chord::of(
             &super::super::key::KeySpec::parse(super::super::stock::STOCK_PREFIX).expect("the stock prefix parses"),
         );
         assert_ne!(
             prefix, ctrl_y,
-            "the default prefix would take the agent panel's INPUT Ctrl+y (#39)"
+            "the default prefix would take the agent panel's INPUT Ctrl+y"
         );
     }
 

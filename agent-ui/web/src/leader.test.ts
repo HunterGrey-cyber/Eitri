@@ -6,7 +6,7 @@ import { binding as b, TABLE } from "./testFixtures";
 /* `resolveKey` completes a prefix from `FIXED_PAIRS`, and the which-key
    box drawn after the prefix lists `FIXED_PENDING_ENTRIES` -- two lists nothing tied together, so a
    pair added to one alone would work unlisted, or be listed and cancel. */
-describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
+describe("the box after g / z / [ / ] / Ctrl+w", () => {
   it("lists exactly the keys FIXED_PAIRS completes each prefix with, each with a label", () => {
     expect(Object.keys(FIXED_PENDING_ENTRIES).sort()).toEqual(Object.keys(FIXED_PAIRS).sort());
     // `Ctrl+w` (`"C-w"`) is the fifth reserved prefix.
@@ -71,7 +71,7 @@ describe("the box after g / z / [ / ] / Ctrl+w (K01)", () => {
   });
 });
 
-describe("the sequence engine (which-key's state.lua)", () => {
+describe("the sequence engine (modelled on which-key's state.lua)", () => {
   it("runs a one-key binding at once", () => {
     expect(startSequence(TABLE, "H", false)).toEqual({ kind: "run", binding: TABLE.bindings[0] });
   });

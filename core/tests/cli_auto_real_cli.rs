@@ -146,7 +146,7 @@ fn drive_turn(set: &mut TabSet, dir: &Path, tab: TabId, prompt: &str, label: &st
         if let Some(tripped) = out.tripped.into_iter().next() {
             let reason = tripped.reason.clone();
             tripped.retired.into_backend().shutdown();
-            panic!("{label}: the tripwire closed the session: {reason}");
+            panic!("{label}: the CLI-mode tripwire closed the session: {reason}");
         }
         let events = events_from_payload(out.active_payload.as_deref());
         for event in &events {

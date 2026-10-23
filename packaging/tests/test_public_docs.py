@@ -476,7 +476,7 @@ class PublicDocsTwinsAreFresh(unittest.TestCase):
         except rc.ReleaseCheckError as e:
             self.fail(
                 f"{_PUBLISH_FILES}'s Chinese twins are stale or incomplete -- update the twin in the "
-                f"same change as its English original: {e}"
+                f"same change as its English original (its translated-from marker): {e}"
             )
 
 

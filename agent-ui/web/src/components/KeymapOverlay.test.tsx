@@ -91,7 +91,7 @@ describe("KeymapOverlay", () => {
     );
   });
 
-  it("names the chords Eitri keeps while typing (C6)", () => {
+  it("names the chords Eitri keeps while typing", () => {
     const { container } = render(
       <KeymapOverlay onClose={() => {}} windowKeys={[]} prefixKeys={[]} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} />,
     );
@@ -120,7 +120,7 @@ describe("KeymapOverlay", () => {
   // key `resolveKey` sees, so it cannot be a row of `BROWSE_KEYS` -- `keymap.test.ts` ties that table
   // to `resolveKey` both ways and would fail on it. It is a note under the table instead, and a section
   // without a note draws no `<p>` at all.
-  describe("the note under This panel (R9)", () => {
+  describe("the note under This panel", () => {
     it("says on another agent's tab that manual asks for what reaches Eitri, and where the rest is described", () => {
       const { container } = render(
         <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+a" panel={EMPTY_PANEL_TABLE} agent="Codex" />,
@@ -187,7 +187,7 @@ describe("KeymapOverlay", () => {
   // same shape as the Escape-alias note under "This panel". The figures are the nvim snippet's own caps
   // (`MAX_SELECTION_LINES = 400`, `CONTENT_LIMIT = 2000`); "not its text or cursor" is because
   // `core/src/editor_context/feed.rs` drops the cursor line and the file's text is never sent.
-  describe("the note under Typing (R13)", () => {
+  describe("the note under Typing", () => {
     it("says what Enter also sends from the editor, in a <p> after the table, and adds no row", () => {
       const section = sectionTitled(overlay().container, "Typing");
       expect(section.querySelectorAll("p")).toHaveLength(1);

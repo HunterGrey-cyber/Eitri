@@ -732,7 +732,7 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
             Some(value) if interactive.contains(&value) => {}
             other => offenders.push(format!(
                 "{rel}: a ClaudeHostPolicy literal's `permissions` is {other:?}, not \
-                 `<PermissionMode>::Interactive as i32` (R07: every session is gated): {}",
+                 `<PermissionMode>::Interactive as i32` (every session is gated): {}",
                 snippet(code, at)
             )),
         }
@@ -740,7 +740,7 @@ fn check_host_policy_literals(rel: &str, code: &str, aliases: &[String], offende
             Some("false") => {}
             other => offenders.push(format!(
                 "{rel}: a ClaudeHostPolicy literal's `permission_mode_switchable` is {other:?}, not `false` \
-                 (R07; `true` sets --allow-dangerously-skip-permissions on the CLI): {}",
+                 (`true` sets --allow-dangerously-skip-permissions on the CLI): {}",
                 snippet(code, at)
             )),
         }
@@ -1079,7 +1079,7 @@ fn check_file(
                 continue;
             }
             offenders.push(format!(
-                "{rel}: `{needle}` -- the sidecar's ungated policy (R07); the only allowed use is the \
+                "{rel}: `{needle}` -- the sidecar's ungated policy; the only allowed use is the \
                  `PermissionModeChanged` decode arm in {}: {}",
                 ALLOWED_ARM.0,
                 snippet(code, at)
@@ -1213,7 +1213,7 @@ fn no_production_source_can_reach_an_ungated_cli() {
     }
     assert!(
         report.offenders.is_empty(),
-        "production code that could reach an ungated CLI (R07; see agent/src/wire_guard.rs):\n{}",
+        "production code that could reach an ungated CLI (see agent/src/wire_guard.rs):\n{}",
         report.offenders.join("\n")
     );
     // A stale allowlist entry is a rotting one: the arm it names must still be there, once.

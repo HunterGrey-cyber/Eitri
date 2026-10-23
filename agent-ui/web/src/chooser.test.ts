@@ -115,7 +115,7 @@ describe("pickerStep", () => {
     expect(pickerStep({ key: "ArrowUp", ctrlKey: false })).toBe(-1);
     expect(pickerStep({ key: "p", ctrlKey: true })).toBe(-1);
   });
-  it("is null for every other key: a bare n or p is typed text, and j, k, Ctrl+j, Ctrl+k stay the caller's own (P4)", () => {
+  it("is null for every other key: a bare n or p is typed text, and j, k, Ctrl+j, Ctrl+k stay the caller's own", () => {
     for (const init of [
       { key: "n", ctrlKey: false },
       { key: "p", ctrlKey: false },

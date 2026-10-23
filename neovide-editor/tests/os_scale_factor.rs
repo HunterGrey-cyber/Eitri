@@ -212,8 +212,8 @@ fn main() {
         assert_eq!(
             harness.os_scale_factor_resyncs(),
             resyncs_before_idle,
-            "set_os_scale_factor resynced the renderer with nothing assigned -- the P11-class \
-             idle-cost regression the change gate exists to prevent"
+            "set_os_scale_factor resynced the renderer with nothing assigned -- the idle-cost \
+             regression the change gate exists to prevent"
         );
     }
     println!("ok: an unchanged os scale leaves the editor alone (resync counter held at {resyncs_before_idle})");

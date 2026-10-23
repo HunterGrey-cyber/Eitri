@@ -7791,7 +7791,7 @@ mod tests {
         });
         assert!(
             set.close_needs_confirm(connecting),
-            "a connect in flight"
+            "a connect in flight (it counts as running)"
         );
 
         let (provider, backend) = live(&dir);
@@ -13260,7 +13260,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_holds_through_every_path_that_moves_active() {
+    fn the_base_view_keeps_the_active_tab_through_every_path_that_moves_it() {
         // Every base-view tab closed while an extra view is live: a fresh base tab opens.
         let mut set = set();
         let one = set.active();

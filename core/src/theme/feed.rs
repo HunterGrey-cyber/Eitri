@@ -49,7 +49,7 @@ const LUA_NAME: &str = "theme.lua";
 /// second row is what builds before 2026-09-17 wrote, swept alongside the current one for
 /// the reason `crate::pane_switch`'s own `SWEPT_NAMES` gives: the sweep matches by prefix, so a
 /// rename with no second sweep orphans every pre-rename directory permanently.
-/// `the_sweep_still_reclaims_a_pre_l2_t5_directory` pins that the legacy row is really swept.
+/// `the_sweep_still_reclaims_a_directory_under_the_old_prefix` pins that the legacy row is really swept.
 const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME), ("neovibe-theme-", "theme.sock")];
 
 /// How often a host should call [`ThemePayloadReader::poll`]. A colorscheme change is not
@@ -367,7 +367,7 @@ mod tests {
     /// would sit under `TMPDIR` forever with nothing left in the code that names it. Sweeping
     /// [`SWEPT_NAMES`] rather than one pair is what closes that.
     #[test]
-    fn the_sweep_still_reclaims_a_pre_l2_t5_directory() {
+    fn the_sweep_still_reclaims_a_directory_under_the_old_prefix() {
         // Own root, so this never touches a real window's directory and never races a sibling test.
         let root = std::env::temp_dir().join(format!("nv-th-sweeptest-{}", uuid::Uuid::new_v4().simple()));
         // pid 0 is rejected before any syscall by `pid_is_alive`, and `std::process::id()` never
@@ -384,7 +384,10 @@ mod tests {
         }
 
         assert!(!current.exists(), "a dead current-shape directory must be reclaimed");
-        assert!(!legacy.exists(), "a dead pre-L2-T5 directory must be reclaimed too");
+        assert!(
+            !legacy.exists(),
+            "a dead directory under the old prefix must be reclaimed too"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

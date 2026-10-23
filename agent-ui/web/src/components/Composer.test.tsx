@@ -134,7 +134,7 @@ describe("Composer on a session that has ended", () => {
 /* A held-back slash command is never sent, the draft stays, and a local flash
  *  names it. `slashCommands.test.ts` covers the classification itself; this only pins the wiring:
  *  Enter goes through `heldBackSlashCommand`, and the flash renders where `submit` puts it. */
-describe("Composer and slash commands (P10)", () => {
+describe("Composer and slash commands", () => {
   it("does not send a held-back command (/login), keeps the draft, and flashes", () => {
     const { container, textarea, onSend } = renderComposer();
     fireEvent.change(textarea, { target: { value: "/login" } });
@@ -262,7 +262,7 @@ describe("Composer restoring a refused draft", () => {
    keystroke to land in -- and the two mouse-driven paths that have to agree with the keyboard
    table in `keymap.ts` on what mode the panel is in. */
 describe("Composer's BROWSE/INPUT split", () => {
-  it("shows an empty-looking box instead of a textarea in BROWSE, with the C1b/S3 hint after it", () => {
+  it("shows an empty-looking box instead of a textarea in BROWSE, with the hint after it", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector("textarea")).toBeNull();
     // The BROWSE box has a dim reminder of the way into INPUT, because an arrival
@@ -315,7 +315,7 @@ describe("Composer's BROWSE/INPUT split", () => {
  *  composer directly) ended. */
 /* The box shows a reminder of the way in; since 2026-10-15 it is the key alone at the box's right end, as
    the start screen's menu shows its keys, not the sentence "i or Ctrl+j to type" after the placeholder. */
-describe("Composer's BROWSE hint (C1b/S3)", () => {
+describe("Composer's BROWSE hint", () => {
   it("shows the key at the right end, with nothing typed, and no sentence", () => {
     const { container } = renderComposer({ mode: "browse" });
     expect(container.querySelector(".composer-key")!.textContent).toBe("i");
@@ -357,7 +357,7 @@ describe("Composer's BROWSE hint (C1b/S3)", () => {
  *  only when `focusRequest` had separately been bumped past 0 (the focus bug was a
  *  fresh `autoFocus` mount of a non-empty box is not reliable on its own, in this project's own
  *  measured GUI pass). */
-describe("Composer's caret on entering INPUT (C1a)", () => {
+describe("Composer's caret on entering INPUT", () => {
   it("i restores the caret left at 3 in 'hello world'", () => {
     const { container, rerender } = renderComposerWithRerender({ mode: "input" });
     const textarea = container.querySelector("textarea")!;
@@ -390,7 +390,7 @@ describe("Composer's caret on entering INPUT (C1a)", () => {
   });
 });
 
-describe("Composer in BROWSE (C2)", () => {
+describe("Composer in BROWSE", () => {
   it("shows the unsent draft, muted and cut to two lines, and how many are queued", () => {
     const { container } = renderComposer({
       mode: "browse",
@@ -412,7 +412,7 @@ describe("Composer in BROWSE (C2)", () => {
   // as exercised in App.test.tsx's "Shift+Tab anywhere in the chat" describe block.
 });
 
-describe("Composer during a turn (C1, F1)", () => {
+describe("Composer during a turn", () => {
   it("stays typable while a turn runs and queues on Enter", () => {
     const onQueue = vi.fn();
     const { textarea, onSend } = renderComposer({ running: true, onQueue });
@@ -464,7 +464,7 @@ describe("Composer during a turn (C1, F1)", () => {
   });
 });
 
-describe("Composer history and queue (C5)", () => {
+describe("Composer history and queue", () => {
   it("takes the queue back on ↑ from the first line, else walks history, and ↓ returns the draft", () => {
     const onTakeBackQueue = vi.fn();
     const queued = renderComposer({ queueCount: 2, onTakeBackQueue, history: ["old"] });
@@ -818,7 +818,7 @@ function keyLike(key: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolea
    the half-written draft today; Claude Code documents both as a newline, so both insert one (ruled a
    bug fix). Plain Enter still sends, Shift+Enter is the textarea's own newline, Ctrl+Enter still sends
    now. */
-describe("Alt+Enter and backslash+Enter insert a newline (#27, K14)", () => {
+describe("Alt+Enter and backslash+Enter insert a newline", () => {
   const place = (textarea: HTMLTextAreaElement, value: string, caret: number = value.length) => {
     fireEvent.change(textarea, { target: { value } });
     textarea.setSelectionRange(caret, caret);

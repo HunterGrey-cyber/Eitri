@@ -114,7 +114,7 @@ describe("Chooser", () => {
     expect(props.onLeave).not.toHaveBeenCalled();
     expect(props.onCloseTab).not.toHaveBeenCalled();
   });
-  it("Esc and q leave with no arguments (wave 4 R2: the chooser no longer says which chooser this was)", () => {
+  it("Esc and q leave with no arguments (the chooser no longer says which chooser this was)", () => {
     const first = renderChooser();
     fireEvent.keyDown(first.root, { key: "Escape" });
     expect(first.props.onLeave).toHaveBeenCalledWith();
@@ -342,7 +342,7 @@ describe("Chooser", () => {
   /** An open tab's line 2 used to read `⏵⏵ <mode> · <backend>[ · <title>]`
    *  unconditionally -- the backend name (which reads "sidecar" in every release build) carried
    *  nothing, and the mode was shown even for the default, auto. */
-  describe("an open tab's line 2 (v1 trial item 1)", () => {
+  describe("an open tab's line 2", () => {
     it("is absent in auto mode with no title -- no mode, no backend", () => {
       const { container } = renderChooser(); // TAB1: auto, title null
       const rows = container.querySelectorAll(".chooser-row");
@@ -387,7 +387,7 @@ describe("Chooser", () => {
     expect(rows[1].querySelector(".chooser-right")!.textContent).toBe("");
   });
 
-  it("Space does nothing -- no preview, decision 6", () => {
+  it("Space does nothing -- no preview", () => {
     const { root, props } = renderChooser();
     fireEvent.keyDown(root, { key: " " });
     expect(props.onSwitch).not.toHaveBeenCalled();
@@ -512,7 +512,7 @@ describe("Chooser", () => {
 /** A filter that matched nothing left no
  *  row under the cursor, `modeLine` read `row.kind` on `undefined`, and the throw took the whole panel
  *  with it. The list keys are `↓` `↑` `Ctrl+n` `Ctrl+p`; the chooser swallows an unmatched key after `g`. */
-describe("Chooser: the list keys", () => {
+describe("Chooser: the list keys, and a filter that matches nothing", () => {
   const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
   /** ↓ ↑ Ctrl+n Ctrl+p, as the four keydowns a real keyboard sends. */
   const FOUR = [
@@ -527,7 +527,7 @@ describe("Chooser: the list keys", () => {
     }
   };
 
-  it("K03: a filter matching nothing keeps the chooser drawn, and Esc still leaves", () => {
+  it("a filter matching nothing keeps the chooser drawn, and Esc still leaves", () => {
     const { root, container, props } = renderChooser();
     fireEvent.keyDown(root, { key: "/" });
     const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
@@ -538,7 +538,7 @@ describe("Chooser: the list keys", () => {
     expect(props.onLeave).toHaveBeenCalled();
   });
 
-  it("K03: with no row under the cursor the mode line is empty, and Enter, x, Ctrl+r and Shift+Tab choose nothing", () => {
+  it("with no row under the cursor the mode line is empty, and Enter, x, Ctrl+r and Shift+Tab choose nothing", () => {
     const { root, container, props } = renderChooser();
     fireEvent.keyDown(root, { key: "/" });
     const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
@@ -555,7 +555,7 @@ describe("Chooser: the list keys", () => {
     expect(container.querySelector(".chooser-rename")).toBeNull();
   });
 
-  it("K03: clearing the filter after an empty result leaves a row under the cursor, never none", () => {
+  it("clearing the filter after an empty result leaves a row under the cursor, never none", () => {
     const { root, container } = renderChooser();
     fireEvent.keyDown(root, { key: "/" });
     const filter = container.querySelector<HTMLInputElement>(".chooser-filter")!;
@@ -568,7 +568,7 @@ describe("Chooser: the list keys", () => {
     expect(currentRow(container)).toContain("New session");
   });
 
-  it("↓ ↑ Ctrl+n Ctrl+p move the list, from the list and from the filter (R12)", () => {
+  it("↓ ↑ Ctrl+n Ctrl+p move the list, from the list and from the filter", () => {
     const { root, container, props } = renderChooser();
     fireEvent.keyDown(root, { key: "ArrowDown" });
     fireEvent.keyDown(root, { key: "Enter" });
@@ -652,7 +652,7 @@ describe("Chooser: the list keys", () => {
     nothingHappened(props);
   });
 
-  it("g then a key that is not g does nothing (R1)", () => {
+  it("g then a key that is not g does nothing", () => {
     const { root, props } = renderChooser();
     fireEvent.keyDown(root, { key: "j" });
     fireEvent.keyDown(root, { key: "g" });
@@ -711,7 +711,7 @@ describe("Chooser: the list keys", () => {
  *  Shift+Tab (the chooser sees it as a key of its own) and the window's cancel routes that reach it as
  *  `dropKeysRequest` (a focus round trip, `arrive`, a HINT, a tab switch, an overlay). Left waiting, the
  *  next `j` after either was swallowed as the cancel of a `g` nobody meant any more. */
-describe("Chooser: a waiting g ends on the window's cancel routes (K01)", () => {
+describe("Chooser: a waiting g ends on the window's cancel routes", () => {
   const currentRow = (c: HTMLElement) => c.querySelector(".chooser-row.current")?.textContent ?? null;
 
   it("Shift+Tab ends it: g, Shift+Tab, then j moves the cursor", () => {

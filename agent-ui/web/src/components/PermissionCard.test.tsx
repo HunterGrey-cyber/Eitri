@@ -150,7 +150,7 @@ describe("PermissionCard on a session that has ended", () => {
   });
 });
 
-describe("P4: the Bash card", () => {
+describe("the Bash card", () => {
   it("shows the command as a shell line with real newlines, and its description", () => {
     const { container } = render(
       <PermissionCard
@@ -199,7 +199,7 @@ describe("P4: the Bash card", () => {
   });
 });
 
-describe("Permission denial with a reason", () => {
+describe("the reason box and the remember button", () => {
   it("denies with the reason on Enter in the reason box", () => {
     const onAnswer = vi.fn();
     const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);

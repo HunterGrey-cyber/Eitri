@@ -79,7 +79,7 @@ describe("TypingGuard: a lone a/d/D waits, then answers", () => {
 });
 
 describe("TypingGuard: typed prose never answers", () => {
-  it('"also add a test" at 60 wpm answers nothing (F1: the first letter has no key before it)', () => {
+  it('"also add a test" at 60 wpm answers nothing (the first letter has no key before it)', () => {
     type("also add a test", 200);
     expect(answers).toEqual([]);
   });
@@ -351,7 +351,7 @@ describe("TypingGuard.mayActAfterMotion: the leader and Stop", () => {
    answers the way `a`/`d` do -- deferred through `defer`, and only when `App.tsx` saw focus put on
    that very button by the key right before it. The guard itself decides no landing: it counts the
    keys it recorded, so `App.tsx` can tie the landing it saw to the key that made it. */
-describe("K02: keyCount", () => {
+describe("keyCount", () => {
   it("counts every recorded key, a cancelling Super included, and no bare Shift", () => {
     const g = new TypingGuard();
     g.onKey("l", 0);
@@ -381,7 +381,7 @@ describe("K02: keyCount", () => {
 
 /* A BROWSE `y` opens a burst in which any other key is typing,
    not a command. `noteCopy` records the `y`; `afterCopy` asks about the key `onKey` just recorded. */
-describe("TypingGuard: the burst after a copy (#26, K15)", () => {
+describe("TypingGuard: the burst after a copy", () => {
   it("is false before any copy", () => {
     expect(guard.afterCopy(Date.now())).toBe(false);
   });

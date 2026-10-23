@@ -6,7 +6,7 @@ const tool = (name: string, input: unknown, content: unknown = "out"): TimelineI
   kind: "tool", seq: 1, key: "t-1", call: { seq: 1, toolUseId: "t", name, input, result: { content, isError: false } },
 });
 
-describe("N3: what y and Y copy", () => {
+describe("what y and Y copy", () => {
   it("y copies what a person would paste: the markdown, the command, the path", () => {
     expect(primaryText({ kind: "message", seq: 1, key: "m-1", text: "**bold** `code`" })).toBe("**bold** `code`");
     expect(primaryText(tool("Bash", { command: "cargo test --lib" }))).toBe("cargo test --lib");

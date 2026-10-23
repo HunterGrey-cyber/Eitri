@@ -186,7 +186,7 @@ if (import.meta.env.REGENERATE_V1_RESOLVE_KEY_FIXTURE) {
     expect(snapshot.length).toBe(RESOLVE_KEY_CASES.length);
   });
 } else {
-  describe("resolveKey keeps every pinned v1 key (F10)", () => {
+  describe("resolveKey keeps every pinned v1 key", () => {
     const fixture = readJson<{ label: string; expected: PanelAction }[]>(resolveKeyFixtureText);
     const byLabel = new Map(fixture.map((row) => [row.label, row.expected]));
 
@@ -198,7 +198,7 @@ if (import.meta.env.REGENERATE_V1_RESOLVE_KEY_FIXTURE) {
       it(`${c.label} still resolves the same as it did at the v1 freeze`, () => {
         expect(byLabel.has(c.label), `no fixture row for ${JSON.stringify(c.label)}`).toBe(true);
         const actual = resolveKey(c.mode, c.event, c.ctx);
-        expect(actual, "\"keys are only ever added, never changed in meaning\"").toEqual(
+        expect(actual, "the frozen table: keys are only ever added, never changed in meaning").toEqual(
           byLabel.get(c.label),
         );
       });
@@ -206,7 +206,7 @@ if (import.meta.env.REGENERATE_V1_RESOLVE_KEY_FIXTURE) {
   });
 }
 
-describe("the panel/leader default table keeps every pinned v1 binding (F10)", () => {
+describe("the panel/leader default table keeps every pinned v1 binding", () => {
   const fixture = readJson<{ keys: string[]; action: string }[]>(panelFixtureText);
 
   // A synthetic PanelTable built from the shared fixture: `desc`/`source` are irrelevant to what
@@ -270,7 +270,7 @@ describe("the panel/leader default table keeps every pinned v1 binding (F10)", (
       const result = resolveRow(row);
       expect(
         result,
-        `"keys are only ever added, never changed in meaning"`,
+        "the frozen table: keys are only ever added, never changed in meaning",
       ).toEqual({ kind: "panel", binding: expect.objectContaining({ keys: row.keys, action: row.action }) });
     });
   }

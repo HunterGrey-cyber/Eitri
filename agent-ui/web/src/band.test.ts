@@ -106,13 +106,13 @@ describe("the band degrades by priority", () => {
  *  520 logical px = 346 CSS px, which comes out to a 47-column budget here (47 * 7.2 = 338.4, the
  *  same char width every other test in this file already uses) -- the exact case that used to lose
  *  a y/n prompt's own `(y/n)`, and the typing-guard flash's own explanation, to `bandLayout`'s old `cut()`. */
-describe("defect 1: a y/n prompt or a flash is never truncated", () => {
+describe("a y/n prompt or a flash is never truncated", () => {
   const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
   const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
   const EMPTY_TAB_PROMPT = "Switch to bypass? New sessions in this window start in bypass too (y/n)";
   const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
 
-  it("keeps the R06 bypass prompt whole, (y/n) included, at a 47-column budget", () => {
+  it("keeps the bypass prompt whole, (y/n) included, at a 47-column budget", () => {
     const segs = bandLayout({ ...idle, prompt: R06_PROMPT }, NARROW_BUDGET_WIDTH, 7.2);
     const prompt = segs.find((s) => s.id === "prompt")!;
     expect(prompt.text).toBe(R06_PROMPT);
@@ -129,7 +129,7 @@ describe("defect 1: a y/n prompt or a flash is never truncated", () => {
     expect(prompt.text).toContain("(y/n)");
   });
 
-  it("keeps the flash whole -- it explains what y does, not just a status word", () => {
+  it("keeps the flash that explains y whole -- it explains what y does, not just a status word", () => {
     const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.text).toBe(D11_FLASH);
@@ -166,7 +166,7 @@ describe("defect 1: a y/n prompt or a flash is never truncated", () => {
     expect(segs.find((s) => s.id === "message")!.wraps).toBeFalsy();
   });
 
-  it("a short prompt still fits the row whole -- no wraps flag, same as before this fix", () => {
+  it("a short prompt still fits the row whole -- no wraps flag", () => {
     const shortPrompt = 'close 1 "docs"? (y/n)';
     const segs = bandLayout({ ...idle, prompt: shortPrompt }, NARROW_BUDGET_WIDTH, 7.2);
     const prompt = segs.find((s) => s.id === "prompt")!;
@@ -184,7 +184,7 @@ describe("defect 1: a y/n prompt or a flash is never truncated", () => {
 
 /** The active tab's last reported usage, right of the model, dropped before
  *  anything else when the band is narrow. */
-describe("usage (R5)", () => {
+describe("the usage segment", () => {
   const u = (cost: number, tokens: TokenUsage | null) => ({ total_cost_usd: cost, num_turns: null, tokens, model: null });
   it("formats all tokens and the cost, and says nothing before a report", () => {
     expect(usageSegment(null)).toBeNull();
@@ -264,7 +264,7 @@ describe("usage (R5)", () => {
  *  the card INPUT's Ctrl+y would approve -- the tool and a short summary -- and drops it by the same
  *  priority order as everything else: shortened to the tool, then gone, after the context, model,
  *  position and queue and before the `⚑N` count. */
-describe("#39: the Ctrl+y segment", () => {
+describe("the Ctrl+y segment", () => {
   const approving: BandFacts = { ...running, approve: { tool: "Bash", summary: "rm build" } };
 
   it("names the tool and the summary, right after the card count, on the left", () => {

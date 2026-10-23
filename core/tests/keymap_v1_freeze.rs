@@ -139,11 +139,11 @@ fn prefix_table_keeps_every_pinned_binding() {
     assert_eq!(
         fixture.prefix,
         current.prefix,
-        "the v1 prefix TRIGGER chord (\"default \
-         prefix Ctrl+b\") was changed: was {:?}, now {:?}. This is `Keymap::defaults().prefix()` -- the \
-         key that *enters* prefix mode -- and is distinct from any `bindings()` row keyed \"C-b\" (see \
-         this file's header). If this is a deliberate change, regenerate {} (see this \
-         file's own header).",
+        "the v1 prefix TRIGGER chord (default prefix Ctrl+b) was changed: was {:?}, now {:?}. This is \
+         `Keymap::defaults().prefix()` -- the key that *enters* prefix mode -- and is distinct from any \
+         `bindings()` row keyed \"C-b\" (see this file's header). After v1, keys are only ever added, \
+         never changed in meaning: if this change is deliberate, regenerate {} (see this file's own \
+         header) and record why.",
         fixture.prefix,
         current.prefix,
         prefix_fixture_path().display(),
@@ -167,10 +167,9 @@ fn prefix_table_keeps_every_pinned_binding() {
     }
     assert!(
         removed.is_empty() && changed.is_empty(),
-        "the v1 prefix-keymap freeze (\"After v1, \
-         keys are only ever added, never changed in meaning\") was broken.\nremoved: {removed:?}\n\
-         changed: {changed:?}\nIf this is a deliberate change, regenerate {} (see this \
-         file's own header).",
+        "the v1 prefix-keymap freeze (after v1, keys are only ever added, never changed in meaning) was \
+         broken.\nremoved: {removed:?}\nchanged: {changed:?}\nIf this is a deliberate change, regenerate {} \
+         (see this file's own header) and record why.",
         prefix_fixture_path().display(),
     );
 }
@@ -197,10 +196,9 @@ fn panel_table_keeps_every_pinned_binding() {
     }
     assert!(
         removed.is_empty() && changed.is_empty(),
-        "the v1 panel-keymap freeze (\"After v1, \
-         keys are only ever added, never changed in meaning\") was broken.\nremoved: {removed:?}\n\
-         changed: {changed:?}\nIf this is a deliberate change, regenerate {} (see this \
-         file's own header) -- and note that agent-ui/web's \
+        "the v1 panel-keymap freeze (after v1, keys are only ever added, never changed in meaning) was \
+         broken.\nremoved: {removed:?}\nchanged: {changed:?}\nIf this is a deliberate change, regenerate {} \
+         (see this file's own header) and record why -- and note that agent-ui/web's \
          keymap.v1Freeze.test.ts reads the very same file.",
         panel_fixture_path().display(),
     );

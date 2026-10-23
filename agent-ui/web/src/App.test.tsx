@@ -301,7 +301,7 @@ describe("arrive", () => {
   /* An earlier test moved the cursor away
      with `gg` and asserted the arrival landed on the last row anyway. Split: a reader on the last row
      (following) still lands there, following resumed; one who put the cursor elsewhere keeps it. The
-     park-and-restore cases are the "#22: coming back restores where you were" describe below. */
+     park-and-restore cases are the "coming back restores where you were" describe below. */
   it("with no card, from INPUT on the last row: BROWSE on the last row, following resumed, no textarea focused", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -324,7 +324,7 @@ describe("arrive", () => {
     expect(container.querySelector("textarea")).toBeNull();
   });
 
-  it("with no card, the cursor moved off the last row: BROWSE where it is, following not resumed (#22)", () => {
+  it("with no card, the cursor moved off the last row: BROWSE where it is, following not resumed", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 2);
@@ -373,7 +373,7 @@ describe("arrive", () => {
    *  request whenever it MOUNTED, so once any keyboard arrival had happened, every new tab made from
    *  a live one (`prefix c`, `<leader>fn`, the chooser's New session) mounted, saw a stale count and
    *  dropped straight to BROWSE -- with nothing focused, so the keys were dead. */
-  it("a new tab made from a live tab after an earlier arrival still lands INPUT (R7)", () => {
+  it("a new tab made from a live tab after an earlier arrival still lands INPUT", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "only" }] }));
@@ -466,7 +466,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(current.textContent).toContain("Permission requested: Bash");
   });
 
-  it("leaves INPUT for the card, so a lone a answers it (after v1 S1's wait)", () => {
+  it("leaves INPUT for the card, so a lone a answers it (after the typing guard's wait)", () => {
     vi.useFakeTimers();
     try {
       const { container } = withTwoCards();
@@ -746,7 +746,7 @@ describe("App rehydration from a snapshot", () => {
 
   /* The WebView holds only the active tab's state, so a switch never
    * renders a stale conversation underneath the new one. */
-  it("renders only the active tab's conversation (V3)", () => {
+  it("renders only the active tab's conversation", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }];
@@ -783,7 +783,7 @@ describe("App event folding", () => {
     expect(container.querySelector(".row-assistant")!.textContent).toContain("Hello world");
   });
 
-  it("keeps the composer live for a whole turn and queues what is typed (C1)", () => {
+  it("keeps the composer live for a whole turn and queues what is typed", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -803,7 +803,7 @@ describe("App event folding", () => {
     expect(lastOfType("send_message")).toBeUndefined();
   });
 
-  it("does not strand enter_input during a running turn (F1)", () => {
+  it("does not strand enter_input during a running turn", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ activeTurnId: "t1" }), 1);
@@ -2155,8 +2155,8 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     /* Enter is still left to a card's own
        buttons -- the regression this block pins -- but Space on them is now claimed and does
        nothing. Enter is pressed with no key just before it, since the typing guard refuses one right
-       after typing; that half is `v1: typing never answers a card`'s. */
-    it("claims Enter and Space on the card's own buttons, and an Enter nothing landed presses nothing (K02, v1 S5)", () => {
+       after typing; that half is `typing never answers a card`'s. */
+    it("claims Enter and Space on the card's own buttons, and an Enter nothing landed presses nothing", () => {
       vi.useFakeTimers();
       const widen = stubBandWidth();
       try {
@@ -2193,7 +2193,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        (`./nav`), a focused button is an ordinary place for the keys to be, so `h`/`j`/`k`/`l` from
        it must still navigate. What the original regression needs is narrower and is asserted
        directly: Enter and Space from a button are left to the button. */
-    it("claims Enter (K02) and Space (v1 S5) on a focused Approve, and still navigates from it", () => {
+    it("claims Enter and Space on a focused Approve, and still navigates from it", () => {
       const { container } = withAToolCallAndAPermission();
       const approve = buttonLabelled(container, "Approve")!;
       // `fireEvent` returns false when the handler called preventDefault, i.e. claimed the key.
@@ -2271,7 +2271,7 @@ describe("App: the which-key box", () => {
     expect(container.querySelector(".which-key")).toBeNull();
   });
 
-  describe("the g prefix box (200ms)", () => {
+  describe("the g prefix box (200 ms)", () => {
     // The `g`/`z`/`[`/`]` prefixes no longer draw their own line in the
     // which-key STRIP -- every pending prefix now shows in the which-key BOX instead, after
     // `WHICH_KEY_DELAY_MS` (200ms, widened from the strip's old `g`-only 400ms).
@@ -2315,7 +2315,7 @@ describe("App: the which-key box", () => {
    conversation's BROWSE. `Ctrl+w` is a reserved prefix: it waits for its next key with no
    timeout, and that key completes one of the four pairs -- posted to shell as `pane_nav`, which runs
    the move `Ctrl+h/j/k/l` do -- or is swallowed. Nothing here reaches a card: the answer side of it (a
-   pause, then `a`/`d`; a landing, then Enter) is in "v1: typing never answers a card" below. */
+   pause, then `a`/`d`; a landing, then Enter) is in "typing never answers a card" below. */
 describe("Ctrl+w h/j/k/l in BROWSE: the keys to the module that way", () => {
   function started(overrides: Partial<AgentUiState> = {}) {
     const rendered = render(<App />);
@@ -2706,7 +2706,7 @@ describe("the leader", () => {
    *  cancelled a pending multi-key sequence, leaving a delayed single-key callback armed.
    *  Replacing the table must cancel both so neither can execute a stale binding
    *  after the wait. */
-  it("a table replaced mid-guard-window drops the deferred L binding entirely (P2-A6)", () => {
+  it("a table replaced mid-guard-window drops the deferred L binding entirely", () => {
     vi.useFakeTimers();
     try {
       const { container } = started();
@@ -2811,7 +2811,7 @@ describe("the leader", () => {
     expect(tabVerbsPosted()).toEqual(["close"]);
   });
 
-  it("Space with the Approve button focused starts no sequence, and no longer activates it (v1 S5)", () => {
+  it("Space with the Approve button focused starts no sequence, and no longer activates it", () => {
     vi.useFakeTimers();
     try {
       const { container } = started();
@@ -3054,7 +3054,7 @@ describe("the leader", () => {
    stand alone (`./typingGuard`), only the cursor's card, and Space on a card button does
    nothing. Time is vitest's fake clock: jsdom stamps each keydown with `Date.now()`, so a gap
    here is exactly the gap between two keys. */
-describe("v1: typing never answers a card", () => {
+describe("typing never answers a card", () => {
   const TYPING = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
   const NO_CARD = "no card here — i, o, A or Ctrl+j to type";
   /** The same refusal while the card waits elsewhere points back to it. */
@@ -3124,7 +3124,7 @@ describe("v1: typing never answers a card", () => {
     expect(band(container)).toBe(TYPE_HINT_FLASH);
   });
 
-  it("with no card waiting anywhere, a says there is no card here (F13)", () => {
+  it("with no card waiting anywhere, a says there is no card here", () => {
     const { container } = arrivedOnACard();
     press("a");
     wait(1000);
@@ -3162,7 +3162,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()[1]).toEqual(expect.objectContaining({ permission_id: "perm-1", decision: "allow" }));
   });
 
-  it("a lone a approves the card under the cursor 250 ms later (R32 unchanged, only delayed)", () => {
+  it("a lone a approves the card under the cursor 250 ms later", () => {
     arrivedOnACard();
     press("a");
     wait(249);
@@ -3185,7 +3185,7 @@ describe("v1: typing never answers a card", () => {
      answer regardless of this fix (`TypingGuard.onKey` cancels on every keydown), which would pass
      even with the bug still there. */
   it.each([{ altKey: true }, { metaKey: true }])(
-    "a modified a is not permission approval: %j (v1 audit P2-A1)",
+    "a modified a is not permission approval: %j",
     (modifier) => {
       arrivedOnACard();
       press("a", modifier);
@@ -3211,7 +3211,7 @@ describe("v1: typing never answers a card", () => {
   /* The case above passes in jsdom but fails on real
      WebKitGTK 2.52.6, which never sets a modifier on `a` while Super is held: only Super's own
      keydown (`key: "Super"`, `code: "OSLeft"`) and keyup arrive. This is that shape. */
-  it("a is not permission approval while Super is held, as WebKitGTK reports it (sandbox pass, 2026-09-28)", () => {
+  it("a is not permission approval while Super is held, as WebKitGTK reports it", () => {
     arrivedOnACard();
     press("Super", { code: "OSLeft" });
     press("a");
@@ -3240,7 +3240,7 @@ describe("v1: typing never answers a card", () => {
      to type an ordinary character, not one of the four modifiers that refuse an answer
      (Alt, Meta, Super, Hyper) -- jsdom
      honours `KeyboardEventInit`'s `modifierAltGraph` the same way it honours `modifierSuper`. */
-  it("a modified a is not permission approval: AltGraph (v1 audit fixes, finding 1)", () => {
+  it("a modified a is not permission approval: AltGraph", () => {
     arrivedOnACard();
     press("a", { modifierAltGraph: true });
     wait(1000);
@@ -3253,7 +3253,7 @@ describe("v1: typing never answers a card", () => {
      that bubble handler never runs at all. Until the mode cycle cancelled a waiting answer on that path
      itself, a card answer deferred moments earlier stayed armed and still fired `TYPING_GUARD_MS`
      later even though the user had moved on. */
-  it("Shift+Tab cancels a card answer deferred moments earlier (v1 audit P2-A2)", () => {
+  it("Shift+Tab cancels a card answer deferred moments earlier", () => {
     const { container } = arrivedOnACard();
     press("a");
     wait(100);
@@ -3335,7 +3335,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  it("two rows below a lone card, a answers nothing and points back to the card (S4, F13, R2-10)", () => {
+  it("two rows below a lone card, a answers nothing and points back to the card", () => {
     const { container } = arrivedOnACard();
     press("j");
     press("j");
@@ -3347,7 +3347,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
   });
 
-  it("Space on a focused Approve does nothing: not the button, not the leader (S5)", () => {
+  it("Space on a focused Approve does nothing: not the button, not the leader", () => {
     const { container } = arrivedOnACard();
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     press("l");
@@ -3539,7 +3539,7 @@ describe("v1: typing never answers a card", () => {
   });
 
   /* A prefix, a pause past every timer, then an answer key. */
-  it.each([["g", "d"], ["g", "a"], ["]", "d"], ["[", "d"], ["z", "d"], ["g", "D"]])("K01: %s, a pause, then %s answers nothing", (first, second) => {
+  it.each([["g", "d"], ["g", "a"], ["]", "d"], ["[", "d"], ["z", "d"], ["g", "D"]])("%s, a pause, then %s answers nothing", (first, second) => {
     const { container } = arrivedOnACard();
     wait(1000);
     press(first);
@@ -3550,7 +3550,7 @@ describe("v1: typing never answers a card", () => {
     expect(container.querySelector(".which-key-box")).toBeNull();
     expect(document.activeElement?.closest(".permission-card input") ?? null).toBeNull();
   });
-  it("K01: a count, a pause, then a answers nothing and says why", () => {
+  it("a count, a pause, then a answers nothing and says why", () => {
     const { container } = arrivedOnACard();
     wait(1000); press("3"); wait(5000); press("a");
     // Read at once: a flash lasts 2 s (`showFlash`'s own timer), so 5 s on the band is empty again.
@@ -3558,14 +3558,14 @@ describe("v1: typing never answers a card", () => {
     wait(5000);
     expect(answered()).toEqual([]);
   });
-  it("K01: g, a pause, then Enter on a focused Approve presses nothing", () => {
+  it("g, a pause, then Enter on a focused Approve presses nothing", () => {
     arrivedOnACard();
     press("l"); wait(1000); press("g"); wait(5000);
     expect(pressOnButton("Enter")).toBe(false);
     wait(1000);
     expect(answered()).toEqual([]);
   });
-  it("K01: g then a held d never answers, and a lone a after a cancelled g still does", () => {
+  it("g then a held d never answers, and a lone a after a cancelled g still does", () => {
     arrivedOnACard();
     wait(1000); press("g"); wait(1000); press("d");
     for (let i = 0; i < 3; i++) press("d", { repeat: true });
@@ -3574,7 +3574,7 @@ describe("v1: typing never answers a card", () => {
     press("a"); wait(1000);
     expect(answered()).toHaveLength(1);
   });
-  it("K01: g then a key an input method is composing drops the prefix and answers nothing", () => {
+  it("g then a key an input method is composing drops the prefix and answers nothing", () => {
     arrivedOnACard();
     wait(1000); press("g"); wait(1000); press("d", { isComposing: true }); press("d", { keyCode: 229 }); wait(1000);
     expect(answered()).toEqual([]);
@@ -3656,7 +3656,7 @@ describe("v1: typing never answers a card", () => {
      on ANY focused control is swallowed -- Stop included, whose press interrupts the turn and
      denies the waiting card with it; a count before Enter/Space on a card's own button cancels, and
      says why. */
-  it.each([["Enter"], [" "]])("K01: g, a pause, then %j on Stop interrupts nothing", (key) => {
+  it.each([["Enter"], [" "]])("g, a pause, then %j on Stop interrupts nothing", (key) => {
     arrivedOnACard();
     const stop = buttonLabelled(document.body, "ctrl+c interrupt")!;
     act(() => stop.focus());
@@ -3667,7 +3667,7 @@ describe("v1: typing never answers a card", () => {
     expect(posted.some((m) => m.type === "interrupt")).toBe(false);
     expect(answered()).toEqual([]);
   });
-  it.each([["Enter"], [" "]])("K01: a count, a pause, then %j on a focused Approve answers nothing and says why", (key) => {
+  it.each([["Enter"], [" "]])("a count, a pause, then %j on a focused Approve answers nothing and says why", (key) => {
     const { container } = arrivedOnACard();
     press("l"); wait(1000); press("3"); wait(5000);
     expect(document.activeElement?.textContent).toBe("Approve");
@@ -3678,7 +3678,7 @@ describe("v1: typing never answers a card", () => {
   });
   /* A prefix's second key never starts a leader sequence, so `g`, a
      pause, Space is a cancelled `g`, and the `m` after it is a plain `m` -- never `<leader>m`. */
-  it("K01: g, a pause, then Space starts no leader sequence: g Space m never reaches <leader>m", () => {
+  it("g, a pause, then Space starts no leader sequence: g Space m never reaches <leader>m", () => {
     const { container } = arrivedOnACard();
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     wait(1000); press("g"); wait(5000); press(" "); wait(1000);
@@ -3740,7 +3740,7 @@ describe("v1: typing never answers a card", () => {
     wait(5000);
     expect(answered()).toEqual([]);
   });
-  it("Ctrl+w j, then a within the guard window answers nothing (the guard's before-half)", () => {
+  it("Ctrl+w j, then a within the guard window answers nothing (the typing guard's before-half)", () => {
     arrivedOnACard();
     wait(1000); press("w", { ctrlKey: true }); press("j"); wait(80); press("a"); wait(5000);
     expect(answered()).toEqual([]);
@@ -3771,7 +3771,7 @@ describe("v1: typing never answers a card", () => {
      a HINT landing with no key since. `pressOnButton` models the browser's own activation, so an
      answer read after it returned false is the panel's own deferred press. */
   const ENTER_LANDING = "Enter answers a card right after l, h or Tab onto its button";
-  it("K02: l, s, Enter at 400 ms a key approves nothing (the walk did not land the Enter)", () => {
+  it("l, s, Enter at 400 ms a key approves nothing (the walk did not land the Enter)", () => {
     const { container } = arrivedOnACard();
     wait(1000); press("l"); wait(400); press("s"); wait(400);
     expect(pressOnButton("Enter")).toBe(false);
@@ -3779,7 +3779,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(ENTER_LANDING);
   });
-  it("K02: :ls Enter at 400 ms a key opens a command line and answers nothing", () => {
+  it(":ls Enter at 400 ms a key opens a command line and answers nothing", () => {
     const { container } = arrivedOnACard();
     wait(400); press(":", { shiftKey: true });
     wait(400); press("l");
@@ -3792,7 +3792,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(container.querySelector(".search-bar")).toBeNull();
   });
-  it("K02: l onto Approve, then :ls Enter at 400 ms a key: the line takes them, and nothing is answered", () => {
+  it("l onto Approve, then :ls Enter at 400 ms a key: the line takes them, and nothing is answered", () => {
     const { container } = arrivedOnACard();
     press("l");
     expect(document.activeElement?.textContent).toBe("Approve");
@@ -3808,7 +3808,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(container.querySelector(".search-bar")).toBeNull();
   });
-  it("K02: l onto Approve, then g h (a cancelled pair, no focus move) and Enter at 400 ms, approves nothing", () => {
+  it("l onto Approve, then g h (a cancelled pair, no focus move) and Enter at 400 ms, approves nothing", () => {
     arrivedOnACard();
     press("l"); wait(400); press("g"); wait(400); press("h"); wait(400);
     expect(document.activeElement?.textContent).toBe("Approve");
@@ -3816,7 +3816,7 @@ describe("v1: typing never answers a card", () => {
     wait(1000);
     expect(answered()).toEqual([]);
   });
-  it("K02: Tab onto Approve, then Enter, approves after S1's wait", () => {
+  it("Tab onto Approve, then Enter, approves after the typing guard's wait", () => {
     const { container } = arrivedOnACard();
     const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
     wait(400); press("Tab"); act(() => approve.focus()); // the browser's own Tab move
@@ -3825,7 +3825,7 @@ describe("v1: typing never answers a card", () => {
     wait(300);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
   });
-  it("K02: a Tab whose move left the page is no landing when focus comes back onto Approve", () => {
+  it("a Tab whose move left the page is no landing when focus comes back onto Approve", () => {
     const { container } = arrivedOnACard();
     const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
     wait(400); press("Tab");
@@ -3839,7 +3839,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(ENTER_LANDING);
   });
-  it("K02: focus no key put on Approve is no landing: Tab, x, then Approve focused from elsewhere", () => {
+  it("focus no key put on Approve is no landing: Tab, x, then Approve focused from elsewhere", () => {
     const { container } = arrivedOnACard();
     const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
     wait(400); press("Tab"); wait(400); press("x"); act(() => approve.focus());
@@ -3849,7 +3849,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(ENTER_LANDING);
   });
-  it("K02: h from Deny back onto Approve, then Enter, approves after S1's wait", () => {
+  it("h from Deny back onto Approve, then Enter, approves after the typing guard's wait", () => {
     arrivedOnACard();
     press("l"); press("l");
     expect(document.activeElement?.textContent).toBe("Deny");
@@ -3860,7 +3860,7 @@ describe("v1: typing never answers a card", () => {
     wait(300);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
   });
-  it("K02: Shift+, Alt+, Ctrl+ and Meta+Enter on a focused Approve answer nothing", () => {
+  it("Shift+, Alt+, Ctrl+ and Meta+Enter on a focused Approve answer nothing", () => {
     const { container } = arrivedOnACard();
     press("l"); wait(300);
     const approve = document.activeElement as HTMLElement;
@@ -3871,7 +3871,7 @@ describe("v1: typing never answers a card", () => {
     }
     expect(answered()).toEqual([]);
   });
-  it("K02: a held Enter on a landed Approve: its repeat cancels the press, and nothing is answered", () => {
+  it("a held Enter on a landed Approve: its repeat cancels the press, and nothing is answered", () => {
     arrivedOnACard();
     press("l"); wait(300);
     expect(pressOnButton("Enter")).toBe(false);
@@ -3895,7 +3895,7 @@ describe("v1: typing never answers a card", () => {
           events: [{ type: "permission_resolved", permission_id: "perm-1", outcome: "allowed" }],
         }),
     ],
-  ])("K02: l, Enter on Approve, then %s before 250 ms: nothing is pressed", (_name, interrupt) => {
+  ])("l, Enter on Approve, then %s before 250 ms: nothing is pressed", (_name, interrupt) => {
     arrivedOnACard();
     press("l"); wait(300);
     expect(pressOnButton("Enter")).toBe(false);
@@ -3911,7 +3911,7 @@ describe("v1: typing never answers a card", () => {
      switch's own `typingGuard.cancel()`, the fire-time tab check behind it, and the switch landing the
      keys on the root (focus leaves the button). The tab check is never the only one: `activeTabRef`
      changes only in the `tabs` arm, which cancels the wait in the same branch. */
-  it("K02: l, Enter on Approve, then a switch to a tab whose card keeps the very same button: nothing is pressed", () => {
+  it("l, Enter on Approve, then a switch to a tab whose card keeps the very same button: nothing is pressed", () => {
     const { container } = arrivedOnACard();
     press("l"); wait(300);
     const approve = document.activeElement as HTMLButtonElement;
@@ -3946,7 +3946,7 @@ describe("v1: typing never answers a card", () => {
     [":", "Escape"],
     ["/", "Enter"],
     ["/", "Escape"],
-  ])("K02: %s, then %s in its line, then a at 80 ms answers nothing (the line's own key counts)", (lead, closeKey) => {
+  ])("%s, then %s in its line, then a at 80 ms answers nothing (the line's own key counts)", (lead, closeKey) => {
     const { container } = arrivedOnACard();
     wait(400);
     press(lead, lead === ":" ? { shiftKey: true } : {});
@@ -3961,7 +3961,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(TYPING);
   });
-  it("K02: the : line closes silently on Esc and on pane_focus, and its Enter says what it is", () => {
+  it("the : line closes silently on Esc and on pane_focus, and its Enter says what it is", () => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     const line = () => container.querySelector<HTMLInputElement>(".search-bar input");
@@ -3991,7 +3991,7 @@ describe("v1: typing never answers a card", () => {
      fires, so focus moved off Approve by no key (a click elsewhere) within the wait presses nothing;
      and a Tab's landing is used up by the first focus after it, so a second focus no key made is no
      landing. */
-  it("K02: l, Enter, then focus moved off Approve by no key before 250 ms: nothing is pressed", () => {
+  it("l, Enter, then focus moved off Approve by no key before 250 ms: nothing is pressed", () => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     press("l");
@@ -4003,7 +4003,7 @@ describe("v1: typing never answers a card", () => {
     wait(1000);
     expect(answered()).toEqual([]);
   });
-  it("K02: a Tab's landing is used up by the first focus after it: a second focus no key made is no landing", () => {
+  it("a Tab's landing is used up by the first focus after it: a second focus no key made is no landing", () => {
     const { container } = arrivedOnACard();
     const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
     const stop = container.querySelector<HTMLButtonElement>(".activity-line .stop")!;
@@ -4051,7 +4051,7 @@ describe("v1: typing never answers a card", () => {
       return rendered;
     }],
     ["the /model picker", ".slash-picker", pickerOverACard],
-  ])("K02: with %s open, Enter or Space on a card button that still has focus answers nothing", (_name, selector, setUp) => {
+  ])("with %s open, Enter or Space on a card button that still has focus answers nothing", (_name, selector, setUp) => {
     const { container } = setUp();
     expect(document.activeElement).toBe(container.querySelector(selector));
     const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
@@ -4071,7 +4071,7 @@ describe("v1: typing never answers a card", () => {
   it.each([
     ["/", ":", "Command line"],
     [":", "/", "Search the conversation"],
-  ])("K02: %s open, the keys back on the conversation, then %s: one line, the new one, holding the keys", (first, second, label) => {
+  ])("%s open, the keys back on the conversation, then %s: one line, the new one, holding the keys", (first, second, label) => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     press(first, first === ":" ? { shiftKey: true } : {});
@@ -4087,7 +4087,7 @@ describe("v1: typing never answers a card", () => {
     dispatch({ kind: "arrive" });
     expect(document.activeElement).toBe(input);
   });
-  it("K02: the : line open, the keys back on the conversation, then <leader>/: one line, the search", () => {
+  it("the : line open, the keys back on the conversation, then <leader>/: one line, the search", () => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "/"], "panel.search", "search")] };
@@ -4112,7 +4112,7 @@ describe("v1: typing never answers a card", () => {
     ["/", "the chooser", () => dispatch({ kind: "chooser", open: [], records: [] }), ".chooser"],
     [":", "a tab rename", () => dispatch({ kind: "begin_rename", tab: 1, current: null }), ".tab-rename"],
     ["/", "a tab rename", () => dispatch({ kind: "begin_rename", tab: 1, current: null }), ".tab-rename"],
-  ])("K02: %s open, then %s takes the keys: the line closes, and leaving it draws no line", (lead, _name, open, selector) => {
+  ])("%s open, then %s takes the keys: the line closes, and leaving it draws no line", (lead, _name, open, selector) => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     wait(400);
@@ -4158,7 +4158,7 @@ describe("v1: typing never answers a card", () => {
     if (fireEvent.keyDown(target, { key: "Enter" }) && target.tagName === "BUTTON") fireEvent.click(target);
   };
   const openLine = (lead: string) => press(lead, lead === ":" ? { shiftKey: true } : {});
-  it.each([":", "/"])("K02: %s, Tab, then l and Enter at 400 ms a key: the line keeps the keys, and nothing is answered", (lead) => {
+  it.each([":", "/"])("%s, Tab, then l and Enter at 400 ms a key: the line keeps the keys, and nothing is answered", (lead) => {
     const { container } = arrivedOnACard();
     wait(400);
     openLine(lead);
@@ -4176,7 +4176,7 @@ describe("v1: typing never answers a card", () => {
     expect(afterTab).toBe(input);
     expect(container.querySelector(".search-bar")).toBeNull();
   });
-  it.each([":", "/"])("K02: %s, Tab, then a lone a: the a is the line's, and nothing is answered", (lead) => {
+  it.each([":", "/"])("%s, Tab, then a lone a: the a is the line's, and nothing is answered", (lead) => {
     const { container } = arrivedOnACard();
     wait(400);
     openLine(lead);
@@ -4190,7 +4190,7 @@ describe("v1: typing never answers a card", () => {
     expect(document.activeElement).toBe(input);
     expect(container.querySelector(".search-bar")).not.toBeNull();
   });
-  it("K02: :, l, Tab, :, l, Enter at 400 ms a key answers nothing", () => {
+  it(":, l, Tab, :, l, Enter at 400 ms a key answers nothing", () => {
     const { container } = arrivedOnACard();
     wait(400);
     openLine(":");
@@ -4208,7 +4208,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(container.querySelector(".search-bar")).toBeNull();
   });
-  it.each([":", "/"])("K02: %s's line claims every Tab: modified, and Shift+Tab's other WebKitGTK shape", (lead) => {
+  it.each([":", "/"])("%s's line claims every Tab: modified, and Shift+Tab's other WebKitGTK shape", (lead) => {
     const { container } = arrivedOnACard();
     openLine(lead);
     const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
@@ -4224,7 +4224,7 @@ describe("v1: typing never answers a card", () => {
     expect(document.activeElement).toBe(input);
     expect(container.querySelector(".search-bar")).not.toBeNull();
   });
-  it.each([":", "/"])("K02: %s open, the keys moved off it by a click, then that key again: its line takes the keys back", (lead) => {
+  it.each([":", "/"])("%s open, the keys moved off it by a click, then that key again: its line takes the keys back", (lead) => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     wait(400);
@@ -4244,7 +4244,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(container.querySelector(".search-bar")).toBeNull();
   });
-  it("K02: the / prompt open, the keys moved off it by a click, then <leader>/: the prompt takes the keys back", () => {
+  it("the / prompt open, the keys moved off it by a click, then <leader>/: the prompt takes the keys back", () => {
     const { container } = arrivedOnACard();
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
     const table: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "/"], "panel.search", "search")] };
@@ -4258,7 +4258,7 @@ describe("v1: typing never answers a card", () => {
     expect(lines).toHaveLength(1);
     expect(document.activeElement).toBe(lines[0].querySelector("input"));
   });
-  it("K02: a Tab the line claimed is no landing: Approve focused by no key after it, then Enter, presses nothing", () => {
+  it("a Tab the line claimed is no landing: Approve focused by no key after it, then Enter, presses nothing", () => {
     const { container } = arrivedOnACard();
     const approve = container.querySelector<HTMLButtonElement>('.permission-card [data-nav-action="allow"]')!;
     wait(400);
@@ -4278,7 +4278,7 @@ describe("v1: typing never answers a card", () => {
      Arming a landing before that cancellation could treat later mouse focus as Tab's landing
      and let Enter press Approve. */
   it.each([["g"], ["z"], ["["], ["]"]])(
-    "K02: %s, then Tab (a cancelled pair: no focus move), then Approve focused by no key: Enter presses nothing",
+    "%s, then Tab (a cancelled pair: no focus move), then Approve focused by no key: Enter presses nothing",
     (prefix) => {
       const { container } = arrivedOnACard();
       const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
@@ -4297,7 +4297,7 @@ describe("v1: typing never answers a card", () => {
       expect(band(container)).toBe(ENTER_LANDING);
     },
   );
-  it("K02: the leader, then Tab (a key its sequence does not bind), then Approve focused by no key: Enter presses nothing", () => {
+  it("the leader, then Tab (a key its sequence does not bind), then Approve focused by no key: Enter presses nothing", () => {
     const { container } = arrivedOnACard();
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
@@ -4353,7 +4353,7 @@ describe("v1: typing never answers a card", () => {
     });
     return { ...rendered, first: controls(cards[0]), second: controls(cards[1]) };
   }
-  it("K02: l l onto Deny, Tab Tab onto the next card's Approve, then Enter: answers nothing, and says why", () => {
+  it("l l onto Deny, Tab Tab onto the next card's Approve, then Enter: answers nothing, and says why", () => {
     const { container, first, second } = arrivedOnTheFirstOfTwoCards();
     press("l");
     press("l");
@@ -4370,7 +4370,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(ENTER_ELSEWHERE);
   });
-  it("K02: Tab onto the next card's Approve, then l onto its Deny, then Enter: answers nothing", () => {
+  it("Tab onto the next card's Approve, then l onto its Deny, then Enter: answers nothing", () => {
     const { container, first, second } = arrivedOnTheFirstOfTwoCards();
     press("l");
     press("l");
@@ -4388,7 +4388,7 @@ describe("v1: typing never answers a card", () => {
     expect(answered()).toEqual([]);
     expect(band(container)).toBe(ENTER_ELSEWHERE);
   });
-  it("K02: j j onto the second card, then l and Enter: answers that card", () => {
+  it("j j onto the second card, then l and Enter: answers that card", () => {
     const { second } = arrivedOnTheFirstOfTwoCards();
     press("j");
     press("j");
@@ -4400,7 +4400,7 @@ describe("v1: typing never answers a card", () => {
     wait(300);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-2", decision: "allow" })]);
   });
-  it("K02: the cursor on a tool call, Tab onto the Approve of the card gating it, then Enter: answers that card, as a does", () => {
+  it("the cursor on a tool call, Tab onto the Approve of the card gating it, then Enter: answers that card, as a does", () => {
     const { container, second } = arrivedOnTheFirstOfTwoCards();
     press("j");
     expect(container.querySelector(".row-current")!.classList.contains("row-tool")).toBe(true);
@@ -5338,7 +5338,7 @@ describe("App global HINT: the panel's half", () => {
     });
   });
 
-  it("offers no composer label only once the session has ended (C1: a running turn no longer disables it)", () => {
+  it("offers no composer label only once the session has ended (a running turn no longer disables it)", () => {
     // A running turn no longer disables the composer (the composer stays live: it queues a follow-up instead), so it is
     // a HINT target through the turn too -- one more than `AT`'s own count.
     const running = conversation();
@@ -5470,7 +5470,7 @@ describe("App global HINT: the panel's half", () => {
 
   /* A HINT landing is a landing -- the Enter right after it presses the button,
      `TYPING_GUARD_MS` later, as `l` then Enter does. A key in between makes it none. */
-  it("K02: a HINT landing on Approve, then Enter, approves after S1's wait", () => {
+  it("a HINT landing on Approve, then Enter, approves after the typing guard's wait", () => {
     vi.useFakeTimers();
     try {
       conversation();
@@ -5485,7 +5485,7 @@ describe("App global HINT: the panel's half", () => {
       vi.useRealTimers();
     }
   });
-  it("K02: a HINT landing on Approve, then x, then Enter, presses nothing", () => {
+  it("a HINT landing on Approve, then x, then Enter, presses nothing", () => {
     vi.useFakeTimers();
     try {
       conversation();
@@ -5792,7 +5792,7 @@ describe("App global HINT: the panel's half", () => {
      on screen; (b) a landing on a code block is drawn -- the block outlined, the row's sign hollow --
      until the next key, as the one-solid-mark rule draws a control inside the current row. The list
      is 0..1000 here (`layOut`), the root too, so a label's `top` is also its y in the list. */
-  describe("K07: code block labels and landings", () => {
+  describe("code block labels and landings", () => {
     const codeLabel = (c: HTMLElement) => c.querySelector<HTMLElement>(".hint-label.hint-code")!;
     const topOf = (el: HTMLElement) => parseFloat(el.style.top);
     function labelled(setUp: (c: HTMLElement) => void, replyTail?: string) {
@@ -5802,27 +5802,27 @@ describe("App global HINT: the panel's half", () => {
       return rendered;
     }
 
-    it("K07-1: a block whose top is scrolled out gets its label at the visible top, not above the list", () => {
+    it("a block whose top is scrolled out gets its label at the visible top, not above the list", () => {
       const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, -62, 300));
       expect(codeLabel(container).style.top).toBe("4px");
     });
-    it("K07-2: a block scrolled 3724px out of its top (the P6 case) likewise", () => {
+    it("a block scrolled 3724px out of its top likewise", () => {
       const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, -3724, 4000));
       expect(codeLabel(container).style.top).toBe("4px");
     });
-    it("K07-3: a block fully in view keeps the label where it always was", () => {
+    it("a block fully in view keeps the label where it always was", () => {
       const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, 200, 50));
       expect(codeLabel(container).style.top).toBe("204px");
     });
-    it("K07-4a: a sliver at the top edge: the label is inside the list, never above it", () => {
+    it("a sliver at the top edge: the label is inside the list, never above it", () => {
       const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, -290, 300));
       expect(codeLabel(container).style.top).toBe("4px");
     });
-    it("K07-4b: a sliver at the bottom edge: the label is inside the list, never past it", () => {
+    it("a sliver at the bottom edge: the label is inside the list, never past it", () => {
       const { container } = labelled((c) => box(c.querySelector("pre.code-block")!, 990, 300));
       expect(codeLabel(container).style.top).toBe("984px");
     });
-    it("K07-5: a tall row whose sign cell starts above the list gets its label inside the list", () => {
+    it("a tall row whose sign cell starts above the list gets its label inside the list", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, -500, 2000);
@@ -5845,7 +5845,7 @@ describe("App global HINT: the panel's half", () => {
       (el as HTMLElement).getBoundingClientRect = () =>
         ({ top, bottom: top, left: 0, right: 0, width: 0, height: 0, x: 0, y: top }) as DOMRect;
     };
-    it("K07-5b: a prose row whose sign cell has no width gets a small label at its visible top-left", () => {
+    it("a prose row whose sign cell has no width gets a small label at its visible top-left", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, 100, 400);
@@ -5857,7 +5857,7 @@ describe("App global HINT: the panel's half", () => {
       expect(label.style.top).toBe("100px");
       expect(label.style.left).toBe("0px");
     });
-    it("K07-5c: a row whose sign cell is scrolled out of the list, its body still showing, gets a small label at the list's top", () => {
+    it("a row whose sign cell is scrolled out of the list, its body still showing, gets a small label at the list's top", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, -300, 600);
@@ -5868,7 +5868,7 @@ describe("App global HINT: the panel's half", () => {
       expect(label.style.height).toBe("");
       expect(label.style.top).toBe("0px");
     });
-    it("K07-5d: a row with no sign cell at all is labelled the same way", () => {
+    it("a row with no sign cell at all is labelled the same way", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, 250, 300);
@@ -5879,7 +5879,7 @@ describe("App global HINT: the panel's half", () => {
       expect(label.style.height).toBe("");
       expect(label.style.top).toBe("250px");
     });
-    it("K07-5e: a row whose sign cell shows is still labelled on the sign cell, at its size", () => {
+    it("a row whose sign cell shows is still labelled on the sign cell, at its size", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, 200, 400);
@@ -5913,7 +5913,7 @@ describe("App global HINT: the panel's half", () => {
       vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(size(() => height));
     };
     afterEach(() => vi.restoreAllMocks());
-    it("K07-5f: a fallback row label is measured, so at a big font it is clamped by its own size", () => {
+    it("a fallback row label is measured, so at a big font it is clamped by its own size", () => {
       measuredLabels(31, 31);
       const { container } = proseOnly();
       const reply = container.querySelectorAll<HTMLElement>(".row-assistant")[0];
@@ -5925,7 +5925,7 @@ describe("App global HINT: the panel's half", () => {
       // 1000 (the list's bottom) - 31, not - 16: it stays inside the list.
       expect(label.style.top).toBe("969px");
     });
-    it("K07-5g: a sign cell only a few px into view gets the fallback label, not a squashed one", () => {
+    it("a sign cell only a few px into view gets the fallback label, not a squashed one", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, -12, 600);
@@ -5936,7 +5936,7 @@ describe("App global HINT: the panel's half", () => {
       expect(label.style.height).toBe("");
       expect(label.style.top).toBe("0px");
     });
-    it("K07-5h: a sign cell that is clipped but still as tall as a label keeps a label sized to what shows", () => {
+    it("a sign cell that is clipped but still as tall as a label keeps a label sized to what shows", () => {
       const { container } = labelled((c) => {
         const reply = c.querySelector<HTMLElement>(".row-assistant")!;
         box(reply, -2, 600);
@@ -5945,12 +5945,12 @@ describe("App global HINT: the panel's half", () => {
       const label = rowLabel(container, AT.reply);
       expect(label.style.height).toBe("18px");
     });
-    it("K07-5i: a small fully visible sign cell is still labelled on the cell, as it always was", () => {
+    it("a small fully visible sign cell is still labelled on the cell, as it always was", () => {
       const { container } = labelled(() => {}); // `layOut`: every sign cell is a whole 10px box
       const label = rowLabel(container, AT.reply);
       expect(label.style.height).toBe("10px");
     });
-    it("K07-5j: a link label that would land on a fallback row label moves to its right edge", () => {
+    it("a link label that would land on a fallback row label moves to its right edge", () => {
       measuredLabels(31, 31);
       const { container } = proseOnly();
       const reply = container.querySelectorAll<HTMLElement>(".row-assistant")[0];
@@ -5970,7 +5970,7 @@ describe("App global HINT: the panel's half", () => {
       // Its own place would be left 26 (link left - 6), inside the row label's 0..31.
       expect(parseFloat(linkLabel.style.left)).toBeGreaterThanOrEqual(31);
     });
-    it("K07-5k: a link label clear of the row label stays where it was", () => {
+    it("a link label clear of the row label stays where it was", () => {
       measuredLabels(16, 16);
       const { container } = proseOnly();
       const reply = container.querySelectorAll<HTMLElement>(".row-assistant")[0];
@@ -5993,7 +5993,7 @@ describe("App global HINT: the panel's half", () => {
        two alternated on every commit until React gave up ("Maximum update depth exceeded") and the panel's
        crash fallback replaced it. jsdom reports no style, so `getComputedStyle` is stubbed for a `.hint-label`
        the way WebKit reports it at that font size. */
-    describe("K07-11: a label's height has one source, so its placement settles", () => {
+    describe("a label's height has one source, so its placement settles", () => {
       const NATURAL = { fontSize: "25.142857px", paddingTop: "3px", paddingBottom: "3px" }; // 31.142857
       function stubLabelStyle(natural: Record<string, string> = NATURAL) {
         const real = window.getComputedStyle.bind(window);
@@ -6056,7 +6056,7 @@ describe("App global HINT: the panel's half", () => {
       });
     });
 
-    it("K07-9: a link partly scrolled out gets its label inside the list", () => {
+    it("a link partly scrolled out gets its label inside the list", () => {
       const { container } = labelled(
         (c) => box(c.querySelector('.row-assistant a[href^="https:"]')!, -5, 20),
         "then see [the docs](https://example.com/docs).",
@@ -6073,7 +6073,7 @@ describe("App global HINT: the panel's half", () => {
     }
     const marked = (c: HTMLElement) => Array.from(c.querySelectorAll("pre[data-hint-landed]"));
 
-    it("K07-6: a landing on a code block marks that block, and nothing else", () => {
+    it("a landing on a code block marks that block, and nothing else", () => {
       const { container } = conversation("then look.\n\n```\npwd\n```\n");
       const [first, second] = Array.from(container.querySelectorAll("pre.code-block"));
       expect(second).toBeDefined();
@@ -6096,7 +6096,7 @@ describe("App global HINT: the panel's half", () => {
       next(container);
       expect(marked(container)).toEqual([]);
     });
-    it("K07-10: a streamed delta that re-renders the landed block takes the mark with it", () => {
+    it("a streamed delta that re-renders the landed block takes the mark with it", () => {
       const { container } = started();
       events(
         { type: "user_prompt_submitted", text: "list it" },
@@ -6164,7 +6164,7 @@ describe("App global HINT: the panel's half", () => {
       const link = container.querySelector<HTMLElement>(".hint-label.hint-link")!;
       expect(parseFloat(link.style.left)).toBeGreaterThanOrEqual(0);
     });
-    it("K07-8: a landing on a block in another row reveals the block, not the row", () => {
+    it("a landing on a block in another row reveals the block, not the row", () => {
       const { container } = conversation();
       expect(container.querySelector(".row-current .code-block")).toBeNull();
       const reveal = Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -6292,7 +6292,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(690); // the very end of the list
   });
 
-  it("K01: a pane switch drops a count, as it drops a prefix", () => {
+  it("a pane switch drops a count, as it drops a prefix", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
     press("g"); press("g"); press("3");
@@ -6303,7 +6303,7 @@ describe("App keyboard: scrolling through the conversation", () => {
   });
   /* Shift+Tab never reaches `onKeyDown` (`onModeKey` stops it), so it drops a
      waiting prefix and a count itself -- the mode still cycles. */
-  it("K01: Shift+Tab drops a waiting prefix: g, Shift+Tab, g is no gg", () => {
+  it("Shift+Tab drops a waiting prefix: g, Shift+Tab, g is no gg", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
     press("k"); press("k");
@@ -6314,7 +6314,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("g");
     expect(current(container)).toBe("r1");
   });
-  it("K01: Shift+Tab drops a count: 2, Shift+Tab, j moves one row", () => {
+  it("Shift+Tab drops a count: 2, Shift+Tab, j moves one row", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
     press("g"); press("g");
@@ -6326,7 +6326,7 @@ describe("App keyboard: scrolling through the conversation", () => {
   });
   /* A count survives its prefix -- `case "pending"` keeps it for the second
      key, and `prompt-jump` repeats (once, `3[[` jumped one prompt). */
-  it("K01 (R2): a count survives its prefix: 3[[ goes three prompts back, 2]] two forward", () => {
+  it("a count survives its prefix: 3[[ goes three prompts back, 2]] two forward", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4", "r5");
     expect(current(container)).toBe("r5");
@@ -6338,7 +6338,7 @@ describe("App keyboard: scrolling through the conversation", () => {
   /* `[`/`]` arm with Alt or Meta held, so the second key accepts the same modifiers and
      `[[`/`]]` still jump. Layouts that type brackets with Option need the modifier on both
      keys. */
-  it("K01: [[ and ]] typed with Alt or Meta held on both keys still jump", () => {
+  it("[[ and ]] typed with Alt or Meta held on both keys still jump", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3");
     expect(current(container)).toBe("r3");
@@ -6356,7 +6356,7 @@ describe("App keyboard: scrolling through the conversation", () => {
 
   /* A count before `G`/`gg` selects row N. Before `gt` it selects tab N; before `gT` it moves N
      tabs back. Other pairs ignore it, except `[[`/`]]`, which repeat the prompt jump. */
-  it("counts: 3G and 3gg go to row 3, 2]] two prompts on (R2)", () => {
+  it("counts: 3G and 3gg go to row 3, 2]] two prompts on", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
     press("3"); press("G", { shiftKey: true }); expect(current(container)).toBe("r2");
@@ -6365,7 +6365,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("g"); press("g"); press("2"); press("]"); press("]"); expect(current(container)).toBe("r2");
   });
 
-  it("counts: 2gt goes to tab 2, 9gt says there is none, a bare gt still steps (R2)", () => {
+  it("counts: 2gt goes to tab 2, 9gt says there is none, a bare gt still steps", () => {
     const widen = stubBandWidth();
     try {
       const { container } = started();
@@ -6444,7 +6444,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBeLessThan(1990);
   });
 
-  it("counts: 3gt posts the tab's id, 2gT wraps back past the first tab, and a count before ]b is ignored (R2)", () => {
+  it("counts: 3gt posts the tab's id, 2gT wraps back past the first tab, and a count before ]b is ignored", () => {
     started();
     const info = (id: number, number: number) => ({ ...LIVE_TAB, id, number, label: `${number} new` });
     dispatch({ kind: "tabs", active: 1, tabs: [info(1, 1), info(2, 2), info(5, 3)] });
@@ -6656,7 +6656,7 @@ describe("App keyboard: scrolling through the conversation", () => {
     expect(list.scrollTop).toBe(20); // `.row-body`'s 20px -- not the row wrapper's mismatched 999px
   });
 
-  it("a count repeats Ctrl+e/Ctrl+y, capped the same way every other count is (R4)", () => {
+  it("a count repeats Ctrl+e/Ctrl+y, capped the same way every other count is", () => {
     const { container } = started();
     prompts("r0", "r1", "r2", "r3", "r4");
     const list = fakeLayout(container, [300, 300, 300, 300, 300]);
@@ -7956,7 +7956,7 @@ describe("App: the ? keymap overlay", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key, ...over });
   const overlay = (c: HTMLElement) => c.querySelector<HTMLElement>(".keymap-overlay");
 
-  it("opens on ? and shows all six groups, in the spec's order", () => {
+  it("opens on ? and shows all eight groups, in their fixed order", () => {
     const { container } = started();
     act(() => root(container).focus());
     expect(overlay(container)).toBeNull();
@@ -8130,7 +8130,7 @@ describe("App: the ? keymap overlay", () => {
    effect) re-dispatches it as a plain Escape keydown on the same target, so every place below is a
    place the panel already reads Escape -- each test drives the real `App` with `Ctrl+[` where its
    Escape tests drive it with `Escape`. The CARET/VISUAL half is in "BROWSE visual mode" further down. */
-describe("Ctrl+[ is Esc everywhere in the panel (R9, kbux P15)", () => {
+describe("Ctrl+[ is Esc everywhere in the panel", () => {
   const CTRL_BRACKET = { key: "[", code: "BracketLeft", ctrlKey: true };
   const CHOOSER = {
     kind: "chooser",
@@ -8636,7 +8636,7 @@ describe("the session chooser", () => {
   });
 });
 
-describe("the mode, queue and context lines, and the band's message/prompt", () => {
+describe("the band's message, queue and prompt lines", () => {
   /** A live tab always cycles now (see "Shift+Tab anywhere in the chat" below) -- the one
    *  case that still flashes rather than posting is a tab that has already ENDED and is not already
    *  in bypass, which can never be asked to ENTER bypass, only leave it. */
@@ -8712,7 +8712,7 @@ describe("the mode, queue and context lines, and the band's message/prompt", () 
   });
 });
 
-describe("P1: the keys land on a card that waits", () => {
+describe("the keys land on a card that waits", () => {
   function oneCard() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -8740,7 +8740,7 @@ describe("P1: the keys land on a card that waits", () => {
   /* `a` answers only the card under the cursor:
      `a` acts on the cursor's card only. The flash it shows instead is `v1: typing never answers a
      card`'s. The wait is long enough that the typing guard is not what refuses it. */
-  it("a from another row does not answer the only card (v1 S4)", () => {
+  it("a from another row does not answer the only card", () => {
     vi.useFakeTimers();
     try {
       const { container } = oneCard();
@@ -8790,7 +8790,7 @@ describe("P1: the keys land on a card that waits", () => {
   });
 });
 
-describe("the first message from the empty tab (the phase-3 GUI pass, 2026-09-25)", () => {
+describe("the first message from the empty tab", () => {
   it("keeps the keys in INPUT once the session it started is live", () => {
     // Seen in the sandbox on both backends: the conversation mounted in BROWSE, so the next message
     // typed straight away ran as BROWSE keys -- `y` copied a row and `i` ate the rest of the word.
@@ -8807,7 +8807,7 @@ describe("the first message from the empty tab (the phase-3 GUI pass, 2026-09-25
   });
 });
 
-describe("the empty tab after a click on its background (the phase-3 GUI pass, 2026-09-25)", () => {
+describe("the empty tab after a click on its background", () => {
   it("a press on the root's own background does not take focus away from the composer", () => {
     // Seen in the sandbox beside a Lua panel: `.empty-tab` is centred (`margin: auto`), so a click
     // above or below it lands on `.agent-ui-root` (tabIndex -1), which took focus and handles no key:
@@ -8822,7 +8822,7 @@ describe("the empty tab after a click on its background (the phase-3 GUI pass, 2
   });
 });
 
-describe("P1 over a restored view (the phase-3 GUI pass, 2026-09-25)", () => {
+describe("the keys landing on a card that waits, over a restored view", () => {
   it("a switch back to a tab whose card waits below its saved view shows the card, not the saved scroll", () => {
     // Seen in the sandbox: `gg` in a tab with a card, `prefix n`, `prefix p` -- the cursor came back
     // on the card (25/25) but the view was restored to the top, so the card was off screen.
@@ -8867,7 +8867,7 @@ describe("P1 over a restored view (the phase-3 GUI pass, 2026-09-25)", () => {
   });
 });
 
-describe("a switch back to a tab whose reply streams (the small-defects GUI pass, 2026-09-25)", () => {
+describe("a switch back to a tab whose reply streams", () => {
   const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
   const rowsUpTo = (n: number) =>
     snapshotState({ activeTurnId: "t", transcript: Array.from({ length: n }, (_, i) => ({ seq: i + 1, text: `row ${i + 1}` })) });
@@ -8945,7 +8945,7 @@ describe("a switch back to a tab whose reply streams (the small-defects GUI pass
 /** A digit prefix must not cost `O(count)` work, and must not simply keep
  *  growing forever either. Pure, DOM-free -- the accumulation function itself, not the keyboard
  *  wiring around it (that's the boundary-scan tests inside "BROWSE: counts…" below). */
-describe("accumulateMotionCount (v1 audit R4)", () => {
+describe("accumulateMotionCount", () => {
   function typeCount(digits: string): number {
     let count: number | null = null;
     for (const ch of digits) count = accumulateMotionCount(count, Number(ch));
@@ -9159,7 +9159,7 @@ describe("the cursor follows the view", () => {
   });
 });
 
-describe("R4: / and n / N", () => {
+describe("/ and n / N", () => {
   function conversation() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9243,7 +9243,7 @@ describe("R4: / and n / N", () => {
   });
 });
 
-describe("P2 runs and R3 the detailed view", () => {
+describe("collapsed runs and the detailed view", () => {
   it("Enter on a collapsed run expands it, and Ctrl+o shows every result and survives a switch", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9381,7 +9381,7 @@ describe("P2 runs and R3 the detailed view", () => {
   });
 });
 
-describe("N3 and P5 in the conversation", () => {
+describe("copying with y and Y, and answering through the card, in the conversation", () => {
   function withBash() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9462,7 +9462,7 @@ describe("N3 and P5 in the conversation", () => {
   });
 });
 
-describe("N2 and R3: the editor round trips", () => {
+describe("the editor round trips", () => {
   function withPaths(text: string) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -9500,7 +9500,7 @@ describe("N2 and R3: the editor round trips", () => {
    *  per-conversation UI state and `pathPick` was not on it. Switching tabs with the picker
    *  open must close it before any letter can choose a stale path
    *  from the previous tab. */
-  it("switching tabs while gf's picker is open drops it: no open_path on the new tab (P2-A5)", () => {
+  it("switching tabs while gf's picker is open drops it: no open_path on the new tab", () => {
     const { container } = withPaths("compare a.rs and b.rs");
     const root = container.querySelector(".agent-ui-conversation")!;
     fireEvent.keyDown(root, { key: "g" });
@@ -10144,7 +10144,7 @@ describe("takes the keys", () => {
     });
   }
 
-  it("a. chooser open: pane_focus losing and regaining focus re-focuses it, and j moves its cursor", () => {
+  it("chooser open: pane_focus losing and regaining focus re-focuses it, and j moves its cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10161,7 +10161,7 @@ describe("takes the keys", () => {
   /** The chooser's own lone-`g` wait is a pending key too. A focus round trip is one of the
    *  window's cancel routes (`dropPendingKeys`), so the `j` after it moves the cursor instead of being
    *  swallowed as the cancel of a `g` typed before the panel lost the keys; Shift+Tab ends it the same way. */
-  it("a2. chooser open: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
+  it("chooser open: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10175,7 +10175,7 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
   });
 
-  it("a3. chooser open: a waiting g does not outlive Shift+Tab, and j moves the cursor", () => {
+  it("chooser open: a waiting g does not outlive Shift+Tab, and j moves the cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10191,7 +10191,7 @@ describe("takes the keys", () => {
   /** `App.tsx` renders the chooser at two sites -- over a live conversation (a2/a3
    *  above) and over an empty tab -- and only the first was covered, so the second one's `dropKeysRequest`
    *  could have been deleted with every test green. Same two routes, on the empty-tab layout. */
-  it("a2e. chooser open over an empty tab: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
+  it("chooser open over an empty tab: a waiting g does not outlive a focus round trip, and j moves the cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10206,7 +10206,7 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
   });
 
-  it("a3e. chooser open over an empty tab: a waiting g does not outlive Shift+Tab, and j moves the cursor", () => {
+  it("chooser open over an empty tab: a waiting g does not outlive Shift+Tab, and j moves the cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10219,7 +10219,7 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser-row.current")!.textContent).not.toBe(before);
   });
 
-  it("b. chooser open with the filter open: pane_focus regaining focus re-focuses the filter input", () => {
+  it("chooser open with the filter open: pane_focus regaining focus re-focuses the filter input", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10232,7 +10232,7 @@ describe("takes the keys", () => {
     expect(document.activeElement).toBe(container.querySelector<HTMLInputElement>(".chooser-filter"));
   });
 
-  it("c. chooser open over a live tab: enter_input never opens a textarea under it", () => {
+  it("chooser open over a live tab: enter_input never opens a textarea under it", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10244,7 +10244,7 @@ describe("takes the keys", () => {
     expect(modeBlock(container).dataset.mode).toBe("browse");
   });
 
-  it("c2. chooser open over an empty tab: enter_input never opens a textarea under it", () => {
+  it("chooser open over an empty tab: enter_input never opens a textarea under it", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10257,7 +10257,7 @@ describe("takes the keys", () => {
     expect(container.querySelector(".chooser")).not.toBeNull();
   });
 
-  it("d. chooser open: arrive keeps the focus in the chooser and does not move the conversation cursor", () => {
+  it("chooser open: arrive keeps the focus in the chooser and does not move the conversation cursor", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "first" }, { seq: 2, text: "second" }] }), 2);
@@ -10276,7 +10276,7 @@ describe("takes the keys", () => {
    *  scenario "e" used to cover here -- Esc at launch, then Rust's `arrive` because the editor
    *  refused the keys -- can no longer happen: `Esc` always returns the keys locally now (see the
    *  "session chooser" describe block above), with no round trip to Rust at all. */
-  it("f. empty tab, composer focused: arrive lands the keys on the empty tab root, not body", () => {
+  it("empty tab, composer focused: arrive lands the keys on the empty tab root, not body", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10286,7 +10286,7 @@ describe("takes the keys", () => {
     expect(container.querySelector(".empty-tab")!.contains(document.activeElement)).toBe(true);
   });
 
-  it("g. begin_rename open: pane_focus regaining focus re-focuses the tab bar's rename input", () => {
+  it("begin_rename open: pane_focus regaining focus re-focuses the tab bar's rename input", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10300,7 +10300,7 @@ describe("takes the keys", () => {
 
   /** Regression guard (passes today, must keep passing): a click landing focus on a control inside
    *  the panel -- Approve, here -- must not be yanked away by a `pane_focus true` that follows it. */
-  it("h. pane_focus true does not steal focus from a control the user just clicked", () => {
+  it("pane_focus true does not steal focus from a control the user just clicked", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 0);
@@ -10478,7 +10478,7 @@ describe("Shift+Tab anywhere in the chat", () => {
 
   /** A live tab cycles on any backend. Entering bypass gets a separate `confirm_bypass` y/n
    *  prompt from Rust. */
-  it("a. live tab, BROWSE, focus on the conversation root: cycle_mode posted, no flash, focus unchanged", () => {
+  it("live tab, BROWSE, focus on the conversation root: cycle_mode posted, no flash, focus unchanged", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10494,7 +10494,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     vi.unstubAllGlobals();
   });
 
-  it("b. live tab, INPUT, focus in the composer textarea: posted, text and focus kept", () => {
+  it("live tab, INPUT, focus in the composer textarea: posted, text and focus kept", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10512,7 +10512,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     vi.unstubAllGlobals();
   });
 
-  it("c. empty tab, event target <body>: one cycle_mode posted with the active tab's id", () => {
+  it("empty tab, event target <body>: one cycle_mode posted with the active tab's id", () => {
     render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10525,7 +10525,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(posts[0]).toMatchObject({ tab: 1 });
   });
 
-  it("d. empty tab, focus on the start screen's .agent-ui-root: one cycle_mode", () => {
+  it("empty tab, focus on the start screen's .agent-ui-root: one cycle_mode", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10539,7 +10539,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(posts[0]).toMatchObject({ tab: 1 });
   });
 
-  it("e. empty tab, BROWSE on the dashboard: exactly one cycle_mode, not two", () => {
+  it("empty tab, BROWSE on the dashboard: exactly one cycle_mode, not two", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchEmptyTab();
@@ -10553,7 +10553,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     expect(posts[0]).toMatchObject({ tab: 1 });
   });
 
-  it("f. chooser open, filter input focused: the chooser's own route (cycle_default_mode, active tab live)", () => {
+  it("chooser open, filter input focused: the chooser's own route (cycle_default_mode, active tab live)", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState(), 1);
@@ -10585,7 +10585,7 @@ describe("Shift+Tab anywhere in the chat", () => {
 
   /** "a starting tab can switch" -- no separate "starting" flash any more, it simply
    *  cycles like `not_started`/`live`. */
-  it("g. a starting tab: posts too, no flash", () => {
+  it("a starting tab: posts too, no flash", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10599,7 +10599,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     vi.unstubAllGlobals();
   });
 
-  it("h. the close prompt open: it closes (tmux confirm-before, any key cancels), no post", () => {
+  it("the close prompt open: it closes (tmux confirm-before, any key cancels), no post", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10618,7 +10618,7 @@ describe("Shift+Tab anywhere in the chat", () => {
 
   /** A live tab's `<leader>` `mode.cycle` always posts now too, the same as its Shift+Tab
    *  (test a/b above) -- there is no capability left to grey the box entry out for. */
-  it("i. <leader> mode.cycle on a live tab posts, and the box does not grey it out", () => {
+  it("<leader> mode.cycle on a live tab posts, and the box does not grey it out", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10649,7 +10649,7 @@ describe("Shift+Tab anywhere in the chat", () => {
    *  posted a `cycle_mode` Rust only refuses. Both now follow `modeKeyRoute`; `failed` in
    *  auto (not already bypass) is still the one state this flashes rather than posts -- and the text
    *  now names `r` (the fixed reset key), not `newTabChord` (there is no rebindable "leave" chord). */
-  it("j. <leader> mode.cycle on a failed tab flashes 'the session has ended — r to start again', no post", () => {
+  it("<leader> mode.cycle on a failed tab flashes 'the session has ended — r to start again', no post", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10667,7 +10667,7 @@ describe("Shift+Tab anywhere in the chat", () => {
   });
 
   /** On a starting tab, `<leader>` `mode.cycle` posts the request just as Shift+Tab does. */
-  it("j2. <leader> mode.cycle on a starting tab posts too, no flash", () => {
+  it("<leader> mode.cycle on a starting tab posts too, no flash", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10688,7 +10688,7 @@ describe("Shift+Tab anywhere in the chat", () => {
    *  already in bypass -- but that same tab, already in bypass, may still leave it. Both the plain
    *  Shift+Tab route and the leader's `mode.cycle` share `modeKeyRoute`, so one check here stands in
    *  for both call sites; the pure cases (every `tabState`/`tabMode` pair) are `modeKey.test.ts`'s. */
-  it("k. an ended tab already in bypass still cycles (to leave it)", () => {
+  it("an ended tab already in bypass still cycles (to leave it)", () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10709,7 +10709,7 @@ describe("Shift+Tab anywhere in the chat", () => {
    reach. A cancel route the dashboard never sees as a key of its own -- Shift+Tab (stopped by
    `onModeKey`), the chooser, a switch to another empty tab, a bypass prompt -- left them armed, so
    the next key was swallowed (`g`, Shift+Tab, `i` opened no composer) or completed the sequence. */
-describe("K01 on the empty tab: every cancel route drops its waiting prefix and leader", () => {
+describe("the empty tab: every cancel route drops its waiting prefix and leader", () => {
   function emptyInBrowse() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10803,7 +10803,7 @@ describe("K01 on the empty tab: every cancel route drops its waiting prefix and 
  *  soon after the prompt appeared -- may answer it. `bypassYesCounts`'s own arithmetic (every
  *  `now`/`openedAt`/`lastKeyAt` combination) is `modeKey.test.ts`'s; this file wires it through a
  *  real `App` render, a real `confirm_bypass` envelope and real keydowns. */
-describe("v1 mode: entering bypass asks first", () => {
+describe("entering bypass asks first", () => {
   /** Fakes `performance.now()` alongside the timer functions -- plain `vi.useFakeTimers()` leaves
    *  `performance.now()` real (confirmed empirically), and `App.tsx`'s guard reads the clock through
    *  nothing else. */
@@ -10832,14 +10832,14 @@ describe("v1 mode: entering bypass asks first", () => {
     return { container, root: container.querySelector(".agent-ui-conversation")! };
   }
 
-  it("a. live tab Shift+Tab posts cycle_mode whatever capabilities says (legacy included)", () => {
+  it("live tab Shift+Tab posts cycle_mode whatever capabilities says (legacy included)", () => {
     const { root } = liveConversation();
     fireEvent.keyDown(root, { key: "Tab", shiftKey: true });
     expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
 
-  it("b. draws lines[0] in the band; a lone y after the guard posts confirm_bypass with the envelope's own values and closes", () => {
+  it("draws lines[0] in the band; a lone y after the guard posts confirm_bypass with the envelope's own values and closes", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -10855,7 +10855,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it("b2. Y (capital) does the same as y (P7)", () => {
+  it("Y (capital) does the same as y", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -10870,7 +10870,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it.each(["n", "Escape", "q"])("b3. %s closes and posts nothing", (key) => {
+  it.each(["n", "Escape", "q"])("%s closes and posts nothing", (key) => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -10885,7 +10885,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it("b4. a bare Shift does nothing -- the prompt stays open", () => {
+  it("a bare Shift does nothing -- the prompt stays open", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -10900,7 +10900,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it('c. a scope:"default" envelope posts tab: null', () => {
+  it('a scope:"default" envelope posts tab: null', () => {
     fakeClock();
     try {
       const { root } = liveConversation();
@@ -10914,7 +10914,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it("d. a second envelope while one is open replaces it (Reprompt): the newest nonce is what gets posted", () => {
+  it("a second envelope while one is open replaces it (Reprompt): the newest nonce is what gets posted", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -10930,7 +10930,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it("d2. a Reprompt restarts the prompt's own 250ms on-screen wait, rather than inheriting the first envelope's elapsed time", () => {
+  it("a Reprompt restarts the prompt's own 250ms on-screen wait, rather than inheriting the first envelope's elapsed time", () => {
     fakeClock();
     try {
       const { root } = liveConversation();
@@ -10948,7 +10948,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it("e. while the prompt is open, Shift+Tab does not post a second cycle_mode (modeKeyRoute -> overlay)", () => {
+  it("while the prompt is open, Shift+Tab does not post a second cycle_mode (modeKeyRoute -> overlay)", () => {
     const { root } = liveConversation();
     dispatchBypassConfirm();
     posted.length = 0; // only what happens AFTER the prompt opens counts here
@@ -10957,7 +10957,7 @@ describe("v1 mode: entering bypass asks first", () => {
     vi.unstubAllGlobals();
   });
 
-  it("f. <leader> mode.cycle on a live tab posts cycle_mode, and the which-key box does not grey it out", () => {
+  it("<leader> mode.cycle on a live tab posts cycle_mode, and the which-key box does not grey it out", () => {
     const { container, root } = liveConversation();
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     act(() => (root as HTMLElement).focus());
@@ -10978,7 +10978,7 @@ describe("v1 mode: entering bypass asks first", () => {
   /** Typed text can never answer the prompt, even when the very keys that triggered it (here,
    *  the leader's own `Space m`) are what land right before the `y`. A live tab in BROWSE with a
    *  card already waiting, so a confirmation can approve real pending work. */
-  it("g. Space, m, y at 100ms with the envelope arriving between m and y: no confirm_bypass, no permission_response, the band names why", () => {
+  it("Space, m, y at 100ms with the envelope arriving between m and y: no confirm_bypass, no permission_response, the band names why", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -11021,7 +11021,7 @@ describe("v1 mode: entering bypass asks first", () => {
    *  prompt opened to also trip the on-screen half (the prompt cannot have been open for the guard's
    *  own duration AND have a non-cancelling key land within the guard's duration of it, at once).
    *  So test h2 below reproduces both halves failing together, the same shape as test g. */
-  it.each(["y", "Y"])("h. %s cancelled: too soon after the prompt opened, no other key at all (on-screen rule)", (key) => {
+  it.each(["y", "Y"])("%s cancelled: too soon after the prompt opened, no other key at all (on-screen rule)", (key) => {
     fakeClock();
     try {
       const { root } = liveConversation();
@@ -11035,7 +11035,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  it.each(["y", "Y"])("h2. %s cancelled: another key landed shortly before it, before the prompt even opened", (key) => {
+  it.each(["y", "Y"])("%s cancelled: another key landed shortly before it, before the prompt even opened", (key) => {
     fakeClock();
     try {
       const { root } = liveConversation();
@@ -11081,7 +11081,7 @@ describe("v1 mode: entering bypass asks first", () => {
     ["Ctrl+Shift+Y", { key: "Y", ctrlKey: true, shiftKey: true }],
     ["a y an input method is composing", { key: "y", isComposing: true }],
     ["an input method's keyCode 229 y", { key: "y", keyCode: 229 }],
-  ] as const)("h3. %s after the guard cancels and posts nothing", (_name, init) => {
+  ] as const)("%s after the guard cancels and posts nothing", (_name, init) => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -11117,7 +11117,7 @@ describe("v1 mode: entering bypass asks first", () => {
    *  inside `isPlainAnswerKey` itself, since it derives its own expectation by calling the same
    *  function under test; a direct `isPlainAnswerKey` unit test (and this file's own Hyper-alone h3
    *  row) covers that instead. */
-  it("h3b. the bypass-y handler calls the real, exported isPlainAnswerKey, not a look-alike copy", () => {
+  it("the bypass-y handler calls the real, exported isPlainAnswerKey, not a look-alike copy", () => {
     const spy = vi.spyOn(keymapModule, "isPlainAnswerKey");
     fakeClock();
     try {
@@ -11139,7 +11139,7 @@ describe("v1 mode: entering bypass asks first", () => {
      which the prompt's old four-name modifier list did not know, so holding Super closed the prompt
      by itself and the y after it copied a row instead. Super's own keydown is a modifier now, and a
      y while it is held is refused like any other modified y. */
-  it("h4. Super's own keydown keeps the prompt, and a y while Super is held is refused with the flash", () => {
+  it("Super's own keydown keeps the prompt, and a y while Super is held is refused with the flash", () => {
     fakeClock();
     try {
       const { container, root } = liveConversation();
@@ -11158,7 +11158,7 @@ describe("v1 mode: entering bypass asks first", () => {
     }
   });
 
-  describe("i. every route away cancels the prompt", () => {
+  describe("every route away cancels the prompt", () => {
     it.each([
       ["pane_focus losing focus", () => dispatch({ kind: "pane_focus", focused: false })],
       ["a tabs envelope naming a DIFFERENT active tab", () => dispatch({ kind: "tabs", active: 2, tabs: [{ ...LIVE_TAB, id: 2 }] })],
@@ -11210,7 +11210,7 @@ describe("v1 mode: entering bypass asks first", () => {
     });
   });
 
-  describe("j. the chooser", () => {
+  describe("the chooser", () => {
     it("over an empty tab: Shift+Tab posts cycle_mode; the envelope shows over the chooser without closing it; y after the guard posts", () => {
       fakeClock();
       try {
@@ -11346,7 +11346,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     return rendered;
   }
 
-  it.each(["a", "d"])("Codex 5: the chooser open over a card -- a lone %s answers nothing and the chooser stays", (key) => {
+  it.each(["a", "d"])("the chooser open over a card -- a lone %s answers nothing and the chooser stays", (key) => {
     fakeClock();
     const { container } = arrivedOnACard();
     dispatch({ kind: "chooser", open: [], records: [] });
@@ -11395,7 +11395,7 @@ describe("the prompt and the chooser take the keys whole", () => {
    *  physical key is still held. Before the fix, each auto-repeat after that fell through to
    *  BROWSE's own `y` (copy the row under the cursor), which calls `copied()` and overwrites the
    *  typing-guard flash with "copied N chars" within about one repeat interval. */
-  it("defect 2: after a held y cancels the prompt, its autorepeats do not fall through as BROWSE's copy", () => {
+  it("after a held y cancels the prompt, its autorepeats do not fall through as BROWSE's copy", () => {
     fakeClock();
     const { container } = arrivedOnACard();
     dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
@@ -11417,7 +11417,7 @@ describe("the prompt and the chooser take the keys whole", () => {
     );
   });
 
-  it("defect 2: once the held key is released, a fresh y answers the next prompt normally", () => {
+  it("once the held key is released, a fresh y answers the next prompt normally", () => {
     fakeClock();
     const { container } = arrivedOnACard();
     dispatch({ kind: "confirm_bypass", tab: 1, scope: "tab", nonce: 1, lines: ["Switch to bypass and approve the 1 waiting card? (y/n)"] });
@@ -11875,7 +11875,7 @@ describe("nav_key over the empty tab", () => {
    only that the pure table returns the right shape (`keymap.test.ts` already pins that). The
    chooser's own Esc-over-an-empty-tab landing is pinned in "the session chooser" above; this
    adds only its live-tab counterpart, for symmetry. */
-describe("v1 C1abc: o/A and the caret, j at the end, Esc while running", () => {
+describe("o/A and the caret, j at the end, Esc while running", () => {
   function startedApp() {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -12135,7 +12135,7 @@ function stubSelectionModify(): () => void {
   };
 }
 
-describe("BROWSE visual mode (spec 2026-09-28)", () => {
+describe("BROWSE visual mode", () => {
   function visualFixture() {
     return snapshotState({
       userPrompts: [{ seq: 1, text: "hello world" }],
@@ -12200,7 +12200,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
    *  read it as a modified key its table does not claim (`vswallow`: swallowed, nothing else), so a
    *  vim user reaching for it saw CARET/VISUAL stay on. It
    *  reaches `resolveKey` as the plain Escape `./ctrlBracket` turns it into, `repeat` and all. */
-  it("R9: Ctrl+[ is Esc in the region -- VISUAL and V-LINE back to CARET, CARET to BROWSE, and a held one steps back once", () => {
+  it("Ctrl+[ is Esc in the region -- VISUAL and V-LINE back to CARET, CARET to BROWSE, and a held one steps back once", () => {
     const { container, root } = startedOnPromptRow();
     const modeBlock = () => container.querySelector('[data-testid="mode-block"]');
     const mode = () => modeBlock()?.getAttribute("data-mode");
@@ -12647,7 +12647,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector(".row-assistant")!.textContent).toContain("a new reply");
   });
 
-  it("blocking finding (both review programs): a session ending during VISUAL, then a tab switch to a DIFFERENT card, does not let a stale frozen card's key answer the new tab's card", () => {
+  it("a session ending during VISUAL, then a tab switch to a DIFFERENT card, does not let a stale frozen card's key answer the new tab's card", () => {
     vi.useFakeTimers();
     try {
       const { container, root } = startedOnPromptRow();
@@ -12794,7 +12794,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(modeOf(container)).toBe("browse");
   });
 
-  it("a tab that leaves `live` by a bare `tabs` envelope (no error, no handoff) ends CARET too", () => {
+  it("a backstop: a tab that leaves `live` by a bare `tabs` envelope (no error, no handoff) ends CARET too", () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" });
     expect(modeOf(container)).toBe("caret");
@@ -13200,7 +13200,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     };
   }
 
-  it("W6's route, in jsdom: / finds the folded result, Enter unfolds it, V then 40 j stays in the box and ends on build line 040", () => {
+  it("in jsdom: / finds the folded result, Enter unfolds it, V then 40 j stays in the box and ends on build line 040", () => {
     restoreModify();
     restoreModify = stubLineModify();
     const clipboard = stubClipboard();
@@ -13462,7 +13462,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
   });
 
   // The observer's flash named VISUAL while CARET was on.
-  it("D13's observer ends CARET on a change under the caret, and names CARET", async () => {
+  it("the freeze's observer ends CARET on a change under the caret, and names CARET", async () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" });
     const anchor = window.getSelection()!.anchorNode as Text;
@@ -13524,7 +13524,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
    *  instead of doing whatever the user meant inside the region. Fixed the same way the chooser/`?`/
    *  `/`-prompt cases already were: `isRegionMode(modeRef.current)` joins the `covered` disjunction,
    *  so the reply stays plain transcript text and neither the picker nor the focus effect ever run. */
-  it("finding 1: a bare /model's reply landing during VISUAL neither opens the picker nor ends the region", () => {
+  it("a bare /model's reply landing during VISUAL neither opens the picker nor ends the region", () => {
     const MODEL_REPLY =
       "Current model: `Haiku 4.5` (effort: high)\n" +
       "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], " +
@@ -13574,7 +13574,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
    *  which the quote's exit already restored) and only THEN is a picker choice refused.
    *  Fixed: a dedicated in-flight kind (`"picker-send"`) whose refusal is a footer flash alone --
    *  the draft (whatever it holds) is left exactly as the user last set it. */
-  it("finding 2: a refused picker choice flashes and leaves an already-quoted draft untouched", () => {
+  it("a refused picker choice flashes and leaves an already-quoted draft untouched", () => {
     vi.useFakeTimers();
     try {
       const MODEL_REPLY =
@@ -13639,7 +13639,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
    *  step (`keymap.test.ts` pins the low-level `resolveKey` mapping; this is the DOM-level proof that
    *  `App.tsx`'s region switch actually scrolls the list and leaves the caret/selection and the mode
    *  alone). */
-  it("finding 3: Ctrl+e/Ctrl+y scroll the frozen list one line in CARET, without moving the caret or ending the region", () => {
+  it("Ctrl+e/Ctrl+y scroll the frozen list one line in CARET, without moving the caret or ending the region", () => {
     const { container, root } = startedOnPromptRow();
     const list = container.querySelector<HTMLElement>(".message-list")!;
     list.scrollTop = 100;
@@ -13656,7 +13656,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
   });
 
-  it("finding 3: Ctrl+e/Ctrl+y scroll the frozen list in VISUAL too, without touching the highlighted selection", () => {
+  it("Ctrl+e/Ctrl+y scroll the frozen list in VISUAL too, without touching the highlighted selection", () => {
     const { container, root } = startedOnPromptRow();
     const list = container.querySelector<HTMLElement>(".message-list")!;
     list.scrollTop = 100;
@@ -13670,7 +13670,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
     expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("visual");
   });
 
-  it("finding 3: a count repeats Ctrl+e/Ctrl+y in the region, the same as R4's other counted region motions", () => {
+  it("a count repeats Ctrl+e/Ctrl+y in the region, the same as the other counted region motions", () => {
     const { container, root } = startedOnPromptRow();
     const list = container.querySelector<HTMLElement>(".message-list")!;
     list.scrollTop = 1000;
@@ -13688,7 +13688,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
   /** Enter's `vend` flash in CARET and VISUAL/V-LINE points to the unfold route: press Enter in
    *  BROWSE before `v` to expose folded text. Other unbound keys, including `d`, keep their
    *  existing messages. */
-  it("finding 4: Enter's vend flash points at BROWSE's own unfold-then-v route, in CARET and in VISUAL", () => {
+  it("Enter's vend flash points at BROWSE's own unfold-then-v route, in CARET and in VISUAL", () => {
     const { container, root } = startedOnPromptRow();
     fireEvent.keyDown(root, { key: "v" }); // CARET
     fireEvent.keyDown(root, { key: "Enter" });
@@ -13720,7 +13720,7 @@ describe("BROWSE visual mode (spec 2026-09-28)", () => {
    `?`/confirm capture; the replay also focused that root, so every later key was dead too. jsdom does
    not apply WebKit's fix-up (a disabled focused textarea stays `activeElement`), so these tests blur
    explicitly where WebKit would. */
-describe("K04: r on a failed empty tab", () => {
+describe("r on a failed empty tab", () => {
   const FAILED = { ...LIVE_TAB, state: "failed", failure: "claude: not logged in -- run claude /login" } as const;
 
   /** A starting tab whose composer holds the keys (the composer is live while starting), then failing. */
@@ -13746,7 +13746,7 @@ describe("K04: r on a failed empty tab", () => {
     else act(() => el.blur());
   }
 
-  it("K04-a (control): after an arrival, r on the failed tab posts reset_tab", () => {
+  it("after an arrival, r on the failed tab posts reset_tab", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
@@ -13757,7 +13757,7 @@ describe("K04: r on a failed empty tab", () => {
     expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
   });
 
-  it("K04-b: failing while the composer had the keys, r on <body> still resets the tab", () => {
+  it("failing while the composer had the keys, r on <body> still resets the tab", () => {
     failWhileTyping();
     // WebKit's focus fix-up: the focused control went disabled (or, after the fix, the keys already
     // moved to the empty tab's root); either way this is where a key lands in the reported trap.
@@ -13767,7 +13767,7 @@ describe("K04: r on a failed empty tab", () => {
     expect(posted.filter((m) => m.type === "reset_tab")).toHaveLength(1);
   });
 
-  it("K04-c: the keys are not stranded afterwards -- a second r still resets", () => {
+  it("the keys are not stranded afterwards -- a second r still resets", () => {
     failWhileTyping();
     focusFixup();
     expect(document.activeElement).toBe(document.body);
@@ -13776,7 +13776,7 @@ describe("K04: r on a failed empty tab", () => {
     expect(posted.filter((m) => m.type === "reset_tab")).toHaveLength(2);
   });
 
-  it("K04-d: a failed tab with no conversation is the empty tab; a kept one is the conversation, and r on <body> resets it", () => {
+  it("a failed tab with no conversation is the empty tab; a kept one is the conversation, and r on <body> resets it", () => {
     const { container, unmount } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "tabs", active: 1, tabs: [FAILED] });
@@ -13796,7 +13796,7 @@ describe("K04: r on a failed empty tab", () => {
     expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
   });
 
-  it("K04-e: the tab failing moves the keys from the dead composer to the empty tab's own root, in BROWSE", () => {
+  it("the tab failing moves the keys from the dead composer to the empty tab's own root, in BROWSE", () => {
     const { container } = failWhileTyping();
     const emptyTab = container.querySelector(".empty-tab")!;
     expect(document.activeElement).toBe(emptyTab);
@@ -13806,7 +13806,7 @@ describe("K04: r on a failed empty tab", () => {
     expect(lastOfType("reset_tab")).toMatchObject({ tab: 1 });
   });
 
-  it("K04-f: a key replayed off <body> on the empty layout reaches the empty tab (a Dismiss that removed its own banner)", () => {
+  it("a key replayed off <body> on the empty layout reaches the empty tab (a Dismiss that removed its own banner)", () => {
     vi.useFakeTimers();
     try {
       const { container } = render(<App />);
@@ -13837,7 +13837,7 @@ describe("K04: r on a failed empty tab", () => {
     }
   });
 
-  it("K04-g: failing while the chooser is open over the empty tab leaves the keys with the chooser", () => {
+  it("failing while the chooser is open over the empty tab leaves the keys with the chooser", () => {
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, state: "starting" }] });
@@ -13864,7 +13864,7 @@ describe("K04: r on a failed empty tab", () => {
     expect(container.querySelector(".chooser")!.contains(document.activeElement)).toBe(true);
   });
 
-  it("K04 edge: r twice on a failed tab resets once per press, and the reset dashboard's own r does not resume by accident", () => {
+  it("r twice on a failed tab resets once per press, and the reset dashboard's own r does not resume by accident", () => {
     vi.useFakeTimers();
     try {
       const resumable: Hello = {
@@ -13911,7 +13911,7 @@ describe("K04: r on a failed empty tab", () => {
    list `viewport` px tall at y = 0, `scrollTop` clamped as a browser's is, every rect following it.
    `scrollIntoView` is this file's mock, so a reveal of a row that fits moves nothing; the view is set by
    writing `scrollTop`. None of this proves what a real WebKit draws. */
-describe("#22: coming back restores where you were", () => {
+describe("coming back restores where you were", () => {
   let revision = 0;
   const row = (n: number) => ({ seq: n, text: `row ${n}` });
   function started(n = 5, extra: Partial<AgentUiState> = {}) {
@@ -14020,7 +14020,7 @@ describe("#22: coming back restores where you were", () => {
     }
   }
 
-  it("T1: a reader following the bottom lands on the last row and keeps following", () => {
+  it("a reader following the bottom lands on the last row and keeps following", () => {
     const { container } = started();
     layOut(container, FIVE, 1100);
     expect(current(container)).toBe("row 5");
@@ -14033,7 +14033,7 @@ describe("#22: coming back restores where you were", () => {
     expect(modeOf(container)).toBe("browse");
   });
 
-  it.each<Order>(["focus-first", "arrive-first"])("T2: a reader who had scrolled up gets their row and scroll back (%s)", (order) => {
+  it.each<Order>(["focus-first", "arrive-first"])("a reader who had scrolled up gets their row and scroll back (%s)", (order) => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14047,7 +14047,7 @@ describe("#22: coming back restores where you were", () => {
     expect(modeOf(container)).toBe("browse");
   });
 
-  it("T2b: at the bottom with the cursor above the last row is not following: row and view stay, streaming does not carry them", () => {
+  it("at the bottom with the cursor above the last row is not following: row and view stay, streaming does not carry them", () => {
     const { container } = started();
     // The last two rows are short, so with the view at the bottom (800) row 4 sits inside the view's
     // two-line margins and `k` onto it moves nothing: the view stays at the bottom, the cursor above it.
@@ -14070,7 +14070,7 @@ describe("#22: coming back restores where you were", () => {
     expect(seen).toEqual([]);
   });
 
-  it("T3: a scroll the reader did not make while away (R1's clamp moved the cursor) is undone", () => {
+  it("a scroll the reader did not make while away (the list's clamp moved the cursor) is undone", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14084,7 +14084,7 @@ describe("#22: coming back restores where you were", () => {
     expect(list.scrollTop).toBe(560);
   });
 
-  it("T4: a row removed above the cursor while away: the same row comes back, by key", () => {
+  it("a row removed above the cursor while away: the same row comes back, by key", () => {
     const { container } = started(4, {
       transcript: [row(1), row(2), row(4), row(5)],
       pendingPermissions: [{ seq: 3, permissionId: "p3", toolUseId: null, toolName: "Write", input: { file_path: "a" } }],
@@ -14103,7 +14103,7 @@ describe("#22: coming back restores where you were", () => {
     expect(list.scrollTop).toBe(800);
   });
 
-  it("T5: a card that arrived while away wins, and the park is dropped with it", () => {
+  it("a card that arrived while away wins, and the park is dropped with it", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14122,7 +14122,7 @@ describe("#22: coming back restores where you were", () => {
     expect(current(container)).toBe(before);
   });
 
-  it("a new tab still lands INPUT; the switch back restores the parked position, and an arrive right after moves nothing", () => {
+  it("a new tab still lands INPUT; the switch back is the restore, and an arrive right after moves nothing", () => {
     const { container } = started();
     parkOnRow3(container);
     const two = [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new", state: "not_started" }];
@@ -14154,7 +14154,7 @@ describe("#22: coming back restores where you were", () => {
     ["prefix a, chat shown", "arrive-first"],
     ["prefix a / tray chip, chat hidden", "focus-first"],
     ["prefix a / tray chip, chat hidden", "arrive-first"],
-  ])("T7: %s (%s) restores the parked row and scroll", (_route, order) => {
+  ])("%s (%s) restores the parked row and scroll", (_route, order) => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14165,7 +14165,7 @@ describe("#22: coming back restores where you were", () => {
     expect(list.scrollTop).toBe(560);
   });
 
-  it("T7b: the card route (a tray chip agent ⚑N, prefix a with a card) lands on the card, and the park is gone", () => {
+  it("the card route (a tray chip agent ⚑N, prefix a with a card) lands on the card, and the park is gone", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14182,7 +14182,7 @@ describe("#22: coming back restores where you were", () => {
     expect(current(container)).toBe(before);
   });
 
-  it("T8: the reader scrolled the list with the wheel while away: that is where they are", () => {
+  it("the reader scrolled the list with the wheel while away: that is where they are", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14197,7 +14197,7 @@ describe("#22: coming back restores where you were", () => {
     expect(list.scrollTop).toBe(1200);
   });
 
-  it("T9: a panel key since the leave makes the park stale", () => {
+  it("a panel key since the leave makes the park stale", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14209,7 +14209,7 @@ describe("#22: coming back restores where you were", () => {
     expect(current(container)).toBe("row 4");
   });
 
-  it("T10: a tab switch while away drops the park: the other tab lands by the live rule", () => {
+  it("a tab switch while away drops the park: the other tab lands by the live rule", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14223,7 +14223,7 @@ describe("#22: coming back restores where you were", () => {
     expect(seen).toEqual(["resume"]);
   });
 
-  it("T11: a reader who left from INPUT comes back in BROWSE on their row, draft untouched", () => {
+  it("a reader who left from INPUT comes back in BROWSE on their row, draft untouched", () => {
     const { container } = started();
     const list = parkOnRow3(container);
     keyGap(); // a lone `i` (#26)
@@ -14242,7 +14242,7 @@ describe("#22: coming back restores where you were", () => {
     expect(container.querySelector("textarea")!.value).toBe("half a thought");
   });
 
-  it("T12: in a conversation that fits the view, a cursor on row 1 stays there, and streaming does not move it", () => {
+  it("in a conversation that fits the view, a cursor on row 1 stays there, and streaming does not move it", () => {
     const { container } = started(3);
     layOut(container, [100, 100, 100]);
     act(() => rootOf(container).focus());
@@ -14258,7 +14258,7 @@ describe("#22: coming back restores where you were", () => {
     expect(current(container)).toBe("row 1");
   });
 
-  it("T13: the restored row is off screen after a reflow: it is revealed, and the cursor stays on it", () => {
+  it("the restored row is off screen after a reflow: it is revealed, and the cursor stays on it", () => {
     const { container } = started();
     parkOnRow3(container);
     leave();
@@ -14381,7 +14381,7 @@ describe("#22: coming back restores where you were", () => {
     expect(current(container)).toBe(before);
   });
 
-  it("T14: a launch arrival (nothing parked) lands on the last row, following", () => {
+  it("a launch arrival (nothing parked) lands on the last row, following", () => {
     const { container } = started();
     const { seen } = recording(() => dispatch({ kind: "arrive" }));
     expect(current(container)).toBe("row 5");
@@ -14392,8 +14392,8 @@ describe("#22: coming back restores where you were", () => {
 /* BROWSE's `i`/`o`/`A` enter INPUT only on a
    key that stands alone (or ends a quick motion run), and any key within `TYPING_GUARD_MS` of a
    BROWSE `y` is typing, not a command. "explain" lost "expla", "follow-up" sent "llow-up one",
-   `yiw` typed the `w`. Time is vitest's fake clock, as in `v1: typing never answers a card` above. */
-describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
+   `yiw` typed the `w`. Time is vitest's fake clock, as in `typing never answers a card` above. */
+describe("typing in BROWSE never starts INPUT mid-word", () => {
   const HINT = "i or Ctrl+j to type";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
@@ -14442,7 +14442,7 @@ describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
     expect(band(container)).toBe(HINT);
   });
 
-  it("follow-up, typed at 80 ms a key, never enters INPUT (K13: the o)", () => {
+  it("follow-up, typed at 80 ms a key, never enters INPUT (the o)", () => {
     const { container } = startedWithRows();
     wait(1000);
     typeAt([..."follow-up"], 80);
@@ -14602,7 +14602,7 @@ describe("#26: typing in BROWSE never starts INPUT mid-word", () => {
    "ll-window -a" as a turn. Rust binds it now (`panel.command-line`) and tells the panel with an
    `open_command_line` envelope, which opens the same `:` line BROWSE's own `:` opens: it runs
    nothing, Enter says so, Esc closes it. */
-describe("#28: prefix : opens the panel's command line", () => {
+describe("prefix : opens the panel's command line", () => {
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
     vi.useFakeTimers();

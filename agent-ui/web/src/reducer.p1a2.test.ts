@@ -45,7 +45,7 @@ function renderedCount(testCase: P1a2Case, events: AgentDomainEvent[]): number {
   return rendered.split(testCase.text).length - 1;
 }
 
-describe("P1-A2: a mid-stream snapshot is never followed by a repeat of its own text", () => {
+describe("a mid-stream snapshot is never followed by a repeat of its own text", () => {
   it("names the Rust test that writes its fixture", () => {
     expect(p1a2Fixture.writtenBy).toContain("core/src/tab_set.rs");
   });

@@ -6107,7 +6107,7 @@ mod tests {
     /// command changes none of them.
     #[cfg(unix)]
     #[test]
-    fn no_rule_turns_any_of_the_p1_audit_cards_into_an_allow() {
+    fn no_saved_rule_turns_a_fail_closed_card_into_an_allow() {
         let ws = Workspace::new();
         let outside = Outside::new();
         ws.write("paths", format!("{}\0", outside.secret().display()));

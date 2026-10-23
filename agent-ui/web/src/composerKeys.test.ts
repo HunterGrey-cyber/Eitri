@@ -39,7 +39,7 @@ describe("composer keys", () => {
     expect(lineEdge("", 0, "end")).toBe(0);
   });
 
-  it("enterNewline: Alt+Enter and a backslash before the caret are newlines; every other Enter is not (#27)", () => {
+  it("enterNewline: Alt+Enter and a backslash before the caret are newlines; every other Enter is not", () => {
     const none = { altKey: false, ctrlKey: false, metaKey: false };
     expect(enterNewline("abcd", 2, 2, { ...none, altKey: true })).toEqual({ value: "ab\ncd", caret: 3 });
     expect(enterNewline("abcd", 1, 3, { ...none, altKey: true })).toEqual({ value: "a\nd", caret: 2 });

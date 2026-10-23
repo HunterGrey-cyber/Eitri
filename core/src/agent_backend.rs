@@ -72,7 +72,7 @@ const _: () = {
     );
     assert!(
         !LEGACY_CAPABILITIES.bypass_permission_mode,
-        "R07: the legacy backend never starts the CLI ungated"
+        "the legacy backend never starts the CLI ungated"
     );
     assert!(
         !LEGACY_CAPABILITIES.cli_auto_mode,

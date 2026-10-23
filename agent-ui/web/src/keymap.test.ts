@@ -74,7 +74,7 @@ describe("resolveKey", () => {
   /* `o` is an exact alias of `i` -- same caret, same refusal -- and `A` is `i`'s
      shifted sibling with the caret forced to the end (`:h A`). Neither reaches `O`/`I`, which stay
      unbound (additive later): the blanket Shift refusal still catches them. */
-  it("adds o as an exact alias of i, and A at the end of the draft (C1a)", () => {
+  it("adds o as an exact alias of i, and A at the end of the draft", () => {
     expect(resolveKey("browse", key("o"), ctx)).toEqual({ kind: "mode", to: "input", caret: "kept" });
     expect(resolveKey("browse", key("A", { shiftKey: true }), ctx)).toEqual({ kind: "mode", to: "input", caret: "end" });
     expect(resolveKey("browse", key("o"), { sessionEnded: true })).toBeNull();
@@ -112,7 +112,7 @@ describe("resolveKey", () => {
      `a`/`d` (the control) must keep working. Super is its own, separate case just below: it is a
      THIRD GDK modifier, not a spelling of Meta (an earlier version of this comment wrongly said
      "Linux's Super arrives as `metaKey` too"). */
-  it("refuses Alt or Meta on a/d, but bare a/d still answer (R2)", () => {
+  it("refuses Alt or Meta on a/d, but bare a/d still answer", () => {
     expect(resolveKey("browse", key("a", { altKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("a", { metaKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("d", { altKey: true }), ctx)).toBeNull();
@@ -241,7 +241,7 @@ describe("resolveKey", () => {
      the typing guard; this table only says which chord it is). Exactly Ctrl+y: Shift, Alt, AltGraph,
      Meta, Super/Hyper, or an input method composing, and it is nothing. BROWSE's Ctrl+y stays the
      one-line scroll above. There is no deny chord in INPUT. */
-  describe("#39: INPUT Ctrl+y", () => {
+  describe("INPUT Ctrl+y", () => {
     it("is approve-oldest in INPUT, and still the one-line scroll in BROWSE", () => {
       expect(resolveKey("input", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "approve-oldest" });
       expect(resolveKey("browse", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: -1 });
@@ -337,7 +337,7 @@ describe("resolveKey", () => {
   /* Shift+D is checked ahead of the blanket modifier refusal (the test
      above), which is exactly why Alt or Meta held alongside it needs its own guard here -- that
      refusal never runs for this chord at all. */
-  it("refuses Alt or Meta on Shift+D (R2)", () => {
+  it("refuses Alt or Meta on Shift+D", () => {
     expect(resolveKey("browse", key("D", { shiftKey: true, altKey: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("D", { shiftKey: true, metaKey: true }), ctx)).toBeNull();
   });
@@ -357,7 +357,7 @@ describe("resolveKey", () => {
      claim is proven, not merely believed, now that both
      paths are read as making one promise. `keyCode === 229` is the same legacy-WebKit signal
      `composerKeys.ts`'s `isImeKey` treats as composing too. */
-  it("refuses a/d/D while an input method is composing (C4, reconciled with the bypass y fix)", () => {
+  it("refuses a/d/D while an input method is composing", () => {
     expect(resolveKey("browse", key("a", { isComposing: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("d", { isComposing: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("D", { shiftKey: true, isComposing: true }), ctx)).toBeNull();
@@ -406,7 +406,7 @@ describe("resolveKey", () => {
   });
 });
 
-describe("resolveKey, phase 3", () => {
+describe("resolveKey: sequences, counts, search and the command line", () => {
   it("reads two-key sequences from the prefix the caller holds", () => {
     expect(resolveKey("browse", key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
     expect(resolveKey("browse", key("g"), { ...ctx, pending: "g" })).toEqual({ kind: "jump", to: "first" });
@@ -447,7 +447,7 @@ describe("resolveKey, phase 3", () => {
      `:l⏎` and `:d⏎` can never reach a card. Matched on `key`, with or without Shift (AZERTY types it
      unshifted); held with Ctrl, Alt or Meta it is not `:`. After a pending prefix it cancels,
      INPUT types it, and CARET/VISUAL still end on it. */
-  it("opens the : command line in BROWSE with or without Shift, and nowhere else (K02)", () => {
+  it("opens the : command line in BROWSE with or without Shift, and nowhere else", () => {
     expect(resolveKey("browse", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "ex-line" });
     expect(resolveKey("browse", key(":"), ctx)).toEqual({ kind: "ex-line" });
     for (const over of [{ ctrlKey: true }, { altKey: true }, { metaKey: true }]) {
@@ -517,7 +517,7 @@ describe("resolveKey, phase 3", () => {
     }
   });
 
-  it("gives every key to the input method while it composes, in BROWSE too (C4)", () => {
+  it("gives every key to the input method while it composes, in BROWSE too", () => {
     for (const k of ["a", "d", "j", "Enter", "3"]) {
       expect(resolveKey("browse", key(k, { isComposing: true }), ctx), k).toBeNull();
       expect(resolveKey("browse", key(k, { keyCode: 229 }), ctx), k).toBeNull();
@@ -559,7 +559,7 @@ describe("resolveKey with a panel table", () => {
   });
   /* This used to pin the leak -- `[b` with no table resolved to `null`, unclaimed. With no pair
      for `b` under `[`, the key now cancels the prefix, swallowed, like any other non-pair key. */
-  it("cancels [b without a table (pinned the K01 leak until X-A-11)", () => {
+  it("cancels [b without a table rather than leaking the b", () => {
     expect(resolveKey("browse", key("b"), { ...ctx, pending: "[" })).toEqual({ kind: "cancel", why: "unbound" });
   });
 });
@@ -568,7 +568,7 @@ describe("resolveKey with a panel table", () => {
    reserved prefix's second key fell through to its own meaning whenever it completed no pair. vim
    waits for a prefix's second key with no timeout and ends the command on a key it does not know
    (`nv_g_cmd`, `nv_zet`, `nv_brackets`: `clearopbeep`); so does this table now. */
-describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs or cancels", () => {
+describe("a reserved prefix's next key completes one of its pairs or cancels", () => {
   // The page and arrow keys are keys of their own now, and a prefix's next key
   // never runs as itself -- `g`, a pause, PageDown pages nothing.
   // `p` too -- `gp`, `zp` and `Ctrl+w p` cancel, while `[p`/`]p` are pairs (skipped below).
@@ -651,7 +651,7 @@ describe("K01 (X-A-11): a reserved prefix's next key completes one of its pairs 
      the exception, because `event.key` being `[` or `]` with Option held IS how a macOS German,
      French or Swiss layout types one (`[[`/`]]` above). Unclaimed, not cancelled: nothing is
      pending, so nothing is there to cancel. */
-  it("arms g and z only unmodified, and a bracket even typed with Option (rc.3 minors 6)", () => {
+  it("arms g and z only unmodified, and a bracket even typed with Option", () => {
     for (const over of [{ altKey: true }, { metaKey: true }, { altKey: true, metaKey: true }]) {
       const held = JSON.stringify(over);
       for (const prefix of ["g", "z"] as const)
@@ -746,7 +746,7 @@ describe("Ctrl+w h/j/k/l: the module that way", () => {
     expect(resolveKey("browse", key("c", { ctrlKey: true }), { ...ctx, pending: "C-w" })).toBeNull();
   });
 
-  it("gives the key to an input method that is composing, after the prefix too (C4)", () => {
+  it("gives the key to an input method that is composing, after the prefix too", () => {
     expect(resolveKey("browse", key("w", { ctrlKey: true, isComposing: true }), ctx)).toBeNull();
     expect(resolveKey("browse", key("w", { ctrlKey: true, keyCode: 229 }), ctx)).toBeNull();
     for (const [k] of PAIRS) {
@@ -1111,7 +1111,7 @@ describe("CARET_KEYS <-> resolveKey", () => {
 /* CARET/VISUAL/V-LINE handle Ctrl+e/Ctrl+y through `resolveRegionModifierKey`.
    These keys scroll by one line using BROWSE's `scroll-line` action. Region modes return
    before BROWSE's chord handling, so they need their own path to that action. */
-describe("v1 trial seam review finding 3: Ctrl+e/Ctrl+y scroll the region instead of vswallow", () => {
+describe("Ctrl+e/Ctrl+y scroll the region instead of vswallow", () => {
   it.each([
     ["caret", "e", 1],
     ["caret", "y", -1],
@@ -1168,7 +1168,7 @@ describe("a modified key in VISUAL is swallowed, VISUAL stays", () => {
     expect(resolveKey("vline", ev, ctx)).toEqual({ kind: "vswallow" });
   });
 
-  it("Ctrl+c stays the exception: interrupt while a turn runs, unclaimed idle -- never vswallow", () => {
+  it("Ctrl+c stays an exception: interrupt while a turn runs, unclaimed idle -- never vswallow", () => {
     const ctrlC = key("c", { ctrlKey: true });
     expect(resolveKey("visual", ctrlC, { ...ctx, turnRunning: true })).toEqual({ kind: "interrupt" });
     expect(resolveKey("visual", ctrlC, ctx)).toBeNull();
@@ -1244,7 +1244,7 @@ describe("isPlainAnswerKey", () => {
     expect(isPlainAnswerKey(key("a", { metaKey: true }))).toBe(false);
   });
 
-  it("is false with Super or Hyper held (the gap 325e007 had, before this reconciliation)", () => {
+  it("is false with Super or Hyper held", () => {
     expect(isPlainAnswerKey(key("a", { superKey: true }))).toBe(false);
   });
 
@@ -1254,7 +1254,7 @@ describe("isPlainAnswerKey", () => {
      direct, independent oracle on `isPlainAnswerKey` (not routed through `resolveKey`, which would
      just call the same broken `hasSuperOrHyper` to compute its own "expected" value and agree with
      the bug), for Hyper alone. */
-  it("is false with Hyper held alone, not only together with Super (v1 audit fixes, finding 1)", () => {
+  it("is false with Hyper held alone, not only together with Super", () => {
     expect(isPlainAnswerKey(key("a", { hyperKey: true }))).toBe(false);
   });
 
@@ -1323,7 +1323,7 @@ const MODIFIER_CASES: ModifierCase[] = [
   ["keyCode 229", { keyCode: 229 }],
 ];
 
-describe("resolveKey's a/d/Shift+D agree with isPlainAnswerKey on every modifier it reads (v1 audit fixes, finding 1)", () => {
+describe("resolveKey's a/d/Shift+D agree with isPlainAnswerKey on every modifier it reads", () => {
   it.each(MODIFIER_CASES)("a: %s", (_name, mod) => {
     const ev = key("a", mod);
     const expected = isPlainAnswerKey(ev) ? { kind: "answer", decision: "allow" } : null;

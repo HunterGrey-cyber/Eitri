@@ -10,7 +10,7 @@ describe("formatQuote", () => {
     expect(formatQuote("a\nb\nc")).toBe("> a\n> b\n> c\n\n");
   });
 
-  it("an interior blank line becomes a bare > (the spec's own worked example)", () => {
+  it("an interior blank line becomes a bare >", () => {
     expect(formatQuote("Hello\n\nworld")).toBe("> Hello\n>\n> world\n\n");
   });
 

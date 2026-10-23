@@ -35,7 +35,7 @@ describe("renderToolCall", () => {
     expect(screen.getByText(/echo hi/)).toBeTruthy();
   });
 
-  it("names the saved rule that allowed a call, and says nothing of the kind otherwise (F18)", () => {
+  it("names the saved rule that allowed a call, and says nothing of the kind otherwise", () => {
     const { container } = render(<>{renderToolCall(call({ allowedByRule: "Bash(echo *)" }))}</>);
     expect(container.querySelector(".tool-rule-note")?.textContent).toBe("allowed by rule Bash(echo *)");
     cleanup();
@@ -281,7 +281,7 @@ describe("a tool call's result", () => {
     expect(pending).not.toEqual(done);
   });
 
-  it("sw-panel-render-6: renders a static notice instead of a permanent spinner for a call the panel knows is abandoned", () => {
+  it("renders a static notice instead of a permanent spinner for a call the panel knows is abandoned", () => {
     // Before the fix, `result === null` meant "still running" unconditionally, so a call abandoned
     // by session end or a resume/reload past its history boundary spun forever. `opts.abandoned` is
     // `MessageList.tsx`'s own `isAbandonedCall` verdict, passed in here rather than recomputed --
@@ -471,7 +471,7 @@ describe("a tool named after an Object.prototype member", () => {
    Edit/NotebookEdit stopped folding into count-only runs and every one of them needed to be this
    compact by default), a gated row (it says it waits rather than repeating the call) and the
    detailed view's wider cuts. */
-describe("P2, P3, P4, R3 in the registry", () => {
+describe("the registry: runs, edits, gated calls and the detailed view", () => {
   const html = (node: ReactNode) => renderToStaticMarkup(<div>{node}</div>);
 
   it("names every tool Claude Code 2.1.27x offers (read from permission_policy.rs)", () => {
@@ -510,7 +510,7 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect(out).not.toContain("Enter to expand");
   });
 
-  it("collapses an edit's diff to a one-line path+counts summary by default; Enter (opts.expanded) shows it whole (P3, v1 trial item 7)", () => {
+  it("collapses an edit's diff to a one-line path+counts summary by default; Enter (opts.expanded) shows it whole", () => {
     const old_string = Array.from({ length: 10 }, (_, i) => `old ${i}`).join("\n");
     const new_string = Array.from({ length: 10 }, (_, i) => `new ${i}`).join("\n");
     const input = { file_path: "/p/a.rs", old_string, new_string };
@@ -580,13 +580,13 @@ describe("P2, P3, P4, R3 in the registry", () => {
     expect((out.match(/class="diff-line/g) ?? []).length).toBe(0);
   });
 
-  it("says a gated call waits for approval instead of repeating it (P4)", () => {
+  it("says a gated call waits for approval instead of repeating it", () => {
     const out = html(renderToolCall({ seq: 1, toolUseId: "t", name: "Bash", input: { command: "rm -rf build" }, result: null }, true, { gated: true }));
     expect(out).toContain("waiting for approval");
     expect(out).not.toContain("rm -rf build");
   });
 
-  it("raises the cut to 20k / 5k in the detailed view (R3)", () => {
+  it("raises the cut to 20k / 5k in the detailed view", () => {
     const long = "h".repeat(30000) + "t".repeat(6000);
     expect(truncateResult(long).shown.length).toBeLessThan(3000);
     const detailed = truncateResult(long, DETAILED_HEAD_CHARS, DETAILED_TAIL_CHARS);

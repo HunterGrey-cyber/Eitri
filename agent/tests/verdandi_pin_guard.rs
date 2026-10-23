@@ -76,7 +76,7 @@ fn manifest_pin_and_expected_revision_name_the_same_commit() {
     assert!(
         manifest_rev.starts_with(expected) || expected.starts_with(manifest_rev.as_str()),
         "agent/Cargo.toml pins claude-runtime-protocol at {manifest_rev:?}, but \
-         agent::EXPECTED_VERDANDI_REVISION is {expected:?} -- these must name the same commit (F15). \
+         agent::EXPECTED_VERDANDI_REVISION is {expected:?} -- these must name the same commit. \
          Bump both together and re-verify against the real proto diff \
          (the drill: `git diff <old>..<new> -- proto crates` \
          should be empty for a \

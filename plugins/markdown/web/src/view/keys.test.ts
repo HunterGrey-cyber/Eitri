@@ -46,7 +46,7 @@ function show(body: string, v: Partial<EditorView> = {}): void {
 }
 
 describe("the page's rows", () => {
-  it("are spec's table, in the page's context, and installed with hello's keyboard values and the find options", async () => {
+  it("are the page's table, in the page's context, and installed with hello's keyboard values and the find options", async () => {
     expect(PAGE_ROWS.map((r) => [r.action, r.keys])).toEqual([
       ["heading.next", ["]]"]], ["heading.prev", ["[["]], ["scroll.left", ["zh"]], ["scroll.right", ["zl"]],
       ["block.yank", ["yy"]], ["edit.here", ["<CR>"]],

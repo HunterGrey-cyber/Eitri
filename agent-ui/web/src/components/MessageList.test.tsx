@@ -832,7 +832,7 @@ describe("MessageList follows by intent, not by the direction of a scroll", () =
 
   // "any wheel up" that the list itself can take -- one that moves nothing is its own
   // block below.
-  it("stops following on any wheel up the list can take, however small (deliberately, since 2026-09-24)", () => {
+  it("stops following on any wheel up the list can take, however small (deliberately)", () => {
     const { container, rerender } = render(<MessageList state={state({ transcript: texts("p") })} {...props} />);
     const list = container.querySelector(".message-list") as HTMLElement;
     const dims = clampedList(list, 400, { scrollHeight: 2000, scrollTop: 1600 });
@@ -903,7 +903,7 @@ describe("MessageList follows by intent, not by the direction of a scroll", () =
    browser keys or a Tab reveal, must stop following. A negative `deltaY` that moves nothing must
    not stop it permanently: a sideways swipe may jitter vertically, a nested tool-result box may
    consume the wheel, or the list may already be at the top. */
-describe("MessageList: a send resumes following (the phase-3 GUI pass, 2026-09-25)", () => {
+describe("MessageList: a send resumes following", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
   it("snaps a reader who scrolled up to the end, and follows the reply that streams after", () => {
@@ -1742,7 +1742,7 @@ function lastUnread(mock: ReturnType<typeof vi.fn>): { label: string | null; jum
   return { label: call[0], jump: call[1], afterSeq: call[2] };
 }
 
-describe("MessageList: the unread pill (reported upward)", () => {
+describe("MessageList: the jump-to-bottom pill (reported upward)", () => {
   const props = { sessionEnded: false, expanded: {}, cursor: 0, onAnswerPermission: vi.fn() };
 
   it("counts rows that arrived while reading up, marks a card, and jumps to the end on a click", () => {
@@ -1779,7 +1779,7 @@ describe("MessageList: the unread pill (reported upward)", () => {
     expect(lastUnread(onUnreadChange).label).toBeNull();
   });
 
-  it("keeps approval after a row resizes -- the observer read the first render's timeline (GUI pass 2026-09-25)", () => {
+  it("keeps approval after a row resizes -- the observer read the first render's timeline", () => {
     // Seen in the sandbox: a Bash card landed below a reader and the pill said "Jump to bottom". The
     // `ResizeObserver`, made once, called the FIRST render's `onScroll`, whose `updatePill` sliced the
     // first render's timeline -- nothing past the reader's mark -- and overwrote the right label the

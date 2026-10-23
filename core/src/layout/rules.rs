@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(
             (rule.at, source),
             (Some(At::Tab), RuleSource::Module),
-            "the module's rule beats a panel's position"
+            "the module's own rule beats a panel's position"
         );
         let (rule, source) = rules.resolve(&id("lua:todo"), OpenPoint::Launch, Some(Placement::BelowRoot));
         assert_eq!(

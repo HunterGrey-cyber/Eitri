@@ -292,7 +292,7 @@ describe("oldestPendingPermission (focus_permission's target)", () => {
   });
 });
 
-describe("promptIndex (R4's [[ / ]])", () => {
+describe("promptIndex ([[ / ]])", () => {
   it("walks to the previous or next prompt row, and stops (never wraps) at either end", () => {
     const timeline = buildTimeline(state({ userPrompts: [{ seq: 1, text: "first" }, { seq: 5, text: "second" }], transcript: [msg(2, "a"), msg(3, "b"), msg(4, "c"), msg(6, "d")] }));
     // [prompt(1), message(2), message(3), message(4), prompt(5), message(6)]
@@ -306,7 +306,7 @@ describe("promptIndex (R4's [[ / ]])", () => {
 /* `]p` / `[p`, the next / previous card waiting for an answer in this tab. Wraps as
    nvim's `]d` does (`vim.diagnostic.jump`'s default) where `[[`/`]]` (`promptIndex` above) never do; a card
    this panel has already answered is not waiting, though it stays on screen until the provider resolves it. */
-describe("waitingCardIndex (R7's ]p / [p)", () => {
+describe("waitingCardIndex (]p / [p)", () => {
   /** Prompt 0, card p1 1, a message 2, card p2 3. */
   const fixture = () =>
     buildTimeline(

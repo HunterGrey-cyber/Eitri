@@ -1177,7 +1177,7 @@ mod deny_list_tests {
             assert!(
                 !list.contains(&tool),
                 "{tool} must be offered: the PreToolUse hook gates every call, \
-                 and bypass, Eitri's own allow, denies nothing (2026-09-20, R07)"
+                 and bypass, Eitri's own allow, denies nothing"
             );
         }
         // Empty, and that is the whole list: an empty list is what makes the legacy spawn omit
@@ -2333,7 +2333,10 @@ exit 0"#,
             "--dangerously-skip-permissions",
             "--allow-dangerously-skip-permissions",
         ] {
-            assert!(!session_argv.contains(ungated), "R07: {ungated} in {session_argv}");
+            assert!(
+                !session_argv.contains(ungated),
+                "an ungated session: {ungated} in {session_argv}"
+            );
         }
         assert!(
             session_argv.contains("--settings"),

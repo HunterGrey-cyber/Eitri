@@ -328,7 +328,7 @@ class TheTwoProfilesDifferOnlyInTheAllowedKeys(unittest.TestCase):
         private_license = _load_yaml(PRIVATE_PATH)["license"]
         self.assertEqual(private_license, f"{public_license} AND LicenseRef-Anthropic-Claude-Agent-SDK")
 
-    def test_public_licence_is_the_spdx_expression_spec_names(self):
+    def test_public_licence_is_the_spdx_expression_of_the_four_licences(self):
         self.assertEqual(_load_yaml(PUBLIC_PATH)["license"], "MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0")
 
     def test_public_maintainer_and_homepage_are_the_public_identity(self):

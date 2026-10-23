@@ -62,7 +62,7 @@ describe("handoffBlockedReason", () => {
   });
 });
 
-describe("ContinueInTerminal closed (open is now the only gate)", () => {
+describe("ContinueInTerminal closed (open is the only gate)", () => {
   it("draws nothing at all while open is false, blocked or not", () => {
     const { container } = renderControl({ open: false });
     expect(container.textContent).toBe("");

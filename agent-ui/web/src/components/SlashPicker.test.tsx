@@ -53,7 +53,7 @@ describe("SlashPicker", () => {
   });
 
   /** The picker shares its four list-motion keys with the chooser. */
-  it("↑ ↓ Ctrl+p Ctrl+n move the cursor, and Enter chooses where they landed (R12)", () => {
+  it("↑ ↓ Ctrl+p Ctrl+n move the cursor, and Enter chooses where they landed", () => {
     const { root, props } = renderPicker(); // current: haiku (row 2)
     fireEvent.keyDown(root, { key: "ArrowUp" }); // -> opus
     fireEvent.keyDown(root, { key: "p", ctrlKey: true }); // -> sonnet

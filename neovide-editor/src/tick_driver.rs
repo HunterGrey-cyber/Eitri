@@ -238,7 +238,7 @@ mod tests {
                 service_pending: true,
                 ..inputs()
             }),
-            "pending service work alone keeps the tick, so the service runs once more (plan review finding 1)"
+            "pending service work alone keeps the tick, so the service runs once more"
         );
     }
 

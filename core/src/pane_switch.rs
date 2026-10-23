@@ -101,7 +101,7 @@ const SOCKET_NAME: &str = "s.sock";
 /// with no second sweep would orphan every such directory permanently, with nothing left in the
 /// code that names it. A pre-rename build that is still *running* is spared by the same two checks
 /// as always -- its pid is alive, and its `switch.sock` answers a `connect()`.
-/// `the_sweep_still_reclaims_a_pre_l2_t5_directory` pins that the legacy row is really swept and
+/// `the_sweep_still_reclaims_a_directory_under_the_old_prefix` pins that the legacy row is really swept and
 /// not merely written down.
 const SWEPT_NAMES: &[(&str, &str)] = &[(DIR_PREFIX, SOCKET_NAME), ("neovibe-pane-switch-", "switch.sock")];
 
@@ -404,7 +404,7 @@ pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
 /// **3.2x the stated bound** for this module specifically -- 160.8ms against a 50ms `READ_TIMEOUT`
 /// (an "18x" figure is the *theme feed's* own measurement on its 100ms timeout, a different module)
 /// -- and reproduced again against this module's own old `accept_pending_messages` before the
-/// change landed -- see `p3_a1_a_trickled_message_never_holds_one_poll_past_its_budget`'s own doc.
+/// change landed -- see `a_trickled_message_never_holds_one_poll_past_its_budget`'s own doc.
 /// `poll` never blocks on a read: every read is non-blocking, and an incomplete connection is kept
 /// (not waited on) for the next call.
 ///
@@ -1007,7 +1007,7 @@ mod tests {
     /// Slow sends must not hold a poll waiting for more bytes, and enough polls must eventually
     /// deliver the complete message.
     #[test]
-    fn p3_a1_a_trickled_message_never_holds_one_poll_past_its_budget() {
+    fn a_trickled_message_never_holds_one_poll_past_its_budget() {
         let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
         std::fs::create_dir_all(&dir).expect("fixture");
         let socket_path = agent::socket_path::in_dir(&dir, SOCKET_NAME).expect("under the cap");
@@ -1251,7 +1251,7 @@ mod tests {
     ///
     /// [`sweep_stale_instance_dirs`]: crate::instance_dir::sweep_stale_instance_dirs
     #[test]
-    fn the_sweep_still_reclaims_a_pre_l2_t5_directory() {
+    fn the_sweep_still_reclaims_a_directory_under_the_old_prefix() {
         // Own root, so this never touches a real window's directory and never races the sibling
         // tests that plant fixtures of their own.
         let root = std::env::temp_dir().join(format!("nv-ps-sweeptest-{}", uuid::Uuid::new_v4().simple()));
@@ -1269,7 +1269,10 @@ mod tests {
         }
 
         assert!(!current.exists(), "a dead current-shape directory must be reclaimed");
-        assert!(!legacy.exists(), "a dead pre-L2-T5 directory must be reclaimed too");
+        assert!(
+            !legacy.exists(),
+            "a dead directory under the old prefix must be reclaimed too"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

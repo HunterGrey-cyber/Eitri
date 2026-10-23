@@ -83,8 +83,8 @@ function textCaret(text: Text, offset: number): Caret {
   return { node: text, offset };
 }
 
-describe("visual.ts: motion modify() calls", () => {
-  it("h/l/0/$ each issue exactly the expected modify() calls; w/e/b issue none", () => {
+describe("visual.ts: the modify() calls of h/l/0/$", () => {
+  it("h/l/0/$ each issue exactly the table's own modify() calls; w/e/b issue none", () => {
     const text = document.createTextNode("hello");
     const cursor = textCaret(text, 2);
     const path = [cursor, textCaret(text, 3), textCaret(text, 4)];
@@ -236,7 +236,7 @@ describe("visual.ts: o swaps ends", () => {
   });
 });
 
-describe("visual.ts: rebuild", () => {
+describe("visual.ts: rebuilding the selection from its anchor and cursor", () => {
   function buildRebuildFixture() {
     const text = document.createTextNode("hello world");
     const earlier = textCaret(text, 2);
@@ -811,7 +811,7 @@ describe("visual.ts: stepToAdjacentTableRow -- j/k cross a table row the pixel p
   // harness (`shell/tests/panel_visual_mode.rs`), not here -- see its own new table-row case.
 });
 
-describe("visual.ts: revealCaret, least scroll", () => {
+describe("visual.ts: revealCaret, the least scroll", () => {
   /** A caret inside an inner scroll box inside the list, laid out by hand: jsdom lays out nothing,
    *  so each rect is derived from the two boxes' own `scrollTop`, the way a real engine moves them. */
   function nested() {
@@ -889,7 +889,7 @@ describe("visual.ts: revealCaret, least scroll", () => {
    their start. Every expected sequence here is nvim's own, measured headless (`nvim --headless
    --clean`, a `normal! w`/`e`/`b` loop printing the cursor until it stops moving) on the same text,
    written in nvim's own `line:byte-col` form and converted to this DOM's UTF-16 offsets. */
-describe("visual.ts: w/e/b follow vim's word rules (2026-10-01)", () => {
+describe("visual.ts: w/e/b follow vim's word rules", () => {
   /** A `.message-list` holding `html`, the shape every caller's `root` has. */
   function listOf(html: string): HTMLElement {
     const root = document.createElement("div");

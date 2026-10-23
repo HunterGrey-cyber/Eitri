@@ -49,7 +49,7 @@ it("moves its star while the agent works, and holds it still while a card waits 
   expect(container.querySelector(".meter, .meter-fill")).toBeNull();
 });
 
-it("counts the queue, names the interrupt key, and names a card that waits (P1)", () => {
+it("counts the queue, names the interrupt key, and names a card that waits", () => {
   const onInterrupt = vi.fn();
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={2} pendingTool={null} />,
@@ -94,7 +94,7 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
  *  "the only card, from any row") nor that the typing guard makes them wait `TYPING_GUARD_MS` since the last key.
  *  A user who moved off the card with `k`, or pressed `a` a beat after `Esc`, followed a hint that
  *  did not explain either refusal. */
-it("codex-release-p1 #9: the hint names both S4's navigation and S1's pause, in both modes", () => {
+it("the hint names both the navigation key and the typing pause, in both modes", () => {
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
   );
@@ -112,7 +112,7 @@ it("codex-release-p1 #9: the hint names both S4's navigation and S1's pause, in 
 /** "the activity line already ends in `ctrl+c interrupt` ...; it is kept and
  *  pinned by a test, including while a card waits." Pins the button's own text, not just its
  *  presence -- CC's own words, unchanged by a card taking over the rest of the line. */
-it("keeps ctrl+c interrupt as the Stop button's own text, even while a card waits (R34)", () => {
+it("keeps ctrl+c interrupt as the Stop button's own text, even while a card waits", () => {
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
   );

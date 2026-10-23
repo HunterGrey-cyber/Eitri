@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PILL_HIDE_PX, PILL_SHOW_PX, pillLabel, pillShown } from "./pill";
 
-describe("the R2 pill", () => {
+describe("the jump-to-bottom pill", () => {
   it("shows past 200px, hides within 60px, and never while following", () => {
     expect(pillShown(false, false, PILL_SHOW_PX)).toBe(false);
     expect(pillShown(false, false, PILL_SHOW_PX + 1)).toBe(true);

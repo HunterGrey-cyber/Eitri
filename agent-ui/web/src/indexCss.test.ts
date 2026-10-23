@@ -901,7 +901,7 @@ describe("index.css", () => {
     }
   });
 
-  it("the status band is one editor row high, and never grows (wave 4, R5)", () => {
+  it("the status band is one editor row high, and never grows", () => {
     // The status band must align with the editor's status line. A min-height lets children,
     // especially the fallback font for the mode glyph, make the band taller. --nv-editor-row
     // supplies the editor's cell height; fixed height and overflow: hidden keep the band at
@@ -1314,7 +1314,7 @@ describe("index.css cascade (which rule actually wins)", () => {
   /** The unread pill is the band's own `.band-unread`, drawn on the
    *  band's right with `↓N` inverted, never over text. It is not floated absolutely over the
    *  list -- the opposite invariant from the one this test used to pin. */
-  it("keeps the R2 pill in normal flow inside the band, not floated over the list", () => {
+  it("keeps the jump-to-bottom pill in normal flow inside the band, not floated over the list", () => {
     const markup = `<div class="status-band"><div class="band-right"><button class="band-seg band-unread">↓</button></div></div>`;
     expect(computed(markup, ".band-unread").position).toBe("static");
     expect(computed(markup, ".band-unread").background).toBe("var(--nv-fg)");
@@ -2079,7 +2079,7 @@ describe("index.css cascade (which rule actually wins)", () => {
      panel does not have the keys. (Until 2026-10-13 the row's solid sign cell also went hollow meanwhile,
      through a `data-code-landed` mark on the list; the chat page's cursor is a soft band under the row,
      never a second solid mark, and the mark is gone.) */
-  it("K07: outlines a HINT-landed code block, thinner without the keys, over the cursor band", () => {
+  it("outlines a HINT-landed code block, thinner without the keys, over the cursor band", () => {
     const landed = (focused: string) =>
       `<div class="message-list" data-focused="${focused}"><div class="row row-assistant row-current">` +
       `<span class="row-sign">●</span><div class="row-body"><pre class="code-block" data-hint-landed=""><code>x</code></pre></div></div>` +
@@ -2586,7 +2586,7 @@ describe("index.css: nothing in the conversation scrolls it sideways", () => {
     expect(railed.sort()).toEqual([".handoff-card .warning", ".handoff-confirm .warning", ".trust-note", ".trust-outside"]);
   });
 
-  it("scrolls a markdown table in its own box and keeps its words whole (T1)", () => {
+  it("scrolls a markdown table in its own box and keeps its words whole", () => {
     document.head.innerHTML = `<style>${css}</style>`;
     document.body.innerHTML = `<div class="message-list"><div class="row"><div class="row-body">${renderMarkdown("| a | b |\n|---|---|\n| supercalifragilistic | 2 |")}</div></div></div>`;
     const wrapper = document.querySelector<HTMLElement>(".table-scroll")!;
@@ -2822,7 +2822,7 @@ describe("text on a --nv-surface fill (sw-theme-2)", () => {
  *  against `bg` only), the composer's dimmed hint 2.3-3.0:1 and its placeholder WebKit's `darkGray`, about
  *  1.9:1 on a light tint. This renders the panel's real tinted boxes, finds each text's nearest fill, and
  *  requires every text on a tint to be drawn in that tint's pair -- and the pairs nowhere else. */
-describe("text on a tinted fill (2026-10-13)", () => {
+describe("text on a tinted fill", () => {
   afterEach(() => {
     document.head.innerHTML = "";
     document.body.innerHTML = "";
@@ -3015,7 +3015,7 @@ describe("VISUAL mode", () => {
     expect(found).toEqual(new Set(VISUAL_CHROME));
   });
 
-  it("hides every VISUAL_CHROME member under data-visual-copying -- the rule copySelectionText's attribute actually needed", () => {
+  it("hides every VISUAL_CHROME member under data-visual-copying, the rule copySelectionText's attribute actually needed", () => {
     const rules = splitRules(stripComments(css));
     const found = new Set<string>();
     for (const rule of rules) {
@@ -3074,7 +3074,7 @@ describe("VISUAL mode", () => {
    lets a span longer than the row break within the row. The selector leaves fenced pre code
    alone. jsdom has no layout, so these tests check the declarations and that they reach the
    markdown renderer's inline spans. Rendering needs to be checked in a browser. */
-describe("inline code never breaks inside a token (rc.4 item 6)", () => {
+describe("inline code never breaks inside a token", () => {
   const rule = () => {
     const found = splitRules(stripComments(css)).filter(
       (r) => r.selector.trim() === ".row-assistant code:not(pre code)" && /display\s*:/.test(r.declarations),
@@ -3111,7 +3111,7 @@ describe("inline code never breaks inside a token (rc.4 item 6)", () => {
    it takes no room of its own: the diff box (`.permission-card-diff`, the `pre` that scrolls sideways) keeps a strip
    of padding under its last line for it to sit in. `scrollbar-gutter` does not help, it reserves the block-axis
    scrollbar's room only. jsdom draws no scrollbar, so this pins the room, not the pixels. */
-describe("an expanded diff keeps room under its last line for its scrollbar (rc.4 item 7)", () => {
+describe("an expanded diff keeps room under its last line for its scrollbar", () => {
   /** The effective bottom padding, in px, of `.permission-card-diff`: its `padding` shorthand and `padding-bottom`
    *  read in source order, as the cascade applies them within one rule. */
   function bottomPaddingPx(): number {
@@ -3145,7 +3145,7 @@ describe("an expanded diff keeps room under its last line for its scrollbar (rc.
    card (an ellipsis rather than a hard clip where even that is too narrow), and the buttons take the panel's face and
    its `--fs-*` scale like every other control in it (the composer, the rename box). jsdom has no layout: this pins the
    rules, and the pixels are owed a screen. */
-describe("the permission card's reason box and buttons follow the panel (rc.4 item 8)", () => {
+describe("the permission card's reason box and buttons follow the panel", () => {
   /** Every declaration block whose selector list names `selector` exactly, in source order. */
   const declarationsFor = (selector: string): string => {
     const blocks = splitRules(stripComments(css))

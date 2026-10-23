@@ -283,7 +283,7 @@ const SITES: Site[] = [
   { name: "the : command line", layout: "conversation", flag: "exLine", overlay: ".search-bar", flash: "the command line failed and closed", open: (c) => keys(c, ":") },
 ];
 
-describe("an overlay that throws closes itself and leaves the panel drawn (K03)", () => {
+describe("an overlay that throws closes itself and leaves the panel drawn", () => {
   const panel = (layout: Layout) => (layout === "conversation" ? ".agent-ui-conversation" : ".empty-tab");
 
   it.each(SITES)("$name: a throw while it opens closes it, says so in the band, and the panel stays", (site) => {
@@ -381,7 +381,7 @@ describe("an overlay that throws closes itself and leaves the panel drawn (K03)"
 });
 
 /** A chooser filter with no matches must remain usable, end to end through `App`, without a forced throw. */
-describe("K03 itself: a chooser filter that matches nothing", () => {
+describe("a chooser filter that matches nothing", () => {
   it("leaves the whole panel drawn, shows 'nothing matches', and Esc still leaves the chooser", () => {
     const { container } = start("conversation");
     dispatch(CHOOSER);

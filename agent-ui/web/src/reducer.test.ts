@@ -81,7 +81,7 @@ describe("applyEvent", () => {
      and a turn that reports none -- interrupted, synthesized -- leaves the last figure standing:
      silence is not a measurement, and the band must never show an invented zero. Mirrors
      `AgentSessionProjection::apply`'s `TurnCompleted` arm. */
-  describe("usage (R5)", () => {
+  describe("the usage report", () => {
     const report = (cost: number, tokens: number | null): UsageInfo => ({
       total_cost_usd: cost,
       num_turns: null,
@@ -569,7 +569,7 @@ describe("partial assistant streaming", () => {
     expect(next.transcript.map((m) => m.text)).toEqual(["an earlier reply", "new message"]);
   });
 
-  it("sw-panel-render-2: a mid-stream snapshot keeps the message open, so the next delta continues it rather than splitting it", () => {
+  it("a mid-stream snapshot keeps the message open, so the next delta continues it rather than splitting it", () => {
     // The defect this pins: `applySnapshot` used to force `assistantMessageOpen: false`
     // unconditionally, on the theory a snapshot always meant "start fresh" -- but Rust's own
     // projection keeps appending to the open message underneath a snapshot taken mid-reply
@@ -1037,7 +1037,7 @@ describe("applyCallNotes", () => {
     expect(applyCallNotes(state, { ruleNotes: [], createsFile: [] })).toBe(state);
   });
 
-  it("puts the note for a call answered without a card on that call (O3 review item 7)", () => {
+  it("puts the note for a call answered without a card on that call", () => {
     let state = initialState();
     for (const id of ["toolu_1", "toolu_2"]) {
       state = applyEvent(state, { type: "tool_call_started", turn_id: "t1", tool_use_id: id, name: "Write", input: {} });

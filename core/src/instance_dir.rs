@@ -209,7 +209,7 @@ fn sweep_entries_owned_by(tmp: &Path, prefix: &str, socket_name: &str, log_tag: 
 ///
 /// `Uuid::parse_str` accepts the hyphenated form as well as the 32-hex `simple` one
 /// [`instance_dir_path`] writes since 2026-09-17, which is what lets one sweep reclaim an older
-/// build's directories; `a_pre_l2_t5_hyphenated_uuid_is_still_recognised` pins that.
+/// build's directories; `an_older_builds_hyphenated_uuid_is_still_recognised` pins that.
 pub(crate) fn stale_instance_dir_pid(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
     match rest.split_once('-') {
@@ -554,7 +554,7 @@ pub(crate) mod tests {
     /// which each caller answers by sweeping its own legacy prefix too, this half needs no second
     /// call, only a parser that keeps accepting the old spelling.
     #[test]
-    fn a_pre_l2_t5_hyphenated_uuid_is_still_recognised() {
+    fn an_older_builds_hyphenated_uuid_is_still_recognised() {
         let uuid = uuid::Uuid::new_v4();
         assert_eq!(uuid.to_string().len(), 36);
         assert_eq!(uuid.simple().to_string().len(), 32);

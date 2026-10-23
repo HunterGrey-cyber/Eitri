@@ -1293,7 +1293,7 @@ fn ending_of(status: &str, error: Value) -> AgentDomainEvent {
 }
 
 #[test]
-fn turn_endings_follow_the_spec_table() {
+fn turn_endings_follow_the_codex_error_info_table() {
     for row in rows() {
         // Both forms Codex writes: the bare name, and an object with one key (a unit variant is never an
         // object on the wire, but the reader accepts it).
