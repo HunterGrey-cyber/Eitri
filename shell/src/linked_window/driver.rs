@@ -300,14 +300,19 @@ impl LinkDriver {
         self.inner.handshake_by.set(Some(at));
     }
 
-    /// At `now`, past the handshake's deadline with no handshake done: the link is closed (the window at its other
-    /// end, should it ever say hello, finds it gone and closes) and `true` is returned, so the pair can start
-    /// another. A linked link, or one with no deadline, is left alone.
+    /// At `now`, past the handshake's deadline with no handshake done: the link is closed and `true` is returned,
+    /// for the caller to end the process at its other end and the pair to start another. What has already arrived
+    /// is handed over first, so a `hello` that came just in time still links. A linked link, one that has ended,
+    /// or one with no deadline is left alone, and `false` returned: its window is never ended for it.
     pub fn handshake_overdue(&self, now: Instant) -> bool {
         let Some(by) = self.inner.handshake_by.get() else {
             return false;
         };
         if now < by || self.linked() || !self.is_up() {
+            return false;
+        }
+        self.pump();
+        if self.linked() || !self.is_up() {
             return false;
         }
         eprintln!("[link] the second window did not finish the handshake in time; the link is closed");
@@ -493,6 +498,39 @@ pub(crate) mod tests {
         let (no_deadline, _theirs, _inbound) = pair();
         assert!(!no_deadline.handshake_overdue(start + HANDSHAKE_WITHIN * 2));
         assert!(no_deadline.is_up());
+    }
+
+    /// Waits, for at most five seconds, until the link thread has queued something for `driver`, without handing it
+    /// over: the wake descriptor turns readable only after the message is in the queue.
+    fn wait_queued(driver: &LinkDriver) -> bool {
+        let handle = driver.inner.handle.borrow();
+        let mut pfd = libc::pollfd {
+            fd: handle.as_ref().expect("the link is up").wake_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one `pollfd` that lives for the call.
+        unsafe { libc::poll(&mut pfd, 1, 5000) == 1 }
+    }
+
+    #[test]
+    fn a_hello_already_waiting_when_the_deadline_passes_still_links() {
+        let start = Instant::now();
+        let (driver, theirs, _their_inbound) = pair();
+        driver.set_handshake_deadline(start + HANDSHAKE_WITHIN);
+        driver.on("hello", |link, _, _| link.set_linked());
+        theirs
+            .send(
+                crate::linked_window::spawn::hello("0.4.0+abc".into(), 4242, 99),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(wait_queued(&driver), "the hello reached this side's queue");
+        assert!(
+            !driver.handshake_overdue(start + HANDSHAKE_WITHIN),
+            "a hello that arrived in time is handed over before the deadline is judged"
+        );
+        assert!(driver.linked(), "and it links instead of being dropped");
     }
 
     #[test]

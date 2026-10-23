@@ -5,6 +5,8 @@
 //! host's controllers, the Super filter and the edge rule for `Ctrl+h/j/k/l` among them, installed by `wire_host`
 //! alone. Also, from `plugin_page.rs`: the kit's reserved path is answered before the plugin's site is looked up,
 //! and a page build applies and logs its policy and proxy plan, and every answer of the scheme carries `nosniff`.
+//! And the pair's wiring: the startup host check asserts the hosts `hosted_at_start` says the controller makes, the
+//! link's end loads again every page that comes back, and window 2's path clicks are checked by the panel's own rule.
 
 use eitri_core::source_scan as scan;
 
@@ -945,5 +947,68 @@ fn a_scan_finds_no_tiling_arm_in_run_verb() {
         "grid.swap_adjacent(",
     ] {
         assert!(!code.contains(verb), "build_ui still calls `{verb}`");
+    }
+}
+
+/// The startup check asserts a host for exactly the modules `hosted_at_start` picks from the surfaces declared, and
+/// runs after the controller has made them: a window with no editor would otherwise fail its own start.
+#[test]
+fn the_startup_host_check_is_built_by_hosted_at_start() {
+    let code = build_ui_code();
+    let built = code
+        .find("letstartup_modules:Vec<ModuleId>=linked_window::hosted_at_start(&startup_surfaces,")
+        .expect("the startup host list is built by hosted_at_start over the surfaces declared");
+    let declared = code
+        .find("StartStep::Surfaces{decls:startup_surfaces,}")
+        .expect("the same surfaces are declared to the controller");
+    let checked = code
+        .find("foridin&startup_modules{assert!(grid.has_host(id),")
+        .expect("each module of that list must have its host");
+    assert!(
+        built < declared && declared < checked,
+        "the list is taken before the surfaces move into the controller, and checked once it made them"
+    );
+}
+
+/// The link's end loads again every page `pages_back` picks from what came back, after the layout took it back:
+/// a page built before it was held away would otherwise show what its store said then.
+#[test]
+fn the_link_ended_hook_loads_again_every_page_that_comes_back() {
+    let code = build_ui_code();
+    let ended = let_block(&code, "letended:linked_window::spawn::OnEnded=");
+    let taken_back = ended
+        .find("linked_window::apply_end(&plan,")
+        .expect("the end plan is carried out in the layout");
+    let reloads = ended
+        .find(
+            "foridinlinked_window::pages_back(&plan){iflinked_window::reload_page_back(&plugin_panels,&lua_pages,&id)",
+        )
+        .expect("every page pages_back names is loaded again");
+    assert!(taken_back < reloads, "after the layout took them back");
+    assert!(
+        code.contains("pair.set_hooks(linked_window::spawn::PairHooks{linked,raise,ended})"),
+        "and that hook is the one the link's end runs"
+    );
+}
+
+/// A path window 2 asks window 1 to open passes the panel's own rule, the same function a click in window 1's
+/// own chat goes through, so the two can never drift apart.
+#[test]
+fn window_2s_paths_follow_the_panels_own_rule() {
+    let code = file_code("shell/src/linked_window/editor.rs");
+    let open = arm(
+        &code,
+        "EditorRequest::OpenPath{path,line,col:_}=>",
+        "EditorRequest::ReviewOpen",
+    );
+    assert!(
+        open.contains("eitri_panel::agent_panel::open_path_target(&self.root,&path)"),
+        "window 2's open request is checked by the panel's rule: {open}"
+    );
+    for own in ["fnopen_target", "fnopen_path_target"] {
+        assert!(
+            !code.contains(own),
+            "the editor proxy keeps no path rule of its own (`{own}`)"
+        );
     }
 }

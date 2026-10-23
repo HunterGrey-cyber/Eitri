@@ -508,12 +508,6 @@ fn view_title(body: &Path) -> String {
     }
 }
 
-/// The file `gf` opens for `path`: the rule a window's own panel uses, so a path from window 2 opens exactly when it
-/// would open from window 1's own chat.
-pub fn open_target(root: &Path, path: &str) -> Result<PathBuf, String> {
-    eitri_panel::agent_panel::open_path_target(root, path)
-}
-
 /// A reviewed file to open: a project path in the form turn review keeps its own (plain names, no link or
 /// non-directory among its parents), which must exist.
 fn review_target(root: &Path, path: &str) -> Result<PathBuf, String> {
@@ -836,7 +830,9 @@ impl Window1Editor {
             .ok_or("this window has no editor to drive")?;
         match request {
             EditorRequest::OpenPath { path, line, col: _ } => {
-                let resolved = open_target(&self.root, &path)?;
+                // The rule a window's own panel uses, so a path from window 2 opens exactly when it would open from
+                // window 1's own chat.
+                let resolved = eitri_panel::agent_panel::open_path_target(&self.root, &path)?;
                 drive(
                     EditorAct::Request(&eitri_core::scratch::open_request(&resolved, line)),
                     token,

@@ -5,14 +5,23 @@
 //! from exactly that child, of exactly this build: the child's pid and start time name it even if another process
 //! somehow held the other end, and the build fingerprint keeps two builds from sharing one pair's state. A `hello`
 //! that does not match is answered with `bye` and the link closes. A matching one is answered with `welcome`,
-//! which carries a copy of the pair lock's descriptor, so the lock stays held while either window lives.
+//! which carries a copy of the pair lock's descriptor, so the lock stays held while either window lives. A window 2
+//! that has not finished the handshake by its deadline has failed to start: its link is closed and its process ended
+//! (SIGTERM, then SIGKILL after a short grace), through a pidfd opened while it was still this window's unreaped
+//! child, so nothing but that process can ever be signalled.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus};
 use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use agent::child::PidFd;
 
 use eitri_core::window_link::fdpass;
 use eitri_core::window_link::link::{LinkHandle, PresenceFlag};
@@ -342,9 +351,282 @@ fn linked_hook(hooks: &Hooks) -> OnLinked {
     })
 }
 
+/// How long a window 2 told to end has before it is killed: enough to close its files, not enough to keep a start
+/// that failed around.
+pub const END_GRACE: Duration = Duration::from_secs(2);
+
+/// Window 2's process as the window that started it holds it. The pidfd is opened while the process is still this
+/// window's unreaped child, so it names that process and no other: once it has ended, a signal through it reaches
+/// nothing, even after its pid is reused. The `Child` itself is waited for on a thread of its own, which reaps it
+/// whenever it ends.
+pub struct SecondProcess {
+    pid: u32,
+    start: u64,
+    pidfd: Arc<PidFd>,
+    #[cfg_attr(not(test), allow(dead_code))] // The window only logs the reap; the tests wait for it.
+    reaped: Arc<Reaped>,
+}
+
+/// The reaped child's status, once its reaper has it.
+#[derive(Default)]
+struct Reaped {
+    status: Mutex<Option<ExitStatus>>,
+    changed: Condvar,
+}
+
+/// What ending a window 2 came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ending {
+    /// It had ended already: nothing was signalled, and its reaper reaps it.
+    AlreadyEnded,
+    /// It ended within the grace after SIGTERM.
+    Terminated,
+    /// It still ran after the grace and was sent SIGKILL.
+    Killed,
+    /// A signal could not be sent.
+    Failed(String),
+}
+
+impl SecondProcess {
+    /// Takes the child just spawned: reads its start time, opens its pidfd and starts its reaper. On an error the
+    /// child is killed, since without those it could not be told from a later holder of its pid, and reaped without
+    /// a wait on the caller (see [`reap_without_waiting`]).
+    pub fn started(mut child: Child) -> io::Result<SecondProcess> {
+        let pid = child.id();
+        let named = agent::child::start_time(pid).and_then(|start| Ok((start, PidFd::open(pid, start)?)));
+        let (start, pidfd) = match named {
+            Ok(named) => named,
+            Err(err) => {
+                let _ = child.kill();
+                reap_without_waiting(child);
+                return Err(err);
+            }
+        };
+        let reaped: Arc<Reaped> = Arc::default();
+        // Kept here as well until the reaper runs, so a reaper that cannot be started leaves no child behind.
+        let slot = Arc::new(Mutex::new(Some(child)));
+        let spawned = {
+            let slot = slot.clone();
+            let reaped = reaped.clone();
+            std::thread::Builder::new()
+                .name("window-2-reaper".into())
+                .spawn(move || {
+                    let Some(mut child) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                        return;
+                    };
+                    match child.wait() {
+                        Ok(status) => {
+                            println!("[window] window 2 (process {pid}) ended: {status}");
+                            *reaped.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+                            reaped.changed.notify_all();
+                        }
+                        Err(err) => eprintln!("[window] window 2 (process {pid}) could not be waited for: {err}"),
+                    }
+                })
+        };
+        if let Err(err) = spawned {
+            if let Some(mut child) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = child.kill();
+                reap_without_waiting(child);
+            }
+            return Err(err);
+        }
+        Ok(SecondProcess {
+            pid,
+            start,
+            pidfd: Arc::new(pidfd),
+            reaped,
+        })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Ends the process on a thread of its own, so no wait falls on the caller: nothing if it has already ended,
+    /// else SIGTERM, and SIGKILL once `grace` has passed with it still running. Only this process is signalled,
+    /// never its group or anything it started.
+    pub fn end(&self, grace: Duration) -> io::Result<JoinHandle<Ending>> {
+        let pidfd = self.pidfd.clone();
+        let pid = self.pid;
+        std::thread::Builder::new()
+            .name("window-2-ender".into())
+            .spawn(move || {
+                let ending = end_process(&pidfd, grace);
+                report_ending(pid, &ending);
+                ending
+            })
+    }
+
+    /// The reaped status, waiting at most `timeout` for it.
+    #[cfg(test)]
+    fn wait_reaped(&self, timeout: Duration) -> Option<ExitStatus> {
+        let status = self.reaped.status.lock().unwrap();
+        let (status, _) = self
+            .reaped
+            .changed
+            .wait_timeout_while(status, timeout, |status| status.is_none())
+            .unwrap();
+        *status
+    }
+}
+
+/// SIGTERM, then SIGKILL after `grace`, to the process `pidfd` names; nothing to one that has ended. A process that
+/// ends between the check and the signal answers `ESRCH` through its pidfd, and nothing else is reached.
+fn end_process(pidfd: &PidFd, grace: Duration) -> Ending {
+    if let Some(done) = terminate(pidfd) {
+        return done;
+    }
+    if pidfd.wait_exited(grace) {
+        return Ending::Terminated;
+    }
+    kill_if_running(pidfd)
+}
+
+/// The first half of ending: SIGTERM unless the process has ended. What it came to when nothing is left to do,
+/// `None` while SIGKILL may still have to follow. Never waits.
+fn terminate(pidfd: &PidFd) -> Option<Ending> {
+    if pidfd.exited() {
+        return Some(Ending::AlreadyEnded);
+    }
+    match pidfd.signal(libc::SIGTERM) {
+        Ok(()) => None,
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Some(Ending::AlreadyEnded),
+        Err(err) => Some(Ending::Failed(format!("SIGTERM could not be sent: {err}"))),
+    }
+}
+
+/// The second half, once the grace has passed: SIGKILL to a process that still runs. Never waits.
+fn kill_if_running(pidfd: &PidFd) -> Ending {
+    if pidfd.exited() {
+        return Ending::Terminated;
+    }
+    match pidfd.signal(libc::SIGKILL) {
+        Ok(()) => Ending::Killed,
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => Ending::Terminated,
+        Err(err) => Ending::Failed(format!("SIGKILL could not be sent: {err}")),
+    }
+}
+
+/// How often the main loop looks again at a child it reaps without a thread.
+const REAP_RETRY: Duration = Duration::from_millis(100);
+
+/// Reaps `child` with no wait on the caller, for when no thread can be started to wait for it: at once if it has
+/// ended, else from the main loop once it has. A killed child can still take a while to end (one in uninterruptible
+/// I/O ends only when that I/O does), and the caller is the GTK thread.
+fn reap_without_waiting(mut child: Child) {
+    if reaped_now(&mut child) {
+        return;
+    }
+    gtk4::glib::timeout_add_local(REAP_RETRY, move || {
+        if reaped_now(&mut child) {
+            gtk4::glib::ControlFlow::Break
+        } else {
+            gtk4::glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// One look that never waits: whether `child` is reaped now, or can never be (its status cannot be read).
+fn reaped_now(child: &mut Child) -> bool {
+    !matches!(child.try_wait(), Ok(None))
+}
+
+/// Ends the process from the main loop, for when no thread can be started for the grace: SIGTERM now, and a timer
+/// that sends SIGKILL once the grace has passed if it still runs. Nothing waits on the caller. The application is
+/// held until the timer has run, so closing the last window during the grace does not end this process first.
+fn end_from_main_loop(pidfd: Arc<PidFd>, pid: u32, grace: Duration) {
+    if let Some(done) = terminate(&pidfd) {
+        report_ending(pid, &done);
+        return;
+    }
+    let hold = hold_application();
+    gtk4::glib::timeout_add_local_once(grace, move || {
+        report_ending(pid, &kill_if_running(&pidfd));
+        // Released here, after the SIGKILL, rather than whenever GLib frees the finished source.
+        drop(hold);
+    });
+}
+
+/// A hold on the running application, so it stays in its main loop with no window left. Once window 1's last
+/// window closes the process would otherwise exit, and with it the thread or timer that still owes a window 2 its
+/// SIGKILL: one that ignores SIGTERM would be left running. `None` when no application runs (the unit tests), where
+/// nothing exits under the ending.
+fn hold_application() -> Option<gtk4::gio::ApplicationHoldGuard> {
+    use gtk4::prelude::*;
+    gtk4::gio::Application::default().map(|app| app.hold())
+}
+
+/// Holds the application until the ending thread has finished, looking from the main loop so nothing waits on the
+/// caller; the thread itself is bounded by its grace.
+fn hold_until_finished(ending: JoinHandle<Ending>) {
+    let Some(hold) = hold_application() else {
+        return;
+    };
+    let mut hold = Some(hold);
+    let mut ending = Some(ending);
+    gtk4::glib::timeout_add_local(REAP_RETRY, move || {
+        if ending.as_ref().is_some_and(|ending| !ending.is_finished()) {
+            return gtk4::glib::ControlFlow::Continue;
+        }
+        if let Some(ending) = ending.take() {
+            let _ = ending.join();
+        }
+        // Released from inside the source, once the ending is done, so the exit it allows never waits on GLib
+        // freeing this closure.
+        hold.take();
+        gtk4::glib::ControlFlow::Break
+    });
+}
+
+/// Ends `second` with `grace` to go: on a thread when one can be started (the thread, returned), else from the main
+/// loop, so a window that ignores SIGTERM is still killed either way.
+fn end_second(second: &SecondProcess, grace: Duration) -> Option<JoinHandle<Ending>> {
+    match second.end(grace) {
+        Ok(ending) => Some(ending),
+        Err(err) => {
+            // With no thread for the grace, the main loop keeps it.
+            eprintln!("[window] window 2 could not be ended on a thread ({err}); the main loop ends it");
+            end_from_main_loop(second.pidfd.clone(), second.pid, grace);
+            None
+        }
+    }
+}
+
+fn report_ending(pid: u32, ending: &Ending) {
+    match ending {
+        Ending::Failed(why) => eprintln!("[window] window 2 (process {pid}) could not be ended: {why}"),
+        done => println!("[window] window 2 (process {pid}): {done:?}"),
+    }
+}
+
+/// When the handshake's deadline passes: a window 2 that has not finished it has failed to start, so its link is
+/// closed and its process ended with `grace` to go. A linked window is left alone. The ending thread, when one was
+/// started.
+fn end_if_overdue(
+    link: &LinkDriver,
+    second: &SecondProcess,
+    now: Instant,
+    grace: Duration,
+) -> Option<JoinHandle<Ending>> {
+    if !link.handshake_overdue(now) {
+        return None;
+    }
+    eprintln!(
+        "[window] window 2 (process {}) did not finish its handshake; it is ended",
+        second.pid
+    );
+    end_second(second, grace)
+}
+
 /// Window 1: makes the socketpair, starts window 2 from this executable with the other end, and links when its
-/// `hello` matches. `linked` runs once `welcome` is sent. The child is reaped on a thread of its own. `legacy`:
-/// window 2 is started with `--legacy`, its chats then running the backend this window's run.
+/// `hello` matches. `linked` runs once `welcome` is sent. The child is reaped on a thread of its own, and ended if it
+/// has not finished the handshake in [`HANDSHAKE_WITHIN`]. `legacy`: window 2 is started with `--legacy`, its chats
+/// then running the backend this window's run.
 pub fn start_second(
     root: &Path,
     token: Option<&str>,
@@ -355,25 +637,21 @@ pub fn start_second(
 ) -> io::Result<LinkDriver> {
     let (mine, theirs) = fdpass::seqpacket_pair()?;
     // The running executable, not the installed path: an upgrade that replaced the file still starts this build.
-    let mut child = spawn_second(Path::new("/proc/self/exe"), theirs, root, token, legacy)?;
-    let pid = child.id();
-    let start = match agent::child::start_time(pid) {
-        Ok(start) => start,
+    let second = SecondProcess::started(spawn_second(Path::new("/proc/self/exe"), theirs, root, token, legacy)?)?;
+    let (pid, start) = (second.pid(), second.start());
+    let presence = not_yet_confirmed();
+    let (handle, inbound) = match LinkHandle::start(mine, presence.clone()) {
+        Ok(started) => started,
         Err(err) => {
-            // Without its start time the child cannot be told from a process that later takes its pid.
-            let _ = child.kill();
-            let _ = child.wait();
+            // No link means no handshake and no deadline to end it by: a window 2 hung before its toolkit came up
+            // would never see its socket close, so it is ended here.
+            eprintln!("[window] the link to window 2 (process {pid}) could not be started ({err}); it is ended");
+            if let Some(ending) = end_second(&second, END_GRACE) {
+                hold_until_finished(ending);
+            }
             return Err(err);
         }
     };
-    std::thread::Builder::new()
-        .name("window-2-reaper".into())
-        .spawn(move || match child.wait() {
-            Ok(status) => println!("[window] window 2 (process {pid}) ended: {status}"),
-            Err(err) => eprintln!("[window] window 2 (process {pid}) could not be waited for: {err}"),
-        })?;
-    let presence = not_yet_confirmed();
-    let (handle, inbound) = LinkHandle::start(mine, presence.clone())?;
     let link = LinkDriver::new(handle, inbound);
     link.set_presence(presence);
     let expected = Expected {
@@ -388,12 +666,16 @@ pub fn start_second(
     });
     link.watch();
     // A window 2 that never says hello (it hung before its toolkit came up, or died in a way the link does not
-    // see) would otherwise leave this link up for good, and `window.new` could never start another.
-    link.set_handshake_deadline(std::time::Instant::now() + HANDSHAKE_WITHIN);
+    // see) would otherwise leave this link up for good, and `window.new` could never start another; its process,
+    // left running, would keep whatever it opened.
+    link.set_handshake_deadline(Instant::now() + HANDSHAKE_WITHIN);
     {
         let link = link.clone();
         gtk4::glib::timeout_add_local_once(HANDSHAKE_WITHIN, move || {
-            link.handshake_overdue(std::time::Instant::now());
+            // The ending thread is bounded by the grace; the application is held until it has finished.
+            if let Some(ending) = end_if_overdue(&link, &second, Instant::now(), END_GRACE) {
+                hold_until_finished(ending);
+            }
         });
     }
     println!("[window] started window 2 as process {pid}");
@@ -629,6 +911,164 @@ mod tests {
                 drop(adopted);
             }
             other => panic!("expected welcome, got {other:?}"),
+        }
+    }
+
+    /// A stand-in for window 2 that never says hello: `sleep`, through the seam window 1 starts window 2 by.
+    /// `ignore_term`: it ignores SIGTERM, as a window hung with that signal blocked would.
+    fn stand_in(ignore_term: bool) -> SecondProcess {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        if ignore_term {
+            // SAFETY: `signal` is async-signal-safe; an ignored disposition survives `exec`.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        SecondProcess::started(command.spawn().unwrap()).unwrap()
+    }
+
+    fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
+        std::os::unix::process::ExitStatusExt::signal(&status)
+    }
+
+    #[test]
+    fn a_window_2_that_misses_its_handshake_is_ended_and_reaped() {
+        use std::time::Instant;
+        // A process that heeds SIGTERM gets a long grace, since ending returns as soon as it has gone: a slow machine
+        // must not turn its SIGTERM into a SIGKILL. Only the one that ignores SIGTERM waits out a short grace.
+        let grace = Duration::from_secs(10);
+        let short_grace = Duration::from_millis(300);
+        let start = Instant::now();
+        let overdue = start + HANDSHAKE_WITHIN;
+
+        // A window that never said hello: its link is closed, and the process gets SIGTERM.
+        let (driver, _theirs, _their_inbound) = pair();
+        driver.set_handshake_deadline(overdue);
+        let second = stand_in(false);
+        assert!(
+            end_if_overdue(&driver, &second, overdue - Duration::from_millis(1), grace).is_none(),
+            "before the deadline the start is still waited for"
+        );
+        let ending = end_if_overdue(&driver, &second, overdue, grace).expect("ended once overdue");
+        assert_eq!(ending.join().unwrap(), Ending::Terminated);
+        assert!(!driver.is_up(), "its link is closed too");
+        let status = second.wait_reaped(Duration::from_secs(10)).expect("reaped");
+        assert_eq!(signal_of(status), Some(libc::SIGTERM), "{status:?}");
+        assert!(
+            end_if_overdue(&driver, &second, overdue + HANDSHAKE_WITHIN, grace).is_none(),
+            "it is ended once"
+        );
+
+        // One that ignores SIGTERM is killed once the grace has passed.
+        let (driver, _theirs, _their_inbound) = pair();
+        driver.set_handshake_deadline(overdue);
+        let stubborn = stand_in(true);
+        // `spawn` returns once the child has exec'd, so the disposition is already in place.
+        let ending = end_if_overdue(&driver, &stubborn, overdue, short_grace).expect("ended once overdue");
+        assert_eq!(ending.join().unwrap(), Ending::Killed);
+        let status = stubborn.wait_reaped(Duration::from_secs(10)).expect("reaped");
+        assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
+
+        // One that already exited is only reaped: nothing is signalled.
+        let (driver, _theirs, _their_inbound) = pair();
+        driver.set_handshake_deadline(overdue);
+        let gone = SecondProcess::started(std::process::Command::new("true").spawn().unwrap()).unwrap();
+        let status = gone.wait_reaped(Duration::from_secs(10)).expect("reaped on its own");
+        assert_eq!(status.code(), Some(0));
+        let ending = end_if_overdue(&driver, &gone, overdue, grace).expect("its link is still closed");
+        assert_eq!(ending.join().unwrap(), Ending::AlreadyEnded);
+
+        // A linked window is never signalled, whatever the clock says.
+        let (driver, _theirs, _their_inbound) = pair();
+        driver.set_handshake_deadline(overdue);
+        driver.set_linked();
+        let linked = stand_in(false);
+        assert!(end_if_overdue(&driver, &linked, overdue + HANDSHAKE_WITHIN, grace).is_none());
+        assert!(driver.linked());
+        assert!(
+            linked.wait_reaped(Duration::from_millis(300)).is_none(),
+            "the linked window still runs"
+        );
+        // The test's own clean-up of its stand-in.
+        assert_eq!(linked.end(grace).unwrap().join().unwrap(), Ending::Terminated);
+        assert!(linked.wait_reaped(Duration::from_secs(10)).is_some());
+    }
+
+    #[test]
+    fn without_a_thread_sigkill_still_follows_and_the_child_is_reaped_by_looks_that_never_wait() {
+        // The two halves the main loop runs when no thread can be started, the grace's timer between them.
+        let stubborn = stand_in(true);
+        assert_eq!(
+            terminate(&stubborn.pidfd),
+            None,
+            "SIGTERM is sent, and SIGKILL may still have to follow"
+        );
+        assert_eq!(kill_if_running(&stubborn.pidfd), Ending::Killed);
+        let status = stubborn.wait_reaped(Duration::from_secs(10)).expect("reaped");
+        assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
+
+        let polite = stand_in(false);
+        assert_eq!(terminate(&polite.pidfd), None);
+        let status = polite.wait_reaped(Duration::from_secs(10)).expect("reaped");
+        assert_eq!(signal_of(status), Some(libc::SIGTERM), "{status:?}");
+        assert_eq!(
+            kill_if_running(&polite.pidfd),
+            Ending::Terminated,
+            "a process that has gone is not signalled again"
+        );
+        assert_eq!(terminate(&polite.pidfd), Some(Ending::AlreadyEnded));
+
+        // A child killed with no reaper thread is reaped by repeated looks, none of which waits.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(!reaped_now(&mut child), "a look does not reap a child that still runs");
+        child.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !reaped_now(&mut child) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed child was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let status = child.try_wait().unwrap().expect("its status is kept once reaped");
+        assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    /// An application whose last window has closed must not exit while a window 2 still waits for its SIGKILL: `run`
+    /// returns only once the ending is done, on the thread and on the main-loop timer alike.
+    ///
+    /// Ignored because `g_application_run` iterates the default main context, which two tests in two threads would
+    /// fight over. Run it alone:
+    /// `cargo test -p shell the_application_outlives_an_ending_in_its_grace -- --ignored --exact`.
+    #[test]
+    #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
+    fn the_application_outlives_an_ending_in_its_grace() {
+        use gtk4::gio;
+        use gtk4::prelude::*;
+        let grace = Duration::from_millis(400);
+        let app = gio::Application::new(None, gio::ApplicationFlags::empty());
+        let stubborn = Rc::new(stand_in(true));
+        let on_timer = Rc::new(stand_in(true));
+        {
+            let (stubborn, on_timer) = (stubborn.clone(), on_timer.clone());
+            // Nothing else holds the application: without the holds, `run` would return as soon as this does.
+            app.connect_activate(move |_| {
+                hold_until_finished(stubborn.end(grace).unwrap());
+                end_from_main_loop(on_timer.pidfd.clone(), on_timer.pid, grace);
+            });
+        }
+        let started = Instant::now();
+        app.run_with_args(&["shell-ending-hold"]);
+        let ran = started.elapsed();
+        assert!(ran >= grace, "run() returned after {ran:?}, inside the grace");
+        for second in [&stubborn, &on_timer] {
+            let status = second.wait_reaped(Duration::from_secs(10)).expect("reaped");
+            assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
         }
     }
 
