@@ -81,9 +81,20 @@ export type Landing = {
  *    line (a third of the way down), going up its tail goes to the mirrored line. It only ever scrolls
  *    in the direction of travel, so a head already above the reading line stays where it is.
  *
+ *  - With `head`, a row taller than the view is entered at its head whatever the direction: the head goes
+ *    to the top margin, even from a view that shows only the row's tail. A permission card is read from its
+ *    first line down to its buttons, so a landing that leaves its bottom in view and its question above
+ *    it is no landing.
+ *
  *  The result is a whole pixel inside the list's own range. */
-export function decideLanding(input: { direction: Direction | 0; view: View; row: Span; line: number }): Landing {
-  const { direction, view, row, line } = input;
+export function decideLanding(input: {
+  direction: Direction | 0;
+  view: View;
+  row: Span;
+  line: number;
+  head?: boolean;
+}): Landing {
+  const { direction, view, row, line, head = false } = input;
   const margin = marginFor(view, line);
   const top = view.scrollTop;
   const bottom = top + view.height;
@@ -95,6 +106,8 @@ export function decideLanding(input: { direction: Direction | 0; view: View; row
   if (row.bottom - row.top <= view.height - 2 * margin + SLACK_PX) {
     return row.bottom > bottom - margin ? to(row.bottom - view.height + margin, "nearest") : to(row.top - margin, "nearest");
   }
+
+  if (head) return Math.round(row.top - margin) === top ? stay : to(row.top - margin, "head");
 
   const toward = direction !== 0 ? direction : row.top >= bottom ? 1 : row.bottom <= top ? -1 : 0;
   if (toward === 0) return stay;

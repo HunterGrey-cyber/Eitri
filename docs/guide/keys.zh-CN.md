@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=6c477145acc88c2d8f10277dadac63809f6b71d096c1655785e5d65060833648 -->
+<!-- translated-from: keys.md sha256=131aca8b79d44e938e4ee2ab9e35ab6958d3e3bd454b7577baf022e85347779a -->
 
 # 按键
 
@@ -219,6 +219,7 @@ k.set("prefix", "F2", "scratchpad.show", { module = "terminal#2" })   -- F2 上�
 | `Up` / `Down` / `Ctrl+n` / `Ctrl+p` | 命令菜单打开时：移动选中项（菜单显示期间这些键不会去翻之前的提示） |
 | `Tab` | 命令菜单打开时：补全选中的命令并加一个空格；`Enter` 在名字还没写全时也一样，写全之后才发送 |
 | `Ctrl+w` / `Ctrl+u` | 删除一个词 / 删到行首 |
+| `Ctrl+a` / `Ctrl+e` | 把光标移到当前行的行首 / 行尾 |
 | `Ctrl+c` | 中断正在运行的回合；空闲时，把输入框清空并存入历史 |
 | `Ctrl+y` | 批准这个标签页里等得最久的卡片（见[回答一张卡片](#answering-a-card)） |
 | `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回来；`:q!` 什么都不改，除非你已经用 `:w` 保存过草稿，这时保存的文字会回来 |

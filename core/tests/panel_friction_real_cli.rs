@@ -66,11 +66,13 @@ fn pump_until(
         }
         if Instant::now() >= deadline {
             let tab = set.active();
+            // Asked before the projection is taken: `turn_running` takes it too, and the guard is not
+            // re-entrant.
+            let running = set.get(tab).map(|t| t.turn_running());
             let state = set.get(tab).and_then(|t| t.live()).map(|b| {
                 let p = b.projection();
                 format!(
-                    "running={} pending={} tools={:?} transcript={:?}",
-                    set.get(tab).unwrap().turn_running(),
+                    "running={running:?} pending={} tools={:?} transcript={:?}",
                     p.pending_permissions.len(),
                     p.tool_calls
                         .iter()
@@ -191,6 +193,24 @@ fn a_rule_answers_its_command_and_git_log_output_still_cards() {
          (check agent::disallowed_tools() still offers Bash)"
     );
 
+    if cli_runs_auto(&set, tab) {
+        the_cli_decides(
+            &mut set,
+            &dir,
+            tab,
+            "Use the Bash tool to run exactly this command, unchanged: git log --output=friction-probe.txt -1",
+            "git log --output=friction-probe.txt",
+        );
+        the_cli_decides(
+            &mut set,
+            &dir,
+            tab,
+            "Use the Bash tool to run exactly this command, unchanged: uname -a > uname-probe.txt",
+            "uname -a > uname-probe.txt",
+        );
+        shut_down(&mut set);
+        return;
+    }
     deny_the_next_card(
         &mut set,
         &dir,
@@ -255,7 +275,8 @@ fn deny_the_next_card(
 }
 
 /// With no saved rules, Auto offers Bash: a read-only in-project command runs without a card,
-/// while a writing command must card.
+/// while a writing command must card -- when Eitri's own policy answers. On a session whose CLI runs
+/// its own `auto` the write is deferred to the CLI's classifier with no card, which is checked instead.
 #[test]
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn auto_offers_bash_runs_a_read_only_command_and_cards_a_write() {
@@ -269,6 +290,52 @@ fn auto_offers_bash_runs_a_read_only_command_and_cards_a_write() {
 #[ignore = "real Claude; run under a test-account wrapper, see the module doc"]
 fn auto_offers_bash_on_the_legacy_backend_too() {
     auto_offers_bash_on(BackendKind::Legacy, "auto-bash-legacy");
+}
+
+/// Whether this tab's session runs the CLI's own `auto` under the gate. Then a call no saved rule
+/// allows is deferred to the CLI's classifier: Eitri draws no card and the CLI decides, so the card
+/// these probes expect from Eitri's own policy cannot come.
+fn cli_runs_auto(set: &TabSet, tab: eitri_core::tabs::TabId) -> bool {
+    set.get(tab).unwrap().live().unwrap().projection().cli_runs_auto()
+}
+
+/// On a CLI-auto session: sends `prompt`, requires that no card is drawn while the turn runs and
+/// that the model really made the Bash call naming `command` (so the deferral was exercised, not
+/// skipped). What the CLI's classifier then did with the call is the CLI's own business.
+fn the_cli_decides(set: &mut TabSet, dir: &std::path::Path, tab: eitri_core::tabs::TabId, prompt: &str, command: &str) {
+    set.get_mut(tab)
+        .unwrap()
+        .live_mut()
+        .unwrap()
+        .send_turn(prompt, command)
+        .map_err(|e| e.message)
+        .unwrap();
+    // Until this turn reports its end: right after the send it has not started, so `turn_running`
+    // alone would already read false.
+    let mut ended_here = false;
+    pump_until(set, dir, command, |set, ended| {
+        assert_eq!(
+            set.get(tab).unwrap().attention.attention().pending,
+            0,
+            "{command}: a CLI-auto session defers the call to the CLI's classifier; no card"
+        );
+        ended_here |= ended.contains(&tab);
+        ended_here && !set.get(tab).unwrap().turn_running()
+    });
+    let made = set
+        .get(tab)
+        .unwrap()
+        .live()
+        .unwrap()
+        .projection()
+        .tool_calls
+        .iter()
+        .any(|call| call.name == "Bash" && call.input["command"].as_str().is_some_and(|c| c.contains(command)));
+    assert!(
+        made,
+        "{command}: the model never made the Bash call, so no deferral was exercised"
+    );
+    println!("[friction] {command}: the CLI runs auto, so the call went to its classifier with no card");
 }
 
 fn auto_offers_bash_on(kind: BackendKind, label: &str) {
@@ -308,6 +375,17 @@ fn auto_offers_bash_on(kind: BackendKind, label: &str) {
         });
     assert!(ran_ls, "the model had Bash in Auto and ran ls through it");
 
+    if cli_runs_auto(&set, tab) {
+        the_cli_decides(
+            &mut set,
+            &dir,
+            tab,
+            "Use the Bash tool to run exactly this command, unchanged: touch auto-bash-probe.txt",
+            "touch auto-bash-probe.txt",
+        );
+        shut_down(&mut set);
+        return;
+    }
     let card = deny_the_next_card(
         &mut set,
         &dir,

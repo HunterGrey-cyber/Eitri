@@ -358,15 +358,18 @@ function scrollKeymapOverlay(el: HTMLDivElement | null, key: string, ctrl: boole
  *  whole-view jump. `direction` is the key that moved the cursor (`1` for `j`, `-1` for `k`) or `0` for
  *  any other way, which judges from where the row lies. `animate` eases the move out over 150ms.
  *
+ *  `head`: a row taller than the view is entered at its head, from any direction -- a permission card that
+ *  `focus_permission` lands on is read from its first line.
+ *
  *  With no layout to judge -- a panel that is not laid out yet, or jsdom -- it falls back to
  *  `scrollIntoView`, which then does nothing a reader could see anyway. */
-function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1 | 0, animate = false) {
+function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1 | 0, animate = false, head = false) {
   const geometry = list === null ? null : readRowGeometry(list, row);
   if (list === null || geometry === null) {
     row.scrollIntoView({ block: "nearest" });
     return;
   }
-  const landing = decideLanding({ direction, ...geometry });
+  const landing = decideLanding({ direction, head, ...geometry });
   if (landing.how !== "stay") scrollListTo(list, landing.scrollTop, animate);
 }
 
@@ -923,6 +926,9 @@ export default function App() {
   /** Whether the view eases to the next landing (`revealRow`'s `animate`): set only by a lone `j`/`k`,
    *  read and reset by the cursor-follow effect with `landingRef`. */
   const landingAnimateRef = useRef(false);
+  /** Whether the next landing enters a row taller than the view at its head (`revealRow`'s `head`): set by
+   *  the `focus_permission` landing, read and reset by the cursor-follow effect with `landingRef`. */
+  const landingHeadRef = useRef(false);
   /** Whether the last `j` moved, so the first repeat of a held `j` that then stops at the last
    *  stop still flashes once (seen in a GUI pass, 2026-09-27) -- see the move branch of `onKeyDown`. */
   const heldMoveRef = useRef(false);
@@ -1998,8 +2004,10 @@ export default function App() {
   useEffect(() => {
     const landing = landingRef.current;
     const animate = landingAnimateRef.current;
+    const head = landingHeadRef.current;
     landingRef.current = 0;
     landingAnimateRef.current = false;
+    landingHeadRef.current = false;
     if (landing === "keep") return;
     // While VISUAL is on the list on screen is the frozen one,
     // and `cursor` indexes the LIVE timeline -- a prompt sent at a turn's end moved it to a row the
@@ -2013,7 +2021,7 @@ export default function App() {
     const list = row.closest<HTMLElement>(".message-list");
     if (list !== null) settleListScroll(list);
     if (landing !== 0) enterBoxAtNearEnd(row, landing);
-    revealRow(list, row, landing, animate);
+    revealRow(list, row, landing, animate, head);
   }, [cursor]);
   /** A scroll the panel did not cause by moving the cursor -- a wheel, a drag, the browser's own
    *  scroll keys -- can leave the cursor's row off screen. Whenever that happens, the cursor moves to
@@ -2334,15 +2342,19 @@ export default function App() {
     // when the cursor is already on it (a switch restored it there), nothing fires the `[cursor]`
     // effect, so the row is revealed here -- after the restore's own scroll, which is a layout effect.
     landingRef.current = 0;
+    // A card is read from its first line: one taller than the view is landed on its head, so the question
+    // shows, not only its buttons (and the scroll up that takes the view there ends following with it).
+    landingHeadRef.current = true;
     if (index === cursorRef.current) {
       // `exitRegion` above has only asked for the thawed list. If VISUAL was on,
       // the DOM here is still the frozen one and `index` is a live index -- a card that arrived
       // during VISUAL is not in it -- so the reveal waits for the live list to render.
+      landingHeadRef.current = false;
       if (frozenSnapshotRef.current !== null) revealAfterThawRef.current = index;
       else {
         const root = containerRef.current;
         const row = root === null ? undefined : conversationRows(root)[index];
-        if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
+        if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0, false, true);
       }
     } else setCursor(index);
     containerRef.current?.focus();
@@ -2358,7 +2370,7 @@ export default function App() {
     if (index === null) return;
     const root = containerRef.current;
     const row = root === null ? undefined : conversationRows(root)[index];
-    if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0);
+    if (row) revealRow(row.closest<HTMLElement>(".message-list"), row, 0, false, true);
   }, [frozenSnapshot]);
 
   /** The freeze's own backstop: "the effect that

@@ -643,8 +643,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // vim's own `Ctrl+e`/`Ctrl+y`, checked here for the same reason as Ctrl+d/
     // Ctrl+u just above -- `key` reports "e"/"y" the same under Ctrl as bare, and bare `y` (the
     // plain-key switch below) copies the current row, so an unchecked Ctrl+y would copy instead
-    // of scrolling. INPUT's own `Ctrl+e` (end of line) is untouched: this whole block is gated on
-    // `mode !== "input"` already.
+    // of scrolling. INPUT's `Ctrl+e` (end of line, which the composer moves the caret for itself,
+    // `Composer.tsx`) is untouched: this whole block is gated on `mode !== "input"` already.
     if (event.ctrlKey && !event.shiftKey && (event.key === "e" || event.key === "y")) {
       return { kind: "scroll-line", delta: event.key === "e" ? 1 : -1 };
     }
@@ -1038,6 +1038,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+n / Ctrl+p", what: "In the command menu: next / previous command (↑ / ↓ too, ahead of prompt history)" },
   { keys: "Tab", what: "In the command menu: complete the selected command and a space; Enter does too when what you typed begins the name" },
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },
+  { keys: "Ctrl+a / Ctrl+e", what: "Caret to the line's start / end" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
   // An added key. The band names the card it would approve.
   { keys: "Ctrl+y", what: "Approve the oldest card waiting in this tab (the band names it); only a lone Ctrl+y answers" },

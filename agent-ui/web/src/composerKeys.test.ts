@@ -6,6 +6,7 @@ import {
   enterNewline,
   growHeight,
   isImeKey,
+  lineEdge,
   mergeTaken,
   readlineEdit,
 } from "./composerKeys";
@@ -24,6 +25,18 @@ describe("composer keys", () => {
     expect(readlineEdit("line one\nline two", 17, 17, "u")).toEqual({ value: "line one\n", caret: 9 });
     expect(readlineEdit("abc", 0, 0, "w")).toBeNull();
     expect(readlineEdit("abc def", 0, 7, "w"), "a selection is deleted whole").toEqual({ value: "", caret: 0 });
+  });
+
+  it("lineEdge: the start and the end of the line the caret is on, as readline's Ctrl+a / Ctrl+e", () => {
+    const text = "first line\nsecond\nthird";
+    expect(lineEdge(text, 14, "start")).toBe(11);
+    expect(lineEdge(text, 14, "end")).toBe(17);
+    expect(lineEdge(text, 3, "start")).toBe(0);
+    expect(lineEdge(text, 3, "end")).toBe(10);
+    expect(lineEdge(text, 20, "end"), "the last line ends at the text's end").toBe(text.length);
+    expect(lineEdge(text, 11, "start"), "already at a line's start").toBe(11);
+    expect(lineEdge(text, 10, "end"), "already at a line's end").toBe(10);
+    expect(lineEdge("", 0, "end")).toBe(0);
   });
 
   it("enterNewline: Alt+Enter and a backslash before the caret are newlines; every other Enter is not (#27)", () => {

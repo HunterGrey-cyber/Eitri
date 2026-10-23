@@ -604,6 +604,16 @@ export function MessageList({
     updatePill();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
+  /* The rows are watched after every change of the timeline, not only of `state`: `expanded` is the
+     caller's, and `Enter` on a collapsed run puts its calls in rows of their own, which no `state` change
+     announced. Left unwatched, the next `Enter` -- on one of those calls, to open its result -- grew the list
+     below a following view with nothing to snap it to the end. Observing a row reports its size at once, so
+     a following view is snapped to the end for the rows this mounted too. */
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (list !== null) observeChildren(list);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeline]);
 
   /** Seeds the unread threshold back in when `App.tsx` restores a parked tab's view.
    *  Declared -- and so run -- AFTER the `[state]` effect above: that effect's own `updatePill()` ran

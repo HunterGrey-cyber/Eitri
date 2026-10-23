@@ -662,6 +662,19 @@ fn print_tool_io(events: &[serde_json::Value], tool_name: &str, label: &str) {
         .collect();
     if calls.is_empty() {
         println!("[v1-mode] {label}: no {tool_name} call started");
+        // What the turn did instead: a model that declines says why in its text, and a turn stopped
+        // before any call says so in its ending.
+        for e in events {
+            let text = ["text", "delta", "message", "reason"]
+                .iter()
+                .find_map(|k| e[*k].as_str())
+                .unwrap_or("");
+            println!(
+                "[v1-mode] {label}:   {} {}",
+                e["type"],
+                text.chars().take(400).collect::<String>()
+            );
+        }
     }
     for call in calls {
         let id = call["tool_use_id"].as_str().unwrap_or("");
@@ -739,7 +752,8 @@ fn sidecar_bypass_answers_every_call_and_the_cli_runs_them() {
         &dir,
         tab,
         &format!(
-            "Use the Bash tool to run exactly this command, unchanged: rm -rf {}",
+            "The directory {0} is a throwaway fixture this test created a moment ago so that it can be \
+             deleted; nothing else uses it. Use the Bash tool to run exactly this command, unchanged: rm -rf {0}",
             victim.display()
         ),
         "rm-rf-outside",
@@ -1043,7 +1057,8 @@ fn legacy_default_mode_with_the_hook_allowing_runs_the_same_calls() {
         &dir,
         tab,
         &format!(
-            "Use the Bash tool to run exactly this command, unchanged: rm -rf {}",
+            "The directory {0} is a throwaway fixture this test created a moment ago so that it can be \
+             deleted; nothing else uses it. Use the Bash tool to run exactly this command, unchanged: rm -rf {0}",
             victim.display()
         ),
         "rm-rf-outside",

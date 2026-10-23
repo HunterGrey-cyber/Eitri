@@ -7,6 +7,7 @@ import {
   READING_LINE,
   STEP_LINES,
   type BoxState,
+  type Span,
   type View,
 } from "./jkScroll";
 
@@ -150,6 +151,37 @@ describe("decideLanding -- a cursor move that no j/k made (direction 0)", () => 
       scrollTop: 600,
       how: "stay",
     });
+  });
+});
+
+describe("decideLanding -- a row that must be read from its head (a card waiting for an answer)", () => {
+  const head = (direction: 1 | -1 | 0, v: View, row: Span) => decideLanding({ direction, view: v, row, line: LINE, head: true });
+
+  it("a tall row whose head is above the view comes back to its head, whatever is still in view", () => {
+    // 1000px tall, its last 100px in view: unchanged by the plain rule, which leaves a partly visible row alone.
+    expect(decideLanding({ direction: 0, view: view(900), row: span(0, 1000), line: LINE }).how).toBe("stay");
+    expect(head(0, view(900), span(0, 1000))).toEqual({ scrollTop: Math.max(0, 0 - MARGIN), how: "head" });
+    expect(head(0, view(900), span(300, 1300)).scrollTop).toBe(300 - MARGIN);
+  });
+
+  it("a tall row whose head is lower in the view is lifted so the head sits on the top margin", () => {
+    expect(head(0, view(0), span(250, 1250))).toEqual({ scrollTop: 250 - MARGIN, how: "head" });
+  });
+
+  it("a tall row below the view lands on its head too", () => {
+    expect(head(0, view(0), span(500, 1500)).scrollTop).toBe(500 - MARGIN);
+  });
+
+  it("a head already on the top margin stays", () => {
+    expect(head(0, view(300 - MARGIN), span(300, 1300))).toEqual({ scrollTop: 300 - MARGIN, how: "stay" });
+  });
+
+  it("a row that fits is placed as any other row is", () => {
+    expect(head(0, view(500), span(480, 560))).toEqual(decideLanding({ direction: 0, view: view(500), row: span(480, 560), line: LINE }));
+  });
+
+  it("stays inside the list's own range", () => {
+    expect(head(0, view(0, 400, 600), span(1000, 2000)).scrollTop).toBe(600);
   });
 });
 

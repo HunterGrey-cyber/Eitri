@@ -1533,6 +1533,65 @@ describe("MessageList watches its own size without writing a width", () => {
   });
 });
 
+/* A row can mount with no new `state`: `Enter` on a collapsed run puts its calls in rows of their own, and
+   `expanded` belongs to the caller. A row nobody watches changes size unseen -- `Enter` on the opened call's
+   result then grew the list below a following view and nothing snapped it to the end. */
+describe("MessageList watches rows that mount without a new state", () => {
+  const props = { sessionEnded: false, cursor: -1, onAnswerPermission: () => {} };
+  const call = (seq: number, id: string) => ({
+    seq,
+    toolUseId: id,
+    name: "Read",
+    input: {},
+    result: { content: "ok", isError: false },
+    turnId: "t1",
+  });
+  const conversation = state({
+    userPrompts: [{ seq: 1, text: "read them" }],
+    toolCalls: [call(2, "a"), call(3, "b"), call(4, "c")],
+    transcript: [{ seq: 5, text: "done" }],
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("puts the rows of an opened run under the observer, and a row that left out of it", () => {
+    const observers = stubResizeObserver();
+    const { container, rerender } = render(<MessageList state={conversation} expanded={{}} {...props} />);
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    const rows = () => Array.from(list.querySelectorAll(".row"));
+    const collapsed = rows();
+    expect(collapsed).toHaveLength(3); // the prompt, the run of three reads, the reply
+    expect(observers[0].observed).toEqual([list, ...collapsed]);
+
+    rerender(<MessageList state={conversation} expanded={{ "r-2": true }} {...props} />);
+
+    const opened = rows();
+    expect(opened).toHaveLength(5); // the run's three calls took its place
+    expect(new Set(observers[0].observed)).toEqual(new Set([list, ...opened]));
+  });
+
+  it("snaps a following view to the end when such a row's result is opened", () => {
+    const observers = stubResizeObserver();
+    const { container, rerender } = render(<MessageList state={conversation} expanded={{}} {...props} />);
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    const dims = { clientHeight: 400, scrollHeight: 2000, scrollTop: 1600 };
+    for (const [name, value] of Object.entries(dims)) {
+      Object.defineProperty(list, name, { configurable: true, writable: true, value });
+    }
+    fireEvent.scroll(list);
+    rerender(<MessageList state={conversation} expanded={{ "r-2": true }} {...props} />);
+    const third = list.querySelectorAll(".row")[3];
+    expect(observers[0].observed).toContain(third);
+
+    Object.defineProperty(list, "scrollHeight", { configurable: true, writable: true, value: 2200 }); // its result opened
+    resize(observers[0], third, 500);
+
+    expect(list.scrollTop).toBe(2200);
+  });
+});
+
 /* A following view must stay at the end when the list or a row changes size, even without a
    state change. Divider drags, zoom, the terminal, or composer growth can resize the list while
    a turn waits. Row wrapping or font changes can resize content independently. Observe both the

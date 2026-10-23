@@ -99,10 +99,10 @@ use std::time::{Duration, Instant};
 use agent::{AgentDomainEvent, AgentSessionProjection, ContentKind, TurnOutcome};
 use eitri_core::agent_backend::{BackendGreeting, BackendKind, ProjectionRef, CLIENT_IMPLEMENTED_PERMISSION_MODES};
 use eitri_core::agent_bridge::{
-    parse_inbound_message, serialize_command_result_for_js, serialize_events_for_js, serialize_hello_for_js,
-    serialize_hint_collect_for_js, serialize_hint_land_for_js, serialize_pane_focus_for_js, serialize_snapshot_for_js,
-    serialize_tabs_for_js, serialize_theme_for_js, InboundMessage, SessionModeChoice, SnapshotView, TabStateWire,
-    TabView,
+    parse_inbound_message, serialize_command_result_for_js, serialize_events_for_js, serialize_focus_permission_for_js,
+    serialize_hello_for_js, serialize_hint_collect_for_js, serialize_hint_land_for_js, serialize_pane_focus_for_js,
+    serialize_snapshot_for_js, serialize_tabs_for_js, serialize_theme_for_js, InboundMessage, SessionModeChoice,
+    SnapshotView, TabStateWire, TabView,
 };
 use eitri_core::theme::ThemeTokens;
 use gtk4::glib;
@@ -853,6 +853,319 @@ fn streaming_reply_steps() -> StreamingReply {
     }
 }
 
+/// An `events` envelope for `events`, applied to `projection` on the way so the next one continues
+/// from its revision.
+fn events_envelope(projection: &mut AgentSessionProjection, events: &[AgentDomainEvent]) -> String {
+    let from = projection.last_revision;
+    for event in events {
+        projection.apply(event);
+    }
+    serialize_events_for_js(eitri_core::tabs::TabId(1), from, projection.last_revision, events)
+}
+
+/// A reply of `paragraphs` short paragraphs: enough rows above the case's own turn that the list scrolls.
+fn filler_reply(paragraphs: usize) -> String {
+    (1..=paragraphs)
+        .map(|n| format!("Filler paragraph {n}, a line of ordinary prose so the conversation is taller than the view."))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The "follow" window's start: three finished turns of filler, then the case's own prompt with its turn
+/// running. Returns the replay and the projection, so a case can deliver what follows.
+fn replay_follow_start() -> (Vec<String>, AgentSessionProjection) {
+    let mut projection = opened_projection();
+    for (id, prompt) in [("f1", "first"), ("f2", "second"), ("f3", "third")] {
+        for event in finished_turn(id, prompt, filler_reply(6)) {
+            projection.apply(&event);
+        }
+    }
+    for event in [
+        AgentDomainEvent::UserPromptSubmitted {
+            text: "read the files".into(),
+        },
+        AgentDomainEvent::TurnStarted { turn_id: "tr".into() },
+    ] {
+        projection.apply(&event);
+    }
+    (on_ready_batch(&projection), projection)
+}
+
+/// Three completed `Read` calls with results taller than a tool result's fold, then a short reply, then the
+/// turn's end: the batches a case delivers one at a time.
+fn read_turn_batches(projection: &mut AgentSessionProjection) -> Vec<String> {
+    let mut batches = Vec::new();
+    for n in 0..3 {
+        let id = format!("toolu_read{n}");
+        let result = (0..14)
+            .map(|k| format!("result line {n}.{k}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        batches.push(events_envelope(
+            projection,
+            &[
+                AgentDomainEvent::ToolCallStarted {
+                    turn_id: "tr".into(),
+                    tool_use_id: id.clone(),
+                    name: "Read".into(),
+                    input: json!({ "file_path": format!("/nonexistent/panel-visual-mode/file{n}.txt") }),
+                },
+                AgentDomainEvent::ToolCallCompleted {
+                    turn_id: "tr".into(),
+                    tool_use_id: id,
+                    content: json!(result),
+                    is_error: false,
+                },
+            ],
+        ));
+    }
+    batches.push(events_envelope(
+        projection,
+        &[AgentDomainEvent::ContentDelta {
+            turn_id: "tr".into(),
+            kind: ContentKind::Text,
+            text: "Done reading.".into(),
+        }],
+    ));
+    batches.push(events_envelope(
+        projection,
+        &[AgentDomainEvent::TurnCompleted {
+            turn_id: "tr".into(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: Some("end_turn".into()),
+            usage: None,
+            detail: Default::default(),
+        }],
+    ));
+    batches
+}
+
+/// How far the list's end lies below the view, in CSS px (`0` when it shows the end).
+const DISTANCE_JS: &str = "(() => { const l = document.querySelector('.message-list'); return l.scrollHeight - l.scrollTop - l.clientHeight; })()";
+
+fn distance_to_end(h: &Harness) -> Result<f64, String> {
+    h.eval(&format!("JSON.stringify({DISTANCE_JS})"), 1000)?
+        .as_f64()
+        .ok_or_else(|| "the list reported no distance".into())
+}
+
+/// The band's own `n/m` position, for a case's message.
+fn band_position(h: &Harness) -> String {
+    h.eval(
+        "JSON.stringify(document.querySelector('.status-band')?.textContent ?? null)",
+        1000,
+    )
+    .map(|v| v.to_string())
+    .unwrap_or_default()
+}
+
+/// Enter on a tool row while the view follows the end: the row's result opens in its capped box, the list
+/// grows below the cursor, and the view stays at the end rather than leaving the new height off screen.
+fn w14_expand_while_following(h: &Harness) -> Result<(), String> {
+    let (_, mut projection) = replay_follow_start();
+    for batch in read_turn_batches(&mut projection) {
+        evaluate_js_dispatch(&h.webview, &batch);
+        pump(120);
+    }
+    pump(600);
+    let at_end = distance_to_end(h)?;
+    println!(
+        "[panel_visual_mode] W14: turn done, distance to the end {at_end:.1}, band {}",
+        band_position(h)
+    );
+    if at_end > 1.0 {
+        return Err(format!(
+            "W14: the view did not follow the streamed turn to its end ({at_end:.1}px short)"
+        ));
+    }
+    // The cursor rides the run of three reads, which sits above the reply. Open it,
+    // walk to its last call and expand that call's result.
+    h.xdotool_key("Return");
+    pump(500);
+    h.xdotool_keys(&["j", "j"]);
+    pump(300);
+    let before = distance_to_end(h)?;
+    println!(
+        "[panel_visual_mode] W14: on the last call, distance {before:.1}, band {}",
+        band_position(h)
+    );
+    h.xdotool_key("Return");
+    pump(700);
+    let after = distance_to_end(h)?;
+    println!(
+        "[panel_visual_mode] W14: expanded, distance {after:.1}, band {}",
+        band_position(h)
+    );
+    if before > 1.0 {
+        return Err(format!(
+            "W14: the view was already short of the end before the expand ({before:.1}px)"
+        ));
+    }
+    if after > 1.0 {
+        return Err(format!(
+            "W14: Enter expanded the last call's result and the view stayed {after:.1}px short of the end"
+        ));
+    }
+    Ok(())
+}
+
+/// The "cards" window's start: filler turns, then a running turn holding two permission cards, the first
+/// far taller than the list (a 60-line command) and the second short.
+fn replay_cards_start() -> (Vec<String>, AgentSessionProjection) {
+    let mut projection = opened_projection();
+    for (id, prompt) in [("f1", "first"), ("f2", "second")] {
+        for event in finished_turn(id, prompt, filler_reply(6)) {
+            projection.apply(&event);
+        }
+    }
+    let tall_command = (0..60)
+        .map(|k| format!("echo line {k} of a tall command"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for event in [
+        AgentDomainEvent::UserPromptSubmitted {
+            text: "run both commands".into(),
+        },
+        AgentDomainEvent::TurnStarted { turn_id: "tc2".into() },
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "tc2".into(),
+            tool_use_id: "toolu_tall".into(),
+            name: "Bash".into(),
+            input: json!({ "command": tall_command }),
+        },
+        AgentDomainEvent::PermissionRequested {
+            permission_id: "perm_tall".into(),
+            tool_use_id: Some("toolu_tall".into()),
+            tool_name: "Bash".into(),
+            input: json!({ "command": tall_command }),
+            provider_prompt: None,
+        },
+        AgentDomainEvent::ToolCallStarted {
+            turn_id: "tc2".into(),
+            tool_use_id: "toolu_short".into(),
+            name: "Bash".into(),
+            input: json!({ "command": "echo short" }),
+        },
+        AgentDomainEvent::PermissionRequested {
+            permission_id: "perm_short".into(),
+            tool_use_id: Some("toolu_short".into()),
+            tool_name: "Bash".into(),
+            input: json!({ "command": "echo short" }),
+            provider_prompt: None,
+        },
+    ] {
+        projection.apply(&event);
+    }
+    (on_ready_batch(&projection), projection)
+}
+
+/// The tray chip's landing (`focus_permission`) on the oldest of two waiting cards, the first taller than the
+/// list, while the view follows the end: the card's head is what shows, and a later arrival does not snap
+/// the view back to the end and the card out of it.
+fn w15_card_landing_while_following(h: &Harness) -> Result<(), String> {
+    let (_, mut projection) = replay_cards_start();
+    let at_end = distance_to_end(h)?;
+    println!(
+        "[panel_visual_mode] W15: two cards waiting, distance to the end {at_end:.1}, band {}",
+        band_position(h)
+    );
+    if at_end > 1.0 {
+        return Err(format!(
+            "W15: the view was not at the end before the landing ({at_end:.1}px short)"
+        ));
+    }
+    evaluate_js_dispatch(
+        &h.webview,
+        &serialize_focus_permission_for_js(eitri_core::tabs::TabId(1)),
+    );
+    pump(700);
+    let card_head = "JSON.stringify((() => { const list = document.querySelector('.message-list').getBoundingClientRect(); \
+         const card = document.querySelector('.row-current .permission-card'); \
+         if (card === null) return null; const r = card.getBoundingClientRect(); \
+         return { listTop: list.top, listBottom: list.bottom, cardTop: r.top, cardBottom: r.bottom, tall: card.textContent.includes('tall command') }; })())";
+    let landed = h.eval(card_head, 1000)?;
+    println!(
+        "[panel_visual_mode] W15: after the landing {landed}, band {}",
+        band_position(h)
+    );
+    let head_in_view = |v: &serde_json::Value| -> bool {
+        let n = |k: &str| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(f64::NAN);
+        v.get("tall").and_then(serde_json::Value::as_bool) == Some(true)
+            && n("cardTop") >= n("listTop") - 1.0
+            && n("cardTop") < n("listBottom")
+    };
+    if !head_in_view(&landed) {
+        return Err(format!(
+            "W15: the cursor is not on the first card with its head in view after the landing: {landed}"
+        ));
+    }
+    evaluate_js_dispatch(
+        &h.webview,
+        &events_envelope(
+            &mut projection,
+            &[AgentDomainEvent::ContentDelta {
+                turn_id: "tc2".into(),
+                kind: ContentKind::Text,
+                text: "LATE TEXT ARRIVAL while the cards wait.".into(),
+            }],
+        ),
+    );
+    pump(700);
+    let later = h.eval(card_head, 1000)?;
+    println!("[panel_visual_mode] W15: after a late arrival {later}");
+    if !head_in_view(&later) {
+        return Err(format!(
+            "W15: a later arrival moved the first card's head out of view: {later}"
+        ));
+    }
+    Ok(())
+}
+
+/// The composer's line-edge keys in the real engine, which binds neither `Ctrl+e` (nothing) nor `Ctrl+a`
+/// (select all) under GTK's default key theme: on the second of two lines, with the caret in its middle,
+/// `Ctrl+e` puts it at that line's end and `Ctrl+a` at that line's start, and the text is untouched.
+fn w16_composer_line_edges(h: &Harness) -> Result<(), String> {
+    h.xdotool_key("i");
+    pump(200);
+    if h.mode()?.as_str() != Some("input") {
+        return Err(format!("W16: i did not enter INPUT: data-mode={}", h.mode()?));
+    }
+    h.xdotool_type("first line");
+    h.xdotool_key("shift+Return");
+    h.xdotool_type("second line");
+    h.xdotool_keys(&["Left", "Left", "Left", "Left", "Left"]);
+    let caret = "JSON.stringify((() => { const t = document.querySelector('textarea'); \
+         return { start: t.selectionStart, end: t.selectionEnd, value: t.value }; })())";
+    let at = h.eval(caret, 1000)?;
+    println!("[panel_visual_mode] W16: before the keys {at}");
+    h.xdotool_key("ctrl+e");
+    let end = h.eval(caret, 1000)?;
+    h.xdotool_key("ctrl+a");
+    let start = h.eval(caret, 1000)?;
+    println!("[panel_visual_mode] W16: after Ctrl+e {end}, after Ctrl+a {start}");
+    let n = |v: &serde_json::Value, k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    let value = "first line\nsecond line";
+    if end.get("value").and_then(serde_json::Value::as_str) != Some(value)
+        || start.get("value").and_then(serde_json::Value::as_str) != Some(value)
+    {
+        return Err(format!("W16: the text changed: {end} / {start}"));
+    }
+    if n(&end, "start") != Some(22) || n(&end, "end") != Some(22) {
+        return Err(format!(
+            "W16: Ctrl+e did not put the caret at the line's end (22): {end}"
+        ));
+    }
+    if n(&start, "start") != Some(11) || n(&start, "end") != Some(11) {
+        return Err(format!(
+            "W16: Ctrl+a did not put the caret at the line's start (11): {start}"
+        ));
+    }
+    h.xdotool_key("Escape");
+    pump(200);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // W-cases. Each returns `Ok(())` on a pass, `Err(reason)` on a failure -- `main` collects both.
 // ---------------------------------------------------------------------------------------------
@@ -1272,6 +1585,24 @@ fn w7_permission_card(h: &Harness) -> Result<(), String> {
     // Deny, Always allow" held of any copy at all. V-LINE from the card's first line, five `j` down:
     // across the diff, the reason box and the buttons, into the Bash row the replay puts after it.
     to_card(h);
+    // A search that lands on a row too tall for the list (the card plus its margins is taller than the list
+    // at zoom 1.5) leaves the row where it is when part of it is already in
+    // view, so its heading can sit above the list's top. `V` then starts at the first character the
+    // reader can see, which is the rule, not a defect: the copy below wants the heading, so the card
+    // is put at the top of the view first, as a reader would with `zt`.
+    h.xdotool_keys(&["z", "t"]);
+    pump(400);
+    let head_in_view = h.eval(
+        "JSON.stringify((() => { const list = document.querySelector('.message-list').getBoundingClientRect(); \
+         const card = document.querySelector('.row-current .permission-card-tool'); \
+         return card !== null && card.getBoundingClientRect().top >= list.top - 1; })())",
+        1000,
+    )?;
+    if head_in_view != serde_json::Value::Bool(true) {
+        return Err(format!(
+            "W7: `zt` did not bring the card's heading into view: {head_in_view}"
+        ));
+    }
     h.clear_clipboard();
     h.xdotool_keys(&["shift+v", "j", "j", "j", "j", "j", "y"]);
     let text = h
@@ -1890,11 +2221,12 @@ fn composer_value(h: &Harness) -> Result<String, String> {
         .ok_or_else(|| format!("no textarea value (is mode really \"input\"?): {v}"))
 }
 
-/// Clears whatever the composer's box holds, through the DOM (select-all, Delete) rather than a
-/// Rust-side reset -- this harness has no direct route into the tab's own draft state, and a real
-/// user clearing the box is exactly what this simulates.
+/// Clears whatever the composer's box holds, through the DOM (select from the start to the end, Delete)
+/// rather than a Rust-side reset -- this harness has no direct route into the tab's own draft state, and a
+/// real user clearing the box is exactly what this simulates. Not `Ctrl+a`: the composer binds it to the
+/// line's start, as Claude Code's input does, so it no longer selects everything.
 fn clear_composer(h: &Harness) {
-    h.xdotool_keys(&["ctrl+a", "Delete"]);
+    h.xdotool_keys(&["ctrl+Home", "ctrl+shift+End", "Delete"]);
 }
 
 /// A quote posts exactly one `draft` containing the box's whole text and sends nothing. Count
@@ -2174,8 +2506,33 @@ fn run_zoom(zoom: f64, display: &str) -> Vec<(String, Result<(), String>)> {
         ("W11 caret view", w11_caret_view),
         ("W13 tall table row", w13_tall_table_row),
     ];
-    let mut results = run_window(zoom, "main", display, replay_main(), &main_cases);
-    results.extend(run_window(zoom, "fixtures", display, replay_fixtures(), &fixture_cases));
+    let follow_cases: Vec<Case> = vec![
+        ("W14 expand while following", w14_expand_while_following),
+        ("W16 composer line edges", w16_composer_line_edges),
+    ];
+    let cards_cases: Vec<Case> = vec![("W15 card landing while following", w15_card_landing_while_following)];
+    // `PANEL_VISUAL_ONLY=follow,cards` runs just those windows (names as below); unset runs them all.
+    let only = std::env::var("PANEL_VISUAL_ONLY").ok();
+    let wanted = |name: &str| only.as_deref().is_none_or(|list| list.split(',').any(|n| n == name));
+    let mut results = Vec::new();
+    if wanted("main") {
+        results.extend(run_window(zoom, "main", display, replay_main(), &main_cases));
+    }
+    if wanted("fixtures") {
+        results.extend(run_window(zoom, "fixtures", display, replay_fixtures(), &fixture_cases));
+    }
+    if wanted("follow") {
+        results.extend(run_window(
+            zoom,
+            "follow",
+            display,
+            replay_follow_start().0,
+            &follow_cases,
+        ));
+    }
+    if wanted("cards") {
+        results.extend(run_window(zoom, "cards", display, replay_cards_start().0, &cards_cases));
+    }
     results
 }
 

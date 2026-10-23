@@ -7,6 +7,7 @@ import {
   enterNewline,
   growHeight,
   isImeKey,
+  lineEdge,
   mergeTaken,
   readlineEdit,
 } from "../composerKeys";
@@ -432,6 +433,14 @@ export function Composer({
         const edit = readlineEdit(el.value, el.selectionStart, el.selectionEnd, e.key);
         e.preventDefault();
         if (edit !== null) setBox(edit.value, edit.caret);
+        return;
+      }
+      // Readline's line start and end, as Claude Code's own input has them. The caret only moves:
+      // the box's text is untouched, so there is no `setBox`.
+      if (e.key === "a" || e.key === "e") {
+        e.preventDefault();
+        const at = lineEdge(el.value, el.selectionStart, e.key === "a" ? "start" : "end");
+        el.setSelectionRange(at, at);
         return;
       }
       if (e.key === "r") {

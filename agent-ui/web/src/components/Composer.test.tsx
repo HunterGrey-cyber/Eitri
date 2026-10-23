@@ -546,6 +546,30 @@ describe("Composer keys", () => {
     expect(textarea.value).toBe("git push ");
   });
 
+  it("moves the caret to the line's end with Ctrl+e and its start with Ctrl+a, WebKitGTK having neither", () => {
+    const { textarea } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "first line\nsecond line" } });
+    textarea.setSelectionRange(14, 14);
+    expect(fireEvent.keyDown(textarea, { key: "e", ctrlKey: true }), "the default is cancelled").toBe(false);
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([22, 22]);
+    fireEvent.keyDown(textarea, { key: "a", ctrlKey: true });
+    expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([11, 11]);
+    textarea.setSelectionRange(3, 3);
+    fireEvent.keyDown(textarea, { key: "e", ctrlKey: true });
+    expect(textarea.selectionStart).toBe(10);
+    expect(textarea.value, "the text is untouched").toBe("first line\nsecond line");
+  });
+
+  it("leaves Ctrl+Shift+e, Alt+Ctrl+e and a bare e to their own meaning", () => {
+    const { textarea } = renderComposer();
+    fireEvent.change(textarea, { target: { value: "abc def" } });
+    textarea.setSelectionRange(1, 1);
+    expect(fireEvent.keyDown(textarea, { key: "E", ctrlKey: true, shiftKey: true })).toBe(true);
+    expect(fireEvent.keyDown(textarea, { key: "e", ctrlKey: true, altKey: true })).toBe(true);
+    expect(fireEvent.keyDown(textarea, { key: "e" })).toBe(true);
+    expect(textarea.selectionStart).toBe(1);
+  });
+
   it("opens the keymap on ? only from an empty box", () => {
     const onOpenKeymap = vi.fn();
     const { textarea } = renderComposer({ onOpenKeymap });
@@ -689,6 +713,15 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       textarea.setSelectionRange(4, 4);
       fireEvent.keyDown(textarea, { key: "u", ctrlKey: true });
       expect(textarea.value).toBe("");
+    },
+    "Ctrl+a / Ctrl+e": () => {
+      const { textarea } = renderComposer();
+      typed(textarea, "one\ntwo");
+      textarea.setSelectionRange(5, 5);
+      fireEvent.keyDown(textarea, { key: "e", ctrlKey: true });
+      expect(textarea.selectionStart).toBe(7);
+      fireEvent.keyDown(textarea, { key: "a", ctrlKey: true });
+      expect(textarea.selectionStart).toBe(4);
     },
     "Ctrl+c": () => {
       const onInterrupt = vi.fn();

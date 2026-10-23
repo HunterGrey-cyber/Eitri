@@ -26,6 +26,15 @@ export function readlineEdit(
   return { value: value.slice(0, from) + value.slice(start), caret: from };
 }
 
+/** Where readline's `Ctrl+a` / `Ctrl+e` put the caret: the start or the end of the line it is on.
+ *  WebKitGTK's text box binds neither under GTK's default key theme (`Ctrl+a` selects everything,
+ *  `Ctrl+e` does nothing), so the composer moves the caret itself. */
+export function lineEdge(value: string, caret: number, edge: "start" | "end"): number {
+  if (edge === "start") return value.lastIndexOf("\n", caret - 1) + 1;
+  const next = value.indexOf("\n", caret);
+  return next === -1 ? value.length : next;
+}
+
 /** Claude Code's two newline keys, which used to send the draft. `Alt+Enter`
  *  inserts a newline in place of the selection; a plain Enter with a backslash right before the caret
  *  (and no selection) removes that backslash and inserts a newline in its place. `null` for every other
@@ -87,6 +96,7 @@ export const COMPOSER_CHORDS: string[] = [
   "Ctrl+n / Ctrl+p",
   "Tab",
   "Ctrl+w / Ctrl+u",
+  "Ctrl+a / Ctrl+e",
   "Ctrl+c",
   // Like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which approves the
   // oldest waiting card on it.

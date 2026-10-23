@@ -343,6 +343,7 @@ right after a reply arrives do not start HINT or open the box in the middle of a
 | `Up` / `Down` / `Ctrl+n` / `Ctrl+p` | with the command menu open: move the selection (these do not step through earlier prompts while it shows) |
 | `Tab` | with the command menu open: complete the selected command and a space; `Enter` does the same until the name is whole, then sends |
 | `Ctrl+w` / `Ctrl+u` | delete a word / to the start of the line |
+| `Ctrl+a` / `Ctrl+e` | move the caret to the start / end of the line it is on |
 | `Ctrl+c` | interrupt a running turn; when idle, clear the box into the history |
 | `Ctrl+y` | approve the oldest card waiting in this tab (see [Answering a card](#answering-a-card)) |
 | `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
