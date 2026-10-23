@@ -73,31 +73,43 @@ impl Stop {
         }
     }
 
-    /// The note in a turn of its own that says the rest of the history is missing, if one is said.
-    fn note(self) -> Vec<AgentDomainEvent> {
+    /// The note in a turn of its own that says the rest of the history is missing, if one is said. `kept` is
+    /// whether any turn of the history is shown below it.
+    fn note(self, kept: bool) -> Vec<AgentDomainEvent> {
         match self {
-            Stop::Slow => note_turn("the rest of this conversation was not loaded: reading it took too long"),
-            Stop::Flooded => {
-                note_turn("the rest of this conversation was not loaded: Codex sent too much while it was being read")
-            }
+            Stop::Slow => history_gap(kept, "could not be loaded: reading it took too long"),
+            Stop::Flooded => history_gap(kept, "could not be loaded: Codex sent too much while it was being read"),
             Stop::Closed => Vec::new(),
         }
     }
+}
+
+/// A note in a turn of its own for history that is missing. With turns shown below it, what is missing is
+/// the turns before them; with none, it is the whole history.
+fn history_gap(kept: bool, problem: &str) -> Vec<AgentDomainEvent> {
+    let subject = if kept {
+        "earlier turns of this conversation"
+    } else {
+        "the history of this conversation"
+    };
+    note_turn(&format!("{subject} {problem}"))
 }
 
 /// The events of a thread's history, oldest turn first. Anything that cannot be read becomes a note row in
 /// the turn it belongs to, or in a turn of its own when the list of turns is what failed. Stops at
 /// `deadline` with a note, since a very long thread must not hold the start for ever; a page that is not
 /// answered in time stops it the same way. A cursor that comes back, and a turn listed twice, are not
-/// followed again.
+/// followed again. Turns are read newest first so the budget leaves older history out, then their event
+/// groups are reversed into chronological order with any missing-history note before them.
 pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Vec<AgentDomainEvent> {
     let mut events = Vec::new();
+    let mut turn_groups = Vec::new();
     let mut cursor: Option<String> = None;
     let mut cursors_seen: HashSet<String> = HashSet::new();
     let mut turns_seen: HashSet<String> = HashSet::new();
     'pages: loop {
         if Instant::now() >= deadline {
-            events.extend(Stop::Slow.note());
+            events.extend(Stop::Slow.note(!turn_groups.is_empty()));
             break;
         }
         let params = match serde_json::to_value(ThreadTurnsListParams::new(thread_id.to_string(), cursor.clone())) {
@@ -109,7 +121,7 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
                 Ok(page) => page,
                 Err(e) => {
                     eprintln!("agent: Codex's list of turns could not be read: {e}");
-                    events.extend(note_turn("the history of this conversation could not be read"));
+                    events.extend(history_gap(!turn_groups.is_empty(), "could not be read"));
                     break;
                 }
             },
@@ -123,23 +135,33 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
             Err(e) => {
                 eprintln!("agent: Codex's list of turns failed: {e:?}");
                 match Stop::of(&e) {
-                    Some(stop) => events.extend(stop.note()),
-                    None => events.extend(note_turn("the history of this conversation could not be loaded")),
+                    Some(stop) => events.extend(stop.note(!turn_groups.is_empty())),
+                    None => events.extend(history_gap(!turn_groups.is_empty(), "could not be loaded")),
                 }
                 break;
             }
         };
-        for turn in &page.data {
+        let last_of_page = page.data.len().saturating_sub(1);
+        for (at, turn) in page.data.iter().enumerate() {
             if !turns_seen.insert(turn.id.clone()) {
                 eprintln!("agent: Codex listed a turn of the history twice; shown once");
                 continue;
             }
             let (items, complete) = load_items(thread_id, turn, deadline, ask);
-            events.extend(turn_events(thread_id, turn, &items, complete));
             if let Complete::Stopped(stop) = complete {
-                events.extend(stop.note());
+                // A turn that stopped before any of its items arrived would show as an empty turn; it is left
+                // out and the note covers it. One with items that is the last turn Codex has is the oldest and
+                // already says it is partial, so a note about earlier turns would name turns that do not exist.
+                let left_out = items.is_empty();
+                if !left_out {
+                    turn_groups.push(turn_events(thread_id, turn, &items, complete));
+                }
+                if left_out || at < last_of_page || page.next_cursor.is_some() {
+                    events.extend(stop.note(!turn_groups.is_empty()));
+                }
                 break 'pages;
             }
+            turn_groups.push(turn_events(thread_id, turn, &items, complete));
         }
         match page.next_cursor {
             // A cursor already followed would ask for pages already read, perhaps for ever.
@@ -147,6 +169,7 @@ pub fn page_history(thread_id: &str, deadline: Instant, ask: &mut Ask<'_>) -> Ve
             _ => break,
         }
     }
+    events.extend(turn_groups.into_iter().rev().flatten());
     events
 }
 
@@ -587,6 +610,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_timed_out_turn_page_keeps_newest_turns_after_the_note() {
+        let mut turn_asks = 0;
+        let mut directions = Vec::new();
+        let mut ask = |name: &str, params: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                turn_asks += 1;
+                let direction = params["sortDirection"].as_str().expect("direction");
+                directions.push(direction.to_string());
+                return match (cursor_of(&params).as_deref(), direction) {
+                    (None, "desc") => Ok(turns_page(&["t6", "t5"], Some("P"))),
+                    (Some("P"), "desc") => Ok(turns_page(&["t4", "t3"], Some("Q"))),
+                    (None, "asc") => Ok(turns_page(&["t1", "t2"], Some("P"))),
+                    (Some("P"), "asc") => Ok(turns_page(&["t3", "t4"], Some("Q"))),
+                    (Some("Q"), _) => Err(LinkError::Timeout.into()),
+                    other => panic!("unexpected turn page: {other:?}"),
+                };
+            }
+            assert_eq!(name, method::THREAD_ITEMS_LIST);
+            let turn = params["turnId"].as_str().expect("turn id");
+            assert!(params.get("sortDirection").is_none());
+            Ok(match cursor_of(&params).as_deref() {
+                None => items_page(turn, &format!("{turn}-first"), Some("items-2")),
+                Some("items-2") => items_page(turn, &format!("{turn}-second"), None),
+                other => panic!("unexpected item page: {other:?}"),
+            })
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(turn_asks, 3);
+        assert_eq!(started(&events), [NOTE_TURN, "t3", "t4", "t5", "t6"]);
+        assert_eq!(directions, ["desc", "desc", "desc"]);
+        assert!(notes(&events)[0].contains("took too long"));
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDomainEvent::ContentDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "t3-first",
+                "t3-second",
+                "t4-first",
+                "t4-second",
+                "t5-first",
+                "t5-second",
+                "t6-first",
+                "t6-second",
+            ]
+        );
+    }
+
     /// A list of turns whose pages go round in a circle, or repeat a turn, shows each turn once.
     #[test]
     fn a_turn_listed_twice_is_shown_once() {
@@ -600,9 +677,9 @@ mod tests {
                 return Err(LinkError::Closed.into());
             }
             Ok(match cursor_of(&params).as_deref() {
-                None => turns_page(&["t1", "t2"], Some("P")),
-                Some("P") => turns_page(&["t2", "t3"], Some("Q")),
-                _ => turns_page(&["t3"], Some("P")),
+                None => turns_page(&["t3", "t2"], Some("P")),
+                Some("P") => turns_page(&["t2", "t1"], Some("Q")),
+                _ => turns_page(&["t1"], Some("P")),
             })
         };
         let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
@@ -610,11 +687,11 @@ mod tests {
         assert!(turn_asks <= 3, "{turn_asks} pages of turns were asked for");
     }
 
-    /// The overall deadline is kept while a turn's items are read, not only between pages of turns.
+    /// The overall deadline is kept while a turn's items are read, not only between pages of turns. The test
+    /// asserts what was read and asked, never how long it took.
     #[test]
     fn the_deadline_holds_inside_a_turns_items() {
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(200);
+        let deadline = Instant::now() + Duration::from_millis(200);
         let mut item_asks = 0;
         let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
             if name == method::THREAD_TURNS_LIST {
@@ -633,15 +710,174 @@ mod tests {
         };
         let events = page_history("th", deadline, &mut ask);
         assert!(
-            start.elapsed() < Duration::from_millis(200 + 50 + 40),
-            "took {:?}",
-            start.elapsed()
-        );
-        assert!(
-            notes(&events).iter().any(|n| n.contains("took too long")),
+            notes(&events)
+                .iter()
+                .any(|n| n == "part of this turn could not be loaded"),
             "{:#?}",
             notes(&events)
         );
+        assert!(
+            !notes(&events).iter().any(|n| n.starts_with("earlier turns")),
+            "the only turn is the oldest, so no turns before it are missing: {:#?}",
+            notes(&events)
+        );
+        assert!(
+            item_asks < 100,
+            "the cap ended it, not the deadline: {item_asks} item asks"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::ContentDelta { text, .. } if text == "i1")),
+            "the first item read before the deadline is kept: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_before_asking_for_history() {
+        let mut ask = |_: &str, _: Value| -> Result<Value, AskError> {
+            panic!("history requested after the deadline");
+        };
+        let events = page_history("th", Instant::now(), &mut ask);
+        assert_eq!(started(&events), [NOTE_TURN]);
+        assert_eq!(
+            notes(&events),
+            ["the history of this conversation could not be loaded: reading it took too long"],
+            "no turn is shown, so the note is about the whole history"
+        );
+    }
+
+    /// Items of a turn: a first page with a cursor and then `second`, which stands for the failure under test.
+    fn items_then(second: impl Fn() -> Result<Value, AskError>) -> impl FnMut(&str, Value) -> Result<Value, AskError> {
+        move |_, params| match cursor_of(&params).as_deref() {
+            None => Ok(items_page(
+                params["turnId"].as_str().expect("turn id"),
+                "first",
+                Some("more"),
+            )),
+            Some("more") => second(),
+            other => panic!("unexpected item page: {other:?}"),
+        }
+    }
+
+    /// The oldest turn is cut short while its items are read and Codex has no turns before it: the turn's own
+    /// row says it is partial, and no note claims earlier turns are missing.
+    #[test]
+    fn a_cut_short_oldest_turn_gets_no_note_about_earlier_turns() {
+        let mut items = items_then(|| Err(LinkError::Timeout.into()));
+        let mut ask = |name: &str, params: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&["t2", "t1"], None));
+            }
+            if params["turnId"] == "t2" {
+                return Ok(items_page("t2", "t2-only", None));
+            }
+            items(name, params)
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(started(&events), ["t1", "t2"]);
+        assert_eq!(notes(&events), ["part of this turn could not be loaded"]);
+    }
+
+    /// The same cut with more turns behind it (a cursor): they are missing, and the note says so.
+    #[test]
+    fn a_cut_short_turn_with_older_turns_behind_it_gets_the_note() {
+        let mut items = items_then(|| Err(LinkError::Timeout.into()));
+        let mut ask = |name: &str, params: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&["t2", "t1"], Some("P")));
+            }
+            items(name, params)
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(started(&events), [NOTE_TURN, "t2"]);
+        assert_eq!(
+            notes(&events),
+            [
+                "earlier turns of this conversation could not be loaded: reading it took too long",
+                "part of this turn could not be loaded"
+            ]
+        );
+    }
+
+    /// A page of turns after the first fails with turns already kept: the note is about the turns before
+    /// them, not the whole conversation, whether the body does not parse or the link fails otherwise.
+    #[test]
+    fn a_failing_later_turn_page_says_earlier_turns_are_missing() {
+        type Failure = fn() -> Result<Value, AskError>;
+        let failures: [(Failure, &str); 2] = [
+            (|| Ok(json!({"data": "not a list"})), "could not be read"),
+            (
+                || {
+                    Err(LinkError::Rpc {
+                        code: -1,
+                        message: "no".into(),
+                    }
+                    .into())
+                },
+                "could not be loaded",
+            ),
+        ];
+        for (failure, wording) in failures {
+            let mut ask = |name: &str, params: Value| -> Result<Value, AskError> {
+                if name == method::THREAD_ITEMS_LIST {
+                    return Ok(items_page("t2", "kept", None));
+                }
+                match cursor_of(&params).as_deref() {
+                    None => Ok(turns_page(&["t2"], Some("P"))),
+                    _ => failure(),
+                }
+            };
+            let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+            assert_eq!(started(&events), [NOTE_TURN, "t2"]);
+            assert_eq!(
+                notes(&events),
+                [format!("earlier turns of this conversation {wording}")]
+            );
+        }
+    }
+
+    /// The first page of turns fails: nothing of the conversation is shown, and the note says the history.
+    #[test]
+    fn a_failing_first_turn_page_says_the_history_is_missing() {
+        let mut ask = |_: &str, _: Value| -> Result<Value, AskError> { Ok(json!({"data": "not a list"})) };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(notes(&events), ["the history of this conversation could not be read"]);
+    }
+
+    /// The deadline passes between two turns: the next older turn was never read, so it is not shown as an
+    /// empty turn marked partial; only the note stands for it.
+    #[test]
+    fn a_turn_the_deadline_reached_before_its_items_is_left_out() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
+            if name == method::THREAD_TURNS_LIST {
+                return Ok(turns_page(&["t2", "t1"], None));
+            }
+            // Answering takes longer than the budget left.
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(items_page("t2", "t2-only", None))
+        };
+        let events = page_history("th", deadline, &mut ask);
+        assert_eq!(started(&events), [NOTE_TURN, "t2"]);
+        assert_eq!(
+            notes(&events),
+            ["earlier turns of this conversation could not be loaded: reading it took too long"]
+        );
+    }
+
+    #[test]
+    fn an_empty_turn_page_ends_history_even_with_a_cursor() {
+        let mut turn_asks = 0;
+        let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
+            assert_eq!(name, method::THREAD_TURNS_LIST);
+            turn_asks += 1;
+            assert_eq!(turn_asks, 1);
+            Ok(turns_page(&[], Some("P")))
+        };
+        let events = page_history("th", Instant::now() + Duration::from_secs(30), &mut ask);
+        assert_eq!(turn_asks, 1);
+        assert!(events.is_empty());
     }
 
     /// A turn with more pages of items than are read at most is shown in part, with a note.
@@ -650,7 +886,7 @@ mod tests {
         let mut item_asks = 0;
         let mut ask = |name: &str, _: Value| -> Result<Value, AskError> {
             if name == method::THREAD_TURNS_LIST {
-                return Ok(turns_page(&["t1", "t2"], None));
+                return Ok(turns_page(&["t2", "t1"], None));
             }
             item_asks += 1;
             if item_asks > 5000 {

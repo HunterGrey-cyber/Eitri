@@ -284,7 +284,7 @@ pub struct ThreadUnsubscribeParams {
     pub thread_id: String,
 }
 
-/// `thread/turns/list`, oldest first, turn metadata only.
+/// `thread/turns/list`, newest first, turn metadata only.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadTurnsListParams {
@@ -302,7 +302,7 @@ impl ThreadTurnsListParams {
             thread_id,
             cursor,
             limit: TURNS_PAGE,
-            sort_direction: "asc",
+            sort_direction: "desc",
             items_view: "notLoaded",
         }
     }

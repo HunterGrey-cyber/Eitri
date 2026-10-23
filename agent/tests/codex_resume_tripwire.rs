@@ -611,20 +611,30 @@ fn resume_pages_history_then_releases_live_events_in_order() {
     script.push(expect_request_like(
         4,
         "thread/turns/list",
-        r#""params":\{"itemsView":"notLoaded","limit":10,"sortDirection":"asc","threadId":"th-old"\}\}$"#,
+        r#""params":\{"itemsView":"notLoaded","limit":10,"sortDirection":"desc","threadId":"th-old"\}\}$"#,
     ));
     script.push(turns_page(
         4,
-        vec![turn_meta("tu-1", "completed"), turn_meta("tu-2", "interrupted")],
+        vec![turn_meta("tu-3", "completed"), turn_meta("tu-2", "interrupted")],
         Some("cursor-2"),
     ));
     script.push(expect_request_like(
         5,
         "thread/items/list",
-        r#""params":\{"limit":50,"threadId":"th-old","turnId":"tu-1"\}\}$"#,
+        r#""params":\{"limit":50,"threadId":"th-old","turnId":"tu-3"\}\}$"#,
     ));
+    script.push(items_page(5, "tu-3", vec![agent_message("a3", "third answer")]));
+    script.push(expect_request(6, "thread/items/list"));
+    script.push(items_page(6, "tu-2", vec![user_message("u2", "second question")]));
+    script.push(expect_request_like(
+        7,
+        "thread/turns/list",
+        r#""params":\{"cursor":"cursor-2","itemsView":"notLoaded","limit":10,"sortDirection":"desc","threadId":"th-old"\}\}$"#,
+    ));
+    script.push(turns_page(7, vec![turn_meta("tu-1", "completed")], None));
+    script.push(expect_request(8, "thread/items/list"));
     script.push(items_page(
-        5,
+        8,
         "tu-1",
         vec![
             user_message("u1", "first question"),
@@ -633,16 +643,6 @@ fn resume_pages_history_then_releases_live_events_in_order() {
                    "status": "completed", "aggregatedOutput": "a\nb\n", "exitCode": 0}),
         ],
     ));
-    script.push(expect_request(6, "thread/items/list"));
-    script.push(items_page(6, "tu-2", vec![user_message("u2", "second question")]));
-    script.push(expect_request_like(
-        7,
-        "thread/turns/list",
-        r#""params":\{"cursor":"cursor-2","itemsView":"notLoaded","limit":10,"sortDirection":"asc","threadId":"th-old"\}\}$"#,
-    ));
-    script.push(turns_page(7, vec![turn_meta("tu-3", "completed")], None));
-    script.push(expect_request(8, "thread/items/list"));
-    script.push(items_page(8, "tu-3", vec![agent_message("a3", "third answer")]));
 
     let provider = connect(script);
     let id = provider
@@ -701,18 +701,18 @@ fn over_cap_history_page_is_skipped_not_fatal() {
     script.push(expect_request(4, "thread/turns/list"));
     script.push(turns_page(
         4,
-        vec![turn_meta("tu-1", "completed"), turn_meta("tu-2", "completed")],
+        vec![turn_meta("tu-2", "completed"), turn_meta("tu-1", "completed")],
         None,
     ));
     script.push(expect_request(5, "thread/items/list"));
     // 17 MiB on one line: past the cap, so it is skipped and the request it answers fails.
     script.push(json!({"write_big": {
-        "prefix": r#"{"id":5,"result":{"data":[{"turnId":"tu-1","item":{"type":"agentMessage","id":"a1","text":""#,
+        "prefix": r#"{"id":5,"result":{"data":[{"turnId":"tu-2","item":{"type":"agentMessage","id":"a1","text":""#,
         "bytes": 17 * 1024 * 1024,
         "suffix": r#""}}],"nextCursor":null}}"#,
     }}));
     script.push(expect_request(6, "thread/items/list"));
-    script.push(items_page(6, "tu-2", vec![agent_message("a2", "still readable")]));
+    script.push(items_page(6, "tu-1", vec![agent_message("a1", "still readable")]));
 
     let provider = connect(script);
     provider
@@ -736,7 +736,7 @@ fn over_cap_history_page_is_skipped_not_fatal() {
             _ => None,
         })
         .expect("a note on the turn that was too large");
-    assert_eq!(note.0, "tu-1");
+    assert_eq!(note.0, "tu-2");
     assert!(note.1.contains("too large to show"), "{}", note.1);
     assert!(events
         .iter()
