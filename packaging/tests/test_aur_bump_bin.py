@@ -97,6 +97,55 @@ class BumpBinTest(unittest.TestCase):
         self.assertIn("NODE_VERSION is not a vX.Y.Z version", r.stderr)
         self.assertEqual(self.pkgbuild(), before)
 
+    def test_skip_tarball_hash_is_refused_before_writing(self):
+        before = self.pkgbuild()
+        rel = _release(self.root)
+        path = os.path.join(rel, "SHA256SUMS")
+        with open(path, encoding="utf-8") as f:
+            sums = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(sums.replace(_TARBALL_SHA, "SKIP"))
+        r = self.run_bump(rel)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("eitri-1.0.0-x86_64-linux.tar.gz", r.stderr)
+        self.assertIn("not a sha256", r.stderr)
+        self.assertEqual(self.pkgbuild(), before)
+
+    def test_duplicate_tarball_hash_is_refused_before_writing(self):
+        before = self.pkgbuild()
+        rel = _release(self.root)
+        with open(os.path.join(rel, "SHA256SUMS"), "a", encoding="utf-8") as f:
+            f.write(f"{_TARBALL_SHA}  eitri-1.0.0-x86_64-linux.tar.gz\n")
+        r = self.run_bump(rel)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("listed 2 times", r.stderr)
+        self.assertEqual(self.pkgbuild(), before)
+
+    def test_malformed_verdandi_source_is_refused_before_writing(self):
+        before = self.pkgbuild()
+        rel = _release(self.root)
+        path = os.path.join(rel, "RELEASE")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text.replace("verdandi-abcdef0-source.tar.gz", "verdandi-abcdef0/source.tar.gz"))
+        sums_path = os.path.join(rel, "SHA256SUMS")
+        with open(sums_path, encoding="utf-8") as f:
+            sums = f.read()
+        with open(sums_path, "w", encoding="utf-8") as f:
+            f.write(sums.replace("verdandi-abcdef0-source.tar.gz", "verdandi-abcdef0/source.tar.gz"))
+        r = self.run_bump(rel)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("VERDANDI_SOURCE", r.stderr)
+        self.assertEqual(self.pkgbuild(), before)
+
+    def test_malformed_eitri_version_is_refused_before_writing(self):
+        before = self.pkgbuild()
+        r = self.run_bump(_release(self.root, version="1.0.0&extra"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("EITRI_VERSION", r.stderr)
+        self.assertEqual(self.pkgbuild(), before)
+
     def test_a_prerelease_is_refused_without_allow_prerelease(self):
         before = self.pkgbuild()
         r = self.run_bump(_release(self.root, version="1.0.0-rc.1"))

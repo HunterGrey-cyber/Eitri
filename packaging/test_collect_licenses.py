@@ -299,6 +299,35 @@ class NpmPackages(unittest.TestCase):
         self.assertFalse(any(n.startswith("@types/") for n in names))
 
 
+class BlankLicenceFiles(unittest.TestCase):
+    def package(self, text, name="fixture-package"):
+        root = _scratch_dir()
+        self.addCleanup(shutil.rmtree, root, True)
+        with open(os.path.join(root, "LICENSE"), "w", encoding="utf-8") as f:
+            f.write(text)
+        return {"eco": "npm", "name": name, "version": "1.0.0", "license": "MIT", "dir": root}
+
+    def test_only_blank_licence_files_are_refused(self):
+        for text in ("", " \t\r\n"):
+            with self.subTest(text=text):
+                pkg = self.package(text)
+                with self.assertRaisesRegex(cl.Fail, r"npm fixture-package 1.0.0 ships only blank licence files "
+                                            r"\(LICENSE\); vendor its licence text"):
+                    cl.resolve(pkg, {}, {})
+
+    def test_blank_licence_beside_real_text_is_reproduced(self):
+        pkg = self.package("")
+        with open(os.path.join(pkg["dir"], "LICENSE-MIT"), "w", encoding="utf-8") as f:
+            f.write("A real licence text\n")
+        entry = cl.resolve(pkg, {}, {})
+        self.assertEqual(dict(entry["files"]), {"LICENSE": "\n", "LICENSE-MIT": "A real licence text\n"})
+
+    def test_allowlisted_required_licence_cannot_be_blank(self):
+        pkg = self.package(" \n", "@anthropic-ai/claude-agent-sdk")
+        with self.assertRaisesRegex(cl.Fail, "ships only blank licence files"):
+            cl.resolve(pkg, {}, {})
+
+
 class NoScratchDiskPathShipsInPinsEnv(unittest.TestCase):
     """The scratch-disk mount point is
     not something a public reader needs -- packaging/pins.env's own comment used to name it

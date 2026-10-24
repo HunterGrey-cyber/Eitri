@@ -91,8 +91,13 @@ kv() {
 sum_of() {
 	# sum_of FILENAME: the sha256 SHA256SUMS records for FILENAME, or die naming it.
 	local v
-	v=$(awk -v f="$1" '$2==f {print $1; found=1} END{if(!found) exit 1}' "$SUMS_FILE") || {
-		echo "bump-bin.sh: $SUMS_FILE has no entry for $1" >&2
+	v=$(awk -v f="$1" '$2==f {n++; h=$1} END{if(n==1) print h; else print "COUNT " n+0}' "$SUMS_FILE")
+	case "$v" in
+	'COUNT 0') echo "bump-bin.sh: $SUMS_FILE is missing an entry for $1" >&2; exit 1 ;;
+	COUNT*) echo "bump-bin.sh: $1 is listed ${v#COUNT } times in $SUMS_FILE; exactly one is required" >&2; exit 1 ;;
+	esac
+	[[ "$v" =~ ^[0-9a-f]{64}$ ]] || {
+		echo "bump-bin.sh: $SUMS_FILE's hash for $1 is not a sha256: $v" >&2
 		exit 1
 	}
 	printf '%s\n' "$v"
@@ -102,6 +107,14 @@ VERSION="$(kv EITRI_VERSION)"
 VERDANDI_SOURCE="$(kv VERDANDI_SOURCE)"
 NODE_VERSION="$(kv NODE_VERSION)"
 NODE_SHA256_X64="$(kv NODE_SHA256_linux_x64)"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || {
+	echo "bump-bin.sh: $RELEASE_FILE's EITRI_VERSION is not an X.Y.Z or X.Y.Z-rc.N version: $VERSION" >&2
+	exit 1
+}
+[[ "$VERDANDI_SOURCE" =~ ^verdandi-[0-9a-f]{7}-source\.tar\.gz$ ]] || {
+	echo "bump-bin.sh: $RELEASE_FILE's VERDANDI_SOURCE is not a plain source archive name: $VERDANDI_SOURCE" >&2
+	exit 1
+}
 # Both go into the PKGBUILD's sed below; refuse anything that is not a plain Node version or hash
 # rather than let a malformed RELEASE write a broken (or sed-injected) PKGBUILD.
 [[ "$NODE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {

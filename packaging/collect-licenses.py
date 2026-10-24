@@ -518,10 +518,14 @@ def resolve(pkg, by_nv, counts):
     for f in found:
         if not os.path.isfile(f):
             raise Fail(f"licence text {f} for {name} {ver} does not exist")
+    files = [(os.path.basename(f), read_text(f)) for f in found]
+    if found and all(not text.strip() for _, text in files):
+        names = ", ".join(name for name, _ in files)
+        raise Fail(f"{eco} {name} {ver} ships only blank licence files ({names}); vendor its licence text (EXTRA_TEXTS)")
     counts[label] = counts.get(label, 0) + 1
     return {"title": f"{name} {ver}", "name": name, "version": ver, "license": label, "status": status, "note": note,
             "copyleft": key in COPYLEFT_ACK,
-            "files": [(os.path.basename(f), read_text(f)) for f in found]}
+            "files": files}
 
 
 # ---------------------------------------------------------------------------------------------

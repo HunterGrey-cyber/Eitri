@@ -76,6 +76,14 @@ t_downloads_bounded() {
 	expect_rc 0
 	if ! grep -F '127.0.0.1:1/' "$S/logs/curl.log" >/dev/null; then fail "no plain-http curl call was made"; fi
 	while IFS= read -r line; do
+		case $line in
+		*' --proto =http '*)
+			case $line in
+			'curl -q --max-redirs 0 '*) ;;
+			*) fail "a loopback curl call reads config or permits redirects: $line" ;;
+			esac
+			;;
+		esac
 		for want in " --connect-timeout 60 " " --speed-limit 1024 --speed-time 300 " " --max-filesize 1073741824 "; do
 			case $line in
 			*"$want"*) ;;
@@ -128,4 +136,78 @@ t_test_mode_overrides_reach_only_loopback() {
 	done
 	if [ -s "$S/logs/curl.log" ]; then fail "a refused override was fetched: $(cat "$S/logs/curl.log")"; fi
 	expect_absent "$TH/.local/lib/eitri"
+}
+
+TESTS="$TESTS t_loopback_ignores_curl_config_redirects"
+t_loopback_ignores_curl_config_redirects() {
+	serve 1.0.0
+	# A config curl must not read: it would follow redirects and mark every request it sends.
+	printf 'location\nheader = "X-Curlrc: 1"\n' >"$TH/.curlrc"
+	# Both servers stay on loopback. The first records that SHA256SUMS was asked for, and whether the request
+	# carried the config's header, then redirects; the second records any request before serving a real fixture.
+	cat >"$T/redirect.py" <<'PY'
+import functools
+import http.server
+import pathlib
+import sys
+import threading
+
+root, ports, contacted, asked, configured = sys.argv[1:]
+
+class Destination(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        pathlib.Path(contacted).touch()
+        super().do_GET()
+
+destination = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 0), functools.partial(Destination, directory=root))
+
+class Redirect(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.headers.get("X-Curlrc"):
+            pathlib.Path(configured).touch()
+        if self.path.endswith("/SHA256SUMS"):
+            pathlib.Path(asked).touch()
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{destination.server_port}{self.path}")
+            self.end_headers()
+        else:
+            super().do_GET()
+
+source = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 0), functools.partial(Redirect, directory=root))
+threading.Thread(target=destination.serve_forever, daemon=True).start()
+pathlib.Path(ports).write_text(str(source.server_port))
+source.serve_forever()
+PY
+	python3 "$T/redirect.py" "$S/srv" "$T/redirect.port" "$T/redirect.contacted" "$T/redirect.asked" \
+		"$T/redirect.configured" >"$T/redirect.log" 2>&1 &
+	redirect_pid=$!
+	# A test body runs in a subshell of its own, which has no EXIT trap of the harness's: this one stops only the
+	# redirect server (stop_server here would kill the fixture server the later tests still use).
+	trap 'kill "$redirect_pid" 2>/dev/null' EXIT
+	redirect_tries=0
+	while [ ! -s "$T/redirect.port" ] && [ "$redirect_tries" -lt 100 ]; do
+		sleep 0.1
+		redirect_tries=$((redirect_tries + 1))
+	done
+	if [ ! -s "$T/redirect.port" ]; then
+		stop_redirect_server
+		fail "the redirect server did not start"
+		return
+	fi
+	redirect_port=$(cat "$T/redirect.port")
+	inst -- --base-url "http://127.0.0.1:$redirect_port" --release-signers "$SIGNERS"
+	expect_fail "a redirected loopback SHA256SUMS download"
+	stop_redirect_server
+	expect_file "$T/redirect.asked"
+	expect_absent "$T/redirect.configured"
+	expect_absent "$T/redirect.contacted"
+	expect_absent "$TH/.local/lib/eitri"
+}
+
+stop_redirect_server() {
+	kill "$redirect_pid" 2>/dev/null
+	wait "$redirect_pid" 2>/dev/null
+	trap - EXIT
 }

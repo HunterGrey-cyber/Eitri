@@ -1195,10 +1195,10 @@ require_curl() {
 }
 
 # fetch URL DEST WHAT: download URL to DEST ('-' = stdout). HTTPS-only for every non-loopback URL,
-# on every redirect too (--proto/--proto-redir); a loopback base follows no redirect at all.
+# on every redirect too (--proto/--proto-redir); a loopback download reads no curl config and follows no redirect.
 fetch() {
 	if [ "$NV_LOOPBACK" = 1 ]; then
-		curl --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
+		curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" || die "could not download $3 from $1: is the server at $NV_BASE running?"
 	else
 		curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsSL -o "$2" -- "$1" || die "could not download $3 from $1: check your network connection and re-run"
 	fi
@@ -1254,7 +1254,7 @@ download_verified() {
 # a predicate reports through a variable), because the sidecar build's own first download (Node) is
 # the one place in this installer where "the network is not reachable" is not fatal (a
 # release with no sidecar still installs; the panel says how to get one). HTTPS is held across every
-# redirect, exactly like fetch; a bare http:// URL (only ever a loopback test override) follows none.
+# redirect, exactly like fetch; a loopback download reads no curl config and follows no redirect.
 curl_get() {
 	CG_OK=0
 	CG_ERR=
@@ -1269,7 +1269,7 @@ curl_get() {
 	http://*)
 		loopback_http "$1"
 		if [ "$LH" != 1 ]; then die "curl_get: $1: plain http is only for a loopback test server"; fi
-		if _cg_out=$(curl --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" 2>&1); then
+		if _cg_out=$(curl -q --max-redirs 0 --proto '=http' --connect-timeout 60 --speed-limit 1024 --speed-time 300 --max-filesize "$NV_MAX_DOWNLOAD_BYTES" -fsS -o "$2" -- "$1" 2>&1); then
 			CG_OK=1
 		else
 			CG_ERR=$_cg_out
