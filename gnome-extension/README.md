@@ -12,7 +12,7 @@ GNOME either.
 
 | file | shipped | what |
 |---|---|---|
-| `metadata.json` | yes | uuid, name, supported shell versions (45-50), the extension's `version` (2) |
+| `metadata.json` | yes | uuid, name, supported shell versions (45-51), the extension's `version` (2) |
 | `extension.js` | yes | owns `cn.huntergrey.Eitri.Shell1` on the session bus, exports `/cn/huntergrey/Eitri/Shell1`, snapshots the shell's windows and activates what `policy.js` allows |
 | `policy.js` | yes | every decision: fresh input, the partner list, who may call what, which windows a monitor move takes. No GNOME imports |
 | `direction.js` | yes | which window lies left/right/above/below the focused one. No GNOME imports |

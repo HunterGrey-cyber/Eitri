@@ -137,7 +137,7 @@ fn the_metadata_names_the_extension_and_the_shell_versions_it_supports() {
         .iter()
         .map(|v| v.as_str().expect("a version is a string"))
         .collect();
-    assert_eq!(versions, ["45", "46", "47", "48", "49", "50"]);
+    assert_eq!(versions, ["45", "46", "47", "48", "49", "50", "51"]);
 }
 
 #[test]

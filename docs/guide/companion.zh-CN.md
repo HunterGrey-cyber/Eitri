@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=4b456d3cb4fbed0f335f6c1cdf5dd88aad02278e1ded3eb04b306f67b4a2cabc -->
+<!-- translated-from: companion.md sha256=3e1475627bb1eeb69cb8306c976a342091241917207c5c36be374ddf345dc628 -->
 
 # 配合你自己的 Neovim 使用
 
@@ -116,7 +116,7 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 <a id="gnome-the-extension"></a>
 ## GNOME：扩展
 
-在 GNOME 上，程序不能自己取得焦点，所以要用 `Ctrl+h/j/k/l` 在面板和它的编辑器之间移动，需要一个小的 GNOME Shell 扩展 `eitri@huntergrey.cn`（GNOME Shell 45 到 50）。`.deb`、`.rpm`、AUR 软件包和 tarball 安装器会把它的四个文件放到位（[文件都装到哪里去了](../../INSTALL.zh-CN.md#where-things-go)）；**启用它是你的一步**，安装器从不替你做：
+在 GNOME 上，程序不能自己取得焦点，所以要用 `Ctrl+h/j/k/l` 在面板和它的编辑器之间移动，需要一个小的 GNOME Shell 扩展 `eitri@huntergrey.cn`（GNOME Shell 45 到 51）。`.deb`、`.rpm`、AUR 软件包和 tarball 安装器会把它的四个文件放到位（[文件都装到哪里去了](../../INSTALL.zh-CN.md#where-things-go)）；**启用它是你的一步**，安装器从不替你做：
 
 ```sh
 gnome-extensions enable eitri@huntergrey.cn

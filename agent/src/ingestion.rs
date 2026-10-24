@@ -1577,24 +1577,68 @@ mod history_snapshot_cost {
         (0..3).map(|_| f()).min().unwrap()
     }
 
-    fn snapshot_time(p: &AgentSessionProjection) -> std::time::Duration {
-        best(|| {
-            let started = std::time::Instant::now();
-            let kept = history_snapshot(p);
-            let elapsed = started.elapsed();
-            assert!(kept.2.len() <= crate::history::HISTORY_MAX_ITEMS);
-            elapsed
-        })
+    /// What the history write used to copy under the lock: all three collections, whole.
+    fn copy_everything(p: &AgentSessionProjection) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        let copied = (p.user_prompts.clone(), p.transcript.clone(), p.tool_calls.clone());
+        let elapsed = started.elapsed();
+        drop(copied);
+        elapsed
     }
 
-    /// What the history write holds the conversation's lock for no longer grows with the session:
-    /// eight times the session takes about as long, where copying it all took eight times as long.
+    fn snapshot_time(p: &AgentSessionProjection) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        let kept = history_snapshot(p);
+        let elapsed = started.elapsed();
+        assert!(kept.2.len() <= crate::history::HISTORY_MAX_ITEMS);
+        elapsed
+    }
+
+    /// What the history write holds the conversation's lock for no longer grows with the session.
+    ///
+    /// Three checks, none an absolute time. The snapshot of eight times the session keeps exactly
+    /// as much as the snapshot of the small one (the character cap fills first in both), which is
+    /// the work, counted, and cannot be disturbed by load. The snapshots of the two sessions and a
+    /// copy of the large session whole, the thing the snapshot replaced, are then measured in turn
+    /// in this process, a sample of each at a time, and each is judged by its fastest sample, so a
+    /// stall that lands on one sample (a loaded machine, a thread switch) costs nothing unless it
+    /// lands on all of them. The large session's snapshot must take less than twice the small one's:
+    /// the two cost about the same, while a part that walks or copies every item is eight times
+    /// larger in the large session, so one that grows there to about the fixed part's cost already
+    /// fails. And it must stay under a quarter of the whole copy, which is dozens of times the
+    /// snapshot's work, so a regression to copying everything misses it by a wide measure.
     #[test]
     fn the_lock_held_part_of_a_history_write_does_not_grow_with_the_session() {
-        let small = snapshot_time(&session(500));
-        let large = snapshot_time(&session(4_000));
-        eprintln!("snapshot of 500 calls: {small:?}, of 4000: {large:?}");
-        assert!(large < small * 3, "4000 calls took {large:?}, 500 took {small:?}");
+        let small = session(500);
+        let large = session(4_000);
+
+        let (small_kept, large_kept) = (history_snapshot(&small), history_snapshot(&large));
+        assert_eq!(
+            (small_kept.0.len(), small_kept.1.len(), small_kept.2.len()),
+            (large_kept.0.len(), large_kept.1.len(), large_kept.2.len()),
+            "the snapshot kept a different amount of a session eight times the size"
+        );
+        assert!(
+            small_kept.2.len() < 500,
+            "the session did not reach the caps, so it proves nothing"
+        );
+
+        let (mut snapshot, mut whole) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        let mut small_snapshot = std::time::Duration::MAX;
+        for _ in 0..9 {
+            small_snapshot = small_snapshot.min(snapshot_time(&small));
+            snapshot = snapshot.min(snapshot_time(&large));
+            whole = whole.min(copy_everything(&large));
+        }
+        eprintln!("snapshot of 500 calls: {small_snapshot:?}, of 4000: {snapshot:?}, copying all 4000: {whole:?}");
+        assert!(
+            snapshot < small_snapshot * 2,
+            "the snapshot of 4000 calls took {snapshot:?}, of 500 calls {small_snapshot:?}"
+        );
+        assert!(
+            snapshot * 4 < whole,
+            "the snapshot of 4000 calls took {snapshot:?}, copying them all {whole:?}"
+        );
     }
 
     /// The copy the history write used to make under the lock, beside the one it makes now, for a
@@ -1604,16 +1648,10 @@ mod history_snapshot_cost {
     fn measure_the_history_snapshot() {
         for calls in [500, 4_000, 16_000] {
             let p = session(calls);
-            let whole = best(|| {
-                let started = std::time::Instant::now();
-                let copied = (p.user_prompts.clone(), p.transcript.clone(), p.tool_calls.clone());
-                let elapsed = started.elapsed();
-                drop(copied);
-                elapsed
-            });
+            let whole = best(|| copy_everything(&p));
             eprintln!(
                 "{calls} calls: copying it all {whole:?}, the snapshot {:?}",
-                snapshot_time(&p)
+                best(|| snapshot_time(&p))
             );
         }
     }

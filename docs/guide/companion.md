@@ -175,7 +175,7 @@ goes to.
 ## GNOME: the extension
 
 On GNOME a program cannot take focus for itself, so moving between the panel and its editor with
-`Ctrl+h/j/k/l` needs a small GNOME Shell extension, `eitri@huntergrey.cn` (GNOME Shell 45 to 50). The `.deb`,
+`Ctrl+h/j/k/l` needs a small GNOME Shell extension, `eitri@huntergrey.cn` (GNOME Shell 45 to 51). The `.deb`,
 the `.rpm`, the AUR packages and the tarball installer put its four files in place
 ([Where things go](../../INSTALL.md#where-things-go)); **turning it on is your step**, and the installer never
 does it:
