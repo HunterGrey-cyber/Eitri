@@ -113,7 +113,7 @@ function sameLink(shown: ShownLink, anchor: HTMLAnchorElement, root: HTMLElement
 
 /** What a click (or Enter, which clicks) on `anchor` must do before the browser follows it. `null` lets it
  *  through: a link `linkOpensAtOnce` accepts, a second click on the link whose address the previous click
- *  showed (between `LINK_LOOK_MIN_MS` and `LINK_LOOK_MAX_MS` after it), or a link that is not a web link at
+ *  showed (between `LINK_LOOK_MIN_MS` and `LINK_LOOK_MAX_MS` after it), or a link that is not a web or mail link at
  *  all (Rust's own scheme check refuses everything but web and mail). Otherwise the address the browser would
  *  open, normalized, to be shown instead of opening: a reply's `<a href="https://evil">https://good</a>` must not
  *  launch the browser on one click. Judged on the anchor's RESOLVED `href`, which is what the click navigates
@@ -124,9 +124,13 @@ export function linkClickNeedsLook(
   shown: ShownLink | null,
   now: number,
 ): string | null {
-  const url = webUrl(anchor.href);
+  const mailto = anchor.protocol === "mailto:";
+  const url = mailto ? anchor.href : webUrl(anchor.href);
   if (url === null) return null;
-  if (linkOpensAtOnce({ el: anchor, url }, root)) return null;
+  if (mailto) {
+    const text = anchor.textContent?.trim() ?? "";
+    if (anchor.childElementCount === 0 && (text === url || text === url.slice("mailto:".length)) && hintVisible(anchor, root)) return null;
+  } else if (linkOpensAtOnce({ el: anchor, url }, root)) return null;
   if (shown !== null && shown.url === url && sameLink(shown, anchor, root)) {
     const since = now - shown.at;
     if (since >= LINK_LOOK_MIN_MS && since <= LINK_LOOK_MAX_MS) return null;

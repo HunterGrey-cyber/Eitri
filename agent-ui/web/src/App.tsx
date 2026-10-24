@@ -5031,7 +5031,10 @@ export default function App() {
       if (event.key === "Escape" || event.key === "q") setDetail(null);
       else if (event.key === "j") setDetailCursor((c) => Math.min(c + 1, detail.length));
       else if (event.key === "k") setDetailCursor((c) => Math.max(c - 1, 0));
-      else if (event.key === "y") void navigator.clipboard?.writeText(detail[detailCursor]?.value ?? "");
+      else if (event.key === "y") {
+        const value = detail[detailCursor]?.value;
+        if (value !== undefined) copied(value, undefined);
+      }
       else if (event.key === "Enter" && detailCursor === detail.length) {
         setDetail(null);
         setHandoffOpen(true);

@@ -18,7 +18,7 @@ export interface DiffLine {
   kind: DiffLineKind;
   text: string;
   /** The line ends its side with no line break while the other side's last line has one (git's "\ No newline
-   *  at end of file"). Set only when the two sides disagree, since an `Edit`'s strings rarely end in one. */
+   *  at end of file"). For an `Edit`, set only when the two sides disagree, since its strings rarely end in one. */
   noNewline?: true;
 }
 
@@ -40,6 +40,20 @@ function lines(text: string): string[] {
   const split = text.split("\n");
   if (split.length > 0 && split[split.length - 1] === "") split.pop();
   return split;
+}
+
+export function wholeReplacement(before: string, after: string): DiffLine[] {
+  const a = lines(before);
+  const b = lines(after);
+  const aOpen = a.length > 0 && !before.endsWith("\n");
+  const bOpen = b.length > 0 && !after.endsWith("\n");
+  const side = (text: string[], kind: DiffLineKind, open: boolean): DiffLine[] =>
+    text.map((line, i) => ({
+      kind,
+      text: line,
+      ...(aOpen !== bOpen && open && i === text.length - 1 ? { noNewline: true as const } : {}),
+    }));
+  return [...side(a, "removed", aOpen), ...side(b, "added", bOpen)];
 }
 
 /** A line-level diff, longest-common-subsequence, smallest thing that is honest.
@@ -65,7 +79,7 @@ export function lineDiff(before: string, after: string): DiffLine[] | null {
   const aOpen = a.length > 0 && !before.endsWith("\n");
   const bOpen = b.length > 0 && !after.endsWith("\n");
   const openDiffers = aOpen !== bOpen;
-  const key = (side: string[], i: number, open: boolean) => (openDiffers && open && i === side.length - 1 ? `${side[i]}\u0000` : side[i]);
+  const key = (side: string[], i: number, open: boolean) => (openDiffers && open && i === side.length - 1 ? `o${side[i]}` : `c${side[i]}`);
   const ka = a.map((_, i) => key(a, i, aOpen));
   const kb = b.map((_, i) => key(b, i, bOpen));
   const mark = (side: string[], i: number, open: boolean): { noNewline: true } | Record<string, never> =>
@@ -103,7 +117,7 @@ export function lineDiff(before: string, after: string): DiffLine[] | null {
 export interface EditPreview {
   /** The file this call would write. Empty when the tool did not name one. */
   filePath: string;
-  /** `null` when the change is too large to render; the card says so instead of showing part. */
+  /** `null` for a Codex change too large for a row (`codexChangePreview` without `whole`); never for the other tools. */
   diff: DiffLine[] | null;
   /** Counts, always available even when `diff` is null, because "how big" is the first question. */
   added: number;
@@ -179,7 +193,7 @@ function computeEditPreview(toolName: string, input: object): EditPreview | null
     const after = str("new_string");
     // An Edit with neither side is not an edit; fall back rather than draw an empty diff.
     if (before === "" && after === "") return null;
-    const diff = lineDiff(before, after);
+    const diff = lineDiff(before, after) ?? wholeReplacement(before, after);
     return {
       filePath,
       diff,
@@ -196,7 +210,7 @@ function computeEditPreview(toolName: string, input: object): EditPreview | null
     // rather than draw a patch that implies the rest of the file survives.
     const content = str("content");
     if (content === "" && filePath === "") return null;
-    const diff = lineDiff("", content);
+    const diff = lineDiff("", content) ?? wholeReplacement("", content);
     return {
       filePath,
       diff,
@@ -216,7 +230,7 @@ function computeEditPreview(toolName: string, input: object): EditPreview | null
   // write), so treating it like every other `NotebookEdit` produced an empty diff, "+0 −0" and
   // "Writes the whole cell" -- true of nothing, and silent about the one thing that actually
   // happened. `edit_mode` defaults to "replace" when the field is absent, matching the tool's own
-  // schema; only "delete" gets its own wording here, named by `cell_id` when the call gives one.
+  // schema; each mode gets its own wording here, named by `cell_id` when the call gives one.
   if (toolName === "NotebookEdit") {
     const notebookPath = str("notebook_path");
     const cellId = str("cell_id");
@@ -236,7 +250,18 @@ function computeEditPreview(toolName: string, input: object): EditPreview | null
     }
     const newSource = str("new_source");
     if (newSource === "" && notebookPath === "") return null;
-    const diff = lineDiff("", newSource);
+    const diff = lineDiff("", newSource) ?? wholeReplacement("", newSource);
+    const rawMode = fields["edit_mode"];
+    const mode = rawMode === undefined ? "replace" : rawMode;
+    const cellType = str("cell_type");
+    const cell = cellId ? `cell ${cellId}` : "a cell";
+    const asType = cellType ? ` as a ${cellType} cell` : "";
+    // An unknown mode is the agent's own value, quoted so an empty one or one that reads like a sentence shows its edges.
+    const wholeFileNote = mode === "insert"
+      ? `Inserts a new ${cellType ? `${cellType} ` : ""}cell ${cellId ? `after cell ${cellId}` : "at the start of the notebook"}.`
+      : mode === "replace"
+        ? `Replaces ${cell}${asType}. The request does not say what is there now.`
+        : `Edit mode ${JSON.stringify(mode) ?? String(mode)} on ${cell}${asType}.`;
     return {
       filePath: notebookPath,
       diff,
@@ -244,7 +269,7 @@ function computeEditPreview(toolName: string, input: object): EditPreview | null
       removed: 0,
       replaceAll: false,
       wholeFile: true,
-      wholeFileNote: "Writes the whole cell. The request does not say what is there now.",
+      wholeFileNote,
     };
   }
 
@@ -272,8 +297,13 @@ export function codexChangePreview(
 ): EditPreview {
   const raw = lines(typeof change.diff === "string" ? change.diff : "");
   let diff: DiffLine[];
-  if (change.kind === "add") diff = raw.map((text) => ({ kind: "added", text }));
-  else if (change.kind === "delete") diff = raw.map((text) => ({ kind: "removed", text }));
+  if (change.kind === "add" || change.kind === "delete") {
+    diff = raw.map((text, i) => ({
+      kind: change.kind === "add" ? "added" : "removed",
+      text,
+      ...(i === raw.length - 1 && !change.diff.endsWith("\n") ? { noNewline: true as const } : {}),
+    }));
+  }
   else {
     diff = [];
     // Without any hunk header the text is taken as the hunk's lines.

@@ -344,7 +344,7 @@ impl Editor {
             // A new editor starts empty: forget the last one's file and selection as a connect begins and as
             // an attached editor goes. Not on arriving at `Attached`: the install makes the editor send its
             // first context, and that line may be read just before.
-            if matches!(state, LinkState::Connecting { .. }) || (was && !is) {
+            if poll.connect_began || matches!(state, LinkState::Connecting { .. }) || (was && !is) {
                 (self.reset_context)();
             }
             if is {

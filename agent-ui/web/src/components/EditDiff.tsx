@@ -1,4 +1,4 @@
-import type { EditPreview } from "../diff";
+import { MAX_DIFF_LINES, type EditPreview } from "../diff";
 import { useProjectRelative } from "../projectPath";
 import { countEscapes, revealHidden } from "../revealHidden";
 import { HiddenWarning, Revealed } from "./Revealed";
@@ -20,11 +20,15 @@ import { HiddenWarning, Revealed } from "./Revealed";
  * protected path), and a right-to-left override in a file name could make it read as another file.
  * `data-path` keeps the real path, so opening it opens the file the call names.
  */
+/** The most lines an expanded transcript row draws of one change. */
+const ROW_MAX_LINES = 2 * MAX_DIFF_LINES;
+
 export function EditDiff({
   preview,
   maxLines,
   createsFile,
   tool,
+  whole = false,
 }: {
   preview: EditPreview;
   maxLines?: number;
@@ -32,9 +36,13 @@ export function EditDiff({
   /** The tool's name, shown before the path where the view is a transcript row's line (`✓ Edit path +5 −1`);
    *  left out inside a permission card, whose own head already names the tool. */
   tool?: string;
+  /** Draw every line however many: a permission card approves exactly this change. A transcript row
+   *  expanded past `ROW_MAX_LINES` shows the counts instead, since it is drawn again on every render. */
+  whole?: boolean;
 }) {
   const shownPath = useProjectRelative(preview.filePath);
-  const diff = preview.diff !== null && maxLines !== undefined && preview.diff.length > maxLines ? preview.diff.slice(0, maxLines) : preview.diff;
+  const full = !whole && preview.diff !== null && preview.diff.length > ROW_MAX_LINES ? null : preview.diff;
+  const diff = full !== null && maxLines !== undefined && full.length > maxLines ? full.slice(0, maxLines) : full;
   const pathPieces = revealHidden(shownPath);
   const linePieces = diff?.map((line) => revealHidden(line.text)) ?? [];
   // The note can carry the call's own text (a `NotebookEdit` delete names its `cell_id`).

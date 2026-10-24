@@ -5,8 +5,9 @@
 //! [`Target`] holds a descriptor of the file's parent directory, reached by opening each component
 //! relative to the previous one with `O_DIRECTORY|O_NOFOLLOW`, and the file's name. Everything done
 //! to the file afterwards is an `*at` call on that parent descriptor, so a directory swapped for a
-//! link to somewhere else, before or during the write, is refused or simply not reached: no path
-//! string is ever resolved again.
+//! link to somewhere else, before or during the write, is refused or simply not reached. Before
+//! changing it, the parent is walked again from the root and compared with the held descriptor,
+//! since a descriptor stays open even when its directory has been moved out of the project.
 //!
 //! **How a file is replaced** depends on what a rename would lose. A file with more than one hard
 //! link is never written: any write reaches every name of it, and another name may be outside the
@@ -46,7 +47,7 @@ const NAME_MAX: usize = 255;
 /// A descriptor of the canonical project root, the one place every [`Target`] is reached from.
 #[derive(Debug)]
 pub struct ProjectDir {
-    root: OwnedFd,
+    root: Arc<OwnedFd>,
 }
 
 /// A file inside the project: a descriptor of its parent directory, reached without following a
@@ -54,6 +55,7 @@ pub struct ProjectDir {
 /// descriptor: it reads as absent, and writing to it fails.
 #[derive(Debug)]
 pub struct Target {
+    root: Arc<OwnedFd>,
     parent: Option<OwnedFd>,
     leaf: CString,
     rel: PathBuf,
@@ -63,6 +65,22 @@ impl Target {
     /// The path the target was asked for, relative to the project root.
     pub fn rel(&self) -> &Path {
         &self.rel
+    }
+
+    /// Whether the project still reaches this parent without following any symbolic link.
+    fn parent_is_reached(&self) -> io::Result<bool> {
+        let root = ProjectDir {
+            root: self.root.clone(),
+        };
+        let Ok(reached) = root.target(&self.rel, false) else {
+            return Ok(false);
+        };
+        let (Some(held), Some(now)) = (&self.parent, &reached.parent) else {
+            return Ok(false);
+        };
+        let held = fstat(held.as_raw_fd())?;
+        let now = fstat(now.as_raw_fd())?;
+        Ok((held.st_dev, held.st_ino) == (now.st_dev, now.st_ino))
     }
 }
 
@@ -81,6 +99,16 @@ pub enum Current {
     Absent,
     /// A directory, a FIFO, a device or a socket.
     Other,
+}
+
+impl Current {
+    /// The link target the caller judged, for the write's final comparison.
+    pub fn link_target(&self) -> Option<&[u8]> {
+        match self {
+            Current::Symlink { target } => Some(target),
+            _ => None,
+        }
+    }
 }
 
 /// What a path is to become.
@@ -216,7 +244,7 @@ impl ProjectDir {
 
         // SAFETY: `open` returned a new descriptor that nothing else owns.
         Ok(ProjectDir {
-            root: unsafe { OwnedFd::from_raw_fd(fd) },
+            root: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
         })
     }
 
@@ -281,6 +309,7 @@ impl ProjectDir {
                 }
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                     return Ok(Target {
+                        root: self.root.clone(),
                         parent: None,
                         leaf,
                         rel: rel.to_path_buf(),
@@ -290,6 +319,7 @@ impl ProjectDir {
             };
         }
         Ok(Target {
+            root: self.root.clone(),
             parent: Some(dir),
             leaf,
             rel: rel.to_path_buf(),
@@ -377,11 +407,13 @@ pub fn write_mode(target: &Target) -> io::Result<WriteMode> {
 ///
 /// Whatever is at the path is looked at once more right before it is replaced or removed (the last
 /// look of the module's header): the same inode, kind, size and times as when this call first
-/// looked, and for a regular file exactly `note.pre`'s bytes. A regular file when `note.pre` names
+/// looked, and for a regular file exactly `note.pre`'s bytes. A link must still point to
+/// `judged_link`, the target the caller read before this call. A regular file when `note.pre` names
 /// none, a link when it names some, or any difference, is [`WriteError::Changed`] and nothing is
 /// written.
 ///
 /// The mode written is always the one in `new`.
+#[allow(clippy::too_many_arguments)]
 pub fn replace(
     target: &Target,
     new: &Content,
@@ -389,6 +421,7 @@ pub fn replace(
     journal: &Journal,
     shadow: &Shadow,
     hooks: &FsHooks,
+    judged_link: Option<&[u8]>,
 ) -> Result<(), WriteError> {
     let shown = target.rel.display().to_string();
     let io_err = |e: io::Error| WriteError::Io(format!("{shown}: {e}"));
@@ -426,7 +459,9 @@ pub fn replace(
         (Content::Absent, Some(_)) => {
             let st = st.expect("a kind comes from a stat");
             // An unlink cannot be taken back: the file must still be what the caller judged.
-            if !still_as_judged(parent, &target.leaf, &st, expected.as_deref()).map_err(io_err)? {
+            if !still_as_judged(parent, &target.leaf, &st, expected.as_deref(), judged_link).map_err(io_err)?
+                || !target.parent_is_reached().map_err(io_err)?
+            {
                 return Err(WriteError::Changed);
             }
             unlink_at(parent, &target.leaf, 0).map_err(io_err)?;
@@ -436,7 +471,7 @@ pub fn replace(
             let made = make_temp(parent, &target.leaf).map_err(io_err)?;
             let filled = fill_temp(&made, bytes, *mode, None, &fault);
             match filled {
-                Ok(_) => link_into_place(parent, &made.name, &target.leaf, &fault, &shown),
+                Ok(_) => link_into_place(target, parent, &made.name, &target.leaf, &fault, &shown),
                 Err(e) => {
                     let _ = unlink_at(parent, &made.name, 0);
                     Err(io_err(e))
@@ -445,12 +480,18 @@ pub fn replace(
         }
         (Content::Symlink { target: link }, None) => {
             let name = make_temp_link(parent, &target.leaf, link).map_err(io_err)?;
-            link_into_place(parent, &name, &target.leaf, &fault, &shown)
+            link_into_place(target, parent, &name, &target.leaf, &fault, &shown)
         }
         (Content::Symlink { target: link }, Some(_)) => {
             let st = st.expect("a kind comes from a stat");
             let name = make_temp_link(parent, &target.leaf, link).map_err(io_err)?;
-            match still_as_judged(parent, &target.leaf, &st, expected.as_deref()) {
+            let unchanged = || -> io::Result<bool> {
+                Ok(
+                    still_as_judged(parent, &target.leaf, &st, expected.as_deref(), judged_link)?
+                        && target.parent_is_reached()?,
+                )
+            };
+            match unchanged() {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = unlink_at(parent, &name, 0);
@@ -465,7 +506,12 @@ pub fn replace(
         }
         (Content::Bytes { bytes, mode }, Some(libc::S_IFLNK)) => {
             let st = st.expect("a kind comes from a stat");
-            let unchanged = || still_as_judged(parent, &target.leaf, &st, expected.as_deref());
+            let unchanged = || -> io::Result<bool> {
+                Ok(
+                    still_as_judged(parent, &target.leaf, &st, expected.as_deref(), judged_link)?
+                        && target.parent_is_reached()?,
+                )
+            };
             atomic(parent, &target.leaf, bytes, *mode, None, &fault, Some(&unchanged))?;
             Ok(())
         }
@@ -480,7 +526,12 @@ pub fn replace(
             match how {
                 WriteMode::HardLinked(links) => return Err(WriteError::HardLinked { links }),
                 WriteMode::Atomic => {
-                    let unchanged = || still_as_judged(parent, &target.leaf, &st, expected.as_deref());
+                    let unchanged = || -> io::Result<bool> {
+                        Ok(
+                            still_as_judged(parent, &target.leaf, &st, expected.as_deref(), judged_link)?
+                                && target.parent_is_reached()?,
+                        )
+                    };
                     match atomic(parent, &target.leaf, bytes, *mode, Some(&st), &fault, Some(&unchanged))? {
                         Renamed::Done => return Ok(()),
                         // The new file could not be given the old one's group: a rename would change
@@ -508,14 +559,21 @@ fn expected_bytes(note: &JournalNote, shadow: &Shadow) -> io::Result<Option<Vec<
 }
 
 /// Whether `leaf` is still the very entry `st` described (same inode, kind, size and times) and
-/// what the caller expected there: a regular file holding exactly `expected`, or a link when
-/// `expected` is `None`. A writer that is not Eitri (a formatter on save, `git checkout`) can change
-/// a path between the last look and the rename or unlink that would lose what it put there.
+/// what the caller expected there: a regular file holding exactly `expected`, or a link pointing
+/// to `judged_link` when `expected` is `None`. A writer that is not Eitri (a formatter on save,
+/// `git checkout`) can change a path between the last look and the rename or unlink that would lose
+/// what it put there.
 ///
 /// `expected` is `None` only when the caller saw a link or nothing at the path, so a regular file
 /// found with nothing expected is one nobody looked at, and a link found with bytes expected is not
 /// the file the caller judged.
-fn still_as_judged(parent: &OwnedFd, leaf: &CString, st: &libc::stat, expected: Option<&[u8]>) -> io::Result<bool> {
+fn still_as_judged(
+    parent: &OwnedFd,
+    leaf: &CString,
+    st: &libc::stat,
+    expected: Option<&[u8]>,
+    judged_link: Option<&[u8]>,
+) -> io::Result<bool> {
     let now = match stat_at(parent, leaf) {
         Ok(now) => now,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
@@ -538,7 +596,22 @@ fn still_as_judged(parent: &OwnedFd, leaf: &CString, st: &libc::stat, expected: 
             };
             holds_exactly(&mut file, expected)
         }
-        (libc::S_IFLNK, None) => Ok(true),
+        (libc::S_IFLNK, None) => match judged_link {
+            Some(target) => {
+                #[cfg(test)]
+                tests::BEFORE_READ_LINK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                match read_link_at(parent, leaf, now.st_size) {
+                    Ok(link) => Ok(link == target),
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::EINVAL)) => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            None => Ok(false),
+        },
         _ => Ok(false),
     }
 }
@@ -604,7 +677,7 @@ fn regular_mode(parent: &OwnedFd, leaf: &CString, st: &libc::stat) -> io::Result
     let own_uid = unsafe { libc::geteuid() };
     #[allow(clippy::unnecessary_cast)] // `nlink_t` is 32 bits on some targets
     let nlink = fst.st_nlink as u64;
-    Ok((decide_mode(nlink, fst.st_uid, own_uid, names), fst))
+    Ok((decide_mode(nlink, fst.st_uid, own_uid, names.len()), fst))
 }
 
 /// A temporary file being filled beside the file it will replace.
@@ -747,6 +820,7 @@ fn make_temp_link(parent: &OwnedFd, leaf: &CString, link: &[u8]) -> io::Result<C
 /// there, then removes the temporary name and syncs the directory. A path that appeared meanwhile is
 /// [`WriteError::Appeared`], and is left as it is.
 fn link_into_place(
+    target: &Target,
     parent: &OwnedFd,
     name: &CString,
     leaf: &CString,
@@ -759,6 +833,10 @@ fn link_into_place(
         WriteError::Io(format!("{shown}: {e}"))
     };
     fault(Stage::BeforeLink).map_err(fail)?;
+    if !target.parent_is_reached().map_err(fail)? {
+        let _ = unlink_at(parent, name, 0);
+        return Err(WriteError::Changed);
+    }
     // Flags 0: a symlink is linked as itself, not followed.
     // SAFETY: both names are NUL-terminated strings that outlive the call; the descriptor is open.
     match retry(|| unsafe { libc::linkat(fd, name.as_ptr(), fd, leaf.as_ptr(), 0) }) {
@@ -810,6 +888,26 @@ fn in_place(
     if links > 1 {
         return Err(WriteError::HardLinked { links });
     }
+    // Truncating can clear privilege metadata which this process cannot reliably restore.
+    // Check ownership and group permissions before journalling or writing.
+    let capability = xattr_names(file.as_raw_fd())
+        .map_err(|e| io_err(e.to_string()))?
+        .iter()
+        .any(|name| name == b"security.capability");
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let in_group =
+        euid == 0 || mode & 0o2000 == 0 || effective_user_in_group(fst.st_gid).map_err(|e| io_err(e.to_string()))?;
+    can_preserve_mode(
+        mode,
+        fst.st_mode as u32 & 0o7777,
+        fst.st_uid,
+        fst.st_gid,
+        euid,
+        in_group,
+        capability,
+    )
+    .map_err(io_err)?;
     let hold = journal.begin(note, mode, shadow).map_err(|e| io_err(e.to_string()))?;
 
     let mut touched = false;
@@ -846,15 +944,28 @@ fn in_place(
             }
             Err(e) => return Err(e),
         }
+        if !target.parent_is_reached()? {
+            refused = Some(WriteError::Changed);
+            return Err(io::Error::other("the parent is no longer reached from the project"));
+        }
         touched = true;
         file.set_len(0)?;
         fault(Stage::Truncated)?;
         let mut writer = &file;
         writer.seek(SeekFrom::Start(0))?;
         write_chunks(&mut writer, bytes, fault)?;
-        if mode != fst.st_mode as u32 & 0o7777 {
+        if mode != fstat(file.as_raw_fd())?.st_mode as u32 & 0o7777 {
             // SAFETY: the descriptor is open for the call; `fchmod` takes no pointers.
             retry(|| unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) })?;
+            #[cfg(test)]
+            tests::AFTER_CHMOD.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            if mode != fstat(file.as_raw_fd())?.st_mode as u32 & 0o7777 {
+                return Err(io::Error::other("the file did not keep its wanted mode"));
+            }
         }
         file.sync_all()?;
         fault(Stage::Synced)?;
@@ -892,6 +1003,61 @@ fn in_place(
             Err(WriteError::Broken(format!(
                 "{message}; putting it back failed too: {e}"
             )))
+        }
+    }
+}
+
+/// Whether a rewrite can keep the wanted permission bits without losing privilege metadata.
+fn can_preserve_mode(
+    wanted: u32,
+    current: u32,
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    in_group: bool,
+    capability: bool,
+) -> Result<(), String> {
+    if capability {
+        return Err("security.capability cannot be preserved by an in-place write".into());
+    }
+    if euid == 0 {
+        return Ok(());
+    }
+    if uid != euid {
+        if wanted != current {
+            return Err("the mode of a file owned by another user cannot be changed".into());
+        }
+        if wanted & 0o6000 != 0 {
+            return Err("set-id bits cannot be preserved on a file owned by another user".into());
+        }
+    }
+    if wanted & 0o2000 != 0 && !in_group {
+        return Err(format!(
+            "set-group-id cannot be preserved without membership in group {gid}"
+        ));
+    }
+    Ok(())
+}
+
+/// Both the effective group and supplementary groups permit retaining set-group-id.
+fn effective_user_in_group(gid: libc::gid_t) -> io::Result<bool> {
+    // SAFETY: `getegid` has no preconditions and cannot fail.
+    if gid == unsafe { libc::getegid() } {
+        return Ok(true);
+    }
+    loop {
+        // SAFETY: size 0 with a null pointer asks only for the group count.
+        let count = retry(|| unsafe { libc::getgroups(0, std::ptr::null_mut()) })?;
+        if count == 0 {
+            return Ok(false);
+        }
+        let mut groups = vec![0; count as usize];
+        // SAFETY: `groups` is writable for `count` group ids.
+        match retry(|| unsafe { libc::getgroups(count, groups.as_mut_ptr()) }) {
+            Ok(got) => return Ok(groups[..got as usize].contains(&gid)),
+            // The group list can grow between counting it and reading it.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => continue,
+            Err(e) => return Err(e),
         }
     }
 }
@@ -940,31 +1106,37 @@ fn write_chunks(out: &mut impl Write, bytes: &[u8], fault: &dyn Fn(Stage) -> io:
 /// Elsewhere there is no call to ask, and a file whose extended attributes cannot be counted is
 /// not written at all rather than risk dropping them.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn xattr_names(_fd: RawFd) -> io::Result<usize> {
+fn xattr_names(_fd: RawFd) -> io::Result<Vec<Vec<u8>>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "this system's extended attributes cannot be counted",
     ))
 }
 
-/// The number of extended attribute names on the open file `fd`. A file system without extended
+/// The extended attribute names on the open file `fd`. A file system without extended
 /// attributes has none.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn xattr_names(fd: RawFd) -> io::Result<usize> {
+fn xattr_names(fd: RawFd) -> io::Result<Vec<Vec<u8>>> {
     loop {
         // SAFETY: a null buffer of size 0 asks only for the size; the descriptor is open.
         let size = match retry_isize(|| unsafe { flistxattr(fd, std::ptr::null_mut(), 0) }) {
             Ok(size) => size,
-            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => return Ok(0),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
         if size == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let mut buf = vec![0u8; size];
         // SAFETY: `buf` is valid and writable for `buf.len()` bytes; the descriptor is open.
         match retry_isize(|| unsafe { flistxattr(fd, buf.as_mut_ptr().cast(), buf.len()) }) {
-            Ok(got) => return Ok(buf[..got].split(|&b| b == 0).filter(|n| !n.is_empty()).count()),
+            Ok(got) => {
+                return Ok(buf[..got]
+                    .split(|&b| b == 0)
+                    .filter(|n| !n.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect())
+            }
             // Grown since the size was asked: ask again.
             Err(e) if e.raw_os_error() == Some(libc::ERANGE) => continue,
             Err(e) => return Err(e),
@@ -1126,4 +1298,132 @@ fn unlink_at(dir: &OwnedFd, name: &CString, flags: libc::c_int) -> io::Result<()
 fn sync_fd(fd: RawFd) -> io::Result<()> {
     // SAFETY: the descriptor is open for the call; `fsync` takes no pointers.
     retry(|| unsafe { libc::fsync(fd) }).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_scratch_dir::ScratchDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    thread_local! {
+        /// A change after the link's stat was checked, before its target is read.
+        pub(super) static BEFORE_READ_LINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        /// A permission bit lost despite a successful chmod.
+        pub(super) static AFTER_CHMOD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn root_can_preserve_set_id_modes_on_another_users_file() {
+        for wanted in [0o4755, 0o2755, 0o6755] {
+            for current in [0o644, wanted] {
+                assert!(can_preserve_mode(wanted, current, 1001, 1002, 0, false, false).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn file_capabilities_are_refused_for_every_effective_user() {
+        for euid in [0, 1000, 1001] {
+            assert!(can_preserve_mode(0o755, 0o755, 1000, 1002, euid, true, true).is_err());
+        }
+    }
+
+    #[test]
+    fn a_non_owner_can_only_keep_an_unchanged_unprivileged_mode() {
+        assert!(can_preserve_mode(0o664, 0o664, 1001, 1002, 1000, true, false).is_ok());
+        for bit in 0..12 {
+            assert!(can_preserve_mode(0o664 ^ (1 << bit), 0o664, 1001, 1002, 1000, true, false).is_err());
+        }
+        for mode in [0o4664, 0o2664, 0o6664] {
+            assert!(can_preserve_mode(mode, mode, 1001, 1002, 1000, true, false).is_err());
+        }
+    }
+
+    #[test]
+    fn set_group_id_requires_membership_in_the_files_group() {
+        for current in [0o755, 0o2755] {
+            assert!(can_preserve_mode(0o2755, current, 1000, 1002, 1000, false, false).is_err());
+            assert!(can_preserve_mode(0o2755, current, 1000, 1002, 1000, true, false).is_ok());
+        }
+        assert!(can_preserve_mode(0o755, 0o2755, 1000, 1002, 1000, false, false).is_ok());
+    }
+
+    #[test]
+    fn an_owner_can_preserve_set_user_id_and_change_permission_bits() {
+        for wanted in [0o4755, 0o600, 0o1755] {
+            assert!(can_preserve_mode(wanted, 0o644, 1000, 1002, 1000, false, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn an_in_place_write_puts_back_the_file_when_chmod_does_not_keep_its_mode() {
+        let scratch = ScratchDir::new("eitri-write", "mode-lost");
+        let project = scratch.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let path = project.join("file");
+        std::fs::write(&path, b"before\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let review = scratch.join("review");
+        let shadow = Shadow::open_with_excludes(&review, &project, None).unwrap();
+        let journal = Journal::open(&review).unwrap();
+        let root = ProjectDir::open(&project).unwrap();
+        let target = root.target(Path::new("file"), false).unwrap();
+        let parent = parent_of(&target).unwrap();
+        let st = stat_at(parent, &target.leaf).unwrap();
+        let note = JournalNote {
+            session: "s1".into(),
+            path: PathBuf::from("file"),
+            pre: Some(shadow.store_blob(b"before\n").unwrap()),
+            pre_mode: 0o600,
+            intended: Some(shadow.store_blob(b"after\n").unwrap()),
+        };
+        let changed = path.clone();
+        AFTER_CHMOD.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }));
+        });
+        let result = in_place(
+            parent,
+            &target,
+            &st,
+            b"after\n",
+            0o640,
+            &note,
+            &journal,
+            &shadow,
+            &|_| Ok(()),
+        );
+        assert!(matches!(result, Err(WriteError::RolledBack(_))), "{result:?}");
+        assert!(AFTER_CHMOD.with(|hook| hook.borrow().is_none()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"before\n");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert!(std::fs::read_dir(journal.dir()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_link_removed_or_replaced_before_reading_its_target_is_changed() {
+        for replace_with_file in [false, true] {
+            let scratch = ScratchDir::new("eitri-write", "link-changed");
+            let path = scratch.join("link");
+            std::os::unix::fs::symlink("judged", &path).unwrap();
+            let root = ProjectDir::open(&scratch).unwrap();
+            let target = root.target(Path::new("link"), false).unwrap();
+            let parent = parent_of(&target).unwrap();
+            let st = stat_at(parent, &target.leaf).unwrap();
+            BEFORE_READ_LINK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::remove_file(&path).unwrap();
+                    if replace_with_file {
+                        std::fs::write(path, b"replacement\n").unwrap();
+                    }
+                }));
+            });
+            assert!(!still_as_judged(parent, &target.leaf, &st, None, Some(b"judged")).unwrap());
+            assert!(BEFORE_READ_LINK.with(|hook| hook.borrow().is_none()));
+        }
+    }
 }

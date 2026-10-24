@@ -1,7 +1,7 @@
 import { memo } from "react";
 import type { ReactNode } from "react";
 import type { InputChange, ToolCallDenial, ToolCallRecord } from "./types";
-import { codexChangePreview, editPreview, lineDiff } from "./diff";
+import { codexChangePreview, editPreview, lineDiff, splitLines } from "./diff";
 import { EditDiff } from "./components/EditDiff";
 import { HiddenWarning, Revealed } from "./components/Revealed";
 import { subagentOf } from "./externalTools";
@@ -363,7 +363,8 @@ function acpConfig(name: string): ToolRenderConfig {
           </div>
           {diffs.map((diff, i) => {
             const shown = lineDiff(diff.oldText ?? "", diff.newText ?? "");
-            const count = (k: "added" | "removed") => shown?.filter((l) => l.kind === k).length ?? 0;
+            const count = (k: "added" | "removed") =>
+              shown?.filter((l) => l.kind === k).length ?? splitLines(k === "added" ? diff.newText ?? "" : diff.oldText ?? "").length;
             return (
               <EditDiff
                 key={i}

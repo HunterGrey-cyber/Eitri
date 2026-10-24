@@ -775,7 +775,16 @@ impl RevertJob {
             || Refusal::ChangedSinceEnd,
         )?;
         let note = journal_note(&self.session, &rel, &current, &pre, &post);
-        replace(&target, &planned.content, &note, &journal, &shadow, &self.fs_hooks).map_err(Refusal::Write)?;
+        replace(
+            &target,
+            &planned.content,
+            &note,
+            &journal,
+            &shadow,
+            &self.fs_hooks,
+            current.link_target(),
+        )
+        .map_err(Refusal::Write)?;
         Ok(AppliedRevert {
             session: self.session,
             turn: resolved.current,
@@ -844,7 +853,16 @@ impl UndoJob {
         )?;
         // The path now holds `post`, and `pre` is what goes in.
         let note = journal_note(&self.session, &rel, &current, &self.post, &self.pre);
-        replace(&target, &content, &note, &journal, &shadow, &self.fs_hooks).map_err(Refusal::Write)
+        replace(
+            &target,
+            &content,
+            &note,
+            &journal,
+            &shadow,
+            &self.fs_hooks,
+            current.link_target(),
+        )
+        .map_err(Refusal::Write)
     }
 }
 
@@ -1033,7 +1051,16 @@ fn restore_entry(
         mode: entry.mode,
     };
     let note = journal_note(&entry.session, &rel, &current, &now, &restored);
-    replace(&target, &content, &note, journal, shadow, fs_hooks).map_err(Refusal::Write)?;
+    replace(
+        &target,
+        &content,
+        &note,
+        journal,
+        shadow,
+        fs_hooks,
+        current.link_target(),
+    )
+    .map_err(Refusal::Write)?;
     journal.remove(&entry.id, shadow).map_err(|e| {
         Refusal::Unavailable(format!(
             "{shown} was restored, but its interrupted revert could not be forgotten: {e}"

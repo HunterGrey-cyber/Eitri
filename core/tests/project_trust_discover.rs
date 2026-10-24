@@ -37,7 +37,10 @@ impl Fixture {
         #[cfg(target_os = "macos")]
         let outer = std::env::temp_dir().join(&uuid::Uuid::new_v4().simple().to_string()[..12]);
         #[cfg(not(target_os = "macos"))]
-        let outer = std::env::temp_dir().join(format!("eitri-trust-it-{label}-{}", uuid::Uuid::new_v4()));
+        let outer = std::env::temp_dir().join(format!(
+            "eitri-trust-it-{label}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         #[cfg(target_os = "macos")]
         let _ = label;
         std::fs::create_dir_all(&outer).unwrap();
@@ -1304,7 +1307,7 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
 
     // A `.codex/` that is CODEX_HOME and holds nothing else is nothing to trust.
     let only = fx.base.join("only");
-    std::fs::create_dir_all(&only).unwrap();
+    fx.repo(&only, false);
     let env = ProfileEnv {
         codex_home: Some(only.join(".codex")),
         fallback_names: Vec::new(),
@@ -1314,6 +1317,60 @@ fn codex_profile_skips_home_dot_codex_only_when_it_is_codex_home() {
     write(&only.join(".codex/config.toml"), b"model = \"x\"\n");
     let lone = discover(&only, None, &Limits::default(), &Profile::Codex, &env);
     assert!(lone.nothing_to_trust(), "{:?}", lone.entries);
+}
+
+#[test]
+fn a_linked_worktree_with_a_symlinked_git_directory_is_uncheckable_only_for_codex() {
+    let fx = Fixture::new("codex-wt-link");
+    let main = fx.home.join("main");
+    fx.repo(&main, true);
+    write(&main.join(".codex/hooks.json"), b"{}");
+    let wt = fx.home.join("wt");
+    fx.git(&main, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+    let gitfile = wt.join(".git");
+    let contents = std::fs::read_to_string(&gitfile).unwrap();
+    let gitdir = contents.strip_prefix("gitdir: ").unwrap().trim();
+    std::fs::remove_file(&gitfile).unwrap();
+    symlink(gitdir, &gitfile).unwrap();
+    write(&wt.join(".codex/config.toml"), b"model = \"w\"\n");
+    write(&wt.join("CLAUDE.md"), b"project instructions\n");
+
+    let found = fx.discover_as(&wt, &Profile::Codex, &fx.codex_env());
+    assert!(!found.fully_hashed());
+    assert!(found.uncheckable().iter().any(|(path, reason)| {
+        *path == Path::new(".git") && *reason == "a .git here could not be checked, so the main checkout whose .codex/ hooks Codex reads for a linked worktree cannot be found"
+    }), "{:?}", found.uncheckable());
+    let claude = fx.discover(&wt);
+    assert!(!claude.nothing_to_trust());
+    assert!(claude.fully_hashed(), "{:?}", claude.uncheckable());
+}
+
+#[test]
+fn a_linked_worktree_with_symlinked_objects_is_uncheckable_only_for_codex() {
+    let fx = Fixture::new("codex-wt-objects-link");
+    let main = fx.home.join("main");
+    fx.repo(&main, true);
+    write(&main.join(".codex/hooks.json"), b"{}");
+    let wt = fx.home.join("wt");
+    fx.git(&main, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+    write(&wt.join(".codex/config.toml"), b"model = \"w\"\n");
+    write(&wt.join("CLAUDE.md"), b"project instructions\n");
+    let claude_before = fx.discover(&wt);
+    let objects = main.join(".git/objects");
+    let moved = main.join(".git/saved-objects");
+    std::fs::rename(&objects, &moved).unwrap();
+    symlink(&moved, &objects).unwrap();
+    assert_eq!(
+        fx.git(&wt, &["rev-parse", "--show-toplevel"]).trim(),
+        wt.to_str().unwrap()
+    );
+
+    let found = fx.discover_as(&wt, &Profile::Codex, &fx.codex_env());
+    assert!(!found.fully_hashed(), "{:?}", found.findings);
+    let claude = fx.discover(&wt);
+    assert!(claude.fully_hashed(), "{:?}", claude.uncheckable());
+    assert_eq!(claude.fingerprint, claude_before.fingerprint);
+    assert_eq!(claude.entries, claude_before.entries);
 }
 
 #[test]

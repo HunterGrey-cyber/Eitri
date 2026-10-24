@@ -217,7 +217,7 @@ function installSanitizeHooks(): void {
         const text = fencedTexts[Number(marker[1])];
         if (text !== undefined && node instanceof Element && node.tagName === "PRE") {
           kept.push("code-block");
-          node.setAttribute(CODE_TEXT_ATTR, text);
+          node.setAttribute(CODE_TEXT_ATTR, JSON.stringify(text));
         }
       } else if (token === "code-escape") {
         if (node instanceof Element && node.tagName === "SPAN" && ESCAPE_TEXT.test(node.textContent ?? "")) {
@@ -392,10 +392,17 @@ export function renderedText(el: HTMLElement): string {
 
 /** The text of a fenced code block a copy should take. A block the renderer wrote carries its own
  *  fence's text (`CODE_TEXT_ATTR`), which no later markup inside the element can change; only a block
- *  without it (not one this module produced) falls back to what is rendered. */
+ *  without valid stored text falls back to what is rendered. */
 export function codeBlockText(block: HTMLElement): string {
   const own = block.getAttribute(CODE_TEXT_ATTR);
-  if (own !== null) return own;
+  if (own !== null) {
+    try {
+      const text: unknown = JSON.parse(own);
+      if (typeof text === "string") return text;
+    } catch {
+      // A damaged attribute leaves the rendered code as the copy source.
+    }
+  }
   const code = block.querySelector<HTMLElement>("code");
   return renderedText(code ?? block);
 }

@@ -12,7 +12,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -32,6 +33,7 @@ impl Limits {
     };
 }
 
+pub const MAX_STORE_IN_FLIGHT: usize = 32;
 pub const MAX_KEYS: usize = 64;
 pub const MAX_VALUE_BYTES: usize = 192 * 1024;
 pub const MAX_ITEM_BYTES: usize = 64 * 1024;
@@ -563,6 +565,7 @@ impl PluginStore {
 /// window cannot hold every later operation. An operation is still run when it reaches the worker after its
 /// deadline, so a write the page was told timed out may still apply.
 pub struct StoreWorker {
+    in_flight: Arc<AtomicUsize>,
     tx: mpsc::Sender<(u64, StoreOp, Instant)>,
     rx: mpsc::Receiver<(u64, Result<Value, StoreError>)>,
 }
@@ -577,27 +580,39 @@ impl StoreWorker {
     ) -> std::io::Result<StoreWorker> {
         let (tx, jobs) = mpsc::channel::<(u64, StoreOp, Instant)>();
         let (done, rx) = mpsc::channel();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let worker_in_flight = in_flight.clone();
         std::thread::Builder::new().name("plugin-store".into()).spawn(move || {
             for (re, op, until) in jobs {
                 if let Some(gate) = &gate {
                     let _ = gate.recv();
                 }
                 let result = store.run(op, until);
-                if done.send((re, result)).is_err() {
+                let sent = done.send((re, result));
+                worker_in_flight.fetch_sub(1, Ordering::Relaxed);
+                if sent.is_err() {
                     return;
                 }
                 wake();
             }
         })?;
-        Ok(StoreWorker { tx, rx })
+        Ok(StoreWorker { tx, rx, in_flight })
     }
 
     pub fn submit(&self, re: u64, op: StoreOp, until: Instant) {
-        let _ = self.tx.send((re, op, until));
+        // Reserve before publishing the job: the worker may finish before send returns.
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send((re, op, until)).is_err() {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn try_results(&self) -> Vec<(u64, Result<Value, StoreError>)> {
         self.rx.try_iter().collect()
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 }
 

@@ -769,6 +769,9 @@ impl Scan<'_> {
 const UNPLACED_COMMON_REASON: &str =
     "the git directory of this linked worktree is not named .git, so the main checkout whose .codex/ hooks Codex reads cannot be found";
 
+const UNVERIFIED_GIT_REASON: &str =
+    "a .git here could not be checked, so the main checkout whose .codex/ hooks Codex reads for a linked worktree cannot be found";
+
 /// Why a `.codex/` that is the user's `CODEX_HOME` is named and not read.
 const CODEX_HOME_REASON: &str = "the user's own Codex configuration (CODEX_HOME), not read";
 
@@ -939,6 +942,19 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
             if let Some(common) = &walk.unplaced_common {
                 if scan.room() {
                     scan.unreadable(relative(&top, common), UNPLACED_COMMON_REASON.to_string());
+                }
+            }
+            let unverified: std::collections::BTreeSet<PathBuf> = scan
+                .findings
+                .iter()
+                .filter_map(|finding| match finding {
+                    Finding::GitUnverified { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect();
+            for path in unverified {
+                if scan.room() {
+                    scan.unreadable(path, UNVERIFIED_GIT_REASON.to_string());
                 }
             }
             // A linked worktree's main checkout, when it is somewhere else than the worktree.

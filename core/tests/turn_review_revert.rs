@@ -1488,7 +1488,7 @@ fn revert_crash_child() {
         bytes: new,
         mode: 0o644,
     };
-    let _ = replace(&target, &content, &note, &journal, &shadow, &hooks);
+    let _ = replace(&target, &content, &note, &journal, &shadow, &hooks, None);
     unreachable!("the write was to abort");
 }
 

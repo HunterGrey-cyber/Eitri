@@ -20,6 +20,7 @@ import type { DashItem } from "./Dashboard";
 import { WhichKeyBox } from "./WhichKeyBox";
 import { classify, failureEvidence, remedyNamesR } from "../problems";
 import { agentTitle } from "../externalTools";
+import { copyToPrimary } from "../primaryCopy";
 import { isExternalAgent } from "../tabs";
 import { hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TypingGuard } from "../typingGuard";
 
@@ -659,6 +660,7 @@ export function EmptyTab(props: EmptyTabProps) {
       if (handoff !== null) {
         event.preventDefault();
         void navigator.clipboard?.writeText(handoff.command);
+        copyToPrimary(handoff.command);
         return;
       }
     }

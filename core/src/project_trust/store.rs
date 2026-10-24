@@ -122,6 +122,12 @@ fn record_name(root: &Path, profile: &Profile) -> String {
     }
 }
 
+fn record_temporary(path: &Path) -> PathBuf {
+    let mut name = path.file_name().expect("a record has a file name").to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
 /// The record at `path` when it is a usable one for `root` and `profile`, read without following
 /// a link.
 fn read_usable_at(path: &Path, root: &Path, profile: &Profile) -> Option<Record> {
@@ -254,7 +260,7 @@ impl TrustStore {
             ));
         }
         state_paths::create_state_dir(&dir)?;
-        let tmp = state_paths::temporary(&path);
+        let tmp = record_temporary(&path);
         let written =
             agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(err) = written {
@@ -444,6 +450,58 @@ pub fn civil_date(unix: u64) -> String {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    #[test]
+    fn each_profile_has_its_own_temporary_record_and_reads_back() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-record-profiles");
+        let root = scratch.0.join("root");
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::write(root.join(".codex/config.toml"), "model = 'test'\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "instructions\n").unwrap();
+        let store = TrustStore::at(Some(scratch.0.join("trust")));
+        let acp = Profile::Acp {
+            name: "demo".into(),
+            files: vec!["AGENTS.md".into()],
+        };
+        let profiles = [Profile::Claude, Profile::Codex, acp];
+        let paths: Vec<_> = profiles
+            .iter()
+            .map(|profile| store.record_path(&root, profile).unwrap())
+            .collect();
+        let temps: Vec<_> = paths.iter().map(|path| record_temporary(path)).collect();
+        for (path, temp) in paths.iter().zip(&temps) {
+            assert_eq!(temp.parent(), path.parent());
+            assert_eq!(
+                temp.file_name().unwrap(),
+                format!(
+                    "{}.{}.tmp",
+                    path.file_name().unwrap().to_str().unwrap(),
+                    std::process::id()
+                )
+                .as_str()
+            );
+            assert_eq!(temp.extension(), Some(OsStr::new("tmp")));
+        }
+        assert_eq!(temps.iter().collect::<std::collections::BTreeSet<_>>().len(), 3);
+        let discoveries: Vec<_> = profiles[1..]
+            .iter()
+            .map(|profile| {
+                discover(
+                    &root,
+                    Some(&scratch.0),
+                    &Limits::default(),
+                    profile,
+                    &ProfileEnv::default(),
+                )
+            })
+            .collect();
+        for discovery in &discoveries {
+            store.record(discovery, 1).unwrap();
+        }
+        for discovery in discoveries {
+            assert!(matches!(store.state(discovery), TrustState::Trusted { .. }));
+        }
+    }
 
     #[test]
     fn every_state_path_is_unchanged() {

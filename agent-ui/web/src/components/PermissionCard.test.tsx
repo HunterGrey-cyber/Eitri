@@ -466,3 +466,20 @@ it("names the key that answers it on Approve and Deny, as data the stylesheet dr
   expect(container.querySelector('[data-nav-action="deny"]')!.getAttribute("data-key")).toBe("d");
   expect(container.querySelector('[data-nav-action="allow"]')!.textContent).toBe("Approve");
 });
+
+it("shows the last line of a Write above the diff cap", () => {
+  const content = [...Array.from({ length: 400 }, (_, i) => `line ${i}`), "rm -rf important"].join("\n");
+  const { container } = render(<PermissionCard request={{ ...REQUEST, toolName: "Write", input: { file_path: "/p/run.sh", content } }} sessionEnded={false} onAnswer={vi.fn()} />);
+  expect(container.textContent).toContain("rm -rf important");
+  expect(container.textContent).not.toContain("Too large to show here");
+  expect(container.querySelectorAll(".diff-added")).toHaveLength(401);
+});
+
+it("shows every removed and added line of a large Edit", () => {
+  const oldLines = Array.from({ length: 401 }, (_, i) => `old ${i}`);
+  const newLines = Array.from({ length: 402 }, (_, i) => `new ${i}`);
+  const { container } = render(<PermissionCard request={{ ...REQUEST, toolName: "Edit", input: { file_path: "/p/a", old_string: oldLines.join("\n"), new_string: newLines.join("\n") } }} sessionEnded={false} onAnswer={vi.fn()} />);
+  expect(Array.from(container.querySelectorAll(".diff-removed .diff-text"), (line) => line.textContent)).toEqual(oldLines);
+  expect(Array.from(container.querySelectorAll(".diff-added .diff-text"), (line) => line.textContent)).toEqual(newLines);
+  expect(container.textContent).not.toContain("Too large to show here");
+});

@@ -581,14 +581,16 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         link::start(
             start.nvim.clone(),
             sockets,
-            move |state, band, peer_pid| {
+            move |state, band, peer_pid, connect_began| {
                 let was = attached.get();
                 let now = matches!(state, LinkState::Attached { .. });
                 attached.set(now);
                 // A new editor starts empty: forget the last one's file and selection as a connect
                 // begins and as an attached editor goes. Not on arriving at `Attached`: the install
-                // makes the editor send its first context, and that line may be read just before.
-                if matches!(state, LinkState::Connecting { .. }) || (was && !now) {
+                // makes the editor send its first context, and that line may be read just before. A
+                // connect that began and attached within one poll still resets: losing the new editor's
+                // first context costs a cursor move, keeping the old editor's would send it with a turn.
+                if connect_began || matches!(state, LinkState::Connecting { .. }) || (was && !now) {
                     reset_context();
                 }
                 // GNOME's extension is told which window the editor is once it is known, and that

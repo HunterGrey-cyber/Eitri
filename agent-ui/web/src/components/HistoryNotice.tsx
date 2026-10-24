@@ -1,5 +1,6 @@
 import type { HistoryNotice as HistoryNoticeData } from "../types";
 import { historyNoticeText } from "../history";
+import { copyToPrimary } from "../primaryCopy";
 
 /**
  * One fixed line at the top of the conversation saying what this session was seeded with
@@ -34,7 +35,10 @@ export function HistoryNotice({ notice }: { notice: HistoryNoticeData }) {
       <span>{historyNoticeText(notice)}</span>
       {/* `title` as well as the clipboard: the path is long and absolute, so it is reachable on
           hover without being pasted into the sentence and wrapping a narrow panel several times. */}
-      <button title={notice.sourcePath} onClick={() => void navigator.clipboard?.writeText(notice.sourcePath)}>
+      <button title={notice.sourcePath} onClick={() => {
+        void navigator.clipboard?.writeText(notice.sourcePath);
+        copyToPrimary(notice.sourcePath);
+      }}>
         Copy path
       </button>
     </div>

@@ -10080,10 +10080,10 @@ describe("gx: web links on a row", () => {
       expect(clickAt(container.querySelector(".row a[href]")!, 10_000)).toBe(true);
     });
 
-    it("leaves a mail link to Rust's own check", () => {
+    it("holds a mail link whose text does not show its address", () => {
       const { container } = withReply("write [to us](mailto:a@example.com)");
       boxLinks(container);
-      expect(clickAt(container.querySelector(".row a[href]")!, 10_000)).toBe(true);
+      expect(clickAt(container.querySelector(".row a[href]")!, 10_000)).toBe(false);
     });
   });
 });

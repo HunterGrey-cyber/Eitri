@@ -22,6 +22,8 @@ pub struct LinkPoll {
     /// The link's state after the poll, when it changed: the state, the band's view of it and the
     /// pid of the process holding the editor's socket ([`CompanionLink::nvim_pid`]).
     pub changed: Option<(LinkState, BandLink, Option<u32>)>,
+    /// A connection began during this poll, even if it is already attached.
+    pub connect_began: bool,
     /// Draft edits in the editor must end (the editor went away or was swapped).
     pub cancel_drafts: bool,
     /// The driver is shut: stop polling.
@@ -63,6 +65,7 @@ impl CompanionLink {
         LinkPoll {
             logs: tick.logs,
             changed,
+            connect_began: tick.connect_began,
             cancel_drafts: tick.cancel_drafts,
             shut: self.driver.borrow().is_shut(),
         }

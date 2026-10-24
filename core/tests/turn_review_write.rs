@@ -112,7 +112,16 @@ impl Fixture {
 
     fn replace(&self, rel: &str, new: &Content, note: &JournalNote, hooks: &FsHooks) -> Result<(), WriteError> {
         let target = self.root.target(Path::new(rel), true).unwrap();
-        replace(&target, new, note, &self.journal, &self.shadow, hooks)
+        let current = read_current(&target).unwrap();
+        replace(
+            &target,
+            new,
+            note,
+            &self.journal,
+            &self.shadow,
+            hooks,
+            current.link_target(),
+        )
     }
 
     /// The shadow's refs under `prefix`.
@@ -367,7 +376,16 @@ fn an_ordinary_file_is_replaced_atomically() {
         bytes: new.clone(),
         mode: 0o755,
     };
-    replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    replace(
+        &target,
+        &content,
+        &note,
+        &fx.journal,
+        &fx.shadow,
+        &FsHooks::default(),
+        None,
+    )
+    .unwrap();
 
     assert_eq!(std::fs::read(fx.file("bin/run")).unwrap(), new);
     assert_ne!(
@@ -407,7 +425,15 @@ fn a_hard_linked_file_is_never_written() {
         mode: 0o640,
     };
     assert_eq!(
-        replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()),
+        replace(
+            &target,
+            &content,
+            &note,
+            &fx.journal,
+            &fx.shadow,
+            &FsHooks::default(),
+            None
+        ),
         Err(WriteError::HardLinked { links: 2 })
     );
     let message = WriteError::HardLinked { links: 2 }.to_string();
@@ -445,7 +471,16 @@ fn a_file_with_an_xattr_is_written_in_place() {
         bytes: new.clone(),
         mode: 0o644,
     };
-    replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    replace(
+        &target,
+        &content,
+        &note,
+        &fx.journal,
+        &fx.shadow,
+        &FsHooks::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(std::fs::read(fx.file("x.txt")).unwrap(), new);
     assert_eq!(meta(&fx.file("x.txt")).ino(), inode);
     let mut value = [0u8; 8];
@@ -453,6 +488,149 @@ fn a_file_with_an_xattr_is_written_in_place() {
     let got = unsafe { xattr_sys::get(&path, &name, &mut value) };
     assert_eq!(got, 3, "the attribute is still there");
     assert_eq!(&value[..3], b"yes");
+}
+
+#[test]
+fn an_in_place_write_restores_set_id_bits_cleared_by_writing() {
+    let scratch = Scratch::new("set-id");
+    let fx = Fixture::at(&scratch.0);
+    let path = fx.file("a.txt");
+    write_file(&path, b"before\n", 0o4755);
+    if !force_in_place(&path) {
+        return;
+    }
+    let note = fx.note("a.txt", b"before\n", 0o4755, b"after\n");
+    fx.replace(
+        "a.txt",
+        &Content::Bytes {
+            bytes: b"after\n".to_vec(),
+            mode: 0o4755,
+        },
+        &note,
+        &FsHooks::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"after\n");
+    // Root keeps the set-id bit on write, so it cannot exercise the kernel clearing it.
+    if unsafe { libc::geteuid() } == 0 {
+        println!("root keeps set-id bits on write; skipped the mode assertion");
+    } else {
+        assert_eq!(mode_of(&path), 0o4755);
+    }
+    assert!(names(fx.journal.dir()).is_empty());
+}
+
+#[test]
+fn an_in_place_write_refuses_a_parent_moved_out_after_journalling() {
+    let scratch = Scratch::new("in-place-moved");
+    let fx = Fixture::at(&scratch.0);
+    write_file(&fx.file("dir/a.txt"), b"before\n", 0o644);
+    if !force_in_place(&fx.file("dir/a.txt")) {
+        return;
+    }
+    let parent = fx.file("dir");
+    let moved = scratch.path("moved");
+    let moved_hook = moved.clone();
+    let hooks = FsHooks {
+        fault: Some(Arc::new(move |stage| {
+            if stage == Stage::JournalWritten {
+                std::fs::rename(&parent, &moved_hook)?;
+            }
+            Ok(())
+        })),
+        ..FsHooks::default()
+    };
+    let note = fx.note("dir/a.txt", b"before\n", 0o644, b"after\n");
+    assert_eq!(
+        fx.replace(
+            "dir/a.txt",
+            &Content::Bytes {
+                bytes: b"after\n".to_vec(),
+                mode: 0o644
+            },
+            &note,
+            &hooks
+        ),
+        Err(WriteError::Changed)
+    );
+    assert_eq!(std::fs::read(moved.join("a.txt")).unwrap(), b"before\n");
+    assert!(names(fx.journal.dir()).is_empty());
+}
+
+#[test]
+fn an_atomic_write_refuses_a_parent_moved_out_before_the_rename() {
+    let scratch = Scratch::new("atomic-moved");
+    let fx = Fixture::at(&scratch.0);
+    write_file(&fx.file("dir/a.txt"), b"before\n", 0o644);
+    let parent = fx.file("dir");
+    let moved = scratch.path("moved");
+    let moved_hook = moved.clone();
+    let hooks = FsHooks {
+        fault: Some(Arc::new(move |stage| {
+            if stage == Stage::Synced {
+                std::fs::rename(&parent, &moved_hook)?;
+            }
+            Ok(())
+        })),
+        ..FsHooks::default()
+    };
+    let note = fx.note("dir/a.txt", b"before\n", 0o644, b"after\n");
+    assert_eq!(
+        fx.replace(
+            "dir/a.txt",
+            &Content::Bytes {
+                bytes: b"after\n".to_vec(),
+                mode: 0o644
+            },
+            &note,
+            &hooks
+        ),
+        Err(WriteError::Changed)
+    );
+    assert_eq!(std::fs::read(moved.join("a.txt")).unwrap(), b"before\n");
+    no_temp_left(&moved);
+}
+
+#[test]
+fn a_link_swapped_before_the_first_stat_is_left_alone() {
+    thread_local! {
+        static SWAP: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+    fn swap_link(_: &eitri_core::turn_review::Target) -> std::io::Result<u64> {
+        let path = SWAP.with(|slot| slot.borrow_mut().take().unwrap());
+        std::fs::remove_file(&path)?;
+        std::os::unix::fs::symlink("new", path)?;
+        Ok(u64::MAX)
+    }
+    let scratch = Scratch::new("link-swapped");
+    let fx = Fixture::at(&scratch.0);
+    std::os::unix::fs::symlink("old", fx.file("a")).unwrap();
+    SWAP.with(|slot| *slot.borrow_mut() = Some(fx.file("a")));
+    let note = JournalNote {
+        session: "s1".into(),
+        path: "a".into(),
+        pre: None,
+        pre_mode: 0o777,
+        intended: None,
+    };
+    let hooks = FsHooks {
+        free_bytes: swap_link,
+        fault: None,
+    };
+    assert_eq!(
+        fx.replace(
+            "a",
+            &Content::Bytes {
+                bytes: b"restored\n".to_vec(),
+                mode: 0o644
+            },
+            &note,
+            &hooks
+        ),
+        Err(WriteError::Changed)
+    );
+    assert_eq!(std::fs::read_link(fx.file("a")).unwrap(), Path::new("new"));
+    no_temp_left(&fx.project);
 }
 
 #[test]
@@ -492,7 +670,16 @@ fn a_symlink_is_replaced_as_a_link() {
     let content = Content::Symlink {
         target: b"real.txt".to_vec(),
     };
-    replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    replace(
+        &target,
+        &content,
+        &note,
+        &fx.journal,
+        &fx.shadow,
+        &FsHooks::default(),
+        Some(b"other.txt"),
+    )
+    .unwrap();
     assert_eq!(std::fs::read_link(fx.file("link")).unwrap(), Path::new("real.txt"));
     assert_eq!(std::fs::read(fx.file("real.txt")).unwrap(), b"pointed at\n");
     assert_eq!(std::fs::read(fx.file("other.txt")).unwrap(), b"other\n");
@@ -504,7 +691,16 @@ fn a_symlink_is_replaced_as_a_link() {
         bytes: b"now a file\n".to_vec(),
         mode: 0o600,
     };
-    replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    replace(
+        &target,
+        &content,
+        &note,
+        &fx.journal,
+        &fx.shadow,
+        &FsHooks::default(),
+        Some(b"real.txt"),
+    )
+    .unwrap();
     assert!(meta(&fx.file("link")).is_file());
     assert_eq!(mode_of(&fx.file("link")), 0o600);
     assert_eq!(std::fs::read(fx.file("real.txt")).unwrap(), b"pointed at\n");
@@ -514,7 +710,16 @@ fn a_symlink_is_replaced_as_a_link() {
     let content = Content::Symlink {
         target: b"does/not/exist".to_vec(),
     };
-    replace(&gone, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    replace(
+        &gone,
+        &content,
+        &note,
+        &fx.journal,
+        &fx.shadow,
+        &FsHooks::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read_link(fx.file("new-link")).unwrap(),
         Path::new("does/not/exist")
@@ -979,14 +1184,31 @@ fn a_missing_parent_is_created_for_a_restore() {
         mode: 0o644,
     };
     assert!(matches!(
-        replace(&looked, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()),
+        replace(
+            &looked,
+            &content,
+            &note,
+            &fx.journal,
+            &fx.shadow,
+            &FsHooks::default(),
+            None
+        ),
         Err(WriteError::Io(_))
     ));
     assert!(!fx.file("a").exists());
 
     let target = fx.root.target(Path::new("a/b/c"), true).unwrap();
     assert!(fx.file("a/b").is_dir());
-    replace(&target, &content, &note, &fx.journal, &fx.shadow, &FsHooks::default()).unwrap();
+    replace(
+        &target,
+        &content,
+        &note,
+        &fx.journal,
+        &fx.shadow,
+        &FsHooks::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(std::fs::read(fx.file("a/b/c")).unwrap(), b"restored\n");
     assert_eq!(mode_of(&fx.file("a/b/c")), 0o644);
     // SAFETY: `umask` only swaps the mask; it is put straight back.

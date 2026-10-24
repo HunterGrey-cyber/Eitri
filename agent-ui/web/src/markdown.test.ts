@@ -384,7 +384,7 @@ describe("what a copy takes is what the reader sees", () => {
   it("a renderer-made block keeps its fence's own text beside the HTML and the real class", () => {
     const host = dom(renderMarkdown("```sh\nls -la <dir> && echo \"x\"\n```"));
     const block = host.querySelector<HTMLElement>("pre.code-block")!;
-    expect(block.getAttribute(CODE_TEXT_ATTR)).toBe('ls -la <dir> && echo "x"');
+    expect(block.getAttribute(CODE_TEXT_ATTR)).toBe(JSON.stringify('ls -la <dir> && echo "x"'));
     expect(codeBlockText(block)).toBe('ls -la <dir> && echo "x"');
   });
 
@@ -503,4 +503,17 @@ describe("what a reply cannot draw or link to", () => {
     for (const dropped of ["a", "b", "c", "d", "e"]) expect(hrefs[dropped] ?? null, dropped).toBeNull();
     expect(hrefs).toMatchObject({ f: "docs/a1.md", g: "page2.html", h: "#frag", i: "./v1:x", j: "docs/v1:x" });
   });
+});
+
+it.each(["x\u0000y", "\uD800", 'quotes " & < >'])("keeps fenced text %j through a fresh HTML parse", (text) => {
+  const host = document.createElement("div");
+  host.innerHTML = renderMarkdown("```\n" + text + "\n```");
+  expect(codeBlockText(host.querySelector("pre")!)).toBe(text);
+});
+
+it.each(["not JSON", "null", "42", "{}"])("falls back to rendered code for an invalid copy attribute %s", (value) => {
+  const block = document.createElement("pre");
+  block.innerHTML = "<code>visible code</code>";
+  block.setAttribute(CODE_TEXT_ATTR, value);
+  expect(codeBlockText(block)).toBe("visible code");
 });

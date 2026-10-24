@@ -29,7 +29,7 @@ use super::protocol::{
     EVENT_EDITOR_VIEW,
 };
 use super::roots::{self, PathRefusal};
-use super::state::{PluginStore, StoreError, StoreErrorKind, StoreOp, StoreWorker};
+use super::state::{PluginStore, StoreError, StoreErrorKind, StoreOp, StoreWorker, MAX_STORE_IN_FLIGHT};
 use super::tasks::{ExitKind, Launch, RunInfo, RunsWaiter, StartError, Stream, TaskEvent, TaskRunner};
 use super::theme::PageTheme;
 use super::trace;
@@ -192,9 +192,15 @@ enum CheckJob {
         window_root: Option<PathBuf>,
         home: Option<PathBuf>,
     },
-    /// A link of the followed document `doc`: `path` (relative, decoded) under the document's directory, or
-    /// under its project with `from_root`.
+    /// A link under the document's approved directory, or its approved project with `from_root`.
     Link {
+        project: PathBuf,
+        doc_dir: PathBuf,
+        path: String,
+        from_root: bool,
+    },
+    /// A link whose document has no approved project yet: look it up on the worker before checking the link.
+    LinkWithProjectLookup {
         doc: PathBuf,
         window_root: Option<PathBuf>,
         home: Option<PathBuf>,
@@ -220,21 +226,19 @@ fn project_of(doc: &Path, window_root: Option<&Path>, home: Option<&Path>) -> Op
 /// Where a document's link leads: a regular file inside the document's project, canonical. A document is
 /// untrusted text, so its links may name anything; only its own project is in reach, by canonical path, so
 /// neither `..` nor a symlink leads out. Reads the filesystem: the path worker only.
-fn link_inside(
-    doc: &Path,
-    window_root: Option<&Path>,
-    home: Option<&Path>,
-    path: &str,
-    from_root: bool,
-) -> Result<PathBuf, PathRefusal> {
-    let (project, doc_dir) = project_of(doc, window_root, home).ok_or(PathRefusal::OutsideRoots)?;
-    let base = if from_root { &project } else { &doc_dir };
+fn link_inside(project: &Path, doc_dir: &Path, path: &str, from_root: bool) -> Result<PathBuf, PathRefusal> {
+    if std::fs::canonicalize(project).ok().as_deref() != Some(project)
+        || std::fs::canonicalize(doc_dir).ok().as_deref() != Some(doc_dir)
+    {
+        return Err(PathRefusal::OutsideRoots);
+    }
+    let base = if from_root { project } else { doc_dir };
     let canonical = std::fs::canonicalize(base.join(path)).map_err(|_| PathRefusal::Missing)?;
     // A link inside the project can lead to a file whose own name holds a control character.
     if roots::has_control(&canonical.to_string_lossy()) {
         return Err(PathRefusal::ControlCharacter);
     }
-    if !canonical.starts_with(&project) {
+    if !canonical.starts_with(project) {
         return Err(PathRefusal::OutsideRoots);
     }
     let meta = std::fs::metadata(&canonical).map_err(|_| PathRefusal::Missing)?;
@@ -297,18 +301,22 @@ impl PathChecker {
                         Checked::Project(project_of(&doc, window_root.as_deref(), home.as_deref()))
                     }
                     CheckJob::Link {
+                        project,
+                        doc_dir,
+                        path,
+                        from_root,
+                    } => Checked::Path(link_inside(&project, &doc_dir, &path, from_root)),
+                    CheckJob::LinkWithProjectLookup {
                         doc,
                         window_root,
                         home,
                         path,
                         from_root,
-                    } => Checked::Path(link_inside(
-                        &doc,
-                        window_root.as_deref(),
-                        home.as_deref(),
-                        &path,
-                        from_root,
-                    )),
+                    } => Checked::Path(
+                        project_of(&doc, window_root.as_deref(), home.as_deref())
+                            .ok_or(PathRefusal::OutsideRoots)
+                            .and_then(|(project, doc_dir)| link_inside(&project, &doc_dir, &path, from_root)),
+                    ),
                 };
                 if done.send((ticket, checked)).is_err() {
                     return;
@@ -1020,7 +1028,7 @@ impl PluginHost {
 
     /// The newest view names this buffer: the route serves its project when it is known (a change starts a
     /// new generation, so addresses made for another project stop resolving), and it is looked up on the path
-    /// worker, once per name, when it is not.
+    /// worker when it is not; only a found project is cached by name.
     fn track_project(&self, name: &str) {
         let job = {
             let st = self.state.borrow();
@@ -1059,7 +1067,9 @@ impl PluginHost {
     fn project_found(&self, name: String, found: Option<(PathBuf, PathBuf)>) {
         let (slot, view, deliver) = {
             let mut st = self.state.borrow_mut();
-            st.projects.insert(name.clone(), found.clone());
+            if found.is_some() {
+                st.projects.insert(name.clone(), found.clone());
+            }
             let view = st.view.clone().filter(|v| v.name == name);
             (st.doc_slot.clone(), view, deliverable(&st))
         };
@@ -1993,12 +2003,20 @@ impl PluginHost {
         }
         let job = {
             let st = self.state.borrow();
-            CheckJob::Link {
-                doc,
-                window_root: st.window_root.clone(),
-                home: st.home.clone(),
-                path: rel.to_owned(),
-                from_root,
+            match st.projects.get(&name).cloned().flatten() {
+                Some((project, doc_dir)) => CheckJob::Link {
+                    project,
+                    doc_dir,
+                    path: rel.to_owned(),
+                    from_root,
+                },
+                None => CheckJob::LinkWithProjectLookup {
+                    doc,
+                    window_root: st.window_root.clone(),
+                    home: st.home.clone(),
+                    path: rel.to_owned(),
+                    from_root,
+                },
             }
         };
         let then = Then::Link {
@@ -2298,6 +2316,17 @@ impl PluginHost {
                 }
             }
         }
+        if st
+            .store
+            .as_ref()
+            .is_some_and(|worker| worker.in_flight() >= MAX_STORE_IN_FLIGHT)
+        {
+            return Some(Reply::err(
+                re,
+                ErrorCode::Busy,
+                "the plugin's store has too many operations in flight",
+            ));
+        }
         let ticket = st.next_ticket;
         st.next_ticket += 1;
         let document = st.document;
@@ -2370,6 +2399,16 @@ impl PluginHost {
                 answer_or_drop(self.id(), audience, &mut call, |_| None, &mut replies);
                 continue;
             }
+            if now >= call.deadline {
+                answer_or_drop(
+                    self.id(),
+                    audience,
+                    &mut call,
+                    |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY)),
+                    &mut replies,
+                );
+                continue;
+            }
             let kind = call.on.call;
             let answer = call.on.answer.try_take();
             match answer {
@@ -2399,17 +2438,6 @@ impl PluginHost {
                     },
                     &mut replies,
                 ),
-                None if now >= call.deadline => {
-                    // The request is still on its way to nvim and may run later, still ahead of every call made
-                    // after it, so nothing waits for its answer.
-                    answer_or_drop(
-                        self.id(),
-                        audience,
-                        &mut call,
-                        |re| Some(Reply::err(re, ErrorCode::EditorTimeout, EDITOR_BUSY)),
-                        &mut replies,
-                    );
-                }
                 None => keep.push(call),
             }
         }
@@ -2533,6 +2561,17 @@ impl PluginHost {
                 .iter()
                 .position(|p| matches!(p.on, AssistOp::Checking { ticket: t, .. } if t == ticket));
             let Some(i) = at else { continue };
+            if now >= st.parked[i].deadline {
+                let mut parked = st.parked.remove(i).expect("the parked check is present");
+                answer_or_drop(
+                    self.id(),
+                    audience,
+                    &mut parked,
+                    |re| Some(Reply::err(re, ErrorCode::Io, CHECK_TIMEOUT)),
+                    replies,
+                );
+                continue;
+            }
             match result {
                 Ok(root) => {
                     let parked = &mut st.parked[i];

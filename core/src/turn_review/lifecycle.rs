@@ -21,7 +21,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent::AgentDomainEvent;
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,7 @@ use super::revert::{
 };
 use super::shadow::{
     review_dir_for, FilePrint, LeftOut, Limits, Shadow, SnapshotKind, SnapshotLabel, SnapshotOutcome, SnapshotRef,
-    TurnMarks,
+    TurnMarks, READ_TIMEOUT,
 };
 use super::write::FsHooks;
 
@@ -1794,6 +1794,7 @@ impl TurnReview {
     pub fn overview_job(&self, session: &str, turn: TurnRef, scope: Scope, named: NamedPaths) -> OverviewJob {
         OverviewJob {
             spec: self.spec.clone(),
+            limits: self.options.limits.clone(),
             session: session.to_owned(),
             records: self.turns(session),
             turn,
@@ -1806,6 +1807,7 @@ impl TurnReview {
     pub fn diff_job(&self, session: &str, turn: u32, scope: Scope, path: &str) -> DiffJob {
         DiffJob {
             spec: self.spec.clone(),
+            limits: self.options.limits.clone(),
             session: session.to_owned(),
             records: self.turns(session),
             turn,
@@ -2639,6 +2641,7 @@ impl Worker {
 #[derive(Debug, Clone)]
 pub struct OverviewJob {
     spec: ShadowSpec,
+    limits: Limits,
     session: String,
     records: Vec<TurnRecord>,
     turn: TurnRef,
@@ -2652,12 +2655,18 @@ impl OverviewJob {
         let turns = merged_turns(&shadow, &self.session, self.records)?;
         // Made relative here, on the worker: it reads the file system.
         let named = self.named.relative_to(shadow.work_tree());
-        let (mut overview, plan) = head(self.session, turns, self.turn, self.scope, named.pending_no_result)?;
-        let (from, to) = match plan.compare {
+        let (mut overview, mut plan) = head(self.session, turns, self.turn, self.scope, named.pending_no_result)?;
+        let (from, mut to) = match plan.compare {
             Compare::Between { from, to } => (from, to),
             // Nothing is shown as the turn's change; the notes say why.
             Compare::NoBaseline(_) | Compare::NotReady => return Ok(overview),
         };
+        // Keep the throwaway tree reachable for every read this job makes of it.
+        let _hold = shadow
+            .lock_shared_until(Instant::now() + READ_TIMEOUT)
+            .map_err(|e| ReviewError::Unavailable(e.to_string()))?;
+        let live_large = snapshot_side(&shadow, &mut to, &self.limits)?;
+        plan.too_large.extend(live_large.keys().cloned());
         overview.compared = true;
         let changes = changed_files(&shadow, &from, &to).map_err(|e| ReviewError::Unavailable(e.to_string()))?;
         let mut rows: BTreeMap<PathBuf, OverviewFile> = BTreeMap::new();
@@ -2730,6 +2739,7 @@ impl OverviewJob {
 #[derive(Debug, Clone)]
 pub struct DiffJob {
     spec: ShadowSpec,
+    limits: Limits,
     session: String,
     records: Vec<TurnRecord>,
     turn: u32,
@@ -2742,10 +2752,14 @@ impl DiffJob {
         let shadow = self.spec.open().map_err(ReviewError::Unavailable)?;
         let Resolved {
             from,
-            to,
+            mut to,
             current,
-            too_large,
+            mut too_large,
         } = resolve_compare(&shadow, &self.session, &self.records, TurnRef::N(self.turn), self.scope)?;
+        let _hold = shadow
+            .lock_shared_until(Instant::now() + READ_TIMEOUT)
+            .map_err(|e| ReviewError::Unavailable(e.to_string()))?;
+        too_large.extend(snapshot_side(&shadow, &mut to, &self.limits)?.into_keys());
         if too_large.contains(&self.path) {
             return Err(ReviewError::TooLarge(self.path));
         }
@@ -2790,6 +2804,18 @@ impl DiffJob {
             }
         }
     }
+}
+
+/// Resolves the disk once so all reads of one job compare the same tree and size omissions.
+fn snapshot_side(shadow: &Shadow, side: &mut Side, limits: &Limits) -> Result<LeftOut, ReviewError> {
+    if *side != Side::WorkTree {
+        return Ok(LeftOut::default());
+    }
+    let (tree, large) = shadow
+        .scratch_tree(limits)
+        .map_err(|e| ReviewError::Unavailable(e.to_string()))?;
+    *side = Side::Snapshot(tree);
+    Ok(large.into_iter().collect())
 }
 
 /// What one file's review, revert or anchor compares, resolved from the snapshots the shadow keeps

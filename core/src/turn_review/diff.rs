@@ -202,7 +202,7 @@ fn resolve(shadow: &Shadow, side: &Side) -> Result<String, ShadowError> {
             check_id(id)?;
             Ok(id.clone())
         }
-        Side::WorkTree => shadow.scratch_tree(&Limits::default()),
+        Side::WorkTree => shadow.scratch_tree(&Limits::default()).map(|(tree, _)| tree),
     }
 }
 

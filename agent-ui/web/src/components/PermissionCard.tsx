@@ -10,7 +10,7 @@ import type {
   ProviderPrompt,
 } from "../types";
 import type { PermissionDecision } from "../bridge";
-import { codexChangePreview, editPreview, lineDiff, splitLines } from "../diff";
+import { codexChangePreview, editPreview, lineDiff, wholeReplacement } from "../diff";
 import type { EditPreview } from "../diff";
 import { isExternalTool, subagentOf } from "../externalTools";
 import { isUsableLink } from "../timeline";
@@ -206,7 +206,7 @@ function ToolInput({ toolName, input, createsFile }: { toolName: string; input: 
   if (preview !== null) {
     // No cap here: a card shows the whole change, unlike the folded preview a conversation row gets
     // (`EditDiff`'s `maxLines`).
-    return <EditDiff preview={preview} createsFile={createsFile} />;
+    return <EditDiff preview={preview} createsFile={createsFile} whole />;
   }
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : null;
   if (toolName === "Bash" && fields && typeof fields.command === "string") {
@@ -342,7 +342,7 @@ function CodexFileChanges({ input }: { input: Partial<CodexFileChangeInput> }) {
         <div key={i} className="permission-card-change">
           <ChangeNote change={change} />
           {/* Every line, however many: the card approves exactly this change. */}
-          <EditDiff preview={codexChangePreview(change, { whole: true })} />
+          <EditDiff preview={codexChangePreview(change, { whole: true })} whole />
         </div>
       ))}
       <AgentSays who="Codex" reason={input.reason} />
@@ -407,11 +407,7 @@ function CodexMcp({ input }: { input: Partial<CodexMcpInput> }) {
 export function acpPreview(diff: NonNullable<AcpCardInput["diffs"]>[number]): EditPreview {
   const before = typeof diff.oldText === "string" ? diff.oldText : "";
   const after = typeof diff.newText === "string" ? diff.newText : "";
-  const shown =
-    lineDiff(before, after) ?? [
-      ...splitLines(before).map((text) => ({ kind: "removed" as const, text })),
-      ...splitLines(after).map((text) => ({ kind: "added" as const, text })),
-    ];
+  const shown = lineDiff(before, after) ?? wholeReplacement(before, after);
   const count = (kind: "added" | "removed") => shown.filter((l) => l.kind === kind).length;
   return { filePath: String(diff.path), diff: shown, added: count("added"), removed: count("removed"), replaceAll: false, wholeFile: false };
 }
@@ -468,7 +464,7 @@ function AcpCall({ input }: { input: AcpCardInput }) {
               Changes <Shown text={String(diff.path)} what="path" />
             </div>
           ))
-        : diffs.map((diff, i) => <EditDiff key={i} preview={acpPreview(diff)} />)}
+        : diffs.map((diff, i) => <EditDiff key={i} preview={acpPreview(diff)} whole />)}
       {raw !== null && (
         <>
           <pre className="permission-card-input">

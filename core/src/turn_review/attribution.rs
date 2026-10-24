@@ -164,7 +164,6 @@ fn relative_path(path: &Path, root: &Path, canonical_root: &Path) -> Option<Path
     } else {
         root.join(path)
     };
-    let cleaned = lexically_clean(&absolute)?;
     let inside = |real: &Path, base: &Path| {
         real.strip_prefix(base)
             .ok()
@@ -175,14 +174,15 @@ fn relative_path(path: &Path, root: &Path, canonical_root: &Path) -> Option<Path
     // really `/private/var`, a linked checkout, a linked directory inside the project -- and the
     // snapshot lists the file where it really is. The file itself may be gone, so its directory
     // is resolved when it cannot be. Where that leads outside the project, so did the write.
-    let real = cleaned.canonicalize().ok().or_else(|| {
-        let name = cleaned.file_name()?;
-        Some(cleaned.parent()?.canonicalize().ok()?.join(name))
+    let real = absolute.canonicalize().ok().or_else(|| {
+        let name = absolute.file_name()?;
+        Some(absolute.parent()?.canonicalize().ok()?.join(name))
     });
     if let Some(real) = real {
         return inside(&real, canonical_root);
     }
     // Nothing of it is on disk to resolve.
+    let cleaned = lexically_clean(&absolute)?;
     [root, canonical_root]
         .into_iter()
         .find_map(|base| inside(&cleaned, base))
@@ -299,6 +299,26 @@ mod tests {
         let relative = named.relative_to(Path::new("/p"));
         let expected: BTreeSet<PathBuf> = ["src/a.rs", "b.rs", "c.rs"].into_iter().map(PathBuf::from).collect();
         assert_eq!(relative.paths, expected);
+    }
+
+    #[test]
+    fn parent_components_are_resolved_after_symbolic_links() {
+        let scratch = crate::test_scratch_dir::ScratchDir::new("eitri-attribution", "linked-parent");
+        std::fs::create_dir_all(scratch.join("dir/sub")).unwrap();
+        std::os::unix::fs::symlink("dir/sub", scratch.join("alias")).unwrap();
+        std::fs::write(scratch.join("a"), b"root").unwrap();
+        std::fs::write(scratch.join("dir/a"), b"nested").unwrap();
+        let root = scratch.canonicalize().unwrap();
+        assert_eq!(
+            relative_path(&root.join("alias/../a"), &root, &root),
+            Some("dir/a".into())
+        );
+        std::fs::remove_file(root.join("dir/a")).unwrap();
+        assert_eq!(
+            relative_path(&root.join("alias/../a"), &root, &root),
+            Some("dir/a".into())
+        );
+        assert_eq!(relative_path(&root.join("../outside"), &root, &root), None);
     }
 
     fn call_with(

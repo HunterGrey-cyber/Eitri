@@ -238,6 +238,8 @@ struct InstallWatch {
 pub struct Tick {
     /// The state is not the one the last tick left.
     pub state_changed: bool,
+    /// A new connection began, even if it attached before this poll returned.
+    pub connect_began: bool,
     /// The editor went away or was swapped: the drafts waiting on it must end.
     pub cancel_drafts: bool,
     /// Lines for the log, in order.
@@ -451,7 +453,7 @@ impl LinkDriver {
             }
             self.install = None;
         }
-        if *self.attacher.state() != self.last_state {
+        if tick.connect_began || *self.attacher.state() != self.last_state {
             self.last_state = self.attacher.state().clone();
             tick.state_changed = true;
         }
@@ -472,10 +474,13 @@ impl LinkDriver {
                 }
                 let channel = link.channel_id();
                 if let Some(addr) = self.current_addr() {
+                    // The socket holder is known now; waiting for the install's answer would leave a
+                    // connection that drops before it with no pid, matching the same channel number in
+                    // any nvim restarted at this address.
                     self.own_channels.push_back(OwnChannel {
                         addr,
                         channel,
-                        pid: None,
+                        pid: link.peer_pid(),
                     });
                 }
                 while self.own_channels.len() > OWN_CHANNELS {
@@ -520,7 +525,12 @@ impl LinkDriver {
         let Some(addr) = self.current_addr() else {
             return false;
         };
-        let pid = self.editor_pid();
+        let pid = self
+            .live
+            .as_ref()
+            .filter(|live| live.gen == self.attacher.gen())
+            .and_then(|live| live.link.peer_pid())
+            .or_else(|| self.editor_pid());
         self.own_channels.iter().any(|own| {
             own.channel == by && own.addr == addr && !matches!((own.pid, pid), (Some(then), Some(now)) if then != now)
         })
@@ -544,6 +554,7 @@ impl LinkDriver {
     }
 
     fn carry_out(&mut self, effects: Vec<Effect>, tick: &mut Tick) {
+        tick.connect_began |= effects.iter().any(|effect| matches!(effect, Effect::Connect { .. }));
         let tx = ToDriver {
             tx: self.tx.clone(),
             wake: Arc::clone(&self.wake),
@@ -875,6 +886,88 @@ mod tests {
             channel,
             pid,
         }
+    }
+
+    #[test]
+    fn a_connect_that_attaches_in_one_poll_is_reported() {
+        let (a, _a_fake, _a_reader) = fake_link();
+        let mut driver = attached_over(a);
+        driver.first_effects.clear();
+        driver.last_state = driver.state().clone();
+        driver.spawn_thread = |_| Ok(());
+        assert!(!driver.poll(Instant::now()).connect_began);
+
+        let (b, _b_fake, _b_reader) = fake_link();
+        let (answer, install) = Pending::pair();
+        answer.send(Ok(Value::Map(vec![
+            ("version".into(), 1.into()),
+            ("installed".into(), Value::Array(vec!["scratch".into()])),
+            ("failed".into(), Value::Array(vec![])),
+            ("pid".into(), 9.into()),
+            ("tmux".into(), false.into()),
+        ])));
+        driver.attach(PathBuf::from("/r/b"));
+        driver
+            .tx
+            .send(WorkerMsg::Linked {
+                gen: 2,
+                link: b,
+                install,
+            })
+            .unwrap();
+        let tick = driver.poll(Instant::now());
+        assert!(matches!(driver.state(), LinkState::Attached { addr, .. } if addr == &PathBuf::from("/r/b")));
+        assert!(tick.connect_began);
+        assert!(tick.state_changed);
+        let quiet = driver.poll(Instant::now());
+        assert!(!quiet.connect_began);
+        assert!(!quiet.state_changed);
+
+        let mut first = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        first.spawn_thread = |_| Ok(());
+        let tick = first.poll(Instant::now());
+        assert!(tick.connect_began);
+        assert!(tick.state_changed);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn an_installing_connection_matches_earlier_channels_by_its_live_socket_pid() {
+        let (link, _fake, _reader) = fake_link();
+        let holder = link.peer_pid().expect("a socket pair names its peer");
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        driver.attacher.handle(Ev::Connected { gen: 1, channel: 3 });
+        driver.live = Some(Live {
+            gen: 1,
+            channel: 3,
+            link,
+        });
+        assert!(matches!(driver.state(), LinkState::Attaching { .. }));
+        driver
+            .own_channels
+            .push_back(own("/r/a", 7, Some(holder.wrapping_add(1))));
+        assert!(!driver.is_own_earlier_channel(7));
+        driver.own_channels.back_mut().unwrap().pid = Some(holder);
+        assert!(driver.is_own_earlier_channel(7));
+        driver.live.as_mut().unwrap().gen = 0;
+        assert!(driver.is_own_earlier_channel(7));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_linked_connection_records_its_socket_holder_pid_before_the_install_answers() {
+        let (link, _fake, _reader) = fake_link();
+        let holder = link.peer_pid().expect("a socket pair names its peer");
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        driver.spawn_thread = |_| Ok(());
+        driver.poll(Instant::now());
+        assert!(matches!(driver.state(), LinkState::Connecting { .. }));
+        let (_answer, install) = Pending::pair();
+        let gen = driver.attacher.gen();
+        driver.tx.send(WorkerMsg::Linked { gen, link, install }).unwrap();
+        driver.poll(Instant::now());
+        let own = driver.own_channels.back().expect("the linked channel is recorded");
+        assert_eq!(own.pid, Some(holder));
     }
 
     #[test]

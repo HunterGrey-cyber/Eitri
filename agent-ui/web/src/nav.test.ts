@@ -525,8 +525,29 @@ describe("linkClickNeedsLook: a click on a reply link whose text is not its addr
     expect(linkClickNeedsLook(rebuilt, root, shown, 2000)).toBe("https://worse.example/");
   });
 
+  it("holds a disguised mail address until a second click in the same row", () => {
+    const href = "mailto:attacker@example.net?subject=hi";
+    const { a, root } = anchorWith(href, "support@example.org");
+    expect(linkClickNeedsLook(a, root, null, 1000)).toBe(href);
+    const shown = { el: a, row: rowOf(root, a), url: href, at: 1000 };
+    expect(linkClickNeedsLook(a, root, shown, 1100)).toBe(href);
+    expect(linkClickNeedsLook(a, root, shown, 1400)).toBeNull();
+    expect(linkClickNeedsLook(a, root, shown, 6001)).toBe(href);
+    expect(linkClickNeedsLook(a, root, { ...shown, row: null, el: document.createElement("a") }, 1500)).toBe(href);
+    a.innerHTML = "attacker@example.net<span>?subject=hi</span>";
+    expect(linkClickNeedsLook(a, root, null, 1000)).toBe(href);
+  });
+
+  it("opens a plain mail address at once with or without its scheme in the text", () => {
+    for (const text of ["a@example.com", " mailto:a@example.com "]) {
+      const { a, root } = anchorWith("mailto:a@example.com", text);
+      expect(linkClickNeedsLook(a, root, null, 0)).toBeNull();
+      expect(webLinks(root)).toEqual([]);
+    }
+  });
+
   it("leaves a link that is not a web link to Rust's own check", () => {
-    for (const href of ["mailto:a@b?subject=x", "javascript:alert(1)", "ftp://x.example/"]) {
+    for (const href of ["javascript:alert(1)", "ftp://x.example/"]) {
       const { a, root } = anchorWith(href, "click me");
       expect(linkClickNeedsLook(a, root, null, 0), href).toBeNull();
     }

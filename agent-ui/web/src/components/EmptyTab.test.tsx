@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { RenderResult } from "@testing-library/react";
 import { EmptyTab, screenOrder } from "./EmptyTab";
@@ -10,6 +10,17 @@ import { WHICH_KEY_DELAY_MS } from "../leader";
 import { hintTypingFlash, tableKeyTypingFlash, TYPING_GUARD_MS } from "../typingGuard";
 
 afterEach(cleanup);
+
+let posted: Array<Record<string, unknown>>;
+beforeEach(() => {
+  posted = [];
+  (window as unknown as { webkit: unknown }).webkit = {
+    messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
+  };
+});
+afterEach(() => {
+  delete (window as unknown as { webkit?: unknown }).webkit;
+});
 
 /** The typing guard reads each keydown's timestamp (jsdom: `Date.now()`), so two keys a test fires
  *  back to back are one burst. `keyGap()` moves the clock past the guard window, as a person pausing
@@ -1650,4 +1661,18 @@ describe("EmptyTab slash actions", () => {
     }
     expect(onSlashAction).not.toHaveBeenCalled();
   });
+});
+
+it("copies a terminal handoff to the clipboard and primary selection", () => {
+  const writeText = vi.fn();
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  try {
+    const rendered = renderEmpty({ handoff: { command: "cd /p && claude --resume abc", cwd: "/p", providerSessionId: "abc" } });
+    const root = toBrowse(rendered, rendered.props);
+    fireEvent.keyDown(root, { key: "y" });
+    expect(writeText).toHaveBeenCalledWith("cd /p && claude --resume abc");
+    expect(posted).toContainEqual({ type: "copy_primary", text: "cd /p && claude --resume abc" });
+  } finally {
+    delete (navigator as unknown as Record<string, unknown>).clipboard;
+  }
 });

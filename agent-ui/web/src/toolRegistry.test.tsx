@@ -540,6 +540,13 @@ describe("the registry: runs, edits, gated calls and the detailed view", () => {
     expect((neither.match(/class="diff-line/g) ?? []).length).toBe(0);
   });
 
+  it("counts an ACP row's lines when its diff is too long to compare, instead of +0 −0", () => {
+    const oldText = Array.from({ length: 401 }, (_, i) => `old ${i}`).join("\n") + "\n";
+    const input = { title: "Edit a.txt", diffs: [{ path: "/p/a.txt", oldText, newText: "new\n" }] };
+    const folded = html(renderToolCall({ seq: 1, toolUseId: "t", name: "acp:edit", input, result: null }, false, { expanded: false }));
+    expect(folded.replace(/<[^>]*>/g, "")).toContain("+1 −401");
+  });
+
   /** A `Write` over a path with nothing there says so instead of warning about an
    *  overwrite it cannot see -- collapsed or not, since the note sits beside the diff body rather
    *  than inside its line budget. */

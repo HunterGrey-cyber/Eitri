@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use agent::{AgentDomainEvent, ResumeStatus, TurnOutcome};
 use eitri_core::turn_review::{
-    review_dir_for, JobEvent, NamedPaths, Origin, ReviewOptions, Scope, Snap, SnapshotKind, TurnRecord, TurnRef,
-    TurnReview, TurnState,
+    review_dir_for, JobEvent, NamedPaths, Origin, ReviewError, ReviewOptions, Scope, Snap, SnapshotKind, TurnRecord,
+    TurnRef, TurnReview, TurnState,
 };
 
 /// A directory of the test's own under the system's temporary directory, removed when dropped.
@@ -1310,6 +1310,33 @@ fn small_limit_review(scratch: &Scratch, jobs: &Jobs) -> TurnReview {
 }
 
 const LARGE: usize = 200;
+
+#[test]
+fn a_running_turn_marks_grown_and_new_large_files_as_too_large() {
+    let scratch = Scratch::new("large-live");
+    let a = scratch.project().join("a.txt");
+    std::fs::write(&a, b"small\n").unwrap();
+    let jobs = Jobs::default();
+    let mut review = small_limit_review(&scratch, &jobs);
+    review.observe(1, "s1", &started("t1"), now());
+    poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
+    std::fs::write(&a, vec![b'a'; LARGE]).unwrap();
+    std::fs::write(scratch.project().join("b.bin"), vec![0; LARGE]).unwrap();
+
+    let overview = review
+        .overview_job("s1", TurnRef::Latest, Scope::Turn, NamedPaths::default())
+        .run()
+        .unwrap();
+    for path in ["a.txt", "b.bin"] {
+        let row = overview.files.iter().find(|f| f.path == Path::new(path)).unwrap();
+        assert!(row.too_large, "{row:?}");
+        assert_eq!((row.added, row.removed), (0, 0));
+        assert!(matches!(
+            review.diff_job("s1", 1, Scope::Turn, path).run(),
+            Err(ReviewError::TooLarge(p)) if p == Path::new(path)
+        ));
+    }
+}
 
 /// Runs one whole turn: `act` runs between its two snapshots.
 fn run_turn(review: &mut TurnReview, id: &str, act: impl FnOnce()) {

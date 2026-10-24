@@ -128,7 +128,7 @@ export function cardSummary(input: unknown): string {
   }
   // Only the whitespace the card keeps as text collapses: a no-break or other unusual space is not one the
   // shell splits at, and is drawn as its escape below, as the card draws it.
-  const line = (text ?? JSON.stringify(input) ?? "").replace(/[ \t\n]+/g, " ").trim();
+  const line = (text ?? JSON.stringify(input) ?? "").replace(/[ \t\n]+/g, " ").replace(/^ | $/g, "");
   // One unit per character, a character the card escapes as its whole escape: the band says what the card
   // says (a direction override drawn raw reorders the command after it), and a cut never splits an escape.
   const units = Array.from(line, (ch) => (isHiddenChar(ch) ? escapeText(ch) : ch));

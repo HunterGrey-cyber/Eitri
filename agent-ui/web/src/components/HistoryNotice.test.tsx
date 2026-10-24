@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { HistoryNotice } from "./HistoryNotice";
 import { rowIndexOf, stopsIn } from "../nav";
@@ -7,6 +7,17 @@ import type { HistoryNotice as HistoryNoticeData } from "../types";
 
 // See EmptyTab.test.tsx: `globals` is off, so RTL's automatic cleanup is not registered.
 afterEach(cleanup);
+
+let posted: Array<Record<string, unknown>>;
+beforeEach(() => {
+  posted = [];
+  (window as unknown as { webkit: unknown }).webkit = {
+    messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
+  };
+});
+afterEach(() => {
+  delete (window as unknown as { webkit?: unknown }).webkit;
+});
 
 function notice(overrides: Partial<HistoryNoticeData> = {}): HistoryNoticeData {
   return {
@@ -90,4 +101,18 @@ describe("HistoryNotice", () => {
     const { root } = renderInPanel();
     expect(root.querySelectorAll('[data-nav-stop="row"]').length).toBe(1);
   });
+});
+
+it("copies a history source path to both selections", () => {
+  const writeText = vi.fn();
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  try {
+    const { button } = renderInPanel();
+    fireEvent.click(button);
+    const text = "/home/user/.claude/projects/-home-user-p/7432932d.jsonl";
+    expect(writeText).toHaveBeenCalledWith(text);
+    expect(posted).toEqual([{ type: "copy_primary", text }]);
+  } finally {
+    delete (navigator as unknown as Record<string, unknown>).clipboard;
+  }
 });

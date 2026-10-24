@@ -563,6 +563,105 @@ fn trim_drops_the_index_of_a_session_with_nothing_left() {
 }
 
 #[test]
+fn trim_keeps_a_running_turn_until_it_ages_out() {
+    let _env = environment();
+    let scratch = Scratch::new("trim-running");
+    let project = scratch.project();
+    write(&project.join("f"), b"running\n");
+    let shadow = scratch.shadow(&project);
+    let base = taken(shadow.snapshot("running", &label(1, SnapshotKind::Base, 1), &Limits::default()));
+    for n in 1..=3 {
+        write(&project.join("f"), format!("finished {n}\n").as_bytes());
+        for kind in [SnapshotKind::Base, SnapshotKind::End] {
+            taken(shadow.snapshot(SESSION, &label(n, kind, 10 + u64::from(n)), &Limits::default()));
+        }
+    }
+    shadow.trim(2, Duration::from_secs(3600), 20, "now").unwrap();
+    assert!(shadow
+        .snapshot_refs()
+        .unwrap()
+        .iter()
+        .any(|(name, _)| name == &base.reference));
+    assert!(shadow_has_object(&shadow, &base.commit));
+    shadow.trim(2, Duration::from_millis(5), 20, "now").unwrap();
+    assert!(!shadow
+        .snapshot_refs()
+        .unwrap()
+        .iter()
+        .any(|(name, _)| name == &base.reference));
+}
+
+#[test]
+fn trim_counts_a_base_only_turn_when_its_session_has_a_later_turn() {
+    let _env = environment();
+    let scratch = Scratch::new("trim-unfinished");
+    let project = scratch.project();
+    write(&project.join("f"), b"content\n");
+    let shadow = scratch.shadow(&project);
+    let old = taken(shadow.snapshot("a", &label(1, SnapshotKind::Base, 1), &Limits::default()));
+    for kind in [SnapshotKind::Base, SnapshotKind::End] {
+        taken(shadow.snapshot("a", &label(2, kind, 2), &Limits::default()));
+    }
+    let running = taken(shadow.snapshot("running", &label(1, SnapshotKind::Base, 3), &Limits::default()));
+    for turn in 1..=3 {
+        taken(shadow.snapshot(
+            "b",
+            &label(turn, SnapshotKind::End, 10 + u64::from(turn)),
+            &Limits::default(),
+        ));
+    }
+    shadow.trim(2, Duration::from_secs(3600), 20, "now").unwrap();
+    let refs = shadow.snapshot_refs().unwrap();
+    assert!(!refs.iter().any(|(name, _)| name == &old.reference));
+    assert!(refs.iter().any(|(name, _)| name == &running.reference));
+    assert_eq!(refs.len(), 3);
+}
+
+#[test]
+fn the_file_limit_leaves_out_deleted_paths_in_the_session_index() {
+    let _env = environment();
+    let scratch = Scratch::new("file-count-deleted");
+    let project = scratch.project();
+    let shadow = scratch.shadow(&project);
+    let limits = Limits {
+        max_files: 3,
+        ..Limits::default()
+    };
+    for name in ["a", "b", "c"] {
+        write(&project.join(name), b"content\n");
+    }
+    taken(shadow.snapshot(SESSION, &label(1, SnapshotKind::Base, 1), &limits));
+    std::fs::remove_file(project.join("b")).unwrap();
+    write(&project.join("d"), b"new\n");
+    let end = taken(shadow.snapshot(SESSION, &label(1, SnapshotKind::End, 2), &limits));
+    assert_eq!(
+        tree_entries(&shadow, &end.commit).keys().cloned().collect::<Vec<_>>(),
+        ["a", "c", "d"]
+    );
+}
+
+#[test]
+fn the_file_limit_counts_unchanged_files_in_the_session_index() {
+    let _env = environment();
+    let scratch = Scratch::new("file-count");
+    let project = scratch.project();
+    let shadow = scratch.shadow(&project);
+    let limits = Limits {
+        max_files: 3,
+        ..Limits::default()
+    };
+    for n in 0..3 {
+        write(&project.join(format!("f{n}")), b"x\n");
+    }
+    taken(shadow.snapshot(SESSION, &label(1, SnapshotKind::Base, 1), &limits));
+    write(&project.join("fourth"), b"x\n");
+    match shadow.snapshot(SESSION, &label(1, SnapshotKind::End, 2), &limits) {
+        SnapshotOutcome::Unavailable(why) => assert!(why.contains("too many files"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn trim_waits_for_a_running_snapshot() {
     let _env = environment();
     let scratch = Scratch::new("trim-waits");
@@ -575,7 +674,7 @@ fn trim_waits_for_a_running_snapshot() {
     let (done_tx, done_rx) = mpsc::channel();
     let trimmer = shadow.clone();
     let worker = std::thread::spawn(move || {
-        let result = trimmer.trim(0, Duration::from_secs(3600), 2_000, "now");
+        let result = trimmer.trim(0, Duration::from_millis(500), 2_000, "now");
         done_tx.send(()).unwrap();
         result
     });

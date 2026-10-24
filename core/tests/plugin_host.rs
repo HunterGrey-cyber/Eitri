@@ -774,6 +774,83 @@ fn a_clear_sent_while_the_apply_root_is_checked_waits_behind_it() {
 }
 
 #[test]
+fn an_assist_check_first_taken_after_its_deadline_applies_nothing() {
+    let rig = Rig::new("host-assist-check-late", |m| m);
+    let gate = rig.host.gate_path_checks();
+    let start = Instant::now();
+    let id = rig.send(
+        "editor.assist",
+        json!({
+            "root": rig.work.join("ex"), "diagnostics": "off", "inlay_hints": "on"
+        }),
+    );
+    drop(gate);
+    rig.wakes
+        .recv_timeout(HANG_GUARD)
+        .expect("the path check never answered");
+    rig.host.pump(start + CHECK_DEADLINE + Duration::from_secs(1));
+    let replies = rig.page.replies_to(id);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0]["error"]["code"], "io");
+    assert_eq!(
+        replies[0]["error"]["message"],
+        "the filesystem did not answer within 5 s"
+    );
+    assert!(rig.editor.calls.borrow().is_empty());
+}
+
+#[test]
+fn an_editor_answer_first_taken_after_its_deadline_times_out_without_focus() {
+    let rig = Rig::new("host-open-answer-late", |m| m);
+    let start = Instant::now();
+    let id = rig.send("editor.open", json!({"path": rig.work.join("ex/src/lib.rs")}));
+    rig.asked(1, start);
+    rig.editor.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Map(vec![
+        ("how".into(), "edit".into()),
+        ("line".into(), 1.into()),
+        ("col".into(), 0.into()),
+    ])));
+    rig.host.pump(start + EDITOR_DEADLINE + Duration::from_secs(1));
+    assert_eq!(rig.page.replies_to(id)[0]["error"]["code"], "editor_timeout");
+    assert!(rig.layout.0.borrow().is_empty());
+    rig.host.pump(start + EDITOR_DEADLINE + Duration::from_secs(2));
+    assert_eq!(rig.page.replies_to(id).len(), 1);
+}
+
+#[test]
+fn store_operations_remain_bounded_until_the_worker_finishes() {
+    let rig = Rig::new("host-store-bounded", |m| m);
+    let gate = rig.host.gate_store();
+    let start = Instant::now();
+    let ids: Vec<_> = (0..32)
+        .map(|value| rig.send("state.write", json!({"key": "position", "value": value})))
+        .collect();
+    let busy = rig.send("state.write", json!({"key": "position", "value": 32}));
+    assert_eq!(rig.page.replies_to(busy)[0]["error"]["code"], "busy");
+    rig.host.pump(start + Duration::from_secs(6));
+    for id in &ids {
+        assert_eq!(rig.page.replies_to(*id)[0]["error"]["code"], "io");
+    }
+    let still_busy = rig.send("state.write", json!({"key": "position", "value": 33}));
+    assert_eq!(rig.page.replies_to(still_busy)[0]["error"]["code"], "busy");
+    drop(gate);
+    for _ in 0..32 {
+        rig.wakes
+            .recv_timeout(HANG_GUARD)
+            .expect("the store operation never finished");
+    }
+    let next = rig.send("state.write", json!({"key": "position", "value": 34}));
+    assert!(rig.page.replies_to(next).is_empty());
+    rig.host.pump(Instant::now());
+    for id in ids {
+        assert_eq!(rig.page.replies_to(id).len(), 1);
+    }
+    assert_eq!(rig.reply(next)["ok"], true);
+    let read = rig.send("state.read", json!({"key": "position"}));
+    assert_eq!(rig.reply(read)["result"]["value"], 34);
+}
+
+#[test]
 fn an_assist_call_past_its_deadline_holds_nothing_behind_it() {
     let rig = Rig::new("host-late-apply", |m| m);
     let root = rig.work.join("ex").display().to_string();
@@ -1737,6 +1814,8 @@ fn open_link_checks_wait_on_a_stalled_filesystem() {
     let d = doc_base("host-open-link-stalled");
     let gate = d.rig.host.gate_path_checks();
     d.rig.host.follow_view(named_view(&d.a, 3, 41), d.t0);
+    gate.send(()).unwrap();
+    wait_slot(&d, &d.proj);
     d.rig.host.pump(d.t0);
     answer(&d.rig, lines(3, 41, &["# a"]));
     d.rig.host.pump(d.t0);
@@ -1761,10 +1840,83 @@ fn open_link_checks_wait_on_a_stalled_filesystem() {
 }
 
 #[test]
+fn a_link_refuses_a_document_directory_replaced_by_a_symlink() {
+    let d = shown("host-link-directory-swap");
+    let outside = d.s.join("private");
+    touch(&outside.join("other.md"), "private text\n");
+    std::fs::rename(d.proj.join("docs"), d.proj.join("old-docs")).unwrap();
+    std::os::unix::fs::symlink(&outside, d.proj.join("docs")).unwrap();
+    let before = calls(&d.rig);
+    let id = link(&d, "other.md");
+    assert_eq!(d.rig.reply(id)["error"]["code"], "outside_roots");
+    assert_eq!(calls(&d.rig), before);
+}
+
+#[test]
+fn a_link_before_the_project_lookup_answers_opens_inside_the_project() {
+    let d = doc_base("host-link-pending-project");
+    let gate = d.rig.host.gate_path_checks();
+    d.rig.host.follow_view(named_view(&d.a, 3, 41), d.t0);
+    d.rig.host.pump(d.t0);
+    answer(&d.rig, lines(3, 41, &["# a"]));
+    d.rig.host.pump(d.t0);
+    let id = link(&d, "other.md");
+    assert!(d.rig.page.replies_to(id).is_empty());
+    drop(gate);
+    d.rig.asked(calls(&d.rig) + 1, d.t0);
+    assert_eq!(
+        opt(&open_calls(&d.rig)[0], "path"),
+        binary(&d.proj.join("docs/other.md"))
+    );
+    answer(
+        &d.rig,
+        map(&[("how", "edit".into()), ("line", 1.into()), ("col", 0.into())]),
+    );
+    d.rig.host.pump(d.t0);
+    assert_eq!(d.rig.page.replies_to(id)[0]["ok"], true);
+}
+
+#[test]
+fn a_project_lookup_that_found_none_is_retried_for_links_and_views() {
+    let d = doc_base("host-link-project-retry");
+    let gate = d.rig.host.gate_path_checks();
+    let saved = d.proj.join("saved-docs");
+    std::fs::rename(d.proj.join("docs"), &saved).unwrap();
+    d.rig.host.follow_view(named_view(&d.a, 3, 41), d.t0);
+    d.rig.host.pump(d.t0);
+    answer(&d.rig, lines(3, 41, &["# a"]));
+    d.rig.host.pump(d.t0);
+    d.rig.wakes.try_iter().for_each(drop);
+    drop(gate);
+    d.rig
+        .wakes
+        .recv_timeout(HANG_GUARD)
+        .expect("the project lookup never answered");
+    d.rig.host.pump(d.t0);
+    assert!(d.slot.borrow().dir.is_none());
+    assert_eq!(last_view(&d.rig)["doc"], Value::Null);
+
+    std::fs::rename(&saved, d.proj.join("docs")).unwrap();
+    let (id, opts) = link_opened(&d, "other.md");
+    assert_eq!(opt(&opts, "path"), binary(&d.proj.join("docs/other.md")));
+    answer(
+        &d.rig,
+        map(&[("how", "edit".into()), ("line", 1.into()), ("col", 0.into())]),
+    );
+    d.rig.host.pump(d.t0);
+    assert_eq!(d.rig.page.replies_to(id)[0]["ok"], true);
+    d.rig.host.follow_view(named_view(&d.a, 3, 42), d.t0);
+    wait_slot(&d, &d.proj);
+    assert!(last_view(&d.rig)["doc"].is_object());
+}
+
+#[test]
 fn a_link_check_that_finishes_after_its_deadline_opens_nothing() {
     let d = doc_base("host-open-link-late");
     let gate = d.rig.host.gate_path_checks();
     d.rig.host.follow_view(named_view(&d.a, 3, 41), d.t0);
+    gate.send(()).unwrap();
+    wait_slot(&d, &d.proj);
     d.rig.host.pump(d.t0);
     answer(&d.rig, lines(3, 41, &["# a"]));
     d.rig.host.pump(d.t0);
@@ -1791,6 +1943,8 @@ fn an_editor_restart_answers_the_page_ops_waiting_in_line_and_sends_none() {
     let d = doc_base("host-verbs-restart");
     let gate = d.rig.host.gate_path_checks();
     d.rig.host.follow_view(named_view(&d.a, 3, 41), d.t0);
+    gate.send(()).unwrap();
+    wait_slot(&d, &d.proj);
     d.rig.host.pump(d.t0);
     assert_eq!(last_call(&d.rig).0, "text", "a pull is out, so the ops below wait");
     let reveal = d.rig.send("editor.reveal", json!({"buf": 3, "line": 10, "token": 1}));

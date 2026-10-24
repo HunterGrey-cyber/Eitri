@@ -155,7 +155,7 @@ describe("editPreview", () => {
 
   it("still reads a plain replace as a whole-cell write, unaffected by the delete branch", () => {
     const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", edit_mode: "replace", new_source: "x\n" })!;
-    expect(preview.wholeFileNote).toMatch(/writes the whole cell/i);
+    expect(preview.wholeFileNote).toBe("Replaces a cell. The request does not say what is there now.");
     expect(preview.added).toBe(1);
   });
 
@@ -167,10 +167,10 @@ describe("editPreview", () => {
 
   /** Counts stay available when the diff is refused: "how big is this" is the first question, and
    *  it must not become unanswerable exactly when the change is large. */
-  it("still reports counts when the change is too large to render", () => {
+  it("reports counts and all lines when the change is too large to compute", () => {
     const huge = Array.from({ length: MAX_DIFF_LINES + 5 }, (_, i) => `l${i}`).join("\n");
     const preview = editPreview("Write", { file_path: "/f", content: huge })!;
-    expect(preview.diff).toBeNull();
+    expect(preview.diff).toHaveLength(MAX_DIFF_LINES + 5);
     expect(preview.added).toBe(MAX_DIFF_LINES + 5);
   });
 });
@@ -208,4 +208,64 @@ describe("codexChangePreview", () => {
       expect(preview.filePath).toBe("a");
     }
   });
+});
+
+describe("complete edit previews", () => {
+  it("keeps every added line of a Write above the diff cap", () => {
+    const content = [...Array.from({ length: 400 }, (_, i) => `line ${i}`), "rm -rf important"].join("\n");
+    const preview = editPreview("Write", { file_path: "/p/run.sh", content })!;
+    expect(preview.diff).not.toBeNull();
+    expect(preview.diff).toHaveLength(401);
+    expect(preview.diff!.every((line) => line.kind === "added")).toBe(true);
+    expect(preview.diff![400]).toEqual({ kind: "added", text: "rm -rf important", noNewline: true });
+    expect([preview.added, preview.removed]).toEqual([401, 0]);
+  });
+
+  it("keeps both sides of an Edit above the diff cap", () => {
+    const before = Array.from({ length: 401 }, (_, i) => `old ${i}`);
+    const after = Array.from({ length: 402 }, (_, i) => `new ${i}`);
+    const preview = editPreview("Edit", { file_path: "/p/a", old_string: before.join("\n"), new_string: after.join("\n") + "\n" })!;
+    expect(preview.diff?.filter((line) => line.kind === "removed").map((line) => line.text)).toEqual(before);
+    expect(preview.diff?.filter((line) => line.kind === "added").map((line) => line.text)).toEqual(after);
+    expect(preview.diff![400].noNewline).toBe(true);
+    expect(preview.diff![802].noNewline).toBeUndefined();
+    expect([preview.added, preview.removed]).toEqual([402, 401]);
+  });
+
+  it("keeps every line of a NotebookEdit above the diff cap", () => {
+    const preview = editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", new_source: "x\n".repeat(401) })!;
+    expect(preview.diff).toHaveLength(401);
+    expect(preview.diff?.every((line) => line.kind === "added" && line.text === "x" && !line.noNewline)).toBe(true);
+  });
+});
+
+describe("notebook cell notes", () => {
+  it.each([
+    [{ edit_mode: "insert", cell_id: "cell-A", cell_type: "markdown" }, "Inserts a new markdown cell after cell cell-A."],
+    [{ edit_mode: "insert", cell_type: "code" }, "Inserts a new code cell at the start of the notebook."],
+    [{ edit_mode: "insert" }, "Inserts a new cell at the start of the notebook."],
+    [{ cell_id: "cell-B", cell_type: "code" }, "Replaces cell cell-B as a code cell. The request does not say what is there now."],
+    [{ edit_mode: "replace", cell_id: "cell-B" }, "Replaces cell cell-B. The request does not say what is there now."],
+    [{ cell_type: "markdown" }, "Replaces a cell as a markdown cell. The request does not say what is there now."],
+    [{ edit_mode: "rotate", cell_id: "cell-C" }, 'Edit mode "rotate" on cell cell-C.'],
+    [{ edit_mode: "", cell_id: "cell-C" }, 'Edit mode "" on cell cell-C.'],
+    [{ edit_mode: 7, cell_type: "code" }, "Edit mode 7 on a cell as a code cell."],
+  ])("names the cell operation %j", (fields, note) => {
+    expect(editPreview("NotebookEdit", { notebook_path: "/p/a.ipynb", new_source: "x", ...fields })!.wholeFileNote).toBe(note);
+  });
+});
+
+it("distinguishes a NUL in a line from a missing final line break", () => {
+  expect(lineDiff("x", "x\u0000\n")).toEqual([
+    { kind: "removed", text: "x", noNewline: true },
+    { kind: "added", text: "x\u0000" },
+  ]);
+});
+
+it.each(["add", "delete"])("marks a Codex %s without a final line break", (kind) => {
+  const open = codexChangePreview({ path: "f", kind, diff: "x" });
+  const closed = codexChangePreview({ path: "f", kind, diff: "x\n" });
+  expect(open.diff).toEqual([{ kind: kind === "add" ? "added" : "removed", text: "x", noNewline: true }]);
+  expect(closed.diff).toEqual([{ kind: kind === "add" ? "added" : "removed", text: "x" }]);
+  expect(codexChangePreview({ path: "f", kind, diff: "" }).diff).toEqual([]);
 });

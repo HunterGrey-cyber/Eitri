@@ -118,7 +118,7 @@ describe("a Codex file change card", () => {
     const big = Array.from({ length: 2500 }, (_, i) => `line ${i}`).join("\n");
     const { container } = card({ ...request, input: { ...input, changes: [{ ...input.changes[0], kind: "add", diff: big }] } });
     expect(container.textContent).not.toContain("Too large to show here");
-    const shown = Array.from(container.querySelectorAll(".permission-card-diff .diff-line"));
+    const shown = Array.from(container.querySelectorAll(".permission-card-diff .diff-added"));
     expect(shown).toHaveLength(2500);
     expect(shown[2499].querySelector(".diff-text")!.textContent).toBe("line 2499");
   });
@@ -207,6 +207,21 @@ describe("an ACP agent's card", () => {
     expect(approve.disabled).toBe(false);
   });
 
+  it("marks a missing last line break in a diff too long to compare line by line", () => {
+    const oldText = Array.from({ length: 401 }, (_, i) => `old ${i}`).join("\n") + "\n";
+    const { container } = card({
+      ...request,
+      toolName: "acp:edit",
+      input: {
+        title: "Edit a.txt",
+        diffs: [{ path: "/project/a.txt", oldText, newText: "new" }],
+        options: [{ name: "Yes", kind: "allow_once" }],
+      },
+    });
+    const diff = container.querySelector(".permission-card-diff")!;
+    expect(diff.textContent).toContain("\\ no line break at the end");
+  });
+
   it("says why a call too large to show cannot be approved, and names its files without drawing them", () => {
     const { container } = card({
       ...request,
@@ -253,4 +268,14 @@ describe("the reason box", () => {
     deny.click();
     expect(onAnswer).toHaveBeenCalledWith("perm-command", "deny", undefined);
   });
+});
+
+it("shows whether a Codex added file has a final line break", () => {
+  const request = requestOf("file_change");
+  const input = request.input as { changes: Array<Record<string, unknown>> };
+  for (const diff of ["x", "x\n"]) {
+    const view = card({ ...request, input: { ...input, changes: [{ ...input.changes[0], kind: "add", diff }] } });
+    expect(view.container.textContent?.includes("\\ no line break at the end")).toBe(diff === "x");
+    view.unmount();
+  }
 });

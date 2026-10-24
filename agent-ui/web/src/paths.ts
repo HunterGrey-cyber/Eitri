@@ -45,11 +45,26 @@ function fieldPaths(name: string, input: unknown): PathRef[] {
   });
 }
 
+/** The longest run of path characters searched for a path. Matching inside a run costs up to the square of its
+ *  length, so this bounds the work per character of a reply. */
+const MAX_PATH_RUN = 256;
+
 function prosePaths(text: string): PathRef[] {
   const out: PathRef[] = [];
-  for (const m of text.matchAll(PATH_RE)) {
-    const ref = withLine(text, m.index ?? 0, m[0]);
-    if (ref !== null && !out.some((o) => o.path === ref.path && o.line === ref.line)) out.push(ref);
+  const seen = new Set<string>();
+  for (const run of text.matchAll(/[\w.\-/]+/g)) {
+    // Bounding each regex input keeps long blobs from retrying a path match at every character; a run this
+    // long in prose is a blob (base64, a hash dump), not a path a reader would open.
+    if (run[0].length > MAX_PATH_RUN || !/[./]/.test(run[0])) continue;
+    for (const m of run[0].matchAll(PATH_RE)) {
+      const ref = withLine(text, run.index! + m.index!, m[0]);
+      if (ref === null) continue;
+      const key = `${ref.path}:${ref.line}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(ref);
+      }
+    }
   }
   return out;
 }

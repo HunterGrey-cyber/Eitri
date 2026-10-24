@@ -464,3 +464,12 @@ describe("the commands an agent left running", () => {
     expect(ids(400, { ...running, background: 2 })).not.toContain("model");
   });
 });
+
+it.each([
+  ["\u00A0rm file", "⟨U+00A0⟩rm file"],
+  ["rm file\r", "rm file⟨U+000D⟩"],
+  ["\uFEFFrm file\u2028", "⟨U+FEFF⟩rm file⟨U+2028⟩"],
+  [" \t\n rm file \n\t ", "rm file"],
+])("preserves escaped whitespace at the edge of a command %j", (command, summary) => {
+  expect(cardSummary({ command })).toBe(summary);
+});

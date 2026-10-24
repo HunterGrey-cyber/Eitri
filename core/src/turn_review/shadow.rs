@@ -56,7 +56,7 @@ pub struct Limits {
     /// A file larger than this is left out of the snapshot and listed in
     /// [`Snapshot::skipped_large`].
     pub max_file_bytes: u64,
-    /// More files than this to add leaves the turn without a snapshot.
+    /// More files than this in the whole snapshot leaves the turn without a snapshot.
     pub max_files: usize,
     /// The whole snapshot, lock wait included, must finish within this.
     pub timeout: Duration,
@@ -438,7 +438,7 @@ pub enum ShadowError {
     Git(GitError),
     /// The operation's time ran out before it finished.
     TimedOut,
-    /// More files to add than [`Limits::max_files`].
+    /// More files in the whole snapshot than [`Limits::max_files`].
     TooManyFiles {
         count: usize,
         max: usize,
@@ -835,11 +835,12 @@ impl Shadow {
     /// a comparison against the live files is made with. It goes through the same isolated
     /// indexing as [`snapshot`](Self::snapshot) (so the same files are left out for size or
     /// ignore rules), but into a throwaway index, never the live one and never a session's.
+    /// Returns the tree id and the paths and prints left out for size.
     ///
     /// Nothing references the returned tree; it stays readable until a collection prunes it, so a
     /// caller that holds [`lock_shared`](Self::lock_shared) from before this call until its last
     /// read of the tree is safe from that.
-    pub fn scratch_tree(&self, limits: &Limits) -> Result<String, ShadowError> {
+    pub fn scratch_tree(&self, limits: &Limits) -> Result<(String, Vec<(PathBuf, Option<FilePrint>)>), ShadowError> {
         let deadline = Instant::now() + limits.timeout;
         let session = format!("scratch-{}", uuid::Uuid::new_v4().simple());
         let index = self.index_path(&session)?;
@@ -849,7 +850,7 @@ impl Shadow {
         let _ = remove_if_present(&index);
         // A run killed for its time leaves the lock; nothing else will ever use this index.
         let _ = remove_if_present(&lock_file_of(&index));
-        Ok(written?.0)
+        written
     }
 
     /// Brings `index` up to date with the work tree and writes its tree, returning the tree and the
@@ -861,26 +862,31 @@ impl Shadow {
         deadline: Instant,
     ) -> Result<(String, Vec<(PathBuf, Option<FilePrint>)>), ShadowError> {
         let mut list = self.git(Some(index));
-        list.args(["ls-files", "-z", "--others", "--modified", "--exclude-standard"]);
+        list.args(["ls-files", "-z", "--others", "--cached", "--exclude-standard"]);
         let listed = self.run_ok("ls-files", list, None, deadline)?;
-        let entries: BTreeSet<&[u8]> = nul_separated(&listed.stdout).collect();
+        let mut ignored = self.git(Some(index));
+        ignored.args(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"]);
+        let ignored = self.run_ok("ls-files", ignored, None, deadline)?;
+        let ignored_paths: BTreeSet<&[u8]> = nul_separated(&ignored.stdout).collect();
+        // Cached entries include paths deleted or ignored since the previous snapshot.
+        let entries: BTreeSet<&[u8]> = nul_separated(&listed.stdout)
+            .filter(|entry| !ignored_paths.contains(entry))
+            .collect();
         #[cfg(test)]
         tests::AFTER_LISTING.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
             }
         });
-        if entries.len() > limits.max_files {
-            return Err(ShadowError::TooManyFiles {
-                count: entries.len(),
-                max: limits.max_files,
-            });
-        }
-
+        let mut count = 0;
         let mut large: Vec<&[u8]> = Vec::new();
         let mut prints: Vec<FilePrint> = Vec::new();
         let mut left_out: Vec<&[u8]> = Vec::new();
         for entry in &entries {
+            remaining(deadline)?;
+            let path = self.work_tree.join(OsStr::from_bytes(entry));
+            let Ok(meta) = path.symlink_metadata() else { continue };
+            count += 1;
             if let Some(dir) = entry.strip_suffix(b"/") {
                 // An untracked nested repository: one gitlink entry, unless it has no commit yet,
                 // which git refuses to add at all.
@@ -889,13 +895,16 @@ impl Shadow {
                 }
                 continue;
             }
-            let path = self.work_tree.join(OsStr::from_bytes(entry));
-            if let Ok(meta) = path.symlink_metadata() {
-                if meta.is_file() && meta.len() > limits.max_file_bytes {
-                    large.push(entry);
-                    prints.push(FilePrint::of(&meta));
-                }
+            if meta.is_file() && meta.len() > limits.max_file_bytes {
+                large.push(entry);
+                prints.push(FilePrint::of(&meta));
             }
+        }
+        if count > limits.max_files {
+            return Err(ShadowError::TooManyFiles {
+                count,
+                max: limits.max_files,
+            });
         }
 
         if !large.is_empty() {
@@ -904,9 +913,6 @@ impl Shadow {
             self.run_ok("update-index", remove, Some(&nul_joined(&large)), deadline)?;
         }
 
-        let mut ignored = self.git(Some(index));
-        ignored.args(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"]);
-        let ignored = self.run_ok("ls-files", ignored, None, deadline)?;
         if !ignored.stdout.is_empty() {
             let mut remove = self.git(Some(index));
             remove.args(["update-index", "-z", "--force-remove", "--stdin"]);
@@ -1402,7 +1408,8 @@ impl Shadow {
         let refs = self.snapshot_refs_locked(deadline)?;
 
         // Turn -> (newest label time, its refs).
-        let mut turns: BTreeMap<(String, String), (u64, Vec<String>)> = BTreeMap::new();
+        let mut turns: BTreeMap<(String, u32), (u64, Vec<String>)> = BTreeMap::new();
+        let mut latest = BTreeMap::<String, u32>::new();
         for (name, label) in &refs {
             let Some(rest) = name.strip_prefix("refs/eitri/") else {
                 continue;
@@ -1411,7 +1418,12 @@ impl Shadow {
             let (Some(session), Some(turn)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            let entry = turns.entry((session.to_owned(), turn.to_owned())).or_default();
+            let Ok(turn) = turn.parse::<u32>() else { continue };
+            latest
+                .entry(session.to_owned())
+                .and_modify(|last| *last = (*last).max(turn))
+                .or_insert(turn);
+            let entry = turns.entry((session.to_owned(), turn)).or_default();
             entry.0 = entry.0.max(label.as_ref().map_or(0, |l| l.time_ms));
             entry.1.push(name.clone());
         }
@@ -1421,8 +1433,16 @@ impl Shadow {
 
         let mut delete = Vec::new();
         let mut kept_sessions = BTreeSet::new();
-        for (position, ((session, _), (time, names))) in ordered.into_iter().enumerate() {
-            if position >= keep || time < oldest_kept {
+        let mut finished = 0;
+        for ((session, turn), (time, names)) in ordered {
+            let running = latest.get(&session) == Some(&turn)
+                && names.iter().any(|name| name.ends_with("/base"))
+                && !names.iter().any(|name| name.ends_with("/end"));
+            let over_count = !running && finished >= keep;
+            if !running {
+                finished += 1;
+            }
+            if over_count || time < oldest_kept {
                 delete.extend(names);
             } else {
                 kept_sessions.insert(session);

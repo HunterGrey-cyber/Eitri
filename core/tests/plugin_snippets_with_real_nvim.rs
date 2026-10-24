@@ -459,6 +459,231 @@ fn open_moves_the_cursor_by_characters_and_splits_over_a_modified_buffer() {
     assert_eq!(refused, Value::from(false), "a relative path is refused");
 }
 
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_refuses_a_checked_file_replaced_by_a_symlink() {
+    let mut c = case("open-symlink");
+    let (a, b, outside) = (c.a.clone(), c.b.clone(), c.outside.clone());
+    std::fs::remove_file(&a).unwrap();
+    std::os::unix::fs::symlink(&outside, &a).unwrap();
+    let refused = c.nvim.lua(
+        "local code, path = ... return pcall(function() return assert(loadstring(code))({ path = path }) end)",
+        vec![PLUGIN_OPEN_LUA.into(), s(&a)],
+    );
+    assert_eq!(refused, Value::from(false));
+    let names = c.nvim.lua(
+        "local names = {} for _, b in ipairs(vim.api.nvim_list_bufs()) do names[#names + 1] = vim.api.nvim_buf_get_name(b) end return names",
+        vec![],
+    );
+    assert!(!names.as_array().unwrap().contains(&s(&outside)));
+    assert!(!names.as_array().unwrap().contains(&s(&a)));
+    let opened = c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&b))])]);
+    assert_eq!(field(&opened, "how").as_str(), Some("edit"));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_checks_the_edited_buffer_and_wipes_only_a_new_buffer() {
+    for existing in [false, true] {
+        let mut c = case(if existing {
+            "open-existing-swap"
+        } else {
+            "open-new-swap"
+        });
+        let (a, b, outside) = (c.a.clone(), c.b.clone(), c.outside.clone());
+        edit(&mut c, &b);
+        let buf = c.nvim.lua(
+            "local path, target, existing = ... \
+             local buf = existing and vim.fn.bufadd(path) or -1 \
+             vim.api.nvim_create_autocmd('BufReadPost', { once = true, callback = function() \
+               local uv = vim.uv or vim.loop assert(uv.fs_unlink(path)) assert(uv.fs_symlink(target, path)) \
+             end }) return buf",
+            vec![s(&a), s(&outside), existing.into()],
+        );
+        let refused = c.nvim.lua(
+            "local code, path = ... return pcall(function() return assert(loadstring(code))({ path = path }) end)",
+            vec![PLUGIN_OPEN_LUA.into(), s(&a)],
+        );
+        assert_eq!(refused, Value::from(false));
+        if existing {
+            assert_eq!(
+                c.nvim.lua("return vim.api.nvim_buf_is_valid(...)", vec![buf]),
+                Value::from(true)
+            );
+        } else {
+            assert_eq!(c.nvim.lua("return vim.fn.bufnr(...)", vec![s(&a)]), Value::from(-1));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_refused_edit_restores_the_window_and_unloads_an_existing_unloaded_buffer() {
+    let mut c = case("open-unloaded-swap");
+    let (a, b, outside) = (c.a.clone(), c.b.clone(), c.outside.clone());
+    edit(&mut c, &b);
+    let previous = c.nvim.lua("return vim.api.nvim_get_current_buf()", vec![]);
+    let win = current_win(&mut c);
+    c.nvim.command(&format!("badd {}", a.display()));
+    let buf = c.nvim.lua("return vim.fn.bufnr(...)", vec![s(&a)]);
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_buf_is_loaded(...)", vec![buf.clone()]),
+        false.into()
+    );
+    c.nvim.lua(
+        "local path, target = ... \
+         vim.api.nvim_create_autocmd('BufReadPre', { once = true, callback = function() \
+           local uv = vim.uv or vim.loop assert(uv.fs_unlink(path)) assert(uv.fs_symlink(target, path)) \
+         end })",
+        vec![s(&a), s(&outside)],
+    );
+    let refused = c.nvim.lua(
+        "local code, path = ... return pcall(function() return assert(loadstring(code))({ path = path, how = 'edit' }) end)",
+        vec![PLUGIN_OPEN_LUA.into(), s(&a)],
+    );
+    assert_eq!(refused, false.into());
+    assert_eq!(current_win(&mut c), win);
+    assert_eq!(c.nvim.lua("return vim.api.nvim_get_current_buf()", vec![]), previous);
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_buf_is_valid(...)", vec![buf.clone()]),
+        true.into()
+    );
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_buf_is_loaded(...)", vec![buf]),
+        false.into()
+    );
+}
+
+/// Swaps `path` for a link to `target` as the next buffer reads it, then runs the open snippet on `path`, which
+/// must refuse; returns the error text.
+fn open_refused_by_a_swap(c: &mut Case, path: &Path, target: &Path) -> String {
+    c.nvim.lua(
+        "local path, target = ... \
+         vim.api.nvim_create_autocmd('BufReadPre', { once = true, callback = function() \
+           local uv = vim.uv or vim.loop assert(uv.fs_unlink(path)) assert(uv.fs_symlink(target, path)) \
+         end })",
+        vec![s(path), s(target)],
+    );
+    let answer = c.nvim.lua(
+        "local code, path = ... local ok, err = pcall(function() return assert(loadstring(code))({ path = path }) end) \
+         return { ok, tostring(err) }",
+        vec![PLUGIN_OPEN_LUA.into(), s(path)],
+    );
+    let answer = answer.as_array().unwrap();
+    assert_eq!(answer[0], false.into(), "the open is refused");
+    answer[1].as_str().unwrap().to_owned()
+}
+
+/// Every loaded buffer's name and lines.
+fn loaded_buffers(c: &mut Case) -> Vec<(String, Vec<String>)> {
+    let v = c.nvim.lua(
+        "local out = {} for _, b in ipairs(vim.api.nvim_list_bufs()) do if vim.api.nvim_buf_is_loaded(b) then \
+           out[#out + 1] = { vim.api.nvim_buf_get_name(b), vim.api.nvim_buf_get_lines(b, 0, -1, false) } end end \
+         return out",
+        vec![],
+    );
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| {
+            let pair = pair.as_array().unwrap();
+            let lines = pair[1]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l.as_str().unwrap().to_owned())
+                .collect();
+            (pair[0].as_str().unwrap().to_owned(), lines)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_refused_edit_from_the_starting_empty_buffer_keeps_no_trace_of_the_swapped_file() {
+    let mut c = case("open-reused-empty-swap");
+    let (a, outside) = (c.a.clone(), c.outside.clone());
+    let win = current_win(&mut c);
+    let err = open_refused_by_a_swap(&mut c, &a, &outside);
+    assert!(err.contains("no longer resolves to the checked path"), "{err}");
+    assert_eq!(current_win(&mut c), win);
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_buf_get_name(0)", vec![]),
+        Value::from("")
+    );
+    for (name, lines) in loaded_buffers(&mut c) {
+        assert_ne!(name, a.to_str().unwrap());
+        assert!(!lines.contains(&"out".to_owned()), "{name} holds the swapped-in file");
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_refused_edit_over_a_buffer_wiped_on_leaving_keeps_no_trace_of_the_swapped_file() {
+    let mut c = case("open-wiped-current-swap");
+    let (a, outside) = (c.a.clone(), c.outside.clone());
+    c.nvim.lua(
+        "vim.cmd('enew') vim.bo.bufhidden = 'wipe' \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'dashboard' }) vim.bo.modified = false",
+        vec![],
+    );
+    let win = current_win(&mut c);
+    let err = open_refused_by_a_swap(&mut c, &a, &outside);
+    assert!(err.contains("no longer resolves to the checked path"), "{err}");
+    assert_eq!(current_win(&mut c), win);
+    for (name, lines) in loaded_buffers(&mut c) {
+        assert_ne!(name, a.to_str().unwrap());
+        assert!(!lines.contains(&"out".to_owned()), "{name} holds the swapped-in file");
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_refused_split_restores_the_windows_and_preserves_an_already_loaded_buffer() {
+    let mut c = case("open-loaded-split-swap");
+    let (a, b, outside) = (c.a.clone(), c.b.clone(), c.outside.clone());
+    c.nvim.command("set hidden");
+    edit(&mut c, &a);
+    let buf = c.nvim.lua("return vim.api.nvim_get_current_buf()", vec![]);
+    let contents = c.nvim.lua("return vim.api.nvim_buf_get_lines(0, 0, -1, false)", vec![]);
+    edit(&mut c, &b);
+    c.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'keep this edit' })",
+        vec![],
+    );
+    let previous = c.nvim.lua("return vim.api.nvim_get_current_buf()", vec![]);
+    let windows = c.nvim.lua("return vim.api.nvim_list_wins()", vec![]);
+    let win = current_win(&mut c);
+    c.nvim.lua(
+        "local buf, path, target = ... \
+         vim.api.nvim_create_autocmd('BufEnter', { buffer = buf, once = true, callback = function() \
+           local uv = vim.uv or vim.loop assert(uv.fs_unlink(path)) assert(uv.fs_symlink(target, path)) \
+         end })",
+        vec![buf.clone(), s(&a), s(&outside)],
+    );
+    let refused = c.nvim.lua(
+        "local code, path = ... return pcall(function() return assert(loadstring(code))({ path = path }) end)",
+        vec![PLUGIN_OPEN_LUA.into(), s(&a)],
+    );
+    assert_eq!(refused, false.into());
+    assert_eq!(current_win(&mut c), win);
+    assert_eq!(c.nvim.lua("return vim.api.nvim_list_wins()", vec![]), windows);
+    assert_eq!(c.nvim.lua("return vim.api.nvim_get_current_buf()", vec![]), previous);
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_buf_is_loaded(...)", vec![buf.clone()]),
+        true.into()
+    );
+    assert_eq!(
+        c.nvim
+            .lua("return vim.api.nvim_buf_get_lines(..., 0, -1, false)", vec![buf]),
+        contents
+    );
+    assert_eq!(
+        c.nvim.lua("return vim.api.nvim_buf_get_lines(0, 0, -1, false)", vec![]),
+        Value::Array(vec!["keep this edit".into()])
+    );
+}
+
 // ---- the follow snippet ----
 
 const OWNER: &str = "demo";

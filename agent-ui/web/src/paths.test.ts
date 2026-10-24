@@ -85,3 +85,28 @@ describe("the paths a card or row offers to open", () => {
     expect(viewText(bash).text).toBe(`$ make\n\n\`\`\`\`\`\n${out}\n\`\`\`\`\``);
   });
 });
+
+describe("paths in long replies", () => {
+  const reply = (text: string): TimelineItem => ({ kind: "message", seq: 1, key: "m-1", text });
+
+  it("finds ordinary paths beside a long name run", () => {
+    expect(pathsIn(reply(`See src/a.rs:12 then ${"a".repeat(20000)} and README.md.`))).toEqual([
+      { path: "src/a.rs", line: 12 },
+      { path: "README.md", line: null },
+    ]);
+  });
+
+  it("scales linearly when a name run grows eightfold", () => {
+    const best = (length: number) => {
+      const item = reply("a".repeat(length));
+      return Math.min(...Array.from({ length: 5 }, () => {
+        const start = performance.now();
+        pathsIn(item);
+        return performance.now() - start;
+      }));
+    };
+    best(1000);
+    // Eightfold input: linear work grows about 8 times, a scan retried at every start about 64 times.
+    expect(best(64000)).toBeLessThan(24 * best(8000));
+  });
+});
