@@ -8,8 +8,9 @@
 # Bind-mount source repositories read-only under /mirrors/ and use git+file:// sources.
 # Tag a throwaway clone with --tag so pkgver() also exercises prerelease tags without
 # changing the input checkout. Validate that the mirrors contain the pinned revisions.
-# Node downloads and cargo registry access still use the network. Cargo fetches the
-# pinned git dependency from its public URL.
+# Node downloads and cargo registry access still use the network. Cargo normally fetches
+# the pinned git dependency from its public URL. The optional cargo mirror redirect applies
+# inside the container for testing unpublished revisions.
 #
 # To test another release, select its asset directory and matching checkout and mirrors.
 set -euo pipefail
@@ -24,6 +25,7 @@ TAG=""
 WORK="${HOME}/.cache/nv-v1dist-aur"
 ONLY=""
 JOBS="4"
+CARGO_VERDANDI_FROM_MIRROR=0
 IMAGE="archlinux:latest"
 
 die() {
@@ -64,6 +66,10 @@ while [ $# -gt 0 ]; do
 	--jobs)
 		JOBS=$2
 		shift 2
+		;;
+	--cargo-verdandi-from-mirror)
+		CARGO_VERDANDI_FROM_MIRROR=1
+		shift
 		;;
 	*)
 		die "unknown argument: $1"
@@ -256,12 +262,24 @@ test_git() {
 
 	local script="$ARCH_SETUP"$'\n'"${BUILD_AND_CHECK//PKGDIR/eitri-git}"
 	script="${script//PKGNAME/eitri-git}"
+	# Only cargo's fetch of the public Verdandi URL is redirected, through git's own config in the
+	# container's environment (runuser keeps it for makepkg); the PKGBUILD itself is not changed, so
+	# what is tested is still the recipe users get.
+	local cargo_mirror=()
+	if [ "$CARGO_VERDANDI_FROM_MIRROR" = 1 ]; then
+		echo "note: --cargo-verdandi-from-mirror: cargo reads the pinned Verdandi $verdandi_rev from" \
+			"$VERDANDI_MIRROR, not https://github.com/HunterGrey-cyber/verdandi.git" >&2
+		cargo_mirror=(-e CARGO_NET_GIT_FETCH_WITH_CLI=true -e GIT_CONFIG_COUNT=1
+			-e "GIT_CONFIG_KEY_0=url.file:///mirrors/verdandi.git.insteadOf"
+			-e "GIT_CONFIG_VALUE_0=https://github.com/HunterGrey-cyber/verdandi.git")
+	fi
 	# Use the default bridge network for cargo, npm, the Skia archive and Node downloads.
 	# The git+file:// source mounts need no network access and no host network mode.
 	run_arch "nv-aur-git-$$" "$WORK/log-git.log" \
 		--mount "type=bind,src=$WORK/eitri-tagged.git,dst=/mirrors/eitri.git,readonly" \
 		--mount "type=bind,src=$NEOVIDE_MIRROR,dst=/mirrors/neovide.git,readonly" \
 		--mount "type=bind,src=$VERDANDI_MIRROR,dst=/mirrors/verdandi.git,readonly" \
+		"${cargo_mirror[@]}" \
 		-- "$script"
 	echo "eitri-git: OK"
 }

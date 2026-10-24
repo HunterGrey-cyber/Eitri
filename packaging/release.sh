@@ -1226,7 +1226,7 @@ ctr_phase_b() {
 		[ "$rc" = 1 ] && [[ "$got" == *"$RS_LEGACY_MESSAGE"* ]] \
 			|| ctr_die "the extracted shell with legacy asked for by $how exited $rc without saying '$RS_LEGACY_MESSAGE': $got"
 	done
-	echo "legacy proof: 4 executables built; nm finds no legacy symbol and the sidecar backend; --legacy and EITRI_AGENT_BACKEND=legacy exit 1 with '$RS_LEGACY_MESSAGE'; no agent-hook in any asset" \
+	echo "legacy proof: ${#RS_BINARIES[@]} executables built; nm finds no legacy symbol and the sidecar backend; --legacy and EITRI_AGENT_BACKEND=legacy exit 1 with '$RS_LEGACY_MESSAGE'; no agent-hook in any asset" \
 		> "$logs/legacy-proof.txt"
 	{ rustc -vV; dpkg-query -W; } > "$logs/toolchain.txt"
 	step "phase B done"
