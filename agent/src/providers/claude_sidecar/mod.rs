@@ -1,16 +1,16 @@
 // agent/src/providers/claude_sidecar/mod.rs
 //! `ClaudeSidecarProvider`: drives Verdandi's `apps/claude-sidecar` gRPC service.
 //! Spawns and owns exactly one sidecar process for its own lifetime, connects to
-//! it over a UDS via `tonic` on a dedicated `RuntimeThread`, and issues the 6 in-scope
-//! unary RPCs synchronously (this file) plus the streaming event pump. `ResumeSession` has
-//! no RPC to call yet -- `resume_session` always returns
-//! `ProviderError::UnsupportedCapability`.
+//! it over a UDS via `tonic` on a dedicated `RuntimeThread`, and issues unary RPCs (this file)
+//! plus the streaming event pump. Fresh sessions and resumes share `CreateSession`, selecting
+//! Claude Code's preset with static panel context only when the handshake offers it.
 
 /// Handing a sidecar to another process (a chat moving to the other window): pidfds, Linux only.
 #[cfg(target_os = "linux")]
 mod moving;
 mod spawn;
 mod steer;
+mod system_prompt;
 mod translate;
 mod watch;
 
@@ -43,7 +43,7 @@ use claude_runtime_protocol::v1::{
     HandshakeRequest, HandshakeResponse, InterruptTurnRequest as ProtoInterruptTurnRequest,
     PermissionMode as ProtoPermissionMode, PersistenceMode, ReplayStart,
     ResolvePermissionRequest as ProtoResolvePermissionRequest, SendTurnRequest as ProtoSendTurnRequest, SettingSource,
-    SettingSourceSelection, SteerTurnRequest as ProtoSteerTurnRequest, StreamingMode, ToolPolicy,
+    SettingSourceSelection, SteerTurnRequest as ProtoSteerTurnRequest, StreamingMode, SystemPromptPreset, ToolPolicy,
     WatchSessionEventsRequest,
 };
 use hyper_util::rt::TokioIo;
@@ -51,6 +51,7 @@ use spawn::SpawnedSidecar;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use system_prompt::EITRI_APPEND;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
@@ -126,6 +127,15 @@ fn provider_prompts_from_handshake(response: &HandshakeResponse) -> bool {
             .capabilities
             .iter()
             .any(|c| c == CAP_PROVIDER_PERMISSION_PROMPTS)
+}
+
+/// Only an explicit capability opts this sidecar into Claude Code's preset; a protocol minor
+/// alone cannot promise that the runtime implements the prompt.
+fn claude_code_prompt_from_handshake(response: &HandshakeResponse) -> bool {
+    response
+        .capabilities
+        .iter()
+        .any(|c| c == claude_runtime_protocol::CAP_SYSTEM_PROMPT_PRESET)
 }
 
 /// Derives what the provider can actually do from what it actually said. Pure, so it is unit-tested
@@ -242,6 +252,8 @@ pub struct ClaudeSidecarProvider {
     /// `provider_prompts_from_handshake`, captured at `connect()`: whether `create_session` and
     /// `resume_session` ask this sidecar for the CLI's own permission prompts.
     provider_prompts: bool,
+    /// Whether this peer offers Claude Code's preset for fresh and resumed sessions.
+    claude_code_prompt: bool,
     /// The watch task of each session opened, newest last; a move cancels the source's. Only a move
     /// reads it, so a build without moves keeps none.
     #[cfg(target_os = "linux")]
@@ -340,6 +352,7 @@ struct Handshaken {
     info: ProviderInfo,
     splits_messages: bool,
     provider_prompts: bool,
+    claude_code_prompt: bool,
 }
 
 /// Connects to the sidecar's socket and runs the real `Handshake`, refusing a socket served by another
@@ -422,6 +435,7 @@ fn handshake_with(
     let capabilities = capabilities_from_handshake(&handshake);
     let splits_messages = handshake.capabilities.iter().any(|c| c == CAP_TEXT_DELTA_MESSAGE_ID);
     let provider_prompts = provider_prompts_from_handshake(&handshake);
+    let claude_code_prompt = claude_code_prompt_from_handshake(&handshake);
     if !provider_prompts {
         // Said once, on stderr only: an older sidecar is not a fault, but a bypass on it is
         // narrower than the CLI's own bypassPermissions, and this is the line that says why.
@@ -435,6 +449,11 @@ fn handshake_with(
     // `build_description`; mixing it in here made `startup_diagnostics` never empty, which lit
     // a permanent warning indicator in the UI for every healthy session.
     let mut diagnostics = sidecar.build_warnings.clone();
+    if !claude_code_prompt {
+        diagnostics.push(format!(
+            "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi {EXPECTED_VERDANDI_REVISION}."
+        ));
+    }
     diagnostics.extend(startup_diagnostics_from_stderr(&sidecar.stderr_tail()));
     let info = info_from_handshake(&handshake, Some(sidecar.build_description.clone()), diagnostics);
     for diagnostic in &info.startup_diagnostics {
@@ -447,6 +466,7 @@ fn handshake_with(
         info,
         splits_messages,
         provider_prompts,
+        claude_code_prompt,
     })
 }
 
@@ -475,6 +495,7 @@ impl ClaudeSidecarProvider {
             info,
             splits_messages,
             provider_prompts,
+            claude_code_prompt,
         } = handshake_with(&runtime, &sidecar, None)?;
         Ok(Self {
             sidecar: Mutex::new(sidecar),
@@ -486,6 +507,7 @@ impl ClaudeSidecarProvider {
             info,
             splits_messages,
             provider_prompts,
+            claude_code_prompt,
             #[cfg(target_os = "linux")]
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(None),
@@ -935,8 +957,8 @@ fn require_interactive(capabilities: &ProviderCapabilities, info: &ProviderInfo)
 /// `executable` is not read at all -- sending any of them would be choosing a value that means
 /// nothing. `streaming` is the exception that proves the rule: PARTIAL has a measured, distinct
 /// effect, so it is sent. `provider_prompts` is another: `provider_prompts_from_handshake`, a
-/// policy field that depends on the peer. `cli_mode` is the last
-/// (`requested_cli_mode`): `Auto` only when the handshake offered both `cli_auto_mode` and
+/// policy field that depends on the peer. `claude_code_prompt` opts into the preset only when
+/// offered. `cli_mode` (`requested_cli_mode`): `Auto` only when the handshake offered both `cli_auto_mode` and
 /// `permission_defer`, and `Default` leaves the field unset, so a request to a sidecar without them
 /// is byte-for-byte what it was before the field existed.
 fn build_create_request(
@@ -945,6 +967,7 @@ fn build_create_request(
     resume_provider_session_id: Option<String>,
     fork: bool,
     provider_prompts: bool,
+    claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
     project: ProjectTrust,
 ) -> ProtoCreateSessionRequest {
@@ -954,6 +977,7 @@ fn build_create_request(
         resume_provider_session_id,
         fork,
         provider_prompts,
+        claude_code_prompt,
         crate::setting_sources::loads_user_settings(),
         project,
         cli_mode,
@@ -982,6 +1006,7 @@ fn build_create_request_loading(
     resume_provider_session_id: Option<String>,
     fork: bool,
     provider_prompts: bool,
+    claude_code_prompt: bool,
     user_settings: bool,
     project: ProjectTrust,
     cli_mode: crate::RequestedCliMode,
@@ -1074,12 +1099,15 @@ fn build_create_request_loading(
         }),
         resume_provider_session_id,
         fork,
-        // Each `None` below leaves the CLI's own default in force -- the proto's own documented
-        // meaning for an absent `optional` field -- so a caller that does not choose gets exactly
-        // what every session got before these fields existed.
-        model: None,         // absent = the CLI's default model
-        effort: None,        // absent = the CLI's default reasoning effort
-        system_prompt: None, // absent = Claude Code's own system prompt, unreplaced
+        // Keep model, effort and output format at their defaults. A replacement would discard
+        // Claude Code's instructions; the preset keeps them and adds only static panel context.
+        // Without the capability both fields stay absent, retaining the SDK's minimal prompt.
+        model: None,  // absent = the CLI's default model
+        effort: None, // absent = the CLI's default reasoning effort
+        system_prompt: None,
+        system_prompt_preset: claude_code_prompt.then(|| SystemPromptPreset {
+            append: Some(EITRI_APPEND.to_string()),
+        }),
         output_format: None, // absent = plain text, not schema-validated structured output
         // false = `CreateSession` returns as soon as the session exists, as it always has.
         await_account_identity: false,
@@ -1091,6 +1119,7 @@ fn build_create_request_loading(
 fn fresh_request(
     request: CreateSessionRequest,
     provider_prompts: bool,
+    claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
 ) -> ProtoCreateSessionRequest {
     let CreateSessionRequest {
@@ -1098,7 +1127,16 @@ fn fresh_request(
         streaming,
         project,
     } = request;
-    build_create_request(cwd, streaming, None, false, provider_prompts, cli_mode, project)
+    build_create_request(
+        cwd,
+        streaming,
+        None,
+        false,
+        provider_prompts,
+        claude_code_prompt,
+        cli_mode,
+        project,
+    )
 }
 
 /// The wire request continuing a Claude session, under the trust the caller states now. Destructured
@@ -1106,6 +1144,7 @@ fn fresh_request(
 fn resume_request(
     request: ResumeSessionRequest,
     provider_prompts: bool,
+    claude_code_prompt: bool,
     cli_mode: crate::RequestedCliMode,
 ) -> ProtoCreateSessionRequest {
     let ResumeSessionRequest {
@@ -1120,6 +1159,7 @@ fn resume_request(
         Some(provider_session_id),
         false,
         provider_prompts,
+        claude_code_prompt,
         cli_mode,
         project,
     )
@@ -1141,6 +1181,7 @@ impl AgentProvider for ClaudeSidecarProvider {
         self.open_session(fresh_request(
             request,
             self.provider_prompts,
+            self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
         ))
     }
@@ -1171,6 +1212,7 @@ impl AgentProvider for ClaudeSidecarProvider {
         self.open_session(resume_request(
             request,
             self.provider_prompts,
+            self.claude_code_prompt,
             requested_cli_mode(&self.capabilities),
         ))
     }
@@ -1681,6 +1723,132 @@ fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64)
 mod tests {
     use super::*;
 
+    #[test]
+    fn append_is_exact_static_panel_context() {
+        let expected = concat!(
+            "This session was started by Eitri, a desktop IDE built around Neovim. While the conversation is shown in Eitri's ",
+            "agent panel, the user edits code in Neovim beside it, and the panel renders your replies as GitHub-flavored Markdown, ",
+            "not in a terminal (images appear as links and are not loaded), shows each tool call with edits drawn as diffs, and asks the user with a ",
+            "card when a tool call needs approval. A file path relative to the project root that you write in a reply, optionally ",
+            "with `:line` (for example `src/main.rs:42`), can be opened in the editor from the panel. A tool call can also be denied ",
+            "by Eitri itself, for example when a permission request expires, a session closes or a turn is interrupted. Those denial ",
+            "messages say what happened; a denial without a reason does not identify who denied it.",
+        );
+        assert_eq!(EITRI_APPEND, expected);
+        assert!(!EITRI_APPEND.contains(['\r', '\n']));
+    }
+
+    #[test]
+    fn only_the_named_capability_selects_the_prompt() {
+        let mut peer = real_handshake_today();
+        assert!(claude_code_prompt_from_handshake(&peer));
+        peer.capabilities.clear();
+        assert!(!claude_code_prompt_from_handshake(&peer));
+        peer.capabilities = vec!["system_prompt".into(), "list_commands".into()];
+        assert!(!claude_code_prompt_from_handshake(&peer));
+        peer.capabilities.push("system_prompt_preset".into());
+        assert!(claude_code_prompt_from_handshake(&peer));
+    }
+
+    #[test]
+    fn preset_requests_follow_the_capability() {
+        use prost::Message as _;
+        for offered in [true, false] {
+            for project in [ProjectTrust::Trusted, ProjectTrust::Untrusted] {
+                for user_settings in [true, false] {
+                    for cli_mode in [crate::RequestedCliMode::Default, crate::RequestedCliMode::Auto] {
+                        for resume in [None, Some("claude-id".to_string())] {
+                            let request = build_create_request_loading(
+                                "/p".into(),
+                                StreamingPreference::Partial,
+                                resume.clone(),
+                                false,
+                                true,
+                                offered,
+                                user_settings,
+                                project,
+                                cli_mode,
+                            );
+                            let decoded =
+                                ProtoCreateSessionRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+                            assert_eq!(decoded.system_prompt, None);
+                            assert_eq!(
+                                decoded.system_prompt_preset,
+                                offered.then(|| SystemPromptPreset {
+                                    append: Some(EITRI_APPEND.into()),
+                                })
+                            );
+                            assert_eq!(decoded.resume_provider_session_id, resume);
+                            if !offered {
+                                let expected = ProtoCreateSessionRequest {
+                                    cwd: "/p".into(),
+                                    policy: Some(ClaudeHostPolicy {
+                                        configuration: ConfigurationProfile::Native as i32,
+                                        permissions: ProtoPermissionMode::Interactive as i32,
+                                        persistence: PersistenceMode::HostCli as i32,
+                                        executable: ExecutableSource::HostCli as i32,
+                                        streaming: StreamingMode::Partial as i32,
+                                        setting_sources: Some(SettingSourceSelection {
+                                            sources: proto_sources(crate::setting_sources::for_session(
+                                                user_settings,
+                                                project,
+                                            )),
+                                        }),
+                                        tool_policy: Some(ToolPolicy {
+                                            deny: vec![],
+                                            unrestricted: true,
+                                            allow: None,
+                                        }),
+                                        permission_mode_switchable: false,
+                                        provider_permission_prompts: true,
+                                        cli_permission_mode: match cli_mode {
+                                            crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32,
+                                            crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32,
+                                        },
+                                        accept_unsupported_cli: false,
+                                    }),
+                                    resume_provider_session_id: resume,
+                                    fork: false,
+                                    model: None,
+                                    effort: None,
+                                    system_prompt: None,
+                                    system_prompt_preset: None,
+                                    output_format: None,
+                                    await_account_identity: false,
+                                };
+                                assert_eq!(request.encode_to_vec(), expected.encode_to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+            let fresh = fresh_request(
+                CreateSessionRequest {
+                    cwd: "/p".into(),
+                    streaming: StreamingPreference::Partial,
+                    project: ProjectTrust::Untrusted,
+                },
+                true,
+                offered,
+                crate::RequestedCliMode::Default,
+            );
+            let resumed = resume_request(
+                ResumeSessionRequest {
+                    provider_session_id: "claude-id".into(),
+                    cwd: "/p".into(),
+                    streaming: StreamingPreference::Partial,
+                    project: ProjectTrust::Untrusted,
+                },
+                true,
+                offered,
+                crate::RequestedCliMode::Default,
+            );
+            assert_eq!(fresh.system_prompt_preset.is_some(), offered);
+            assert_eq!(resumed.system_prompt_preset, fresh.system_prompt_preset);
+            assert_eq!(resumed.resume_provider_session_id.as_deref(), Some("claude-id"));
+        }
+    }
+
     /// Fresh, resumed and forked sidecar requests all use `INTERACTIVE`, are never switchable,
     /// and state an empty deny list as `unrestricted`, regardless of the tab's mode. The request
     /// carries no tab mode. Verdandi installs its `PreToolUse` broker for `INTERACTIVE`
@@ -1698,6 +1866,7 @@ mod tests {
                         None,
                         false,
                         true,
+                        false,
                         cli_mode,
                         ProjectTrust::Untrusted,
                     ),
@@ -1710,6 +1879,7 @@ mod tests {
                         Some("claude-id".into()),
                         false,
                         true,
+                        false,
                         cli_mode,
                         ProjectTrust::Untrusted,
                     ),
@@ -1722,6 +1892,7 @@ mod tests {
                         Some("claude-id".into()),
                         true,
                         true,
+                        false,
                         cli_mode,
                         ProjectTrust::Untrusted,
                     ),
@@ -1778,6 +1949,7 @@ mod tests {
                     resume,
                     fork,
                     offered,
+                    false,
                     crate::RequestedCliMode::Default,
                     ProjectTrust::Untrusted,
                 )
@@ -1807,6 +1979,7 @@ mod tests {
             resume.map(str::to_string),
             fork,
             false,
+            false,
             user_settings,
             project,
             crate::RequestedCliMode::Default,
@@ -1832,6 +2005,7 @@ mod tests {
                     StreamingPreference::Partial,
                     resume.map(str::to_string),
                     fork,
+                    false,
                     false,
                     true,
                     ProjectTrust::Untrusted,
@@ -1859,6 +2033,7 @@ mod tests {
                 StreamingPreference::Partial,
                 resume.map(str::to_string),
                 fork,
+                false,
                 false,
                 false,
                 ProjectTrust::Untrusted,
@@ -1912,6 +2087,7 @@ mod tests {
                     project,
                 },
                 false,
+                false,
                 crate::RequestedCliMode::Default,
             )
         };
@@ -1922,6 +2098,7 @@ mod tests {
                     streaming: StreamingPreference::Partial,
                     project,
                 },
+                false,
                 false,
                 crate::RequestedCliMode::Default,
             )
@@ -1995,6 +2172,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
                 crate::RequestedCliMode::Default,
                 project,
             )
@@ -2024,7 +2202,7 @@ mod tests {
         HandshakeResponse {
             protocol_major: 3,
             // The handshake reports the protocol minor from `capabilities.json`.
-            protocol_minor: 20,
+            protocol_minor: 21,
             sidecar_version: "0.2.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
@@ -2092,6 +2270,7 @@ mod tests {
                 // which is translated whenever it arrives.
                 "steer_turn",
                 "list_commands",
+                "system_prompt_preset",
                 // Executable sources are advertised as capabilities rather than a separate wire field.
                 // `executable_host_cli` is always present; checkout builds also offer `executable_sdk_bundled`.
                 // Packaged builds cannot offer it: the SDK uses `createRequire` to find its CLI, and the
@@ -2508,10 +2687,10 @@ mod tests {
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));
-        // Forty-one capabilities in the packaged fixture returned by `real_handshake_today()`.
+        // Forty-two capabilities in the packaged fixture returned by `real_handshake_today()`.
         // Checkout builds also advertise `executable_sdk_bundled`; a sidecar with egress
         // restrictions enabled additionally advertises `egress_restricted`.
-        assert_eq!(info.advertised_capabilities.len(), 41);
+        assert_eq!(info.advertised_capabilities.len(), 42);
         assert_eq!(info.startup_diagnostics, vec!["diag".to_string()]);
         assert_eq!(info.build_description.as_deref(), Some("checkout @ abc1234"));
     }
@@ -2579,6 +2758,7 @@ mod tests {
                     resume.clone(),
                     fork,
                     true,
+                    false,
                     true,
                     ProjectTrust::Untrusted,
                     cli_mode,

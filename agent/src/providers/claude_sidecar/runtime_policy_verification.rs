@@ -15,10 +15,13 @@
 //!
 //! The CONTROL arm builds a request through `build_create_request` and changes that field.
 //! The TEST arm uses `ClaudeSidecarProvider::create_session`, carrying
-//! `CONSERVATIVE_DISALLOWED_TOOLS` and the `[PROJECT, LOCAL]` selection.
+//! the product's unrestricted tool policy and settings tiers selected for its trust.
+//! Both arms use their own handshake's prompt choice, including Claude Code's preset and
+//! static panel context when offered, just as product sessions do.
 //!
-//! Every session here is INTERACTIVE and never switchable; `build_create_request` takes
-//! no mode. A BYPASS deny-list test would not cover a session this client can create.
+//! Every session here is INTERACTIVE and never switchable. Each provider handshake supplies
+//! the requested CLI mode and prompt choice; neither arm substitutes its own prompt choice.
+//! A BYPASS deny-list test would not cover a session this client can create.
 //!
 //! `build_create_request` and `open_session` stay private so tests do not widen the product's
 //! policy API. These are crate-local `--lib` tests and add model turns to the real-CLI tests:
@@ -221,6 +224,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         None,
         false,
         control.provider_prompts,
+        control.claude_code_prompt,
         requested_cli_mode(&control.capabilities),
         ProjectTrust::Trusted,
     );
@@ -304,6 +308,7 @@ fn setting_sources_decide_whether_the_user_tier_loads_at_runtime() {
         None,
         false,
         opted_out.provider_prompts,
+        opted_out.claude_code_prompt,
         false,
         ProjectTrust::Trusted,
         requested_cli_mode(&opted_out.capabilities),
@@ -404,6 +409,7 @@ fn ask_arm(cwd: &Scratch, ask: &str, user_settings: bool, project: ProjectTrust,
         None,
         false,
         provider.provider_prompts,
+        provider.claude_code_prompt,
         user_settings,
         project,
         requested_cli_mode(&provider.capabilities),

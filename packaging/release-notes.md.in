@@ -47,7 +47,8 @@ ACP join Claude Code, and you can put web pages of your own in the window. Your 
 
 **Agents you supervise**
 
-- Claude Code as before; **Codex tabs** (`:tabnew codex`, with `codex` 0.160.0 or newer, always in Codex's
+- Claude Code tabs request Claude Code's own system prompt (the one `claude -p` uses), plus a short
+  note about Eitri's panel; **Codex tabs** (`:tabnew codex`, with `codex` 0.160.0 or newer, always in Codex's
   `workspace-write` sandbox); and **any ACP agent** you register with `eitri.agent.register{...}`. Each kind asks its
   own trust question about the project files it would load.
 - **Manual mode**: in a Claude Code tab every file edit is a card you answer, and your saved rules still apply.
@@ -96,6 +97,9 @@ ACP join Claude Code, and you can put web pages of your own in the window. Your 
 - **The agent backend is built again, once.** 0.3.0 pins a newer Verdandi (@VERDANDI_REV@), so `install.sh`
   builds the new backend before it switches over, and after a `.deb`/`.rpm` upgrade you run `eitri setup` before
   your first turn. It downloads Node.js and the Claude Agent SDK from npm again (about 600 MiB of disk).
+- A Claude Code conversation started in Eitri before 0.3.0 **keeps** its earlier, shorter instructions when you
+  continue it (measured with Claude Code 2.1.302); a new conversation gets the full ones, and `/compact` may
+  refresh them too (not yet measured).
 - Your window opens as you left it. Its 0.2.2 layout file is read once into the new one and left as it was, so
   0.2.2 still opens with it.
 
@@ -111,8 +115,14 @@ for good; later releases' `install.sh` cannot build 0.2.0 from source. The 0.2.0
 
 Everything new has automated tests. The tiling window (containers, floats, the scratchpad, workspaces, chat
 views and open rules) and the Markdown preview passed every row of their checks in an isolated, headless test
-session: scripted keys, not a person at a real desktop. The Claude Code backend's conformance suites passed
-against the real `claude` (2.1.302) on a development build shortly before this release. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
+session: scripted keys, not a person at a real desktop. The Claude Code backend's suites that run the real `claude` (2.1.302; 113 cases) were run on a development
+build shortly before this release, in two sessions because the first stopped when the test account reached the model
+service's rate limit; after the second, all 113 pass. Two cases failed along the way for reasons other than this
+release's change: one hit the model service's usage-policy check on a probe that asks for a destructive command (it
+passed when run again), and one met this CLI version's new transcript line types, which the history reader now skips.
+Eight Glob and Grep probes in one suite are skipped, because this CLI build lists no such tools. The request a Claude Code tab
+now sends was captured from the built backend against a local stand-in: it carries `claude -p`'s system prompt with
+Claude Code's own identity line for the Agent SDK and Eitri's note once at its end. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
 newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
 Steering, the redesigned chat page in a real window, input methods, and companion mode on Hyprland, niri, KDE or
 a real GNOME login have not been seen on a screen yet.
@@ -127,14 +137,18 @@ repository).
 Measured on development builds shortly before this release, in an isolated, headless test session on an AMD
 desktop, and on an Intel laptop where it says so:
 
-- **Typing on GTK 4.24 (current Arch) is one refresh slower than native Neovide.** GTK 4.23 and 4.24 changed the
-  frame clock, so the redraw after a key waits for the next frame. In the headless session, which runs at GTK's
-  60 Hz default, typing added 17.15 ms at the median and 21.75 ms at the 99th percentile. On a real display the
-  wait should be at most one of its refreshes (about 6 ms at 165 Hz); that has not been measured. The same build
-  with GTK 4.22.5 added 0.13 ms at the median. Eitri cannot work around it without an interface GTK does not have.
-- **Scrolling with a held `j` on GTK 4.24 at 165 Hz** drew 85 % of the frames native Neovide drew, and its 99th
-  percentile frame interval was twice native's. The same build with GTK 4.22.5 scrolls as native does (165 frames
-  a second, p99 6 ms), so this too is GTK 4.24's frame clock; a real display has not been measured.
+- **On GTK 4.24, typing is one refresh slower than native Neovide.** In a headless session with the compositor
+  feeding GTK a real 165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median;
+  the same build with GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about
+  16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
+  commit c36202f6, 2026-10-25). Three workarounds using public GTK API were measured; none restored native
+  latency (the best still added about 5.8 ms at 165 Hz), so none ships. Settled idle stayed quiet. The period
+  was real, but the screen was the headless session's; a physical display has still not been measured.
+- **On GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
+  165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
+  The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
+  used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
+  repeated with real-period feedback or on a physical display.
 - **While a reply streams**, a key's redraw took 11.2 ms at the median with WebKitGTK 2.54 (a stand-in reply),
   against about 2.3 ms with WebKitGTK 2.52.
 - **Memory:** one tab used 253 to 283 MiB more than native Neovide, against a goal of 256 MiB, and each extra
@@ -213,7 +227,7 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 
 **你监督的 agent**
 
-- Claude Code 照旧；**Codex 标签页**（`:tabnew codex`，需要 `codex` 0.160.0 或更新版本，始终在 Codex 的 `workspace-write` 沙箱里运行）；以及用 `eitri.agent.register{...}` 注册的**任何 ACP agent**。每一种都会就它要加载的项目文件单独问一次信任。
+- Claude Code 标签页请求 Claude Code 自己的系统提示词（`claude -p` 使用的那一份），另外附上一小段 Eitri 面板的说明；**Codex 标签页**（`:tabnew codex`，需要 `codex` 0.160.0 或更新版本，始终在 Codex 的 `workspace-write` 沙箱里运行）；以及用 `eitri.agent.register{...}` 注册的**任何 ACP agent**。每一种都会就它要加载的项目文件单独问一次信任。
 - **Manual 模式**：在 Claude Code 标签页里，每一次文件编辑都是一张由你回答的卡片，你保存的规则照样适用。在 Codex 标签页里，Manual 让 Codex 每一次要离开沙箱的请求都成为一张卡片，而沙箱里面的编辑和命令仍然不经询问就运行（agent 指南里有详细说明）；ACP 标签页没有 Manual。`Shift+Tab` 在 manual、auto 和 bypass 之间轮换；`agent.default_mode` 决定新标签页从哪个模式开始。
 - **回合进行中按 Enter 会把消息插进这个回合**（Claude Code 和 Codex 标签页）：agent 在下一步读到它。ACP 标签页会把消息留到回合结束。`Ctrl+Enter` 打断回合并立即发送。
 - 聊天页面重做了：安静的一栏，只在你要审阅或回答的内容周围加框，agent 的思考按你选的方式显示（`agent.thinking`），每个结束的回合下面写着 `Worked for 8s`，还有一个列出 agent 自己命令的 `/` 菜单。
@@ -237,13 +251,14 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 ### 从 0.2.2 升级
 
 - **agent 后端要重新构建一次。** 0.3.0 固定了一个更新的 Verdandi（@VERDANDI_REV@），所以 `install.sh` 会先构建新的后端再切换过去；`.deb`/`.rpm` 升级之后，在第一次对话之前运行 `eitri setup`。它会再从 npm 下载一次 Node.js 和 Claude Agent SDK（大约需要 600 MiB 磁盘空间）。
+- 在 0.3.0 之前于 Eitri 里开始的 Claude Code 对话，继续时**会保留**原来较短的指令（用 Claude Code 2.1.302 测过）；新对话会得到完整的指令，`/compact` 也可能刷新它们（还没有测过）。
 - 你的窗口会照你离开时的样子打开。它 0.2.2 的布局文件只读一次、读进新的文件，旧文件原样保留，所以 0.2.2 仍然用它打开。
 
 **`v0.2.0` 将无法再从 git 构建。** 0.2.0 之后，Neovide fork 的公开历史被改写了（只改了提交的元数据，文件内容没有变），所以 `v0.2.0` 这个 tag 以及之前所有的公开提交，指向的都是已经没有任何分支持有的 fork 提交。请从 git 构建 0.2.1 或更新的版本。至于 0.2.0 本身：用它自己的 `install.sh`（0.2.0 的发布资源）加 `--from-source`，只在 GitHub 还提供那些旧对象时才能成功；用 0.2.0 发布页上的 `eitri-0.2.0-source.tar.gz` 则可以一直重新构建它，里面带着 fork 的文件。之后版本的 `install.sh` 都没法从源码构建 0.2.0。0.2.0 的安装包、tar 包和 `install.sh` 不受影响。
 
 ### 哪些已经试过
 
-所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端的一致性测试在本次发布前不久的一个开发构建上，对着真实的 `claude`（2.1.302）通过。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。插话引导、真实窗口里的新聊天页面、输入法，以及在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，都还没有在屏幕上见过。
+所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端中用真实 `claude`（2.1.302）运行的测试共 113 个用例，在本次发布前不久的一个开发构建上分两次运行，因为第一次在测试账号触到模型服务的速率限制时中断；第二次之后，113 个用例全部通过。中途有两个用例失败，原因都不在本次发布的改动：一个是在要求执行破坏性命令的探测上触发了模型服务的使用政策检查（重跑后通过），另一个是遇到这个 CLI 版本新增的对话记录行类型，历史读取器现在会跳过它们。某个测试套件里有八个 Glob 和 Grep 探测被跳过，因为这个 CLI 版本没有列出这两个工具。Claude Code 标签页现在发出的请求，在构建好的后端上对着一个本地替身录了下来：它带着 `claude -p` 的系统提示词，身份那一行换成 Claude Code 在 Agent SDK 里的说法，末尾带一次 Eitri 的说明。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。插话引导、真实窗口里的新聊天页面、输入法，以及在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，都还没有在屏幕上见过。
 
 0.3.0 的所有内容都还没有经过真实硬件和真人的手，所以它还没有稳定到可以日常使用。这要等真实硬件和一周的日常使用，而不是等某个版本号；特别欢迎来自真实桌面的反馈。你可能遇到的问题列在已知问题里（仓库中的 `docs/known-issues.zh-CN.md`）。
 
@@ -251,8 +266,8 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 
 在本次发布前不久的开发构建上，于一台 AMD 台式机上的隔离无界面测试会话里测得；注明的地方是在一台 Intel 笔记本上测的：
 
-- **在 GTK 4.24（目前的 Arch）上，打字比原生 Neovide 慢一个刷新周期。** GTK 4.23 和 4.24 改了帧时钟，按键之后的重绘要等下一帧。在无界面会话里（它按 GTK 默认的 60 Hz 运行），打字的中位数多 17.15 ms，第 99 百分位多 21.75 ms。在真实显示器上，这个等待应该最多是它的一个刷新周期（165 Hz 下约 6 ms），但还没有测过。同一个构建用 GTK 4.22.5 时，中位数只多 0.13 ms。GTK 没有提供能让 Eitri 绕开它的接口。
-- **在 GTK 4.24、165 Hz 下按住 `j` 滚动**时，画出的帧数是原生 Neovide 的 85 %，第 99 百分位的帧间隔是原生的两倍。同一个构建用 GTK 4.22.5 时滚动和原生一样（每秒 165 帧，第 99 百分位 6 ms），所以这同样是 GTK 4.24 的帧时钟造成的；还没有在真实显示器上测过。
+- **在 GTK 4.24 上，打字比原生 Neovide 慢一个刷新周期。** 在无界面会话里，合成器通过呈现反馈向 GTK 提供真实的 165 Hz 周期时，GTK 4.24.1 的打字中位数多 5.97 ms；同一个构建用 GTK 4.22.5 时只多 0.30 ms。GTK 使用默认的 60 Hz 回退时钟时，约多 16.5 ms。一个 156 行的纯 GTK 复现程序在 GTK 开发分支（4.25.0，提交 c36202f6，2026-10-25）上也测到了这个延迟。测过三种使用公开 GTK API 的绕行办法，都没恢复原生延迟（最好的在 165 Hz 下仍多约 5.8 ms），所以都不随产品发布。静置后仍然没有重绘。周期是真实的，但画面仍是无界面会话的；实体显示器仍未测量。
+- **在 GTK 4.24、165 Hz 的无界面输出上按住 `j` 滚动会掉帧。** 原生 Neovide 每秒画出 165.5 个有变化的帧，Eitri 用 GTK 4.24.1 时为 140.6，同一个构建用 GTK 4.22.5 时为 165.4。第 99 百分位的帧间隔依次为 6.1、12.1 和 6.1 ms。这是另一次滚动测量，使用原样的呈现反馈，因此 GTK 4.24 仍使用 60 Hz 回退时钟；滚动还没有用真实周期反馈重测，也没有在实体显示器上测量。
 - **回复正在输出时**，在 WebKitGTK 2.54 上一次按键的重绘中位数是 11.2 ms（替身回复），WebKitGTK 2.52 上约为 2.3 ms。
 - **内存：** 一个标签页比原生 Neovide 多用 253 到 283 MiB，目标是 256 MiB；每多一个聊天视图约多 28 MB。
 - **闲置：** 不画任何帧，每分钟约 13 ms CPU。**启动：** 260 ms，原生为 253 ms。

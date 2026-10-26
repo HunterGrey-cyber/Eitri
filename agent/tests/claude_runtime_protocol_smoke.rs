@@ -51,11 +51,12 @@ fn generated_types_construct_and_carry_the_expected_field_values() {
             // that predate this field.
             accept_unsupported_cli: false,
         }),
-        // Absent `model`, `effort`, `system_prompt` and `output_format` use the CLI defaults.
-        // This smoke test does not exercise these options.
+        // Leave model, effort and output format at their defaults. With both prompt fields absent,
+        // the Agent SDK uses its minimal system prompt.
         model: None,
         effort: None,
         system_prompt: None,
+        system_prompt_preset: None,
         output_format: None,
         // `await_account_identity` is unexercised here.
         await_account_identity: false,

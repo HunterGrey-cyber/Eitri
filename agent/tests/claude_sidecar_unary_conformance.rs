@@ -157,6 +157,7 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "extra_mcp_servers_http",
         "steer_turn",
         "list_commands",
+        "system_prompt_preset",
         "executable_host_cli",
     ]
     .iter()

@@ -142,12 +142,15 @@ import { copyToPrimary } from "./primaryCopy";
  *  is this module's logic now, since `BandFacts` itself stays decoupled from `ProviderInfo`. */
 export const SKEW_PREFIX = "Verdandi baseline drift";
 
-/** `⚠` only for version skew or a refusal: a warning that shows on every session stops being read.
+/** `⚠` only for version skew, an unavailable Claude Code prompt or a refusal:
+ *  a warning that shows on every session stops being read.
  *  Returns what the glyph's title says, or null. Routine diagnostics (the CLI version one, which can
  *  be present on every session of a host) go to the detail popover only. */
 export function statusWarning(provider: ProviderInfo | null, failure: string | null): string | null {
   if (failure !== null) return failure;
-  return provider?.startupDiagnostics.find((line) => line.startsWith(SKEW_PREFIX)) ?? null;
+  return provider?.startupDiagnostics.find(
+    (line) => line.startsWith(SKEW_PREFIX) || line.startsWith("Claude Code's system prompt unavailable"),
+  ) ?? null;
 }
 
 /** `ContextSummary` (the wire shape) to `BandFacts["context"]` (band.ts's own shape, `file`

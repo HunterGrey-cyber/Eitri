@@ -1,7 +1,7 @@
 //! Turning the real Claude CLI's own `<uuid>.jsonl` transcript into ordered `AgentDomainEvent`s.
 //!
-//! Every number quoted in this file was
-//! measured on 2026-09-20 over the 822 real `.jsonl` files (570 MB, 117,826 lines) under this
+//! The corpus measurements quoted in this file were
+//! made on 2026-09-20 over the 822 real `.jsonl` files (570 MB, 117,826 lines) under this
 //! machine's own `$CLAUDE_CONFIG_DIR/projects`.
 //!
 //! Three properties this module exists to hold, none of which is convenience:
@@ -143,7 +143,7 @@ pub struct HistoryCounts {
     pub attachment_lines: u64,
     /// `system` lines, all ten subtypes, `compact_boundary` included.
     pub system_lines: u64,
-    /// The eleven side-record types (`last-prompt`, `ai-title`, `cost-state`, ...).
+    /// The fourteen side-record types (`last-prompt`, `ai-title`, `cost-state`, `api-request`, ...).
     pub side_record_lines: u64,
     /// The five types that occur only in `agent-*.jsonl` subagent files. Defence, not a live path:
     /// zero of them appear in any top-level session file.
@@ -394,7 +394,7 @@ impl ParsedLine {
 /// Every `type` value this module knows about, so that the classifier is a total match and a new
 /// one has to be added deliberately rather than falling into a catch-all.
 ///
-/// The first fifteen are the complete set found in top-level session files. The next five occur
+/// The first eighteen are the complete set found in top-level session files. The next five occur
 /// only in `agent-*.jsonl` subagent files, which `transcript_path` can never name; they are listed
 /// because the file split is the CLI's implementation detail, not a promise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +414,9 @@ enum LineType {
     Relocated,
     WorktreeState,
     CostState,
+    ApiRequest,
+    ApiRequestBlob,
+    ApiRequestShape,
     Started,
     Result,
     Failed,
@@ -439,6 +442,9 @@ fn line_type(name: &str) -> LineType {
         "relocated" => LineType::Relocated,
         "worktree-state" => LineType::WorktreeState,
         "cost-state" => LineType::CostState,
+        "api-request" => LineType::ApiRequest,
+        "api-request-blob" => LineType::ApiRequestBlob,
+        "api-request-shape" => LineType::ApiRequestShape,
         "started" => LineType::Started,
         "result" => LineType::Result,
         "failed" => LineType::Failed,
@@ -491,7 +497,11 @@ pub(crate) fn classify_line(raw: &str) -> ParsedLine {
         | LineType::WorktreeState
         // `cost-state` carries `totalCostUSD` and `modelUsage`. History still does not fill
         // `usage`: a restored figure would read as this session's live running cost.
-        | LineType::CostState => with_version(ParsedLine::skipped(SkipReason::SideRecord)),
+        | LineType::CostState
+        // Request bodies are private records, never conversation or summary input.
+        | LineType::ApiRequest
+        | LineType::ApiRequestBlob
+        | LineType::ApiRequestShape => with_version(ParsedLine::skipped(SkipReason::SideRecord)),
         LineType::Started
         | LineType::Result
         | LineType::Failed
@@ -828,7 +838,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
-    // The fifteen line types a top-level session file can hold, plus the five that only occur in
+    // The eighteen line types a top-level session file can hold, plus the five that only occur in
     // subagent files. Every one has a stated destination; there is no "everything else" bucket, so
     // each is checked rather than assumed.
     // ---------------------------------------------------------------------------------------
@@ -889,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn all_eleven_side_record_types_are_skipped_and_counted() {
+    fn all_known_side_record_types_are_skipped_and_counted() {
         let lines = [
             r#"{"type":"last-prompt","leafUuid":"l","sessionId":"s"}"#,
             r#"{"type":"atis-latch","atis":{},"sessionId":"s"}"#,
@@ -902,14 +912,57 @@ mod tests {
             r#"{"type":"relocated","sessionId":"s"}"#,
             r#"{"type":"worktree-state","sessionId":"s"}"#,
             r#"{"type":"cost-state","totalCostUSD":1.5,"modelUsage":{}}"#,
+            r#"{"type":"api-request"}"#,
+            r#"{"type":"api-request-blob"}"#,
+            r#"{"type":"api-request-shape"}"#,
         ];
         for line in lines {
             assert_eq!(skip_reason(line), Some(SkipReason::SideRecord), "line {line}");
         }
         let history = fold(&lines.join("\n"));
         assert!(history.events.is_empty());
-        assert_eq!(history.counts.side_record_lines, 11);
-        assert_eq!(history.counts.skipped_lines, 11);
+        assert_eq!(history.counts.side_record_lines, 14);
+        assert_eq!(history.counts.skipped_lines, 14);
+        assert_eq!(history.counts.unknown_type_lines, 0);
+    }
+
+    #[test]
+    fn request_records_never_contribute_conversation_even_with_message_fields() {
+        let mut lines = vec![typed_prompt("before")];
+        for kind in ["api-request", "api-request-blob", "api-request-shape"] {
+            for role in ["user", "assistant"] {
+                let line = serde_json::json!({
+                    "type": kind,
+                    "version": "2.1.302",
+                    "uuid": "synthetic-request",
+                    "promptSource": "sdk",
+                    "message": {"role": role, "content": [
+                        {"type": "text", "text": "synthetic private sentinel"},
+                        {"type": "tool_use", "id": "synthetic-tool", "name": "Read", "input": {}},
+                        {"type": "tool_result", "tool_use_id": "synthetic-tool", "content": "synthetic result"}
+                    ]}
+                })
+                .to_string();
+                let parsed = classify_line(&line);
+                assert_eq!(parsed.skip, Some(SkipReason::SideRecord), "{kind}, {role}");
+                assert!(parsed.outcomes.is_empty(), "{kind}, {role}");
+                let history = fold(&line);
+                assert!(history.events.is_empty(), "{kind}, {role}");
+                assert_eq!(history.parsed_items, 0);
+                assert_eq!(history.counts.side_record_lines, 1);
+                assert_eq!(history.counts.unknown_type_lines, 0);
+                lines.push(line);
+            }
+        }
+        lines.push(typed_prompt("after"));
+        let history = fold(&lines.join("\n"));
+        assert_eq!(prompts(&history), vec!["before", "after"]);
+        assert_eq!(history.events.len(), 2);
+        assert_eq!(history.parsed_items, 2);
+        assert_eq!(history.omitted_items, Some(0));
+        assert_eq!(history.counts.side_record_lines, 6);
+        assert_eq!(history.counts.skipped_lines, 6);
+        assert_eq!(history.counts.unknown_type_lines, 0);
     }
 
     /// `cost-state` is the one side record carrying something the projection has a field for.

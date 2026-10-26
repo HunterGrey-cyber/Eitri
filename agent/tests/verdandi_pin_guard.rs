@@ -13,6 +13,17 @@ use std::path::PathBuf;
 
 use agent::EXPECTED_VERDANDI_REVISION;
 
+#[test]
+fn the_pinned_protocol_exposes_the_preset() {
+    assert_eq!(claude_runtime_protocol::PROTOCOL_MINOR, 21);
+    assert_eq!(
+        claude_runtime_protocol::CAP_SYSTEM_PROMPT_PRESET,
+        "system_prompt_preset"
+    );
+    let preset = claude_runtime_protocol::v1::SystemPromptPreset { append: None };
+    assert!(preset.append.is_none());
+}
+
 /// Pulls the `rev = "..."` value off `agent/Cargo.toml`'s `claude-runtime-protocol` dependency line,
 /// by text, deliberately not by parsing TOML -- this test wants to fail loudly if that one line's
 /// shape ever stops looking like a `git` dependency with a `rev`, not silently accept some other

@@ -108,6 +108,20 @@ event kind appeared that either parser misreads or drops without saying so.
 
 Nothing in this capture required a change to `agent/src/wire.rs` or `agent/src/history/`.
 
+## Transcript compatibility with Claude Code 2.1.302 (2026-10-26)
+
+The later TEST-profile `stream_capture_conformance` run reported ten previously unknown transcript
+lines: four `api-request`, five `api-request-blob` and one `api-request-shape`. The run is recorded in
+`/home/user/work/p0a/t8-results.md` on the maintainer's machine (outside git); no request bodies or
+transcript text are reproduced here. This is a transcript-format update, not a re-recording of the
+2.1.292 backend baseline above.
+
+`agent/src/history/transcript_jsonl.rs` classifies all three as known side records, skipped and counted
+in `side_record_lines` rather than `unknown_type_lines`. Their request bodies never become conversation
+events, panel content or summary input, even if they contain message-shaped fields. Synthetic unit tests
+pin each type, its counters and the unchanged conversation on either side. The real captured-transcript
+case still needs its post-repair rerun; unit checks alone do not complete that conformance row.
+
 ## What is pinned elsewhere, not re-tested here
 
 - **Concurrent permission requests** (several pending at once, each answerable in any order): pinned at the pure-reducer

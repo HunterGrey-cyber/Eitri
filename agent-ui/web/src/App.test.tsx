@@ -10100,10 +10100,23 @@ describe("statusWarning", () => {
     buildDescription: "Verdandi checkout: /v @ 28a5e4c (via default path)",
     startupDiagnostics: diagnostics,
   });
+  const promptDiagnostic =
+    "Claude Code's system prompt unavailable: this sidecar does not offer system_prompt_preset, so Claude runs with the Agent SDK's minimal prompt. Build the sidecar for Verdandi a1f637a.";
+  const drift = "Verdandi baseline drift: running 1234567, this client was verified against 28a5e4c.";
 
   it("warns for Verdandi skew", () => {
-    const drift = "Verdandi baseline drift: running 1234567, this client was verified against 28a5e4c.";
     expect(statusWarning(provider([drift]), null)).toBe(drift);
+  });
+  it("warns when Claude Code's system prompt is unavailable", () => {
+    expect(statusWarning(provider([promptDiagnostic]), null)).toBe(promptDiagnostic);
+  });
+  it("prioritizes a failure over a prompt warning", () => {
+    expect(statusWarning(provider([promptDiagnostic]), "failed")).toBe("failed");
+  });
+  it("uses the first matching startup diagnostic", () => {
+    const routine = "[claude-sidecar] CLI version diagnostic: 2.1.282 is in range but untested";
+    expect(statusWarning(provider([routine, promptDiagnostic, drift]), null)).toBe(promptDiagnostic);
+    expect(statusWarning(provider([routine, drift, promptDiagnostic]), null)).toBe(drift);
   });
   it("warns for a refusal, which is a tab that failed to start", () => {
     expect(statusWarning(null, "the CLI gate refused 2.1.999")).toBe("the CLI gate refused 2.1.999");

@@ -561,6 +561,17 @@ class GuideCompleteTests(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(_GUIDE_DIR, file)), file)
 
 
+class KnownIssuesAnchorsTests(unittest.TestCase):
+    def test_chinese_agent_links_land_on_the_corresponding_sections(self):
+        with open(os.path.join(_PUBLISH_FILES, "docs/known-issues.zh-CN.md"), encoding="utf-8") as stream:
+            text = stream.read()
+        for anchor, heading in (("claude-code-conversations", "Claude Code 对话"),
+                                ("codex-and-acp-tabs", "Codex 与 ACP 标签页")):
+            self.assertRegex(text, rf'<a id="{anchor}"></a>\s*\n## {re.escape(heading)}\n')
+        with open(os.path.join(_GUIDE_DIR, "agents.zh-CN.md"), encoding="utf-8") as stream:
+            self.assertIn("../known-issues.zh-CN.md#codex-and-acp-tabs", stream.read())
+
+
 class PublicTreeLayoutTests(unittest.TestCase):
     """This suite ships in the public tree (publish/manifest.txt's `include packaging/*`) and must pass
     there too, where there is no publish/ at all and publish/files/ has been copied over the root by

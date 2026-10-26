@@ -26,6 +26,7 @@ use claude_runtime_protocol::v1::{
     SessionCloseReason, SessionClosed, SessionEvent, SessionReady, SteerTurnRequest, SteerTurnResponse, TextDelta,
     TurnCompleted, TurnOutcome, TurnStarted, UserMessageDelivered, WatchSessionEventsRequest,
 };
+use prost::Message as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
@@ -45,6 +46,7 @@ type Watcher = tokio::sync::mpsc::UnboundedSender<Result<SessionEvent, Status>>;
 
 #[derive(Default)]
 struct Session {
+    closed: bool,
     ring: Vec<SessionEvent>,
     watchers: Vec<Watcher>,
     /// The rest of a script, by the permission it waits on, with its turn.
@@ -55,6 +57,8 @@ struct Session {
 struct Shared {
     sessions: Mutex<HashMap<String, Session>>,
     next_id: AtomicU64,
+    without_system_prompt_preset: bool,
+    record_create: Mutex<Option<std::fs::File>>,
 }
 
 static IGNORE_EOF: AtomicBool = AtomicBool::new(false);
@@ -152,10 +156,10 @@ fn run(shared: Arc<Shared>, session_id: String, turn_id: String, mut steps: Vec<
     });
 }
 
-fn handshake() -> HandshakeResponse {
-    HandshakeResponse {
+fn handshake(without_system_prompt_preset: bool) -> HandshakeResponse {
+    let mut response = HandshakeResponse {
         protocol_major: 3,
-        protocol_minor: 20,
+        protocol_minor: 21,
         sidecar_version: "stand-in".to_string(),
         capabilities: [
             "handshake",
@@ -165,15 +169,21 @@ fn handshake() -> HandshakeResponse {
             "interrupt_turn",
             "resolve_permission",
             "close_session",
+            "resume_session",
             "text_delta_message_id",
             "steer_turn",
+            "system_prompt_preset",
         ]
         .iter()
         .map(ToString::to_string)
         .collect(),
         permission_modes: vec!["interactive".to_string()],
         ..Default::default()
+    };
+    if without_system_prompt_preset {
+        response.capabilities.retain(|c| c != "system_prompt_preset");
     }
+    response
 }
 
 #[derive(Clone, Default)]
@@ -221,10 +231,25 @@ impl Service<http::Request<Body>> for StandIn {
                 .unwrap_or_default()
                 .to_string();
             let response = match method.as_str() {
-                "Handshake" => unary(req, |_: HandshakeRequest| async { Ok(handshake()) }).await,
+                "Handshake" => {
+                    unary(req, move |_: HandshakeRequest| async move {
+                        Ok(handshake(shared.without_system_prompt_preset))
+                    })
+                    .await
+                }
                 "CreateSession" => {
                     unary(req, move |request: CreateSessionRequest| async move {
+                        // Record before consuming any fields, so assertions see exactly the decoded wire request.
+                        if let Some(file) = shared.record_create.lock().unwrap().as_mut() {
+                            let bytes = request.encode_to_vec();
+                            file.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+                            file.write_all(&bytes).unwrap();
+                            file.flush().unwrap();
+                        }
                         let session_id = shared.id("session");
+                        let provider_session_id = request
+                            .resume_provider_session_id
+                            .unwrap_or_else(|| format!("claude-{session_id}"));
                         shared
                             .sessions
                             .lock()
@@ -235,7 +260,7 @@ impl Service<http::Request<Body>> for StandIn {
                             None,
                             Event::SessionReady(SessionReady {
                                 session_id: session_id.clone(),
-                                provider_session_id: format!("claude-{session_id}"),
+                                provider_session_id,
                                 model: "stand-in".to_string(),
                                 cwd: request.cwd,
                                 permission_mode: "default".to_string(),
@@ -325,6 +350,11 @@ impl Service<http::Request<Body>> for StandIn {
                                 reason: SessionCloseReason::ClosedByHost as i32,
                             }),
                         );
+                        // The terminal event precedes stream completion, as it does on the real service.
+                        if let Some(session) = shared.sessions.lock().unwrap().get_mut(&request.session_id) {
+                            session.closed = true;
+                            session.watchers.clear();
+                        }
                         Ok(CloseSessionResponse {})
                     })
                     .await
@@ -343,7 +373,9 @@ impl Service<http::Request<Body>> for StandIn {
                             for event in session.ring.iter().filter(|event| event.sequence > after) {
                                 let _ = tx.send(Ok(event.clone()));
                             }
-                            session.watchers.push(tx);
+                            if !session.closed {
+                                session.watchers.push(tx);
+                            }
                             Ok(tonic::Response::new(UnboundedReceiverStream::new(rx)))
                         }
                     });
@@ -359,6 +391,19 @@ impl Service<http::Request<Body>> for StandIn {
 }
 
 fn main() {
+    let mut shared = Shared::default();
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--without-system-prompt-preset") => shared.without_system_prompt_preset = true,
+            Some("--record-create") => {
+                let path = std::path::PathBuf::from(args.next().expect("record file"));
+                assert!(path.is_absolute(), "record file must be absolute");
+                *shared.record_create.get_mut().unwrap() = Some(agent::private_fs::open_private(&path).unwrap());
+            }
+            _ => panic!("unknown stand-in argument: {arg:?}"),
+        }
+    }
     let socket = std::env::var_os("VERDANDI_CLAUDE_SIDECAR_SOCKET").expect("the socket to serve on");
     // Ends on stdin's end of file, as the real sidecar does.
     std::thread::spawn(|| {
@@ -389,7 +434,9 @@ fn main() {
         print!("stand-in stdout line in progress");
         let _ = std::io::stdout().flush();
         tonic::transport::Server::builder()
-            .add_service(StandIn::default())
+            .add_service(StandIn {
+                shared: Arc::new(shared),
+            })
             .serve_with_incoming(UnixListenerStream::new(listener))
             .await
             .expect("the stand-in serves");

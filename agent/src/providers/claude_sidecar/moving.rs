@@ -132,6 +132,7 @@ impl ClaudeSidecarProvider {
             info: _,
             splits_messages: _,
             provider_prompts: _,
+            claude_code_prompt: _,
             watches,
             parked,
             released,
@@ -243,6 +244,7 @@ impl ClaudeSidecarProvider {
             info,
             splits_messages,
             provider_prompts,
+            claude_code_prompt,
         } = handshake_with(&runtime, &sidecar, Some(child.pid))?;
         let mark = WatchMark {
             sequence: folded_through,
@@ -259,6 +261,7 @@ impl ClaudeSidecarProvider {
             info,
             splits_messages,
             provider_prompts,
+            claude_code_prompt,
             watches: Mutex::new(Vec::new()),
             parked: Mutex::new(Some(ParkedWatch { session_id, mark })),
             released: AtomicBool::new(false),

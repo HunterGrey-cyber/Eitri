@@ -44,16 +44,21 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 ## Speed and drawing
 
 These were measured on development builds shortly before 0.3.0, in an isolated, headless test session on an AMD
-desktop, unless a bullet names another machine. None of them has been measured on a real display yet.
+desktop, unless a bullet names another machine. A physical display has still not been measured; the items below
+distinguish real refresh-period feedback from the fallback clock.
 
-- **On GTK 4.24, typing is one refresh slower than native Neovide.** GTK 4.23 and 4.24 changed the frame clock,
-  so the redraw after a key waits for the next frame. In the headless session, which runs at GTK's 60 Hz default,
-  typing added 17.15 ms at the median and 21.75 ms at the 99th percentile. On a real display the wait should be at
-  most one of its refreshes (about 6 ms at 165 Hz). The same build with GTK 4.22.5 added 0.13 ms at the median.
-  Eitri cannot work around it without an interface GTK does not have.
-- **On GTK 4.24, scrolling with a held `j` at 165 Hz drops frames.** It drew 85 % of the frames native Neovide drew,
-  and its 99th-percentile frame interval was twice native's (12 ms against 6 ms). The same build with GTK 4.22.5
-  scrolls as native does (165 frames a second, p99 6 ms), so this too is GTK 4.24's frame clock.
+- **On GTK 4.24, typing is one refresh slower than native Neovide.** In a headless session with the compositor
+  feeding GTK a real 165 Hz period through presentation feedback, GTK 4.24.1 added 5.97 ms at the median;
+  the same build with GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about
+  16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
+  commit c36202f6, 2026-10-25). Three workarounds using public GTK API were measured; none restored native
+  latency (the best still added about 5.8 ms at 165 Hz), so none ships. Settled idle stayed quiet. The period
+  was real, but the screen was the headless session's; a physical display has still not been measured.
+- **On GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
+  165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
+  The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
+  used stock presentation feedback, so GTK 4.24 still used its 60 Hz fallback clock; scrolling has not been
+  repeated with real-period feedback or on a physical display.
 - **While an agent reply streams, typing in the editor is slower.** With WebKitGTK 2.54 a key's redraw took 11.2 ms
   at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
   WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
@@ -167,6 +172,21 @@ one-window mode.
   panel now allows only its own script by hash instead of any inline script. If the agent panel stays blank
   after an update, please report it with your WebKitGTK version.
 
+## Claude Code conversations
+
+- A Claude Code conversation started in Eitri before 0.3.0 **keeps** its earlier, shorter instructions when you
+  continue it (measured with Claude Code 2.1.302); a new conversation gets the full ones, and `/compact` may
+  refresh them too (not yet measured).
+- A conversation started in Eitri and continued with `claude --resume` in a terminal **keeps** Eitri's short
+  panel note (measured with Claude Code 2.1.302). The note says the session was started by Eitri, so it stays
+  true there.
+- A conversation started in a terminal and continued in Eitri **may keep** its terminal instructions without
+  Eitri's panel note (not yet measured).
+- A sidecar without `system_prompt_preset` still starts sessions with the Agent SDK's minimal prompt.
+  The startup diagnostic says Claude Code's system prompt is unavailable and names the required backend revision;
+  if `EITRI_VERDANDI_CHECKOUT` or `EITRI_SIDECAR_BINARY` selects an older backend, point that override at a backend
+  built for the named revision. Otherwise, run `eitri setup`.
+
 ## Codex and ACP tabs
 
 Tabs for Codex and for agents registered with `eitri.agent.register` are new ([the guide](guide/agents.md)). They
@@ -202,6 +222,10 @@ adapter; they have not been tried on every setup.
 - **What an ACP agent runs without asking is the agent's own.** Eitri shows the requests it receives and sets
   only the mode the registration names. Eitri has no rate limits, context bar, slash-command list or model picker
   for these tabs, and `<leader>t` (continue in a terminal) is not available for them yet.
+- **The last row of a tab's details, "Continue in a terminal…", is for Claude tabs only.** `prefix i` draws it on
+  Codex and ACP tabs too. Choosing it there, on a tab with a session, ends that session in Eitri and prints a
+  `claude --resume` command that cannot open it. Do not use it on these tabs; `<leader>t` already refuses them. The
+  row goes away for them in the next release.
 
 ## Turn review
 

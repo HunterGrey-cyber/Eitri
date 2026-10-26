@@ -1094,10 +1094,77 @@ fn an_adopted_shell_whose_spawner_never_reports_ends_unknown() {
 
 // --- the adopted child, and keys after the move -------------------------------------------------------------------
 
+fn pidfd_sleeper() -> std::process::Child {
+    let mut command = Command::new("/bin/sleep");
+    // A sleeper surviving a failed check must not keep the subprocess report pipe open.
+    command
+        .arg("60")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // A detached test launcher can ignore HUP; exec preserves ignored dispositions.
+    // These children must accept it so their status can distinguish the signal's target.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    command.spawn().expect("sleep starts")
+}
+
+#[test]
+fn pidfd_sleepers_do_not_hold_the_report_pipe_after_an_early_exit() {
+    const CHECK: &str = "pidfd_sleepers_do_not_hold_the_report_pipe_after_an_early_exit";
+    if std::env::var(HELPER_ENV).as_deref() == Ok("pidfd-report") {
+        let sleeper = pidfd_sleeper();
+        println!("pidfd sleeper {}", sleeper.id());
+        // Dropping Child leaves it alive, as when an assertion prevents explicit cleanup.
+        return;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", CHECK, "--nocapture", "--test-threads", "1"])
+        .env(HELPER_ENV, "pidfd-report")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (started, pid) = mpsc::channel();
+    let (finished, eof) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use io::BufRead;
+        for line in io::BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if let Some((_, pid)) = line.split_once("pidfd sleeper ") {
+                started.send(pid.parse::<u32>().unwrap()).unwrap();
+            }
+        }
+        finished.send(()).unwrap();
+    });
+    let sleeper = pidfd_open(pid.recv_timeout(WAIT).expect("the helper started its sleeper"));
+    let status = child.wait().unwrap();
+    let closed = eof.recv_timeout(WAIT);
+    // End the surviving fixture through its descriptor even when waiting for EOF failed.
+    let killed = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            sleeper.as_raw_fd(),
+            libc::SIGKILL,
+            0usize,
+            0,
+        )
+    };
+    reader.join().unwrap();
+    assert_eq!(killed, 0, "the surviving sleeper was ended");
+    assert!(status.success(), "the helper exited early: {status}");
+    assert!(
+        closed.is_ok(),
+        "the sleeper kept the report pipe open after the helper exited"
+    );
+}
+
 #[test]
 fn an_adopted_ptychild_signals_only_through_its_pidfd() {
-    let sleeper = || Command::new("/bin/sleep").arg("60").spawn().expect("sleep starts");
-    let (mut named, mut other) = (sleeper(), sleeper());
+    let (mut named, mut other) = (pidfd_sleeper(), pidfd_sleeper());
     let pty = PtyChild::spawn(&spec("/bin/sleep", &["60"]), grid()).unwrap();
     let (master, shell_pid) = pty.forget();
     // The pidfd names one process and the pid another: only the pidfd may be signalled.
@@ -1120,6 +1187,56 @@ fn an_adopted_ptychild_signals_only_through_its_pidfd() {
     other.kill().unwrap();
     other.wait().unwrap();
     end(shell_pid);
+}
+
+#[test]
+fn the_pidfd_signal_check_also_runs_under_a_launcher_ignoring_hup() {
+    const CHECK: &str = "an_adopted_ptychild_signals_only_through_its_pidfd";
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", CHECK, "--nocapture", "--test-threads", "1"])
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: only an async-signal-safe disposition change in the forked child.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    // Read the child's report on its own thread so a full pipe never stalls it.
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut report = String::new();
+        io::Read::read_to_string(&mut stdout, &mut report).unwrap();
+        report
+    });
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("pidfd check hung with inherited ignored HUP");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let report = reader.join().unwrap();
+    assert!(
+        status.success(),
+        "pidfd check failed with inherited ignored HUP: {status}\n{report}"
+    );
+    // libtest exits 0 when an --exact filter matches nothing, so the report must show the check ran and passed.
+    assert!(
+        report.lines().any(|line| line == format!("test {CHECK} ... ok")),
+        "the re-executed binary did not run {CHECK}:\n{report}"
+    );
+    assert!(
+        report.contains("test result: ok. 1 passed;"),
+        "the re-executed binary ran other than exactly one passing test:\n{report}"
+    );
 }
 
 #[test]
