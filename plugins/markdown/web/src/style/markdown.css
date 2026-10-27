@@ -2,11 +2,15 @@
 
 /* Every colour and font comes from the --nv-* set the host keeps on :root, so the preview follows nvim's colourscheme
    live; light or dark comes from --nv-color-scheme, never from the desktop's preference, which is not Eitri's. The
-   page sets its background and its text together, so neither half is left to the host's defaults. */
+   page sets its background and its text together, so neither half is left to the host's defaults. The engine's own
+   scrolls to a target (a focused link, a fragment) leave the reading reserve above it, as the page's keys do (the
+   page keeps --mdp-reserve at nvim's 'scrolloff'), and stay clear of the keys' 20 px HUD below. */
 html {
   color-scheme: var(--nv-color-scheme);
   background-color: var(--nv-bg);
   color: var(--nv-fg);
+  scroll-padding-top: var(--mdp-reserve, 44px);
+  scroll-padding-bottom: 20px;
 }
 
 html, body {

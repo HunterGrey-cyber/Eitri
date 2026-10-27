@@ -9,6 +9,7 @@ const DEFAULT_ROWS: (Row & { action: GenericAction })[] = [
   { action: "scroll.half_down", keys: ["d", "<C-d>"], context: DEFAULT_PAGE_LABEL, desc: "half a page down" },
   { action: "scroll.half_up", keys: ["u", "<C-u>"], context: DEFAULT_PAGE_LABEL, desc: "half a page up" },
   { action: "scroll.page_down", keys: ["<C-f>"], context: DEFAULT_PAGE_LABEL, desc: "a page down" },
+  { action: "scroll.page_up", keys: ["<C-b>"], context: DEFAULT_PAGE_LABEL, desc: "a page up" },
   { action: "scroll.top", keys: ["gg"], context: DEFAULT_PAGE_LABEL, desc: "top of the page" },
   { action: "scroll.bottom", keys: ["G"], context: DEFAULT_PAGE_LABEL, desc: "bottom of the page" },
   { action: "history.back", keys: ["H", "<C-o>"], context: DEFAULT_PAGE_LABEL, desc: "back" },

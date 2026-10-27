@@ -537,6 +537,7 @@ fn editor_view(v: &ViewLine) -> EditorView {
         cause: v.cause,
         token: v.token,
         doc: None,
+        scrolloff: v.scrolloff,
     }
 }
 
@@ -1458,8 +1459,15 @@ impl PluginHost {
                     FollowOp::Jump { focus, .. } => ("jump", *focus),
                     _ => ("reveal", false),
                 };
+                // A reveal's cursor, when the page sent one, is named too: what the page asked nvim's cursor to hold.
+                let cursor = match &op {
+                    FollowOp::Reveal {
+                        cursor: Some(cursor), ..
+                    } => format!(" cursor={cursor}"),
+                    _ => String::new(),
+                };
                 if let Ok(applied) = applied {
-                    trace::line(self.id(), event, &format!("line={line} applied={applied}"));
+                    trace::line(self.id(), event, &format!("line={line}{cursor} applied={applied}"));
                 }
                 // The keys move only for a page still waiting on this answer, and only before the deadline: one
                 // told the editor was busy, or replaced since, has moved on, and so may the user have while nvim
@@ -1577,8 +1585,15 @@ impl PluginHost {
                 None,
             ),
             FollowOp::Reveal {
-                buf, line, token, re, ..
-            } => (editor::follow_reveal(&*editor, id, *buf, *line, *token), Some(*re)),
+                buf,
+                line,
+                token,
+                cursor,
+                re,
+            } => (
+                editor::follow_reveal(&*editor, id, *buf, *line, *token, *cursor),
+                Some(*re),
+            ),
             FollowOp::Jump { buf, line, col, re, .. } => {
                 (editor::follow_jump(&*editor, id, *buf, *line, *col), Some(*re))
             }
@@ -1927,6 +1942,7 @@ impl PluginHost {
             buf: args.buf,
             line: args.line,
             token: args.token,
+            cursor: args.cursor,
             re,
         };
         if let Some(mut old) = self.park_page_op(op, re, now + EDITOR_DEADLINE) {

@@ -2,7 +2,8 @@
 //! clears exactly, keeps the first baseline, leaves a value the user changed, re-asserts after an
 //! `LspAttach` that turns hints on, and reports a missing API; open moves the cursor by characters and
 //! splits over a modified buffer; follow defines and removes only its own commands, reports only the buffers it
-//! may follow, scrolls only the followed window, and refuses text past its caps.
+//! may follow, scrolls only the followed window, holds a reveal's cursor without scrolling under 'scrolloff' and
+//! 'wrap', and refuses text past its caps.
 //!
 //! Every case is `#[ignore]`d: it needs `nvim` (>= 0.10) on `PATH`, spends no tokens and opens no window.
 
@@ -829,10 +830,10 @@ fn install_before_vimenter_defines_nothing_and_says_early() {
     );
     let socket = c.dir.join("f.sock");
     assert_eq!(c.nvim.eval("v:vim_did_enter"), Value::from(0));
-    let early = install(&mut c, &socket, false, &[("MarkdownPreviewToggle", "toggle")], None);
+    let early = install(&mut c, &socket, false, &[("EitriMarkdownToggle", "toggle")], None);
     assert_eq!(field(&early, "ok"), &Value::from(false));
     assert_eq!(field(&early, "early"), &Value::from(true));
-    assert_eq!(c.nvim.eval("exists(':MarkdownPreviewToggle')"), Value::from(0));
+    assert_eq!(c.nvim.eval("exists(':EitriMarkdownToggle')"), Value::from(0));
     let group = c.nvim.lua(
         "return pcall(vim.api.nvim_get_autocmds, { group = 'EitriPluginFollow_demo' })",
         vec![],
@@ -841,33 +842,33 @@ fn install_before_vimenter_defines_nothing_and_says_early() {
     c.nvim.lua("vim.g.hold = false", vec![]);
     c.nvim
         .wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
-    let done = install(&mut c, &socket, false, &[("MarkdownPreviewToggle", "toggle")], None);
+    let done = install(&mut c, &socket, false, &[("EitriMarkdownToggle", "toggle")], None);
     assert_eq!(field(&done, "ok"), &Value::from(true));
-    assert_eq!(c.nvim.eval("exists(':MarkdownPreviewToggle')"), Value::from(2));
+    assert_eq!(c.nvim.eval("exists(':EitriMarkdownToggle')"), Value::from(2));
 }
 
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn install_defines_the_commands_and_skips_ones_the_user_has() {
     let (mut c, listener, socket) = follow_case("define");
-    c.nvim.command("command! MarkdownPreview echo 'other'");
+    c.nvim.command("command! EitriMarkdown echo 'other'");
     c.nvim.command("command! -buffer DemoLocal echo 'x'");
     let commands = [
-        ("MarkdownPreview", "show"),
-        ("MarkdownPreviewToggle", "toggle"),
+        ("EitriMarkdown", "show"),
+        ("EitriMarkdownToggle", "toggle"),
         ("DemoLocal", "hide"),
     ];
     let answer = install(&mut c, &socket, false, &commands, None);
     assert_eq!(field(&answer, "ok"), &Value::from(true));
-    let skipped = Value::Array(vec!["MarkdownPreview".into(), "DemoLocal".into()]);
+    let skipped = Value::Array(vec!["EitriMarkdown".into(), "DemoLocal".into()]);
     assert_eq!(field(&answer, "skipped"), &skipped);
-    assert_eq!(c.nvim.eval("exists(':MarkdownPreviewToggle')"), Value::from(2));
-    c.nvim.command("MarkdownPreviewToggle");
+    assert_eq!(c.nvim.eval("exists(':EitriMarkdownToggle')"), Value::from(2));
+    c.nvim.command("EitriMarkdownToggle");
     assert_eq!(
         lines_within(&mut c.nvim, &listener, SETTLE),
         vec![serde_json::json!({"v": 1, "k": "cmd", "owner": "demo", "cmd": "toggle"})]
     );
-    let out = c.nvim.eval("execute('MarkdownPreview')");
+    let out = c.nvim.eval("execute('EitriMarkdown')");
     assert!(
         out.as_str().unwrap().contains("other"),
         "the user's command ran: {out:?}"
@@ -881,16 +882,16 @@ fn install_defines_the_commands_and_skips_ones_the_user_has() {
     );
     let ours = c.nvim.lua(
         "local all = vim.api.nvim_get_commands({ builtin = false }) \
-         return { all.MarkdownPreviewToggle.definition, all.MarkdownPreview.definition }",
+         return { all.EitriMarkdownToggle.definition, all.EitriMarkdown.definition }",
         vec![],
     );
     assert_eq!(
         ours,
         Value::Array(vec!["eitri plugin demo toggle".into(), "echo 'other'".into()]),
-        "the toggle command is the reinstalled one, and the user's MarkdownPreview untouched"
+        "the toggle command is the reinstalled one, and the user's EitriMarkdown untouched"
     );
     drain(&mut c, &listener);
-    c.nvim.command("MarkdownPreviewToggle");
+    c.nvim.command("EitriMarkdownToggle");
     assert_eq!(
         lines_within(&mut c.nvim, &listener, SETTLE),
         vec![serde_json::json!({"v": 1, "k": "cmd", "owner": "demo", "cmd": "toggle"})],
@@ -909,22 +910,22 @@ fn teardown_leaves_no_augroup_timer_or_command_and_spares_a_redefined_one() {
         &mut c,
         &socket,
         true,
-        &[("MarkdownPreviewToggle", "toggle"), ("MarkdownPreviewStop", "hide")],
+        &[("EitriMarkdownToggle", "toggle"), ("EitriMarkdownHide", "hide")],
         None,
     );
     follow(&mut c, true);
     c.nvim.command("normal! 10G");
     c.nvim.command("normal! 20G");
     // The user redefines one of the commands.
-    c.nvim.command("command! MarkdownPreviewStop echo 'mine'");
+    c.nvim.command("command! EitriMarkdownHide echo 'mine'");
     let answer = op(&mut c, "teardown", opts_map(&[("owner", OWNER.into())]));
     assert_eq!(field(&answer, "ok"), &Value::from(true));
     let footprint = c.nvim.footprint_of(&["EitriPluginFollow_demo"], &[]);
     assert_eq!(footprint.autocmds, 0);
     assert_eq!(footprint.active_timers, timers);
-    assert_eq!(c.nvim.eval("exists(':MarkdownPreviewToggle')"), Value::from(0));
+    assert_eq!(c.nvim.eval("exists(':EitriMarkdownToggle')"), Value::from(0));
     assert_eq!(
-        c.nvim.eval("exists(':MarkdownPreviewStop')"),
+        c.nvim.eval("exists(':EitriMarkdownHide')"),
         Value::from(2),
         "the user's command is left"
     );
@@ -1217,6 +1218,103 @@ fn reveal_scrolls_only_the_followed_window_of_a_buffer_shown_twice() {
     assert!(applied(&op(&mut c, "reveal", at(a_buf, 140, ("token", 3)))));
     assert_eq!(top_line(&mut c, w3), 140, "any window showing it");
     assert_eq!(current_win(&mut c), w1);
+}
+
+/// A reveal's options with the cursor line the page reads at.
+fn reveal_at(buf: u64, line: u64, cursor: u64, token: u64) -> Value {
+    opts_map(&[
+        ("owner", OWNER.into()),
+        ("buf", buf.into()),
+        ("line", line.into()),
+        ("token", token.into()),
+        ("cursor", cursor.into()),
+    ])
+}
+
+/// The window's top as nvim validates it (`line('w0')` brings the top in line with 'scrolloff' first) and the
+/// cursor line.
+fn top_and_cursor(c: &mut Case, win: u64) -> (u64, u64) {
+    let v = c.nvim.lua(
+        "local w = ... return { vim.fn.line('w0', w), vim.api.nvim_win_get_cursor(w)[1] }",
+        vec![Value::from(win)],
+    );
+    let v = v.as_array().unwrap();
+    (v[0].as_u64().unwrap(), v[1].as_u64().unwrap())
+}
+
+/// A reader's nvim: 'scrolloff' 4, 'smoothscroll', 'wrap', line numbers both ways.
+fn readers_window(c: &mut Case) -> u64 {
+    c.nvim
+        .command("setlocal scrolloff=4 smoothscroll wrap number relativenumber");
+    current_win(c)
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reveal_with_a_cursor_keeps_the_top_and_holds_the_cursor_without_scrolling() {
+    let (mut c, listener, socket) = follow_case("reveal-cursor");
+    let mut doc = numbered(300);
+    // Line 100 wraps over several screen lines.
+    doc[99] = "word ".repeat(80);
+    let a = write_doc(&c, "a.md", &doc);
+    edit(&mut c, &a);
+    let w = readers_window(&mut c);
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    drain(&mut c, &listener);
+    let a_buf = buf_of(&mut c, &a);
+
+    // A reading line outside the 'scrolloff' band: the cursor is put on it and the top stays.
+    assert!(applied(&op(&mut c, "reveal", reveal_at(a_buf, 50, 60, 1))));
+    assert_eq!(top_and_cursor(&mut c, w), (50, 60));
+    let lines = lines_within(&mut c.nvim, &listener, SETTLE);
+    let echo = views(&lines)
+        .into_iter()
+        .find(|l| l["token"] == 1)
+        .unwrap_or_else(|| panic!("the echo: {lines:?}"));
+    assert_eq!(echo["top"], 50);
+    assert_eq!(echo["cursor"]["line"], 60);
+    assert_eq!(echo["scrolloff"], 4, "the view says the window's 'scrolloff'");
+
+    // Enter's jump to the line the cursor is on moves no window.
+    assert!(applied(&op(&mut c, "jump", at(a_buf, 60, ("col", 0)))));
+    assert_eq!(top_and_cursor(&mut c, w), (50, 60));
+    // Nor does a jump to another line the window holds outside the band.
+    assert!(applied(&op(&mut c, "jump", at(a_buf, 57, ("col", 0)))));
+    assert_eq!(top_and_cursor(&mut c, w), (50, 57));
+
+    // A reading line inside the band at the top: the nearest line nvim can hold there, and the top stays.
+    assert!(applied(&op(&mut c, "reveal", reveal_at(a_buf, 80, 81, 2))));
+    assert_eq!(top_and_cursor(&mut c, w), (80, 84));
+    // At the bottom edge likewise, from the other side.
+    assert!(applied(&op(&mut c, "reveal", reveal_at(a_buf, 200, 200, 3))));
+    let bottom = c
+        .nvim
+        .lua("return vim.fn.line('w$', ...)", vec![Value::from(w)])
+        .as_u64()
+        .unwrap();
+    assert!(applied(&op(&mut c, "reveal", reveal_at(a_buf, 200, bottom, 6))));
+    assert_eq!(top_and_cursor(&mut c, w), (200, bottom - 4));
+
+    // Screen lines, not buffer lines: line 100 at the top takes more than four of them, so line 101 already has its
+    // 'scrolloff' above it.
+    assert!(applied(&op(&mut c, "reveal", reveal_at(a_buf, 100, 100, 4))));
+    assert_eq!(top_and_cursor(&mut c, w), (100, 101));
+    assert!(applied(&op(&mut c, "jump", at(a_buf, 101, ("col", 0)))));
+    assert_eq!(
+        top_and_cursor(&mut c, w),
+        (100, 101),
+        "Enter on the held line keeps the window"
+    );
+    let skip = c.nvim.lua(
+        "local w = ... return vim.api.nvim_win_call(w, vim.fn.winsaveview).skipcol",
+        vec![Value::from(w)],
+    );
+    assert_eq!(skip, Value::from(0), "no part of the top line is scrolled away");
+
+    // A reveal without a cursor keeps the old behaviour: the cursor moves only as far as 'scrolloff' needs.
+    assert!(applied(&op(&mut c, "reveal", at(a_buf, 140, ("token", 5)))));
+    assert_eq!(top_and_cursor(&mut c, w), (140, 144));
 }
 
 #[test]

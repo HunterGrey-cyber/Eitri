@@ -12,6 +12,7 @@ it("names the generic rows in English by default", () => {
     ["scroll.half_down", "d <C-d>", "page", "half a page down"],
     ["scroll.half_up", "u <C-u>", "page", "half a page up"],
     ["scroll.page_down", "<C-f>", "page", "a page down"],
+    ["scroll.page_up", "<C-b>", "page", "a page up"],
     ["scroll.top", "gg", "page", "top of the page"],
     ["scroll.bottom", "G", "page", "bottom of the page"],
     ["history.back", "H <C-o>", "page", "back"],
@@ -32,7 +33,9 @@ it("replaces the generic words with the page's labels, keeping the defaults it l
   expect(rows[0]).toEqual({ action: "scroll.down", keys: ["j", "<C-e>"], context: "页面", desc: "向下滚动" });
   expect(rows[1]).toEqual({ action: "scroll.up", keys: ["k", "<C-y>"], context: "页面", desc: "scroll up" });
   expect(GENERIC_ROWS[0].context).toBe("page");
-  expect(mergeRows([], { page: "页面" }, "Ctrl+b")).toEqual(genericRows({ page: "页面" }));
+  expect(mergeRows([], { page: "页面" }, "Ctrl+a")).toEqual(genericRows({ page: "页面" }));
+  expect(mergeRows([], { page: "页面" }, "Ctrl+b")).toEqual(
+    genericRows({ page: "页面" }).filter((row) => row.action !== "scroll.page_up"));
 });
 
 it("tells a generic action from a page action", () => {

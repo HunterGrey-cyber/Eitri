@@ -19,6 +19,7 @@
     "doc": {
       "root": "eitri-plugin://markdown/.eitri/doc/4/",
       "base": "eitri-plugin://markdown/.eitri/doc/4/docs/"
-    }
+    },
+    "scrolloff": 4
   }
 }

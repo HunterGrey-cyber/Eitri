@@ -170,6 +170,8 @@ type Options = {
   messages?: Partial<Record<KitMessage, string>>;
   /** Called after the prompt closed, so the HUD shows the mode focus is in now. */
   render?: () => void;
+  /** Called just before and just after a move to a match: a jump, which the page may record as history. */
+  jump?: (when: "before" | "after") => void;
 };
 
 let options: Options = {};
@@ -380,8 +382,18 @@ function land(wrap: KitMessage | null): void {
   shown = true;
   setAnchor();
   paint();
+  tellJump("before");
   reveal();
+  tellJump("after");
   showCount(wrap);
+}
+
+function tellJump(when: "before" | "after"): void {
+  try {
+    options.jump?.(when);
+  } catch (error) {
+    console.warn("eitri keys: the page's jump hook failed", error);
+  }
 }
 
 function notFound(): void {

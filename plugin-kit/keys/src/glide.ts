@@ -199,6 +199,15 @@ export class GlideMotion {
     if (!this.held) this.stop();
   }
 
+  /** Ends the motion at once where it was heading: a press or a stop at its destination, a hold where its release
+   *  would come to rest. Returns that position. */
+  finish(now: number): number {
+    if (this.held) this.release(now);
+    if (this.curve) this.pos = clamp(this.curve.to, 0, this.max);
+    this.stop();
+    return this.pos;
+  }
+
   /** Stops at once where the view is. */
   stop(): void {
     this.curve = null;
@@ -471,6 +480,26 @@ export function jump(el: ScrollTargetEl, top: number): void {
 
 const STEPS: Record<string, 1 | -1> = { "scroll.down": 1, "scroll.up": -1 };
 
+/** Where `scroll.bottom` takes the window, as the page says (`null`: the end of the scroll range). */
+let bottomOf: (() => number | null) | null = null;
+
+/** Lets the installed page say where `G` takes the window: a page with room past its end puts its last line at the
+ *  bottom of the view rather than at the end of that room. `null` restores the end of the scroll range. */
+export function setBottom(fn: (() => number | null) | null): void {
+  bottomOf = fn;
+}
+
+function pageBottom(): number | null {
+  if (!bottomOf) return null;
+  try {
+    const at = bottomOf();
+    return typeof at === "number" && Number.isFinite(at) ? at : null;
+  } catch (error) {
+    console.warn("eitri keys: the page's bottom failed", error);
+    return null;
+  }
+}
+
 /** Runs a `scroll.*` action for its key event (`null`: not from a key). False for any other action. */
 export function glideAction(action: string, ev: KeyboardEvent | null): boolean {
   if (!action.startsWith("scroll.")) return false;
@@ -483,6 +512,7 @@ export function glideAction(action: string, ev: KeyboardEvent | null): boolean {
     "scroll.half_down": view / 2,
     "scroll.half_up": -view / 2,
     "scroll.page_down": Math.max(scrollStep, view - 2 * scrollStep),
+    "scroll.page_up": -Math.max(scrollStep, view - 2 * scrollStep),
   };
   const absolute = action === "scroll.top" || action === "scroll.bottom";
   if (!absolute && !Object.hasOwnProperty.call(deltas, action)) return false;
@@ -490,7 +520,11 @@ export function glideAction(action: string, ev: KeyboardEvent | null): boolean {
   const target = (from: number) => {
     if (action === "scroll.top") return 0;
     const max = maxOf(el);
-    if (action === "scroll.bottom") return Number.isFinite(max) ? max : from;
+    if (action === "scroll.bottom") {
+      const page = el === null ? pageBottom() : null;
+      if (page !== null) return Number.isFinite(max) ? clamp(page, 0, max) : Math.max(0, page);
+      return Number.isFinite(max) ? max : from;
+    }
     return from + deltas[action];
   };
   if (instant()) {
@@ -547,4 +581,22 @@ export function scrollToAnimated(el: ScrollTargetEl, top: number): void {
   run(g);
 }
 
+/** Where the window is heading: the running glide's destination on the window, else where it is. A page that moves
+ *  by its own steps (a heading at a time) starts from here, so presses made during a glide add up. */
+export function windowDestination(): number {
+  if (glide && glide.el === null && glide.motion.moving) return glide.motion.destination ?? glide.motion.position;
+  return window.scrollY;
+}
+
+/** Ends the running glide at once where it was heading (a hold where its release would come to rest), so a page
+ *  that hands the position on (to the editor) hands on where the reader was going, not a point on the way. */
+export function settleGlide(): void {
+  const g = glide;
+  if (!g) return;
+  const top = Math.round(g.motion.finish(performance.now()));
+  cancelGlide();
+  if (top !== Math.round(topOf(g.el))) write(g.el, top);
+}
+
 onRemove(cancelGlide);
+onRemove(() => setBottom(null));

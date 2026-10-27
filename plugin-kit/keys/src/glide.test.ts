@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   GlideMotion, MAX_FRAME_MS, PRESS_MS, RAMP_MS, SETTLE_MS, cancelGlide, endHold, glideAction, scrollToAnimated,
-  scrollerOf, stallAfter,
+  scrollerOf, setBottom, settleGlide, stallAfter, windowDestination,
 } from "./glide";
 import { DEFAULT_SETTINGS, useSettings } from "./settings";
 
@@ -122,6 +122,38 @@ describe("presses", () => {
     expect(y).toBe(680);
   });
 
+  it("<C-b> moves the view back less two steps, and presses add up", () => {
+    y = 2000;
+    glideAction("scroll.page_up", key("b", "KeyB"));
+    glideAction("scroll.page_up", key("b", "KeyB"));
+    vi.advanceTimersByTime(600);
+    expect(y).toBe(2000 - 2 * 680);
+  });
+
+  it("G goes where the page says its bottom is, held to the scroll range", () => {
+    stub(document.documentElement, "scrollHeight", 2000);
+    setBottom(() => 700);
+    glideAction("scroll.bottom", key("G", "KeyG"));
+    vi.advanceTimersByTime(400);
+    expect(y).toBe(700);
+    setBottom(() => 5000);
+    glideAction("scroll.bottom", key("G", "KeyG"));
+    vi.advanceTimersByTime(400);
+    expect(y).toBe(1200);
+    setBottom(() => null);
+    y = 0;
+    glideAction("scroll.bottom", key("G", "KeyG"));
+    vi.advanceTimersByTime(400);
+    expect(y).toBe(1200);
+    setBottom(() => { throw new Error("no"); });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    y = 0;
+    glideAction("scroll.bottom", key("G", "KeyG"));
+    vi.advanceTimersByTime(400);
+    expect(y).toBe(1200);
+    setBottom(null);
+  });
+
   it("goes to the top and to the bottom of the document", () => {
     stub(document.documentElement, "scrollHeight", 2000);
     glideAction("scroll.bottom", key("G", "KeyG"));
@@ -176,6 +208,42 @@ describe("presses", () => {
   it("leaves other actions alone", () => {
     expect(glideAction("history.back", null)).toBe(false);
     expect(glideAction("scroll.sideways", null)).toBe(false);
+  });
+
+  it("windowDestination is where a running press is heading, and where the window is at rest", () => {
+    expect(windowDestination()).toBe(0);
+    glideAction("scroll.down", J());
+    vi.advanceTimersByTime(30);
+    expect(y).toBeGreaterThan(0);
+    expect(y).toBeLessThan(60);
+    expect(windowDestination()).toBe(60);
+    glideAction("scroll.down", J());
+    expect(windowDestination()).toBe(120);
+    vi.advanceTimersByTime(400);
+    expect(windowDestination()).toBe(120);
+    y = 333;
+    expect(windowDestination()).toBe(333);
+  });
+
+  it("settleGlide ends a press at its destination at once, and a hold where its release comes to rest", () => {
+    glideAction("scroll.half_down", D());
+    vi.advanceTimersByTime(30);
+    expect(y).toBeLessThan(400);
+    settleGlide();
+    expect(y).toBe(400);
+    const count = writes.length;
+    vi.advanceTimersByTime(400);
+    expect(writes).toHaveLength(count);
+    holdJ(33, 240);
+    vi.advanceTimersByTime(250);
+    const before = y;
+    settleGlide();
+    expect(y).toBeGreaterThanOrEqual(before);
+    const settled = y;
+    vi.advanceTimersByTime(400);
+    expect(y).toBe(settled);
+    settleGlide();
+    expect(y).toBe(settled);
   });
 
   it("scrollToAnimated eases the window to a place", () => {

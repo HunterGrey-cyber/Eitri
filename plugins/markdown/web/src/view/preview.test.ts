@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bridge, EditorView, PreviewSettings } from "../protocol";
 import type { MermaidRunner } from "../render/mermaid";
+import { currentBlock, setClickedBlock } from "./current";
 import { BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT } from "./notices";
 import { Preview } from "./preview";
 
@@ -100,13 +101,13 @@ describe("the preview", () => {
     show(p, 1, paragraphs(30));
     p.onFocus(true);
     setScroll(300);
-    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1 }]);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }]);
     setScroll(305);
     vi.advanceTimersByTime(40);
     expect(reveals().length).toBe(1);
     setScroll(330);
     vi.advanceTimersByTime(40);
-    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1 }, { buf: 1, line: 23, token: 2 }]);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }, { buf: 1, line: 23, token: 2, cursor: 25 }]);
     p.onView(view(1, 40, { cause: "reveal", token: 2 }));
     p.onView(view(1, 5));
     expect(window.scrollY).toBe(330);
@@ -118,6 +119,11 @@ describe("the preview", () => {
     show(p, 1, paragraphs(30));
     window.dispatchEvent(new Event("wheel"));
     setScroll(300);
+    // Without the keys the reveal carries the top alone: nvim's cursor moves no further than 'scrolloff' needs, and
+    // a scroll that keeps the top line sends nothing.
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1 }]);
+    setScroll(305);
+    vi.advanceTimersByTime(40);
     expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1 }]);
     p.onView(view(1, 5));
     expect(window.scrollY).toBe(60);
@@ -301,7 +307,7 @@ describe("the anchor and the reveals across a change of lead", () => {
     p.onFocus(true);
     setScroll(300);
     vi.advanceTimersByTime(100);
-    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1 }, { buf: 1, line: 21, token: 2 }]);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }, { buf: 1, line: 21, token: 2, cursor: 23 }]);
   });
 
   it("hides the cursor bar with the document when the text is too large", () => {
@@ -313,5 +319,236 @@ describe("the anchor and the reveals across a change of lead", () => {
     p.onText({ buf: 1, tick: 2, name: "/p/1.md", too_large: { bytes: 5452595, lines: 61000, max_bytes: 4194304, max_lines: 50000 } });
     vi.advanceTimersByTime(0);
     expect(bar.hidden).toBe(true);
+  });
+});
+
+describe("the reading line shared with nvim", () => {
+  it("sits nvim's 'scrolloff' lines below the top, two when nvim does not say, at most a quarter of the view", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    expect(p.reservePx()).toBe(44);
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("44px");
+    p.onView(view(1, 1, { scrolloff: 4 }));
+    expect(p.reservePx()).toBe(88);
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("88px");
+    setScroll(100);
+    expect(p.readingY()).toBe(188);
+    p.onView(view(1, 1, { scrolloff: 0 }));
+    expect(p.readingY()).toBe(100);
+    p.onView(view(1, 1, { scrolloff: 50 }));
+    expect(p.reservePx()).toBe(window.innerHeight / 4);
+  });
+
+  it("goes to nvim as the reveal's cursor, and a change of the reading line alone sends a reveal", () => {
+    const p = make();
+    p.onView(view(1, 1, { scrolloff: 0 }));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    // Reading at the top: the block at 300 is line 20.
+    setScroll(300);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 21 }]);
+    // nvim's own view says 'scrolloff' 1 now: the reading line moves a line down, the top stays.
+    p.onView(view(1, 21, { scrolloff: 1, cause: "reveal", token: 1 }));
+    setScroll(301);
+    vi.advanceTimersByTime(40);
+    expect(reveals().at(-1)).toEqual({ buf: 1, line: 21, token: 2, cursor: 23 });
+  });
+
+  it("stops sending the cursor once the host refuses it", async () => {
+    const refusing: Bridge = {
+      call: async (verb, args) => {
+        calls.push({ verb, args });
+        if (verb === "editor.reveal" && (args as { cursor?: number }).cursor !== undefined) {
+          throw Object.assign(new Error("unknown field `cursor`"), { code: "bad_request" });
+        }
+        return { applied: true };
+      },
+      on: () => () => {},
+    };
+    const p = new Preview(root, refusing, { auto: false, remote_images: "https", sync: "both" }, runner);
+    made.push(p);
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    setScroll(300);
+    await vi.advanceTimersByTimeAsync(0);
+    // The refused reveal moved nothing, so its place goes again without the cursor.
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }, { buf: 1, line: 21, token: 2 }]);
+    setScroll(400);
+    vi.advanceTimersByTime(40);
+    expect(reveals().at(-1)).toEqual({ buf: 1, line: 27, token: 3 });
+    expect(reveals().length).toBe(3);
+  });
+
+  it("makes nvim's cursor block the current block when the keys come in and it is on screen", () => {
+    const p = make();
+    p.onView(view(1, 1, { cursor: { line: 21, col: 0 } }));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    expect(currentBlock(p)?.line).toBe(20);
+    // Until the next scroll.
+    setScroll(50);
+    expect(currentBlock(p)?.line).toBe(6);
+  });
+
+  it("leaves the reading point current when nvim's cursor block is off screen", () => {
+    // With sync off nothing brings nvim's cursor into the preview's view.
+    const p = make({ sync: "off" });
+    p.onView(view(1, 1, { cursor: { line: 59, col: 0 } }));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    expect(currentBlock(p)?.line).toBe(0);
+  });
+
+  it("reads the first block at the document's start, the reserve growing as the page scrolls", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(30));
+    expect(p.readingY()).toBe(0);
+    setScroll(10);
+    expect(p.readingY()).toBe(20);
+    setScroll(100);
+    expect(p.readingY()).toBe(144);
+  });
+
+  it("lets a click that just happened win over nvim's cursor block", () => {
+    const p = make();
+    p.onView(view(1, 1, { cursor: { line: 21, col: 0 } }));
+    show(p, 1, paragraphs(30));
+    const box = p.index().find((b) => b.line === 4)!;
+    setClickedBlock(box);
+    p.onFocus(true);
+    expect(currentBlock(p)?.line).toBe(4);
+  });
+
+  it("keeps its own place, inside a block, when nvim takes the lead back without having moved", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(30, "TALL p0"));
+    p.onFocus(true);
+    // Inside the tall first block: the top line is 0, 70 % of the way through it.
+    setScroll(84);
+    expect(reveals().at(-1)).toMatchObject({ line: 1 });
+    p.onFocus(false);
+    p.onView(view(1, 1, { cursor: { line: 3, col: 0 } }));
+    expect(window.scrollY).toBe(84);
+    // nvim scrolled: its top goes.
+    p.onView(view(1, 3));
+    expect(window.scrollY).toBe(130);
+    // And a later view at the old top is nvim's own top again.
+    p.onView(view(1, 1));
+    expect(window.scrollY).toBe(0);
+  });
+
+  it("finishes a running glide and tells nvim the final place when the keys leave", () => {
+    const settle = vi.fn(() => setScroll(600));
+    (window as unknown as { eitriKeys: unknown }).eitriKeys = { version: 4, settle };
+    try {
+      const p = make();
+      p.onView(view(1, 1));
+      show(p, 1, paragraphs(30));
+      p.onFocus(true);
+      setScroll(300);
+      const before = reveals().length;
+      p.onFocus(false);
+      expect(settle).toHaveBeenCalled();
+      expect(reveals().length).toBe(before + 1);
+      expect(reveals().at(-1)).toMatchObject({ line: 41 });
+      // nvim's echo, then its first own view at that top, leave the preview where it is.
+      p.onView(view(1, 41, { cause: "reveal", token: (reveals().at(-1) as { token: number }).token }));
+      p.onView(view(1, 41, { cursor: { line: 44, col: 0 } }));
+      expect(window.scrollY).toBe(600);
+    } finally {
+      delete (window as unknown as { eitriKeys?: unknown }).eitriKeys;
+    }
+  });
+
+  it("sends nothing on a focus round trip in which the preview did not move", () => {
+    const p = make();
+    p.onView(view(1, 1, { cursor: { line: 21, col: 0 } }));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    p.onFocus(false);
+    expect(reveals()).toEqual([]);
+    // Nor once the preview's last move has already gone to nvim.
+    p.onFocus(true);
+    setScroll(300);
+    vi.advanceTimersByTime(100);
+    const sent = reveals().length;
+    p.onFocus(false);
+    expect(reveals().length).toBe(sent);
+  });
+
+  it("sends the trailing place still due when the keys leave", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    setScroll(300);
+    setScroll(330);
+    expect(reveals().length).toBe(1);
+    p.onFocus(false);
+    expect(reveals().at(-1)).toMatchObject({ line: 23, cursor: 25 });
+    vi.advanceTimersByTime(100);
+    expect(reveals().length).toBe(2);
+  });
+
+  it("sends nothing over an edit jump's cursor: its own owed place goes first, top alone", () => {
+    const settle = vi.fn(() => setScroll(600));
+    (window as unknown as { eitriKeys: unknown }).eitriKeys = { version: 4, settle, destination: () => 600 };
+    try {
+      const p = make();
+      p.onView(view(1, 1));
+      show(p, 1, paragraphs(30));
+      p.onFocus(true);
+      setScroll(300);
+      const before = reveals().length;
+      // Enter during a glide heading for 600: the glide ends there and that top goes without a cursor.
+      p.beforeEditJump();
+      expect(settle).toHaveBeenCalled();
+      expect(reveals().slice(before)).toEqual([{ buf: 1, line: 41, token: 2 }]);
+      // The page's own scroll events until the keys go reveal nothing, and the hand-off sends nothing.
+      setScroll(620);
+      vi.advanceTimersByTime(100);
+      p.onFocus(false);
+      expect(reveals().length).toBe(before + 1);
+    } finally {
+      delete (window as unknown as { eitriKeys?: unknown }).eitriKeys;
+    }
+  });
+
+  it("reveals again on scrolling once an edit jump is refused", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    p.beforeEditJump();
+    p.editJumpFailed();
+    setScroll(300);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }]);
+  });
+
+  it("keeps nvim's cursor line in view while nvim leads, scrolling the least, and reveals nothing", () => {
+    const p = make();
+    p.onView(view(1, 1, { scrolloff: 2 }));
+    show(p, 1, paragraphs(60));
+    const view_ = window.innerHeight;
+    // Line 61 (block 30, at 900) is below the view from the top.
+    p.onView(view(1, 1, { scrolloff: 2, cursor: { line: 61, col: 0 } }));
+    expect(window.scrollY).toBe(900 + 20 - view_ + 44);
+    // Inside the view: nvim's top, as before.
+    p.onView(view(1, 21, { scrolloff: 2, cursor: { line: 25, col: 0 } }));
+    expect(window.scrollY).toBe(300);
+    expect(reveals()).toEqual([]);
+  });
+
+  it("puts G's place with the last block at the bottom of the view", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(60));
+    // 60 blocks: the last ends at 59 * 30 + 20.
+    expect(p.bottomY()).toBe(59 * 30 + 20 - window.innerHeight);
+    expect(p.yFor(600)).toBe(556);
+    expect(p.yFor(10)).toBe(0);
   });
 });

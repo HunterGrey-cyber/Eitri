@@ -306,6 +306,20 @@ describe("the prompt and n/N", () => {
     expect(hudMessage()).toBe("[2/3]");
   });
 
+  it("a finished search, n and N tell the page's onJump before and after each move, with the window's place", async () => {
+    article([100, 1000, 2000]);
+    const seen: string[] = [];
+    await start({ onJump: (when) => { seen.push(`${when}@${window.scrollY}`); } });
+    search("alpha");
+    key("n");
+    key("N", { shiftKey: true });
+    const second = Math.round(1000 - window.innerHeight / 3);
+    expect(seen).toEqual(["before@0", "after@0", "before@0", `after@${second}`, `before@${second}`, "after@0"]);
+    seen.length = 0;
+    search("nothing here");
+    expect(seen).toEqual([]);
+  });
+
   it("n with no search says so", async () => {
     article([100]);
     await start();

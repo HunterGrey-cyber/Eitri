@@ -2678,9 +2678,14 @@ export default function App() {
           // to show it, and a count (which would multiply a `j` pressed after coming back) go the same way.
           dropPendingKeys();
           // The keys overlay has no reason to stay drawn while another pane has the keys; left up, coming back
-          // with `Ctrl+l` landed in INPUT with every keystroke swallowed by the overlay. The review overlay is not
-          // closed here (see the model's `pane_focus` arm).
-          closeTransientOverlays();
+          // with `Ctrl+l` landed in INPUT with every keystroke swallowed by the overlay. So the keys leaving close
+          // it, and the keys arriving do not: `prefix ?` from another module sends `open_keymap` before the focus
+          // report that the chat now holds the keys, and closing here would take the sheet down as it opens, with
+          // the way back to that module. The review overlay is not closed here (see the model's `pane_focus` arm).
+          if (payload.focused) {
+            setDetail(null);
+            setHandoffOpen(false);
+          } else closeTransientOverlays();
           // The `/` prompt and the `:` line are this panel's own, like the keys overlay.
           setSearch(null);
           setExLine(null);

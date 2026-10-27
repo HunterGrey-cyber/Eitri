@@ -55,6 +55,39 @@ describe("closing the sheet prefix ? opened", () => {
     expect(closes()).toEqual([expect.objectContaining({ type: "keymap_closed", opening: 7, return_keys: true })]);
   });
 
+  it("stays up through the focus report that follows it, so Esc still returns the keys", () => {
+    const container = shown();
+    // prefix ? from another module: the chat did not hold the keys, and the report that it does comes after.
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "open_keymap", opening: 7 });
+    dispatch({ kind: "pane_focus", focused: true });
+    fireEvent.keyDown(sheetOf(container), { key: "Escape" });
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+    expect(closes()).toEqual([expect.objectContaining({ type: "keymap_closed", opening: 7, return_keys: true })]);
+  });
+
+  it("stays up over an empty tab through the focus report that follows it, so Esc still returns the keys", () => {
+    const container = shown();
+    dispatch({ kind: "tabs", active: 1, tabs: [{ id: 1, number: 1, label: "1 new", name: null, state: "not_started",
+      mode: "auto", marker: null, pending: 0, resumable: true, failure: null, title: null, agent: "claude" }] });
+    dispatch({ kind: "pane_focus", focused: false });
+    dispatch({ kind: "open_keymap", opening: 8 });
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(container.querySelector(".empty-tab")).not.toBeNull();
+    fireEvent.keyDown(document.activeElement ?? sheetOf(container), { key: "Escape" });
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+    expect(closes()).toEqual([expect.objectContaining({ type: "keymap_closed", opening: 8, return_keys: true })]);
+  });
+
+  it("closes when the keys leave, returning nothing", () => {
+    const container = shown();
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "open_keymap", opening: 7 });
+    dispatch({ kind: "pane_focus", focused: false });
+    expect(container.querySelector(".keymap-overlay")).toBeNull();
+    expect(closes()).toEqual([expect.objectContaining({ opening: 7, return_keys: false })]);
+  });
+
   it("a click outside the sheet posts one keymap_closed that returns the keys", () => {
     const container = shown();
     dispatch({ kind: "open_keymap", opening: 7 });

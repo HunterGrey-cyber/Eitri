@@ -43,6 +43,8 @@ export interface EditorView {
   cause: "user" | "reveal";
   token?: number;
   doc: DocPrefixes | null;
+  /** The window's effective 'scrolloff', in screen lines; an older host sends none. */
+  scrolloff?: number;
 }
 
 export interface TooLarge {
@@ -155,6 +157,7 @@ export function isEditorView(v: unknown): v is EditorView {
   if (typeof f !== "number" || !Number.isFinite(f) || f < 0 || f >= 1) return false;
   if (v.cause !== "user" && v.cause !== "reveal") return false;
   if (v.token !== undefined && !isCount(v.token)) return false;
+  if (v.scrolloff !== undefined && !isCount(v.scrolloff)) return false;
   return v.doc === null || isDoc(v.doc);
 }
 
@@ -188,8 +191,12 @@ export function follow(b: Bridge): Promise<{ filetypes: string[] }> {
   return verb(b, "editor.follow", {}, (v): v is { filetypes: string[] } => isRecord(v) && isStringArray(v.filetypes));
 }
 
-// The host refuses an argument it does not know, so each verb sends exactly the object it was given.
-export function reveal(b: Bridge, a: { buf: number; line: number; token: number }): Promise<{ applied: boolean }> {
+// The host refuses an argument it does not know, so each verb sends exactly the object it was given. A reveal's
+// `cursor` (the line nvim's cursor goes to, kept in view) is optional: an older host refuses it.
+export function reveal(
+  b: Bridge,
+  a: { buf: number; line: number; token: number; cursor?: number },
+): Promise<{ applied: boolean }> {
   return verb(b, "editor.reveal", a, isApplied);
 }
 

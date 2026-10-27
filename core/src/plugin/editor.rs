@@ -205,17 +205,25 @@ pub fn follow_text(rpc: &dyn EditorRpc, owner: &str, buf: u64, max_bytes: u64, m
     )
 }
 
-pub fn follow_reveal(rpc: &dyn EditorRpc, owner: &str, buf: u64, line: u32, token: u64) -> Pending {
-    follow_call(
-        rpc,
-        "reveal",
-        vec![
-            (Value::from("owner"), Value::from(owner)),
-            (Value::from("buf"), Value::from(buf)),
-            (Value::from("line"), Value::from(line)),
-            (Value::from("token"), Value::from(token)),
-        ],
-    )
+/// `cursor`, when given, is the line the window's cursor goes to, held inside the window as it then stands.
+pub fn follow_reveal(
+    rpc: &dyn EditorRpc,
+    owner: &str,
+    buf: u64,
+    line: u32,
+    token: u64,
+    cursor: Option<u32>,
+) -> Pending {
+    let mut args = vec![
+        (Value::from("owner"), Value::from(owner)),
+        (Value::from("buf"), Value::from(buf)),
+        (Value::from("line"), Value::from(line)),
+        (Value::from("token"), Value::from(token)),
+    ];
+    if let Some(cursor) = cursor {
+        args.push((Value::from("cursor"), Value::from(cursor)));
+    }
+    follow_call(rpc, "reveal", args)
 }
 
 /// `col` counts Unicode scalar values from 1; 0 asks for the line's first non-blank character.
@@ -444,7 +452,7 @@ mod tests {
     fn every_follow_value_is_an_argument_of_the_follow_chunk() {
         let rpc = Recorder::default();
         let filetypes = vec!["markdown".to_string()];
-        let commands = vec![("MarkdownPreview".to_string(), "show")];
+        let commands = vec![("EitriMarkdown".to_string(), "show")];
         let mut install = FollowInstall {
             owner: "demo",
             socket: Path::new("/run/x/follow"),
@@ -456,14 +464,17 @@ mod tests {
         let _ = follow_install(&rpc, &install);
         let _ = follow_on(&rpc, "demo", false);
         let _ = follow_text(&rpc, "demo", 3, 4_194_304, 50_000);
-        let _ = follow_reveal(&rpc, "demo", 3, 50, 7);
+        let _ = follow_reveal(&rpc, "demo", 3, 50, 7, None);
         let _ = follow_jump(&rpc, "demo", 3, 5, 0);
         let _ = follow_teardown(&rpc, "demo");
         install.scratch_dir = None;
         let _ = follow_install(&rpc, &install);
+        let _ = follow_reveal(&rpc, "demo", 3, 50, 8, Some(54));
         let calls = rpc.0.borrow();
-        assert_eq!(calls.len(), 7);
-        let ops = ["install", "follow", "text", "reveal", "jump", "teardown", "install"];
+        assert_eq!(calls.len(), 8);
+        let ops = [
+            "install", "follow", "text", "reveal", "jump", "teardown", "install", "reveal",
+        ];
         for (call, op) in calls.iter().zip(ops) {
             assert!(
                 std::ptr::eq(call.0, PLUGIN_FOLLOW_LUA),
@@ -484,7 +495,7 @@ mod tests {
         assert_eq!(
             get(opts, "commands"),
             &Value::Array(vec![Value::Array(vec![
-                Value::from("MarkdownPreview"),
+                Value::from("EitriMarkdown"),
                 Value::from("show")
             ])])
         );
@@ -495,6 +506,8 @@ mod tests {
         assert_eq!(get(&calls[2].1[1], "max_lines"), &Value::from(50_000));
         assert_eq!(get(&calls[3].1[1], "line"), &Value::from(50));
         assert_eq!(get(&calls[3].1[1], "token"), &Value::from(7));
+        assert_eq!(field(&calls[3].1[1], "cursor"), None, "no cursor unless one was given");
+        assert_eq!(get(&calls[7].1[1], "cursor"), &Value::from(54));
         assert_eq!(get(&calls[4].1[1], "line"), &Value::from(5));
         assert_eq!(get(&calls[4].1[1], "col"), &Value::from(0));
         assert!(
@@ -510,10 +523,10 @@ mod tests {
         assert_eq!(
             read_installed(&m(&[
                 ("ok", true.into()),
-                ("skipped", Value::Array(vec!["MarkdownPreview".into()]))
+                ("skipped", Value::Array(vec!["EitriMarkdown".into()]))
             ])),
             Ok(Installed {
-                skipped: vec!["MarkdownPreview".to_string()],
+                skipped: vec!["EitriMarkdown".to_string()],
                 early: false
             })
         );

@@ -1187,10 +1187,10 @@ mod tests {
     }
 
     #[test]
-    fn the_generic_action_list_parses_and_holds_17_unique_actions() {
+    fn the_generic_action_list_parses_and_holds_18_unique_actions() {
         let actions = generic_actions();
-        assert_eq!(actions.len(), 17);
-        assert_eq!(actions.iter().collect::<std::collections::HashSet<_>>().len(), 17);
+        assert_eq!(actions.len(), 18);
+        assert_eq!(actions.iter().collect::<std::collections::HashSet<_>>().len(), 18);
     }
 
     #[test]

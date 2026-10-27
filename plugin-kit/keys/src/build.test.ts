@@ -28,9 +28,13 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
       window.eitriKeys.findSeed("query");
       const stroke: KeyStroke = {key: "x", ctrl: false, shift: false};
       const action: GenericAction = "hint.start";
-      const version: 3 = window.eitriKeys.version;
+      const version: 4 = window.eitriKeys.version;
+      const v4: InstallOptions = { rows: [row], run: () => true, bottom: () => null, onJump: (when) => void when };
       window.eitriKeys.install(opts);
       window.eitriKeys.install(v3);
+      window.eitriKeys.install(v4);
+      window.eitriKeys.scrollTo(window.eitriKeys.destination());
+      window.eitriKeys.settle();
       window.eitriKeys.status("s");
       const keys: string[] = window.eitriKeys.keys(action);
       window.eitriKeys.message(stroke.key + keys.join("") + String(version));

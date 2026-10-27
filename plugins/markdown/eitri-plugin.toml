@@ -17,11 +17,11 @@ focus = false
 filetypes = ["markdown"]            # 1-16 names, each [a-z0-9_]{1,32}
 auto_show = "auto"                  # names a bool setting; optional
 
-[commands.MarkdownPreview]
+[commands.EitriMarkdown]
 does = "show"                       # show | toggle | hide
-[commands.MarkdownPreviewToggle]
+[commands.EitriMarkdownToggle]
 does = "toggle"
-[commands.MarkdownPreviewStop]
+[commands.EitriMarkdownHide]
 does = "hide"
 
 [settings.auto]

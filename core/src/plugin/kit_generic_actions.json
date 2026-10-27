@@ -5,6 +5,7 @@
     "scroll.half_down",
     "scroll.half_up",
     "scroll.page_down",
+    "scroll.page_up",
     "scroll.top",
     "scroll.bottom",
     "history.back",

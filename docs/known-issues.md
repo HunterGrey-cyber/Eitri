@@ -52,8 +52,10 @@ distinguish real refresh-period feedback from the fallback clock.
   the same build with GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about
   16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
   commit c36202f6, 2026-10-25). Three workarounds using public GTK API were measured; none restored native
-  latency (the best still added about 5.8 ms at 165 Hz), so none ships. Settled idle stayed quiet. The period
-  was real, but the screen was the headless session's; a physical display has still not been measured.
+  latency, so none ships. The one measured at the real 165 Hz period (`render`) still added about 5.8 ms;
+  the other two were measured only with the 60 Hz fallback clock. Settled idle was measured only with
+  that fallback clock and stayed quiet. The period was real, but the screen was the headless session's;
+  a physical display has still not been measured.
 - **On GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
   165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
   The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run

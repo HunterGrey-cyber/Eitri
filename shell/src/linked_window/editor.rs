@@ -350,9 +350,13 @@ pub fn view_line(view: &ViewLine) -> String {
             ViewCause::Reveal => "reveal",
         },
     });
-    // A view with no token carries none, as the snippet writes it: a `null` token is not a line it writes.
+    // A view with no token carries none, as the snippet writes it: a `null` token is not a line it writes. The same
+    // goes for a missing 'scrolloff'.
     if let Some(token) = view.token {
         line["token"] = json!(token);
+    }
+    if let Some(scrolloff) = view.scrolloff {
+        line["scrolloff"] = json!(scrolloff);
     }
     line.to_string()
 }
@@ -2310,6 +2314,7 @@ mod tests {
             cursor_col: 2,
             cause,
             token,
+            scrolloff: Some(4),
         }
     }
 

@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=77f71d4a7658692b1809f7c36e520581a5e3098588c00069536b1cde73afd4c0 -->
+<!-- translated-from: markdown-preview.md sha256=b0e9980afa5ebc40586e7d4bf312f14438aa84c1fec46b81c0b51fb69358e5dd -->
 
 # Markdown 预览
 
@@ -21,14 +21,14 @@ eitri.plugin.load("markdown")
 <a id="open-and-close-it"></a>
 ## 打开和关闭预览
 
-- `:MarkdownPreview` 在编辑器右边显示预览；`:MarkdownPreviewToggle` 显示或隐藏它；`:MarkdownPreviewStop` 隐藏它。从 Neovim 打开时，预览把按键留在 Neovim 里，你可以继续输入。
+- `:EitriMarkdown` 在编辑器右边显示预览；`:EitriMarkdownToggle` 显示或隐藏它；`:EitriMarkdownHide` 隐藏它。从 Neovim 打开时，预览把按键留在 Neovim 里，你可以继续输入。
 - 你自己的按键：`eitri.plugin.load("markdown", { key = "b" })` 让前缀再按 `b`（默认前缀下是 `Ctrl+b b`）显示预览并把按键交给它，在它拿着按键时再按一次就隐藏它。没有默认按键。
-- 如果你的 Neovim 配置已经定义了 `:MarkdownPreview`（另一个预览插件，或者延迟加载它的占位命令），Eitri 不动那个命令，只定义另外两个，并在你启动 Eitri 的终端里打印 `[plugin markdown] :MarkdownPreview is already defined; not replacing it`。要用 Eitri 的命令，就删掉或改名你自己的那个。
+- 命令名都以 `Eitri` 开头，这样不会和其他预览插件的命令撞名。如果你的 Neovim 配置已经定义了同名的命令（比如 `:EitriMarkdown`），Eitri 不动那个命令，只定义其余的，并在你启动 Eitri 的终端里打印 `[plugin markdown] :EitriMarkdown is already defined; not replacing it`。要用 Eitri 的命令，就删掉或改名你自己的那个。
 
 - 在 Neovim 里用 VS Code 风格的按键。Eitri 不绑定它；想要的话，加到你的 Neovim 配置里：
 
   ```lua
-  vim.keymap.set("n", "<C-S-v>", "<Cmd>MarkdownPreviewToggle<CR>")
+  vim.keymap.set("n", "<C-S-v>", "<Cmd>EitriMarkdownToggle<CR>")
   ```
 
   在 fcitx5 这类输入法占用 `Ctrl+Shift` 组合键的桌面上，这个组合键到不了 Neovim；换一个键，比如 `<leader>mp`。
@@ -63,8 +63,12 @@ eitri.plugin.load("markdown", { auto = true })
 Neovim 的窗口和预览的顶部显示同一行源码，经过折叠、很长的自动换行、很长的代码块和稍后才加载的图片时也是如此。哪一边拿着按键，哪一边带头：
 
 - 按键在 Neovim 里（或者在预览以外的任何地方）时，在 Neovim 里滚动和跳转会带动预览，预览的边栏里有一条竖线标出 Neovim 光标所在的行。
-- 按键在预览里时，滚动预览会带动 Neovim 的窗口，所以离开预览时，Neovim 就停在同一个位置。Neovim 会把光标保持在窗口里，所以窗口滚动时光标可能会跟着移动。
-- 用鼠标滚轮滚动预览，即使按键在 Neovim 里，也会带动 Neovim 的窗口。Neovim 自己的下一次移动会把带头的位置拿回来。
+- 按键在预览里时，滚动预览会带动 Neovim 的窗口，Neovim 的光标也会跟着你在预览里正在读的那一行，所以离开预览时，Neovim 停在同一个位置，光标就在那一行上。如果 Neovim 的 `scrolloff` 不允许光标停在那一行而不滚动，光标会停在最近的、不用滚动的那一行；Neovim 的窗口不会因此移动。离开时还在进行的滚动会立即结束，并把结束的位置告诉 Neovim。如果离开前没有滚动过，就什么也不告诉 Neovim，它的光标留在原处。
+- 你正在读的那一行在预览顶部往下几行处，就像 Neovim 的光标在窗口顶部往下 `scrolloff` 行处一样：预览在它上面留出的行数等于你的 Neovim 的 `scrolloff`（Neovim 没有告诉时为两行），最多是视图的四分之一。在文档开头没有这样的空间，和 Neovim 一样。
+- 回到 Neovim 后，如果你在 Neovim 里还没有移动过，Neovim 的第一次移动不会让预览跳到某个整行：预览停在你离开时的位置，即使是在一个很长的自动换行段落中间。
+- 进入预览时，如果 Neovim 光标所在的块在屏幕上，它就成为当前块，所以 `yy` 和 `Enter` 作用在你刚才编辑的内容上。光标在任何块之外的一行上（比如段落之间的空行）时，离它最近的块成为当前块，`Enter` 仍然让 Neovim 的光标留在它自己那一行。
+- Neovim 带头时，预览会让 Neovim 光标所在的行保持可见：渲染后的文字比 Neovim 里的高，那一行快要落到预览下方时，预览只滚动必要的距离把它显示出来。
+- 用鼠标滚轮滚动预览，即使按键在 Neovim 里，也会带动 Neovim 的窗口；这时 Neovim 的光标只按它的 `scrolloff` 需要的那样移动。Neovim 自己的下一次移动会把带头的位置拿回来。
 
 <a id="reading-with-the-keyboard"></a>
 ## 用键盘阅读
@@ -75,23 +79,25 @@ Neovim 的窗口和预览的顶部显示同一行源码，经过折叠、很长�
 |---|---|
 | `j` 或 `Ctrl+e` / `k` 或 `Ctrl+y` | 向下 / 向上滚动一步（按住不放会一直滚动） |
 | `d` 或 `Ctrl+d` / `u` 或 `Ctrl+u` | 向下 / 向上半页 |
-| `Ctrl+f` | 向下一页 |
-| `gg` / `G` | 顶部 / 底部 |
-| `]]` / `[[` | 下一个 / 上一个标题，放到顶部 |
+| `Ctrl+f` / `Ctrl+b` | 向下 / 向上一页 |
+| `gg` / `G` | 顶部 / 底部（文档最后一行在视图底部，和 Vim 一样） |
+| `]]` / `[[` | 下一个 / 上一个标题，放到你阅读的位置，即顶部往下几行处 |
 | `zh` / `zl` | 横向滚动当前块（很宽的表格、代码块、公式或图表） |
 | `/` | 在渲染后的文字里查找；`Enter` 执行搜索（空的搜索重复上一次），`Esc` 取消 |
 | `n` / `N` | 下一个 / 上一个匹配，到头后从另一头接着找 |
 | `f` | 在链接、脚注链接和折叠开关上显示标签；输入标签就跟随它 |
 | `yy` | 复制当前块的 Markdown 源码（代码块只复制代码，不含围栏那两行） |
 | `Enter` | 在这里编辑：把 Neovim 的光标移到这个位置，并把按键交给 Neovim |
-| `H` 或 `Ctrl+o` / `L` 或 `Ctrl+i` | 在文档内部的跳转（标题链接、脚注）之间后退 / 前进 |
+| `H` 或 `Ctrl+o` / `L` 或 `Ctrl+i` | 在文档内部的跳转之间后退 / 前进：`gg`、`G`、`]]`、`[[`、搜索和 `n`/`N`、标题链接、脚注 |
 | `?` | 列出这些按键 |
 | `Esc` | 退出当前模式；同时清除搜索高亮 |
 
-- 当前块是视图顶部往下一行处的那一块；预览拿着按键时，边栏里有一条竖线标出它。点击一个块会让它成为当前块，直到你滚动为止。双击一个块，等于在那里按 `Enter`。
+- 当前块是你阅读的位置（视图顶部往下留出的那几行之下）的那一块；预览拿着按键时，边栏里有一条竖线标出它。点击一个块会让它成为当前块，直到你滚动为止。双击一个块，等于在那里按 `Enter`。
+- 如果 Neovim 的光标已经在当前块里（滚动时放到那里的，或者进入预览时带进来的那一块，这时连所在的列也不变），`Enter` 让它留在那一行，所以 Neovim 的窗口不会滚动。如果你读的那一块是在 Neovim 顶行上折行显示的长段落，`scrolloff` 不让光标停在它上面，`Enter` 就让光标留在 Neovim 停住的下面那一行，而不让 Neovim 滚动。
+- 跳转类的移动（`gg`、`G`、`]]`、`[[`、搜索和 `n`/`N`、文档内的链接）和滚动键一样平滑移动；关掉平滑滚动，或者桌面要求减少动画时，就立即跳过去。快速连按几次 `]]` 就移动几个标题。
 - 默认情况下，搜索不区分大小写，除非搜索里有大写字母，和 Vim 的 `smartcase` 一样（`plugins.keys.find_case` 可以改）。状态行显示 `[3/12]`，到头接着找时显示 `search hit BOTTOM, continuing at TOP`。
 - 按下一个较长按键的第一个键（`g`、`z`、`y`、`[`、`]`）之后，状态行会列出接下来可以按的键。
-- 如果你的 Eitri 前缀是这些 Ctrl 键中的一个，它仍然是前缀，预览里就没有这个键。
+- 如果你的 Eitri 前缀是这些 Ctrl 键中的一个，它仍然是前缀，预览里就没有这个键：用默认前缀 `Ctrl+b` 时，没有 `Ctrl+b` 向上翻页。
 - 按 `yy` 之后，状态行显示 `yanked 3 lines`。
 - 指向项目里另一个文件的链接会在 Neovim 里打开它（按键留在预览里，如果那个文件是 Markdown，预览接着显示它）；`src/main.rs#L10` 会打开到第 10 行。网页链接在你的浏览器里打开。指向项目以外的链接，或者指向不存在的文件的链接，会显示 `outside the project` 或 `no such file`，此外什么也不做。
 
@@ -101,7 +107,7 @@ Neovim 的窗口和预览的顶部显示同一行源码，经过折叠、很长�
 eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `scroll.down`、`scroll.up`、`scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.top`、`scroll.bottom`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open` 和 `mode.escape`。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `scroll.down`、`scroll.up`、`scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top`、`scroll.bottom`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open` 和 `mode.escape`。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 

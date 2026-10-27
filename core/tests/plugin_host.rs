@@ -958,6 +958,7 @@ fn view(buf: u64, tick: u64) -> ViewLine {
         cursor_col: 0,
         cause: ViewCause::User,
         token: None,
+        scrolloff: None,
     }
 }
 
@@ -1641,6 +1642,56 @@ fn reveal_answers_applied_and_only_the_newest_parked_reveal_is_sent() {
     assert_eq!(d.rig.page.replies_to(a).len(), 1, "answered once");
     d.rig.host.pump(t + Duration::from_secs(1));
     assert_eq!(ops_since(&d.rig, from), ["reveal"], "nothing else");
+}
+
+#[test]
+fn a_reveal_hands_its_cursor_to_nvim_only_when_the_page_sends_one() {
+    let d = shown("host-reveal-cursor");
+    let t = d.t0 + ms(300);
+    let from = calls(&d.rig);
+    let with = d
+        .rig
+        .send("editor.reveal", json!({"buf": 3, "line": 10, "token": 1, "cursor": 14}));
+    d.rig.host.pump(t);
+    assert_eq!(ops_since(&d.rig, from), ["reveal"]);
+    let (_, opts) = last_call(&d.rig);
+    assert_eq!(opt(&opts, "line"), 10.into());
+    assert_eq!(opt(&opts, "cursor"), 14.into());
+    answer(&d.rig, map(&[("applied", true.into())]));
+    d.rig.host.pump(t);
+    assert_eq!(d.rig.page.replies_to(with)[0]["result"], json!({"applied": true}));
+    d.rig.send("editor.reveal", json!({"buf": 3, "line": 20, "token": 2}));
+    d.rig.host.pump(t);
+    let (_, opts) = last_call(&d.rig);
+    assert_eq!(opt(&opts, "line"), 20.into());
+    assert!(!has_key(&opts, "cursor"), "no cursor key without one from the page");
+    let bad = d
+        .rig
+        .send("editor.reveal", json!({"buf": 3, "line": 20, "token": 3, "cursor": 0}));
+    let reply = &d.rig.page.replies_to(bad)[0];
+    assert_eq!(reply["error"]["code"], "bad_request", "{reply}");
+    assert_eq!(reply["error"]["message"], "cursor must be at least 1");
+}
+
+#[test]
+fn a_view_hands_its_scrolloff_to_the_page_and_leaves_it_out_when_nvim_did_not_say() {
+    let d = shown("host-view-scrolloff");
+    let t = d.t0 + ms(300);
+    let mut v = named_view(&d.a, 3, 41);
+    v.top = 7;
+    v.scrolloff = Some(4);
+    d.rig.host.follow_view(v, t);
+    d.rig.host.pump(t);
+    let last = last_view(&d.rig);
+    assert_eq!(last["top"], 7);
+    assert_eq!(last["scrolloff"], 4);
+    let mut v = named_view(&d.a, 3, 41);
+    v.top = 8;
+    d.rig.host.follow_view(v, t + ms(10));
+    d.rig.host.pump(t + ms(10));
+    let last = last_view(&d.rig);
+    assert_eq!(last["top"], 8);
+    assert!(last.get("scrolloff").is_none(), "{last}");
 }
 
 #[test]

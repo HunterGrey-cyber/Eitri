@@ -66,6 +66,8 @@ pub struct ViewLine {
     pub cursor_col: u64,
     pub cause: ViewCause,
     pub token: Option<u64>,
+    /// The window's effective 'scrolloff' in screen lines; `None` from a snippet that does not say it.
+    pub scrolloff: Option<u64>,
 }
 
 /// A command the user ran in nvim, for the plugin named by the line's owner.
@@ -123,6 +125,10 @@ pub fn parse_line(bytes: &[u8]) -> Option<(Option<ViewLine>, Option<Ordered>)> {
                 None => None,
                 Some(token) => Some(token.as_u64()?),
             };
+            let scrolloff = match line.get("scrolloff") {
+                None => None,
+                Some(scrolloff) => Some(scrolloff.as_u64()?),
+            };
             let view = ViewLine {
                 owner,
                 seq: int("seq")?,
@@ -139,6 +145,7 @@ pub fn parse_line(bytes: &[u8]) -> Option<(Option<ViewLine>, Option<Ordered>)> {
                 cursor_col: cursor.get("col")?.as_u64()?,
                 cause,
                 token,
+                scrolloff,
             };
             Some((Some(view), None))
         }
@@ -588,8 +595,24 @@ mod tests {
             cursor_col: 4,
             cause: ViewCause::User,
             token: None,
+            scrolloff: None,
         };
         assert_eq!(parse(VIEW), Some((Some(expected.clone()), None)));
+        let with_scrolloff = VIEW.replace(r#""cause":"user""#, r#""cause":"user","scrolloff":4"#);
+        assert_eq!(
+            parse(&with_scrolloff),
+            Some((
+                Some(ViewLine {
+                    scrolloff: Some(4),
+                    ..expected.clone()
+                }),
+                None
+            ))
+        );
+        for bad in [r#""scrolloff":-1"#, r#""scrolloff":"4""#, r#""scrolloff":null"#] {
+            let line = VIEW.replace(r#""cause":"user""#, &format!(r#""cause":"user",{bad}"#));
+            assert_eq!(parse(&line), None, "{bad}");
+        }
         let reveal = VIEW.replace(r#""cause":"user""#, r#""cause":"reveal","token":7"#);
         assert_eq!(
             parse(&reveal),

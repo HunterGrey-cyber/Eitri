@@ -32,7 +32,7 @@ it("lists the page's rows under their contexts, then one line of the generic row
   expect(rowTexts()).toEqual([
     "]q / <C-n>  next item",
     "1  pick",
-    "scroll j / <C-e> k / <C-y> d / <C-d> u / <C-u> <C-f> gg G · history H / <C-o> L / <C-i> · pages [[ ]] · find / n N · hints f · help ? · leave <Esc>",
+    "scroll j / <C-e> k / <C-y> d / <C-d> u / <C-u> <C-f> <C-b> gg G · history H / <C-o> L / <C-i> · pages [[ ]] · find / n N · hints f · help ? · leave <Esc>",
   ]);
   expect(genericLine()).toBe(rowTexts().at(-1));
 });
@@ -50,7 +50,7 @@ it("folds a page row that reuses a generic action into its group, and leaves out
 it("names the groups with the page's labels, keeping the defaults it leaves out", () => {
   openSheet([...GENERIC_ROWS, ...pageRows], { groups: { scroll: "滚动", history: "历史" } });
   expect(genericLine()).toBe(
-    "滚动 j / <C-e> k / <C-y> d / <C-d> u / <C-u> <C-f> gg G · 历史 H / <C-o> L / <C-i> · pages [[ ]] · find / n N · hints f · help ? · leave <Esc>",
+    "滚动 j / <C-e> k / <C-y> d / <C-d> u / <C-u> <C-f> <C-b> gg G · 历史 H / <C-o> L / <C-i> · pages [[ ]] · find / n N · hints f · help ? · leave <Esc>",
   );
 });
 

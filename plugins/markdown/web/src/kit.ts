@@ -3,7 +3,8 @@ export type Row = { action: string; keys: string[]; context: string; desc: strin
 export type Mode = "normal" | "hint" | "insert";
 export type HintTarget = { el: Element; rank?: number };
 export type GenericAction =
-  | "scroll.down" | "scroll.up" | "scroll.half_down" | "scroll.half_up" | "scroll.page_down" | "scroll.top"
+  | "scroll.down" | "scroll.up" | "scroll.half_down" | "scroll.half_up" | "scroll.page_down" | "scroll.page_up"
+  | "scroll.top"
   | "scroll.bottom" | "history.back" | "history.forward" | "link.prev" | "link.next" | "find.start" | "find.next"
   | "find.prev" | "hint.start" | "sheet.open" | "mode.escape";
 export type KitMessage = "find.notFound" | "find.none" | "find.wrapBottom" | "find.wrapTop" | "find.count";
@@ -25,6 +26,10 @@ export type InstallOptions = {
   initial?: { timeoutlen: number; hasKeys: boolean; prefix?: string | null; settings?: unknown };
   labels?: KitLabels;
   find?: { root?: () => Element | null; exclude?: string };
+  /** Version 4 and later: where `G` takes the window. */
+  bottom?: () => number | null;
+  /** Version 4 and later: called around the kit's own jumps (`gg`, `G`, a find move). */
+  onJump?: (when: "before" | "after") => void;
 };
 
 export interface EitriKeys {
@@ -36,6 +41,10 @@ export interface EitriKeys {
   keys(action: string): string[];
   findRefresh(): void;
   findSeed(query: string): void;
+  /** Version 4 and later: the window's glide to `top`, where it is heading, and ending it at once there. */
+  scrollTo?(top: number): void;
+  destination?(): number;
+  settle?(): void;
 }
 /** The kit the host serves at /.eitri/keys.js, or null when the page runs without it (a test, a browser). */
 export function kit(): EitriKeys | null {

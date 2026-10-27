@@ -23,19 +23,19 @@ no module, no Neovim command, nothing running.
 
 ## Open and close it
 
-- `:MarkdownPreview` shows the preview to the right of the editor; `:MarkdownPreviewToggle` shows or hides it;
-  `:MarkdownPreviewStop` hides it. Opened from Neovim, the preview leaves the keys in Neovim, so you keep typing.
+- `:EitriMarkdown` shows the preview to the right of the editor; `:EitriMarkdownToggle` shows or hides it;
+  `:EitriMarkdownHide` hides it. Opened from Neovim, the preview leaves the keys in Neovim, so you keep typing.
 - A key of your own: `eitri.plugin.load("markdown", { key = "b" })` makes the prefix then `b` (`Ctrl+b b` with the
   default prefix) show the preview and give it the keys, and hide it again while it has them. There is no default key.
-- If your Neovim configuration already defines `:MarkdownPreview` (another preview plugin, or a stub that loads one
-  lazily), Eitri leaves that command alone, defines the other two, and prints
-  `[plugin markdown] :MarkdownPreview is already defined; not replacing it` in the terminal you started Eitri from.
-  Remove or rename your own command to use Eitri's.
+- The command names start with `Eitri` so they do not clash with the commands of other preview plugins. If your
+  Neovim configuration already defines a command of the same name (`:EitriMarkdown`, say), Eitri leaves that command
+  alone, defines the others, and prints `[plugin markdown] :EitriMarkdown is already defined; not replacing it` in
+  the terminal you started Eitri from. Remove or rename your own command to use Eitri's.
 
 - A key in Neovim, VS Code style. Eitri does not bind it; add it to your Neovim configuration if you want it:
 
   ```lua
-  vim.keymap.set("n", "<C-S-v>", "<Cmd>MarkdownPreviewToggle<CR>")
+  vim.keymap.set("n", "<C-S-v>", "<Cmd>EitriMarkdownToggle<CR>")
   ```
 
   On desktops where an input method such as fcitx5 owns `Ctrl+Shift` combinations, that chord never reaches Neovim;
@@ -78,10 +78,23 @@ blocks and images that load late. Whichever side has the keys leads:
 
 - With the keys in Neovim (or anywhere outside the preview), scrolling and jumping in Neovim move the preview, and a
   bar in the preview's margin marks Neovim's cursor line.
-- With the keys in the preview, scrolling it moves Neovim's window, so leaving the preview finds Neovim at the same
-  place. Neovim keeps its cursor inside its window, so the cursor may move as the window scrolls.
-- Scrolling the preview with the mouse wheel moves Neovim's window too, even while Neovim has the keys. Neovim's next
-  own move takes the lead back.
+- With the keys in the preview, scrolling it moves Neovim's window, and Neovim's cursor follows the line you are
+  reading in the preview, so leaving the preview finds Neovim at the same place with the cursor on that line. Where
+  Neovim's `scrolloff` does not let the cursor sit on that line without scrolling, the cursor goes to the nearest line
+  that does; Neovim's window never moves for it. A scroll still running when you leave finishes at once, and Neovim
+  is told where it ended. If you leave without having scrolled, Neovim is told nothing and its cursor stays put.
+- The line you are reading sits a few lines below the preview's top, as Neovim's cursor sits `scrolloff` lines below
+  its window's top: the preview keeps as many lines above it as your Neovim's `scrolloff` (two when Neovim does not
+  say), at most a quarter of the view. Near the top of the document there is no such room, as in Neovim.
+- Coming back to Neovim without having moved in it, Neovim's first move does not jump the preview to a whole line:
+  it stays where you left it, even in the middle of a long wrapped paragraph.
+- Going into the preview, the block Neovim's cursor is in, when it is on screen, becomes the current block, so `yy`
+  and `Enter` act on what you were editing. On a line outside any block (a blank line between paragraphs) the
+  nearest block becomes current, and `Enter` still leaves Neovim's cursor on its own line.
+- While Neovim leads, the preview keeps the line Neovim's cursor is on in view: when the rendered text is taller than
+  Neovim's and that line would fall below the preview, the preview scrolls the least it needs to show it.
+- Scrolling the preview with the mouse wheel moves Neovim's window too, even while Neovim has the keys; Neovim's
+  cursor then moves only as far as its `scrolloff` needs. Neovim's next own move takes the lead back.
 
 ## Reading with the keyboard
 
@@ -91,27 +104,35 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 |---|---|
 | `j` or `Ctrl+e` / `k` or `Ctrl+y` | scroll down / up a step (held, they keep scrolling) |
 | `d` or `Ctrl+d` / `u` or `Ctrl+u` | half a page down / up |
-| `Ctrl+f` | a page down |
-| `gg` / `G` | top / bottom |
-| `]]` / `[[` | next / previous heading, put at the top |
+| `Ctrl+f` / `Ctrl+b` | a page down / up |
+| `gg` / `G` | top / bottom (the document's last line at the bottom of the view, as in Vim) |
+| `]]` / `[[` | next / previous heading, put where you read, a few lines below the top |
 | `zh` / `zl` | scroll the current block sideways (a wide table, code block, formula or diagram) |
 | `/` | find in the rendered text; `Enter` runs the search (an empty one repeats the last), `Esc` cancels |
 | `n` / `N` | next / previous match, wrapping round |
 | `f` | labels on links, footnote links and fold toggles; type a label to follow it |
 | `yy` | copy the current block's Markdown source (for a code block, the code without the fence lines) |
 | `Enter` | edit here: move Neovim's cursor to this place and give Neovim the keys |
-| `H` or `Ctrl+o` / `L` or `Ctrl+i` | back / forward between jumps inside the document (a heading link, a footnote) |
+| `H` or `Ctrl+o` / `L` or `Ctrl+i` | back / forward between jumps inside the document: `gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a heading link, a footnote |
 | `?` | the list of these keys |
 | `Esc` | leave a mode; also clears the search highlights |
 
-- The current block is the one at the top of the view, a line down; a bar in the margin marks it while the preview
-  has the keys. A click makes the clicked block current until you scroll. Double-clicking a block does what `Enter`
-  does there.
+- The current block is the one where you read, the reading lines below the top of the view; a bar in the margin
+  marks it while the preview has the keys. A click makes the clicked block current until you scroll. Double-clicking
+  a block does what `Enter` does there.
+- `Enter` leaves Neovim's cursor on its line when it is already in the current block (put there as you scrolled, or
+  the block you came in with, where the column stays too), so Neovim's window does not scroll. When the block you read is a
+  long wrapped paragraph on Neovim's top line, `scrolloff` keeps the cursor off it, and `Enter` leaves the cursor on
+  the line Neovim holds just below rather than scroll Neovim.
+- Moves that jump (`gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a link inside the document) glide like the scroll
+  keys, or jump at once when smooth scrolling is off or your desktop asks for reduced motion. `]]` pressed quickly
+  several times moves that many headings.
 - By default the search ignores case unless it has a capital letter, as in Vim's `smartcase`
   (`plugins.keys.find_case` changes that). The status line shows `[3/12]`, and `search hit BOTTOM, continuing at TOP`
   when it wraps.
 - After the first key of a longer one (`g`, `z`, `y`, `[`, `]`), the status line lists the keys that may follow.
-- If your Eitri prefix is one of these Ctrl keys, it stays the prefix and the preview goes without that key.
+- If your Eitri prefix is one of these Ctrl keys, it stays the prefix and the preview goes without that key: with the
+  default prefix, `Ctrl+b`, there is no `Ctrl+b` page up.
 - After `yy` the status line says `yanked 3 lines`.
 - A link to another file in the project opens it in Neovim (the keys stay in the preview, which then shows that file
   when it is Markdown); `src/main.rs#L10` opens at line 10. A web link opens in your browser. A link outside the
@@ -124,7 +145,7 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
 `<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `scroll.down`,
-`scroll.up`, `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.top`, `scroll.bottom`,
+`scroll.up`, `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top`, `scroll.bottom`,
 `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`, `find.next`, `find.prev`, `hint.start`,
 `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open` and `mode.escape`.
 

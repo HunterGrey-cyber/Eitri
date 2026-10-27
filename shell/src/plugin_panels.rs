@@ -1290,6 +1290,7 @@ mod tests {
             cursor_col: 0,
             cause: eitri_core::plugin::protocol::ViewCause::User,
             token: None,
+            scrolloff: None,
         }
     }
 

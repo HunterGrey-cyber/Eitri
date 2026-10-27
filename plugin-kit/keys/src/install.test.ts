@@ -5,6 +5,8 @@ import { GENERIC_ROWS, type Row } from "./rows";
 import type { InstallOptions } from "./index";
 import "./index";
 
+/** The generic rows a page declares under the stock prefix, Ctrl+b: all but `<C-b>`'s page up. */
+const STOCK_GENERIC = GENERIC_ROWS.filter((row) => row.action !== "scroll.page_up");
 const pageRows: Row[] = [
   { action: "item.next", keys: ["]q"], context: "阅读", desc: "下一题" },
   { action: "item.pick", keys: ["1"], context: "题目", desc: "选择" },
@@ -63,6 +65,36 @@ async function start(run = vi.fn(() => true), initial: InstallOptions["initial"]
 }
 
 describe("installation", () => {
+  it("tells the page's onJump before and after gg and G, not on a repeat, and takes G's place from bottom", async () => {
+    Object.defineProperty(document.documentElement, "scrollHeight", { configurable: true, value: 5000 });
+    Object.defineProperty(document.documentElement, "clientHeight", { configurable: true, value: 800 });
+    const seen: string[] = [];
+    cleanup = await install({ rows: pageRows, run: vi.fn(() => true), initial: { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+b" },
+      bottom: () => 3000, onJump: (when) => { seen.push(`${when}@${window.scrollY}`); } });
+    key("G", { shiftKey: true });
+    expect(y).toBe(3000);
+    key("G", { shiftKey: true, repeat: true });
+    key("g");
+    key("g");
+    expect(y).toBe(0);
+    expect(seen).toEqual(["before@0", "after@3000", "before@3000", "after@0"]);
+    cleanup();
+    cleanup = await install({ rows: pageRows, run: vi.fn(() => true), initial: { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+b" } });
+    key("G", { shiftKey: true });
+    expect(y).toBe(4200);
+    delete (document.documentElement as unknown as Record<string, unknown>).scrollHeight;
+    delete (document.documentElement as unknown as Record<string, unknown>).clientHeight;
+  });
+  it("declares <C-b> for a page up unless the window's prefix is Ctrl+b", async () => {
+    await start(vi.fn(() => true), { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+a" });
+    expect((call.mock.calls[0] as unknown[])[1]).toMatchObject({ rows: expect.arrayContaining([
+      expect.objectContaining({ action: "scroll.page_up", keys: ["<C-b>"] })]) });
+    cleanup?.();
+    call.mockClear();
+    await start(vi.fn(() => true), { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+b" });
+    const rows = ((call.mock.calls[0] as unknown[])[1] as { rows: Row[] }).rows;
+    expect(rows.some((row) => row.action === "scroll.page_up")).toBe(false);
+  });
   it("passes the page's labels to the in-page sheet", async () => {
     cleanup = await install({ rows: pageRows, run: vi.fn(() => true), labels: { sheetTitle: "按键" } });
     key("?", { shiftKey: true });
@@ -71,7 +103,7 @@ describe("installation", () => {
   });
 
   it("publishes the versioned API", () => {
-    expect(window.eitriKeys).toMatchObject({ version: 3, install, setCurrent });
+    expect(window.eitriKeys).toMatchObject({ version: 4, install, setCurrent });
     for (const name of ["message", "status", "keys", "findRefresh", "findSeed"] as const) {
       expect(typeof window.eitriKeys[name]).toBe("function");
     }
@@ -79,7 +111,7 @@ describe("installation", () => {
 
   it("declares merged rows without owning host.hello", async () => {
     await start();
-    expect(call.mock.calls).toEqual([["keys.declare", { rows: [...GENERIC_ROWS, ...pageRows] }]]);
+    expect(call.mock.calls).toEqual([["keys.declare", { rows: [...STOCK_GENERIC, ...pageRows] }]]);
     expect([...events.keys()]).toEqual(["focus", "keys_config"]);
   });
 
@@ -430,7 +462,7 @@ describe("installation", () => {
     cleanup = await install({ rows: [find, hint], run: vi.fn(() => true),
       initial: { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+b" } });
     const declared: Row[] = call.mock.calls[0][1].rows;
-    expect(declared.map((row) => row.action)).toEqual([...GENERIC_ROWS.map((row) => row.action), "item.find"]);
+    expect(declared.map((row) => row.action)).toEqual([...STOCK_GENERIC.map((row) => row.action), "item.find"]);
     expect(declared.find((row) => row.action === "hint.start")).toEqual(hint);
   });
 
@@ -590,9 +622,9 @@ describe("status() and keys()", () => {
 
 describe("the window's prefix and the settings", () => {
   const declared = () => (call.mock.calls[0][1] as { rows: Row[] }).rows;
-  it("keeps every generic Ctrl default under the stock prefix", async () => {
+  it("keeps every generic Ctrl default but <C-b> under the stock prefix", async () => {
     await start(vi.fn(() => true), { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+b" });
-    expect(declared()).toEqual([...GENERIC_ROWS, ...pageRows]);
+    expect(declared()).toEqual([...STOCK_GENERIC, ...pageRows]);
   });
   it("drops a generic Ctrl default equal to the window's prefix before declaring", async () => {
     await start(vi.fn(() => true), { timeoutlen: 1000, hasKeys: true, prefix: "Ctrl+d" });

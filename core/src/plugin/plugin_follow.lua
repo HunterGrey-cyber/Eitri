@@ -168,6 +168,17 @@ local function clamp(n, lo, hi)
   return math.max(lo, math.min(n, hi))
 end
 
+-- The window's effective 'scrolloff' in screen lines: the window's own value, else the global one, at most what
+-- the window's height lets nvim keep (a large value keeps the cursor in the middle).
+local function scrolloff_of(w)
+  local so = vim.wo[w].scrolloff
+  if so == nil or so < 0 then
+    so = vim.go.scrolloff
+  end
+  local half = math.floor((vim.api.nvim_win_get_height(w) - 1) / 2)
+  return math.max(0, math.min(so, half))
+end
+
 local function send_view(st)
   st.last_sent = now()
   st.dirty = false
@@ -217,6 +228,7 @@ local function send_view(st)
       bottom = clamp(last.bottom, 1, count),
       cursor = { line = clamp(last.cursor.line, 1, count), col = last.cursor.col },
       cause = 'user',
+      scrolloff = last.scrolloff,
     }
     st.last_view = msg
     send(st, msg)
@@ -241,6 +253,7 @@ local function send_view(st)
     bottom = vim.fn.line('w$', w),
     cursor = { line = c[1], col = c[2] },
     cause = 'user',
+    scrolloff = scrolloff_of(w),
   }
   local r = st.reveal
   if r ~= nil and r.buf == buf and r.top == top and now() - r.at <= ECHO_MS then
@@ -531,15 +544,6 @@ local function clamp_line(buf, line)
   return line
 end
 
-local function scrolloff_of(w)
-  local so = vim.wo[w].scrolloff
-  if so == nil or so < 0 then
-    so = vim.go.scrolloff
-  end
-  local half = math.floor((vim.api.nvim_win_get_height(w) - 1) / 2)
-  return math.max(0, math.min(so, half))
-end
-
 -- Puts `line` at the top of `w`. The cursor moves only as far as it must to stay in view, as a scroll command
 -- moves it: nvim would otherwise scroll the window back to the cursor.
 local function scroll_to(w, buf, line)
@@ -569,6 +573,45 @@ local function scroll_to(w, buf, line)
   end)
 end
 
+-- Puts the cursor of `w` on `want`, or on the line nearest it inside the window that keeps the window where it is.
+-- nvim scrolls whenever the cursor is within 'scrolloff' screen lines of an edge, and with 'wrap' a line may take
+-- several, so each candidate is set and checked against what nvim makes of it (`winline` validates the window),
+-- moving toward the window's middle until the top stays. With none found the cursor is left where it was.
+local function place_cursor(w, want)
+  vim.api.nvim_win_call(w, function()
+    local view = vim.fn.winsaveview()
+    local top, skip = view.topline, view.skipcol or 0
+    local first, last = top, vim.fn.line('w$')
+    if first > last then
+      return
+    end
+    local function stays(l)
+      local keep = { topline = top, skipcol = skip, lnum = l }
+      if l == view.lnum then
+        keep.col = view.col
+        keep.coladd = view.coladd
+        keep.curswant = view.curswant
+      else
+        keep.col = 0
+        keep.curswant = 0
+      end
+      vim.fn.winrestview(keep)
+      vim.fn.winline()
+      local now = vim.fn.winsaveview()
+      return now.topline == top and (now.skipcol or 0) == skip
+    end
+    local l = clamp(want, first, last)
+    local step = (l - first) <= (last - l) and 1 or -1
+    while l >= first and l <= last do
+      if stays(l) then
+        return
+      end
+      l = l + step
+    end
+    vim.fn.winrestview(view)
+  end)
+end
+
 local function reveal(o)
   local st = state_of(o.owner)
   local buf = o.buf
@@ -577,6 +620,9 @@ local function reveal(o)
     return { applied = false }
   end
   scroll_to(w, buf, clamp_line(buf, o.line))
+  if o.cursor ~= nil then
+    place_cursor(w, clamp_line(buf, o.cursor))
+  end
   local top = top_of(w)
   -- Bound to its buffer: another buffer whose window happens to start on the same line is not this echo.
   st.reveal = { buf = buf, token = o.token, top = top, at = now() }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boxAt, currentBlock, setClickedBlock } from "./current";
+import { boxAt, clickedRecently, currentBlock, lineAt, pickBlock, pickedLine, setClickedBlock } from "./current";
 import type { Box } from "./lineindex";
 import type { Preview } from "./preview";
 
@@ -17,7 +17,8 @@ describe("the current block", () => {
     expect(boxAt(INDEX, 10)).toBe(INDEX[0]);
     expect(boxAt(INDEX, 25)).toBe(INDEX[1]);
     expect(boxAt(INDEX, 100)).toBe(INDEX[2]);
-    expect(boxAt(INDEX, 500)).toBeNull();
+    expect(boxAt(INDEX, 500)).toBe(INDEX[2]);
+    expect(boxAt([], 5)).toBeNull();
     scrollTo(0);
     expect(currentBlock(fake(10))).toBe(INDEX[0]);
     expect(currentBlock(fake(22))).toBe(INDEX[1]);
@@ -31,5 +32,45 @@ describe("the current block", () => {
     scrollTo(0);
     expect(currentBlock(fake(10))).toBe(INDEX[0]);
     expect(currentBlock(fake(22))).toBe(INDEX[1]);
+  });
+  it("is the block holding nvim's cursor when the keys picked it, keeping that line, until the next scroll", () => {
+    scrollTo(0);
+    pickBlock(INDEX[2], 6);
+    expect(currentBlock(fake(22))).toBe(INDEX[2]);
+    expect(pickedLine(INDEX[2])).toBe(6);
+    expect(pickedLine(INDEX[1])).toBeNull();
+    scrollTo(5);
+    expect(pickedLine(INDEX[2])).toBeNull();
+    expect(currentBlock(fake(27))).toBe(INDEX[1]);
+  });
+  it("tells a recent click from the keys' pick", () => {
+    scrollTo(0);
+    setClickedBlock(null);
+    expect(clickedRecently()).toBe(false);
+    pickBlock(INDEX[0], 0);
+    expect(clickedRecently()).toBe(false);
+    setClickedBlock(INDEX[1]);
+    expect(clickedRecently()).toBe(true);
+    expect(pickedLine(INDEX[1])).toBeNull();
+  });
+});
+
+describe("the line at a position", () => {
+  it("is the line under it inside a block, else the first line of the block below", () => {
+    expect(lineAt(INDEX, 10)).toBe(0);
+    expect(lineAt(INDEX, 25)).toBe(2);
+    expect(lineAt(INDEX, 60 + 45)).toBe(6);
+    expect(lineAt(INDEX, 159)).toBe(8);
+    expect(lineAt(INDEX, 500)).toBe(4);
+    expect(lineAt([], 5)).toBeNull();
+  });
+
+  it("past the end is the last block, never the end sentinel", () => {
+    const end = document.createElement("div");
+    end.setAttribute("data-line", "9");
+    const index: Box[] = [...INDEX, { line: 9, end: 10, top: 170, height: 1, el: end }];
+    expect(boxAt(index, 165)).toBe(INDEX[2]);
+    expect(boxAt(index, 170)).toBe(INDEX[2]);
+    expect(boxAt(index, 900)).toBe(INDEX[2]);
   });
 });

@@ -1352,11 +1352,11 @@ focus = false
 filetypes = ["markdown"]            # 1-16 names, each [a-z0-9_]{1,32}
 auto_show = "auto"                  # names a bool setting; optional
 
-[commands.MarkdownPreview]
+[commands.EitriMarkdown]
 does = "show"                       # show | toggle | hide
-[commands.MarkdownPreviewToggle]
+[commands.EitriMarkdownToggle]
 does = "toggle"
-[commands.MarkdownPreviewStop]
+[commands.EitriMarkdownHide]
 does = "hide"
 
 [settings.auto]
@@ -1387,9 +1387,9 @@ images = "${remote_images}"         # resolves to "https" or "off"
         assert_eq!(
             names,
             [
-                ("MarkdownPreview", CommandDoes::Show),
-                ("MarkdownPreviewStop", CommandDoes::Hide),
-                ("MarkdownPreviewToggle", CommandDoes::Toggle),
+                ("EitriMarkdown", CommandDoes::Show),
+                ("EitriMarkdownHide", CommandDoes::Hide),
+                ("EitriMarkdownToggle", CommandDoes::Toggle),
             ]
         );
         assert_eq!(
@@ -1435,9 +1435,9 @@ images = "${remote_images}"         # resolves to "https" or "off"
         assert_eq!(
             commands,
             vec![
-                ("MarkdownPreview", CommandDoes::Show),
-                ("MarkdownPreviewStop", CommandDoes::Hide),
-                ("MarkdownPreviewToggle", CommandDoes::Toggle),
+                ("EitriMarkdown", CommandDoes::Show),
+                ("EitriMarkdownHide", CommandDoes::Hide),
+                ("EitriMarkdownToggle", CommandDoes::Toggle),
             ]
         );
         assert_eq!(m.images, Some(NetImages::Setting("remote_images".into())));

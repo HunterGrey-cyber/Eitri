@@ -164,13 +164,16 @@ impl PageSaved {
 /// The longest link target a page may hand to `editor.open_link`.
 pub const MAX_LINK_TARGET: usize = 4096;
 
-/// `editor.reveal`: put a source line of the followed buffer at the top of its window.
+/// `editor.reveal`: put a source line of the followed buffer at the top of its window, and with `cursor` the
+/// window's cursor on that line, or as near it as the window can hold without scrolling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorReveal {
     pub buf: u64,
     pub line: u32,
     pub token: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u32>,
 }
 
 /// `editor.jump`: move the followed window's cursor, and with `focus` the keys, to a source line.
@@ -201,7 +204,11 @@ fn line_ok(line: u32) -> Result<(), String> {
 
 impl EditorReveal {
     pub fn check(&self) -> Result<(), String> {
-        line_ok(self.line)
+        line_ok(self.line)?;
+        match self.cursor {
+            Some(0) => Err("cursor must be at least 1".to_string()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -581,6 +588,9 @@ pub struct EditorView {
     /// Required on the wire, `null` for an unnamed buffer or while the project is still being looked up.
     #[serde(deserialize_with = "Option::deserialize")]
     pub doc: Option<DocPrefixes>,
+    /// The window's effective 'scrolloff' in screen lines; absent when the editor did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrolloff: Option<u64>,
 }
 
 /// Why a document was not sent: its size and the caps it went over.
@@ -964,7 +974,17 @@ mod tests {
             Verb::EditorReveal(EditorReveal {
                 buf: 3,
                 line: 120,
-                token: 7
+                token: 7,
+                cursor: None
+            })
+        );
+        assert_eq!(
+            verb("req-editor-reveal-cursor.json"),
+            Verb::EditorReveal(EditorReveal {
+                buf: 3,
+                line: 120,
+                token: 8,
+                cursor: Some(124)
             })
         );
         assert_eq!(
@@ -1004,9 +1024,20 @@ mod tests {
 
     #[test]
     fn a_line_below_one_or_a_bad_link_target_is_refused_by_its_check() {
-        let reveal = |line| EditorReveal { buf: 1, line, token: 1 };
+        let reveal = |line| EditorReveal {
+            buf: 1,
+            line,
+            token: 1,
+            cursor: None,
+        };
         assert_eq!(reveal(0).check(), Err("line must be at least 1".to_string()));
         assert_eq!(reveal(1).check(), Ok(()));
+        let with_cursor = |cursor| EditorReveal {
+            cursor: Some(cursor),
+            ..reveal(1)
+        };
+        assert_eq!(with_cursor(0).check(), Err("cursor must be at least 1".to_string()));
+        assert_eq!(with_cursor(5).check(), Ok(()));
         let jump = |line| EditorJump {
             buf: 1,
             line,
@@ -1049,6 +1080,8 @@ mod tests {
         };
         let written = serde_json::to_value(&user).unwrap();
         assert!(written.get("token").is_none(), "no token on a user view");
+        assert_eq!(user.scrolloff, None, "an older view has no scrolloff");
+        assert!(written.get("scrolloff").is_none(), "no scrolloff written when unknown");
         data.as_object_mut().unwrap().remove("doc");
         assert!(serde_json::from_value::<EditorView>(data).is_err(), "doc is required");
         let view: EditorView = serde_json::from_value(fixture("ev-editor-view.json")["data"].clone()).unwrap();
@@ -1060,6 +1093,7 @@ mod tests {
             })
         );
         assert_eq!(view.cursor, Cursor { line: 125, col: 4 });
+        assert_eq!(view.scrolloff, Some(4));
     }
 
     #[test]

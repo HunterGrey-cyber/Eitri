@@ -142,8 +142,10 @@ desktop, and on an Intel laptop where it says so:
   the same build with GTK 4.22.5 added 0.30 ms. With GTK's 60 Hz fallback clock, the addition was about
   16.5 ms. A 156-line GTK-only reproduction also shows the delay on GTK's development branch (4.25.0,
   commit c36202f6, 2026-10-25). Three workarounds using public GTK API were measured; none restored native
-  latency (the best still added about 5.8 ms at 165 Hz), so none ships. Settled idle stayed quiet. The period
-  was real, but the screen was the headless session's; a physical display has still not been measured.
+  latency, so none ships. The one measured at the real 165 Hz period (`render`) still added about 5.8 ms;
+  the other two were measured only with the 60 Hz fallback clock. Settled idle was measured only with
+  that fallback clock and stayed quiet. The period was real, but the screen was the headless session's;
+  a physical display has still not been measured.
 - **On GTK 4.24, scrolling with a held `j` at a 165 Hz headless output drops frames.** Native Neovide drew
   165.5 changed frames a second, Eitri on GTK 4.24.1 140.6, and the same build on GTK 4.22.5 165.4.
   The 99th-percentile frame intervals were 6.1, 12.1 and 6.1 ms respectively. This separate scrolling run
@@ -266,7 +268,7 @@ Eitri @VERSION@ -- 你的 Neovim，和 agent、终端、你自己做的网页一
 
 在本次发布前不久的开发构建上，于一台 AMD 台式机上的隔离无界面测试会话里测得；注明的地方是在一台 Intel 笔记本上测的：
 
-- **在 GTK 4.24 上，打字比原生 Neovide 慢一个刷新周期。** 在无界面会话里，合成器通过呈现反馈向 GTK 提供真实的 165 Hz 周期时，GTK 4.24.1 的打字中位数多 5.97 ms；同一个构建用 GTK 4.22.5 时只多 0.30 ms。GTK 使用默认的 60 Hz 回退时钟时，约多 16.5 ms。一个 156 行的纯 GTK 复现程序在 GTK 开发分支（4.25.0，提交 c36202f6，2026-10-25）上也测到了这个延迟。测过三种使用公开 GTK API 的绕行办法，都没恢复原生延迟（最好的在 165 Hz 下仍多约 5.8 ms），所以都不随产品发布。静置后仍然没有重绘。周期是真实的，但画面仍是无界面会话的；实体显示器仍未测量。
+- **在 GTK 4.24 上，打字比原生 Neovide 慢一个刷新周期。** 在无界面会话里，合成器通过呈现反馈向 GTK 提供真实的 165 Hz 周期时，GTK 4.24.1 的打字中位数多 5.97 ms；同一个构建用 GTK 4.22.5 时只多 0.30 ms。GTK 使用默认的 60 Hz 回退时钟时，约多 16.5 ms。一个 156 行的纯 GTK 复现程序在 GTK 开发分支（4.25.0，提交 c36202f6，2026-10-25）上也测到了这个延迟。测过三种使用公开 GTK API 的绕行办法，都没恢复原生延迟，所以都不随产品发布。唯一用真实 165 Hz 周期测过的办法（`render`）仍多约 5.8 ms；另外两种只用 60 Hz 回退时钟测过。静置也只用这个回退时钟测过，仍然没有重绘。周期是真实的，但画面仍是无界面会话的；实体显示器仍未测量。
 - **在 GTK 4.24、165 Hz 的无界面输出上按住 `j` 滚动会掉帧。** 原生 Neovide 每秒画出 165.5 个有变化的帧，Eitri 用 GTK 4.24.1 时为 140.6，同一个构建用 GTK 4.22.5 时为 165.4。第 99 百分位的帧间隔依次为 6.1、12.1 和 6.1 ms。这是另一次滚动测量，使用原样的呈现反馈，因此 GTK 4.24 仍使用 60 Hz 回退时钟；滚动还没有用真实周期反馈重测，也没有在实体显示器上测量。
 - **回复正在输出时**，在 WebKitGTK 2.54 上一次按键的重绘中位数是 11.2 ms（替身回复），WebKitGTK 2.52 上约为 2.3 ms。
 - **内存：** 一个标签页比原生 Neovide 多用 253 到 283 MiB，目标是 256 MiB；每多一个聊天视图约多 28 MB。

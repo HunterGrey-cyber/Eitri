@@ -51,7 +51,7 @@ describe("links in the preview", () => {
     show(`[go](#later)\n\n${Array.from({ length: 12 }, (_, i) => `p${i}`).join("\n\n")}\n\n## Later`);
     const ev = click('a[href="#later"]');
     expect(ev.defaultPrevented).toBe(true);
-    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-later")!)!.top);
+    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-later")!)!.top - 44);
     expect((history.state as { mdp?: boolean } | null)?.mdp).toBe(true);
   });
 
@@ -62,13 +62,13 @@ describe("links in the preview", () => {
     await Promise.resolve();
     await Promise.resolve();
     show(`${Array.from({ length: 12 }, (_, i) => `p${i}`).join("\n\n")}\n\n## Install`, 2);
-    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-install")!)!.top);
+    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-install")!)!.top - 44);
   });
 
   it("scroll to a fragment of the document already shown at once, since opening it renders nothing new", async () => {
     const body = `[alias](alias.md#details) [self](./1.md#details)\n\n${paras(12)}\n\n## Details\n\n${paras(12)}`;
     show(body);
-    const details = () => layout.boxOf(root.querySelector("#user-content-details")!)!.top;
+    const details = () => layout.boxOf(root.querySelector("#user-content-details")!)!.top - 44;
     // nvim's current file is the target (through another name here) and the preview shows nvim's current buffer.
     reply = async () => ({ how: "current", line: 1 });
     click('a[href="alias.md#details"]');
@@ -91,7 +91,7 @@ describe("links in the preview", () => {
     show(`${body}\n\nmore`, 1, 2);
     expect(window.scrollY).toBe(0);
     show(`${paras(14)}\n\n## Later`, 2);
-    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-later")!)!.top);
+    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-later")!)!.top - 44);
   });
 
   it("resolve a local link against the document shown, while another buffer's view waits for its text", async () => {

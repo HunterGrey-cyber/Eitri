@@ -1,7 +1,7 @@
 import { effectiveRows, hasKeys, onRemove as registerReset, pluginBridge, removalResets, timeoutOf } from "./bridge";
 import { blockedEvent, isEscape, shouldSkip, textField } from "./events";
 import { installHeldSuperTracking, reset as resetSuper, superHeld } from "./held-super";
-import { endHold, holdCode } from "./glide";
+import { endHold, holdCode, setBottom } from "./glide";
 import { clearFind, configureFind, findNext, openFind } from "./find";
 import { activate, startHints } from "./hints";
 import { setDimmed, setModeWords, showMessage, showMode, showStatus, showWhichKey } from "./hud";
@@ -364,10 +364,26 @@ export async function install(opts: InstallOptions): Promise<() => void> {
         handled = true;
         break;
       }
+      case "scroll.top": case "scroll.bottom": {
+        // gg and G are jumps, as in vim: the page hears of them before and after, so it can keep a jump list. A
+        // repeat of the key moves nothing.
+        const jumps = !ev.repeat;
+        if (jumps) tellJump("before");
+        handled = runScroll(action, ev);
+        if (jumps) tellJump("after");
+        break;
+      }
       default:
         handled = isGenericAction(action) ? runScroll(action, ev) : opts.run(action, ev);
     }
     return handled;
+  };
+  const tellJump = (when: "before" | "after") => {
+    try {
+      opts.onJump?.(when);
+    } catch (error) {
+      console.warn("eitri keys: the page's onJump failed", error);
+    }
   };
   /** Moves focus off a focused control, as Vimium's Esc does: to the current item when the control is inside it, so
    *  the item's keys go on working, else nowhere. */
@@ -381,7 +397,9 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     }
     if (current !== active) active.blur();
   };
-  configureFind({ root: opts.find?.root, exclude: opts.find?.exclude, messages: opts.labels?.messages, render: renderMode });
+  configureFind({ root: opts.find?.root, exclude: opts.find?.exclude, messages: opts.labels?.messages, render: renderMode,
+    jump: tellJump });
+  setBottom(opts.bottom ?? null);
   window.addEventListener("keydown", onKeyFirst, true);
   window.addEventListener("keydown", onKey);
   if (spaceToKeys) window.addEventListener("keydown", onSpaceFirst, true);
