@@ -268,12 +268,13 @@ pub fn label_text(n: usize) -> String {
 }
 
 /// Which question a classifier request asks. The CLI asks the severity first and, when it reads one above its
-/// threshold, asks again for a block decision.
+/// threshold, asks again for the decision that blocks or lets the call through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassifierStage {
     /// "Respond with <severity>N</severity> ONLY".
     Severity,
-    /// A `<block>yes|no</block>` answer.
+    /// The second question: reasoning in `<thinking>` first, then `<severity>N</severity>` (above 50 blocks), plus
+    /// `<category>` naming the rule when it blocks.
     Block,
 }
 
@@ -289,14 +290,16 @@ pub fn classifier_stage(view: &View) -> ClassifierStage {
 }
 
 /// A classifier answer in the format of the stage's own prompt. A severity of 0 allows and one of 90 sends the CLI
-/// on to the block question; a block answer names a rule category and gives the reason in square brackets.
+/// on to the second question, which is answered with the reason as the reasoning, the same severity, and, to block,
+/// a rule category. A second answer in any other form is one the CLI cannot read: it blocks the call as
+/// unevaluated and asks again.
 pub fn verdict_text(stage: ClassifierStage, allow: bool, reason: &str) -> String {
     match (stage, allow) {
         (ClassifierStage::Severity, true) => "<severity>0</severity>".to_owned(),
         (ClassifierStage::Severity, false) => "<severity>90</severity><category>Scripted Block</category>".to_owned(),
-        (ClassifierStage::Block, true) => "<block>no</block>".to_owned(),
+        (ClassifierStage::Block, true) => format!("<thinking>{reason}</thinking><severity>0</severity>"),
         (ClassifierStage::Block, false) => {
-            format!("<block>yes</block><category>Scripted Block</category><reason>[Scripted Block] {reason}</reason>")
+            format!("<thinking>{reason}</thinking><severity>90</severity><category>Scripted Block</category>")
         }
     }
 }
@@ -407,8 +410,14 @@ mod tests {
     fn answer_texts_carry_their_counters() {
         assert!(compaction_text(3).contains("SCRIPTED SUMMARY 3"));
         assert_eq!(label_text(2), "SCRIPTED LABEL 2");
-        assert_eq!(verdict_text(ClassifierStage::Block, true, "ok"), "<block>no</block>");
-        assert!(verdict_text(ClassifierStage::Block, false, "no").starts_with("<block>yes</block><category>"));
+        assert_eq!(
+            verdict_text(ClassifierStage::Block, true, "ok"),
+            "<thinking>ok</thinking><severity>0</severity>"
+        );
+        assert_eq!(
+            verdict_text(ClassifierStage::Block, false, "outside"),
+            "<thinking>outside</thinking><severity>90</severity><category>Scripted Block</category>"
+        );
         assert_eq!(
             verdict_text(ClassifierStage::Severity, true, "ok"),
             "<severity>0</severity>"

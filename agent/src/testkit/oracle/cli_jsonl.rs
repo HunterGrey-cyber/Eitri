@@ -20,15 +20,16 @@
 //!   and content) is read once and counted as unrecorded.
 //! - `[Request interrupted by user]` is the turn's interruption (another text with that start is too, and
 //!   is counted as unrecorded); `compact_boundary` of trigger `manual` is
-//!   a compaction, placed in the turn of the `/compact` command that follows it.
+//!   a compaction, placed in the turn of the `/compact` command that follows it, and one of trigger `auto`
+//!   is a compaction entry of the turn that was running, at the point the boundary was written (before the
+//!   continued reply, or between a tool result and the next call).
 //! - A subagent's transcript (`<session>/subagents/agent-<id>.jsonl`, named by its `.meta.json`) is nested
 //!   under the Agent call that started it.
 //!
 //! Every other line is skipped and counted. A line of a kind the pinned CLI was never recorded writing is
 //! never decoded, and is counted as unrecorded as well, so a new shape shows up in the counts instead of
-//! being misread. Shapes of a recorded kind that no recording holds yet (an automatic compaction, the
-//! result of a tool call cut short to deliver a message) are counted as unrecorded and give no entry of
-//! their own.
+//! being misread. Shapes of a recorded kind that no recording holds yet (the result of a tool call cut short
+//! to deliver a message) are counted as unrecorded and give no entry of their own.
 
 use super::{CliForm, Entry, Inconsistency, InputKind, Origin, Pos, Turn, Via};
 use serde_json::Value;
@@ -349,6 +350,17 @@ impl Reader {
     }
 
     fn assistant_line(&mut self, form: &mut CliForm, line: &Value, pos: Pos) {
+        // The CLI answers an interrupted turn it finds unfinished when it resumes a session (`No response
+        // requested.`) with a line of its own model name, not the model's words: no record of a live
+        // session holds it, so it is not a reply to compare. An API error it writes under the same name
+        // (`isApiErrorMessage`) is shown to the person as the turn's reply, and every record holds it, so
+        // it is read like any reply.
+        let synthetic = line.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>");
+        let api_error = line.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false);
+        if synthetic && !api_error {
+            bump(&mut form.skipped, "assistant:synthetic");
+            return;
+        }
         let message_id = line
             .pointer("/message/id")
             .and_then(Value::as_str)
@@ -473,6 +485,17 @@ impl Reader {
             .pointer("/compactMetadata/trigger")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if trigger == "auto" {
+            // The CLI compacts while it runs a turn, so the boundary falls inside that turn.
+            self.mid_turn(
+                form,
+                Entry::Compaction {
+                    trigger: trigger.to_owned(),
+                },
+                pos,
+            );
+            return;
+        }
         if trigger != "manual" {
             let key = format!("system/compact_boundary:{trigger}");
             bump(&mut form.skipped, key.clone());
@@ -652,6 +675,38 @@ mod tests {
             .iter()
             .map(|t| t.entries.iter().map(Entry::kind).collect())
             .collect()
+    }
+
+    #[test]
+    fn a_reply_the_cli_writes_under_its_own_model_name_is_skipped_and_counted() {
+        let text = [
+            r#"{"type":"user","isSidechain":false,"promptSource":"sdk","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m1","content":[{"type":"text","text":"x"}]}}"#,
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"id":"m2","model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#,
+        ]
+        .join("\n");
+        let form = read_texts(&[&text]);
+        assert_eq!(kinds(&form), vec![vec!["user", "assistant", "interrupted"]]);
+        assert_eq!(form.skipped.get("assistant:synthetic"), Some(&1));
+        assert!(form.unrecorded.is_empty(), "{:?}", form.unrecorded);
+    }
+
+    #[test]
+    fn an_api_error_the_cli_writes_under_its_own_model_name_is_read_as_a_reply() {
+        let text = [
+            r#"{"type":"user","isSidechain":false,"promptSource":"sdk","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"assistant","isSidechain":false,"isApiErrorMessage":true,"message":{"id":"m1","model":"<synthetic>","content":[{"type":"text","text":"API Error: Request rejected (429)"}]}}"#,
+        ]
+        .join("\n");
+        let form = read_texts(&[&text]);
+        assert_eq!(kinds(&form), vec![vec!["user", "assistant"]]);
+        assert!(
+            matches!(&form.turns[0].entries[1], Entry::Assistant { text } if text == "API Error: Request rejected (429)"),
+            "{:?}",
+            form.turns[0].entries
+        );
+        assert_eq!(form.skipped.get("assistant:synthetic"), None);
     }
 
     #[test]

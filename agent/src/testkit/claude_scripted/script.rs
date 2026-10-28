@@ -237,6 +237,11 @@ pub struct Scenario {
     pub slow: bool,
     #[serde(default)]
     pub variants: BTreeMap<String, Variant>,
+    /// What the scenario's own test expects of the host, with the source of each expectation. The stand-in, the
+    /// driver and the runner never read it; it lives here so an expectation and the script it is about stay in
+    /// one file. An object when present.
+    #[serde(default)]
+    pub expect: Option<Value>,
 }
 
 fn default_layers() -> Vec<String> {
@@ -365,6 +370,9 @@ impl Scenario {
                 return Err(format!("scenario `{id}`: every driver part is an object"));
             }
             check_requires(&requires_of(part), &format!("scenario `{id}` driver"))?;
+        }
+        if self.expect.as_ref().is_some_and(|e| !e.is_object()) {
+            return Err(format!("scenario `{id}`: `expect` is an object"));
         }
         check_branches(id, &self.branches)?;
         validate_steps(id, &self.model, &self.branches)?;
@@ -892,6 +900,19 @@ mod tests {
             base[k] = v.clone();
         }
         base
+    }
+
+    #[test]
+    fn a_scenario_may_state_what_its_own_test_expects_as_an_object_and_nothing_else() {
+        let with = parse(scenario(
+            "c08_manual",
+            json!({"expect": {"columns": {"auto": {"cards_shown": []}}}}),
+        ))
+        .expect("an object parses");
+        assert_eq!(with.expect.unwrap()["columns"]["auto"]["cards_shown"], json!([]));
+        assert!(parse(scenario("c00", json!({}))).unwrap().expect.is_none());
+        let err = parse(scenario("c08_manual", json!({"expect": ["not", "an", "object"]}))).unwrap_err();
+        assert!(err.contains("`expect` is an object"), "{err}");
     }
 
     #[test]

@@ -34,3 +34,6 @@ uuid = { version = "1", features = ["v4"] }
 # The crate's own test doubles (`PresenceGuard::for_tests`, `EditorClear::for_tests`) for its
 # integration tests, which see it only as an outside crate.
 eitri-core = { path = ".", features = ["test-support"] }
+# The scripted Claude harness (`agent::testkit`) and the ingestion's history and fold-log accessors, for
+# the layer (b) tests in `tests/claude_scripted/`.
+agent = { path = "../agent", features = ["test-support"] }

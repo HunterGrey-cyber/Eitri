@@ -3,8 +3,9 @@
 //! Each entry has `{id, scenario, source, matcher, reason}`. The scenario is the file's name
 //! or `*` for shared entries. The source is `E`, `A` or `B`; the matcher selects differences,
 //! and the reason explains the gap.
-//! Ids must be canonical names from `allowances/_ids.json` ([`KnownIds`]); duplicate names
-//! are rejected with the canonical id to use. Several allowances can match one difference.
+//! Ids must be canonical names from `allowances/_ids.json` ([`KnownIds`]) or harness-only ids
+//! for CLI differences outside the oracle's inputs. Duplicate names are rejected with the
+//! canonical id to use. Several allowances can match one difference.
 //! An allowance must match a difference whenever its source is computed, so fixing a gap
 //! requires removing its allowance. Sources not computed are not checked; replay computes E only.
 //! Differences common to every entry of a kind are handled in code with explanations in
@@ -12,12 +13,13 @@
 
 use super::report::{field_word, origin_word, turn_match_word, via_word, Difference, Marker};
 use super::report::{FIELD_WORDS, KIND_WORDS, ORIGIN_WORDS, TURN_MATCH_WORDS, VIA_WORDS};
-use super::Source;
+use super::{Entry, Origin, Source, Turn, Via};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// The ids an allowance may carry, read from `allowances/_ids.json`: `{"canonical": [...], "duplicates":
-/// {"<name>": "<canonical id>", ...}}`. The list lives beside the allowances, with the gaps it names.
+/// {"<name>": "<canonical id>", ...}, "harness_only": {"<id>": "<what it covers>", ...}}`. The list lives beside
+/// the allowances, with the gaps it names.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KnownIds {
@@ -28,6 +30,10 @@ pub struct KnownIds {
     /// Names that repeat a canonical gap, with the id that stands for both.
     #[serde(default)]
     pub duplicates: std::collections::BTreeMap<String, String>,
+    /// Ids for differences that are no gap of Eitri's, each with what it covers. They are kept apart from the
+    /// gap ids, which other ledgers share, so that a ledger of Eitri's gaps never has to carry them.
+    #[serde(default)]
+    pub harness_only: std::collections::BTreeMap<String, String>,
 }
 
 /// The file listing the ids an allowance may carry.
@@ -49,6 +55,18 @@ impl KnownIds {
                 )));
             }
         }
+        for (id, covers) in &ids.harness_only {
+            if ids.canonical.contains(id) || ids.duplicates.contains_key(id) {
+                return Err(AllowanceError(format!(
+                    "{IDS_FILE}: {id} is a harness-only id and also a gap's"
+                )));
+            }
+            if covers.trim().is_empty() {
+                return Err(AllowanceError(format!(
+                    "{IDS_FILE}: the harness-only id {id} does not say what it covers"
+                )));
+            }
+        }
         Ok(ids)
     }
 
@@ -57,7 +75,7 @@ impl KnownIds {
         if let Some(canonical) = self.duplicates.get(id) {
             return Err(format!("allowance {id} repeats another gap: use {canonical}"));
         }
-        if self.canonical.iter().any(|c| c == id) {
+        if self.canonical.iter().any(|c| c == id) || self.harness_only.contains_key(id) {
             Ok(())
         } else {
             Err(format!("allowance {id} is not a known gap's canonical id"))
@@ -143,6 +161,8 @@ struct RawAllowance {
     source: String,
     matcher: Matcher,
     reason: String,
+    #[serde(default)]
+    shape: Option<String>,
 }
 
 /// One allowance, checked.
@@ -154,6 +174,10 @@ pub struct Allowance {
     pub source: Source,
     pub matcher: Matcher,
     pub reason: String,
+    /// One of [`SHAPES`]: the allowance covers a difference that exists only when the CLI's turns have that shape
+    /// (the CLI decides how it takes two notifications that arrive together). A run whose turns do not have the
+    /// shape does not have the difference; a run whose turns have it must match it.
+    pub shape: Option<String>,
 }
 
 /// A refused allowance file.
@@ -180,6 +204,42 @@ pub fn allowances_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/claude_scenarios/allowances")
 }
 
+/// The shapes of the CLI's turns an allowance may be conditioned on (see [`shapes_of`]).
+pub const SHAPES: &[&str] = &["replies-adjacent-across-turns", "notification-turn"];
+
+/// Which of [`SHAPES`] the CLI's turns have. `replies-adjacent-across-turns`: two replies of the CLI that no
+/// entry but a task notification separates, the second in a later turn than the first. A restore of the files
+/// reads them as one reply, since no turn start falls between them. `notification-turn`: a turn a task
+/// notification opened. A recording that ends before the CLI hands its last notification over has none, and
+/// the same scenario resumed has one.
+pub fn shapes_of(cli: &[Turn]) -> Vec<&'static str> {
+    let mut previous: Option<(usize, bool)> = None;
+    let mut shapes = Vec::new();
+    if cli.iter().any(|t| t.origin == Origin::TaskNotification) {
+        shapes.push(SHAPES[1]);
+    }
+    for (at, turn) in cli.iter().enumerate() {
+        for entry in &turn.entries {
+            match entry {
+                Entry::User {
+                    via: Via::TaskNotification,
+                    ..
+                } => continue,
+                Entry::Assistant { .. } => {
+                    if previous.is_some_and(|(turn_of_reply, is_reply)| is_reply && turn_of_reply != at) {
+                        shapes.push(SHAPES[0]);
+                    }
+                    previous = Some((at, true));
+                }
+                _ => previous = Some((at, false)),
+            }
+        }
+    }
+    shapes.sort_unstable();
+    shapes.dedup();
+    shapes
+}
+
 /// The file holding the allowances for every scenario.
 pub const ALL_SCENARIOS_FILE: &str = "_all.json";
 
@@ -201,13 +261,13 @@ fn parse_file(
                 return Err(fail(format!(
                     "allowance {id} names scenario {:?}; this file holds scenario {s}'s",
                     entry.scenario
-                )))
+                )));
             }
             None if entry.scenario != "*" => {
                 return Err(fail(format!(
                     "allowance {id} names scenario {:?}; this file holds the allowances of every scenario (\"*\")",
                     entry.scenario
-                )))
+                )));
             }
             _ => {}
         }
@@ -221,6 +281,12 @@ fn parse_file(
             .matcher
             .validate()
             .map_err(|m| fail(format!("allowance {id}: {m}")))?;
+        if let Some(shape) = entry.shape.as_deref().filter(|s| !SHAPES.contains(s)) {
+            return Err(fail(format!(
+                "allowance {id}: shape {shape:?} is not one of {}",
+                SHAPES.join(", ")
+            )));
+        }
         if entry.reason.trim().is_empty() {
             return Err(fail(format!("allowance {id} gives no reason")));
         }
@@ -230,6 +296,7 @@ fn parse_file(
             source,
             matcher: entry.matcher,
             reason: entry.reason,
+            shape: entry.shape,
         });
     }
     Ok(out)
@@ -285,6 +352,14 @@ impl AllowanceSet {
         Self::load(&allowances_dir(), scenario)
     }
 
+    /// The allowances that apply to a run whose CLI turns have the shapes `seen`: those naming no shape, and those
+    /// naming one of them.
+    pub fn observing(mut self, seen: &[&str]) -> Self {
+        self.entries
+            .retain(|a| a.shape.as_deref().is_none_or(|shape| seen.contains(&shape)));
+        self
+    }
+
     pub fn scenario(&self) -> &str {
         &self.scenario
     }
@@ -310,6 +385,108 @@ mod tests {
         let dup = ids.check("gap-again").unwrap_err();
         assert!(dup.contains("use gap-one"), "{dup}");
         assert!(KnownIds::parse(r#"{"canonical": ["a"], "duplicates": {"b": "c"}}"#).is_err());
+    }
+
+    #[test]
+    fn a_harness_only_id_is_accepted_apart_from_the_gaps_and_says_what_it_covers() {
+        let ids = KnownIds::parse(r#"{"canonical": ["gap-one"], "harness_only": {"cli-files-it-so": "why"}}"#).unwrap();
+        assert!(ids.check("cli-files-it-so").is_ok());
+        assert!(!ids.canonical.iter().any(|c| c == "cli-files-it-so"));
+        assert!(KnownIds::parse(r#"{"canonical": ["a"], "harness_only": {"a": "why"}}"#).is_err());
+        assert!(KnownIds::parse(r#"{"canonical": ["a"], "harness_only": {"b": " "}}"#).is_err());
+    }
+
+    #[test]
+    fn an_allowance_that_names_a_shape_applies_only_to_a_run_whose_turns_have_it() {
+        let ids = ids();
+        let entry = |extra: &str| {
+            format!(
+                r#"[{{"id": "gap-one", "scenario": "c01c", "source": "B",
+                      "matcher": {{"marker": "-"}}, "reason": "a race the CLI decides"{extra}}}]"#
+            )
+        };
+        let load = |extra: &str| AllowanceSet::from_texts("c01c", &ids, Some(&entry(extra)), None).unwrap();
+        assert_eq!(load("").entries()[0].shape, None);
+        assert_eq!(load("").observing(&[]).entries().len(), 1);
+        let named = load(r#", "shape": "replies-adjacent-across-turns""#);
+        assert_eq!(
+            named.entries()[0].shape.as_deref(),
+            Some("replies-adjacent-across-turns")
+        );
+        assert_eq!(
+            named
+                .clone()
+                .observing(&["replies-adjacent-across-turns"])
+                .entries()
+                .len(),
+            1
+        );
+        assert!(named.observing(&[]).entries().is_empty());
+        let unknown = entry(r#", "shape": "made-up""#);
+        assert!(AllowanceSet::from_texts("c01c", &ids, Some(&unknown), None).is_err());
+    }
+
+    #[test]
+    fn replies_with_only_notifications_between_them_are_adjacent_across_turns() {
+        let reply = |text: &str| Entry::Assistant { text: text.to_owned() };
+        let notified = || Entry::User {
+            text: "<task-notification/>".to_owned(),
+            via: Via::TaskNotification,
+        };
+        let call = || Entry::ToolUse {
+            id: "toolu_1".to_owned(),
+            name: "Bash".to_owned(),
+            input: serde_json::Value::Null,
+        };
+        let turns = |shape: Vec<Vec<Entry>>| -> Vec<Turn> {
+            shape
+                .into_iter()
+                .enumerate()
+                .map(|(n, entries)| {
+                    let mut turn = Turn::new(n + 1, Origin::Unknown);
+                    turn.entries = entries;
+                    turn
+                })
+                .collect()
+        };
+        // A notification turn with no reply of its own, then one that answers: the restore joins the replies.
+        let empty_first = turns(vec![
+            vec![reply("one")],
+            vec![notified()],
+            vec![notified(), reply("two")],
+        ]);
+        assert_eq!(shapes_of(&empty_first), ["replies-adjacent-across-turns"]);
+        // A call between the replies keeps them apart.
+        let call_between = turns(vec![vec![reply("one")], vec![notified(), call(), reply("two")]]);
+        assert!(shapes_of(&call_between).is_empty());
+        // Two replies of one turn are one turn's own business.
+        let one_turn = turns(vec![vec![reply("one"), reply("two")]]);
+        assert!(shapes_of(&one_turn).is_empty());
+    }
+
+    #[test]
+    fn a_turn_a_notification_opened_is_its_own_shape() {
+        let turn = |origin: Origin, entries: Vec<Entry>| {
+            let mut turn = Turn::new(1, origin);
+            turn.entries = entries;
+            turn
+        };
+        let prompt = || Entry::User {
+            text: "go".to_owned(),
+            via: Via::Prompt,
+        };
+        let notified = || Entry::User {
+            text: "<task-notification/>".to_owned(),
+            via: Via::TaskNotification,
+        };
+        assert!(shapes_of(&[turn(Origin::Human, vec![prompt()])]).is_empty());
+        assert_eq!(
+            shapes_of(&[
+                turn(Origin::Human, vec![prompt()]),
+                turn(Origin::TaskNotification, vec![notified()])
+            ]),
+            ["notification-turn"]
+        );
     }
 
     #[test]

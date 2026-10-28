@@ -16,20 +16,36 @@
 //! | `release` | hold name |
 //! | `stop_task`, `task_output` | task id |
 //! | `set_per_task_stop` | bool |
-//! | `answer_question` | `{picks: [[label...]...], other?: {index: text}, notes?: text}` |
-//! | `decline_question` | `{kind: "cancel"\|"chat"}` |
+//! | `answer_question` | `{picks: [[option...]...], other?: [text\|null...], notes?: [text\|null...], refused?: text}` |
+//! | `decline_question` | `{kind: "cancel"\|"chat"}`, with `picks`, `other` and `notes` as the answers so far (chat only) and `refused?` |
 //! | `request`, `request_done` | step id or side kind, or `{id, count}` |
 //! | `held` | hold name |
 //! | `tap_line` | `{kind, fields?, count?}`; `kind` is a stdout line's `type` or `type/subtype` |
 //! | `cli_results` | how many `result` lines at least |
 //! | `session_state` | `idle`, `running` or `requires_action`: the newest state line since the last action |
 //! | `transcript_line` | `{type, fields?, count?}` over the CLI's own session files |
-//! | `projection`, `interaction` | an object the host judges |
+//! | `projection` | `{question: "waiting"\|"settled"}`, or an object the host judges |
+//! | `interaction` | an object the host judges |
 //! | `roster` | `{task, status}` |
 //! | `card` | `{tool}`: a request of that tool needed (or got) a driver answer |
 //! | `wall_floor` | `{after, seconds}`: `after` is a part's `name` or `<verb>:<target>` of an earlier wait |
 //!
 //! String values may hold `{name}` captures of the scripted requests and `{RUN}`.
+//!
+//! **Questions.** `answer_question` and `decline_question` answer the oldest question still waiting: the CLI's
+//! `can_use_tool` request for `AskUserQuestion` on the tap's stdout that has no `control_response` on its stdin.
+//! `picks` holds, per question in the CLI's order, the option indexes picked (from 0); `other` the typed text
+//! and `notes` the notes, per question, `null` where there is none; a question left out is unanswered. Before the
+//! host is called the driver checks the arguments against that request (an option or a question it does not have
+//! fails the part) and checks that nothing has answered the question already: no card and no automatic answer
+//! for `AskUserQuestion`, and no request at the stand-in carrying the question's `tool_result`. With `refused`
+//! the part expects the host to refuse, with that text in the refusal, and checks the newest question instead
+//! (a late answer to one that has gone). A host that does not declare `structured_questions_v1` gets the call
+//! unchecked, and fails it as missing.
+//!
+//! `projection{question: waiting}` holds while the host shows the newest question as waiting for the person;
+//! `settled` once it shows it answered, declined, or ended by anything else. The host judges it, and an
+//! `interaction` object (`outcome`, `answers`, `notes`, `count`), in [`Host::interaction_holds`].
 
 use super::{gate_answer::Answered, script::Expander, RequestRecord, ScriptedModel};
 use serde_json::{json, Value};
@@ -72,6 +88,20 @@ pub enum DeclineKind {
     Cancel,
     Chat,
 }
+
+/// The answer to one question of a set, as the person gives it: the indexes of the options picked, in the
+/// CLI's option order, the text typed into "Type something", and notes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    /// The question's place in the set, from 0.
+    pub question: usize,
+    pub options: Vec<usize>,
+    pub other: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// The tool whose calls are questions for the person, never permission requests.
+pub const QUESTION_TOOL: &str = "AskUserQuestion";
 
 /// What a driver needs from the thing under test. Layer (a) implements it over the sidecar provider; the
 /// companion plans implement it over Eitri's host.
@@ -134,19 +164,18 @@ pub trait Host {
     fn roster(&self) -> Result<Vec<RosterEntry>, DriverError> {
         Err(DriverError::CapabilityMissing("background_tasks"))
     }
-    fn answer_question(
-        &mut self,
-        picks: &[Vec<String>],
-        other: &BTreeMap<usize, String>,
-        notes: Option<&str>,
-    ) -> Result<(), DriverError> {
-        let _ = (picks, other, notes);
+    /// Answers the oldest waiting question with `answers`, one entry per answered question.
+    fn answer_question(&mut self, answers: &[QuestionAnswer]) -> Result<(), DriverError> {
+        let _ = answers;
         Err(DriverError::CapabilityMissing("structured_questions_v1"))
     }
-    fn decline_question(&mut self, kind: DeclineKind) -> Result<(), DriverError> {
-        let _ = kind;
+    /// Declines the oldest waiting question; `so_far` are the answers given before a chat request.
+    fn decline_question(&mut self, kind: DeclineKind, so_far: &[QuestionAnswer]) -> Result<(), DriverError> {
+        let _ = (kind, so_far);
         Err(DriverError::CapabilityMissing("structured_questions_v1"))
     }
+    /// Whether the host's question records hold what `want` describes (`question: waiting|settled`, or an
+    /// `interaction` wait's object).
     fn interaction_holds(&self, want: &Value) -> Result<bool, DriverError> {
         let _ = want;
         Err(DriverError::CapabilityMissing("structured_questions_v1"))
@@ -532,44 +561,104 @@ impl<'a> Driver<'a> {
                     .ok_or_else(|| Failure::text("`set_per_task_stop` needs true or false"))?;
                 Ok(self.host.set_per_task_stop(on)?)
             }
-            "answer_question" => {
-                let picks = arg["picks"]
-                    .as_array()
-                    .ok_or_else(|| Failure::text("`answer_question` needs `picks`: a list of lists of labels"))?
-                    .iter()
-                    .map(|q| {
-                        q.as_array()
-                            .map(|l| {
-                                l.iter()
-                                    .filter_map(|v| v.as_str().map(str::to_owned))
-                                    .collect::<Vec<_>>()
-                            })
-                            .ok_or_else(|| Failure::text("`picks` holds a list of labels per question"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut other = BTreeMap::new();
-                for (index, text) in arg["other"].as_object().into_iter().flatten() {
-                    let index = index
-                        .parse::<usize>()
-                        .map_err(|_| Failure::text(format!("`other` key `{index}` is not a question number")))?;
-                    other.insert(index, text.as_str().unwrap_or_default().to_owned());
-                }
-                Ok(self.host.answer_question(&picks, &other, arg["notes"].as_str())?)
-            }
-            "decline_question" => {
-                let kind = match arg["kind"].as_str() {
-                    Some("cancel") => DeclineKind::Cancel,
-                    Some("chat") => DeclineKind::Chat,
-                    other => {
-                        return Err(Failure::text(format!(
-                            "`decline_question` kind is cancel or chat, not {other:?}"
-                        )))
-                    }
-                };
-                Ok(self.host.decline_question(kind)?)
-            }
+            "answer_question" | "decline_question" => self.question_action(verb, arg),
             other => Err(Failure::text(format!("no action `{other}`"))),
         }
+    }
+
+    /// `answer_question` and `decline_question`: the arguments read and checked against the question they answer,
+    /// the question checked as untouched, then the host called.
+    fn question_action(&mut self, verb: &str, arg: &Value) -> Result<(), Failure> {
+        let QuestionAction {
+            decline,
+            refused,
+            answers,
+        } = question_action_of(verb, arg)?;
+        let call = |host: &mut dyn Host| match decline {
+            None => host.answer_question(&answers),
+            Some(kind) => host.decline_question(kind, &answers),
+        };
+        if !self.host.capabilities().contains("structured_questions_v1") {
+            return Ok(call(&mut *self.host)?);
+        }
+        let asked = self.question_to_answer(refused.is_some())?;
+        check_against(verb, &answers, &asked)?;
+        if refused.is_none() {
+            self.check_untouched(&asked)?;
+        }
+        match (call(&mut *self.host), refused) {
+            (Ok(()), None) => Ok(()),
+            (Ok(()), Some(want)) => Err(Failure::text(format!(
+                "`{verb}` was taken, and the scenario expects a refusal holding `{want}`"
+            ))),
+            (Err(DriverError::Failed(why)), Some(want)) if why.contains(&want) => Ok(()),
+            (Err(DriverError::Failed(why)), Some(want)) => Err(Failure::text(format!(
+                "`{verb}` was refused with `{why}`, which does not hold `{want}`"
+            ))),
+            (Err(e), _) => Err(e.into()),
+        }
+    }
+
+    /// The question an answer goes to: the oldest one still waiting, or for a late answer the newest one.
+    fn question_to_answer(&self, late: bool) -> Result<AskedQuestion, Failure> {
+        let asked = asked_questions(&self.settings.run.join("log"));
+        let found = if late {
+            asked.into_iter().next_back()
+        } else {
+            asked.into_iter().find(|q| !q.settled)
+        };
+        found.ok_or_else(|| {
+            Failure::text(if late {
+                "the CLI has asked no question to answer late".to_owned()
+            } else {
+                format!(
+                    "no {QUESTION_TOOL} request of the CLI waits for an answer{}",
+                    self.report_tail()
+                )
+            })
+        })
+    }
+
+    /// Nothing but the person answers a question: no card and no automatic answer for the question tool, and no
+    /// request at the stand-in carries the question's result yet.
+    fn check_untouched(&self, asked: &AskedQuestion) -> Result<(), Failure> {
+        let (cards, automatic) = (self.host.cards_shown(), self.host.automatic_answers());
+        let touched: Vec<Value> = cards
+            .iter()
+            .map(|a| ("card", a))
+            .chain(automatic.iter().map(|a| ("automatic answer", a)))
+            .filter(|(_, a)| a.tool() == QUESTION_TOOL)
+            .map(|(what, a)| json!({"as": what, "answer": a.to_json()}))
+            .collect();
+        if !touched.is_empty() {
+            return Err(Failure::text(format!(
+                "the question went through the permission gate: {}",
+                Value::Array(touched)
+            )));
+        }
+        let standin = self.settings.run.join("standin");
+        for record in self.endpoint.records() {
+            let Ok(text) = std::fs::read_to_string(standin.join(&record.body_file)) else {
+                continue;
+            };
+            let Ok(body) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let ids = question_results_in(&body);
+            let hit = match &asked.tool_use_id {
+                Some(id) => ids.contains(id),
+                // Without the call's id, every result for a question has to belong to one the CLI got an answer
+                // for before this one was asked.
+                None => ids.len() > asked.answered_before,
+            };
+            if hit {
+                return Err(Failure::text(format!(
+                    "request #{} reached the stand-in with the question's tool_result before the driver answered",
+                    record.arrival_index
+                )));
+            }
+        }
+        Ok(())
     }
 
     // ---- waits ----
@@ -649,6 +738,18 @@ impl<'a> Driver<'a> {
                         .filter(|j| j["type"].as_str() == Some(&ty) && fields_match(j, &fields))
                         .count();
                     Ok(n >= count)
+                })
+            }
+            "projection" if arg.get("question").is_some() => {
+                let word = arg["question"].as_str().unwrap_or_default();
+                if !["waiting", "settled"].contains(&word) || arg.as_object().is_some_and(|o| o.len() != 1) {
+                    return Err(Failure::text(
+                        "`projection` on a question is exactly `{\"question\": \"waiting\"}` or `{\"question\": \"settled\"}`",
+                    ));
+                }
+                let want = json!({"question": word});
+                self.wait_for(&what, limit, false, move |d| {
+                    d.host.interaction_holds(&want).map_err(Failure::from)
                 })
             }
             "projection" => {
@@ -829,6 +930,255 @@ impl<'a> Driver<'a> {
     }
 }
 
+/// One `AskUserQuestion` request the CLI made through its control channel.
+#[derive(Clone, Debug)]
+struct AskedQuestion {
+    tool_use_id: Option<String>,
+    /// The `questions` of the call's input, in the CLI's order.
+    questions: Vec<Value>,
+    answered: bool,
+    /// Nothing more can answer it: it was answered, the CLI withdrew it (`control_cancel_request`), or the
+    /// process that asked it has been replaced by another (a resumed session).
+    settled: bool,
+    /// How many earlier question requests had an answer by the time this one came.
+    answered_before: usize,
+}
+
+/// Every `can_use_tool` request for the question tool on the tap's stdout, oldest first, each marked answered when
+/// a `control_response` with its request id went to the CLI's stdin, and settled when it was answered, the CLI
+/// withdrew it, or a later process started: the tap's index is one counter across both directions and every
+/// process of the run, so a question whose index is below a later `initialize` request on stdin was asked by a
+/// process that is gone.
+fn asked_questions(log: &Path) -> Vec<AskedQuestion> {
+    let stdin: Vec<(u64, Value)> = read_tap(&log.join("cli-stdin.jsonl"))
+        .into_iter()
+        .filter_map(|l| l.json.map(|j| (l.index, j)))
+        .collect();
+    let responses: BTreeSet<String> = stdin
+        .iter()
+        .filter(|(_, j)| j["type"] == "control_response")
+        .filter_map(|(_, j)| j["response"]["request_id"].as_str().map(str::to_owned))
+        .collect();
+    let last_start = stdin
+        .iter()
+        .filter(|(_, j)| j["type"] == "control_request" && j["request"]["subtype"] == "initialize")
+        .map(|(index, _)| *index)
+        .max();
+    let stdout = read_tap(&log.join("cli-stdout.jsonl"));
+    let withdrawn: BTreeSet<String> = stdout
+        .iter()
+        .filter_map(|l| l.json.as_ref())
+        .filter(|j| j["type"] == "control_cancel_request")
+        .filter_map(|j| j["request_id"].as_str().map(str::to_owned))
+        .collect();
+    let mut out: Vec<AskedQuestion> = Vec::new();
+    for line in stdout {
+        let index = line.index;
+        let Some(j) = line.json else { continue };
+        let request = &j["request"];
+        if j["type"] != "control_request"
+            || request["subtype"] != "can_use_tool"
+            || request["tool_name"] != QUESTION_TOOL
+        {
+            continue;
+        }
+        let id = j["request_id"].as_str().unwrap_or_default();
+        let answered_before = out.iter().filter(|q| q.answered).count();
+        let answered = responses.contains(id);
+        let gone = last_start.is_some_and(|start| start > index);
+        out.push(AskedQuestion {
+            tool_use_id: request["tool_use_id"].as_str().map(str::to_owned),
+            questions: request["input"]["questions"].as_array().cloned().unwrap_or_default(),
+            answered,
+            settled: answered || withdrawn.contains(id) || gone,
+            answered_before,
+        });
+    }
+    out
+}
+
+/// Whether a question the CLI asked through its control channel still waits for its answer, by the tap logs in
+/// `log`: a `can_use_tool` request for the question tool of the live process, neither answered nor withdrawn.
+pub fn question_waits(log: &Path) -> bool {
+    asked_questions(log).iter().any(|q| !q.settled)
+}
+
+/// The ids of the question tool's calls whose `tool_result` a request body carries.
+fn question_results_in(body: &Value) -> Vec<String> {
+    let blocks = || {
+        body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+    };
+    let calls: BTreeSet<&str> = blocks()
+        .filter(|b| b["type"] == "tool_use" && b["name"] == QUESTION_TOOL)
+        .filter_map(|b| b["id"].as_str())
+        .collect();
+    blocks()
+        .filter(|b| b["type"] == "tool_result")
+        .filter_map(|b| b["tool_use_id"].as_str())
+        .filter(|id| calls.contains(id))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `picks`, `other` and `notes` as one answer per question that has any of them. Only the shape is checked here.
+fn answers_of(verb: &str, arg: &Value) -> Result<Vec<QuestionAnswer>, Failure> {
+    let list = |key: &str| -> Result<Vec<Value>, Failure> {
+        match &arg[key] {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(items) => Ok(items.clone()),
+            _ => Err(Failure::text(format!(
+                "`{verb}` `{key}` is a list with one entry per question"
+            ))),
+        }
+    };
+    let picks = list("picks")?
+        .iter()
+        .enumerate()
+        .map(|(q, p)| {
+            p.as_array()
+                .and_then(|l| {
+                    l.iter()
+                        .map(|v| v.as_u64().map(|i| i as usize))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| {
+                    Failure::text(format!(
+                        "`{verb}` picks for question {q} is not a list of option indexes"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let texts = |key: &str| -> Result<Vec<Option<String>>, Failure> {
+        list(key)?
+            .iter()
+            .enumerate()
+            .map(|(q, v)| match v {
+                Value::Null => Ok(None),
+                Value::String(s) => Ok(Some(s.clone())),
+                _ => Err(Failure::text(format!(
+                    "`{verb}` {key} for question {q} is neither a text nor null"
+                ))),
+            })
+            .collect()
+    };
+    let (other, notes) = (texts("other")?, texts("notes")?);
+    let count = picks.len().max(other.len()).max(notes.len());
+    Ok((0..count)
+        .map(|q| QuestionAnswer {
+            question: q,
+            options: picks.get(q).cloned().unwrap_or_default(),
+            other: other.get(q).cloned().flatten(),
+            notes: notes.get(q).cloned().flatten(),
+        })
+        .filter(|a| !a.options.is_empty() || a.other.is_some() || a.notes.is_some())
+        .collect())
+}
+
+/// A question action's arguments, read and checked for shape.
+struct QuestionAction {
+    /// `None` for an answer; the kind for a decline.
+    decline: Option<DeclineKind>,
+    /// The text a refusal of a late answer holds.
+    refused: Option<String>,
+    answers: Vec<QuestionAnswer>,
+}
+
+fn question_action_of(verb: &str, arg: &Value) -> Result<QuestionAction, Failure> {
+    let decline = match verb {
+        "answer_question" => None,
+        _ => Some(match arg["kind"].as_str() {
+            Some("cancel") => DeclineKind::Cancel,
+            Some("chat") => DeclineKind::Chat,
+            other => {
+                return Err(Failure::text(format!(
+                    "`decline_question` kind is cancel or chat, not {other:?}"
+                )))
+            }
+        }),
+    };
+    for key in arg.as_object().into_iter().flat_map(|o| o.keys()) {
+        let known =
+            ["picks", "other", "notes", "refused"].contains(&key.as_str()) || (decline.is_some() && key == "kind");
+        if !known {
+            return Err(Failure::text(format!("`{verb}` has an unknown key `{key}`")));
+        }
+    }
+    let refused = match &arg["refused"] {
+        Value::Null => None,
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => {
+            return Err(Failure::text(format!(
+                "`{verb}` `refused` is the text the refusal holds"
+            )))
+        }
+    };
+    let answers = answers_of(verb, arg)?;
+    if decline == Some(DeclineKind::Cancel) && !answers.is_empty() {
+        return Err(Failure::text(
+            "`decline_question` with kind cancel takes no answers: only a chat request sends the answers so far",
+        ));
+    }
+    if verb == "answer_question" && arg.get("picks").is_none() {
+        return Err(Failure::text(
+            "`answer_question` needs `picks`: a list of option indexes per question",
+        ));
+    }
+    Ok(QuestionAction {
+        decline,
+        refused,
+        answers,
+    })
+}
+
+/// Every answer names a question of the set and options that question has.
+fn check_against(verb: &str, answers: &[QuestionAnswer], asked: &AskedQuestion) -> Result<(), Failure> {
+    let n = asked.questions.len();
+    for a in answers {
+        let Some(question) = asked.questions.get(a.question) else {
+            let what = if !a.options.is_empty() {
+                "picks"
+            } else if a.other.is_some() {
+                "other"
+            } else {
+                "notes"
+            };
+            return Err(Failure::text(format!(
+                "`{verb}` {what} for question {}, and the CLI asked {n} question(s)",
+                a.question
+            )));
+        };
+        let options = question["options"].as_array().map_or(0, Vec::len);
+        if let Some(bad) = a.options.iter().find(|&&i| i >= options) {
+            return Err(Failure::text(format!(
+                "`{verb}` picks option {bad} of question {}, which has {options} option(s)",
+                a.question
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        if let Some(again) = a.options.iter().find(|&&i| !seen.insert(i)) {
+            return Err(Failure::text(format!(
+                "`{verb}` picks option {again} of question {} twice",
+                a.question
+            )));
+        }
+        // A question the CLI asks without multiSelect takes one option; a typed text stands in for a pick.
+        let single = !question["multiSelect"].as_bool().unwrap_or(false);
+        let chosen = a.options.len() + usize::from(a.other.is_some());
+        if single && chosen > 1 {
+            return Err(Failure::text(format!(
+                "`{verb}` gives question {} {chosen} answers (picks and typed text), and it takes one: the CLI \
+                 asks it without multiSelect",
+                a.question
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn target_of(verb: &str, arg: &Value) -> Option<String> {
     match verb {
         "request" | "request_done" => text_arg(arg, "id"),
@@ -885,6 +1235,8 @@ mod tests {
         cards: RefCell<Vec<Answered>>,
         roster: Vec<RosterEntry>,
         interaction: bool,
+        /// A question answer is refused with this text.
+        refuse: Option<String>,
     }
 
     impl Fake {
@@ -897,6 +1249,7 @@ mod tests {
                 cards: RefCell::new(Vec::new()),
                 roster: Vec::new(),
                 interaction: false,
+                refuse: None,
             }
         }
         fn note(&self, text: impl Into<String>) {
@@ -973,6 +1326,20 @@ mod tests {
             } else {
                 Err(DriverError::CapabilityMissing("background_tasks"))
             }
+        }
+        fn answer_question(&mut self, answers: &[QuestionAnswer]) -> Result<(), DriverError> {
+            if !self.caps.contains("structured_questions_v1") {
+                return Err(DriverError::CapabilityMissing("structured_questions_v1"));
+            }
+            self.note(format!("answer {answers:?}"));
+            self.refuse.clone().map_or(Ok(()), |why| Err(DriverError::Failed(why)))
+        }
+        fn decline_question(&mut self, kind: DeclineKind, so_far: &[QuestionAnswer]) -> Result<(), DriverError> {
+            if !self.caps.contains("structured_questions_v1") {
+                return Err(DriverError::CapabilityMissing("structured_questions_v1"));
+            }
+            self.note(format!("decline {kind:?} {so_far:?}"));
+            self.refuse.clone().map_or(Ok(()), |why| Err(DriverError::Failed(why)))
         }
         fn interaction_holds(&self, _: &Value) -> Result<bool, DriverError> {
             if self.caps.contains("structured_questions_v1") {
@@ -1465,6 +1832,297 @@ mod tests {
         assert!(err.contains("structured_questions_v1"), "{err}");
     }
 
+    /// A tap where the CLI asked one question set of two questions (two options, then four), `answered` saying
+    /// whether its control response went back.
+    fn asked(run: &Path, answered: bool) {
+        let options = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| json!({"label": format!("L{i}"), "description": "d"}))
+                .collect()
+        };
+        tap(
+            run,
+            "cli-stdout.jsonl",
+            &[(
+                4,
+                json!({"type": "control_request", "request_id": "req-q1", "request": {
+                "subtype": "can_use_tool", "tool_name": "AskUserQuestion", "tool_use_id": "toolu_q1",
+                "input": {"questions": [
+                    {"question": "One?", "header": "One", "multiSelect": false, "options": options(2)},
+                    {"question": "Two?", "header": "Two", "multiSelect": true, "options": options(4)}
+                ]}}}),
+            )],
+        );
+        let mut stdin = vec![(0, json!({"type": "user", "message": {"role": "user", "content": "go"}}))];
+        if answered {
+            stdin.push((
+                6,
+                json!({"type": "control_response", "response": {"subtype": "success", "request_id": "req-q1", "response": {}}}),
+            ));
+        }
+        tap(run, "cli-stdin.jsonl", &stdin);
+    }
+
+    fn questions_host() -> Fake {
+        let mut host = Fake::new();
+        host.caps.insert("structured_questions_v1");
+        host
+    }
+
+    #[test]
+    fn an_answer_reaches_the_host_as_option_indexes_typed_text_and_notes_per_question() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+        asked(&run, false);
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"answer_question": {"picks": [[1], [0, 2]], "other": [null, "typed"], "notes": ["a note"]}}]),
+        )
+        .unwrap();
+        let want = vec![
+            QuestionAnswer {
+                question: 0,
+                options: vec![1],
+                other: None,
+                notes: Some("a note".into()),
+            },
+            QuestionAnswer {
+                question: 1,
+                options: vec![0, 2],
+                other: Some("typed".into()),
+                notes: None,
+            },
+        ];
+        assert_eq!(host.calls.lock().unwrap().as_slice(), [format!("answer {want:?}")]);
+    }
+
+    #[test]
+    fn an_answer_picking_an_option_or_a_question_the_cli_did_not_ask_fails_before_the_host() {
+        for (answer, word) in [
+            (json!({"picks": [[2]]}), "option 2 of question 0, which has 2 option(s)"),
+            (
+                json!({"picks": [[0], [4]]}),
+                "option 4 of question 1, which has 4 option(s)",
+            ),
+            (
+                json!({"picks": [[0], [1], [0]]}),
+                "picks for question 2, and the CLI asked 2 question(s)",
+            ),
+            (
+                json!({"picks": [[0]], "other": [null, null, "x"]}),
+                "other for question 2",
+            ),
+            (
+                json!({"picks": [], "notes": [null, null, null, "n"]}),
+                "notes for question 3",
+            ),
+            (json!({"picks": [["L0"]]}), "not a list of option indexes"),
+            (json!({"picks": [[0]], "other": {"1": "x"}}), "`other` is a list"),
+            (json!({"picks": [[0]], "label": "x"}), "unknown key `label`"),
+            (json!({"other": ["x"]}), "needs `picks`"),
+            (json!({"picks": [[0, 1]]}), "gives question 0 2 answers"),
+            (json!({"picks": [[0]], "other": ["x"]}), "gives question 0 2 answers"),
+            (json!({"picks": [[0], [2, 2]]}), "picks option 2 of question 1 twice"),
+        ] {
+            let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+            asked(&run, false);
+            let err = drive(&mut host, &endpoint, &run, json!([{ "answer_question": answer }])).unwrap_err();
+            assert!(err.contains(word), "{answer}: {err}");
+            assert!(host.calls.lock().unwrap().is_empty(), "{answer}: the host was called");
+        }
+    }
+
+    /// Every question answer a scenario file scripts fits the question its model step asks, so a slip in a row's
+    /// arguments shows here and not only when a host that answers questions first runs the row.
+    #[test]
+    fn every_scripted_question_answer_fits_the_question_its_scenario_asks() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/claude_scenarios");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let scenario: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let asked: Vec<AskedQuestion> = scenario["model"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|step| step["reply"].as_array().into_iter().flatten())
+                .filter(|r| r["tool_use"]["name"] == QUESTION_TOOL)
+                .map(|r| AskedQuestion {
+                    tool_use_id: r["tool_use"]["id"].as_str().map(str::to_owned),
+                    questions: r["tool_use"]["input"]["questions"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                    answered: false,
+                    settled: false,
+                    answered_before: 0,
+                })
+                .collect();
+            let actions = scenario["driver"].as_array().into_iter().flatten().filter_map(|part| {
+                ["answer_question", "decline_question"]
+                    .into_iter()
+                    .find_map(|verb| part.get(verb).map(|arg| (verb, arg)))
+            });
+            for (n, (verb, arg)) in actions.enumerate() {
+                let name = path.display();
+                // Answers go to the scripted calls in order; a late answer goes to the last one.
+                let question = asked
+                    .get(n)
+                    .or(asked.last())
+                    .unwrap_or_else(|| panic!("{name}: `{verb}` and no scripted {QUESTION_TOOL} call"));
+                let why = |f: Failure| match f {
+                    Failure::Text(t) => t,
+                    Failure::Host(e) => format!("{e:?}"),
+                };
+                let action = question_action_of(verb, arg).unwrap_or_else(|f| panic!("{name}: {}", why(f)));
+                check_against(verb, &action.answers, question).unwrap_or_else(|f| panic!("{name}: {}", why(f)));
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the scenario files script question answers");
+    }
+
+    #[test]
+    fn an_answer_needs_a_question_still_waiting() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+        let part = json!([{"answer_question": {"picks": [[0]]}}]);
+        let err = drive(&mut host, &endpoint, &run, part.clone()).unwrap_err();
+        assert!(err.contains("no AskUserQuestion request of the CLI waits"), "{err}");
+        asked(&run, true);
+        let err = drive(&mut host, &endpoint, &run, part).unwrap_err();
+        assert!(err.contains("no AskUserQuestion request of the CLI waits"), "{err}");
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_question_the_gate_or_anything_else_answered_fails_the_answer() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+        asked(&run, false);
+        host.cards.borrow_mut().push(Answered {
+            request: Request {
+                permission_id: "p1".into(),
+                tool_use_id: Some("toolu_q1".into()),
+                tool_name: "AskUserQuestion".into(),
+                input: json!({}),
+                origin: Origin::Hook,
+            },
+            decision: Some(PermissionDecision::Allow),
+        });
+        let part = json!([{"answer_question": {"picks": [[0]]}}]);
+        let err = drive(&mut host, &endpoint, &run, part.clone()).unwrap_err();
+        assert!(err.contains("went through the permission gate"), "{err}");
+
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+        asked(&run, false);
+        std::fs::create_dir_all(run.join("standin")).unwrap();
+        let body = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_q1", "name": "AskUserQuestion", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_q1", "content": "answered"}]}
+        ]});
+        std::fs::write(run.join("standin/body_3.json"), body.to_string()).unwrap();
+        *endpoint.records.lock().unwrap() = vec![record(3, Some("m2"), None, None)];
+        let err = drive(&mut host, &endpoint, &run, part).unwrap_err();
+        assert!(
+            err.contains("request #3") && err.contains("before the driver answered"),
+            "{err}"
+        );
+        assert!(host.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_late_answer_passes_only_on_the_refusal_it_names() {
+        let late = json!([{"answer_question": {"picks": [[0]], "refused": "INTERACTION_NOT_FOUND"}}]);
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+        asked(&run, true);
+        host.refuse = Some("resolve_interaction: INTERACTION_NOT_FOUND".into());
+        drive(&mut host, &endpoint, &run, late.clone()).unwrap();
+        host.refuse = Some("resolve_interaction: INTERACTION_ANSWER_REFUSED".into());
+        let err = drive(&mut host, &endpoint, &run, late.clone()).unwrap_err();
+        assert!(err.contains("does not hold `INTERACTION_NOT_FOUND`"), "{err}");
+        host.refuse = None;
+        let err = drive(&mut host, &endpoint, &run, late).unwrap_err();
+        assert!(err.contains("expects a refusal"), "{err}");
+    }
+
+    #[test]
+    fn a_decline_takes_cancel_or_chat_and_only_a_chat_sends_answers_so_far() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), questions_host());
+        asked(&run, false);
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"decline_question": {"kind": "chat", "picks": [[1]]}}, {"decline_question": {"kind": "cancel"}}]),
+        )
+        .unwrap();
+        let so_far = vec![QuestionAnswer {
+            question: 0,
+            options: vec![1],
+            other: None,
+            notes: None,
+        }];
+        assert_eq!(
+            host.calls.lock().unwrap().as_slice(),
+            [format!("decline Chat {so_far:?}"), "decline Cancel []".to_owned()]
+        );
+        for (part, word) in [
+            (json!({"kind": "cancel", "picks": [[0]]}), "takes no answers"),
+            (json!({"kind": "dismiss"}), "cancel or chat"),
+            (json!({"kind": "chat", "picks": [[5]]}), "option 5 of question 0"),
+        ] {
+            let err = drive(&mut host, &endpoint, &run, json!([{ "decline_question": part }])).unwrap_err();
+            assert!(err.contains(word), "{part}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_question_wait_asks_the_host_question_records_and_takes_two_words() {
+        let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
+        let err = drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"projection": {"question": "waiting"}}]),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("structured_questions_v1") && err.contains("requires"),
+            "{err}"
+        );
+        let report = drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"projection": {"question": "settled"}, "requires": "structured_questions_v1"}]),
+        )
+        .unwrap();
+        assert_eq!(
+            report.pending,
+            ["PENDING fake/0-projection: needs structured_questions_v1"]
+        );
+        host.caps.insert("structured_questions_v1");
+        host.interaction = true;
+        drive(
+            &mut host,
+            &endpoint,
+            &run,
+            json!([{"projection": {"question": "waiting"}}]),
+        )
+        .unwrap();
+        for bad in [
+            json!({"question": "answered"}),
+            json!({"question": "waiting", "count": 2}),
+        ] {
+            let err = drive(&mut host, &endpoint, &run, json!([{ "projection": bad }])).unwrap_err();
+            assert!(err.contains("exactly"), "{bad}: {err}");
+        }
+    }
+
     #[test]
     fn a_part_needs_one_known_verb() {
         let (run, endpoint, mut host) = (run_dir(), FakeEndpoint::default(), Fake::new());
@@ -1491,5 +2149,57 @@ mod tests {
         assert!(!fields_match(&v, &json!({"n": 2})));
         assert!(!fields_match(&v, &json!({"a.b.9": {"exists": true}})));
         assert!(fields_match(&v, &Value::Null));
+    }
+
+    /// A question the CLI withdrew (`control_cancel_request`), or one a process that has since been replaced
+    /// asked (a later `initialize` on stdin), no longer waits; only the live process's open question does.
+    #[test]
+    fn a_withdrawn_question_or_one_from_a_closed_process_no_longer_waits() {
+        let run = run_dir();
+        let log = run.join("log");
+        let init =
+            |id: &str| json!({"type": "control_request", "request_id": id, "request": {"subtype": "initialize"}});
+        let ask = |id: &str, call: &str| {
+            json!({"type": "control_request", "request_id": id, "request": {
+                "subtype": "can_use_tool", "tool_name": QUESTION_TOOL, "tool_use_id": call,
+                "input": {"questions": [{"question": format!("{call}?")}]}
+            }})
+        };
+        tap(&run, "cli-stdin.jsonl", &[(0, init("i1"))]);
+        tap(
+            &run,
+            "cli-stdout.jsonl",
+            &[
+                (1, ask("q1", "toolu_old")),
+                (2, ask("q2", "toolu_cancelled")),
+                (3, json!({"type": "control_cancel_request", "request_id": "q2"})),
+            ],
+        );
+        let waiting = |log: &Path| -> Vec<String> {
+            asked_questions(log)
+                .into_iter()
+                .filter(|q| !q.settled)
+                .filter_map(|q| q.tool_use_id)
+                .collect()
+        };
+        assert_eq!(waiting(&log), ["toolu_old"], "a withdrawn question does not wait");
+        assert!(question_waits(&log));
+
+        tap(&run, "cli-stdin.jsonl", &[(0, init("i1")), (4, init("i2"))]);
+        assert!(waiting(&log).is_empty(), "the closed process's question does not wait");
+        assert!(!question_waits(&log));
+
+        tap(
+            &run,
+            "cli-stdout.jsonl",
+            &[
+                (1, ask("q1", "toolu_old")),
+                (2, ask("q2", "toolu_cancelled")),
+                (3, json!({"type": "control_cancel_request", "request_id": "q2"})),
+                (5, ask("q3", "toolu_live")),
+            ],
+        );
+        assert_eq!(waiting(&log), ["toolu_live"]);
+        let _ = std::fs::remove_dir_all(&run);
     }
 }

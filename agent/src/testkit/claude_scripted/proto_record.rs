@@ -137,6 +137,13 @@ impl ProtoRecorder {
             .or_else(|| state.first_sequence.filter(|s| *s != 1).map(first_sequence_message))
     }
 
+    /// How many of the CLI's session state changes the recording holds: the sidecar passes each
+    /// `system`/`session_state_changed` line on as a provider notice of that subtype.
+    pub fn state_changes(&self) -> usize {
+        let state = self.shared.state.lock().unwrap();
+        state.events.iter().filter(|e| is_state_change(e)).count()
+    }
+
     /// Waits until the recording holds the event with `sequence` (or a later one), up to `limit`.
     pub fn wait_through(&self, sequence: u64, limit: Duration) -> Result<(), String> {
         let end = Instant::now() + limit;
@@ -225,6 +232,11 @@ async fn pump(mut stream: tonic::Streaming<SessionEvent>, shared: Arc<Shared>, m
     }
 }
 
+/// A provider notice for one of the CLI's `session_state_changed` lines.
+pub fn is_state_change(event: &SessionEvent) -> bool {
+    matches!(&event.event, Some(Event::ProviderNotice(notice)) if notice.subtype.as_deref() == Some("session_state_changed"))
+}
+
 /// The kind of an event, with the one field that tells similar events apart.
 pub fn describe(event: &SessionEvent) -> String {
     match &event.event {
@@ -252,6 +264,22 @@ mod tests {
     fn a_recording_that_starts_after_sequence_one_is_reported_with_both_numbers() {
         let message = first_sequence_message(7);
         assert!(message.contains("sequence 7") && message.contains("not 1"), "{message}");
+    }
+
+    #[test]
+    fn only_a_state_change_notice_counts_as_a_state_change() {
+        use claude_runtime_protocol::v1::ProviderNotice;
+        let notice = |subtype: Option<&str>| SessionEvent {
+            event: Some(Event::ProviderNotice(ProviderNotice {
+                kind: "system".into(),
+                subtype: subtype.map(str::to_owned),
+            })),
+            ..SessionEvent::default()
+        };
+        assert!(is_state_change(&notice(Some("session_state_changed"))));
+        assert!(!is_state_change(&notice(Some("status"))));
+        assert!(!is_state_change(&notice(None)));
+        assert!(!is_state_change(&SessionEvent::default()));
     }
 
     #[test]

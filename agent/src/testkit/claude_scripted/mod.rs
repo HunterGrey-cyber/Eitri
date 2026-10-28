@@ -4,6 +4,7 @@ pub mod gate_answer;
 mod http;
 pub mod matchers;
 pub mod proto_record;
+pub mod questions;
 pub mod replay;
 pub mod sandbox;
 pub mod script;

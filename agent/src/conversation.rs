@@ -876,6 +876,22 @@ impl AgentConversation {
         self.ingest.stats()
     }
 
+    /// Where this conversation's stored history stands against what it has folded
+    /// (`ConversationIngest::history_progress`).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn history_progress(&self) -> crate::ingestion::HistoryProgress {
+        self.ingest.history_progress()
+    }
+
+    /// Every event folded so far with its revision, and the projection they produced
+    /// (`ConversationIngest::fold_log`).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fold_log(&self) -> Option<(Vec<(u64, AgentDomainEvent)>, crate::AgentSessionProjection)> {
+        self.ingest.fold_log()
+    }
+
     /// What the provider said it can do when it connected, with `steer` asked again: a provider may
     /// learn mid-session that its agent cannot take messages while a turn runs.
     pub fn capabilities(&self) -> ProviderCapabilities {

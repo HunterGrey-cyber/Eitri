@@ -1340,8 +1340,8 @@ impl AgentProvider for ClaudeSidecarProvider {
 }
 
 /// The events received off the wire and not yet taken by `pump`, with the signal that says so.
-/// Whatever becomes ready raises it, so nothing can be queued without whoever drains `pump` being
-/// woken.
+/// Whatever becomes ready raises it, and so does a move of the ready position with nothing to hand
+/// over, so neither an event nor a position can be queued without whoever drains `pump` being woken.
 ///
 /// Every event passes the steer gate (`steer::SteerGate`) on its way in, under the same lock as the
 /// ready list, so a turn's end held for its follow-up and the follow-up's start become ready in one
@@ -1417,6 +1417,18 @@ impl EventQueue {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Brings the ready position up to the latest event once nothing is held back, and wakes the reader
+    /// when it moved. A wire event can translate to no domain event and still move the position `take`
+    /// reports; without the wake that position would wait for the next event to be handed over, and a
+    /// session whose last event is such a one would report a fold short of it until something else came.
+    fn settle(&self, state: &mut QueueState) {
+        let before = state.ready_through.as_ref().map(|mark| mark.sequence);
+        state.settle();
+        if state.ready_through.as_ref().map(|mark| mark.sequence) != before {
+            self.signal.raise();
+        }
+    }
+
     /// Makes `events` ready, in order, and wakes the reader when there are any.
     fn deliver(&self, state: &mut QueueState, events: Vec<AgentDomainEvent>) {
         if events.is_empty() {
@@ -1433,7 +1445,7 @@ impl EventQueue {
             let mut state = self.lock();
             let passed = state.gate.pass(event);
             self.deliver(&mut state, passed.ready);
-            state.settle();
+            self.settle(&mut state);
             passed.hold_started
         };
         if let Some(generation) = hold_started {
@@ -1454,7 +1466,7 @@ impl EventQueue {
                 holds.extend(passed.hold_started);
             }
             state.latest = Some(mark);
-            state.settle();
+            self.settle(&mut state);
         }
         for generation in holds {
             self.arm_hold(generation);
@@ -1555,7 +1567,7 @@ impl EventQueue {
         let mut state = self.lock();
         let out = state.gate.expire(generation);
         self.deliver(&mut state, out);
-        state.settle();
+        self.settle(&mut state);
     }
 
     fn open_steer(
@@ -1579,14 +1591,14 @@ impl EventQueue {
         let mut state = self.lock();
         let out = state.gate.refused(client_id, reason);
         self.deliver(&mut state, out);
-        state.settle();
+        self.settle(&mut state);
     }
 
     fn steer_unknown(&self, client_id: &str) {
         let mut state = self.lock();
         let out = state.gate.unknown(client_id);
         self.deliver(&mut state, out);
-        state.settle();
+        self.settle(&mut state);
     }
 
     fn take(&self) -> Vec<AgentDomainEvent> {
@@ -3002,6 +3014,24 @@ mod tests {
         queue.push_wire(Vec::new(), mark(5, "m2"));
         assert_eq!(queue.take(), [boundary, text("two")]);
         assert_eq!(queue.taken_through(), Some(5));
+    }
+
+    /// A wire event that becomes no domain event still moves the position a take reports, so the reader is
+    /// woken to take it: a session whose last event is such a one (the CLI's idle notice after a turn's end)
+    /// would otherwise report its fold one event short until the next event arrived.
+    #[test]
+    fn an_event_that_becomes_nothing_wakes_the_reader_to_take_its_position() {
+        let queue = Arc::new(EventQueue::default());
+        queue.push_wire(vec![text("one")], mark(3, "m1"));
+        assert_eq!(queue.take(), [text("one")]);
+        let seen = queue.signal.seen();
+        queue.push_wire(Vec::new(), mark(4, "m1"));
+        assert_ne!(queue.signal.seen(), seen, "the position moved, so the reader is woken");
+        assert!(queue.take().is_empty());
+        assert_eq!(queue.taken_through(), Some(4));
+        let seen = queue.signal.seen();
+        queue.push_wire(Vec::new(), mark(4, "m1"));
+        assert_eq!(queue.signal.seen(), seen, "the same position again wakes nobody");
     }
 
     #[cfg(target_os = "linux")]

@@ -202,6 +202,82 @@ struct IngestState {
     ///
     /// [`AgentProvider::pumped_through`]: crate::provider::AgentProvider::pumped_through
     folded_through: u64,
+    /// The `folded_through` through which the stored history holds everything this conversation owes
+    /// it. Set to the position the last write's snapshot was taken at once `store::save` returned, and
+    /// to `folded_through` whenever the thread finds nothing owed (`history_dirty` false between its own
+    /// writes and no failed write outstanding). `history_dirty` is cleared before a write starts, so it
+    /// alone cannot say the file is on disk; this can. Only the ingestion thread writes it, and only the
+    /// test-support accessor (`ConversationIngest::history_progress`) reads it: nothing in the product
+    /// waits on it.
+    history_saved_through: u64,
+    /// The last history write failed and no write has succeeded since: the stored history lacks what
+    /// that write carried, so `history_saved_through` stays where it was until a write succeeds. A move
+    /// between turns hands the history to the destination as owed; a move in the middle of a turn leaves
+    /// it to that turn's end, whose write carries it. Only the ingestion thread writes it.
+    history_save_failed: bool,
+    /// Every event folded, with the revision its fold produced, oldest first: only when a test asked for
+    /// fold logs before this conversation started ([`keep_fold_logs`]).
+    #[cfg(feature = "test-support")]
+    fold_log: Option<Vec<(u64, AgentDomainEvent)>>,
+}
+
+/// Whether conversations started from now on keep a log of every event they fold.
+#[cfg(feature = "test-support")]
+static KEEP_FOLD_LOGS: AtomicBool = AtomicBool::new(false);
+
+/// Makes every conversation started after this call keep a log of every event it folds, for a test
+/// that compares what was folded with another record of the same session. Off by default: the log
+/// grows with every event.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn keep_fold_logs() {
+    KEEP_FOLD_LOGS.store(true, Ordering::SeqCst);
+}
+
+#[cfg(feature = "test-support")]
+fn new_fold_log() -> Option<Vec<(u64, AgentDomainEvent)>> {
+    KEEP_FOLD_LOGS.load(Ordering::SeqCst).then(Vec::new)
+}
+
+/// Where a conversation's stored history stands against what it has folded, read under the state lock.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryProgress {
+    /// A turn boundary has been folded and its write has not started yet.
+    pub history_dirty: bool,
+    /// The provider position of the last batch folded.
+    pub folded_through: u64,
+    /// The position through which the stored history is on disk.
+    pub history_saved_through: u64,
+    /// The last history write failed and none has succeeded since.
+    pub history_save_failed: bool,
+}
+
+#[cfg(feature = "test-support")]
+fn progress_of(state: &IngestState) -> HistoryProgress {
+    HistoryProgress {
+        history_dirty: state.history_dirty,
+        folded_through: state.folded_through,
+        history_saved_through: state.history_saved_through,
+        history_save_failed: state.history_save_failed,
+    }
+}
+
+/// Notes the provider position of a batch folded (or of one that held no event). With nothing owed to
+/// the history, the stored history is current through it too.
+fn note_folded_through(state: &mut IngestState, through: u64) {
+    state.folded_through = through;
+    note_nothing_owed(state);
+}
+
+/// Called on the ingestion thread after a fold: its own write, if one ran, has finished by then, so a
+/// clean flag with no failed write outstanding means the stored history holds everything owed through
+/// `folded_through`.
+fn note_nothing_owed(state: &mut IngestState) {
+    if !state.history_dirty && !state.history_save_failed {
+        state.history_saved_through = state.history_saved_through.max(state.folded_through);
+    }
 }
 
 /// A running turn as another window needs it to rebuild this projection: the settled export and the
@@ -326,6 +402,10 @@ impl IngestState {
             });
         }
         self.projection.apply(&event);
+        #[cfg(feature = "test-support")]
+        if let Some(log) = &mut self.fold_log {
+            log.push((self.projection.last_revision, event.clone()));
+        }
         self.stats.events_ingested += 1;
         note_lifecycle(&mut self.lifecycle_since_open, &event);
         if let Some(turn) = &mut self.running_turn {
@@ -395,6 +475,12 @@ impl IngestState {
             lifecycle_since_open,
             running_turn,
             folded_through,
+            // The destination's thread starts its own account of what it has written; a failed write
+            // moves as history owed (below).
+            history_saved_through: _,
+            history_save_failed,
+            #[cfg(feature = "test-support")]
+                fold_log: _,
         } = self;
         // Emptied by the source's last pump; the destination's first delivery is a snapshot.
         if !pending_ui.is_empty() || *resync_pending {
@@ -422,7 +508,11 @@ impl IngestState {
             pending_title: pending_title.clone(),
             pending_name: pending_name.clone(),
             record_written: *record_written,
-            history_dirty: *history_dirty,
+            // A write that failed left the stored history without its turn: the destination owes it again,
+            // but only between turns. In the middle of a turn the destination's projection holds the turn's
+            // reply still open, so writing at once would store it half-written; that turn's own end marks
+            // the history dirty, and its write carries the turn that failed too.
+            history_dirty: *history_dirty || (*history_save_failed && running_turn.is_none()),
         };
         Ok((core, handoff))
     }
@@ -479,6 +569,13 @@ impl IngestState {
             lifecycle_since_open,
             running_turn,
             folded_through,
+            // What the source wrote is on disk; with nothing owed, through the position it moved at. A
+            // failed write carried in the middle of a turn is owed at that turn's end and reads as saved
+            // until then: only the test-support accessor reads this, and only once the tab is idle.
+            history_saved_through: if history_dirty { 0 } else { folded_through },
+            history_save_failed: false,
+            #[cfg(feature = "test-support")]
+            fold_log: new_fold_log(),
         };
         (state, provider_session_id)
     }
@@ -660,6 +757,10 @@ impl ConversationIngest {
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,
+            history_saved_through: 0,
+            history_save_failed: false,
+            #[cfg(feature = "test-support")]
+            fold_log: new_fold_log(),
         };
         let context = AdoptionContext {
             provider_name,
@@ -837,6 +938,26 @@ impl ConversationIngest {
         self.lock_state("stats").stats
     }
 
+    /// Where the stored history stands against what has been folded: whether a turn boundary waits for
+    /// its write, the position folded through, and the position the history is on disk through. The
+    /// stored history holds the last turn once the flag is clear and the two positions meet.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn history_progress(&self) -> HistoryProgress {
+        progress_of(&self.lock_state("history_progress"))
+    }
+
+    /// Every event folded so far with its fold revision, and the projection they produced, read under
+    /// one lock so the two agree. `None` when fold logs were not asked for before this conversation
+    /// started ([`keep_fold_logs`]).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fold_log(&self) -> Option<(Vec<(u64, AgentDomainEvent)>, AgentSessionProjection)> {
+        let state = self.lock_state("fold_log");
+        let log = state.fold_log.clone()?;
+        Some((log, state.projection.clone()))
+    }
+
     /// Keeps `title` for the ingestion thread to write (`AgentConversation::note_title`). Nothing
     /// here touches the disk: the caller is the GTK main loop, and a record write is two fsyncs.
     /// The ingestion thread writes it with the record if adoption has not happened yet, or into the
@@ -983,7 +1104,7 @@ fn ingest_loop(
         if events.is_empty() {
             // A provider event can become no domain event, and the position still moves past it.
             if let Some(through) = through {
-                state.lock().unwrap().folded_through = through;
+                note_folded_through(&mut state.lock().unwrap(), through);
             }
             drop(batch);
             idle(seen);
@@ -1025,6 +1146,7 @@ fn ingest_loop(
                 }
                 guard.fold(event);
             }
+            note_nothing_owed(&mut guard);
         }
         // After the lock is released: the UI takes the same lock when it is woken.
         wake_ui(&ui_wake);
@@ -1112,7 +1234,7 @@ fn flush_name(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, co
 /// The cost is the design's own accepted one: a `kill -9`, a power loss or a close can lose the last
 /// turn. A is the fallback; B normally covers it.
 fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>, context: &AdoptionContext) {
-    let (provider_session_id, user_prompts, transcript, tool_calls) = {
+    let (provider_session_id, user_prompts, transcript, tool_calls, snapshot_through) = {
         let mut guard = state.lock().unwrap();
         if !guard.history_dirty || !guard.record_written {
             return;
@@ -1124,7 +1246,7 @@ fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>,
         // mark the history dirty again rather than be swallowed by a later clear.
         guard.history_dirty = false;
         let (user_prompts, transcript, tool_calls) = history_snapshot(&guard.projection);
-        (id, user_prompts, transcript, tool_calls)
+        (id, user_prompts, transcript, tool_calls, guard.folded_through)
     };
     let history = crate::history::StoredHistory::from_collections(
         context.conversation_id.clone(),
@@ -1135,9 +1257,17 @@ fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>,
     );
     #[cfg(test)]
     tests::note_history_writer_thread(&context.conversation_id);
+    #[cfg(test)]
+    tests::hold_history_write(&context.conversation_id);
     if let Err(e) = crate::history::store::save(&history) {
         eprintln!("agent: could not store the history of session {provider_session_id}: {e}");
+        state.lock().unwrap().history_save_failed = true;
         return;
+    }
+    {
+        let mut guard = state.lock().unwrap();
+        guard.history_save_failed = false;
+        guard.history_saved_through = guard.history_saved_through.max(snapshot_through);
     }
     // The turn changed the conversation, so the record's "last used" moves with it: the session picker
     // and the launch offer lead with the session used last, not the one opened last.
@@ -1231,6 +1361,280 @@ pub(crate) mod tests {
     /// The thread that last wrote `conversation_id`'s stored history, if any did.
     pub(crate) fn history_writer_thread(conversation_id: &str) -> Option<String> {
         HISTORY_WRITER_THREAD.lock().unwrap().get(conversation_id).cloned()
+    }
+
+    /// A history write held open: the writer says it reached the write, then waits to be let go.
+    struct HeldWrite {
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    /// The next history write of each conversation listed here waits inside `flush_history`, after the
+    /// flag was cleared and before the file is written. Per conversation, as above.
+    static HELD_WRITES: Mutex<BTreeMap<String, HeldWrite>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn hold_history_write(conversation_id: &str) {
+        let held = HELD_WRITES.lock().unwrap().remove(conversation_id);
+        if let Some(held) = held {
+            let _ = held.reached.send(());
+            let _ = held.release.recv();
+        }
+    }
+
+    /// Holds the next history write of `conversation_id`: the first receiver hears when the writer is
+    /// inside the write, and a send on the returned sender lets it finish.
+    fn hold_next_history_write(conversation_id: &str) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        HELD_WRITES
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_string(), HeldWrite { reached, release });
+        (reached_rx, release_tx)
+    }
+
+    /// While a history write is in progress the flag is already clear, so only the saved position says
+    /// the file is not on disk yet: a test that waits for the history must wait for that position.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_write_in_progress_keeps_the_saved_position_behind_while_the_flag_is_already_clear() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut initial = state();
+        initial.record_written = true;
+        initial
+            .projection
+            .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        initial.folded_through = 7;
+        initial.history_dirty = true;
+        let state = Arc::new(Mutex::new(initial));
+        let session_id = Arc::new(Mutex::new(Some("sess-held".to_string())));
+        let (reached, release) = hold_next_history_write(&conversation_id);
+        let writer = {
+            let (state, session_id, conversation_id) =
+                (Arc::clone(&state), Arc::clone(&session_id), conversation_id.clone());
+            std::thread::spawn(move || flush_history(&state, &session_id, &adoption_context(&conversation_id)))
+        };
+        reached
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the writer reached the write");
+        assert_eq!(
+            progress_of(&state.lock().unwrap()),
+            HistoryProgress {
+                history_dirty: false,
+                folded_through: 7,
+                history_saved_through: 0,
+                history_save_failed: false,
+            },
+            "the flag is clear before the file is written; only the saved position is behind"
+        );
+        assert!(
+            !crate::history::store::history_path(&conversation_id, "sess-held")
+                .unwrap()
+                .exists(),
+            "the held write has not reached the disk"
+        );
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(progress_of(&state.lock().unwrap()).history_saved_through, 7);
+        assert!(crate::history::store::load(&conversation_id, "sess-held").is_ok());
+    }
+
+    /// A failed write clears the flag like any other, so only the saved position can say the stored history
+    /// lacks a turn: later folds that owe nothing must not move it, and the next write that succeeds does.
+    #[test]
+    fn a_failed_write_keeps_the_saved_position_behind_until_a_write_succeeds() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut initial = state();
+        initial.record_written = true;
+        initial
+            .projection
+            .apply(&AgentDomainEvent::UserPromptSubmitted { text: "hi".into() });
+        initial.folded_through = 7;
+        initial.history_dirty = true;
+        let state = Mutex::new(initial);
+        let session_id = Mutex::new(Some("sess-failed".to_string()));
+        let context = adoption_context(&conversation_id);
+        // A file where the conversation's history directory has to go makes the save fail.
+        let path = crate::history::store::history_path(&conversation_id, "sess-failed").unwrap();
+        let blocker = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        flush_history(&state, &session_id, &context);
+        {
+            let mut st = state.lock().unwrap();
+            assert!(!st.history_dirty, "the flag is cleared before the write, failed or not");
+            assert!(st.history_save_failed);
+            note_folded_through(&mut st, 9);
+            assert_eq!(
+                st.history_saved_through, 0,
+                "a fold that owes nothing does not cover a write that failed"
+            );
+            st.history_dirty = true;
+        }
+        std::fs::remove_file(&blocker).unwrap();
+        flush_history(&state, &session_id, &context);
+        let mut st = state.lock().unwrap();
+        assert!(!st.history_save_failed);
+        assert_eq!(st.history_saved_through, 9);
+        note_folded_through(&mut st, 11);
+        assert_eq!(
+            st.history_saved_through, 11,
+            "with the write done, folds that owe nothing move it again"
+        );
+    }
+
+    /// A conversation moved between turns after its last history write failed owes the destination that
+    /// write: the stored history lacks its turn, so the destination starts behind and writes the history again.
+    #[test]
+    fn a_move_between_turns_after_a_failed_write_owes_the_destination_the_write() {
+        let mut source = state();
+        source.folded_through = 9;
+        source.history_saved_through = 5;
+        source.history_save_failed = true;
+        assert!(source.running_turn.is_none(), "no turn is running");
+        let Ok((core, handoff)) = source.take_move_record(Some("sess-moved".into())) else {
+            panic!("a settled conversation moves");
+        };
+        let (mut moved, session) = IngestState::moved(MovedIngest {
+            projection: AgentSessionProjection::default(),
+            core,
+            state: handoff,
+            lease: None,
+        });
+        assert_eq!(session.as_deref(), Some("sess-moved"));
+        assert!(moved.history_dirty, "the failed write is owed again in the destination");
+        assert_eq!(moved.history_saved_through, 0);
+        note_folded_through(&mut moved, 11);
+        assert_eq!(
+            moved.history_saved_through, 0,
+            "a fold that owes nothing does not cover the write that failed before the move"
+        );
+    }
+
+    /// A move in the middle of a turn after a failed write does not hand the write over as owed: the
+    /// destination's projection holds the turn's reply still open, and writing it then would store the reply
+    /// half-written. The turn's own end in the destination marks the history dirty, and that write holds both
+    /// the turn whose write failed and the whole reply of the one that moved.
+    #[test]
+    fn a_move_in_a_turn_after_a_failed_write_owes_the_write_only_at_the_turn_end() {
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation_id = uuid::Uuid::new_v4().simple().to_string();
+        let completed = |turn: &str| AgentDomainEvent::TurnCompleted {
+            turn_id: turn.into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let mut source = state();
+        source.record_written = true;
+        source.fold(AgentDomainEvent::TurnStarted { turn_id: "t0".into() });
+        source.fold(AgentDomainEvent::ContentDelta {
+            turn_id: "t0".into(),
+            kind: ContentKind::Text,
+            text: "FIRST-REPLY".into(),
+        });
+        source.fold(completed("t0"));
+        assert!(source.history_dirty);
+        // The write of turn t0 failed: the writer cleared the flag and noted the failure.
+        source.history_dirty = false;
+        source.history_save_failed = true;
+        source.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        source.fold(text("HALF"));
+        assert!(
+            source.running_turn.is_some(),
+            "the move happens in the middle of turn t1"
+        );
+        // The source's last pump delivered everything folded.
+        let _ = source.take_delivery();
+
+        let Ok((core, handoff)) = source.take_move_record(Some("sess-mid-turn".into())) else {
+            panic!("a conversation in the middle of a turn moves");
+        };
+        assert!(!handoff.history_dirty, "nothing is owed while the reply is open");
+        let projection = AgentSessionProjection::adopt(&core).expect("the destination rebuilds the projection");
+        let (moved, _) = IngestState::moved(MovedIngest {
+            projection,
+            core,
+            state: handoff,
+            lease: None,
+        });
+        assert!(
+            !moved.history_dirty,
+            "the destination does not write with the reply open"
+        );
+
+        let state = Mutex::new(moved);
+        let session_id = Mutex::new(Some("sess-mid-turn".to_string()));
+        let context = adoption_context(&conversation_id);
+        flush_history(&state, &session_id, &context);
+        assert!(
+            crate::history::store::load(&conversation_id, "sess-mid-turn").is_err(),
+            "no history is written before the turn ends"
+        );
+        {
+            let mut st = state.lock().unwrap();
+            st.fold(text(" DONE"));
+            st.fold(completed("t1"));
+            assert!(st.history_dirty, "the turn's end owes the history");
+        }
+        flush_history(&state, &session_id, &context);
+        let stored = crate::history::store::load(&conversation_id, "sess-mid-turn").expect("the turn end wrote");
+        let texts: Vec<&str> = stored.transcript.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["FIRST-REPLY", "HALF DONE"],
+            "the turn whose write failed and the whole reply of the turn that moved"
+        );
+    }
+
+    /// A fold with nothing owed to the history moves the saved position with the folded one; a turn
+    /// boundary leaves it behind until its write.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn the_saved_position_follows_folds_that_owe_nothing_and_waits_after_a_boundary() {
+        let mut st = state();
+        note_folded_through(&mut st, 3);
+        assert_eq!(st.history_saved_through, 3);
+        st.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        note_folded_through(&mut st, 5);
+        assert_eq!(st.history_saved_through, 5);
+        st.fold(AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: crate::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        note_folded_through(&mut st, 9);
+        assert_eq!(
+            progress_of(&st),
+            HistoryProgress {
+                history_dirty: true,
+                folded_through: 9,
+                history_saved_through: 5,
+                history_save_failed: false,
+            }
+        );
+    }
+
+    /// The fold log, when asked for, holds every folded event with the revision its fold produced,
+    /// derived events included.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_fold_log_holds_each_event_with_its_revision() {
+        let mut st = state();
+        st.fold_log = Some(Vec::new());
+        st.fold(AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        st.fold(text("hello"));
+        let log = st.fold_log.clone().unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.last().unwrap().0, st.projection.last_revision);
+        assert!(log.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     fn adoption_context(conversation_id: &str) -> AdoptionContext {
@@ -1434,6 +1838,10 @@ pub(crate) mod tests {
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,
+            history_saved_through: 0,
+            history_save_failed: false,
+            #[cfg(feature = "test-support")]
+            fold_log: None,
         }
     }
 
