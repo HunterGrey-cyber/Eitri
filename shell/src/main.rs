@@ -175,7 +175,13 @@ fn helper_is_this_build(helper: &Path) -> bool {
 }
 
 fn main() -> glib::ExitCode {
-    // Collected once, before anything else, and consulted through `flag_given` -- never a raw
+    // setenv is not thread-safe, so fill in the display before any thread or GTK code runs.
+    if let Some(name) = eitri_core::display_env::wayland_display_fallback(|key| std::env::var_os(key), Path::exists) {
+        std::env::set_var("WAYLAND_DISPLAY", name);
+        eprintln!("eitri: WAYLAND_DISPLAY was unset; using wayland-0 (the default libwayland connects to)");
+    }
+
+    // Collected once and consulted through `flag_given` -- never a raw
     // `args_os().any(|a| a == "...")` -- by every early flag scan below (`--version`, `--legacy`,
     // `--clean`). `flag_given` stops at the first `--`, the same end-of-flags rule
     // `eitri_core::project_root::select_root_source` applies to the project-directory argument

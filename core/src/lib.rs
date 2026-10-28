@@ -19,6 +19,7 @@ pub mod companion;
 pub mod compositor;
 pub mod config_dir;
 pub mod config_switch;
+pub mod display_env;
 pub mod editor_context;
 pub mod editor_feeds;
 pub mod editor_lines;

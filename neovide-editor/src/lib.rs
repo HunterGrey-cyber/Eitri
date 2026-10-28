@@ -52,6 +52,7 @@ pub type LuaReply = Box<dyn FnOnce(Result<rmpv::Value, String>) + Send + 'static
 pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
 use std::cell::{Cell, RefCell};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -693,6 +694,17 @@ fn build_start_failure_message(raw_error: &str) -> String {
              Install it: {NVIM_INSTALL_URL}"
         ),
     }
+}
+
+/// A construction panic can come from the window system before nvim is started, so it carries
+/// the panic's detail without suggesting an nvim version problem.
+fn build_start_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    format!("the editor could not start: {detail}")
 }
 
 /// Pulls the detected version out of the fork's own too-old sentence ("... but {found} was detected.
@@ -1406,8 +1418,9 @@ impl NeovideEditorPane {
                         // Before the launch, so the one new `--embed` child after it is nvim.
                         let children_before = nvim_child::direct_children();
                         let t0 = Instant::now();
-                        match LiveHarness::with_options(options) {
-                            Ok(mut harness) => {
+                        // A construction panic must stop here: GTK's render trampoline cannot unwind.
+                        match catch_unwind(AssertUnwindSafe(|| LiveHarness::with_options(options))) {
+                            Ok(Ok(mut harness)) => {
                                 let elapsed = t0.elapsed();
                                 println!(
                                     "[live] LiveHarness::with_options returned after {elapsed:?} \
@@ -1475,7 +1488,7 @@ impl NeovideEditorPane {
                                     &tick_driver_for_render,
                                 )));
                             }
-                            Err(err) => {
+                            Ok(Err(err)) => {
                                 let elapsed = t0.elapsed();
                                 let raw = format!("{err:#}");
                                 println!("[live] LiveHarness::with_options failed after {elapsed:?}: {raw}");
@@ -1483,6 +1496,13 @@ impl NeovideEditorPane {
                                 // pane's own state, and what a host is handed, is the built message
                                 // -- what failed, the version floor, where to get a newer nvim.
                                 let message = build_start_failure_message(&raw);
+                                *live = LiveState::Failed(message.clone());
+                                start_failed_message = Some(message);
+                            }
+                            Err(payload) => {
+                                let elapsed = t0.elapsed();
+                                let message = build_start_panic_message(payload.as_ref());
+                                println!("[live] LiveHarness::with_options failed after {elapsed:?}: {message}");
                                 *live = LiveState::Failed(message.clone());
                                 start_failed_message = Some(message);
                             }
@@ -2367,11 +2387,11 @@ impl NeovideEditorPane {
     }
 
     /// Registers `callback`, called at most once, with the human-readable reason
-    /// ([`build_start_failure_message`]) if `LiveHarness::with_options` ever returns `Err` -- nvim
-    /// missing from `PATH`, or older than this fork's floor. Before this there was no way for a host
-    /// to learn *why* the pane went [`LiveState::Failed`] at all; only a `[live] ... failed` line on
-    /// stdout, which a launch from a menu never shows. Fired from the render callback, after `live`
-    /// is dropped -- the same reentrancy rule [`NeovideEditorPane::on_exited_unrequested`]'s own
+    /// ([`build_start_failure_message`] or [`build_start_panic_message`]) if `LiveHarness::with_options`
+    /// returns `Err` or panics. Errors include nvim missing from `PATH` or older than this fork's
+    /// floor; panics can also come from the window system before nvim starts. Fired from the render
+    /// callback, after `live` is dropped -- the same reentrancy rule
+    /// [`NeovideEditorPane::on_exited_unrequested`]'s own
     /// callback follows, so a host's handler (`shell` drawing a label over this pane and moving focus
     /// elsewhere) is free to call back into this pane's own methods. Replaces any earlier callback.
     pub fn on_start_failed(&self, callback: impl Fn(&str) + 'static) {
@@ -2484,10 +2504,10 @@ impl NeovideEditorPane {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_start_failure_message, cell_size_changed, exit_events, failed_tick_should_render, nvim_args,
-        os_scale_to_apply, restart_refusal, run_detached, sessionless_tick_should_render, spawn_named,
-        tick_should_render, ExitEvents, LiveState, RemapKick, RestartRefused, ScaleWatch, NVIM_INSTALL_URL,
-        NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        build_start_failure_message, build_start_panic_message, cell_size_changed, exit_events,
+        failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal, run_detached,
+        sessionless_tick_should_render, spawn_named, tick_should_render, ExitEvents, LiveState, RemapKick,
+        RestartRefused, ScaleWatch, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -2715,6 +2735,24 @@ mod tests {
         assert!(message.contains(NVIM_VERSION_FLOOR), "message: {message}");
         assert!(message.contains(NVIM_INSTALL_URL), "message: {message}");
         assert!(message.contains(raw), "message: {message}");
+    }
+
+    #[test]
+    fn a_start_panic_keeps_its_detail_without_nvim_version_advice() {
+        let cases: [(Box<dyn std::any::Any + Send>, &str); 3] = [
+            (
+                Box::new("event loop unavailable"),
+                "the editor could not start: event loop unavailable",
+            ),
+            (
+                Box::new(String::from("no display")),
+                "the editor could not start: no display",
+            ),
+            (Box::new(42_u32), "the editor could not start: unknown panic"),
+        ];
+        for (payload, expected) in cases {
+            assert_eq!(build_start_panic_message(payload.as_ref()), expected);
+        }
     }
 
     // --- failed_tick_should_render renders the failure once and stops. The pure decision for
