@@ -4409,6 +4409,88 @@ mod tests {
         }
     }
 
+    /// `agent-ui/web/src/fixtures/claude-scripted-<scenario>.json`: the events of a scripted Claude scenario, as
+    /// the harness records them with every string the CLI wrote reduced to a digest (`domain_events`), the
+    /// events payload this side sends for them and the snapshot it sends after folding them. The panel's
+    /// reducer must fold the payload to what the snapshot carries (`claudeScripted.test.ts`). The harness
+    /// writes `domain_events` and `scenario`; this test adds the rest. Compared on every run;
+    /// `EITRI_WRITE_FIXTURES=1` rewrites each file.
+    #[test]
+    fn the_claude_scripted_twins_are_what_the_serializer_sends() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web/src/fixtures");
+        let mut twins: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("the fixtures directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("claude-scripted-") && name.ends_with(".json"))
+            })
+            .collect();
+        twins.sort();
+        assert!(!twins.is_empty(), "no claude-scripted twin under {}", dir.display());
+        let write = std::env::var_os("EITRI_WRITE_FIXTURES").is_some_and(|v| v == "1");
+        let mut stale = Vec::new();
+        for path in twins {
+            let committed = std::fs::read_to_string(&path).expect("a twin");
+            let twin: Value = serde_json::from_str(&committed).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let source = twin["domain_events"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: no domain_events", path.display()));
+            let events: Vec<AgentDomainEvent> = source
+                .iter()
+                .enumerate()
+                .map(|(n, event)| {
+                    serde_json::from_value(event.clone())
+                        .unwrap_or_else(|e| panic!("{}: domain event {n} does not parse: {e}", path.display()))
+                })
+                .collect();
+            let mut projection = AgentSessionProjection::default();
+            for event in &events {
+                projection.apply(event);
+            }
+            let snapshot = {
+                let view = SnapshotView {
+                    backend: "sidecar",
+                    conversation_id: None,
+                    session_id: Some("sess-1"),
+                    provider_session_id: Some("prov-1".into()),
+                    capabilities: agent::ProviderCapabilities::default(),
+                    provider: None,
+                    projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+                    hidden_pending: None,
+                };
+                serde_json::from_str::<Value>(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap()
+            };
+            let payload =
+                serde_json::from_str::<Value>(&serialize_events_for_js(TabId(1), 0, projection.last_revision, &events))
+                    .unwrap();
+            let fixture = json!({
+                "writtenBy": "core/src/agent_bridge.rs, tests::the_claude_scripted_twins_are_what_the_serializer_sends \
+                              -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it",
+                "scenario": twin["scenario"],
+                "domain_events": twin["domain_events"],
+                "events": payload,
+                "snapshot": snapshot,
+            });
+            let written = format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap());
+            if written == committed {
+                continue;
+            }
+            if write {
+                std::fs::write(&path, &written).expect("write a twin");
+            } else {
+                stale.push(path.display().to_string());
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "these twins are not what this test produces; if the change is intended, regenerate them with \
+             EITRI_WRITE_FIXTURES=1: {stale:?}"
+        );
+    }
+
     /// `agent-ui/web/src/fixtures/codex-cards.json`: what a Codex tab's permission cards, tool rows and
     /// limit-stopped turn look like on the wire -- the events payload this side sends and the snapshot it
     /// sends after folding the same events -- built from the provider's own card and tool-call

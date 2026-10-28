@@ -533,6 +533,25 @@ impl ClaudeSidecarProvider {
         lock(&self.sidecar).stderr_tail()
     }
 
+    /// The unix socket the sidecar serves on, for a test that opens a watch of its own beside the provider's.
+    /// Owned rather than borrowed: a move can hand the sidecar on, so the path lives behind the lock.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn sidecar_socket_path(&self) -> std::path::PathBuf {
+        lock(&self.sidecar).socket_path.clone()
+    }
+
+    /// What this provider's watch was told about its sessions, which decides how their wire events translate:
+    /// recorded beside a session's wire events so [`replay_frames`] can translate them the same way.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn replay_settings(&self) -> ReplaySettings {
+        ReplaySettings {
+            splits_messages: self.splits_messages,
+            requested_cli_mode: requested_cli_mode(&self.capabilities),
+        }
+    }
+
     /// The OS pid of the sidecar process this provider spawned and owns.
     ///
     /// Exists so an orphan check can assert on the ONE process this provider is responsible for.
@@ -1717,6 +1736,113 @@ fn record_delivery_lag(counters: &BackpressureCounters, occurred_at_millis: i64)
     }
     counters.last_delivery_lag_ms.store(lag, Ordering::Relaxed);
     counters.max_delivery_lag_ms.fetch_max(lag, Ordering::Relaxed);
+}
+
+/// What decides how a session's wire events translate, as the provider that watched it held it.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplaySettings {
+    /// The sidecar advertised `text_delta_message_id`, so a change of message id opens a new assistant message.
+    pub splits_messages: bool,
+    /// The permission mode the session asked the CLI to run in.
+    pub requested_cli_mode: crate::RequestedCliMode,
+}
+
+/// A steered message the host handed the provider, at the point of the recorded wire it was handed over.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaySteer {
+    /// How many wire events were recorded when the host made the call.
+    pub after_events: usize,
+    pub client_message_id: String,
+    /// What the user typed: the text the delivery event is given.
+    pub as_typed: String,
+    pub outcome: ReplaySteerOutcome,
+}
+
+/// How the sidecar answered a steered message.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplaySteerOutcome {
+    Accepted,
+    Refused(String),
+    /// No answer reached the provider: the CLI may have the message.
+    Unknown,
+}
+
+/// Feeds recorded wire events through the translation the live watch applies (sequence check, message
+/// splitting, `translate::translate`, the steer gate with its typed-text fill-in) and returns the domain
+/// events the host's `pump` would have handed over. The gate's wait for a follow-up turn runs on the events'
+/// own clock (`occurred_at`) and ends at the last event.
+#[cfg(feature = "test-support")]
+pub fn replay_frames(
+    frames: &[claude_runtime_protocol::v1::SessionEvent],
+    steers: &[ReplaySteer],
+    settings: ReplaySettings,
+) -> Result<Vec<AgentDomainEvent>, String> {
+    let wait_ms = i64::try_from(steer::FOLLOW_UP_WAIT.as_millis()).unwrap_or(i64::MAX);
+    let mut gate: steer::SteerGate<()> = steer::SteerGate::default();
+    let mut tracker = watch::SequenceTracker::new();
+    let mut split = translate::MessageSplit::new(settings.splits_messages);
+    let mut out: Vec<AgentDomainEvent> = Vec::new();
+    // The generation of the hold in force and the time its turn end arrived.
+    let mut hold: Option<(u64, i64)> = None;
+    let mut pending: Vec<&ReplaySteer> = steers.iter().collect();
+    pending.sort_by_key(|s| s.after_events);
+    let mut pending = pending.into_iter().peekable();
+
+    let hand_in = |gate: &mut steer::SteerGate<()>, out: &mut Vec<AgentDomainEvent>, steer: &ReplaySteer| {
+        gate.open(&steer.client_message_id, steer.as_typed.clone(), ())
+            .map_err(|e| format!("steered message {}: {e}", steer.client_message_id))?;
+        match &steer.outcome {
+            ReplaySteerOutcome::Accepted => {
+                gate.accepted(&steer.client_message_id);
+            }
+            ReplaySteerOutcome::Refused(reason) => out.extend(gate.refused(&steer.client_message_id, reason)),
+            ReplaySteerOutcome::Unknown => out.extend(gate.unknown(&steer.client_message_id)),
+        }
+        Ok::<(), String>(())
+    };
+
+    for (at, event) in frames.iter().enumerate() {
+        while let Some(steer) = pending.next_if(|s| s.after_events <= at) {
+            hand_in(&mut gate, &mut out, steer)?;
+        }
+        if let Some((generation, since)) = hold {
+            if event.occurred_at.saturating_sub(since) >= wait_ms {
+                out.extend(gate.expire(generation));
+                hold = None;
+            }
+        }
+        match tracker.observe(event.sequence) {
+            watch::SequenceVerdict::Deliver => {}
+            watch::SequenceVerdict::Duplicate => continue,
+            watch::SequenceVerdict::Lost { first, last } => return Err(watch::events_lost_reason(first, last)),
+            watch::SequenceVerdict::Invalid => return Err("an event with the reserved sequence 0".into()),
+        }
+        let mut translated = Vec::new();
+        if let Some(boundary) = split.before(event) {
+            translated.push(boundary);
+        }
+        translated.extend(translate::translate(event.clone(), settings.requested_cli_mode));
+        for domain_event in translated {
+            let passed = gate.pass(domain_event);
+            out.extend(passed.ready);
+            if let Some(generation) = passed.hold_started {
+                hold = Some((generation, event.occurred_at));
+            }
+        }
+        if !gate.holding() {
+            hold = None;
+        }
+    }
+    for steer in pending {
+        hand_in(&mut gate, &mut out, steer)?;
+    }
+    if let Some((generation, _)) = hold {
+        out.extend(gate.expire(generation));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

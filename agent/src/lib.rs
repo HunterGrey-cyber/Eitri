@@ -71,6 +71,8 @@ pub mod settings;
 #[doc(hidden)]
 pub mod socket_path;
 pub mod state_dirs;
+#[cfg(feature = "test-support")]
+pub mod testkit;
 pub mod transcript;
 
 pub use account::{AccountError, ClaudeAccount};

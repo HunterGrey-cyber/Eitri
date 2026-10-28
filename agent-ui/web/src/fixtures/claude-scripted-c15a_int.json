@@ -1,0 +1,1040 @@
+{
+  "domain_events": [
+    {
+      "commands": [
+        {
+          "description": "<cli-text chars=135 sha256=525158602182d83e>",
+          "name": "deep-research"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=371d10dc21696cfd>",
+          "name": "dataviz"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f6b5b0c497e4d657>",
+          "name": "update-config"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=a7c6bdac902852fc>",
+          "name": "verify"
+        },
+        {
+          "description": "<cli-text chars=62 sha256=2243f16254904994>",
+          "hint": "<cli-text chars=19 sha256=fa1f6e2f041980ff>",
+          "name": "debug"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=99c89e45df45e923>",
+          "hint": "<cli-text chars=60 sha256=cbdaa0442b80f3f2>",
+          "name": "code-review"
+        },
+        {
+          "description": "<cli-text chars=176 sha256=ee4d71082e384255>",
+          "hint": "<cli-text chars=10 sha256=8ab092fa58610586>",
+          "name": "simplify"
+        },
+        {
+          "description": "<cli-text chars=125 sha256=d591c2226ed70977>",
+          "hint": "<cli-text chars=13 sha256=35672d83f8ed9da4>",
+          "name": "batch"
+        },
+        {
+          "description": "<cli-text chars=163 sha256=4493a51b007504d3>",
+          "name": "fewer-permission-prompts"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=aa926f828a7bbeb9>",
+          "hint": "<cli-text chars=23 sha256=89039fb9eef3d2e0>",
+          "name": "doctor"
+        },
+        {
+          "description": "<cli-text chars=121 sha256=bdb824e52f143e90>",
+          "hint": "<cli-text chars=19 sha256=84d2a35338b66a8f>",
+          "name": "loop"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f23242251a737310>",
+          "name": "claude-api"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=fe799bdf270a9553>",
+          "name": "workflow-authoring"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=eeb93bd0fe7e22e6>",
+          "name": "run"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=ef29ea510a5b133d>",
+          "name": "run-skill-generator"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=22876b04e1118716>",
+          "name": "plugin-authoring"
+        },
+        {
+          "description": "<cli-text chars=72 sha256=50803a5285096ddf>",
+          "name": "agents"
+        },
+        {
+          "description": "<cli-text chars=65 sha256=2262db6e4aedc630>",
+          "hint": "<cli-text chars=60 sha256=994434bc33a3f50d>",
+          "name": "auto-mode-setup"
+        },
+        {
+          "description": "<cli-text chars=38 sha256=6f9449d5e6d66826>",
+          "hint": "<cli-text chars=15 sha256=59dca5b2c7007a98>",
+          "name": "autocompact"
+        },
+        {
+          "description": "<cli-text chars=95 sha256=91436713930c2f8b>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "clear"
+        },
+        {
+          "description": "<cli-text chars=41 sha256=70d461afed1db282>",
+          "hint": "<cli-text chars=55 sha256=cbe07215f262ce80>",
+          "name": "color"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=98917d774a83dd77>",
+          "hint": "<cli-text chars=44 sha256=636a24ef03b08ed9>",
+          "name": "compact"
+        },
+        {
+          "description": "<cli-text chars=20 sha256=f4e2182c236c3cef>",
+          "hint": "<cli-text chars=9 sha256=563f0357118d05ef>",
+          "name": "config"
+        },
+        {
+          "description": "<cli-text chars=35 sha256=ec2d2d2f5067a922>",
+          "hint": "<cli-text chars=7 sha256=73803bd455b94b23>",
+          "name": "output-style"
+        },
+        {
+          "description": "<cli-text chars=26 sha256=3bc131b9ee2efbfc>",
+          "name": "context"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=a727becb529cd062>",
+          "hint": "<cli-text chars=51 sha256=f88f44fb7c447dd1>",
+          "name": "effort"
+        },
+        {
+          "description": "<cli-text chars=27 sha256=5a48dc2204e31cf1>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "fast"
+        },
+        {
+          "description": "<cli-text chars=58 sha256=e64d5754a7c891d3>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "focus"
+        },
+        {
+          "description": "<cli-text chars=84 sha256=29af1db29618c76a>",
+          "name": "heapdump"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=8bbd147819053c34>",
+          "name": "init"
+        },
+        {
+          "description": "<cli-text chars=18 sha256=196720ccc0b3e120>",
+          "hint": "<cli-text chars=41 sha256=c9253e8f9d89683c>",
+          "name": "mcp"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=066c5a4e6fb25cce>",
+          "hint": "<cli-text chars=7 sha256=c89b39d95f30edb2>",
+          "name": "model"
+        },
+        {
+          "description": "<cli-text chars=93 sha256=7ca9ad3b89f1412d>",
+          "name": "__remote-workflow"
+        },
+        {
+          "description": "<cli-text chars=80 sha256=f37b73d88eca6101>",
+          "name": "workflow-launch-exec"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=db84d17682e48294>",
+          "hint": "<cli-text chars=9 sha256=3107c4a4a6e6a57d>",
+          "name": "reload-plugins"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=d1c09c3572af5b5f>",
+          "name": "reload-skills"
+        },
+        {
+          "description": "<cli-text chars=31 sha256=75b92bf45cad1542>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "rename"
+        },
+        {
+          "description": "<cli-text chars=71 sha256=99012032bc93d8e3>",
+          "name": "security-review"
+        },
+        {
+          "description": "<cli-text chars=69 sha256=96112a14a8cdaf62>",
+          "name": "usage"
+        },
+        {
+          "description": "<cli-text chars=53 sha256=77df6c9b6b262acb>",
+          "name": "insights"
+        },
+        {
+          "description": "<cli-text chars=37 sha256=85eedf3fb1fc60ae>",
+          "name": "recap"
+        },
+        {
+          "description": "<cli-text chars=52 sha256=90f45833eef0a4c1>",
+          "name": "goal"
+        },
+        {
+          "description": "<cli-text chars=68 sha256=b86e28928cd88651>",
+          "name": "list-agents"
+        },
+        {
+          "description": "<cli-text chars=63 sha256=1cf42d17139a3989>",
+          "name": "team-onboarding"
+        }
+      ],
+      "type": "commands_available"
+    },
+    {
+      "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+      "type": "turn_started"
+    },
+    {
+      "cwd": "$RUN/project",
+      "model": "claude-opus-5-5",
+      "provider_session_id": "f530967b-689f-40f7-a9c0-cd246aa4d29a",
+      "session_id": "3bf9a322-9ebc-4ee4-bbbd-1fc4cde9f201",
+      "type": "session_opened"
+    },
+    {
+      "reported": "auto",
+      "type": "cli_permission_mode"
+    },
+    {
+      "input": {
+        "delaySeconds": 60,
+        "noop": false,
+        "prompt": "C15AI-FIRE",
+        "reason": "C15AI-REASON"
+      },
+      "permission_id": "6eaf366b-ebad-4ae3-968a-de3977f710fc",
+      "tool_name": "ScheduleWakeup",
+      "tool_use_id": "toolu_wake1",
+      "type": "permission_requested"
+    },
+    {
+      "outcome": "allowed",
+      "permission_id": "6eaf366b-ebad-4ae3-968a-de3977f710fc",
+      "type": "permission_resolved"
+    },
+    {
+      "input": {
+        "delaySeconds": 60,
+        "noop": false,
+        "prompt": "C15AI-FIRE",
+        "reason": "C15AI-REASON"
+      },
+      "name": "ScheduleWakeup",
+      "tool_use_id": "toolu_wake1",
+      "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+      "type": "tool_call_started"
+    },
+    {
+      "content": "<cli-text chars=233 sha256=7e2d415183fd972c>",
+      "is_error": false,
+      "tool_use_id": "toolu_wake1",
+      "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+      "type": "tool_call_completed"
+    },
+    {
+      "kind": "text",
+      "text": "SCHEDULED",
+      "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+      "type": "content_delta"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "reason": "completed"
+      },
+      "outcome": "completed",
+      "result_text": "SCHEDULED",
+      "stop_reason": "end_turn",
+      "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+      "type": "turn_completed",
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 2000,
+          "output": 20
+        },
+        "total_cost_usd": 0.0084
+      }
+    },
+    {
+      "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+      "type": "turn_started"
+    },
+    {
+      "cwd": "$RUN/project",
+      "model": "claude-opus-5-5",
+      "provider_session_id": "f530967b-689f-40f7-a9c0-cd246aa4d29a",
+      "session_id": "3bf9a322-9ebc-4ee4-bbbd-1fc4cde9f201",
+      "type": "session_opened"
+    },
+    {
+      "reported": "auto",
+      "type": "cli_permission_mode"
+    },
+    {
+      "kind": "text",
+      "text": "C15A-BUSY-PARTIAL some ",
+      "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+      "type": "content_delta"
+    },
+    {
+      "kind": "text",
+      "text": "words before ",
+      "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+      "type": "content_delta"
+    },
+    {
+      "kind": "text",
+      "text": "the interrupt",
+      "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+      "type": "content_delta"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "reason": "<cli-text chars=17 sha256=b87712cf78a6767c>"
+      },
+      "outcome": "interrupted",
+      "result_text": "",
+      "stop_reason": null,
+      "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+      "type": "turn_completed",
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 2000,
+          "output": 20
+        },
+        "total_cost_usd": 0.0084
+      }
+    },
+    {
+      "cwd": "$RUN/project",
+      "model": "claude-opus-5-5",
+      "provider_session_id": "f530967b-689f-40f7-a9c0-cd246aa4d29a",
+      "session_id": "3bf9a322-9ebc-4ee4-bbbd-1fc4cde9f201",
+      "type": "session_opened"
+    },
+    {
+      "reported": "auto",
+      "type": "cli_permission_mode"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "reason": "completed"
+      },
+      "outcome": "completed",
+      "result_text": "FIRED-AFTER-INTERRUPT",
+      "stop_reason": "end_turn",
+      "turn_id": "unknown-turn",
+      "type": "turn_completed",
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 3000,
+          "output": 30
+        },
+        "total_cost_usd": 0.0126
+      }
+    }
+  ],
+  "events": {
+    "events": [
+      {
+        "commands": [
+          {
+            "description": "<cli-text chars=135 sha256=525158602182d83e>",
+            "name": "deep-research"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=371d10dc21696cfd>",
+            "name": "dataviz"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=f6b5b0c497e4d657>",
+            "name": "update-config"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=a7c6bdac902852fc>",
+            "name": "verify"
+          },
+          {
+            "description": "<cli-text chars=62 sha256=2243f16254904994>",
+            "hint": "<cli-text chars=19 sha256=fa1f6e2f041980ff>",
+            "name": "debug"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=99c89e45df45e923>",
+            "hint": "<cli-text chars=60 sha256=cbdaa0442b80f3f2>",
+            "name": "code-review"
+          },
+          {
+            "description": "<cli-text chars=176 sha256=ee4d71082e384255>",
+            "hint": "<cli-text chars=10 sha256=8ab092fa58610586>",
+            "name": "simplify"
+          },
+          {
+            "description": "<cli-text chars=125 sha256=d591c2226ed70977>",
+            "hint": "<cli-text chars=13 sha256=35672d83f8ed9da4>",
+            "name": "batch"
+          },
+          {
+            "description": "<cli-text chars=163 sha256=4493a51b007504d3>",
+            "name": "fewer-permission-prompts"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=aa926f828a7bbeb9>",
+            "hint": "<cli-text chars=23 sha256=89039fb9eef3d2e0>",
+            "name": "doctor"
+          },
+          {
+            "description": "<cli-text chars=121 sha256=bdb824e52f143e90>",
+            "hint": "<cli-text chars=19 sha256=84d2a35338b66a8f>",
+            "name": "loop"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=f23242251a737310>",
+            "name": "claude-api"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=fe799bdf270a9553>",
+            "name": "workflow-authoring"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=eeb93bd0fe7e22e6>",
+            "name": "run"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=ef29ea510a5b133d>",
+            "name": "run-skill-generator"
+          },
+          {
+            "description": "<cli-text chars=200 sha256=22876b04e1118716>",
+            "name": "plugin-authoring"
+          },
+          {
+            "description": "<cli-text chars=72 sha256=50803a5285096ddf>",
+            "name": "agents"
+          },
+          {
+            "description": "<cli-text chars=65 sha256=2262db6e4aedc630>",
+            "hint": "<cli-text chars=60 sha256=994434bc33a3f50d>",
+            "name": "auto-mode-setup"
+          },
+          {
+            "description": "<cli-text chars=38 sha256=6f9449d5e6d66826>",
+            "hint": "<cli-text chars=15 sha256=59dca5b2c7007a98>",
+            "name": "autocompact"
+          },
+          {
+            "description": "<cli-text chars=95 sha256=91436713930c2f8b>",
+            "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+            "name": "clear"
+          },
+          {
+            "description": "<cli-text chars=41 sha256=70d461afed1db282>",
+            "hint": "<cli-text chars=55 sha256=cbe07215f262ce80>",
+            "name": "color"
+          },
+          {
+            "description": "<cli-text chars=54 sha256=98917d774a83dd77>",
+            "hint": "<cli-text chars=44 sha256=636a24ef03b08ed9>",
+            "name": "compact"
+          },
+          {
+            "description": "<cli-text chars=20 sha256=f4e2182c236c3cef>",
+            "hint": "<cli-text chars=9 sha256=563f0357118d05ef>",
+            "name": "config"
+          },
+          {
+            "description": "<cli-text chars=35 sha256=ec2d2d2f5067a922>",
+            "hint": "<cli-text chars=7 sha256=73803bd455b94b23>",
+            "name": "output-style"
+          },
+          {
+            "description": "<cli-text chars=26 sha256=3bc131b9ee2efbfc>",
+            "name": "context"
+          },
+          {
+            "description": "<cli-text chars=32 sha256=a727becb529cd062>",
+            "hint": "<cli-text chars=51 sha256=f88f44fb7c447dd1>",
+            "name": "effort"
+          },
+          {
+            "description": "<cli-text chars=27 sha256=5a48dc2204e31cf1>",
+            "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+            "name": "fast"
+          },
+          {
+            "description": "<cli-text chars=58 sha256=e64d5754a7c891d3>",
+            "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+            "name": "focus"
+          },
+          {
+            "description": "<cli-text chars=84 sha256=29af1db29618c76a>",
+            "name": "heapdump"
+          },
+          {
+            "description": "<cli-text chars=59 sha256=8bbd147819053c34>",
+            "name": "init"
+          },
+          {
+            "description": "<cli-text chars=18 sha256=196720ccc0b3e120>",
+            "hint": "<cli-text chars=41 sha256=c9253e8f9d89683c>",
+            "name": "mcp"
+          },
+          {
+            "description": "<cli-text chars=32 sha256=066c5a4e6fb25cce>",
+            "hint": "<cli-text chars=7 sha256=c89b39d95f30edb2>",
+            "name": "model"
+          },
+          {
+            "description": "<cli-text chars=93 sha256=7ca9ad3b89f1412d>",
+            "name": "__remote-workflow"
+          },
+          {
+            "description": "<cli-text chars=80 sha256=f37b73d88eca6101>",
+            "name": "workflow-launch-exec"
+          },
+          {
+            "description": "<cli-text chars=54 sha256=db84d17682e48294>",
+            "hint": "<cli-text chars=9 sha256=3107c4a4a6e6a57d>",
+            "name": "reload-plugins"
+          },
+          {
+            "description": "<cli-text chars=59 sha256=d1c09c3572af5b5f>",
+            "name": "reload-skills"
+          },
+          {
+            "description": "<cli-text chars=31 sha256=75b92bf45cad1542>",
+            "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+            "name": "rename"
+          },
+          {
+            "description": "<cli-text chars=71 sha256=99012032bc93d8e3>",
+            "name": "security-review"
+          },
+          {
+            "description": "<cli-text chars=69 sha256=96112a14a8cdaf62>",
+            "name": "usage"
+          },
+          {
+            "description": "<cli-text chars=53 sha256=77df6c9b6b262acb>",
+            "name": "insights"
+          },
+          {
+            "description": "<cli-text chars=37 sha256=85eedf3fb1fc60ae>",
+            "name": "recap"
+          },
+          {
+            "description": "<cli-text chars=52 sha256=90f45833eef0a4c1>",
+            "name": "goal"
+          },
+          {
+            "description": "<cli-text chars=68 sha256=b86e28928cd88651>",
+            "name": "list-agents"
+          },
+          {
+            "description": "<cli-text chars=63 sha256=1cf42d17139a3989>",
+            "name": "team-onboarding"
+          }
+        ],
+        "type": "commands_available"
+      },
+      {
+        "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+        "type": "turn_started"
+      },
+      {
+        "cwd": "$RUN/project",
+        "model": "claude-opus-5-5",
+        "provider_session_id": "f530967b-689f-40f7-a9c0-cd246aa4d29a",
+        "session_id": "3bf9a322-9ebc-4ee4-bbbd-1fc4cde9f201",
+        "type": "session_opened"
+      },
+      {
+        "reported": "auto",
+        "type": "cli_permission_mode"
+      },
+      {
+        "input": {
+          "delaySeconds": 60,
+          "noop": false,
+          "prompt": "C15AI-FIRE",
+          "reason": "C15AI-REASON"
+        },
+        "permission_id": "6eaf366b-ebad-4ae3-968a-de3977f710fc",
+        "tool_name": "ScheduleWakeup",
+        "tool_use_id": "toolu_wake1",
+        "type": "permission_requested"
+      },
+      {
+        "outcome": "allowed",
+        "permission_id": "6eaf366b-ebad-4ae3-968a-de3977f710fc",
+        "type": "permission_resolved"
+      },
+      {
+        "input": {
+          "delaySeconds": 60,
+          "noop": false,
+          "prompt": "C15AI-FIRE",
+          "reason": "C15AI-REASON"
+        },
+        "name": "ScheduleWakeup",
+        "tool_use_id": "toolu_wake1",
+        "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+        "type": "tool_call_started"
+      },
+      {
+        "content": "<cli-text chars=233 sha256=7e2d415183fd972c>",
+        "is_error": false,
+        "tool_use_id": "toolu_wake1",
+        "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+        "type": "tool_call_completed"
+      },
+      {
+        "kind": "text",
+        "text": "SCHEDULED",
+        "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": "completed"
+        },
+        "outcome": "completed",
+        "result_text": "SCHEDULED",
+        "stop_reason": "end_turn",
+        "turn_id": "b9a900c6-385b-4f67-8c70-7af76ce2bfee",
+        "type": "turn_completed",
+        "usage": {
+          "model": "claude-opus-5-5",
+          "num_turns": null,
+          "tokens": {
+            "cache_creation": 0,
+            "cache_read": 0,
+            "input": 2000,
+            "output": 20
+          },
+          "total_cost_usd": 0.0084
+        }
+      },
+      {
+        "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+        "type": "turn_started"
+      },
+      {
+        "cwd": "$RUN/project",
+        "model": "claude-opus-5-5",
+        "provider_session_id": "f530967b-689f-40f7-a9c0-cd246aa4d29a",
+        "session_id": "3bf9a322-9ebc-4ee4-bbbd-1fc4cde9f201",
+        "type": "session_opened"
+      },
+      {
+        "reported": "auto",
+        "type": "cli_permission_mode"
+      },
+      {
+        "kind": "text",
+        "text": "C15A-BUSY-PARTIAL some ",
+        "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+        "type": "content_delta"
+      },
+      {
+        "kind": "text",
+        "text": "words before ",
+        "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+        "type": "content_delta"
+      },
+      {
+        "kind": "text",
+        "text": "the interrupt",
+        "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": "<cli-text chars=17 sha256=b87712cf78a6767c>"
+        },
+        "outcome": "interrupted",
+        "result_text": "",
+        "stop_reason": null,
+        "turn_id": "cac2c625-ddfd-46ef-941c-fc23486aa509",
+        "type": "turn_completed",
+        "usage": {
+          "model": "claude-opus-5-5",
+          "num_turns": null,
+          "tokens": {
+            "cache_creation": 0,
+            "cache_read": 0,
+            "input": 2000,
+            "output": 20
+          },
+          "total_cost_usd": 0.0084
+        }
+      },
+      {
+        "cwd": "$RUN/project",
+        "model": "claude-opus-5-5",
+        "provider_session_id": "f530967b-689f-40f7-a9c0-cd246aa4d29a",
+        "session_id": "3bf9a322-9ebc-4ee4-bbbd-1fc4cde9f201",
+        "type": "session_opened"
+      },
+      {
+        "reported": "auto",
+        "type": "cli_permission_mode"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": "completed"
+        },
+        "outcome": "completed",
+        "result_text": "FIRED-AFTER-INTERRUPT",
+        "stop_reason": "end_turn",
+        "turn_id": "unknown-turn",
+        "type": "turn_completed",
+        "usage": {
+          "model": "claude-opus-5-5",
+          "num_turns": null,
+          "tokens": {
+            "cache_creation": 0,
+            "cache_read": 0,
+            "input": 3000,
+            "output": 30
+          },
+          "total_cost_usd": 0.0126
+        }
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 20
+  },
+  "scenario": "c15a_int",
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": null,
+      "assistantMessageOpen": false,
+      "availableCommands": [
+        {
+          "description": "<cli-text chars=135 sha256=525158602182d83e>",
+          "name": "deep-research"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=371d10dc21696cfd>",
+          "name": "dataviz"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f6b5b0c497e4d657>",
+          "name": "update-config"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=a7c6bdac902852fc>",
+          "name": "verify"
+        },
+        {
+          "description": "<cli-text chars=62 sha256=2243f16254904994>",
+          "hint": "<cli-text chars=19 sha256=fa1f6e2f041980ff>",
+          "name": "debug"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=99c89e45df45e923>",
+          "hint": "<cli-text chars=60 sha256=cbdaa0442b80f3f2>",
+          "name": "code-review"
+        },
+        {
+          "description": "<cli-text chars=176 sha256=ee4d71082e384255>",
+          "hint": "<cli-text chars=10 sha256=8ab092fa58610586>",
+          "name": "simplify"
+        },
+        {
+          "description": "<cli-text chars=125 sha256=d591c2226ed70977>",
+          "hint": "<cli-text chars=13 sha256=35672d83f8ed9da4>",
+          "name": "batch"
+        },
+        {
+          "description": "<cli-text chars=163 sha256=4493a51b007504d3>",
+          "name": "fewer-permission-prompts"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=aa926f828a7bbeb9>",
+          "hint": "<cli-text chars=23 sha256=89039fb9eef3d2e0>",
+          "name": "doctor"
+        },
+        {
+          "description": "<cli-text chars=121 sha256=bdb824e52f143e90>",
+          "hint": "<cli-text chars=19 sha256=84d2a35338b66a8f>",
+          "name": "loop"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=f23242251a737310>",
+          "name": "claude-api"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=fe799bdf270a9553>",
+          "name": "workflow-authoring"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=eeb93bd0fe7e22e6>",
+          "name": "run"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=ef29ea510a5b133d>",
+          "name": "run-skill-generator"
+        },
+        {
+          "description": "<cli-text chars=200 sha256=22876b04e1118716>",
+          "name": "plugin-authoring"
+        },
+        {
+          "description": "<cli-text chars=72 sha256=50803a5285096ddf>",
+          "name": "agents"
+        },
+        {
+          "description": "<cli-text chars=65 sha256=2262db6e4aedc630>",
+          "hint": "<cli-text chars=60 sha256=994434bc33a3f50d>",
+          "name": "auto-mode-setup"
+        },
+        {
+          "description": "<cli-text chars=38 sha256=6f9449d5e6d66826>",
+          "hint": "<cli-text chars=15 sha256=59dca5b2c7007a98>",
+          "name": "autocompact"
+        },
+        {
+          "description": "<cli-text chars=95 sha256=91436713930c2f8b>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "clear"
+        },
+        {
+          "description": "<cli-text chars=41 sha256=70d461afed1db282>",
+          "hint": "<cli-text chars=55 sha256=cbe07215f262ce80>",
+          "name": "color"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=98917d774a83dd77>",
+          "hint": "<cli-text chars=44 sha256=636a24ef03b08ed9>",
+          "name": "compact"
+        },
+        {
+          "description": "<cli-text chars=20 sha256=f4e2182c236c3cef>",
+          "hint": "<cli-text chars=9 sha256=563f0357118d05ef>",
+          "name": "config"
+        },
+        {
+          "description": "<cli-text chars=35 sha256=ec2d2d2f5067a922>",
+          "hint": "<cli-text chars=7 sha256=73803bd455b94b23>",
+          "name": "output-style"
+        },
+        {
+          "description": "<cli-text chars=26 sha256=3bc131b9ee2efbfc>",
+          "name": "context"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=a727becb529cd062>",
+          "hint": "<cli-text chars=51 sha256=f88f44fb7c447dd1>",
+          "name": "effort"
+        },
+        {
+          "description": "<cli-text chars=27 sha256=5a48dc2204e31cf1>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "fast"
+        },
+        {
+          "description": "<cli-text chars=58 sha256=e64d5754a7c891d3>",
+          "hint": "<cli-text chars=8 sha256=310dbe260b95ffcc>",
+          "name": "focus"
+        },
+        {
+          "description": "<cli-text chars=84 sha256=29af1db29618c76a>",
+          "name": "heapdump"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=8bbd147819053c34>",
+          "name": "init"
+        },
+        {
+          "description": "<cli-text chars=18 sha256=196720ccc0b3e120>",
+          "hint": "<cli-text chars=41 sha256=c9253e8f9d89683c>",
+          "name": "mcp"
+        },
+        {
+          "description": "<cli-text chars=32 sha256=066c5a4e6fb25cce>",
+          "hint": "<cli-text chars=7 sha256=c89b39d95f30edb2>",
+          "name": "model"
+        },
+        {
+          "description": "<cli-text chars=93 sha256=7ca9ad3b89f1412d>",
+          "name": "__remote-workflow"
+        },
+        {
+          "description": "<cli-text chars=80 sha256=f37b73d88eca6101>",
+          "name": "workflow-launch-exec"
+        },
+        {
+          "description": "<cli-text chars=54 sha256=db84d17682e48294>",
+          "hint": "<cli-text chars=9 sha256=3107c4a4a6e6a57d>",
+          "name": "reload-plugins"
+        },
+        {
+          "description": "<cli-text chars=59 sha256=d1c09c3572af5b5f>",
+          "name": "reload-skills"
+        },
+        {
+          "description": "<cli-text chars=31 sha256=75b92bf45cad1542>",
+          "hint": "<cli-text chars=6 sha256=2ce6105f0185b13c>",
+          "name": "rename"
+        },
+        {
+          "description": "<cli-text chars=71 sha256=99012032bc93d8e3>",
+          "name": "security-review"
+        },
+        {
+          "description": "<cli-text chars=69 sha256=96112a14a8cdaf62>",
+          "name": "usage"
+        },
+        {
+          "description": "<cli-text chars=53 sha256=77df6c9b6b262acb>",
+          "name": "insights"
+        },
+        {
+          "description": "<cli-text chars=37 sha256=85eedf3fb1fc60ae>",
+          "name": "recap"
+        },
+        {
+          "description": "<cli-text chars=52 sha256=90f45833eef0a4c1>",
+          "name": "goal"
+        },
+        {
+          "description": "<cli-text chars=68 sha256=b86e28928cd88651>",
+          "name": "list-agents"
+        },
+        {
+          "description": "<cli-text chars=63 sha256=1cf42d17139a3989>",
+          "name": "team-onboarding"
+        }
+      ],
+      "backend": "sidecar",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": false,
+        "resume": false,
+        "steer": false
+      },
+      "conversationId": null,
+      "cwd": "$RUN/project",
+      "history": null,
+      "lastTurnEnding": "interrupted",
+      "model": "claude-opus-5-5",
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": "prov-1",
+      "sessionId": "sess-1",
+      "status": {
+        "kind": "running"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [
+        {
+          "input": {
+            "delaySeconds": 60,
+            "noop": false,
+            "prompt": "C15AI-FIRE",
+            "reason": "C15AI-REASON"
+          },
+          "name": "ScheduleWakeup",
+          "result": {
+            "content": "<cli-text chars=233 sha256=7e2d415183fd972c>",
+            "isError": false
+          },
+          "seq": 6,
+          "toolUseId": "toolu_wake1",
+          "turnId": "b9a900c6-385b-4f67-8c70-7af76ce2bfee"
+        }
+      ],
+      "transcript": [
+        {
+          "seq": 8,
+          "text": "SCHEDULED"
+        },
+        {
+          "seq": 13,
+          "text": "C15A-BUSY-PARTIAL some words before the interrupt"
+        }
+      ],
+      "turnEndings": [
+        {
+          "apiErrorStatus": null,
+          "kind": "interrupted",
+          "message": null,
+          "reason": "<cli-text chars=17 sha256=b87712cf78a6767c>",
+          "resetsAt": null,
+          "seq": 16,
+          "turnId": "cac2c625-ddfd-46ef-941c-fc23486aa509"
+        }
+      ],
+      "usage": {
+        "model": "claude-opus-5-5",
+        "num_turns": null,
+        "tokens": {
+          "cache_creation": 0,
+          "cache_read": 0,
+          "input": 3000,
+          "output": 30
+        },
+        "total_cost_usd": 0.0126
+      },
+      "userPrompts": []
+    },
+    "tab": 1,
+    "throughRevision": 20,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  },
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_claude_scripted_twins_are_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

@@ -58,6 +58,9 @@ const PROTO_CREATE_SESSION_REQUEST: &str = "claude_runtime_protocol::v1::CreateS
 /// - the one constructor of the requested `Auto`, from that capability (`requested_cli_mode`);
 /// - the one proto `Auto`, as the value of the `Auto` arm of the request's `match`
 ///   (`build_create_request_loading`);
+/// - the replay seam's reading of a recorded session's settings (`testkit::claude_scripted::replay`, built only
+///   with `test-support`): it names the mode a fixture's manifest says the recording session asked for, and
+///   reaches no CLI;
 /// - two patterns and a comparison, which construct nothing: the CLI-mode classification of what the CLI
 ///   reported against what was asked for (`classify_reported_cli_mode`), and the translator's check
 ///   that an auto session never reports a mode switch.
@@ -74,6 +77,10 @@ const AUTO_SITES: &[(&str, &str)] = &[
         "providers/claude_sidecar/mod.rs",
         "cli_permission_mode: match cli_mode { crate::RequestedCliMode::Auto => CliPermissionMode::Auto as i32, \
          crate::RequestedCliMode::Default => CliPermissionMode::Unspecified as i32, },",
+    ),
+    (
+        "testkit/claude_scripted/replay.rs",
+        "Some(\"auto\") => RequestedCliMode::Auto,",
     ),
     (
         "process.rs",

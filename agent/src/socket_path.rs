@@ -453,7 +453,8 @@ mod tests {
     /// by hand when either crate's set of socket-building files changes.
     #[test]
     fn every_sock_path_in_this_crate_is_built_here() {
-        // (file, a substring of the line) -- each one a path that is never passed to bind/connect.
+        // (file, a substring of the line) -- each one a path that is never bound as written (or, for the
+        // last two, is bound only under a scratch root).
         const NEVER_BOUND: &[(&str, &str)] = &[
             // Only formats the hook's argv JSON; asserts on the string.
             ("src/settings.rs", "\"/tmp/eitri-agent-hook-abc123.sock\""),
@@ -462,6 +463,13 @@ mod tests {
             ("src/settings.rs", "\"/tmp/b.sock\""),
             // Probes that the agent-hook binary exists; never bound.
             ("src/process.rs", "dir.join(\"probe.sock\")"),
+            // Absolute paths of a host that the sandbox self-check's tests re-create inside a scratch
+            // root and bind there; the root is temp_dir plus a uuid, and the longest tail is 30 bytes.
+            ("src/testkit/claude_scripted/sandbox.rs", "\"/run/docker.sock\""),
+            (
+                "src/testkit/claude_scripted/sandbox.rs",
+                "\"/var/lib/gssproxy/default.sock\"",
+            ),
         ];
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));

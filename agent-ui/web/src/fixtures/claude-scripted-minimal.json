@@ -1,0 +1,216 @@
+{
+  "domain_events": [
+    {
+      "cwd": "$RUN/project",
+      "model": "claude-opus-5-5",
+      "provider_session_id": "prov-1",
+      "session_id": "sess-1",
+      "type": "session_opened"
+    },
+    {
+      "reported": "auto",
+      "type": "cli_permission_mode"
+    },
+    {
+      "turn_id": "turn-1",
+      "type": "turn_started"
+    },
+    {
+      "input": {
+        "command": "sleep 5"
+      },
+      "name": "Bash",
+      "tool_use_id": "toolu_1",
+      "turn_id": "turn-1",
+      "type": "tool_call_started"
+    },
+    {
+      "client_message_id": "msg-2",
+      "text": "STEER-NOW",
+      "turn_id": "turn-1",
+      "type": "user_message_delivered"
+    },
+    {
+      "content": "<cli-text chars=11 sha256=efefc15c24ee8645>",
+      "is_error": false,
+      "tool_use_id": "toolu_1",
+      "turn_id": "turn-1",
+      "type": "tool_call_completed"
+    },
+    {
+      "kind": "text",
+      "text": "Steered",
+      "turn_id": "turn-1",
+      "type": "content_delta"
+    },
+    {
+      "turn_id": "turn-1",
+      "type": "assistant_message_boundary"
+    },
+    {
+      "kind": "text",
+      "text": " and done",
+      "turn_id": "turn-1",
+      "type": "content_delta"
+    },
+    {
+      "detail": {
+        "api_error_status": null,
+        "message": null,
+        "reason": "completed"
+      },
+      "outcome": "completed",
+      "result_text": "Steered and done",
+      "stop_reason": "end_turn",
+      "turn_id": "turn-1",
+      "type": "turn_completed",
+      "usage": null
+    }
+  ],
+  "events": {
+    "events": [
+      {
+        "cwd": "$RUN/project",
+        "model": "claude-opus-5-5",
+        "provider_session_id": "prov-1",
+        "session_id": "sess-1",
+        "type": "session_opened"
+      },
+      {
+        "reported": "auto",
+        "type": "cli_permission_mode"
+      },
+      {
+        "turn_id": "turn-1",
+        "type": "turn_started"
+      },
+      {
+        "input": {
+          "command": "sleep 5"
+        },
+        "name": "Bash",
+        "tool_use_id": "toolu_1",
+        "turn_id": "turn-1",
+        "type": "tool_call_started"
+      },
+      {
+        "client_message_id": "msg-2",
+        "text": "STEER-NOW",
+        "turn_id": "turn-1",
+        "type": "user_message_delivered"
+      },
+      {
+        "content": "<cli-text chars=11 sha256=efefc15c24ee8645>",
+        "is_error": false,
+        "tool_use_id": "toolu_1",
+        "turn_id": "turn-1",
+        "type": "tool_call_completed"
+      },
+      {
+        "kind": "text",
+        "text": "Steered",
+        "turn_id": "turn-1",
+        "type": "content_delta"
+      },
+      {
+        "turn_id": "turn-1",
+        "type": "assistant_message_boundary"
+      },
+      {
+        "kind": "text",
+        "text": " and done",
+        "turn_id": "turn-1",
+        "type": "content_delta"
+      },
+      {
+        "detail": {
+          "api_error_status": null,
+          "message": null,
+          "reason": "completed"
+        },
+        "outcome": "completed",
+        "result_text": "Steered and done",
+        "stop_reason": "end_turn",
+        "turn_id": "turn-1",
+        "type": "turn_completed",
+        "usage": null
+      }
+    ],
+    "fromRevision": 0,
+    "kind": "events",
+    "tab": 1,
+    "throughRevision": 10
+  },
+  "scenario": "minimal",
+  "snapshot": {
+    "kind": "snapshot",
+    "state": {
+      "accountLimits": null,
+      "activeTurnId": null,
+      "assistantMessageOpen": false,
+      "availableCommands": null,
+      "backend": "sidecar",
+      "backgroundCalls": 0,
+      "capabilities": {
+        "bypassPermissionMode": false,
+        "fork": false,
+        "interrupt": false,
+        "resume": false,
+        "steer": false
+      },
+      "conversationId": null,
+      "cwd": "$RUN/project",
+      "history": null,
+      "lastTurnEnding": null,
+      "model": "claude-opus-5-5",
+      "pendingPermissions": [],
+      "provider": null,
+      "providerSessionId": "prov-1",
+      "sessionId": "sess-1",
+      "status": {
+        "kind": "running"
+      },
+      "thinking": [],
+      "thinkingOpen": false,
+      "toolCalls": [
+        {
+          "input": {
+            "command": "sleep 5"
+          },
+          "name": "Bash",
+          "result": {
+            "content": "<cli-text chars=11 sha256=efefc15c24ee8645>",
+            "isError": false
+          },
+          "seq": 3,
+          "toolUseId": "toolu_1",
+          "turnId": "turn-1"
+        }
+      ],
+      "transcript": [
+        {
+          "seq": 6,
+          "text": "Steered"
+        },
+        {
+          "seq": 8,
+          "text": " and done"
+        }
+      ],
+      "turnEndings": [],
+      "usage": null,
+      "userPrompts": [
+        {
+          "delivered": true,
+          "seq": 4,
+          "text": "STEER-NOW"
+        }
+      ]
+    },
+    "tab": 1,
+    "throughRevision": 10,
+    "turnStartedAtMs": null,
+    "turnTimes": []
+  },
+  "writtenBy": "core/src/agent_bridge.rs, tests::the_claude_scripted_twins_are_what_the_serializer_sends -- compared on every run; EITRI_WRITE_FIXTURES=1 rewrites it"
+}

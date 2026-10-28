@@ -54,6 +54,27 @@ name = "eitri-agent-standin"
 path = "src/bin/eitri-agent-standin.rs"
 required-features = ["test-support"]
 
+# The scripted Messages API stand-in as a process: `eitri-claude-scripted serve <dir>` answers a CLI from the
+# script in `<dir>/script.json`. Never shipped.
+[[bin]]
+name = "eitri-claude-scripted"
+path = "src/bin/eitri-claude-scripted.rs"
+required-features = ["test-support"]
+
+# A relay in front of the real Claude CLI that copies its stdio unchanged and logs both directions line
+# by line under one arrival index, for the Claude harness. Never shipped.
+[[bin]]
+name = "eitri-stdio-tap"
+path = "src/bin/eitri-stdio-tap.rs"
+required-features = ["test-support"]
+
+# The transcript oracle: a Claude CLI session's files against Eitri's records of it, redacted by default.
+# Never shipped.
+[[bin]]
+name = "eitri-transcript-oracle"
+path = "src/bin/eitri-transcript-oracle.rs"
+required-features = ["test-support"]
+
 # A stand-in for Verdandi's Claude sidecar (its gRPC service on a unix socket, a replay ring, several
 # watchers, the end on stdin's EOF), for the tests that hand a sidecar to another process. Never shipped.
 [[bin]]
