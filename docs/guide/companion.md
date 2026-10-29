@@ -159,7 +159,7 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 
 | desktop | detected by | what Eitri does |
 |---|---|---|
-| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch movefocus`; what happens at the edge is Hyprland's own |
+| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | moves focus with `hyprctl dispatch`. Eitri first asks Hyprland once whether it runs a Lua config (`hyprland.lua`) or a `hyprland.conf`, and writes its commands the way that config takes them. What happens at the edge is Hyprland's own |
 | sway | `SWAYSOCK` | moves focus with `swaymsg`, after checking that a visible window really lies in that direction (on any output), so sway's default focus wrapping does not carry you to the far side. At the edge the key is consumed |
 | niri | `NIRI_SOCKET` | moves focus with `niri msg action`; what happens at the edge is niri's own |
 | GNOME | `XDG_CURRENT_DESKTOP` contains `GNOME`, in a Wayland session | moves focus through the [Eitri GNOME Shell extension](#gnome-the-extension), once you have enabled it. Without it no focus moves (a Wayland client cannot take focus on GNOME by itself), and the band says once that your desktop does not let Eitri move focus and names the extension |

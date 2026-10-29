@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=3e1475627bb1eeb69cb8306c976a342091241917207c5c36be374ddf345dc628 -->
+<!-- translated-from: companion.md sha256=659eef0f3fdbb9cf5c9c48f8ef88374a91af108da04c6766278b61e8d6aa98f0 -->
 
 # 配合你自己的 Neovim 使用
 
@@ -103,7 +103,7 @@ eitri.config.set("companion.wm", "auto")   -- "auto" (the default), "hyprland", 
 
 | 桌面 | 通过什么检测 | Eitri 做什么 |
 |---|---|---|
-| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch movefocus` 移动焦点；到了边缘会怎样，由 Hyprland 自己决定 |
+| Hyprland | `HYPRLAND_INSTANCE_SIGNATURE` | 用 `hyprctl dispatch` 移动焦点。Eitri 先问一次 Hyprland 用的是 Lua 配置（`hyprland.lua`）还是 `hyprland.conf`，再按那种配置的写法发命令。到了边缘会怎样，由 Hyprland 自己决定 |
 | sway | `SWAYSOCK` | 用 `swaymsg` 移动焦点，会先确认那个方向上确实有一个可见的窗口（在任何输出上），所以 sway 默认的焦点环绕不会把你带到远端。到了边缘，这个键被吞掉 |
 | niri | `NIRI_SOCKET` | 用 `niri msg action` 移动焦点；到了边缘会怎样，由 niri 自己决定 |
 | GNOME | `XDG_CURRENT_DESKTOP` 含有 `GNOME`，且是 Wayland 会话 | 通过 [Eitri GNOME Shell 扩展](#gnome-the-extension)移动焦点，前提是你已经启用了它。没有它就不移动焦点（在 GNOME 上 Wayland 客户端没法自己抢到焦点），状态条会提示一次：你的桌面不允许 Eitri 移动焦点，并指出这个扩展 |

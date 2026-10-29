@@ -109,6 +109,15 @@ The agents guide's first section describes all of this.
 - An idle window draws nothing, and the panel wakes only when it has something to draw. The bottom terminal echoes
   a key without waiting for a frame, and a long scrollback costs far less to draw.
 
+**Companion mode on Hyprland**
+
+- Focus moves and raises now work on Hyprland's Lua config (0.55 and later) and on 0.57, which removed the legacy
+  `hyprctl dispatch` names Eitri sent: `Ctrl+h/j/k/l` at the panel's edge, nvim's edge key toward the panel,
+  `:EitriPanel` and the hand-back to the editor did nothing there. Eitri now asks Hyprland once which config it
+  runs and writes its commands to match, and a command Hyprland refuses is written to the log once. Run on a live
+  Hyprland 0.57.0, and 0.56.2 with `hyprland.conf` and with `hyprland.lua`. The second window's raises have not
+  been run on a live Hyprland.
+
 **What this can break:**
 
 - **Your `init.lua` may stop Eitri at startup** if it `set`s one of the new prefix keys, as every `set` over a
@@ -173,7 +182,7 @@ with Claude Code's own identity line for the Agent SDK and Eitri's note once at 
 model service has run on this release's backend; what it adds was checked against a scripted stand-in, as the next
 paragraph says. Codex tabs passed their scripted suites with `codex` 0.160.0 to 0.161.0 (a
 newer Codex runs and is marked untested), and the real `codex` 0.162 and 0.163 were run against a scripted model.
-Companion mode on Hyprland, niri, KDE or a real GNOME login has not been seen on a screen yet.
+Companion mode on Hyprland (0.57.0 and 0.56.2) was run on a live desktop in a virtual machine, with keys sent through QEMU; on niri, KDE or a real GNOME login it has not been seen on a screen yet.
 
 The Claude Code tab's handling of Claude Code's own work was tested on this release's backend with the real Claude
 Code 2.1.311 against a scripted stand-in for the model service. The flows above ran end to end through Eitri's agent
@@ -312,6 +321,10 @@ agent 指南的第一节讲了这些。
 
 - 闲置的窗口什么都不画，面板只在有东西要画时才醒来。底部终端回显按键不再等一帧，很长的回滚内容画起来也便宜得多。
 
+**Hyprland 上的 companion 模式**
+
+- 焦点移动和置前现在在 Hyprland 的 Lua 配置（0.55 及以后）和 0.57 上可用；0.57 去掉了 Eitri 以前发送的旧 `hyprctl dispatch` 名字，在那里面板边缘的 `Ctrl+h/j/k/l`、nvim 朝面板方向的边缘键、`:EitriPanel` 和把焦点交还给编辑器都没有任何效果。现在 Eitri 会先问一次 Hyprland 用的是哪种配置，再按那种写法发命令，被 Hyprland 拒绝的命令会在日志里记一次。已在真实运行的 Hyprland 0.57.0 上跑过，也在 0.56.2 上用 `hyprland.conf` 和 `hyprland.lua` 各跑过一次。第二个窗口的置前还没有在真实运行的 Hyprland 上跑过。
+
 **可能受影响的地方：**
 
 - **如果你的 `init.lua` `set` 了新的前缀键之一，Eitri 会在启动时停下**，和 `set` 任何默认键时一样；提示里写着是哪个键。新增的键（按 `eitri.keymap` 的写法）：`m`、`M`、`q`、`E`、`H`、`J`、`K`、`L`、`s`、`Space`、`(`、`)`、`$`、`!`、`C-o`、`C-=`、`C-+`、`C--`、`C-0`、`M-3`、`M-4`、`M-5`、`M-e`、`M-o`、`M-w`、`M-s`、`M-a`、`M-d`、`M-H`、`M-J`、`M-K`、`M-L`、`M-Enter`、`M-S-Space`、`M--` 和 `M-_`。在那条 `set` 前面加上 `k.del("prefix", "<key>")`。如果打开了 tmux 导入、你的 tmux 配置也绑定了这个键，就不需要 `del`。`del` 一个没有绑定的键同样会让启动停下，所以这些行要在升级时加，不要提前加。键设为 `H`、`J` 或 `K` 的 Lua 面板或插件，现在也会让启动停下。
@@ -335,7 +348,7 @@ agent 指南的第一节讲了这些。
 
 ### 哪些已经试过
 
-所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端中用真实 `claude`（2.1.302）连真实模型服务运行的测试共 113 个用例，最近一次是在一个开发构建上跑的，那时用的 Verdandi 比这一版固定的要早。它们分两次运行，因为第一次在测试账号触到模型服务的速率限制时中断；第二次之后，113 个用例全部通过。中途有两个用例失败，原因都不在本次发布的改动：一个是在要求执行破坏性命令的探测上触发了模型服务的使用政策检查（重跑后通过），另一个是遇到这个 CLI 版本新增的对话记录行类型，历史读取器现在会跳过它们。某个测试套件里有八个 Glob 和 Grep 探测被跳过，因为这个 CLI 版本没有列出这两个工具。Claude Code 标签页发出的请求，也是在那个较早的后端上对着一个本地替身录下来的：它带着 `claude -p` 的系统提示词，身份那一行换成 Claude Code 在 Agent SDK 里的说法，末尾带一次 Eitri 的说明。这一版的后端还没有跟真实模型服务跑过一个回合；它新增的部分是对着脚本替身检查的，见下一段。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。在 Hyprland、niri、KDE 或真实 GNOME 登录里的 companion 模式，还没有在屏幕上见过。
+所有新内容都有自动化测试。平铺窗口（容器、浮动窗口、便笺板、工作区、聊天视图和打开规则）和 Markdown 预览，在一个隔离的、无界面的测试会话里通过了全部检查项：用脚本按键，不是一个人坐在真实桌面前。Claude Code 后端中用真实 `claude`（2.1.302）连真实模型服务运行的测试共 113 个用例，最近一次是在一个开发构建上跑的，那时用的 Verdandi 比这一版固定的要早。它们分两次运行，因为第一次在测试账号触到模型服务的速率限制时中断；第二次之后，113 个用例全部通过。中途有两个用例失败，原因都不在本次发布的改动：一个是在要求执行破坏性命令的探测上触发了模型服务的使用政策检查（重跑后通过），另一个是遇到这个 CLI 版本新增的对话记录行类型，历史读取器现在会跳过它们。某个测试套件里有八个 Glob 和 Grep 探测被跳过，因为这个 CLI 版本没有列出这两个工具。Claude Code 标签页发出的请求，也是在那个较早的后端上对着一个本地替身录下来的：它带着 `claude -p` 的系统提示词，身份那一行换成 Claude Code 在 Agent SDK 里的说法，末尾带一次 Eitri 的说明。这一版的后端还没有跟真实模型服务跑过一个回合；它新增的部分是对着脚本替身检查的，见下一段。Codex 标签页的脚本测试在 `codex` 0.160.0 到 0.161.0 上通过（更新的 Codex 也能运行，会标为未测试），真实的 `codex` 0.162 和 0.163 也对着一个脚本模型跑过。Hyprland（0.57.0 和 0.56.2）上的 companion 模式已在虚拟机里的真实桌面上跑过，按键经 QEMU 发送；niri、KDE 或真实 GNOME 登录里的 companion 模式，还没有在屏幕上见过。
 
 Claude Code 标签页对 Claude Code 自己工作的处理，是在这一版的后端上，用真实的 Claude Code 2.1.311 对着一个模拟模型服务的脚本替身测的。上面这些流程都经 Eitri 的 agent 宿主端到端跑过，其中十五项画面检查在隔离的无界面会话里、在新的聊天页面上通过，深色、浅色和窄面板宽度都试过：Claude Code 发起的回合、`/tasks` 和 `/workflows`、工作流卡片、子 agent、压缩、插进运行中回合的消息、`/clear`、定时唤醒、重试和提问框（在提问框里用输入法打出的回答也发出去了）。恢复出来的对话还和真实的 Claude Code 会话文件做过比对。插话引导只在 Claude Code 标签页里在屏幕上看过；用输入法在 companion 面板里打字（无论是输入框还是提问框）还没有验证过。
 

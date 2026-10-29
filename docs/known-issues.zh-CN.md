@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=0c9ed05f349f23093aa814d213248cf61b05b7255fffc9d1b951e79a76e17dfa -->
+<!-- translated-from: known-issues.md sha256=2ab7a6161a8dd27e293c2f15b0744751503ec8715718afed35d7b27bf0724e9d -->
 
 # 已知问题与限制
 
@@ -8,7 +8,7 @@
 ## 能在哪里运行
 
 - **x86_64 的 Linux，Wayland。** X11 没有测试过（不过欢迎来自 X11 的反馈）。macOS：移植中。Windows：不支持，WSL2 配合 WSLg 也许能用，但没有测试过。目前还没有 ARM 版本。
-- **在 GNOME 和 sway 上测试过。** 其他桌面和合成器，包括 KDE Plasma 和 Hyprland，没有测试过，欢迎反馈。
+- **在 GNOME 和 sway 上测试过，companion 模式还在 Hyprland 上测试过。** 其他桌面和合成器，包括 KDE Plasma，没有测试过，欢迎反馈。Hyprland：companion 模式（焦点移动和置前）在真实运行的 0.57.0 和 0.56.2 上跑过（0.56.2 分别用 `hyprland.conf` 和 `hyprland.lua`）；第二个窗口的置前没有跑过。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
 - **Neovim 0.10 或更新**：用你自己 `PATH` 里的，或者让安装脚本为 Eitri 单独下载的一份私有副本。
 - **Claude Code**，已安装并已登录，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
@@ -61,7 +61,7 @@ Lua 面板和插件页面（[你自己做的页面](guide/pages.zh-CN.md)）是*
 
 Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的 nvim 旁边（见[使用指南](guide/companion.zh-CN.md)）。它比较新，试过的部分比单窗口模式少。
 
-- **到目前为止只在一个隔离的、无界面的测试会话里试过，还没有在真实硬件上试过：** sway 配合终端里的 nvim；sway 上配合 Neovide 0.16.2 的 `eitri split`（也试过从 tmux 里的 shell 启动）；无界面 GNOME Shell 50 里的 GNOME Shell 扩展。Hyprland、niri、别的 nvim 图形前端，以及在真实 GNOME 登录会话里启用扩展，完全还没有试过。Hyprland 和 niri 上，边缘上的行为是窗口管理器自己的，Eitri 不去检查它。
+- **到目前为止只在一个隔离的、无界面的测试会话里试过，还没有在真实硬件上试过：** sway 配合终端里的 nvim；sway 上配合 Neovide 0.16.2 的 `eitri split`（也试过从 tmux 里的 shell 启动）；无界面 GNOME Shell 50 里的 GNOME Shell 扩展。Hyprland 只在虚拟机里跑过（终端 nvim 的 companion 模式，在 0.57.0 和 0.56.2 上；没跑第二个窗口的置前，也没在真实硬件上跑）。niri、别的 nvim 图形前端，以及在真实 GNOME 登录会话里启用扩展，完全还没有试过。niri 上，边缘上的行为是窗口管理器自己的，Eitri 不去检查它。
 - **nvim 运行在 tmux 里的情况还没有试过。** tmux 窗格的边缘仍归 tmux 管。用 vim-tmux-navigator 时，没法用 `Ctrl+h/j/k/l` 从 nvim 跨到面板窗口；用 smart-splits.nvim 并按[使用指南](guide/companion.zh-CN.md#navigator-plugins-and-tmux)设好它的 `at_edge` 钩子时，在 tmux 自己的边缘上这次移动应该能到达面板，但还没有测试过。从面板里打开文件也不会把编辑器的窗口提到前面（从 nvim 往上的进程树通向的是 tmux server，而不是终端）。
 - **在窗口管理器会话之前启动的 tmux server** 会在它的环境里一直保留那个会话旧的 `SWAYSOCK` 或 `HYPRLAND_INSTANCE_SIGNATURE`，从它里面的 nvim 启动的面板会继承这个过期的值：移动焦点和提到前面都不会有任何效果。重新登录后请重启 tmux server，或者从带有当前会话环境的 shell 里启动面板。
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。

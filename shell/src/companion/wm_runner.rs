@@ -5,18 +5,25 @@
 //! The commands themselves are injected (`Exec`), so the logic below runs in tests without a
 //! compositor and without starting a process.
 //!
+//! Hyprland takes its dispatches in the form its config manager reads, legacy or Lua. The first dispatch a
+//! runner sends probes which one that is, on the worker, and the answer is kept for the runner (the main
+//! window and the companion window each have a runner, so each probes once); a failure whose reply names the
+//! other form probes once more (a user who switched config files mid-session). Every Hyprland dispatch's reply
+//! is read: anything but `ok`, for each part of a batch, is a failure, logged once per kind.
+//!
 //! GNOME is the one adapter with no command to run: a client there cannot list or focus windows, so
 //! its Shell extension does, and the calls to it go through `gnome_shell` (async gio calls, no
 //! worker thread, no child). Behind the `GnomeCalls` trait the routing below is tested with a fake.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use eitri_core::compositor::{self, WindowRef, Wm};
+use eitri_core::compositor::{self, HyprForm, WindowRef, Wm};
 use eitri_core::layout::Direction;
 use eitri_core::proc_chain;
 
@@ -33,7 +40,8 @@ const CHAIN_MAX: usize = 32;
 pub(crate) struct WmRunner {
     wm: Wm,
     notice_shown: Cell<bool>,
-    exec: Exec,
+    /// The commands, shared with the worker threads that run them.
+    commands: Commands,
     read_stat: ReadStat,
     /// The Eitri extension's service, on GNOME only.
     gnome: Option<Rc<dyn GnomeCalls>>,
@@ -118,7 +126,7 @@ impl WmRunner {
         WmRunner {
             wm,
             notice_shown: Cell::new(false),
-            exec,
+            commands: Commands::new(wm, exec),
             read_stat,
             gnome,
             partner: Rc::default(),
@@ -166,8 +174,8 @@ impl WmRunner {
             gnome.focus_direction(dir, Box::new(|_| {}));
             return true;
         }
-        let (wm, exec) = (self.wm, self.exec.clone());
-        thread::spawn(move || move_focus_blocking(wm, &*exec, dir, &|line| println!("{line}")));
+        let commands = self.commands.clone();
+        thread::spawn(move || commands.move_focus_blocking(dir, &|line| println!("{line}")));
         true
     }
 
@@ -314,10 +322,10 @@ impl WmRunner {
         if matches!(self.wm, Wm::None | Wm::Gnome) {
             return;
         }
-        let (wm, exec, read_stat) = (self.wm, self.exec.clone(), self.read_stat.clone());
+        let (commands, read_stat) = (self.commands.clone(), self.read_stat.clone());
         thread::spawn(move || {
             let chain = chain(&*read_stat);
-            raise_blocking(wm, &*exec, &chain, &|line| println!("{line}"));
+            commands.raise_blocking(&chain, &|line| println!("{line}"));
         });
     }
 }
@@ -336,17 +344,13 @@ fn wm_name(wm: Wm) -> &'static str {
 /// tool that is missing is missing for every key, and a line per key press would bury the log.
 fn real_exec(wm: Wm) -> Exec {
     let logged = Arc::new(AtomicBool::new(false));
+    let exits: Arc<Mutex<HashSet<(String, String)>>> = Arc::default();
     Arc::new(move |argv: Vec<String>| {
         let (program, args) = argv.split_first().ok_or_else(|| "empty command".to_string())?;
         match Command::new(program).args(args).output() {
             Ok(output) => {
-                if !output.status.success() {
-                    println!(
-                        "[companion] {} adapter: {program} exited with {}: {}",
-                        wm_name(wm),
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
+                if let Some(line) = exit_note(wm, &exits, program, &output) {
+                    println!("{line}");
                 }
                 Ok(String::from_utf8_lossy(&output.stdout).into_owned())
             }
@@ -360,66 +364,218 @@ fn real_exec(wm: Wm) -> Exec {
     })
 }
 
-fn move_focus_blocking(
+/// The log line for a command that exited non-zero, or `None` when it needs none. `hyprctl` exits non-zero
+/// when a reply starts with `error:` and has already put that reply on stdout, where the caller reads and logs
+/// it once per kind, so a Hyprland exit with output is not noted here. Any other non-zero exit is noted once
+/// per program and status: a failing tool fails the same way on every key press.
+fn exit_note(
     wm: Wm,
-    exec: &dyn Fn(Vec<String>) -> Result<String, String>,
-    dir: Direction,
-    log: &dyn Fn(&str),
-) {
-    if wm == Wm::Sway {
-        let windows = compositor::list_windows_argv(wm)
-            .and_then(|argv| exec(argv).ok())
-            .and_then(|json| compositor::parse_windows(wm, &json).ok());
-        match windows
-            .as_deref()
-            .and_then(|windows| compositor::has_neighbour(windows, dir))
-        {
-            Some(false) => {
-                log(&format!(
-                    "[companion] sway: no window {dir:?} of the panel; the key stops here"
-                ));
-                return;
-            }
-            // Not knowing is not a reason to eat the key: sway's own answer is the better guess.
-            None => log("[companion] sway: could not read the window tree; moving focus anyway"),
-            Some(true) => {}
-        }
+    seen: &Mutex<HashSet<(String, String)>>,
+    program: &str,
+    output: &std::process::Output,
+) -> Option<String> {
+    if output.status.success() || (wm == Wm::Hyprland && !output.stdout.trim_ascii().is_empty()) {
+        return None;
     }
-    if let Some(argv) = compositor::move_focus_argv(wm, dir) {
-        let _ = exec(argv);
+    let status = output.status.to_string();
+    if !locked(seen).insert((program.to_string(), status.clone())) {
+        return None;
     }
+    Some(format!(
+        "[companion] {} adapter: {program} exited with {status}: {}",
+        wm_name(wm),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
-/// Focuses the first window owned by one of `chain`'s processes, nearest first. With none found
-/// nothing is run and one line names the chain: inside tmux it ends at the tmux server, which owns
-/// no window.
-fn raise_blocking(wm: Wm, exec: &dyn Fn(Vec<String>) -> Result<String, String>, chain: &[u32], log: &dyn Fn(&str)) {
-    let Some(list) = compositor::list_windows_argv(wm) else {
-        return;
-    };
-    let Ok(json) = exec(list) else { return };
-    let windows: Vec<WindowRef> = match compositor::parse_windows(wm, &json) {
-        Ok(windows) => windows,
-        Err(err) => {
-            log(&format!("[companion] {} adapter: {err}", wm_name(wm)));
+/// What one runner's Hyprland adapter has learned: the dispatch form the running config manager takes
+/// (`None` until the first dispatch needs it), whether the one probe after a failure was spent, and how often each
+/// kind of failure was seen. Only worker threads touch it, so a probe never runs on the GTK thread.
+#[derive(Default)]
+struct HyprState {
+    form: Mutex<Option<HyprForm>>,
+    reprobed: AtomicBool,
+    failures: Mutex<HashMap<String, u64>>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Everything a worker thread needs to run window-manager commands: the adapter, the way to run a command, and
+/// what this runner learned about Hyprland.
+#[derive(Clone)]
+struct Commands {
+    wm: Wm,
+    exec: Exec,
+    hypr: Arc<HyprState>,
+}
+
+impl Commands {
+    fn new(wm: Wm, exec: Exec) -> Commands {
+        Commands {
+            wm,
+            exec,
+            hypr: Arc::default(),
+        }
+    }
+
+    /// The form Hyprland's dispatches are written in, probed on the first call. Other adapters have one form
+    /// and nothing is run for them.
+    fn form(&self, log: &dyn Fn(&str)) -> HyprForm {
+        if self.wm != Wm::Hyprland {
+            return HyprForm::Legacy;
+        }
+        // Held through the probe, so two first dispatches on two workers probe once. A worker waits here for as
+        // long as the probe runs; no timeout wraps `hyprctl`, whose own 5 s receive timeout bounds a compositor
+        // that does not answer.
+        let mut form = locked(&self.hypr.form);
+        *form.get_or_insert_with(|| self.probe(log))
+    }
+
+    /// `hyprctl eval 'return 1'`: `ok` means the Lua config manager; any other answer, or a `hyprctl` that cannot
+    /// run, means the legacy dispatchers. One log line says which and why.
+    fn probe(&self, log: &dyn Fn(&str)) -> HyprForm {
+        match (self.exec)(compositor::hyprland_probe_argv()) {
+            Ok(reply) => {
+                let form = HyprForm::from_probe_reply(&reply);
+                log(&format!(
+                    "[companion] hyprland adapter: {} dispatch (the config-manager probe answered {:?})",
+                    form.name(),
+                    compositor::first_line(&reply)
+                ));
+                form
+            }
+            Err(err) => {
+                log(&format!(
+                    "[companion] hyprland adapter: the config-manager probe could not run ({err}); using the legacy dispatch"
+                ));
+                HyprForm::Legacy
+            }
+        }
+    }
+
+    /// Runs the command `build` gives for the current form and reads its reply. A Hyprland failure whose reply
+    /// names the other form probes again, once per runner; when that finds the other form, the command is sent
+    /// once more in it, since a failure of that kind ran nothing. `false` when there is no command to run.
+    fn dispatch(&self, operation: &str, build: &dyn Fn(HyprForm) -> Option<Vec<String>>, log: &dyn Fn(&str)) -> bool {
+        let form = self.form(log);
+        let Some(argv) = build(form) else {
+            return false;
+        };
+        let Some(failure) = self.run(operation, argv, log) else {
+            return true;
+        };
+        if self.wm != Wm::Hyprland
+            || !compositor::names_other_form(&failure)
+            || self.hypr.reprobed.swap(true, Ordering::SeqCst)
+        {
+            return true;
+        }
+        let now = {
+            let mut current = locked(&self.hypr.form);
+            let now = self.probe(log);
+            *current = Some(now);
+            now
+        };
+        if now != form {
+            if let Some(argv) = build(now) {
+                self.run(operation, argv, log);
+            }
+        }
+        true
+    }
+
+    /// Runs one command; the failing reply when the compositor said it failed. A command that could not be run
+    /// at all was logged by `exec` and is no reply to judge.
+    fn run(&self, operation: &str, argv: Vec<String>, log: &dyn Fn(&str)) -> Option<String> {
+        let reply = (self.exec)(argv.clone()).ok()?;
+        let failure = compositor::dispatch_reply_failure(self.wm, &argv, &reply)?;
+        self.note_failure(operation, &failure, log);
+        Some(failure)
+    }
+
+    /// The first failure of a kind (the operation and the reply's first line) is logged; later ones are counted.
+    fn note_failure(&self, operation: &str, reply: &str, log: &dyn Fn(&str)) {
+        let kind = compositor::failure_kind(operation, reply);
+        let mut failures = locked(&self.hypr.failures);
+        let seen = failures.entry(kind).or_insert(0);
+        *seen += 1;
+        if *seen == 1 {
+            log(&format!(
+                "[companion] {} adapter: {operation} failed: {} (later failures like it are counted, not logged)",
+                wm_name(self.wm),
+                compositor::first_line(reply)
+            ));
+        }
+    }
+
+    #[cfg(test)]
+    fn failure_counts(&self) -> HashMap<String, u64> {
+        locked(&self.hypr.failures).clone()
+    }
+
+    fn move_focus_blocking(&self, dir: Direction, log: &dyn Fn(&str)) {
+        let wm = self.wm;
+        if wm == Wm::Sway {
+            let windows = compositor::list_windows_argv(wm)
+                .and_then(|argv| (self.exec)(argv).ok())
+                .and_then(|json| compositor::parse_windows(wm, &json).ok());
+            match windows
+                .as_deref()
+                .and_then(|windows| compositor::has_neighbour(windows, dir))
+            {
+                Some(false) => {
+                    log(&format!(
+                        "[companion] sway: no window {dir:?} of the panel; the key stops here"
+                    ));
+                    return;
+                }
+                // Not knowing is not a reason to eat the key: sway's own answer is the better guess.
+                None => log("[companion] sway: could not read the window tree; moving focus anyway"),
+                Some(true) => {}
+            }
+        }
+        self.dispatch(
+            "focus by direction",
+            &|form| compositor::move_focus_argv(wm, form, dir),
+            log,
+        );
+    }
+
+    /// Focuses the first window owned by one of `chain`'s processes, nearest first. With none found
+    /// nothing is run and one line names the chain: inside tmux it ends at the tmux server, which owns
+    /// no window.
+    fn raise_blocking(&self, chain: &[u32], log: &dyn Fn(&str)) {
+        let wm = self.wm;
+        let Some(list) = compositor::list_windows_argv(wm) else {
             return;
+        };
+        let Ok(json) = (self.exec)(list) else { return };
+        let windows: Vec<WindowRef> = match compositor::parse_windows(wm, &json) {
+            Ok(windows) => windows,
+            Err(err) => {
+                log(&format!("[companion] {} adapter: {err}", wm_name(wm)));
+                return;
+            }
+        };
+        let Some(target) = compositor::first_window_owner(chain, &windows).copied() else {
+            log(&format!(
+                "[companion] raise: no window owned by any process in {chain:?}; nothing raised"
+            ));
+            return;
+        };
+        if !self.dispatch(
+            "focus by pid",
+            &|form| compositor::focus_window_argv(wm, form, &target),
+            log,
+        ) {
+            log(&format!(
+                "[companion] raise: {} cannot focus pid {} without a window id",
+                wm_name(wm),
+                target.pid
+            ));
         }
-    };
-    let Some(target) = compositor::first_window_owner(chain, &windows) else {
-        log(&format!(
-            "[companion] raise: no window owned by any process in {chain:?}; nothing raised"
-        ));
-        return;
-    };
-    match compositor::focus_window_argv(wm, target) {
-        Some(argv) => {
-            let _ = exec(argv);
-        }
-        None => log(&format!(
-            "[companion] raise: {} cannot focus pid {} without a window id",
-            wm_name(wm),
-            target.pid
-        )),
     }
 }
 
@@ -473,9 +629,7 @@ mod tests {
         assert_eq!(chain, vec![300, 250]);
         let (exec, seen) = fake(sway_tree(0, 500));
         let lines = RefCell::new(Vec::new());
-        raise_blocking(Wm::Sway, &*exec, &chain, &|line| {
-            lines.borrow_mut().push(line.to_string())
-        });
+        Commands::new(Wm::Sway, exec).raise_blocking(&chain, &|line| lines.borrow_mut().push(line.to_string()));
         // Only the window list was asked for: no focus command ran.
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert_eq!(seen.lock().unwrap()[0], vec!["swaymsg", "-t", "get_tree"]);
@@ -486,7 +640,7 @@ mod tests {
     #[test]
     fn a_chain_that_reaches_a_window_focuses_it() {
         let (exec, seen) = fake(sway_tree(0, 500));
-        raise_blocking(Wm::Sway, &*exec, &[300, 200], &|_| {});
+        Commands::new(Wm::Sway, exec).raise_blocking(&[300, 200], &|_| {});
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[1], vec!["swaymsg".to_string(), "[pid=200] focus".to_string()]);
@@ -496,10 +650,10 @@ mod tests {
     fn sway_stops_at_an_edge_and_moves_when_a_window_lies_that_way() {
         // The panel (focused) is on the left, the other window on the right.
         let (exec, seen) = fake(sway_tree(0, 500));
-        move_focus_blocking(Wm::Sway, &*exec, Direction::Left, &|_| {});
+        Commands::new(Wm::Sway, exec).move_focus_blocking(Direction::Left, &|_| {});
         assert_eq!(seen.lock().unwrap().len(), 1, "an edge runs only the tree query");
         let (exec, seen) = fake(sway_tree(0, 500));
-        move_focus_blocking(Wm::Sway, &*exec, Direction::Right, &|_| {});
+        Commands::new(Wm::Sway, exec).move_focus_blocking(Direction::Right, &|_| {});
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[1], vec!["swaymsg", "focus", "right"]);
@@ -507,12 +661,471 @@ mod tests {
 
     #[test]
     fn hyprland_moves_without_asking() {
-        let (exec, seen) = fake("");
-        move_focus_blocking(Wm::Hyprland, &*exec, Direction::Up, &|_| {});
+        let (exec, seen) = hyprland(|_| LEGACY_PROBE, |_| "ok");
+        Commands::new(Wm::Hyprland, exec).move_focus_blocking(Direction::Up, &|_| {});
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![vec!["hyprctl", "dispatch", "movefocus", "u"]]
+            vec![probe(), strings(&["hyprctl", "dispatch", "movefocus", "u"])]
         );
+    }
+
+    const LEGACY_PROBE: &str = "eval is only supported with the lua config manager";
+    /// What the Lua manager answers to legacy text: hyprctl 0.57 starts a Lua error reply with `error: <code> ` (3
+    /// is the syntax error code), which is also why it exits non-zero. Read from its source, not run.
+    const LUA_UPDATE_NOTE: &str =
+        "error: 3 [string \"return hl.dispatch(movefocus l)\"]:1: ')' expected near 'l'\n\n → \
+        Note: dispatch in lua is a shorthand for hl.dispatch(...), your syntax might need to be updated.";
+
+    fn strings(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(ToString::to_string).collect()
+    }
+
+    fn probe() -> Vec<String> {
+        strings(&["hyprctl", "eval", "return 1"])
+    }
+
+    /// A fake `hyprctl`: `probe_reply` answers the n-th probe (from 0), `dispatch_reply` every other command.
+    fn hyprland(
+        probe_reply: impl Fn(usize) -> &'static str + Send + Sync + 'static,
+        dispatch_reply: impl Fn(&[String]) -> &'static str + Send + Sync + 'static,
+    ) -> (Exec, Arc<Mutex<Vec<Vec<String>>>>) {
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let record = seen.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exec: Exec = Arc::new(move |argv: Vec<String>| {
+            record.lock().unwrap().push(argv.clone());
+            if argv == probe() {
+                return Ok(probe_reply(probes.fetch_add(1, Ordering::SeqCst)).to_string());
+            }
+            Ok(dispatch_reply(&argv).to_string())
+        });
+        (exec, seen)
+    }
+
+    fn logged() -> (Rc<RefCell<Vec<String>>>, impl Fn(&str)) {
+        let lines: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = lines.clone();
+        (lines, move |line: &str| sink.borrow_mut().push(line.to_string()))
+    }
+
+    #[test]
+    fn a_probe_answering_ok_gives_the_lua_form_and_is_not_repeated() {
+        let (exec, seen) = hyprland(|_| "ok\n", |_| "ok\n");
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let (lines, log) = logged();
+        commands.move_focus_blocking(Direction::Left, &log);
+        commands.move_focus_blocking(Direction::Down, &log);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                probe(),
+                strings(&["hyprctl", "dispatch", "hl.dsp.focus({ direction = 'l' })"]),
+                strings(&["hyprctl", "dispatch", "hl.dsp.focus({ direction = 'd' })"]),
+            ]
+        );
+        assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
+        assert!(lines.borrow()[0].contains("lua dispatch"), "{:?}", lines.borrow());
+        assert!(commands.failure_counts().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_manager_or_a_hyprland_without_eval_gives_the_legacy_form() {
+        for reply in [LEGACY_PROBE, "unknown request", ""] {
+            let (exec, seen) = hyprland(move |_| reply, |_| "ok");
+            let commands = Commands::new(Wm::Hyprland, exec);
+            let (lines, log) = logged();
+            commands.move_focus_blocking(Direction::Right, &log);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![probe(), strings(&["hyprctl", "dispatch", "movefocus", "r"])],
+                "{reply:?}"
+            );
+            assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
+            assert!(lines.borrow()[0].contains("legacy dispatch"), "{:?}", lines.borrow());
+        }
+    }
+
+    /// A Lua dispatch that fails for each window it is asked about, with a reply that echoes the pid: one log line,
+    /// every later failure counted under the same kind.
+    #[test]
+    fn a_repeated_failing_lua_dispatch_logs_once() {
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let record = seen.clone();
+        let exec: Exec = Arc::new(move |argv: Vec<String>| {
+            record.lock().unwrap().push(argv.clone());
+            if argv == probe() {
+                return Ok("ok\n".to_string());
+            }
+            let pid: String = argv[2].chars().filter(char::is_ascii_digit).collect();
+            Ok(format!(
+                "error: 3 [string \"return hl.dispatch(hl.dsp.focus({{ window = 'pid:{pid}' }}))\"]:1: no window pid:{pid}\n"
+            ))
+        });
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let (lines, log) = logged();
+        for pid in [11, 12, 13, 12, 11, 4000] {
+            let target = WindowRef {
+                pid,
+                id: None,
+                focused: false,
+                visible: true,
+                rect: None,
+            };
+            commands.dispatch(
+                "focus by pid",
+                &|form| compositor::focus_window_argv(Wm::Hyprland, form, &target),
+                &log,
+            );
+        }
+        let failed: Vec<String> = lines
+            .borrow()
+            .iter()
+            .filter(|line| line.contains("failed"))
+            .cloned()
+            .collect();
+        assert_eq!(failed.len(), 1, "{:?}", lines.borrow());
+        assert!(failed[0].contains("error: 3"), "{failed:?}");
+        assert_eq!(commands.failure_counts().values().copied().collect::<Vec<_>>(), vec![6]);
+        // The reply named no form, so nothing probed again.
+        assert_eq!(seen.lock().unwrap().iter().filter(|argv| **argv == probe()).count(), 1);
+    }
+
+    /// Two workers making the first dispatch at the same moment probe once between them.
+    #[test]
+    fn two_first_dispatches_at_once_probe_once() {
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = probes.clone();
+        let exec: Exec = Arc::new(move |argv: Vec<String>| {
+            if argv == probe() {
+                count.fetch_add(1, Ordering::SeqCst);
+                // Long enough that the other worker reaches the form while this probe is running.
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok("ok".to_string())
+        });
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [Direction::Left, Direction::Right]
+            .into_iter()
+            .map(|dir| {
+                let (commands, start) = (commands.clone(), start.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    commands.move_focus_blocking(dir, &|_| {});
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// `hyprctl` exits 7 on an `error:` reply and has put the reply on stdout: the reply's reader logs that, so
+    /// the exit is not logged per call. An exit with nothing on stdout is logged once per program and status.
+    #[test]
+    fn a_failing_exit_is_logged_once_and_never_for_a_reply_that_is_read() {
+        let seen: Mutex<HashSet<(String, String)>> = Mutex::default();
+        let reply = exit_output(7, "error: 3 something\n", "");
+        for _ in 0..5 {
+            assert_eq!(exit_note(Wm::Hyprland, &seen, "hyprctl", &reply), None);
+        }
+        assert!(exit_note(Wm::Hyprland, &seen, "hyprctl", &exit_output(0, "", "")).is_none());
+        let silent = exit_output(1, "", "no socket\n");
+        let first = exit_note(Wm::Hyprland, &seen, "hyprctl", &silent).expect("the first is logged");
+        assert!(
+            first.contains("hyprctl exited with") && first.ends_with("no socket"),
+            "{first}"
+        );
+        for _ in 0..5 {
+            assert_eq!(exit_note(Wm::Hyprland, &seen, "hyprctl", &silent), None);
+        }
+        // Another status, or another program, is another kind.
+        assert!(exit_note(Wm::Hyprland, &seen, "hyprctl", &exit_output(2, "", "")).is_some());
+        assert!(exit_note(Wm::Sway, &seen, "swaymsg", &silent).is_some());
+        // Only Hyprland's replies are read by the caller; sway's exit is logged even with output.
+        assert!(exit_note(Wm::Sway, &seen, "swaymsg", &exit_output(3, "[]", "")).is_some());
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_gives_the_legacy_form_and_one_log_line() {
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let record = seen.clone();
+        let exec: Exec = Arc::new(move |argv: Vec<String>| {
+            record.lock().unwrap().push(argv.clone());
+            if argv == probe() {
+                Err("No such file or directory (os error 2)".to_string())
+            } else {
+                Ok("ok".to_string())
+            }
+        });
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let (lines, log) = logged();
+        commands.move_focus_blocking(Direction::Left, &log);
+        commands.move_focus_blocking(Direction::Up, &log);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                probe(),
+                strings(&["hyprctl", "dispatch", "movefocus", "l"]),
+                strings(&["hyprctl", "dispatch", "movefocus", "u"]),
+            ]
+        );
+        assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
+        assert!(lines.borrow()[0].contains("could not run"), "{:?}", lines.borrow());
+    }
+
+    /// Each failure that names the other form is logged once for its kind, counted after that, and probes once
+    /// more; the one probe after a failure is spent for the runner.
+    #[test]
+    fn a_failure_naming_the_other_form_is_logged_once_and_probes_once_more() {
+        let cases: [(&str, &'static str, &'static str); 3] = [
+            ("lua", "ok", "Invalid dispatcher"),
+            ("legacy", LEGACY_PROBE, LUA_UPDATE_NOTE),
+            (
+                "legacy",
+                LEGACY_PROBE,
+                "current config provider doesn't support dispatch",
+            ),
+        ];
+        for (name, probe_reply, failure) in cases {
+            let (exec, seen) = hyprland(move |_| probe_reply, move |_| failure);
+            let commands = Commands::new(Wm::Hyprland, exec);
+            let (lines, log) = logged();
+            for _ in 0..3 {
+                commands.move_focus_blocking(Direction::Left, &log);
+            }
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen.iter().filter(|argv| **argv == probe()).count(),
+                2,
+                "{name}: the first probe and one more: {seen:?}"
+            );
+            // The form did not change, so nothing is sent again: three dispatches in all.
+            assert_eq!(seen.len(), 5, "{seen:?}");
+            let failed = lines.borrow().iter().filter(|line| line.contains("failed")).count();
+            assert_eq!(failed, 1, "{:?}", lines.borrow());
+            assert_eq!(
+                commands
+                    .failure_counts()
+                    .get(&compositor::failure_kind("focus by direction", failure)),
+                Some(&3)
+            );
+            // Two probe lines and one failure line, whatever the reply's later lines held.
+            assert_eq!(lines.borrow().len(), 3, "{:?}", lines.borrow());
+            assert!(lines.borrow().iter().all(|line| !line.contains('\n')));
+        }
+    }
+
+    /// A user who switched from `hyprland.conf` to `hyprland.lua` mid-session: the legacy command fails with the
+    /// update note, the probe now answers `ok`, and the move is sent once more in the Lua form.
+    #[test]
+    fn a_probe_that_finds_the_other_form_sends_the_command_again_in_it() {
+        let (exec, seen) = hyprland(
+            |n| if n == 0 { LEGACY_PROBE } else { "ok" },
+            |argv| {
+                if argv[2].starts_with("hl.dsp") {
+                    "ok"
+                } else {
+                    LUA_UPDATE_NOTE
+                }
+            },
+        );
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let (lines, log) = logged();
+        commands.move_focus_blocking(Direction::Left, &log);
+        commands.move_focus_blocking(Direction::Right, &log);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                probe(),
+                strings(&["hyprctl", "dispatch", "movefocus", "l"]),
+                probe(),
+                strings(&["hyprctl", "dispatch", "hl.dsp.focus({ direction = 'l' })"]),
+                strings(&["hyprctl", "dispatch", "hl.dsp.focus({ direction = 'r' })"]),
+            ]
+        );
+        assert_eq!(commands.failure_counts().values().sum::<u64>(), 1);
+        assert_eq!(lines.borrow().len(), 3, "{:?}", lines.borrow());
+    }
+
+    #[test]
+    fn a_failure_that_names_no_form_probes_nothing_more() {
+        let (exec, seen) = hyprland(|_| "ok", |_| "No such window found");
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let (lines, log) = logged();
+        commands.move_focus_blocking(Direction::Left, &log);
+        commands.move_focus_blocking(Direction::Left, &log);
+        assert_eq!(seen.lock().unwrap().iter().filter(|argv| **argv == probe()).count(), 1);
+        assert_eq!(
+            lines.borrow().len(),
+            2,
+            "the probe and one failure: {:?}",
+            lines.borrow()
+        );
+        // Another operation failing the same way is another kind.
+        let (exec, _) = hyprland(
+            |_| "ok",
+            |argv| {
+                if argv[0] == "hyprctl" && argv[1] == "clients" {
+                    r#"[{"mapped":true,"pid":9,"focusHistoryID":1}]"#
+                } else {
+                    "No such window found"
+                }
+            },
+        );
+        let commands = Commands::new(Wm::Hyprland, exec);
+        let (lines, log) = logged();
+        commands.move_focus_blocking(Direction::Left, &log);
+        commands.raise_blocking(&[9], &log);
+        commands.raise_blocking(&[9], &log);
+        assert_eq!(commands.failure_counts().len(), 2);
+        assert_eq!(lines.borrow().iter().filter(|line| line.contains("failed")).count(), 2);
+    }
+
+    #[test]
+    fn a_batch_succeeds_only_when_every_part_answers_ok() {
+        let target = WindowRef {
+            pid: 42,
+            id: None,
+            focused: false,
+            visible: true,
+            rect: None,
+        };
+        for (reply, fails) in [
+            ("ok\n\n\nok", false),
+            ("ok\n\n\nok\n", false),
+            ("ok\n\n\nInvalid dispatcher", true),
+            ("Invalid dispatcher\n\n\nok", true),
+            ("ok", true),
+        ] {
+            let (exec, seen) = hyprland(|_| LEGACY_PROBE, move |_| reply);
+            let commands = Commands::new(Wm::Hyprland, exec);
+            let (lines, log) = logged();
+            assert!(commands.dispatch(
+                "move to output",
+                &|form| compositor::move_to_output_argv(Wm::Hyprland, form, &target, "DP-1"),
+                &log,
+            ));
+            assert_eq!(
+                seen.lock().unwrap()[1],
+                strings(&[
+                    "hyprctl",
+                    "--batch",
+                    "dispatch focuswindow pid:42 ; dispatch movewindow mon:DP-1"
+                ])
+            );
+            assert_eq!(!commands.failure_counts().is_empty(), fails, "{reply:?}");
+            assert_eq!(
+                lines.borrow().iter().any(|line| line.contains("failed")),
+                fails,
+                "{reply:?}"
+            );
+        }
+        // The Lua move is one command.
+        let (exec, seen) = hyprland(|_| "ok", |_| "ok");
+        let commands = Commands::new(Wm::Hyprland, exec);
+        commands.dispatch(
+            "move to output",
+            &|form| compositor::move_to_output_argv(Wm::Hyprland, form, &target, "DP-1"),
+            &|_| {},
+        );
+        assert_eq!(
+            seen.lock().unwrap()[1],
+            strings(&[
+                "hyprctl",
+                "dispatch",
+                "hl.dsp.window.move({ window = 'pid:42', monitor = 'DP-1' })"
+            ])
+        );
+        assert!(commands.failure_counts().is_empty());
+    }
+
+    #[test]
+    fn a_hyprland_raise_reads_the_window_list_then_probes_then_focuses_by_pid() {
+        let (exec, seen) = hyprland(
+            |_| "ok",
+            |argv| {
+                if argv[1] == "clients" {
+                    r#"[{"mapped":true,"pid":300,"focusHistoryID":1},{"mapped":true,"pid":250,"focusHistoryID":0}]"#
+                } else {
+                    "ok"
+                }
+            },
+        );
+        let (lines, log) = logged();
+        Commands::new(Wm::Hyprland, exec).raise_blocking(&[300, 250], &log);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                strings(&["hyprctl", "clients", "-j"]),
+                probe(),
+                strings(&["hyprctl", "dispatch", "hl.dsp.focus({ window = 'pid:300' })"]),
+            ]
+        );
+        assert_eq!(lines.borrow().len(), 1, "{:?}", lines.borrow());
+    }
+
+    /// The runner's own methods run on the GTK thread. They reach Hyprland's probe and its dispatches only
+    /// through the two worker functions, and only from inside a spawned thread.
+    #[test]
+    fn the_probe_and_every_dispatch_run_on_a_worker_thread() {
+        use eitri_core::source_scan::{braced, code_only, modules, read_required, without};
+        let text = read_required("shell/src/companion/wm_runner.rs").text;
+        let code = code_only(&text);
+        let code = without(&code, &modules(&code, "tests"));
+        let at = code.find("impl WmRunner {").expect("the runner's impl");
+        let runner = braced(&code, at + "impl WmRunner ".len());
+        // Of its `Commands`, the runner only clones them and hands them to a worker.
+        for (at, _) in runner.match_indices("commands.") {
+            let method: String = runner[at + "commands.".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                ["clone", "move_focus_blocking", "raise_blocking"].contains(&method.as_str()),
+                "the runner calls `commands.{method}` on its own thread"
+            );
+        }
+        let mut workers = 0;
+        for name in [".move_focus_blocking(", ".raise_blocking("] {
+            for (at, _) in runner.match_indices(name) {
+                workers += 1;
+                let before = &runner[at.saturating_sub(160)..at];
+                assert!(
+                    before.contains("thread::spawn(move ||"),
+                    "`{name}` is called outside a spawned thread: {before}"
+                );
+            }
+        }
+        assert_eq!(workers, 2, "the scan saw the two worker calls");
+    }
+
+    /// sway and niri have one form and no reply rule: nothing is probed, nothing judged.
+    #[test]
+    fn other_compositors_are_never_probed() {
+        let (exec, seen) = fake(sway_tree(0, 500));
+        let (lines, log) = logged();
+        let commands = Commands::new(Wm::Sway, exec);
+        commands.move_focus_blocking(Direction::Right, &log);
+        assert!(seen.lock().unwrap().iter().all(|argv| argv[0] == "swaymsg"));
+        assert!(lines.borrow().is_empty(), "{:?}", lines.borrow());
+        let (exec, seen) = fake("anything");
+        Commands::new(Wm::Niri, exec).move_focus_blocking(Direction::Up, &log);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![strings(&["niri", "msg", "action", "focus-window-up"])]
+        );
+        assert!(lines.borrow().is_empty(), "{:?}", lines.borrow());
     }
 
     use crate::companion::gnome_shell::Done;
@@ -787,16 +1400,16 @@ mod tests {
 
     #[test]
     fn an_edge_letter_is_the_ordinary_move_where_gnome_is_not_in_play() {
-        let (exec, seen) = fake("");
+        let (exec, seen) = hyprland(|_| LEGACY_PROBE, |_| "ok");
         let runner = WmRunner::with_commands(Wm::Hyprland, exec, Arc::new(|_| None));
         assert!(runner.editor_edge(Direction::Right, &no_notice));
         let waited = Instant::now();
-        while seen.lock().unwrap().is_empty() && waited.elapsed() < Duration::from_secs(5) {
+        while seen.lock().unwrap().len() < 2 && waited.elapsed() < Duration::from_secs(5) {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![vec!["hyprctl", "dispatch", "movefocus", "r"]]
+            vec![probe(), strings(&["hyprctl", "dispatch", "movefocus", "r"])]
         );
         let runner = WmRunner::with_commands(Wm::None, fake("").0, Arc::new(|_| None));
         let notices = RefCell::new(Vec::new());

@@ -10,8 +10,10 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 
 - **Linux on x86_64, Wayland.** X11 is untested (a report from X11 is still welcome). macOS is in progress.
   Windows is not supported; WSL2 with WSLg may work, untested. There is no ARM build yet.
-- **Tested on GNOME and sway.** Other desktops and compositors, KDE Plasma and Hyprland among them, have not
-  been tested; reports from them are welcome.
+- **Tested on GNOME and sway, and companion mode on Hyprland.** Other desktops and compositors, KDE Plasma
+  among them, have not been tested; reports from them are welcome. Hyprland: companion mode (focus moves and
+  raises) was run on a live 0.57.0 and 0.56.2 (with `hyprland.conf` and with `hyprland.lua`); the second window's
+  raises were not.
 - **WebKitGTK 2.40 or newer** (the `webkitgtk-6.0` API) is required. The prebuilt binaries are built against
   glibc 2.39 and GTK 4.14; older versions are untested. Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch
   meet this; Ubuntu 22.04 and Debian 12 do not.
@@ -114,8 +116,9 @@ one-window mode.
 
 - **Tried only in an isolated, headless test session so far, not on real hardware:** sway with a terminal nvim,
   `eitri split` with Neovide 0.16.2 on sway (also started from a shell inside tmux), and the GNOME Shell extension in a headless GNOME Shell
-  50. Hyprland, niri, other nvim GUIs and a real GNOME login with the extension have not been tried at all. On
-  Hyprland and niri the edge behaviour is the window manager's own; Eitri does not check it.
+  50. Hyprland was run only in a virtual machine (companion mode with a terminal nvim on 0.57.0 and 0.56.2, not
+  the second window's raises, not real hardware). niri, other nvim GUIs and a real GNOME login with the extension
+  have not been tried at all. On niri the edge behaviour is the window manager's own; Eitri does not check it.
 - **nvim inside tmux has not been tried yet.** The edge of tmux's panes stays tmux's. With vim-tmux-navigator
   there is no crossing from nvim to the panel window with `Ctrl+h/j/k/l`; with smart-splits.nvim and its
   `at_edge` hook set as in [the guide](guide/companion.md#navigator-plugins-and-tmux), the move should reach the panel at

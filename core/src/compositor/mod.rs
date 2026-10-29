@@ -2,6 +2,10 @@
 //! focus or raises a window, and how to read its window list. Nothing here runs a command or
 //! touches the desktop; the caller does that off the GTK thread and feeds the output back in.
 //!
+//! Hyprland's commands are built in `hyprland_dispatch` from typed values only, in the form its config manager
+//! takes ([`HyprForm`], picked by a probe the caller runs); its replies must be read, since a failed dispatch
+//! still exits 0 ([`dispatch_reply_failure`]).
+//!
 //! Only sway is asked whether a move would wrap (it wraps around the edge of the last window);
 //! Hyprland and niri have no such check. GNOME has no command line to ask: a client there cannot
 //! list or focus windows, so `Wm::Gnome` is served by a Shell extension over D-Bus (the shell crate
@@ -10,7 +14,13 @@
 use crate::layout::Direction;
 use std::ffi::OsString;
 
+pub use hyprland_dispatch::{
+    failure_kind, first_line, names_other_form, probe_argv as hyprland_probe_argv, HyprAddress, HyprDispatch, HyprForm,
+    OutputName,
+};
+
 mod hyprland;
+mod hyprland_dispatch;
 mod niri;
 mod sway;
 
@@ -109,17 +119,27 @@ fn argv(parts: &[&str]) -> Option<Vec<String>> {
     Some(parts.iter().map(ToString::to_string).collect())
 }
 
-pub fn move_focus_argv(wm: Wm, dir: Direction) -> Option<Vec<String>> {
+/// The `hyprctl` argv that runs `dispatches` in order, in `form`: one command as `hyprctl dispatch`, several as one
+/// `--batch`. The only way a Hyprland dispatch is built.
+pub fn hyprland_argv(form: HyprForm, dispatches: &[HyprDispatch]) -> Option<Vec<String>> {
+    hyprland_dispatch::argv(form, dispatches)
+}
+
+/// What the compositor answered for a dispatch `argv`, when that was not success. Only Hyprland's dispatches are
+/// judged: each command of one, every part of a `--batch` included, must answer `ok`, and anything else comes back
+/// here as the failing part's text. `hyprctl` puts the reply on stdout and exits 0 for most failures (always for a
+/// batch), so the reply is the only sign. `None` for success, and for every other compositor's commands.
+pub fn dispatch_reply_failure(wm: Wm, argv: &[String], reply: &str) -> Option<String> {
     match wm {
-        Wm::Hyprland => {
-            let d = match dir {
-                Direction::Left => "l",
-                Direction::Right => "r",
-                Direction::Up => "u",
-                Direction::Down => "d",
-            };
-            argv(&["hyprctl", "dispatch", "movefocus", d])
-        }
+        Wm::Hyprland => hyprland_dispatch::reply_failure(argv, reply),
+        Wm::Sway | Wm::Niri | Wm::Gnome | Wm::None => None,
+    }
+}
+
+/// The command that moves focus toward `dir`. `form` is read for Hyprland only.
+pub fn move_focus_argv(wm: Wm, form: HyprForm, dir: Direction) -> Option<Vec<String>> {
+    match wm {
+        Wm::Hyprland => hyprland_argv(form, &[HyprDispatch::FocusDir(dir)]),
         Wm::Sway => {
             let d = match dir {
                 Direction::Left => "left",
@@ -151,15 +171,11 @@ pub fn list_windows_argv(wm: Wm) -> Option<Vec<String>> {
     }
 }
 
-/// The command that focuses `target`. niri needs the window id; without one there is no command.
-pub fn focus_window_argv(wm: Wm, target: &WindowRef) -> Option<Vec<String>> {
+/// The command that focuses `target`. niri needs the window id; without one there is no command. `form` is read
+/// for Hyprland only.
+pub fn focus_window_argv(wm: Wm, form: HyprForm, target: &WindowRef) -> Option<Vec<String>> {
     match wm {
-        Wm::Hyprland => Some(vec![
-            "hyprctl".to_string(),
-            "dispatch".to_string(),
-            "focuswindow".to_string(),
-            format!("pid:{}", target.pid),
-        ]),
+        Wm::Hyprland => hyprland_argv(form, &[HyprDispatch::FocusPid(target.pid)]),
         // One argv element: swaymsg joins its arguments itself, and the criteria must lead the command.
         Wm::Sway => Some(vec!["swaymsg".to_string(), format!("[pid={}] focus", target.pid)]),
         Wm::Niri => target.id.map(|id| {
@@ -184,31 +200,29 @@ pub fn valid_output_name(name: &str) -> bool {
 }
 
 /// The command that moves `target`'s window to the output `output` (GDK's connector name, which is the
-/// compositor's own output name). niri needs the window id. Hyprland's `movewindow` acts on the focused window, so
-/// its batch focuses the window by pid first: this runs when a window opens or its monitor appears, never while the
-/// user works in another window.
-pub fn move_to_output_argv(wm: Wm, target: &WindowRef, output: &str) -> Option<Vec<String>> {
-    if !valid_output_name(output) {
-        return None;
-    }
+/// compositor's own output name). niri needs the window id. Hyprland's Lua `move` names the window, so it is one
+/// command; its legacy `movewindow` acts on the focused window, so that batch focuses the window by pid first: this
+/// runs when a window opens or its monitor appears, never while the user works in another window. `form` is read
+/// for Hyprland only.
+pub fn move_to_output_argv(wm: Wm, form: HyprForm, target: &WindowRef, output: &str) -> Option<Vec<String>> {
+    let output = OutputName::new(output)?;
     match wm {
         Wm::Sway => Some(vec![
             "swaymsg".to_string(),
-            format!("[pid={}] move container to output \"{output}\"", target.pid),
+            format!("[pid={}] move container to output \"{}\"", target.pid, output.as_str()),
         ]),
-        Wm::Hyprland => Some(vec![
-            "hyprctl".to_string(),
-            "--batch".to_string(),
-            format!(
-                "dispatch focuswindow pid:{} ; dispatch movewindow mon:{output}",
-                target.pid
-            ),
-        ]),
+        Wm::Hyprland => hyprland_argv(
+            form,
+            &[HyprDispatch::MoveToOutput {
+                pid: target.pid,
+                output,
+            }],
+        ),
         Wm::Niri => target.id.map(|id| {
             ["niri", "msg", "action", "move-window-to-monitor", "--id"]
                 .iter()
                 .map(ToString::to_string)
-                .chain([id.to_string(), output.to_string()])
+                .chain([id.to_string(), output.as_str().to_string()])
                 .collect()
         }),
         Wm::Gnome | Wm::None => None,
@@ -334,10 +348,10 @@ mod tests {
             rect: None,
         };
         for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
-            assert_eq!(move_focus_argv(Wm::Gnome, dir), None);
+            assert_eq!(move_focus_argv(Wm::Gnome, HyprForm::Legacy, dir), None);
         }
         assert_eq!(list_windows_argv(Wm::Gnome), None);
-        assert_eq!(focus_window_argv(Wm::Gnome, &w), None);
+        assert_eq!(focus_window_argv(Wm::Gnome, HyprForm::Legacy, &w), None);
         assert!(parse_windows(Wm::Gnome, "[]").is_err());
         assert_eq!(
             GNOME_NO_EXTENSION_NOTICE,
@@ -420,12 +434,18 @@ mod tests {
         ];
         for (i, dir) in dirs.into_iter().enumerate() {
             assert_eq!(
-                move_focus_argv(Wm::Hyprland, dir),
+                move_focus_argv(Wm::Hyprland, HyprForm::Legacy, dir),
                 v(&["hyprctl", "dispatch", "movefocus", hypr[i]])
             );
-            assert_eq!(move_focus_argv(Wm::Sway, dir), v(&["swaymsg", "focus", sway[i]]));
-            assert_eq!(move_focus_argv(Wm::Niri, dir), v(&["niri", "msg", "action", niri[i]]));
-            assert_eq!(move_focus_argv(Wm::None, dir), None);
+            assert_eq!(
+                move_focus_argv(Wm::Sway, HyprForm::Legacy, dir),
+                v(&["swaymsg", "focus", sway[i]])
+            );
+            assert_eq!(
+                move_focus_argv(Wm::Niri, HyprForm::Legacy, dir),
+                v(&["niri", "msg", "action", niri[i]])
+            );
+            assert_eq!(move_focus_argv(Wm::None, HyprForm::Legacy, dir), None);
         }
         assert_eq!(list_windows_argv(Wm::Hyprland), v(&["hyprctl", "clients", "-j"]));
         assert_eq!(list_windows_argv(Wm::Sway), v(&["swaymsg", "-t", "get_tree"]));
@@ -440,18 +460,21 @@ mod tests {
             rect: None,
         };
         assert_eq!(
-            focus_window_argv(Wm::Hyprland, &w),
+            focus_window_argv(Wm::Hyprland, HyprForm::Legacy, &w),
             v(&["hyprctl", "dispatch", "focuswindow", "pid:42"])
         );
-        assert_eq!(focus_window_argv(Wm::Sway, &w), v(&["swaymsg", "[pid=42] focus"]));
         assert_eq!(
-            focus_window_argv(Wm::Niri, &w),
+            focus_window_argv(Wm::Sway, HyprForm::Legacy, &w),
+            v(&["swaymsg", "[pid=42] focus"])
+        );
+        assert_eq!(
+            focus_window_argv(Wm::Niri, HyprForm::Legacy, &w),
             v(&["niri", "msg", "action", "focus-window", "--id", "7"])
         );
-        assert_eq!(focus_window_argv(Wm::None, &w), None);
+        assert_eq!(focus_window_argv(Wm::None, HyprForm::Legacy, &w), None);
         let no_id = WindowRef { id: None, ..w };
-        assert_eq!(focus_window_argv(Wm::Niri, &no_id), None);
-        assert!(focus_window_argv(Wm::Sway, &no_id).is_some());
+        assert_eq!(focus_window_argv(Wm::Niri, HyprForm::Legacy, &no_id), None);
+        assert!(focus_window_argv(Wm::Sway, HyprForm::Legacy, &no_id).is_some());
     }
 
     #[test]
@@ -465,11 +488,11 @@ mod tests {
             rect: None,
         };
         assert_eq!(
-            move_to_output_argv(Wm::Sway, &w, "HEADLESS-2"),
+            move_to_output_argv(Wm::Sway, HyprForm::Legacy, &w, "HEADLESS-2"),
             v(&["swaymsg", "[pid=42] move container to output \"HEADLESS-2\""])
         );
         assert_eq!(
-            move_to_output_argv(Wm::Hyprland, &w, "DP-1"),
+            move_to_output_argv(Wm::Hyprland, HyprForm::Legacy, &w, "DP-1"),
             v(&[
                 "hyprctl",
                 "--batch",
@@ -477,15 +500,68 @@ mod tests {
             ])
         );
         assert_eq!(
-            move_to_output_argv(Wm::Niri, &w, "eDP-1"),
+            move_to_output_argv(Wm::Niri, HyprForm::Legacy, &w, "eDP-1"),
             v(&["niri", "msg", "action", "move-window-to-monitor", "--id", "7", "eDP-1"])
         );
         assert_eq!(
-            move_to_output_argv(Wm::Niri, &WindowRef { id: None, ..w }, "eDP-1"),
+            move_to_output_argv(Wm::Niri, HyprForm::Legacy, &WindowRef { id: None, ..w }, "eDP-1"),
             None
         );
-        assert_eq!(move_to_output_argv(Wm::Gnome, &w, "DP-1"), None);
-        assert_eq!(move_to_output_argv(Wm::None, &w, "DP-1"), None);
+        assert_eq!(move_to_output_argv(Wm::Gnome, HyprForm::Legacy, &w, "DP-1"), None);
+        assert_eq!(move_to_output_argv(Wm::None, HyprForm::Legacy, &w, "DP-1"), None);
+    }
+
+    #[test]
+    fn hyprland_takes_the_probed_form_and_the_others_ignore_it() {
+        let v = |parts: &[&str]| Some(parts.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let w = WindowRef {
+            pid: 42,
+            id: Some(7),
+            focused: false,
+            visible: true,
+            rect: None,
+        };
+        assert_eq!(
+            move_focus_argv(Wm::Hyprland, HyprForm::Lua, Direction::Left),
+            v(&["hyprctl", "dispatch", "hl.dsp.focus({ direction = 'l' })"])
+        );
+        assert_eq!(
+            focus_window_argv(Wm::Hyprland, HyprForm::Lua, &w),
+            v(&["hyprctl", "dispatch", "hl.dsp.focus({ window = 'pid:42' })"])
+        );
+        assert_eq!(
+            move_to_output_argv(Wm::Hyprland, HyprForm::Lua, &w, "DP-1"),
+            v(&[
+                "hyprctl",
+                "dispatch",
+                "hl.dsp.window.move({ window = 'pid:42', monitor = 'DP-1' })"
+            ])
+        );
+        for wm in [Wm::Sway, Wm::Niri] {
+            for dir in [Direction::Left, Direction::Down] {
+                assert_eq!(
+                    move_focus_argv(wm, HyprForm::Lua, dir),
+                    move_focus_argv(wm, HyprForm::Legacy, dir)
+                );
+            }
+            assert_eq!(
+                focus_window_argv(wm, HyprForm::Lua, &w),
+                focus_window_argv(wm, HyprForm::Legacy, &w)
+            );
+            assert_eq!(
+                move_to_output_argv(wm, HyprForm::Lua, &w, "DP-1"),
+                move_to_output_argv(wm, HyprForm::Legacy, &w, "DP-1")
+            );
+        }
+        // Replies are judged for Hyprland's dispatches only.
+        let hypr = move_focus_argv(Wm::Hyprland, HyprForm::Legacy, Direction::Left).unwrap();
+        assert_eq!(dispatch_reply_failure(Wm::Hyprland, &hypr, "ok\n"), None);
+        assert_eq!(
+            dispatch_reply_failure(Wm::Hyprland, &hypr, "Invalid dispatcher"),
+            Some("Invalid dispatcher".to_string())
+        );
+        let sway = move_focus_argv(Wm::Sway, HyprForm::Legacy, Direction::Left).unwrap();
+        assert_eq!(dispatch_reply_failure(Wm::Sway, &sway, r#"[{"success": true}]"#), None);
     }
 
     #[test]
@@ -500,7 +576,7 @@ mod tests {
                 visible: true,
                 rect: None,
             };
-            assert_eq!(move_to_output_argv(Wm::Sway, &w, bad), None);
+            assert_eq!(move_to_output_argv(Wm::Sway, HyprForm::Legacy, &w, bad), None);
         }
         for good in ["DP-1", "HDMI-A-2", "HEADLESS-2", "eDP-1", "Virtual-1", "DVI_I.1"] {
             assert!(valid_output_name(good), "{good}");
@@ -582,7 +658,7 @@ mod tests {
         assert_eq!(has_neighbour(&ws, Direction::Left), Some(false));
         assert_eq!(first_window_owner(&[300, 1], &ws).map(|w| w.pid), Some(1));
         assert_eq!(
-            first_window_owner(&[300, 1], &ws).and_then(|w| focus_window_argv(Wm::Sway, w)),
+            first_window_owner(&[300, 1], &ws).and_then(|w| focus_window_argv(Wm::Sway, HyprForm::Legacy, w)),
             Some(vec!["swaymsg".to_string(), "[pid=1] focus".to_string()])
         );
         // The same from the fixture's window on workspace 2.
@@ -648,6 +724,40 @@ mod tests {
         // Focused window is on the right output: the left output's window is a left neighbour.
         assert_eq!(has_neighbour(&ws, Direction::Left), Some(true));
         assert_eq!(has_neighbour(&ws, Direction::Right), Some(false));
+    }
+
+    /// `hyprctl clients -j` as Hyprland 0.56.2 and 0.57.0 print it, with nvim's foot on the left and the panel on the
+    /// right, the panel focused: each carries many more fields than the parser reads, and the ones it reads are there.
+    #[test]
+    fn real_hyprland_window_lists_parse() {
+        for (name, foot, panel) in [
+            ("hyprland_clients_0.56.2.json", 4144, 4498),
+            ("hyprland_clients_0.57.0.json", 5114, 5128),
+        ] {
+            let windows = parse_windows(Wm::Hyprland, &fixture(name)).unwrap();
+            let seen: Vec<(u32, bool, bool, Option<Rect>)> =
+                windows.iter().map(|w| (w.pid, w.focused, w.visible, w.rect)).collect();
+            let rect = |x| {
+                Some(Rect {
+                    x,
+                    y: 22,
+                    w: 931,
+                    h: 1036,
+                })
+            };
+            assert_eq!(
+                seen,
+                [(foot, false, true, rect(22)), (panel, true, true, rect(967))],
+                "{name}"
+            );
+            assert_eq!(
+                first_window_owner(&[panel], &windows).map(|w| w.pid),
+                Some(panel),
+                "{name}"
+            );
+            assert_eq!(has_neighbour(&windows, Direction::Left), Some(true), "{name}");
+            assert_eq!(has_neighbour(&windows, Direction::Right), Some(false), "{name}");
+        }
     }
 
     #[test]
