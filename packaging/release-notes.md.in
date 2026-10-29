@@ -19,8 +19,7 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 
 - Splits, tabbed and stacked containers (`<prefix> Alt+w` / `Alt+s`), floats (`<prefix> Alt+Shift+Space`), a
   scratchpad (`<prefix> Alt+_` puts a module away, `Alt+-` brings it back) and named workspaces (`<prefix> (`, `)`,
-  `L`, `s`, `$`; `main` always stays). If you tile your desktop with i3, sway or Hyprland, you already know how it
-  works.
+  `L`, `s`, `$`; `main` always stays). i3's moves are there as Alt chords after the prefix.
 - tmux's prefix keys, with `Ctrl+b` as the prefix and 36 new keys after it: layouts (`Alt+3` to `Alt+5`, `Space`,
   `E`), rotate (`Ctrl+o`, `Alt+o`), mark and swap (`m`, `M`), move to an edge (`H`, `J`, `K`), pane numbers (`q`),
   moving a module (`Alt+H/J/K/L`), selecting a container (`Alt+a`, `Alt+d`), breaking a chat tab out into a view of
@@ -33,6 +32,8 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   `eitri.layout.export()`, which returns the window you arranged as the `init.lua` calls that make it.
 - The layout file is now version 2. The old file is read once and left as it was, so going back to 0.2.2 is safe.
 - For i3 or sway with `$mod = Alt`, `docs/keymap/i3-alt-mod.lua` moves the rows your window manager would take.
+- `:EitriTutor` in the editor teaches the window's keys hands-on, in English or Simplified Chinese, on Neovim's own
+  tutor. The Keys page of the guide now opens with the prefix basics.
 
 **Pages you build** (experimental)
 

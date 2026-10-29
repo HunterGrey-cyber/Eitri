@@ -52,9 +52,44 @@ pub fn current_uid() -> u32 {
 }
 
 /// This process's effective user id: the owner every file and directory it creates gets.
-fn euid() -> u32 {
+pub fn euid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
+}
+
+/// A real directory (a symlink is not followed) owned by this process's effective user, with no
+/// group or other permission bit.
+pub fn is_private_dir(path: &Path) -> bool {
+    matches!(path.symlink_metadata(), Ok(m) if m.is_dir() && m.uid() == euid() && m.mode() & 0o077 == 0)
+}
+
+/// Whether the owner and mode of the directory a private directory is created in keep anyone else
+/// from replacing that private directory: owned by `euid` or root, and not group- or other-writable
+/// unless sticky.
+pub(crate) fn parent_is_safe(owner: u32, mode: u32, euid: u32) -> bool {
+    (owner == euid || owner == 0) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+/// Refuses `dir` as the place to create a private directory in unless [`parent_is_safe`] holds for
+/// it. Whoever can rename entries in `dir` can move a validated 0700 directory away and put their
+/// own, also 0700 but theirs, in its place; the sticky bit stops everyone but an entry's owner and
+/// the directory's owner, both trusted by the first rule. A symlink named by `dir` is followed
+/// (macOS's `/var` is one): it is the directory it leads to whose entries can be renamed. `what`
+/// names what would have gone there, for the error.
+pub fn require_safe_parent(dir: &Path, what: &str) -> std::io::Result<()> {
+    let meta = std::fs::metadata(dir)?;
+    if meta.is_dir() && parent_is_safe(meta.uid(), meta.mode(), euid()) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is not a directory of this user or root, or is writable by its group or by anyone without \
+             the sticky bit, so another user could swap a directory made in it; refusing to put {what} there \
+             (point TMPDIR at a directory of your own)",
+            dir.display()
+        ),
+    ))
 }
 
 /// Whether `path` is itself a real directory (a symlink is not followed) owned by this user.

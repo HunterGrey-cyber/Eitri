@@ -35,6 +35,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::private_fs::{is_private_dir, require_safe_parent};
+
 /// The longest socket path, in bytes and without the trailing NUL, that binds on macOS.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
@@ -104,7 +106,7 @@ pub(crate) fn private_socket_dir(runtime_dir: Option<&Path>, tmp: &Path, uid: u3
     let dir = match runtime_dir.filter(|d| d.is_absolute() && is_private_dir(d)) {
         Some(runtime) => runtime.join("eitri"),
         None => {
-            require_safe_parent(tmp)?;
+            require_safe_parent(tmp, "the sidecar's socket")?;
             tmp.join(format!("eitri-{uid}"))
         }
     };
@@ -127,43 +129,6 @@ pub(crate) fn private_socket_dir(runtime_dir: Option<&Path>, tmp: &Path, uid: u3
         ));
     }
     Ok(dir)
-}
-
-/// Whether the owner and mode of the directory a private directory is created in keep anyone else
-/// from replacing that private directory: owned by `euid` or root, and not group- or other-writable
-/// unless sticky.
-fn parent_is_safe(owner: u32, mode: u32, euid: u32) -> bool {
-    (owner == euid || owner == 0) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
-}
-
-/// [`parent_is_safe`] for `tmp`. A symlink named by `TMPDIR` is followed (macOS's `/var` is one); it
-/// is the directory it leads to whose entries can be renamed.
-fn require_safe_parent(tmp: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    let meta = std::fs::metadata(tmp)?;
-    if meta.is_dir() && parent_is_safe(meta.uid(), meta.mode(), euid) {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!(
-            "{} is not a directory of this user or root, or is writable by its group or by anyone without \
-             the sticky bit, so another user could swap the sidecar's socket directory in it; refusing to \
-             bind the sidecar's socket there (point TMPDIR at a directory of your own)",
-            tmp.display()
-        ),
-    ))
-}
-
-/// A real directory (a symlink is not followed) owned by this process's effective user, with no
-/// group or other permission bit.
-fn is_private_dir(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    matches!(path.symlink_metadata(), Ok(m) if m.is_dir() && m.uid() == euid && m.mode() & 0o077 == 0)
 }
 
 /// Whether the process on the other end of a freshly connected socket may be talked to: only this
@@ -284,7 +249,11 @@ mod tests {
             (me + 1, 0o755, false),
             (me + 1, 0o1777, false),
         ] {
-            assert_eq!(parent_is_safe(owner, mode, me), safe, "owner {owner} mode {mode:o}");
+            assert_eq!(
+                crate::private_fs::parent_is_safe(owner, mode, me),
+                safe,
+                "owner {owner} mode {mode:o}"
+            );
         }
     }
 

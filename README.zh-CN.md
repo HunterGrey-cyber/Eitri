@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=a72ec4bff61b1cdc5091a72dc9a3aec40fbdb0b91b4199d1f4e304e79fc1d18a -->
+<!-- translated-from: README.md sha256=5a52528ba73b50cb2bc27384fae0c60fcc49df749a96468576b58ab34ca4d843 -->
 
 <div align="center">
 
@@ -25,7 +25,7 @@
 
 一个 Linux 上的 Neovim 图形前端。Eitri 是一个桌面窗口（MIT 许可），包在你自己的 Neovim 配置外面，你监督的 agent（Claude Code、Codex，或任何讲 ACP 的 agent）、终端和你自己的网页平铺在它旁边。回复是排好版的 markdown 和 diff，带一张张权限卡片，全程不用碰鼠标。
 
-键盘驱动的平铺：分屏、标签、堆叠、浮窗和工作区，用的是 tmux 的前缀键。如果你在桌面上用 i3、sway、Hyprland 或 AeroSpace 平铺窗口，你已经知道它怎么用了。
+键盘驱动的平铺：分屏、标签、堆叠、浮窗和工作区，用的是 tmux 的前缀键：先按 `Ctrl+b`，再按一个键；`Ctrl+b ?` 列出全部按键。i3 的那些移动也有，是前缀之后的 Alt 组合键；在编辑器里运行 `:EitriTutor`，会带你一步步把这些键走一遍。
 
 **[eitri.cc](https://eitri.cc/zh/)** 上有截图、按键、和其他方案的对比，以及环境要求和限制。
 

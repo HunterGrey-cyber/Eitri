@@ -1,0 +1,11 @@
+{
+  "expect": {
+    "30": "Press the prefix, then this key, to list every key: Ctrl+b ?",
+    "87": "Zoom this module, or restore it: Ctrl+b z",
+    "122": "Go back to the module that had the keys before: Ctrl+b ;",
+    "164": "Open a new tab in the agent panel: Ctrl+b c",
+    "198": "Clear the terminal's screen: Ctrl+b Ctrl+l",
+    "233": "Float this module, or put a float back: Ctrl+b Alt+Shift+Space",
+    "262": "eitri.keymap.prefix(\"C-a\")"
+  }
+}

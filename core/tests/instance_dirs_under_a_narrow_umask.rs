@@ -69,6 +69,13 @@ fn every_instance_directory_is_exactly_private_under_umask_0277() {
     std::fs::write(scratch.path().join("probe"), b"x").expect("a draft can be written in it");
     std::fs::remove_dir_all(scratch.path()).unwrap();
 
+    // The tutorial's lessons' directory, which nvim writes the lessons into when `:EitriTutor` runs (its snippet
+    // sets each directory it makes to 0700 itself).
+    let lessons = eitri_core::tutor::TutorDir::in_dir(&tmp).expect("the lessons' directory is made under umask 0277");
+    assert_eq!(mode(lessons.path()), 0o700, "tutor");
+    std::fs::write(lessons.path().join("probe"), b"x").expect("a file can be written in it");
+    lessons.cleanup();
+
     usable("editor context", editor.socket_path());
     usable("nvim keys", keys.socket_path());
     usable("theme", theme.socket_path());

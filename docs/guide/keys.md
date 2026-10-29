@@ -7,6 +7,21 @@ modules, layout), a few keys that work **everywhere** in the window, and the **a
 which are vim's. Everything below is the default setup. `?` in the panel lists the keys of your own setup,
 including anything you changed in [your configuration](configuration.md) or took over from tmux.
 
+> **First time with prefix keys?**
+>
+> - Press `Ctrl+b`, let go, then press one key. `Ctrl+b ?` lists every key, and `Esc` after `Ctrl+b` cancels it.
+> - `Ctrl+b` belongs to the window, so to give it to whatever has the keys, press it twice: `Ctrl+b Ctrl+b` is
+>   Neovim's page up, and the key Claude Code uses to move a running command to the background when it runs in the
+>   bottom terminal.
+> - `Ctrl+h`, `Ctrl+j`, `Ctrl+k` and `Ctrl+l` move between modules, so in the bottom terminal the shell's clear-screen
+>   is `Ctrl+b Ctrl+l` (and readline's `Ctrl+k` is `Ctrl+b Ctrl+k`).
+> - If you use tmux, your prefix and prefix-table bindings come from your tmux configuration
+>   ([Your tmux keys](#your-tmux-keys)), and `Ctrl+b ?` (or your own prefix and `?`) lists what did not come across.
+> - For a `Ctrl+a` prefix, start from [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua); for i3 or sway with
+>   Alt as `$mod`, from [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua).
+> - `:EitriTutor` in the editor walks you through these keys, step by step, in English or Simplified Chinese
+>   (whichever your locale asks for, as Neovim's `:Tutor` picks).
+
 ## The prefix
 
 The prefix is stock tmux's: press `Ctrl+b`, let go, then press one key. It is read before the editor, the

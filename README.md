@@ -26,7 +26,7 @@ A Neovim GUI for Linux. Eitri is a desktop window (MIT) around your own Neovim c
 supervise (Claude Code, Codex, or any agent that speaks ACP), terminals and web pages of your own tiled beside it.
 Replies come as rendered markdown and diffs with permission cards, all without reaching for the mouse.
 
-Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys. If you tile your desktop with i3, sway, Hyprland or AeroSpace, you already know how it works.
+Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's prefix keys: press `Ctrl+b`, then a key; `Ctrl+b ?` lists them all. i3's moves are there as Alt chords after the prefix, and `:EitriTutor` in the editor walks you through the keys.
 
 **[eitri.cc](https://eitri.cc)** has the screenshots, the keys, how it compares, and the requirements and limits.
 

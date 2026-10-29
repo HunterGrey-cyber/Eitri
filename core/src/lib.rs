@@ -56,6 +56,7 @@ pub mod theme;
 pub mod transcript_titles;
 pub mod turn_review;
 pub mod turn_trace;
+pub mod tutor;
 pub mod window_link;
 pub mod wm;
 

@@ -65,6 +65,12 @@ impl Embed {
     /// Runs `nvim --clean --embed --headless -n -i NONE <extra_args>` in `dir`, with `env` added and
     /// every XDG directory pointed under `dir`, so nothing of the user's reaches it.
     pub fn start(dir: &Path, extra_args: &[&str], env: &[(&str, &str)]) -> Embed {
+        Embed::start_under_umask(dir, extra_args, env, None)
+    }
+
+    /// [`Embed::start`] with the child's umask set to `umask` before it runs `nvim`; this process's own is untouched,
+    /// so tests running beside it create files as they always did.
+    pub fn start_under_umask(dir: &Path, extra_args: &[&str], env: &[(&str, &str)], umask: Option<u32>) -> Embed {
         std::fs::create_dir_all(dir).expect("scratch dir");
         let mut command = Command::new("nvim");
         // Nothing of the outer environment may decide what the snippets do: an nvim started inside tmux
@@ -78,6 +84,16 @@ impl Embed {
         command.args(extra_args);
         for (k, v) in env {
             command.env(k, v);
+        }
+        if let Some(mask) = umask {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: `umask(2)` is async-signal-safe and touches nothing of this process's memory.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::umask(mask as libc::mode_t);
+                    Ok(())
+                });
+            }
         }
         let mut child = command
             .current_dir(dir)

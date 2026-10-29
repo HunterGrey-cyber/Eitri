@@ -1,9 +1,23 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=0ce12956067407009778a68adabb77cde3f03dfc0bc81208b269a9999e048618 -->
+<!-- translated-from: keys.md sha256=61ca2b710a20e005a62589ef401934746aaa52cea9f53f598736eb9e2614aa43 -->
 
 # 按键
 
 Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（标签页、模块、布局）的**前缀**；在窗口里**任何地方**都有效的几个键；以及**agent 面板自己的按键**，那些是 vim 的。下面写的都是默认设置。在面板里按 `?` 会列出你自己这套设置下的按键，包括你在[自己的配置](configuration.zh-CN.md)里改过的，或者从 tmux 拿过来的。
+
+> **第一次用前缀键？**
+>
+> - 按下 `Ctrl+b`，松开，再按一个键。`Ctrl+b ?` 列出所有按键，`Ctrl+b` 之后按 `Esc` 取消。
+> - `Ctrl+b` 归窗口所有，所以要把它交给当前拿着按键的东西，就连按两次：`Ctrl+b Ctrl+b` 是 Neovim 的向上翻页，
+>   在底部终端里运行 Claude Code 时，也是它把正在运行的命令移到后台的那个键。
+> - `Ctrl+h`、`Ctrl+j`、`Ctrl+k` 和 `Ctrl+l` 在模块之间移动，所以在底部终端里，shell 的清屏是 `Ctrl+b Ctrl+l`
+>   （readline 的 `Ctrl+k` 是 `Ctrl+b Ctrl+k`）。
+> - 如果你用 tmux，你的前缀和前缀表里的绑定来自你的 tmux 配置（[你的 tmux 按键](#your-tmux-keys)），
+>   `Ctrl+b ?`（或者你自己的前缀加 `?`）会列出没拿过来的那些。
+> - 想用 `Ctrl+a` 当前缀，从 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua) 开始；i3 或 sway 把 Alt
+>   当 `$mod` 的话，从 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 开始。
+> - 在编辑器里运行 `:EitriTutor`，会一步步带你把这些键走一遍，用英文或简体中文（按你的语言环境来选，和
+>   Neovim 的 `:Tutor` 一样）。
 
 ## 前缀
 

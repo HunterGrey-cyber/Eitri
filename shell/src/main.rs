@@ -35,6 +35,7 @@ mod text_size;
 mod theme;
 mod toast;
 mod tray;
+mod tutor;
 mod version;
 mod web_host;
 mod webkit_sandbox;
@@ -485,6 +486,9 @@ fn build_ui(
     let mut nvim_keys_feed = owns_editor
         .then(eitri_core::nvim_keys::feed::NvimKeysFeed::new)
         .flatten();
+    // `:EitriTutor`, installed in each nvim session once the feeds report it started. Only the window that
+    // embeds nvim has one.
+    let tutor = owns_editor.then(tutor::Tutor::new);
     let mut nvim_child_env = pane_switch.as_ref().map(|ps| ps.child_env()).unwrap_or_default();
     nvim_child_env.extend(theme_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
     nvim_child_env.extend(context_feed.as_ref().map(|feed| feed.child_env()).unwrap_or_default());
@@ -925,6 +929,7 @@ fn build_ui(
         let apply = apply_nvim_keys.clone();
         let plugin_panels = plugin_panels.clone();
         let one = window1_editor.clone();
+        let tutor = tutor.clone();
         feed_pump.listen_keys(feed, move |report| {
             if let Some(one) = &one {
                 one.keys_changed(&report);
@@ -932,6 +937,9 @@ fn build_ui(
             apply(report);
             // The feed reports at nvim's VimEnter: a new editor session may be ready for the plugins' snippets.
             plugin_panels.editor_session();
+            if let Some(tutor) = &tutor {
+                tutor.editor_session();
+            }
         });
     }
     if let Some(two) = &window2_editor {
@@ -1620,6 +1628,7 @@ fn build_ui(
         let apply = apply_theme.clone();
         let plugin_panels = plugin_panels.clone();
         let one = window1_editor.clone();
+        let tutor = tutor.clone();
         feed_pump.listen_theme(feed, move |payload| {
             if let Some(one) = &one {
                 one.theme_changed(&payload);
@@ -1627,6 +1636,9 @@ fn build_ui(
             apply(payload);
             // The feed reports at nvim's VimEnter: a new editor session may be ready for the plugins' snippets.
             plugin_panels.editor_session();
+            if let Some(tutor) = &tutor {
+                tutor.editor_session();
+            }
         });
     }
     if let Some(two) = &window2_editor {
@@ -2402,6 +2414,9 @@ fn build_ui(
         panel_hooks.set_editor_rpc = Some(editor_rpc.clone());
         if let Some(one) = &window1_editor {
             one.set_rpc(editor_rpc.clone());
+        }
+        if let Some(tutor) = &tutor {
+            tutor.set_editor(editor_rpc.clone());
         }
         plugin_panels.set_editor(editor_rpc);
     }
@@ -4172,6 +4187,10 @@ fn build_ui(
         // The plugins' follow socket, for the same two reasons.
         if let Some(socket) = &follow_socket {
             socket.cleanup();
+        }
+        // The tutorial's lessons, written for this window's nvim; the next window's sweep is only a backstop.
+        if let Some(tutor) = &tutor {
+            tutor.cleanup();
         }
         // Shuts down whatever `AgentSession` the agent panel started (a no-op if the user never
         // left the mode-selector screen) -- without this, a normal window close never runs
